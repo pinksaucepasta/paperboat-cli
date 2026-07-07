@@ -55,10 +55,49 @@ type Config struct {
 	DefaultSize  string `json:"default_size,omitempty"`
 	// Upload configures the image-paste bridge.
 	Upload UploadConfig `json:"upload,omitempty"`
+	// Connect tunes the pre-connect broker + readiness polling.
+	Connect ConnectConfig `json:"connect,omitempty"`
+	// SSH configures the agentunnel SSH transport.
+	SSH SSHConfig `json:"ssh,omitempty"`
 
 	// path is where this config was loaded from (or would be written to).
 	path string `json:"-"`
 }
+
+// ConnectConfig tunes how the CLI waits for an idle machine to resume and its
+// agentunnel tunnel to come up after cli-connect. Both are data-driven so the
+// wait behavior can change without a rebuild.
+type ConnectConfig struct {
+	// ReadyTimeoutSeconds caps how long to poll for the tunnel to become
+	// connectable before giving up. Defaults to DefaultReadyTimeoutSeconds.
+	ReadyTimeoutSeconds int `json:"ready_timeout_seconds,omitempty"`
+	// PollIntervalSeconds is the gap between readiness polls. Defaults to
+	// DefaultPollIntervalSeconds.
+	PollIntervalSeconds int `json:"poll_interval_seconds,omitempty"`
+}
+
+// SSHConfig configures the client side of the agentunnel SSH transport. The CLI
+// authenticates with the user's existing local SSH credentials (agent + key
+// files) exactly like `ssh paperboat@host` — paperboat-server never hands out
+// keys. Everything here is optional; sane SSH defaults apply when unset.
+type SSHConfig struct {
+	// IdentityFile is an explicit private key path to offer. Empty means use the
+	// SSH agent and the user's default keys.
+	IdentityFile string `json:"identity_file,omitempty"`
+	// KnownHostsFile overrides the host-key database. Empty uses
+	// ~/.ssh/known_hosts.
+	KnownHostsFile string `json:"known_hosts_file,omitempty"`
+	// InsecureSkipHostKeyCheck disables host-key verification. Off by default;
+	// only for local/dev tunnels where the host key is not yet pinned.
+	InsecureSkipHostKeyCheck bool `json:"insecure_skip_host_key_check,omitempty"`
+}
+
+// Connect polling defaults. Chosen to cover a cold Fly machine resume without
+// hanging indefinitely; overridable per install.
+const (
+	DefaultReadyTimeoutSeconds = 180
+	DefaultPollIntervalSeconds = 3
+)
 
 // Path returns the resolved config file location.
 func (c *Config) Path() string { return c.path }
@@ -118,6 +157,12 @@ func (c *Config) applyDefaults() {
 	}
 	if len(c.Upload.AllowedMimePrefixes) == 0 {
 		c.Upload.AllowedMimePrefixes = []string{"image/"}
+	}
+	if c.Connect.ReadyTimeoutSeconds == 0 {
+		c.Connect.ReadyTimeoutSeconds = DefaultReadyTimeoutSeconds
+	}
+	if c.Connect.PollIntervalSeconds == 0 {
+		c.Connect.PollIntervalSeconds = DefaultPollIntervalSeconds
 	}
 }
 

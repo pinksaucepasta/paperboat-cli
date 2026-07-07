@@ -8,11 +8,14 @@ agentunnel, and transparently bridges **local image pastes into remote TUIs**: w
 a local image into a coding agent running on the VM, the CLI uploads it to the VM and rewrites
 the paste to the VM-side path before the agent sees it — so pasting "just works" remotely.
 
-> **Status:** CLI scaffold implemented and runnable end-to-end. Cross-service calls
-> (project resolution, auth, tunnel, image upload) run behind interfaces with local dev
-> stubs until `paperboat-server` and the agentunnel/papercode wiring land — the command and
-> flag surface will not change when the real backends drop in. See [AGENTS.md](AGENTS.md)
-> for design/conventions and the workspace `USERSTORY.md` for how this fits the platform.
+> **Status:** CLI scaffold implemented with local dev stubs. The production
+> `cli-connect` contract is now papercode WebSocket based: `paperboat-server`
+> will return a tunneled papercode HTTP/WSS endpoint plus scoped auth once the
+> Phase 1 credential issuer exists, and the CLI will attach through papercode
+> terminal RPC when the Phase 4 transport lands.
+> SSH is debug/operator access only, not the production CLI handoff. See
+> [AGENTS.md](AGENTS.md) for design/conventions and the workspace
+> `USERSTORY.md` for how this fits the platform.
 
 ## Usage
 
@@ -46,7 +49,7 @@ Go — distributed as a single static binary (`github.com/urfave/cli/v2`, Go 1.2
 - `internal/config` — local config + read-only reuse of papercode credentials.
 - `internal/catalog` — dynamic agent/machine-size catalog (interface + stub).
 - `internal/resolver` — project-name → connect info (interface + stub).
-- `internal/tunnel` — reach the VM terminal through agentunnel (interface + local-shell stub).
+- `internal/tunnel` — reach the VM terminal through agentunnel/papercode WebSocket RPC (interface + local-shell stub).
 - `internal/session` — transparent PTY wrapper (raw mode, resize, exit-code passthrough).
 - `internal/paste` — bracketed-paste interceptor + image-path rewriter (the risk center).
 - `internal/upload` — papercode-compatible image encoder + uploader (interface + stub).

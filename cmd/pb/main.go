@@ -11,6 +11,7 @@ import (
 	"os"
 	"text/tabwriter"
 
+	"github.com/pujan-modha/paperboat-cli/internal/api"
 	"github.com/pujan-modha/paperboat-cli/internal/buildinfo"
 	"github.com/pujan-modha/paperboat-cli/internal/catalog"
 	"github.com/pujan-modha/paperboat-cli/internal/config"
@@ -163,8 +164,20 @@ func actionConnect(c *cli.Context) error {
 		return err
 	}
 	if errors.Is(err, config.ErrNoCredentials) {
+		if d.cfg.ServerURL != "" {
+			// Real backend configured: a credential is required. Route the user
+			// to papercode rather than prompting for a separate login.
+			return errors.New("no papercode credentials found — sign in with papercode first, then retry")
+		}
 		fmt.Fprintln(os.Stderr, "pb: no papercode credentials found — sign in with papercode first.")
 		fmt.Fprintln(os.Stderr, "    (running in local dev mode against a stub target)")
+	}
+
+	// Do not broker a real connect session until the papercode WebSocket
+	// terminal transport lands. Otherwise a configured backend can authorize and
+	// resume a project, then fail locally with no possible terminal attach.
+	if d.cfg.ServerURL != "" {
+		return errors.New("backend terminal attach is not available yet: papercode WebSocket transport is required before using server_url")
 	}
 
 	// Validate flag values against the dynamic catalog.
@@ -188,6 +201,9 @@ func actionConnect(c *cli.Context) error {
 		Credential: cred,
 	})
 	if err != nil {
+		if errors.Is(err, api.ErrUnauthenticated) {
+			return errors.New("your papercode session was rejected — sign in again with papercode, then retry")
+		}
 		return err
 	}
 
@@ -332,18 +348,47 @@ func doctorCommand() *cli.Command {
 			}
 			fmt.Printf("config:      %s\n", d.cfg.Path())
 			fmt.Printf("server:      %s\n", orLocal(d.cfg.ServerURL))
-			if _, err := d.auth.Credential(); err != nil {
-				if errors.Is(err, config.ErrNoCredentials) {
+			cred, credErr := d.auth.Credential()
+			if credErr != nil {
+				if errors.Is(credErr, config.ErrNoCredentials) {
 					fmt.Println("papercode:   not signed in (sign in with papercode)")
 				} else {
-					fmt.Printf("papercode:   error: %v\n", err)
+					fmt.Printf("papercode:   error: %v\n", credErr)
 				}
 			} else {
 				fmt.Println("papercode:   credentials found ✓")
 			}
+
+			if d.cfg.ServerURL == "" {
+				fmt.Println("backend:     local dev stub (set server_url to connect)")
+				return nil
+			}
+			if credErr != nil {
+				fmt.Println("backend:     skipped (no credentials to authenticate)")
+				return nil
+			}
+			me, err := api.New(d.cfg.ServerURL, cred, nil).Me(c.Context)
+			if errors.Is(err, api.ErrUnauthenticated) {
+				fmt.Println("backend:     credential rejected — sign in again with papercode")
+				return nil
+			}
+			if err != nil {
+				fmt.Printf("backend:     unreachable: %v\n", err)
+				return nil
+			}
+			fmt.Printf("backend:     authenticated as %s ✓\n", firstNonEmpty(me.Email, me.DisplayName, me.ID))
 			return nil
 		},
 	}
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func mark(b bool) string {

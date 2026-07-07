@@ -36,6 +36,42 @@ type ConnectInfo struct {
 	Size string
 	// Local is true when this resolves to a local dev target (no real VM).
 	Local bool
+	// Terminal is the papercode WebSocket attach descriptor returned by paperboat-server's
+	// pre-connect broker. Nil for the local dev stub (Local == true).
+	Terminal *TerminalTarget
+	// Upload is the papercode image-upload endpoint hint from the broker. Nil
+	// when the broker did not return one.
+	Upload *UploadTarget
+}
+
+// AuthTarget is short-lived, scoped auth material returned by the broker.
+type AuthTarget struct {
+	Method    string
+	Ticket    string
+	Token     string
+	ExpiresAt string
+	Scopes    []string
+}
+
+// TerminalTarget is the client-safe papercode WebSocket endpoint carried
+// through agentunnel. It carries route metadata and scoped papercode auth, not
+// raw machine addresses, SSH credentials, or agentunnel control tokens.
+type TerminalTarget struct {
+	HTTPBaseURL      string
+	WebSocketBaseURL string
+	Auth             AuthTarget
+	ThreadID         string
+	TerminalID       string
+	CWD              string
+}
+
+// UploadTarget is the papercode-server upload endpoint reachable through
+// agentunnel, with the server-authoritative size/MIME policy.
+type UploadTarget struct {
+	HTTPBaseURL      string
+	Auth             AuthTarget
+	MaxBytes         int64
+	AllowedMIMETypes []string
 }
 
 // ProjectResolver resolves a project name to connect info.

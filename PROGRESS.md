@@ -6,13 +6,34 @@ product source of truth is the workspace `USERSTORY.md`.)
 
 ## Status at a glance
 
-**CLI scaffold implemented and runnable end-to-end against local dev stubs.** No real
-backend is wired yet (paperboat-server has no endpoints; agentunnel/papercode transport not
-connected). All cross-service work sits behind Go interfaces, so real implementations drop
-in without changing the command/flag surface.
+**CLI control-plane contract corrected for papercode WebSocket attach.** The production
+descriptor target is a tunneled papercode HTTP/WSS endpoint plus scoped auth. Server-side
+credential issuance is Phase 1 and the actual WebSocket terminal transport is Phase 4.
+Until those exist, `pb <project>` refuses `server_url` backend attach before brokering a
+connect session. With `server_url` unset the local dev stubs still run, so the CLI stays
+exercisable offline.
 
 - Build: `make build` → `bin/pb`. `gofmt`/`go vet` clean, `go test ./...` green.
-- Verified end-to-end with the real binary (see "Verification" below).
+- Verified end-to-end with the real binary against a mock paperboat-server implementing the
+  session-cookie auth + connect flow (see "Verification" below).
+
+### Real backend wiring (this pass)
+- **`internal/api`** — paperboat-server control-plane client. Speaks the frozen JSON
+  envelope (`{"data"}` / `{"error":{code,message}}`), authenticates with the
+  `paperboat_session` cookie carrying the **reused papercode token** (the server has no
+  bearer path; connect endpoints need no CSRF). Methods: `Me`, `ListProjects`, `CLIConnect`,
+  `ConnectionStatus`. 401 → `ErrUnauthenticated`; other non-2xx → structured `*APIError`.
+- **`internal/resolver.APIResolver`** — matches the requested token to a project by id then
+  case-insensitive name, calls `cli-connect` (authorizes + reconciles agentunnel resources +
+  resumes an idle machine), and polls `connection-status` until connectable, re-brokering
+  once when the ready status lacks routing detail. Returns a client-safe papercode
+  WebSocket `TerminalTarget` (+ file-upload `UploadTarget`). Poll timeout/interval are
+  config-driven (`connect.*`).
+- **`internal/tunnel.SSHTunnel`** — retained only as optional debug/operator plumbing.
+  Production CLI attach must use papercode WebSocket terminal RPC; that transport is not
+  implemented yet.
+- **`cmd/pb`** — `server_url` gates real vs. stub impls; `doctor` now verifies backend auth
+  via `GET /api/me`.
 
 ## What was built
 
@@ -52,19 +73,19 @@ in without changing the command/flag surface.
   10 MB/image, 8 attachments, ~14 M dataURL chars, `image/*`) so the real transport is a
   drop-in.
 
-## Stubs / dummies kept (replace when backends exist)
+## Real vs. stub, by interface
 
-| Interface | Stub | File | Replace with |
+Real implementations are selected when `server_url` is configured; stubs run otherwise so the
+CLI stays exercisable offline. The interfaces are unchanged, so both drop in interchangeably.
+
+| Interface | Real (server_url set) | Stub (local dev) | Still pending |
 | --- | --- | --- | --- |
-| `catalog.Catalog` | `StubCatalog` — hard-seeded agents (claude/codex/cursor) + sizes (1x/2x/4x) | `internal/catalog/stub.go` | paperboat-server catalog endpoint. Values here are placeholder seed data, **not** a product catalog baked into logic. |
-| `resolver.ProjectResolver` | `StubResolver` — resolves every project to a local target | `internal/resolver/stub.go` | paperboat-server project resolution + pre-connect broker. |
-| `tunnel.Tunnel` | `StubTunnel` — spawns a local `$SHELL` PTY via `creack/pty` | `internal/tunnel/stub.go` | agentunnel-backed connection to the VM PTY. |
-| `upload.Uploader` | `StubUploader` — returns a content-addressed `/workspace/.paperboat/attachments/<hash>.<ext>` path, transfers nothing | `internal/upload/stub.go` | papercode T3 WebSocket upload transport. |
-| `config.AuthSource` | `FileAuthSource` — reads `~/.config/papercode/auth.json` | `internal/config/auth.go` | Real only needs the actual papercode credential path/format; interface stays. |
-| `buildinfo.Version` | `"dev"` | `internal/buildinfo/buildinfo.go` | stamped by release `-ldflags`. |
-
-Also placeholder: config default paths (`~/.config/paperboat`, `~/.config/papercode`) and the
-stub uploader's VM base dir — all config-overridable.
+| `resolver.ProjectResolver` | `APIResolver` — resolve + `cli-connect` broker + readiness poll (`internal/resolver/api.go`) | `StubResolver` — local target | — |
+| `tunnel.Tunnel` | Pending papercode WebSocket terminal transport (`internal/tunnel/ssh.go` now fails explicitly for production descriptors) | `StubTunnel` — local `$SHELL` PTY | Implement Phase 4: `terminal.open` / `terminal.attach` / `terminal.write` / `terminal.resize` / `terminal.close` over the tunneled papercode `/ws` endpoint. |
+| `config.AuthSource` | `FileAuthSource` — reads papercode `auth.json`, sent as the `paperboat_session` cookie | same | exact papercode credential path/format (mapping-only change) |
+| `catalog.Catalog` | `StubCatalog` — seed agents/sizes for **flag validation UX only** | same | no public catalog endpoint on paperboat-server (contracts frozen); left as placeholder seed data, not baked-in logic. Needs a server catalog endpoint agreed before wiring. |
+| `upload.Uploader` | `StubUploader` — returns a VM path, transfers nothing | same | real papercode VM upload endpoint (see open contract below). `cli-connect` must not return upload auth until Phase 1 can issue credentials the VM papercode server validates. |
+| `buildinfo.Version` | stamped by release `-ldflags` | `"dev"` | — |
 
 ## Known open contract question (needs the user / cross-project agreement)
 
@@ -75,10 +96,15 @@ cross-project contract to agree on before implementing. papercode was not modifi
 
 ## Not yet done (deferred by design)
 
-- Real agentunnel transport (client protocol, TCP/SSH tunnel to the VM PTY).
-- Real paperboat-server calls (project resolve, catalog, pre-connect authz).
-- Real papercode image-upload transport (pending the contract above).
-- Machine-resume semantics against the real Fly lifecycle (size → boot shape).
+- **papercode WebSocket terminal transport** — Phase 4 must replace the placeholder tunnel
+  with a client for the existing papercode terminal RPC methods.
+- Real papercode image-upload transport (pending the contract below); the `upload`
+  hint is already plumbed through to the paste bridge's boundary.
+- A paperboat-server **catalog endpoint** for agents/sizes (contracts frozen; needs
+  agreement) — `--agent`/`--size` validate against seed data until then.
+- Machine-resume shape selection (`--size` → boot machine-type) against the real Fly
+  lifecycle: `cli-connect` resumes the machine, but mapping a session `--size` override to a
+  boot shape needs the server-side contract (currently the project's configured shape boots).
 
 ## Verification (done)
 
@@ -88,3 +114,15 @@ cross-project contract to agree on before implementing. papercode was not modifi
 - Real binary: exit-code passthrough (`exit 7`→7, `exit 0`→0), stream I/O, bracketed-paste
   image path rewritten to a VM path, plain-text paste untouched, flag validation
   (`--agent nope` rejected), flags after project name, and the `paperboat` alias symlink.
+- **Control-plane end-to-end** against a mock paperboat-server (session-cookie auth + the
+  real connect flow), with the actual `bin/pb`:
+  - `pb doctor` → authenticates via `GET /api/me` (`authenticated as … ✓`).
+  - Previous mock control-plane E2E covered project resolution, `cli-connect` not-ready
+    handling, and `connection-status` polling. It needs a new WebSocket terminal mock once
+    Phase 4 lands.
+  - Bad token → server 401 → "sign in again with papercode".
+  - Unknown project → `ErrProjectNotFound`.
+  - No `server_url` → local stub shell still runs (offline-safe).
+- New unit tests: `internal/api` (cookie auth, `{data}`/`{error}` envelope, 401→sentinel,
+  structured error, terminal decode) and `internal/resolver` (id/name match, poll-until-ready,
+  re-broker when status lacks routing, not-found).
