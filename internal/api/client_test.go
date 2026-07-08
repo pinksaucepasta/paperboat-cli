@@ -61,6 +61,10 @@ func TestClientUnauthenticated(t *testing.T) {
 
 func TestClientStructuredError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/auth/csrf" {
+			writeData(w, http.StatusOK, map[string]string{"csrf_token": "csrf"})
+			return
+		}
 		writeErr(w, http.StatusConflict, "machine_not_ready", "Machine is not ready.")
 	}))
 	defer srv.Close()
@@ -76,9 +80,57 @@ func TestClientStructuredError(t *testing.T) {
 	}
 }
 
+func TestClientUnsafeRequestsFetchAndSendCSRF(t *testing.T) {
+	var sawCSRF bool
+	var gotSession string
+	var gotCSRFHeader string
+	var gotCSRFCookie string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/auth/csrf":
+			sawCSRF = true
+			if c, err := r.Cookie(SessionCookieName); err != nil || c.Value != "initial-session" {
+				t.Fatalf("csrf session cookie = %#v, err = %v", c, err)
+			}
+			http.SetCookie(w, &http.Cookie{Name: csrfCookieName, Value: "csrf-token", Path: "/"})
+			writeData(w, http.StatusOK, map[string]string{"csrf_token": "csrf-token"})
+		case "/api/projects/prj_1/keep-alive":
+			if c, err := r.Cookie(SessionCookieName); err == nil {
+				gotSession = c.Value
+			}
+			if c, err := r.Cookie(csrfCookieName); err == nil {
+				gotCSRFCookie = c.Value
+			}
+			gotCSRFHeader = r.Header.Get(csrfHeaderName)
+			writeData(w, http.StatusOK, KeepAliveResponse{Project: Project{ID: "prj_1", Name: "Demo", State: "running"}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, config.Credential{AccessToken: "initial-session"}, nil)
+	if _, err := c.SetKeepAlive(context.Background(), "prj_1", 3600, false); err != nil {
+		t.Fatalf("SetKeepAlive: %v", err)
+	}
+	if !sawCSRF {
+		t.Fatal("expected csrf fetch")
+	}
+	if gotSession != "initial-session" {
+		t.Fatalf("session cookie = %q, want initial-session", gotSession)
+	}
+	if gotCSRFCookie != "csrf-token" || gotCSRFHeader != "csrf-token" {
+		t.Fatalf("csrf cookie/header = %q/%q", gotCSRFCookie, gotCSRFHeader)
+	}
+}
+
 func TestCLIConnectDecodesPapercodeWebSocketTerminal(t *testing.T) {
 	var body []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/api/auth/csrf" {
+			writeData(w, http.StatusOK, map[string]string{"csrf_token": "csrf"})
+			return
+		}
 		if r.Method != http.MethodPost || r.URL.Path != "/api/projects/prj_1/cli-connect" {
 			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 		}

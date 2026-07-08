@@ -5,8 +5,8 @@
 // paperboat-server authenticates requests with the session cookie
 // (`paperboat_session`); there is no bearer path. The CLI reuses the token that
 // papercode already stored and presents it as that cookie — the CLI never owns
-// or mints credentials (see AGENTS.md). Connect endpoints do not require CSRF,
-// so the read-only cookie is sufficient for the whole CLI connect flow.
+// or mints credentials (see AGENTS.md). Unsafe requests fetch a CSRF token from
+// paperboat-server and replay the returned CSRF cookie/header pair.
 package api
 
 import (
@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pujan-modha/paperboat-cli/internal/config"
@@ -28,6 +29,8 @@ import (
 // single client-side constant for the auth transport; the value carried in it
 // is the reused papercode credential, never minted by the CLI.
 const SessionCookieName = "paperboat_session"
+const csrfCookieName = "paperboat_csrf"
+const csrfHeaderName = "X-CSRF-Token"
 
 // ErrUnauthenticated means the server rejected the reused credential. Callers
 // should route the user back to papercode to sign in rather than prompting.
@@ -54,9 +57,12 @@ func (e *APIError) Error() string {
 
 // Client talks to a paperboat-server base URL with a reused credential.
 type Client struct {
-	baseURL string
-	cred    config.Credential
-	http    *http.Client
+	baseURL      string
+	cred         config.Credential
+	http         *http.Client
+	mu           sync.Mutex
+	sessionToken string
+	csrfToken    string
 }
 
 // New builds a client. baseURL is the paperboat-server base (e.g.
@@ -67,9 +73,10 @@ func New(baseURL string, cred config.Credential, httpClient *http.Client) *Clien
 		httpClient = &http.Client{Timeout: 30 * time.Second}
 	}
 	return &Client{
-		baseURL: strings.TrimRight(baseURL, "/"),
-		cred:    cred,
-		http:    httpClient,
+		baseURL:      strings.TrimRight(baseURL, "/"),
+		cred:         cred,
+		http:         httpClient,
+		sessionToken: strings.TrimSpace(cred.AccessToken),
 	}
 }
 
@@ -145,6 +152,11 @@ type ConnectResponse struct {
 	Reason       string       `json:"reason,omitempty"`
 }
 
+type KeepAliveResponse struct {
+	Project        Project   `json:"project"`
+	KeepAliveUntil time.Time `json:"keep_alive_until,omitempty"`
+}
+
 // Me fetches the authenticated user, validating the reused credential.
 func (c *Client) Me(ctx context.Context) (Me, error) {
 	var out Me
@@ -176,9 +188,24 @@ func (c *Client) ConnectionStatus(ctx context.Context, projectID string) (Connec
 	return out, err
 }
 
+func (c *Client) SetKeepAlive(ctx context.Context, projectID string, durationSeconds int, clear bool) (KeepAliveResponse, error) {
+	var out KeepAliveResponse
+	body := map[string]any{
+		"duration_seconds": durationSeconds,
+		"clear":            clear,
+	}
+	err := c.do(ctx, http.MethodPost, "/api/projects/"+url.PathEscape(projectID)+"/keep-alive", body, &out)
+	return out, err
+}
+
 func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
 	if strings.TrimSpace(c.baseURL) == "" {
 		return errors.New("paperboat-server base URL is not configured")
+	}
+	if unsafeMethod(method) {
+		if err := c.ensureCSRF(ctx); err != nil {
+			return err
+		}
 	}
 
 	var reader io.Reader
@@ -198,9 +225,7 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	if token := strings.TrimSpace(c.cred.AccessToken); token != "" {
-		req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: token})
-	}
+	c.addAuthCookies(req)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -238,4 +263,92 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 		return fmt.Errorf("decode %s %s data: %w", method, path, err)
 	}
 	return nil
+}
+
+func (c *Client) ensureCSRF(ctx context.Context) error {
+	c.mu.Lock()
+	if c.csrfToken != "" {
+		c.mu.Unlock()
+		return nil
+	}
+	c.mu.Unlock()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/auth/csrf", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/json")
+	c.addAuthCookies(req)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("fetch csrf token: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var envelope struct {
+		Data struct {
+			CSRFToken string `json:"csrf_token"`
+		} `json:"data"`
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	decodeErr := json.NewDecoder(resp.Body).Decode(&envelope)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if resp.StatusCode == http.StatusUnauthorized {
+			return ErrUnauthenticated
+		}
+		return &APIError{Status: resp.StatusCode, Code: envelope.Error.Code, Message: envelope.Error.Message}
+	}
+	if decodeErr != nil {
+		return fmt.Errorf("decode csrf response: %w", decodeErr)
+	}
+	token := strings.TrimSpace(envelope.Data.CSRFToken)
+	if token == "" {
+		return errors.New("paperboat-server returned an empty csrf token")
+	}
+	sessionToken := ""
+	csrfToken := token
+	for _, cookie := range resp.Cookies() {
+		switch cookie.Name {
+		case SessionCookieName:
+			sessionToken = strings.TrimSpace(cookie.Value)
+		case csrfCookieName:
+			if value := strings.TrimSpace(cookie.Value); value != "" {
+				csrfToken = value
+			}
+		}
+	}
+	c.mu.Lock()
+	if sessionToken != "" {
+		c.sessionToken = sessionToken
+	}
+	c.csrfToken = csrfToken
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *Client) addAuthCookies(req *http.Request) {
+	c.mu.Lock()
+	sessionToken := c.sessionToken
+	csrfToken := c.csrfToken
+	c.mu.Unlock()
+	if strings.TrimSpace(sessionToken) != "" {
+		req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: sessionToken})
+	}
+	if strings.TrimSpace(csrfToken) != "" {
+		req.AddCookie(&http.Cookie{Name: csrfCookieName, Value: csrfToken})
+		req.Header.Set(csrfHeaderName, csrfToken)
+	}
+}
+
+func unsafeMethod(method string) bool {
+	switch strings.ToUpper(method) {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
+		return false
+	default:
+		return true
+	}
 }

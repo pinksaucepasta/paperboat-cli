@@ -6,10 +6,14 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
+	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/pujan-modha/paperboat-cli/internal/api"
 	"github.com/pujan-modha/paperboat-cli/internal/buildinfo"
@@ -39,6 +43,19 @@ var valueFlags = map[string]bool{
 	"--size": true, "-s": true,
 }
 
+var subcommands = map[string]bool{
+	"connect":    true,
+	"agents":     true,
+	"sizes":      true,
+	"keep-alive": true,
+	"config":     true,
+	"doctor":     true,
+}
+
+var subcommandValueFlags = map[string]bool{
+	"--hours": true,
+}
+
 // normalizeArgs moves flags ahead of positional arguments so `pb <project>
 // --agent x` works as well as `pb --agent x <project>`. urfave/cli stops
 // parsing flags at the first positional, so we reorder to keep the UX flexible.
@@ -51,6 +68,15 @@ func normalizeArgs(args []string) []string {
 	for i := 0; i < len(rest); i++ {
 		tok := rest[i]
 		switch {
+		case subcommands[tok]:
+			out := make([]string, 0, len(args))
+			out = append(out, args[0])
+			out = append(out, flags...)
+			out = append(out, tok)
+			cmdFlags, cmdPositionals := reorderFlags(rest[i+1:], subcommandValueFlags)
+			out = append(out, cmdFlags...)
+			out = append(out, cmdPositionals...)
+			return out
 		case tok == "--":
 			positionals = append(positionals, rest[i+1:]...)
 			i = len(rest)
@@ -71,6 +97,27 @@ func normalizeArgs(args []string) []string {
 	out = append(out, flags...)
 	out = append(out, positionals...)
 	return out
+}
+
+func reorderFlags(tokens []string, values map[string]bool) ([]string, []string) {
+	var flags, positionals []string
+	for i := 0; i < len(tokens); i++ {
+		tok := tokens[i]
+		if tok == "--" {
+			positionals = append(positionals, tokens[i+1:]...)
+			break
+		}
+		if len(tok) > 1 && tok[0] == '-' {
+			flags = append(flags, tok)
+			if values[tok] && i+1 < len(tokens) {
+				flags = append(flags, tokens[i+1])
+				i++
+			}
+			continue
+		}
+		positionals = append(positionals, tok)
+	}
+	return flags, positionals
 }
 
 func newApp() *cli.App {
@@ -95,10 +142,96 @@ func newApp() *cli.App {
 			connectCommand(),
 			agentsCommand(),
 			sizesCommand(),
+			keepAliveCommand(),
 			configCommand(),
 			doctorCommand(),
 		},
 	}
+}
+
+func keepAliveCommand() *cli.Command {
+	return &cli.Command{
+		Name:      "keep-alive",
+		Usage:     "Keep a project VM running temporarily",
+		ArgsUsage: "<project>",
+		Flags: []cli.Flag{
+			&cli.Float64Flag{Name: "hours", Usage: "hours to keep the project running"},
+			&cli.BoolFlag{Name: "clear", Usage: "clear the current keep-alive pin"},
+		},
+		Action: func(c *cli.Context) error {
+			project := c.Args().First()
+			if project == "" {
+				return errors.New("missing project name; usage: pb keep-alive <project> --hours <n>")
+			}
+			client, err := backendClient(c)
+			if err != nil {
+				return err
+			}
+			clear := c.Bool("clear")
+			hours := c.Float64("hours")
+			if !clear && hours <= 0 {
+				return errors.New("set --hours to a positive value, or use --clear")
+			}
+			if clear && hours > 0 {
+				return errors.New("use either --hours or --clear, not both")
+			}
+			resolved, err := resolveProjectID(c.Context, client, project)
+			if err != nil {
+				return err
+			}
+			seconds := int(math.Ceil((time.Duration(hours * float64(time.Hour))).Seconds()))
+			resp, err := client.SetKeepAlive(c.Context, resolved.ID, seconds, clear)
+			if err != nil {
+				if msg := friendlyAPIError(err); msg != "" {
+					return errors.New(msg)
+				}
+				return err
+			}
+			if clear {
+				fmt.Fprintf(os.Stdout, "Keep-alive cleared for %s\n", firstNonEmpty(resp.Project.Name, resolved.Name, resolved.ID))
+				return nil
+			}
+			fmt.Fprintf(os.Stdout, "Keeping %s running until %s\n", firstNonEmpty(resp.Project.Name, resolved.Name, resolved.ID), resp.KeepAliveUntil.Local().Format(time.RFC1123))
+			return nil
+		},
+	}
+}
+
+func backendClient(c *cli.Context) (*api.Client, error) {
+	d, err := buildDeps(c)
+	if err != nil {
+		return nil, err
+	}
+	if d.cfg.ServerURL == "" {
+		return nil, errors.New("server_url is not configured; set --server or configure Paperboat server_url")
+	}
+	cred, err := d.auth.Credential()
+	if errors.Is(err, config.ErrNoCredentials) {
+		return nil, errors.New("no papercode credentials found — sign in with papercode first, then retry")
+	}
+	if err != nil {
+		return nil, err
+	}
+	return api.New(d.cfg.ServerURL, cred, nil), nil
+}
+
+func resolveProjectID(ctx context.Context, client *api.Client, requested string) (api.Project, error) {
+	projects, err := client.ListProjects(ctx)
+	if err != nil {
+		if errors.Is(err, api.ErrUnauthenticated) {
+			return api.Project{}, errors.New("your papercode session was rejected — sign in again with papercode, then retry")
+		}
+		if msg := friendlyAPIError(err); msg != "" {
+			return api.Project{}, errors.New(msg)
+		}
+		return api.Project{}, err
+	}
+	for _, p := range projects {
+		if p.ID == requested || strings.EqualFold(p.Name, requested) {
+			return p, nil
+		}
+	}
+	return api.Project{}, fmt.Errorf("%w: %q", resolver.ErrProjectNotFound, requested)
 }
 
 // deps bundles the wired (stubbed) dependencies for a command.
@@ -209,6 +342,9 @@ func actionConnect(c *cli.Context) error {
 		if errors.Is(err, api.ErrUnauthenticated) {
 			return errors.New("your papercode session was rejected — sign in again with papercode, then retry")
 		}
+		if msg := friendlyAPIError(err); msg != "" {
+			return errors.New(msg)
+		}
 		return err
 	}
 	if d.cfg.ServerURL != "" {
@@ -217,6 +353,9 @@ func actionConnect(c *cli.Context) error {
 
 	conn, err := d.tunnel.Dial(ctx, info)
 	if err != nil {
+		if msg := friendlyAPIError(err); msg != "" {
+			return errors.New(msg)
+		}
 		return fmt.Errorf("connect to %q: %w", project, err)
 	}
 
@@ -234,6 +373,28 @@ func actionConnect(c *cli.Context) error {
 		os.Exit(code)
 	}
 	return nil
+}
+
+func friendlyAPIError(err error) string {
+	var apiErr *api.APIError
+	if !errors.As(err, &apiErr) {
+		return ""
+	}
+	switch apiErr.Code {
+	case "credits_exhausted":
+		return "credits are exhausted; top up credits in Paperboat, then retry"
+	case "entitlement_lost", "payment_required":
+		return "your Paperboat plan is inactive; restore billing access, then retry"
+	case "idle_timeout":
+		return "the project stopped after reaching its idle timeout; retry to resume it"
+	case "activity_reporter_lost":
+		return "the project stopped because activity reporting was lost; retry after the VM restarts"
+	case "tunnel_unavailable":
+		return "the secure tunnel is not available yet; retry in a moment"
+	case "machine_not_ready":
+		return "the project machine is not ready yet; retry in a moment"
+	}
+	return ""
 }
 
 func shouldValidateLocalCatalog(cfg *config.Config) bool {
