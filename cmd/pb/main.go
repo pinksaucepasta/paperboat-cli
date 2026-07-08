@@ -119,13 +119,19 @@ func buildDeps(c *cli.Context) (*deps, error) {
 	if s := c.String("server"); s != "" {
 		cfg.ServerURL = s
 	}
+	var termTunnel tunnel.Tunnel = tunnel.NewStubTunnel()
+	var uploader upload.Uploader = upload.NewStubUploader(cfg.Upload.Endpoint)
+	if cfg.ServerURL != "" {
+		termTunnel = tunnel.NewPapercodeWSTunnel()
+		uploader = upload.NewDisabledUploader()
+	}
 	return &deps{
 		cfg:      cfg,
 		auth:     config.AuthSourceFor(cfg),
 		catalog:  catalog.NewStubCatalog(),
 		resolver: resolver.NewStubResolver(cfg),
-		tunnel:   tunnel.NewStubTunnel(),
-		uploader: upload.NewStubUploader(cfg.Upload.Endpoint),
+		tunnel:   termTunnel,
+		uploader: uploader,
 	}, nil
 }
 
@@ -172,23 +178,22 @@ func actionConnect(c *cli.Context) error {
 		fmt.Fprintln(os.Stderr, "pb: no papercode credentials found — sign in with papercode first.")
 		fmt.Fprintln(os.Stderr, "    (running in local dev mode against a stub target)")
 	}
-
-	// Do not broker a real connect session until the papercode WebSocket
-	// terminal transport lands. Otherwise a configured backend can authorize and
-	// resume a project, then fail locally with no possible terminal attach.
 	if d.cfg.ServerURL != "" {
-		return errors.New("backend terminal attach is not available yet: papercode WebSocket transport is required before using server_url")
+		d.resolver = resolver.NewAPIResolver(api.New(d.cfg.ServerURL, cred, nil), d.cfg)
 	}
 
 	// Validate flag values against the dynamic catalog.
 	agent := c.String("agent")
-	if agent != "" {
+	if agent != "" && shouldValidateLocalCatalog(d.cfg) {
 		if _, err := catalog.ValidateAgent(ctx, d.catalog, agent); err != nil {
 			return err
 		}
 	}
 	size := c.String("size")
-	if size != "" {
+	if size != "" && d.cfg.ServerURL != "" {
+		return errors.New("--size is not supported with server_url until paperboat-server exposes a machine-shape override contract")
+	}
+	if size != "" && shouldValidateLocalCatalog(d.cfg) {
 		if _, err := catalog.ValidateSize(ctx, d.catalog, size); err != nil {
 			return err
 		}
@@ -206,6 +211,9 @@ func actionConnect(c *cli.Context) error {
 		}
 		return err
 	}
+	if d.cfg.ServerURL != "" {
+		d.uploader = uploaderForTarget(info.Upload)
+	}
 
 	conn, err := d.tunnel.Dial(ctx, info)
 	if err != nil {
@@ -213,7 +221,7 @@ func actionConnect(c *cli.Context) error {
 	}
 
 	// Wrap remote input with the image-paste interceptor.
-	interceptor := paste.New(conn, d.uploader, uploadLimits(d.cfg),
+	interceptor := paste.New(conn, d.uploader, uploadLimits(d.cfg, info.Upload),
 		paste.WithNotifier(os.Stderr),
 		paste.WithWatchDirs(expandDirs(d.cfg.Upload.WatchDirs)),
 	)
@@ -228,13 +236,38 @@ func actionConnect(c *cli.Context) error {
 	return nil
 }
 
-func uploadLimits(cfg *config.Config) upload.Limits {
-	return upload.Limits{
+func shouldValidateLocalCatalog(cfg *config.Config) bool {
+	return cfg.ServerURL == ""
+}
+
+func uploaderForTarget(target *resolver.UploadTarget) upload.Uploader {
+	if target == nil || target.HTTPBaseURL == "" {
+		return upload.NewDisabledUploader()
+	}
+	return upload.NewHTTPUploader(target.HTTPBaseURL, upload.Auth{
+		Method: target.Auth.Method,
+		Token:  target.Auth.Token,
+		Ticket: target.Auth.Ticket,
+	})
+}
+
+func uploadLimits(cfg *config.Config, target *resolver.UploadTarget) upload.Limits {
+	limits := upload.Limits{
 		MaxImageBytes:       cfg.Upload.MaxImageBytes,
 		MaxDataURLChars:     cfg.Upload.MaxDataURLChars,
 		MaxAttachments:      cfg.Upload.MaxAttachments,
 		AllowedMimePrefixes: cfg.Upload.AllowedMimePrefixes,
 	}
+	if target != nil {
+		if target.MaxBytes > 0 {
+			limits.MaxImageBytes = target.MaxBytes
+		}
+		if len(target.AllowedMIMETypes) > 0 {
+			limits.AllowedMimePrefixes = nil
+			limits.AllowedMIMETypes = append([]string(nil), target.AllowedMIMETypes...)
+		}
+	}
+	return limits
 }
 
 func expandDirs(dirs []string) []string {
@@ -339,13 +372,15 @@ func configCommand() *cli.Command {
 
 func doctorCommand() *cli.Command {
 	return &cli.Command{
-		Name:  "doctor",
-		Usage: "Check auth reuse and connectivity",
+		Name:      "doctor",
+		Usage:     "Check auth reuse and connectivity",
+		ArgsUsage: "[project]",
 		Action: func(c *cli.Context) error {
 			d, err := buildDeps(c)
 			if err != nil {
 				return err
 			}
+			project := c.Args().First()
 			fmt.Printf("config:      %s\n", d.cfg.Path())
 			fmt.Printf("server:      %s\n", orLocal(d.cfg.ServerURL))
 			cred, credErr := d.auth.Credential()
@@ -377,6 +412,26 @@ func doctorCommand() *cli.Command {
 				return nil
 			}
 			fmt.Printf("backend:     authenticated as %s ✓\n", firstNonEmpty(me.Email, me.DisplayName, me.ID))
+			if project == "" {
+				return nil
+			}
+			info, err := resolver.NewAPIResolver(api.New(d.cfg.ServerURL, cred, nil), d.cfg).Resolve(c.Context, resolver.ConnectRequest{
+				Project:    project,
+				Credential: cred,
+			})
+			if err != nil {
+				fmt.Printf("papercode:   descriptor unavailable: %v\n", err)
+				return nil
+			}
+			if info.Terminal == nil {
+				fmt.Println("papercode:   descriptor missing terminal endpoint")
+				return nil
+			}
+			if err := tunnel.NewPapercodeWSTunnel().Check(c.Context, info.Terminal); err != nil {
+				fmt.Printf("papercode:   websocket unavailable: %v\n", err)
+				return nil
+			}
+			fmt.Printf("papercode:   websocket route/auth ready for %s ✓\n", info.Project)
 			return nil
 		},
 	}

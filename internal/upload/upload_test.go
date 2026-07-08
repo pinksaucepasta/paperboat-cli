@@ -53,6 +53,19 @@ func TestPrepareImageRejectsOversize(t *testing.T) {
 	}
 }
 
+func TestPrepareImageHonorsExactAllowedMIMETypes(t *testing.T) {
+	dir := t.TempDir()
+	png := write(t, dir, "image.png", 3)
+	jpg := write(t, dir, "image.jpg", 3)
+
+	if _, err := PrepareImage(png, Limits{AllowedMIMETypes: []string{"image/png"}}); err != nil {
+		t.Fatalf("png should be allowed: %v", err)
+	}
+	if _, err := PrepareImage(jpg, Limits{AllowedMIMETypes: []string{"image/png"}}); err == nil {
+		t.Fatal("jpg should be rejected by exact MIME policy")
+	}
+}
+
 func TestPrepareImageRejectsDataURLLimit(t *testing.T) {
 	dir := t.TempDir()
 	p := write(t, dir, "m.png", 1000)

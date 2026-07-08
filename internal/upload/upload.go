@@ -33,6 +33,7 @@ type Limits struct {
 	MaxDataURLChars     int
 	MaxAttachments      int
 	AllowedMimePrefixes []string
+	AllowedMIMETypes    []string
 }
 
 // Uploader sends a prepared image and returns its VM-side path.
@@ -58,7 +59,7 @@ func PrepareImage(path string, limits Limits) (Image, error) {
 	}
 
 	mimeType := MimeTypeFor(path)
-	if !mimeAllowed(mimeType, limits.AllowedMimePrefixes) {
+	if !mimeAllowedByPolicy(mimeType, limits.AllowedMimePrefixes, limits.AllowedMIMETypes) {
 		return Image{}, fmt.Errorf("%s has type %q which is not an allowed image", path, mimeType)
 	}
 
@@ -122,6 +123,18 @@ func IsImagePath(path string) bool {
 }
 
 func mimeAllowed(mimeType string, prefixes []string) bool {
+	return mimeAllowedByPolicy(mimeType, prefixes, nil)
+}
+
+func mimeAllowedByPolicy(mimeType string, prefixes, exact []string) bool {
+	for _, allowed := range exact {
+		if strings.EqualFold(mimeType, allowed) {
+			return true
+		}
+	}
+	if len(exact) > 0 {
+		return false
+	}
 	if len(prefixes) == 0 {
 		prefixes = []string{"image/"}
 	}

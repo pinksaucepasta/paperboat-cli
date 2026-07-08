@@ -7,10 +7,9 @@ product source of truth is the workspace `USERSTORY.md`.)
 ## Status at a glance
 
 **CLI control-plane contract corrected for papercode WebSocket attach.** The production
-descriptor target is a tunneled papercode HTTP/WSS endpoint plus scoped auth. Server-side
-credential issuance is Phase 1 and the actual WebSocket terminal transport is Phase 4.
-Until those exist, `pb <project>` refuses `server_url` backend attach before brokering a
-connect session. With `server_url` unset the local dev stubs still run, so the CLI stays
+descriptor target is a tunneled papercode HTTP/WSS endpoint plus scoped auth. The CLI now
+uses that descriptor to attach through papercode WebSocket terminal RPC when `server_url`
+is configured. With `server_url` unset the local dev stubs still run, so the CLI stays
 exercisable offline.
 
 - Build: `make build` → `bin/pb`. `gofmt`/`go vet` clean, `go test ./...` green.
@@ -29,11 +28,16 @@ exercisable offline.
   once when the ready status lacks routing detail. Returns a client-safe papercode
   WebSocket `TerminalTarget` (+ file-upload `UploadTarget`). Poll timeout/interval are
   config-driven (`connect.*`).
-- **`internal/tunnel.SSHTunnel`** — retained only as optional debug/operator plumbing.
-  Production CLI attach must use papercode WebSocket terminal RPC; that transport is not
-  implemented yet.
-- **`cmd/pb`** — `server_url` gates real vs. stub impls; `doctor` now verifies backend auth
-  via `GET /api/me`.
+- **`internal/tunnel.PapercodeWSTunnel`** — production terminal transport. Connects to the
+  descriptor's `/ws` route with a WebSocket ticket, speaks papercode's Effect RPC JSON
+  socket envelope, calls `terminal.attach` with `restartIfNotRunning: true`, streams output
+  chunks, sends `terminal.write` and `terminal.resize`, closes with `terminal.close`, and
+  returns remote exit status.
+- **`internal/tunnel.SSHTunnel`** — retained only as optional debug/operator plumbing, not
+  selected for real `server_url` attaches.
+- **`cmd/pb`** — `server_url` gates real vs. stub impls; `doctor` verifies backend auth
+  via `GET /api/me`, and `pb doctor <project>` brokers a descriptor and verifies the
+  papercode WebSocket route/auth handshake without attaching a terminal.
 
 ## What was built
 
@@ -81,10 +85,10 @@ CLI stays exercisable offline. The interfaces are unchanged, so both drop in int
 | Interface | Real (server_url set) | Stub (local dev) | Still pending |
 | --- | --- | --- | --- |
 | `resolver.ProjectResolver` | `APIResolver` — resolve + `cli-connect` broker + readiness poll (`internal/resolver/api.go`) | `StubResolver` — local target | — |
-| `tunnel.Tunnel` | Pending papercode WebSocket terminal transport (`internal/tunnel/ssh.go` now fails explicitly for production descriptors) | `StubTunnel` — local `$SHELL` PTY | Implement Phase 4: `terminal.open` / `terminal.attach` / `terminal.write` / `terminal.resize` / `terminal.close` over the tunneled papercode `/ws` endpoint. |
+| `tunnel.Tunnel` | `PapercodeWSTunnel` — `terminal.attach` / `terminal.write` / `terminal.resize` / `terminal.close` over the tunneled papercode `/ws` endpoint | `StubTunnel` — local `$SHELL` PTY | Real hosted papercode validation deferred to Phase 9. |
 | `config.AuthSource` | `FileAuthSource` — reads papercode `auth.json`, sent as the `paperboat_session` cookie | same | exact papercode credential path/format (mapping-only change) |
-| `catalog.Catalog` | `StubCatalog` — seed agents/sizes for **flag validation UX only** | same | no public catalog endpoint on paperboat-server (contracts frozen); left as placeholder seed data, not baked-in logic. Needs a server catalog endpoint agreed before wiring. |
-| `upload.Uploader` | `StubUploader` — returns a VM path, transfers nothing | same | real papercode VM upload endpoint (see open contract below). `cli-connect` must not return upload auth until Phase 1 can issue credentials the VM papercode server validates. |
+| `catalog.Catalog` | The CLI does not reject real-mode overrides against local seed data | `StubCatalog` — seed agents/sizes for offline flag validation UX | no public catalog endpoint or override request contract on paperboat-server (contracts frozen); listing commands still use placeholder seed data until a server catalog endpoint is agreed. |
+| `upload.Uploader` | `HTTPUploader` when the broker returns an upload descriptor, using brokered max-bytes/MIME policy; otherwise `DisabledUploader` fails open | `StubUploader` — returns a VM path, transfers nothing | papercode must provide the VM-path upload endpoint for hosted validation. |
 | `buildinfo.Version` | stamped by release `-ldflags` | `"dev"` | — |
 
 ## Known open contract question (needs the user / cross-project agreement)
@@ -96,12 +100,12 @@ cross-project contract to agree on before implementing. papercode was not modifi
 
 ## Not yet done (deferred by design)
 
-- **papercode WebSocket terminal transport** — Phase 4 must replace the placeholder tunnel
-  with a client for the existing papercode terminal RPC methods.
 - Real papercode image-upload transport (pending the contract below); the `upload`
   hint is already plumbed through to the paste bridge's boundary.
-- A paperboat-server **catalog endpoint** for agents/sizes (contracts frozen; needs
-  agreement) — `--agent`/`--size` validate against seed data until then.
+- A paperboat-server **catalog endpoint** and backend `--size` override request contract
+  (contracts frozen; needs agreement) — local stub mode validates against seed data, real
+  mode does not send an override request body, and `--size` is rejected in real mode until
+  the broker can apply it before machine resume.
 - Machine-resume shape selection (`--size` → boot machine-type) against the real Fly
   lifecycle: `cli-connect` resumes the machine, but mapping a session `--size` override to a
   boot shape needs the server-side contract (currently the project's configured shape boots).
@@ -126,3 +130,6 @@ cross-project contract to agree on before implementing. papercode was not modifi
 - New unit tests: `internal/api` (cookie auth, `{data}`/`{error}` envelope, 401→sentinel,
   structured error, terminal decode) and `internal/resolver` (id/name match, poll-until-ready,
   re-broker when status lacks routing, not-found).
+- Phase 4 WebSocket transport harness: local WebSocket server verifies `/ws?wsTicket=...`,
+  `terminal.attach` payload, split terminal output reads, `terminal.write`,
+  `terminal.resize`, and remote `exit 7` propagation.

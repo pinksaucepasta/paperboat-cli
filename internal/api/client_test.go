@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -76,10 +77,12 @@ func TestClientStructuredError(t *testing.T) {
 }
 
 func TestCLIConnectDecodesPapercodeWebSocketTerminal(t *testing.T) {
+	var body []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/api/projects/prj_1/cli-connect" {
 			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
+		body, _ = io.ReadAll(r.Body)
 		writeData(w, http.StatusOK, ConnectResponse{
 			ProjectID:   "prj_1",
 			Connectable: true,
@@ -110,5 +113,8 @@ func TestCLIConnectDecodesPapercodeWebSocketTerminal(t *testing.T) {
 	}
 	if resp.Upload == nil || resp.Upload.Kind != "papercode_file_upload" || resp.Upload.HTTPBaseURL != "https://agentunnel.dev/projects/prj_1" {
 		t.Fatalf("upload = %+v", resp.Upload)
+	}
+	if len(body) != 0 {
+		t.Fatalf("cli-connect request body = %q, want empty", string(body))
 	}
 }

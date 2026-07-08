@@ -77,7 +77,7 @@ func TestResolveImmediatelyConnectable(t *testing.T) {
 	}
 	r := newTestResolver(fc)
 
-	info, err := r.Resolve(context.Background(), ConnectRequest{Project: "my app"}) // case-insensitive name
+	info, err := r.Resolve(context.Background(), ConnectRequest{Project: "my app", Agent: "codex", Size: "2x"}) // case-insensitive name
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -86,6 +86,9 @@ func TestResolveImmediatelyConnectable(t *testing.T) {
 	}
 	if info.Project != "My App" {
 		t.Fatalf("project = %q", info.Project)
+	}
+	if info.Agent != "codex" || info.Size != "2x" {
+		t.Fatalf("overrides = %q/%q", info.Agent, info.Size)
 	}
 }
 
@@ -111,7 +114,7 @@ func TestResolvePollsUntilReady(t *testing.T) {
 		},
 	}
 	r := newTestResolver(fc)
-	info, err := r.Resolve(context.Background(), ConnectRequest{Project: "app"})
+	info, err := r.Resolve(context.Background(), ConnectRequest{Project: "app", Agent: "claude", Size: "1x"})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -133,7 +136,7 @@ func TestResolveRebrokersWhenStatusLacksTerminalDescriptor(t *testing.T) {
 		statusSeq: []api.ConnectResponse{{Connectable: true, Terminal: nil}}, // ready but no routing detail
 	}
 	r := newTestResolver(fc)
-	info, err := r.Resolve(context.Background(), ConnectRequest{Project: "app"})
+	info, err := r.Resolve(context.Background(), ConnectRequest{Project: "app", Agent: "claude", Size: "1x"})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
