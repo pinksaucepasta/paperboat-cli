@@ -31,16 +31,28 @@ func TestPapercodeWSTunnelAttachIOResizeAndExit(t *testing.T) {
 			return
 		}
 		defer ws.Close()
+		waitingForAttachAck := false
 		for {
 			var req rpcRequestSeen
 			if err := ws.ReadJSON(&req); err != nil {
 				return
 			}
+			if req.Type == rpcAckTagValue {
+				if req.RequestID != "1" {
+					t.Errorf("unexpected stream acknowledgement: %#v", req)
+					return
+				}
+				if waitingForAttachAck {
+					waitingForAttachAck = false
+					sendChunk(t, ws, 1, terminalEvent{Type: "output", Data: "world"})
+				}
+				continue
+			}
 			requests <- req
 			switch req.Tag {
 			case rpcTerminalAttach:
 				sendChunk(t, ws, 1, terminalEvent{Type: "output", Data: "hello "})
-				sendChunk(t, ws, 1, terminalEvent{Type: "output", Data: "world"})
+				waitingForAttachAck = true
 			case rpcTerminalResize:
 				code := 7
 				sendChunk(t, ws, 1, terminalEvent{Type: "exited", ExitCode: &code})
@@ -50,7 +62,7 @@ func TestPapercodeWSTunnelAttachIOResizeAndExit(t *testing.T) {
 	defer server.Close()
 
 	target := testTerminalTarget(server.URL)
-	conn, err := NewPapercodeWSTunnel().Dial(context.Background(), resolver.ConnectInfo{Terminal: target, Agent: "codex", Size: "2x"})
+	conn, err := NewPapercodeWSTunnel().Dial(context.Background(), resolver.ConnectInfo{Terminal: target})
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -66,9 +78,8 @@ func TestPapercodeWSTunnelAttachIOResizeAndExit(t *testing.T) {
 	if attach.Payload["restartIfNotRunning"] != true || attach.Payload["cwd"] != "/workspace" {
 		t.Fatalf("bad attach payload: %#v", attach.Payload)
 	}
-	env, ok := attach.Payload["env"].(map[string]any)
-	if !ok || env["PAPERBOAT_AGENT"] != "codex" || env["PAPERBOAT_MACHINE_SIZE"] != "2x" {
-		t.Fatalf("bad attach env: %#v", attach.Payload["env"])
+	if _, ok := attach.Payload["env"]; ok {
+		t.Fatalf("unexpected attach env: %#v", attach.Payload["env"])
 	}
 
 	buf := make([]byte, 3)
@@ -216,11 +227,12 @@ func testTerminalTarget(httpURL string) *resolver.TerminalTarget {
 }
 
 type rpcRequestSeen struct {
-	Type    string         `json:"_tag"`
-	Tag     string         `json:"tag"`
-	Payload map[string]any `json:"payload"`
-	ID      string         `json:"id"`
-	Headers [][2]string    `json:"headers"`
+	Type      string         `json:"_tag"`
+	RequestID string         `json:"requestId"`
+	Tag       string         `json:"tag"`
+	Payload   map[string]any `json:"payload"`
+	ID        string         `json:"id"`
+	Headers   [][2]string    `json:"headers"`
 }
 
 func TestPapercodeWSConnReadEOF(t *testing.T) {

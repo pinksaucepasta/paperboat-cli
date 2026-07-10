@@ -17,11 +17,47 @@ import (
 )
 
 const (
-	rpcTerminalAttach = "terminal.attach"
-	rpcTerminalWrite  = "terminal.write"
-	rpcTerminalResize = "terminal.resize"
-	rpcTerminalClose  = "terminal.close"
+	papercodeTerminalProtocol     = "paperboat-terminal-rpc/v1"
+	papercodeWebSocketPath        = "/ws"
+	papercodeTicketQueryParameter = "wsTicket"
+	rpcRequestTagValue            = "Request"
+	rpcAckTagValue                = "Ack"
+	rpcChunkTag                   = "Chunk"
+	rpcExitTag                    = "Exit"
+	rpcClientProtocolErrorTag     = "ClientProtocolError"
+	rpcDefectTag                  = "Defect"
+	rpcTerminalAttach             = "terminal.attach"
+	rpcTerminalWrite              = "terminal.write"
+	rpcTerminalResize             = "terminal.resize"
+	rpcTerminalClose              = "terminal.close"
+	rpcFieldThreadID              = "threadId"
+	rpcFieldTerminalID            = "terminalId"
+	rpcFieldRestartIfNotRunning   = "restartIfNotRunning"
+	rpcFieldCWD                   = "cwd"
+	rpcFieldEnv                   = "env"
+	rpcFieldData                  = "data"
+	rpcFieldRows                  = "rows"
+	rpcFieldCols                  = "cols"
+	terminalEventSnapshot         = "snapshot"
+	terminalEventOutput           = "output"
+	terminalEventExited           = "exited"
+	terminalEventClosed           = "closed"
+	terminalEventError            = "error"
+	terminalEventCleared          = "cleared"
+	terminalEventRestarted        = "restarted"
+	terminalEventActivity         = "activity"
 )
+
+var papercodeAttachEventTypes = []string{
+	terminalEventSnapshot,
+	terminalEventOutput,
+	terminalEventExited,
+	terminalEventClosed,
+	terminalEventError,
+	terminalEventCleared,
+	terminalEventRestarted,
+	terminalEventActivity,
+}
 
 // PapercodeWSTunnel attaches to the VM-local papercode terminal RPC over the
 // agentunnel-provided WebSocket route.
@@ -73,7 +109,6 @@ func (t *PapercodeWSTunnel) Dial(ctx context.Context, info resolver.ConnectInfo)
 		return nil, fmt.Errorf("dial papercode websocket: %w", err)
 	}
 	c := newPapercodeWSConn(ws, target)
-	c.sessionEnv = sessionEnv(info)
 	if err := c.attach(ctx); err != nil {
 		_ = c.Close()
 		return nil, err
@@ -93,8 +128,8 @@ func papercodeWebSocketRequest(target *resolver.TerminalTarget) (string, http.He
 	if u.Scheme != "ws" && u.Scheme != "wss" {
 		return "", nil, fmt.Errorf("papercode websocket URL must use ws or wss, got %q", u.Scheme)
 	}
-	if !strings.HasSuffix(u.Path, "/ws") {
-		u.Path = strings.TrimRight(u.Path, "/") + "/ws"
+	if !strings.HasSuffix(u.Path, papercodeWebSocketPath) {
+		u.Path = strings.TrimRight(u.Path, "/") + papercodeWebSocketPath
 	}
 	headers := make(http.Header)
 	switch target.Auth.Method {
@@ -103,7 +138,7 @@ func papercodeWebSocketRequest(target *resolver.TerminalTarget) (string, http.He
 			return "", nil, errors.New("missing papercode websocket ticket")
 		}
 		q := u.Query()
-		q.Set("wsTicket", target.Auth.Ticket)
+		q.Set(papercodeTicketQueryParameter, target.Auth.Ticket)
 		u.RawQuery = q.Encode()
 	case "bearer":
 		if target.Auth.Token == "" {
@@ -131,9 +166,8 @@ type papercodeWSConn struct {
 	exitCode int
 	exitErr  error
 
-	sessionEnv map[string]string
-	nextID     int
-	closing    atomic.Bool
+	nextID  int
+	closing atomic.Bool
 }
 
 func newPapercodeWSConn(ws *websocket.Conn, target *resolver.TerminalTarget) *papercodeWSConn {
@@ -152,31 +186,14 @@ func newPapercodeWSConn(ws *websocket.Conn, target *resolver.TerminalTarget) *pa
 
 func (c *papercodeWSConn) attach(ctx context.Context) error {
 	payload := map[string]any{
-		"threadId":            c.target.ThreadID,
-		"terminalId":          c.target.TerminalID,
-		"restartIfNotRunning": true,
+		rpcFieldThreadID:            c.target.ThreadID,
+		rpcFieldTerminalID:          c.target.TerminalID,
+		rpcFieldRestartIfNotRunning: true,
 	}
 	if c.target.CWD != "" {
-		payload["cwd"] = c.target.CWD
-	}
-	if len(c.sessionEnv) > 0 {
-		payload["env"] = c.sessionEnv
+		payload[rpcFieldCWD] = c.target.CWD
 	}
 	return c.call(ctx, rpcTerminalAttach, payload)
-}
-
-func sessionEnv(info resolver.ConnectInfo) map[string]string {
-	env := make(map[string]string, 2)
-	if info.Agent != "" {
-		env["PAPERBOAT_AGENT"] = info.Agent
-	}
-	if info.Size != "" {
-		env["PAPERBOAT_MACHINE_SIZE"] = info.Size
-	}
-	if len(env) == 0 {
-		return nil
-	}
-	return env
 }
 
 func (c *papercodeWSConn) Read(p []byte) (int, error) {
@@ -203,9 +220,9 @@ func (c *papercodeWSConn) Write(p []byte) (int, error) {
 		return 0, nil
 	}
 	payload := map[string]any{
-		"threadId":   c.target.ThreadID,
-		"terminalId": c.target.TerminalID,
-		"data":       string(p),
+		rpcFieldThreadID:   c.target.ThreadID,
+		rpcFieldTerminalID: c.target.TerminalID,
+		rpcFieldData:       string(p),
 	}
 	if err := c.call(context.Background(), rpcTerminalWrite, payload); err != nil {
 		return 0, err
@@ -218,10 +235,10 @@ func (c *papercodeWSConn) Resize(rows, cols uint16) error {
 		return nil
 	}
 	payload := map[string]any{
-		"threadId":   c.target.ThreadID,
-		"terminalId": c.target.TerminalID,
-		"rows":       rows,
-		"cols":       cols,
+		rpcFieldThreadID:   c.target.ThreadID,
+		rpcFieldTerminalID: c.target.TerminalID,
+		rpcFieldRows:       rows,
+		rpcFieldCols:       cols,
 	}
 	return c.call(context.Background(), rpcTerminalResize, payload)
 }
@@ -234,8 +251,8 @@ func (c *papercodeWSConn) Close() error {
 	}
 	c.closing.Store(true)
 	_ = c.call(context.Background(), rpcTerminalClose, map[string]any{
-		"threadId":   c.target.ThreadID,
-		"terminalId": c.target.TerminalID,
+		rpcFieldThreadID:   c.target.ThreadID,
+		rpcFieldTerminalID: c.target.TerminalID,
 	})
 	return c.ws.Close()
 }
@@ -255,7 +272,7 @@ func (c *papercodeWSConn) call(ctx context.Context, method string, payload any) 
 	}
 	id := c.nextID
 	c.nextID++
-	msg := rpcRequest{Type: "Request", Tag: method, ID: fmt.Sprintf("%d", id), Payload: payload, Headers: [][2]string{}}
+	msg := rpcRequest{Type: rpcRequestTagValue, Tag: method, ID: fmt.Sprintf("%d", id), Payload: payload, Headers: [][2]string{}}
 	return c.ws.WriteJSON(msg)
 }
 
@@ -301,7 +318,7 @@ func (c *papercodeWSConn) isClosing() bool {
 
 func (c *papercodeWSConn) handleFrame(frame rpcFrame) error {
 	switch frame.Tag {
-	case "Chunk":
+	case rpcChunkTag:
 		for _, raw := range frame.Values {
 			var ev terminalEvent
 			if err := json.Unmarshal(raw, &ev); err != nil {
@@ -309,41 +326,55 @@ func (c *papercodeWSConn) handleFrame(frame rpcFrame) error {
 			}
 			c.handleTerminalEvent(ev)
 		}
-	case "Exit":
+		if err := c.acknowledgeChunk(frame.RequestID); err != nil {
+			return err
+		}
+	case rpcExitTag:
 		if frame.Exit.Tag == "Failure" {
 			return errors.New(effectFailureMessage(frame.Exit.Cause))
 		}
-	case "ClientProtocolError", "Defect":
+	case rpcClientProtocolErrorTag, rpcDefectTag:
 		return errors.New("papercode websocket protocol error")
 	}
 	return nil
 }
 
+func (c *papercodeWSConn) acknowledgeChunk(requestID string) error {
+	if requestID == "" {
+		return errors.New("papercode websocket chunk is missing requestId")
+	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.ws.WriteJSON(rpcAcknowledgement{Type: rpcAckTagValue, RequestID: requestID})
+}
+
 func (c *papercodeWSConn) handleTerminalEvent(ev terminalEvent) {
 	switch ev.Type {
-	case "snapshot", "restarted":
+	case terminalEventSnapshot, terminalEventRestarted:
 		if ev.Snapshot.History != "" {
 			c.out <- []byte(ev.Snapshot.History)
 		}
 		c.finishFromStatus(ev.Snapshot.Status, ev.Snapshot.ExitCode, ev.Snapshot.ExitSignal, "")
-	case "output":
+	case terminalEventOutput:
 		if ev.Data != "" {
 			c.out <- []byte(ev.Data)
 		}
-	case "exited":
+	case terminalEventExited:
 		c.finish(exitStatus(ev.ExitCode, ev.ExitSignal), nil)
-	case "closed":
+	case terminalEventClosed:
 		c.finish(0, nil)
-	case "error":
+	case terminalEventError:
 		c.finish(1, errors.New(ev.Message))
+	case terminalEventCleared, terminalEventActivity:
+		// These events carry no terminal bytes or lifecycle transition for the CLI.
 	}
 }
 
 func (c *papercodeWSConn) finishFromStatus(status string, exitCode, exitSignal *int, errMsg string) {
 	switch status {
-	case "exited":
+	case terminalEventExited:
 		c.finish(exitStatus(exitCode, exitSignal), nil)
-	case "error":
+	case terminalEventError:
 		if errMsg == "" {
 			errMsg = "terminal is in error state"
 		}
@@ -375,6 +406,11 @@ type rpcRequest struct {
 	Payload any         `json:"payload"`
 	Headers [][2]string `json:"headers"`
 	Type    string      `json:"_tag"`
+}
+
+type rpcAcknowledgement struct {
+	Type      string `json:"_tag"`
+	RequestID string `json:"requestId"`
 }
 
 type rpcFrame struct {

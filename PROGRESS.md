@@ -18,10 +18,9 @@ exercisable offline.
 
 ### Real backend wiring (this pass)
 - **`internal/api`** — paperboat-server control-plane client. Speaks the frozen JSON
-  envelope (`{"data"}` / `{"error":{code,message}}`), authenticates with the
-  `paperboat_session` cookie carrying the **reused papercode token** (the server has no
-  bearer path; connect endpoints need no CSRF). Methods: `Me`, `ListProjects`, `CLIConnect`,
-  `ConnectionStatus`. 401 → `ErrUnauthenticated`; other non-2xx → structured `*APIError`.
+  envelope (`{"data"}` / `{"error":{code,message}}`). Its current papercode-token-as-cookie
+  authentication is transitional and superseded by the Phase 0 scoped Paperboat bearer
+  session contract. Methods: `Me`, `ListProjects`, `CLIConnect`, `ConnectionStatus`.
 - **`internal/resolver.APIResolver`** — matches the requested token to a project by id then
   case-insensitive name, calls `cli-connect` (authorizes + reconciles agentunnel resources +
   resumes an idle machine), and polls `connection-status` until connectable, re-brokering
@@ -44,21 +43,20 @@ exercisable offline.
 ### Command surface (`cmd/pb`)
 - `pb <project>` resumes the VM (stubbed) and attaches its terminal. `paperboat` is an
   install-time symlink alias (urfave/cli derives the program name from argv[0]).
-- Session-scoped, catalog-validated flags — deliberately **value-based**, not literal
-  `--2x`/`--claude` booleans, to keep the catalog dynamic (no hardcoding):
-  - `--agent, -a <name>` — launch a different agent this session.
-  - `--size, -s <shape>` — machine shape to boot on the idle-resume.
+- Session-scoped `--agent` and `--size` overrides were removed in Phase 0 because neither
+  had an implemented server/runtime contract. Presets and machine type remain project
+  configuration applied through the control plane.
 - Subcommands: `agents`, `sizes`, `doctor`, `config path|show`.
 - `normalizeArgs` reorders tokens so flags work **before or after** the project name
   (urfave/cli otherwise stops flag parsing at the first positional).
 
-### Config + auth reuse (`internal/config`)
+### Transitional config and auth (`internal/config`)
 - JSON config loaded from `$PAPERBOAT_CONFIG` or the user config dir; missing file is not an
   error (defaults applied). Everything tunable is here (server URL, papercode path, upload
-  endpoint/watch-dirs/limits, default agent/size) — no hardcoding in command logic.
-- `AuthSource` reads papercode credentials **read-only**; the CLI never owns/writes creds.
-  Missing creds → `ErrNoCredentials` (guides the user to sign in via papercode, no separate
-  login).
+  endpoint/watch-dirs/limits) — no hardcoding in command logic.
+- `AuthSource` currently reads a papercode JSON token. This is explicitly superseded by the
+  Paperboat device-session and secure credential-store contract and must not ship as a
+  production auth path.
 
 ### Transparent terminal wrapper (`internal/session`)
 - Raw mode (skipped when stdin isn't a TTY), SIGWINCH resize propagation (unix; no-op on
@@ -86,29 +84,26 @@ CLI stays exercisable offline. The interfaces are unchanged, so both drop in int
 | --- | --- | --- | --- |
 | `resolver.ProjectResolver` | `APIResolver` — resolve + `cli-connect` broker + readiness poll (`internal/resolver/api.go`) | `StubResolver` — local target | — |
 | `tunnel.Tunnel` | `PapercodeWSTunnel` — `terminal.attach` / `terminal.write` / `terminal.resize` / `terminal.close` over the tunneled papercode `/ws` endpoint | `StubTunnel` — local `$SHELL` PTY | Real hosted papercode validation deferred to Phase 9. |
-| `config.AuthSource` | `FileAuthSource` — reads papercode `auth.json`, sent as the `paperboat_session` cookie | same | exact papercode credential path/format (mapping-only change) |
-| `catalog.Catalog` | The CLI does not reject real-mode overrides against local seed data | `StubCatalog` — seed agents/sizes for offline flag validation UX | no public catalog endpoint or override request contract on paperboat-server (contracts frozen); listing commands still use placeholder seed data until a server catalog endpoint is agreed. |
+| `config.AuthSource` | Transitional `FileAuthSource`; superseded and not production-safe | same | Paperboat device session and OS secure-store implementation (Phase 3) |
+| `catalog.Catalog` | No server implementation yet | `StubCatalog` — seed agents/sizes for offline listing UX | listing commands use placeholder seed data until a server catalog endpoint is agreed; attach has no agent/size overrides. |
 | `upload.Uploader` | `HTTPUploader` when the broker returns an upload descriptor, using brokered max-bytes/MIME policy; otherwise `DisabledUploader` fails open | `StubUploader` — returns a VM path, transfers nothing | papercode must provide the VM-path upload endpoint for hosted validation. |
 | `buildinfo.Version` | stamped by release `-ldflags` | `"dev"` | — |
 
-## Known open contract question (needs the user / cross-project agreement)
+## Frozen Phase 0 contracts
 
-The papercode **GUI** sends images as chat-turn *attachments* (base64 dataURL). A TUI wrapper
-instead needs a VM-side *file path* to inject into the paste stream. So the real `Uploader`
-requires a papercode-server endpoint that accepts an image and **returns a VM path** — a
-cross-project contract to agree on before implementing. papercode was not modified.
+- Paperboat client authentication uses device authorization and scoped bearer sessions.
+- Image staging uses multipart `POST /api/files/staged-images`, requires `file:stage`, and
+  returns a VM-absolute `path`; the current base64 uploader is transitional.
+- Terminal compatibility is owned by papercode's versioned protocol fixture. Hand-written
+  CLI wire types must be checked against that fixture and the real server.
+- Project presets and machine shape are project configuration applied on restart. There
+  are no session-scoped `--agent` or `--size` contracts.
 
 ## Not yet done (deferred by design)
 
 - Real papercode image-upload transport (pending the contract below); the `upload`
   hint is already plumbed through to the paste bridge's boundary.
-- A paperboat-server **catalog endpoint** and backend `--size` override request contract
-  (contracts frozen; needs agreement) — local stub mode validates against seed data, real
-  mode does not send an override request body, and `--size` is rejected in real mode until
-  the broker can apply it before machine resume.
-- Machine-resume shape selection (`--size` → boot machine-type) against the real Fly
-  lifecycle: `cli-connect` resumes the machine, but mapping a session `--size` override to a
-  boot shape needs the server-side contract (currently the project's configured shape boots).
+- A paperboat-server catalog read endpoint for server-backed agent/preset listing.
 
 ## Verification (done)
 
@@ -116,8 +111,8 @@ cross-project contract to agree on before implementing. papercode was not modifi
   (paste parser + upload pipeline unit tests: split reads, partial markers, adjacent pastes,
   non-image pass-through, upload-failure fail-open, dataURL limits).
 - Real binary: exit-code passthrough (`exit 7`→7, `exit 0`→0), stream I/O, bracketed-paste
-  image path rewritten to a VM path, plain-text paste untouched, flag validation
-  (`--agent nope` rejected), flags after project name, and the `paperboat` alias symlink.
+  image path rewritten to a VM path, plain-text paste untouched, unsupported session
+  overrides rejected, flags after project name, and the `paperboat` alias symlink.
 - **Control-plane end-to-end** against a mock paperboat-server (session-cookie auth + the
   real connect flow), with the actual `bin/pb`:
   - `pb doctor` → authenticates via `GET /api/me` (`authenticated as … ✓`).

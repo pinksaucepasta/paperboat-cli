@@ -8,14 +8,12 @@ import (
 	"path/filepath"
 )
 
-// ErrNoCredentials means no reusable papercode credential was found. Callers
-// should treat this as "user needs to log in via papercode first" rather than
-// prompting for a separate login — paperboat-cli never owns credentials.
+// ErrNoCredentials is the transitional missing-papercode-token error. Phase 3
+// replaces this source with the Paperboat credential-store profile.
 var ErrNoCredentials = errors.New("no papercode credentials found")
 
-// Credential is the minimal, read-only view of papercode auth that the CLI
-// needs to authenticate a connection. paperboat-cli is a consumer of this
-// auth, not a second source of truth (see AGENTS.md), so it never writes here.
+// Credential is the transitional read-only papercode auth view retained until
+// the Phase 3 Paperboat credential-store implementation replaces it.
 type Credential struct {
 	AccessToken string `json:"access_token"`
 	TokenType   string `json:"token_type,omitempty"`

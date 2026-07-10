@@ -36,7 +36,7 @@ func TestConnectWithServerURLUsesBackendResolver(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := newApp().Run([]string{"pb", "--config", configPath, "--server", server.URL, "--agent", "backend-agent", "demo"})
+	err := newApp().Run([]string{"pb", "--config", configPath, "--server", server.URL, "demo"})
 	if err == nil {
 		t.Fatal("expected project lookup error")
 	}
@@ -110,33 +110,14 @@ func TestKeepAliveCommandCallsBackend(t *testing.T) {
 	}
 }
 
-func TestConnectWithServerURLRejectsSizeOverrideUntilBrokerContractExists(t *testing.T) {
-	dir := t.TempDir()
-	authPath := filepath.Join(dir, "auth.json")
-	configPath := filepath.Join(dir, "config.json")
-	var sawRequest bool
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		sawRequest = true
-		http.NotFound(w, r)
-	}))
-	defer server.Close()
-
-	if err := os.WriteFile(authPath, []byte(`{"access_token":"token"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(configPath, []byte(`{"papercode_config_path":`+quote(authPath)+`}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	err := newApp().Run([]string{"pb", "--config", configPath, "--server", server.URL, "--size", "2x", "demo"})
-	if err == nil {
-		t.Fatal("expected size override error")
-	}
-	if sawRequest {
-		t.Fatal("backend should not be called for unsupported size override")
-	}
-	if !strings.Contains(err.Error(), "--size is not supported with server_url") {
-		t.Fatalf("err = %v", err)
+func TestConnectDoesNotExposeSessionOverrides(t *testing.T) {
+	for _, flag := range []string{"--size", "--agent"} {
+		t.Run(flag, func(t *testing.T) {
+			err := newApp().Run([]string{"pb", flag, "value", "demo"})
+			if err == nil || !strings.Contains(err.Error(), "flag provided but not defined") {
+				t.Fatalf("err = %v", err)
+			}
+		})
 	}
 }
 

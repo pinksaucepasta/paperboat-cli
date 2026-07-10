@@ -1,0 +1,56 @@
+{
+  "protocol": "paperboat-terminal-rpc/v1",
+  "websocket": {
+    "path": "/ws",
+    "ticket_query_parameter": "wsTicket"
+  },
+  "request_envelope": {
+    "tag_field": "_tag",
+    "tag_value": "Request",
+    "method_field": "tag",
+    "id_field": "id",
+    "id_type": "string",
+    "payload_field": "payload",
+    "headers_field": "headers"
+  },
+  "response_frames": {
+    "chunk_tag": "Chunk",
+    "chunk_values_field": "values",
+    "exit_tag": "Exit",
+    "exit_field": "exit",
+    "protocol_error_tags": ["ClientProtocolError", "Defect"]
+  },
+  "stream_acknowledgement": {
+    "tag_field": "_tag",
+    "tag_value": "Ack",
+    "request_id_field": "requestId",
+    "request_id_type": "string",
+    "required_after_response_tag": "Chunk"
+  },
+  "methods": {
+    "attach": "terminal.attach",
+    "write": "terminal.write",
+    "resize": "terminal.resize",
+    "close": "terminal.close"
+  },
+  "fields": {
+    "thread_id": "threadId",
+    "terminal_id": "terminalId",
+    "restart_if_not_running": "restartIfNotRunning",
+    "cwd": "cwd",
+    "env": "env",
+    "data": "data",
+    "rows": "rows",
+    "cols": "cols"
+  },
+  "attach_event_types": [
+    "snapshot",
+    "output",
+    "exited",
+    "closed",
+    "error",
+    "cleared",
+    "restarted",
+    "activity"
+  ]
+}

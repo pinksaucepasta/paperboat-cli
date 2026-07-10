@@ -72,8 +72,6 @@ func (r *APIResolver) Resolve(ctx context.Context, req ConnectRequest) (ConnectI
 	info := ConnectInfo{
 		Project:      project.Name,
 		TunnelTarget: resp.Terminal.WebSocketBaseURL,
-		Agent:        firstNonEmpty(req.Agent, r.cfg.DefaultAgent),
-		Size:         firstNonEmpty(req.Size, r.cfg.DefaultSize),
 		Local:        false,
 		Terminal: &TerminalTarget{
 			HTTPBaseURL:      resp.Terminal.HTTPBaseURL,

@@ -20,25 +20,11 @@ func NewStubResolver(cfg *config.Config) *StubResolver {
 	return &StubResolver{cfg: cfg}
 }
 
-// Resolve implements ProjectResolver, filling agent/size from request overrides
-// then config defaults.
+// Resolve implements ProjectResolver for local development.
 func (r *StubResolver) Resolve(_ context.Context, req ConnectRequest) (ConnectInfo, error) {
-	agent := firstNonEmpty(req.Agent, r.cfg.DefaultAgent)
-	size := firstNonEmpty(req.Size, r.cfg.DefaultSize)
 	return ConnectInfo{
 		Project:      strings.TrimSpace(req.Project),
 		TunnelTarget: "local-shell",
-		Agent:        agent,
-		Size:         size,
 		Local:        true,
 	}, nil
-}
-
-func firstNonEmpty(vals ...string) string {
-	for _, v := range vals {
-		if strings.TrimSpace(v) != "" {
-			return v
-		}
-	}
-	return ""
 }

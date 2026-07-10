@@ -1,7 +1,7 @@
 // Package config loads the paperboat-cli local configuration and reuses the
 // user's existing papercode credentials. Everything that could reasonably
 // change is data-driven here — nothing about endpoints, limits, agents, or
-// machine sizes is hardcoded in command logic. See AGENTS.md ("No hardcoding").
+// machine catalogs are hardcoded in command logic. See AGENTS.md ("No hardcoding").
 package config
 
 import (
@@ -49,10 +49,6 @@ type Config struct {
 	// PapercodeConfigPath points at papercode's stored credentials to reuse.
 	// Empty means "use the platform default location".
 	PapercodeConfigPath string `json:"papercode_config_path,omitempty"`
-	// DefaultAgent / DefaultSize are used when the user does not pass a flag.
-	// Empty means "whatever the project has configured server-side".
-	DefaultAgent string `json:"default_agent,omitempty"`
-	DefaultSize  string `json:"default_size,omitempty"`
 	// Upload configures the image-paste bridge.
 	Upload UploadConfig `json:"upload,omitempty"`
 	// Connect tunes the pre-connect broker + readiness polling.

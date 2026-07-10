@@ -1,6 +1,6 @@
 // Command pb (alias: paperboat) is the invisible terminal wrapper for the
 // Paperboat platform. `pb <project>` resumes the project VM and attaches its
-// terminal, reusing papercode auth and bridging local image pastes into remote
+// terminal, using Paperboat auth and bridging local image pastes into remote
 // TUIs. Cross-service calls run behind interfaces with local dev stubs until
 // paperboat-server and the agentunnel/papercode wiring land.
 package main
@@ -39,8 +39,6 @@ func main() {
 // normalizeArgs so users can put flags after the project name.
 var valueFlags = map[string]bool{
 	"--config": true, "--server": true,
-	"--agent": true, "-a": true,
-	"--size": true, "-s": true,
 }
 
 var subcommands = map[string]bool{
@@ -56,8 +54,7 @@ var subcommandValueFlags = map[string]bool{
 	"--hours": true,
 }
 
-// normalizeArgs moves flags ahead of positional arguments so `pb <project>
-// --agent x` works as well as `pb --agent x <project>`. urfave/cli stops
+// normalizeArgs moves flags ahead of positional arguments. urfave/cli stops
 // parsing flags at the first positional, so we reorder to keep the UX flexible.
 func normalizeArgs(args []string) []string {
 	if len(args) <= 1 {
@@ -125,8 +122,6 @@ func newApp() *cli.App {
 		&cli.StringFlag{Name: "config", Usage: "path to the CLI config file"},
 		&cli.StringFlag{Name: "server", Usage: "paperboat-server base URL override"},
 	}
-	rootFlags = append(rootFlags, connectFlags()...)
-
 	return &cli.App{
 		Name:                   "pb",
 		Usage:                  "Connect to your Paperboat project VM terminal",
@@ -134,10 +129,9 @@ func newApp() *cli.App {
 		UseShortOptionHandling: true,
 		HideHelpCommand:        true,
 		Flags:                  rootFlags,
-		ArgsUsage:              "<project> [--agent <name>] [--size <shape>]",
-		Description: "Run `pb <project>` to attach your project's remote terminal.\n" +
-			"Flags select a different agent or machine shape for this session.",
-		Action: actionConnect,
+		ArgsUsage:              "<project>",
+		Description:            "Run `pb <project>` to attach your project's remote terminal.",
+		Action:                 actionConnect,
 		Commands: []*cli.Command{
 			connectCommand(),
 			agentsCommand(),
@@ -273,15 +267,7 @@ func connectCommand() *cli.Command {
 		Name:      "connect",
 		Usage:     "Attach to a project VM terminal (default action)",
 		ArgsUsage: "<project>",
-		Flags:     connectFlags(),
 		Action:    actionConnect,
-	}
-}
-
-func connectFlags() []cli.Flag {
-	return []cli.Flag{
-		&cli.StringFlag{Name: "agent", Aliases: []string{"a"}, Usage: "agent to launch this session (overrides project config)"},
-		&cli.StringFlag{Name: "size", Aliases: []string{"s"}, Usage: "machine shape to boot on resume (e.g. 1x, 2x)"},
 	}
 }
 
@@ -297,7 +283,7 @@ func actionConnect(c *cli.Context) error {
 	}
 	ctx := c.Context
 
-	// Reuse papercode auth; guide the user rather than prompting for a login.
+	// Transitional auth wiring is replaced by the Phase 3 Paperboat device flow.
 	cred, err := d.auth.Credential()
 	if err != nil && !errors.Is(err, config.ErrNoCredentials) {
 		return err
@@ -315,27 +301,8 @@ func actionConnect(c *cli.Context) error {
 		d.resolver = resolver.NewAPIResolver(api.New(d.cfg.ServerURL, cred, nil), d.cfg)
 	}
 
-	// Validate flag values against the dynamic catalog.
-	agent := c.String("agent")
-	if agent != "" && shouldValidateLocalCatalog(d.cfg) {
-		if _, err := catalog.ValidateAgent(ctx, d.catalog, agent); err != nil {
-			return err
-		}
-	}
-	size := c.String("size")
-	if size != "" && d.cfg.ServerURL != "" {
-		return errors.New("--size is not supported with server_url until paperboat-server exposes a machine-shape override contract")
-	}
-	if size != "" && shouldValidateLocalCatalog(d.cfg) {
-		if _, err := catalog.ValidateSize(ctx, d.catalog, size); err != nil {
-			return err
-		}
-	}
-
 	info, err := d.resolver.Resolve(ctx, resolver.ConnectRequest{
 		Project:    project,
-		Agent:      agent,
-		Size:       size,
 		Credential: cred,
 	})
 	if err != nil {
@@ -395,10 +362,6 @@ func friendlyAPIError(err error) string {
 		return "the project machine is not ready yet; retry in a moment"
 	}
 	return ""
-}
-
-func shouldValidateLocalCatalog(cfg *config.Config) bool {
-	return cfg.ServerURL == ""
 }
 
 func uploaderForTarget(target *resolver.UploadTarget) upload.Uploader {
@@ -519,8 +482,6 @@ func configCommand() *cli.Command {
 					}
 					fmt.Printf("server_url: %s\n", orNone(d.cfg.ServerURL))
 					fmt.Printf("papercode_config: %s\n", orNone(d.cfg.PapercodeConfigPath))
-					fmt.Printf("default_agent: %s\n", orNone(d.cfg.DefaultAgent))
-					fmt.Printf("default_size: %s\n", orNone(d.cfg.DefaultSize))
 					fmt.Printf("upload.endpoint: %s\n", orNone(d.cfg.Upload.Endpoint))
 					fmt.Printf("upload.max_image_bytes: %d\n", d.cfg.Upload.MaxImageBytes)
 					fmt.Printf("upload.max_attachments: %d\n", d.cfg.Upload.MaxAttachments)

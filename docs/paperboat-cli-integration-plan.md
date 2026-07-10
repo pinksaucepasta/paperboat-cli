@@ -29,14 +29,14 @@ checklist, acceptance criteria, tests, documentation, and evidence are complete.
 
 | Phase | Area | Status | Owner | Evidence |
 | --- | --- | --- | --- | --- |
-| 0 | Product decisions and cross-repo contract freeze | In progress | TBD | Existing server access baseline and papercode environment-auth docs; device auth and staged-image contracts remain to freeze. |
+| 0 | Product decisions and cross-repo contract freeze | Implemented | Codex | Workspace user story plus server CLI auth/OpenAPI, dashboard approval, agentunnel data-plane, papercode schema/fixture, and CLI contracts are aligned; immutable commit links remain release evidence. |
 | 1 | Paperboat device authorization and CLI sessions | Not started | TBD | None |
 | 2 | Dashboard device approval experience | Not started | TBD | None |
 | 3 | Shared client identity and secure credential storage | In progress | TBD | CLI has a read-only JSON credential abstraction, but it implements the superseded papercode-token assumption and no secure device flow. |
 | 4 | Papercode control-plane credential minting | In progress | TBD | Papercode has scoped environment auth, token exchange, WebSocket tickets, and a Paperboat mint endpoint; the real server issuer/revocation path is missing. |
 | 5 | Agentunnel HTTP/WebSocket data path and revocation | In progress | TBD | Agentunnel forwards HTTP/WebSocket and server provisions access resources; real hosted route, per-session revocation, and end-to-end evidence remain. |
 | 6 | Fly project VM runtime and readiness | In progress | TBD | Project image, papercode/agentunnel startup, Fly orchestration, and readiness foundations exist; production auth provisioning and real Fly evidence remain. |
-| 7 | Papercode staged-image upload contract | Not started | TBD | None |
+| 7 | Papercode staged-image upload contract | In progress | TBD | Schema-owned path/response/errors and `file:stage` are frozen; the existing base64 terminal-upload route remains transitional and must be replaced. |
 | 8 | CLI production connection and terminal behavior | In progress | TBD | API resolver, readiness polling, papercode WebSocket terminal RPC, raw terminal handling, resize, and exit propagation exist; auth and real-server compatibility remain. |
 | 9 | CLI image-paste bridge completion | In progress | TBD | Bracketed-paste parsing, fail-open rewriting, and uploader tests exist; the real staged-image transport, bounded async ordering, and cross-platform evidence remain. |
 | 10 | Security, observability, operations, and distribution | Not started | TBD | None |
@@ -66,9 +66,10 @@ Use an OAuth 2.0 Device Authorization Grant-style flow, matching GitHub CLI:
 3. The dashboard uses the existing WorkOS browser session. After login, it shows the CLI
    name, operating system, requested scopes, code, and expiry, then requires explicit
    approval or denial.
-4. The CLI polls at the server-provided interval. Approval returns a short-lived access
-   token and rotating refresh token; denial, expiry, cancellation, and slow-down responses
-   are distinct terminal outcomes.
+4. Browser approval moves the grant to `approved` without issuing credentials. The CLI
+   polls at the server-provided interval; exactly one successful poll consumes the approved
+   grant while returning a short-lived access token and rotating refresh token. Denial,
+   expiry, cancellation, and slow-down responses remain distinct outcomes.
 
 This is preferred over a loopback callback because it works unchanged in local terminals,
 remote shells, containers, and headless machines. `verification_uri_complete` removes the
@@ -109,15 +110,35 @@ operator/debug access only and is not the production `pb` transport.
 
 Use papercode's existing Paperboat control-plane mint flow:
 
-- The VM is provisioned with Paperboat's public mint key, issuer/audience configuration,
-  stable environment ID, and linked Paperboat owner ID.
-- For an authorized connect, `paperboat-server` signs a one-time `environment:connect`
-  proof for exactly one environment, user, client proof key, scope set, and expiry.
+- The VM is provisioned with Paperboat's JWKS URL, issuer/audience configuration, stable
+  environment ID, and linked Paperboat owner ID.
+- For an authorized connect, `paperboat-server` signs one one-time `environment:connect`
+  proof per downstream papercode session, each bound to exactly one environment, user,
+  Paperboat client session, nonce/JTI, and expiry.
 - The proof is posted to papercode's `POST /api/t3-connect/mint-credential` through the
   project's agentunnel route.
-- The bootstrap credential is exchanged at `/oauth/token` for a papercode access token.
-- A single-use WebSocket ticket is requested at `/api/auth/websocket-ticket`.
-- CLI sessions receive only `terminal:operate` and the new `file:stage` capability.
+- One bootstrap credential is exchanged at `/oauth/token` for a terminal-only
+  bearer `terminal:operate` access session, from which a single-use WebSocket ticket is
+  requested. The terminal bearer is retained by `paperboat-server` and never returned.
+- A separate proof/bootstrap exchange creates a file-only `file:stage` bearer session.
+  That short-lived bearer is returned as upload auth. Both downstream session ids are
+  recorded against the Paperboat client session.
+
+The proof is an Ed25519 compact JWS with `alg=EdDSA`,
+`typ=t3-cloud-mint+jwt`, and a required JWKS `kid`. It binds `iss`,
+`aud=t3-env:<environmentId>`, Paperboat owner `sub`, `jti`, `iat`, `exp`, environment id,
+Paperboat client-session id, nonce, and exactly `scope=["environment:connect"]`. The
+Paperboat profile omits `clientProofKeyThumbprint` and `cnf`; neither the CLI nor
+`paperboat-server` owns or registers a downstream proof key. `paperboat-server` exchanges
+each bootstrap credential without a DPoP header so papercode intentionally issues the
+scoped bearer sessions described above. Maximum lifetime is 300 seconds and accepted clock skew is
+60 seconds. JTI and nonce are atomically single-use through expiry plus skew. Unknown keys
+trigger one JWKS refresh and otherwise fail closed; rotation overlap lasts only while the
+old key remains published.
+
+The normalized Paperboat issuer publishes public Ed25519 keys at
+`GET /.well-known/jwks.json` using `kty=OKP`, `crv=Ed25519`, `alg=EdDSA`, `use=sig`, `kid`,
+and `x`. Cache and rotation-overlap durations are dynamic configuration.
 
 No agentunnel API key, machine token, Fly credential, mint signing key, SSH key, or reusable
 bootstrap credential is returned to the CLI.
@@ -160,33 +181,45 @@ Request:
   "client_label": "Pujan's MacBook Pro",
   "device_type": "desktop",
   "os": "darwin",
-  "scopes": ["account:read", "projects:read", "projects:connect", "session:refresh"]
+  "scopes": ["account:read", "clients:revoke", "projects:read", "projects:connect", "session:refresh"]
 }
 ```
 
-Response:
+Response uses the Paperboat `{ "data": ... }` envelope:
 
 ```json
 {
-  "device_code": "secret-high-entropy-value",
-  "user_code": "ABCD-EFGH",
-  "verification_uri": "https://dashboard.example.com/cli/authorize",
-  "verification_uri_complete": "https://dashboard.example.com/cli/authorize?code=ABCD-EFGH",
-  "expires_in": 600,
-  "interval": 5
+  "data": {
+    "device_code": "secret-high-entropy-value",
+    "user_code": "ABCD-EFGH",
+    "verification_uri": "https://dashboard.example.com/cli/authorize",
+    "verification_uri_complete": "https://dashboard.example.com/cli/authorize?code=ABCD-EFGH",
+    "expires_in": 600,
+    "interval": 5
+  }
 }
 ```
 
-`POST /api/auth/device/token` accepts the device code and returns one of
-`authorization_pending`, `slow_down`, `access_denied`, `expired_token`, or a token set.
+`POST /api/auth/device/token` accepts exactly `client_id` and `device_code`. It returns one
+of `authorization_pending`, `slow_down`, `access_denied`, `expired_token`, `invalid_grant`,
+or a token set. Errors use the standard Paperboat error envelope. `slow_down` returns the
+next interval in `error.details`; general limiting is HTTP `429 rate_limited` with
+`Retry-After`.
+
+The CLI requests exactly those five scopes; ordering is insignificant, while missing,
+duplicate, additional, and unknown scopes return `invalid_scope`. Unknown clients return
+`invalid_client`; other malformed requests return `validation_failed`.
 
 ```json
 {
-  "access_token": "opaque-access-token",
-  "refresh_token": "opaque-rotating-refresh-token",
-  "token_type": "Bearer",
-  "expires_in": 900,
-  "scope": "account:read projects:read projects:connect session:refresh"
+  "data": {
+    "access_token": "opaque-access-token",
+    "refresh_token": "opaque-rotating-refresh-token",
+    "token_type": "Bearer",
+    "expires_in": 900,
+    "scope": "account:read clients:revoke projects:read projects:connect session:refresh",
+    "client_session_id": "cls_..."
+  }
 }
 ```
 
@@ -196,17 +229,37 @@ Dashboard approval and denial use cookie session plus CSRF:
 - `POST /api/auth/device/requests/{user_code}/approve`
 - `POST /api/auth/device/requests/{user_code}/deny`
 
-Refresh and logout use bearer authentication, rotate refresh tokens, and revoke the device
-session family on detected reuse:
+Refresh sends the current refresh token only as a bearer credential, rotates it on every
+success, serializes concurrent family refresh, and revokes the device-session family on
+detected reuse. Revoke accepts the current access or refresh bearer and is idempotent:
 
 - `POST /api/auth/token/refresh`
 - `POST /api/auth/token/revoke`
 - `GET /api/auth/clients`
 - `DELETE /api/auth/clients/{client_session_id}`
 
+Authorized-client listing accepts `limit`, `offset`, and optional `state=active|revoked`.
+Its `data` is `{items, pagination}`. Items contain client/session identity, label, device/OS,
+normalized scopes, state, creation/approval/last-use/revocation timestamps, revocation
+reason, and whether the item is the calling session. Pagination contains `limit`, `offset`,
+`total`, and nullable `next_offset`; the exact fields are schema-owned by
+`paperboat-server/docs/openapi.json`.
+
+For bearer callers, listing requires `account:read` and deleting another authorized client
+requires `clients:revoke`. Dashboard cookie callers retain cookie authentication plus CSRF
+for deletion. Self-family logout through `POST /api/auth/token/revoke` does not require the
+client-management mutation scope.
+
 Device codes, user codes, access tokens, and refresh tokens are stored only as hashes.
 User-code lookup uses a separate keyed hash so the short code is not recoverable from the
-database. Approval is transactional and single-use.
+database. Approval transactionally changes `pending` to `approved`; the single successful
+token poll changes `approved` to `consumed` while issuing credentials.
+
+Device grant lifetime, access-token lifetime, polling interval, and rate thresholds are
+dynamic server configuration; responses are authoritative. Initial production defaults are
+600 seconds, 900 seconds, and 5 seconds. Device codes have at least 256 bits of entropy.
+Rate limits apply independently by network, grant, and account. The exact contract and
+credential-profile rules live in `paperboat-server/docs/contracts/cli-authorization.md`.
 
 ### CLI Connect Descriptor
 
@@ -214,17 +267,20 @@ database. Approval is transactional and single-use.
 `projects:connect`. It remains responsible for ownership, entitlement, credit, project
 state, Fly start/resume, agentunnel reconciliation, and papercode credential minting.
 
-Ready response:
+Ready Paperboat response `data` payload:
 
 ```json
 {
   "project_id": "prj_...",
   "project_state": "running",
   "connectable": true,
+  "status": "ready",
+  "reason": "ready",
+  "retry_after_seconds": 0,
   "expires_at": "2026-07-10T12:00:00Z",
   "environment": {
     "environment_id": "env_...",
-    "display_name": "paperboat-cli",
+    "display_name": "Project name",
     "project_root": "/workspace/project"
   },
   "terminal": {
@@ -236,6 +292,7 @@ Ready response:
       "expires_at": "2026-07-10T12:00:00Z",
       "scopes": ["terminal:operate"]
     },
+    "thread_id": "paperboat-cli",
     "terminal_id": "term_...",
     "cwd": "/workspace/project"
   },
@@ -261,13 +318,20 @@ server-provided retry interval. `GET /api/projects/{project_id}/connection-statu
 readiness but does not return stale credentials. Once ready, the CLI calls `cli-connect`
 again to mint fresh, single-use auth material.
 
+Frozen readiness pairs are `machine_starting` with `machine_start_queued` or
+`machine_not_running`, `tunnel_connecting` with `tunnel_offline`, and
+`papercode_starting` with `papercode_unhealthy`. Pending pairs require
+`connectable: false` and a positive retry interval. The only ready shape is
+`connectable: true`, `status: ready`, `reason: ready`, and `retry_after_seconds: 0`.
+
 The existing browser-cookie-plus-CSRF behavior in `paperboat-cli/internal/api` must be
 replaced with bearer access tokens. A CLI must never synthesize dashboard cookies.
 
 ### Papercode Staged Image
 
-`POST /api/files/staged-images` accepts one multipart part named `image` plus an optional
-display filename. The server derives the extension from validated content, not the name.
+`POST /api/files/staged-images` accepts one multipart file part named `image` plus an
+optional text part named `display_filename`. The server derives the extension from
+validated content, not the name.
 
 Success response:
 
@@ -276,7 +340,7 @@ Success response:
   "path": "/workspace/project/.paperboat/uploads/2026/07/img_...png",
   "mime_type": "image/png",
   "size_bytes": 123456,
-  "sha256": "hex-digest",
+  "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "expires_at": "2026-07-17T12:00:00Z"
 }
 ```
@@ -289,36 +353,38 @@ never accept a destination path from the client.
 
 ### Terminal RPC
 
-The CLI consumes papercode's schema-owned RPC contract; it must not maintain hand-written
-guesses indefinitely. Phase 0 chooses one of these contract-safe mechanisms:
+The CLI consumes papercode's schema-owned RPC contract through the versioned
+`packages/contracts/fixtures/paperboat-cli-terminal-v1.json` protocol fixture. The Go repo
+vendors that exact fixture, pins `paperboat-terminal-rpc/v1`, and tests its wire constants
+against it. The CLI sends an Effect RPC `Ack` with the matching string `requestId` after
+processing every streamed `Chunk`; without that acknowledgement papercode applies
+backpressure and does not send the next chunk. Fixture refresh and real-server compatibility
+tests are required in the same cross-repo change whenever the terminal schema changes.
 
-- generate Go wire types and method constants from a versioned JSON schema exported by
-  `packages/contracts`; or
-- publish a versioned protocol fixture and compatibility test consumed by the Go repo.
-
-Required terminal operations are attach/create, write, resize, output subscription, exit,
-and close. Exact tags, payload fields, framing, errors, and protocol version must be tested
+Required terminal operations are attach with `restartIfNotRunning`, write, resize, output
+subscription, exit, and close. Exact tags, payload fields, framing, errors, and protocol version must be tested
 against the real papercode server in CI.
 
 ## Phase 0: Product Decisions And Contract Freeze
 
 Repositories: all five integration repos plus workspace docs.
 
-- [ ] Update `USERSTORY.md`: device authorization, client-specific sessions, exact
+- [x] Update `USERSTORY.md`: device authorization, client-specific sessions, exact
       pre-connect role, papercode mint flow, and agentunnel HTTP/WSS data path.
-- [ ] Update `paperboat-cli/AGENTS.md`: replace read-only papercode credential reuse with
+- [x] Update `paperboat-cli/AGENTS.md`: replace read-only papercode credential reuse with
       the approved shared Paperboat credential-store/session model.
-- [ ] Reconcile `paperboat-server/docs/contracts/access-handoff.md`, OpenAPI, and this plan.
-- [ ] Freeze device-auth endpoint fields, scopes, polling errors, expiry, rate limits,
+- [x] Reconcile `paperboat-server/docs/contracts/access-handoff.md`, OpenAPI, and this plan.
+- [x] Freeze device-auth endpoint fields, scopes, polling errors, expiry, rate limits,
       refresh rotation, logout, and revocation semantics.
-- [ ] Freeze papercode mint proof claims, signing algorithm, JWKS/key rotation, audience,
+- [x] Freeze papercode mint proof claims, signing algorithm, JWKS/key rotation, audience,
       nonce/replay storage, and clock-skew bounds.
-- [ ] Freeze the staged-image endpoint and add `file:stage` to papercode auth schemas.
-- [ ] Freeze terminal RPC compatibility/export mechanism.
-- [ ] Define environment identity as stable per project, surviving machine replacement.
-- [ ] Remove or contractually define unsupported CLI flags. In particular, `--size` must
+- [x] Freeze the staged-image endpoint and add `file:stage` to papercode auth schemas.
+- [x] Freeze terminal RPC compatibility/export mechanism.
+- [x] Define environment identity as stable per project, surviving machine replacement.
+- [x] Remove or contractually define unsupported CLI flags. In particular, `--size` must
       not imply a per-session Fly resize contrary to the user story's restart-apply rule.
-- [ ] Record approval links in every affected repo's contract/progress document.
+      `--agent` is also removed because no agent-launch RPC contract exists.
+- [x] Record the owning contract links in every affected repo's contract/progress document.
 
 Acceptance criteria:
 
@@ -328,7 +394,15 @@ Acceptance criteria:
 
 Evidence:
 
-- Approved contract commit links for all affected repositories.
+- Workspace: `USERSTORY.md`.
+- CLI: `AGENTS.md`, `PROGRESS.md`, and the vendored terminal fixture compatibility test.
+- Server: `docs/contracts/cli-authorization.md`, `access-handoff.md`, and
+  `docs/openapi.json`.
+- Dashboard: `docs/cli-device-authorization.md`.
+- Papercode: `docs/cloud/environment-auth.md`, schema-owned Paperboat/staged-image
+  contracts, and the terminal fixture.
+- Agentunnel: `docs/paperboat-integration.md`.
+- Immutable approved commit links remain required before changing Phase 0 to `Complete`.
 
 ## Phase 1: Paperboat Device Authorization And CLI Sessions
 
@@ -343,7 +417,8 @@ Repository: `paperboat-server`.
 - [ ] Generate human-readable codes without ambiguous characters; compare in constant time.
 - [ ] Enforce polling interval and `slow_down`; rate-limit by network, device grant, and
       account without making NAT-shared users unusable.
-- [ ] Make approval/denial/expiry single-use and race-safe across server replicas.
+- [ ] Make approval, poll consumption, denial, and expiry transitions race-safe across
+      server replicas.
 - [ ] Rotate refresh tokens on every use; revoke the family on replay.
 - [ ] Add explicit client-session revocation hooks for logout, account suspension, and
       administrator action.
@@ -436,11 +511,13 @@ Repositories: `papercode` and `paperboat-server`.
 - [ ] Implement server-side mint signing with a managed key provider and published key IDs;
       no signing key is stored in source, database plaintext, or VM images.
 - [ ] Bind each proof to environment, user, Paperboat client session, requested scopes,
-      client proof-key thumbprint, nonce/JTI, and a very short expiry.
+      nonce/JTI, and a very short expiry; omit downstream proof-key claims for this bearer
+      profile.
 - [ ] Validate exact issuer/audience/scope, linked owner, key ID, time bounds, and replay at
       papercode before issuing a one-time bootstrap credential.
-- [ ] Have `paperboat-server` exchange the bootstrap credential, request the WebSocket
-      ticket, and return only the scoped descriptor material.
+- [ ] Have `paperboat-server` exchange each bootstrap credential without DPoP, retain the
+      terminal bearer only long enough to request the WebSocket ticket, and return the
+      separate file bearer only as scoped upload descriptor material.
 - [ ] Persist downstream papercode session IDs against the Paperboat access session.
 - [ ] Add a signed control-plane revocation endpoint so logout, entitlement loss, project
       suspension/deletion, and account revocation terminate active environment sessions.

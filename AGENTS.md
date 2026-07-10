@@ -21,10 +21,12 @@ Primary responsibilities:
 
 1. **Connect** to the user's project VM (Fly.io machine) and attach to its terminal (PTY),
    with the connection carried **through agentunnel** (never a raw exposed port).
-2. **Auth** by reusing the user's existing Paperboat identity from the **global papercode
-   config** — do **not** implement a separate login. Read papercode's stored
-   tokens/config and keep the format compatible; the CLI is a consumer of that auth, not a
-   second source of truth.
+2. **Auth** as a public client of the Paperboat identity authority. `pb auth login` uses a
+   device-authorization flow approved in the dashboard through WorkOS. Each installation
+   has its own revocable client session. CLI and papercode may share a documented,
+   versioned Paperboat credential-store profile, but the CLI must never parse papercode's
+   private state, copy browser cookies, or reinterpret an environment token as a Paperboat
+   session.
 3. **Bridge local image pastes into remote TUIs** (headline feature, below).
 4. Manage server/agent config from the CLI where the platform calls for it.
 
@@ -77,9 +79,10 @@ code. If this decision is revisited, update this section first.
 
 ## Conventions
 
-- **Client-side & untrusted-network aware.** Assume the network is hostile. Do not persist
-  secrets in plaintext beyond what papercode already does — reuse papercode's credential
-  storage rather than copying tokens elsewhere.
+- **Client-side & untrusted-network aware.** Assume the network is hostile. Store access
+  and refresh secrets in macOS Keychain, Windows Credential Manager, or Linux Secret
+  Service. A file fallback is explicit, disabled by default, restricted to `0600`, and
+  visibly warned. Shared client metadata contains secret references, never secret values.
 - **Cross-project contracts are frozen.** The papercode server upload endpoint and the
   agentunnel connection are contracts owned by other repos. Treat them as frozen; changing
   them requires explicit permission (see workspace rules). Do not edit those repos from here.

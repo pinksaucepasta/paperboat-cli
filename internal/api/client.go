@@ -1,12 +1,6 @@
 // Package api is the paperboat-server control-plane client. It speaks the
-// server's frozen JSON HTTP contract (envelope: {"data": ...} on success,
-// {"error": {...}} on failure) and reuses the papercode session credential.
-//
-// paperboat-server authenticates requests with the session cookie
-// (`paperboat_session`); there is no bearer path. The CLI reuses the token that
-// papercode already stored and presents it as that cookie — the CLI never owns
-// or mints credentials (see AGENTS.md). Unsafe requests fetch a CSRF token from
-// paperboat-server and replay the returned CSRF cookie/header pair.
+// server's JSON HTTP envelope. Its cookie/CSRF authentication is transitional;
+// Phase 8 replaces it with the Phase 0 Paperboat bearer-session contract.
 package api
 
 import (
