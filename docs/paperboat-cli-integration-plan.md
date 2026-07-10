@@ -30,7 +30,7 @@ checklist, acceptance criteria, tests, documentation, and evidence are complete.
 | Phase | Area | Status | Owner | Evidence |
 | --- | --- | --- | --- | --- |
 | 0 | Product decisions and cross-repo contract freeze | Implemented | Codex | Workspace user story plus server CLI auth/OpenAPI, dashboard approval, agentunnel data-plane, papercode schema/fixture, and CLI contracts are aligned; immutable commit links remain release evidence. |
-| 1 | Paperboat device authorization and CLI sessions | Not started | TBD | None |
+| 1 | Paperboat device authorization and CLI sessions | Implemented | Codex | `paperboat-server` has durable grants/client sessions, hashed access and rotating refresh tokens, cookie-or-scoped-bearer middleware, device/refresh/revoke/client APIs, shared rate limits, redacted request logging, and automated state/replay/race tests. Linked local access records revoke immediately; actual papercode terminal/file credential invalidation is deferred to Phase 4. Postgres execution evidence also remains before `Complete`. |
 | 2 | Dashboard device approval experience | Not started | TBD | None |
 | 3 | Shared client identity and secure credential storage | In progress | TBD | CLI has a read-only JSON credential abstraction, but it implements the superseded papercode-token assumption and no secure device flow. |
 | 4 | Papercode control-plane credential minting | In progress | TBD | Papercode has scoped environment auth, token exchange, WebSocket tickets, and a Paperboat mint endpoint; the real server issuer/revocation path is missing. |
@@ -408,22 +408,26 @@ Evidence:
 
 Repository: `paperboat-server`.
 
-- [ ] Add durable device grants, client sessions, access-token hashes, rotating refresh
+- [x] Add durable device grants, client sessions, access-token hashes, rotating refresh
       token families, approval metadata, expiry, revocation, and audit migrations.
-- [ ] Implement device authorization, polling, refresh, revoke, and client-list APIs.
-- [ ] Authenticate non-browser APIs with scoped bearer tokens while preserving dashboard
+- [x] Implement device authorization, polling, refresh, revoke, and client-list APIs.
+- [x] Authenticate non-browser APIs with scoped bearer tokens while preserving dashboard
       cookie sessions and CSRF for browser mutations.
-- [ ] Enforce exact client and scope allowlists from dynamic server configuration.
-- [ ] Generate human-readable codes without ambiguous characters; compare in constant time.
-- [ ] Enforce polling interval and `slow_down`; rate-limit by network, device grant, and
+- [x] Enforce exact client and scope allowlists from dynamic server configuration.
+- [x] Generate human-readable codes without ambiguous characters; compare in constant time.
+- [x] Enforce polling interval and `slow_down`; rate-limit by network, device grant, and
       account without making NAT-shared users unusable.
-- [ ] Make approval, poll consumption, denial, and expiry transitions race-safe across
+- [x] Make approval, poll consumption, denial, and expiry transitions race-safe across
       server replicas.
-- [ ] Rotate refresh tokens on every use; revoke the family on replay.
-- [ ] Add explicit client-session revocation hooks for logout, account suspension, and
-      administrator action.
-- [ ] Redact every token and code from logs, traces, errors, and audit metadata.
-- [ ] Publish OpenAPI and API documentation.
+- [x] Rotate refresh tokens on every use; revoke the family on replay.
+- [x] Add explicit client-session revocation hooks for CLI family logout, account
+      suspension, and administrator action. Dashboard logout remains scoped to its browser
+      session and does not revoke independent CLI installations.
+- [ ] Propagate those hooks to actual papercode terminal and file sessions. Phase 1 records
+      the client/access-session linkage and local revocation state; the signed papercode
+      revocation endpoint and real server issuer remain Phase 4 work.
+- [x] Redact every token and code from logs, traces, errors, and audit metadata.
+- [x] Publish OpenAPI and API documentation.
 
 Acceptance criteria:
 
