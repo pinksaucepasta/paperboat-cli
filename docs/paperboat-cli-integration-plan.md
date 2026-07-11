@@ -34,7 +34,7 @@ checklist, acceptance criteria, tests, documentation, and evidence are complete.
 | 2 | Dashboard device approval experience | Implemented | Codex | Dashboard implements the external `/cli/authorize` flow, validated login return, explicit approve/deny states, and authorized-device revocation; unit tests, lint, typecheck, and production build pass. |
 | 3 | Shared client identity and secure credential storage | Implemented | Codex | CLI has issuer-namespaced versioned profiles, aligned OS keyring storage, recoverable locked refresh rotation, durable retryable revocation, bearer auth, and device login/status/logout/switch. Papercode desktop schema-validates shared profiles and authenticates their access credentials against each issuer entirely in its main process. Cross-platform manual evidence and login UX goldens remain before `Complete`. |
 | 4 | Papercode control-plane credential minting | Implemented | Codex | Minting/exchange, protected stable VM identity provisioning, signed client/user/project/enforcement revocation with durable retry, and signing-key overlap/rollback behavior are implemented and covered by automated tests. Real-infrastructure evidence is intentionally deferred to Phase 11. |
-| 5 | Agentunnel HTTP/WebSocket data path and revocation | In progress | TBD | Agentunnel forwards HTTP/WebSocket and server provisions access resources; real hosted route, per-session revocation, and end-to-end evidence remain. |
+| 5 | Agentunnel HTTP/WebSocket data path and revocation | Implemented | Codex | Agentunnel reports live route/body-limit state, supports stable reassignment, preserves routes on suspension, and closes them on deletion. Server readiness rotates credentials before Fly start, probes papercode with a signed one-time environment health proof, emits distinct machine-starting, machine-failed, tunnel-offline, papercode-unhealthy, entitlement, and credit results, and rejects undersized proxy limits using configured upload policy. Correlation events contain stable IDs without errors, URLs, payloads, or credentials. Production-path tests prove one durable route carries streamed uploads and bidirectional WebSocket bytes, survives reconnect, and stops after revocation; Fly configs expose no public services. Agentunnel and server Go test/vet suites, papercode contract/server tests, `vp check`, and typecheck pass. Real hosted deployment evidence remains before `Complete`. |
 | 6 | Fly project VM runtime and readiness | In progress | TBD | Project image, papercode/agentunnel startup, Fly orchestration, and readiness foundations exist; production auth provisioning and real Fly evidence remain. |
 | 7 | Papercode staged-image upload contract | In progress | TBD | Schema-owned path/response/errors and `file:stage` are frozen; the existing base64 terminal-upload route remains transitional and must be replaced. |
 | 8 | CLI production connection and terminal behavior | In progress | TBD | API resolver, readiness polling, papercode WebSocket terminal RPC, raw terminal handling, resize, and exit propagation exist; auth and real-server compatibility remain. |
@@ -563,20 +563,20 @@ Evidence:
 
 Repositories: `agentunnel` and `paperboat-server`.
 
-- [ ] Provision one stable, idempotent agentunnel HTTP route per project to the VM-local
+- [x] Provision one stable, idempotent agentunnel HTTP route per project to the VM-local
       papercode server; verify both HTTP and WebSocket upgrade forwarding.
-- [ ] Keep the route hostname, TLS, local papercode port, readiness timeout, and retry policy
+- [x] Keep the route hostname, TLS, local papercode port, readiness timeout, and retry policy
       configuration-driven.
-- [ ] Ensure the route exposes no VM address or agentunnel machine credential and that all
+- [x] Ensure the route exposes no VM address or agentunnel machine credential and that all
       papercode application endpoints still enforce papercode auth.
-- [ ] Start the Fly machine before readiness polling and distinguish machine starting,
+- [x] Start the Fly machine before readiness polling and distinguish machine starting,
       machine failed, tunnel offline, papercode unhealthy, entitlement, and credit errors.
-- [ ] Reattach the machine-side agentunnel client after VM restart without changing the
+- [x] Reattach the machine-side agentunnel client after VM restart without changing the
       project route identity.
-- [ ] Revoke/suspend agentunnel resources on project suspension/deletion and close live
+- [x] Revoke/suspend agentunnel resources on project suspension/deletion and close live
       routes where supported.
-- [ ] Verify proxy limits permit configured image sizes without buffering unbounded bodies.
-- [ ] Emit correlation-safe route/session events without payloads or credentials.
+- [x] Verify proxy limits permit configured image sizes without buffering unbounded bodies.
+- [x] Emit correlation-safe route/session events without payloads or credentials.
 
 Acceptance criteria:
 
