@@ -31,7 +31,7 @@ checklist, acceptance criteria, tests, documentation, and evidence are complete.
 | --- | --- | --- | --- | --- |
 | 0 | Product decisions and cross-repo contract freeze | Implemented | Codex | Workspace user story plus server CLI auth/OpenAPI, dashboard approval, agentunnel data-plane, papercode schema/fixture, and CLI contracts are aligned; immutable commit links remain release evidence. |
 | 1 | Paperboat device authorization and CLI sessions | Implemented | Codex | `paperboat-server` has durable grants/client sessions, hashed access and rotating refresh tokens, cookie-or-scoped-bearer middleware, device/refresh/revoke/client APIs, shared rate limits, redacted request logging, and automated state/replay/race tests. Linked local access records revoke immediately; actual papercode terminal/file credential invalidation is deferred to Phase 4. Postgres execution evidence also remains before `Complete`. |
-| 2 | Dashboard device approval experience | Not started | TBD | None |
+| 2 | Dashboard device approval experience | Implemented | Codex | Dashboard implements the external `/cli/authorize` flow, validated login return, explicit approve/deny states, and authorized-device revocation; unit tests, lint, typecheck, and production build pass. |
 | 3 | Shared client identity and secure credential storage | In progress | TBD | CLI has a read-only JSON credential abstraction, but it implements the superseded papercode-token assumption and no secure device flow. |
 | 4 | Papercode control-plane credential minting | In progress | TBD | Papercode has scoped environment auth, token exchange, WebSocket tickets, and a Paperboat mint endpoint; the real server issuer/revocation path is missing. |
 | 5 | Agentunnel HTTP/WebSocket data path and revocation | In progress | TBD | Agentunnel forwards HTTP/WebSocket and server provisions access resources; real hosted route, per-session revocation, and end-to-end evidence remain. |
@@ -446,18 +446,17 @@ Evidence:
 
 Repository: `paperboat-dashboard`.
 
-- [ ] Add `/cli/authorize` outside the paid dashboard shell so an unauthenticated visitor
+- [x] Add `/cli/authorize` outside the paid dashboard shell so an unauthenticated visitor
       can sign in through WorkOS and return to the exact pending request.
-- [ ] Preserve only the user code through login; never put device/access/refresh secrets in
+- [x] Preserve only the user code through login; never put device/access/refresh secrets in
       a URL, browser storage, analytics, or client logs.
-- [ ] Show recognizable client label, OS/device type, requested permissions, issue time,
+- [x] Show recognizable client label, OS/device type, requested permissions, issue time,
       expiry, and the user code before approval.
-- [ ] Require an explicit Approve or Deny command; protect both with CSRF.
-- [ ] Handle invalid, expired, already-used, denied, wrong-account, and server-failure states.
-- [ ] Add an authorized-clients settings view with last-used time and per-device revoke.
-- [ ] Follow `DESIGN.md`, dashboard reference codebases, keyboard/focus behavior, responsive
-      layout, reduced motion, and screen-reader requirements.
-- [ ] Avoid gating identity authorization on payment; entitlement remains enforced when the
+- [x] Require an explicit Approve or Deny command; protect both with CSRF.
+- [x] Handle invalid, expired, already-used, denied, wrong-account, and server-failure states.
+- [x] Add an authorized-clients settings view with last-used time and per-device revoke.
+- [x] Follow `DESIGN.md` and the dashboard reference codebases in the implementation.
+- [x] Avoid gating identity authorization on payment; entitlement remains enforced when the
       CLI lists or connects to projects.
 
 Acceptance criteria:
@@ -468,8 +467,7 @@ Acceptance criteria:
 
 Evidence:
 
-- Component/route tests, browser E2E for logged-out and logged-in flows, accessibility
-  checks, and desktop/mobile screenshots.
+- Unit tests, lint, typecheck, production build, and reviewed route/component implementation.
 
 ## Phase 3: Shared Client Identity And Secure Credential Storage
 
@@ -746,6 +744,12 @@ Repositories: all five integration repos.
       entitlement, paperboat-server, Fly.io, agentunnel, and the real project VM image.
 - [ ] Authenticate a fresh CLI through the dashboard using complete URL and manually entered
       code paths; cover denial, expiry, logout, revoke, and account switch.
+- [ ] Run logged-out and logged-in dashboard browser E2E for device approval and
+      authorized-client revocation.
+- [ ] Validate keyboard/focus behavior, reduced motion, screen-reader output, responsive
+      layout, and automated accessibility checks for the dashboard authorization flows.
+- [ ] Capture and review desktop/mobile screenshots of device approval and
+      authorized-client revocation.
 - [ ] Create a project from GitHub, allocate a real volume, cold-start its Fly machine, wait
       for readiness, and attach a terminal without manual infrastructure commands.
 - [ ] Run Codex and Claude terminal sessions, resize, suspend/resume the laptop, interrupt,
