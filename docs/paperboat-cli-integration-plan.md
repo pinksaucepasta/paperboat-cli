@@ -30,10 +30,10 @@ checklist, acceptance criteria, tests, documentation, and evidence are complete.
 | Phase | Area | Status | Owner | Evidence |
 | --- | --- | --- | --- | --- |
 | 0 | Product decisions and cross-repo contract freeze | Implemented | Codex | Workspace user story plus server CLI auth/OpenAPI, dashboard approval, agentunnel data-plane, papercode schema/fixture, and CLI contracts are aligned; immutable commit links remain release evidence. |
-| 1 | Paperboat device authorization and CLI sessions | Implemented | Codex | `paperboat-server` has durable grants/client sessions, hashed access and rotating refresh tokens, cookie-or-scoped-bearer middleware, device/refresh/revoke/client APIs, shared rate limits, redacted request logging, and automated state/replay/race tests. Linked local access records revoke immediately; actual papercode terminal/file credential invalidation is deferred to Phase 4. Postgres execution evidence also remains before `Complete`. |
+| 1 | Paperboat device authorization and CLI sessions | Implemented | Codex | `paperboat-server` has durable grants/client sessions, hashed access and rotating refresh tokens, cookie-or-scoped-bearer middleware, device/refresh/revoke/client APIs, shared rate limits, redacted request logging, and automated state/replay/race tests. Linked papercode terminal/file credentials are invalidated through the implemented Phase 4 signed revocation path. Postgres execution evidence remains before `Complete`. |
 | 2 | Dashboard device approval experience | Implemented | Codex | Dashboard implements the external `/cli/authorize` flow, validated login return, explicit approve/deny states, and authorized-device revocation; unit tests, lint, typecheck, and production build pass. |
 | 3 | Shared client identity and secure credential storage | Implemented | Codex | CLI has issuer-namespaced versioned profiles, aligned OS keyring storage, recoverable locked refresh rotation, durable retryable revocation, bearer auth, and device login/status/logout/switch. Papercode desktop schema-validates shared profiles and authenticates their access credentials against each issuer entirely in its main process. Cross-platform manual evidence and login UX goldens remain before `Complete`. |
-| 4 | Papercode control-plane credential minting | In progress | TBD | Papercode has scoped environment auth, token exchange, WebSocket tickets, and a Paperboat mint endpoint; the real server issuer/revocation path is missing. |
+| 4 | Papercode control-plane credential minting | Implemented | Codex | Minting/exchange, protected stable VM identity provisioning, signed client/user/project/enforcement revocation with durable retry, and signing-key overlap/rollback behavior are implemented and covered by automated tests. Real-infrastructure evidence is intentionally deferred to Phase 11. |
 | 5 | Agentunnel HTTP/WebSocket data path and revocation | In progress | TBD | Agentunnel forwards HTTP/WebSocket and server provisions access resources; real hosted route, per-session revocation, and end-to-end evidence remain. |
 | 6 | Fly project VM runtime and readiness | In progress | TBD | Project image, papercode/agentunnel startup, Fly orchestration, and readiness foundations exist; production auth provisioning and real Fly evidence remain. |
 | 7 | Papercode staged-image upload contract | In progress | TBD | Schema-owned path/response/errors and `file:stage` are frozen; the existing base64 terminal-upload route remains transitional and must be replaced. |
@@ -115,7 +115,7 @@ Use papercode's existing Paperboat control-plane mint flow:
 - For an authorized connect, `paperboat-server` signs one one-time `environment:connect`
   proof per downstream papercode session, each bound to exactly one environment, user,
   Paperboat client session, nonce/JTI, and expiry.
-- The proof is posted to papercode's `POST /api/t3-connect/mint-credential` through the
+- The proof is posted to papercode's `POST /api/paperboat/mint-credential` through the
   project's agentunnel route.
 - One bootstrap credential is exchanged at `/oauth/token` for a terminal-only
   bearer `terminal:operate` access session, from which a single-use WebSocket ticket is
@@ -423,9 +423,9 @@ Repository: `paperboat-server`.
 - [x] Add explicit client-session revocation hooks for CLI family logout, account
       suspension, and administrator action. Dashboard logout remains scoped to its browser
       session and does not revoke independent CLI installations.
-- [ ] Propagate those hooks to actual papercode terminal and file sessions. Phase 1 records
-      the client/access-session linkage and local revocation state; the signed papercode
-      revocation endpoint and real server issuer remain Phase 4 work.
+- [x] Propagate those hooks to actual papercode terminal and file sessions through the
+      Phase 4 signed revocation endpoint, with durable exact-session retry after downstream
+      delivery failures.
 - [x] Redact every token and code from logs, traces, errors, and audit metadata.
 - [x] Publish OpenAPI and API documentation.
 
@@ -510,23 +510,39 @@ Evidence:
 
 Repositories: `papercode` and `paperboat-server`.
 
-- [ ] Finalize papercode's existing `/api/t3-connect/mint-credential` Paperboat profile.
-- [ ] Provision a stable environment ID, linked Paperboat owner ID, issuer, audience, and
+- [x] Finalize papercode's dedicated `/api/paperboat/mint-credential` profile without
+      changing the existing relay `/api/t3-connect/mint-credential` contract.
+- [x] Provision a stable environment ID, linked Paperboat owner ID, issuer, audience, and
       Paperboat public mint keys into each project VM.
-- [ ] Implement server-side mint signing with a managed key provider and published key IDs;
+- [x] Implement server-side mint signing with a managed key provider and published key IDs;
       no signing key is stored in source, database plaintext, or VM images.
-- [ ] Bind each proof to environment, user, Paperboat client session, requested scopes,
+      The server-side provider, proof signer, JWKS endpoint, external secret-file loading,
+      and rotation-overlap tests are implemented and wired into `cli-connect`.
+- [x] Bind each proof to environment, user, Paperboat client session, requested scopes,
       nonce/JTI, and a very short expiry; omit downstream proof-key claims for this bearer
       profile.
-- [ ] Validate exact issuer/audience/scope, linked owner, key ID, time bounds, and replay at
+- [x] Validate exact issuer/audience/scope, linked owner, key ID, time bounds, and replay at
       papercode before issuing a one-time bootstrap credential.
-- [ ] Have `paperboat-server` exchange each bootstrap credential without DPoP, retain the
+- [x] Have `paperboat-server` exchange each bootstrap credential without DPoP, retain the
       terminal bearer only long enough to request the WebSocket ticket, and return the
       separate file bearer only as scoped upload descriptor material.
-- [ ] Persist downstream papercode session IDs against the Paperboat access session.
-- [ ] Add a signed control-plane revocation endpoint so logout, entitlement loss, project
+      Both bearer sessions are bounded to the connect descriptor lifetime, and partially
+      issued sessions are revoked when later issuance or persistence steps fail. Failed
+      cleanup after access-session persistence errors is retained in a dedicated durable
+      outbox until papercode acknowledges every issued session ID.
+- [x] Persist downstream papercode session IDs against the Paperboat access session.
+- [x] Add a signed control-plane revocation endpoint so logout, entitlement loss, project
       suspension/deletion, and account revocation terminate active environment sessions.
-- [ ] Support signing-key rotation with an overlap window and tested rollback.
+      Signed client/user/project revocation is implemented with exact proof scope, JWKS
+      verification, replay guards, client-subject binding, and persisted downstream IDs.
+      Client, user, project, and credit/entitlement enforcement persist local revocation
+      before downstream delivery and retry each exact failed session on later worker passes;
+      an unavailable environment does not block independent revocations. Project tunnel
+      cleanup is attempted even when papercode is unavailable and is durably retried after
+      provider failures. Revocation retries run even when Fly observation or metering fails.
+- [x] Support signing-key rotation with an overlap window and tested rollback.
+      JWKS publication accepts active plus overlap keys; unknown keys force one refresh,
+      and rollback to the still-published prior key is covered by automated tests.
 
 Acceptance criteria:
 
@@ -538,8 +554,10 @@ Acceptance criteria:
 
 Evidence:
 
-- Cross-repo contract fixtures, adversarial proof tests, key-rotation tests, and a real
-  papercode mint/exchange/ticket integration test.
+- Cross-repo contract fixtures, adversarial proof tests, key-rotation/rollback tests,
+  VM auth-provisioning smoke tests, and server-side mint/exchange/revocation protocol tests.
+- Real papercode mint/exchange/ticket/revoke and deployed key-rotation evidence is owned by
+  Phase 11 and is not remaining Phase 4 implementation work.
 
 ## Phase 5: Agentunnel HTTP/WebSocket Data Path And Revocation
 
@@ -762,6 +780,10 @@ Repositories: all five integration repos.
       config restore, agentunnel reconnect, and papercode restart.
 - [ ] Test concurrent projects, concurrent CLI/papercode clients, refresh rotation, logout,
       entitlement loss, credit exhaustion, project deletion, and downstream session revocation.
+- [ ] Exercise the real papercode mint/exchange/WebSocket-ticket flow, verify
+      `credential_issuer_unavailable` is absent for a correctly provisioned ready project,
+      measure signed revocation propagation, and rotate then roll back deployed Ed25519 keys
+      through the configured JWKS overlap window.
 - [ ] Measure login, cold-start, terminal input/output, and image-upload latency against
       explicit release budgets established before this phase.
 - [ ] Run load, soak, network-loss, provider-failure, and recovery tests with no leaked
