@@ -5,12 +5,11 @@ local machine to your project's cloud VM and gives you its terminal as if it wer
 
 The production target signs in through Paperboat's dashboard-approved device flow, connects
 through agentunnel, and transparently bridges **local image pastes into remote TUIs**. The
-current scaffold still uses the superseded papercode JSON-token/cookie adapter; `pb auth
-login`, secure credential storage, and bearer authentication land in integration Phases 1
-and 3 before this is releasable.
+CLI now uses Paperboat bearer sessions and stores secrets in the operating system credential
+store; plaintext fallback is explicit and intended only for headless systems.
 
-> **Status:** CLI scaffold implemented with local dev stubs and transitional authentication.
-> Device login is specified but not implemented. The production
+> **Status:** CLI scaffold implemented with local dev stubs and device-session authentication.
+> The production
 > `cli-connect` contract is now papercode WebSocket based: `paperboat-server`
 > will return a tunneled papercode HTTP/WSS endpoint after device sessions and the
 > papercode credential issuer are implemented. The CLI's WebSocket terminal transport
@@ -25,7 +24,11 @@ and 3 before this is releasable.
 pb <project>                 # resume the project VM (if idle) and attach its terminal
 pb agents                    # list available agent presets
 pb sizes                     # list available machine shapes
-pb doctor                    # check transitional auth + project connectivity
+pb auth login                # approve this installation in the dashboard
+pb auth status               # show the active account for the configured server
+pb auth switch               # replace the active account for this server
+pb auth logout               # revoke and remove this installation's session
+pb doctor                    # check auth + project connectivity
 pb config path|show          # inspect the local config
 ```
 

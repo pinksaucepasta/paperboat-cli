@@ -50,13 +50,22 @@ exercisable offline.
 - `normalizeArgs` reorders tokens so flags work **before or after** the project name
   (urfave/cli otherwise stops flag parsing at the first positional).
 
-### Transitional config and auth (`internal/config`)
+### Config and auth (`internal/config`)
 - JSON config loaded from `$PAPERBOAT_CONFIG` or the user config dir; missing file is not an
   error (defaults applied). Everything tunable is here (server URL, papercode path, upload
   endpoint/watch-dirs/limits) — no hardcoding in command logic.
-- `AuthSource` currently reads a papercode JSON token. This is explicitly superseded by the
-  Paperboat device-session and secure credential-store contract and must not ship as a
-  production auth path.
+- Versioned profiles contain normalized issuer, account/session metadata, token expiry, and
+  opaque secret references. Tokens use the OS credential store by default; an explicit
+  headless fallback enforces `0600`. Profile writes are atomic and inter-process locked.
+- `pb auth login|status|logout|switch` implements device approval, cancellation, best-effort
+  browser opening, account replacement, and session revocation. Expiring access tokens rotate
+  under the profile lock; concurrency coverage verifies one refresh-token use.
+- Revocation is durable and retryable: logout, account switching, and failed post-issuance
+  validation move refresh tokens to OS-store-backed pending records. Local cleanup completes
+  only after the server confirms revocation; later auth commands retry unfinished records.
+- The native credential identifiers are aligned with papercode desktop's `keytar` adapter on
+  macOS, Windows, and Linux. Papercode consumes schema-validated metadata in its main process;
+  renderer code never receives Paperboat access or refresh tokens.
 
 ### Transparent terminal wrapper (`internal/session`)
 - Raw mode (skipped when stdin isn't a TTY), SIGWINCH resize propagation (unix; no-op on
@@ -119,7 +128,7 @@ CLI stays exercisable offline. The interfaces are unchanged, so both drop in int
   - Previous mock control-plane E2E covered project resolution, `cli-connect` not-ready
     handling, and `connection-status` polling. It needs a new WebSocket terminal mock once
     Phase 4 lands.
-  - Bad token → server 401 → "sign in again with papercode".
+  - Bad token → server 401 → `pb auth login` guidance.
   - Unknown project → `ErrProjectNotFound`.
   - No `server_url` → local stub shell still runs (offline-safe).
 - New unit tests: `internal/api` (cookie auth, `{data}`/`{error}` envelope, 401→sentinel,

@@ -1,5 +1,4 @@
-// Package config loads the paperboat-cli local configuration and reuses the
-// user's existing papercode credentials. Everything that could reasonably
+// Package config loads paperboat-cli configuration and credential profiles. Everything that could reasonably
 // change is data-driven here — nothing about endpoints, limits, agents, or
 // machine catalogs are hardcoded in command logic. See AGENTS.md ("No hardcoding").
 package config
@@ -46,9 +45,9 @@ const (
 type Config struct {
 	// ServerURL is the paperboat-server base URL. Empty means local dev stub.
 	ServerURL string `json:"server_url,omitempty"`
-	// PapercodeConfigPath points at papercode's stored credentials to reuse.
-	// Empty means "use the platform default location".
-	PapercodeConfigPath string `json:"papercode_config_path,omitempty"`
+	// PapercodeConfigPath is retained only to detect the obsolete auth setup.
+	PapercodeConfigPath string     `json:"papercode_config_path,omitempty"`
+	Auth                AuthConfig `json:"auth,omitempty"`
 	// Upload configures the image-paste bridge.
 	Upload UploadConfig `json:"upload,omitempty"`
 	// Connect tunes the pre-connect broker + readiness polling.
@@ -58,6 +57,13 @@ type Config struct {
 
 	// path is where this config was loaded from (or would be written to).
 	path string `json:"-"`
+}
+
+type AuthConfig struct {
+	// AllowFileFallback opts into plaintext 0600 token files for headless systems.
+	AllowFileFallback bool `json:"allow_file_fallback,omitempty"`
+	// ProfileDir overrides the shared profile directory (primarily for managed/headless installs).
+	ProfileDir string `json:"profile_dir,omitempty"`
 }
 
 // ConnectConfig tunes how the CLI waits for an idle machine to resume and its

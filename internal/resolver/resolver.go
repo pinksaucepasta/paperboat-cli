@@ -14,7 +14,7 @@ import (
 // ConnectRequest describes what the user asked to connect to.
 type ConnectRequest struct {
 	Project string
-	// Credential is transitional auth used until the Paperboat device flow lands.
+	// Credential is the current Paperboat client-session access credential.
 	Credential config.Credential
 }
 

@@ -32,7 +32,7 @@ checklist, acceptance criteria, tests, documentation, and evidence are complete.
 | 0 | Product decisions and cross-repo contract freeze | Implemented | Codex | Workspace user story plus server CLI auth/OpenAPI, dashboard approval, agentunnel data-plane, papercode schema/fixture, and CLI contracts are aligned; immutable commit links remain release evidence. |
 | 1 | Paperboat device authorization and CLI sessions | Implemented | Codex | `paperboat-server` has durable grants/client sessions, hashed access and rotating refresh tokens, cookie-or-scoped-bearer middleware, device/refresh/revoke/client APIs, shared rate limits, redacted request logging, and automated state/replay/race tests. Linked local access records revoke immediately; actual papercode terminal/file credential invalidation is deferred to Phase 4. Postgres execution evidence also remains before `Complete`. |
 | 2 | Dashboard device approval experience | Implemented | Codex | Dashboard implements the external `/cli/authorize` flow, validated login return, explicit approve/deny states, and authorized-device revocation; unit tests, lint, typecheck, and production build pass. |
-| 3 | Shared client identity and secure credential storage | In progress | TBD | CLI has a read-only JSON credential abstraction, but it implements the superseded papercode-token assumption and no secure device flow. |
+| 3 | Shared client identity and secure credential storage | Implemented | Codex | CLI has issuer-namespaced versioned profiles, aligned OS keyring storage, recoverable locked refresh rotation, durable retryable revocation, bearer auth, and device login/status/logout/switch. Papercode desktop schema-validates shared profiles and authenticates their access credentials against each issuer entirely in its main process. Cross-platform manual evidence and login UX goldens remain before `Complete`. |
 | 4 | Papercode control-plane credential minting | In progress | TBD | Papercode has scoped environment auth, token exchange, WebSocket tickets, and a Paperboat mint endpoint; the real server issuer/revocation path is missing. |
 | 5 | Agentunnel HTTP/WebSocket data path and revocation | In progress | TBD | Agentunnel forwards HTTP/WebSocket and server provisions access resources; real hosted route, per-session revocation, and end-to-end evidence remain. |
 | 6 | Fly project VM runtime and readiness | In progress | TBD | Project image, papercode/agentunnel startup, Fly orchestration, and readiness foundations exist; production auth provisioning and real Fly evidence remain. |
@@ -473,21 +473,24 @@ Evidence:
 
 Repositories: `paperboat-cli` and `papercode`.
 
-- [ ] Define a versioned Paperboat client profile containing server identity, account
+- [x] Define a versioned Paperboat client profile containing server identity, account
       metadata, client-session ID, token expiry, and a reference to secure secrets.
-- [ ] Store access and refresh secrets in macOS Keychain, Windows Credential Manager, and
+- [x] Store access and refresh secrets in macOS Keychain, Windows Credential Manager, and
       Linux Secret Service. A file fallback is disabled by default and, if explicitly
       enabled for a headless environment, requires `0600` permissions and a visible warning.
-- [ ] Use an inter-process refresh lock plus atomic metadata updates so CLI and desktop
+- [x] Use an inter-process refresh lock plus atomic metadata updates so CLI and desktop
       papercode cannot corrupt a shared profile.
-- [ ] Namescope credentials by normalized Paperboat server/issuer so staging and production
+      The cross-platform lock is the documented atomic `.lock.d/owner.json` lease; a
+      versioned `credentials-location.json` pointer shares configured `auth.profile_dir`
+      overrides with desktop papercode.
+- [x] Namescope credentials by normalized Paperboat server/issuer so staging and production
       accounts cannot collide.
-- [ ] Add `pb auth login`, `pb auth status`, `pb auth logout`, and account switching.
-- [ ] Make browser opening best-effort and platform-native; always print the URL and code.
-- [ ] Handle Ctrl-C by cancelling the local poll without approving or leaking the grant.
-- [ ] Teach papercode desktop to consume the same documented profile when appropriate;
+- [x] Add `pb auth login`, `pb auth status`, `pb auth logout`, and account switching.
+- [x] Make browser opening best-effort and platform-native; always print the URL and code.
+- [x] Handle Ctrl-C by cancelling the local poll without approving or leaking the grant.
+- [x] Teach papercode desktop to consume the same documented profile when appropriate;
       mobile and web keep device-local sessions through the same Paperboat identity APIs.
-- [ ] Provide explicit migration from any shipped papercode JSON-token assumption; never
+- [x] Provide explicit migration from any shipped papercode JSON-token assumption; never
       silently reinterpret an old token as a Paperboat session.
 
 Acceptance criteria:

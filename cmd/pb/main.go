@@ -9,13 +9,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
+	"os/exec"
+	"os/signal"
+	"runtime"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
 	"github.com/pujan-modha/paperboat-cli/internal/api"
+	sessionauth "github.com/pujan-modha/paperboat-cli/internal/auth"
 	"github.com/pujan-modha/paperboat-cli/internal/buildinfo"
 	"github.com/pujan-modha/paperboat-cli/internal/catalog"
 	"github.com/pujan-modha/paperboat-cli/internal/config"
@@ -29,7 +35,9 @@ import (
 
 func main() {
 	app := newApp()
-	if err := app.Run(normalizeArgs(os.Args)); err != nil {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	if err := app.RunContext(ctx, normalizeArgs(os.Args)); err != nil {
 		fmt.Fprintln(os.Stderr, "pb:", err)
 		os.Exit(1)
 	}
@@ -48,6 +56,7 @@ var subcommands = map[string]bool{
 	"keep-alive": true,
 	"config":     true,
 	"doctor":     true,
+	"auth":       true,
 }
 
 var subcommandValueFlags = map[string]bool{
@@ -61,7 +70,20 @@ func normalizeArgs(args []string) []string {
 		return args
 	}
 	var flags, positionals []string
-	rest := args[1:]
+	rest := make([]string, 0, len(args)-1)
+	for i := 1; i < len(args); i++ {
+		tok := args[i]
+		if valueFlags[tok] && i+1 < len(args) {
+			flags = append(flags, tok, args[i+1])
+			i++
+			continue
+		}
+		if strings.HasPrefix(tok, "--config=") || strings.HasPrefix(tok, "--server=") {
+			flags = append(flags, tok)
+			continue
+		}
+		rest = append(rest, tok)
+	}
 	for i := 0; i < len(rest); i++ {
 		tok := rest[i]
 		switch {
@@ -137,10 +159,245 @@ func newApp() *cli.App {
 			agentsCommand(),
 			sizesCommand(),
 			keepAliveCommand(),
+			authCommand(),
 			configCommand(),
 			doctorCommand(),
 		},
 	}
+}
+
+func authCommand() *cli.Command {
+	return &cli.Command{Name: "auth", Usage: "Manage Paperboat sign-in", Subcommands: []*cli.Command{
+		{Name: "login", Usage: "Sign in through the Paperboat dashboard", Action: authLogin},
+		{Name: "switch", Usage: "Replace the active account for this server", Action: func(c *cli.Context) error { return authLoginMode(c, true) }},
+		{Name: "status", Usage: "Show the active Paperboat account", Action: authStatus},
+		{Name: "logout", Usage: "Revoke and remove the active client session", Action: authLogout},
+	}}
+}
+
+func requireAuthConfig(c *cli.Context) (*config.Config, config.ProfileStore, error) {
+	d, err := buildDeps(c)
+	if err != nil {
+		return nil, config.ProfileStore{}, err
+	}
+	if strings.TrimSpace(d.cfg.ServerURL) == "" {
+		return nil, config.ProfileStore{}, errors.New("Paperboat server is not configured; set server_url or use --server")
+	}
+	if d.cfg.PapercodeConfigPath != "" {
+		return nil, config.ProfileStore{}, errors.New("papercode_config_path is obsolete and cannot be migrated as a Paperboat session; run `pb auth login`")
+	}
+	s, err := config.ProfileStoreFor(d.cfg)
+	if err != nil {
+		return nil, config.ProfileStore{}, err
+	}
+	return d.cfg, s, nil
+}
+
+func warnPlaintextCredentialStorage(cfg *config.Config, output io.Writer) {
+	if cfg.Auth.AllowFileFallback {
+		fmt.Fprintln(output, "WARNING: OS secure credential storage is disabled; Paperboat access and refresh tokens are stored as plaintext in local files restricted to mode 0600")
+	}
+}
+
+func authLogin(c *cli.Context) error {
+	return authLoginMode(c, false)
+}
+
+func authLoginMode(c *cli.Context, replace bool) error {
+	cfg, store, err := requireAuthConfig(c)
+	if err != nil {
+		return err
+	}
+	if err := drainPendingRevocations(c.Context, cfg.ServerURL, store); err != nil {
+		fmt.Fprintln(os.Stderr, "WARNING: an earlier session revocation remains pending:", err)
+	}
+	var previous *config.Profile
+	if existingProfile, existingErr := store.Load(cfg.ServerURL); existingErr == nil {
+		if !replace {
+			return errors.New("already signed in for this Paperboat server; use `pb auth switch` to change accounts")
+		}
+		previous = &existingProfile
+	} else if !errors.Is(existingErr, config.ErrNoCredentials) {
+		return existingErr
+	}
+	host, _ := os.Hostname()
+	label := strings.TrimSpace(host)
+	if label == "" {
+		label = "Paperboat CLI"
+	}
+	deviceType := "desktop"
+	if os.Getenv("SSH_CONNECTION") != "" {
+		deviceType = "server"
+	}
+	if _, ok := os.LookupEnv("container"); ok {
+		deviceType = "container"
+	}
+	grant, err := api.DeviceAuthorize(c.Context, cfg.ServerURL, label, deviceType, runtime.GOOS, nil)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stdout, "Open %s\nEnter code: %s\n", grant.VerificationURI, grant.UserCode)
+	complete := grant.VerificationURIComplete
+	if complete == "" {
+		complete = grant.VerificationURI
+	}
+	_ = openBrowser(complete)
+	interval := time.Duration(grant.Interval) * time.Second
+	if interval <= 0 {
+		interval = time.Second
+	}
+	deadline := time.NewTimer(time.Duration(grant.ExpiresIn) * time.Second)
+	defer deadline.Stop()
+	for {
+		select {
+		case <-c.Context.Done():
+			return errors.New("login cancelled")
+		case <-deadline.C:
+			return errors.New("device authorization expired")
+		case <-time.After(interval):
+		}
+		tokens, pollErr := api.DeviceToken(c.Context, cfg.ServerURL, grant.DeviceCode, nil)
+		if pollErr != nil {
+			var ae *api.APIError
+			if errors.As(pollErr, &ae) {
+				switch ae.Code {
+				case "authorization_pending":
+					continue
+				case "slow_down":
+					if next, ok := ae.Details["interval"].(float64); ok && next > 0 {
+						interval = time.Duration(next) * time.Second
+					} else {
+						interval += 5 * time.Second
+					}
+					continue
+				case "access_denied":
+					return errors.New("login denied")
+				case "expired_token":
+					return errors.New("device authorization expired")
+				}
+			}
+			return pollErr
+		}
+		expires := time.Now().UTC().Add(time.Duration(tokens.ExpiresIn) * time.Second)
+		cred := config.Credential{AccessToken: tokens.AccessToken, RefreshToken: tokens.RefreshToken, TokenType: tokens.TokenType, ExpiresAt: expires}
+		me, err := api.New(cfg.ServerURL, cred, nil).Me(c.Context)
+		if err != nil {
+			return errors.Join(fmt.Errorf("validate new session: %w", err), cleanupIssuedSession(cfg.ServerURL, tokens.ClientSessionID, tokens.RefreshToken, store))
+		}
+		p := config.Profile{Issuer: cfg.ServerURL, ClientSessionID: tokens.ClientSessionID, AccessExpiresAt: expires, Account: config.Account{ID: me.ID, Email: me.Email, DisplayName: me.DisplayName}}
+		var saveErr error
+		if previous != nil {
+			saveErr = store.Switch(previous.ClientSessionID, p, cred)
+		} else {
+			saveErr = store.Save(p, cred)
+		}
+		if saveErr != nil {
+			return errors.Join(saveErr, cleanupIssuedSession(cfg.ServerURL, tokens.ClientSessionID, tokens.RefreshToken, store))
+		}
+		if previous != nil {
+			if err := drainPendingRevocations(context.Background(), cfg.ServerURL, store); err != nil {
+				fmt.Fprintln(os.Stderr, "WARNING: account switched; previous session revocation remains pending:", err)
+			}
+		}
+		fmt.Fprintf(os.Stdout, "Signed in as %s\n", firstNonEmpty(me.Email, me.DisplayName, me.ID))
+		return nil
+	}
+}
+
+func cleanupIssuedSession(issuer, clientSessionID, refreshToken string, store config.ProfileStore) error {
+	if err := store.QueueRevocation(issuer, clientSessionID, refreshToken); err != nil {
+		if revokeErr := api.RevokeToken(context.Background(), issuer, refreshToken, nil); revokeErr != nil {
+			return errors.Join(fmt.Errorf("retain failed session for revocation: %w", err), fmt.Errorf("revoke unretained session: %w", revokeErr))
+		}
+		return nil
+	}
+	_ = drainPendingRevocations(context.Background(), issuer, store)
+	return nil
+}
+
+func authStatus(c *cli.Context) error {
+	cfg, store, err := requireAuthConfig(c)
+	if err != nil {
+		return err
+	}
+	p, err := store.Load(cfg.ServerURL)
+	if errors.Is(err, config.ErrNoCredentials) {
+		fmt.Println("Not signed in")
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Signed in as %s\nServer: %s\nSession: %s\nAccess expires: %s\n", firstNonEmpty(p.Account.Email, p.Account.DisplayName, p.Account.ID), p.Issuer, p.ClientSessionID, p.AccessExpiresAt.Format(time.RFC3339))
+	return nil
+}
+
+func authLogout(c *cli.Context) error {
+	cfg, store, err := requireAuthConfig(c)
+	if err != nil {
+		return err
+	}
+	if err := store.QueueActiveRevocation(cfg.ServerURL); err != nil && !errors.Is(err, config.ErrNoCredentials) {
+		return err
+	}
+	if err := drainPendingRevocations(c.Context, cfg.ServerURL, store); err != nil {
+		return fmt.Errorf("sign-out revocation remains pending; retry `pb auth logout`: %w", err)
+	}
+	fmt.Println("Signed out")
+	return nil
+}
+
+func drainPendingRevocations(ctx context.Context, issuer string, store config.ProfileStore) error {
+	records, err := store.PendingRevocations(issuer)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, record := range records {
+		if record.Cancelled {
+			if err := store.CompleteRevocation(record); err != nil {
+				errs = append(errs, err)
+			}
+			continue
+		}
+		if record.ServerRevoked {
+			if err := store.CompleteRevocation(record); err != nil {
+				errs = append(errs, err)
+			}
+			continue
+		}
+		cred, err := store.PendingRevocationCredential(record)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if err := api.RevokeToken(ctx, issuer, cred.RefreshToken, nil); err != nil {
+			errs = append(errs, fmt.Errorf("revoke client session %s: %w", record.ClientSessionID, err))
+			continue
+		}
+		record, err = store.MarkRevocationSucceeded(record)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if err := store.CompleteRevocation(record); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func openBrowser(target string) error {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", target)
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", target)
+	default:
+		cmd = exec.Command("xdg-open", target)
+	}
+	return cmd.Start()
 }
 
 func keepAliveCommand() *cli.Command {
@@ -201,7 +458,7 @@ func backendClient(c *cli.Context) (*api.Client, error) {
 	}
 	cred, err := d.auth.Credential()
 	if errors.Is(err, config.ErrNoCredentials) {
-		return nil, errors.New("no papercode credentials found — sign in with papercode first, then retry")
+		return nil, errors.New("not signed in to Paperboat; run `pb auth login`, then retry")
 	}
 	if err != nil {
 		return nil, err
@@ -213,7 +470,7 @@ func resolveProjectID(ctx context.Context, client *api.Client, requested string)
 	projects, err := client.ListProjects(ctx)
 	if err != nil {
 		if errors.Is(err, api.ErrUnauthenticated) {
-			return api.Project{}, errors.New("your papercode session was rejected — sign in again with papercode, then retry")
+			return api.Project{}, errors.New("your Paperboat session was rejected; run `pb auth login`, then retry")
 		}
 		if msg := friendlyAPIError(err); msg != "" {
 			return api.Project{}, errors.New(msg)
@@ -252,9 +509,17 @@ func buildDeps(c *cli.Context) (*deps, error) {
 		termTunnel = tunnel.NewPapercodeWSTunnel()
 		uploader = upload.NewDisabledUploader()
 	}
+	var authSource config.AuthSource = config.NoCredentialsSource{}
+	if cfg.ServerURL != "" {
+		warnPlaintextCredentialStorage(cfg, os.Stderr)
+		authSource, err = sessionauth.NewSource(cfg)
+		if err != nil {
+			return nil, err
+		}
+	}
 	return &deps{
 		cfg:      cfg,
-		auth:     config.AuthSourceFor(cfg),
+		auth:     authSource,
 		catalog:  catalog.NewStubCatalog(),
 		resolver: resolver.NewStubResolver(cfg),
 		tunnel:   termTunnel,
@@ -283,18 +548,15 @@ func actionConnect(c *cli.Context) error {
 	}
 	ctx := c.Context
 
-	// Transitional auth wiring is replaced by the Phase 3 Paperboat device flow.
 	cred, err := d.auth.Credential()
 	if err != nil && !errors.Is(err, config.ErrNoCredentials) {
 		return err
 	}
 	if errors.Is(err, config.ErrNoCredentials) {
 		if d.cfg.ServerURL != "" {
-			// Real backend configured: a credential is required. Route the user
-			// to papercode rather than prompting for a separate login.
-			return errors.New("no papercode credentials found — sign in with papercode first, then retry")
+			return errors.New("not signed in to Paperboat; run `pb auth login`, then retry")
 		}
-		fmt.Fprintln(os.Stderr, "pb: no papercode credentials found — sign in with papercode first.")
+		fmt.Fprintln(os.Stderr, "pb: not signed in to Paperboat; run `pb auth login`.")
 		fmt.Fprintln(os.Stderr, "    (running in local dev mode against a stub target)")
 	}
 	if d.cfg.ServerURL != "" {
@@ -307,7 +569,7 @@ func actionConnect(c *cli.Context) error {
 	})
 	if err != nil {
 		if errors.Is(err, api.ErrUnauthenticated) {
-			return errors.New("your papercode session was rejected — sign in again with papercode, then retry")
+			return errors.New("your Paperboat session was rejected; run `pb auth login`, then retry")
 		}
 		if msg := friendlyAPIError(err); msg != "" {
 			return errors.New(msg)
@@ -481,7 +743,7 @@ func configCommand() *cli.Command {
 						return err
 					}
 					fmt.Printf("server_url: %s\n", orNone(d.cfg.ServerURL))
-					fmt.Printf("papercode_config: %s\n", orNone(d.cfg.PapercodeConfigPath))
+					fmt.Printf("auth.file_fallback: %t\n", d.cfg.Auth.AllowFileFallback)
 					fmt.Printf("upload.endpoint: %s\n", orNone(d.cfg.Upload.Endpoint))
 					fmt.Printf("upload.max_image_bytes: %d\n", d.cfg.Upload.MaxImageBytes)
 					fmt.Printf("upload.max_attachments: %d\n", d.cfg.Upload.MaxAttachments)
@@ -495,7 +757,7 @@ func configCommand() *cli.Command {
 func doctorCommand() *cli.Command {
 	return &cli.Command{
 		Name:      "doctor",
-		Usage:     "Check auth reuse and connectivity",
+		Usage:     "Check authentication and connectivity",
 		ArgsUsage: "[project]",
 		Action: func(c *cli.Context) error {
 			d, err := buildDeps(c)
@@ -508,12 +770,12 @@ func doctorCommand() *cli.Command {
 			cred, credErr := d.auth.Credential()
 			if credErr != nil {
 				if errors.Is(credErr, config.ErrNoCredentials) {
-					fmt.Println("papercode:   not signed in (sign in with papercode)")
+					fmt.Println("auth:        not signed in (run `pb auth login`)")
 				} else {
-					fmt.Printf("papercode:   error: %v\n", credErr)
+					fmt.Printf("auth:        error: %v\n", credErr)
 				}
 			} else {
-				fmt.Println("papercode:   credentials found ✓")
+				fmt.Println("auth:        Paperboat credentials found ✓")
 			}
 
 			if d.cfg.ServerURL == "" {
@@ -526,7 +788,7 @@ func doctorCommand() *cli.Command {
 			}
 			me, err := api.New(d.cfg.ServerURL, cred, nil).Me(c.Context)
 			if errors.Is(err, api.ErrUnauthenticated) {
-				fmt.Println("backend:     credential rejected — sign in again with papercode")
+				fmt.Println("backend:     credential rejected; run `pb auth login`")
 				return nil
 			}
 			if err != nil {

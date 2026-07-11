@@ -23,12 +23,10 @@ func writeErr(w http.ResponseWriter, status int, code, msg string) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"code": code, "message": msg}})
 }
 
-func TestClientSendsSessionCookie(t *testing.T) {
+func TestClientSendsBearer(t *testing.T) {
 	var gotToken string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if c, err := r.Cookie(SessionCookieName); err == nil {
-			gotToken = c.Value
-		}
+		gotToken = r.Header.Get("Authorization")
 		writeData(w, http.StatusOK, Me{ID: "usr_1", Email: "a@b.dev"})
 	}))
 	defer srv.Close()
@@ -38,8 +36,8 @@ func TestClientSendsSessionCookie(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Me: %v", err)
 	}
-	if gotToken != "sess-token" {
-		t.Fatalf("session cookie = %q, want sess-token", gotToken)
+	if gotToken != "Bearer sess-token" {
+		t.Fatalf("authorization = %q", gotToken)
 	}
 	if me.Email != "a@b.dev" {
 		t.Fatalf("me.Email = %q", me.Email)
@@ -61,10 +59,6 @@ func TestClientUnauthenticated(t *testing.T) {
 
 func TestClientStructuredError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/auth/csrf" {
-			writeData(w, http.StatusOK, map[string]string{"csrf_token": "csrf"})
-			return
-		}
 		writeErr(w, http.StatusConflict, "machine_not_ready", "Machine is not ready.")
 	}))
 	defer srv.Close()
@@ -80,30 +74,13 @@ func TestClientStructuredError(t *testing.T) {
 	}
 }
 
-func TestClientUnsafeRequestsFetchAndSendCSRF(t *testing.T) {
-	var sawCSRF bool
-	var gotSession string
-	var gotCSRFHeader string
-	var gotCSRFCookie string
+func TestClientMutationUsesBearerWithoutCSRF(t *testing.T) {
+	var gotAuthorization string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api/auth/csrf":
-			sawCSRF = true
-			if c, err := r.Cookie(SessionCookieName); err != nil || c.Value != "initial-session" {
-				t.Fatalf("csrf session cookie = %#v, err = %v", c, err)
-			}
-			http.SetCookie(w, &http.Cookie{Name: csrfCookieName, Value: "csrf-token", Path: "/"})
-			writeData(w, http.StatusOK, map[string]string{"csrf_token": "csrf-token"})
-		case "/api/projects/prj_1/keep-alive":
-			if c, err := r.Cookie(SessionCookieName); err == nil {
-				gotSession = c.Value
-			}
-			if c, err := r.Cookie(csrfCookieName); err == nil {
-				gotCSRFCookie = c.Value
-			}
-			gotCSRFHeader = r.Header.Get(csrfHeaderName)
+		if r.URL.Path == "/api/projects/prj_1/keep-alive" {
+			gotAuthorization = r.Header.Get("Authorization")
 			writeData(w, http.StatusOK, KeepAliveResponse{Project: Project{ID: "prj_1", Name: "Demo", State: "running"}})
-		default:
+		} else {
 			http.NotFound(w, r)
 		}
 	}))
@@ -113,24 +90,14 @@ func TestClientUnsafeRequestsFetchAndSendCSRF(t *testing.T) {
 	if _, err := c.SetKeepAlive(context.Background(), "prj_1", 3600, false); err != nil {
 		t.Fatalf("SetKeepAlive: %v", err)
 	}
-	if !sawCSRF {
-		t.Fatal("expected csrf fetch")
-	}
-	if gotSession != "initial-session" {
-		t.Fatalf("session cookie = %q, want initial-session", gotSession)
-	}
-	if gotCSRFCookie != "csrf-token" || gotCSRFHeader != "csrf-token" {
-		t.Fatalf("csrf cookie/header = %q/%q", gotCSRFCookie, gotCSRFHeader)
+	if gotAuthorization != "Bearer initial-session" {
+		t.Fatalf("authorization = %q", gotAuthorization)
 	}
 }
 
 func TestCLIConnectDecodesPapercodeWebSocketTerminal(t *testing.T) {
 	var body []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet && r.URL.Path == "/api/auth/csrf" {
-			writeData(w, http.StatusOK, map[string]string{"csrf_token": "csrf"})
-			return
-		}
 		if r.Method != http.MethodPost || r.URL.Path != "/api/projects/prj_1/cli-connect" {
 			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
