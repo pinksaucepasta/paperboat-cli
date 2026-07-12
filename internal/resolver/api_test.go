@@ -226,6 +226,32 @@ func TestResolveRebrokersWhenStatusLacksAuthMaterial(t *testing.T) {
 	}
 }
 
+func TestResolveKeepsPollingWhenRebrokerIsStillStarting(t *testing.T) {
+	fc := &fakeClient{
+		projects: []api.Project{{ID: "prj_1", Name: "app"}},
+		connectSeq: []api.ConnectResponse{
+			{Connectable: false, Status: "starting"},
+			{Connectable: false, Status: "papercode_starting", Reason: "papercode_unhealthy"},
+			readyResponse(readyTerminal()),
+		},
+		statusSeq: []api.ConnectResponse{
+			{Connectable: true, Terminal: routeOnlyTerminal()},
+			readyResponse(readyTerminal()),
+		},
+	}
+	r := newTestResolver(fc)
+	info, err := r.Resolve(context.Background(), ConnectRequest{Project: "app"})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if info.Terminal == nil || info.Terminal.Auth.Ticket != "pct_1" {
+		t.Fatalf("terminal = %+v", info.Terminal)
+	}
+	if fc.connectN != 2 || fc.statusN != 2 {
+		t.Fatalf("connect calls=%d status calls=%d, want 2/2", fc.connectN, fc.statusN)
+	}
+}
+
 func TestResolveProjectNotFound(t *testing.T) {
 	fc := &fakeClient{projects: []api.Project{{ID: "prj_1", Name: "app"}}}
 	r := newTestResolver(fc)

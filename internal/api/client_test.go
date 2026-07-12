@@ -113,6 +113,37 @@ func TestClientUnauthenticated(t *testing.T) {
 	}
 }
 
+func TestListProjectsDecodesPaginatedResponse(t *testing.T) {
+	var requests int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		switch r.URL.Query().Get("offset") {
+		case "0":
+			writeData(w, http.StatusOK, map[string]any{
+				"items":      []Project{{ID: "prj_1", Name: "One"}},
+				"pagination": map[string]any{"next_offset": 1},
+			})
+		case "1":
+			writeData(w, http.StatusOK, map[string]any{
+				"items":      []Project{{ID: "prj_2", Name: "Two"}},
+				"pagination": map[string]any{"next_offset": nil},
+			})
+		default:
+			t.Fatalf("unexpected offset %q", r.URL.Query().Get("offset"))
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, config.Credential{AccessToken: "token"}, nil)
+	projects, err := c.ListProjects(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests != 2 || len(projects) != 2 || projects[0].ID != "prj_1" || projects[1].ID != "prj_2" {
+		t.Fatalf("requests=%d projects=%#v", requests, projects)
+	}
+}
+
 func TestClientStructuredError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Request-Id", "req_123")

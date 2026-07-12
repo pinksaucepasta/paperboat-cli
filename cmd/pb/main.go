@@ -149,7 +149,6 @@ func newApp() *cli.App {
 		Usage:                  "Connect to your Paperboat project VM terminal",
 		Version:                buildinfo.Version,
 		UseShortOptionHandling: true,
-		HideHelpCommand:        true,
 		Flags:                  rootFlags,
 		ArgsUsage:              "<project>",
 		Description:            "Run `pb <project>` to attach your project's remote terminal.",

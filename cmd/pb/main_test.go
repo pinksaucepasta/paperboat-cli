@@ -120,6 +120,19 @@ func TestConnectWithServerURLUsesBackendResolver(t *testing.T) {
 	}
 }
 
+func TestHelpCommandDoesNotCallBackend(t *testing.T) {
+	var output bytes.Buffer
+	app := newApp()
+	app.Writer = &output
+	app.ErrWriter = &output
+	if err := app.Run([]string{"pb", "help"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "USAGE:") || !strings.Contains(output.String(), "COMMANDS:") {
+		t.Fatalf("help output = %q", output.String())
+	}
+}
+
 func TestKeepAliveCommandCallsBackend(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
