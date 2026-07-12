@@ -17,7 +17,25 @@ import (
 	"github.com/pujan-modha/paperboat-cli/internal/api"
 	"github.com/pujan-modha/paperboat-cli/internal/config"
 	"github.com/pujan-modha/paperboat-cli/internal/resolver"
+	"github.com/pujan-modha/paperboat-cli/internal/telemetry"
 )
+
+func TestConnectTelemetryFailsOpenWithWarning(t *testing.T) {
+	blockedParent := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blockedParent, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{Observability: config.ObservabilityConfig{EventLogPath: filepath.Join(blockedParent, "telemetry.jsonl")}}
+	var warnings bytes.Buffer
+	sink, closeSink := connectTelemetry(cfg, &warnings)
+	defer closeSink()
+	if _, ok := sink.(telemetry.NopSink); !ok {
+		t.Fatalf("sink type = %T, want telemetry.NopSink", sink)
+	}
+	if warnings.String() != "warning: telemetry disabled: local event log unavailable\n" {
+		t.Fatalf("warning = %q", warnings.String())
+	}
+}
 
 func TestRetryableInitialConnectError(t *testing.T) {
 	if retryableInitialConnectError(fmt.Errorf("connect to project: %w", resolver.ErrProjectNotFound)) {

@@ -60,10 +60,21 @@ type Config struct {
 	Connect ConnectConfig `json:"connect,omitempty"`
 	// SSH configures the agentunnel SSH transport.
 	SSH SSHConfig `json:"ssh,omitempty"`
+	// Observability controls the local metadata-only event log.
+	Observability ObservabilityConfig `json:"observability,omitempty"`
 
 	// path is where this config was loaded from (or would be written to).
 	path                  string `json:"-"`
 	dialRetriesConfigured bool
+}
+
+type ObservabilityConfig struct {
+	// EventLogPath overrides the default telemetry.jsonl next to config.json.
+	EventLogPath string `json:"event_log_path,omitempty"`
+	// DisableEventLog explicitly disables local metadata events.
+	DisableEventLog bool `json:"disable_event_log,omitempty"`
+	// MaxEventLogBytes bounds the local JSONL file before it is truncated.
+	MaxEventLogBytes int64 `json:"max_event_log_bytes,omitempty"`
 }
 
 type AuthConfig struct {
@@ -112,10 +123,24 @@ const (
 	DefaultPollIntervalSeconds = 3
 	DefaultDialRetries         = 2
 	DefaultDialRetrySeconds    = 2
+	DefaultTelemetryMaxBytes   = 5 * 1024 * 1024
 )
 
 // Path returns the resolved config file location.
 func (c *Config) Path() string { return c.path }
+
+func (c *Config) TelemetryPath() string {
+	if c.Observability.DisableEventLog {
+		return ""
+	}
+	if c.Observability.EventLogPath != "" {
+		if filepath.IsAbs(c.Observability.EventLogPath) {
+			return c.Observability.EventLogPath
+		}
+		return filepath.Join(filepath.Dir(c.path), c.Observability.EventLogPath)
+	}
+	return filepath.Join(filepath.Dir(c.path), "telemetry.jsonl")
+}
 
 // DefaultPath resolves the config path from the env override or the user's
 // config dir (~/.config/paperboat/config.json on Unix).
@@ -166,6 +191,9 @@ func Load(path string) (*Config, error) {
 }
 
 func (c *Config) applyDefaults() {
+	if c.Observability.MaxEventLogBytes == 0 {
+		c.Observability.MaxEventLogBytes = DefaultTelemetryMaxBytes
+	}
 	if c.Upload.MaxImageBytes == 0 {
 		c.Upload.MaxImageBytes = DefaultMaxImageBytes
 	}

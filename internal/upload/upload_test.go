@@ -104,24 +104,3 @@ func TestIsImagePath(t *testing.T) {
 		}
 	}
 }
-
-func TestStubUploaderDeterministic(t *testing.T) {
-	dir := t.TempDir()
-	p := write(t, dir, "x.png", 8)
-	img, err := PrepareImage(p, baseLimits())
-	if err != nil {
-		t.Fatal(err)
-	}
-	u := NewStubUploader("")
-	a, err := u.Upload(t.Context(), img)
-	if err != nil {
-		t.Fatal(err)
-	}
-	b, _ := u.Upload(t.Context(), img)
-	if a != b {
-		t.Fatalf("non-deterministic: %q vs %q", a, b)
-	}
-	if !strings.HasSuffix(a, ".png") {
-		t.Fatalf("expected .png suffix, got %q", a)
-	}
-}

@@ -9,7 +9,12 @@ import (
 
 	"github.com/pujan-modha/paperboat-cli/internal/api"
 	"github.com/pujan-modha/paperboat-cli/internal/config"
+	"github.com/pujan-modha/paperboat-cli/internal/telemetry"
 )
+
+type resolverEventSink struct{ events []telemetry.Event }
+
+func (s *resolverEventSink) Record(e telemetry.Event) { s.events = append(s.events, e) }
 
 type fakeClient struct {
 	projects   []api.Project
@@ -95,6 +100,25 @@ func TestResolveImmediatelyConnectable(t *testing.T) {
 	}
 	if info.Project != "My App" {
 		t.Fatalf("project = %q", info.Project)
+	}
+}
+
+func TestResolveRecordsMetadataOnlyConnectResult(t *testing.T) {
+	fc := &fakeClient{projects: []api.Project{{ID: "prj_1", Name: "app"}}, connectSeq: []api.ConnectResponse{readyResponse(readyTerminal())}}
+	r := newTestResolver(fc)
+	sink := &resolverEventSink{}
+	times := []time.Time{time.Unix(20, 0), time.Unix(20, 15_000_000)}
+	r.Telemetry = sink
+	r.Now = func() time.Time { v := times[0]; times = times[1:]; return v }
+	if _, err := r.Resolve(context.Background(), ConnectRequest{Project: "app"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.events) != 1 {
+		t.Fatalf("events = %+v", sink.events)
+	}
+	e := sink.events[0]
+	if e.Name != "connect.result" || e.Outcome != "success" || e.ProjectID != "prj_1" || e.EnvironmentID != "env_1" || e.LatencyMS != 15 {
+		t.Fatalf("event = %+v", e)
 	}
 }
 

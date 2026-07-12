@@ -3,9 +3,11 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/pujan-modha/paperboat-cli/internal/config"
@@ -46,9 +48,10 @@ func writeErr(w http.ResponseWriter, status int, code, msg string) {
 }
 
 func TestClientSendsBearer(t *testing.T) {
-	var gotToken string
+	var gotToken, gotProtocol string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotToken = r.Header.Get("Authorization")
+		gotProtocol = r.Header.Get("X-Paperboat-Protocol")
 		writeData(w, http.StatusOK, Me{ID: "usr_1", Email: "a@b.dev"})
 	}))
 	defer srv.Close()
@@ -61,8 +64,39 @@ func TestClientSendsBearer(t *testing.T) {
 	if gotToken != "Bearer sess-token" {
 		t.Fatalf("authorization = %q", gotToken)
 	}
+	if gotProtocol == "" {
+		t.Fatal("missing protocol negotiation header")
+	}
 	if me.Email != "a@b.dev" {
 		t.Fatalf("me.Email = %q", me.Email)
+	}
+}
+
+func TestClientIncompatibleVersionIsActionable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUpgradeRequired)
+		_, _ = io.WriteString(w, `{"error":{"code":"incompatible_client_version","message":"upgrade required","details":{"required_protocol":"2"}}}`)
+	}))
+	defer srv.Close()
+	_, err := New(srv.URL, config.Credential{}, nil).Me(context.Background())
+	var versionErr *ErrIncompatibleVersion
+	if !errors.As(err, &versionErr) || versionErr.Required != "2" || !strings.Contains(versionErr.Error(), "upgrade") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestDeviceAuthorizeIncompatibleVersionIsActionable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUpgradeRequired)
+		_, _ = io.WriteString(w, `{"error":{"code":"incompatible_client_version","message":"upgrade pb before signing in","details":{"required_protocol":"2"}}}`)
+	}))
+	defer srv.Close()
+	_, err := DeviceAuthorize(context.Background(), srv.URL, "device", "desktop", "darwin", nil)
+	var versionErr *ErrIncompatibleVersion
+	if !errors.As(err, &versionErr) || versionErr.Required != "2" || !strings.Contains(versionErr.Error(), "upgrade pb") {
+		t.Fatalf("err = %v", err)
 	}
 }
 
@@ -81,6 +115,7 @@ func TestClientUnauthenticated(t *testing.T) {
 
 func TestClientStructuredError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Request-Id", "req_123")
 		writeErr(w, http.StatusConflict, "machine_not_ready", "Machine is not ready.")
 	}))
 	defer srv.Close()
@@ -91,8 +126,23 @@ func TestClientStructuredError(t *testing.T) {
 	if !ok {
 		t.Fatalf("err type = %T, want *APIError", err)
 	}
-	if apiErr.Code != "machine_not_ready" || apiErr.Status != http.StatusConflict {
+	if apiErr.Code != "machine_not_ready" || apiErr.Status != http.StatusConflict || apiErr.RequestID != "req_123" || !strings.Contains(apiErr.Error(), "request req_123") {
 		t.Fatalf("apiErr = %+v", apiErr)
+	}
+}
+
+func TestIncompatibleVersionAlwaysIncludesUpgradeGuidance(t *testing.T) {
+	err := (&ErrIncompatibleVersion{Message: "protocol 1 is unsupported"}).Error()
+	if !strings.Contains(err, "upgrade pb") {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestClientRejectsUnsafeRequestID(t *testing.T) {
+	for _, value := range []string{"secret value", "path/value", "line\nbreak"} {
+		if got := safeRequestID(value); got != "" {
+			t.Fatalf("safeRequestID(%q) = %q", value, got)
+		}
 	}
 }
 

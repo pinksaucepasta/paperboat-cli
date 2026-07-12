@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/pujan-modha/paperboat-cli/internal/buildinfo"
 )
 
 const ClientID = "paperboat-cli"
@@ -70,6 +72,9 @@ func publicCall(ctx context.Context, baseURL, path string, body any, bearer stri
 		return err
 	}
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "paperboat-cli/"+buildinfo.Version)
+	req.Header.Set("X-Paperboat-Client", ClientID)
+	req.Header.Set("X-Paperboat-Protocol", buildinfo.ProtocolVersion)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -89,11 +94,16 @@ func publicCall(ctx context.Context, baseURL, path string, body any, bearer stri
 			Details map[string]any `json:"details"`
 		} `json:"error"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
-		return fmt.Errorf("decode auth response: %w", err)
-	}
+	decodeErr := json.NewDecoder(resp.Body).Decode(&env)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return &APIError{Status: resp.StatusCode, Code: env.Error.Code, Message: env.Error.Message, Details: env.Error.Details}
+		if resp.StatusCode == http.StatusUpgradeRequired || env.Error.Code == "incompatible_client_version" {
+			required, _ := env.Error.Details["required_protocol"].(string)
+			return &ErrIncompatibleVersion{Required: required, Message: env.Error.Message}
+		}
+		return &APIError{Status: resp.StatusCode, Code: env.Error.Code, Message: env.Error.Message, RequestID: responseRequestID(resp.Header), Details: env.Error.Details}
+	}
+	if decodeErr != nil {
+		return fmt.Errorf("decode auth response: %w", decodeErr)
 	}
 	if out != nil {
 		return json.Unmarshal(env.Data, out)

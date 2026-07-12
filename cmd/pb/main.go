@@ -23,11 +23,11 @@ import (
 	"github.com/pujan-modha/paperboat-cli/internal/api"
 	sessionauth "github.com/pujan-modha/paperboat-cli/internal/auth"
 	"github.com/pujan-modha/paperboat-cli/internal/buildinfo"
-	"github.com/pujan-modha/paperboat-cli/internal/catalog"
 	"github.com/pujan-modha/paperboat-cli/internal/config"
 	"github.com/pujan-modha/paperboat-cli/internal/paste"
 	"github.com/pujan-modha/paperboat-cli/internal/resolver"
 	"github.com/pujan-modha/paperboat-cli/internal/session"
+	"github.com/pujan-modha/paperboat-cli/internal/telemetry"
 	"github.com/pujan-modha/paperboat-cli/internal/tunnel"
 	"github.com/pujan-modha/paperboat-cli/internal/upload"
 	"github.com/urfave/cli/v2"
@@ -52,8 +52,6 @@ var valueFlags = map[string]bool{
 var subcommands = map[string]bool{
 	"connect":    true,
 	"projects":   true,
-	"agents":     true,
-	"sizes":      true,
 	"keep-alive": true,
 	"config":     true,
 	"doctor":     true,
@@ -158,8 +156,6 @@ func newApp() *cli.App {
 		Commands: []*cli.Command{
 			connectCommand(),
 			projectsCommand(),
-			agentsCommand(),
-			sizesCommand(),
 			keepAliveCommand(),
 			authCommand(),
 			configCommand(),
@@ -505,12 +501,12 @@ func resolveProjectID(ctx context.Context, client *api.Client, requested string)
 
 // deps bundles production dependencies for a command.
 type deps struct {
-	cfg      *config.Config
-	auth     config.AuthSource
-	catalog  catalog.Catalog
-	resolver resolver.ProjectResolver
-	tunnel   tunnel.Tunnel
-	uploader upload.Uploader
+	cfg       *config.Config
+	auth      config.AuthSource
+	resolver  resolver.ProjectResolver
+	tunnel    tunnel.Tunnel
+	uploader  upload.Uploader
+	telemetry telemetry.Sink
 }
 
 func buildDeps(c *cli.Context) (*deps, error) {
@@ -534,7 +530,6 @@ func buildDeps(c *cli.Context) (*deps, error) {
 	return &deps{
 		cfg:      cfg,
 		auth:     authSource,
-		catalog:  catalog.NewStubCatalog(),
 		resolver: nil,
 		tunnel:   termTunnel,
 		uploader: uploader,
@@ -587,6 +582,9 @@ func actionConnect(c *cli.Context) error {
 	if strings.TrimSpace(d.cfg.ServerURL) == "" {
 		return errors.New("Paperboat server is not configured; set server_url or use --server")
 	}
+	var closeTelemetry func()
+	d.telemetry, closeTelemetry = connectTelemetry(d.cfg, os.Stderr)
+	defer closeTelemetry()
 
 	cred, err := d.auth.Credential()
 	if err != nil && !errors.Is(err, config.ErrNoCredentials) {
@@ -597,6 +595,7 @@ func actionConnect(c *cli.Context) error {
 	}
 	d.resolver = resolver.NewAPIResolver(api.New(d.cfg.ServerURL, cred, nil), d.cfg)
 	if apiResolver, ok := d.resolver.(*resolver.APIResolver); ok {
+		apiResolver.Telemetry = d.telemetry
 		apiResolver.Progress = func(status, reason string, retryAfter time.Duration) {
 			fmt.Fprintf(os.Stderr, "Connecting: %s (%s), retrying in %s...\n", status, reason, retryAfter.Round(time.Second))
 		}
@@ -609,12 +608,21 @@ func actionConnect(c *cli.Context) error {
 		if !ok {
 			return
 		}
+		projectID, environmentID := info.ProjectID, ""
+		if info.Terminal != nil {
+			environmentID = info.Terminal.EnvironmentID
+		}
+		httpUploader.ConfigureTelemetry(d.telemetry, projectID, environmentID)
 		httpUploader.RefreshAuth = func(refreshCtx context.Context) (upload.Auth, error) {
 			freshCred, credErr := d.auth.Credential()
 			if credErr != nil {
 				return upload.Auth{}, credErr
 			}
-			freshInfo, resolveErr := r.Resolve(refreshCtx, resolver.ConnectRequest{Project: project, Credential: freshCred})
+			projectToken := project
+			if info.ProjectID != "" {
+				projectToken = info.ProjectID
+			}
+			freshInfo, resolveErr := r.Resolve(refreshCtx, resolver.ConnectRequest{Project: projectToken, Credential: freshCred})
 			if resolveErr != nil {
 				return upload.Auth{}, fmt.Errorf("refresh upload descriptor: %w", resolveErr)
 			}
@@ -654,12 +662,13 @@ func actionConnect(c *cli.Context) error {
 		return fmt.Errorf("connect to %q: %w", project, err)
 	}
 	var pastePolicy *paste.Policy
-	conn = tunnel.NewReconnectingConn(ctx, conn, d.cfg.Connect.DialRetries, time.Duration(d.cfg.Connect.DialRetrySeconds)*time.Second, func(reconnectCtx context.Context) (tunnel.Conn, error) {
+	conn = tunnel.NewObservedReconnectingConn(ctx, conn, d.cfg.Connect.DialRetries, time.Duration(d.cfg.Connect.DialRetrySeconds)*time.Second, func(reconnectCtx context.Context) (tunnel.Conn, error) {
 		freshCred, credErr := d.auth.Credential()
 		if credErr != nil {
 			return nil, credErr
 		}
 		freshResolver := resolver.NewAPIResolver(api.New(d.cfg.ServerURL, freshCred, nil), d.cfg)
+		freshResolver.Telemetry = d.telemetry
 		freshInfo, resolveErr := freshResolver.Resolve(reconnectCtx, resolver.ConnectRequest{Project: info.ProjectID, Credential: freshCred})
 		if resolveErr != nil {
 			return nil, resolveErr
@@ -674,7 +683,7 @@ func actionConnect(c *cli.Context) error {
 			pastePolicy.Update(freshUploader, uploadLimits(d.cfg, freshInfo.Upload))
 		}
 		return freshConn, nil
-	})
+	}, d.telemetry, nil, tunnel.TelemetryContext{ProjectID: info.ProjectID, EnvironmentID: info.Terminal.EnvironmentID})
 
 	// Wrap remote input with the image-paste interceptor.
 	pastePolicy = paste.NewPolicy(d.uploader, uploadLimits(d.cfg, info.Upload))
@@ -700,6 +709,17 @@ func actionConnect(c *cli.Context) error {
 		os.Exit(code)
 	}
 	return nil
+}
+
+func connectTelemetry(cfg *config.Config, warnings io.Writer) (telemetry.Sink, func()) {
+	if path := cfg.TelemetryPath(); path != "" {
+		fileSink, err := telemetry.NewJSONFileSinkWithLimit(path, cfg.Observability.MaxEventLogBytes)
+		if err == nil {
+			return fileSink, func() { _ = fileSink.Close() }
+		}
+		fmt.Fprintln(warnings, "warning: telemetry disabled: local event log unavailable")
+	}
+	return telemetry.NopSink{}, func() {}
 }
 
 func retryableInitialConnectError(err error) bool {
@@ -807,52 +827,6 @@ func expandDirs(dirs []string) []string {
 		out = append(out, d)
 	}
 	return out
-}
-
-func agentsCommand() *cli.Command {
-	return &cli.Command{
-		Name:  "agents",
-		Usage: "List available agent presets",
-		Action: func(c *cli.Context) error {
-			d, err := buildDeps(c)
-			if err != nil {
-				return err
-			}
-			agents, err := d.catalog.Agents(c.Context)
-			if err != nil {
-				return err
-			}
-			tw := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-			fmt.Fprintln(tw, "ID\tNAME\tDEFAULT")
-			for _, a := range agents {
-				fmt.Fprintf(tw, "%s\t%s\t%s\n", a.ID, a.DisplayName, mark(a.Default))
-			}
-			return tw.Flush()
-		},
-	}
-}
-
-func sizesCommand() *cli.Command {
-	return &cli.Command{
-		Name:  "sizes",
-		Usage: "List available machine shapes",
-		Action: func(c *cli.Context) error {
-			d, err := buildDeps(c)
-			if err != nil {
-				return err
-			}
-			sizes, err := d.catalog.Sizes(c.Context)
-			if err != nil {
-				return err
-			}
-			tw := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-			fmt.Fprintln(tw, "ID\tvCPU\tMEM(MB)\tWEIGHT\tDEFAULT")
-			for _, s := range sizes {
-				fmt.Fprintf(tw, "%s\t%d\t%d\t%.1f\t%s\n", s.ID, s.VCPUs, s.MemoryMB, s.Weight, mark(s.Default))
-			}
-			return tw.Flush()
-		},
-	}
 }
 
 func configCommand() *cli.Command {
@@ -974,13 +948,6 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
-func mark(b bool) string {
-	if b {
-		return "✓"
-	}
-	return ""
-}
-
 func orNone(s string) string {
 	if s == "" {
 		return "(unset)"
@@ -990,7 +957,7 @@ func orNone(s string) string {
 
 func orLocal(s string) string {
 	if s == "" {
-		return "(local dev stub)"
+		return "(unset)"
 	}
 	return s
 }

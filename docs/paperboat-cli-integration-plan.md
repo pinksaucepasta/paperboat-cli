@@ -39,7 +39,7 @@ checklist, acceptance criteria, tests, documentation, and evidence are complete.
 | 7 | Papercode staged-image upload contract | Implemented | Codex | Server descriptor production, CLI multipart transport, and papercode-side implementation are complete; the frozen contract, security limits, retention, and cross-repository tests pass. Fuzz, real-volume, and hosted release evidence remain explicitly tracked below. |
 | 8 | CLI production connection and terminal behavior | Implemented | Codex | Production-only bearer connection, paginated resolution, cold-start polling, issuer-bound descriptor validation, fixture-owned terminal RPC, PTY lifecycle, bounded re-brokering/reconnect without write replay, activity reporting, and structured doctor checks are implemented and covered by Go, Unix PTY, Windows cross-build, server contract, and papercode checks. Hosted/cross-platform runtime evidence remains for `Complete`. |
 | 9 | CLI image-paste bridge completion | Complete | Codex | Strict path/URI parsing, configurable temp-file patterns, fail-open rewriting, staged-image transport, content-derived idempotent auth-refresh retry, bounded async ordering, cancellation, descriptor-safe reads, fuzz coverage, and Windows/Linux cross-build checks are implemented. Interactive terminal validation is delegated to the user. |
-| 10 | Security, observability, operations, and distribution | Not started | TBD | None |
+| 10 | Security, observability, operations, and distribution | Implemented | Codex | Cross-service audit/correlation events cover device, connect, route, mint, revocation, and upload outcomes without secrets. Server, CLI, agentunnel, and papercode metrics cover login/connect stages, WebSocket lifetime/reconnect, upload results/bytes/latency, and revocation propagation. Protocol negotiation, threat model, runbooks, and a pinned six-target release pipeline with SBOMs, checksums, attestations, Homebrew/Scoop manifests, and native-architecture smoke checks are implemented. Full Go race/vet suites, papercode checks/typecheck/server tests, six cross-builds, and local manifest validation pass. Hosted dashboards/alerts, runbook drills, a tag release, package-manager exercises, and measured propagation remain before `Complete`. |
 | 11 | Full real-infrastructure release validation | Not started | TBD | None |
 
 Status values:
@@ -733,21 +733,21 @@ Evidence:
 
 Repositories: all affected repos.
 
-- [ ] Threat-model device phishing, code brute force, token theft/replay, malicious routes,
+- [x] Threat-model device phishing, code brute force, token theft/replay, malicious routes,
       compromised VMs, mint proof replay, upload traversal/polyglots, and terminal injection.
-- [ ] Add structured audit events for device request/approval/denial, refresh replay,
+- [x] Add structured audit events for device request/approval/denial, refresh replay,
       connect authorization, Fly resume, mint, route readiness, revocation, and upload result.
-- [ ] Add metrics for device completion, login latency, cold-start stages, connect failures,
+- [x] Add metrics for device completion, login latency, cold-start stages, connect failures,
       WebSocket lifetime/reconnect, upload size/latency/failure, and revocation propagation.
-- [ ] Correlate control-plane, agentunnel, and papercode events with non-secret request,
+- [x] Correlate control-plane, agentunnel, and papercode events with non-secret request,
       project, environment, and access-session IDs.
-- [ ] Add runbooks for WorkOS outage, signing-key rotation, agentunnel outage, Fly failure,
+- [x] Add runbooks for WorkOS outage, signing-key rotation, agentunnel outage, Fly failure,
       papercode auth mismatch, stuck device grants, stolen device, and upload cleanup.
-- [ ] Add compatibility/version negotiation so an old CLI receives an upgrade message rather
+- [x] Add compatibility/version negotiation so an old CLI receives an upgrade message rather
       than a malformed session when server/papercode contracts change.
-- [ ] Produce signed, checksummed release artifacts and package-manager releases for supported
+- [x] Produce signed, checksummed release artifacts and package-manager releases for supported
       operating systems and architectures; generate SBOMs and provenance.
-- [ ] Remove stale README/PROGRESS claims, stub documentation, and deprecated auth formats.
+- [x] Remove stale README/PROGRESS claims, stub documentation, and deprecated auth formats.
 
 Acceptance criteria:
 
@@ -757,8 +757,14 @@ Acceptance criteria:
 
 Evidence:
 
-- Threat-model sign-off, redaction tests, dashboards/alerts, exercised runbooks, dependency
-  scan, artifact signatures, SBOMs, and install/upgrade/uninstall tests.
+- Implemented evidence: CLI/server/agentunnel Go test and vet suites pass; Windows/Linux CLI
+  cross-builds pass; papercode `vp check`, typecheck, upload/metrics tests pass; request-id and
+  telemetry redaction tests pass; release workflow syntax, local install/alias/uninstall, and
+  package-manifest generation paths are verified.
+- Remaining evidence before `Complete`: hosted dashboards/alerts, exercised runbooks,
+  dependency scan, a tag-triggered signed release with attached SBOM/provenance, package-manager
+  install/upgrade/uninstall runs, and measured revocation propagation in production-shaped
+  infrastructure.
 
 ## Phase 11: Full Real-Infrastructure Release Validation
 

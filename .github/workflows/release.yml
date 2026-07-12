@@ -1,0 +1,142 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: linux, arch: amd64, runner: ubuntu-latest, ext: tar.gz }
+          - { os: linux, arch: arm64, runner: ubuntu-latest, ext: tar.gz }
+          - { os: darwin, arch: amd64, runner: macos-latest, ext: tar.gz }
+          - { os: darwin, arch: arm64, runner: macos-latest, ext: tar.gz }
+          - { os: windows, arch: amd64, runner: windows-latest, ext: zip }
+          - { os: windows, arch: arm64, runner: windows-latest, ext: zip }
+    runs-on: ${{ matrix.runner }}
+    env:
+      CGO_ENABLED: "0"
+      GOOS: ${{ matrix.os }}
+      GOARCH: ${{ matrix.arch }}
+      VERSION: ${{ github.ref_name }}
+      ARTIFACT: paperboat-cli_${{ github.ref_name }}_${{ matrix.os }}_${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Validate release version
+        shell: bash
+        run: |
+          [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p staging
+          suffix=""
+          if [[ "$GOOS" == "windows" ]]; then suffix=".exe"; fi
+          go build -trimpath -buildvcs=true \
+            -ldflags "-s -w -X github.com/pujan-modha/paperboat-cli/internal/buildinfo.Version=$VERSION -X github.com/pujan-modha/paperboat-cli/internal/buildinfo.ProtocolVersion=1" \
+            -o "staging/pb${suffix}" ./cmd/pb
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GOOS" == "windows" ]]; then
+            (cd staging && 7z a "../$ARTIFACT.zip" pb.exe)
+          else
+            tar -C staging -czf "$ARTIFACT.tar.gz" pb
+          fi
+          file="$ARTIFACT.${{ matrix.ext }}"
+          shasum -a 256 "$file" > "$file.sha256"
+      - name: Verify install, upgrade, and uninstall
+        shell: bash
+        run: |
+          set -euo pipefail
+          host_os="$(go env GOHOSTOS)"
+          host_arch="$(go env GOHOSTARCH)"
+          if [[ "$GOOS" != "$host_os" || "$GOARCH" != "$host_arch" ]]; then
+            echo "Skipping runtime smoke check for cross-built $GOOS/$GOARCH on $host_os/$host_arch"
+            exit 0
+          fi
+          install_dir="$RUNNER_TEMP/paperboat-install"
+          mkdir -p "$install_dir"
+          suffix=""
+          if [[ "$GOOS" == "windows" ]]; then suffix=".exe"; fi
+          cp "staging/pb${suffix}" "$install_dir/pb${suffix}"
+          version_output="$("$install_dir/pb${suffix}" --version)"
+          [[ "$version_output" == *"$VERSION"* ]]
+          cp "staging/pb${suffix}" "$install_dir/pb${suffix}.new"
+          mv -f "$install_dir/pb${suffix}.new" "$install_dir/pb${suffix}"
+          if [[ "$GOOS" != "windows" ]]; then
+            ln -s "$install_dir/pb" "$install_dir/paperboat"
+            alias_output="$("$install_dir/paperboat" --version)"
+            [[ "$alias_output" == *"$VERSION"* ]]
+          fi
+          rm -f "$install_dir/pb${suffix}" "$install_dir/paperboat"
+          [[ ! -e "$install_dir/pb${suffix}" ]]
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          file: ${{ env.ARTIFACT }}.${{ matrix.ext }}
+          format: spdx-json
+          output-file: ${{ env.ARTIFACT }}.${{ matrix.ext }}.spdx.json
+      - name: Attest artifact provenance
+        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        with:
+          subject-path: |
+            ${{ env.ARTIFACT }}.${{ matrix.ext }}
+            ${{ env.ARTIFACT }}.${{ matrix.ext }}.sha256
+            ${{ env.ARTIFACT }}.${{ matrix.ext }}.spdx.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ env.ARTIFACT }}
+          path: |
+            ${{ env.ARTIFACT }}.${{ matrix.ext }}
+            ${{ env.ARTIFACT }}.${{ matrix.ext }}.sha256
+            ${{ env.ARTIFACT }}.${{ matrix.ext }}.spdx.json
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate package-manager manifests
+        run: |
+          sh scripts/generate-package-manifests.sh dist "${{ github.repository }}" "${{ github.ref_name }}"
+          ruby -c dist/paperboat.rb
+          ruby -rjson -e 'JSON.parse(File.read("dist/paperboat.json"))'
+          shasum -a 256 dist/paperboat.rb > dist/paperboat.rb.sha256
+          shasum -a 256 dist/paperboat.json > dist/paperboat.json.sha256
+      - name: Attest package-manager manifests
+        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        with:
+          subject-path: |
+            dist/paperboat.rb
+            dist/paperboat.rb.sha256
+            dist/paperboat.json
+            dist/paperboat.json.sha256
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          generate_release_notes: true
+          files: dist/*

@@ -23,7 +23,7 @@ type ConnectInfo struct {
 	ProjectState string
 	// TunnelTarget identifies how the tunnel layer should reach the VM. Its
 	// meaning is tunnel-implementation specific (agentunnel tcp-tunnel id in
-	// production, a local shell marker in the dev stub).
+	// production).
 	TunnelTarget string
 	// Local is true when this resolves to a local dev target (no real VM).
 	Local bool

@@ -8,7 +8,13 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/pujan-modha/paperboat-cli/internal/telemetry"
 )
+
+type tunnelEventSink struct{ events []telemetry.Event }
+
+func (s *tunnelEventSink) Record(e telemetry.Event) { s.events = append(s.events, e) }
 
 type closeTrackingConn struct {
 	*reconnectTestConn
@@ -44,6 +50,29 @@ func TestReconnectingConnReattachesWithoutReplayingInput(t *testing.T) {
 	}
 	if first.writes.Len() != 0 || second.writes.Len() != 0 {
 		t.Fatal("reconnect replayed terminal input")
+	}
+}
+
+func TestReconnectingConnRecordsReconnectAndLifetime(t *testing.T) {
+	first := &reconnectTestConn{Reader: bytes.NewReader(nil), err: ErrTransportLost}
+	second := &reconnectTestConn{Reader: bytes.NewReader(nil)}
+	sink := &tunnelEventSink{}
+	n := int64(0)
+	now := func() time.Time { n++; return time.Unix(0, n*int64(time.Millisecond)) }
+	c := NewObservedReconnectingConn(context.Background(), first, 1, 0, func(context.Context) (Conn, error) { return second, nil }, sink, now, TelemetryContext{ProjectID: "prj_1", EnvironmentID: "env_1"})
+	_, _ = io.ReadAll(c)
+	_, _ = c.Wait()
+	if len(sink.events) != 2 {
+		t.Fatalf("events = %+v", sink.events)
+	}
+	if sink.events[0].Name != "terminal.reconnect" || sink.events[0].Outcome != "success" {
+		t.Fatalf("reconnect event = %+v", sink.events[0])
+	}
+	if sink.events[0].ProjectID != "prj_1" || sink.events[0].EnvironmentID != "env_1" || sink.events[1].ProjectID != "prj_1" || sink.events[1].EnvironmentID != "env_1" {
+		t.Fatalf("missing correlation: %+v", sink.events)
+	}
+	if sink.events[1].Name != "terminal.lifetime" || sink.events[1].Outcome != "success" {
+		t.Fatalf("lifetime event = %+v", sink.events[1])
 	}
 }
 

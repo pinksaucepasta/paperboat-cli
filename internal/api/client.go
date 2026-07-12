@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pujan-modha/paperboat-cli/internal/buildinfo"
 	"github.com/pujan-modha/paperboat-cli/internal/config"
 )
 
@@ -20,24 +21,56 @@ import (
 // should route the user through Paperboat device login.
 var ErrUnauthenticated = errors.New("paperboat-server rejected the credential")
 
+// ErrIncompatibleVersion tells callers to upgrade instead of retrying.
+type ErrIncompatibleVersion struct{ Required, Message string }
+
+func (e *ErrIncompatibleVersion) Error() string {
+	message := strings.Join(strings.Fields(e.Message), " ")
+	if len(message) > 500 {
+		message = message[:500]
+	}
+	if message != "" {
+		if strings.Contains(strings.ToLower(message), "upgrade") {
+			return message
+		}
+		return message + "; upgrade pb"
+	}
+	if e.Required != "" {
+		return fmt.Sprintf("this CLI is incompatible with the server (required protocol %s); upgrade pb", e.Required)
+	}
+	return "this CLI is incompatible with the server; upgrade pb"
+}
+
+func responseRequestID(header http.Header) string {
+	if requestID := safeRequestID(header.Get("Request-Id")); requestID != "" {
+		return requestID
+	}
+	return safeRequestID(header.Get("X-Request-ID"))
+}
+
 // APIError is a structured server error surfaced to the caller. It carries the
 // server's stable error code so command logic can branch without string
 // matching on messages.
 type APIError struct {
-	Status  int
-	Code    string
-	Message string
-	Details map[string]any
+	Status    int
+	Code      string
+	Message   string
+	RequestID string
+	Details   map[string]any
 }
 
 func (e *APIError) Error() string {
-	if e.Message != "" {
-		return e.Message
+	message := e.Message
+	if message == "" {
+		message = e.Code
 	}
-	if e.Code != "" {
-		return e.Code
+	if message == "" {
+		message = fmt.Sprintf("paperboat-server returned status %d", e.Status)
 	}
-	return fmt.Sprintf("paperboat-server returned status %d", e.Status)
+	if e.RequestID != "" {
+		return fmt.Sprintf("%s (request %s)", message, e.RequestID)
+	}
+	return message
 }
 
 // Client talks to paperboat-server with a Paperboat client-session access token.
@@ -238,6 +271,9 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 		return err
 	}
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "paperboat-cli/"+buildinfo.Version)
+	req.Header.Set("X-Paperboat-Client", "paperboat-cli")
+	req.Header.Set("X-Paperboat-Protocol", buildinfo.ProtocolVersion)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -264,10 +300,14 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 	decodeErr := json.NewDecoder(resp.Body).Decode(&envelope)
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if resp.StatusCode == http.StatusUpgradeRequired || envelope.Error.Code == "incompatible_client_version" {
+			required, _ := envelope.Error.Details["required_protocol"].(string)
+			return &ErrIncompatibleVersion{Required: required, Message: envelope.Error.Message}
+		}
 		if resp.StatusCode == http.StatusUnauthorized {
 			return ErrUnauthenticated
 		}
-		return &APIError{Status: resp.StatusCode, Code: envelope.Error.Code, Message: envelope.Error.Message, Details: envelope.Error.Details}
+		return &APIError{Status: resp.StatusCode, Code: envelope.Error.Code, Message: envelope.Error.Message, RequestID: responseRequestID(resp.Header), Details: envelope.Error.Details}
 	}
 	if decodeErr != nil {
 		return fmt.Errorf("decode %s %s response: %w", method, path, decodeErr)
@@ -282,4 +322,17 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 		return fmt.Errorf("decode %s %s data: %w", method, path, err)
 	}
 	return nil
+}
+
+func safeRequestID(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 200 {
+		return ""
+	}
+	for _, r := range value {
+		if !(r >= 'a' && r <= 'z') && !(r >= 'A' && r <= 'Z') && !(r >= '0' && r <= '9') && !strings.ContainsRune("_.:-", r) {
+			return ""
+		}
+	}
+	return value
 }

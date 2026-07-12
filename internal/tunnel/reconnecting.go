@@ -6,9 +6,16 @@ import (
 	"io"
 	"sync"
 	"time"
+
+	"github.com/pujan-modha/paperboat-cli/internal/telemetry"
 )
 
 type ReconnectFunc func(context.Context) (Conn, error)
+
+type TelemetryContext struct {
+	ProjectID     string
+	EnvironmentID string
+}
 
 var ErrWriteUncertain = errors.New("terminal write outcome is uncertain")
 var ErrTransportLost = errors.New("terminal transport lost")
@@ -20,18 +27,37 @@ type transportFailureMarker interface {
 // ReconnectingConn supervises unexpected transport loss while one session
 // loop retains ownership of stdin. Failed writes are never replayed.
 type ReconnectingConn struct {
-	ctx        context.Context
-	mu         sync.RWMutex
-	current    Conn
-	available  chan struct{}
-	reconnect  ReconnectFunc
-	maxRetries int
-	delay      time.Duration
-	out        chan []byte
-	done       chan reconnectResult
-	closed     chan struct{}
-	closeOnce  sync.Once
-	pending    []byte
+	ctx         context.Context
+	mu          sync.RWMutex
+	current     Conn
+	available   chan struct{}
+	reconnect   ReconnectFunc
+	maxRetries  int
+	delay       time.Duration
+	out         chan []byte
+	done        chan reconnectResult
+	closed      chan struct{}
+	closeOnce   sync.Once
+	pending     []byte
+	telemetry   telemetry.Sink
+	started     time.Time
+	now         func() time.Time
+	correlation TelemetryContext
+}
+
+func (c *ReconnectingConn) record(name, outcome string, started time.Time) {
+	if c.telemetry == nil {
+		return
+	}
+	now := time.Now
+	if c.now != nil {
+		now = c.now
+	}
+	ended := now()
+	e := telemetry.Event{Name: name, At: ended, ProjectID: c.correlation.ProjectID, EnvironmentID: c.correlation.EnvironmentID, Outcome: outcome, LatencyMS: ended.Sub(started).Milliseconds()}
+	if e.Validate() == nil {
+		c.telemetry.Record(e)
+	}
 }
 
 type reconnectResult struct {
@@ -40,15 +66,24 @@ type reconnectResult struct {
 }
 
 func NewReconnectingConn(ctx context.Context, initial Conn, maxRetries int, delay time.Duration, reconnect ReconnectFunc) *ReconnectingConn {
+	return NewObservedReconnectingConn(ctx, initial, maxRetries, delay, reconnect, nil, nil, TelemetryContext{})
+}
+
+func NewObservedReconnectingConn(ctx context.Context, initial Conn, maxRetries int, delay time.Duration, reconnect ReconnectFunc, sink telemetry.Sink, now func() time.Time, correlation TelemetryContext) *ReconnectingConn {
 	available := make(chan struct{})
 	close(available)
-	c := &ReconnectingConn{ctx: ctx, current: initial, available: available, reconnect: reconnect, maxRetries: maxRetries, delay: delay, out: make(chan []byte, 64), done: make(chan reconnectResult, 1), closed: make(chan struct{})}
+	if now == nil {
+		now = time.Now
+	}
+	c := &ReconnectingConn{ctx: ctx, current: initial, available: available, reconnect: reconnect, maxRetries: maxRetries, delay: delay, out: make(chan []byte, 64), done: make(chan reconnectResult, 1), closed: make(chan struct{}), telemetry: sink, now: now, started: now(), correlation: correlation}
 	go c.supervise(initial)
 	return c
 }
 
 func (c *ReconnectingConn) supervise(conn Conn) {
 	defer close(c.out)
+	lifetimeOutcome := "failure"
+	defer func() { c.record("terminal.lifetime", lifetimeOutcome, c.started) }()
 	for {
 		readDone := make(chan struct{})
 		go func() {
@@ -73,34 +108,48 @@ func (c *ReconnectingConn) supervise(conn Conn) {
 		_ = conn.Close()
 		<-readDone
 		if err == nil || !errors.Is(err, ErrTransportLost) || c.reconnect == nil || c.maxRetries <= 0 {
+			if err == nil {
+				lifetimeOutcome = "success"
+			}
 			c.done <- reconnectResult{code, err}
 			return
 		}
 		c.setUnavailable(conn)
 		reconnected := false
 		for attempt := 0; attempt < c.maxRetries; attempt++ {
+			attemptStarted := time.Now()
+			if c.now != nil {
+				attemptStarted = c.now()
+			}
 			if waitErr := c.waitDelay(); waitErr != nil {
+				c.record("terminal.reconnect", "cancelled", attemptStarted)
+				lifetimeOutcome = "cancelled"
 				c.done <- reconnectResult{130, nil}
 				return
 			}
 			next, dialErr := c.reconnect(c.ctx)
 			if dialErr != nil {
+				c.record("terminal.reconnect", "failure", attemptStarted)
 				err = errors.Join(err, dialErr)
 				continue
 			}
 			if next == nil {
+				c.record("terminal.reconnect", "failure", attemptStarted)
 				err = errors.Join(err, errors.New("reconnect returned no connection"))
 				continue
 			}
 			select {
 			case <-c.closed:
 				_ = next.Close()
+				c.record("terminal.reconnect", "cancelled", attemptStarted)
+				lifetimeOutcome = "cancelled"
 				c.done <- reconnectResult{130, nil}
 				return
 			default:
 			}
 			conn = next
 			c.setCurrent(next)
+			c.record("terminal.reconnect", "success", attemptStarted)
 			reconnected = true
 			break
 		}

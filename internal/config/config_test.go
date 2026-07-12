@@ -32,6 +32,9 @@ func TestLoadAppliesDialRetryDefaultWhenOmitted(t *testing.T) {
 	if cfg.Connect.DialRetries != DefaultDialRetries {
 		t.Fatalf("dial retries = %d, want %d", cfg.Connect.DialRetries, DefaultDialRetries)
 	}
+	if cfg.Observability.MaxEventLogBytes != DefaultTelemetryMaxBytes {
+		t.Fatalf("telemetry max bytes = %d, want %d", cfg.Observability.MaxEventLogBytes, DefaultTelemetryMaxBytes)
+	}
 }
 
 func TestSavePreservesExplicitZeroDialRetries(t *testing.T) {
@@ -46,5 +49,22 @@ func TestSavePreservesExplicitZeroDialRetries(t *testing.T) {
 	}
 	if reloaded.Connect.DialRetries != 0 {
 		t.Fatalf("dial retries = %d after save, want explicit zero", reloaded.Connect.DialRetries)
+	}
+}
+
+func TestTelemetryPathDefaultsBesideConfigAndCanBeDisabled(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "paperboat", "config.json")
+	cfg := &Config{path: path}
+	if got, want := cfg.TelemetryPath(), filepath.Join(filepath.Dir(path), "telemetry.jsonl"); got != want {
+		t.Fatalf("TelemetryPath() = %q, want %q", got, want)
+	}
+	cfg.Observability.DisableEventLog = true
+	if got := cfg.TelemetryPath(); got != "" {
+		t.Fatalf("disabled TelemetryPath() = %q", got)
+	}
+	cfg.Observability.DisableEventLog = false
+	cfg.Observability.EventLogPath = "events/custom.jsonl"
+	if got, want := cfg.TelemetryPath(), filepath.Join(filepath.Dir(path), "events", "custom.jsonl"); got != want {
+		t.Fatalf("relative TelemetryPath() = %q, want %q", got, want)
 	}
 }

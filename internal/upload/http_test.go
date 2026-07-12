@@ -6,8 +6,42 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/pujan-modha/paperboat-cli/internal/telemetry"
 )
+
+type eventSink struct{ events []telemetry.Event }
+
+func (s *eventSink) Record(e telemetry.Event) { s.events = append(s.events, e) }
+
+func TestUploadRecordsMetadataOnlyResult(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"path":"/workspace/.staged/image.png"}`))
+	}))
+	defer srv.Close()
+
+	sink := &eventSink{}
+	times := []time.Time{time.Unix(10, 0), time.Unix(10, 12_000_000)}
+	u := NewHTTPUploader(srv.URL, "/upload", Auth{Method: "bearer", Token: "secret"})
+	u.ConfigureTelemetry(sink, "prj_1", "env_1")
+	u.Now = func() time.Time { v := times[0]; times = times[1:]; return v }
+	_, err := u.Upload(context.Background(), Image{Name: "private.png", Bytes: []byte("abc"), MimeType: "image/png"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.events) != 1 {
+		t.Fatalf("events = %d", len(sink.events))
+	}
+	e := sink.events[0]
+	if e.Name != "upload.result" || e.ProjectID != "prj_1" || e.EnvironmentID != "env_1" || e.Outcome != "success" || e.SizeBytes != 3 || e.LatencyMS != 12 {
+		t.Fatalf("event = %+v", e)
+	}
+}
 
 func TestHTTPUploaderUploadsAndReturnsVMPath(t *testing.T) {
 	var gotAuth string
@@ -56,6 +90,52 @@ func TestHTTPUploaderUploadsAndReturnsVMPath(t *testing.T) {
 		t.Fatalf("auth = %q", gotAuth)
 	}
 	_ = gotBody
+}
+
+func TestHTTPUploaderSerializesConcurrentAuthRefresh(t *testing.T) {
+	var oldRequests atomic.Int32
+	var refreshes atomic.Int32
+	oldRequestsReady := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Header.Get("Authorization") == "Bearer old-token" {
+			if oldRequests.Add(1) == 2 {
+				close(oldRequestsReady)
+			}
+			<-oldRequestsReady
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":{"code":"unauthenticated","message":"expired"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"path":"/workspace/staged.png"}`))
+	}))
+	defer srv.Close()
+
+	u := NewHTTPUploader(srv.URL, "/upload", Auth{Method: "bearer", Token: "old-token"})
+	u.RefreshAuth = func(context.Context) (Auth, error) {
+		refreshes.Add(1)
+		return Auth{Method: "bearer", Token: "new-token"}, nil
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := u.Upload(context.Background(), Image{Name: "image.png", Bytes: []byte("bytes")})
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if refreshes.Load() != 1 {
+		t.Fatalf("refreshes = %d, want 1", refreshes.Load())
+	}
 }
 
 func TestHTTPUploaderRequiresAbsoluteVMPath(t *testing.T) {

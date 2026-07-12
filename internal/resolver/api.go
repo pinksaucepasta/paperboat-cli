@@ -10,6 +10,7 @@ import (
 
 	"github.com/pujan-modha/paperboat-cli/internal/api"
 	"github.com/pujan-modha/paperboat-cli/internal/config"
+	"github.com/pujan-modha/paperboat-cli/internal/telemetry"
 )
 
 // ErrProjectNotFound means no project matched the requested name or id for this
@@ -37,8 +38,10 @@ type APIResolver struct {
 	readyTimeout time.Duration
 	pollInterval time.Duration
 	// sleep is injectable for tests; nil uses a real timer honoring ctx.
-	sleep    func(ctx context.Context, d time.Duration) error
-	Progress func(status, reason string, retryAfter time.Duration)
+	sleep     func(ctx context.Context, d time.Duration) error
+	Progress  func(status, reason string, retryAfter time.Duration)
+	Telemetry telemetry.Sink
+	Now       func() time.Time
 }
 
 // NewAPIResolver builds a resolver bound to a paperboat-server client.
@@ -53,6 +56,11 @@ func NewAPIResolver(client connectClient, cfg *config.Config) *APIResolver {
 
 // Resolve implements ProjectResolver against the real backend.
 func (r *APIResolver) Resolve(ctx context.Context, req ConnectRequest) (ConnectInfo, error) {
+	started := r.now()
+	projectID := ""
+	environmentID := ""
+	outcome := "failure"
+	defer func() { r.record("connect.result", outcome, projectID, environmentID, "", started) }()
 	if err := r.validatePolicy(); err != nil {
 		return ConnectInfo{}, err
 	}
@@ -60,6 +68,7 @@ func (r *APIResolver) Resolve(ctx context.Context, req ConnectRequest) (ConnectI
 	if err != nil {
 		return ConnectInfo{}, err
 	}
+	projectID = project.ID
 
 	resp, err := r.client.CLIConnect(ctx, project.ID)
 	if err != nil {
@@ -69,6 +78,9 @@ func (r *APIResolver) Resolve(ctx context.Context, req ConnectRequest) (ConnectI
 	resp, err = r.waitConnectable(ctx, project.ID, resp)
 	if err != nil {
 		return ConnectInfo{}, err
+	}
+	if resp.Environment != nil {
+		environmentID = resp.Environment.EnvironmentID
 	}
 
 	if !completeTerminalDescriptor(resp.Terminal) {
@@ -102,7 +114,26 @@ func (r *APIResolver) Resolve(ctx context.Context, req ConnectRequest) (ConnectI
 			RetentionSeconds: resp.Upload.RetentionSeconds,
 		}
 	}
+	outcome = "success"
 	return info, nil
+}
+
+func (r *APIResolver) now() time.Time {
+	if r.Now != nil {
+		return r.Now()
+	}
+	return time.Now()
+}
+
+func (r *APIResolver) record(name, outcome, projectID, environmentID, stage string, started time.Time) {
+	if r.Telemetry == nil {
+		return
+	}
+	ended := r.now()
+	e := telemetry.Event{Name: name, At: ended, Outcome: outcome, ProjectID: projectID, EnvironmentID: environmentID, Stage: stage, LatencyMS: ended.Sub(started).Milliseconds()}
+	if e.Validate() == nil {
+		r.Telemetry.Record(e)
+	}
 }
 
 func (r *APIResolver) validatePolicy() error {
@@ -188,6 +219,7 @@ func (r *APIResolver) waitConnectable(ctx context.Context, projectID string, res
 		if r.Progress != nil {
 			r.Progress(resp.Status, resp.Reason, interval)
 		}
+		r.record("connect.stage", "waiting", projectID, "", resp.Status, r.now())
 		if err := r.wait(pollCtx, interval); err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
 				return api.ConnectResponse{}, fmt.Errorf("timed out waiting for the machine to become ready (last status: %s)", statusReason(resp))

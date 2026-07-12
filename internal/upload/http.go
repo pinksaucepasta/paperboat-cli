@@ -12,7 +12,10 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/pujan-modha/paperboat-cli/internal/telemetry"
 )
 
 type Auth struct {
@@ -22,11 +25,23 @@ type Auth struct {
 }
 
 type HTTPUploader struct {
-	BaseURL     string
-	Path        string
-	Auth        Auth
-	HTTPClient  *http.Client
-	RefreshAuth func(context.Context) (Auth, error)
+	BaseURL       string
+	Path          string
+	HTTPClient    *http.Client
+	RefreshAuth   func(context.Context) (Auth, error)
+	Now           func() time.Time
+	authMu        sync.RWMutex
+	refreshMu     sync.Mutex
+	auth          Auth
+	telemetry     telemetry.Sink
+	projectID     string
+	environmentID string
+}
+
+func (u *HTTPUploader) ConfigureTelemetry(sink telemetry.Sink, projectID, environmentID string) {
+	u.telemetry = sink
+	u.projectID = projectID
+	u.environmentID = environmentID
 }
 
 // Error is the structured error envelope returned by papercode's staged-image
@@ -51,7 +66,7 @@ func NewHTTPUploader(baseURL, uploadPath string, auth Auth) *HTTPUploader {
 	return &HTTPUploader{
 		BaseURL: strings.TrimRight(baseURL, "/"),
 		Path:    uploadPath,
-		Auth:    auth,
+		auth:    auth,
 		HTTPClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
@@ -59,31 +74,75 @@ func NewHTTPUploader(baseURL, uploadPath string, auth Auth) *HTTPUploader {
 }
 
 func (u *HTTPUploader) Upload(ctx context.Context, img Image) (string, error) {
+	started := u.now()
 	key := fmt.Sprintf("sha256:%x", sha256.Sum256(img.Bytes))
 	for attempt := 0; attempt < 2; attempt++ {
-		path, err := u.uploadOnce(ctx, img, key)
+		auth := u.currentAuth()
+		path, err := u.uploadOnce(ctx, img, key, auth)
 		if err == nil {
+			u.recordUpload("success", int64(len(img.Bytes)), started)
 			return path, nil
 		}
 		var stagedErr *Error
 		if attempt == 0 && u.RefreshAuth != nil && errors.As(err, &stagedErr) && (stagedErr.Code == "unauthenticated" || stagedErr.Code == "insufficient_scope") {
-			auth, refreshErr := u.RefreshAuth(ctx)
-			if refreshErr == nil {
-				u.Auth = auth
+			u.refreshMu.Lock()
+			if u.currentAuth() != auth {
+				u.refreshMu.Unlock()
 				continue
 			}
+			refreshed, refreshErr := u.RefreshAuth(ctx)
+			if refreshErr == nil {
+				u.setAuth(refreshed)
+			}
+			u.refreshMu.Unlock()
+			if refreshErr == nil {
+				continue
+			}
+			err = errors.Join(err, fmt.Errorf("refresh upload authorization: %w", refreshErr))
 		}
+		u.recordUpload("failure", int64(len(img.Bytes)), started)
 		return "", err
 	}
+	u.recordUpload("failure", int64(len(img.Bytes)), started)
 	return "", fmt.Errorf("upload retry exhausted")
 }
 
-func (u *HTTPUploader) uploadOnce(ctx context.Context, img Image, idempotencyKey string) (string, error) {
+func (u *HTTPUploader) currentAuth() Auth {
+	u.authMu.RLock()
+	defer u.authMu.RUnlock()
+	return u.auth
+}
+
+func (u *HTTPUploader) setAuth(auth Auth) {
+	u.authMu.Lock()
+	u.auth = auth
+	u.authMu.Unlock()
+}
+
+func (u *HTTPUploader) now() time.Time {
+	if u.Now != nil {
+		return u.Now()
+	}
+	return time.Now()
+}
+
+func (u *HTTPUploader) recordUpload(outcome string, size int64, started time.Time) {
+	if u.telemetry == nil {
+		return
+	}
+	ended := u.now()
+	e := telemetry.Event{Name: "upload.result", At: ended, ProjectID: u.projectID, EnvironmentID: u.environmentID, Outcome: outcome, SizeBytes: size, LatencyMS: ended.Sub(started).Milliseconds()}
+	if e.Validate() == nil {
+		u.telemetry.Record(e)
+	}
+}
+
+func (u *HTTPUploader) uploadOnce(ctx context.Context, img Image, idempotencyKey string, auth Auth) (string, error) {
 	endpoint, err := uploadURL(u.BaseURL, u.Path)
 	if err != nil {
 		return "", err
 	}
-	if u.Auth.Method != "bearer" || u.Auth.Token == "" {
+	if auth.Method != "bearer" || auth.Token == "" {
 		return "", fmt.Errorf("staged-image upload requires bearer file:stage auth")
 	}
 	pipeReader, pipeWriter := io.Pipe()
@@ -128,7 +187,7 @@ func (u *HTTPUploader) uploadOnce(ctx context.Context, img Image, idempotencyKey
 	}()
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", contentType)
-	req.Header.Set("Authorization", "Bearer "+u.Auth.Token)
+	req.Header.Set("Authorization", "Bearer "+auth.Token)
 	req.Header.Set("Idempotency-Key", idempotencyKey)
 	client := u.HTTPClient
 	if client == nil {
