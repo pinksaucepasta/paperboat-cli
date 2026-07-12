@@ -3,7 +3,9 @@ package upload
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -20,10 +22,11 @@ type Auth struct {
 }
 
 type HTTPUploader struct {
-	BaseURL    string
-	Path       string
-	Auth       Auth
-	HTTPClient *http.Client
+	BaseURL     string
+	Path        string
+	Auth        Auth
+	HTTPClient  *http.Client
+	RefreshAuth func(context.Context) (Auth, error)
 }
 
 // Error is the structured error envelope returned by papercode's staged-image
@@ -56,6 +59,26 @@ func NewHTTPUploader(baseURL, uploadPath string, auth Auth) *HTTPUploader {
 }
 
 func (u *HTTPUploader) Upload(ctx context.Context, img Image) (string, error) {
+	key := fmt.Sprintf("sha256:%x", sha256.Sum256(img.Bytes))
+	for attempt := 0; attempt < 2; attempt++ {
+		path, err := u.uploadOnce(ctx, img, key)
+		if err == nil {
+			return path, nil
+		}
+		var stagedErr *Error
+		if attempt == 0 && u.RefreshAuth != nil && errors.As(err, &stagedErr) && (stagedErr.Code == "unauthenticated" || stagedErr.Code == "insufficient_scope") {
+			auth, refreshErr := u.RefreshAuth(ctx)
+			if refreshErr == nil {
+				u.Auth = auth
+				continue
+			}
+		}
+		return "", err
+	}
+	return "", fmt.Errorf("upload retry exhausted")
+}
+
+func (u *HTTPUploader) uploadOnce(ctx context.Context, img Image, idempotencyKey string) (string, error) {
 	endpoint, err := uploadURL(u.BaseURL, u.Path)
 	if err != nil {
 		return "", err
@@ -106,6 +129,7 @@ func (u *HTTPUploader) Upload(ctx context.Context, img Image) (string, error) {
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("Authorization", "Bearer "+u.Auth.Token)
+	req.Header.Set("Idempotency-Key", idempotencyKey)
 	client := u.HTTPClient
 	if client == nil {
 		client = http.DefaultClient

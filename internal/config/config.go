@@ -22,12 +22,17 @@ type UploadConfig struct {
 	// WatchDirs are directories terminals write temp images into on paste.
 	// Absolute paths, or "~"-prefixed for the home dir.
 	WatchDirs []string `json:"watch_dirs,omitempty"`
+	// TempFilePatterns optionally restrict terminal-created image names. Patterns
+	// use filepath glob syntax and may match a basename or normalized full path.
+	TempFilePatterns []string `json:"temp_file_patterns,omitempty"`
 	// MaxImageBytes caps a single image. Defaults to 10 MiB (papercode limit).
 	MaxImageBytes int64 `json:"max_image_bytes,omitempty"`
 	// MaxDataURLChars caps the encoded data URL length (papercode limit).
 	MaxDataURLChars int `json:"max_data_url_chars,omitempty"`
 	// MaxAttachments caps images per paste (papercode limit).
 	MaxAttachments int `json:"max_attachments,omitempty"`
+	// MaxQueuedInputBytes bounds local input held behind an image upload.
+	MaxQueuedInputBytes int `json:"max_queued_input_bytes,omitempty"`
 	// AllowedMimePrefixes gates which files are treated as images.
 	AllowedMimePrefixes []string `json:"allowed_mime_prefixes,omitempty"`
 }
@@ -36,9 +41,10 @@ type UploadConfig struct {
 // packages/contracts/src/orchestration.ts. They are applied only when a field
 // is left unset, so a config file can always override them.
 const (
-	DefaultMaxImageBytes   = 10 * 1024 * 1024
-	DefaultMaxDataURLChars = 14_000_000
-	DefaultMaxAttachments  = 8
+	DefaultMaxImageBytes       = 10 * 1024 * 1024
+	DefaultMaxDataURLChars     = 14_000_000
+	DefaultMaxAttachments      = 8
+	DefaultMaxQueuedInputBytes = 1024 * 1024
 )
 
 // Config is the on-disk CLI configuration.
@@ -168,6 +174,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Upload.MaxAttachments == 0 {
 		c.Upload.MaxAttachments = DefaultMaxAttachments
+	}
+	if c.Upload.MaxQueuedInputBytes == 0 {
+		c.Upload.MaxQueuedInputBytes = DefaultMaxQueuedInputBytes
 	}
 	if len(c.Upload.AllowedMimePrefixes) == 0 {
 		c.Upload.AllowedMimePrefixes = []string{"image/"}

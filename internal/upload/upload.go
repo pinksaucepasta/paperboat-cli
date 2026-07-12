@@ -10,6 +10,7 @@ package upload
 import (
 	"context"
 	"fmt"
+	"io"
 	"mime"
 	"os"
 	"path/filepath"
@@ -48,32 +49,54 @@ type Uploader interface {
 // if the file is not an allowed image or exceeds a limit — callers fail open
 // (keep the original paste text).
 func PrepareImage(path string, limits Limits) (Image, error) {
-	info, err := os.Stat(path)
+	f, err := os.Open(path)
+	if err != nil {
+		return Image{}, fmt.Errorf("open image: %w", err)
+	}
+	defer f.Close()
+	return PrepareImageFile(f, path, limits)
+}
+
+// PrepareImageFile validates and reads an already-open image descriptor. The
+// caller retains ownership of f. This binds path authorization and uploaded
+// bytes to the same file even if the pathname changes concurrently.
+func PrepareImageFile(f *os.File, displayPath string, limits Limits) (Image, error) {
+	info, err := f.Stat()
 	if err != nil {
 		return Image{}, fmt.Errorf("stat image: %w", err)
 	}
-	if info.IsDir() {
-		return Image{}, fmt.Errorf("%s is a directory, not an image", path)
+	if !info.Mode().IsRegular() {
+		return Image{}, fmt.Errorf("%s is not a regular image file", displayPath)
 	}
 	if limits.MaxImageBytes > 0 && info.Size() > limits.MaxImageBytes {
-		return Image{}, fmt.Errorf("image %s is %d bytes, over limit %d", path, info.Size(), limits.MaxImageBytes)
+		return Image{}, fmt.Errorf("image %s is %d bytes, over limit %d", displayPath, info.Size(), limits.MaxImageBytes)
 	}
 
-	mimeType := MimeTypeFor(path)
+	mimeType := MimeTypeFor(displayPath)
 	if !mimeAllowedByPolicy(mimeType, limits.AllowedMimePrefixes, limits.AllowedMIMETypes) {
-		return Image{}, fmt.Errorf("%s has type %q which is not an allowed image", path, mimeType)
+		return Image{}, fmt.Errorf("%s has type %q which is not an allowed image", displayPath, mimeType)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return Image{}, fmt.Errorf("seek image: %w", err)
 	}
 
-	data, err := os.ReadFile(path)
+	// Read through the already-open descriptor so a path replacement after the
+	// validation above cannot cause us to upload a different file. The extra
+	// byte makes the post-read limit check allocation-bounded.
+	var reader io.Reader = f
+	if limits.MaxImageBytes > 0 {
+		reader = io.LimitReader(f, limits.MaxImageBytes+1)
+	}
+	data, err := io.ReadAll(reader)
 	if err != nil {
 		return Image{}, fmt.Errorf("read image: %w", err)
 	}
 	if limits.MaxImageBytes > 0 && int64(len(data)) > limits.MaxImageBytes {
-		return Image{}, fmt.Errorf("image %s is %d bytes, over limit %d", path, len(data), limits.MaxImageBytes)
+		return Image{}, fmt.Errorf("image %s is %d bytes, over limit %d", displayPath, len(data), limits.MaxImageBytes)
 	}
 
 	return Image{
-		Name:     filepath.Base(path),
+		Name:     filepath.Base(displayPath),
 		MimeType: mimeType,
 		Bytes:    data,
 	}, nil

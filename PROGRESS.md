@@ -93,7 +93,16 @@ replayed, so reconnect cannot duplicate terminal input.
 ### Image-paste bridge (`internal/paste` + `internal/upload`) — the risk center
 - Streaming bracketed-paste state machine (`ESC[200~ … ESC[201~`) that survives split reads,
   partial markers, and adjacent/multiple pastes.
-- Detects local image paths (strips quotes/`file://`, honors config watch-dirs), uploads via
+- Asynchronous input recovery handles `ErrWriteUncertain` internally: it discards only the
+  affected buffered paste, invokes the reconnecting destination's discard hook, and keeps
+  subsequent queued input available after transport recovery.
+- Fatal asynchronous destination errors are delivered directly to the session supervisor,
+  which tears down the connection instead of leaving terminal input silently disabled.
+- Watch-directory authorization and image preparation share one open descriptor; canonical
+  containment is verified with `os.SameFile`, and growth is read through the configured
+  byte limit rather than truncated to a stale stat size.
+- Detects local image paths (strict quotes/`file://`, canonical symlink-resolved watch-dir
+  containment), uploads via
   the `Uploader` interface, and rewrites the paste to the returned VM path. Non-image pastes
   pass through byte-for-byte. **Fail open, visibly**: on any failure the original paste is
   emitted and a notice is written to the local terminal.
@@ -119,7 +128,7 @@ interfaces for deterministic unit and protocol tests.
 
 - Paperboat client authentication uses device authorization and scoped bearer sessions.
 - Image staging uses multipart `POST /api/files/staged-images`, requires `file:stage`, and
-  returns a VM-absolute `path`; the current base64 uploader is transitional.
+  returns a VM-absolute `path`; the CLI uses this transport in production.
 - Terminal compatibility is owned by papercode's versioned protocol fixture. Hand-written
   CLI wire types must be checked against that fixture and the real server.
 - Project presets and machine shape are project configuration applied on restart. There
@@ -127,8 +136,8 @@ interfaces for deterministic unit and protocol tests.
 
 ## Not yet done (deferred by design)
 
-- Real papercode image-upload transport (pending the contract below); the `upload`
-  hint is already plumbed through to the paste bridge's boundary.
+- Auth-expiry upload rebrokering retries once with a content-derived idempotency key;
+  papercode namespaces replay state by staging root and rejects key/digest conflicts.
 - A paperboat-server catalog read endpoint for server-backed agent/preset listing.
 
 ## Verification (done)
@@ -138,6 +147,8 @@ interfaces for deterministic unit and protocol tests.
   non-image pass-through, upload-failure fail-open, dataURL limits).
 - Real binary: exit-code passthrough (`exit 7`→7, `exit 0`→0), stream I/O, bracketed-paste
   image path rewritten to a VM path, plain-text paste untouched, unsupported session
+- Cross-build verification: paste tests and the CLI compile for Windows/amd64 and
+  Linux/amd64; interactive terminal evidence on each supported OS remains release work.
   overrides rejected, flags after project name, and the `paperboat` alias symlink.
 - **Control-plane end-to-end** against a mock paperboat-server (session-cookie auth + the
   real connect flow), with the actual `bin/pb`:

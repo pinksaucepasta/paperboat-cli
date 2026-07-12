@@ -131,6 +131,10 @@ func RunWithActivity(ctx context.Context, conn tunnel.Conn, stdinSink io.WriteCl
 		code, err := conn.Wait()
 		done <- result{code, err}
 	}()
+	var sinkErrors <-chan error
+	if source, ok := stdinSink.(interface{ Errors() <-chan error }); ok {
+		sinkErrors = source.Errors()
+	}
 
 	select {
 	case <-ctx.Done():
@@ -154,6 +158,13 @@ func RunWithActivity(ctx context.Context, conn tunnel.Conn, stdinSink io.WriteCl
 		<-inputDone
 		<-done
 		return 1, streamError
+	case sinkError := <-sinkErrors:
+		stopInput()
+		_ = conn.Close()
+		<-outputDone
+		<-inputDone
+		<-done
+		return 1, fmt.Errorf("send terminal input: %w", sinkError)
 	}
 }
 

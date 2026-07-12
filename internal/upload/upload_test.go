@@ -53,6 +53,16 @@ func TestPrepareImageRejectsOversize(t *testing.T) {
 	}
 }
 
+func TestPrepareImageRejectsNonRegularFile(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := PrepareImage(filepath.Join(dir, "fake.png"), baseLimits()); err == nil {
+		t.Fatal("expected missing-file error")
+	}
+	if _, err := PrepareImage(dir, baseLimits()); err == nil || !strings.Contains(err.Error(), "not a regular image file") {
+		t.Fatalf("expected non-regular-file error, got %v", err)
+	}
+}
+
 func TestPrepareImageHonorsExactAllowedMIMETypes(t *testing.T) {
 	dir := t.TempDir()
 	png := write(t, dir, "image.png", 3)

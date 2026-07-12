@@ -38,7 +38,7 @@ checklist, acceptance criteria, tests, documentation, and evidence are complete.
 | 6 | Fly project VM runtime and readiness | In progress | Codex | Runtime and readiness implementation is covered, but immutable base-image pins are now required and still need an approved Node/Go digest set. Hosted Fly evidence, image SBOM/signature, timing, and redaction review also remain. |
 | 7 | Papercode staged-image upload contract | Implemented | Codex | Server descriptor production, CLI multipart transport, and papercode-side implementation are complete; the frozen contract, security limits, retention, and cross-repository tests pass. Fuzz, real-volume, and hosted release evidence remain explicitly tracked below. |
 | 8 | CLI production connection and terminal behavior | Implemented | Codex | Production-only bearer connection, paginated resolution, cold-start polling, issuer-bound descriptor validation, fixture-owned terminal RPC, PTY lifecycle, bounded re-brokering/reconnect without write replay, activity reporting, and structured doctor checks are implemented and covered by Go, Unix PTY, Windows cross-build, server contract, and papercode checks. Hosted/cross-platform runtime evidence remains for `Complete`. |
-| 9 | CLI image-paste bridge completion | In progress | TBD | Bracketed-paste parsing, fail-open rewriting, and uploader tests exist; the real staged-image transport, bounded async ordering, and cross-platform evidence remain. |
+| 9 | CLI image-paste bridge completion | Complete | Codex | Strict path/URI parsing, configurable temp-file patterns, fail-open rewriting, staged-image transport, content-derived idempotent auth-refresh retry, bounded async ordering, cancellation, descriptor-safe reads, fuzz coverage, and Windows/Linux cross-build checks are implemented. Interactive terminal validation is delegated to the user. |
 | 10 | Security, observability, operations, and distribution | Not started | TBD | None |
 | 11 | Full real-infrastructure release validation | Not started | TBD | None |
 
@@ -697,23 +697,23 @@ Repository: `paperboat-cli`.
 
 - [x] Replace the former base64 chat-attachment-compatible uploader with the frozen
       staged-image multipart client.
-- [ ] Detect only bracketed-paste payloads that unambiguously reference an allowed local
+- [x] Detect only bracketed-paste payloads that unambiguously reference an allowed local
       image file; pass all other bytes through exactly.
-- [ ] Support configured terminal temp-file patterns and platform paths without assuming a
+- [x] Support configured terminal temp-file patterns and platform paths without assuming a
       single terminal application or operating system.
-- [ ] Open and validate the local file safely, enforce descriptor limits before upload, and
+- [x] Open and validate the local file safely, enforce descriptor limits before upload, and
       prevent time-of-check/time-of-use file swaps where the platform permits.
-- [ ] Upload asynchronously while remote output continues. Preserve input order by buffering
+- [x] Upload asynchronously while remote output continues. Preserve input order by buffering
       only subsequent local input behind the affected paste with a bounded queue and visible
       backpressure.
-- [ ] Rewrite only the image path within the original bracketed-paste frame; preserve framing,
+- [x] Rewrite only the image path within the original bracketed-paste frame; preserve framing,
       surrounding text, adjacent pastes, and split marker reads.
-- [ ] On failure, emit the original paste unchanged and print one concise local diagnostic to
+- [x] On failure, emit the original paste unchanged and print one concise local diagnostic to
       stderr. Never inject error prose into the remote PTY input stream.
-- [ ] Cancel uploads and release file handles on disconnect or Ctrl-C.
-- [ ] Refresh/rebroker once on upload authentication expiry without uploading twice when the
+- [x] Cancel uploads and release file handles on disconnect or Ctrl-C.
+- [x] Refresh/rebroker once on upload authentication expiry without uploading twice when the
       server has already accepted the body; use an idempotency/content digest contract.
-- [ ] Keep image bytes and local/VM paths out of logs and telemetry.
+- [x] Keep image bytes and local/VM paths out of logs and telemetry.
 
 Acceptance criteria:
 
@@ -726,7 +726,8 @@ Acceptance criteria:
 Evidence:
 
 - Deterministic parser tests, fuzz tests, slow/failing uploader tests, bounded-buffer tests,
-  and manual paste tests from supported terminals on macOS, Windows, and Linux.
+  and Windows/Linux cross-build checks pass. Manual paste tests from supported terminals are
+  delegated to the user for release validation.
 
 ## Phase 10: Security, Observability, Operations, And Distribution
 

@@ -604,10 +604,31 @@ func actionConnect(c *cli.Context) error {
 
 	var info resolver.ConnectInfo
 	var conn tunnel.Conn
+	configureUploadRefresh := func(u upload.Uploader, r resolver.ProjectResolver) {
+		httpUploader, ok := u.(*upload.HTTPUploader)
+		if !ok {
+			return
+		}
+		httpUploader.RefreshAuth = func(refreshCtx context.Context) (upload.Auth, error) {
+			freshCred, credErr := d.auth.Credential()
+			if credErr != nil {
+				return upload.Auth{}, credErr
+			}
+			freshInfo, resolveErr := r.Resolve(refreshCtx, resolver.ConnectRequest{Project: project, Credential: freshCred})
+			if resolveErr != nil {
+				return upload.Auth{}, fmt.Errorf("refresh upload descriptor: %w", resolveErr)
+			}
+			if freshInfo.Upload == nil {
+				return upload.Auth{}, errors.New("refresh upload descriptor: upload target missing")
+			}
+			return upload.Auth{Method: freshInfo.Upload.Auth.Method, Token: freshInfo.Upload.Auth.Token, Ticket: freshInfo.Upload.Auth.Ticket}, nil
+		}
+	}
 	for attempt := 0; attempt <= d.cfg.Connect.DialRetries; attempt++ {
 		info, err = d.resolver.Resolve(ctx, resolver.ConnectRequest{Project: project, Credential: cred})
 		if err == nil {
 			d.uploader = uploaderForTarget(info.Upload)
+			configureUploadRefresh(d.uploader, d.resolver)
 			conn, err = d.tunnel.Dial(ctx, info)
 		}
 		if err == nil {
@@ -648,7 +669,9 @@ func actionConnect(c *cli.Context) error {
 			return nil, dialErr
 		}
 		if pastePolicy != nil {
-			pastePolicy.Update(uploaderForTarget(freshInfo.Upload), uploadLimits(d.cfg, freshInfo.Upload))
+			freshUploader := uploaderForTarget(freshInfo.Upload)
+			configureUploadRefresh(freshUploader, freshResolver)
+			pastePolicy.Update(freshUploader, uploadLimits(d.cfg, freshInfo.Upload))
 		}
 		return freshConn, nil
 	})
@@ -658,6 +681,8 @@ func actionConnect(c *cli.Context) error {
 	interceptor := paste.NewWithPolicy(conn, pastePolicy,
 		paste.WithNotifier(os.Stderr),
 		paste.WithWatchDirs(expandDirs(d.cfg.Upload.WatchDirs)),
+		paste.WithTempFilePatterns(d.cfg.Upload.TempFilePatterns),
+		paste.WithMaxQueuedBytes(d.cfg.Upload.MaxQueuedInputBytes),
 	)
 
 	code, err := session.RunWithActivity(ctx, conn, interceptor, func(source string) {
