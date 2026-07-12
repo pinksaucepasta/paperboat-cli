@@ -2,15 +2,13 @@
 // reads the local file, hands it to an Uploader, and rewrites the paste to the
 // returned VM path so the remote agent receives something it can open.
 //
-// The encoding mirrors papercode's UploadChatImageAttachment
-// (packages/contracts/src/orchestration.ts): a base64 data URL plus size/count
-// limits. The real Uploader targets the same T3 WebSocket server; the interface
-// keeps that transport swappable and paperboat-cli out of papercode's code.
+// Images are staged through papercode's authenticated multipart HTTP contract.
+// The interface keeps transport details swappable and paperboat-cli out of
+// papercode's implementation.
 package upload
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
 	"mime"
 	"os"
@@ -23,7 +21,9 @@ type Image struct {
 	Name     string
 	MimeType string
 	Bytes    []byte
-	DataURL  string
+	// DataURL is retained for callers that prepare images for older integrations;
+	// staged-image HTTP uploads send Bytes as a multipart stream.
+	DataURL string
 }
 
 // Limits captures the papercode-compatible upload constraints. They come from
@@ -44,8 +44,9 @@ type Uploader interface {
 }
 
 // PrepareImage reads a local file, infers its MIME type, enforces limits, and
-// builds the base64 data URL. It returns an error if the file is not an allowed
-// image or exceeds a limit — callers fail open (keep the original paste text).
+// prepares raw bytes for the streaming multipart uploader. It returns an error
+// if the file is not an allowed image or exceeds a limit — callers fail open
+// (keep the original paste text).
 func PrepareImage(path string, limits Limits) (Image, error) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -71,16 +72,10 @@ func PrepareImage(path string, limits Limits) (Image, error) {
 		return Image{}, fmt.Errorf("image %s is %d bytes, over limit %d", path, len(data), limits.MaxImageBytes)
 	}
 
-	dataURL := "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(data)
-	if limits.MaxDataURLChars > 0 && len(dataURL) > limits.MaxDataURLChars {
-		return Image{}, fmt.Errorf("encoded image %s is %d chars, over limit %d", path, len(dataURL), limits.MaxDataURLChars)
-	}
-
 	return Image{
 		Name:     filepath.Base(path),
 		MimeType: mimeType,
 		Bytes:    data,
-		DataURL:  dataURL,
 	}, nil
 }
 

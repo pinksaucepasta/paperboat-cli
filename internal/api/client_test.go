@@ -114,7 +114,7 @@ func TestCLIConnectDecodesPapercodeWebSocketTerminal(t *testing.T) {
 				TerminalID:       "term-1",
 				CWD:              "/workspace",
 			},
-			Upload: &Upload{Kind: "papercode_file_upload", HTTPBaseURL: "https://agentunnel.dev/projects/prj_1", MaxBytes: 10485760},
+			Upload: &Upload{Kind: "papercode_staged_image", HTTPBaseURL: "https://agentunnel.dev/projects/prj_1", Path: "/projects/prj_1/api/files/staged-images", MaxBytes: 10485760, RetentionSeconds: 604800},
 		})
 	}))
 	defer srv.Close()
@@ -130,7 +130,7 @@ func TestCLIConnectDecodesPapercodeWebSocketTerminal(t *testing.T) {
 	if resp.Terminal.Auth.Method != "websocket_ticket" || resp.Terminal.Auth.Ticket != "pct_1" {
 		t.Fatalf("terminal auth = %+v", resp.Terminal.Auth)
 	}
-	if resp.Upload == nil || resp.Upload.Kind != "papercode_file_upload" || resp.Upload.HTTPBaseURL != "https://agentunnel.dev/projects/prj_1" {
+	if resp.Upload == nil || resp.Upload.Kind != "papercode_staged_image" || resp.Upload.HTTPBaseURL != "https://agentunnel.dev/projects/prj_1" || resp.Upload.Path != "/projects/prj_1/api/files/staged-images" || resp.Upload.RetentionSeconds != 604800 {
 		t.Fatalf("upload = %+v", resp.Upload)
 	}
 	if len(body) != 0 {

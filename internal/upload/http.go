@@ -5,9 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
-	"path"
 	"strings"
 	"time"
 )
@@ -20,13 +21,33 @@ type Auth struct {
 
 type HTTPUploader struct {
 	BaseURL    string
+	Path       string
 	Auth       Auth
 	HTTPClient *http.Client
 }
 
-func NewHTTPUploader(baseURL string, auth Auth) *HTTPUploader {
+// Error is the structured error envelope returned by papercode's staged-image
+// endpoint. Code lets callers distinguish retryable workspace/storage failures
+// from user input and authorization failures without parsing text.
+type Error struct {
+	Code    string
+	Message string
+}
+
+func (e *Error) Error() string {
+	if e.Message == "" {
+		return "upload failed: " + e.Code
+	}
+	if e.Code == "" {
+		return "upload failed: " + e.Message
+	}
+	return "upload failed (" + e.Code + "): " + e.Message
+}
+
+func NewHTTPUploader(baseURL, uploadPath string, auth Auth) *HTTPUploader {
 	return &HTTPUploader{
 		BaseURL: strings.TrimRight(baseURL, "/"),
+		Path:    uploadPath,
 		Auth:    auth,
 		HTTPClient: &http.Client{
 			Timeout: 30 * time.Second,
@@ -35,34 +56,56 @@ func NewHTTPUploader(baseURL string, auth Auth) *HTTPUploader {
 }
 
 func (u *HTTPUploader) Upload(ctx context.Context, img Image) (string, error) {
-	endpoint, err := uploadURL(u.BaseURL)
+	endpoint, err := uploadURL(u.BaseURL, u.Path)
 	if err != nil {
 		return "", err
 	}
-	body, err := json.Marshal(map[string]any{
-		"name":      img.Name,
-		"mime_type": img.MimeType,
-		"data_url":  img.DataURL,
-	})
+	if u.Auth.Method != "bearer" || u.Auth.Token == "" {
+		return "", fmt.Errorf("staged-image upload requires bearer file:stage auth")
+	}
+	pipeReader, pipeWriter := io.Pipe()
+	mw := multipart.NewWriter(pipeWriter)
+	contentType := mw.FormDataContentType()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		part, err := mw.CreateFormFile("image", img.Name)
+		if err == nil {
+			_, err = io.Copy(part, bytes.NewReader(img.Bytes))
+		}
+		if err == nil && img.Name != "" {
+			err = mw.WriteField("display_filename", img.Name)
+		}
+		if err == nil {
+			err = mw.Close()
+		}
+		if err != nil {
+			_ = pipeWriter.CloseWithError(err)
+			return
+		}
+		_ = pipeWriter.Close()
+	}()
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = pipeWriter.CloseWithError(ctx.Err())
+		case <-done:
+		}
+	}()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, pipeReader)
 	if err != nil {
+		_ = pipeWriter.CloseWithError(err)
+		_ = pipeReader.Close()
+		<-done
 		return "", err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
-	if err != nil {
-		return "", err
-	}
+	defer func() {
+		_ = pipeReader.Close()
+		<-done
+	}()
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/json")
-	switch u.Auth.Method {
-	case "bearer":
-		if u.Auth.Token != "" {
-			req.Header.Set("Authorization", "Bearer "+u.Auth.Token)
-		}
-	case "websocket_ticket":
-		if u.Auth.Ticket != "" {
-			req.Header.Set("Authorization", "Bearer "+u.Auth.Ticket)
-		}
-	}
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Authorization", "Bearer "+u.Auth.Token)
 	client := u.HTTPClient
 	if client == nil {
 		client = http.DefaultClient
@@ -73,34 +116,28 @@ func (u *HTTPUploader) Upload(ctx context.Context, img Image) (string, error) {
 	}
 	defer resp.Body.Close()
 	var out struct {
-		VMPath string `json:"vm_path"`
-		Path   string `json:"path"`
-		Data   struct {
-			VMPath string `json:"vm_path"`
-			Path   string `json:"path"`
-		} `json:"data"`
+		Path  string `json:"path"`
 		Error struct {
+			Code    string `json:"code"`
 			Message string `json:"message"`
 		} `json:"error"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out); err != nil {
 		return "", fmt.Errorf("decode upload response: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		if out.Error.Message != "" {
-			return "", fmt.Errorf("upload failed: %s", out.Error.Message)
+		if out.Error.Code != "" || out.Error.Message != "" {
+			return "", &Error{Code: out.Error.Code, Message: out.Error.Message}
 		}
 		return "", fmt.Errorf("upload failed with status %d", resp.StatusCode)
 	}
-	for _, candidate := range []string{out.VMPath, out.Path, out.Data.VMPath, out.Data.Path} {
-		if strings.HasPrefix(candidate, "/") {
-			return candidate, nil
-		}
+	if strings.HasPrefix(out.Path, "/") {
+		return out.Path, nil
 	}
 	return "", fmt.Errorf("upload response did not include an absolute VM path")
 }
 
-func uploadURL(base string) (string, error) {
+func uploadURL(base, uploadPath string) (string, error) {
 	if strings.TrimSpace(base) == "" {
 		return "", ErrUnavailable
 	}
@@ -111,11 +148,17 @@ func uploadURL(base string) (string, error) {
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return "", fmt.Errorf("upload URL must use http or https, got %q", u.Scheme)
 	}
-	if strings.HasSuffix(u.Path, "/api/paperboat/terminal-upload") {
-		return u.String(), nil
+	if strings.TrimSpace(uploadPath) == "" {
+		return "", fmt.Errorf("upload descriptor did not include a path")
 	}
-	u.Path = path.Join(u.Path, "/api/paperboat/terminal-upload")
-	return u.String(), nil
+	reference, err := url.Parse(uploadPath)
+	if err != nil {
+		return "", fmt.Errorf("parse upload path: %w", err)
+	}
+	if reference.IsAbs() || reference.Host != "" || reference.RawQuery != "" || reference.Fragment != "" || !strings.HasPrefix(reference.Path, "/") {
+		return "", fmt.Errorf("upload path must be an absolute URL path, got %q", uploadPath)
+	}
+	return u.ResolveReference(reference).String(), nil
 }
 
 var _ Uploader = (*HTTPUploader)(nil)

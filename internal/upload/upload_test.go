@@ -25,7 +25,7 @@ func baseLimits() Limits {
 	}
 }
 
-func TestPrepareImageDataURL(t *testing.T) {
+func TestPrepareImageReturnsRawBytes(t *testing.T) {
 	dir := t.TempDir()
 	p := write(t, dir, "x.png", 4)
 	img, err := PrepareImage(p, baseLimits())
@@ -35,8 +35,8 @@ func TestPrepareImageDataURL(t *testing.T) {
 	if img.MimeType != "image/png" {
 		t.Fatalf("mime=%q", img.MimeType)
 	}
-	if !strings.HasPrefix(img.DataURL, "data:image/png;base64,") {
-		t.Fatalf("dataurl=%q", img.DataURL)
+	if len(img.Bytes) != 4 || img.DataURL != "" {
+		t.Fatalf("payload bytes=%d dataurl=%q", len(img.Bytes), img.DataURL)
 	}
 	if img.Name != "x.png" {
 		t.Fatalf("name=%q", img.Name)
@@ -66,13 +66,13 @@ func TestPrepareImageHonorsExactAllowedMIMETypes(t *testing.T) {
 	}
 }
 
-func TestPrepareImageRejectsDataURLLimit(t *testing.T) {
+func TestPrepareImageIgnoresLegacyDataURLLimit(t *testing.T) {
 	dir := t.TempDir()
 	p := write(t, dir, "m.png", 1000)
 	lim := baseLimits()
 	lim.MaxDataURLChars = 100
-	if _, err := PrepareImage(p, lim); err == nil {
-		t.Fatal("expected data url length error")
+	if _, err := PrepareImage(p, lim); err != nil {
+		t.Fatalf("raw multipart upload should ignore legacy data URL limit: %v", err)
 	}
 }
 

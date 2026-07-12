@@ -60,9 +60,11 @@ type TerminalTarget struct {
 // agentunnel, with the server-authoritative size/MIME policy.
 type UploadTarget struct {
 	HTTPBaseURL      string
+	Path             string
 	Auth             AuthTarget
 	MaxBytes         int64
 	AllowedMIMETypes []string
+	RetentionSeconds int64
 }
 
 // ProjectResolver resolves a project name to connect info.

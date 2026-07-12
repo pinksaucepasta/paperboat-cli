@@ -85,9 +85,11 @@ func (r *APIResolver) Resolve(ctx context.Context, req ConnectRequest) (ConnectI
 	if resp.Upload != nil && strings.TrimSpace(resp.Upload.HTTPBaseURL) != "" {
 		info.Upload = &UploadTarget{
 			HTTPBaseURL:      resp.Upload.HTTPBaseURL,
+			Path:             resp.Upload.Path,
 			Auth:             mapAuth(resp.Upload.Auth),
 			MaxBytes:         resp.Upload.MaxBytes,
 			AllowedMIMETypes: resp.Upload.AllowedMIMETypes,
+			RetentionSeconds: resp.Upload.RetentionSeconds,
 		}
 	}
 	return info, nil

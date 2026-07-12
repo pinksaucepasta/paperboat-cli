@@ -630,7 +630,7 @@ func uploaderForTarget(target *resolver.UploadTarget) upload.Uploader {
 	if target == nil || target.HTTPBaseURL == "" {
 		return upload.NewDisabledUploader()
 	}
-	return upload.NewHTTPUploader(target.HTTPBaseURL, upload.Auth{
+	return upload.NewHTTPUploader(target.HTTPBaseURL, target.Path, upload.Auth{
 		Method: target.Auth.Method,
 		Token:  target.Auth.Token,
 		Ticket: target.Auth.Ticket,

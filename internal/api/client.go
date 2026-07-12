@@ -118,9 +118,11 @@ type Terminal struct {
 type Upload struct {
 	Kind             string       `json:"kind"`
 	HTTPBaseURL      string       `json:"http_base_url"`
+	Path             string       `json:"path"`
 	Auth             AuthMaterial `json:"auth"`
 	MaxBytes         int64        `json:"max_bytes"`
 	AllowedMIMETypes []string     `json:"allowed_mime_types"`
+	RetentionSeconds int64        `json:"retention_seconds"`
 }
 
 // ConnectResponse is the cli-connect / connection-status descriptor. When

@@ -36,7 +36,7 @@ checklist, acceptance criteria, tests, documentation, and evidence are complete.
 | 4 | Papercode control-plane credential minting | Implemented | Codex | Minting/exchange, protected stable VM identity provisioning, signed client/user/project/enforcement revocation with durable retry, and signing-key overlap/rollback behavior are implemented and covered by automated tests. Real-infrastructure evidence is intentionally deferred to Phase 11. |
 | 5 | Agentunnel HTTP/WebSocket data path and revocation | Implemented | Codex | Agentunnel reports live route/body-limit state, supports stable reassignment, preserves routes on suspension, and closes them on deletion. Server readiness rotates credentials before Fly start, probes papercode with a signed one-time environment health proof, emits distinct machine-starting, machine-failed, tunnel-offline, papercode-unhealthy, entitlement, and credit results, and rejects undersized proxy limits using configured upload policy. Correlation events contain stable IDs without errors, URLs, payloads, or credentials. Production-path tests prove one durable route carries streamed uploads and bidirectional WebSocket bytes, survives reconnect, and stops after revocation; Fly configs expose no public services. Agentunnel and server Go test/vet suites, papercode contract/server tests, `vp check`, and typecheck pass. Real hosted deployment evidence remains before `Complete`. |
 | 6 | Fly project VM runtime and readiness | In progress | Codex | Runtime and readiness implementation is covered, but immutable base-image pins are now required and still need an approved Node/Go digest set. Hosted Fly evidence, image SBOM/signature, timing, and redaction review also remain. |
-| 7 | Papercode staged-image upload contract | In progress | TBD | Schema-owned path/response/errors and `file:stage` are frozen; the existing base64 terminal-upload route remains transitional and must be replaced. |
+| 7 | Papercode staged-image upload contract | Implemented | Codex | Server descriptor production, CLI multipart transport, and papercode-side implementation are complete; the frozen contract, security limits, retention, and cross-repository tests pass. Fuzz, real-volume, and hosted release evidence remain explicitly tracked below. |
 | 8 | CLI production connection and terminal behavior | In progress | TBD | API resolver, readiness polling, papercode WebSocket terminal RPC, raw terminal handling, resize, and exit propagation exist; auth and real-server compatibility remain. |
 | 9 | CLI image-paste bridge completion | In progress | TBD | Bracketed-paste parsing, fail-open rewriting, and uploader tests exist; the real staged-image transport, bounded async ordering, and cross-platform evidence remain. |
 | 10 | Security, observability, operations, and distribution | Not started | TBD | None |
@@ -624,20 +624,20 @@ Evidence:
 
 Repository: `papercode`.
 
-- [ ] Add `file:stage` to schema-owned auth scopes and method authorization.
-- [ ] Implement streaming multipart upload with hard request and decoded-image limits.
-- [ ] Detect type from bytes, decode to validate, reject unsupported/unsafe formats, and
+- [x] Add `file:stage` to schema-owned auth scopes and method authorization.
+- [x] Implement streaming multipart upload with hard request and decoded-image limits.
+- [x] Detect type from bytes, decode to validate, reject unsupported/unsafe formats, and
       normalize the extension independently of the supplied filename.
-- [ ] Resolve the configured project workspace server-side and create only below the
+- [x] Resolve the configured project workspace server-side and create only below the
       configured staging directory using symlink-safe, atomic file operations.
-- [ ] Generate unguessable filenames, set restrictive permissions, and return an absolute
+- [x] Generate unguessable filenames, set restrictive permissions, and return an absolute
       VM path plus metadata.
-- [ ] Implement configurable retention and a restart-safe garbage collector that cannot
+- [x] Implement configurable retention and a restart-safe garbage collector that cannot
       traverse outside the staging root or delete a file still being written.
-- [ ] Account for workspace/volume availability and free space; return structured failures.
-- [ ] Record metadata-only audit/telemetry without image bytes, paths containing secrets, or
+- [x] Account for workspace/volume availability and free space; return structured failures.
+- [x] Record metadata-only audit/telemetry without image bytes, paths containing secrets, or
       bearer tokens.
-- [ ] Export the endpoint and errors from `packages/contracts` and document the contract.
+- [x] Export the endpoint and errors from `packages/contracts` and document the contract.
 
 Acceptance criteria:
 
@@ -693,7 +693,7 @@ Evidence:
 
 Repository: `paperboat-cli`.
 
-- [ ] Replace the current base64 chat-attachment-compatible uploader with the frozen
+- [x] Replace the former base64 chat-attachment-compatible uploader with the frozen
       staged-image multipart client.
 - [ ] Detect only bracketed-paste payloads that unambiguously reference an allowed local
       image file; pass all other bytes through exactly.
