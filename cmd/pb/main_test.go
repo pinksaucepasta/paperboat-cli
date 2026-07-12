@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,10 +14,64 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pujan-modha/paperboat-cli/internal/api"
 	"github.com/pujan-modha/paperboat-cli/internal/config"
 	"github.com/pujan-modha/paperboat-cli/internal/resolver"
-	"github.com/urfave/cli/v2"
 )
+
+func TestRetryableInitialConnectError(t *testing.T) {
+	if retryableInitialConnectError(fmt.Errorf("connect to project: %w", resolver.ErrProjectNotFound)) {
+		t.Fatal("project lookup failure must not retry")
+	}
+	if !retryableInitialConnectError(&api.APIError{Code: "machine_not_ready"}) {
+		t.Fatal("machine_not_ready should retry")
+	}
+}
+
+type refreshTestAuth struct {
+	current   config.Credential
+	refreshed config.Credential
+	refreshes int
+}
+
+func (a *refreshTestAuth) Credential() (config.Credential, error) { return a.current, nil }
+func (a *refreshTestAuth) Refresh() (config.Credential, error) {
+	a.refreshes++
+	return a.refreshed, nil
+}
+
+func TestReportActivityRefreshesAndRetriesUnauthorized(t *testing.T) {
+	var authHeaders []string
+	var bodies []map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authHeaders = append(authHeaders, r.Header.Get("Authorization"))
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		bodies = append(bodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		if len(authHeaders) == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":{"code":"unauthenticated","message":"expired"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"data":{"accepted":true}}`))
+	}))
+	defer srv.Close()
+	auth := &refreshTestAuth{current: config.Credential{AccessToken: "old"}, refreshed: config.Credential{AccessToken: "new"}}
+	if err := reportActivity(context.Background(), srv.URL, auth, "prj_1", "human_input"); err != nil {
+		t.Fatal(err)
+	}
+	if auth.refreshes != 1 || strings.Join(authHeaders, ",") != "Bearer old,Bearer new" {
+		t.Fatalf("refreshes=%d headers=%v", auth.refreshes, authHeaders)
+	}
+	if bodies[1]["source"] != "cli_activity" {
+		t.Fatalf("body=%#v", bodies[1])
+	}
+	metadata, _ := bodies[1]["metadata"].(map[string]any)
+	if metadata["event"] != "human_input" {
+		t.Fatalf("metadata=%#v", metadata)
+	}
+}
 
 func TestConnectWithServerURLUsesBackendResolver(t *testing.T) {
 	dir := t.TempDir()
@@ -26,7 +81,7 @@ func TestConnectWithServerURLUsesBackendResolver(t *testing.T) {
 		if r.URL.Path == "/api/projects" {
 			sawProjects = true
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"data":[]}`))
+			_, _ = w.Write([]byte(`{"data":{"items":[],"pagination":{"limit":200,"offset":0,"total":0,"next_offset":null}}}`))
 			return
 		}
 		http.NotFound(w, r)
@@ -64,7 +119,7 @@ func TestKeepAliveCommandCallsBackend(t *testing.T) {
 				w.Header().Set("Content-Type", "application/json")
 				switch r.URL.Path {
 				case "/api/projects":
-					_, _ = w.Write([]byte(`{"data":[{"id":"prj_1","name":"Demo","state":"running"}]}`))
+					_, _ = w.Write([]byte(`{"data":{"items":[{"id":"prj_1","name":"Demo","state":"running"}],"pagination":{"limit":200,"offset":0,"total":1,"next_offset":null}}}`))
 				case "/api/projects/prj_1/keep-alive":
 					gotKeepAlive = true
 					if r.Header.Get("Authorization") != "Bearer token" {
@@ -108,34 +163,26 @@ func TestConnectDoesNotExposeSessionOverrides(t *testing.T) {
 	}
 }
 
-func TestBuildDepsWithoutServerUsesNoCredentialsSource(t *testing.T) {
+func TestConnectWithoutServerDoesNotRunLocalShell(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.json")
 	if err := os.WriteFile(configPath, []byte(`{}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	app := newApp()
-	var checked bool
-	app.Commands = append(app.Commands, &cli.Command{
-		Name: "test-deps",
-		Action: func(c *cli.Context) error {
-			d, err := buildDeps(c)
-			if err != nil {
-				return err
-			}
-			_, err = d.auth.Credential()
-			if !errors.Is(err, config.ErrNoCredentials) {
-				t.Fatalf("credential err = %v", err)
-			}
-			checked = true
-			return nil
-		},
-	})
-	if err := app.Run([]string{"pb", "--config", configPath, "test-deps"}); err != nil {
+	err := newApp().Run([]string{"pb", "--config", configPath, "demo"})
+	if err == nil || !strings.Contains(err.Error(), "server is not configured") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestDoctorReturnsFailureWhenBackendIsUnconfigured(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, []byte(`{"connect":{"accepted_terminal_kinds":["papercode_websocket"],"ready_timeout_seconds":30,"poll_interval_seconds":1}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if !checked {
-		t.Fatal("dependency source was not checked")
+	if err := newApp().Run([]string{"pb", "--config", path, "doctor"}); err == nil {
+		t.Fatal("doctor returned success for missing server")
 	}
 }
 
@@ -172,7 +219,7 @@ func quote(value string) string {
 func writeTestProfile(t *testing.T, dir, configPath, serverURL string) {
 	t.Helper()
 	profileDir := filepath.Join(dir, "credentials")
-	configJSON := `{"server_url":` + quote(serverURL) + `,"auth":{"allow_file_fallback":true,"profile_dir":` + quote(profileDir) + `}}`
+	configJSON := `{"server_url":` + quote(serverURL) + `,"auth":{"allow_file_fallback":true,"profile_dir":` + quote(profileDir) + `},"connect":{"ready_timeout_seconds":30,"poll_interval_seconds":1,"dial_retries":0,"accepted_terminal_kinds":["papercode_websocket"]}}`
 	if err := os.WriteFile(configPath, []byte(configJSON), 0o600); err != nil {
 		t.Fatal(err)
 	}

@@ -25,7 +25,15 @@ func NewSource(cfg *config.Config) (*Source, error) {
 }
 
 func (s *Source) Credential() (config.Credential, error) {
-	return s.Store.CredentialWithRefresh(s.Issuer, refreshBefore, func(current config.Credential) (config.Credential, string, error) {
+	return s.credential(refreshBefore)
+}
+
+func (s *Source) Refresh() (config.Credential, error) {
+	return s.credential(100 * 365 * 24 * time.Hour)
+}
+
+func (s *Source) credential(refreshWindow time.Duration) (config.Credential, error) {
+	return s.Store.CredentialWithRefresh(s.Issuer, refreshWindow, func(current config.Credential) (config.Credential, string, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		tokens, err := api.RefreshToken(ctx, s.Issuer, current.RefreshToken, nil)

@@ -8,12 +8,9 @@ through agentunnel, and transparently bridges **local image pastes into remote T
 CLI now uses Paperboat bearer sessions and stores secrets in the operating system credential
 store; plaintext fallback is explicit and intended only for headless systems.
 
-> **Status:** CLI scaffold implemented with local dev stubs and device-session authentication.
-> The production
-> `cli-connect` contract is now papercode WebSocket based: `paperboat-server`
-> will return a tunneled papercode HTTP/WSS endpoint after device sessions and the
-> papercode credential issuer are implemented. The CLI's WebSocket terminal transport
-> foundation exists, but production bearer auth and real-server compatibility remain.
+> **Status:** Production commands use Paperboat device sessions and never fall back to a
+> local shell. `cli-connect` returns a tunneled papercode WSS terminal plus a separate
+> staged-image upload descriptor.
 > SSH is debug/operator access only, not the production CLI handoff. See
 > [AGENTS.md](AGENTS.md) for design/conventions and the workspace
 > `USERSTORY.md` for how this fits the platform.
@@ -34,6 +31,20 @@ pb config path|show          # inspect the local config
 
 Flags may appear before or after the project name. `paperboat` is an alias for `pb`.
 
+Connection policy is deployment/profile configuration, not compiled into the CLI:
+
+```json
+{
+  "connect": {
+    "ready_timeout_seconds": 180,
+    "poll_interval_seconds": 3,
+    "dial_retries": 2,
+    "dial_retry_seconds": 2,
+    "accepted_terminal_kinds": ["papercode_websocket"]
+  }
+}
+```
+
 ## Build
 
 ```sh
@@ -49,10 +60,10 @@ Go — distributed as a single static binary (`github.com/urfave/cli/v2`, Go 1.2
 ## Layout
 
 - `cmd/pb` — CLI entrypoint (commands, flags, wiring).
-- `internal/config` — transitional config/auth plus the future credential-profile boundary.
+- `internal/config` — local policy and secure, versioned credential profiles.
 - `internal/catalog` — dynamic agent/machine-size catalog (interface + stub).
-- `internal/resolver` — project-name → connect info (interface + stub).
-- `internal/tunnel` — reach the VM terminal through agentunnel/papercode WebSocket RPC (interface + local-shell stub).
+- `internal/resolver` — paginated project resolution and validated connect descriptors.
+- `internal/tunnel` — papercode WebSocket RPC and bounded reconnect supervision.
 - `internal/session` — transparent PTY wrapper (raw mode, resize, exit-code passthrough).
 - `internal/paste` — bracketed-paste interceptor + image-path rewriter (the risk center).
-- `internal/upload` — papercode-compatible image encoder + uploader (interface + stub).
+- `internal/upload` — authenticated staged-image multipart transport.

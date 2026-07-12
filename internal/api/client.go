@@ -16,11 +16,8 @@ import (
 	"github.com/pujan-modha/paperboat-cli/internal/config"
 )
 
-// SessionCookieName mirrors paperboat-server's session cookie. Kept here as the
-// single client-side constant for the auth transport; the value carried in it
-// is the reused papercode credential, never minted by the CLI.
 // ErrUnauthenticated means the server rejected the reused credential. Callers
-// should route the user back to papercode to sign in rather than prompting.
+// should route the user through Paperboat device login.
 var ErrUnauthenticated = errors.New("paperboat-server rejected the credential")
 
 // APIError is a structured server error surfaced to the caller. It carries the
@@ -84,6 +81,18 @@ type Project struct {
 	State string `json:"state"`
 }
 
+type Pagination struct {
+	Limit      int  `json:"limit"`
+	Offset     int  `json:"offset"`
+	Total      int  `json:"total"`
+	NextOffset *int `json:"next_offset"`
+}
+
+type ProjectPage struct {
+	Items      []Project  `json:"items"`
+	Pagination Pagination `json:"pagination"`
+}
+
 // AuthMaterial is short-lived auth material scoped by paperboat-server for a
 // specific connect descriptor. Phase 1 will finalize the exact token format.
 type AuthMaterial struct {
@@ -97,6 +106,7 @@ type AuthMaterial struct {
 // Environment is the papercode environment metadata returned by cli-connect.
 type Environment struct {
 	EnvironmentID string `json:"environment_id"`
+	ProjectID     string `json:"project_id"`
 	DisplayName   string `json:"display_name"`
 	ProjectRoot   string `json:"project_root"`
 }
@@ -129,20 +139,28 @@ type Upload struct {
 // Connectable is false the machine is not ready yet; Status/Reason explain why
 // and the caller should poll ConnectionStatus.
 type ConnectResponse struct {
-	ProjectID    string       `json:"project_id"`
-	ProjectState string       `json:"project_state"`
-	Connectable  bool         `json:"connectable"`
-	ExpiresAt    time.Time    `json:"expires_at"`
-	Environment  *Environment `json:"environment,omitempty"`
-	Terminal     *Terminal    `json:"terminal,omitempty"`
-	Upload       *Upload      `json:"upload,omitempty"`
-	Status       string       `json:"status,omitempty"`
-	Reason       string       `json:"reason,omitempty"`
+	Issuer            string       `json:"issuer,omitempty"`
+	ProjectID         string       `json:"project_id"`
+	ProjectState      string       `json:"project_state"`
+	Connectable       bool         `json:"connectable"`
+	ExpiresAt         time.Time    `json:"expires_at"`
+	Environment       *Environment `json:"environment,omitempty"`
+	Terminal          *Terminal    `json:"terminal,omitempty"`
+	Upload            *Upload      `json:"upload,omitempty"`
+	Status            string       `json:"status,omitempty"`
+	Reason            string       `json:"reason,omitempty"`
+	RetryAfterSeconds int          `json:"retry_after_seconds,omitempty"`
 }
 
 type KeepAliveResponse struct {
 	Project        Project   `json:"project"`
 	KeepAliveUntil time.Time `json:"keep_alive_until,omitempty"`
+}
+
+// Activity records human/agent activity for server-owned idle detection.
+func (c *Client) Activity(ctx context.Context, projectID, source string) error {
+	body := map[string]any{"source": "cli_activity", "metadata": map[string]any{"event": source}}
+	return c.do(ctx, http.MethodPost, "/api/projects/"+url.PathEscape(projectID)+"/activity", body, nil)
 }
 
 // Me fetches the authenticated user, validating the reused credential.
@@ -152,11 +170,26 @@ func (c *Client) Me(ctx context.Context) (Me, error) {
 	return out, err
 }
 
-// ListProjects returns the user's projects for name resolution.
+// ListProjects returns every project page using the server-authored cursor.
 func (c *Client) ListProjects(ctx context.Context) ([]Project, error) {
-	var out []Project
-	err := c.do(ctx, http.MethodGet, "/api/projects", nil, &out)
-	return out, err
+	const pageSize = 200
+	projects := make([]Project, 0)
+	offset := 0
+	for {
+		var page ProjectPage
+		path := fmt.Sprintf("/api/projects?limit=%d&offset=%d&sort=name", pageSize, offset)
+		if err := c.do(ctx, http.MethodGet, path, nil, &page); err != nil {
+			return nil, err
+		}
+		projects = append(projects, page.Items...)
+		if page.Pagination.NextOffset == nil {
+			return projects, nil
+		}
+		if *page.Pagination.NextOffset <= offset {
+			return nil, errors.New("project pagination did not advance")
+		}
+		offset = *page.Pagination.NextOffset
+	}
 }
 
 // CLIConnect runs the pre-connect broker: it authorizes, provisions/reconciles
@@ -249,13 +282,4 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 		return fmt.Errorf("decode %s %s data: %w", method, path, err)
 	}
 	return nil
-}
-
-func unsafeMethod(method string) bool {
-	switch strings.ToUpper(method) {
-	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
-		return false
-	default:
-		return true
-	}
 }

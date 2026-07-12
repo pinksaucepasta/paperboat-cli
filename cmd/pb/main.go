@@ -1,8 +1,8 @@
 // Command pb (alias: paperboat) is the invisible terminal wrapper for the
 // Paperboat platform. `pb <project>` resumes the project VM and attaches its
 // terminal, using Paperboat auth and bridging local image pastes into remote
-// TUIs. Cross-service calls run behind interfaces with local dev stubs until
-// paperboat-server and the agentunnel/papercode wiring land.
+// TUIs. Cross-service calls run behind interfaces so protocol behavior remains
+// independently testable.
 package main
 
 import (
@@ -51,6 +51,7 @@ var valueFlags = map[string]bool{
 
 var subcommands = map[string]bool{
 	"connect":    true,
+	"projects":   true,
 	"agents":     true,
 	"sizes":      true,
 	"keep-alive": true,
@@ -156,6 +157,7 @@ func newApp() *cli.App {
 		Action:                 actionConnect,
 		Commands: []*cli.Command{
 			connectCommand(),
+			projectsCommand(),
 			agentsCommand(),
 			sizesCommand(),
 			keepAliveCommand(),
@@ -478,14 +480,30 @@ func resolveProjectID(ctx context.Context, client *api.Client, requested string)
 		return api.Project{}, err
 	}
 	for _, p := range projects {
-		if p.ID == requested || strings.EqualFold(p.Name, requested) {
+		if p.ID == requested {
 			return p, nil
 		}
+	}
+	var matches []api.Project
+	for _, p := range projects {
+		if strings.EqualFold(p.Name, requested) {
+			matches = append(matches, p)
+		}
+	}
+	if len(matches) == 1 {
+		return matches[0], nil
+	}
+	if len(matches) > 1 {
+		ids := make([]string, 0, len(matches))
+		for _, match := range matches {
+			ids = append(ids, match.ID)
+		}
+		return api.Project{}, fmt.Errorf("%w: %q matches project IDs %s; use an exact ID", resolver.ErrProjectAmbiguous, requested, strings.Join(ids, ", "))
 	}
 	return api.Project{}, fmt.Errorf("%w: %q", resolver.ErrProjectNotFound, requested)
 }
 
-// deps bundles the wired (stubbed) dependencies for a command.
+// deps bundles production dependencies for a command.
 type deps struct {
 	cfg      *config.Config
 	auth     config.AuthSource
@@ -503,12 +521,8 @@ func buildDeps(c *cli.Context) (*deps, error) {
 	if s := c.String("server"); s != "" {
 		cfg.ServerURL = s
 	}
-	var termTunnel tunnel.Tunnel = tunnel.NewStubTunnel()
-	var uploader upload.Uploader = upload.NewStubUploader(cfg.Upload.Endpoint)
-	if cfg.ServerURL != "" {
-		termTunnel = tunnel.NewPapercodeWSTunnel()
-		uploader = upload.NewDisabledUploader()
-	}
+	var termTunnel tunnel.Tunnel = tunnel.NewPapercodeWSTunnel()
+	var uploader upload.Uploader = upload.NewDisabledUploader()
 	var authSource config.AuthSource = config.NoCredentialsSource{}
 	if cfg.ServerURL != "" {
 		warnPlaintextCredentialStorage(cfg, os.Stderr)
@@ -521,7 +535,7 @@ func buildDeps(c *cli.Context) (*deps, error) {
 		cfg:      cfg,
 		auth:     authSource,
 		catalog:  catalog.NewStubCatalog(),
-		resolver: resolver.NewStubResolver(cfg),
+		resolver: nil,
 		tunnel:   termTunnel,
 		uploader: uploader,
 	}, nil
@@ -536,6 +550,29 @@ func connectCommand() *cli.Command {
 	}
 }
 
+func projectsCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "projects",
+		Usage: "List projects available to this account",
+		Action: func(c *cli.Context) error {
+			client, err := backendClient(c)
+			if err != nil {
+				return err
+			}
+			projects, err := client.ListProjects(c.Context)
+			if err != nil {
+				return err
+			}
+			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+			fmt.Fprintln(w, "NAME\tID\tSTATE")
+			for _, project := range projects {
+				fmt.Fprintf(w, "%s\t%s\t%s\n", project.Name, project.ID, project.State)
+			}
+			return w.Flush()
+		},
+	}
+}
+
 func actionConnect(c *cli.Context) error {
 	project := c.Args().First()
 	if project == "" {
@@ -547,54 +584,90 @@ func actionConnect(c *cli.Context) error {
 		return err
 	}
 	ctx := c.Context
+	if strings.TrimSpace(d.cfg.ServerURL) == "" {
+		return errors.New("Paperboat server is not configured; set server_url or use --server")
+	}
 
 	cred, err := d.auth.Credential()
 	if err != nil && !errors.Is(err, config.ErrNoCredentials) {
 		return err
 	}
 	if errors.Is(err, config.ErrNoCredentials) {
-		if d.cfg.ServerURL != "" {
-			return errors.New("not signed in to Paperboat; run `pb auth login`, then retry")
-		}
-		fmt.Fprintln(os.Stderr, "pb: not signed in to Paperboat; run `pb auth login`.")
-		fmt.Fprintln(os.Stderr, "    (running in local dev mode against a stub target)")
+		return errors.New("not signed in to Paperboat; run `pb auth login`, then retry")
 	}
-	if d.cfg.ServerURL != "" {
-		d.resolver = resolver.NewAPIResolver(api.New(d.cfg.ServerURL, cred, nil), d.cfg)
+	d.resolver = resolver.NewAPIResolver(api.New(d.cfg.ServerURL, cred, nil), d.cfg)
+	if apiResolver, ok := d.resolver.(*resolver.APIResolver); ok {
+		apiResolver.Progress = func(status, reason string, retryAfter time.Duration) {
+			fmt.Fprintf(os.Stderr, "Connecting: %s (%s), retrying in %s...\n", status, reason, retryAfter.Round(time.Second))
+		}
 	}
 
-	info, err := d.resolver.Resolve(ctx, resolver.ConnectRequest{
-		Project:    project,
-		Credential: cred,
-	})
-	if err != nil {
+	var info resolver.ConnectInfo
+	var conn tunnel.Conn
+	for attempt := 0; attempt <= d.cfg.Connect.DialRetries; attempt++ {
+		info, err = d.resolver.Resolve(ctx, resolver.ConnectRequest{Project: project, Credential: cred})
+		if err == nil {
+			d.uploader = uploaderForTarget(info.Upload)
+			conn, err = d.tunnel.Dial(ctx, info)
+		}
+		if err == nil {
+			break
+		}
 		if errors.Is(err, api.ErrUnauthenticated) {
 			return errors.New("your Paperboat session was rejected; run `pb auth login`, then retry")
 		}
-		if msg := friendlyAPIError(err); msg != "" {
-			return errors.New(msg)
+		if attempt == d.cfg.Connect.DialRetries || !retryableInitialConnectError(err) {
+			break
 		}
-		return err
+		fmt.Fprintf(os.Stderr, "Connection attempt %d failed; refreshing the descriptor in %ds...\n", attempt+1, d.cfg.Connect.DialRetrySeconds)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(d.cfg.Connect.DialRetrySeconds) * time.Second):
+		}
 	}
-	if d.cfg.ServerURL != "" {
-		d.uploader = uploaderForTarget(info.Upload)
-	}
-
-	conn, err := d.tunnel.Dial(ctx, info)
 	if err != nil {
 		if msg := friendlyAPIError(err); msg != "" {
 			return errors.New(msg)
 		}
 		return fmt.Errorf("connect to %q: %w", project, err)
 	}
+	var pastePolicy *paste.Policy
+	conn = tunnel.NewReconnectingConn(ctx, conn, d.cfg.Connect.DialRetries, time.Duration(d.cfg.Connect.DialRetrySeconds)*time.Second, func(reconnectCtx context.Context) (tunnel.Conn, error) {
+		freshCred, credErr := d.auth.Credential()
+		if credErr != nil {
+			return nil, credErr
+		}
+		freshResolver := resolver.NewAPIResolver(api.New(d.cfg.ServerURL, freshCred, nil), d.cfg)
+		freshInfo, resolveErr := freshResolver.Resolve(reconnectCtx, resolver.ConnectRequest{Project: info.ProjectID, Credential: freshCred})
+		if resolveErr != nil {
+			return nil, resolveErr
+		}
+		freshConn, dialErr := d.tunnel.Dial(reconnectCtx, freshInfo)
+		if dialErr != nil {
+			return nil, dialErr
+		}
+		if pastePolicy != nil {
+			pastePolicy.Update(uploaderForTarget(freshInfo.Upload), uploadLimits(d.cfg, freshInfo.Upload))
+		}
+		return freshConn, nil
+	})
 
 	// Wrap remote input with the image-paste interceptor.
-	interceptor := paste.New(conn, d.uploader, uploadLimits(d.cfg, info.Upload),
+	pastePolicy = paste.NewPolicy(d.uploader, uploadLimits(d.cfg, info.Upload))
+	interceptor := paste.NewWithPolicy(conn, pastePolicy,
 		paste.WithNotifier(os.Stderr),
 		paste.WithWatchDirs(expandDirs(d.cfg.Upload.WatchDirs)),
 	)
 
-	code, err := session.Run(ctx, conn, interceptor)
+	code, err := session.RunWithActivity(ctx, conn, interceptor, func(source string) {
+		activityCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		activityErr := reportActivity(activityCtx, d.cfg.ServerURL, d.auth, info.ProjectID, source)
+		if activityErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: activity report failed: %v\n", activityErr)
+		}
+	})
 	if err != nil {
 		return err
 	}
@@ -602,6 +675,46 @@ func actionConnect(c *cli.Context) error {
 		os.Exit(code)
 	}
 	return nil
+}
+
+func retryableInitialConnectError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var apiErr *api.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.Code == "machine_not_ready" || apiErr.Code == "tunnel_unavailable"
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "timed out waiting for the machine") ||
+		strings.Contains(msg, "dial papercode websocket") ||
+		strings.Contains(msg, "websocket route") ||
+		strings.Contains(msg, "transport lost")
+}
+
+type refreshableAuthSource interface {
+	config.AuthSource
+	Refresh() (config.Credential, error)
+}
+
+func reportActivity(ctx context.Context, serverURL string, source config.AuthSource, projectID, event string) error {
+	cred, err := source.Credential()
+	if err != nil {
+		return err
+	}
+	err = api.New(serverURL, cred, nil).Activity(ctx, projectID, event)
+	if !errors.Is(err, api.ErrUnauthenticated) {
+		return err
+	}
+	refreshable, ok := source.(refreshableAuthSource)
+	if !ok {
+		return err
+	}
+	cred, refreshErr := refreshable.Refresh()
+	if refreshErr != nil {
+		return errors.Join(err, refreshErr)
+	}
+	return api.New(serverURL, cred, nil).Activity(ctx, projectID, event)
 }
 
 func friendlyAPIError(err error) string {
@@ -779,24 +892,25 @@ func doctorCommand() *cli.Command {
 			}
 
 			if d.cfg.ServerURL == "" {
-				fmt.Println("backend:     local dev stub (set server_url to connect)")
-				return nil
+				fmt.Println("backend:     unavailable (set server_url or use --server)")
+				return errors.New("doctor: Paperboat server is not configured")
 			}
 			if credErr != nil {
 				fmt.Println("backend:     skipped (no credentials to authenticate)")
-				return nil
+				return errors.New("doctor: Paperboat credentials are unavailable")
 			}
 			me, err := api.New(d.cfg.ServerURL, cred, nil).Me(c.Context)
 			if errors.Is(err, api.ErrUnauthenticated) {
 				fmt.Println("backend:     credential rejected; run `pb auth login`")
-				return nil
+				return errors.New("doctor: Paperboat credentials were rejected")
 			}
 			if err != nil {
 				fmt.Printf("backend:     unreachable: %v\n", err)
-				return nil
+				return fmt.Errorf("doctor: backend check failed: %w", err)
 			}
 			fmt.Printf("backend:     authenticated as %s ✓\n", firstNonEmpty(me.Email, me.DisplayName, me.ID))
 			if project == "" {
+				fmt.Println("entitlement: not checked (provide a project to verify connect access)")
 				return nil
 			}
 			info, err := resolver.NewAPIResolver(api.New(d.cfg.ServerURL, cred, nil), d.cfg).Resolve(c.Context, resolver.ConnectRequest{
@@ -805,17 +919,22 @@ func doctorCommand() *cli.Command {
 			})
 			if err != nil {
 				fmt.Printf("papercode:   descriptor unavailable: %v\n", err)
-				return nil
+				return fmt.Errorf("doctor: descriptor check failed: %w", err)
 			}
 			if info.Terminal == nil {
 				fmt.Println("papercode:   descriptor missing terminal endpoint")
-				return nil
+				return errors.New("doctor: descriptor missing terminal endpoint")
 			}
+			fmt.Printf("project:      %s (%s) ✓\n", info.ProjectID, firstNonEmpty(info.ProjectState, "ready"))
+			fmt.Println("entitlement:  connect authorization accepted ✓")
+			fmt.Println("fly readiness: ready ✓")
+			fmt.Println("agentunnel:   route descriptor ready ✓")
 			if err := tunnel.NewPapercodeWSTunnel().Check(c.Context, info.Terminal); err != nil {
 				fmt.Printf("papercode:   websocket unavailable: %v\n", err)
-				return nil
+				return fmt.Errorf("doctor: papercode protocol check failed: %w", err)
 			}
 			fmt.Printf("papercode:   websocket route/auth ready for %s ✓\n", info.Project)
+			fmt.Println("protocol:    paperboat-terminal-rpc/v1 ✓")
 			return nil
 		},
 	}

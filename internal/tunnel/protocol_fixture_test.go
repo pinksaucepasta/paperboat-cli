@@ -44,6 +44,11 @@ func TestPapercodeTerminalProtocolFixture(t *testing.T) {
 			RequestIDType            string `json:"request_id_type"`
 			RequiredAfterResponseTag string `json:"required_after_response_tag"`
 		} `json:"stream_acknowledgement"`
+		Reconnect struct {
+			ReattachSameThreadAndTerminal bool `json:"reattach_same_thread_and_terminal"`
+			RestartIfNotRunning           bool `json:"restart_if_not_running"`
+			ReplayFailedWrites            bool `json:"replay_failed_writes"`
+		} `json:"reconnect"`
 		Methods struct {
 			Attach string `json:"attach"`
 			Write  string `json:"write"`
@@ -114,6 +119,9 @@ func TestPapercodeTerminalProtocolFixture(t *testing.T) {
 		fixture.StreamAcknowledgement.RequestIDType != "string" || requestIDField.Type.Kind() != reflect.String ||
 		fixture.StreamAcknowledgement.RequiredAfterResponseTag != rpcChunkTag {
 		t.Fatalf("stream acknowledgement does not match implementation: %#v", fixture.StreamAcknowledgement)
+	}
+	if !fixture.Reconnect.ReattachSameThreadAndTerminal || !fixture.Reconnect.RestartIfNotRunning || fixture.Reconnect.ReplayFailedWrites {
+		t.Fatalf("reconnect contract does not match implementation: %#v", fixture.Reconnect)
 	}
 	if fixture.Methods.Attach != rpcTerminalAttach || fixture.Methods.Write != rpcTerminalWrite ||
 		fixture.Methods.Resize != rpcTerminalResize || fixture.Methods.Close != rpcTerminalClose {

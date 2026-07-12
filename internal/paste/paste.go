@@ -20,6 +20,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pujan-modha/paperboat-cli/internal/upload"
@@ -36,15 +37,37 @@ const DefaultUploadTimeout = 30 * time.Second
 // Interceptor wraps the writer feeding the remote PTY. Feed stdin bytes to it
 // via Write; it forwards them to dest, rewriting image pastes along the way.
 type Interceptor struct {
+	ctx       context.Context
+	cancel    context.CancelFunc
+	policy    *Policy
 	dest      io.Writer
-	up        upload.Uploader
-	limits    upload.Limits
 	notify    io.Writer
 	timeout   time.Duration
 	watchDirs []string
 
 	buf     []byte
 	inPaste bool
+}
+
+type Policy struct {
+	mu       sync.RWMutex
+	uploader upload.Uploader
+	limits   upload.Limits
+}
+
+func NewPolicy(uploader upload.Uploader, limits upload.Limits) *Policy {
+	return &Policy{uploader: uploader, limits: limits}
+}
+func (p *Policy) Update(uploader upload.Uploader, limits upload.Limits) {
+	p.mu.Lock()
+	p.uploader = uploader
+	p.limits = limits
+	p.mu.Unlock()
+}
+func (p *Policy) snapshot() (upload.Uploader, upload.Limits) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.uploader, p.limits
 }
 
 // Option configures an Interceptor.
@@ -62,10 +85,16 @@ func WithWatchDirs(dirs []string) Option { return func(i *Interceptor) { i.watch
 
 // New builds an Interceptor writing rewritten output to dest.
 func New(dest io.Writer, up upload.Uploader, limits upload.Limits, opts ...Option) *Interceptor {
+	return NewWithPolicy(dest, NewPolicy(up, limits), opts...)
+}
+
+func NewWithPolicy(dest io.Writer, policy *Policy, opts ...Option) *Interceptor {
+	ctx, cancel := context.WithCancel(context.Background())
 	i := &Interceptor{
+		ctx:     ctx,
+		cancel:  cancel,
+		policy:  policy,
 		dest:    dest,
-		up:      up,
-		limits:  limits,
 		notify:  io.Discard,
 		timeout: DefaultUploadTimeout,
 	}
@@ -74,6 +103,10 @@ func New(dest io.Writer, up upload.Uploader, limits upload.Limits, opts ...Optio
 	}
 	return i
 }
+
+// Abort cancels any in-flight upload during terminal teardown.
+func (i *Interceptor) Abort()   { i.cancel() }
+func (i *Interceptor) Discard() { i.buf = nil; i.inPaste = false }
 
 // Write consumes p, forwarding processed bytes to dest. It always reports the
 // full input as written (the interceptor owns buffering) unless dest errors.
@@ -194,12 +227,13 @@ func (i *Interceptor) rewrite(body []byte) []byte {
 	if nonEmpty == 0 {
 		return body
 	}
-	if i.limits.MaxAttachments > 0 && nonEmpty > i.limits.MaxAttachments {
-		i.warn("paste has %d images, over the limit of %d; sending as-is", nonEmpty, i.limits.MaxAttachments)
+	uploader, limits := i.policy.snapshot()
+	if limits.MaxAttachments > 0 && nonEmpty > limits.MaxAttachments {
+		i.warn("paste has %d images, over the limit of %d; sending as-is", nonEmpty, limits.MaxAttachments)
 		return body
 	}
 
-	ctx := context.Background()
+	ctx := i.ctx
 	if i.timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, i.timeout)
@@ -213,7 +247,7 @@ func (i *Interceptor) rewrite(body []byte) []byte {
 			continue
 		}
 		local, _ := candidatePath(ln)
-		vmPath, err := i.uploadOne(ctx, local)
+		vmPath, err := uploadOne(ctx, uploader, limits, local)
 		if err != nil {
 			i.warn("image upload failed (%v); pasting original path", err)
 			return body // fail open for the whole paste
@@ -223,12 +257,12 @@ func (i *Interceptor) rewrite(body []byte) []byte {
 	return []byte(strings.Join(out, "\n"))
 }
 
-func (i *Interceptor) uploadOne(ctx context.Context, path string) (string, error) {
-	img, err := upload.PrepareImage(path, i.limits)
+func uploadOne(ctx context.Context, uploader upload.Uploader, limits upload.Limits, path string) (string, error) {
+	img, err := upload.PrepareImage(path, limits)
 	if err != nil {
 		return "", err
 	}
-	return i.up.Upload(ctx, img)
+	return uploader.Upload(ctx, img)
 }
 
 // isLocalImage reports whether p points at an existing local image file,

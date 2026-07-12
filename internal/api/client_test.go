@@ -17,6 +17,28 @@ func writeData(w http.ResponseWriter, status int, data any) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"data": data})
 }
 
+func TestListProjectsFollowsPagination(t *testing.T) {
+	var offsets []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		offsets = append(offsets, r.URL.Query().Get("offset"))
+		if r.URL.Query().Get("offset") == "0" {
+			next := 1
+			writeData(w, http.StatusOK, ProjectPage{Items: []Project{{ID: "prj_1", Name: "A"}}, Pagination: Pagination{Limit: 200, Total: 2, NextOffset: &next}})
+			return
+		}
+		writeData(w, http.StatusOK, ProjectPage{Items: []Project{{ID: "prj_2", Name: "B"}}, Pagination: Pagination{Limit: 200, Offset: 1, Total: 2}})
+	}))
+	defer srv.Close()
+
+	projects, err := New(srv.URL, config.Credential{AccessToken: "t"}, nil).ListProjects(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projects) != 2 || projects[1].ID != "prj_2" || len(offsets) != 2 || offsets[0] != "0" || offsets[1] != "1" {
+		t.Fatalf("projects = %#v, offsets = %#v", projects, offsets)
+	}
+}
+
 func writeErr(w http.ResponseWriter, status int, code, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)

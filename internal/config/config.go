@@ -17,7 +17,7 @@ const EnvConfigPath = "PAPERBOAT_CONFIG"
 // behavior can change without rebuilding the binary.
 type UploadConfig struct {
 	// Endpoint is the papercode-server upload endpoint (on the VM, reached
-	// through agentunnel). Empty means the local dev stub is used.
+	// through agentunnel). Production uploads use the brokered descriptor.
 	Endpoint string `json:"endpoint,omitempty"`
 	// WatchDirs are directories terminals write temp images into on paste.
 	// Absolute paths, or "~"-prefixed for the home dir.
@@ -43,7 +43,7 @@ const (
 
 // Config is the on-disk CLI configuration.
 type Config struct {
-	// ServerURL is the paperboat-server base URL. Empty means local dev stub.
+	// ServerURL is the paperboat-server base URL. It is required for production commands.
 	ServerURL string `json:"server_url,omitempty"`
 	// PapercodeConfigPath is retained only to detect the obsolete auth setup.
 	PapercodeConfigPath string     `json:"papercode_config_path,omitempty"`
@@ -56,7 +56,8 @@ type Config struct {
 	SSH SSHConfig `json:"ssh,omitempty"`
 
 	// path is where this config was loaded from (or would be written to).
-	path string `json:"-"`
+	path                  string `json:"-"`
+	dialRetriesConfigured bool
 }
 
 type AuthConfig struct {
@@ -76,6 +77,12 @@ type ConnectConfig struct {
 	// PollIntervalSeconds is the gap between readiness polls. Defaults to
 	// DefaultPollIntervalSeconds.
 	PollIntervalSeconds int `json:"poll_interval_seconds,omitempty"`
+	// AllowedRouteHosts restricts descriptor endpoint hosts. Empty preserves
+	// server-authored routing while a managed install can pin its relay hosts.
+	AllowedRouteHosts     []string `json:"allowed_route_hosts,omitempty"`
+	DialRetries           int      `json:"dial_retries"`
+	DialRetrySeconds      int      `json:"dial_retry_seconds,omitempty"`
+	AcceptedTerminalKinds []string `json:"accepted_terminal_kinds,omitempty"`
 }
 
 // SSHConfig configures the client side of the agentunnel SSH transport. The CLI
@@ -94,11 +101,11 @@ type SSHConfig struct {
 	InsecureSkipHostKeyCheck bool `json:"insecure_skip_host_key_check,omitempty"`
 }
 
-// Connect polling defaults. Chosen to cover a cold Fly machine resume without
-// hanging indefinitely; overridable per install.
 const (
 	DefaultReadyTimeoutSeconds = 180
 	DefaultPollIntervalSeconds = 3
+	DefaultDialRetries         = 2
+	DefaultDialRetrySeconds    = 2
 )
 
 // Path returns the resolved config file location.
@@ -118,8 +125,7 @@ func DefaultPath() (string, error) {
 }
 
 // Load reads the config at path (or DefaultPath when path is empty). A missing
-// file is not an error — a zero-value config with defaults is returned so the
-// CLI works out of the box.
+// file is not an error; commands report any required missing policy fields.
 func Load(path string) (*Config, error) {
 	if path == "" {
 		p, err := DefaultPath()
@@ -141,6 +147,12 @@ func Load(path string) (*Config, error) {
 			return nil, fmt.Errorf("parse config %s: %w", path, err)
 		}
 		cfg.path = path
+		var raw struct {
+			Connect map[string]json.RawMessage `json:"connect"`
+		}
+		if json.Unmarshal(data, &raw) == nil {
+			_, cfg.dialRetriesConfigured = raw.Connect["dial_retries"]
+		}
 	}
 
 	cfg.applyDefaults()
@@ -165,6 +177,15 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Connect.PollIntervalSeconds == 0 {
 		c.Connect.PollIntervalSeconds = DefaultPollIntervalSeconds
+	}
+	if c.Connect.DialRetries == 0 && !c.dialRetriesConfigured {
+		c.Connect.DialRetries = DefaultDialRetries
+	}
+	if c.Connect.DialRetrySeconds == 0 {
+		c.Connect.DialRetrySeconds = DefaultDialRetrySeconds
+	}
+	if len(c.Connect.AcceptedTerminalKinds) == 0 {
+		c.Connect.AcceptedTerminalKinds = []string{"papercode_websocket"}
 	}
 }
 

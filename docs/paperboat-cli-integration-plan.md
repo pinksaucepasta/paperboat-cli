@@ -37,7 +37,7 @@ checklist, acceptance criteria, tests, documentation, and evidence are complete.
 | 5 | Agentunnel HTTP/WebSocket data path and revocation | Implemented | Codex | Agentunnel reports live route/body-limit state, supports stable reassignment, preserves routes on suspension, and closes them on deletion. Server readiness rotates credentials before Fly start, probes papercode with a signed one-time environment health proof, emits distinct machine-starting, machine-failed, tunnel-offline, papercode-unhealthy, entitlement, and credit results, and rejects undersized proxy limits using configured upload policy. Correlation events contain stable IDs without errors, URLs, payloads, or credentials. Production-path tests prove one durable route carries streamed uploads and bidirectional WebSocket bytes, survives reconnect, and stops after revocation; Fly configs expose no public services. Agentunnel and server Go test/vet suites, papercode contract/server tests, `vp check`, and typecheck pass. Real hosted deployment evidence remains before `Complete`. |
 | 6 | Fly project VM runtime and readiness | In progress | Codex | Runtime and readiness implementation is covered, but immutable base-image pins are now required and still need an approved Node/Go digest set. Hosted Fly evidence, image SBOM/signature, timing, and redaction review also remain. |
 | 7 | Papercode staged-image upload contract | Implemented | Codex | Server descriptor production, CLI multipart transport, and papercode-side implementation are complete; the frozen contract, security limits, retention, and cross-repository tests pass. Fuzz, real-volume, and hosted release evidence remain explicitly tracked below. |
-| 8 | CLI production connection and terminal behavior | In progress | TBD | API resolver, readiness polling, papercode WebSocket terminal RPC, raw terminal handling, resize, and exit propagation exist; auth and real-server compatibility remain. |
+| 8 | CLI production connection and terminal behavior | Implemented | Codex | Production-only bearer connection, paginated resolution, cold-start polling, issuer-bound descriptor validation, fixture-owned terminal RPC, PTY lifecycle, bounded re-brokering/reconnect without write replay, activity reporting, and structured doctor checks are implemented and covered by Go, Unix PTY, Windows cross-build, server contract, and papercode checks. Hosted/cross-platform runtime evidence remains for `Complete`. |
 | 9 | CLI image-paste bridge completion | In progress | TBD | Bracketed-paste parsing, fail-open rewriting, and uploader tests exist; the real staged-image transport, bounded async ordering, and cross-platform evidence remain. |
 | 10 | Security, observability, operations, and distribution | Not started | TBD | None |
 | 11 | Full real-infrastructure release validation | Not started | TBD | None |
@@ -271,6 +271,7 @@ Ready Paperboat response `data` payload:
 
 ```json
 {
+  "issuer": "https://api.example.com",
   "project_id": "prj_...",
   "project_state": "running",
   "connectable": true,
@@ -280,6 +281,7 @@ Ready Paperboat response `data` payload:
   "expires_at": "2026-07-10T12:00:00Z",
   "environment": {
     "environment_id": "env_...",
+    "project_id": "prj_...",
     "display_name": "Project name",
     "project_root": "/workspace/project"
   },
@@ -654,26 +656,26 @@ Evidence:
 
 Repository: `paperboat-cli`.
 
-- [ ] Remove the `server_url`-missing local-shell/stub selection from production commands;
+- [x] Remove the `server_url`-missing local-shell/stub selection from production commands;
       test doubles remain dependency-injected in tests only.
-- [ ] Replace cookie/CSRF emulation with Paperboat bearer auth and automatic safe refresh.
-- [ ] Resolve projects by exact ID or unambiguous name using paginated server results; add a
+- [x] Replace cookie/CSRF emulation with Paperboat bearer auth and automatic safe refresh.
+- [x] Resolve projects by exact ID or unambiguous name using paginated server results; add a
       project list command and clear ambiguity errors.
-- [ ] Call `cli-connect`, show cold-start progress on stderr without corrupting terminal
+- [x] Call `cli-connect`, show cold-start progress on stderr without corrupting terminal
       stdout, follow server retry hints, and mint a fresh descriptor after readiness.
-- [ ] Validate descriptor kind, HTTPS/WSS schemes, issuer/host policy, scope, expiry, project,
+- [x] Validate descriptor kind, HTTPS/WSS schemes, issuer/host policy, scope, expiry, project,
       and environment before dialing.
-- [ ] Consume the frozen papercode terminal RPC contract rather than hand-maintained guesses.
-- [ ] Preserve raw mode, bracketed paste, resize, signal forwarding, remote exit code,
+- [x] Consume the frozen papercode terminal RPC contract rather than hand-maintained guesses.
+- [x] Preserve raw mode, bracketed paste, resize, signal forwarding, remote exit code,
       half-close, and terminal restoration on every exit path.
-- [ ] Refresh expired descriptors before dial and after authentication-specific disconnects;
+- [x] Refresh expired descriptors before dial and after authentication-specific disconnects;
       use bounded reconnect for transient route loss without duplicating terminal input.
-- [ ] Send rate-limited CLI activity through the authenticated control path while real user
+- [x] Send rate-limited CLI activity through the authenticated control path while real user
       input or agent output is active.
-- [ ] Make `pb doctor` verify secure storage, Paperboat auth, entitlement, project state, Fly
+- [x] Make `pb doctor` verify secure storage, Paperboat auth, entitlement, project state, Fly
       readiness, agentunnel route, papercode auth, and terminal protocol compatibility with
       actionable structured results.
-- [ ] Keep all provider URLs, timeouts, accepted descriptor kinds, and limits sourced from
+- [x] Keep all provider URLs, timeouts, accepted descriptor kinds, and limits sourced from
       signed/server-authored configuration or local profile, not source constants.
 
 Acceptance criteria:

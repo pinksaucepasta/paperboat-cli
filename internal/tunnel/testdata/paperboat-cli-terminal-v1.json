@@ -27,6 +27,11 @@
     "request_id_type": "string",
     "required_after_response_tag": "Chunk"
   },
+  "reconnect": {
+    "reattach_same_thread_and_terminal": true,
+    "restart_if_not_running": true,
+    "replay_failed_writes": false
+  },
   "methods": {
     "attach": "terminal.attach",
     "write": "terminal.write",

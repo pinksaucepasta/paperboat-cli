@@ -30,6 +30,7 @@ const (
 	rpcTerminalWrite              = "terminal.write"
 	rpcTerminalResize             = "terminal.resize"
 	rpcTerminalClose              = "terminal.close"
+	rpcSubscribeTerminalMetadata  = "subscribeTerminalMetadata"
 	rpcFieldThreadID              = "threadId"
 	rpcFieldTerminalID            = "terminalId"
 	rpcFieldRestartIfNotRunning   = "restartIfNotRunning"
@@ -85,7 +86,12 @@ func (t *PapercodeWSTunnel) Check(ctx context.Context, target *resolver.Terminal
 		}
 		return fmt.Errorf("dial papercode websocket: %w", err)
 	}
-	return ws.Close()
+	c := newPapercodeWSConn(ws, target)
+	defer c.Close()
+	if err := c.call(ctx, rpcSubscribeTerminalMetadata, map[string]any{}); err != nil {
+		return err
+	}
+	return c.waitProtocol(ctx)
 }
 
 func (t *PapercodeWSTunnel) Dial(ctx context.Context, info resolver.ConnectInfo) (Conn, error) {
@@ -110,6 +116,10 @@ func (t *PapercodeWSTunnel) Dial(ctx context.Context, info resolver.ConnectInfo)
 	}
 	c := newPapercodeWSConn(ws, target)
 	if err := c.attach(ctx); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	if err := c.waitProtocol(ctx); err != nil {
 		_ = c.Close()
 		return nil, err
 	}
@@ -166,22 +176,39 @@ type papercodeWSConn struct {
 	exitCode int
 	exitErr  error
 
-	nextID  int
-	closing atomic.Bool
+	nextID        int
+	closing       atomic.Bool
+	protocolReady chan struct{}
+	protocolOnce  sync.Once
 }
 
 func newPapercodeWSConn(ws *websocket.Conn, target *resolver.TerminalTarget) *papercodeWSConn {
 	c := &papercodeWSConn{
-		ws:       ws,
-		target:   target,
-		out:      make(chan []byte, 64),
-		done:     make(chan struct{}),
-		closed:   make(chan struct{}),
-		exitCode: 0,
-		nextID:   1,
+		ws:            ws,
+		target:        target,
+		out:           make(chan []byte, 64),
+		done:          make(chan struct{}),
+		closed:        make(chan struct{}),
+		exitCode:      0,
+		nextID:        1,
+		protocolReady: make(chan struct{}),
 	}
 	go c.readLoop()
 	return c
+}
+
+func (c *papercodeWSConn) waitProtocol(ctx context.Context) error {
+	select {
+	case <-c.protocolReady:
+		return nil
+	case <-c.done:
+		if c.exitErr != nil {
+			return c.exitErr
+		}
+		return errors.New("papercode terminal attach ended before a protocol frame")
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (c *papercodeWSConn) attach(ctx context.Context) error {
@@ -230,6 +257,12 @@ func (c *papercodeWSConn) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// CloseWrite reports the protocol limitation instead of pretending EOF was
+// delivered and leaving a non-interactive remote process waiting forever.
+func (c *papercodeWSConn) CloseWrite() error {
+	return ErrInputEOFUnsupported
+}
+
 func (c *papercodeWSConn) Resize(rows, cols uint16) error {
 	if rows == 0 || cols == 0 {
 		return nil
@@ -250,10 +283,9 @@ func (c *papercodeWSConn) Close() error {
 	default:
 	}
 	c.closing.Store(true)
-	_ = c.call(context.Background(), rpcTerminalClose, map[string]any{
-		rpcFieldThreadID:   c.target.ThreadID,
-		rpcFieldTerminalID: c.target.TerminalID,
-	})
+	// Closing the client detaches the transport. terminal.close is destructive:
+	// it stops and unregisters the remote PTY, which would break reconnect and
+	// make `pb doctor` terminate a user's session.
 	return c.ws.Close()
 }
 
@@ -285,7 +317,7 @@ func (c *papercodeWSConn) readLoop() {
 			if c.isClosing() {
 				c.finish(0, nil)
 			} else {
-				c.finish(1, fmt.Errorf("papercode websocket read failed: %w", err))
+				c.finish(1, errors.Join(ErrTransportLost, fmt.Errorf("papercode websocket read failed: %w", err)))
 			}
 			return
 		}
@@ -316,6 +348,16 @@ func (c *papercodeWSConn) isClosing() bool {
 	return c.closing.Load()
 }
 
+// MarkTransportLost terminates the socket as an unexpected transport failure,
+// allowing the reconnect supervisor to distinguish it from an intentional close.
+func (c *papercodeWSConn) MarkTransportLost(err error) {
+	if err == nil {
+		err = ErrTransportLost
+	}
+	c.finish(1, errors.Join(ErrTransportLost, err))
+	_ = c.ws.Close()
+}
+
 func (c *papercodeWSConn) handleFrame(frame rpcFrame) error {
 	switch frame.Tag {
 	case rpcChunkTag:
@@ -329,6 +371,11 @@ func (c *papercodeWSConn) handleFrame(frame rpcFrame) error {
 		if err := c.acknowledgeChunk(frame.RequestID); err != nil {
 			return err
 		}
+		c.protocolOnce.Do(func() {
+			if c.protocolReady != nil {
+				close(c.protocolReady)
+			}
+		})
 	case rpcExitTag:
 		if frame.Exit.Tag == "Failure" {
 			return errors.New(effectFailureMessage(frame.Exit.Cause))

@@ -3,13 +3,16 @@ package tunnel
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/pujan-modha/paperboat-cli/internal/resolver"
@@ -117,6 +120,57 @@ func TestPapercodeWSTunnelAttachIOResizeAndExit(t *testing.T) {
 	}
 	if code != 7 {
 		t.Fatalf("exit code = %d", code)
+	}
+}
+
+func TestPapercodeWSTunnelCheckRejectsHandshakeWithoutRPC(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer ws.Close()
+		for {
+			if _, _, err := ws.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	err := NewPapercodeWSTunnel().Check(ctx, testTerminalTarget(server.URL))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Check error = %v", err)
+	}
+}
+
+func TestPapercodeWSTunnelCheckUsesNonAttachingMetadataProbe(t *testing.T) {
+	requests := make(chan rpcRequestSeen, 1)
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer ws.Close()
+		var req rpcRequestSeen
+		if err := ws.ReadJSON(&req); err != nil {
+			return
+		}
+		requests <- req
+		sendChunk(t, ws, 1, terminalEvent{Type: terminalEventSnapshot})
+		var ack rpcRequestSeen
+		_ = ws.ReadJSON(&ack)
+	}))
+	defer server.Close()
+	if err := NewPapercodeWSTunnel().Check(context.Background(), testTerminalTarget(server.URL)); err != nil {
+		t.Fatal(err)
+	}
+	req := <-requests
+	if req.Tag != rpcSubscribeTerminalMetadata {
+		t.Fatalf("doctor probe sent %q, want %q", req.Tag, rpcSubscribeTerminalMetadata)
 	}
 }
 
@@ -261,6 +315,11 @@ func TestPapercodeWSConnUnexpectedReadFailureSurfacesError(t *testing.T) {
 			t.Errorf("upgrade: %v", err)
 			return
 		}
+		var req rpcRequestSeen
+		if err := ws.ReadJSON(&req); err == nil && req.Tag == rpcTerminalAttach {
+			sendChunk(t, ws, 1, terminalEvent{Type: "output", Data: "ready"})
+			_ = ws.ReadJSON(&req)
+		}
 		_ = ws.Close()
 	}))
 	defer server.Close()
@@ -280,6 +339,7 @@ func TestPapercodeWSConnUnexpectedReadFailureSurfacesError(t *testing.T) {
 
 func TestPapercodeWSConnLocalCloseDoesNotSurfaceReadError(t *testing.T) {
 	upgrader := websocket.Upgrader{}
+	var destructiveClose atomic.Bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ws, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
@@ -294,6 +354,8 @@ func TestPapercodeWSConnLocalCloseDoesNotSurfaceReadError(t *testing.T) {
 			}
 			if req.Tag == rpcTerminalAttach {
 				sendChunk(t, ws, 1, terminalEvent{Type: "output", Data: "ready"})
+			} else if req.Tag == rpcTerminalClose {
+				destructiveClose.Store(true)
 			}
 		}
 	}))
@@ -309,5 +371,8 @@ func TestPapercodeWSConnLocalCloseDoesNotSurfaceReadError(t *testing.T) {
 	code, err := conn.Wait()
 	if err != nil || code != 0 {
 		t.Fatalf("Wait = %d, %v", code, err)
+	}
+	if destructiveClose.Load() {
+		t.Fatal("transport detach sent destructive terminal.close")
 	}
 }

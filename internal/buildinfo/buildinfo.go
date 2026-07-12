@@ -6,5 +6,5 @@ package buildinfo
 var Version = "dev"
 
 // DefaultServerURL is the default paperboat-server base URL. Replaced by
-// release builds; empty means "not configured, use local dev stub".
+// release builds; empty requires server_url or --server at runtime.
 var DefaultServerURL = ""

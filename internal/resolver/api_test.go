@@ -3,6 +3,7 @@ package resolver
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -40,8 +41,10 @@ func (f *fakeClient) ConnectionStatus(context.Context, string) (api.ConnectRespo
 
 func newTestResolver(fc *fakeClient) *APIResolver {
 	cfg := &config.Config{}
+	cfg.ServerURL = "https://api.paperboat.test"
 	cfg.Connect.ReadyTimeoutSeconds = 30
 	cfg.Connect.PollIntervalSeconds = 1
+	cfg.Connect.AcceptedTerminalKinds = []string{"papercode_websocket"}
 	r := NewAPIResolver(fc, cfg)
 	r.sleep = func(context.Context, time.Duration) error { return nil } // no real waiting
 	return r
@@ -52,11 +55,17 @@ func readyTerminal() *api.Terminal {
 		Kind:             "papercode_websocket",
 		HTTPBaseURL:      "https://agentunnel.dev/projects/prj_1",
 		WebSocketBaseURL: "wss://agentunnel.dev/projects/prj_1",
-		Auth:             api.AuthMaterial{Method: "websocket_ticket", Ticket: "pct_1", Scopes: []string{"terminal:operate"}},
+		Auth:             api.AuthMaterial{Method: "websocket_ticket", Ticket: "pct_1", ExpiresAt: time.Now().Add(time.Hour), Scopes: []string{"terminal:operate"}},
 		ThreadID:         "paperboat-cli",
 		TerminalID:       "term-1",
 		CWD:              "/workspace",
 	}
+}
+
+func readyResponse(term *api.Terminal) api.ConnectResponse {
+	expires := time.Now().Add(time.Hour)
+	term.Auth.ExpiresAt = expires.Add(-time.Minute)
+	return api.ConnectResponse{Issuer: "https://api.paperboat.test", ProjectID: "prj_1", Connectable: true, ExpiresAt: expires, Environment: &api.Environment{EnvironmentID: "env_1", ProjectID: "prj_1", ProjectRoot: "/workspace"}, Terminal: term, Upload: &api.Upload{Kind: "papercode_staged_image", HTTPBaseURL: term.HTTPBaseURL, Path: "/projects/prj_1/api/files/staged-images", Auth: api.AuthMaterial{Method: "bearer", Token: "file-token", ExpiresAt: expires.Add(-time.Minute), Scopes: []string{"file:stage"}}, MaxBytes: 1024, AllowedMIMETypes: []string{"image/png"}, RetentionSeconds: 60}}
 }
 
 func routeOnlyTerminal() *api.Terminal {
@@ -73,7 +82,7 @@ func routeOnlyTerminal() *api.Terminal {
 func TestResolveImmediatelyConnectable(t *testing.T) {
 	fc := &fakeClient{
 		projects:   []api.Project{{ID: "prj_1", Name: "My App", State: "running"}},
-		connectSeq: []api.ConnectResponse{{ProjectID: "prj_1", Connectable: true, Terminal: readyTerminal()}},
+		connectSeq: []api.ConnectResponse{readyResponse(readyTerminal())},
 	}
 	r := newTestResolver(fc)
 
@@ -92,7 +101,7 @@ func TestResolveImmediatelyConnectable(t *testing.T) {
 func TestResolveMatchesByID(t *testing.T) {
 	fc := &fakeClient{
 		projects:   []api.Project{{ID: "prj_1", Name: "app"}},
-		connectSeq: []api.ConnectResponse{{Connectable: true, Terminal: readyTerminal()}},
+		connectSeq: []api.ConnectResponse{readyResponse(readyTerminal())},
 	}
 	r := newTestResolver(fc)
 	if _, err := r.Resolve(context.Background(), ConnectRequest{Project: "prj_1"}); err != nil {
@@ -107,7 +116,7 @@ func TestResolvePollsUntilReady(t *testing.T) {
 		statusSeq: []api.ConnectResponse{
 			{Connectable: false, Status: "starting"},
 			{Connectable: false, Status: "starting"},
-			{Connectable: true, Terminal: readyTerminal()},
+			readyResponse(readyTerminal()),
 		},
 	}
 	r := newTestResolver(fc)
@@ -127,8 +136,8 @@ func TestResolveRebrokersWhenStatusLacksTerminalDescriptor(t *testing.T) {
 	fc := &fakeClient{
 		projects: []api.Project{{ID: "prj_1", Name: "app"}},
 		connectSeq: []api.ConnectResponse{
-			{Connectable: false, Status: "starting"},       // initial cli-connect
-			{Connectable: true, Terminal: readyTerminal()}, // re-broker after ready
+			{Connectable: false, Status: "starting"}, // initial cli-connect
+			readyResponse(readyTerminal()),           // re-broker after ready
 		},
 		statusSeq: []api.ConnectResponse{{Connectable: true, Terminal: nil}}, // ready but no routing detail
 	}
@@ -149,8 +158,8 @@ func TestResolveRebrokersWhenStatusLacksAuthMaterial(t *testing.T) {
 	fc := &fakeClient{
 		projects: []api.Project{{ID: "prj_1", Name: "app"}},
 		connectSeq: []api.ConnectResponse{
-			{Connectable: false, Status: "starting"},       // initial cli-connect
-			{Connectable: true, Terminal: readyTerminal()}, // re-broker after route-only status
+			{Connectable: false, Status: "starting"}, // initial cli-connect
+			readyResponse(readyTerminal()),           // re-broker after route-only status
 		},
 		statusSeq: []api.ConnectResponse{{Connectable: true, Terminal: routeOnlyTerminal()}},
 	}
@@ -173,5 +182,139 @@ func TestResolveProjectNotFound(t *testing.T) {
 	_, err := r.Resolve(context.Background(), ConnectRequest{Project: "nope"})
 	if !errors.Is(err, ErrProjectNotFound) {
 		t.Fatalf("err = %v, want ErrProjectNotFound", err)
+	}
+}
+
+func TestResolveRejectsAmbiguousProjectName(t *testing.T) {
+	fc := &fakeClient{projects: []api.Project{{ID: "prj_1", Name: "app"}, {ID: "prj_2", Name: "APP"}}}
+	r := newTestResolver(fc)
+	_, err := r.Resolve(context.Background(), ConnectRequest{Project: "App"})
+	if !errors.Is(err, ErrProjectAmbiguous) || !strings.Contains(err.Error(), "prj_1, prj_2") {
+		t.Fatalf("err = %v, want ambiguity with both IDs", err)
+	}
+}
+
+func TestResolveAcceptsDistinctEnvironmentIdentity(t *testing.T) {
+	response := readyResponse(readyTerminal())
+	response.Environment.EnvironmentID = "env_other"
+	fc := &fakeClient{
+		projects:   []api.Project{{ID: "prj_1", Name: "app"}},
+		connectSeq: []api.ConnectResponse{response},
+	}
+	if _, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "app"}); err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+}
+
+func TestResolveRejectsEnvironmentOwnedByAnotherProject(t *testing.T) {
+	response := readyResponse(readyTerminal())
+	response.Environment.ProjectID = "prj_other"
+	fc := &fakeClient{projects: []api.Project{{ID: "prj_1", Name: "app"}}, connectSeq: []api.ConnectResponse{response}}
+	_, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "app"})
+	if err == nil || !strings.Contains(err.Error(), "invalid environment") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestResolveRejectsNonWSSTerminal(t *testing.T) {
+	term := readyTerminal()
+	term.WebSocketBaseURL = "https://route.example"
+	response := readyResponse(term)
+	fc := &fakeClient{
+		projects:   []api.Project{{ID: "prj_1", Name: "app"}},
+		connectSeq: []api.ConnectResponse{response},
+	}
+	_, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "app"})
+	if err == nil || !strings.Contains(err.Error(), "WebSocket endpoint") {
+		t.Fatalf("err = %v, want wss validation", err)
+	}
+}
+
+func TestResolveEnforcesConfiguredRouteHostPolicy(t *testing.T) {
+	term := readyTerminal()
+	fc := &fakeClient{projects: []api.Project{{ID: "prj_1", Name: "app"}}, connectSeq: []api.ConnectResponse{readyResponse(term)}}
+	cfg := &config.Config{}
+	cfg.ServerURL = "https://api.paperboat.test"
+	cfg.Connect.ReadyTimeoutSeconds = 30
+	cfg.Connect.PollIntervalSeconds = 1
+	cfg.Connect.AllowedRouteHosts = []string{"relay.example.com"}
+	cfg.Connect.AcceptedTerminalKinds = []string{"papercode_websocket"}
+	r := NewAPIResolver(fc, cfg)
+	_, err := r.Resolve(context.Background(), ConnectRequest{Project: "app"})
+	if err == nil || !strings.Contains(err.Error(), "host is not allowed") {
+		t.Fatalf("err = %v, want host policy rejection", err)
+	}
+}
+
+func TestResolveRejectsUnexpectedIssuer(t *testing.T) {
+	response := readyResponse(readyTerminal())
+	response.Issuer = "https://evil.example"
+	fc := &fakeClient{projects: []api.Project{{ID: "prj_1", Name: "app"}}, connectSeq: []api.ConnectResponse{response}}
+	_, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "app"})
+	if err == nil || !strings.Contains(err.Error(), "unexpected issuer") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestResolveRejectsInvalidUploadDescriptor(t *testing.T) {
+	response := readyResponse(readyTerminal())
+	response.Upload.Auth.Scopes = []string{"terminal:operate"}
+	fc := &fakeClient{projects: []api.Project{{ID: "prj_1", Name: "app"}}, connectSeq: []api.ConnectResponse{response}}
+	_, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "app"})
+	if err == nil || !strings.Contains(err.Error(), "upload descriptor") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestResolveAcceptsFrozenTerminalWithoutHTTPBaseURL(t *testing.T) {
+	term := readyTerminal()
+	term.HTTPBaseURL = ""
+	response := readyResponse(term)
+	response.Upload.HTTPBaseURL = "https://agentunnel.dev/projects/prj_1"
+	fc := &fakeClient{projects: []api.Project{{ID: "prj_1", Name: "app"}}, connectSeq: []api.ConnectResponse{response}}
+	if _, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "app"}); err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+}
+
+func TestResolveRejectsTerminalHTTPPortMismatch(t *testing.T) {
+	term := readyTerminal()
+	term.HTTPBaseURL = "https://agentunnel.dev:8443/projects/prj_1"
+	response := readyResponse(term)
+	response.Upload.HTTPBaseURL = term.HTTPBaseURL
+	fc := &fakeClient{projects: []api.Project{{ID: "prj_1", Name: "app"}}, connectSeq: []api.ConnectResponse{response}}
+	_, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "app"})
+	if err == nil || !strings.Contains(err.Error(), "hosts do not match") {
+		t.Fatalf("err = %v, want origin mismatch", err)
+	}
+}
+
+func TestResolveRejectsUploadPortMismatch(t *testing.T) {
+	response := readyResponse(readyTerminal())
+	response.Upload.HTTPBaseURL = "https://agentunnel.dev:8443/projects/prj_1"
+	fc := &fakeClient{projects: []api.Project{{ID: "prj_1", Name: "app"}}, connectSeq: []api.ConnectResponse{response}}
+	_, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "app"})
+	if err == nil || !strings.Contains(err.Error(), "validated terminal route") {
+		t.Fatalf("err = %v, want upload origin mismatch", err)
+	}
+}
+
+func TestResolveRequiresProfileConnectionPolicy(t *testing.T) {
+	cfg := &config.Config{ServerURL: "https://api.paperboat.test"}
+	_, err := NewAPIResolver(&fakeClient{}, cfg).Resolve(context.Background(), ConnectRequest{Project: "app"})
+	if err == nil || !strings.Contains(err.Error(), "ready_timeout_seconds") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestResolveCapsRetryHintAtReadyDeadline(t *testing.T) {
+	fc := &fakeClient{projects: []api.Project{{ID: "prj_1", Name: "app"}}, connectSeq: []api.ConnectResponse{{ProjectID: "prj_1", Connectable: false, RetryAfterSeconds: 300, Status: "starting"}}}
+	r := newTestResolver(fc)
+	r.readyTimeout = 30 * time.Second
+	var waited time.Duration
+	r.sleep = func(_ context.Context, d time.Duration) error { waited = d; return context.Canceled }
+	_, err := r.Resolve(context.Background(), ConnectRequest{Project: "app"})
+	if err == nil || waited <= 0 || waited > 30*time.Second {
+		t.Fatalf("err=%v waited=%s", err, waited)
 	}
 }

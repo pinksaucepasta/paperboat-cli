@@ -6,21 +6,34 @@ product source of truth is the workspace `USERSTORY.md`.)
 
 ## Status at a glance
 
-**CLI control-plane contract corrected for papercode WebSocket attach.** The production
+**Phase 8 production connection work is in progress.** The production
 descriptor target is a tunneled papercode HTTP/WSS endpoint plus scoped auth. The CLI now
-uses that descriptor to attach through papercode WebSocket terminal RPC when `server_url`
-is configured. With `server_url` unset the local dev stubs still run, so the CLI stays
-exercisable offline.
+uses that descriptor to attach through papercode WebSocket terminal RPC. Production
+commands require a configured Paperboat server and authenticated profile; they never fall
+back to a local shell or dummy credentials.
+
+The resolver now follows server-provided readiness retry hints, emits cold-start progress
+on stderr, re-brokers for fresh terminal credentials once the route is ready, and validates
+project, scheme, scope, and credential expiry fields before dialing.
+
+Terminal sessions now report human input and agent output through the authenticated activity
+endpoint with a one-event-per-second limiter and asynchronous callbacks that cannot block PTY
+traffic. Each report obtains the current profile credential; a 401 forces one serialized
+refresh-and-retry, so long-lived sessions continue resetting server-owned idle detection.
+
+Ready descriptors are bound to the normalized Paperboat issuer. Unexpected transport loss is
+supervised with bounded re-brokering and stable terminal reattach; failed writes are never
+replayed, so reconnect cannot duplicate terminal input.
 
 - Build: `make build` → `bin/pb`. `gofmt`/`go vet` clean, `go test ./...` green.
-- Verified end-to-end with the real binary against a mock paperboat-server implementing the
-  session-cookie auth + connect flow (see "Verification" below).
+- Verified with automated control-plane and terminal protocol harnesses (see "Verification"
+  below); hosted infrastructure validation remains.
 
 ### Real backend wiring (this pass)
-- **`internal/api`** — paperboat-server control-plane client. Speaks the frozen JSON
-  envelope (`{"data"}` / `{"error":{code,message}}`). Its current papercode-token-as-cookie
-  authentication is transitional and superseded by the Phase 0 scoped Paperboat bearer
-  session contract. Methods: `Me`, `ListProjects`, `CLIConnect`, `ConnectionStatus`.
+- **`internal/api`** — bearer-authenticated paperboat-server control-plane client. Speaks
+  the frozen JSON envelope (`{"data"}` / `{"error":{code,message}}`). Project listing
+  follows the server's pagination contract. Methods: `Me`, `ListProjects`, `CLIConnect`,
+  `ConnectionStatus`.
 - **`internal/resolver.APIResolver`** — matches the requested token to a project by id then
   case-insensitive name, calls `cli-connect` (authorizes + reconciles agentunnel resources +
   resumes an idle machine), and polls `connection-status` until connectable, re-brokering
@@ -34,14 +47,18 @@ exercisable offline.
   returns remote exit status.
 - **`internal/tunnel.SSHTunnel`** — retained only as optional debug/operator plumbing, not
   selected for real `server_url` attaches.
-- **`cmd/pb`** — `server_url` gates real vs. stub impls; `doctor` verifies backend auth
-  via `GET /api/me`, and `pb doctor <project>` brokers a descriptor and verifies the
-  papercode WebSocket route/auth handshake without attaching a terminal.
+- **`cmd/pb`** — production connection commands require `server_url`; `doctor` verifies backend auth
+  via `GET /api/me`, and `pb doctor <project>` brokers a descriptor, performs a real
+  `terminal.attach`, validates a streamed RPC chunk and acknowledgement, then detaches without
+  sending destructive `terminal.close`.
+- **`cmd/pb projects`** — lists all paginated server projects. Connect and keep-alive
+  resolution prefer exact IDs, accept only unambiguous case-insensitive names, and report
+  matching IDs when a name is duplicated.
 
 ## What was built
 
 ### Command surface (`cmd/pb`)
-- `pb <project>` resumes the VM (stubbed) and attaches its terminal. `paperboat` is an
+- `pb <project>` asks the control plane to resume the VM and attaches its terminal. `paperboat` is an
   install-time symlink alias (urfave/cli derives the program name from argv[0]).
 - Session-scoped `--agent` and `--size` overrides were removed in Phase 0 because neither
   had an implemented server/runtime contract. Presets and machine type remain project
@@ -51,9 +68,9 @@ exercisable offline.
   (urfave/cli otherwise stops flag parsing at the first positional).
 
 ### Config and auth (`internal/config`)
-- JSON config loaded from `$PAPERBOAT_CONFIG` or the user config dir; missing file is not an
-  error (defaults applied). Everything tunable is here (server URL, papercode path, upload
-  endpoint/watch-dirs/limits) — no hardcoding in command logic.
+- JSON config loaded from `$PAPERBOAT_CONFIG` or the user config dir; missing files are
+  reported only when a command needs their policy. Connection timeouts, retries, accepted
+  descriptor kinds, server URL, and upload policy come from the profile or broker descriptor.
 - Versioned profiles contain normalized issuer, account/session metadata, token expiry, and
   opaque secret references. Tokens use the OS credential store by default; an explicit
   headless fallback enforces `0600`. Profile writes are atomic and inter-process locked.
@@ -84,12 +101,12 @@ exercisable offline.
   10 MB/image, 8 attachments, ~14 M dataURL chars, `image/*`) so the real transport is a
   drop-in.
 
-## Real vs. stub, by interface
+## Production implementations and test doubles
 
-Real implementations are selected when `server_url` is configured; stubs run otherwise so the
-CLI stays exercisable offline. The interfaces are unchanged, so both drop in interchangeably.
+Production commands require `server_url` and never select stubs. Test doubles remain behind
+interfaces for deterministic unit and protocol tests.
 
-| Interface | Real (server_url set) | Stub (local dev) | Still pending |
+| Interface | Production | Test double | Still pending |
 | --- | --- | --- | --- |
 | `resolver.ProjectResolver` | `APIResolver` — resolve + `cli-connect` broker + readiness poll (`internal/resolver/api.go`) | `StubResolver` — local target | — |
 | `tunnel.Tunnel` | `PapercodeWSTunnel` — `terminal.attach` / `terminal.write` / `terminal.resize` / `terminal.close` over the tunneled papercode `/ws` endpoint | `StubTunnel` — local `$SHELL` PTY | Real hosted papercode validation deferred to Phase 9. |
@@ -130,8 +147,7 @@ CLI stays exercisable offline. The interfaces are unchanged, so both drop in int
     Phase 4 lands.
   - Bad token → server 401 → `pb auth login` guidance.
   - Unknown project → `ErrProjectNotFound`.
-  - No `server_url` → local stub shell still runs (offline-safe).
-- New unit tests: `internal/api` (cookie auth, `{data}`/`{error}` envelope, 401→sentinel,
+- New unit tests: `internal/api` (bearer auth, `{data}`/`{error}` envelope, 401→sentinel,
   structured error, terminal decode) and `internal/resolver` (id/name match, poll-until-ready,
   re-broker when status lacks routing, not-found).
 - Phase 4 WebSocket transport harness: local WebSocket server verifies `/ws?wsTicket=...`,

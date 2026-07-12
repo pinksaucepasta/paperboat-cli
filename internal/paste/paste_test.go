@@ -98,6 +98,21 @@ func TestImagePasteRewritten(t *testing.T) {
 	}
 }
 
+func TestPolicyUpdateChangesUploaderForSubsequentPastes(t *testing.T) {
+	dir := t.TempDir()
+	img := makeImage(t, dir, "shot.png")
+	var dest bytes.Buffer
+	policy := NewPolicy(fixedUploader{"/vm/old.png"}, defaultLimits())
+	i := NewWithPolicy(&dest, policy)
+	writeInChunks(t, i, wrap(img), 8)
+	policy.Update(fixedUploader{"/vm/new.png"}, defaultLimits())
+	dest.Reset()
+	writeInChunks(t, i, wrap(img), 8)
+	if got := dest.String(); got != wrap("/vm/new.png") {
+		t.Fatalf("got %q", got)
+	}
+}
+
 func TestImagePasteSplitAcrossWrites(t *testing.T) {
 	dir := t.TempDir()
 	img := makeImage(t, dir, "a.png")
