@@ -432,7 +432,7 @@ func (i *Interceptor) rewrite(body []byte) []byte {
 		candidate := candidates[idx]
 		vmPath, err := uploadOne(ctx, uploader, limits, candidate)
 		if err != nil {
-			i.warn("image upload failed; pasting original path")
+			i.warn("image upload failed: %v; pasting original path", err)
 			return body // fail open for the whole paste
 		}
 		out[idx] = ln[:candidate.start] + vmPath + ln[candidate.end:]

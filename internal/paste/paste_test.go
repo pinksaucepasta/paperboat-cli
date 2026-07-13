@@ -239,8 +239,8 @@ func TestUploadFailureFailsOpen(t *testing.T) {
 	if got := dest.String(); got != wrap(img) {
 		t.Fatalf("fail-open: got %q want original %q", got, wrap(img))
 	}
-	if !strings.Contains(notice.String(), "upload failed") {
-		t.Fatalf("expected a visible notice, got %q", notice.String())
+	if !strings.Contains(notice.String(), "image upload failed: boom; pasting original path") {
+		t.Fatalf("expected the upload error in the visible notice, got %q", notice.String())
 	}
 }
 
