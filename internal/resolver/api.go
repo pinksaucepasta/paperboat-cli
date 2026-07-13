@@ -240,6 +240,10 @@ func (r *APIResolver) waitConnectable(ctx context.Context, projectID string, res
 				if err != nil {
 					return api.ConnectResponse{}, err
 				}
+				if !fresh.Connectable {
+					resp = fresh
+					continue
+				}
 				return r.validateDescriptor(fresh, projectID)
 			}
 			return r.validateDescriptor(next, projectID)
@@ -257,7 +261,10 @@ func (r *APIResolver) validateDescriptor(resp api.ConnectResponse, projectID str
 	if err != nil || gotIssuer != wantIssuer {
 		return api.ConnectResponse{}, errors.New("server returned a descriptor for an unexpected issuer")
 	}
-	if !resp.Connectable || (resp.ProjectID != "" && resp.ProjectID != projectID) {
+	if !resp.Connectable {
+		return api.ConnectResponse{}, errors.New("server returned a non-connectable descriptor")
+	}
+	if resp.ProjectID != "" && resp.ProjectID != projectID {
 		return api.ConnectResponse{}, errors.New("server returned a descriptor for the wrong project")
 	}
 	if resp.ExpiresAt.IsZero() || !time.Now().Before(resp.ExpiresAt) {

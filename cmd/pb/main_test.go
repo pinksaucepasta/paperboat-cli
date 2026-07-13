@@ -338,6 +338,51 @@ func TestAuthLogoutRetainsPendingRevocationUntilRetrySucceeds(t *testing.T) {
 	}
 }
 
+func TestAuthLogoutIgnoresFailedHistoricalRevocationAfterCurrentSucceeds(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/auth/token/revoke" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if r.Header.Get("Authorization") == "Bearer refresh-old" {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":{"code":"internal","message":"old revocation failed"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"data":{}}`))
+	}))
+	defer server.Close()
+	writeTestProfile(t, dir, configPath, server.URL)
+
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := config.ProfileStoreFor(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.QueueRevocation(server.URL, "cls_old", "refresh-old"); err != nil {
+		t.Fatal(err)
+	}
+	if err := newApp().Run([]string{"pb", "--config", configPath, "auth", "logout"}); err != nil {
+		t.Fatalf("logout err = %v", err)
+	}
+	if _, err := store.Load(server.URL); !errors.Is(err, config.ErrNoCredentials) {
+		t.Fatalf("active profile err = %v", err)
+	}
+	pending, err := store.PendingRevocations(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].ClientSessionID != "cls_old" {
+		t.Fatalf("pending revocations = %#v", pending)
+	}
+}
+
 func TestDrainPendingRevocationsProcessesMultipleSessions(t *testing.T) {
 	dir := t.TempDir()
 	store := config.ProfileStore{Path: dir, Secrets: config.FileSecretStore{Dir: filepath.Join(dir, "secrets")}}

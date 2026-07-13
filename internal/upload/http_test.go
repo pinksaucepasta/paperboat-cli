@@ -66,8 +66,11 @@ func TestHTTPUploaderUploadsAndReturnsVMPath(t *testing.T) {
 			data, _ := io.ReadAll(part)
 			gotBody[part.FormName()] = string(data)
 		}
-		if gotBody["image"] != "image-bytes" || gotBody["display_filename"] != "image.png" {
+		if gotBody["image"] != "image-bytes" {
 			t.Fatalf("multipart body = %#v", gotBody)
+		}
+		if _, ok := gotBody["display_filename"]; ok {
+			t.Fatalf("optional display_filename must be omitted: %#v", gotBody)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"path":"/workspace/project/.paperboat/uploads/image.png","mime_type":"image/png","size_bytes":11,"sha256":"abc","expires_at":"2026-07-17T12:00:00Z"}`))

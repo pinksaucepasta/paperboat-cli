@@ -155,9 +155,6 @@ func (u *HTTPUploader) uploadOnce(ctx context.Context, img Image, idempotencyKey
 		if err == nil {
 			_, err = io.Copy(part, bytes.NewReader(img.Bytes))
 		}
-		if err == nil && img.Name != "" {
-			err = mw.WriteField("display_filename", img.Name)
-		}
 		if err == nil {
 			err = mw.Close()
 		}

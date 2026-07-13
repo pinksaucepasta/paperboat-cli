@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/pujan-modha/paperboat-cli/internal/buildinfo"
 )
@@ -57,7 +56,7 @@ func RefreshToken(ctx context.Context, baseURL, refreshToken string, hc *http.Cl
 
 func publicCall(ctx context.Context, baseURL, path string, body any, bearer string, out any, hc *http.Client) error {
 	if hc == nil {
-		hc = &http.Client{Timeout: 30 * time.Second}
+		hc = defaultHTTPClient()
 	}
 	var payload []byte
 	var err error

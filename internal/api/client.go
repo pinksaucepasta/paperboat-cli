@@ -86,7 +86,7 @@ type Client struct {
 // timeout is used when nil.
 func New(baseURL string, cred config.Credential, httpClient *http.Client) *Client {
 	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 30 * time.Second}
+		httpClient = defaultHTTPClient()
 	}
 	return &Client{
 		baseURL:     strings.TrimRight(baseURL, "/"),

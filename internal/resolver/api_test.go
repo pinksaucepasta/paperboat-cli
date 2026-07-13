@@ -178,6 +178,32 @@ func TestResolveRebrokersWhenStatusLacksTerminalDescriptor(t *testing.T) {
 	}
 }
 
+func TestResolveKeepsPollingWhenRebrokerRegressesToNotReady(t *testing.T) {
+	fc := &fakeClient{
+		projects: []api.Project{{ID: "prj_1", Name: "app"}},
+		connectSeq: []api.ConnectResponse{
+			{Connectable: false, Status: "starting"},
+			{Connectable: false, Status: "reconciling"},
+			readyResponse(readyTerminal()),
+		},
+		statusSeq: []api.ConnectResponse{
+			{Connectable: true, Terminal: nil},
+			{Connectable: true, Terminal: nil},
+		},
+	}
+	r := newTestResolver(fc)
+	info, err := r.Resolve(context.Background(), ConnectRequest{Project: "app"})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if info.Terminal == nil || info.Terminal.Auth.Ticket != "pct_1" {
+		t.Fatalf("expected final re-brokered terminal, got %+v", info.Terminal)
+	}
+	if fc.connectN != 3 || fc.statusN != 2 {
+		t.Fatalf("connect calls = %d, status calls = %d", fc.connectN, fc.statusN)
+	}
+}
+
 func TestResolveRebrokersWhenStatusLacksAuthMaterial(t *testing.T) {
 	fc := &fakeClient{
 		projects: []api.Project{{ID: "prj_1", Name: "app"}},

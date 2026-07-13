@@ -336,10 +336,32 @@ func authLogout(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
+	active, loadErr := store.Load(cfg.ServerURL)
+	if loadErr != nil && !errors.Is(loadErr, config.ErrNoCredentials) {
+		return loadErr
+	}
 	if err := store.QueueActiveRevocation(cfg.ServerURL); err != nil && !errors.Is(err, config.ErrNoCredentials) {
 		return err
 	}
 	if err := drainPendingRevocations(c.Context, cfg.ServerURL, store); err != nil {
+		if loadErr == nil {
+			records, listErr := store.PendingRevocations(cfg.ServerURL)
+			if listErr != nil {
+				return errors.Join(err, listErr)
+			}
+			currentPending := false
+			for _, record := range records {
+				if record.ClientSessionID == active.ClientSessionID {
+					currentPending = true
+					break
+				}
+			}
+			if !currentPending {
+				fmt.Fprintln(os.Stderr, "WARNING: an earlier session revocation remains pending:", err)
+				fmt.Println("Signed out")
+				return nil
+			}
+		}
 		return fmt.Errorf("sign-out revocation remains pending; retry `pb auth logout`: %w", err)
 	}
 	fmt.Println("Signed out")
