@@ -56,6 +56,11 @@ type TerminalTarget struct {
 	ThreadID         string
 	TerminalID       string
 	CWD              string
+	// ReplayHistory controls whether an attach should emit retained terminal
+	// history. Reconnects suppress it because the local session already has it.
+	ReplayHistory bool
+	AfterSequence int
+	SequenceSink  func(int)
 }
 
 // UploadTarget is the papercode-server upload endpoint reachable through

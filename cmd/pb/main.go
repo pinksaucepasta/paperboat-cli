@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -603,6 +604,15 @@ func actionConnect(c *cli.Context) error {
 
 	var info resolver.ConnectInfo
 	var conn tunnel.Conn
+	var lastTerminalSequence atomic.Int64
+	recordTerminalSequence := func(sequence int) {
+		for {
+			current := lastTerminalSequence.Load()
+			if int64(sequence) <= current || lastTerminalSequence.CompareAndSwap(current, int64(sequence)) {
+				return
+			}
+		}
+	}
 	configureUploadRefresh := func(u upload.Uploader, r resolver.ProjectResolver) {
 		httpUploader, ok := u.(*upload.HTTPUploader)
 		if !ok {
@@ -635,6 +645,10 @@ func actionConnect(c *cli.Context) error {
 	for attempt := 0; attempt <= d.cfg.Connect.DialRetries; attempt++ {
 		info, err = d.resolver.Resolve(ctx, resolver.ConnectRequest{Project: project, Credential: cred})
 		if err == nil {
+			if info.Terminal != nil {
+				info.Terminal.ReplayHistory = true
+				info.Terminal.SequenceSink = recordTerminalSequence
+			}
 			d.uploader = uploaderForTarget(info.Upload)
 			configureUploadRefresh(d.uploader, d.resolver)
 			conn, err = d.tunnel.Dial(ctx, info)
@@ -672,6 +686,11 @@ func actionConnect(c *cli.Context) error {
 		freshInfo, resolveErr := freshResolver.Resolve(reconnectCtx, resolver.ConnectRequest{Project: info.ProjectID, Credential: freshCred})
 		if resolveErr != nil {
 			return nil, resolveErr
+		}
+		if freshInfo.Terminal != nil {
+			freshInfo.Terminal.ReplayHistory = false
+			freshInfo.Terminal.AfterSequence = int(lastTerminalSequence.Load())
+			freshInfo.Terminal.SequenceSink = recordTerminalSequence
 		}
 		freshConn, dialErr := d.tunnel.Dial(reconnectCtx, freshInfo)
 		if dialErr != nil {

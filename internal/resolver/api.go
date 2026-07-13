@@ -102,6 +102,7 @@ func (r *APIResolver) Resolve(ctx context.Context, req ConnectRequest) (ConnectI
 			ThreadID:         resp.Terminal.ThreadID,
 			TerminalID:       resp.Terminal.TerminalID,
 			CWD:              resp.Terminal.CWD,
+			ReplayHistory:    true,
 		},
 	}
 	if resp.Upload != nil && strings.TrimSpace(resp.Upload.HTTPBaseURL) != "" {

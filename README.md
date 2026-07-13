@@ -40,7 +40,7 @@ Connection policy is deployment/profile configuration, not compiled into the CLI
   "connect": {
     "ready_timeout_seconds": 180,
     "poll_interval_seconds": 3,
-    "dial_retries": 2,
+    "dial_retries": 6,
     "dial_retry_seconds": 2,
     "accepted_terminal_kinds": ["papercode_websocket"]
   },

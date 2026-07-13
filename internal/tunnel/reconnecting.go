@@ -121,7 +121,7 @@ func (c *ReconnectingConn) supervise(conn Conn) {
 			if c.now != nil {
 				attemptStarted = c.now()
 			}
-			if waitErr := c.waitDelay(); waitErr != nil {
+			if waitErr := c.waitDelay(attempt); waitErr != nil {
 				c.record("terminal.reconnect", "cancelled", attemptStarted)
 				lifetimeOutcome = "cancelled"
 				c.done <- reconnectResult{130, nil}
@@ -192,8 +192,15 @@ func (c *ReconnectingConn) waitCurrent(ctx context.Context) (Conn, error) {
 		}
 	}
 }
-func (c *ReconnectingConn) waitDelay() error {
-	timer := time.NewTimer(c.delay)
+func (c *ReconnectingConn) waitDelay(attempt int) error {
+	delay := c.delay
+	for i := 0; i < attempt && delay < 30*time.Second; i++ {
+		delay *= 2
+		if delay > 30*time.Second {
+			delay = 30 * time.Second
+		}
+	}
+	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {
 	case <-timer.C:

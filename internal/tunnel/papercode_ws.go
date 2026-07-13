@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/pujan-modha/paperboat-cli/internal/resolver"
@@ -36,6 +37,7 @@ const (
 	rpcFieldRestartIfNotRunning   = "restartIfNotRunning"
 	rpcFieldCWD                   = "cwd"
 	rpcFieldEnv                   = "env"
+	rpcFieldAfterSequence         = "afterSequence"
 	rpcFieldData                  = "data"
 	rpcFieldRows                  = "rows"
 	rpcFieldCols                  = "cols"
@@ -47,6 +49,9 @@ const (
 	terminalEventCleared          = "cleared"
 	terminalEventRestarted        = "restarted"
 	terminalEventActivity         = "activity"
+	websocketKeepaliveInterval    = 30 * time.Second
+	websocketKeepaliveTimeout     = 10 * time.Second
+	websocketWriteTimeout         = 10 * time.Second
 )
 
 var papercodeAttachEventTypes = []string{
@@ -180,6 +185,8 @@ type papercodeWSConn struct {
 	closing       atomic.Bool
 	protocolReady chan struct{}
 	protocolOnce  sync.Once
+	keepaliveStop chan struct{}
+	keepaliveOnce sync.Once
 }
 
 func newPapercodeWSConn(ws *websocket.Conn, target *resolver.TerminalTarget) *papercodeWSConn {
@@ -192,8 +199,10 @@ func newPapercodeWSConn(ws *websocket.Conn, target *resolver.TerminalTarget) *pa
 		exitCode:      0,
 		nextID:        1,
 		protocolReady: make(chan struct{}),
+		keepaliveStop: make(chan struct{}),
 	}
 	go c.readLoop()
+	go c.keepaliveLoop()
 	return c
 }
 
@@ -219,6 +228,9 @@ func (c *papercodeWSConn) attach(ctx context.Context) error {
 	}
 	if c.target.CWD != "" {
 		payload[rpcFieldCWD] = c.target.CWD
+	}
+	if c.target.AfterSequence > 0 {
+		payload[rpcFieldAfterSequence] = c.target.AfterSequence
 	}
 	return c.call(ctx, rpcTerminalAttach, payload)
 }
@@ -251,7 +263,9 @@ func (c *papercodeWSConn) Write(p []byte) (int, error) {
 		rpcFieldTerminalID: c.target.TerminalID,
 		rpcFieldData:       string(p),
 	}
-	if err := c.call(context.Background(), rpcTerminalWrite, payload); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), websocketWriteTimeout)
+	defer cancel()
+	if err := c.call(ctx, rpcTerminalWrite, payload); err != nil {
 		return 0, err
 	}
 	return len(p), nil
@@ -273,7 +287,9 @@ func (c *papercodeWSConn) Resize(rows, cols uint16) error {
 		rpcFieldRows:       rows,
 		rpcFieldCols:       cols,
 	}
-	return c.call(context.Background(), rpcTerminalResize, payload)
+	ctx, cancel := context.WithTimeout(context.Background(), websocketWriteTimeout)
+	defer cancel()
+	return c.call(ctx, rpcTerminalResize, payload)
 }
 
 func (c *papercodeWSConn) Close() error {
@@ -283,6 +299,7 @@ func (c *papercodeWSConn) Close() error {
 	default:
 	}
 	c.closing.Store(true)
+	c.stopKeepalive()
 	// Closing the client detaches the transport. terminal.close is destructive:
 	// it stops and unregisters the remote PTY, which would break reconnect and
 	// make `pb doctor` terminate a user's session.
@@ -305,10 +322,45 @@ func (c *papercodeWSConn) call(ctx context.Context, method string, payload any) 
 	id := c.nextID
 	c.nextID++
 	msg := rpcRequest{Type: rpcRequestTagValue, Tag: method, ID: fmt.Sprintf("%d", id), Payload: payload, Headers: [][2]string{}}
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = c.ws.SetWriteDeadline(deadline)
+		defer c.ws.SetWriteDeadline(time.Time{})
+	}
 	return c.ws.WriteJSON(msg)
 }
 
+func (c *papercodeWSConn) keepaliveLoop() {
+	_ = c.ws.SetReadDeadline(time.Now().Add(websocketKeepaliveInterval + websocketKeepaliveTimeout))
+	c.ws.SetPongHandler(func(string) error {
+		return c.ws.SetReadDeadline(time.Now().Add(websocketKeepaliveInterval + websocketKeepaliveTimeout))
+	})
+	ticker := time.NewTicker(websocketKeepaliveInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			c.writeMu.Lock()
+			_ = c.ws.SetWriteDeadline(time.Now().Add(websocketKeepaliveTimeout))
+			err := c.ws.WriteControl(websocket.PingMessage, nil, time.Now().Add(websocketKeepaliveTimeout))
+			_ = c.ws.SetWriteDeadline(time.Time{})
+			c.writeMu.Unlock()
+			if err != nil {
+				c.finish(1, errors.Join(ErrTransportLost, err))
+				_ = c.ws.Close()
+				return
+			}
+		case <-c.keepaliveStop:
+			return
+		}
+	}
+}
+
+func (c *papercodeWSConn) stopKeepalive() {
+	c.keepaliveOnce.Do(func() { close(c.keepaliveStop) })
+}
+
 func (c *papercodeWSConn) readLoop() {
+	defer c.stopKeepalive()
 	defer close(c.closed)
 	defer close(c.out)
 	for {
@@ -366,7 +418,9 @@ func (c *papercodeWSConn) handleFrame(frame rpcFrame) error {
 			if err := json.Unmarshal(raw, &ev); err != nil {
 				return err
 			}
-			c.handleTerminalEvent(ev)
+			if err := c.handleTerminalEvent(ev); err != nil {
+				return err
+			}
 		}
 		if err := c.acknowledgeChunk(frame.RequestID); err != nil {
 			return err
@@ -392,29 +446,75 @@ func (c *papercodeWSConn) acknowledgeChunk(requestID string) error {
 	}
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	defer c.ws.SetWriteDeadline(time.Time{})
 	return c.ws.WriteJSON(rpcAcknowledgement{Type: rpcAckTagValue, RequestID: requestID})
 }
 
-func (c *papercodeWSConn) handleTerminalEvent(ev terminalEvent) {
+func (c *papercodeWSConn) handleTerminalEvent(ev terminalEvent) error {
+	commitSequence := func(sequence *int) {
+		if sequence != nil && c.target != nil && c.target.SequenceSink != nil {
+			c.target.SequenceSink(*sequence)
+		}
+	}
+	pushOutput := func(data []byte) error {
+		if len(data) == 0 {
+			return nil
+		}
+		timer := time.NewTimer(websocketWriteTimeout)
+		defer timer.Stop()
+		select {
+		case c.out <- data:
+			return nil
+		case <-c.keepaliveStop:
+			return ErrTransportLost
+		case <-timer.C:
+			return errors.Join(ErrTransportLost, errors.New("papercode terminal output queue stalled"))
+		}
+	}
 	switch ev.Type {
 	case terminalEventSnapshot, terminalEventRestarted:
-		if ev.Snapshot.History != "" {
-			c.out <- []byte(ev.Snapshot.History)
+		replayHistory := ev.Type == terminalEventRestarted || c.target == nil || c.target.ReplayHistory
+		if ev.Snapshot.History != "" && replayHistory {
+			if ev.Type == terminalEventRestarted && c.target != nil && !c.target.ReplayHistory {
+				if err := pushOutput([]byte("\x1b[2J\x1b[H")); err != nil {
+					return err
+				}
+			}
+			if err := pushOutput([]byte(ev.Snapshot.History)); err != nil {
+				return err
+			}
 		}
-		c.finishFromStatus(ev.Snapshot.Status, ev.Snapshot.ExitCode, ev.Snapshot.ExitSignal, "")
+		if replayHistory {
+			commitSequence(ev.Snapshot.Sequence)
+		}
+		if replayHistory {
+			c.finishFromStatus(ev.Snapshot.Status, ev.Snapshot.ExitCode, ev.Snapshot.ExitSignal, "")
+		}
 	case terminalEventOutput:
 		if ev.Data != "" {
-			c.out <- []byte(ev.Data)
+			if err := pushOutput([]byte(ev.Data)); err != nil {
+				return err
+			}
 		}
+		commitSequence(ev.Sequence)
 	case terminalEventExited:
+		commitSequence(ev.Sequence)
 		c.finish(exitStatus(ev.ExitCode, ev.ExitSignal), nil)
 	case terminalEventClosed:
+		commitSequence(ev.Sequence)
 		c.finish(0, nil)
 	case terminalEventError:
+		commitSequence(ev.Sequence)
 		c.finish(1, errors.New(ev.Message))
-	case terminalEventCleared, terminalEventActivity:
-		// These events carry no terminal bytes or lifecycle transition for the CLI.
+	case terminalEventCleared:
+		if err := pushOutput([]byte("\x1b[2J\x1b[H")); err != nil {
+			return err
+		}
+		commitSequence(ev.Sequence)
+	case terminalEventActivity:
+		commitSequence(ev.Sequence)
 	}
+	return nil
 }
 
 func (c *papercodeWSConn) finishFromStatus(status string, exitCode, exitSignal *int, errMsg string) {
@@ -495,6 +595,7 @@ func effectFailureMessage(causes []effectCause) string {
 
 type terminalEvent struct {
 	Type       string           `json:"type"`
+	Sequence   *int             `json:"sequence"`
 	Data       string           `json:"data"`
 	Message    string           `json:"message"`
 	ExitCode   *int             `json:"exitCode"`
@@ -505,6 +606,7 @@ type terminalEvent struct {
 type terminalSnapshot struct {
 	Status     string `json:"status"`
 	History    string `json:"history"`
+	Sequence   *int   `json:"sequence"`
 	ExitCode   *int   `json:"exitCode"`
 	ExitSignal *int   `json:"exitSignal"`
 }

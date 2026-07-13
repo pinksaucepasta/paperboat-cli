@@ -121,7 +121,7 @@ type SSHConfig struct {
 const (
 	DefaultReadyTimeoutSeconds = 180
 	DefaultPollIntervalSeconds = 3
-	DefaultDialRetries         = 2
+	DefaultDialRetries         = 6
 	DefaultDialRetrySeconds    = 2
 	DefaultTelemetryMaxBytes   = 5 * 1024 * 1024
 )

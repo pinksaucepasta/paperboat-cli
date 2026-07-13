@@ -220,6 +220,55 @@ func TestPapercodeWSConnHandlesSnapshotHistory(t *testing.T) {
 	}
 }
 
+func TestPapercodeWSConnCanSuppressReconnectHistory(t *testing.T) {
+	sequence := 0
+	snapshotSequence := 9
+	c := &papercodeWSConn{out: make(chan []byte, 1), done: make(chan struct{}), target: &resolver.TerminalTarget{ReplayHistory: false, SequenceSink: func(value int) { sequence = value }}}
+	_ = c.handleTerminalEvent(terminalEvent{Type: terminalEventSnapshot, Snapshot: terminalSnapshot{Status: "running", History: "old output\n", Sequence: &snapshotSequence}})
+	select {
+	case <-c.out:
+		t.Fatal("reconnect snapshot replayed retained history")
+	default:
+	}
+	if sequence != 0 {
+		t.Fatalf("suppressed snapshot advanced reconnect cursor to %d", sequence)
+	}
+}
+
+func TestPapercodeWSConnAdvancesCursorAfterReplayOutputIsQueued(t *testing.T) {
+	sequence := 0
+	eventSequence := 7
+	c := &papercodeWSConn{out: make(chan []byte, 1), done: make(chan struct{}), target: &resolver.TerminalTarget{ReplayHistory: false, SequenceSink: func(value int) { sequence = value }}}
+	if err := c.handleTerminalEvent(terminalEvent{Type: terminalEventOutput, Sequence: &eventSequence, Data: "replayed\n"}); err != nil {
+		t.Fatal(err)
+	}
+	if sequence != eventSequence || string(<-c.out) != "replayed\n" {
+		t.Fatalf("sequence=%d output queue did not commit replay atomically", sequence)
+	}
+}
+
+func TestPapercodeWSConnDoesNotAdvanceCursorWhenReplayQueueCloses(t *testing.T) {
+	sequence := 0
+	eventSequence := 7
+	stop := make(chan struct{})
+	close(stop)
+	c := &papercodeWSConn{out: make(chan []byte), done: make(chan struct{}), keepaliveStop: stop, target: &resolver.TerminalTarget{ReplayHistory: false, SequenceSink: func(value int) { sequence = value }}}
+	err := c.handleTerminalEvent(terminalEvent{Type: terminalEventOutput, Sequence: &eventSequence, Data: "lost\n"})
+	if !errors.Is(err, ErrTransportLost) || sequence != 0 {
+		t.Fatalf("err=%v sequence=%d, want transport loss without cursor advance", err, sequence)
+	}
+}
+
+func TestPapercodeWSConnResynchronizesFromRestartedSnapshot(t *testing.T) {
+	c := &papercodeWSConn{out: make(chan []byte, 2), done: make(chan struct{}), target: &resolver.TerminalTarget{ReplayHistory: false}}
+	c.handleTerminalEvent(terminalEvent{Type: terminalEventRestarted, Snapshot: terminalSnapshot{Status: "running", History: "recovered output\n"}})
+	first := <-c.out
+	second := <-c.out
+	if string(first) != "\x1b[2J\x1b[H" || string(second) != "recovered output\n" {
+		t.Fatalf("resync output = %q then %q", first, second)
+	}
+}
+
 func TestPapercodeWSConnHandlesExitedSnapshot(t *testing.T) {
 	code := 7
 	c := &papercodeWSConn{out: make(chan []byte, 1), done: make(chan struct{})}
@@ -277,6 +326,7 @@ func testTerminalTarget(httpURL string) *resolver.TerminalTarget {
 		ThreadID:         "paperboat-cli",
 		TerminalID:       "term-1",
 		CWD:              "/workspace",
+		ReplayHistory:    true,
 	}
 }
 
