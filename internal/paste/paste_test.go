@@ -111,7 +111,7 @@ func makeImage(t *testing.T, dir, name string) string {
 
 func TestNonPasteBytesPassThrough(t *testing.T) {
 	var dest bytes.Buffer
-	i := New(&dest, fixedUploader{"/vm/x.png"}, defaultLimits())
+	i := New(&dest, fixedUploader{"/vm/x.png"}, defaultLimits(), WithPartialFlushDelay(time.Hour))
 	in := "hello world\nno paste here"
 	writeInChunks(t, i, in, 3)
 	if dest.String() != in {
@@ -121,7 +121,7 @@ func TestNonPasteBytesPassThrough(t *testing.T) {
 
 func TestNonImagePasteUntouched(t *testing.T) {
 	var dest bytes.Buffer
-	i := New(&dest, fixedUploader{"/vm/x.png"}, defaultLimits())
+	i := New(&dest, fixedUploader{"/vm/x.png"}, defaultLimits(), WithPartialFlushDelay(time.Hour))
 	in := wrap("just some pasted text")
 	writeInChunks(t, i, in, 4)
 	if dest.String() != in {
@@ -133,7 +133,7 @@ func TestImagePasteRewritten(t *testing.T) {
 	dir := t.TempDir()
 	img := makeImage(t, dir, "shot.png")
 	var dest bytes.Buffer
-	i := New(&dest, fixedUploader{"/vm/attach/shot.png"}, defaultLimits())
+	i := New(&dest, fixedUploader{"/vm/attach/shot.png"}, defaultLimits(), WithPartialFlushDelay(time.Hour))
 	writeInChunks(t, i, wrap(img), 5)
 	want := wrap("/vm/attach/shot.png")
 	if dest.String() != want {
@@ -145,7 +145,7 @@ func TestImagePastePreservesWhitespaceAndQuotes(t *testing.T) {
 	dir := t.TempDir()
 	img := makeImage(t, dir, "quoted image.png")
 	var dest bytes.Buffer
-	i := New(&dest, fixedUploader{"/vm/quoted.png"}, defaultLimits())
+	i := New(&dest, fixedUploader{"/vm/quoted.png"}, defaultLimits(), WithPartialFlushDelay(time.Hour))
 	writeInChunks(t, i, wrap("  \""+img+"\"\t"), 4)
 	if got, want := dest.String(), wrap("  \"/vm/quoted.png\"\t"); got != want {
 		t.Fatalf("got %q want %q", got, want)
@@ -157,7 +157,7 @@ func TestFileURLImagePaste(t *testing.T) {
 	img := makeImage(t, dir, "url image.png")
 	fileURL := "file://" + strings.ReplaceAll(img, " ", "%20")
 	var dest bytes.Buffer
-	i := New(&dest, fixedUploader{"/vm/url.png"}, defaultLimits())
+	i := New(&dest, fixedUploader{"/vm/url.png"}, defaultLimits(), WithPartialFlushDelay(time.Hour))
 	writeInChunks(t, i, wrap(fileURL), 3)
 	if got, want := dest.String(), wrap("/vm/url.png"); got != want {
 		t.Fatalf("got %q want %q", got, want)
@@ -170,7 +170,8 @@ func TestTempFilePatterns(t *testing.T) {
 	rejected := makeImage(t, dir, "manual.png")
 	var dest bytes.Buffer
 	i := New(&dest, fixedUploader{"/vm/allowed.png"}, defaultLimits(),
-		WithWatchDirs([]string{dir}), WithTempFilePatterns([]string{"terminal-paste-*.png"}))
+		WithWatchDirs([]string{dir}), WithTempFilePatterns([]string{"terminal-paste-*.png"}),
+		WithPartialFlushDelay(time.Hour))
 	writeInChunks(t, i, wrap(allowed)+wrap(rejected), 5)
 	if got, want := dest.String(), wrap("/vm/allowed.png")+wrap(rejected); got != want {
 		t.Fatalf("got %q want %q", got, want)
@@ -206,11 +207,11 @@ func TestPolicyUpdateChangesUploaderForSubsequentPastes(t *testing.T) {
 	img := makeImage(t, dir, "shot.png")
 	var dest bytes.Buffer
 	policy := NewPolicy(fixedUploader{"/vm/old.png"}, defaultLimits())
-	i := NewWithPolicy(&dest, policy)
+	i := NewWithPolicy(&dest, policy, WithPartialFlushDelay(time.Hour))
 	writeInChunks(t, i, wrap(img), 8)
 	policy.Update(fixedUploader{"/vm/new.png"}, defaultLimits())
 	dest.Reset()
-	i = NewWithPolicy(&dest, policy)
+	i = NewWithPolicy(&dest, policy, WithPartialFlushDelay(time.Hour))
 	writeInChunks(t, i, wrap(img), 8)
 	if got := dest.String(); got != wrap("/vm/new.png") {
 		t.Fatalf("got %q", got)
@@ -222,7 +223,7 @@ func TestImagePasteSplitAcrossWrites(t *testing.T) {
 	img := makeImage(t, dir, "a.png")
 	for _, chunk := range []int{1, 2, 7} {
 		var dest bytes.Buffer
-		i := New(&dest, fixedUploader{"/vm/a.png"}, defaultLimits())
+		i := New(&dest, fixedUploader{"/vm/a.png"}, defaultLimits(), WithPartialFlushDelay(time.Hour))
 		writeInChunks(t, i, wrap(img), chunk)
 		if got, want := dest.String(), wrap("/vm/a.png"); got != want {
 			t.Fatalf("chunk=%d got %q want %q", chunk, got, want)
@@ -234,7 +235,7 @@ func TestUploadFailureFailsOpen(t *testing.T) {
 	dir := t.TempDir()
 	img := makeImage(t, dir, "b.png")
 	var dest, notice bytes.Buffer
-	i := New(&dest, failUploader{}, defaultLimits(), WithNotifier(&notice))
+	i := New(&dest, failUploader{}, defaultLimits(), WithNotifier(&notice), WithPartialFlushDelay(time.Hour))
 	writeInChunks(t, i, wrap(img), 6)
 	if got := dest.String(); got != wrap(img) {
 		t.Fatalf("fail-open: got %q want original %q", got, wrap(img))
@@ -248,7 +249,7 @@ func TestAdjacentPastes(t *testing.T) {
 	dir := t.TempDir()
 	img := makeImage(t, dir, "c.png")
 	var dest bytes.Buffer
-	i := New(&dest, fixedUploader{"/vm/c.png"}, defaultLimits())
+	i := New(&dest, fixedUploader{"/vm/c.png"}, defaultLimits(), WithPartialFlushDelay(time.Hour))
 	in := "x" + wrap(img) + "y" + wrap("plain") + "z"
 	writeInChunks(t, i, in, 3)
 	want := "x" + wrap("/vm/c.png") + "y" + wrap("plain") + "z"
@@ -262,7 +263,7 @@ func TestSlowUploadDoesNotBlockInitialWriteAndPreservesOrder(t *testing.T) {
 	img := makeImage(t, dir, "slow.png")
 	var dest bytes.Buffer
 	uploader := &blockingUploader{started: make(chan struct{}), release: make(chan struct{})}
-	i := New(&dest, uploader, defaultLimits())
+	i := New(&dest, uploader, defaultLimits(), WithPartialFlushDelay(time.Hour))
 
 	writeDone := make(chan error, 1)
 	go func() {
@@ -299,7 +300,7 @@ func TestAbortCancelsUpload(t *testing.T) {
 	img := makeImage(t, dir, "cancel.png")
 	var dest bytes.Buffer
 	uploader := &blockingUploader{started: make(chan struct{}), release: make(chan struct{})}
-	i := New(&dest, uploader, defaultLimits())
+	i := New(&dest, uploader, defaultLimits(), WithPartialFlushDelay(time.Hour))
 	if _, err := i.Write([]byte(wrap(img))); err != nil {
 		t.Fatal(err)
 	}
@@ -316,9 +317,24 @@ func TestAbortCancelsUpload(t *testing.T) {
 
 func TestUncertainDestinationWriteIsRecoveredByWorker(t *testing.T) {
 	dest := &uncertainWriter{uncertain: true}
-	i := New(dest, fixedUploader{"/vm/x.png"}, defaultLimits())
+	i := New(dest, fixedUploader{"/vm/x.png"}, defaultLimits(), WithPartialFlushDelay(time.Hour))
 	if _, err := i.Write([]byte("first")); err != nil {
 		t.Fatal(err)
+	}
+	// Wait for the uncertain write to be discarded before sending more, so
+	// "second" cannot coalesce into the discarded batch.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		dest.mu.Lock()
+		discarded := dest.discarded
+		dest.mu.Unlock()
+		if discarded > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("destination discard hook was not called")
+		}
+		time.Sleep(time.Millisecond)
 	}
 	if _, err := i.Write([]byte("second")); err != nil {
 		t.Fatal(err)
@@ -336,7 +352,7 @@ func TestUncertainDestinationWriteIsRecoveredByWorker(t *testing.T) {
 
 func TestFatalDestinationWriteIsReportedAsynchronously(t *testing.T) {
 	want := errors.New("fatal destination")
-	i := New(fatalWriter{err: want}, fixedUploader{"/vm/x.png"}, defaultLimits())
+	i := New(fatalWriter{err: want}, fixedUploader{"/vm/x.png"}, defaultLimits(), WithPartialFlushDelay(time.Hour))
 	if _, err := i.Write([]byte("input")); err != nil {
 		t.Fatal(err)
 	}
@@ -406,7 +422,7 @@ func TestMultipleImageLines(t *testing.T) {
 	a := makeImage(t, dir, "one.png")
 	b := makeImage(t, dir, "two.png")
 	var dest bytes.Buffer
-	i := New(&dest, fixedUploader{"/vm/x.png"}, defaultLimits())
+	i := New(&dest, fixedUploader{"/vm/x.png"}, defaultLimits(), WithPartialFlushDelay(time.Hour))
 	writeInChunks(t, i, wrap(a+"\n"+b), 5)
 	want := wrap("/vm/x.png\n/vm/x.png")
 	if dest.String() != want {
@@ -419,7 +435,7 @@ func TestMultipleImageLinesPreserveBlankLines(t *testing.T) {
 	a := makeImage(t, dir, "one.png")
 	b := makeImage(t, dir, "two.png")
 	var dest bytes.Buffer
-	i := New(&dest, fixedUploader{"/vm/x.png"}, defaultLimits())
+	i := New(&dest, fixedUploader{"/vm/x.png"}, defaultLimits(), WithPartialFlushDelay(time.Hour))
 	writeInChunks(t, i, wrap(a+"\n\n"+b+"\n"), 5)
 	want := wrap("/vm/x.png\n\n/vm/x.png\n")
 	if dest.String() != want {
@@ -429,7 +445,7 @@ func TestMultipleImageLinesPreserveBlankLines(t *testing.T) {
 
 func TestPartialStartMarkerHeldThenFlushed(t *testing.T) {
 	var dest bytes.Buffer
-	i := New(&dest, fixedUploader{"/vm/x.png"}, defaultLimits())
+	i := New(&dest, fixedUploader{"/vm/x.png"}, defaultLimits(), WithPartialFlushDelay(time.Hour))
 	// A lone ESC[ that never becomes a paste must eventually pass through.
 	if _, err := i.Write([]byte("ab\x1b[")); err != nil {
 		t.Fatal(err)
@@ -446,6 +462,110 @@ func TestPartialStartMarkerHeldThenFlushed(t *testing.T) {
 	}
 }
 
+type syncedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func TestBareEscapeFlushedWithoutFurtherInput(t *testing.T) {
+	dest := &syncedBuffer{}
+	i := New(dest, fixedUploader{"/vm/x.png"}, defaultLimits(), WithPartialFlushDelay(5*time.Millisecond))
+	defer i.Close()
+	// A lone ESC (prefix of the paste start marker) must reach the remote on
+	// its own — waiting for the next keypress makes the ESC key feel dead.
+	if _, err := i.Write([]byte("\x1b")); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for dest.String() != "\x1b" {
+		if time.Now().After(deadline) {
+			t.Fatalf("ESC not flushed; dest=%q", dest.String())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestSplitStartMarkerWithinDelayStillIntercepted(t *testing.T) {
+	dir := t.TempDir()
+	img := makeImage(t, dir, "a.png")
+	dest := &syncedBuffer{}
+	i := New(dest, fixedUploader{"/vm/a.png"}, defaultLimits(), WithPartialFlushDelay(5*time.Second))
+	if _, err := i.Write([]byte("\x1b[2")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := i.Write([]byte("00~" + img + "\x1b[201~")); err != nil {
+		t.Fatal(err)
+	}
+	if err := i.Close(); err != nil {
+		t.Fatal(err)
+	}
+	want := wrap("/vm/a.png")
+	if dest.String() != want {
+		t.Fatalf("got %q want %q", dest.String(), want)
+	}
+}
+
+// gatedWriter blocks its first Write until released, recording each Write it
+// receives afterwards.
+type gatedWriter struct {
+	mu      sync.Mutex
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+	writes  []string
+}
+
+func (w *gatedWriter) Write(p []byte) (int, error) {
+	w.once.Do(func() {
+		close(w.entered)
+		<-w.release
+	})
+	w.mu.Lock()
+	w.writes = append(w.writes, string(p))
+	w.mu.Unlock()
+	return len(p), nil
+}
+
+func (w *gatedWriter) snapshot() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]string(nil), w.writes...)
+}
+
+func TestQueuedInputChunksAreCoalescedIntoOneWrite(t *testing.T) {
+	dest := &gatedWriter{entered: make(chan struct{}), release: make(chan struct{})}
+	i := New(dest, fixedUploader{"/vm/x.png"}, defaultLimits(), WithPartialFlushDelay(time.Hour))
+	if _, err := i.Write([]byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	<-dest.entered // worker is stalled inside dest.Write("a")
+	for _, s := range []string{"b", "c", "d"} {
+		if _, err := i.Write([]byte(s)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(dest.release)
+	if err := i.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got := dest.snapshot()
+	if len(got) != 2 || got[0] != "a" || got[1] != "bcd" {
+		t.Fatalf("expected backlog coalesced into one write [a bcd], got %q", got)
+	}
+}
+
 func FuzzBracketedPasteStreamPreservesUnknownInput(f *testing.F) {
 	f.Add([]byte("plain text"), uint8(1))
 	f.Add([]byte(wrap("not an image")), uint8(3))
@@ -456,7 +576,7 @@ func FuzzBracketedPasteStreamPreservesUnknownInput(f *testing.F) {
 		}
 		chunk := int(chunkByte)%64 + 1
 		var dest bytes.Buffer
-		i := New(&dest, fixedUploader{"/vm/fuzz.png"}, defaultLimits())
+		i := New(&dest, fixedUploader{"/vm/fuzz.png"}, defaultLimits(), WithPartialFlushDelay(time.Hour))
 		writeInChunks(t, i, string(input), chunk)
 		if !bytes.Equal(dest.Bytes(), input) {
 			t.Fatalf("stream changed: got %q want %q", dest.Bytes(), input)

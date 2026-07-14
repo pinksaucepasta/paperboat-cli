@@ -106,6 +106,16 @@ type ConnectConfig struct {
 	TerminalOutputBatchMilliseconds int `json:"terminal_output_batch_milliseconds,omitempty"`
 	// TerminalOutputBufferBytes controls each local terminal output read.
 	TerminalOutputBufferBytes int `json:"terminal_output_buffer_bytes,omitempty"`
+	// ForwardTerminalEnv lists local environment variables forwarded to the
+	// remote PTY on attach so it inherits the client terminal's capabilities
+	// (color depth, terminal program, locale). Unset variables are skipped.
+	// Defaults to DefaultForwardTerminalEnv.
+	ForwardTerminalEnv []string `json:"forward_terminal_env,omitempty"`
+	// InputPartialFlushMilliseconds bounds how long input bytes that could
+	// begin a bracketed-paste start marker (e.g. a bare ESC keypress) are
+	// withheld before being forwarded to the remote terminal. Negative
+	// disables the flush.
+	InputPartialFlushMilliseconds int `json:"input_partial_flush_milliseconds,omitempty"`
 }
 
 // SSHConfig configures the client side of the agentunnel SSH transport. The CLI
@@ -133,7 +143,20 @@ const (
 	DefaultTerminalOutputQueueChunks       = 256
 	DefaultTerminalOutputBatchMilliseconds = 1
 	DefaultTerminalOutputBufferBytes       = 128 * 1024
+	DefaultInputPartialFlushMilliseconds   = 25
 )
+
+// DefaultForwardTerminalEnv covers the variables TUIs use to pick color depth
+// and rendering features (truecolor detection, terminal identity, locale).
+var DefaultForwardTerminalEnv = []string{
+	"TERM",
+	"COLORTERM",
+	"TERM_PROGRAM",
+	"TERM_PROGRAM_VERSION",
+	"LANG",
+	"LC_ALL",
+	"LC_CTYPE",
+}
 
 // Path returns the resolved config file location.
 func (c *Config) Path() string { return c.path }
@@ -241,6 +264,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Connect.TerminalOutputBufferBytes <= 0 {
 		c.Connect.TerminalOutputBufferBytes = DefaultTerminalOutputBufferBytes
+	}
+	if len(c.Connect.ForwardTerminalEnv) == 0 {
+		c.Connect.ForwardTerminalEnv = append([]string(nil), DefaultForwardTerminalEnv...)
+	}
+	if c.Connect.InputPartialFlushMilliseconds == 0 {
+		c.Connect.InputPartialFlushMilliseconds = DefaultInputPartialFlushMilliseconds
 	}
 }
 

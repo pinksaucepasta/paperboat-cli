@@ -123,6 +123,55 @@ func TestPapercodeWSTunnelAttachIOResizeAndExit(t *testing.T) {
 	}
 }
 
+func TestPapercodeWSTunnelAttachForwardsEnvAndSize(t *testing.T) {
+	requests := make(chan rpcRequestSeen, 4)
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade: %v", err)
+			return
+		}
+		defer ws.Close()
+		for {
+			var req rpcRequestSeen
+			if err := ws.ReadJSON(&req); err != nil {
+				return
+			}
+			if req.Type != rpcRequestTagValue {
+				continue
+			}
+			requests <- req
+			if req.Tag == rpcTerminalAttach {
+				sendChunk(t, ws, 1, terminalEvent{Type: "output", Data: "ready"})
+			}
+		}
+	}))
+	defer server.Close()
+
+	target := testTerminalTarget(server.URL)
+	target.Env = map[string]string{"TERM": "xterm-ghostty", "COLORTERM": "truecolor"}
+	target.Cols = 120
+	target.Rows = 40
+	conn, err := NewPapercodeWSTunnel().Dial(context.Background(), resolver.ConnectInfo{Terminal: target})
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer conn.Close()
+
+	attach := <-requests
+	if attach.Tag != rpcTerminalAttach {
+		t.Fatalf("first request = %#v", attach)
+	}
+	env, ok := attach.Payload["env"].(map[string]any)
+	if !ok || env["TERM"] != "xterm-ghostty" || env["COLORTERM"] != "truecolor" {
+		t.Fatalf("bad attach env: %#v", attach.Payload["env"])
+	}
+	if attach.Payload["cols"] != float64(120) || attach.Payload["rows"] != float64(40) {
+		t.Fatalf("bad attach size: cols=%#v rows=%#v", attach.Payload["cols"], attach.Payload["rows"])
+	}
+}
+
 func TestPapercodeWSTunnelCheckRejectsHandshakeWithoutRPC(t *testing.T) {
 	upgrader := websocket.Upgrader{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

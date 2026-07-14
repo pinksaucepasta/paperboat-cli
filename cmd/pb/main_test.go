@@ -452,3 +452,12 @@ func TestCleanupIssuedSessionQueuesAndRevokesSwitchSession(t *testing.T) {
 		t.Fatalf("pending revocations = %d", len(pending))
 	}
 }
+
+func TestForwardedTerminalEnvFiltersInvalidAndUnset(t *testing.T) {
+	t.Setenv("PB_TEST_TERM", "xterm-256color")
+	t.Setenv("PB_TEST_EMPTY", "")
+	env := forwardedTerminalEnv([]string{"PB_TEST_TERM", "PB_TEST_EMPTY", "PB_TEST_UNSET_VAR", "bad-key!"})
+	if len(env) != 1 || env["PB_TEST_TERM"] != "xterm-256color" {
+		t.Fatalf("env = %#v", env)
+	}
+}

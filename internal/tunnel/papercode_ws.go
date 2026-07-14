@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -241,6 +242,13 @@ func (c *papercodeWSConn) attach(ctx context.Context) error {
 	if c.target.CWD != "" {
 		payload[rpcFieldCWD] = c.target.CWD
 	}
+	if len(c.target.Env) > 0 {
+		payload[rpcFieldEnv] = c.target.Env
+	}
+	if c.target.Cols > 0 && c.target.Rows > 0 {
+		payload[rpcFieldCols] = c.target.Cols
+		payload[rpcFieldRows] = c.target.Rows
+	}
 	if c.target.AfterSequence > 0 {
 		payload[rpcFieldAfterSequence] = c.target.AfterSequence
 	}
@@ -259,14 +267,22 @@ func (c *papercodeWSConn) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	payload := map[string]any{
-		rpcFieldThreadID:   c.target.ThreadID,
-		rpcFieldTerminalID: c.target.TerminalID,
-		rpcFieldData:       string(p),
+	// Terminal input is latency-sensitive: send it without the per-call
+	// context/timer setup and map-payload allocation of the generic call path.
+	payload := terminalWritePayload{
+		ThreadID:   c.target.ThreadID,
+		TerminalID: c.target.TerminalID,
+		Data:       string(p),
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), websocketWriteTimeout)
-	defer cancel()
-	if err := c.call(ctx, rpcTerminalWrite, payload); err != nil {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	id := c.nextID
+	c.nextID++
+	msg := rpcRequest{Type: rpcRequestTagValue, Tag: rpcTerminalWrite, ID: strconv.Itoa(id), Payload: payload, Headers: [][2]string{}}
+	_ = c.ws.SetWriteDeadline(time.Now().Add(websocketWriteTimeout))
+	err := c.ws.WriteJSON(msg)
+	_ = c.ws.SetWriteDeadline(time.Time{})
+	if err != nil {
 		return 0, err
 	}
 	return len(p), nil
@@ -546,6 +562,14 @@ func (c *papercodeWSConn) finish(code int, err error) {
 		c.exitErr = err
 		close(c.done)
 	})
+}
+
+// terminalWritePayload mirrors the map payload used by call() for
+// terminal.write, with identical JSON field names (frozen wire contract).
+type terminalWritePayload struct {
+	ThreadID   string `json:"threadId"`
+	TerminalID string `json:"terminalId"`
+	Data       string `json:"data"`
 }
 
 type rpcRequest struct {

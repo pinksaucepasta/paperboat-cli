@@ -56,6 +56,15 @@ type TerminalTarget struct {
 	ThreadID         string
 	TerminalID       string
 	CWD              string
+	// Env is local-terminal environment forwarded on attach (TERM, COLORTERM,
+	// ...) so the remote PTY spawns with the client's terminal capabilities.
+	// Applied by the papercode server when the PTY (re)starts.
+	Env map[string]string
+	// Cols/Rows seed the remote PTY size at attach time so retained history
+	// replays at the local geometry instead of the server default until the
+	// first resize lands.
+	Cols uint16
+	Rows uint16
 	// ReplayHistory controls whether an attach should emit retained terminal
 	// history. Reconnects suppress it because the local session already has it.
 	ReplayHistory bool

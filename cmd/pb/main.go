@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync/atomic"
@@ -32,6 +33,7 @@ import (
 	"github.com/pujan-modha/paperboat-cli/internal/tunnel"
 	"github.com/pujan-modha/paperboat-cli/internal/upload"
 	"github.com/urfave/cli/v2"
+	"golang.org/x/term"
 )
 
 func main() {
@@ -671,6 +673,8 @@ func actionConnect(c *cli.Context) error {
 			if info.Terminal != nil {
 				info.Terminal.ReplayHistory = true
 				info.Terminal.SequenceSink = recordTerminalSequence
+				info.Terminal.Env = forwardedTerminalEnv(d.cfg.Connect.ForwardTerminalEnv)
+				info.Terminal.Cols, info.Terminal.Rows = localTerminalSize()
 			}
 			d.uploader = uploaderForTarget(info.Upload)
 			configureUploadRefresh(d.uploader, d.resolver)
@@ -714,6 +718,8 @@ func actionConnect(c *cli.Context) error {
 			freshInfo.Terminal.ReplayHistory = false
 			freshInfo.Terminal.AfterSequence = int(lastTerminalSequence.Load())
 			freshInfo.Terminal.SequenceSink = recordTerminalSequence
+			freshInfo.Terminal.Env = forwardedTerminalEnv(d.cfg.Connect.ForwardTerminalEnv)
+			freshInfo.Terminal.Cols, freshInfo.Terminal.Rows = localTerminalSize()
 		}
 		freshConn, dialErr := d.tunnel.Dial(reconnectCtx, freshInfo)
 		if dialErr != nil {
@@ -737,6 +743,7 @@ func actionConnect(c *cli.Context) error {
 		paste.WithWatchDirs(expandDirs(d.cfg.Upload.WatchDirs)),
 		paste.WithTempFilePatterns(d.cfg.Upload.TempFilePatterns),
 		paste.WithMaxQueuedBytes(d.cfg.Upload.MaxQueuedInputBytes),
+		paste.WithPartialFlushDelay(time.Duration(d.cfg.Connect.InputPartialFlushMilliseconds)*time.Millisecond),
 	)
 
 	code, err := session.RunWithActivity(ctx, conn, interceptor, func(source string) {
@@ -857,6 +864,45 @@ func uploadLimits(cfg *config.Config, target *resolver.UploadTarget) upload.Limi
 		}
 	}
 	return limits
+}
+
+// terminalEnvKeyPattern mirrors the papercode terminal env schema; an invalid
+// key or oversized value would reject the whole attach, so filter locally.
+var terminalEnvKeyPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+const maxTerminalEnvValueChars = 8_192
+
+// forwardedTerminalEnv snapshots the configured local environment variables so
+// the remote PTY spawns with the client terminal's capabilities.
+func forwardedTerminalEnv(keys []string) map[string]string {
+	env := make(map[string]string, len(keys))
+	for _, key := range keys {
+		if !terminalEnvKeyPattern.MatchString(key) {
+			continue
+		}
+		value, ok := os.LookupEnv(key)
+		if !ok || value == "" || len(value) > maxTerminalEnvValueChars {
+			continue
+		}
+		env[key] = value
+	}
+	return env
+}
+
+// localTerminalSize returns the current terminal geometry, clamped to the
+// papercode schema bounds, or zeros when stdout is not a terminal.
+func localTerminalSize() (cols, rows uint16) {
+	w, h, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil || w <= 0 || h <= 0 {
+		return 0, 0
+	}
+	if w > 1000 {
+		w = 1000
+	}
+	if h > 500 {
+		h = 500
+	}
+	return uint16(w), uint16(h)
 }
 
 func expandDirs(dirs []string) []string {

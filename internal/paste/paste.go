@@ -40,6 +40,12 @@ var (
 // DefaultUploadTimeout bounds how long a single paste is held for upload.
 const DefaultUploadTimeout = 30 * time.Second
 
+// DefaultPartialFlushDelay bounds how long bytes that could begin a paste
+// start marker (e.g. a bare ESC keypress) are withheld while waiting for the
+// rest of the marker. Without this flush, a lone ESC would not reach the
+// remote TUI until the next keypress.
+const DefaultPartialFlushDelay = 25 * time.Millisecond
+
 const (
 	defaultQueueChunkSize = 32 * 1024
 	defaultQueueChunks    = 32
@@ -54,6 +60,7 @@ type Interceptor struct {
 	dest           io.Writer
 	notify         io.Writer
 	timeout        time.Duration
+	flushDelay     time.Duration
 	watchDirs      []string
 	tempPatterns   []string
 	queueChunkSize int
@@ -103,6 +110,13 @@ func WithNotifier(w io.Writer) Option { return func(i *Interceptor) { i.notify =
 // WithTimeout sets the per-paste upload timeout.
 func WithTimeout(d time.Duration) Option { return func(i *Interceptor) { i.timeout = d } }
 
+// WithPartialFlushDelay sets how long a partial paste start marker is withheld
+// before being forwarded as ordinary input. Zero or negative disables the
+// flush (partial prefixes wait for the next write indefinitely).
+func WithPartialFlushDelay(d time.Duration) Option {
+	return func(i *Interceptor) { i.flushDelay = d }
+}
+
 // WithWatchDirs restricts temp-image detection to these directories (in
 // addition to absolute paths that exist). Empty means "any existing path".
 func WithWatchDirs(dirs []string) Option { return func(i *Interceptor) { i.watchDirs = dirs } }
@@ -140,6 +154,7 @@ func NewWithPolicy(dest io.Writer, policy *Policy, opts ...Option) *Interceptor 
 		dest:           dest,
 		notify:         io.Discard,
 		timeout:        DefaultUploadTimeout,
+		flushDelay:     DefaultPartialFlushDelay,
 		queueChunkSize: defaultQueueChunkSize,
 		queueChunks:    defaultQueueChunks,
 	}
@@ -236,11 +251,63 @@ func (i *Interceptor) Errors() <-chan error { return i.errCh }
 
 func (i *Interceptor) run() {
 	defer close(i.done)
+	// flushTimer forwards a withheld partial start-marker prefix (e.g. a bare
+	// ESC keypress) when the rest of the marker does not arrive in time. Real
+	// paste markers arrive in a single terminal write, so the timer firing
+	// means the bytes were keyboard input, not a paste.
+	flushTimer := time.NewTimer(time.Hour)
+	if !flushTimer.Stop() {
+		<-flushTimer.C
+	}
+	defer flushTimer.Stop()
+	timerArmed := false
+	rearmFlush := func() {
+		if timerArmed {
+			if !flushTimer.Stop() {
+				<-flushTimer.C
+			}
+			timerArmed = false
+		}
+		if i.flushDelay <= 0 {
+			return
+		}
+		i.stateMu.Lock()
+		pending := !i.inPaste && len(i.buf) > 0
+		i.stateMu.Unlock()
+		if pending {
+			flushTimer.Reset(i.flushDelay)
+			timerArmed = true
+		}
+	}
+	handleWriteErr := func(err error) (fatal bool) {
+		if errors.Is(err, tunnel.ErrWriteUncertain) {
+			i.Discard()
+			if discarder, ok := i.dest.(interface{ Discard() }); ok {
+				discarder.Discard()
+			}
+			return false
+		}
+		i.setError(err)
+		return true
+	}
 	for {
 		select {
 		case <-i.ctx.Done():
 			i.setError(i.ctx.Err())
 			return
+		case <-flushTimer.C:
+			timerArmed = false
+			i.stateMu.Lock()
+			var err error
+			if !i.inPaste && len(i.buf) > 0 {
+				out := i.buf
+				i.buf = nil
+				_, err = i.dest.Write(out)
+			}
+			i.stateMu.Unlock()
+			if err != nil && handleWriteErr(err) {
+				return
+			}
 		case p, ok := <-i.input:
 			if !ok {
 				i.stateMu.Lock()
@@ -251,19 +318,35 @@ func (i *Interceptor) run() {
 			}
 			i.stateMu.Lock()
 			i.buf = append(i.buf, p...)
-			err := i.drain()
-			i.stateMu.Unlock()
-			if err != nil {
-				if errors.Is(err, tunnel.ErrWriteUncertain) {
-					i.Discard()
-					if discarder, ok := i.dest.(interface{ Discard() }); ok {
-						discarder.Discard()
+			// Coalesce input that queued up while this worker was busy (e.g.
+			// behind a slow destination write) so the backlog is forwarded in
+			// one destination write instead of one write per chunk.
+			inputClosed := false
+		coalesce:
+			for {
+				select {
+				case q, more := <-i.input:
+					if !more {
+						inputClosed = true
+						break coalesce
 					}
-					continue
+					i.buf = append(i.buf, q...)
+				default:
+					break coalesce
 				}
-				i.setError(err)
+			}
+			err := i.drain()
+			if err == nil && inputClosed {
+				err = i.flush()
+			}
+			i.stateMu.Unlock()
+			if err != nil && handleWriteErr(err) {
 				return
 			}
+			if inputClosed {
+				return
+			}
+			rearmFlush()
 		}
 	}
 }
