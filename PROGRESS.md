@@ -60,6 +60,12 @@ Ready descriptors are bound to the normalized Paperboat issuer. Unexpected trans
 supervised with bounded re-brokering and stable terminal reattach; failed writes are never
 replayed, so reconnect cannot duplicate terminal input.
 
+Animated terminal output is coalesced across the WebSocket and reconnect layers with a bounded
+one-millisecond outer batching window and larger output buffers. Session telemetry records total
+output, peak local write latency, and peak queue depth without recording terminal content. The
+local terminal's mouse, paste, focus, alternate-screen, and cursor modes are reset on attach and
+teardown so interrupted TUIs cannot leak control modes into the shell.
+
 - Build: `make build` → `bin/pb`. `gofmt`/`go vet` clean, `go test ./...` green.
 - Verified with automated control-plane and terminal protocol harnesses (see "Verification"
   below); hosted infrastructure validation remains.

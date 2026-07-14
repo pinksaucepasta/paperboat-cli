@@ -18,6 +18,22 @@ import (
 	"golang.org/x/term"
 )
 
+const terminalOutputBufferBytes = 128 * 1024
+
+const terminalCleanupSequence = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?1049l\x1b[?25h"
+
+type RunOption func(*runOptions)
+
+type runOptions struct{ outputBufferBytes int }
+
+func WithOutputBufferBytes(size int) RunOption {
+	return func(options *runOptions) {
+		if size > 0 {
+			options.outputBufferBytes = size
+		}
+	}
+}
+
 // Run wires the local terminal to conn. stdinSink is the writer local input is
 // copied into — typically the paste interceptor wrapping conn. Run blocks until
 // the remote session ends (or ctx is cancelled) and returns the remote exit
@@ -28,12 +44,17 @@ func Run(ctx context.Context, conn tunnel.Conn, stdinSink io.WriteCloser) (int, 
 
 // RunWithActivity is Run with an optional, non-blocking activity callback.
 // The callback is rate-limited and runs asynchronously so it cannot stall PTY I/O.
-func RunWithActivity(ctx context.Context, conn tunnel.Conn, stdinSink io.WriteCloser, activity func(source string)) (int, error) {
+func RunWithActivity(ctx context.Context, conn tunnel.Conn, stdinSink io.WriteCloser, activity func(source string), opts ...RunOption) (int, error) {
+	options := runOptions{outputBufferBytes: terminalOutputBufferBytes}
+	for _, option := range opts {
+		option(&options)
+	}
 	inputCtx, cancelInput := context.WithCancel(ctx)
 	defer cancelInput()
 	stdinFd := int(os.Stdin.Fd())
 	restore := func() {}
-	if term.IsTerminal(stdinFd) {
+	isTerminal := term.IsTerminal(stdinFd)
+	if isTerminal {
 		oldState, err := term.MakeRaw(stdinFd)
 		if err != nil {
 			return 1, err
@@ -41,6 +62,11 @@ func RunWithActivity(ctx context.Context, conn tunnel.Conn, stdinSink io.WriteCl
 		restore = func() { _ = term.Restore(stdinFd, oldState) }
 	}
 	defer restore()
+	if isTerminal {
+		resetTerminalEmulator := func() { _, _ = os.Stdout.Write([]byte(terminalCleanupSequence)) }
+		resetTerminalEmulator()
+		defer resetTerminalEmulator()
+	}
 
 	// Propagate the initial size and subsequent resizes.
 	stopResize := watchResize(conn)
@@ -67,13 +93,17 @@ func RunWithActivity(ctx context.Context, conn tunnel.Conn, stdinSink io.WriteCl
 	streamErr := make(chan error, 2)
 	go func() {
 		defer close(outputDone)
-		buf := make([]byte, 32*1024)
+		buf := make([]byte, options.outputBufferBytes)
 		for {
 			n, err := conn.Read(buf)
 			if n > 0 {
+				started := time.Now()
 				if _, writeErr := os.Stdout.Write(buf[:n]); writeErr != nil {
 					streamErr <- fmt.Errorf("write terminal output: %w", writeErr)
 					return
+				}
+				if observer, ok := conn.(interface{ ObserveLocalWrite(int, time.Duration) }); ok {
+					observer.ObserveLocalWrite(n, time.Since(started))
 				}
 				report("agent_output")
 			}

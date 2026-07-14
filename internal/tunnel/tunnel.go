@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"time"
 
 	"github.com/pujan-modha/paperboat-cli/internal/resolver"
 )
@@ -25,6 +26,79 @@ type Conn interface {
 
 type InputHalfCloser interface {
 	CloseWrite() error
+}
+
+func readBufferedChunks(p []byte, pending *[]byte, out <-chan []byte) (int, error) {
+	return readBufferedChunksWithWait(p, pending, out, 0)
+}
+
+func readBufferedChunksWithWait(p []byte, pending *[]byte, out <-chan []byte, wait time.Duration) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	n := 0
+	if len(*pending) > 0 {
+		copied := copy(p, *pending)
+		n += copied
+		*pending = (*pending)[copied:]
+		if n == len(p) {
+			return n, nil
+		}
+	}
+	if n == 0 {
+		b, ok := <-out
+		if !ok {
+			return 0, io.EOF
+		}
+		copied := copy(p, b)
+		n += copied
+		if copied < len(b) {
+			*pending = append(*pending, b[copied:]...)
+			return n, nil
+		}
+	}
+	var timer *time.Timer
+	var timerC <-chan time.Time
+	if wait > 0 {
+		timer = time.NewTimer(wait)
+		timerC = timer.C
+		defer timer.Stop()
+	}
+	for n < len(p) {
+		select {
+		case b, ok := <-out:
+			if !ok {
+				return n, nil
+			}
+			copied := copy(p[n:], b)
+			n += copied
+			if copied < len(b) {
+				*pending = append(*pending, b[copied:]...)
+				return n, nil
+			}
+		case <-timerC:
+			return n, nil
+		default:
+			if wait <= 0 {
+				return n, nil
+			}
+			select {
+			case b, ok := <-out:
+				if !ok {
+					return n, nil
+				}
+				copied := copy(p[n:], b)
+				n += copied
+				if copied < len(b) {
+					*pending = append(*pending, b[copied:]...)
+					return n, nil
+				}
+			case <-timerC:
+				return n, nil
+			}
+		}
+	}
+	return n, nil
 }
 
 // Tunnel dials a project VM and attaches its terminal.

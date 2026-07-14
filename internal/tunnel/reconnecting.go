@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pujan-modha/paperboat-cli/internal/telemetry"
@@ -20,6 +21,26 @@ type TelemetryContext struct {
 var ErrWriteUncertain = errors.New("terminal write outcome is uncertain")
 var ErrTransportLost = errors.New("terminal transport lost")
 
+const terminalOutputBatchWindow = time.Millisecond
+
+type ReconnectingOption func(*reconnectingOptions)
+
+type reconnectingOptions struct {
+	outputQueueChunks int
+	outputBatchWindow time.Duration
+}
+
+func WithReconnectingOutput(queueChunks int, batchWindow time.Duration) ReconnectingOption {
+	return func(options *reconnectingOptions) {
+		if queueChunks > 0 {
+			options.outputQueueChunks = queueChunks
+		}
+		if batchWindow >= 0 {
+			options.outputBatchWindow = batchWindow
+		}
+	}
+}
+
 type transportFailureMarker interface {
 	MarkTransportLost(error)
 }
@@ -27,22 +48,26 @@ type transportFailureMarker interface {
 // ReconnectingConn supervises unexpected transport loss while one session
 // loop retains ownership of stdin. Failed writes are never replayed.
 type ReconnectingConn struct {
-	ctx         context.Context
-	mu          sync.RWMutex
-	current     Conn
-	available   chan struct{}
-	reconnect   ReconnectFunc
-	maxRetries  int
-	delay       time.Duration
-	out         chan []byte
-	done        chan reconnectResult
-	closed      chan struct{}
-	closeOnce   sync.Once
-	pending     []byte
-	telemetry   telemetry.Sink
-	started     time.Time
-	now         func() time.Time
-	correlation TelemetryContext
+	ctx               context.Context
+	mu                sync.RWMutex
+	current           Conn
+	available         chan struct{}
+	reconnect         ReconnectFunc
+	maxRetries        int
+	delay             time.Duration
+	out               chan []byte
+	done              chan reconnectResult
+	closed            chan struct{}
+	closeOnce         sync.Once
+	pending           []byte
+	telemetry         telemetry.Sink
+	started           time.Time
+	now               func() time.Time
+	correlation       TelemetryContext
+	outputBytes       atomic.Int64
+	maxQueueChunks    atomic.Int64
+	maxWriteLatencyMS atomic.Int64
+	outputBatchWindow time.Duration
 }
 
 func (c *ReconnectingConn) record(name, outcome string, started time.Time) {
@@ -69,13 +94,17 @@ func NewReconnectingConn(ctx context.Context, initial Conn, maxRetries int, dela
 	return NewObservedReconnectingConn(ctx, initial, maxRetries, delay, reconnect, nil, nil, TelemetryContext{})
 }
 
-func NewObservedReconnectingConn(ctx context.Context, initial Conn, maxRetries int, delay time.Duration, reconnect ReconnectFunc, sink telemetry.Sink, now func() time.Time, correlation TelemetryContext) *ReconnectingConn {
+func NewObservedReconnectingConn(ctx context.Context, initial Conn, maxRetries int, delay time.Duration, reconnect ReconnectFunc, sink telemetry.Sink, now func() time.Time, correlation TelemetryContext, opts ...ReconnectingOption) *ReconnectingConn {
 	available := make(chan struct{})
 	close(available)
 	if now == nil {
 		now = time.Now
 	}
-	c := &ReconnectingConn{ctx: ctx, current: initial, available: available, reconnect: reconnect, maxRetries: maxRetries, delay: delay, out: make(chan []byte, 64), done: make(chan reconnectResult, 1), closed: make(chan struct{}), telemetry: sink, now: now, started: now(), correlation: correlation}
+	options := reconnectingOptions{outputQueueChunks: terminalOutputQueueChunks, outputBatchWindow: terminalOutputBatchWindow}
+	for _, option := range opts {
+		option(&options)
+	}
+	c := &ReconnectingConn{ctx: ctx, current: initial, available: available, reconnect: reconnect, maxRetries: maxRetries, delay: delay, out: make(chan []byte, options.outputQueueChunks), done: make(chan reconnectResult, 1), closed: make(chan struct{}), telemetry: sink, now: now, started: now(), correlation: correlation, outputBatchWindow: options.outputBatchWindow}
 	go c.supervise(initial)
 	return c
 }
@@ -83,7 +112,10 @@ func NewObservedReconnectingConn(ctx context.Context, initial Conn, maxRetries i
 func (c *ReconnectingConn) supervise(conn Conn) {
 	defer close(c.out)
 	lifetimeOutcome := "failure"
-	defer func() { c.record("terminal.lifetime", lifetimeOutcome, c.started) }()
+	defer func() {
+		c.recordOutputPerformance(lifetimeOutcome)
+		c.record("terminal.lifetime", lifetimeOutcome, c.started)
+	}()
 	for {
 		readDone := make(chan struct{})
 		go func() {
@@ -95,6 +127,7 @@ func (c *ReconnectingConn) supervise(conn Conn) {
 					b := append([]byte(nil), buf[:n]...)
 					select {
 					case c.out <- b:
+						updateAtomicMax(&c.maxQueueChunks, int64(len(c.out)))
 					case <-c.closed:
 						return
 					}
@@ -212,20 +245,42 @@ func (c *ReconnectingConn) waitDelay(attempt int) error {
 	}
 }
 func (c *ReconnectingConn) Read(p []byte) (int, error) {
-	if len(c.pending) > 0 {
-		n := copy(p, c.pending)
-		c.pending = c.pending[n:]
-		return n, nil
+	return readBufferedChunksWithWait(p, &c.pending, c.out, c.outputBatchWindow)
+}
+
+func (c *ReconnectingConn) ObserveLocalWrite(size int, duration time.Duration) {
+	if size > 0 {
+		c.outputBytes.Add(int64(size))
 	}
-	b, ok := <-c.out
-	if !ok {
-		return 0, io.EOF
+	updateAtomicMax(&c.maxWriteLatencyMS, duration.Milliseconds())
+}
+
+func (c *ReconnectingConn) recordOutputPerformance(outcome string) {
+	if c.telemetry == nil {
+		return
 	}
-	n := copy(p, b)
-	if n < len(b) {
-		c.pending = append(c.pending, b[n:]...)
+	e := telemetry.Event{
+		Name:          "terminal.output",
+		At:            c.now(),
+		ProjectID:     c.correlation.ProjectID,
+		EnvironmentID: c.correlation.EnvironmentID,
+		Outcome:       outcome,
+		SizeBytes:     c.outputBytes.Load(),
+		LatencyMS:     c.maxWriteLatencyMS.Load(),
+		Count:         c.maxQueueChunks.Load(),
 	}
-	return n, nil
+	if e.Validate() == nil {
+		c.telemetry.Record(e)
+	}
+}
+
+func updateAtomicMax(value *atomic.Int64, candidate int64) {
+	for {
+		current := value.Load()
+		if candidate <= current || value.CompareAndSwap(current, candidate) {
+			return
+		}
+	}
 }
 func (c *ReconnectingConn) Write(p []byte) (int, error) {
 	conn, err := c.waitCurrent(c.ctx)

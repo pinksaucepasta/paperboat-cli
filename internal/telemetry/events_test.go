@@ -6,7 +6,7 @@ import (
 )
 
 func TestEventValidationAllowsCorrelationMetadata(t *testing.T) {
-	e := Event{Name: "upload.result", RequestID: "req_1", ProjectID: "prj_1", EnvironmentID: "env_1", SessionID: "ses_1", Outcome: "accepted", SizeBytes: 42, LatencyMS: 8}
+	e := Event{Name: "upload.result", RequestID: "req_1", ProjectID: "prj_1", EnvironmentID: "env_1", SessionID: "ses_1", Outcome: "accepted", SizeBytes: 42, LatencyMS: 8, Count: 3}
 	if err := e.Validate(); err != nil {
 		t.Fatal(err)
 	}

@@ -540,7 +540,9 @@ func buildDeps(c *cli.Context) (*deps, error) {
 	if s := c.String("server"); s != "" {
 		cfg.ServerURL = s
 	}
-	var termTunnel tunnel.Tunnel = tunnel.NewPapercodeWSTunnel()
+	papercodeTunnel := tunnel.NewPapercodeWSTunnel()
+	papercodeTunnel.OutputQueueChunks = cfg.Connect.TerminalOutputQueueChunks
+	var termTunnel tunnel.Tunnel = papercodeTunnel
 	var uploader upload.Uploader = upload.NewDisabledUploader()
 	var authSource config.AuthSource = config.NoCredentialsSource{}
 	if cfg.ServerURL != "" {
@@ -724,7 +726,10 @@ func actionConnect(c *cli.Context) error {
 			pastePolicy.Update(freshUploader, uploadLimits(d.cfg, freshInfo.Upload))
 		}
 		return freshConn, nil
-	}, d.telemetry, nil, tunnel.TelemetryContext{ProjectID: info.ProjectID, EnvironmentID: info.Terminal.EnvironmentID})
+	}, d.telemetry, nil, tunnel.TelemetryContext{ProjectID: info.ProjectID, EnvironmentID: info.Terminal.EnvironmentID}, tunnel.WithReconnectingOutput(
+		d.cfg.Connect.TerminalOutputQueueChunks,
+		time.Duration(d.cfg.Connect.TerminalOutputBatchMilliseconds)*time.Millisecond,
+	))
 
 	// Wrap remote input with the image-paste interceptor.
 	pastePolicy = paste.NewPolicy(d.uploader, uploadLimits(d.cfg, info.Upload))
@@ -742,7 +747,7 @@ func actionConnect(c *cli.Context) error {
 		if activityErr != nil {
 			fmt.Fprintf(os.Stderr, "warning: activity report failed: %v\n", activityErr)
 		}
-	})
+	}, session.WithOutputBufferBytes(d.cfg.Connect.TerminalOutputBufferBytes))
 	if err != nil {
 		return err
 	}

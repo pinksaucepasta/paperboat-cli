@@ -62,17 +62,35 @@ func TestReconnectingConnRecordsReconnectAndLifetime(t *testing.T) {
 	c := NewObservedReconnectingConn(context.Background(), first, 1, 0, func(context.Context) (Conn, error) { return second, nil }, sink, now, TelemetryContext{ProjectID: "prj_1", EnvironmentID: "env_1"})
 	_, _ = io.ReadAll(c)
 	_, _ = c.Wait()
-	if len(sink.events) != 2 {
+	if len(sink.events) != 3 {
 		t.Fatalf("events = %+v", sink.events)
 	}
 	if sink.events[0].Name != "terminal.reconnect" || sink.events[0].Outcome != "success" {
 		t.Fatalf("reconnect event = %+v", sink.events[0])
 	}
-	if sink.events[0].ProjectID != "prj_1" || sink.events[0].EnvironmentID != "env_1" || sink.events[1].ProjectID != "prj_1" || sink.events[1].EnvironmentID != "env_1" {
+	if sink.events[0].ProjectID != "prj_1" || sink.events[0].EnvironmentID != "env_1" || sink.events[2].ProjectID != "prj_1" || sink.events[2].EnvironmentID != "env_1" {
 		t.Fatalf("missing correlation: %+v", sink.events)
 	}
-	if sink.events[1].Name != "terminal.lifetime" || sink.events[1].Outcome != "success" {
-		t.Fatalf("lifetime event = %+v", sink.events[1])
+	if sink.events[1].Name != "terminal.output" || sink.events[1].Outcome != "success" {
+		t.Fatalf("output event = %+v", sink.events[1])
+	}
+	if sink.events[2].Name != "terminal.lifetime" || sink.events[2].Outcome != "success" {
+		t.Fatalf("lifetime event = %+v", sink.events[2])
+	}
+}
+
+func TestReconnectingConnRecordsOutputPerformance(t *testing.T) {
+	sink := &tunnelEventSink{}
+	c := &ReconnectingConn{telemetry: sink, now: time.Now}
+	c.ObserveLocalWrite(6, 12*time.Millisecond)
+	c.maxQueueChunks.Store(4)
+	c.recordOutputPerformance("success")
+	if len(sink.events) != 1 {
+		t.Fatalf("events = %+v", sink.events)
+	}
+	output := sink.events[0]
+	if output.Name != "terminal.output" || output.SizeBytes != 6 || output.LatencyMS != 12 || output.Count != 4 {
+		t.Fatalf("output event = %+v", output)
 	}
 }
 

@@ -35,6 +35,11 @@ func TestLoadAppliesDialRetryDefaultWhenOmitted(t *testing.T) {
 	if cfg.Observability.MaxEventLogBytes != DefaultTelemetryMaxBytes {
 		t.Fatalf("telemetry max bytes = %d, want %d", cfg.Observability.MaxEventLogBytes, DefaultTelemetryMaxBytes)
 	}
+	if cfg.Connect.TerminalOutputQueueChunks != DefaultTerminalOutputQueueChunks ||
+		cfg.Connect.TerminalOutputBatchMilliseconds != DefaultTerminalOutputBatchMilliseconds ||
+		cfg.Connect.TerminalOutputBufferBytes != DefaultTerminalOutputBufferBytes {
+		t.Fatalf("terminal output defaults = %+v", cfg.Connect)
+	}
 }
 
 func TestSavePreservesExplicitZeroDialRetries(t *testing.T) {

@@ -100,6 +100,12 @@ type ConnectConfig struct {
 	DialRetries           int      `json:"dial_retries"`
 	DialRetrySeconds      int      `json:"dial_retry_seconds,omitempty"`
 	AcceptedTerminalKinds []string `json:"accepted_terminal_kinds,omitempty"`
+	// TerminalOutputQueueChunks bounds buffered remote output events.
+	TerminalOutputQueueChunks int `json:"terminal_output_queue_chunks,omitempty"`
+	// TerminalOutputBatchMilliseconds coalesces animation bursts before local rendering.
+	TerminalOutputBatchMilliseconds int `json:"terminal_output_batch_milliseconds,omitempty"`
+	// TerminalOutputBufferBytes controls each local terminal output read.
+	TerminalOutputBufferBytes int `json:"terminal_output_buffer_bytes,omitempty"`
 }
 
 // SSHConfig configures the client side of the agentunnel SSH transport. The CLI
@@ -119,11 +125,14 @@ type SSHConfig struct {
 }
 
 const (
-	DefaultReadyTimeoutSeconds = 180
-	DefaultPollIntervalSeconds = 3
-	DefaultDialRetries         = 6
-	DefaultDialRetrySeconds    = 2
-	DefaultTelemetryMaxBytes   = 5 * 1024 * 1024
+	DefaultReadyTimeoutSeconds             = 180
+	DefaultPollIntervalSeconds             = 3
+	DefaultDialRetries                     = 6
+	DefaultDialRetrySeconds                = 2
+	DefaultTelemetryMaxBytes               = 5 * 1024 * 1024
+	DefaultTerminalOutputQueueChunks       = 256
+	DefaultTerminalOutputBatchMilliseconds = 1
+	DefaultTerminalOutputBufferBytes       = 128 * 1024
 )
 
 // Path returns the resolved config file location.
@@ -223,6 +232,15 @@ func (c *Config) applyDefaults() {
 	}
 	if len(c.Connect.AcceptedTerminalKinds) == 0 {
 		c.Connect.AcceptedTerminalKinds = []string{"papercode_websocket"}
+	}
+	if c.Connect.TerminalOutputQueueChunks <= 0 {
+		c.Connect.TerminalOutputQueueChunks = DefaultTerminalOutputQueueChunks
+	}
+	if c.Connect.TerminalOutputBatchMilliseconds <= 0 {
+		c.Connect.TerminalOutputBatchMilliseconds = DefaultTerminalOutputBatchMilliseconds
+	}
+	if c.Connect.TerminalOutputBufferBytes <= 0 {
+		c.Connect.TerminalOutputBufferBytes = DefaultTerminalOutputBufferBytes
 	}
 }
 

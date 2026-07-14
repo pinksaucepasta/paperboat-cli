@@ -5,8 +5,10 @@ package session
 import (
 	"bytes"
 	"context"
+	"io"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/creack/pty"
@@ -32,6 +34,14 @@ func TestRunRestoresRawTerminalState(t *testing.T) {
 	close(c.wait)
 	if code, err := Run(context.Background(), c, &sink{}); err != nil || code != 0 {
 		t.Fatalf("code=%d err=%v", code, err)
+	}
+	_ = outW.Close()
+	output, err := io.ReadAll(outR)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(output), terminalCleanupSequence) != 2 {
+		t.Fatalf("terminal cleanup count = %d, want 2", strings.Count(string(output), terminalCleanupSequence))
 	}
 	after, err := term.GetState(int(tty.Fd()))
 	if err != nil {

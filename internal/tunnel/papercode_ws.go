@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -52,6 +51,7 @@ const (
 	websocketKeepaliveInterval    = 30 * time.Second
 	websocketKeepaliveTimeout     = 10 * time.Second
 	websocketWriteTimeout         = 10 * time.Second
+	terminalOutputQueueChunks     = 256
 )
 
 var papercodeAttachEventTypes = []string{
@@ -68,11 +68,12 @@ var papercodeAttachEventTypes = []string{
 // PapercodeWSTunnel attaches to the VM-local papercode terminal RPC over the
 // agentunnel-provided WebSocket route.
 type PapercodeWSTunnel struct {
-	Dialer *websocket.Dialer
+	Dialer            *websocket.Dialer
+	OutputQueueChunks int
 }
 
 func NewPapercodeWSTunnel() *PapercodeWSTunnel {
-	return &PapercodeWSTunnel{Dialer: websocket.DefaultDialer}
+	return &PapercodeWSTunnel{Dialer: websocket.DefaultDialer, OutputQueueChunks: terminalOutputQueueChunks}
 }
 
 func (t *PapercodeWSTunnel) Check(ctx context.Context, target *resolver.TerminalTarget) error {
@@ -91,7 +92,7 @@ func (t *PapercodeWSTunnel) Check(ctx context.Context, target *resolver.Terminal
 		}
 		return fmt.Errorf("dial papercode websocket: %w", err)
 	}
-	c := newPapercodeWSConn(ws, target)
+	c := newPapercodeWSConn(ws, target, t.outputQueueChunks())
 	defer c.Close()
 	if err := c.call(ctx, rpcSubscribeTerminalMetadata, map[string]any{}); err != nil {
 		return err
@@ -119,7 +120,7 @@ func (t *PapercodeWSTunnel) Dial(ctx context.Context, info resolver.ConnectInfo)
 		}
 		return nil, fmt.Errorf("dial papercode websocket: %w", err)
 	}
-	c := newPapercodeWSConn(ws, target)
+	c := newPapercodeWSConn(ws, target, t.outputQueueChunks())
 	if err := c.attach(ctx); err != nil {
 		_ = c.Close()
 		return nil, err
@@ -189,11 +190,22 @@ type papercodeWSConn struct {
 	keepaliveOnce sync.Once
 }
 
-func newPapercodeWSConn(ws *websocket.Conn, target *resolver.TerminalTarget) *papercodeWSConn {
+func (t *PapercodeWSTunnel) outputQueueChunks() int {
+	if t.OutputQueueChunks > 0 {
+		return t.OutputQueueChunks
+	}
+	return terminalOutputQueueChunks
+}
+
+func newPapercodeWSConn(ws *websocket.Conn, target *resolver.TerminalTarget, configuredQueueChunks ...int) *papercodeWSConn {
+	outputQueueChunks := terminalOutputQueueChunks
+	if len(configuredQueueChunks) > 0 && configuredQueueChunks[0] > 0 {
+		outputQueueChunks = configuredQueueChunks[0]
+	}
 	c := &papercodeWSConn{
 		ws:            ws,
 		target:        target,
-		out:           make(chan []byte, 64),
+		out:           make(chan []byte, outputQueueChunks),
 		done:          make(chan struct{}),
 		closed:        make(chan struct{}),
 		exitCode:      0,
@@ -238,20 +250,9 @@ func (c *papercodeWSConn) attach(ctx context.Context) error {
 func (c *papercodeWSConn) Read(p []byte) (int, error) {
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
-	if len(c.pending) > 0 {
-		n := copy(p, c.pending)
-		c.pending = c.pending[n:]
-		return n, nil
-	}
-	b, ok := <-c.out
-	if !ok {
-		return 0, io.EOF
-	}
-	n := copy(p, b)
-	if n < len(b) {
-		c.pending = append(c.pending, b[n:]...)
-	}
-	return n, nil
+	// Animated TUIs emit many small PTY updates. Drain output that is already
+	// available so one local write can render a burst without dropping bytes.
+	return readBufferedChunks(p, &c.pending, c.out)
 }
 
 func (c *papercodeWSConn) Write(p []byte) (int, error) {

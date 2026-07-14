@@ -21,6 +21,7 @@ type Event struct {
 	Stage         string    `json:"stage,omitempty"`
 	SizeBytes     int64     `json:"size_bytes,omitempty"`
 	LatencyMS     int64     `json:"latency_ms,omitempty"`
+	Count         int64     `json:"count,omitempty"`
 }
 
 var idPattern = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,200}$`)
@@ -36,7 +37,7 @@ func (e Event) Validate() error {
 			return fmt.Errorf("invalid %s", label)
 		}
 	}
-	if e.SizeBytes < 0 || e.LatencyMS < 0 {
+	if e.SizeBytes < 0 || e.LatencyMS < 0 || e.Count < 0 {
 		return fmt.Errorf("negative event measurement")
 	}
 	return nil
