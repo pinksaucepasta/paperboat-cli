@@ -6,8 +6,11 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // EnvConfigPath overrides the config file location when set.
@@ -290,8 +293,60 @@ func (c *Config) Save() error {
 		return fmt.Errorf("encode config: %w", err)
 	}
 	data = append(data, '\n')
-	if err := os.WriteFile(c.path, data, 0o600); err != nil {
+	// A torn config file can strand the CLI without its server configuration.
+	// Write beside the target then atomically replace it.
+	tmp, err := os.CreateTemp(filepath.Dir(c.path), ".config-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create config temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("restrict config temp file: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
 		return fmt.Errorf("write config %s: %w", c.path, err)
 	}
-	return nil
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("sync config %s: %w", c.path, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close config %s: %w", c.path, err)
+	}
+	if err := os.Rename(tmpPath, c.path); err != nil {
+		return fmt.Errorf("replace config %s: %w", c.path, err)
+	}
+	return os.Chmod(c.path, 0o600)
 }
+
+// NormalizeServerURL accepts the public Paperboat API URL. HTTP is restricted
+// to loopback for local development; other targets must use HTTPS.
+func NormalizeServerURL(value string) (string, error) {
+	raw := strings.TrimSpace(value)
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "", fmt.Errorf("invalid Paperboat server URL %q", value)
+	}
+	if u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Path != "" && u.Path != "/" {
+		return "", errorsNewServerURL()
+	}
+	host := u.Hostname()
+	if host == "" {
+		return "", errorsNewServerURL()
+	}
+	if u.Scheme == "http" {
+		ip := net.ParseIP(host)
+		if !strings.EqualFold(host, "localhost") && (ip == nil || !ip.IsLoopback()) {
+			return "", fmt.Errorf("Paperboat server URL must use HTTPS unless the host is loopback")
+		}
+	} else if u.Scheme != "https" {
+		return "", fmt.Errorf("Paperboat server URL must use HTTPS")
+	}
+	u.Path = ""
+	return strings.TrimRight(u.String(), "/"), nil
+}
+
+func errorsNewServerURL() error { return fmt.Errorf("invalid Paperboat server URL") }

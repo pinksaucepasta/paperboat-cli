@@ -128,7 +128,30 @@ func TestHelpCommandDoesNotCallBackend(t *testing.T) {
 	if err := app.Run([]string{"pb", "help"}); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(output.String(), "USAGE:") || !strings.Contains(output.String(), "COMMANDS:") {
+	if !strings.Contains(output.String(), "Usage:") || !strings.Contains(output.String(), "Available Commands:") {
+		t.Fatalf("help output = %q", output.String())
+	}
+}
+
+func TestRootWithoutArgumentsShowsHelp(t *testing.T) {
+	var output bytes.Buffer
+	app := newApp()
+	app.Writer = &output
+	app.ErrWriter = &output
+	if err := app.Run([]string{"pb"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "Usage:") {
+		t.Fatalf("root output = %q", output.String())
+	}
+}
+
+func TestCobraRootWithoutArgumentsShowsHelp(t *testing.T) {
+	var output bytes.Buffer
+	if code := run(context.Background(), nil, &output, &output); code != 0 {
+		t.Fatalf("exit code = %d", code)
+	}
+	if !strings.Contains(output.String(), "Usage:") {
 		t.Fatalf("help output = %q", output.String())
 	}
 }
@@ -173,8 +196,8 @@ func TestKeepAliveCommandCallsBackend(t *testing.T) {
 			}))
 			defer server.Close()
 			writeTestProfile(t, dir, configPath, server.URL)
-			if err := newApp().Run(normalizeArgs([]string{"pb", "--config", configPath, "--server", server.URL, "keep-alive", "Demo", "--hours", tc.hours})); err != nil {
-				t.Fatal(err)
+			if code := run(context.Background(), []string{"keep-alive", "Demo", "--hours", tc.hours, "--config", configPath, "--server", server.URL}, os.Stdout, os.Stderr); code != 0 {
+				t.Fatalf("exit code = %d", code)
 			}
 			if !gotKeepAlive {
 				t.Fatal("expected keep-alive request")
@@ -187,7 +210,7 @@ func TestConnectDoesNotExposeSessionOverrides(t *testing.T) {
 	for _, flag := range []string{"--size", "--agent"} {
 		t.Run(flag, func(t *testing.T) {
 			err := newApp().Run([]string{"pb", flag, "value", "demo"})
-			if err == nil || !strings.Contains(err.Error(), "flag provided but not defined") {
+			if err == nil || !strings.Contains(err.Error(), "unknown flag") {
 				t.Fatalf("err = %v", err)
 			}
 		})
@@ -235,11 +258,59 @@ func TestWarnPlaintextCredentialStorage(t *testing.T) {
 	}
 }
 
-func TestNormalizeArgsMovesTrailingRootFlagsBeforeNestedAuthCommand(t *testing.T) {
-	got := normalizeArgs([]string{"pb", "auth", "login", "--server", "https://api.example.com", "--config", "/tmp/pb.json"})
-	want := []string{"pb", "--server", "https://api.example.com", "--config", "/tmp/pb.json", "auth", "login"}
-	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
-		t.Fatalf("normalizeArgs = %#v, want %#v", got, want)
+func TestCobraAcceptsPersistentFlagsAfterNestedCommand(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	var output bytes.Buffer
+	if code := run(context.Background(), []string{"config", "path", "--server", "https://api.example.com", "--config", path}, &output, &output); code != 0 {
+		t.Fatalf("exit code = %d, output = %q", code, output.String())
+	}
+}
+
+func TestCobraParsesNestedSessionFlagsWithoutRewriting(t *testing.T) {
+	var output bytes.Buffer
+	code := run(context.Background(), []string{"sessions", "delete", "demo", "api", "--yes", "--server", "http://127.0.0.1:1"}, &output, &output)
+	if code != 1 || strings.Contains(output.String(), "unknown flag") {
+		t.Fatalf("exit code = %d output = %q", code, output.String())
+	}
+}
+
+func TestCobraUsageErrorsReturnExitCodeTwo(t *testing.T) {
+	for _, args := range [][]string{
+		{"auth", "unknown"},
+		{"connect", "demo", "--", "--new"},
+		{"demo", "--new", "--session", "api"},
+		{"config", "path", "extra"},
+	} {
+		var output bytes.Buffer
+		if code := run(context.Background(), args, &output, &output); code != 2 {
+			t.Fatalf("args=%q exit code=%d output=%q", args, code, output.String())
+		}
+		if !strings.Contains(output.String(), "Usage:") {
+			t.Fatalf("args=%q missing usage: %q", args, output.String())
+		}
+	}
+}
+
+func TestBareServerFlagPersistsNormalizedServer(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if code := run(context.Background(), []string{"--config", path, "--server", "https://api.example.com/"}, os.Stdout, os.Stderr); code != 0 {
+		t.Fatalf("exit code = %d", code)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ServerURL != "https://api.example.com" {
+		t.Fatalf("server URL = %q", cfg.ServerURL)
+	}
+}
+
+func TestSessionNameReservesOnlyAutomaticShellNames(t *testing.T) {
+	if err := validateSessionName("shell-tools"); err != nil {
+		t.Fatalf("shell-tools should be valid: %v", err)
+	}
+	if err := validateSessionName("shell-2"); err == nil {
+		t.Fatal("shell-2 should be reserved")
 	}
 }
 

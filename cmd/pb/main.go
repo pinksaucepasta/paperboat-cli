@@ -7,7 +7,11 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"math"
@@ -16,6 +20,7 @@ import (
 	"os/signal"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -24,153 +29,268 @@ import (
 
 	"github.com/pujan-modha/paperboat-cli/internal/api"
 	sessionauth "github.com/pujan-modha/paperboat-cli/internal/auth"
-	"github.com/pujan-modha/paperboat-cli/internal/buildinfo"
 	"github.com/pujan-modha/paperboat-cli/internal/config"
+	cli "github.com/pujan-modha/paperboat-cli/internal/legacycli"
 	"github.com/pujan-modha/paperboat-cli/internal/paste"
 	"github.com/pujan-modha/paperboat-cli/internal/resolver"
 	"github.com/pujan-modha/paperboat-cli/internal/session"
 	"github.com/pujan-modha/paperboat-cli/internal/telemetry"
 	"github.com/pujan-modha/paperboat-cli/internal/tunnel"
 	"github.com/pujan-modha/paperboat-cli/internal/upload"
-	"github.com/urfave/cli/v2"
+	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
 
 func main() {
-	app := newApp()
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	if err := app.RunContext(ctx, normalizeArgs(os.Args)); err != nil {
-		fmt.Fprintln(os.Stderr, "pb:", err)
-		os.Exit(1)
+	os.Exit(run(ctx, os.Args[1:], os.Stdout, os.Stderr))
+}
+
+var errUsage = errors.New("command usage error")
+
+type exitCodeError struct{ code int }
+
+func (e exitCodeError) Error() string { return "" }
+func (e exitCodeError) ExitCode() int { return e.code }
+
+type usageError struct{ err error }
+
+func (e usageError) Error() string { return e.err.Error() }
+func (e usageError) Unwrap() error { return errUsage }
+
+func invocationError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return usageError{err: err}
+}
+
+func commandArgs(args cobra.PositionalArgs) cobra.PositionalArgs {
+	return func(command *cobra.Command, values []string) error {
+		return invocationError(args(command, values))
 	}
 }
 
-// valueFlags are flags that consume the following token as their value. Used by
-// normalizeArgs so users can put flags after the project name.
-var valueFlags = map[string]bool{
-	"--config": true, "--server": true,
-}
-
-var subcommands = map[string]bool{
-	"connect":    true,
-	"projects":   true,
-	"keep-alive": true,
-	"config":     true,
-	"doctor":     true,
-	"auth":       true,
-}
-
-var subcommandValueFlags = map[string]bool{
-	"--hours": true,
-}
-
-// normalizeArgs moves flags ahead of positional arguments. urfave/cli stops
-// parsing flags at the first positional, so we reorder to keep the UX flexible.
-func normalizeArgs(args []string) []string {
-	if len(args) <= 1 {
-		return args
+func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	root := newRootCommand()
+	root.SetOut(stdout)
+	root.SetErr(stderr)
+	root.SetArgs(args)
+	err := root.ExecuteContext(ctx)
+	if err == nil {
+		return 0
 	}
-	var flags, positionals []string
-	rest := make([]string, 0, len(args)-1)
-	for i := 1; i < len(args); i++ {
-		tok := args[i]
-		if valueFlags[tok] && i+1 < len(args) {
-			flags = append(flags, tok, args[i+1])
-			i++
-			continue
-		}
-		if strings.HasPrefix(tok, "--config=") || strings.HasPrefix(tok, "--server=") {
-			flags = append(flags, tok)
-			continue
-		}
-		rest = append(rest, tok)
+	if errors.Is(err, errUsage) || isCobraUsageError(err) {
+		fmt.Fprintln(stderr, "pb:", err)
+		root.SetOut(stderr)
+		_ = root.Usage()
+		return 2
 	}
-	for i := 0; i < len(rest); i++ {
-		tok := rest[i]
-		switch {
-		case subcommands[tok]:
-			out := make([]string, 0, len(args))
-			out = append(out, args[0])
-			out = append(out, flags...)
-			out = append(out, tok)
-			cmdFlags, cmdPositionals := reorderFlags(rest[i+1:], subcommandValueFlags)
-			out = append(out, cmdFlags...)
-			out = append(out, cmdPositionals...)
-			return out
-		case tok == "--":
-			positionals = append(positionals, rest[i+1:]...)
-			i = len(rest)
-		case len(tok) > 1 && tok[0] == '-':
-			flags = append(flags, tok)
-			// Consume a separate value token for known value flags (unless the
-			// value was already attached with =).
-			if valueFlags[tok] && i+1 < len(rest) {
-				flags = append(flags, rest[i+1])
-				i++
+	if exitErr, ok := err.(interface{ ExitCode() int }); ok {
+		return exitErr.ExitCode()
+	}
+	if err.Error() != "" {
+		fmt.Fprintln(stderr, "pb:", err)
+	}
+	return 1
+}
+
+func isCobraUsageError(err error) bool {
+	message := err.Error()
+	return strings.HasPrefix(message, "unknown command ") ||
+		strings.HasPrefix(message, "unknown flag: ") ||
+		strings.Contains(message, " accepts ") ||
+		strings.Contains(message, " requires at least ") ||
+		strings.Contains(message, " requires at most ")
+}
+
+func newRootCommand() *cobra.Command {
+	root := &cobra.Command{
+		Use:   "pb [project]",
+		Short: "Connect to your Paperboat project VM terminal",
+		Args:  commandArgs(cobra.MaximumNArgs(1)),
+		RunE: func(command *cobra.Command, args []string) error {
+			if err := validateConnectInvocation(command); err != nil {
+				return err
 			}
-		default:
-			positionals = append(positionals, tok)
-		}
+			server, _ := command.Flags().GetString("server")
+			if len(args) == 0 && strings.TrimSpace(server) == "" {
+				return command.Help()
+			}
+			return actionConnect(legacyContext(command, args))
+		},
+		SilenceUsage:  true,
+		SilenceErrors: true,
 	}
-	out := make([]string, 0, len(args))
-	out = append(out, args[0])
-	out = append(out, flags...)
-	out = append(out, positionals...)
-	return out
+	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return invocationError(err) })
+	root.PersistentFlags().String("config", "", "path to the CLI config file")
+	root.PersistentFlags().String("server", "", "paperboat-server base URL override")
+	addConnectFlags(root)
+
+	connect := &cobra.Command{Use: "connect <project>", Short: "Attach to a project VM terminal", Args: commandArgs(cobra.ExactArgs(1)), RunE: func(command *cobra.Command, args []string) error {
+		if err := validateConnectInvocation(command); err != nil {
+			return err
+		}
+		return actionConnect(legacyContext(command, args))
+	}}
+	addConnectFlags(connect)
+	root.AddCommand(connect)
+
+	projects := &cobra.Command{Use: "projects", Short: "List projects available to this account", Args: commandArgs(cobra.NoArgs), RunE: legacyRun(projectsCommand().Action)}
+	projects.Flags().Bool("json", false, "print JSON")
+	root.AddCommand(projects)
+
+	keepAlive := &cobra.Command{Use: "keep-alive <project>", Args: commandArgs(cobra.ExactArgs(1)), RunE: legacyRun(keepAliveCommand().Action)}
+	keepAlive.Flags().Float64("hours", 0, "duration in hours")
+	keepAlive.Flags().Bool("clear", false, "clear keep-alive")
+	root.AddCommand(keepAlive)
+
+	doctor := &cobra.Command{Use: "doctor [project]", Short: "Check authentication and connectivity", Args: commandArgs(cobra.MaximumNArgs(1)), RunE: legacyRun(doctorCommand().Action)}
+	doctor.Flags().Bool("json", false, "print JSON")
+	root.AddCommand(doctor)
+
+	root.AddCommand(legacyTree(authCommand(), "auth"))
+	root.AddCommand(legacyTree(configCommand(), "config"))
+	root.AddCommand(sessionsCobraCommand())
+	return root
 }
 
-func reorderFlags(tokens []string, values map[string]bool) ([]string, []string) {
-	var flags, positionals []string
-	for i := 0; i < len(tokens); i++ {
-		tok := tokens[i]
-		if tok == "--" {
-			positionals = append(positionals, tokens[i+1:]...)
-			break
-		}
-		if len(tok) > 1 && tok[0] == '-' {
-			flags = append(flags, tok)
-			if values[tok] && i+1 < len(tokens) {
-				flags = append(flags, tokens[i+1])
-				i++
-			}
-			continue
-		}
-		positionals = append(positionals, tok)
+func addConnectFlags(command *cobra.Command) {
+	command.Flags().Bool("new", false, "create a new terminal session")
+	command.Flags().String("name", "", "name for a new terminal session")
+	command.Flags().String("session", "", "attach an existing terminal session by name or ID")
+}
+
+func validateConnectInvocation(command *cobra.Command) error {
+	newSession, _ := command.Flags().GetBool("new")
+	name, _ := command.Flags().GetString("name")
+	ref, _ := command.Flags().GetString("session")
+	if newSession && strings.TrimSpace(ref) != "" {
+		return invocationError(errors.New("--new and --session cannot be used together"))
 	}
-	return flags, positionals
+	if !newSession && strings.TrimSpace(name) != "" {
+		return invocationError(errors.New("--name requires --new"))
+	}
+	server, _ := command.Flags().GetString("server")
+	if strings.TrimSpace(server) != "" {
+		if _, err := config.NormalizeServerURL(server); err != nil {
+			return invocationError(err)
+		}
+	}
+	return nil
+}
+
+func legacyTree(source *cli.Command, use string) *cobra.Command {
+	command := &cobra.Command{Use: use, Short: source.Usage, Args: commandArgs(cobra.NoArgs)}
+	if source.Action != nil {
+		command.RunE = legacyRun(source.Action)
+	} else {
+		command.RunE = func(command *cobra.Command, _ []string) error { return command.Help() }
+	}
+	for _, child := range source.Subcommands {
+		child := child
+		entry := &cobra.Command{Use: child.Name, Short: child.Usage, Args: commandArgs(legacyCommandArgs(use, child.Name)), RunE: legacyRun(child.Action)}
+		if (use == "auth" && child.Name == "status") || (use == "config" && child.Name == "show") {
+			entry.Flags().Bool("json", false, "print JSON")
+		}
+		command.AddCommand(entry)
+	}
+	return command
+}
+
+func legacyCommandArgs(parent, name string) cobra.PositionalArgs {
+	if parent == "config" {
+		switch name {
+		case "set":
+			return cobra.ExactArgs(2)
+		case "unset":
+			return cobra.ExactArgs(1)
+		}
+	}
+	return cobra.NoArgs
+}
+
+func sessionsCobraCommand() *cobra.Command {
+	source := sessionsCommand()
+	command := &cobra.Command{Use: "sessions <project>", Args: commandArgs(cobra.ExactArgs(1)), RunE: legacyRun(source.Action)}
+	command.Flags().Bool("wide", false, "include immutable IDs")
+	command.Flags().Bool("json", false, "print JSON")
+	for _, child := range source.Subcommands {
+		child := child
+		var args cobra.PositionalArgs
+		switch child.Name {
+		case "rename":
+			args = cobra.ExactArgs(3)
+		case "close", "delete":
+			args = cobra.ExactArgs(2)
+		}
+		entry := &cobra.Command{Use: child.Name, Short: child.Usage, Args: commandArgs(args), RunE: legacyRun(child.Action)}
+		if child.Name == "delete" {
+			entry.Flags().Bool("yes", false, "confirm deletion")
+		}
+		command.AddCommand(entry)
+	}
+	return command
+}
+
+func legacyRun(action cli.ActionFunc) func(*cobra.Command, []string) error {
+	return func(command *cobra.Command, args []string) error { return action(legacyContext(command, args)) }
+}
+
+func legacyContext(command *cobra.Command, args []string) *cli.Context {
+	set := flag.NewFlagSet("pb", flag.ContinueOnError)
+	values := map[string]string{}
+	for _, name := range []string{"config", "server", "name", "session"} {
+		value, _ := command.Flags().GetString(name)
+		values[name] = value
+		set.String(name, value, "")
+	}
+	hours, _ := command.Flags().GetFloat64("hours")
+	set.Float64("hours", hours, "")
+	for _, name := range []string{"new", "json", "wide", "yes", "clear"} {
+		value, _ := command.Flags().GetBool(name)
+		values[name] = strconv.FormatBool(value)
+		set.Bool(name, value, "")
+	}
+	_ = set.Parse(args)
+	context := cli.NewContext(newApp(), set, nil)
+	context.Context = command.Context()
+	return context
 }
 
 func newApp() *cli.App {
 	rootFlags := []cli.Flag{
 		&cli.StringFlag{Name: "config", Usage: "path to the CLI config file"},
 		&cli.StringFlag{Name: "server", Usage: "paperboat-server base URL override"},
+		&cli.BoolFlag{Name: "new", Usage: "create a new terminal session"},
+		&cli.StringFlag{Name: "name", Usage: "name for a new terminal session"},
+		&cli.StringFlag{Name: "session", Usage: "attach an existing terminal session by name or ID"},
 	}
-	return &cli.App{
-		Name:                   "pb",
-		Usage:                  "Connect to your Paperboat project VM terminal",
-		Version:                buildinfo.Version,
-		UseShortOptionHandling: true,
-		Flags:                  rootFlags,
-		ArgsUsage:              "<project>",
-		Description:            "Run `pb <project>` to attach your project's remote terminal.",
-		Action:                 actionConnect,
-		Commands: []*cli.Command{
-			connectCommand(),
-			projectsCommand(),
-			keepAliveCommand(),
-			authCommand(),
-			configCommand(),
-			doctorCommand(),
-		},
+	_ = rootFlags
+	app := &cli.App{}
+	app.RunFunc = func(args []string) error {
+		root := newRootCommand()
+		if app.Writer != nil {
+			root.SetOut(app.Writer)
+		}
+		if app.ErrWriter != nil {
+			root.SetErr(app.ErrWriter)
+		}
+		if len(args) > 0 {
+			args = args[1:]
+		}
+		root.SetArgs(args)
+		return root.ExecuteContext(context.Background())
 	}
+	return app
 }
 
 func authCommand() *cli.Command {
 	return &cli.Command{Name: "auth", Usage: "Manage Paperboat sign-in", Subcommands: []*cli.Command{
 		{Name: "login", Usage: "Sign in through the Paperboat dashboard", Action: authLogin},
 		{Name: "switch", Usage: "Replace the active account for this server", Action: func(c *cli.Context) error { return authLoginMode(c, true) }},
-		{Name: "status", Usage: "Show the active Paperboat account", Action: authStatus},
+		{Name: "status", Usage: "Show the active Paperboat account", Flags: []cli.Flag{&cli.BoolFlag{Name: "json"}}, Action: authStatus},
 		{Name: "logout", Usage: "Revoke and remove the active client session", Action: authLogout},
 	}}
 }
@@ -322,11 +442,17 @@ func authStatus(c *cli.Context) error {
 	}
 	p, err := store.Load(cfg.ServerURL)
 	if errors.Is(err, config.ErrNoCredentials) {
+		if c.Bool("json") {
+			return json.NewEncoder(os.Stdout).Encode(map[string]any{"signed_in": false})
+		}
 		fmt.Println("Not signed in")
 		return nil
 	}
 	if err != nil {
 		return err
+	}
+	if c.Bool("json") {
+		return json.NewEncoder(os.Stdout).Encode(map[string]any{"signed_in": true, "issuer": p.Issuer, "client_session_id": p.ClientSessionID, "access_expires_at": p.AccessExpiresAt, "account": p.Account})
 	}
 	fmt.Printf("Signed in as %s\nServer: %s\nSession: %s\nAccess expires: %s\n", firstNonEmpty(p.Account.Email, p.Account.DisplayName, p.Account.ID), p.Issuer, p.ClientSessionID, p.AccessExpiresAt.Format(time.RFC3339))
 	return nil
@@ -539,7 +665,17 @@ func buildDeps(c *cli.Context) (*deps, error) {
 		return nil, err
 	}
 	if s := c.String("server"); s != "" {
-		cfg.ServerURL = s
+		normalized, err := config.NormalizeServerURL(s)
+		if err != nil {
+			return nil, err
+		}
+		cfg.ServerURL = normalized
+	} else if cfg.ServerURL != "" {
+		normalized, err := config.NormalizeServerURL(cfg.ServerURL)
+		if err != nil {
+			return nil, fmt.Errorf("invalid configured Paperboat server: %w", err)
+		}
+		cfg.ServerURL = normalized
 	}
 	papercodeTunnel := tunnel.NewPapercodeWSTunnel()
 	papercodeTunnel.OutputQueueChunks = cfg.Connect.TerminalOutputQueueChunks
@@ -567,7 +703,16 @@ func connectCommand() *cli.Command {
 		Name:      "connect",
 		Usage:     "Attach to a project VM terminal (default action)",
 		ArgsUsage: "<project>",
+		Flags:     connectFlags(),
 		Action:    actionConnect,
+	}
+}
+
+func connectFlags() []cli.Flag {
+	return []cli.Flag{
+		&cli.BoolFlag{Name: "new", Usage: "create a new terminal session"},
+		&cli.StringFlag{Name: "name", Usage: "name for a new terminal session"},
+		&cli.StringFlag{Name: "session", Usage: "attach an existing terminal session by name or ID"},
 	}
 }
 
@@ -575,6 +720,7 @@ func projectsCommand() *cli.Command {
 	return &cli.Command{
 		Name:  "projects",
 		Usage: "List projects available to this account",
+		Flags: []cli.Flag{&cli.BoolFlag{Name: "json"}},
 		Action: func(c *cli.Context) error {
 			client, err := backendClient(c)
 			if err != nil {
@@ -583,6 +729,9 @@ func projectsCommand() *cli.Command {
 			projects, err := client.ListProjects(c.Context)
 			if err != nil {
 				return err
+			}
+			if c.Bool("json") {
+				return json.NewEncoder(os.Stdout).Encode(projects)
 			}
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 			fmt.Fprintln(w, "NAME\tID\tSTATE")
@@ -594,10 +743,281 @@ func projectsCommand() *cli.Command {
 	}
 }
 
+func sessionsCommand() *cli.Command {
+	list := func(c *cli.Context) error {
+		client, err := backendClient(c)
+		if err != nil {
+			return err
+		}
+		project, err := resolveProjectID(c.Context, client, c.Args().First())
+		if err != nil {
+			return err
+		}
+		sessions, err := client.ListTerminalSessions(c.Context, project.ID)
+		if err != nil {
+			return friendlyCommandError(err)
+		}
+		if c.Bool("json") {
+			return json.NewEncoder(os.Stdout).Encode(sessions)
+		}
+		w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+		if c.Bool("wide") {
+			fmt.Fprintln(w, "NAME\tID\tSTATE\tATTACHED\tLAST ACTIVE")
+		} else {
+			fmt.Fprintln(w, "NAME\tSTATE\tATTACHED\tLAST ACTIVE")
+		}
+		for _, s := range sessions {
+			attached := "-"
+			if s.AttachedCount != nil {
+				attached = fmt.Sprintf("%d", *s.AttachedCount)
+			}
+			if c.Bool("wide") {
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", s.Name, s.ID, s.State, attached, relativeTime(s.LastActiveAt))
+			} else {
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", s.Name, s.State, attached, relativeTime(s.LastActiveAt))
+			}
+		}
+		return w.Flush()
+	}
+	return &cli.Command{Name: "sessions", Usage: "Manage project terminal sessions", ArgsUsage: "<project>", Flags: []cli.Flag{&cli.BoolFlag{Name: "wide"}, &cli.BoolFlag{Name: "json"}}, Action: list, Subcommands: []*cli.Command{
+		{Name: "rename", ArgsUsage: "<project> <session> <new-name>", Action: func(c *cli.Context) error {
+			if c.Args().Len() != 3 {
+				return errors.New("usage: pb sessions rename <project> <session> <new-name>")
+			}
+			if err := validateSessionName(c.Args().Get(2)); err != nil {
+				return err
+			}
+			client, err := backendClient(c)
+			if err != nil {
+				return err
+			}
+			project, err := resolveProjectID(c.Context, client, c.Args().First())
+			if err != nil {
+				return err
+			}
+			session, err := resolveTerminalSession(c.Context, client, project.ID, c.Args().Get(1))
+			if err != nil {
+				return err
+			}
+			if session.IsDefault {
+				return errors.New("the default session cannot be renamed")
+			}
+			_, err = client.RenameTerminalSession(c.Context, project.ID, session.ID, c.Args().Get(2))
+			return friendlyCommandError(err)
+		}},
+		{Name: "close", ArgsUsage: "<project> <session>", Action: func(c *cli.Context) error {
+			if c.Args().Len() != 2 {
+				return errors.New("usage: pb sessions close <project> <session>")
+			}
+			client, err := backendClient(c)
+			if err != nil {
+				return err
+			}
+			project, err := resolveProjectID(c.Context, client, c.Args().First())
+			if err != nil {
+				return err
+			}
+			session, err := resolveTerminalSession(c.Context, client, project.ID, c.Args().Get(1))
+			if err != nil {
+				return err
+			}
+			return friendlyCommandError(client.CloseTerminalSession(c.Context, project.ID, session.ID))
+		}},
+		{Name: "delete", ArgsUsage: "<project> <session>", Flags: []cli.Flag{&cli.BoolFlag{Name: "yes", Usage: "confirm deletion"}}, Action: func(c *cli.Context) error {
+			if c.Args().Len() != 2 {
+				return errors.New("usage: pb sessions delete <project> <session> [--yes]")
+			}
+			client, err := backendClient(c)
+			if err != nil {
+				return err
+			}
+			project, err := resolveProjectID(c.Context, client, c.Args().First())
+			if err != nil {
+				return err
+			}
+			session, err := resolveTerminalSession(c.Context, client, project.ID, c.Args().Get(1))
+			if err != nil {
+				return err
+			}
+			if session.IsDefault {
+				return errors.New("the default session cannot be deleted")
+			}
+			if !c.Bool("yes") {
+				if !term.IsTerminal(int(os.Stdin.Fd())) {
+					return errors.New("refusing non-interactive deletion without --yes")
+				}
+				fmt.Fprintf(os.Stderr, "Delete terminal session %q? [y/N] ", session.Name)
+				var answer string
+				if _, err := fmt.Fscanln(os.Stdin, &answer); err != nil || !strings.EqualFold(answer, "y") && !strings.EqualFold(answer, "yes") {
+					return errors.New("deletion cancelled")
+				}
+			}
+			return friendlyCommandError(client.DeleteTerminalSession(c.Context, project.ID, session.ID))
+		}},
+	}}
+}
+
+func selectTerminalSession(ctx context.Context, client *api.Client, projectRef string, create bool, name, ref string) (string, error) {
+	project, err := resolveProjectID(ctx, client, projectRef)
+	if err != nil {
+		return "", err
+	}
+	if create {
+		if err := validateSessionNameOptional(name); err != nil {
+			return "", err
+		}
+		session, err := client.CreateTerminalSession(ctx, project.ID, name, newIdempotencyKey())
+		if err != nil {
+			return "", friendlyCommandError(err)
+		}
+		if name == "" {
+			fmt.Fprintf(os.Stderr, "Session: %s\n", session.Name)
+		}
+		return session.ID, nil
+	}
+	if strings.TrimSpace(ref) == "" {
+		return "", nil
+	}
+	session, err := resolveTerminalSession(ctx, client, project.ID, ref)
+	if err != nil {
+		return "", err
+	}
+	return session.ID, nil
+}
+
+func resolveTerminalSession(ctx context.Context, client *api.Client, projectID, ref string) (api.TerminalSession, error) {
+	sessions, err := client.ListTerminalSessions(ctx, projectID)
+	if err != nil {
+		return api.TerminalSession{}, friendlyCommandError(err)
+	}
+	for _, s := range sessions {
+		if s.ID == ref || strings.EqualFold(s.Name, ref) {
+			return s, nil
+		}
+	}
+	var suggestions []string
+	for _, s := range sessions {
+		if strings.HasPrefix(strings.ToLower(s.Name), strings.ToLower(ref)) || editDistance(strings.ToLower(s.Name), strings.ToLower(ref)) <= 2 {
+			suggestions = append(suggestions, s.Name)
+			if len(suggestions) == 3 {
+				break
+			}
+		}
+	}
+	message := fmt.Sprintf("terminal session %q was not found", ref)
+	if len(suggestions) > 0 {
+		message += "; did you mean " + strings.Join(suggestions, ", ") + "?"
+	}
+	message += "; create one with --new --name"
+	return api.TerminalSession{}, errors.New(message)
+}
+
+var sessionNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
+var automaticSessionNamePattern = regexp.MustCompile(`^shell-[0-9]+$`)
+
+func validateSessionNameOptional(name string) error {
+	if name == "" {
+		return nil
+	}
+	return validateSessionName(name)
+}
+func validateSessionName(name string) error {
+	if name == "default" || automaticSessionNamePattern.MatchString(name) || !sessionNamePattern.MatchString(name) {
+		return errors.New("session names must be lowercase 1-64 character values matching [a-z0-9][a-z0-9._-]{0,63}; default and shell-N are reserved")
+	}
+	return nil
+}
+
+func newIdempotencyKey() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("pb-%d", time.Now().UnixNano())
+	}
+	return "pb-" + hex.EncodeToString(b[:])
+}
+func relativeTime(at *time.Time) string {
+	if at == nil {
+		return "-"
+	}
+	d := time.Since(*at)
+	if d < time.Minute {
+		return "now"
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	}
+	if d < 24*time.Hour {
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	}
+	return fmt.Sprintf("%dd ago", int(d.Hours()/24))
+}
+func editDistance(a, b string) int {
+	prev := make([]int, len(b)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i, ra := range a {
+		current := make([]int, len(b)+1)
+		current[0] = i + 1
+		for j, rb := range b {
+			cost := 0
+			if ra != rb {
+				cost = 1
+			}
+			current[j+1] = minInt(current[j]+1, prev[j+1]+1, prev[j]+cost)
+		}
+		prev = current
+	}
+	return prev[len(b)]
+}
+func minInt(values ...int) int {
+	value := values[0]
+	for _, candidate := range values[1:] {
+		if candidate < value {
+			value = candidate
+		}
+	}
+	return value
+}
+func friendlyCommandError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if msg := friendlyAPIError(err); msg != "" {
+		return errors.New(msg)
+	}
+	return err
+}
+
 func actionConnect(c *cli.Context) error {
 	project := c.Args().First()
 	if project == "" {
+		if server := strings.TrimSpace(c.String("server")); server != "" {
+			cfg, err := config.Load(c.String("config"))
+			if err != nil {
+				return err
+			}
+			normalized, err := config.NormalizeServerURL(server)
+			if err != nil {
+				return err
+			}
+			cfg.ServerURL = normalized
+			if err := cfg.Save(); err != nil {
+				return err
+			}
+			fmt.Fprintln(os.Stdout, cfg.Path())
+			return nil
+		}
 		return errors.New("missing project name; usage: pb <project>")
+	}
+	if c.Args().Len() > 1 {
+		return errors.New("expected exactly one project name")
+	}
+	if c.Bool("new") && strings.TrimSpace(c.String("session")) != "" {
+		return errors.New("--new and --session cannot be used together")
+	}
+	if !c.Bool("new") && strings.TrimSpace(c.String("name")) != "" {
+		return errors.New("--name requires --new")
 	}
 
 	d, err := buildDeps(c)
@@ -619,7 +1039,12 @@ func actionConnect(c *cli.Context) error {
 	if errors.Is(err, config.ErrNoCredentials) {
 		return errors.New("not signed in to Paperboat; run `pb auth login`, then retry")
 	}
-	d.resolver = resolver.NewAPIResolver(api.New(d.cfg.ServerURL, cred, nil), d.cfg)
+	backend := api.New(d.cfg.ServerURL, cred, nil)
+	terminalSessionID, err := selectTerminalSession(c.Context, backend, project, c.Bool("new"), c.String("name"), c.String("session"))
+	if err != nil {
+		return err
+	}
+	d.resolver = resolver.NewAPIResolver(backend, d.cfg)
 	if apiResolver, ok := d.resolver.(*resolver.APIResolver); ok {
 		apiResolver.Telemetry = d.telemetry
 		apiResolver.Progress = func(status, reason string, retryAfter time.Duration) {
@@ -657,7 +1082,7 @@ func actionConnect(c *cli.Context) error {
 			if info.ProjectID != "" {
 				projectToken = info.ProjectID
 			}
-			freshInfo, resolveErr := r.Resolve(refreshCtx, resolver.ConnectRequest{Project: projectToken, Credential: freshCred})
+			freshInfo, resolveErr := r.Resolve(refreshCtx, resolver.ConnectRequest{Project: projectToken, Credential: freshCred, TerminalSessionID: terminalSessionID})
 			if resolveErr != nil {
 				return upload.Auth{}, fmt.Errorf("refresh upload descriptor: %w", resolveErr)
 			}
@@ -668,7 +1093,7 @@ func actionConnect(c *cli.Context) error {
 		}
 	}
 	for attempt := 0; attempt <= d.cfg.Connect.DialRetries; attempt++ {
-		info, err = d.resolver.Resolve(ctx, resolver.ConnectRequest{Project: project, Credential: cred})
+		info, err = d.resolver.Resolve(ctx, resolver.ConnectRequest{Project: project, Credential: cred, TerminalSessionID: terminalSessionID})
 		if err == nil {
 			if info.Terminal != nil {
 				info.Terminal.ReplayHistory = true
@@ -710,7 +1135,7 @@ func actionConnect(c *cli.Context) error {
 		}
 		freshResolver := resolver.NewAPIResolver(api.New(d.cfg.ServerURL, freshCred, nil), d.cfg)
 		freshResolver.Telemetry = d.telemetry
-		freshInfo, resolveErr := freshResolver.Resolve(reconnectCtx, resolver.ConnectRequest{Project: info.ProjectID, Credential: freshCred})
+		freshInfo, resolveErr := freshResolver.Resolve(reconnectCtx, resolver.ConnectRequest{Project: info.ProjectID, Credential: freshCred, TerminalSessionID: terminalSessionID})
 		if resolveErr != nil {
 			return nil, resolveErr
 		}
@@ -758,7 +1183,7 @@ func actionConnect(c *cli.Context) error {
 		return err
 	}
 	if code != 0 {
-		os.Exit(code)
+		return exitCodeError{code: code}
 	}
 	return nil
 }
@@ -926,6 +1351,46 @@ func configCommand() *cli.Command {
 		Usage: "Inspect the local CLI config",
 		Subcommands: []*cli.Command{
 			{
+				Name: "set", ArgsUsage: "server <url>", Usage: "Set a local configuration value",
+				Action: func(c *cli.Context) error {
+					if c.Args().Len() != 2 || c.Args().First() != "server" {
+						return errors.New("usage: pb config set server <url>")
+					}
+					cfg, err := config.Load(c.String("config"))
+					if err != nil {
+						return err
+					}
+					server, err := config.NormalizeServerURL(c.Args().Get(1))
+					if err != nil {
+						return err
+					}
+					cfg.ServerURL = server
+					if err := cfg.Save(); err != nil {
+						return err
+					}
+					fmt.Fprintln(os.Stdout, cfg.Path())
+					return nil
+				},
+			},
+			{
+				Name: "unset", ArgsUsage: "server", Usage: "Remove a local configuration value",
+				Action: func(c *cli.Context) error {
+					if c.Args().Len() != 1 || c.Args().First() != "server" {
+						return errors.New("usage: pb config unset server")
+					}
+					cfg, err := config.Load(c.String("config"))
+					if err != nil {
+						return err
+					}
+					cfg.ServerURL = ""
+					if err := cfg.Save(); err != nil {
+						return err
+					}
+					fmt.Fprintln(os.Stdout, cfg.Path())
+					return nil
+				},
+			},
+			{
 				Name:  "path",
 				Usage: "Print the config file path",
 				Action: func(c *cli.Context) error {
@@ -940,10 +1405,14 @@ func configCommand() *cli.Command {
 			{
 				Name:  "show",
 				Usage: "Print the effective config",
+				Flags: []cli.Flag{&cli.BoolFlag{Name: "json"}},
 				Action: func(c *cli.Context) error {
 					d, err := buildDeps(c)
 					if err != nil {
 						return err
+					}
+					if c.Bool("json") {
+						return json.NewEncoder(os.Stdout).Encode(map[string]any{"path": d.cfg.Path(), "server_url": d.cfg.ServerURL, "auth_file_fallback": d.cfg.Auth.AllowFileFallback, "upload_endpoint": d.cfg.Upload.Endpoint, "upload_max_image_bytes": d.cfg.Upload.MaxImageBytes, "upload_max_attachments": d.cfg.Upload.MaxAttachments})
 					}
 					fmt.Printf("server_url: %s\n", orNone(d.cfg.ServerURL))
 					fmt.Printf("auth.file_fallback: %t\n", d.cfg.Auth.AllowFileFallback)
@@ -962,10 +1431,14 @@ func doctorCommand() *cli.Command {
 		Name:      "doctor",
 		Usage:     "Check authentication and connectivity",
 		ArgsUsage: "[project]",
+		Flags:     []cli.Flag{&cli.BoolFlag{Name: "json"}},
 		Action: func(c *cli.Context) error {
 			d, err := buildDeps(c)
 			if err != nil {
 				return err
+			}
+			if c.Bool("json") {
+				return doctorJSON(c, d)
 			}
 			project := c.Args().First()
 			fmt.Printf("config:      %s\n", d.cfg.Path())
@@ -1028,6 +1501,67 @@ func doctorCommand() *cli.Command {
 			return nil
 		},
 	}
+}
+
+func doctorJSON(c *cli.Context, d *deps) error {
+	result := map[string]any{"config_path": d.cfg.Path(), "server": d.cfg.ServerURL, "auth": "unknown", "backend": "skipped"}
+	cred, credErr := d.auth.Credential()
+	if errors.Is(credErr, config.ErrNoCredentials) {
+		result["auth"] = "not_signed_in"
+	} else if credErr != nil {
+		result["auth"] = "error"
+		result["auth_error"] = credErr.Error()
+	} else {
+		result["auth"] = "available"
+	}
+	if d.cfg.ServerURL == "" {
+		_ = json.NewEncoder(os.Stdout).Encode(result)
+		return errors.New("doctor: Paperboat server is not configured")
+	}
+	if credErr != nil {
+		_ = json.NewEncoder(os.Stdout).Encode(result)
+		return errors.New("doctor: Paperboat credentials are unavailable")
+	}
+	client := api.New(d.cfg.ServerURL, cred, nil)
+	me, err := client.Me(c.Context)
+	if err != nil {
+		result["backend"] = "error"
+		result["backend_error"] = err.Error()
+		_ = json.NewEncoder(os.Stdout).Encode(result)
+		return fmt.Errorf("doctor: backend check failed: %w", err)
+	}
+	result["backend"] = "authenticated"
+	result["account"] = firstNonEmpty(me.Email, me.DisplayName, me.ID)
+	project := c.Args().First()
+	if project == "" {
+		result["project"] = nil
+		return json.NewEncoder(os.Stdout).Encode(result)
+	}
+	info, err := resolver.NewAPIResolver(client, d.cfg).Resolve(c.Context, resolver.ConnectRequest{Project: project, Credential: cred})
+	if err != nil {
+		result["project"] = project
+		result["connect"] = "error"
+		result["connect_error"] = err.Error()
+		_ = json.NewEncoder(os.Stdout).Encode(result)
+		return fmt.Errorf("doctor: descriptor check failed: %w", err)
+	}
+	if info.Terminal == nil {
+		result["project"] = info.ProjectID
+		result["connect"] = "missing_terminal"
+		_ = json.NewEncoder(os.Stdout).Encode(result)
+		return errors.New("doctor: descriptor missing terminal endpoint")
+	}
+	if err := tunnel.NewPapercodeWSTunnel().Check(c.Context, info.Terminal); err != nil {
+		result["project"] = info.ProjectID
+		result["connect"] = "websocket_error"
+		result["connect_error"] = err.Error()
+		_ = json.NewEncoder(os.Stdout).Encode(result)
+		return fmt.Errorf("doctor: papercode protocol check failed: %w", err)
+	}
+	result["project"] = map[string]string{"id": info.ProjectID, "name": info.Project, "state": info.ProjectState}
+	result["connect"] = "ready"
+	result["protocol"] = "paperboat-terminal-rpc/v1"
+	return json.NewEncoder(os.Stdout).Encode(result)
 }
 
 func firstNonEmpty(vals ...string) string {

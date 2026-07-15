@@ -34,28 +34,22 @@ func TestPapercodeWSTunnelAttachIOResizeAndExit(t *testing.T) {
 			return
 		}
 		defer ws.Close()
-		waitingForAttachAck := false
 		for {
 			var req rpcRequestSeen
 			if err := ws.ReadJSON(&req); err != nil {
 				return
 			}
-			if req.Type == rpcAckTagValue {
-				if req.RequestID != "1" {
-					t.Errorf("unexpected stream acknowledgement: %#v", req)
-					return
-				}
-				if waitingForAttachAck {
-					waitingForAttachAck = false
-					sendChunk(t, ws, 1, terminalEvent{Type: "output", Data: "world"})
-				}
-				continue
+			if req.Type == "Ack" {
+				// The server runs with client acks disabled; the CLI must not
+				// spend uplink bandwidth acknowledging every output chunk.
+				t.Errorf("unexpected stream acknowledgement: %#v", req)
+				return
 			}
 			requests <- req
 			switch req.Tag {
 			case rpcTerminalAttach:
 				sendChunk(t, ws, 1, terminalEvent{Type: "output", Data: "hello "})
-				waitingForAttachAck = true
+				sendChunk(t, ws, 1, terminalEvent{Type: "output", Data: "world"})
 			case rpcTerminalResize:
 				code := 7
 				sendChunk(t, ws, 1, terminalEvent{Type: "exited", ExitCode: &code})
@@ -210,8 +204,10 @@ func TestPapercodeWSTunnelCheckUsesNonAttachingMetadataProbe(t *testing.T) {
 		}
 		requests <- req
 		sendChunk(t, ws, 1, terminalEvent{Type: terminalEventSnapshot})
-		var ack rpcRequestSeen
-		_ = ws.ReadJSON(&ack)
+		var next rpcRequestSeen
+		if err := ws.ReadJSON(&next); err == nil && next.Type == "Ack" {
+			t.Errorf("doctor probe acknowledged a chunk: %#v", next)
+		}
 	}))
 	defer server.Close()
 	if err := NewPapercodeWSTunnel().Check(context.Background(), testTerminalTarget(server.URL)); err != nil {
@@ -417,7 +413,6 @@ func TestPapercodeWSConnUnexpectedReadFailureSurfacesError(t *testing.T) {
 		var req rpcRequestSeen
 		if err := ws.ReadJSON(&req); err == nil && req.Tag == rpcTerminalAttach {
 			sendChunk(t, ws, 1, terminalEvent{Type: "output", Data: "ready"})
-			_ = ws.ReadJSON(&req)
 		}
 		_ = ws.Close()
 	}))
@@ -473,5 +468,69 @@ func TestPapercodeWSConnLocalCloseDoesNotSurfaceReadError(t *testing.T) {
 	}
 	if destructiveClose.Load() {
 		t.Fatal("transport detach sent destructive terminal.close")
+	}
+}
+
+func TestPapercodeWSConnMalformedFrameIsTransportLost(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade: %v", err)
+			return
+		}
+		defer ws.Close()
+		var req rpcRequestSeen
+		if err := ws.ReadJSON(&req); err == nil && req.Tag == rpcTerminalAttach {
+			sendChunk(t, ws, 1, terminalEvent{Type: "output", Data: "ready"})
+			// Simulate tunnel corruption: bytes that are not valid JSON.
+			_ = ws.WriteMessage(websocket.TextMessage, []byte("{corrupt"))
+		}
+		var next rpcRequestSeen
+		_ = ws.ReadJSON(&next)
+	}))
+	defer server.Close()
+
+	conn, err := NewPapercodeWSTunnel().Dial(context.Background(), resolver.ConnectInfo{Terminal: testTerminalTarget(server.URL)})
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	code, err := conn.Wait()
+	if code != 1 {
+		t.Fatalf("code = %d", code)
+	}
+	if !errors.Is(err, ErrTransportLost) {
+		t.Fatalf("corrupt frame must surface as transport loss for reconnect, got %v", err)
+	}
+}
+
+func TestPapercodeWSConnExitFailureClassification(t *testing.T) {
+	cases := []struct {
+		name          string
+		message       string
+		wantReconnect bool
+	}{
+		{"attach stream overflow reconnects", "terminal attach stream overflow: over 4096 undelivered events", true},
+		{"history errors reconnect", "TerminalHistoryError: failed to read terminal history", true},
+		{"authorization failures stay fatal", "The authenticated token is missing required scope: terminal:operate.", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &papercodeWSConn{out: make(chan []byte, 1), done: make(chan struct{})}
+			raw, err := json.Marshal(map[string]any{"message": tc.message})
+			if err != nil {
+				t.Fatal(err)
+			}
+			frameErr := c.handleFrame(rpcFrame{
+				Tag:  rpcExitTag,
+				Exit: effectExit{Tag: "Failure", Cause: []effectCause{{Tag: "Fail", Error: raw}}},
+			})
+			if frameErr == nil {
+				t.Fatal("exit failure must surface an error")
+			}
+			if got := errors.Is(frameErr, ErrTransportLost); got != tc.wantReconnect {
+				t.Fatalf("reconnectable = %v, want %v (err %v)", got, tc.wantReconnect, frameErr)
+			}
+		})
 	}
 }

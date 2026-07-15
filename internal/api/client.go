@@ -126,6 +126,24 @@ type ProjectPage struct {
 	Pagination Pagination `json:"pagination"`
 }
 
+// TerminalSession is the durable session catalog record returned by the
+// control plane. Runtime-only fields may be unavailable while a VM is stopped.
+type TerminalSession struct {
+	ID            string     `json:"id"`
+	Name          string     `json:"name"`
+	IsDefault     bool       `json:"is_default"`
+	State         string     `json:"state"`
+	AttachedCount *int       `json:"attached_count"`
+	LastActiveAt  *time.Time `json:"last_active_at"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
+}
+
+type TerminalSessionPage struct {
+	Items      []TerminalSession `json:"items"`
+	Pagination Pagination        `json:"pagination"`
+}
+
 // AuthMaterial is short-lived auth material scoped by paperboat-server for a
 // specific connect descriptor. Phase 1 will finalize the exact token format.
 type AuthMaterial struct {
@@ -230,15 +248,80 @@ func (c *Client) ListProjects(ctx context.Context) ([]Project, error) {
 // WebSocket terminal descriptor. A not-yet-ready machine returns
 // Connectable=false (HTTP 202); the caller polls ConnectionStatus.
 func (c *Client) CLIConnect(ctx context.Context, projectID string) (ConnectResponse, error) {
+	return c.CLIConnectSession(ctx, projectID, "")
+}
+
+// CLIConnectSession connects the selected durable terminal session. An empty
+// session ID preserves the default-session behavior for older servers/clients.
+func (c *Client) CLIConnectSession(ctx context.Context, projectID, terminalSessionID string) (ConnectResponse, error) {
 	var out ConnectResponse
-	err := c.do(ctx, http.MethodPost, "/api/projects/"+url.PathEscape(projectID)+"/cli-connect", nil, &out)
+	var body any
+	if terminalSessionID != "" {
+		body = map[string]string{"terminal_session_id": terminalSessionID}
+	}
+	err := c.do(ctx, http.MethodPost, "/api/projects/"+url.PathEscape(projectID)+"/cli-connect", body, &out)
 	return out, err
+}
+
+func (c *Client) ListTerminalSessions(ctx context.Context, projectID string) ([]TerminalSession, error) {
+	const pageSize = 200
+	var sessions []TerminalSession
+	for offset := 0; ; {
+		var page TerminalSessionPage
+		path := fmt.Sprintf("/api/projects/%s/terminal-sessions?limit=%d&offset=%d", url.PathEscape(projectID), pageSize, offset)
+		if err := c.do(ctx, http.MethodGet, path, nil, &page); err != nil {
+			return nil, err
+		}
+		sessions = append(sessions, page.Items...)
+		if page.Pagination.NextOffset == nil {
+			return sessions, nil
+		}
+		if *page.Pagination.NextOffset <= offset {
+			return nil, errors.New("terminal session pagination did not advance")
+		}
+		offset = *page.Pagination.NextOffset
+	}
+}
+
+func (c *Client) CreateTerminalSession(ctx context.Context, projectID, name, idempotencyKey string) (TerminalSession, error) {
+	var out TerminalSession
+	body := map[string]string{}
+	if name != "" {
+		body["name"] = name
+	}
+	path := "/api/projects/" + url.PathEscape(projectID) + "/terminal-sessions"
+	return out, c.doWithHeaders(ctx, http.MethodPost, path, body, &out, http.Header{"Idempotency-Key": []string{idempotencyKey}})
+}
+
+func (c *Client) RenameTerminalSession(ctx context.Context, projectID, sessionID, name string) (TerminalSession, error) {
+	var out TerminalSession
+	err := c.do(ctx, http.MethodPatch, "/api/projects/"+url.PathEscape(projectID)+"/terminal-sessions/"+url.PathEscape(sessionID), map[string]string{"name": name}, &out)
+	return out, err
+}
+
+func (c *Client) CloseTerminalSession(ctx context.Context, projectID, sessionID string) error {
+	return c.do(ctx, http.MethodPost, "/api/projects/"+url.PathEscape(projectID)+"/terminal-sessions/"+url.PathEscape(sessionID)+"/close", nil, &struct{}{})
+}
+
+func (c *Client) DeleteTerminalSession(ctx context.Context, projectID, sessionID string) error {
+	return c.do(ctx, http.MethodDelete, "/api/projects/"+url.PathEscape(projectID)+"/terminal-sessions/"+url.PathEscape(sessionID), nil, &struct{}{})
 }
 
 // ConnectionStatus reports current tunnel readiness without re-brokering.
 func (c *Client) ConnectionStatus(ctx context.Context, projectID string) (ConnectResponse, error) {
+	return c.ConnectionStatusSession(ctx, projectID, "")
+}
+
+// ConnectionStatusSession polls readiness for the same durable terminal
+// session selected for cli-connect. The returned descriptor has no credential,
+// but its terminal identity must never silently fall back to the default.
+func (c *Client) ConnectionStatusSession(ctx context.Context, projectID, terminalSessionID string) (ConnectResponse, error) {
 	var out ConnectResponse
-	err := c.do(ctx, http.MethodGet, "/api/projects/"+url.PathEscape(projectID)+"/connection-status", nil, &out)
+	path := "/api/projects/" + url.PathEscape(projectID) + "/connection-status"
+	if terminalSessionID != "" {
+		path += "?terminal_session_id=" + url.QueryEscape(terminalSessionID)
+	}
+	err := c.do(ctx, http.MethodGet, path, nil, &out)
 	return out, err
 }
 
@@ -253,6 +336,10 @@ func (c *Client) SetKeepAlive(ctx context.Context, projectID string, durationSec
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
+	return c.doWithHeaders(ctx, method, path, body, out, nil)
+}
+
+func (c *Client) doWithHeaders(ctx context.Context, method, path string, body, out any, headers http.Header) error {
 	if strings.TrimSpace(c.baseURL) == "" {
 		return errors.New("paperboat-server base URL is not configured")
 	}
@@ -279,6 +366,11 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 	}
 	if c.accessToken != "" {
 		req.Header.Set("Authorization", "Bearer "+c.accessToken)
+	}
+	for key, values := range headers {
+		for _, value := range values {
+			req.Header.Add(key, value)
+		}
 	}
 
 	resp, err := c.http.Do(req)

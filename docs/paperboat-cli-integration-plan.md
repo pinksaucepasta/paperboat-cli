@@ -263,9 +263,26 @@ credential-profile rules live in `paperboat-server/docs/contracts/cli-authorizat
 
 ### CLI Connect Descriptor
 
+### Durable Terminal Sessions
+
+The CLI selects a durable server-owned terminal session before requesting a connect
+descriptor. `pb <project>` omits `terminal_session_id` and therefore preserves the default
+session behavior. `pb <project> --new [--name <name>]` creates a catalog row with an
+idempotency key; `--session <name-or-pts-id>` attaches only an existing row. Readiness
+polling, the final re-broker, reconnect, and upload-auth refresh retain the selected
+immutable ID.
+
+Session management uses `GET`/`POST /api/projects/{project_id}/terminal-sessions`,
+`PATCH /api/projects/{project_id}/terminal-sessions/{session_id}`, `POST .../close`, and
+`DELETE .../{session_id}`. Names are lower-case and case-insensitively unique per project;
+the default session can be closed and restarted but cannot be renamed or deleted. Human list
+output is for terminals; `--json` returns the stable catalog records on stdout.
+
 `POST /api/projects/{project_id}/cli-connect` requires a Paperboat bearer token with
 `projects:connect`. It remains responsible for ownership, entitlement, credit, project
 state, Fly start/resume, agentunnel reconciliation, and papercode credential minting.
+Its optional request body is `{ "terminal_session_id": "pts_..." }`; omitting it selects
+the default session for backward compatibility.
 
 Ready Paperboat response `data` payload:
 

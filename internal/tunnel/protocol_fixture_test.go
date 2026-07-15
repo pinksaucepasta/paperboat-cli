@@ -38,11 +38,11 @@ func TestPapercodeTerminalProtocolFixture(t *testing.T) {
 			ProtocolErrorTags []string `json:"protocol_error_tags"`
 		} `json:"response_frames"`
 		StreamAcknowledgement struct {
-			TagField                 string `json:"tag_field"`
-			TagValue                 string `json:"tag_value"`
-			RequestIDField           string `json:"request_id_field"`
-			RequestIDType            string `json:"request_id_type"`
-			RequiredAfterResponseTag string `json:"required_after_response_tag"`
+			TagField       string `json:"tag_field"`
+			TagValue       string `json:"tag_value"`
+			RequestIDField string `json:"request_id_field"`
+			RequestIDType  string `json:"request_id_type"`
+			SentByClient   bool   `json:"sent_by_client"`
 		} `json:"stream_acknowledgement"`
 		Reconnect struct {
 			ReattachSameThreadAndTerminal bool `json:"reattach_same_thread_and_terminal"`
@@ -108,17 +108,16 @@ func TestPapercodeTerminalProtocolFixture(t *testing.T) {
 		!reflect.DeepEqual(fixture.ResponseFrames.ProtocolErrorTags, []string{rpcClientProtocolErrorTag, rpcDefectTag}) {
 		t.Fatalf("response frames do not match implementation: %#v", fixture.ResponseFrames)
 	}
-	ackType := reflect.TypeOf(rpcAcknowledgement{})
-	requestIDField, ok := ackType.FieldByName("RequestID")
-	if !ok {
-		t.Fatal("rpcAcknowledgement is missing RequestID field")
+	// The server runs Effect RPC with client acks disabled (supportsAck:
+	// false), so the CLI intentionally has no acknowledgement encoder. The
+	// fixture pins that contract: acks exist on the wire protocol but are
+	// never sent by this client.
+	if fixture.StreamAcknowledgement.SentByClient {
+		t.Fatalf("fixture requires client acknowledgements, but the CLI does not send them: %#v", fixture.StreamAcknowledgement)
 	}
-	if jsonFieldName(t, ackType, "Type") != fixture.StreamAcknowledgement.TagField ||
-		jsonFieldName(t, ackType, "RequestID") != fixture.StreamAcknowledgement.RequestIDField ||
-		fixture.StreamAcknowledgement.TagValue != rpcAckTagValue ||
-		fixture.StreamAcknowledgement.RequestIDType != "string" || requestIDField.Type.Kind() != reflect.String ||
-		fixture.StreamAcknowledgement.RequiredAfterResponseTag != rpcChunkTag {
-		t.Fatalf("stream acknowledgement does not match implementation: %#v", fixture.StreamAcknowledgement)
+	if fixture.StreamAcknowledgement.TagField != "_tag" || fixture.StreamAcknowledgement.TagValue != "Ack" ||
+		fixture.StreamAcknowledgement.RequestIDField != "requestId" || fixture.StreamAcknowledgement.RequestIDType != "string" {
+		t.Fatalf("stream acknowledgement wire shape changed: %#v", fixture.StreamAcknowledgement)
 	}
 	if !fixture.Reconnect.ReattachSameThreadAndTerminal || !fixture.Reconnect.RestartIfNotRunning || fixture.Reconnect.ReplayFailedWrites {
 		t.Fatalf("reconnect contract does not match implementation: %#v", fixture.Reconnect)

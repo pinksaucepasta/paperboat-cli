@@ -18,14 +18,17 @@
     "chunk_values_field": "values",
     "exit_tag": "Exit",
     "exit_field": "exit",
-    "protocol_error_tags": ["ClientProtocolError", "Defect"]
+    "protocol_error_tags": [
+      "ClientProtocolError",
+      "Defect"
+    ]
   },
   "stream_acknowledgement": {
     "tag_field": "_tag",
     "tag_value": "Ack",
     "request_id_field": "requestId",
     "request_id_type": "string",
-    "required_after_response_tag": "Chunk"
+    "sent_by_client": false
   },
   "reconnect": {
     "reattach_same_thread_and_terminal": true,

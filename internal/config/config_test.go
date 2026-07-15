@@ -6,6 +6,44 @@ import (
 	"testing"
 )
 
+func TestNormalizeServerURL(t *testing.T) {
+	for _, tc := range []struct {
+		raw, want string
+		valid     bool
+	}{
+		{"https://api.example/", "https://api.example", true},
+		{"http://127.0.0.1:8080", "http://127.0.0.1:8080", true},
+		{"http://localhost", "http://localhost", true},
+		{"http://api.example", "", false},
+		{"https://user:pass@api.example", "", false},
+		{"https://api.example/path", "", false},
+		{"https://api.example?token=x", "", false},
+	} {
+		got, err := NormalizeServerURL(tc.raw)
+		if tc.valid && (err != nil || got != tc.want) {
+			t.Fatalf("NormalizeServerURL(%q) = %q, %v", tc.raw, got, err)
+		}
+		if !tc.valid && err == nil {
+			t.Fatalf("NormalizeServerURL(%q) succeeded", tc.raw)
+		}
+	}
+}
+
+func TestSaveUsesRestrictedPermissions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	cfg := &Config{path: path, ServerURL: "https://api.example"}
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("config permissions = %o, want 600", info.Mode().Perm())
+	}
+}
+
 func TestLoadPreservesExplicitZeroDialRetries(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(path, []byte(`{"connect":{"dial_retries":0},"server_url":"https://api.example"}`), 0o600); err != nil {

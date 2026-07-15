@@ -14,6 +14,9 @@ type ConnectRequest struct {
 	Project string
 	// Credential is the current Paperboat client-session access credential.
 	Credential config.Credential
+	// TerminalSessionID is the immutable server catalog ID. Empty selects the
+	// project's default session for backward-compatible attaches.
+	TerminalSessionID string
 }
 
 // ConnectInfo is what the resolver hands back to the tunnel + session layers.

@@ -17,16 +17,18 @@ type resolverEventSink struct{ events []telemetry.Event }
 func (s *resolverEventSink) Record(e telemetry.Event) { s.events = append(s.events, e) }
 
 type fakeClient struct {
-	projects   []api.Project
-	connectSeq []api.ConnectResponse // returned by CLIConnect in order
-	statusSeq  []api.ConnectResponse // returned by ConnectionStatus in order
-	connectN   int
-	statusN    int
+	projects          []api.Project
+	connectSeq        []api.ConnectResponse // returned by CLIConnect in order
+	statusSeq         []api.ConnectResponse // returned by ConnectionStatus in order
+	connectN          int
+	statusN           int
+	connectSessionIDs []string
+	statusSessionIDs  []string
 }
 
 func (f *fakeClient) ListProjects(context.Context) ([]api.Project, error) { return f.projects, nil }
 
-func (f *fakeClient) CLIConnect(context.Context, string) (api.ConnectResponse, error) {
+func (f *fakeClient) nextConnect() (api.ConnectResponse, error) {
 	i := f.connectN
 	if i >= len(f.connectSeq) {
 		i = len(f.connectSeq) - 1
@@ -35,13 +37,31 @@ func (f *fakeClient) CLIConnect(context.Context, string) (api.ConnectResponse, e
 	return f.connectSeq[i], nil
 }
 
-func (f *fakeClient) ConnectionStatus(context.Context, string) (api.ConnectResponse, error) {
+func (f *fakeClient) CLIConnect(context.Context, string) (api.ConnectResponse, error) {
+	return f.nextConnect()
+}
+
+func (f *fakeClient) CLIConnectSession(_ context.Context, _ string, terminalSessionID string) (api.ConnectResponse, error) {
+	f.connectSessionIDs = append(f.connectSessionIDs, terminalSessionID)
+	return f.nextConnect()
+}
+
+func (f *fakeClient) nextStatus() (api.ConnectResponse, error) {
 	i := f.statusN
 	if i >= len(f.statusSeq) {
 		i = len(f.statusSeq) - 1
 	}
 	f.statusN++
 	return f.statusSeq[i], nil
+}
+
+func (f *fakeClient) ConnectionStatus(context.Context, string) (api.ConnectResponse, error) {
+	return f.nextStatus()
+}
+
+func (f *fakeClient) ConnectionStatusSession(_ context.Context, _ string, terminalSessionID string) (api.ConnectResponse, error) {
+	f.statusSessionIDs = append(f.statusSessionIDs, terminalSessionID)
+	return f.nextStatus()
 }
 
 func newTestResolver(fc *fakeClient) *APIResolver {
@@ -175,6 +195,26 @@ func TestResolveRebrokersWhenStatusLacksTerminalDescriptor(t *testing.T) {
 	}
 	if fc.connectN != 2 {
 		t.Fatalf("expected 2 CLIConnect calls (initial + re-broker), got %d", fc.connectN)
+	}
+}
+
+func TestResolveKeepsSelectedSessionThroughReadinessPollingAndRebroker(t *testing.T) {
+	fc := &fakeClient{
+		projects: []api.Project{{ID: "prj_1", Name: "app"}},
+		connectSeq: []api.ConnectResponse{
+			{Connectable: false, Status: "starting"},
+			readyResponse(readyTerminal()),
+		},
+		statusSeq: []api.ConnectResponse{{Connectable: true, Terminal: nil}},
+	}
+	if _, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "app", TerminalSessionID: "pts_api"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(fc.connectSessionIDs, ","); got != "pts_api,pts_api" {
+		t.Fatalf("cli-connect session IDs = %q, want pts_api,pts_api", got)
+	}
+	if got := strings.Join(fc.statusSessionIDs, ","); got != "pts_api" {
+		t.Fatalf("status session IDs = %q, want pts_api", got)
 	}
 }
 

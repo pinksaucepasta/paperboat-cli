@@ -22,7 +22,6 @@ const (
 	papercodeWebSocketPath        = "/ws"
 	papercodeTicketQueryParameter = "wsTicket"
 	rpcRequestTagValue            = "Request"
-	rpcAckTagValue                = "Ack"
 	rpcChunkTag                   = "Chunk"
 	rpcExitTag                    = "Exit"
 	rpcClientProtocolErrorTag     = "ClientProtocolError"
@@ -189,6 +188,26 @@ type papercodeWSConn struct {
 	protocolOnce  sync.Once
 	keepaliveStop chan struct{}
 	keepaliveOnce sync.Once
+
+	// stall is the reused slow-path timer for pushOutput. Only the readLoop
+	// goroutine touches it, so no locking is needed.
+	stall *time.Timer
+}
+
+// stallTimer arms the reused slow-path timer and returns its channel.
+func (c *papercodeWSConn) stallTimer(d time.Duration) <-chan time.Time {
+	if c.stall == nil {
+		c.stall = time.NewTimer(d)
+		return c.stall.C
+	}
+	if !c.stall.Stop() {
+		select {
+		case <-c.stall.C:
+		default:
+		}
+	}
+	c.stall.Reset(d)
+	return c.stall.C
 }
 
 func (t *PapercodeWSTunnel) outputQueueChunks() int {
@@ -390,16 +409,29 @@ func (c *papercodeWSConn) readLoop() {
 			}
 			return
 		}
+		// Any successful read proves the transport is alive. Extend the read
+		// deadline here as well as in the pong handler: under a sustained
+		// output flood the server's pongs can lag behind queued data frames,
+		// and a healthy connection must not be killed by the keepalive
+		// deadline while it is actively delivering bytes.
+		_ = c.ws.SetReadDeadline(time.Now().Add(websocketKeepaliveInterval + websocketKeepaliveTimeout))
 		var frames []rpcFrame
 		if len(data) > 0 && data[0] == '[' {
 			if err := json.Unmarshal(data, &frames); err != nil {
-				c.finish(1, err)
+				// A frame that fails to decode means the transport delivered
+				// corrupt bytes (or the server restarted mid-frame). Treat it
+				// as transport loss so the reconnect supervisor re-attaches
+				// and resyncs from the last committed sequence instead of
+				// killing the session.
+				c.finish(1, errors.Join(ErrTransportLost, fmt.Errorf("papercode frame decode failed: %w", err)))
+				_ = c.ws.Close()
 				return
 			}
 		} else {
 			var frame rpcFrame
 			if err := json.Unmarshal(data, &frame); err != nil {
-				c.finish(1, err)
+				c.finish(1, errors.Join(ErrTransportLost, fmt.Errorf("papercode frame decode failed: %w", err)))
+				_ = c.ws.Close()
 				return
 			}
 			frames = []rpcFrame{frame}
@@ -407,6 +439,7 @@ func (c *papercodeWSConn) readLoop() {
 		for _, frame := range frames {
 			if err := c.handleFrame(frame); err != nil {
 				c.finish(1, err)
+				_ = c.ws.Close()
 				return
 			}
 		}
@@ -433,14 +466,11 @@ func (c *papercodeWSConn) handleFrame(frame rpcFrame) error {
 		for _, raw := range frame.Values {
 			var ev terminalEvent
 			if err := json.Unmarshal(raw, &ev); err != nil {
-				return err
+				return errors.Join(ErrTransportLost, fmt.Errorf("papercode terminal event decode failed: %w", err))
 			}
 			if err := c.handleTerminalEvent(ev); err != nil {
 				return err
 			}
-		}
-		if err := c.acknowledgeChunk(frame.RequestID); err != nil {
-			return err
 		}
 		c.protocolOnce.Do(func() {
 			if c.protocolReady != nil {
@@ -449,22 +479,37 @@ func (c *papercodeWSConn) handleFrame(frame rpcFrame) error {
 		})
 	case rpcExitTag:
 		if frame.Exit.Tag == "Failure" {
-			return errors.New(effectFailureMessage(frame.Exit.Cause))
+			message := effectFailureMessage(frame.Exit.Cause)
+			if isTransientStreamFailure(message) {
+				// The server intentionally failed the attach stream for a
+				// recoverable reason (e.g. the attach buffer overflowed under
+				// heavy output). Reconnecting resyncs from the last committed
+				// sequence; only auth/lookup failures stay fatal.
+				return errors.Join(ErrTransportLost, errors.New(message))
+			}
+			return errors.New(message)
 		}
 	case rpcClientProtocolErrorTag, rpcDefectTag:
-		return errors.New("papercode websocket protocol error")
+		return errors.Join(ErrTransportLost, errors.New("papercode websocket protocol error"))
 	}
 	return nil
 }
 
-func (c *papercodeWSConn) acknowledgeChunk(requestID string) error {
-	if requestID == "" {
-		return errors.New("papercode websocket chunk is missing requestId")
+// isTransientStreamFailure classifies server-side stream failures that a
+// re-attach can recover from. Overflow/history errors mean the client fell
+// behind the output stream, not that the terminal is gone.
+func isTransientStreamFailure(message string) bool {
+	lowered := strings.ToLower(message)
+	for _, marker := range []string{
+		"terminal attach stream overflow",
+		"terminalhistoryerror",
+		"history",
+	} {
+		if strings.Contains(lowered, marker) {
+			return true
+		}
 	}
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	defer c.ws.SetWriteDeadline(time.Time{})
-	return c.ws.WriteJSON(rpcAcknowledgement{Type: rpcAckTagValue, RequestID: requestID})
+	return false
 }
 
 func (c *papercodeWSConn) handleTerminalEvent(ev terminalEvent) error {
@@ -477,14 +522,19 @@ func (c *papercodeWSConn) handleTerminalEvent(ev terminalEvent) error {
 		if len(data) == 0 {
 			return nil
 		}
-		timer := time.NewTimer(websocketWriteTimeout)
-		defer timer.Stop()
+		// Fast path: no timer allocation while the local consumer keeps up.
+		select {
+		case c.out <- data:
+			return nil
+		default:
+		}
+		timer := c.stallTimer(websocketWriteTimeout)
 		select {
 		case c.out <- data:
 			return nil
 		case <-c.keepaliveStop:
 			return ErrTransportLost
-		case <-timer.C:
+		case <-timer:
 			return errors.Join(ErrTransportLost, errors.New("papercode terminal output queue stalled"))
 		}
 	}
@@ -580,16 +630,10 @@ type rpcRequest struct {
 	Type    string      `json:"_tag"`
 }
 
-type rpcAcknowledgement struct {
-	Type      string `json:"_tag"`
-	RequestID string `json:"requestId"`
-}
-
 type rpcFrame struct {
-	Tag       string            `json:"_tag"`
-	RequestID string            `json:"requestId"`
-	Values    []json.RawMessage `json:"values"`
-	Exit      effectExit        `json:"exit"`
+	Tag    string            `json:"_tag"`
+	Values []json.RawMessage `json:"values"`
+	Exit   effectExit        `json:"exit"`
 }
 
 type effectExit struct {

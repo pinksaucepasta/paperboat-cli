@@ -70,12 +70,12 @@ func (r *APIResolver) Resolve(ctx context.Context, req ConnectRequest) (ConnectI
 	}
 	projectID = project.ID
 
-	resp, err := r.client.CLIConnect(ctx, project.ID)
+	resp, err := r.cliConnect(ctx, project.ID, req.TerminalSessionID)
 	if err != nil {
 		return ConnectInfo{}, fmt.Errorf("connect to project %q: %w", req.Project, err)
 	}
 
-	resp, err = r.waitConnectable(ctx, project.ID, resp)
+	resp, err = r.waitConnectable(ctx, project.ID, req.TerminalSessionID, resp)
 	if err != nil {
 		return ConnectInfo{}, err
 	}
@@ -117,6 +117,36 @@ func (r *APIResolver) Resolve(ctx context.Context, req ConnectRequest) (ConnectI
 	}
 	outcome = "success"
 	return info, nil
+}
+
+type sessionConnectClient interface {
+	CLIConnectSession(context.Context, string, string) (api.ConnectResponse, error)
+}
+
+type sessionStatusClient interface {
+	ConnectionStatusSession(context.Context, string, string) (api.ConnectResponse, error)
+}
+
+func (r *APIResolver) cliConnect(ctx context.Context, projectID, terminalSessionID string) (api.ConnectResponse, error) {
+	if terminalSessionID == "" {
+		return r.client.CLIConnect(ctx, projectID)
+	}
+	client, ok := r.client.(sessionConnectClient)
+	if !ok {
+		return api.ConnectResponse{}, errors.New("this server client does not support selected terminal sessions")
+	}
+	return client.CLIConnectSession(ctx, projectID, terminalSessionID)
+}
+
+func (r *APIResolver) connectionStatus(ctx context.Context, projectID, terminalSessionID string) (api.ConnectResponse, error) {
+	if terminalSessionID == "" {
+		return r.client.ConnectionStatus(ctx, projectID)
+	}
+	client, ok := r.client.(sessionStatusClient)
+	if !ok {
+		return api.ConnectResponse{}, errors.New("this server client does not support selected terminal sessions")
+	}
+	return client.ConnectionStatusSession(ctx, projectID, terminalSessionID)
 }
 
 func (r *APIResolver) now() time.Time {
@@ -195,7 +225,7 @@ func (r *APIResolver) findProject(ctx context.Context, requested string) (api.Pr
 // waitConnectable polls connection-status until the tunnel is connectable or the
 // configured timeout elapses. cli-connect already queued any needed machine
 // resume, so this only waits for readiness; it never re-brokers.
-func (r *APIResolver) waitConnectable(ctx context.Context, projectID string, resp api.ConnectResponse) (api.ConnectResponse, error) {
+func (r *APIResolver) waitConnectable(ctx context.Context, projectID, terminalSessionID string, resp api.ConnectResponse) (api.ConnectResponse, error) {
 	if resp.Connectable {
 		return r.validateDescriptor(resp, projectID)
 	}
@@ -227,7 +257,7 @@ func (r *APIResolver) waitConnectable(ctx context.Context, projectID string, res
 			}
 			return api.ConnectResponse{}, err
 		}
-		next, err := r.client.ConnectionStatus(pollCtx, projectID)
+		next, err := r.connectionStatus(pollCtx, projectID, terminalSessionID)
 		if err != nil {
 			return api.ConnectResponse{}, fmt.Errorf("poll connection status: %w", err)
 		}
@@ -236,7 +266,7 @@ func (r *APIResolver) waitConnectable(ctx context.Context, projectID string, res
 			// re-broker once now that the machine is ready to get a fresh,
 			// fully-populated WebSocket descriptor and access session.
 			if !completeTerminalDescriptor(next.Terminal) {
-				fresh, err := r.client.CLIConnect(pollCtx, projectID)
+				fresh, err := r.cliConnect(pollCtx, projectID, terminalSessionID)
 				if err != nil {
 					return api.ConnectResponse{}, err
 				}

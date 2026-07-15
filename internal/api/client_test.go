@@ -240,3 +240,47 @@ func TestCLIConnectDecodesPapercodeWebSocketTerminal(t *testing.T) {
 		t.Fatalf("cli-connect request body = %q, want empty", string(body))
 	}
 }
+
+func TestTerminalSessionRequests(t *testing.T) {
+	var createKey string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case "POST /api/projects/prj_1/terminal-sessions":
+			createKey = r.Header.Get("Idempotency-Key")
+			_, _ = w.Write([]byte(`{"data":{"id":"pts_1","name":"api","state":"running","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}}`))
+		case "GET /api/projects/prj_1/terminal-sessions":
+			_, _ = w.Write([]byte(`{"data":{"items":[{"id":"pts_1","name":"api","state":"running","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}],"pagination":{"limit":200,"offset":0,"total":1,"next_offset":null}}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	c := New(srv.URL, config.Credential{AccessToken: "token"}, nil)
+	created, err := c.CreateTerminalSession(context.Background(), "prj_1", "api", "key-1")
+	if err != nil || created.ID != "pts_1" || createKey != "key-1" {
+		t.Fatalf("created=%+v key=%q err=%v", created, createKey, err)
+	}
+	sessions, err := c.ListTerminalSessions(context.Background(), "prj_1")
+	if err != nil || len(sessions) != 1 || sessions[0].Name != "api" {
+		t.Fatalf("sessions=%+v err=%v", sessions, err)
+	}
+}
+
+func TestConnectionStatusSessionUsesSelectedTerminalID(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/projects/prj_1/connection-status" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		if got := r.URL.Query().Get("terminal_session_id"); got != "pts_api" {
+			t.Fatalf("terminal_session_id = %q", got)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"project_id": "prj_1", "connectable": false}})
+	}))
+	defer server.Close()
+
+	client := New(server.URL, config.Credential{AccessToken: "token"}, server.Client())
+	if _, err := client.ConnectionStatusSession(context.Background(), "prj_1", "pts_api"); err != nil {
+		t.Fatal(err)
+	}
+}
