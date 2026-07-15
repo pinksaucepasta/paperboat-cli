@@ -65,10 +65,29 @@ type Config struct {
 	SSH SSHConfig `json:"ssh,omitempty"`
 	// Observability controls the local metadata-only event log.
 	Observability ObservabilityConfig `json:"observability,omitempty"`
+	// StatusBar controls the local terminal status line during interactive sessions.
+	StatusBar StatusBarConfig `json:"status_bar,omitempty"`
 
 	// path is where this config was loaded from (or would be written to).
 	path                  string `json:"-"`
 	dialRetriesConfigured bool
+}
+
+// StatusBarConfig controls the optional local status line. It has no effect on
+// the remote terminal byte stream.
+type StatusBarConfig struct {
+	// Mode is auto, on, or off. Auto enables only on compatible interactive terminals.
+	Mode string `json:"mode,omitempty"`
+	// NoticeSeconds controls how long non-error event notices remain visible.
+	NoticeSeconds int `json:"notice_seconds,omitempty"`
+	// SyncPollSeconds controls config-sync status polling while attached.
+	SyncPollSeconds int `json:"sync_poll_seconds,omitempty"`
+	// Left, Center, and Right select ordered widgets for each status-bar region.
+	// Supported widgets: project, session, connection, activity, config_sync,
+	// credits, and storage. An explicit empty list hides that region.
+	Left   []string `json:"left,omitempty"`
+	Center []string `json:"center,omitempty"`
+	Right  []string `json:"right,omitempty"`
 }
 
 type ObservabilityConfig struct {
@@ -147,6 +166,15 @@ const (
 	DefaultTerminalOutputBatchMilliseconds = 1
 	DefaultTerminalOutputBufferBytes       = 128 * 1024
 	DefaultInputPartialFlushMilliseconds   = 25
+	DefaultStatusBarMode                   = "auto"
+	DefaultStatusBarNoticeSeconds          = 5
+	DefaultStatusBarSyncPollSeconds        = 30
+)
+
+var (
+	DefaultStatusBarLeft   = []string{"project", "session"}
+	DefaultStatusBarCenter = []string{"activity"}
+	DefaultStatusBarRight  = []string{"credits", "connection"}
 )
 
 // DefaultForwardTerminalEnv covers the variables TUIs use to pick color depth
@@ -222,6 +250,9 @@ func Load(path string) (*Config, error) {
 	}
 
 	cfg.applyDefaults()
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
 	return cfg, nil
 }
 
@@ -274,6 +305,54 @@ func (c *Config) applyDefaults() {
 	if c.Connect.InputPartialFlushMilliseconds == 0 {
 		c.Connect.InputPartialFlushMilliseconds = DefaultInputPartialFlushMilliseconds
 	}
+	if c.StatusBar.Mode == "" {
+		c.StatusBar.Mode = DefaultStatusBarMode
+	}
+	if c.StatusBar.NoticeSeconds == 0 {
+		c.StatusBar.NoticeSeconds = DefaultStatusBarNoticeSeconds
+	}
+	if c.StatusBar.SyncPollSeconds == 0 {
+		c.StatusBar.SyncPollSeconds = DefaultStatusBarSyncPollSeconds
+	}
+	if c.StatusBar.Left == nil {
+		c.StatusBar.Left = append([]string(nil), DefaultStatusBarLeft...)
+	}
+	if c.StatusBar.Center == nil {
+		c.StatusBar.Center = append([]string(nil), DefaultStatusBarCenter...)
+	}
+	if c.StatusBar.Right == nil {
+		c.StatusBar.Right = append([]string(nil), DefaultStatusBarRight...)
+	}
+}
+
+func (c *Config) validate() error {
+	switch strings.ToLower(strings.TrimSpace(c.StatusBar.Mode)) {
+	case "auto", "on", "off":
+	default:
+		return fmt.Errorf("status_bar.mode must be auto, on, or off")
+	}
+	if c.StatusBar.NoticeSeconds < 1 {
+		return fmt.Errorf("status_bar.notice_seconds must be positive")
+	}
+	if c.StatusBar.SyncPollSeconds < 1 {
+		return fmt.Errorf("status_bar.sync_poll_seconds must be positive")
+	}
+	seen := make(map[string]string, len(c.StatusBar.Left)+len(c.StatusBar.Center)+len(c.StatusBar.Right))
+	for region, widgets := range map[string][]string{"left": c.StatusBar.Left, "center": c.StatusBar.Center, "right": c.StatusBar.Right} {
+		for _, widget := range widgets {
+			widget = strings.ToLower(strings.TrimSpace(widget))
+			switch widget {
+			case "project", "session", "connection", "activity", "config_sync", "credits", "storage":
+			default:
+				return fmt.Errorf("status_bar.%s has unsupported widget %q", region, widget)
+			}
+			if firstRegion, ok := seen[widget]; ok {
+				return fmt.Errorf("status_bar.%s repeats widget %q already used in status_bar.%s", region, widget, firstRegion)
+			}
+			seen[widget] = region
+		}
+	}
+	return nil
 }
 
 // Save writes the config to its path, creating parent dirs as needed.

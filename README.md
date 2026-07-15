@@ -47,9 +47,27 @@ Connection policy is deployment/profile configuration, not compiled into the CLI
   "observability": {
     "event_log_path": "/managed/path/paperboat-telemetry.jsonl",
     "max_event_log_bytes": 5242880
+  },
+  "status_bar": {
+    "mode": "auto",
+    "notice_seconds": 5,
+    "sync_poll_seconds": 30,
+    "left": ["project", "session"],
+    "center": ["activity"],
+    "right": ["credits", "connection"]
   }
 }
 ```
+
+`status_bar.mode` accepts `auto`, `on`, or `off`. In `auto` mode it is used
+only on supported interactive terminals; redirected output, `TERM=dumb`, and
+terminals shorter than two rows retain the ordinary transparent terminal flow.
+The bar is divided into left, center, and right regions. Each region accepts an
+ordered subset of `project`, `session`, `connection`, `activity`,
+`config_sync`, `credits`, and `storage`; a widget can appear once and an
+explicit empty array hides a region. `activity` shows active work with an ASCII
+spinner, while `config_sync`, `credits`, and `storage` are refreshed from the
+authenticated control plane.
 
 When no observability path is configured, metadata-only events are appended to
 `telemetry.jsonl` beside the CLI config with mode `0600`. Set

@@ -208,10 +208,53 @@ type KeepAliveResponse struct {
 	KeepAliveUntil time.Time `json:"keep_alive_until,omitempty"`
 }
 
+// ConfigSyncStatus is the account-wide status response. The CLI selects the
+// entry matching the attached project and intentionally ignores path/error
+// details when rendering its local status line.
+type ConfigSyncStatus struct {
+	State    string                   `json:"state"`
+	Projects []ConfigSyncProjectState `json:"projects"`
+}
+
+type ConfigSyncProjectState struct {
+	ProjectID        string `json:"project_id"`
+	State            string `json:"state"`
+	PendingPathCount int    `json:"pending_path_count"`
+}
+
+// UsageSummary is the account-level, server-authoritative usage payload used
+// by the connected terminal's optional status widgets.
+type UsageSummary struct {
+	Credits struct {
+		Balance string `json:"balance"`
+	} `json:"credits"`
+	Storage struct {
+		AvailableGB int `json:"available_gb"`
+	} `json:"storage"`
+	Projects struct {
+		Running int `json:"running"`
+		Total   int `json:"total"`
+	} `json:"projects"`
+}
+
 // Activity records human/agent activity for server-owned idle detection.
 func (c *Client) Activity(ctx context.Context, projectID, source string) error {
 	body := map[string]any{"source": "cli_activity", "metadata": map[string]any{"event": source}}
 	return c.do(ctx, http.MethodPost, "/api/projects/"+url.PathEscape(projectID)+"/activity", body, nil)
+}
+
+// ConfigSyncStatus gets the authenticated account's configuration sync state.
+func (c *Client) ConfigSyncStatus(ctx context.Context) (ConfigSyncStatus, error) {
+	var out ConfigSyncStatus
+	err := c.do(ctx, http.MethodGet, "/api/config-sync/status", nil, &out)
+	return out, err
+}
+
+// UsageSummary returns account credits, available storage, and project counts.
+func (c *Client) UsageSummary(ctx context.Context) (UsageSummary, error) {
+	var out UsageSummary
+	err := c.do(ctx, http.MethodGet, "/api/dashboard/usage-summary", nil, &out)
+	return out, err
 }
 
 // Me fetches the authenticated user, validating the reused credential.

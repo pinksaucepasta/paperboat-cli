@@ -25,9 +25,23 @@ const terminalOutputBatchWindow = time.Millisecond
 
 type ReconnectingOption func(*reconnectingOptions)
 
+// ReconnectEvent carries only lifecycle state, never transport error details.
+type ReconnectEvent string
+
+const (
+	ReconnectStarted   ReconnectEvent = "reconnecting"
+	ReconnectRecovered ReconnectEvent = "recovered"
+	ReconnectFailed    ReconnectEvent = "failed"
+)
+
 type reconnectingOptions struct {
 	outputQueueChunks int
 	outputBatchWindow time.Duration
+	observer          func(ReconnectEvent)
+}
+
+func WithReconnectObserver(observer func(ReconnectEvent)) ReconnectingOption {
+	return func(options *reconnectingOptions) { options.observer = observer }
 }
 
 func WithReconnectingOutput(queueChunks int, batchWindow time.Duration) ReconnectingOption {
@@ -68,6 +82,7 @@ type ReconnectingConn struct {
 	maxQueueChunks    atomic.Int64
 	maxWriteLatencyMS atomic.Int64
 	outputBatchWindow time.Duration
+	observer          func(ReconnectEvent)
 }
 
 func (c *ReconnectingConn) record(name, outcome string, started time.Time) {
@@ -104,7 +119,7 @@ func NewObservedReconnectingConn(ctx context.Context, initial Conn, maxRetries i
 	for _, option := range opts {
 		option(&options)
 	}
-	c := &ReconnectingConn{ctx: ctx, current: initial, available: available, reconnect: reconnect, maxRetries: maxRetries, delay: delay, out: make(chan []byte, options.outputQueueChunks), done: make(chan reconnectResult, 1), closed: make(chan struct{}), telemetry: sink, now: now, started: now(), correlation: correlation, outputBatchWindow: options.outputBatchWindow}
+	c := &ReconnectingConn{ctx: ctx, current: initial, available: available, reconnect: reconnect, maxRetries: maxRetries, delay: delay, out: make(chan []byte, options.outputQueueChunks), done: make(chan reconnectResult, 1), closed: make(chan struct{}), telemetry: sink, now: now, started: now(), correlation: correlation, outputBatchWindow: options.outputBatchWindow, observer: options.observer}
 	go c.supervise(initial)
 	return c
 }
@@ -148,6 +163,7 @@ func (c *ReconnectingConn) supervise(conn Conn) {
 			return
 		}
 		c.setUnavailable(conn)
+		c.notify(ReconnectStarted)
 		reconnected := false
 		for attempt := 0; attempt < c.maxRetries; attempt++ {
 			attemptStarted := time.Now()
@@ -182,14 +198,22 @@ func (c *ReconnectingConn) supervise(conn Conn) {
 			}
 			conn = next
 			c.setCurrent(next)
+			c.notify(ReconnectRecovered)
 			c.record("terminal.reconnect", "success", attemptStarted)
 			reconnected = true
 			break
 		}
 		if !reconnected {
+			c.notify(ReconnectFailed)
 			c.done <- reconnectResult{1, err}
 			return
 		}
+	}
+}
+
+func (c *ReconnectingConn) notify(event ReconnectEvent) {
+	if c.observer != nil {
+		c.observer(event)
 	}
 }
 

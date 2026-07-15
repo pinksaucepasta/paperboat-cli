@@ -24,7 +24,11 @@ const terminalCleanupSequence = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1
 
 type RunOption func(*runOptions)
 
-type runOptions struct{ outputBufferBytes int }
+type runOptions struct {
+	outputBufferBytes int
+	output            io.Writer
+	remoteSize        func() (uint16, uint16)
+}
 
 func WithOutputBufferBytes(size int) RunOption {
 	return func(options *runOptions) {
@@ -32,6 +36,22 @@ func WithOutputBufferBytes(size int) RunOption {
 			options.outputBufferBytes = size
 		}
 	}
+}
+
+// WithOutput sends remote terminal bytes through output. A status renderer can
+// use this to serialize remote output with local redraws.
+func WithOutput(output io.Writer) RunOption {
+	return func(options *runOptions) {
+		if output != nil {
+			options.output = output
+		}
+	}
+}
+
+// WithRemoteSize supplies the remote PTY viewport for initial and resize
+// propagation.
+func WithRemoteSize(size func() (uint16, uint16)) RunOption {
+	return func(options *runOptions) { options.remoteSize = size }
 }
 
 // Run wires the local terminal to conn. stdinSink is the writer local input is
@@ -45,7 +65,7 @@ func Run(ctx context.Context, conn tunnel.Conn, stdinSink io.WriteCloser) (int, 
 // RunWithActivity is Run with an optional, non-blocking activity callback.
 // The callback is rate-limited and runs asynchronously so it cannot stall PTY I/O.
 func RunWithActivity(ctx context.Context, conn tunnel.Conn, stdinSink io.WriteCloser, activity func(source string), opts ...RunOption) (int, error) {
-	options := runOptions{outputBufferBytes: terminalOutputBufferBytes}
+	options := runOptions{outputBufferBytes: terminalOutputBufferBytes, output: os.Stdout}
 	for _, option := range opts {
 		option(&options)
 	}
@@ -63,13 +83,13 @@ func RunWithActivity(ctx context.Context, conn tunnel.Conn, stdinSink io.WriteCl
 	}
 	defer restore()
 	if isTerminal {
-		resetTerminalEmulator := func() { _, _ = os.Stdout.Write([]byte(terminalCleanupSequence)) }
+		resetTerminalEmulator := func() { _, _ = options.output.Write([]byte(terminalCleanupSequence)) }
 		resetTerminalEmulator()
 		defer resetTerminalEmulator()
 	}
 
 	// Propagate the initial size and subsequent resizes.
-	stopResize := watchResize(conn)
+	stopResize := watchResize(conn, options.remoteSize)
 	defer stopResize()
 
 	// Remote -> local. Ends when the remote PTY closes; that is normal EOF, not
@@ -98,7 +118,7 @@ func RunWithActivity(ctx context.Context, conn tunnel.Conn, stdinSink io.WriteCl
 			n, err := conn.Read(buf)
 			if n > 0 {
 				started := time.Now()
-				if _, writeErr := os.Stdout.Write(buf[:n]); writeErr != nil {
+				if _, writeErr := options.output.Write(buf[:n]); writeErr != nil {
 					streamErr <- fmt.Errorf("write terminal output: %w", writeErr)
 					return
 				}
@@ -200,8 +220,8 @@ func RunWithActivity(ctx context.Context, conn tunnel.Conn, stdinSink io.WriteCl
 
 // watchResize sends the current terminal size to conn immediately and on every
 // SIGWINCH, returning a stop function.
-func watchResize(conn tunnel.Conn) (stop func()) {
-	pushSize(conn)
+func watchResize(conn tunnel.Conn, remoteSize func() (uint16, uint16)) (stop func()) {
+	pushSize(conn, remoteSize)
 	ch := make(chan os.Signal, 1)
 	notifyWinch(ch)
 	done := make(chan struct{})
@@ -209,7 +229,7 @@ func watchResize(conn tunnel.Conn) (stop func()) {
 		for {
 			select {
 			case <-ch:
-				pushSize(conn)
+				pushSize(conn, remoteSize)
 			case <-done:
 				return
 			}
@@ -221,7 +241,14 @@ func watchResize(conn tunnel.Conn) (stop func()) {
 	}
 }
 
-func pushSize(conn tunnel.Conn) {
+func pushSize(conn tunnel.Conn, remoteSize func() (uint16, uint16)) {
+	if remoteSize != nil {
+		cols, rows := remoteSize()
+		if cols > 0 && rows > 0 {
+			_ = conn.Resize(rows, cols)
+		}
+		return
+	}
 	w, h, err := term.GetSize(int(os.Stdout.Fd()))
 	if err != nil {
 		return

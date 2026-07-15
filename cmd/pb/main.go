@@ -34,6 +34,7 @@ import (
 	"github.com/pujan-modha/paperboat-cli/internal/paste"
 	"github.com/pujan-modha/paperboat-cli/internal/resolver"
 	"github.com/pujan-modha/paperboat-cli/internal/session"
+	"github.com/pujan-modha/paperboat-cli/internal/statusbar"
 	"github.com/pujan-modha/paperboat-cli/internal/telemetry"
 	"github.com/pujan-modha/paperboat-cli/internal/tunnel"
 	"github.com/pujan-modha/paperboat-cli/internal/upload"
@@ -1028,6 +1029,18 @@ func actionConnect(c *cli.Context) error {
 	if strings.TrimSpace(d.cfg.ServerURL) == "" {
 		return errors.New("Paperboat server is not configured; set server_url or use --server")
 	}
+	bar := statusbar.New(statusbar.Options{
+		Mode:           d.cfg.StatusBar.Mode,
+		NoticeDuration: time.Duration(d.cfg.StatusBar.NoticeSeconds) * time.Second,
+		Layout: statusbar.Layout{
+			Left:   d.cfg.StatusBar.Left,
+			Center: d.cfg.StatusBar.Center,
+			Right:  d.cfg.StatusBar.Right,
+		},
+	})
+	bar.SetIdentity(project, requestedSessionLabel(c))
+	defer func() { _ = bar.Close() }()
+	useStatusBar := bar.Enabled()
 	var closeTelemetry func()
 	d.telemetry, closeTelemetry = connectTelemetry(d.cfg, os.Stderr)
 	defer closeTelemetry()
@@ -1044,12 +1057,29 @@ func actionConnect(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	d.resolver = resolver.NewAPIResolver(backend, d.cfg)
-	if apiResolver, ok := d.resolver.(*resolver.APIResolver); ok {
+	newResolver := func(credential config.Credential) *resolver.APIResolver {
+		apiResolver := resolver.NewAPIResolver(api.New(d.cfg.ServerURL, credential, nil), d.cfg)
 		apiResolver.Telemetry = d.telemetry
+		return apiResolver
+	}
+	d.resolver = newResolver(cred)
+	if apiResolver, ok := d.resolver.(*resolver.APIResolver); ok {
 		apiResolver.Progress = func(status, reason string, retryAfter time.Duration) {
+			if useStatusBar {
+				bar.SetConnection("connecting")
+				bar.Loading("Preparing connection")
+				return
+			}
 			fmt.Fprintf(os.Stderr, "Connecting: %s (%s), retrying in %s...\n", status, reason, retryAfter.Round(time.Second))
 		}
+	}
+	remoteSize := func() (uint16, uint16) {
+		if useStatusBar {
+			if cols, rows := bar.RemoteSize(); cols > 0 && rows > 0 {
+				return cols, rows
+			}
+		}
+		return localTerminalSize()
 	}
 
 	var info resolver.ConnectInfo
@@ -1063,7 +1093,7 @@ func actionConnect(c *cli.Context) error {
 			}
 		}
 	}
-	configureUploadRefresh := func(u upload.Uploader, r resolver.ProjectResolver) {
+	configureUploadRefresh := func(u upload.Uploader) {
 		httpUploader, ok := u.(*upload.HTTPUploader)
 		if !ok {
 			return
@@ -1074,22 +1104,9 @@ func actionConnect(c *cli.Context) error {
 		}
 		httpUploader.ConfigureTelemetry(d.telemetry, projectID, environmentID)
 		httpUploader.RefreshAuth = func(refreshCtx context.Context) (upload.Auth, error) {
-			freshCred, credErr := d.auth.Credential()
-			if credErr != nil {
-				return upload.Auth{}, credErr
-			}
-			projectToken := project
-			if info.ProjectID != "" {
-				projectToken = info.ProjectID
-			}
-			freshInfo, resolveErr := r.Resolve(refreshCtx, resolver.ConnectRequest{Project: projectToken, Credential: freshCred, TerminalSessionID: terminalSessionID})
-			if resolveErr != nil {
-				return upload.Auth{}, fmt.Errorf("refresh upload descriptor: %w", resolveErr)
-			}
-			if freshInfo.Upload == nil {
-				return upload.Auth{}, errors.New("refresh upload descriptor: upload target missing")
-			}
-			return upload.Auth{Method: freshInfo.Upload.Auth.Method, Token: freshInfo.Upload.Auth.Token, Ticket: freshInfo.Upload.Auth.Ticket}, nil
+			return refreshUploadAuthorization(refreshCtx, d.auth, func(credential config.Credential) resolver.ProjectResolver {
+				return newResolver(credential)
+			}, project, info.ProjectID, terminalSessionID)
 		}
 	}
 	for attempt := 0; attempt <= d.cfg.Connect.DialRetries; attempt++ {
@@ -1099,10 +1116,10 @@ func actionConnect(c *cli.Context) error {
 				info.Terminal.ReplayHistory = true
 				info.Terminal.SequenceSink = recordTerminalSequence
 				info.Terminal.Env = forwardedTerminalEnv(d.cfg.Connect.ForwardTerminalEnv)
-				info.Terminal.Cols, info.Terminal.Rows = localTerminalSize()
+				info.Terminal.Cols, info.Terminal.Rows = remoteSize()
 			}
 			d.uploader = uploaderForTarget(info.Upload)
-			configureUploadRefresh(d.uploader, d.resolver)
+			configureUploadRefresh(d.uploader)
 			conn, err = d.tunnel.Dial(ctx, info)
 		}
 		if err == nil {
@@ -1114,7 +1131,12 @@ func actionConnect(c *cli.Context) error {
 		if attempt == d.cfg.Connect.DialRetries || !retryableInitialConnectError(err) {
 			break
 		}
-		fmt.Fprintf(os.Stderr, "Connection attempt %d failed; refreshing the descriptor in %ds...\n", attempt+1, d.cfg.Connect.DialRetrySeconds)
+		if useStatusBar {
+			bar.SetConnection("reconnecting")
+			bar.Loading("Retrying connection")
+		} else {
+			fmt.Fprintf(os.Stderr, "Connection attempt %d failed; refreshing the descriptor in %ds...\n", attempt+1, d.cfg.Connect.DialRetrySeconds)
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -1122,10 +1144,19 @@ func actionConnect(c *cli.Context) error {
 		}
 	}
 	if err != nil {
+		if useStatusBar {
+			bar.SetConnection("failed")
+			bar.FailureFor("connection", "Connection failed")
+		}
 		if msg := friendlyAPIError(err); msg != "" {
 			return errors.New(msg)
 		}
 		return fmt.Errorf("connect to %q: %w", project, err)
+	}
+	if useStatusBar {
+		bar.SetConnection("connected")
+		bar.Notice("Connected")
+		bar.PrepareRemoteViewport()
 	}
 	var pastePolicy *paste.Policy
 	conn = tunnel.NewObservedReconnectingConn(ctx, conn, d.cfg.Connect.DialRetries, time.Duration(d.cfg.Connect.DialRetrySeconds)*time.Second, func(reconnectCtx context.Context) (tunnel.Conn, error) {
@@ -1133,8 +1164,7 @@ func actionConnect(c *cli.Context) error {
 		if credErr != nil {
 			return nil, credErr
 		}
-		freshResolver := resolver.NewAPIResolver(api.New(d.cfg.ServerURL, freshCred, nil), d.cfg)
-		freshResolver.Telemetry = d.telemetry
+		freshResolver := newResolver(freshCred)
 		freshInfo, resolveErr := freshResolver.Resolve(reconnectCtx, resolver.ConnectRequest{Project: info.ProjectID, Credential: freshCred, TerminalSessionID: terminalSessionID})
 		if resolveErr != nil {
 			return nil, resolveErr
@@ -1144,7 +1174,7 @@ func actionConnect(c *cli.Context) error {
 			freshInfo.Terminal.AfterSequence = int(lastTerminalSequence.Load())
 			freshInfo.Terminal.SequenceSink = recordTerminalSequence
 			freshInfo.Terminal.Env = forwardedTerminalEnv(d.cfg.Connect.ForwardTerminalEnv)
-			freshInfo.Terminal.Cols, freshInfo.Terminal.Rows = localTerminalSize()
+			freshInfo.Terminal.Cols, freshInfo.Terminal.Rows = remoteSize()
 		}
 		freshConn, dialErr := d.tunnel.Dial(reconnectCtx, freshInfo)
 		if dialErr != nil {
@@ -1152,33 +1182,78 @@ func actionConnect(c *cli.Context) error {
 		}
 		if pastePolicy != nil {
 			freshUploader := uploaderForTarget(freshInfo.Upload)
-			configureUploadRefresh(freshUploader, freshResolver)
+			configureUploadRefresh(freshUploader)
 			pastePolicy.Update(freshUploader, uploadLimits(d.cfg, freshInfo.Upload))
 		}
 		return freshConn, nil
 	}, d.telemetry, nil, tunnel.TelemetryContext{ProjectID: info.ProjectID, EnvironmentID: info.Terminal.EnvironmentID}, tunnel.WithReconnectingOutput(
 		d.cfg.Connect.TerminalOutputQueueChunks,
 		time.Duration(d.cfg.Connect.TerminalOutputBatchMilliseconds)*time.Millisecond,
-	))
+	), tunnel.WithReconnectObserver(func(event tunnel.ReconnectEvent) {
+		if !useStatusBar {
+			return
+		}
+		switch event {
+		case tunnel.ReconnectStarted:
+			bar.SetConnection("reconnecting")
+			bar.Loading("Reconnecting")
+		case tunnel.ReconnectRecovered:
+			bar.RecoverFailureFor("connection")
+			bar.SetConnection("connected")
+			bar.Notice("Reconnected")
+		case tunnel.ReconnectFailed:
+			bar.SetConnection("failed")
+			bar.FailureFor("connection", "Connection lost")
+		}
+	}))
 
 	// Wrap remote input with the image-paste interceptor.
 	pastePolicy = paste.NewPolicy(d.uploader, uploadLimits(d.cfg, info.Upload))
 	interceptor := paste.NewWithPolicy(conn, pastePolicy,
-		paste.WithNotifier(os.Stderr),
+		paste.WithNotifier(statusNotifier(useStatusBar)),
+		paste.WithLifecycle(func(event paste.LifecycleEvent) {
+			if !useStatusBar {
+				return
+			}
+			switch event {
+			case paste.ImageDetected:
+				bar.Loading("Image detected")
+			case paste.ImageUploading:
+				bar.Loading("Uploading image")
+			case paste.ImageComplete:
+				bar.RecoverFailureFor("upload")
+				bar.Notice("Image uploaded")
+			case paste.ImageFailed:
+				bar.FailureFor("upload", "Image upload failed; pasted original")
+			}
+		}),
 		paste.WithWatchDirs(expandDirs(d.cfg.Upload.WatchDirs)),
 		paste.WithTempFilePatterns(d.cfg.Upload.TempFilePatterns),
 		paste.WithMaxQueuedBytes(d.cfg.Upload.MaxQueuedInputBytes),
 		paste.WithPartialFlushDelay(time.Duration(d.cfg.Connect.InputPartialFlushMilliseconds)*time.Millisecond),
 	)
 
+	if useStatusBar {
+		pollCtx, cancelPoll := context.WithCancel(ctx)
+		defer cancelPoll()
+		go pollConfigSync(pollCtx, d.cfg.ServerURL, d.auth, info.ProjectID, time.Duration(d.cfg.StatusBar.SyncPollSeconds)*time.Second, bar)
+	}
+	runOptions := []session.RunOption{session.WithOutputBufferBytes(d.cfg.Connect.TerminalOutputBufferBytes)}
+	if useStatusBar {
+		runOptions = append(runOptions, session.WithOutput(bar), session.WithRemoteSize(remoteSize))
+	}
 	code, err := session.RunWithActivity(ctx, conn, interceptor, func(source string) {
 		activityCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		activityErr := reportActivity(activityCtx, d.cfg.ServerURL, d.auth, info.ProjectID, source)
 		if activityErr != nil {
-			fmt.Fprintf(os.Stderr, "warning: activity report failed: %v\n", activityErr)
+			if useStatusBar {
+				bar.Notice("Activity reporting unavailable")
+			} else {
+				fmt.Fprintf(os.Stderr, "warning: activity report failed: %v\n", activityErr)
+			}
 		}
-	}, session.WithOutputBufferBytes(d.cfg.Connect.TerminalOutputBufferBytes))
+	}, runOptions...)
 	if err != nil {
 		return err
 	}
@@ -1186,6 +1261,119 @@ func actionConnect(c *cli.Context) error {
 		return exitCodeError{code: code}
 	}
 	return nil
+}
+
+func requestedSessionLabel(c *cli.Context) string {
+	if c.Bool("new") {
+		if name := strings.TrimSpace(c.String("name")); name != "" {
+			return name
+		}
+		return "new session"
+	}
+	if session := strings.TrimSpace(c.String("session")); session != "" {
+		return session
+	}
+	return "default"
+}
+
+func statusNotifier(enabled bool) io.Writer {
+	if enabled {
+		return io.Discard
+	}
+	return os.Stderr
+}
+
+func pollConfigSync(ctx context.Context, serverURL string, source config.AuthSource, projectID string, interval time.Duration, bar *statusbar.Bar) {
+	if interval <= 0 {
+		return
+	}
+	poll := func() bool {
+		credential, err := source.Credential()
+		if err != nil {
+			bar.FailureFor("config-sync", "Config sync status unavailable")
+			return true
+		}
+		client := api.New(serverURL, credential, nil)
+		status, err := client.ConfigSyncStatus(ctx)
+		if err != nil {
+			bar.FailureFor("config-sync", "Config sync status unavailable")
+			bar.SetConfigSync("error")
+			return true
+		}
+		state := ""
+		found := false
+		for _, candidate := range status.Projects {
+			if candidate.ProjectID == projectID {
+				state = candidate.State
+				found = true
+				break
+			}
+		}
+		if !found {
+			bar.RecoverFailureFor("config-sync")
+			bar.SetConfigSync("waiting")
+			bar.Loading("Config sync awaiting status")
+		} else {
+			bar.SetConfigSync(state)
+			switch state {
+			case "healthy", "watching", "idle":
+				bar.RecoverFailureFor("config-sync")
+				bar.Notice("Config synced")
+			case "pending":
+				bar.RecoverFailureFor("config-sync")
+				bar.Loading("Config sync pending")
+			case "syncing", "restoring":
+				bar.RecoverFailureFor("config-sync")
+				bar.Loading("Config sync in progress")
+			case "warning":
+				bar.FailureFor("config-sync", "Config sync needs attention")
+			case "conflict":
+				bar.FailureFor("config-sync", "Config sync conflict")
+			case "error":
+				bar.FailureFor("config-sync", "Config sync failed")
+			case "offline":
+				bar.FailureFor("config-sync", "Config sync offline")
+			default:
+				bar.FailureFor("config-sync", "Config sync status unavailable")
+			}
+		}
+		usage, usageErr := client.UsageSummary(ctx)
+		if usageErr == nil {
+			bar.SetUsage(formatStatusCredits(usage.Credits.Balance), fmt.Sprintf("%d GB", usage.Storage.AvailableGB))
+		}
+		return true
+	}
+	if !poll() {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !poll() {
+				return
+			}
+		}
+	}
+}
+
+func formatStatusCredits(raw string) string {
+	value := strings.TrimSpace(raw)
+	if whole, fraction, ok := strings.Cut(value, "."); ok {
+		fraction = strings.TrimRight(fraction, "0")
+		if fraction == "" {
+			value = whole
+		} else {
+			value = whole + "." + fraction
+		}
+	}
+	if value == "" || value == "-0" {
+		return "0"
+	}
+	return value
 }
 
 func connectTelemetry(cfg *config.Config, warnings io.Writer) (telemetry.Sink, func()) {
@@ -1259,6 +1447,29 @@ func friendlyAPIError(err error) string {
 		return "the project machine is not ready yet; retry in a moment"
 	}
 	return ""
+}
+
+// refreshUploadAuthorization re-brokers an upload descriptor with a newly
+// constructed control-plane client. API clients bind their bearer token at
+// construction, so reusing the resolver from the initial terminal attach
+// would retry with an expired credential.
+func refreshUploadAuthorization(ctx context.Context, source config.AuthSource, newResolver func(config.Credential) resolver.ProjectResolver, project, projectID, terminalSessionID string) (upload.Auth, error) {
+	freshCred, err := source.Credential()
+	if err != nil {
+		return upload.Auth{}, err
+	}
+	projectToken := project
+	if projectID != "" {
+		projectToken = projectID
+	}
+	freshInfo, err := newResolver(freshCred).Resolve(ctx, resolver.ConnectRequest{Project: projectToken, Credential: freshCred, TerminalSessionID: terminalSessionID})
+	if err != nil {
+		return upload.Auth{}, fmt.Errorf("refresh upload descriptor: %w", err)
+	}
+	if freshInfo.Upload == nil {
+		return upload.Auth{}, errors.New("refresh upload descriptor: upload target missing")
+	}
+	return upload.Auth{Method: freshInfo.Upload.Auth.Method, Token: freshInfo.Upload.Auth.Token, Ticket: freshInfo.Upload.Auth.Ticket}, nil
 }
 
 func uploaderForTarget(target *resolver.UploadTarget) upload.Uploader {

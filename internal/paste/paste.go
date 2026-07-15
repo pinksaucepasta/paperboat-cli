@@ -71,6 +71,7 @@ type Interceptor struct {
 	lifecycleMu    sync.RWMutex
 	closed         bool
 	pressureOnce   sync.Once
+	lifecycle      func(LifecycleEvent)
 	stateMu        sync.Mutex
 	errMu          sync.Mutex
 	err            error
@@ -104,8 +105,24 @@ func (p *Policy) snapshot() (upload.Uploader, upload.Limits) {
 // Option configures an Interceptor.
 type Option func(*Interceptor)
 
+// LifecycleEvent is metadata-only so status renderers never receive local
+// paths, remote paths, or raw server errors.
+type LifecycleEvent string
+
+const (
+	ImageDetected  LifecycleEvent = "detected"
+	ImageUploading LifecycleEvent = "uploading"
+	ImageComplete  LifecycleEvent = "complete"
+	ImageFailed    LifecycleEvent = "failed"
+)
+
 // WithNotifier sets where user-facing (fail-open) messages are written.
 func WithNotifier(w io.Writer) Option { return func(i *Interceptor) { i.notify = w } }
+
+// WithLifecycle reports image-paste lifecycle transitions.
+func WithLifecycle(callback func(LifecycleEvent)) Option {
+	return func(i *Interceptor) { i.lifecycle = callback }
+}
 
 // WithTimeout sets the per-paste upload timeout.
 func WithTimeout(d time.Duration) Option { return func(i *Interceptor) { i.timeout = d } }
@@ -489,6 +506,7 @@ func (i *Interceptor) rewrite(body []byte) []byte {
 		candidate.path = resolved
 		candidate.file = file
 		candidates[idx] = candidate
+		i.report(ImageDetected)
 	}
 	if nonEmpty == 0 {
 		return body
@@ -513,14 +531,23 @@ func (i *Interceptor) rewrite(body []byte) []byte {
 			continue
 		}
 		candidate := candidates[idx]
+		i.report(ImageUploading)
 		vmPath, err := uploadOne(ctx, uploader, limits, candidate)
 		if err != nil {
+			i.report(ImageFailed)
 			i.warn("image upload failed: %v; pasting original path", err)
 			return body // fail open for the whole paste
 		}
 		out[idx] = ln[:candidate.start] + vmPath + ln[candidate.end:]
 	}
+	i.report(ImageComplete)
 	return []byte(strings.Join(out, "\n"))
+}
+
+func (i *Interceptor) report(event LifecycleEvent) {
+	if i.lifecycle != nil {
+		i.lifecycle(event)
+	}
 }
 
 func uploadOne(ctx context.Context, uploader upload.Uploader, limits upload.Limits, candidate pathCandidate) (string, error) {

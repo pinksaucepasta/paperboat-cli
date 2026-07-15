@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -77,6 +78,53 @@ func TestLoadAppliesDialRetryDefaultWhenOmitted(t *testing.T) {
 		cfg.Connect.TerminalOutputBatchMilliseconds != DefaultTerminalOutputBatchMilliseconds ||
 		cfg.Connect.TerminalOutputBufferBytes != DefaultTerminalOutputBufferBytes {
 		t.Fatalf("terminal output defaults = %+v", cfg.Connect)
+	}
+	if cfg.StatusBar.Mode != DefaultStatusBarMode || cfg.StatusBar.NoticeSeconds != DefaultStatusBarNoticeSeconds || cfg.StatusBar.SyncPollSeconds != DefaultStatusBarSyncPollSeconds {
+		t.Fatalf("status bar defaults = %+v", cfg.StatusBar)
+	}
+	if got, want := strings.Join(cfg.StatusBar.Left, ","), "project,session"; got != want {
+		t.Fatalf("status bar left = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(cfg.StatusBar.Center, ","), "activity"; got != want {
+		t.Fatalf("status bar center = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(cfg.StatusBar.Right, ","), "credits,connection"; got != want {
+		t.Fatalf("status bar right = %q, want %q", got, want)
+	}
+}
+
+func TestLoadValidatesStatusBarWidgetsAndPreservesEmptyRegions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"status_bar":{"left":[],"center":["storage"],"right":["credits","connection"]}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.StatusBar.Left == nil || len(cfg.StatusBar.Left) != 0 {
+		t.Fatalf("explicit empty left region was replaced: %#v", cfg.StatusBar.Left)
+	}
+	for _, raw := range []string{
+		`{"status_bar":{"left":["unknown"]}}`,
+		`{"status_bar":{"left":["project"],"right":["project"]}}`,
+	} {
+		if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(path); err == nil {
+			t.Fatalf("Load accepted invalid status bar config: %s", raw)
+		}
+	}
+}
+
+func TestLoadRejectsInvalidStatusBarMode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"status_bar":{"mode":"sometimes"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("Load accepted invalid status_bar.mode")
 	}
 }
 

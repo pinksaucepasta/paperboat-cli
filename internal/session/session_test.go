@@ -47,6 +47,20 @@ type failingSink struct{}
 func (failingSink) Write([]byte) (int, error) { return 0, errors.New("route lost") }
 func (failingSink) Close() error              { return nil }
 
+type resizeConn struct {
+	rows uint16
+	cols uint16
+}
+
+func (c *resizeConn) Read([]byte) (int, error)    { return 0, io.EOF }
+func (c *resizeConn) Write(p []byte) (int, error) { return len(p), nil }
+func (c *resizeConn) Resize(rows, cols uint16) error {
+	c.rows, c.cols = rows, cols
+	return nil
+}
+func (c *resizeConn) Close() error       { return nil }
+func (c *resizeConn) Wait() (int, error) { return 0, nil }
+
 func TestRunPropagatesRemoteOutputExitAndCloses(t *testing.T) {
 	inR, inW, _ := os.Pipe()
 	outR, outW, _ := os.Pipe()
@@ -126,5 +140,13 @@ func TestRunSurfacesInputWriteFailure(t *testing.T) {
 	code, err := Run(context.Background(), c, failingSink{})
 	if code != 1 || err == nil || !strings.Contains(err.Error(), "send terminal input") || !c.closed.Load() {
 		t.Fatalf("code=%d err=%v closed=%v", code, err, c.closed.Load())
+	}
+}
+
+func TestPushSizeUsesReservedRemoteViewport(t *testing.T) {
+	conn := &resizeConn{}
+	pushSize(conn, func() (uint16, uint16) { return 120, 39 })
+	if conn.cols != 120 || conn.rows != 39 {
+		t.Fatalf("resize = %dx%d, want 120x39", conn.cols, conn.rows)
 	}
 }

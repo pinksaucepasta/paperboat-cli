@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -17,7 +18,9 @@ import (
 	"github.com/pujan-modha/paperboat-cli/internal/api"
 	"github.com/pujan-modha/paperboat-cli/internal/config"
 	"github.com/pujan-modha/paperboat-cli/internal/resolver"
+	"github.com/pujan-modha/paperboat-cli/internal/statusbar"
 	"github.com/pujan-modha/paperboat-cli/internal/telemetry"
+	"github.com/pujan-modha/paperboat-cli/internal/upload"
 )
 
 func TestConnectTelemetryFailsOpenWithWarning(t *testing.T) {
@@ -88,6 +91,249 @@ func TestReportActivityRefreshesAndRetriesUnauthorized(t *testing.T) {
 	metadata, _ := bodies[1]["metadata"].(map[string]any)
 	if metadata["event"] != "human_input" {
 		t.Fatalf("metadata=%#v", metadata)
+	}
+}
+
+func TestPollConfigSyncUsesAttachedProjectState(t *testing.T) {
+	requested := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer token" {
+			t.Fatalf("request = %s authorization=%q", r.URL.Path, r.Header.Get("Authorization"))
+		}
+		switch r.URL.Path {
+		case "/api/config-sync/status":
+			_, _ = w.Write([]byte(`{"data":{"state":"healthy","projects":[{"project_id":"other","state":"healthy"},{"project_id":"attached","state":"warning"}]}}`))
+			requested <- struct{}{}
+		case "/api/dashboard/usage-summary":
+			_, _ = w.Write([]byte(`{"data":{"credits":{"balance":"100.000000"},"storage":{"available_gb":12}}}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	}))
+	defer server.Close()
+	input, _, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer input.Close()
+	outputReader, output, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outputReader.Close()
+	bar := statusbar.New(statusbar.Options{
+		Mode:           statusbar.ModeAuto,
+		Term:           "xterm-256color",
+		NoticeDuration: time.Second,
+		Input:          input,
+		Output:         output,
+		IsTerminal:     func(int) bool { return true },
+		GetSize:        func(int) (int, int, error) { return 80, 24, nil },
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		pollConfigSync(ctx, server.URL, &refreshTestAuth{current: config.Credential{AccessToken: "token"}}, "attached", time.Hour, bar)
+		close(done)
+	}()
+	select {
+	case <-requested:
+	case <-time.After(time.Second):
+		t.Fatal("config-sync poll was not requested")
+	}
+	deadline := time.Now().Add(time.Second)
+	for !strings.Contains(bar.Text(), "Config sync needs attention") && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := bar.Text(); !strings.Contains(got, "Config sync needs attention") {
+		t.Fatalf("active project state was not selected: %q", got)
+	}
+	deadline = time.Now().Add(time.Second)
+	for !strings.Contains(bar.Render(80), "credits 100") && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := bar.Render(80); !strings.Contains(got, "credits 100") {
+		t.Fatalf("usage summary was not rendered: %q", got)
+	}
+	cancel()
+	<-done
+	_ = bar.Close()
+	_ = output.Close()
+	raw, err := io.ReadAll(outputReader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "Config sync needs attention") || !strings.Contains(string(raw), "credits 100") {
+		t.Fatalf("status/usage were not rendered: %q", raw)
+	}
+}
+
+func TestPollConfigSyncWaitsForAttachedProjectStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"data":{"state":"healthy","projects":[]}}`))
+	}))
+	defer server.Close()
+	input, _, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer input.Close()
+	_, output, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer output.Close()
+	bar := statusbar.New(statusbar.Options{
+		Mode: statusbar.ModeAuto, Term: "xterm-256color", NoticeDuration: time.Second,
+		Input: input, Output: output, IsTerminal: func(int) bool { return true },
+		GetSize: func(int) (int, int, error) { return 80, 24, nil },
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		pollConfigSync(ctx, server.URL, &refreshTestAuth{current: config.Credential{AccessToken: "token"}}, "attached", time.Hour, bar)
+		close(done)
+	}()
+	deadline := time.Now().Add(time.Second)
+	for !strings.Contains(bar.Text(), "Config sync awaiting status") && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := bar.Text(); !strings.Contains(got, "Config sync awaiting status") || strings.Contains(got, "unavailable") {
+		t.Fatalf("missing-project status = %q", got)
+	}
+	cancel()
+	<-done
+}
+
+func TestPollConfigSyncKeepsAuthenticationFailuresVisible(t *testing.T) {
+	requests := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests <- struct{}{}
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"code":"unauthenticated","message":"Authentication is required."}}`))
+	}))
+	defer server.Close()
+	input, _, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer input.Close()
+	_, output, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer output.Close()
+	bar := statusbar.New(statusbar.Options{
+		Mode: statusbar.ModeAuto, Term: "xterm-256color", NoticeDuration: time.Second,
+		Input: input, Output: output, IsTerminal: func(int) bool { return true },
+		GetSize: func(int) (int, int, error) { return 80, 24, nil },
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		pollConfigSync(ctx, server.URL, &refreshTestAuth{current: config.Credential{AccessToken: "token"}}, "attached", time.Hour, bar)
+		close(done)
+	}()
+	select {
+	case <-requests:
+	case <-time.After(time.Second):
+		t.Fatal("config-sync request was not sent")
+	}
+	deadline := time.Now().Add(time.Second)
+	for !strings.Contains(bar.Text(), "Config sync status unavailable") && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := bar.Text(); !strings.Contains(got, "Config sync status unavailable") {
+		t.Fatalf("authentication failure was hidden: %q", got)
+	}
+	cancel()
+	<-done
+}
+
+func TestFormatStatusCredits(t *testing.T) {
+	for raw, want := range map[string]string{
+		"100":        "100",
+		"100.000000": "100",
+		"0.000000":   "0",
+		"12.340000":  "12.34",
+	} {
+		if got := formatStatusCredits(raw); got != want {
+			t.Fatalf("formatStatusCredits(%q) = %q, want %q", raw, got, want)
+		}
+	}
+}
+
+func TestUploadAuthRefreshRebrokersWithFreshControlPlaneCredential(t *testing.T) {
+	var controlPlaneAuth, uploadAuth []string
+	var server *httptest.Server
+	server = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/projects":
+			controlPlaneAuth = append(controlPlaneAuth, r.Header.Get("Authorization"))
+			if r.Header.Get("Authorization") != "Bearer control-new" {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"error":{"code":"unauthenticated","message":"expired"}}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"data":{"items":[{"id":"prj_1","name":"Demo","state":"running"}],"pagination":{"limit":200,"offset":0,"total":1,"next_offset":null}}}`))
+		case "/api/projects/prj_1/cli-connect":
+			controlPlaneAuth = append(controlPlaneAuth, r.Header.Get("Authorization"))
+			if r.Header.Get("Authorization") != "Bearer control-new" {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"error":{"code":"unauthenticated","message":"expired"}}`))
+				return
+			}
+			now := time.Now().UTC()
+			wsURL := "wss" + strings.TrimPrefix(server.URL, "https")
+			response := map[string]any{"data": map[string]any{
+				"issuer": server.URL, "project_id": "prj_1", "connectable": true, "expires_at": now.Add(5 * time.Minute),
+				"environment": map[string]any{"environment_id": "env_1", "project_id": "prj_1", "project_root": "/workspace"},
+				"terminal":    map[string]any{"kind": "papercode_websocket", "http_base_url": server.URL, "websocket_base_url": wsURL, "auth": map[string]any{"method": "websocket_ticket", "ticket": "terminal-ticket", "expires_at": now.Add(4 * time.Minute), "scopes": []string{"terminal:operate"}}, "thread_id": "paperboat-cli", "terminal_id": "term_1", "cwd": "/workspace"},
+				"upload":      map[string]any{"kind": "papercode_staged_image", "http_base_url": server.URL, "path": "/api/files/staged-images", "auth": map[string]any{"method": "bearer", "token": "upload-new", "expires_at": now.Add(4 * time.Minute), "scopes": []string{"file:stage"}}, "max_bytes": 1024, "allowed_mime_types": []string{"image/png"}, "retention_seconds": 60},
+			}}
+			if err := json.NewEncoder(w).Encode(response); err != nil {
+				t.Fatal(err)
+			}
+		case "/api/files/staged-images":
+			uploadAuth = append(uploadAuth, r.Header.Get("Authorization"))
+			if r.Header.Get("Authorization") != "Bearer upload-new" {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"error":{"code":"unauthenticated","message":"server rejected the credential"}}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"path":"/workspace/.paperboat/staged/image.png"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{ServerURL: server.URL, Connect: config.ConnectConfig{ReadyTimeoutSeconds: 30, PollIntervalSeconds: 1, AcceptedTerminalKinds: []string{"papercode_websocket"}}}
+	auth := &refreshTestAuth{current: config.Credential{AccessToken: "control-new"}}
+	uploader := upload.NewHTTPUploader(server.URL, "/api/files/staged-images", upload.Auth{Method: "bearer", Token: "upload-expired"})
+	uploader.HTTPClient = server.Client()
+	uploader.RefreshAuth = func(ctx context.Context) (upload.Auth, error) {
+		return refreshUploadAuthorization(ctx, auth, func(credential config.Credential) resolver.ProjectResolver {
+			return resolver.NewAPIResolver(api.New(server.URL, credential, server.Client()), cfg)
+		}, "Demo", "prj_1", "")
+	}
+
+	path, err := uploader.Upload(context.Background(), upload.Image{Name: "image.png", MimeType: "image/png", Bytes: []byte("image-bytes")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if path != "/workspace/.paperboat/staged/image.png" {
+		t.Fatalf("path = %q", path)
+	}
+	if got := strings.Join(controlPlaneAuth, ","); got != "Bearer control-new,Bearer control-new" {
+		t.Fatalf("control-plane authorization = %q", got)
+	}
+	if got := strings.Join(uploadAuth, ","); got != "Bearer upload-expired,Bearer upload-new" {
+		t.Fatalf("upload authorization = %q", got)
 	}
 }
 
