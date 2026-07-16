@@ -49,6 +49,25 @@ func TestRetryableInitialConnectError(t *testing.T) {
 	}
 }
 
+func TestSelectTerminalSessionDoesNotHideAmbiguousProjectWithConnectedMachine(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/projects":
+			_, _ = w.Write([]byte(`{"data":{"items":[{"id":"prj_1","name":"studio"},{"id":"prj_2","name":"Studio"}],"pagination":{"next_offset":null}}}`))
+		case "/api/connected-machines":
+			t.Fatal("connected-machine lookup must not hide an ambiguous project name")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	_, err := selectTerminalSession(context.Background(), api.New(server.URL, config.Credential{AccessToken: "token"}, server.Client()), "studio", false, "", "")
+	if !errors.Is(err, resolver.ErrProjectAmbiguous) {
+		t.Fatalf("err = %v, want project ambiguity", err)
+	}
+}
+
 type refreshTestAuth struct {
 	current   config.Credential
 	refreshed config.Credential

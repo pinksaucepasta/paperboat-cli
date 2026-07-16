@@ -1,8 +1,8 @@
 // Command pb (alias: paperboat) is the invisible terminal wrapper for the
-// Paperboat platform. `pb <project>` resumes the project VM and attaches its
-// terminal, using Paperboat auth and bridging local image pastes into remote
-// TUIs. Cross-service calls run behind interfaces so protocol behavior remains
-// independently testable.
+// Paperboat platform. `pb <environment>` attaches a hosted project or enrolled
+// connected machine through Paperboat auth and bridges local image pastes into
+// remote TUIs. Cross-service calls run behind interfaces so protocol behavior
+// remains independently testable.
 package main
 
 import (
@@ -108,8 +108,8 @@ func isCobraUsageError(err error) bool {
 
 func newRootCommand() *cobra.Command {
 	root := &cobra.Command{
-		Use:   "pb [project]",
-		Short: "Connect to your Paperboat project VM terminal",
+		Use:   "pb [environment]",
+		Short: "Connect to a Paperboat environment terminal",
 		Args:  commandArgs(cobra.MaximumNArgs(1)),
 		RunE: func(command *cobra.Command, args []string) error {
 			if err := validateConnectInvocation(command); err != nil {
@@ -129,7 +129,7 @@ func newRootCommand() *cobra.Command {
 	root.PersistentFlags().String("server", "", "paperboat-server base URL override")
 	addConnectFlags(root)
 
-	connect := &cobra.Command{Use: "connect <project>", Short: "Attach to a project VM terminal", Args: commandArgs(cobra.ExactArgs(1)), RunE: func(command *cobra.Command, args []string) error {
+	connect := &cobra.Command{Use: "connect <environment>", Short: "Attach to an environment terminal", Args: commandArgs(cobra.ExactArgs(1)), RunE: func(command *cobra.Command, args []string) error {
 		if err := validateConnectInvocation(command); err != nil {
 			return err
 		}
@@ -141,6 +141,10 @@ func newRootCommand() *cobra.Command {
 	projects := &cobra.Command{Use: "projects", Short: "List projects available to this account", Args: commandArgs(cobra.NoArgs), RunE: legacyRun(projectsCommand().Action)}
 	projects.Flags().Bool("json", false, "print JSON")
 	root.AddCommand(projects)
+
+	environments := &cobra.Command{Use: "environments", Short: "List hosted projects and connected machines", Args: commandArgs(cobra.NoArgs), RunE: legacyRun(environmentsCommand().Action)}
+	environments.Flags().Bool("json", false, "print JSON")
+	root.AddCommand(environments)
 
 	keepAlive := &cobra.Command{Use: "keep-alive <project>", Args: commandArgs(cobra.ExactArgs(1)), RunE: legacyRun(keepAliveCommand().Action)}
 	keepAlive.Flags().Float64("hours", 0, "duration in hours")
@@ -214,7 +218,7 @@ func legacyCommandArgs(parent, name string) cobra.PositionalArgs {
 
 func sessionsCobraCommand() *cobra.Command {
 	source := sessionsCommand()
-	command := &cobra.Command{Use: "sessions <project>", Args: commandArgs(cobra.ExactArgs(1)), RunE: legacyRun(source.Action)}
+	command := &cobra.Command{Use: "sessions <environment>", Args: commandArgs(cobra.ExactArgs(1)), RunE: legacyRun(source.Action)}
 	command.Flags().Bool("wide", false, "include immutable IDs")
 	command.Flags().Bool("json", false, "print JSON")
 	for _, child := range source.Subcommands {
@@ -650,6 +654,70 @@ func resolveProjectID(ctx context.Context, client *api.Client, requested string)
 	return api.Project{}, fmt.Errorf("%w: %q", resolver.ErrProjectNotFound, requested)
 }
 
+type environmentTarget struct {
+	kind string
+	id   string
+	name string
+}
+
+const (
+	environmentProject          = "project"
+	environmentConnectedMachine = "connected_machine"
+)
+
+func resolveEnvironmentTarget(ctx context.Context, client *api.Client, requested string) (environmentTarget, error) {
+	project, err := resolveProjectID(ctx, client, requested)
+	if err == nil {
+		return environmentTarget{kind: environmentProject, id: project.ID, name: project.Name}, nil
+	}
+	if !errors.Is(err, resolver.ErrProjectNotFound) {
+		return environmentTarget{}, err
+	}
+	machine, machineErr := resolveConnectedMachine(ctx, client, requested)
+	if machineErr != nil {
+		if api.IsNotFound(machineErr) {
+			return environmentTarget{}, err
+		}
+		return environmentTarget{}, machineErr
+	}
+	return environmentTarget{kind: environmentConnectedMachine, id: machine.ID, name: machine.DisplayName}, nil
+}
+
+func listTerminalSessionsForTarget(ctx context.Context, client *api.Client, target environmentTarget) ([]api.TerminalSession, error) {
+	if target.kind == environmentConnectedMachine {
+		return client.ListConnectedMachineTerminalSessions(ctx, target.id)
+	}
+	return client.ListTerminalSessions(ctx, target.id)
+}
+
+func createTerminalSessionForTarget(ctx context.Context, client *api.Client, target environmentTarget, name, idempotencyKey string) (api.TerminalSession, error) {
+	if target.kind == environmentConnectedMachine {
+		return client.CreateConnectedMachineTerminalSession(ctx, target.id, name, idempotencyKey)
+	}
+	return client.CreateTerminalSession(ctx, target.id, name, idempotencyKey)
+}
+
+func renameTerminalSessionForTarget(ctx context.Context, client *api.Client, target environmentTarget, sessionID, name string) (api.TerminalSession, error) {
+	if target.kind == environmentConnectedMachine {
+		return client.RenameConnectedMachineTerminalSession(ctx, target.id, sessionID, name)
+	}
+	return client.RenameTerminalSession(ctx, target.id, sessionID, name)
+}
+
+func closeTerminalSessionForTarget(ctx context.Context, client *api.Client, target environmentTarget, sessionID string) error {
+	if target.kind == environmentConnectedMachine {
+		return client.CloseConnectedMachineTerminalSession(ctx, target.id, sessionID)
+	}
+	return client.CloseTerminalSession(ctx, target.id, sessionID)
+}
+
+func deleteTerminalSessionForTarget(ctx context.Context, client *api.Client, target environmentTarget, sessionID string) error {
+	if target.kind == environmentConnectedMachine {
+		return client.DeleteConnectedMachineTerminalSession(ctx, target.id, sessionID)
+	}
+	return client.DeleteTerminalSession(ctx, target.id, sessionID)
+}
+
 // deps bundles production dependencies for a command.
 type deps struct {
 	cfg       *config.Config
@@ -702,8 +770,8 @@ func buildDeps(c *cli.Context) (*deps, error) {
 func connectCommand() *cli.Command {
 	return &cli.Command{
 		Name:      "connect",
-		Usage:     "Attach to a project VM terminal (default action)",
-		ArgsUsage: "<project>",
+		Usage:     "Attach to an environment terminal (default action)",
+		ArgsUsage: "<environment>",
 		Flags:     connectFlags(),
 		Action:    actionConnect,
 	}
@@ -744,17 +812,55 @@ func projectsCommand() *cli.Command {
 	}
 }
 
+func environmentsCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "environments",
+		Usage: "List hosted projects and connected machines",
+		Flags: []cli.Flag{&cli.BoolFlag{Name: "json"}},
+		Action: func(c *cli.Context) error {
+			client, err := backendClient(c)
+			if err != nil {
+				return err
+			}
+			projects, err := client.ListProjects(c.Context)
+			if err != nil {
+				return err
+			}
+			machines, err := client.ListConnectedMachines(c.Context)
+			if err != nil {
+				return err
+			}
+			if c.Bool("json") {
+				return json.NewEncoder(os.Stdout).Encode(map[string]any{"projects": projects, "connected_machines": machines})
+			}
+			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+			fmt.Fprintln(w, "TYPE\tNAME\tID\tSTATE")
+			for _, project := range projects {
+				fmt.Fprintf(w, "project\t%s\t%s\t%s\n", project.Name, project.ID, project.State)
+			}
+			for _, machine := range machines {
+				state := machine.State
+				if machine.Online && state == "" {
+					state = "online"
+				}
+				fmt.Fprintf(w, "connected_machine\t%s\t%s\t%s\n", machine.DisplayName, machine.ID, state)
+			}
+			return w.Flush()
+		},
+	}
+}
+
 func sessionsCommand() *cli.Command {
 	list := func(c *cli.Context) error {
 		client, err := backendClient(c)
 		if err != nil {
 			return err
 		}
-		project, err := resolveProjectID(c.Context, client, c.Args().First())
+		target, err := resolveEnvironmentTarget(c.Context, client, c.Args().First())
 		if err != nil {
 			return err
 		}
-		sessions, err := client.ListTerminalSessions(c.Context, project.ID)
+		sessions, err := listTerminalSessionsForTarget(c.Context, client, target)
 		if err != nil {
 			return friendlyCommandError(err)
 		}
@@ -780,10 +886,10 @@ func sessionsCommand() *cli.Command {
 		}
 		return w.Flush()
 	}
-	return &cli.Command{Name: "sessions", Usage: "Manage project terminal sessions", ArgsUsage: "<project>", Flags: []cli.Flag{&cli.BoolFlag{Name: "wide"}, &cli.BoolFlag{Name: "json"}}, Action: list, Subcommands: []*cli.Command{
-		{Name: "rename", ArgsUsage: "<project> <session> <new-name>", Action: func(c *cli.Context) error {
+	return &cli.Command{Name: "sessions", Usage: "Manage environment terminal sessions", ArgsUsage: "<environment>", Flags: []cli.Flag{&cli.BoolFlag{Name: "wide"}, &cli.BoolFlag{Name: "json"}}, Action: list, Subcommands: []*cli.Command{
+		{Name: "rename", ArgsUsage: "<environment> <session> <new-name>", Action: func(c *cli.Context) error {
 			if c.Args().Len() != 3 {
-				return errors.New("usage: pb sessions rename <project> <session> <new-name>")
+				return errors.New("usage: pb sessions rename <environment> <session> <new-name>")
 			}
 			if err := validateSessionName(c.Args().Get(2)); err != nil {
 				return err
@@ -792,51 +898,51 @@ func sessionsCommand() *cli.Command {
 			if err != nil {
 				return err
 			}
-			project, err := resolveProjectID(c.Context, client, c.Args().First())
+			target, err := resolveEnvironmentTarget(c.Context, client, c.Args().First())
 			if err != nil {
 				return err
 			}
-			session, err := resolveTerminalSession(c.Context, client, project.ID, c.Args().Get(1))
+			session, err := resolveTerminalSession(c.Context, client, target, c.Args().Get(1))
 			if err != nil {
 				return err
 			}
 			if session.IsDefault {
 				return errors.New("the default session cannot be renamed")
 			}
-			_, err = client.RenameTerminalSession(c.Context, project.ID, session.ID, c.Args().Get(2))
+			_, err = renameTerminalSessionForTarget(c.Context, client, target, session.ID, c.Args().Get(2))
 			return friendlyCommandError(err)
 		}},
-		{Name: "close", ArgsUsage: "<project> <session>", Action: func(c *cli.Context) error {
+		{Name: "close", ArgsUsage: "<environment> <session>", Action: func(c *cli.Context) error {
 			if c.Args().Len() != 2 {
-				return errors.New("usage: pb sessions close <project> <session>")
+				return errors.New("usage: pb sessions close <environment> <session>")
 			}
 			client, err := backendClient(c)
 			if err != nil {
 				return err
 			}
-			project, err := resolveProjectID(c.Context, client, c.Args().First())
+			target, err := resolveEnvironmentTarget(c.Context, client, c.Args().First())
 			if err != nil {
 				return err
 			}
-			session, err := resolveTerminalSession(c.Context, client, project.ID, c.Args().Get(1))
+			session, err := resolveTerminalSession(c.Context, client, target, c.Args().Get(1))
 			if err != nil {
 				return err
 			}
-			return friendlyCommandError(client.CloseTerminalSession(c.Context, project.ID, session.ID))
+			return friendlyCommandError(closeTerminalSessionForTarget(c.Context, client, target, session.ID))
 		}},
-		{Name: "delete", ArgsUsage: "<project> <session>", Flags: []cli.Flag{&cli.BoolFlag{Name: "yes", Usage: "confirm deletion"}}, Action: func(c *cli.Context) error {
+		{Name: "delete", ArgsUsage: "<environment> <session>", Flags: []cli.Flag{&cli.BoolFlag{Name: "yes", Usage: "confirm deletion"}}, Action: func(c *cli.Context) error {
 			if c.Args().Len() != 2 {
-				return errors.New("usage: pb sessions delete <project> <session> [--yes]")
+				return errors.New("usage: pb sessions delete <environment> <session> [--yes]")
 			}
 			client, err := backendClient(c)
 			if err != nil {
 				return err
 			}
-			project, err := resolveProjectID(c.Context, client, c.Args().First())
+			target, err := resolveEnvironmentTarget(c.Context, client, c.Args().First())
 			if err != nil {
 				return err
 			}
-			session, err := resolveTerminalSession(c.Context, client, project.ID, c.Args().Get(1))
+			session, err := resolveTerminalSession(c.Context, client, target, c.Args().Get(1))
 			if err != nil {
 				return err
 			}
@@ -853,13 +959,13 @@ func sessionsCommand() *cli.Command {
 					return errors.New("deletion cancelled")
 				}
 			}
-			return friendlyCommandError(client.DeleteTerminalSession(c.Context, project.ID, session.ID))
+			return friendlyCommandError(deleteTerminalSessionForTarget(c.Context, client, target, session.ID))
 		}},
 	}}
 }
 
 func selectTerminalSession(ctx context.Context, client *api.Client, projectRef string, create bool, name, ref string) (string, error) {
-	project, err := resolveProjectID(ctx, client, projectRef)
+	target, err := resolveEnvironmentTarget(ctx, client, projectRef)
 	if err != nil {
 		return "", err
 	}
@@ -867,7 +973,7 @@ func selectTerminalSession(ctx context.Context, client *api.Client, projectRef s
 		if err := validateSessionNameOptional(name); err != nil {
 			return "", err
 		}
-		session, err := client.CreateTerminalSession(ctx, project.ID, name, newIdempotencyKey())
+		session, err := createTerminalSessionForTarget(ctx, client, target, name, newIdempotencyKey())
 		if err != nil {
 			return "", friendlyCommandError(err)
 		}
@@ -879,15 +985,44 @@ func selectTerminalSession(ctx context.Context, client *api.Client, projectRef s
 	if strings.TrimSpace(ref) == "" {
 		return "", nil
 	}
-	session, err := resolveTerminalSession(ctx, client, project.ID, ref)
+	session, err := resolveTerminalSession(ctx, client, target, ref)
 	if err != nil {
 		return "", err
 	}
 	return session.ID, nil
 }
 
-func resolveTerminalSession(ctx context.Context, client *api.Client, projectID, ref string) (api.TerminalSession, error) {
-	sessions, err := client.ListTerminalSessions(ctx, projectID)
+func resolveConnectedMachine(ctx context.Context, client *api.Client, requested string) (api.ConnectedMachine, error) {
+	machines, err := client.ListConnectedMachines(ctx)
+	if err != nil {
+		return api.ConnectedMachine{}, err
+	}
+	for _, machine := range machines {
+		if machine.ID == requested {
+			return machine, nil
+		}
+	}
+	var matches []api.ConnectedMachine
+	for _, machine := range machines {
+		if strings.EqualFold(machine.DisplayName, requested) {
+			matches = append(matches, machine)
+		}
+	}
+	if len(matches) == 1 {
+		return matches[0], nil
+	}
+	if len(matches) > 1 {
+		ids := make([]string, 0, len(matches))
+		for _, machine := range matches {
+			ids = append(ids, machine.ID)
+		}
+		return api.ConnectedMachine{}, fmt.Errorf("%w: %q matches connected-machine IDs %s; use an exact ID", resolver.ErrProjectAmbiguous, requested, strings.Join(ids, ", "))
+	}
+	return api.ConnectedMachine{}, fmt.Errorf("%w: %q", resolver.ErrProjectNotFound, requested)
+}
+
+func resolveTerminalSession(ctx context.Context, client *api.Client, target environmentTarget, ref string) (api.TerminalSession, error) {
+	sessions, err := listTerminalSessionsForTarget(ctx, client, target)
 	if err != nil {
 		return api.TerminalSession{}, friendlyCommandError(err)
 	}
@@ -1009,10 +1144,10 @@ func actionConnect(c *cli.Context) error {
 			fmt.Fprintln(os.Stdout, cfg.Path())
 			return nil
 		}
-		return errors.New("missing project name; usage: pb <project>")
+		return errors.New("missing environment name; usage: pb <environment>")
 	}
 	if c.Args().Len() > 1 {
-		return errors.New("expected exactly one project name")
+		return errors.New("expected exactly one environment name")
 	}
 	if c.Bool("new") && strings.TrimSpace(c.String("session")) != "" {
 		return errors.New("--new and --session cannot be used together")
@@ -1233,7 +1368,7 @@ func actionConnect(c *cli.Context) error {
 		paste.WithPartialFlushDelay(time.Duration(d.cfg.Connect.InputPartialFlushMilliseconds)*time.Millisecond),
 	)
 
-	if useStatusBar {
+	if useStatusBar && info.TargetKind == "project" {
 		pollCtx, cancelPoll := context.WithCancel(ctx)
 		defer cancelPoll()
 		go pollConfigSync(pollCtx, d.cfg.ServerURL, d.auth, info.ProjectID, time.Duration(d.cfg.StatusBar.SyncPollSeconds)*time.Second, bar)
@@ -1243,6 +1378,9 @@ func actionConnect(c *cli.Context) error {
 		runOptions = append(runOptions, session.WithOutput(bar), session.WithRemoteSize(remoteSize))
 	}
 	code, err := session.RunWithActivity(ctx, conn, interceptor, func(source string) {
+		if info.TargetKind != "project" {
+			return
+		}
 		activityCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		activityErr := reportActivity(activityCtx, d.cfg.ServerURL, d.auth, info.ProjectID, source)
@@ -1445,6 +1583,10 @@ func friendlyAPIError(err error) string {
 		return "the secure tunnel is not available yet; retry in a moment"
 	case "machine_not_ready":
 		return "the project machine is not ready yet; retry in a moment"
+	case "connected_machine_offline":
+		return "the connected machine is offline; start or repair its Paperboat connector, then retry"
+	case "connected_machine_revoked":
+		return "this connected machine has been disconnected or revoked; repair or reconnect it in the Paperboat dashboard"
 	}
 	return ""
 }
@@ -1684,7 +1826,7 @@ func doctorCommand() *cli.Command {
 			}
 			fmt.Printf("backend:     authenticated as %s ✓\n", firstNonEmpty(me.Email, me.DisplayName, me.ID))
 			if project == "" {
-				fmt.Println("entitlement: not checked (provide a project to verify connect access)")
+				fmt.Println("entitlement: not checked (provide an environment to verify connect access)")
 				return nil
 			}
 			info, err := resolver.NewAPIResolver(api.New(d.cfg.ServerURL, cred, nil), d.cfg).Resolve(c.Context, resolver.ConnectRequest{
@@ -1699,9 +1841,13 @@ func doctorCommand() *cli.Command {
 				fmt.Println("papercode:   descriptor missing terminal endpoint")
 				return errors.New("doctor: descriptor missing terminal endpoint")
 			}
-			fmt.Printf("project:      %s (%s) ✓\n", info.ProjectID, firstNonEmpty(info.ProjectState, "ready"))
+			fmt.Printf("environment:  %s (%s) ✓\n", info.ProjectID, firstNonEmpty(info.ProjectState, "ready"))
 			fmt.Println("entitlement:  connect authorization accepted ✓")
-			fmt.Println("fly readiness: ready ✓")
+			if info.TargetKind == "connected_machine" {
+				fmt.Println("connector:    connected machine route ready ✓")
+			} else {
+				fmt.Println("fly readiness: ready ✓")
+			}
 			fmt.Println("agentunnel:   route descriptor ready ✓")
 			if err := tunnel.NewPapercodeWSTunnel().Check(c.Context, info.Terminal); err != nil {
 				fmt.Printf("papercode:   websocket unavailable: %v\n", err)
@@ -1770,6 +1916,7 @@ func doctorJSON(c *cli.Context, d *deps) error {
 		return fmt.Errorf("doctor: papercode protocol check failed: %w", err)
 	}
 	result["project"] = map[string]string{"id": info.ProjectID, "name": info.Project, "state": info.ProjectState}
+	result["environment_type"] = info.TargetKind
 	result["connect"] = "ready"
 	result["protocol"] = "paperboat-terminal-rpc/v1"
 	return json.NewEncoder(os.Stdout).Encode(result)

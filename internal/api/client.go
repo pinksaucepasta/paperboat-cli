@@ -59,6 +59,14 @@ type APIError struct {
 	Details   map[string]any
 }
 
+// IsNotFound reports whether the control plane explicitly rejected a request
+// because its resource or route is absent. Callers use it only for additive
+// capability discovery; authorization failures are never treated as absent.
+func IsNotFound(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.Status == http.StatusNotFound
+}
+
 func (e *APIError) Error() string {
 	message := e.Message
 	if message == "" {
@@ -126,6 +134,23 @@ type ProjectPage struct {
 	Pagination Pagination `json:"pagination"`
 }
 
+// ConnectedMachine is a user-owned environment reached through its enrolled
+// connector rather than a Paperboat-managed Fly VM. The control plane owns its
+// lifecycle and authorization; the CLI only needs enough metadata to select it.
+type ConnectedMachine struct {
+	ID           string `json:"id"`
+	DisplayName  string `json:"display_name"`
+	State        string `json:"state"`
+	Online       bool   `json:"online"`
+	Platform     string `json:"platform"`
+	Architecture string `json:"architecture"`
+}
+
+type ConnectedMachinePage struct {
+	Items      []ConnectedMachine `json:"items"`
+	Pagination Pagination         `json:"pagination"`
+}
+
 // TerminalSession is the durable session catalog record returned by the
 // control plane. Runtime-only fields may be unavailable while a VM is stopped.
 type TerminalSession struct {
@@ -156,10 +181,11 @@ type AuthMaterial struct {
 
 // Environment is the papercode environment metadata returned by cli-connect.
 type Environment struct {
-	EnvironmentID string `json:"environment_id"`
-	ProjectID     string `json:"project_id"`
-	DisplayName   string `json:"display_name"`
-	ProjectRoot   string `json:"project_root"`
+	EnvironmentID      string `json:"environment_id"`
+	ProjectID          string `json:"project_id"`
+	ConnectedMachineID string `json:"connected_machine_id"`
+	DisplayName        string `json:"display_name"`
+	ProjectRoot        string `json:"project_root"`
 }
 
 // Terminal is the CLI-safe papercode WebSocket attach descriptor from
@@ -190,17 +216,19 @@ type Upload struct {
 // Connectable is false the machine is not ready yet; Status/Reason explain why
 // and the caller should poll ConnectionStatus.
 type ConnectResponse struct {
-	Issuer            string       `json:"issuer,omitempty"`
-	ProjectID         string       `json:"project_id"`
-	ProjectState      string       `json:"project_state"`
-	Connectable       bool         `json:"connectable"`
-	ExpiresAt         time.Time    `json:"expires_at"`
-	Environment       *Environment `json:"environment,omitempty"`
-	Terminal          *Terminal    `json:"terminal,omitempty"`
-	Upload            *Upload      `json:"upload,omitempty"`
-	Status            string       `json:"status,omitempty"`
-	Reason            string       `json:"reason,omitempty"`
-	RetryAfterSeconds int          `json:"retry_after_seconds,omitempty"`
+	Issuer                string       `json:"issuer,omitempty"`
+	ProjectID             string       `json:"project_id"`
+	ProjectState          string       `json:"project_state"`
+	ConnectedMachineID    string       `json:"connected_machine_id"`
+	ConnectedMachineState string       `json:"connected_machine_state"`
+	Connectable           bool         `json:"connectable"`
+	ExpiresAt             time.Time    `json:"expires_at"`
+	Environment           *Environment `json:"environment,omitempty"`
+	Terminal              *Terminal    `json:"terminal,omitempty"`
+	Upload                *Upload      `json:"upload,omitempty"`
+	Status                string       `json:"status,omitempty"`
+	Reason                string       `json:"reason,omitempty"`
+	RetryAfterSeconds     int          `json:"retry_after_seconds,omitempty"`
 }
 
 type KeepAliveResponse struct {
@@ -286,6 +314,30 @@ func (c *Client) ListProjects(ctx context.Context) ([]Project, error) {
 	}
 }
 
+// ListConnectedMachines returns every enrolled machine page using the
+// server-authored cursor. Calling it never reveals connector credentials or
+// local paths beyond the machine's declared scope.
+func (c *Client) ListConnectedMachines(ctx context.Context) ([]ConnectedMachine, error) {
+	const pageSize = 200
+	machines := make([]ConnectedMachine, 0)
+	offset := 0
+	for {
+		var page ConnectedMachinePage
+		path := fmt.Sprintf("/api/connected-machines?limit=%d&offset=%d&sort=display_name", pageSize, offset)
+		if err := c.do(ctx, http.MethodGet, path, nil, &page); err != nil {
+			return nil, err
+		}
+		machines = append(machines, page.Items...)
+		if page.Pagination.NextOffset == nil {
+			return machines, nil
+		}
+		if *page.Pagination.NextOffset <= offset {
+			return nil, errors.New("connected-machine pagination did not advance")
+		}
+		offset = *page.Pagination.NextOffset
+	}
+}
+
 // CLIConnect runs the pre-connect broker: it authorizes, provisions/reconciles
 // agentunnel resources, resumes an idle machine, and returns the papercode
 // WebSocket terminal descriptor. A not-yet-ready machine returns
@@ -306,12 +358,54 @@ func (c *Client) CLIConnectSession(ctx context.Context, projectID, terminalSessi
 	return out, err
 }
 
+// ConnectConnectedMachine obtains the default terminal session's short-lived
+// papercode descriptor. It deliberately does not accept a client-supplied
+// route or connector credential.
+func (c *Client) ConnectConnectedMachine(ctx context.Context, machineID string) (ConnectResponse, error) {
+	return c.ConnectConnectedMachineSession(ctx, machineID, "")
+}
+
+// ConnectConnectedMachineSession connects a durable terminal session belonging
+// to an enrolled connected machine.
+func (c *Client) ConnectConnectedMachineSession(ctx context.Context, machineID, terminalSessionID string) (ConnectResponse, error) {
+	var out ConnectResponse
+	var body any
+	if terminalSessionID != "" {
+		body = map[string]string{"terminal_session_id": terminalSessionID}
+	}
+	err := c.do(ctx, http.MethodPost, "/api/connected-machines/"+url.PathEscape(machineID)+"/connect", body, &out)
+	return out, err
+}
+
+// ConnectedMachineConnectionStatus polls readiness without minting a fresh
+// descriptor. Reconnects re-run ConnectConnectedMachine after this reports
+// ready, matching the hosted-project flow.
+func (c *Client) ConnectedMachineConnectionStatus(ctx context.Context, machineID string) (ConnectResponse, error) {
+	return c.ConnectedMachineConnectionStatusSession(ctx, machineID, "")
+}
+
+// ConnectedMachineConnectionStatusSession preserves the selected terminal
+// session through readiness polling, exactly as hosted-project polling does.
+func (c *Client) ConnectedMachineConnectionStatusSession(ctx context.Context, machineID, terminalSessionID string) (ConnectResponse, error) {
+	var out ConnectResponse
+	path := "/api/connected-machines/" + url.PathEscape(machineID) + "/connection-status"
+	if terminalSessionID != "" {
+		path += "?terminal_session_id=" + url.QueryEscape(terminalSessionID)
+	}
+	err := c.do(ctx, http.MethodGet, path, nil, &out)
+	return out, err
+}
+
 func (c *Client) ListTerminalSessions(ctx context.Context, projectID string) ([]TerminalSession, error) {
+	return c.listTerminalSessions(ctx, "/api/projects/"+url.PathEscape(projectID)+"/terminal-sessions")
+}
+
+func (c *Client) listTerminalSessions(ctx context.Context, basePath string) ([]TerminalSession, error) {
 	const pageSize = 200
 	var sessions []TerminalSession
 	for offset := 0; ; {
 		var page TerminalSessionPage
-		path := fmt.Sprintf("/api/projects/%s/terminal-sessions?limit=%d&offset=%d", url.PathEscape(projectID), pageSize, offset)
+		path := fmt.Sprintf("%s?limit=%d&offset=%d", basePath, pageSize, offset)
 		if err := c.do(ctx, http.MethodGet, path, nil, &page); err != nil {
 			return nil, err
 		}
@@ -348,6 +442,40 @@ func (c *Client) CloseTerminalSession(ctx context.Context, projectID, sessionID 
 
 func (c *Client) DeleteTerminalSession(ctx context.Context, projectID, sessionID string) error {
 	return c.do(ctx, http.MethodDelete, "/api/projects/"+url.PathEscape(projectID)+"/terminal-sessions/"+url.PathEscape(sessionID), nil, &struct{}{})
+}
+
+// ListConnectedMachineTerminalSessions lists the durable papercode sessions
+// for a connected machine. Session records remain server-owned, so the CLI
+// never discovers local paths or connector state through this endpoint.
+func (c *Client) ListConnectedMachineTerminalSessions(ctx context.Context, machineID string) ([]TerminalSession, error) {
+	return c.listTerminalSessions(ctx, "/api/connected-machines/"+url.PathEscape(machineID)+"/terminal-sessions")
+}
+
+func (c *Client) CreateConnectedMachineTerminalSession(ctx context.Context, machineID, name, idempotencyKey string) (TerminalSession, error) {
+	var out TerminalSession
+	body := map[string]string{}
+	if name != "" {
+		body["name"] = name
+	}
+	path := "/api/connected-machines/" + url.PathEscape(machineID) + "/terminal-sessions"
+	return out, c.doWithHeaders(ctx, http.MethodPost, path, body, &out, http.Header{"Idempotency-Key": []string{idempotencyKey}})
+}
+
+func (c *Client) RenameConnectedMachineTerminalSession(ctx context.Context, machineID, sessionID, name string) (TerminalSession, error) {
+	var out TerminalSession
+	path := "/api/connected-machines/" + url.PathEscape(machineID) + "/terminal-sessions/" + url.PathEscape(sessionID)
+	err := c.do(ctx, http.MethodPatch, path, map[string]string{"name": name}, &out)
+	return out, err
+}
+
+func (c *Client) CloseConnectedMachineTerminalSession(ctx context.Context, machineID, sessionID string) error {
+	path := "/api/connected-machines/" + url.PathEscape(machineID) + "/terminal-sessions/" + url.PathEscape(sessionID) + "/close"
+	return c.do(ctx, http.MethodPost, path, nil, &struct{}{})
+}
+
+func (c *Client) DeleteConnectedMachineTerminalSession(ctx context.Context, machineID, sessionID string) error {
+	path := "/api/connected-machines/" + url.PathEscape(machineID) + "/terminal-sessions/" + url.PathEscape(sessionID)
+	return c.do(ctx, http.MethodDelete, path, nil, &struct{}{})
 }
 
 // ConnectionStatus reports current tunnel readiness without re-brokering.

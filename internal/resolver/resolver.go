@@ -21,6 +21,10 @@ type ConnectRequest struct {
 
 // ConnectInfo is what the resolver hands back to the tunnel + session layers.
 type ConnectInfo struct {
+	// TargetKind identifies the Paperboat environment provider. It is
+	// "project" for a hosted Fly environment and "connected_machine" for an
+	// enrolled customer machine.
+	TargetKind   string
 	ProjectID    string
 	Project      string
 	ProjectState string

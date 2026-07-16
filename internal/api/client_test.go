@@ -41,6 +41,93 @@ func TestListProjectsFollowsPagination(t *testing.T) {
 	}
 }
 
+func TestConnectedMachineRequestsUseScopedRoutes(t *testing.T) {
+	var paths []string
+	var connectBodies []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.Method+" "+r.URL.RequestURI())
+		switch r.URL.Path {
+		case "/api/connected-machines":
+			writeData(w, http.StatusOK, ConnectedMachinePage{Items: []ConnectedMachine{{ID: "cm_1", DisplayName: "Studio Mac", Online: true}}, Pagination: Pagination{}})
+		case "/api/connected-machines/cm_1/connect":
+			body, _ := io.ReadAll(r.Body)
+			connectBodies = append(connectBodies, string(body))
+			writeData(w, http.StatusOK, ConnectResponse{ConnectedMachineID: "cm_1", Connectable: false})
+		case "/api/connected-machines/cm_1/connection-status":
+			writeData(w, http.StatusOK, ConnectResponse{ConnectedMachineID: "cm_1", Connectable: false})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, config.Credential{AccessToken: "t"}, nil)
+	machines, err := c.ListConnectedMachines(context.Background())
+	if err != nil || len(machines) != 1 || machines[0].ID != "cm_1" {
+		t.Fatalf("machines=%+v err=%v", machines, err)
+	}
+	if _, err := c.ConnectConnectedMachine(context.Background(), "cm_1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ConnectConnectedMachineSession(context.Background(), "cm_1", "pts_1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ConnectedMachineConnectionStatus(context.Background(), "cm_1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ConnectedMachineConnectionStatusSession(context.Background(), "cm_1", "pts_1"); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(paths, ","); !strings.Contains(got, "GET /api/connected-machines?limit=200&offset=0&sort=display_name") || !strings.Contains(got, "POST /api/connected-machines/cm_1/connect") || !strings.Contains(got, "GET /api/connected-machines/cm_1/connection-status?terminal_session_id=pts_1") {
+		t.Fatalf("paths=%q", got)
+	}
+	if got := strings.Join(connectBodies, ","); got != `,{"terminal_session_id":"pts_1"}` {
+		t.Fatalf("connect bodies=%q", got)
+	}
+}
+
+func TestConnectedMachineTerminalSessionRequests(t *testing.T) {
+	var seen []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.Method+" "+r.URL.Path)
+		switch r.Method + " " + r.URL.Path {
+		case "POST /api/connected-machines/cm_1/terminal-sessions":
+			if r.Header.Get("Idempotency-Key") != "key-1" {
+				t.Fatalf("missing idempotency key")
+			}
+			_, _ = w.Write([]byte(`{"data":{"id":"pts_1","name":"api","state":"running","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}}`))
+		case "GET /api/connected-machines/cm_1/terminal-sessions":
+			_, _ = w.Write([]byte(`{"data":{"items":[{"id":"pts_1","name":"api","state":"running","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}],"pagination":{"next_offset":null}}}`))
+		case "PATCH /api/connected-machines/cm_1/terminal-sessions/pts_1":
+			_, _ = w.Write([]byte(`{"data":{"id":"pts_1","name":"renamed","state":"running","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}}`))
+		case "POST /api/connected-machines/cm_1/terminal-sessions/pts_1/close", "DELETE /api/connected-machines/cm_1/terminal-sessions/pts_1":
+			writeData(w, http.StatusOK, map[string]bool{"ok": true})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	c := New(srv.URL, config.Credential{AccessToken: "token"}, nil)
+	if session, err := c.CreateConnectedMachineTerminalSession(context.Background(), "cm_1", "api", "key-1"); err != nil || session.ID != "pts_1" {
+		t.Fatalf("create session=%+v err=%v", session, err)
+	}
+	if sessions, err := c.ListConnectedMachineTerminalSessions(context.Background(), "cm_1"); err != nil || len(sessions) != 1 || sessions[0].ID != "pts_1" {
+		t.Fatalf("sessions=%+v err=%v", sessions, err)
+	}
+	if _, err := c.RenameConnectedMachineTerminalSession(context.Background(), "cm_1", "pts_1", "renamed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CloseConnectedMachineTerminalSession(context.Background(), "cm_1", "pts_1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.DeleteConnectedMachineTerminalSession(context.Background(), "cm_1", "pts_1"); err != nil {
+		t.Fatal(err)
+	}
+	if len(seen) != 5 {
+		t.Fatalf("requests=%v", seen)
+	}
+}
+
 func writeErr(w http.ResponseWriter, status int, code, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)

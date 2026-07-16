@@ -1,7 +1,7 @@
 # paperboat-cli
 
 The Paperboat command-line client — an **invisible terminal wrapper** that connects your
-local machine to your project's cloud VM and gives you its terminal as if it were local.
+local machine to a Paperboat environment and gives you its terminal as if it were local.
 
 The production target signs in through Paperboat's dashboard-approved device flow, connects
 through agentunnel, and transparently bridges **local image pastes into remote TUIs**. The
@@ -22,16 +22,80 @@ an actionable upgrade error instead of malformed session data. See
 ## Usage
 
 ```sh
-pb <project>                 # resume the project VM (if idle) and attach its terminal
+pb <environment>             # attach a hosted project or connected-machine terminal
+pb environments               # list hosted projects and connected machines
 pb auth login                # approve this installation in the dashboard
 pb auth status               # show the active account for the configured server
 pb auth switch               # replace the active account for this server
 pb auth logout               # revoke and remove this installation's session
-pb doctor                    # check auth + project connectivity
+pb doctor                    # check auth + environment connectivity
 pb config path|show          # inspect the local config
 ```
 
-Flags may appear before or after the project name. `paperboat` is an alias for `pb`.
+Flags may appear before or after the environment name. `paperboat` is an alias for `pb`.
+Hosted projects and connected machines use the same durable terminal-session workflow:
+`--new`, `--session`, and `pb sessions` apply to either environment type.
+
+## Connected-machine connector
+
+The public bootstrap command displayed in the dashboard is deployment configuration. It
+starts with a local enrollment and ends with a signed, user-service installation:
+
+```sh
+paperboat-connect enroll --server https://api.example --name "Studio Mac" --workspace "$HOME"
+paperboat-connect install \
+  --manifest-url https://releases.example/manifest.json \
+  --release-public-key "$PAPERBOAT_RELEASE_PUBLIC_KEY"
+```
+
+`install` requires an approved enrollment and a base64 Ed25519 **public** key. It verifies
+the signed manifest and SHA-256 of each `paperboat-connect`, `papercode`, and `agentunnel`
+artifact for the current OS/architecture, replaces the three binaries atomically, installs
+the launchd or systemd user service, and restores the preceding binaries if activation
+fails. The agentunnel enrollment token stays in the OS secret store (or the explicit 0600
+file fallback), never in the service unit.
+
+The manifest is canonical JSON signed over the object containing `version` and `artifacts`:
+
+```json
+{
+  "version": "1.2.3",
+  "artifacts": [
+    {"component":"paperboat-connect","os":"darwin","arch":"arm64","url":"https://...","sha256":"..."},
+    {"component":"papercode","os":"darwin","arch":"arm64","url":"https://...","sha256":"...","format":"tar.gz"},
+    {"component":"agentunnel","os":"darwin","arch":"arm64","url":"https://...","sha256":"..."}
+  ],
+  "signature": "base64-ed25519-signature"
+}
+```
+
+The release signer is local-only. Its private PKCS#8 Ed25519 PEM must remain outside the
+repository; the public verification key may be published in the bootstrap command. Give the
+signer an input file containing public URLs and local artifact paths, then publish the generated
+manifest beside those immutable artifacts:
+
+Build the Papercode input as a self-contained production bundle. The archive includes the selected
+Node runtime, so the connected machine does not rely on a separately installed Node version:
+
+```sh
+scripts/package-papercode.sh ../papercode ./dist/papercode-darwin-arm64.tar.gz "$(command -v node)"
+```
+
+```json
+[
+  {"component":"paperboat-connect","os":"darwin","arch":"arm64","url":"https://releases.example/paperboat-connect","path":"./dist/paperboat-connect"},
+  {"component":"papercode","os":"darwin","arch":"arm64","url":"https://releases.example/papercode.tar.gz","path":"./dist/papercode.tar.gz","format":"tar.gz"},
+  {"component":"agentunnel","os":"darwin","arch":"arm64","url":"https://releases.example/agentunnel","path":"./dist/agentunnel"}
+]
+```
+
+```sh
+go run ./cmd/paperboat-release sign-manifest \
+  --version 1.2.3 \
+  --artifacts ./release-artifacts.json \
+  --private-key "$HOME/.paperboat/release-signing/paperboat-release-ed25519.pem" \
+  --output ./dist/connector-manifest.json
+```
 
 Connection policy is deployment/profile configuration, not compiled into the CLI:
 
@@ -96,7 +160,7 @@ Go — distributed as a single static binary (`github.com/urfave/cli/v2`, Go 1.2
 
 - `cmd/pb` — CLI entrypoint (commands, flags, wiring).
 - `internal/config` — local policy and secure, versioned credential profiles.
-- `internal/resolver` — paginated project resolution and validated connect descriptors.
+- `internal/resolver` — paginated environment resolution and validated connect descriptors.
 - `internal/tunnel` — papercode WebSocket RPC and bounded reconnect supervision.
 - `internal/session` — transparent PTY wrapper (raw mode, resize, exit-code passthrough).
 - `internal/paste` — bracketed-paste interceptor + image-path rewriter (the risk center).

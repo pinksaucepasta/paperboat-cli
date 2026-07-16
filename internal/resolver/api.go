@@ -27,6 +27,29 @@ type connectClient interface {
 	ConnectionStatus(ctx context.Context, projectID string) (api.ConnectResponse, error)
 }
 
+type connectedMachineClient interface {
+	ListConnectedMachines(context.Context) ([]api.ConnectedMachine, error)
+	ConnectConnectedMachine(context.Context, string) (api.ConnectResponse, error)
+	ConnectedMachineConnectionStatus(context.Context, string) (api.ConnectResponse, error)
+}
+
+type connectedMachineSessionClient interface {
+	ConnectConnectedMachineSession(context.Context, string, string) (api.ConnectResponse, error)
+	ConnectedMachineConnectionStatusSession(context.Context, string, string) (api.ConnectResponse, error)
+}
+
+type target struct {
+	kind  string
+	id    string
+	name  string
+	state string
+}
+
+const (
+	targetProject          = "project"
+	targetConnectedMachine = "connected_machine"
+)
+
 // APIResolver resolves projects against paperboat-server: it matches the
 // requested name/id to one of the user's projects, runs the pre-connect broker
 // (which authorizes, reconciles agentunnel resources, and resumes an idle
@@ -64,18 +87,18 @@ func (r *APIResolver) Resolve(ctx context.Context, req ConnectRequest) (ConnectI
 	if err := r.validatePolicy(); err != nil {
 		return ConnectInfo{}, err
 	}
-	project, err := r.findProject(ctx, req.Project)
+	target, err := r.findTarget(ctx, req.Project)
 	if err != nil {
 		return ConnectInfo{}, err
 	}
-	projectID = project.ID
+	projectID = target.id
 
-	resp, err := r.cliConnect(ctx, project.ID, req.TerminalSessionID)
+	resp, err := r.connect(ctx, target, req.TerminalSessionID)
 	if err != nil {
-		return ConnectInfo{}, fmt.Errorf("connect to project %q: %w", req.Project, err)
+		return ConnectInfo{}, fmt.Errorf("connect to environment %q: %w", req.Project, err)
 	}
 
-	resp, err = r.waitConnectable(ctx, project.ID, req.TerminalSessionID, resp)
+	resp, err = r.waitConnectable(ctx, target, req.TerminalSessionID, resp)
 	if err != nil {
 		return ConnectInfo{}, err
 	}
@@ -84,13 +107,14 @@ func (r *APIResolver) Resolve(ctx context.Context, req ConnectRequest) (ConnectI
 	}
 
 	if !completeTerminalDescriptor(resp.Terminal) {
-		return ConnectInfo{}, fmt.Errorf("connect to project %q: server did not return a terminal endpoint", req.Project)
+		return ConnectInfo{}, fmt.Errorf("connect to environment %q: server did not return a terminal endpoint", req.Project)
 	}
 
 	info := ConnectInfo{
-		ProjectID:    project.ID,
-		Project:      project.Name,
-		ProjectState: resp.ProjectState,
+		TargetKind:   target.kind,
+		ProjectID:    target.id,
+		Project:      target.name,
+		ProjectState: targetState(target, resp),
 		TunnelTarget: resp.Terminal.WebSocketBaseURL,
 		Local:        false,
 		Terminal: &TerminalTarget{
@@ -127,26 +151,62 @@ type sessionStatusClient interface {
 	ConnectionStatusSession(context.Context, string, string) (api.ConnectResponse, error)
 }
 
-func (r *APIResolver) cliConnect(ctx context.Context, projectID, terminalSessionID string) (api.ConnectResponse, error) {
-	if terminalSessionID == "" {
-		return r.client.CLIConnect(ctx, projectID)
+func (r *APIResolver) connect(ctx context.Context, target target, terminalSessionID string) (api.ConnectResponse, error) {
+	switch target.kind {
+	case targetProject:
+		if terminalSessionID == "" {
+			return r.client.CLIConnect(ctx, target.id)
+		}
+		client, ok := r.client.(sessionConnectClient)
+		if !ok {
+			return api.ConnectResponse{}, errors.New("this server client does not support selected terminal sessions")
+		}
+		return client.CLIConnectSession(ctx, target.id, terminalSessionID)
+	case targetConnectedMachine:
+		client, ok := r.client.(connectedMachineClient)
+		if !ok {
+			return api.ConnectResponse{}, errors.New("this server client does not support connected machines")
+		}
+		if terminalSessionID != "" {
+			sessionClient, ok := r.client.(connectedMachineSessionClient)
+			if !ok {
+				return api.ConnectResponse{}, errors.New("this server client does not support selected connected-machine terminal sessions")
+			}
+			return sessionClient.ConnectConnectedMachineSession(ctx, target.id, terminalSessionID)
+		}
+		return client.ConnectConnectedMachine(ctx, target.id)
+	default:
+		return api.ConnectResponse{}, errors.New("unknown environment target")
 	}
-	client, ok := r.client.(sessionConnectClient)
-	if !ok {
-		return api.ConnectResponse{}, errors.New("this server client does not support selected terminal sessions")
-	}
-	return client.CLIConnectSession(ctx, projectID, terminalSessionID)
 }
 
-func (r *APIResolver) connectionStatus(ctx context.Context, projectID, terminalSessionID string) (api.ConnectResponse, error) {
-	if terminalSessionID == "" {
-		return r.client.ConnectionStatus(ctx, projectID)
+func (r *APIResolver) connectionStatus(ctx context.Context, target target, terminalSessionID string) (api.ConnectResponse, error) {
+	switch target.kind {
+	case targetProject:
+		if terminalSessionID == "" {
+			return r.client.ConnectionStatus(ctx, target.id)
+		}
+		client, ok := r.client.(sessionStatusClient)
+		if !ok {
+			return api.ConnectResponse{}, errors.New("this server client does not support selected terminal sessions")
+		}
+		return client.ConnectionStatusSession(ctx, target.id, terminalSessionID)
+	case targetConnectedMachine:
+		client, ok := r.client.(connectedMachineClient)
+		if !ok {
+			return api.ConnectResponse{}, errors.New("this server client does not support connected machines")
+		}
+		if terminalSessionID != "" {
+			sessionClient, ok := r.client.(connectedMachineSessionClient)
+			if !ok {
+				return api.ConnectResponse{}, errors.New("this server client does not support selected connected-machine terminal sessions")
+			}
+			return sessionClient.ConnectedMachineConnectionStatusSession(ctx, target.id, terminalSessionID)
+		}
+		return client.ConnectedMachineConnectionStatus(ctx, target.id)
+	default:
+		return api.ConnectResponse{}, errors.New("unknown environment target")
 	}
-	client, ok := r.client.(sessionStatusClient)
-	if !ok {
-		return api.ConnectResponse{}, errors.New("this server client does not support selected terminal sessions")
-	}
-	return client.ConnectionStatusSession(ctx, projectID, terminalSessionID)
 }
 
 func (r *APIResolver) now() time.Time {
@@ -222,12 +282,59 @@ func (r *APIResolver) findProject(ctx context.Context, requested string) (api.Pr
 	return api.Project{}, fmt.Errorf("%w: %q", ErrProjectNotFound, requested)
 }
 
+func (r *APIResolver) findTarget(ctx context.Context, requested string) (target, error) {
+	project, err := r.findProject(ctx, requested)
+	if err == nil {
+		return target{kind: targetProject, id: project.ID, name: project.Name, state: project.State}, nil
+	}
+	if !errors.Is(err, ErrProjectNotFound) {
+		return target{}, err
+	}
+	client, ok := r.client.(connectedMachineClient)
+	if !ok {
+		return target{}, err
+	}
+	machines, listErr := client.ListConnectedMachines(ctx)
+	if listErr != nil {
+		// Connected machines are additive. Older control planes do not expose
+		// this catalog yet, so preserve the historical project-not-found result.
+		if api.IsNotFound(listErr) {
+			return target{}, err
+		}
+		return target{}, fmt.Errorf("list connected machines: %w", listErr)
+	}
+	want := strings.TrimSpace(requested)
+	for _, machine := range machines {
+		if machine.ID == want {
+			return target{kind: targetConnectedMachine, id: machine.ID, name: machine.DisplayName, state: machine.State}, nil
+		}
+	}
+	var matches []api.ConnectedMachine
+	for _, machine := range machines {
+		if strings.EqualFold(machine.DisplayName, want) {
+			matches = append(matches, machine)
+		}
+	}
+	if len(matches) == 1 {
+		machine := matches[0]
+		return target{kind: targetConnectedMachine, id: machine.ID, name: machine.DisplayName, state: machine.State}, nil
+	}
+	if len(matches) > 1 {
+		ids := make([]string, 0, len(matches))
+		for _, machine := range matches {
+			ids = append(ids, machine.ID)
+		}
+		return target{}, fmt.Errorf("%w: %q matches connected-machine IDs %s; connect using an exact ID", ErrProjectAmbiguous, requested, strings.Join(ids, ", "))
+	}
+	return target{}, err
+}
+
 // waitConnectable polls connection-status until the tunnel is connectable or the
 // configured timeout elapses. cli-connect already queued any needed machine
 // resume, so this only waits for readiness; it never re-brokers.
-func (r *APIResolver) waitConnectable(ctx context.Context, projectID, terminalSessionID string, resp api.ConnectResponse) (api.ConnectResponse, error) {
+func (r *APIResolver) waitConnectable(ctx context.Context, target target, terminalSessionID string, resp api.ConnectResponse) (api.ConnectResponse, error) {
 	if resp.Connectable {
-		return r.validateDescriptor(resp, projectID)
+		return r.validateDescriptor(resp, target)
 	}
 	deadline := time.Now().Add(r.readyTimeout)
 	pollCtx, cancel := context.WithDeadline(ctx, deadline)
@@ -250,14 +357,14 @@ func (r *APIResolver) waitConnectable(ctx context.Context, projectID, terminalSe
 		if r.Progress != nil {
 			r.Progress(resp.Status, resp.Reason, interval)
 		}
-		r.record("connect.stage", "waiting", projectID, "", resp.Status, r.now())
+		r.record("connect.stage", "waiting", target.id, "", resp.Status, r.now())
 		if err := r.wait(pollCtx, interval); err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
 				return api.ConnectResponse{}, fmt.Errorf("timed out waiting for the machine to become ready (last status: %s)", statusReason(resp))
 			}
 			return api.ConnectResponse{}, err
 		}
-		next, err := r.connectionStatus(pollCtx, projectID, terminalSessionID)
+		next, err := r.connectionStatus(pollCtx, target, terminalSessionID)
 		if err != nil {
 			return api.ConnectResponse{}, fmt.Errorf("poll connection status: %w", err)
 		}
@@ -266,7 +373,7 @@ func (r *APIResolver) waitConnectable(ctx context.Context, projectID, terminalSe
 			// re-broker once now that the machine is ready to get a fresh,
 			// fully-populated WebSocket descriptor and access session.
 			if !completeTerminalDescriptor(next.Terminal) {
-				fresh, err := r.cliConnect(pollCtx, projectID, terminalSessionID)
+				fresh, err := r.connect(pollCtx, target, terminalSessionID)
 				if err != nil {
 					return api.ConnectResponse{}, err
 				}
@@ -274,15 +381,15 @@ func (r *APIResolver) waitConnectable(ctx context.Context, projectID, terminalSe
 					resp = fresh
 					continue
 				}
-				return r.validateDescriptor(fresh, projectID)
+				return r.validateDescriptor(fresh, target)
 			}
-			return r.validateDescriptor(next, projectID)
+			return r.validateDescriptor(next, target)
 		}
 		resp = next
 	}
 }
 
-func (r *APIResolver) validateDescriptor(resp api.ConnectResponse, projectID string) (api.ConnectResponse, error) {
+func (r *APIResolver) validateDescriptor(resp api.ConnectResponse, target target) (api.ConnectResponse, error) {
 	wantIssuer, err := config.NormalizeIssuer(r.cfg.ServerURL)
 	if err != nil {
 		return api.ConnectResponse{}, fmt.Errorf("normalize configured issuer: %w", err)
@@ -294,8 +401,11 @@ func (r *APIResolver) validateDescriptor(resp api.ConnectResponse, projectID str
 	if !resp.Connectable {
 		return api.ConnectResponse{}, errors.New("server returned a non-connectable descriptor")
 	}
-	if resp.ProjectID != "" && resp.ProjectID != projectID {
+	if target.kind == targetProject && resp.ProjectID != "" && resp.ProjectID != target.id {
 		return api.ConnectResponse{}, errors.New("server returned a descriptor for the wrong project")
+	}
+	if target.kind == targetConnectedMachine && resp.ConnectedMachineID != target.id {
+		return api.ConnectResponse{}, errors.New("server returned a descriptor for the wrong connected machine")
 	}
 	if resp.ExpiresAt.IsZero() || !time.Now().Before(resp.ExpiresAt) {
 		return api.ConnectResponse{}, errors.New("server returned an expired connection descriptor")
@@ -303,7 +413,7 @@ func (r *APIResolver) validateDescriptor(resp api.ConnectResponse, projectID str
 	if !completeTerminalDescriptor(resp.Terminal) {
 		return api.ConnectResponse{}, errors.New("server returned an incomplete terminal descriptor")
 	}
-	if !supportedTerminalKind(resp.Terminal.Kind) || len(r.cfg.Connect.AcceptedTerminalKinds) == 0 || !hasScope(r.cfg.Connect.AcceptedTerminalKinds, resp.Terminal.Kind) || resp.Environment == nil || strings.TrimSpace(resp.Environment.EnvironmentID) == "" || resp.Environment.ProjectID != projectID {
+	if !supportedTerminalKind(resp.Terminal.Kind) || len(r.cfg.Connect.AcceptedTerminalKinds) == 0 || !hasScope(r.cfg.Connect.AcceptedTerminalKinds, resp.Terminal.Kind) || resp.Environment == nil || strings.TrimSpace(resp.Environment.EnvironmentID) == "" || !environmentMatchesTarget(resp.Environment, target) {
 		return api.ConnectResponse{}, errors.New("server returned an invalid environment descriptor")
 	}
 	if strings.TrimSpace(resp.Environment.ProjectRoot) == "" || strings.TrimSpace(resp.Terminal.ThreadID) == "" || strings.TrimSpace(resp.Terminal.TerminalID) == "" || strings.TrimSpace(resp.Terminal.CWD) == "" {
@@ -334,6 +444,27 @@ func (r *APIResolver) validateDescriptor(resp api.ConnectResponse, projectID str
 		return api.ConnectResponse{}, err
 	}
 	return resp, nil
+}
+
+func environmentMatchesTarget(environment *api.Environment, target target) bool {
+	switch target.kind {
+	case targetProject:
+		return environment.ProjectID == target.id && environment.ConnectedMachineID == ""
+	case targetConnectedMachine:
+		return environment.ConnectedMachineID == target.id && environment.ProjectID == ""
+	default:
+		return false
+	}
+}
+
+func targetState(target target, resp api.ConnectResponse) string {
+	if target.kind == targetConnectedMachine && strings.TrimSpace(resp.ConnectedMachineState) != "" {
+		return resp.ConnectedMachineState
+	}
+	if target.kind == targetProject && strings.TrimSpace(resp.ProjectState) != "" {
+		return resp.ProjectState
+	}
+	return target.state
 }
 
 func supportedTerminalKind(kind string) bool { return kind == "papercode_websocket" }

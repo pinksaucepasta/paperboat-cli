@@ -18,6 +18,7 @@ func (s *resolverEventSink) Record(e telemetry.Event) { s.events = append(s.even
 
 type fakeClient struct {
 	projects          []api.Project
+	machines          []api.ConnectedMachine
 	connectSeq        []api.ConnectResponse // returned by CLIConnect in order
 	statusSeq         []api.ConnectResponse // returned by ConnectionStatus in order
 	connectN          int
@@ -27,6 +28,10 @@ type fakeClient struct {
 }
 
 func (f *fakeClient) ListProjects(context.Context) ([]api.Project, error) { return f.projects, nil }
+
+func (f *fakeClient) ListConnectedMachines(context.Context) ([]api.ConnectedMachine, error) {
+	return f.machines, nil
+}
 
 func (f *fakeClient) nextConnect() (api.ConnectResponse, error) {
 	i := f.connectN
@@ -64,6 +69,24 @@ func (f *fakeClient) ConnectionStatusSession(_ context.Context, _ string, termin
 	return f.nextStatus()
 }
 
+func (f *fakeClient) ConnectConnectedMachine(context.Context, string) (api.ConnectResponse, error) {
+	return f.nextConnect()
+}
+
+func (f *fakeClient) ConnectedMachineConnectionStatus(context.Context, string) (api.ConnectResponse, error) {
+	return f.nextStatus()
+}
+
+func (f *fakeClient) ConnectConnectedMachineSession(_ context.Context, _ string, terminalSessionID string) (api.ConnectResponse, error) {
+	f.connectSessionIDs = append(f.connectSessionIDs, terminalSessionID)
+	return f.nextConnect()
+}
+
+func (f *fakeClient) ConnectedMachineConnectionStatusSession(_ context.Context, _ string, terminalSessionID string) (api.ConnectResponse, error) {
+	f.statusSessionIDs = append(f.statusSessionIDs, terminalSessionID)
+	return f.nextStatus()
+}
+
 func newTestResolver(fc *fakeClient) *APIResolver {
 	cfg := &config.Config{}
 	cfg.ServerURL = "https://api.paperboat.test"
@@ -91,6 +114,12 @@ func readyResponse(term *api.Terminal) api.ConnectResponse {
 	expires := time.Now().Add(time.Hour)
 	term.Auth.ExpiresAt = expires.Add(-time.Minute)
 	return api.ConnectResponse{Issuer: "https://api.paperboat.test", ProjectID: "prj_1", Connectable: true, ExpiresAt: expires, Environment: &api.Environment{EnvironmentID: "env_1", ProjectID: "prj_1", ProjectRoot: "/workspace"}, Terminal: term, Upload: &api.Upload{Kind: "papercode_staged_image", HTTPBaseURL: term.HTTPBaseURL, Path: "/projects/prj_1/api/files/staged-images", Auth: api.AuthMaterial{Method: "bearer", Token: "file-token", ExpiresAt: expires.Add(-time.Minute), Scopes: []string{"file:stage"}}, MaxBytes: 1024, AllowedMIMETypes: []string{"image/png"}, RetentionSeconds: 60}}
+}
+
+func readyConnectedMachineResponse(term *api.Terminal) api.ConnectResponse {
+	expires := time.Now().Add(time.Hour)
+	term.Auth.ExpiresAt = expires.Add(-time.Minute)
+	return api.ConnectResponse{Issuer: "https://api.paperboat.test", ConnectedMachineID: "cm_1", ConnectedMachineState: "online", Connectable: true, ExpiresAt: expires, Environment: &api.Environment{EnvironmentID: "env_cm_1", ConnectedMachineID: "cm_1", ProjectRoot: "/Users/paperboat"}, Terminal: term, Upload: &api.Upload{Kind: "papercode_staged_image", HTTPBaseURL: term.HTTPBaseURL, Path: "/connected-machines/cm_1/api/files/staged-images", Auth: api.AuthMaterial{Method: "bearer", Token: "file-token", ExpiresAt: expires.Add(-time.Minute), Scopes: []string{"file:stage"}}, MaxBytes: 1024, AllowedMIMETypes: []string{"image/png"}, RetentionSeconds: 60}}
 }
 
 func routeOnlyTerminal() *api.Terminal {
@@ -150,6 +179,83 @@ func TestResolveMatchesByID(t *testing.T) {
 	r := newTestResolver(fc)
 	if _, err := r.Resolve(context.Background(), ConnectRequest{Project: "prj_1"}); err != nil {
 		t.Fatalf("Resolve by id: %v", err)
+	}
+}
+
+func TestResolveConnectedMachineByDisplayName(t *testing.T) {
+	term := readyTerminal()
+	term.HTTPBaseURL = "https://agentunnel.dev/connected-machines/cm_1"
+	term.WebSocketBaseURL = "wss://agentunnel.dev/connected-machines/cm_1"
+	fc := &fakeClient{
+		machines:   []api.ConnectedMachine{{ID: "cm_1", DisplayName: "Studio Mac", State: "online", Online: true}},
+		connectSeq: []api.ConnectResponse{readyConnectedMachineResponse(term)},
+	}
+	info, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "studio mac"})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if info.TargetKind != targetConnectedMachine || info.ProjectID != "cm_1" || info.Project != "Studio Mac" || info.ProjectState != "online" {
+		t.Fatalf("info = %+v", info)
+	}
+}
+
+func TestResolveRejectsConnectedMachineDescriptorForDifferentMachine(t *testing.T) {
+	term := readyTerminal()
+	term.HTTPBaseURL = "https://agentunnel.dev/connected-machines/cm_1"
+	term.WebSocketBaseURL = "wss://agentunnel.dev/connected-machines/cm_1"
+	response := readyConnectedMachineResponse(term)
+	response.ConnectedMachineID = "cm_other"
+	fc := &fakeClient{
+		machines:   []api.ConnectedMachine{{ID: "cm_1", DisplayName: "Studio Mac"}},
+		connectSeq: []api.ConnectResponse{response},
+	}
+	_, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "cm_1"})
+	if err == nil || !strings.Contains(err.Error(), "wrong connected machine") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestResolveConnectedMachineRebrokersAfterReadiness(t *testing.T) {
+	term := readyTerminal()
+	term.HTTPBaseURL = "https://agentunnel.dev/connected-machines/cm_1"
+	term.WebSocketBaseURL = "wss://agentunnel.dev/connected-machines/cm_1"
+	fc := &fakeClient{
+		machines: []api.ConnectedMachine{{ID: "cm_1", DisplayName: "Studio Mac"}},
+		connectSeq: []api.ConnectResponse{
+			{ConnectedMachineID: "cm_1", Connectable: false, Status: "connector_connecting"},
+			readyConnectedMachineResponse(term),
+		},
+		statusSeq: []api.ConnectResponse{{ConnectedMachineID: "cm_1", Connectable: true}},
+	}
+	info, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "cm_1"})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if info.Terminal == nil || fc.connectN != 2 || fc.statusN != 1 {
+		t.Fatalf("info=%+v connect=%d status=%d", info, fc.connectN, fc.statusN)
+	}
+}
+
+func TestResolveKeepsSelectedConnectedMachineSessionThroughReadinessPolling(t *testing.T) {
+	term := readyTerminal()
+	term.HTTPBaseURL = "https://agentunnel.dev/connected-machines/cm_1"
+	term.WebSocketBaseURL = "wss://agentunnel.dev/connected-machines/cm_1"
+	fc := &fakeClient{
+		machines: []api.ConnectedMachine{{ID: "cm_1", DisplayName: "Studio Mac"}},
+		connectSeq: []api.ConnectResponse{
+			{ConnectedMachineID: "cm_1", Connectable: false, Status: "connector_connecting"},
+			readyConnectedMachineResponse(term),
+		},
+		statusSeq: []api.ConnectResponse{{ConnectedMachineID: "cm_1", Connectable: true}},
+	}
+	if _, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "cm_1", TerminalSessionID: "pts_api"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(fc.connectSessionIDs, ","); got != "pts_api,pts_api" {
+		t.Fatalf("connected-machine connect session IDs = %q", got)
+	}
+	if got := strings.Join(fc.statusSessionIDs, ","); got != "pts_api" {
+		t.Fatalf("connected-machine status session IDs = %q", got)
 	}
 }
 
