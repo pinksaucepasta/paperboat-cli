@@ -25,14 +25,23 @@ var ErrEnrollmentUnavailable = errors.New("connector enrollment is unavailable")
 // approved. It is intentionally stored only through the OS credential store
 // unless the caller explicitly opts into config.FileSecretStore.
 type Enrollment struct {
-	MachineID           string `json:"machine_id"`
-	EnvironmentID       string `json:"environment_id"`
-	AgentunnelClientID  string `json:"agentunnel_client_id"`
-	AgentunnelRouteID   string `json:"agentunnel_route_id"`
-	AgentunnelServerURL string `json:"agentunnel_server_url"`
-	PapercodeLocalURL   string `json:"papercode_local_url"`
-	Agentunnel          string `json:"agentunnel_token"`
-	Version             string `json:"version"`
+	MachineID           string             `json:"machine_id"`
+	EnvironmentID       string             `json:"environment_id"`
+	AgentunnelClientID  string             `json:"agentunnel_client_id"`
+	AgentunnelRouteID   string             `json:"agentunnel_route_id"`
+	AgentunnelServerURL string             `json:"agentunnel_server_url"`
+	PapercodeLocalURL   string             `json:"papercode_local_url"`
+	PapercodeBootstrap  PapercodeBootstrap `json:"papercode_bootstrap"`
+	Agentunnel          string             `json:"agentunnel_token"`
+	Version             string             `json:"version"`
+}
+
+type PapercodeBootstrap struct {
+	RelayURL              string `json:"relay_url"`
+	RelayIssuer           string `json:"relay_issuer"`
+	CloudUserID           string `json:"cloud_user_id"`
+	EnvironmentCredential string `json:"environment_credential"`
+	CloudMintPublicKey    string `json:"cloud_mint_public_key"`
 }
 
 type PairingRequest struct {
@@ -123,7 +132,7 @@ func (c EnrollmentClient) ConsumeInstallation(ctx context.Context, verifier stri
 	var envelope struct {
 		Data Enrollment `json:"data"`
 	}
-	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&envelope); err != nil || envelope.Data.MachineID == "" || envelope.Data.EnvironmentID == "" || envelope.Data.AgentunnelRouteID == "" || envelope.Data.AgentunnelServerURL == "" || envelope.Data.PapercodeLocalURL == "" || envelope.Data.Agentunnel == "" {
+	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&envelope); err != nil || envelope.Data.MachineID == "" || envelope.Data.EnvironmentID == "" || envelope.Data.AgentunnelRouteID == "" || envelope.Data.AgentunnelServerURL == "" || envelope.Data.PapercodeLocalURL == "" || envelope.Data.Agentunnel == "" || envelope.Data.PapercodeBootstrap.invalid() {
 		return Enrollment{}, ErrEnrollmentUnavailable
 	}
 	return envelope.Data, nil
@@ -139,6 +148,10 @@ type EnrollmentStore struct {
 
 type EnrollmentMetadata struct {
 	MachineID, EnvironmentID, AgentunnelClientID, AgentunnelRouteID, AgentunnelServerURL, PapercodeLocalURL, Version string
+}
+
+func (b PapercodeBootstrap) invalid() bool {
+	return strings.TrimSpace(b.RelayURL) == "" || strings.TrimSpace(b.RelayIssuer) == "" || strings.TrimSpace(b.CloudUserID) == "" || strings.TrimSpace(b.EnvironmentCredential) == "" || strings.TrimSpace(b.CloudMintPublicKey) == ""
 }
 
 // PendingEnrollmentStore makes device-style approval resilient to a connector
@@ -200,10 +213,17 @@ func (s PendingEnrollmentStore) secretRef() string {
 }
 
 func (s EnrollmentStore) Save(value Enrollment) error {
-	if s.Secrets == nil || strings.TrimSpace(value.MachineID) == "" || strings.TrimSpace(value.EnvironmentID) == "" || strings.TrimSpace(value.Agentunnel) == "" {
+	if s.Secrets == nil || strings.TrimSpace(value.MachineID) == "" || strings.TrimSpace(value.EnvironmentID) == "" || strings.TrimSpace(value.Agentunnel) == "" || value.PapercodeBootstrap.invalid() {
 		return ErrEnrollmentUnavailable
 	}
-	if err := s.Secrets.Set(s.secretRef(), value.Agentunnel); err != nil {
+	secret, err := json.Marshal(struct {
+		Agentunnel string             `json:"agentunnel_token"`
+		Bootstrap  PapercodeBootstrap `json:"papercode_bootstrap"`
+	}{Agentunnel: value.Agentunnel, Bootstrap: value.PapercodeBootstrap})
+	if err != nil {
+		return err
+	}
+	if err := s.Secrets.Set(s.secretRef(), string(secret)); err != nil {
 		return fmt.Errorf("store connector enrollment: %w", err)
 	}
 	metadata, err := json.Marshal(EnrollmentMetadata{MachineID: value.MachineID, EnvironmentID: value.EnvironmentID, AgentunnelClientID: value.AgentunnelClientID, AgentunnelRouteID: value.AgentunnelRouteID, AgentunnelServerURL: value.AgentunnelServerURL, PapercodeLocalURL: value.PapercodeLocalURL, Version: value.Version})
@@ -229,7 +249,14 @@ func (s EnrollmentStore) Load() (Enrollment, error) {
 	if err != nil || secret == "" {
 		return Enrollment{}, ErrEnrollmentUnavailable
 	}
-	return Enrollment{MachineID: metadata.MachineID, EnvironmentID: metadata.EnvironmentID, AgentunnelClientID: metadata.AgentunnelClientID, AgentunnelRouteID: metadata.AgentunnelRouteID, AgentunnelServerURL: metadata.AgentunnelServerURL, PapercodeLocalURL: metadata.PapercodeLocalURL, Version: metadata.Version, Agentunnel: secret}, nil
+	var stored struct {
+		Agentunnel string             `json:"agentunnel_token"`
+		Bootstrap  PapercodeBootstrap `json:"papercode_bootstrap"`
+	}
+	if json.Unmarshal([]byte(secret), &stored) != nil || stored.Agentunnel == "" || stored.Bootstrap.invalid() {
+		return Enrollment{}, ErrEnrollmentUnavailable
+	}
+	return Enrollment{MachineID: metadata.MachineID, EnvironmentID: metadata.EnvironmentID, AgentunnelClientID: metadata.AgentunnelClientID, AgentunnelRouteID: metadata.AgentunnelRouteID, AgentunnelServerURL: metadata.AgentunnelServerURL, PapercodeLocalURL: metadata.PapercodeLocalURL, PapercodeBootstrap: stored.Bootstrap, Version: metadata.Version, Agentunnel: stored.Agentunnel}, nil
 }
 
 func (s EnrollmentStore) secretRef() string {

@@ -11,7 +11,7 @@ import (
 func TestEnrollmentStoreSeparatesSecretFromMetadata(t *testing.T) {
 	dir := t.TempDir()
 	store := EnrollmentStore{Dir: filepath.Join(dir, "connector"), Secrets: config.FileSecretStore{Dir: filepath.Join(dir, "secrets")}}
-	want := Enrollment{MachineID: "cm_1", EnvironmentID: "env_1", AgentunnelClientID: "cli_1", AgentunnelRouteID: "tun_1", AgentunnelServerURL: "https://agentunnel.example", PapercodeLocalURL: "http://127.0.0.1:4099", Agentunnel: "secret-token", Version: "1.2.3"}
+	want := Enrollment{MachineID: "cm_1", EnvironmentID: "env_1", AgentunnelClientID: "cli_1", AgentunnelRouteID: "tun_1", AgentunnelServerURL: "https://agentunnel.example", PapercodeLocalURL: "http://127.0.0.1:4099", PapercodeBootstrap: PapercodeBootstrap{RelayURL: "https://paperboat.example", RelayIssuer: "https://paperboat.example", CloudUserID: "usr_1", EnvironmentCredential: "credential", CloudMintPublicKey: "public-key"}, Agentunnel: "secret-token", Version: "1.2.3"}
 	if err := store.Save(want); err != nil {
 		t.Fatal(err)
 	}
@@ -37,7 +37,7 @@ func TestEnrollmentStoreSeparatesSecretFromMetadata(t *testing.T) {
 
 func TestWriteAgentunnelMachineConfigSeparatesToken(t *testing.T) {
 	dir := t.TempDir()
-	configPath, err := WriteAgentunnelMachineConfig(dir, Enrollment{MachineID: "cm_1", AgentunnelRouteID: "tun_1", AgentunnelServerURL: "https://agentunnel.example", PapercodeLocalURL: "http://127.0.0.1:4099", Agentunnel: "secret-token"})
+	configPath, err := WriteAgentunnelMachineConfig(dir, Enrollment{MachineID: "cm_1", AgentunnelRouteID: "tun_1", AgentunnelServerURL: "https://agentunnel.example", PapercodeLocalURL: "http://127.0.0.1:4099", PapercodeBootstrap: PapercodeBootstrap{RelayURL: "https://paperboat.example", RelayIssuer: "https://paperboat.example", CloudUserID: "usr_1", EnvironmentCredential: "credential", CloudMintPublicKey: "public-key"}, Agentunnel: "secret-token"})
 	if err != nil {
 		t.Fatal(err)
 	}

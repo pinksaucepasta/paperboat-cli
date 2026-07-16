@@ -244,7 +244,7 @@ func serve(ctx context.Context, args []string, stderr io.Writer) int {
 	}
 	supervisor := connect.Supervisor{
 		Processes: []connect.RuntimeProcess{
-			{Name: "papercode", Executable: *papercode, Arguments: papercodeArgs},
+			{Name: "papercode", Executable: *papercode, Arguments: papercodeArgs, Ready: func(ctx context.Context) error { return connect.BootstrapPapercode(ctx, *papercode, enrollment) }},
 			{Name: "agentunnel", Executable: *agentunnel, Arguments: append([]string{"client", "run", "--config", agentunnelConfig}, agentunnelArgs...)},
 		},
 		Runner: connect.ExecRunner{},

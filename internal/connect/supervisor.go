@@ -17,6 +17,7 @@ type RuntimeProcess struct {
 	Name, Executable string
 	Arguments        []string
 	Environment      []string
+	Ready            func(context.Context) error
 }
 
 type Child interface {
@@ -89,6 +90,12 @@ func (s Supervisor) runOnce(ctx context.Context) error {
 			return fmt.Errorf("start %s: %w", process.Name, err)
 		}
 		children = append(children, child)
+		if process.Ready != nil {
+			if err := process.Ready(ctx); err != nil {
+				stopAll(children)
+				return fmt.Errorf("prepare %s: %w", process.Name, err)
+			}
+		}
 	}
 	results := make(chan error, len(children))
 	for _, child := range children {
