@@ -25,10 +25,14 @@ var ErrEnrollmentUnavailable = errors.New("connector enrollment is unavailable")
 // approved. It is intentionally stored only through the OS credential store
 // unless the caller explicitly opts into config.FileSecretStore.
 type Enrollment struct {
-	MachineID     string `json:"machine_id"`
-	EnvironmentID string `json:"environment_id"`
-	Agentunnel    string `json:"agentunnel_token"`
-	Version       string `json:"version"`
+	MachineID           string `json:"machine_id"`
+	EnvironmentID       string `json:"environment_id"`
+	AgentunnelClientID  string `json:"agentunnel_client_id"`
+	AgentunnelRouteID   string `json:"agentunnel_route_id"`
+	AgentunnelServerURL string `json:"agentunnel_server_url"`
+	PapercodeLocalURL   string `json:"papercode_local_url"`
+	Agentunnel          string `json:"agentunnel_token"`
+	Version             string `json:"version"`
 }
 
 type PairingRequest struct {
@@ -119,7 +123,7 @@ func (c EnrollmentClient) ConsumeInstallation(ctx context.Context, verifier stri
 	var envelope struct {
 		Data Enrollment `json:"data"`
 	}
-	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&envelope); err != nil || envelope.Data.MachineID == "" || envelope.Data.EnvironmentID == "" || envelope.Data.Agentunnel == "" {
+	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&envelope); err != nil || envelope.Data.MachineID == "" || envelope.Data.EnvironmentID == "" || envelope.Data.AgentunnelRouteID == "" || envelope.Data.AgentunnelServerURL == "" || envelope.Data.PapercodeLocalURL == "" || envelope.Data.Agentunnel == "" {
 		return Enrollment{}, ErrEnrollmentUnavailable
 	}
 	return envelope.Data, nil
@@ -134,7 +138,65 @@ type EnrollmentStore struct {
 }
 
 type EnrollmentMetadata struct {
-	MachineID, EnvironmentID, Version string
+	MachineID, EnvironmentID, AgentunnelClientID, AgentunnelRouteID, AgentunnelServerURL, PapercodeLocalURL, Version string
+}
+
+// PendingEnrollmentStore makes device-style approval resilient to a connector
+// restart. The verifier remains in the configured secret store.
+type PendingEnrollmentStore struct {
+	Dir     string
+	Secrets config.SecretStore
+}
+
+type PendingEnrollment struct {
+	ServerURL string    `json:"server_url"`
+	UserCode  string    `json:"user_code"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+func (s PendingEnrollmentStore) Save(value PendingEnrollment, verifier string) error {
+	if s.Secrets == nil || strings.TrimSpace(value.ServerURL) == "" || strings.TrimSpace(value.UserCode) == "" || strings.TrimSpace(verifier) == "" {
+		return ErrEnrollmentUnavailable
+	}
+	if err := s.Secrets.Set(s.secretRef(), verifier); err != nil {
+		return err
+	}
+	b, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(s.Dir, 0o700); err != nil {
+		return err
+	}
+	return atomicWrite(filepath.Join(s.Dir, "pending-enrollment.json"), append(b, '\n'), 0o600)
+}
+
+func (s PendingEnrollmentStore) Load() (PendingEnrollment, string, error) {
+	b, err := os.ReadFile(filepath.Join(s.Dir, "pending-enrollment.json"))
+	if err != nil {
+		return PendingEnrollment{}, "", err
+	}
+	var value PendingEnrollment
+	if err := json.Unmarshal(b, &value); err != nil || value.ServerURL == "" || value.UserCode == "" || value.ExpiresAt.IsZero() {
+		return PendingEnrollment{}, "", ErrEnrollmentUnavailable
+	}
+	verifier, err := s.Secrets.Get(s.secretRef())
+	if err != nil || verifier == "" {
+		return PendingEnrollment{}, "", ErrEnrollmentUnavailable
+	}
+	return value, verifier, nil
+}
+
+func (s PendingEnrollmentStore) Delete() {
+	_ = os.Remove(filepath.Join(s.Dir, "pending-enrollment.json"))
+	if s.Secrets != nil {
+		_ = s.Secrets.Delete(s.secretRef())
+	}
+}
+
+func (s PendingEnrollmentStore) secretRef() string {
+	sum := sha256.Sum256([]byte("pending:" + filepath.Clean(s.Dir)))
+	return "paperboat-connect:" + base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
 func (s EnrollmentStore) Save(value Enrollment) error {
@@ -144,7 +206,7 @@ func (s EnrollmentStore) Save(value Enrollment) error {
 	if err := s.Secrets.Set(s.secretRef(), value.Agentunnel); err != nil {
 		return fmt.Errorf("store connector enrollment: %w", err)
 	}
-	metadata, err := json.Marshal(EnrollmentMetadata{MachineID: value.MachineID, EnvironmentID: value.EnvironmentID, Version: value.Version})
+	metadata, err := json.Marshal(EnrollmentMetadata{MachineID: value.MachineID, EnvironmentID: value.EnvironmentID, AgentunnelClientID: value.AgentunnelClientID, AgentunnelRouteID: value.AgentunnelRouteID, AgentunnelServerURL: value.AgentunnelServerURL, PapercodeLocalURL: value.PapercodeLocalURL, Version: value.Version})
 	if err != nil {
 		return err
 	}
@@ -160,14 +222,14 @@ func (s EnrollmentStore) Load() (Enrollment, error) {
 		return Enrollment{}, err
 	}
 	var metadata EnrollmentMetadata
-	if err := json.Unmarshal(b, &metadata); err != nil || metadata.MachineID == "" || metadata.EnvironmentID == "" {
+	if err := json.Unmarshal(b, &metadata); err != nil || metadata.MachineID == "" || metadata.EnvironmentID == "" || metadata.AgentunnelRouteID == "" || metadata.AgentunnelServerURL == "" || metadata.PapercodeLocalURL == "" {
 		return Enrollment{}, ErrEnrollmentUnavailable
 	}
 	secret, err := s.Secrets.Get(s.secretRef())
 	if err != nil || secret == "" {
 		return Enrollment{}, ErrEnrollmentUnavailable
 	}
-	return Enrollment{MachineID: metadata.MachineID, EnvironmentID: metadata.EnvironmentID, Version: metadata.Version, Agentunnel: secret}, nil
+	return Enrollment{MachineID: metadata.MachineID, EnvironmentID: metadata.EnvironmentID, AgentunnelClientID: metadata.AgentunnelClientID, AgentunnelRouteID: metadata.AgentunnelRouteID, AgentunnelServerURL: metadata.AgentunnelServerURL, PapercodeLocalURL: metadata.PapercodeLocalURL, Version: metadata.Version, Agentunnel: secret}, nil
 }
 
 func (s EnrollmentStore) secretRef() string {

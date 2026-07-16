@@ -11,7 +11,8 @@ import (
 func TestEnrollmentStoreSeparatesSecretFromMetadata(t *testing.T) {
 	dir := t.TempDir()
 	store := EnrollmentStore{Dir: filepath.Join(dir, "connector"), Secrets: config.FileSecretStore{Dir: filepath.Join(dir, "secrets")}}
-	if err := store.Save(Enrollment{MachineID: "cm_1", EnvironmentID: "env_1", Agentunnel: "secret-token", Version: "1.2.3"}); err != nil {
+	want := Enrollment{MachineID: "cm_1", EnvironmentID: "env_1", AgentunnelClientID: "cli_1", AgentunnelRouteID: "tun_1", AgentunnelServerURL: "https://agentunnel.example", PapercodeLocalURL: "http://127.0.0.1:4099", Agentunnel: "secret-token", Version: "1.2.3"}
+	if err := store.Save(want); err != nil {
 		t.Fatal(err)
 	}
 	metadata, err := os.ReadFile(filepath.Join(store.Dir, "enrollment.json"))
@@ -29,8 +30,31 @@ func TestEnrollmentStoreSeparatesSecretFromMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.MachineID != "cm_1" || got.EnvironmentID != "env_1" || got.Agentunnel != "secret-token" || got.Version != "1.2.3" {
+	if got != want {
 		t.Fatalf("enrollment = %#v", got)
+	}
+}
+
+func TestWriteAgentunnelMachineConfigSeparatesToken(t *testing.T) {
+	dir := t.TempDir()
+	configPath, err := WriteAgentunnelMachineConfig(dir, Enrollment{MachineID: "cm_1", AgentunnelRouteID: "tun_1", AgentunnelServerURL: "https://agentunnel.example", PapercodeLocalURL: "http://127.0.0.1:4099", Agentunnel: "secret-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contains(string(config), "secret-token") || !contains(string(config), `"tunnel_id":"tun_1"`) || !contains(string(config), `"local_url":"http://127.0.0.1:4099"`) {
+		t.Fatalf("unexpected config: %s", config)
+	}
+	token, err := os.ReadFile(filepath.Join(dir, "agentunnel-client.token"))
+	if err != nil || string(token) != "secret-token\n" {
+		t.Fatalf("token = %q, err = %v", token, err)
+	}
+	info, err := os.Stat(filepath.Join(dir, "agentunnel-client.token"))
+	if err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("token mode = %v, err = %v", info.Mode().Perm(), err)
 	}
 }
 

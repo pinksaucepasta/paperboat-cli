@@ -133,6 +133,7 @@ func enroll(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	workspace := flags.String("workspace", "", "Absolute workspace root")
 	stateDir := flags.String("state-dir", "", "Connector state directory")
 	fileFallback := flags.Bool("file-secret-fallback", false, "Allow 0600 file-backed enrollment secrets")
+	resume := flags.Bool("resume", false, "Resume a pending enrollment approval")
 	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
 		return 2
 	}
@@ -142,24 +143,41 @@ func enroll(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	*stateDir = resolvedStateDir
-	verifier, err := connect.NewVerifier()
-	if err != nil {
-		fmt.Fprintln(stderr, "paperboat-connect:", err)
-		return 1
-	}
-	client := connect.EnrollmentClient{ServerURL: *server}
-	pairing, err := client.CreatePairing(ctx, connect.PairingRequest{Verifier: verifier, DisplayName: *name, Platform: runtime.GOOS, Architecture: runtime.GOARCH, WorkspaceRoot: *workspace, RuntimeVersions: map[string]string{"connector": buildinfo.Version, "protocol": buildinfo.ProtocolVersion}})
-	if err != nil {
-		fmt.Fprintln(stderr, "paperboat-connect:", err)
-		return 1
-	}
-	fmt.Fprintln(stdout, pairing.UserCode)
 	secrets := config.SecretStore(config.KeyringStore{})
 	if *fileFallback {
 		secrets = config.FileSecretStore{Dir: filepath.Join(*stateDir, "secrets")}
 		fmt.Fprintln(stderr, "paperboat-connect: using explicit 0600 file secret fallback")
 	}
-	deadline := pairing.ExpiresAt
+	pendingStore := connect.PendingEnrollmentStore{Dir: *stateDir, Secrets: secrets}
+	var pending connect.PendingEnrollment
+	var verifier string
+	if *resume {
+		pending, verifier, err = pendingStore.Load()
+		if err != nil {
+			fmt.Fprintln(stderr, "paperboat-connect: pending enrollment is unavailable; run enroll again")
+			return 1
+		}
+	} else {
+		verifier, err = connect.NewVerifier()
+		if err != nil {
+			fmt.Fprintln(stderr, "paperboat-connect:", err)
+			return 1
+		}
+		client := connect.EnrollmentClient{ServerURL: *server}
+		pairing, createErr := client.CreatePairing(ctx, connect.PairingRequest{Verifier: verifier, DisplayName: *name, Platform: runtime.GOOS, Architecture: runtime.GOARCH, WorkspaceRoot: *workspace, RuntimeVersions: map[string]string{"connector": buildinfo.Version, "protocol": buildinfo.ProtocolVersion}})
+		if createErr != nil {
+			fmt.Fprintln(stderr, "paperboat-connect:", createErr)
+			return 1
+		}
+		pending = connect.PendingEnrollment{ServerURL: *server, UserCode: pairing.UserCode, ExpiresAt: pairing.ExpiresAt}
+		if err := pendingStore.Save(pending, verifier); err != nil {
+			fmt.Fprintln(stderr, "paperboat-connect:", err)
+			return 1
+		}
+		fmt.Fprintln(stdout, pending.UserCode)
+	}
+	client := connect.EnrollmentClient{ServerURL: pending.ServerURL}
+	deadline := pending.ExpiresAt
 	for time.Now().UTC().Before(deadline) {
 		material, consumeErr := client.ConsumeInstallation(ctx, verifier)
 		if consumeErr == nil {
@@ -167,6 +185,7 @@ func enroll(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 				fmt.Fprintln(stderr, "paperboat-connect:", err)
 				return 1
 			}
+			pendingStore.Delete()
 			fmt.Fprintln(stdout, material.MachineID)
 			return 0
 		}
@@ -211,10 +230,22 @@ func serve(ctx context.Context, args []string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "paperboat-connect: enrollment is unavailable; run enroll first")
 		return 1
 	}
+	agentunnelConfig, err := connect.WriteAgentunnelMachineConfig(dir, enrollment)
+	if err != nil {
+		fmt.Fprintln(stderr, "paperboat-connect: enrollment is invalid")
+		return 1
+	}
+	if len(papercodeArgs) == 0 {
+		papercodeArgs, err = connect.PapercodeServeArgs(enrollment.PapercodeLocalURL)
+		if err != nil {
+			fmt.Fprintln(stderr, "paperboat-connect: enrollment is invalid")
+			return 1
+		}
+	}
 	supervisor := connect.Supervisor{
 		Processes: []connect.RuntimeProcess{
 			{Name: "papercode", Executable: *papercode, Arguments: papercodeArgs},
-			{Name: "agentunnel", Executable: *agentunnel, Arguments: agentunnelArgs, Environment: []string{"PAPERBOAT_AGENTUNNEL_TOKEN=" + enrollment.Agentunnel, "PAPERBOAT_CONNECTED_MACHINE_ID=" + enrollment.MachineID}},
+			{Name: "agentunnel", Executable: *agentunnel, Arguments: append([]string{"client", "run", "--config", agentunnelConfig}, agentunnelArgs...)},
 		},
 		Runner: connect.ExecRunner{},
 	}
