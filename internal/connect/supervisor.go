@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -127,6 +128,8 @@ type execChild struct{ command *exec.Cmd }
 func (ExecRunner) Start(ctx context.Context, process RuntimeProcess) (Child, error) {
 	command := exec.CommandContext(ctx, process.Executable, process.Arguments...)
 	command.Env = append(command.Environ(), process.Environment...)
+	command.Stdout = os.Stdout
+	command.Stderr = os.Stderr
 	if err := command.Start(); err != nil {
 		return nil, err
 	}

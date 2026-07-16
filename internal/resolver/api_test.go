@@ -18,6 +18,7 @@ func (s *resolverEventSink) Record(e telemetry.Event) { s.events = append(s.even
 
 type fakeClient struct {
 	projects          []api.Project
+	projectsErr       error
 	machines          []api.ConnectedMachine
 	connectSeq        []api.ConnectResponse // returned by CLIConnect in order
 	statusSeq         []api.ConnectResponse // returned by ConnectionStatus in order
@@ -27,7 +28,9 @@ type fakeClient struct {
 	statusSessionIDs  []string
 }
 
-func (f *fakeClient) ListProjects(context.Context) ([]api.Project, error) { return f.projects, nil }
+func (f *fakeClient) ListProjects(context.Context) ([]api.Project, error) {
+	return f.projects, f.projectsErr
+}
 
 func (f *fakeClient) ListConnectedMachines(context.Context) ([]api.ConnectedMachine, error) {
 	return f.machines, nil
@@ -96,6 +99,20 @@ func newTestResolver(fc *fakeClient) *APIResolver {
 	r := NewAPIResolver(fc, cfg)
 	r.sleep = func(context.Context, time.Duration) error { return nil } // no real waiting
 	return r
+}
+
+func TestFindTargetAllowsConnectedMachineWithoutHostedPlan(t *testing.T) {
+	fc := &fakeClient{
+		projectsErr: &api.APIError{Code: "payment_required"},
+		machines:    []api.ConnectedMachine{{ID: "cm_1", DisplayName: "Studio Mac", State: "online"}},
+	}
+	target, err := newTestResolver(fc).findTarget(context.Background(), "cm_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target.kind != targetConnectedMachine || target.id != "cm_1" {
+		t.Fatalf("target = %+v", target)
+	}
 }
 
 func readyTerminal() *api.Terminal {

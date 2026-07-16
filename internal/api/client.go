@@ -67,6 +67,14 @@ func IsNotFound(err error) bool {
 	return errors.As(err, &apiErr) && apiErr.Status == http.StatusNotFound
 }
 
+// IsHostedEntitlementRequired reports the hosted-project billing gate. Callers
+// that also expose separately entitled connected machines may skip projects
+// while preserving every other API failure.
+func IsHostedEntitlementRequired(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && (apiErr.Code == "payment_required" || apiErr.Code == "entitlement_lost")
+}
+
 func (e *APIError) Error() string {
 	message := e.Message
 	if message == "" {

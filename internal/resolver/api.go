@@ -287,19 +287,20 @@ func (r *APIResolver) findTarget(ctx context.Context, requested string) (target,
 	if err == nil {
 		return target{kind: targetProject, id: project.ID, name: project.Name, state: project.State}, nil
 	}
-	if !errors.Is(err, ErrProjectNotFound) {
+	if !errors.Is(err, ErrProjectNotFound) && !api.IsHostedEntitlementRequired(err) {
 		return target{}, err
 	}
+	projectErr := err
 	client, ok := r.client.(connectedMachineClient)
 	if !ok {
-		return target{}, err
+		return target{}, projectErr
 	}
 	machines, listErr := client.ListConnectedMachines(ctx)
 	if listErr != nil {
 		// Connected machines are additive. Older control planes do not expose
 		// this catalog yet, so preserve the historical project-not-found result.
 		if api.IsNotFound(listErr) {
-			return target{}, err
+			return target{}, projectErr
 		}
 		return target{}, fmt.Errorf("list connected machines: %w", listErr)
 	}
@@ -326,7 +327,7 @@ func (r *APIResolver) findTarget(ctx context.Context, requested string) (target,
 		}
 		return target{}, fmt.Errorf("%w: %q matches connected-machine IDs %s; connect using an exact ID", ErrProjectAmbiguous, requested, strings.Join(ids, ", "))
 	}
-	return target{}, err
+	return target{}, projectErr
 }
 
 // waitConnectable polls connection-status until the tunnel is connectable or the

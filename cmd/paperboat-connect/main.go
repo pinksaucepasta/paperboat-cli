@@ -235,6 +235,11 @@ func serve(ctx context.Context, args []string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "paperboat-connect: enrollment is invalid")
 		return 1
 	}
+	papercodeState, err := connect.PreparePapercodeState(dir, enrollment)
+	if err != nil {
+		fmt.Fprintln(stderr, "paperboat-connect: enrollment is invalid")
+		return 1
+	}
 	if len(papercodeArgs) == 0 {
 		papercodeArgs, err = connect.PapercodeServeArgs(enrollment.PapercodeLocalURL)
 		if err != nil {
@@ -242,9 +247,12 @@ func serve(ctx context.Context, args []string, stderr io.Writer) int {
 			return 1
 		}
 	}
+	papercodeArgs = append(papercodeArgs, "--base-dir", papercodeState)
 	supervisor := connect.Supervisor{
 		Processes: []connect.RuntimeProcess{
-			{Name: "papercode", Executable: *papercode, Arguments: papercodeArgs, Ready: func(ctx context.Context) error { return connect.BootstrapPapercode(ctx, *papercode, enrollment) }},
+			{Name: "papercode", Executable: *papercode, Arguments: papercodeArgs, Ready: func(ctx context.Context) error {
+				return connect.BootstrapPapercode(ctx, *papercode, papercodeState, enrollment)
+			}},
 			{Name: "agentunnel", Executable: *agentunnel, Arguments: append([]string{"client", "run", "--config", agentunnelConfig}, agentunnelArgs...)},
 		},
 		Runner: connect.ExecRunner{},

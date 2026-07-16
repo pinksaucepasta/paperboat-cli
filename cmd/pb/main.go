@@ -625,6 +625,9 @@ func resolveProjectID(ctx context.Context, client *api.Client, requested string)
 		if errors.Is(err, api.ErrUnauthenticated) {
 			return api.Project{}, errors.New("your Paperboat session was rejected; run `pb auth login`, then retry")
 		}
+		if api.IsHostedEntitlementRequired(err) {
+			return api.Project{}, err
+		}
 		if msg := friendlyAPIError(err); msg != "" {
 			return api.Project{}, errors.New(msg)
 		}
@@ -670,7 +673,7 @@ func resolveEnvironmentTarget(ctx context.Context, client *api.Client, requested
 	if err == nil {
 		return environmentTarget{kind: environmentProject, id: project.ID, name: project.Name}, nil
 	}
-	if !errors.Is(err, resolver.ErrProjectNotFound) {
+	if !errors.Is(err, resolver.ErrProjectNotFound) && !api.IsHostedEntitlementRequired(err) {
 		return environmentTarget{}, err
 	}
 	machine, machineErr := resolveConnectedMachine(ctx, client, requested)
@@ -796,8 +799,11 @@ func projectsCommand() *cli.Command {
 				return err
 			}
 			projects, err := client.ListProjects(c.Context)
-			if err != nil {
+			if err != nil && !api.IsHostedEntitlementRequired(err) {
 				return err
+			}
+			if err != nil {
+				projects = nil
 			}
 			if c.Bool("json") {
 				return json.NewEncoder(os.Stdout).Encode(projects)
@@ -823,8 +829,11 @@ func environmentsCommand() *cli.Command {
 				return err
 			}
 			projects, err := client.ListProjects(c.Context)
-			if err != nil {
+			if err != nil && !api.IsHostedEntitlementRequired(err) {
 				return err
+			}
+			if err != nil {
+				projects = nil
 			}
 			machines, err := client.ListConnectedMachines(c.Context)
 			if err != nil {
