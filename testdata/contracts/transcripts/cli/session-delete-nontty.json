@@ -1,0 +1,1 @@
+{"version":"1.0.0","argv":["pb","session","delete","env_test_01","work"],"terminal":{"stdin_tty":false,"stdout_tty":false,"stderr_tty":false,"width":80},"environment":{"NO_COLOR":"1"},"clock":"2026-01-01T00:00:00Z","stdin":"","stdout":"","stderr":"session deletion requires --yes when stdin is not a terminal\n","exit":200,"remote_mutations":0}

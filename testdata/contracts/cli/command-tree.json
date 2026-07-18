@@ -1,0 +1,32 @@
+{
+  "version": "1.0.0",
+  "binary": "pb",
+  "default": {"syntax":"pb [environment]","behavior":"resume-or-select-and-attach","requires_tty":true},
+  "global_flags": ["--config <path>","--server <url>","--json","--no-color"],
+  "commands": [
+    {"name":"login","aliases":["auth login"],"args":[],"interactive":true},
+    {"name":"logout","aliases":["auth logout"],"args":[],"interactive":false},
+    {"name":"auth status","aliases":[],"args":[],"json":true},
+    {"name":"auth switch","aliases":[],"args":[],"interactive":true},
+    {"name":"create","aliases":[],"args":["[name]"],"interactive":true,"billable":true},
+    {"name":"environment list","aliases":["environments","projects"],"args":[],"json":true},
+    {"name":"connect","aliases":[],"args":["<environment>"],"flags":["--new","--name <name>","--session <name-or-id>"]},
+    {"name":"session list","aliases":["sessions"],"args":["[environment]"],"flags":["--wide"],"json":true},
+    {"name":"session rename","aliases":["sessions rename"],"args":["<environment>","<session>","<new-name>"]},
+    {"name":"session close","aliases":["sessions close"],"args":["<environment>","<session>"],"flags":["--yes"]},
+    {"name":"session delete","aliases":["sessions delete"],"args":["<environment>","<session>"],"flags":["--yes"],"destructive":true},
+    {"name":"preview list","aliases":["preview"],"args":["[environment]"],"json":true},
+    {"name":"preview create","aliases":[],"args":["<environment>","<port>"],"flags":["--key <key>","--yes"],"public_disclosure":true},
+    {"name":"preview remove","aliases":[],"args":["<environment>","<preview>"],"flags":["--yes"],"destructive":true},
+    {"name":"machine add","aliases":[],"args":[],"interactive":true},
+    {"name":"machine list","aliases":[],"args":[],"json":true},
+    {"name":"machine revoke","aliases":[],"args":["<machine>"],"flags":["--yes"],"destructive":true},
+    {"name":"config assign","aliases":[],"args":["<repository>","<environment>"],"interactive":true},
+    {"name":"config unassign","aliases":[],"args":["<environment>"],"flags":["--yes"],"destructive":true},
+    {"name":"config show","aliases":[],"args":[],"json":true},
+    {"name":"config path","aliases":[],"args":[]},
+    {"name":"doctor","aliases":[],"args":["[environment]"],"json":true}
+  ],
+  "precedence": ["explicit stable id","explicit unambiguous name","remembered environment in interactive mode","interactive selection"],
+  "automation_requires": ["stable id or unique name","--yes for destructive actions","--json for machine-readable output"]
+}

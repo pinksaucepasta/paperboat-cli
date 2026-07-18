@@ -11,7 +11,10 @@ GOFMT       := $(shell GOTOOLCHAIN=local go env GOROOT 2>/dev/null)/bin/gofmt
 GO_FILES    := $(shell find . -path ./.git -prune -o -name '*.go' -print)
 LDFLAGS     := -X github.com/pujan-modha/paperboat-cli/internal/buildinfo.Version=$(VERSION) -X github.com/pujan-modha/paperboat-cli/internal/buildinfo.ProtocolVersion=$(PROTOCOL_VERSION)
 
-.PHONY: build check clean fmt fmt-check generate install lint race release-metadata test tidy uninstall verify-toolchain vet
+.PHONY: build check clean contracts fmt fmt-check generate install lint race release-metadata test tidy uninstall verify-toolchain vet
+
+contracts:
+	@./testdata/contracts/validate.sh
 
 verify-toolchain:
 	@test "$$(GOTOOLCHAIN=local go env GOVERSION)" = "go$(GO_VERSION)" || { echo "required Go $(GO_VERSION), found $$(GOTOOLCHAIN=local go env GOVERSION)" >&2; exit 1; }
@@ -64,7 +67,7 @@ lint: fmt-check vet
 tidy:
 	$(GO) mod tidy
 
-check: verify-toolchain fmt-check vet test build
+check: verify-toolchain contracts fmt-check vet test build
 
 clean:
 	rm -rf bin
