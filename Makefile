@@ -5,12 +5,19 @@ PREFIX      ?= /usr/local
 BINDIR      := $(PREFIX)/bin
 VERSION     ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 PROTOCOL_VERSION ?= 1
+GO_VERSION  := 1.25.7
+GO          := GOTOOLCHAIN=local go
+GOFMT       := $(shell GOTOOLCHAIN=local go env GOROOT 2>/dev/null)/bin/gofmt
+GO_FILES    := $(shell find . -path ./.git -prune -o -name '*.go' -print)
 LDFLAGS     := -X github.com/pujan-modha/paperboat-cli/internal/buildinfo.Version=$(VERSION) -X github.com/pujan-modha/paperboat-cli/internal/buildinfo.ProtocolVersion=$(PROTOCOL_VERSION)
 
-.PHONY: build release-metadata install uninstall test vet fmt lint tidy clean
+.PHONY: build check clean fmt fmt-check generate install lint race release-metadata test tidy uninstall verify-toolchain vet
+
+verify-toolchain:
+	@test "$$(GOTOOLCHAIN=local go env GOVERSION)" = "go$(GO_VERSION)" || { echo "required Go $(GO_VERSION), found $$(GOTOOLCHAIN=local go env GOVERSION)" >&2; exit 1; }
 
 build:
-	go build -ldflags "$(LDFLAGS)" -o bin/$(BINARY) $(PKG)
+	$(GO) build -ldflags "$(LDFLAGS)" -o bin/$(BINARY) $(PKG)
 
 # Produce reviewable integrity metadata alongside a release binary. Signing,
 # SBOM generation, and publishing are performed by the release pipeline.
@@ -35,19 +42,29 @@ uninstall:
 	rm -f $(BINDIR)/$(BINARY) $(BINDIR)/$(ALIAS)
 
 test:
-	go test ./...
+	$(GO) test ./...
+
+race:
+	$(GO) test -race ./...
 
 vet:
-	go vet ./...
+	$(GO) vet ./...
 
 fmt:
-	gofmt -l -w .
+	$(GOFMT) -w $(GO_FILES)
 
-lint: vet
-	gofmt -l .
+fmt-check:
+	@test -z "$$($(GOFMT) -l $(GO_FILES))" || { $(GOFMT) -l $(GO_FILES); echo "Go files are not formatted" >&2; exit 1; }
+
+generate:
+	$(GO) generate ./...
+
+lint: fmt-check vet
 
 tidy:
-	go mod tidy
+	$(GO) mod tidy
+
+check: verify-toolchain fmt-check vet test build
 
 clean:
 	rm -rf bin

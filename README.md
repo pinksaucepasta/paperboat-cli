@@ -1,23 +1,19 @@
 # paperboat-cli
 
-The Paperboat command-line client — an **invisible terminal wrapper** that connects your
-local machine to a Paperboat environment and gives you its terminal as if it were local.
+The Paperboat command-line client. `pb` authenticates the user, selects an environment,
+attaches to helper-managed terminal sessions, and bridges local image pastes into remote
+agent workflows.
 
-The production target signs in through Paperboat's dashboard-approved device flow, connects
-through agentunnel, and transparently bridges **local image pastes into remote TUIs**. The
-CLI now uses Paperboat bearer sessions and stores secrets in the operating system credential
-store; plaintext fallback is explicit and intended only for headless systems.
+The CLI uses Paperboat device sessions and stores secrets in the operating-system
+credential store. It does not own remote PTYs, tunnel infrastructure, or reusable
+connector credentials.
 
 Control-plane requests identify the CLI and protocol version so incompatible clients receive
 an actionable upgrade error instead of malformed session data. See
 [docs/operations.md](docs/operations.md) for security and outage handling.
 
-> **Status:** Production commands use Paperboat device sessions and never fall back to a
-> local shell. `cli-connect` returns a tunneled papercode WSS terminal plus a separate
-> staged-image upload descriptor.
-> SSH is debug/operator access only, not the production CLI handoff. See
-> [AGENTS.md](AGENTS.md) for design/conventions and the workspace
-> `USERSTORY.md` for how this fits the platform.
+See [AGENTS.md](AGENTS.md) for repository ownership and engineering requirements, and
+[docs/operations.md](docs/operations.md) for security and outage handling.
 
 ## Usage
 
@@ -147,11 +143,6 @@ make install    # install pb + a `paperboat` alias symlink
 make test       # unit tests (paste parser + upload pipeline)
 ```
 
-Version tags trigger cross-platform release builds for macOS, Linux, and Windows
-on amd64/arm64. Published assets include SHA-256 checksums, SPDX JSON SBOMs, and
-GitHub build-provenance attestations. Each release also includes a checksum-bound
-Homebrew formula (`paperboat.rb`) and Scoop manifest (`paperboat.json`).
-
 ## Stack
 
 Go — distributed as a single static binary (`github.com/urfave/cli/v2`, Go 1.25).
@@ -165,3 +156,7 @@ Go — distributed as a single static binary (`github.com/urfave/cli/v2`, Go 1.2
 - `internal/session` — transparent PTY wrapper (raw mode, resize, exit-code passthrough).
 - `internal/paste` — bracketed-paste interceptor + image-path rewriter (the risk center).
 - `internal/upload` — authenticated staged-image multipart transport.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
