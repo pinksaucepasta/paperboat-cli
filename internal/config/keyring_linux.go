@@ -13,6 +13,10 @@ type KeyringStore struct{}
 
 var errKeyringSecretNotFound = errors.New("credential not found")
 
+func unavailableCredentialStore(err error) error {
+	return fmt.Errorf("%w: %v", ErrCredentialStoreUnavailable, err)
+}
+
 func linuxSecretAttributes(ref string) map[string]string {
 	return map[string]string{"service": keyringService, "account": ref}
 }
@@ -33,18 +37,21 @@ func linuxSecretItem(service *secretservice.SecretService, ref string) (dbus.Obj
 func (KeyringStore) Set(ref, value string) error {
 	service, err := secretservice.NewSecretService()
 	if err != nil {
-		return err
+		return unavailableCredentialStore(err)
 	}
 	session, err := service.OpenSession()
 	if err != nil {
-		return err
+		return unavailableCredentialStore(err)
 	}
 	defer service.Close(session)
 	collection := service.GetLoginCollection()
 	if err := service.Unlock(collection.Path()); err != nil {
-		return err
+		return unavailableCredentialStore(err)
 	}
-	return service.CreateItem(collection, fmt.Sprintf("%s/%s", keyringService, ref), linuxSecretAttributes(ref), secretservice.NewSecret(session.Path(), value))
+	if err := service.CreateItem(collection, fmt.Sprintf("%s/%s", keyringService, ref), linuxSecretAttributes(ref), secretservice.NewSecret(session.Path(), value)); err != nil {
+		return unavailableCredentialStore(err)
+	}
+	return nil
 }
 func (KeyringStore) Get(ref string) (string, error) {
 	service, err := secretservice.NewSecretService()

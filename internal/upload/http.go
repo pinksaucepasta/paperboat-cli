@@ -4,13 +4,17 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -48,18 +52,28 @@ func (u *HTTPUploader) ConfigureTelemetry(sink telemetry.Sink, projectID, enviro
 // endpoint. Code lets callers distinguish retryable workspace/storage failures
 // from user input and authorization failures without parsing text.
 type Error struct {
-	Code    string
-	Message string
+	Code      string
+	Message   string
+	RequestID string
+	Stage     string
+	Retryable bool
 }
 
 func (e *Error) Error() string {
+	detail := ""
+	if e.Stage != "" {
+		detail += ", stage " + e.Stage
+	}
+	if e.RequestID != "" {
+		detail += ", request " + e.RequestID
+	}
 	if e.Message == "" {
-		return "upload failed: " + e.Code
+		return "upload failed: " + e.Code + detail
 	}
 	if e.Code == "" {
-		return "upload failed: " + e.Message
+		return "upload failed: " + e.Message + detail
 	}
-	return "upload failed (" + e.Code + "): " + e.Message
+	return "upload failed (" + e.Code + "): " + e.Message + detail
 }
 
 func NewHTTPUploader(baseURL, uploadPath string, auth Auth) *HTTPUploader {
@@ -75,7 +89,8 @@ func NewHTTPUploader(baseURL, uploadPath string, auth Auth) *HTTPUploader {
 
 func (u *HTTPUploader) Upload(ctx context.Context, img Image) (string, error) {
 	started := u.now()
-	key := fmt.Sprintf("sha256:%x", sha256.Sum256(img.Bytes))
+	operationDigest := sha256.Sum256(append(append([]byte(img.Name+"\x00"+img.MimeType+"\x00"), img.Bytes...), byte(0)))
+	key := "upload_" + hex.EncodeToString(operationDigest[:])
 	for attempt := 0; attempt < 2; attempt++ {
 		auth := u.currentAuth()
 		path, err := u.uploadOnce(ctx, img, key, auth)
@@ -148,10 +163,14 @@ func (u *HTTPUploader) uploadOnce(ctx context.Context, img Image, idempotencyKey
 	pipeReader, pipeWriter := io.Pipe()
 	mw := multipart.NewWriter(pipeWriter)
 	contentType := mw.FormDataContentType()
+	contentDigest := sha256.Sum256(img.Bytes)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		part, err := mw.CreateFormFile("image", img.Name)
+		header := make(textproto.MIMEHeader)
+		header.Set("Content-Disposition", mime.FormatMediaType("form-data", map[string]string{"name": "file", "filename": img.Name}))
+		header.Set("Content-Type", img.MimeType)
+		part, err := mw.CreatePart(header)
 		if err == nil {
 			_, err = io.Copy(part, bytes.NewReader(img.Bytes))
 		}
@@ -186,6 +205,13 @@ func (u *HTTPUploader) uploadOnce(ctx context.Context, img Image, idempotencyKey
 	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("Authorization", "Bearer "+auth.Token)
 	req.Header.Set("Idempotency-Key", idempotencyKey)
+	req.Header.Set("X-Paperboat-Request-ID", "req_"+strings.TrimPrefix(idempotencyKey, "upload_"))
+	req.Header.Set("X-Paperboat-Operation-ID", idempotencyKey)
+	req.Header.Set("X-Paperboat-Deadline-Ms", "30000")
+	req.Header.Set("X-Paperboat-File-Name", img.Name)
+	req.Header.Set("X-Paperboat-File-Mime", img.MimeType)
+	req.Header.Set("X-Paperboat-File-Size", strconv.FormatInt(int64(len(img.Bytes)), 10))
+	req.Header.Set("X-Paperboat-File-Sha256", hex.EncodeToString(contentDigest[:]))
 	client := u.HTTPClient
 	if client == nil {
 		client = http.DefaultClient
@@ -196,7 +222,14 @@ func (u *HTTPUploader) uploadOnce(ctx context.Context, img Image, idempotencyKey
 	}
 	defer resp.Body.Close()
 	var out struct {
-		Path  string `json:"path"`
+		Path      string `json:"path"`
+		Code      string `json:"code"`
+		Message   string `json:"message"`
+		RequestID string `json:"requestId"`
+		Retryable bool   `json:"retryable"`
+		Details   struct {
+			Stage string `json:"stage"`
+		} `json:"details"`
 		Error struct {
 			Code    string `json:"code"`
 			Message string `json:"message"`
@@ -206,6 +239,9 @@ func (u *HTTPUploader) uploadOnce(ctx context.Context, img Image, idempotencyKey
 		return "", fmt.Errorf("decode upload response: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if out.Code != "" || out.Message != "" {
+			return "", &Error{Code: out.Code, Message: out.Message, RequestID: out.RequestID, Stage: out.Details.Stage, Retryable: out.Retryable}
+		}
 		if out.Error.Code != "" || out.Error.Message != "" {
 			return "", &Error{Code: out.Error.Code, Message: out.Error.Message}
 		}

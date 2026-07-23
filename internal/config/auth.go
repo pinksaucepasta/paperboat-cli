@@ -17,6 +17,9 @@ import (
 
 const ProfileVersion = 1
 const keyringService = "paperboat"
+
+var ErrCredentialStoreUnavailable = errors.New("OS credential store unavailable")
+
 const sharedLockRemoteStaleAfter = 30 * time.Minute
 
 type sharedLockOwner struct {

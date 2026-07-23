@@ -211,6 +211,40 @@ func TestDefersRedrawWhileRemoteUsesANSICursorSave(t *testing.T) {
 	}
 }
 
+func TestDefersRedrawDuringSynchronizedOutput(t *testing.T) {
+	bar, reader := newTestBar(t, ModeAuto, "xterm-256color", 40, 3, true, time.Second)
+	if _, err := bar.Write([]byte("\x1b[?2026hframe-a")); err != nil {
+		t.Fatal(err)
+	}
+	bar.Notice("Reconnected")
+	if _, err := bar.Write([]byte("frame-b")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bar.Write([]byte("\x1b[?2026l")); err != nil {
+		t.Fatal(err)
+	}
+	_ = bar.Close()
+	if output, ok := bar.out.(*os.File); ok {
+		_ = output.Close()
+	}
+	raw, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transcript := string(raw)
+	start := strings.Index(transcript, "\x1b[?2026h")
+	end := strings.Index(transcript, "\x1b[?2026l")
+	if start < 0 || end < start {
+		t.Fatalf("missing synchronized frame: %q", transcript)
+	}
+	if strings.Contains(transcript[start:end], "\x1b[3;1H") {
+		t.Fatalf("status bar redrew inside synchronized frame: %q", transcript[start:end])
+	}
+	if !strings.Contains(transcript[end+len("\x1b[?2026l"):], "\x1b[3;1H") {
+		t.Fatalf("status bar did not redraw after synchronized frame: %q", transcript)
+	}
+}
+
 func TestTruncationAndFallbackModes(t *testing.T) {
 	bar, _ := newTestBar(t, ModeAuto, "xterm-256color", 8, 2, true, time.Second)
 	bar.SetIdentity("very-long-project", "default")

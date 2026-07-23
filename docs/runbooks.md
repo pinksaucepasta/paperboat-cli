@@ -16,7 +16,7 @@ requests fail while existing client sessions remain otherwise healthy.
 
 ## Signing-key rotation or rollback
 
-Detection: papercode mint/health calls reject an otherwise authorized project with
+Detection: helper credential verification rejects an otherwise authorized environment with
 an unknown key or signature error.
 
 1. Confirm the active `kid`, issuer, audience, and configured JWKS overlap without recording proofs.
@@ -24,12 +24,12 @@ an unknown key or signature error.
 3. Roll back the active signing key if new proofs fail while old-key verification succeeds.
 4. Verify one new connect, one old-key overlap verification, and revocation before retiring the old key.
 
-## Agentunnel outage
+## Tunnel outage
 
 Detection: control-plane authorization succeeds but route readiness or WSS/HTTPS
 dialing fails across projects.
 
-1. Use `pb doctor <project>` to distinguish route readiness from papercode health.
+1. Use `pb doctor <environment>` to distinguish route readiness from helper health.
 2. Stop reconnect storms and honor configured retry bounds.
 3. Do not expose a Fly port or fall back to SSH.
 4. After recovery, verify terminal attach, reconnect, staged upload, and revoked-route rejection.
@@ -37,14 +37,14 @@ dialing fails across projects.
 ## Fly start or machine failure
 
 Detection: readiness remains in a machine-starting state, reports machine failure,
-or times out before route/papercode checks.
+or times out before route/helper checks.
 
 1. Correlate the project and machine lifecycle event in the control plane.
 2. Confirm entitlement, credits, volume attachment, image identity, and runtime health.
 3. Avoid repeated replacement while volume ownership is uncertain.
 4. After recovery, run `pb doctor <project>`, attach once, and verify the persistent workspace.
 
-## Papercode authorization mismatch
+## Helper authorization mismatch
 
 Detection: route and runtime are healthy but mint, token exchange, WebSocket ticket,
 terminal scope, or file-stage scope is rejected.
@@ -67,7 +67,7 @@ grant cannot be consumed exactly once.
 ## Stolen device
 
 1. Revoke the device's client session from the dashboard immediately.
-2. Verify the Paperboat token family, papercode sessions, and agentunnel access are revoked within the configured bound.
+2. Verify the Paperboat token family, helper sessions, and tunnel access are revoked within the configured bound.
 3. Run `pb auth logout` on the device if recovered so queued local cleanup completes.
 4. Review metadata-only access events; rotate unrelated account credentials only if evidence warrants it.
 
@@ -78,7 +78,7 @@ reports repeated failures.
 
 1. Stop accepting uploads if storage safety limits are threatened; terminal access remains separately scoped.
 2. Inspect counts, sizes, ages, and environment IDs only, never image contents or paths.
-3. Restore the papercode cleanup worker and run its idempotent cleanup operation.
+3. Restore the helper cleanup worker and run its idempotent cleanup operation.
 4. Verify expired files are gone, active files remain readable, traversal is rejected, and new uploads obey retention.
 
 ## Recovery evidence

@@ -130,6 +130,70 @@ type Project struct {
 	State string `json:"state"`
 }
 
+type GitHubRepository struct {
+	FullName      string `json:"full_name"`
+	CloneURL      string `json:"clone_url"`
+	DefaultBranch string `json:"default_branch"`
+}
+
+type CatalogMachineType struct {
+	Code   string `json:"code"`
+	Active bool   `json:"active"`
+}
+type CatalogRegion struct {
+	Code    string `json:"code"`
+	Enabled bool   `json:"enabled"`
+}
+type CatalogIdleTimeout struct {
+	Code   string `json:"code"`
+	Active bool   `json:"active"`
+}
+
+func (c *Client) ListGitHubRepositories(ctx context.Context) ([]GitHubRepository, error) {
+	var out []GitHubRepository
+	err := c.do(ctx, http.MethodGet, "/api/github/repositories", nil, &out)
+	return out, err
+}
+
+func (c *Client) ListCatalogMachineTypes(ctx context.Context) ([]CatalogMachineType, error) {
+	var out []CatalogMachineType
+	err := c.do(ctx, http.MethodGet, "/api/catalog/machine-types", nil, &out)
+	return out, err
+}
+
+func (c *Client) ListCatalogRegions(ctx context.Context) ([]CatalogRegion, error) {
+	var out []CatalogRegion
+	err := c.do(ctx, http.MethodGet, "/api/catalog/regions", nil, &out)
+	return out, err
+}
+
+func (c *Client) ListCatalogIdleTimeouts(ctx context.Context) ([]CatalogIdleTimeout, error) {
+	var out []CatalogIdleTimeout
+	err := c.do(ctx, http.MethodGet, "/api/catalog/idle-timeouts", nil, &out)
+	return out, err
+}
+
+type CreateProjectInput struct {
+	Name            string   `json:"name"`
+	RepositoryURL   string   `json:"repository_url"`
+	DefaultBranch   string   `json:"default_branch,omitempty"`
+	StorageGB       int      `json:"storage_gb"`
+	MachineTypeCode string   `json:"machine_type_code"`
+	RegionCode      string   `json:"region_code"`
+	PresetCodes     []string `json:"preset_codes,omitempty"`
+	IdleTimeoutCode string   `json:"idle_timeout_code"`
+	SetupScript     string   `json:"setup_script,omitempty"`
+}
+
+func (c *Client) CreateProject(ctx context.Context, input CreateProjectInput, idempotencyKey string) (Project, error) {
+	if strings.TrimSpace(idempotencyKey) == "" {
+		return Project{}, errors.New("project creation idempotency key is required")
+	}
+	var out Project
+	err := c.doWithHeaders(ctx, http.MethodPost, "/api/projects", input, &out, http.Header{"Idempotency-Key": []string{idempotencyKey}})
+	return out, err
+}
+
 type Pagination struct {
 	Limit      int  `json:"limit"`
 	Offset     int  `json:"offset"`
@@ -146,12 +210,89 @@ type ProjectPage struct {
 // connector rather than a Paperboat-managed Fly VM. The control plane owns its
 // lifecycle and authorization; the CLI only needs enough metadata to select it.
 type ConnectedMachine struct {
-	ID           string `json:"id"`
-	DisplayName  string `json:"display_name"`
-	State        string `json:"state"`
-	Online       bool   `json:"online"`
-	Platform     string `json:"platform"`
-	Architecture string `json:"architecture"`
+	ID            string `json:"id"`
+	EnvironmentID string `json:"environment_id"`
+	DisplayName   string `json:"display_name"`
+	State         string `json:"state"`
+	Online        bool   `json:"online"`
+	Platform      string `json:"platform"`
+	Architecture  string `json:"architecture"`
+}
+
+type ConfigRepository struct {
+	ID          string `json:"id"`
+	Provider    string `json:"provider"`
+	ExternalRef string `json:"external_ref"`
+	DisplayName string `json:"display_name"`
+}
+
+type ConfigAssignment struct {
+	ID              string  `json:"id"`
+	EnvironmentID   string  `json:"environment_id"`
+	RepositoryID    *string `json:"repository_id"`
+	ConsentState    string  `json:"consent_state"`
+	WarningRevision *string `json:"warning_revision"`
+	Version         int64   `json:"version"`
+}
+
+type Preview struct {
+	ID              string     `json:"id"`
+	EnvironmentID   string     `json:"environment_id"`
+	ProjectID       string     `json:"project_id"`
+	MachineID       string     `json:"machine_id"`
+	UserID          string     `json:"user_id"`
+	LogicalName     string     `json:"logical_name"`
+	PreviewKey      string     `json:"preview_key"`
+	URL             string     `json:"url"`
+	TargetPort      int32      `json:"target_port"`
+	State           string     `json:"state"`
+	ExpiresAt       *time.Time `json:"expires_at"`
+	RemovedAt       *time.Time `json:"removed_at"`
+	Version         int64      `json:"version"`
+	EnvironmentName string     `json:"environment_name"`
+	EnvironmentKind string     `json:"environment_kind"`
+	OwnerEmail      string     `json:"owner_email"`
+}
+
+func (c *Client) ListPreviews(ctx context.Context) ([]Preview, error) {
+	var out []Preview
+	err := c.do(ctx, http.MethodGet, "/api/previews", nil, &out)
+	return out, err
+}
+
+func (c *Client) RemovePreview(ctx context.Context, previewID, idempotencyKey string) (Preview, error) {
+	if strings.TrimSpace(idempotencyKey) == "" {
+		return Preview{}, errors.New("preview idempotency key is required")
+	}
+	var out Preview
+	path := "/api/previews/" + url.PathEscape(previewID)
+	err := c.doWithHeaders(ctx, http.MethodDelete, path, nil, &out, http.Header{"Idempotency-Key": []string{idempotencyKey}})
+	return out, err
+}
+
+func (c *Client) ListConfigRepositories(ctx context.Context) ([]ConfigRepository, error) {
+	var page struct {
+		Items []ConfigRepository `json:"items"`
+	}
+	err := c.do(ctx, http.MethodGet, "/api/config-repositories", nil, &page)
+	return page.Items, err
+}
+
+func (c *Client) ConfigAssignment(ctx context.Context, environmentID string) (ConfigAssignment, error) {
+	var out ConfigAssignment
+	err := c.do(ctx, http.MethodGet, "/api/environments/"+url.PathEscape(environmentID)+"/config-assignment", nil, &out)
+	return out, err
+}
+
+func (c *Client) AssignConfig(ctx context.Context, environmentID, repositoryID string, expectedVersion int64) (ConfigAssignment, error) {
+	var out ConfigAssignment
+	err := c.do(ctx, http.MethodPut, "/api/environments/"+url.PathEscape(environmentID)+"/config-assignment", map[string]any{"repository_id": repositoryID, "warning_revision": "", "expected_version": expectedVersion}, &out)
+	return out, err
+}
+
+func (c *Client) UnassignConfig(ctx context.Context, environmentID string, expectedVersion int64) error {
+	path := fmt.Sprintf("/api/environments/%s/config-assignment?expected_version=%d", url.PathEscape(environmentID), expectedVersion)
+	return c.do(ctx, http.MethodDelete, path, nil, nil)
 }
 
 type ConnectedMachinePage struct {
@@ -187,8 +328,15 @@ type AuthMaterial struct {
 	Scopes    []string  `json:"scopes,omitempty"`
 }
 
-// Environment is the papercode environment metadata returned by cli-connect.
+const ConnectionSchemaV1 = "paperboat.environment-connection/v1"
+
+// Environment identifies either a hosted project or a BYOD machine.
 type Environment struct {
+	ID                 string `json:"id"`
+	Kind               string `json:"kind"`
+	ResourceID         string `json:"resource_id"`
+	State              string `json:"state"`
+	Root               string `json:"root"`
 	EnvironmentID      string `json:"environment_id"`
 	ProjectID          string `json:"project_id"`
 	ConnectedMachineID string `json:"connected_machine_id"`
@@ -197,9 +345,12 @@ type Environment struct {
 }
 
 // Terminal is the CLI-safe papercode WebSocket attach descriptor from
-// cli-connect. It carries client-safe agentunnel route URLs, not raw VM
+// cli-connect. It carries client-safe Paperboat route URLs, not raw VM
 // addresses or SSH credentials.
 type Terminal struct {
+	Endpoint         string       `json:"endpoint"`
+	HTTPEndpoint     string       `json:"http_endpoint"`
+	SessionID        string       `json:"session_id"`
 	Kind             string       `json:"kind"`
 	HTTPBaseURL      string       `json:"http_base_url"`
 	WebSocketBaseURL string       `json:"websocket_base_url"`
@@ -211,6 +362,7 @@ type Terminal struct {
 
 // Upload is the papercode image-upload endpoint hint from cli-connect.
 type Upload struct {
+	Endpoint         string       `json:"endpoint"`
 	Kind             string       `json:"kind"`
 	HTTPBaseURL      string       `json:"http_base_url"`
 	Path             string       `json:"path"`
@@ -224,6 +376,7 @@ type Upload struct {
 // Connectable is false the machine is not ready yet; Status/Reason explain why
 // and the caller should poll ConnectionStatus.
 type ConnectResponse struct {
+	Schema                string       `json:"schema"`
 	Issuer                string       `json:"issuer,omitempty"`
 	ProjectID             string       `json:"project_id"`
 	ProjectState          string       `json:"project_state"`
@@ -237,6 +390,45 @@ type ConnectResponse struct {
 	Status                string       `json:"status,omitempty"`
 	Reason                string       `json:"reason,omitempty"`
 	RetryAfterSeconds     int          `json:"retry_after_seconds,omitempty"`
+	Capabilities          []string     `json:"capabilities,omitempty"`
+}
+
+// NormalizeConnectionDescriptor maps the canonical wire contract onto the
+// internal transport fields. Legacy fields are accepted only when Schema is
+// empty, which keeps rollback compatibility from becoming a second writer.
+func (r *ConnectResponse) NormalizeConnectionDescriptor() error {
+	if r.Schema != "" && r.Schema != ConnectionSchemaV1 {
+		return fmt.Errorf("unsupported connection descriptor schema %q", r.Schema)
+	}
+	if r.Schema == "" || r.Environment == nil {
+		return nil
+	}
+	e := r.Environment
+	e.EnvironmentID, e.ProjectRoot = e.ID, e.Root
+	switch e.Kind {
+	case "hosted":
+		e.ProjectID, r.ProjectID, r.ProjectState = e.ResourceID, e.ResourceID, e.State
+	case "byod":
+		e.ConnectedMachineID, r.ConnectedMachineID, r.ConnectedMachineState = e.ResourceID, e.ResourceID, e.State
+	default:
+		return fmt.Errorf("invalid environment kind %q", e.Kind)
+	}
+	if r.Terminal != nil {
+		r.Terminal.Kind = "paperboat_terminal_v1"
+		r.Terminal.WebSocketBaseURL = r.Terminal.Endpoint
+		r.Terminal.HTTPBaseURL = r.Terminal.HTTPEndpoint
+	}
+	if r.Upload != nil {
+		r.Upload.Kind = "paperboat_staged_image_v1"
+		u, err := url.Parse(r.Upload.Endpoint)
+		if err != nil || u.Scheme == "" || u.Host == "" || u.Path == "" {
+			return errors.New("invalid canonical upload endpoint")
+		}
+		r.Upload.Path = u.EscapedPath()
+		u.Path, u.RawPath, u.RawQuery, u.Fragment = "", "", "", ""
+		r.Upload.HTTPBaseURL = strings.TrimSuffix(u.String(), "/")
+	}
+	return nil
 }
 
 type KeepAliveResponse struct {
@@ -346,8 +538,22 @@ func (c *Client) ListConnectedMachines(ctx context.Context) ([]ConnectedMachine,
 	}
 }
 
+func (c *Client) DisconnectConnectedMachine(ctx context.Context, machineID string) error {
+	if strings.TrimSpace(machineID) == "" {
+		return errors.New("connected-machine ID is required")
+	}
+	return c.do(ctx, http.MethodPost, "/api/connected-machines/"+url.PathEscape(machineID)+"/disconnect", nil, nil)
+}
+
+func (c *Client) DeleteConnectedMachine(ctx context.Context, machineID string) error {
+	if strings.TrimSpace(machineID) == "" {
+		return errors.New("connected-machine ID is required")
+	}
+	return c.do(ctx, http.MethodDelete, "/api/connected-machines/"+url.PathEscape(machineID), nil, nil)
+}
+
 // CLIConnect runs the pre-connect broker: it authorizes, provisions/reconciles
-// agentunnel resources, resumes an idle machine, and returns the papercode
+// route resources, resumes an idle machine, and returns the helper
 // WebSocket terminal descriptor. A not-yet-ready machine returns
 // Connectable=false (HTTP 202); the caller polls ConnectionStatus.
 func (c *Client) CLIConnect(ctx context.Context, projectID string) (ConnectResponse, error) {
@@ -363,6 +569,9 @@ func (c *Client) CLIConnectSession(ctx context.Context, projectID, terminalSessi
 		body = map[string]string{"terminal_session_id": terminalSessionID}
 	}
 	err := c.do(ctx, http.MethodPost, "/api/projects/"+url.PathEscape(projectID)+"/cli-connect", body, &out)
+	if err == nil {
+		err = out.NormalizeConnectionDescriptor()
+	}
 	return out, err
 }
 
@@ -382,6 +591,9 @@ func (c *Client) ConnectConnectedMachineSession(ctx context.Context, machineID, 
 		body = map[string]string{"terminal_session_id": terminalSessionID}
 	}
 	err := c.do(ctx, http.MethodPost, "/api/connected-machines/"+url.PathEscape(machineID)+"/connect", body, &out)
+	if err == nil {
+		err = out.NormalizeConnectionDescriptor()
+	}
 	return out, err
 }
 
@@ -401,6 +613,9 @@ func (c *Client) ConnectedMachineConnectionStatusSession(ctx context.Context, ma
 		path += "?terminal_session_id=" + url.QueryEscape(terminalSessionID)
 	}
 	err := c.do(ctx, http.MethodGet, path, nil, &out)
+	if err == nil {
+		err = out.NormalizeConnectionDescriptor()
+	}
 	return out, err
 }
 
@@ -501,6 +716,9 @@ func (c *Client) ConnectionStatusSession(ctx context.Context, projectID, termina
 		path += "?terminal_session_id=" + url.QueryEscape(terminalSessionID)
 	}
 	err := c.do(ctx, http.MethodGet, path, nil, &out)
+	if err == nil {
+		err = out.NormalizeConnectionDescriptor()
+	}
 	return out, err
 }
 
@@ -557,6 +775,9 @@ func (c *Client) doWithHeaders(ctx context.Context, method, path string, body, o
 		return fmt.Errorf("call %s %s: %w", method, path, err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNoContent {
+		return nil
+	}
 
 	var envelope struct {
 		Data  json.RawMessage `json:"data"`

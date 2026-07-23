@@ -11,7 +11,7 @@ GOFMT       := $(shell GOTOOLCHAIN=local go env GOROOT 2>/dev/null)/bin/gofmt
 GO_FILES    := $(shell find . -path ./.git -prune -o -name '*.go' -print)
 LDFLAGS     := -X github.com/pujan-modha/paperboat-cli/internal/buildinfo.Version=$(VERSION) -X github.com/pujan-modha/paperboat-cli/internal/buildinfo.ProtocolVersion=$(PROTOCOL_VERSION)
 
-.PHONY: build check clean contracts fmt fmt-check generate install lint race release-metadata test tidy uninstall verify-toolchain vet
+.PHONY: build check clean complete contracts cross-build fmt fmt-check generate install lint race release-metadata test tidy uninstall verify-toolchain vet
 
 contracts:
 	@./testdata/contracts/validate.sh
@@ -21,6 +21,11 @@ verify-toolchain:
 
 build:
 	$(GO) build -ldflags "$(LDFLAGS)" -o bin/$(BINARY) $(PKG)
+
+cross-build: verify-toolchain
+	@mkdir -p dist
+	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o dist/$(BINARY)-darwin-arm64 $(PKG)
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o dist/$(BINARY)-linux-amd64 $(PKG)
 
 # Produce reviewable integrity metadata alongside a release binary. Signing,
 # SBOM generation, and publishing are performed by the release pipeline.
@@ -68,6 +73,8 @@ tidy:
 	$(GO) mod tidy
 
 check: verify-toolchain contracts fmt-check vet test build
+
+complete: check race cross-build
 
 clean:
 	rm -rf bin

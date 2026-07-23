@@ -52,7 +52,7 @@ const (
 
 // APIResolver resolves projects against paperboat-server: it matches the
 // requested name/id to one of the user's projects, runs the pre-connect broker
-// (which authorizes, reconciles agentunnel resources, and resumes an idle
+// (which authorizes, reconciles Paperboat routes, and resumes an idle
 // machine), and polls until the tunnel is connectable — then hands the tunnel
 // layer a client-safe papercode WebSocket descriptor.
 type APIResolver struct {
@@ -125,6 +125,7 @@ func (r *APIResolver) Resolve(ctx context.Context, req ConnectRequest) (ConnectI
 			Auth:             mapAuth(resp.Terminal.Auth),
 			ThreadID:         resp.Terminal.ThreadID,
 			TerminalID:       resp.Terminal.TerminalID,
+			SessionID:        resp.Terminal.SessionID,
 			CWD:              resp.Terminal.CWD,
 			ReplayHistory:    true,
 		},
@@ -334,6 +335,9 @@ func (r *APIResolver) findTarget(ctx context.Context, requested string) (target,
 // configured timeout elapses. cli-connect already queued any needed machine
 // resume, so this only waits for readiness; it never re-brokers.
 func (r *APIResolver) waitConnectable(ctx context.Context, target target, terminalSessionID string, resp api.ConnectResponse) (api.ConnectResponse, error) {
+	if err := terminalConnectionError(resp); err != nil {
+		return api.ConnectResponse{}, err
+	}
 	if resp.Connectable {
 		return r.validateDescriptor(resp, target)
 	}
@@ -386,8 +390,19 @@ func (r *APIResolver) waitConnectable(ctx context.Context, target target, termin
 			}
 			return r.validateDescriptor(next, target)
 		}
+		if err := terminalConnectionError(next); err != nil {
+			return api.ConnectResponse{}, err
+		}
 		resp = next
 	}
+}
+
+func terminalConnectionError(resp api.ConnectResponse) error {
+	switch resp.Status {
+	case "connected_machine_revoked":
+		return &api.APIError{Code: resp.Status, Message: "connected machine access was revoked"}
+	}
+	return nil
 }
 
 func (r *APIResolver) validateDescriptor(resp api.ConnectResponse, target target) (api.ConnectResponse, error) {
@@ -414,7 +429,8 @@ func (r *APIResolver) validateDescriptor(resp api.ConnectResponse, target target
 	if !completeTerminalDescriptor(resp.Terminal) {
 		return api.ConnectResponse{}, errors.New("server returned an incomplete terminal descriptor")
 	}
-	if !supportedTerminalKind(resp.Terminal.Kind) || len(r.cfg.Connect.AcceptedTerminalKinds) == 0 || !hasScope(r.cfg.Connect.AcceptedTerminalKinds, resp.Terminal.Kind) || resp.Environment == nil || strings.TrimSpace(resp.Environment.EnvironmentID) == "" || !environmentMatchesTarget(resp.Environment, target) {
+	kindAccepted := resp.Terminal.Kind == "paperboat_terminal_v1" || (len(r.cfg.Connect.AcceptedTerminalKinds) > 0 && hasScope(r.cfg.Connect.AcceptedTerminalKinds, resp.Terminal.Kind))
+	if !supportedTerminalKind(resp.Terminal.Kind) || !kindAccepted || resp.Environment == nil || strings.TrimSpace(resp.Environment.EnvironmentID) == "" || !environmentMatchesTarget(resp.Environment, target) {
 		return api.ConnectResponse{}, errors.New("server returned an invalid environment descriptor")
 	}
 	if strings.TrimSpace(resp.Environment.ProjectRoot) == "" || strings.TrimSpace(resp.Terminal.ThreadID) == "" || strings.TrimSpace(resp.Terminal.TerminalID) == "" || strings.TrimSpace(resp.Terminal.CWD) == "" {
@@ -435,7 +451,8 @@ func (r *APIResolver) validateDescriptor(resp api.ConnectResponse, target target
 			return api.ConnectResponse{}, errors.New("terminal descriptor host is not allowed by local policy")
 		}
 	}
-	if resp.Terminal.Auth.Method != "websocket_ticket" || !exactScopes(resp.Terminal.Auth.Scopes, "terminal:operate") {
+	validTerminalAuth := resp.Terminal.Auth.Method == "websocket_ticket" && resp.Terminal.Auth.Ticket != "" || resp.Terminal.Auth.Method == "bearer" && resp.Terminal.Auth.Token != ""
+	if !validTerminalAuth || !exactScopes(resp.Terminal.Auth.Scopes, "terminal:operate") {
 		return api.ConnectResponse{}, errors.New("terminal descriptor has invalid scope or auth")
 	}
 	if resp.Terminal.Auth.ExpiresAt.IsZero() || !time.Now().Before(resp.Terminal.Auth.ExpiresAt) || resp.Terminal.Auth.ExpiresAt.After(resp.ExpiresAt) {
@@ -468,10 +485,12 @@ func targetState(target target, resp api.ConnectResponse) string {
 	return target.state
 }
 
-func supportedTerminalKind(kind string) bool { return kind == "papercode_websocket" }
+func supportedTerminalKind(kind string) bool {
+	return kind == "paperboat_terminal_v1" || kind == "papercode_websocket"
+}
 
 func (r *APIResolver) validateUpload(up *api.Upload, terminalURL *url.URL, descriptorExpiry time.Time) error {
-	if up == nil || up.Kind != "papercode_staged_image" || up.Path == "" || up.MaxBytes <= 0 || up.RetentionSeconds <= 0 {
+	if up == nil || (up.Kind != "paperboat_staged_image_v1" && up.Kind != "papercode_staged_image") || up.Path == "" || up.MaxBytes <= 0 || up.RetentionSeconds <= 0 {
 		return errors.New("server returned an incomplete upload descriptor")
 	}
 	u, err := secureEndpoint(up.HTTPBaseURL, "https")

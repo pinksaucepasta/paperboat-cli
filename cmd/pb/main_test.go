@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -22,6 +23,20 @@ import (
 	"github.com/pujan-modha/paperboat-cli/internal/telemetry"
 	"github.com/pujan-modha/paperboat-cli/internal/upload"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
+func writeAPIData(t *testing.T, writer http.ResponseWriter, data any) {
+	t.Helper()
+	writer.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(writer).Encode(map[string]any{"data": data}); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestConnectTelemetryFailsOpenWithWarning(t *testing.T) {
 	blockedParent := filepath.Join(t.TempDir(), "not-a-directory")
@@ -398,26 +413,253 @@ func TestHelpCommandDoesNotCallBackend(t *testing.T) {
 	}
 }
 
-func TestRootWithoutArgumentsShowsHelp(t *testing.T) {
+func TestCanonicalPhaseSixCommandsAreDiscoverable(t *testing.T) {
+	root := newRootCommand()
+	for _, path := range [][]string{{"login"}, {"logout"}, {"create"}, {"session", "attach"}, {"session", "list"}, {"machine", "add"}, {"machine", "list"}, {"machine", "revoke"}, {"preview", "list"}, {"preview", "revoke"}} {
+		command, remaining, err := root.Find(path)
+		if err != nil || len(remaining) != 0 || command == root {
+			t.Fatalf("command %q not discoverable: command=%v remaining=%q err=%v", path, command, remaining, err)
+		}
+	}
+}
+
+func TestPromptChoiceRejectsOutOfRangeAndSelectsStableIndex(t *testing.T) {
+	if _, err := promptChoice(bufio.NewReader(strings.NewReader("0\n")), "Region", 2, func(index int) string { return []string{"iad", "lhr"}[index] }); err == nil {
+		t.Fatal("out-of-range selection was accepted")
+	}
+	got, err := promptChoice(bufio.NewReader(strings.NewReader("2\n")), "Region", 2, func(index int) string { return []string{"iad", "lhr"}[index] })
+	if err != nil || got != 1 {
+		t.Fatalf("selection=%d err=%v", got, err)
+	}
+}
+
+func TestCreateCatalogFiltersUnavailableOptions(t *testing.T) {
+	if got := activeMachineCodes([]api.CatalogMachineType{{Code: "off"}, {Code: "on", Active: true}}); len(got) != 1 || got[0] != "on" {
+		t.Fatalf("machine codes=%v", got)
+	}
+	if got := enabledRegionCodes([]api.CatalogRegion{{Code: "off"}, {Code: "on", Enabled: true}}); len(got) != 1 || got[0] != "on" {
+		t.Fatalf("region codes=%v", got)
+	}
+	if got := activeIdleTimeoutCodes([]api.CatalogIdleTimeout{{Code: "off"}, {Code: "on", Active: true}}); len(got) != 1 || got[0] != "on" {
+		t.Fatalf("idle codes=%v", got)
+	}
+}
+
+func TestMachineRevokeRequiresConfirmationBeforeBackend(t *testing.T) {
+	root := newRootCommand()
+	root.SetArgs([]string{"machine", "revoke", "cm_1"})
+	err := root.Execute()
+	if err == nil || !strings.Contains(err.Error(), "requires --yes") {
+		t.Fatalf("err=%v, want confirmation error", err)
+	}
+}
+
+func TestPreviewRevokeDisplaysResolvedContextBeforeConfirmation(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	var requests []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		if r.Method != http.MethodGet {
+			t.Fatalf("unexpected mutation before confirmation: %s %s", r.Method, r.URL.Path)
+		}
+		writeAPIData(t, w, []map[string]any{{"id": "prv_1", "environment_id": "env_1", "project_id": "prj_1", "machine_id": "cm_1", "user_id": "usr_1", "logical_name": "web", "environment_name": "studio", "environment_kind": "byod", "owner_email": "owner@example.test", "url": "https://preview.example.test", "state": "ready", "target_port": 3000}})
+	}))
+	defer srv.Close()
+	writeTestProfile(t, dir, configPath, srv.URL)
+	var stderr bytes.Buffer
+	code := run(context.Background(), []string{"--config", configPath, "preview", "revoke", "prv_1"}, &bytes.Buffer{}, &stderr)
+	if code != 1 || !strings.Contains(stderr.String(), "Preview: web (studio, byod)") || !strings.Contains(stderr.String(), "Project: prj_1  Machine: cm_1  User: usr_1") || len(requests) != 1 {
+		t.Fatalf("code=%d stderr=%q requests=%v", code, stderr.String(), requests)
+	}
+}
+
+func TestSessionCloseRequiresConfirmationBeforeBackend(t *testing.T) {
+	root := newRootCommand()
+	root.SetArgs([]string{"session", "close", "cm_1", "shell-2"})
+	err := root.Execute()
+	if err == nil || !strings.Contains(err.Error(), "requires --yes") {
+		t.Fatalf("err=%v, want confirmation error", err)
+	}
+}
+
+func TestSessionListAcceptsDefaultEnvironment(t *testing.T) {
+	root := newRootCommand()
+	command, remaining, err := root.Find([]string{"session", "list"})
+	if err != nil || command == root || len(remaining) != 0 {
+		t.Fatalf("session list lookup command=%v remaining=%q err=%v", command, remaining, err)
+	}
+	if err := command.Args(command, nil); err != nil {
+		t.Fatalf("session list rejected omitted environment: %v", err)
+	}
+}
+
+func TestResolveMachineTargetRejectsAmbiguousNames(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeAPIData(t, w, map[string]any{"items": []map[string]any{
+			{"id": "cm_1", "display_name": "Studio"}, {"id": "cm_2", "display_name": "studio"},
+		}, "pagination": map[string]any{"next_offset": nil}})
+	}))
+	defer srv.Close()
+	_, _, err := resolveMachineTarget(context.Background(), api.New(srv.URL, config.Credential{AccessToken: "token"}, srv.Client()), "studio")
+	if err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("err=%v, want ambiguity", err)
+	}
+}
+
+func TestConfigCommandsAreDiscoverableAndUnassignRequiresConfirmation(t *testing.T) {
+	root := newRootCommand()
+	for _, path := range []string{"config assign", "config unassign", "config show", "config path"} {
+		command, _, err := root.Find(strings.Fields(path))
+		if err != nil || command.CommandPath() != "pb "+path {
+			t.Fatalf("find %q command=%v err=%v", path, command, err)
+		}
+	}
+	root.SetArgs([]string{"config", "unassign", "prj_1"})
+	err := root.ExecuteContext(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "requires --yes") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestConfigAssignHostedJSONContract(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	var assigned bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer token" {
+			t.Fatalf("authorization=%q", r.Header.Get("Authorization"))
+		}
+		switch r.Method + " " + r.URL.Path {
+		case "GET /api/projects":
+			writeAPIData(t, w, map[string]any{"items": []map[string]any{{"id": "prj_1", "name": "demo", "state": "ready"}}, "pagination": map[string]any{"next_offset": nil}})
+		case "GET /api/config-repositories":
+			writeAPIData(t, w, map[string]any{"items": []map[string]any{{"id": "cfgrepo_1", "provider": "github", "external_ref": "acme/config", "display_name": "Shared"}}})
+		case "GET /api/environments/prj_1/config-assignment":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"code": "not_found_or_forbidden", "message": "not found"}})
+		case "PUT /api/environments/prj_1/config-assignment":
+			assigned = true
+			writeAPIData(t, w, map[string]any{"id": "cfgasn_1", "environment_id": "prj_1", "repository_id": "cfgrepo_1", "consent_state": "not_required", "version": 1})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	writeTestProfile(t, dir, configPath, srv.URL)
+	var output bytes.Buffer
+	if code := run(context.Background(), []string{"--config", configPath, "config", "assign", "Shared", "demo", "--json"}, &output, &output); code != 0 {
+		t.Fatalf("exit=%d output=%q", code, output.String())
+	}
+	if !assigned {
+		t.Fatal("assignment endpoint was not called")
+	}
+	var got struct {
+		Version    string               `json:"version"`
+		Outcome    string               `json:"outcome"`
+		Assignment api.ConfigAssignment `json:"assignment"`
+	}
+	if err := json.Unmarshal(output.Bytes(), &got); err != nil || got.Version != "1" || got.Outcome != "confirmed" || got.Assignment.EnvironmentID != "prj_1" {
+		t.Fatalf("output=%q decoded=%+v err=%v", output.String(), got, err)
+	}
+}
+
+func TestMachineRevokeJSONOutputContract(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	var disconnected bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer token" {
+			t.Fatalf("authorization=%q", r.Header.Get("Authorization"))
+		}
+		switch r.Method + " " + r.URL.Path {
+		case "GET /api/connected-machines":
+			writeAPIData(t, w, map[string]any{"items": []map[string]any{{"id": "cm_1", "display_name": "Studio"}}, "pagination": map[string]any{"next_offset": nil}})
+		case "POST /api/connected-machines/cm_1/disconnect":
+			disconnected = true
+			writeAPIData(t, w, map[string]bool{"ok": true})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	writeTestProfile(t, dir, configPath, srv.URL)
+	var output bytes.Buffer
+	if code := run(context.Background(), []string{"--config", configPath, "machine", "revoke", "Studio", "--yes", "--json"}, &output, &output); code != 0 {
+		t.Fatalf("exit code=%d output=%q", code, output.String())
+	}
+	if !disconnected {
+		t.Fatal("disconnect endpoint was not called")
+	}
+	var got struct {
+		Version string `json:"version"`
+		Machine struct {
+			ID          string `json:"id"`
+			DisplayName string `json:"display_name"`
+			State       string `json:"state"`
+		} `json:"machine"`
+		Outcome string `json:"outcome"`
+		Retry   string `json:"retry"`
+	}
+	if err := json.Unmarshal(output.Bytes(), &got); err != nil {
+		t.Fatalf("decode output %q: %v", output.String(), err)
+	}
+	if got.Version != "1" || got.Machine.ID != "cm_1" || got.Machine.DisplayName != "Studio" || got.Machine.State != "disconnected" || got.Outcome != "confirmed" || got.Retry != "not_required" {
+		t.Fatalf("output=%s", output.String())
+	}
+}
+
+func TestDefaultEnvironmentUsesStableRememberedIDWithoutListing(t *testing.T) {
+	client := api.New("https://api.paperboat.test", config.Credential{AccessToken: "token"}, &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		t.Fatal("remembered target should not list environments")
+		return nil, nil
+	})})
+	got, err := defaultEnvironment(context.Background(), client, "cm_1")
+	if err != nil || got != "cm_1" {
+		t.Fatalf("target=%q err=%v", got, err)
+	}
+}
+
+func TestDefaultEnvironmentSelectsOnlyAvailableTarget(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/projects":
+			writeAPIData(t, w, map[string]any{"items": []any{}, "pagination": map[string]any{"limit": 200, "offset": 0, "total": 0}})
+		case "/api/connected-machines":
+			writeAPIData(t, w, map[string]any{"items": []map[string]any{{"id": "cm_1", "display_name": "Studio"}}, "pagination": map[string]any{"limit": 200, "offset": 0, "total": 1}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	got, err := defaultEnvironment(context.Background(), api.New(server.URL, config.Credential{AccessToken: "token"}, server.Client()), "")
+	if err != nil || got != "cm_1" {
+		t.Fatalf("target=%q err=%v", got, err)
+	}
+}
+
+func TestRootWithoutArgumentsAttemptsPrimaryWorkflow(t *testing.T) {
 	var output bytes.Buffer
 	app := newApp()
 	app.Writer = &output
 	app.ErrWriter = &output
-	if err := app.Run([]string{"pb"}); err != nil {
-		t.Fatal(err)
+	err := app.Run([]string{"pb", "--config", filepath.Join(t.TempDir(), "config.json")})
+	if err == nil {
+		t.Fatal("expected an actionable setup error")
 	}
-	if !strings.Contains(output.String(), "Usage:") {
-		t.Fatalf("root output = %q", output.String())
+	if strings.Contains(output.String(), "Usage:") {
+		t.Fatalf("root stopped at generic help: %q", output.String())
 	}
 }
 
-func TestCobraRootWithoutArgumentsShowsHelp(t *testing.T) {
+func TestCobraRootWithoutArgumentsAttemptsPrimaryWorkflow(t *testing.T) {
 	var output bytes.Buffer
-	if code := run(context.Background(), nil, &output, &output); code != 0 {
+	if code := run(context.Background(), []string{"--config", filepath.Join(t.TempDir(), "config.json")}, &output, &output); code != 1 {
 		t.Fatalf("exit code = %d", code)
 	}
-	if !strings.Contains(output.String(), "Usage:") {
-		t.Fatalf("help output = %q", output.String())
+	if strings.Contains(output.String(), "Usage:") {
+		t.Fatalf("root stopped at generic help: %q", output.String())
 	}
 }
 
@@ -505,24 +747,6 @@ func TestDoctorReturnsFailureWhenBackendIsUnconfigured(t *testing.T) {
 	}
 }
 
-func TestWarnPlaintextCredentialStorage(t *testing.T) {
-	var output bytes.Buffer
-	cfg := &config.Config{}
-	cfg.Auth.AllowFileFallback = true
-	warnPlaintextCredentialStorage(cfg, &output)
-	got := output.String()
-	if !strings.Contains(got, "WARNING:") || !strings.Contains(got, "plaintext") || !strings.Contains(got, "0600") {
-		t.Fatalf("warning = %q", got)
-	}
-
-	output.Reset()
-	cfg.Auth.AllowFileFallback = false
-	warnPlaintextCredentialStorage(cfg, &output)
-	if output.Len() != 0 {
-		t.Fatalf("unexpected secure-store warning = %q", output.String())
-	}
-}
-
 func TestCobraAcceptsPersistentFlagsAfterNestedCommand(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	var output bytes.Buffer
@@ -567,6 +791,31 @@ func TestBareServerFlagPersistsNormalizedServer(t *testing.T) {
 	}
 	if cfg.ServerURL != "https://api.example.com" {
 		t.Fatalf("server URL = %q", cfg.ServerURL)
+	}
+}
+
+func TestFileCredentialFallbackPersistsSelection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := fileCredentialFallback(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Auth.AllowFileFallback {
+		t.Fatal("file credential fallback was not enabled")
+	}
+	if _, ok := store.Secrets.(config.FileSecretStore); !ok {
+		t.Fatalf("secret store = %T, want config.FileSecretStore", store.Secrets)
+	}
+	loaded, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !loaded.Auth.AllowFileFallback {
+		t.Fatal("file credential fallback consent was not persisted")
 	}
 }
 

@@ -10,7 +10,7 @@ retry.
 - A rejected access token requires `pb auth login`; there is no local-shell fallback.
 - Upload failures are fail-open only for the affected paste. Image bytes and paths are never logged.
 - For a stolen device, revoke its client session in the dashboard, then run `pb auth logout`.
-- During outages, use `pb doctor`; never bypass agentunnel or attach over SSH.
+- During outages, use `pb doctor`; never bypass `paperboat-tunnel` or attach over SSH.
 
 Production connection metrics are written as validated JSONL to
 `observability.event_log_path`, or `telemetry.jsonl` beside the CLI config by

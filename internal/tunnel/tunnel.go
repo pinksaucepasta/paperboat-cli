@@ -1,5 +1,5 @@
 // Package tunnel abstracts reaching a project VM's terminal. In production the
-// connection is carried through agentunnel (never a raw exposed port); the
+// connection is carried through `paperboat-tunnel` (never a raw exposed port); the
 // Tunnel/Conn interfaces keep the production transport testable through injected doubles.
 package tunnel
 

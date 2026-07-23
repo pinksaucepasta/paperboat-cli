@@ -75,6 +75,7 @@ type Bar struct {
 	ansiState      byte
 	appCursorSaved bool
 	appInverse     bool
+	synchronized   bool
 	isTerminal     func(int) bool
 	getSize        func(int) (int, int, error)
 }
@@ -396,8 +397,18 @@ func (b *Bar) consumeANSI(data []byte) {
 		}
 		b.trackRemoteCursorSave(data[:n])
 		b.trackRemoteSGR(data[:n])
+		b.trackSynchronizedOutput(data[:n])
 		b.ansiState = state
 		data = data[n:]
+	}
+}
+
+func (b *Bar) trackSynchronizedOutput(sequence []byte) {
+	switch string(sequence) {
+	case "\x1b[?2026h":
+		b.synchronized = true
+	case "\x1b[?2026l":
+		b.synchronized = false
 	}
 }
 
@@ -458,7 +469,7 @@ func (b *Bar) drawLocked() {
 		return
 	}
 	b.refreshViewportLocked()
-	if !b.enabled || b.ansiState != byte(parser.GroundState) || b.appCursorSaved {
+	if !b.enabled || b.ansiState != byte(parser.GroundState) || b.appCursorSaved || b.synchronized {
 		return
 	}
 	w, h, err := b.getSize(b.outputFD)

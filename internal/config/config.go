@@ -54,6 +54,10 @@ const (
 type Config struct {
 	// ServerURL is the paperboat-server base URL. It is required for production commands.
 	ServerURL string `json:"server_url,omitempty"`
+	// LastEnvironmentID is the last successfully connected stable project or
+	// BYOD machine ID. Names are never persisted because they may become
+	// ambiguous or change ownership.
+	LastEnvironmentID string `json:"last_environment_id,omitempty"`
 	// PapercodeConfigPath is retained only to detect the obsolete auth setup.
 	PapercodeConfigPath string     `json:"papercode_config_path,omitempty"`
 	Auth                AuthConfig `json:"auth,omitempty"`
@@ -100,7 +104,8 @@ type ObservabilityConfig struct {
 }
 
 type AuthConfig struct {
-	// AllowFileFallback opts into plaintext 0600 token files for headless systems.
+	// AllowFileFallback records use of owner-only 0600 token files when the OS
+	// credential service is unavailable, as is common on headless Linux.
 	AllowFileFallback bool `json:"allow_file_fallback,omitempty"`
 	// ProfileDir overrides the shared profile directory (primarily for managed/headless installs).
 	ProfileDir string `json:"profile_dir,omitempty"`

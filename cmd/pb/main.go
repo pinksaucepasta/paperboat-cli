@@ -6,6 +6,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -29,8 +30,8 @@ import (
 
 	"github.com/pujan-modha/paperboat-cli/internal/api"
 	sessionauth "github.com/pujan-modha/paperboat-cli/internal/auth"
+	"github.com/pujan-modha/paperboat-cli/internal/command"
 	"github.com/pujan-modha/paperboat-cli/internal/config"
-	cli "github.com/pujan-modha/paperboat-cli/internal/legacycli"
 	"github.com/pujan-modha/paperboat-cli/internal/paste"
 	"github.com/pujan-modha/paperboat-cli/internal/resolver"
 	"github.com/pujan-modha/paperboat-cli/internal/session"
@@ -115,11 +116,7 @@ func newRootCommand() *cobra.Command {
 			if err := validateConnectInvocation(command); err != nil {
 				return err
 			}
-			server, _ := command.Flags().GetString("server")
-			if len(args) == 0 && strings.TrimSpace(server) == "" {
-				return command.Help()
-			}
-			return actionConnect(legacyContext(command, args))
+			return actionConnect(actionContext(command, args))
 		},
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -133,31 +130,37 @@ func newRootCommand() *cobra.Command {
 		if err := validateConnectInvocation(command); err != nil {
 			return err
 		}
-		return actionConnect(legacyContext(command, args))
+		return actionConnect(actionContext(command, args))
 	}}
 	addConnectFlags(connect)
 	root.AddCommand(connect)
 
-	projects := &cobra.Command{Use: "projects", Short: "List projects available to this account", Args: commandArgs(cobra.NoArgs), RunE: legacyRun(projectsCommand().Action)}
+	projects := &cobra.Command{Use: "projects", Short: "List projects available to this account", Args: commandArgs(cobra.NoArgs), RunE: actionRun(projectsCommand().Action)}
 	projects.Flags().Bool("json", false, "print JSON")
 	root.AddCommand(projects)
 
-	environments := &cobra.Command{Use: "environments", Short: "List hosted projects and connected machines", Args: commandArgs(cobra.NoArgs), RunE: legacyRun(environmentsCommand().Action)}
+	environments := &cobra.Command{Use: "environments", Short: "List hosted projects and connected machines", Args: commandArgs(cobra.NoArgs), RunE: actionRun(environmentsCommand().Action)}
 	environments.Flags().Bool("json", false, "print JSON")
 	root.AddCommand(environments)
 
-	keepAlive := &cobra.Command{Use: "keep-alive <project>", Args: commandArgs(cobra.ExactArgs(1)), RunE: legacyRun(keepAliveCommand().Action)}
+	keepAlive := &cobra.Command{Use: "keep-alive <project>", Args: commandArgs(cobra.ExactArgs(1)), RunE: actionRun(keepAliveCommand().Action)}
 	keepAlive.Flags().Float64("hours", 0, "duration in hours")
 	keepAlive.Flags().Bool("clear", false, "clear keep-alive")
 	root.AddCommand(keepAlive)
 
-	doctor := &cobra.Command{Use: "doctor [project]", Short: "Check authentication and connectivity", Args: commandArgs(cobra.MaximumNArgs(1)), RunE: legacyRun(doctorCommand().Action)}
+	doctor := &cobra.Command{Use: "doctor [project]", Short: "Check authentication and connectivity", Args: commandArgs(cobra.MaximumNArgs(1)), RunE: actionRun(doctorCommand().Action)}
 	doctor.Flags().Bool("json", false, "print JSON")
 	root.AddCommand(doctor)
 
-	root.AddCommand(legacyTree(authCommand(), "auth"))
-	root.AddCommand(legacyTree(configCommand(), "config"))
+	root.AddCommand(specTree(authCommand(), "auth"))
+	root.AddCommand(&cobra.Command{Use: "login", Short: "Sign in through the Paperboat dashboard", Args: commandArgs(cobra.NoArgs), RunE: actionRun(authLogin)})
+	root.AddCommand(&cobra.Command{Use: "logout", Short: "Revoke and remove the active client session", Args: commandArgs(cobra.NoArgs), RunE: actionRun(authLogout)})
+	root.AddCommand(&cobra.Command{Use: "create [name]", Short: "Create and attach to a hosted project", Args: commandArgs(cobra.MaximumNArgs(1)), RunE: actionRun(createProject)})
+	root.AddCommand(specTree(configCommand(), "config"))
+	root.AddCommand(specTree(previewCommand(), "preview"))
 	root.AddCommand(sessionsCobraCommand())
+	root.AddCommand(sessionCobraCommand())
+	root.AddCommand(machineCobraCommand())
 	return root
 }
 
@@ -186,30 +189,61 @@ func validateConnectInvocation(command *cobra.Command) error {
 	return nil
 }
 
-func legacyTree(source *cli.Command, use string) *cobra.Command {
+func specTree(source *command.Spec, use string) *cobra.Command {
 	command := &cobra.Command{Use: use, Short: source.Usage, Args: commandArgs(cobra.NoArgs)}
 	if source.Action != nil {
-		command.RunE = legacyRun(source.Action)
+		command.RunE = actionRun(source.Action)
 	} else {
 		command.RunE = func(command *cobra.Command, _ []string) error { return command.Help() }
 	}
 	for _, child := range source.Subcommands {
 		child := child
-		entry := &cobra.Command{Use: child.Name, Short: child.Usage, Args: commandArgs(legacyCommandArgs(use, child.Name)), RunE: legacyRun(child.Action)}
+		entry := &cobra.Command{Use: child.Name, Short: child.Usage, Args: commandArgs(specCommandArgs(use, child.Name)), RunE: actionRun(child.Action)}
 		if (use == "auth" && child.Name == "status") || (use == "config" && child.Name == "show") {
 			entry.Flags().Bool("json", false, "print JSON")
+		}
+		if use == "config" && (child.Name == "assign" || child.Name == "unassign") {
+			entry.Flags().Bool("json", false, "print JSON")
+		}
+		if use == "config" && child.Name == "unassign" {
+			entry.Flags().Bool("yes", false, "confirm removal")
+		}
+		if use == "preview" {
+			if child.Name == "list" {
+				entry.Flags().Bool("json", false, "print JSON")
+			}
+			if child.Name == "create" {
+				entry.Flags().Bool("yes", false, "acknowledge public access")
+				entry.Flags().Bool("json", false, "print JSON")
+			}
+			if child.Name == "revoke" {
+				entry.Flags().Bool("yes", false, "confirm removal")
+				entry.Flags().Bool("json", false, "print JSON")
+			}
 		}
 		command.AddCommand(entry)
 	}
 	return command
 }
 
-func legacyCommandArgs(parent, name string) cobra.PositionalArgs {
+func specCommandArgs(parent, name string) cobra.PositionalArgs {
 	if parent == "config" {
 		switch name {
 		case "set":
 			return cobra.ExactArgs(2)
 		case "unset":
+			return cobra.ExactArgs(1)
+		case "assign":
+			return cobra.ExactArgs(2)
+		case "unassign":
+			return cobra.ExactArgs(1)
+		}
+	}
+	if parent == "preview" {
+		switch name {
+		case "list":
+			return cobra.NoArgs
+		case "revoke":
 			return cobra.ExactArgs(1)
 		}
 	}
@@ -218,7 +252,7 @@ func legacyCommandArgs(parent, name string) cobra.PositionalArgs {
 
 func sessionsCobraCommand() *cobra.Command {
 	source := sessionsCommand()
-	command := &cobra.Command{Use: "sessions <environment>", Args: commandArgs(cobra.ExactArgs(1)), RunE: legacyRun(source.Action)}
+	command := &cobra.Command{Use: "sessions [environment]", Args: commandArgs(cobra.MaximumNArgs(1)), RunE: actionRun(source.Action)}
 	command.Flags().Bool("wide", false, "include immutable IDs")
 	command.Flags().Bool("json", false, "print JSON")
 	for _, child := range source.Subcommands {
@@ -230,50 +264,182 @@ func sessionsCobraCommand() *cobra.Command {
 		case "close", "delete":
 			args = cobra.ExactArgs(2)
 		}
-		entry := &cobra.Command{Use: child.Name, Short: child.Usage, Args: commandArgs(args), RunE: legacyRun(child.Action)}
-		if child.Name == "delete" {
-			entry.Flags().Bool("yes", false, "confirm deletion")
+		entry := &cobra.Command{Use: child.Name, Short: child.Usage, Args: commandArgs(args), RunE: actionRun(child.Action)}
+		if child.Name == "close" || child.Name == "delete" {
+			entry.Flags().Bool("yes", false, "confirm "+child.Name)
 		}
 		command.AddCommand(entry)
 	}
 	return command
 }
 
-func legacyRun(action cli.ActionFunc) func(*cobra.Command, []string) error {
-	return func(command *cobra.Command, args []string) error { return action(legacyContext(command, args)) }
+func sessionCobraCommand() *cobra.Command {
+	source := sessionsCommand()
+	command := &cobra.Command{Use: "session", Short: source.Usage, Args: commandArgs(cobra.NoArgs), RunE: func(command *cobra.Command, _ []string) error { return command.Help() }}
+	attach := &cobra.Command{Use: "attach <name>", Short: "Attach to a durable terminal session", Args: commandArgs(cobra.ExactArgs(1)), RunE: func(cobraCommand *cobra.Command, args []string) error {
+		if err := cobraCommand.Flags().Set("session", args[0]); err != nil {
+			return err
+		}
+		return actionConnect(actionContext(cobraCommand, nil))
+	}}
+	attach.Flags().String("session", "", "")
+	_ = attach.Flags().MarkHidden("session")
+	command.AddCommand(attach)
+	list := &cobra.Command{Use: "list [environment]", Short: "List durable terminal sessions", Args: commandArgs(cobra.MaximumNArgs(1)), RunE: actionRun(source.Action)}
+	list.Flags().Bool("wide", false, "include immutable IDs")
+	list.Flags().Bool("json", false, "print JSON")
+	command.AddCommand(list)
+	for _, child := range source.Subcommands {
+		child := child
+		var args cobra.PositionalArgs
+		switch child.Name {
+		case "rename":
+			args = cobra.ExactArgs(3)
+		case "close", "delete":
+			args = cobra.ExactArgs(2)
+		}
+		entry := &cobra.Command{Use: child.Name, Short: child.Usage, Args: commandArgs(args), RunE: actionRun(child.Action)}
+		if child.Name == "close" || child.Name == "delete" {
+			entry.Flags().Bool("yes", false, "confirm "+child.Name)
+		}
+		command.AddCommand(entry)
+	}
+	return command
 }
 
-func legacyContext(command *cobra.Command, args []string) *cli.Context {
+func machineCobraCommand() *cobra.Command {
+	machine := &cobra.Command{Use: "machine", Short: "Manage BYOD machines", Args: commandArgs(cobra.NoArgs), RunE: func(command *cobra.Command, _ []string) error { return command.Help() }}
+	add := &cobra.Command{Use: "add", Short: "Start BYOD enrollment in the dashboard", Args: commandArgs(cobra.NoArgs), RunE: func(command *cobra.Command, args []string) error {
+		ctx := actionContext(command, args)
+		cfg, err := config.Load(ctx.String("config"))
+		if err != nil {
+			return err
+		}
+		if server := strings.TrimSpace(ctx.String("server")); server != "" {
+			cfg.ServerURL, err = config.NormalizeServerURL(server)
+			if err != nil {
+				return err
+			}
+		}
+		if strings.TrimSpace(cfg.ServerURL) == "" {
+			return errors.New("Paperboat server is not configured; set server_url or use --server")
+		}
+		target := strings.TrimRight(cfg.ServerURL, "/") + "/dashboard/connected-machines"
+		if err := openBrowser(target); err != nil {
+			fmt.Fprintf(command.ErrOrStderr(), "Could not open a browser: %v\n", err)
+		}
+		fmt.Fprintf(command.OutOrStdout(), "Continue BYOD enrollment at %s\n", target)
+		return nil
+	}}
+	list := &cobra.Command{Use: "list", Short: "List enrolled BYOD machines", Args: commandArgs(cobra.NoArgs), RunE: func(command *cobra.Command, args []string) error {
+		ctx := actionContext(command, args)
+		client, err := backendClient(ctx)
+		if err != nil {
+			return err
+		}
+		machines, err := client.ListConnectedMachines(ctx.Context)
+		if err != nil {
+			return friendlyCommandError(err)
+		}
+		jsonOutput, _ := command.Flags().GetBool("json")
+		if jsonOutput {
+			return json.NewEncoder(command.OutOrStdout()).Encode(map[string]any{"version": "1", "machines": machines})
+		}
+		writer := tabwriter.NewWriter(command.OutOrStdout(), 0, 4, 2, ' ', 0)
+		fmt.Fprintln(writer, "NAME\tKIND\tSTATE\tID")
+		for _, item := range machines {
+			state := item.State
+			if item.Online {
+				state = "online"
+			}
+			fmt.Fprintf(writer, "%s\tBYOD\t%s\t%s\n", item.DisplayName, state, item.ID)
+		}
+		return writer.Flush()
+	}}
+	list.Flags().Bool("json", false, "print JSON")
+	revoke := &cobra.Command{Use: "revoke <machine>", Short: "Disconnect and revoke a BYOD machine", Args: commandArgs(cobra.ExactArgs(1)), RunE: func(cobraCommand *cobra.Command, args []string) error {
+		if confirmed, _ := cobraCommand.Flags().GetBool("yes"); !confirmed {
+			return errors.New("machine revocation requires --yes")
+		}
+		ctx := actionContext(cobraCommand, args)
+		client, err := backendClient(ctx)
+		if err != nil {
+			return err
+		}
+		machineID, displayName, err := resolveMachineTarget(ctx.Context, client, args[0])
+		if err != nil {
+			return err
+		}
+		if err := client.DisconnectConnectedMachine(ctx.Context, machineID); err != nil {
+			return friendlyCommandError(err)
+		}
+		jsonOutput, _ := cobraCommand.Flags().GetBool("json")
+		if jsonOutput {
+			return json.NewEncoder(cobraCommand.OutOrStdout()).Encode(map[string]any{"version": "1", "machine": map[string]string{"id": machineID, "display_name": displayName, "state": "disconnected"}, "outcome": "confirmed", "retry": "not_required"})
+		}
+		fmt.Fprintf(cobraCommand.OutOrStdout(), "Disconnected BYOD machine %s (%s).\n", displayName, machineID)
+		return nil
+	}}
+	revoke.Flags().Bool("yes", false, "confirm revocation")
+	revoke.Flags().Bool("json", false, "print JSON")
+	machine.AddCommand(add, list, revoke)
+	return machine
+}
+
+func resolveMachineTarget(ctx context.Context, client *api.Client, requested string) (string, string, error) {
+	machines, err := client.ListConnectedMachines(ctx)
+	if err != nil {
+		return "", "", friendlyCommandError(err)
+	}
+	for _, machine := range machines {
+		if machine.ID == requested {
+			return machine.ID, machine.DisplayName, nil
+		}
+	}
+	matches := make([]api.ConnectedMachine, 0, 1)
+	for _, machine := range machines {
+		if strings.EqualFold(machine.DisplayName, requested) {
+			matches = append(matches, machine)
+		}
+	}
+	if len(matches) == 1 {
+		return matches[0].ID, matches[0].DisplayName, nil
+	}
+	if len(matches) > 1 {
+		return "", "", fmt.Errorf("machine name %q is ambiguous; use a stable machine ID", requested)
+	}
+	return "", "", fmt.Errorf("machine %q was not found", requested)
+}
+
+func actionRun(action command.Action) func(*cobra.Command, []string) error {
+	return func(command *cobra.Command, args []string) error { return action(actionContext(command, args)) }
+}
+
+func actionContext(cobraCommand *cobra.Command, args []string) *command.Context {
 	set := flag.NewFlagSet("pb", flag.ContinueOnError)
 	values := map[string]string{}
 	for _, name := range []string{"config", "server", "name", "session"} {
-		value, _ := command.Flags().GetString(name)
+		value, _ := cobraCommand.Flags().GetString(name)
 		values[name] = value
 		set.String(name, value, "")
 	}
-	hours, _ := command.Flags().GetFloat64("hours")
+	hours, _ := cobraCommand.Flags().GetFloat64("hours")
 	set.Float64("hours", hours, "")
 	for _, name := range []string{"new", "json", "wide", "yes", "clear"} {
-		value, _ := command.Flags().GetBool(name)
+		value, _ := cobraCommand.Flags().GetBool(name)
 		values[name] = strconv.FormatBool(value)
 		set.Bool(name, value, "")
 	}
 	_ = set.Parse(args)
-	context := cli.NewContext(newApp(), set, nil)
-	context.Context = command.Context()
+	context := command.NewContext(set)
+	context.Context = cobraCommand.Context()
+	context.Writer = cobraCommand.OutOrStdout()
+	context.ErrWriter = cobraCommand.ErrOrStderr()
 	return context
 }
 
-func newApp() *cli.App {
-	rootFlags := []cli.Flag{
-		&cli.StringFlag{Name: "config", Usage: "path to the CLI config file"},
-		&cli.StringFlag{Name: "server", Usage: "paperboat-server base URL override"},
-		&cli.BoolFlag{Name: "new", Usage: "create a new terminal session"},
-		&cli.StringFlag{Name: "name", Usage: "name for a new terminal session"},
-		&cli.StringFlag{Name: "session", Usage: "attach an existing terminal session by name or ID"},
-	}
-	_ = rootFlags
-	app := &cli.App{}
+func newApp() *command.App {
+	app := &command.App{}
 	app.RunFunc = func(args []string) error {
 		root := newRootCommand()
 		if app.Writer != nil {
@@ -291,16 +457,16 @@ func newApp() *cli.App {
 	return app
 }
 
-func authCommand() *cli.Command {
-	return &cli.Command{Name: "auth", Usage: "Manage Paperboat sign-in", Subcommands: []*cli.Command{
+func authCommand() *command.Spec {
+	return &command.Spec{Name: "auth", Usage: "Manage Paperboat sign-in", Subcommands: []*command.Spec{
 		{Name: "login", Usage: "Sign in through the Paperboat dashboard", Action: authLogin},
-		{Name: "switch", Usage: "Replace the active account for this server", Action: func(c *cli.Context) error { return authLoginMode(c, true) }},
-		{Name: "status", Usage: "Show the active Paperboat account", Flags: []cli.Flag{&cli.BoolFlag{Name: "json"}}, Action: authStatus},
+		{Name: "switch", Usage: "Replace the active account for this server", Action: func(c *command.Context) error { return authLoginMode(c, true) }},
+		{Name: "status", Usage: "Show the active Paperboat account", Flags: []command.Flag{&command.BoolFlag{Name: "json"}}, Action: authStatus},
 		{Name: "logout", Usage: "Revoke and remove the active client session", Action: authLogout},
 	}}
 }
 
-func requireAuthConfig(c *cli.Context) (*config.Config, config.ProfileStore, error) {
+func requireAuthConfig(c *command.Context) (*config.Config, config.ProfileStore, error) {
 	d, err := buildDeps(c)
 	if err != nil {
 		return nil, config.ProfileStore{}, err
@@ -318,17 +484,11 @@ func requireAuthConfig(c *cli.Context) (*config.Config, config.ProfileStore, err
 	return d.cfg, s, nil
 }
 
-func warnPlaintextCredentialStorage(cfg *config.Config, output io.Writer) {
-	if cfg.Auth.AllowFileFallback {
-		fmt.Fprintln(output, "WARNING: OS secure credential storage is disabled; Paperboat access and refresh tokens are stored as plaintext in local files restricted to mode 0600")
-	}
-}
-
-func authLogin(c *cli.Context) error {
+func authLogin(c *command.Context) error {
 	return authLoginMode(c, false)
 }
 
-func authLoginMode(c *cli.Context, replace bool) error {
+func authLoginMode(c *command.Context, replace bool) error {
 	cfg, store, err := requireAuthConfig(c)
 	if err != nil {
 		return err
@@ -416,6 +576,15 @@ func authLoginMode(c *cli.Context, replace bool) error {
 		} else {
 			saveErr = store.Save(p, cred)
 		}
+		if errors.Is(saveErr, config.ErrCredentialStoreUnavailable) && previous == nil && !cfg.Auth.AllowFileFallback {
+			fallbackStore, fallbackErr := fileCredentialFallback(cfg)
+			if fallbackErr == nil {
+				store = fallbackStore
+				saveErr = store.Save(p, cred)
+			} else {
+				saveErr = errors.Join(saveErr, fallbackErr)
+			}
+		}
 		if saveErr != nil {
 			return errors.Join(saveErr, cleanupIssuedSession(cfg.ServerURL, tokens.ClientSessionID, tokens.RefreshToken, store))
 		}
@@ -429,6 +598,14 @@ func authLoginMode(c *cli.Context, replace bool) error {
 	}
 }
 
+func fileCredentialFallback(cfg *config.Config) (config.ProfileStore, error) {
+	cfg.Auth.AllowFileFallback = true
+	if err := cfg.Save(); err != nil {
+		return config.ProfileStore{}, fmt.Errorf("enable protected file credential storage: %w", err)
+	}
+	return config.ProfileStoreFor(cfg)
+}
+
 func cleanupIssuedSession(issuer, clientSessionID, refreshToken string, store config.ProfileStore) error {
 	if err := store.QueueRevocation(issuer, clientSessionID, refreshToken); err != nil {
 		if revokeErr := api.RevokeToken(context.Background(), issuer, refreshToken, nil); revokeErr != nil {
@@ -440,7 +617,7 @@ func cleanupIssuedSession(issuer, clientSessionID, refreshToken string, store co
 	return nil
 }
 
-func authStatus(c *cli.Context) error {
+func authStatus(c *command.Context) error {
 	cfg, store, err := requireAuthConfig(c)
 	if err != nil {
 		return err
@@ -463,7 +640,7 @@ func authStatus(c *cli.Context) error {
 	return nil
 }
 
-func authLogout(c *cli.Context) error {
+func authLogout(c *command.Context) error {
 	cfg, store, err := requireAuthConfig(c)
 	if err != nil {
 		return err
@@ -553,16 +730,16 @@ func openBrowser(target string) error {
 	return cmd.Start()
 }
 
-func keepAliveCommand() *cli.Command {
-	return &cli.Command{
+func keepAliveCommand() *command.Spec {
+	return &command.Spec{
 		Name:      "keep-alive",
 		Usage:     "Keep a project VM running temporarily",
 		ArgsUsage: "<project>",
-		Flags: []cli.Flag{
-			&cli.Float64Flag{Name: "hours", Usage: "hours to keep the project running"},
-			&cli.BoolFlag{Name: "clear", Usage: "clear the current keep-alive pin"},
+		Flags: []command.Flag{
+			&command.Float64Flag{Name: "hours", Usage: "hours to keep the project running"},
+			&command.BoolFlag{Name: "clear", Usage: "clear the current keep-alive pin"},
 		},
-		Action: func(c *cli.Context) error {
+		Action: func(c *command.Context) error {
 			project := c.Args().First()
 			if project == "" {
 				return errors.New("missing project name; usage: pb keep-alive <project> --hours <n>")
@@ -601,7 +778,7 @@ func keepAliveCommand() *cli.Command {
 	}
 }
 
-func backendClient(c *cli.Context) (*api.Client, error) {
+func backendClient(c *command.Context) (*api.Client, error) {
 	d, err := buildDeps(c)
 	if err != nil {
 		return nil, err
@@ -668,6 +845,40 @@ const (
 	environmentConnectedMachine = "connected_machine"
 )
 
+func defaultEnvironment(ctx context.Context, client *api.Client, rememberedID string) (string, error) {
+	if rememberedID = strings.TrimSpace(rememberedID); rememberedID != "" {
+		return rememberedID, nil
+	}
+	projects, err := client.ListProjects(ctx)
+	if err != nil && !api.IsHostedEntitlementRequired(err) {
+		return "", friendlyCommandError(err)
+	}
+	if api.IsHostedEntitlementRequired(err) {
+		projects = nil
+	}
+	machines, err := client.ListConnectedMachines(ctx)
+	if err != nil {
+		return "", friendlyCommandError(err)
+	}
+	if len(projects)+len(machines) == 1 {
+		if len(projects) == 1 {
+			return projects[0].ID, nil
+		}
+		return machines[0].ID, nil
+	}
+	if len(projects)+len(machines) == 0 {
+		return "", errors.New("no Paperboat environments are available; run `pb create` or `pb machine add`")
+	}
+	choices := make([]string, 0, len(projects)+len(machines))
+	for _, project := range projects {
+		choices = append(choices, fmt.Sprintf("%s (hosted, %s)", project.Name, project.ID))
+	}
+	for _, machine := range machines {
+		choices = append(choices, fmt.Sprintf("%s (BYOD, %s)", machine.DisplayName, machine.ID))
+	}
+	return "", fmt.Errorf("multiple environments are available: %s; choose one with `pb <environment>`", strings.Join(choices, ", "))
+}
+
 func resolveEnvironmentTarget(ctx context.Context, client *api.Client, requested string) (environmentTarget, error) {
 	project, err := resolveProjectID(ctx, client, requested)
 	if err == nil {
@@ -731,7 +942,7 @@ type deps struct {
 	telemetry telemetry.Sink
 }
 
-func buildDeps(c *cli.Context) (*deps, error) {
+func buildDeps(c *command.Context) (*deps, error) {
 	cfg, err := config.Load(c.String("config"))
 	if err != nil {
 		return nil, err
@@ -749,13 +960,12 @@ func buildDeps(c *cli.Context) (*deps, error) {
 		}
 		cfg.ServerURL = normalized
 	}
-	papercodeTunnel := tunnel.NewPapercodeWSTunnel()
-	papercodeTunnel.OutputQueueChunks = cfg.Connect.TerminalOutputQueueChunks
-	var termTunnel tunnel.Tunnel = papercodeTunnel
+	websocketTunnel := tunnel.NewWebSocketTunnel()
+	websocketTunnel.OutputQueueChunks = cfg.Connect.TerminalOutputQueueChunks
+	var termTunnel tunnel.Tunnel = websocketTunnel
 	var uploader upload.Uploader = upload.NewDisabledUploader()
 	var authSource config.AuthSource = config.NoCredentialsSource{}
 	if cfg.ServerURL != "" {
-		warnPlaintextCredentialStorage(cfg, os.Stderr)
 		authSource, err = sessionauth.NewSource(cfg)
 		if err != nil {
 			return nil, err
@@ -770,8 +980,8 @@ func buildDeps(c *cli.Context) (*deps, error) {
 	}, nil
 }
 
-func connectCommand() *cli.Command {
-	return &cli.Command{
+func connectCommand() *command.Spec {
+	return &command.Spec{
 		Name:      "connect",
 		Usage:     "Attach to an environment terminal (default action)",
 		ArgsUsage: "<environment>",
@@ -780,20 +990,20 @@ func connectCommand() *cli.Command {
 	}
 }
 
-func connectFlags() []cli.Flag {
-	return []cli.Flag{
-		&cli.BoolFlag{Name: "new", Usage: "create a new terminal session"},
-		&cli.StringFlag{Name: "name", Usage: "name for a new terminal session"},
-		&cli.StringFlag{Name: "session", Usage: "attach an existing terminal session by name or ID"},
+func connectFlags() []command.Flag {
+	return []command.Flag{
+		&command.BoolFlag{Name: "new", Usage: "create a new terminal session"},
+		&command.StringFlag{Name: "name", Usage: "name for a new terminal session"},
+		&command.StringFlag{Name: "session", Usage: "attach an existing terminal session by name or ID"},
 	}
 }
 
-func projectsCommand() *cli.Command {
-	return &cli.Command{
+func projectsCommand() *command.Spec {
+	return &command.Spec{
 		Name:  "projects",
 		Usage: "List projects available to this account",
-		Flags: []cli.Flag{&cli.BoolFlag{Name: "json"}},
-		Action: func(c *cli.Context) error {
+		Flags: []command.Flag{&command.BoolFlag{Name: "json"}},
+		Action: func(c *command.Context) error {
 			client, err := backendClient(c)
 			if err != nil {
 				return err
@@ -818,12 +1028,12 @@ func projectsCommand() *cli.Command {
 	}
 }
 
-func environmentsCommand() *cli.Command {
-	return &cli.Command{
+func environmentsCommand() *command.Spec {
+	return &command.Spec{
 		Name:  "environments",
 		Usage: "List hosted projects and connected machines",
-		Flags: []cli.Flag{&cli.BoolFlag{Name: "json"}},
-		Action: func(c *cli.Context) error {
+		Flags: []command.Flag{&command.BoolFlag{Name: "json"}},
+		Action: func(c *command.Context) error {
 			client, err := backendClient(c)
 			if err != nil {
 				return err
@@ -859,13 +1069,90 @@ func environmentsCommand() *cli.Command {
 	}
 }
 
-func sessionsCommand() *cli.Command {
-	list := func(c *cli.Context) error {
+func previewCommand() *command.Spec {
+	return &command.Spec{Name: "preview", Usage: "Manage public previews", Subcommands: []*command.Spec{
+		{Name: "list", Flags: []command.Flag{&command.BoolFlag{Name: "json"}}, Action: previewListCommand},
+		{Name: "revoke", ArgsUsage: "<preview-id>", Flags: []command.Flag{&command.BoolFlag{Name: "yes"}, &command.BoolFlag{Name: "json"}}, Action: previewRemoveCommand},
+	}}
+}
+
+func previewListCommand(c *command.Context) error {
+	client, err := backendClient(c)
+	if err != nil {
+		return err
+	}
+	items, err := client.ListPreviews(c.Context)
+	if err != nil {
+		return friendlyCommandError(err)
+	}
+	if c.Bool("json") {
+		return json.NewEncoder(c.Writer).Encode(map[string]any{"schema_version": "1.0", "ok": true, "data": map[string]any{"previews": items}})
+	}
+	w := tabwriter.NewWriter(c.Writer, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "NAME\tPROJECT\tMACHINE\tENVIRONMENT\tTYPE\tUSER\tOWNER\tSTATE\tURL\tPORT")
+	for _, item := range items {
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\n", item.LogicalName, item.ProjectID, item.MachineID, item.EnvironmentName, item.EnvironmentKind, item.UserID, item.OwnerEmail, item.State, item.URL, item.TargetPort)
+	}
+	return w.Flush()
+}
+
+func previewRemoveCommand(c *command.Context) error {
+	if c.Args().Len() != 1 {
+		return errors.New("usage: pb preview revoke <preview-id> --yes")
+	}
+	client, err := backendClient(c)
+	if err != nil {
+		return err
+	}
+	previewID := c.Args().First()
+	items, err := client.ListPreviews(c.Context)
+	if err != nil {
+		return friendlyCommandError(err)
+	}
+	var selected api.Preview
+	for _, item := range items {
+		if item.ID == previewID {
+			selected = item
+			break
+		}
+	}
+	if selected.ID == "" {
+		return friendlyCommandError(fmt.Errorf("preview %q was not found", previewID))
+	}
+	fmt.Fprintf(c.ErrWriter, "Preview: %s (%s, %s)\n", selected.LogicalName, selected.EnvironmentName, selected.EnvironmentKind)
+	fmt.Fprintf(c.ErrWriter, "Project: %s  Machine: %s  User: %s\n", selected.ProjectID, selected.MachineID, selected.UserID)
+	if !c.Bool("yes") {
+		return errors.New("preview removal requires --yes")
+	}
+	item, err := client.RemovePreview(c.Context, previewID, newIdempotencyKey())
+	if err != nil {
+		return friendlyCommandError(err)
+	}
+	if c.Bool("json") {
+		return json.NewEncoder(c.Writer).Encode(map[string]any{"schema_version": "1.0", "ok": true, "data": map[string]any{"preview_id": item.ID, "state": item.State}})
+	}
+	fmt.Fprintf(c.Writer, "Removed preview %s.\n", item.LogicalName)
+	return nil
+}
+
+func sessionsCommand() *command.Spec {
+	list := func(c *command.Context) error {
 		client, err := backendClient(c)
 		if err != nil {
 			return err
 		}
-		target, err := resolveEnvironmentTarget(c.Context, client, c.Args().First())
+		requested := strings.TrimSpace(c.Args().First())
+		if requested == "" {
+			cfg, loadErr := config.Load(c.String("config"))
+			if loadErr != nil {
+				return loadErr
+			}
+			requested, err = defaultEnvironment(c.Context, client, cfg.LastEnvironmentID)
+			if err != nil {
+				return err
+			}
+		}
+		target, err := resolveEnvironmentTarget(c.Context, client, requested)
 		if err != nil {
 			return err
 		}
@@ -874,7 +1161,7 @@ func sessionsCommand() *cli.Command {
 			return friendlyCommandError(err)
 		}
 		if c.Bool("json") {
-			return json.NewEncoder(os.Stdout).Encode(sessions)
+			return json.NewEncoder(os.Stdout).Encode(map[string]any{"version": "1", "environment": map[string]string{"id": target.id, "kind": target.kind, "display_name": target.name}, "sessions": sessions})
 		}
 		w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 		if c.Bool("wide") {
@@ -895,8 +1182,8 @@ func sessionsCommand() *cli.Command {
 		}
 		return w.Flush()
 	}
-	return &cli.Command{Name: "sessions", Usage: "Manage environment terminal sessions", ArgsUsage: "<environment>", Flags: []cli.Flag{&cli.BoolFlag{Name: "wide"}, &cli.BoolFlag{Name: "json"}}, Action: list, Subcommands: []*cli.Command{
-		{Name: "rename", ArgsUsage: "<environment> <session> <new-name>", Action: func(c *cli.Context) error {
+	return &command.Spec{Name: "sessions", Usage: "Manage environment terminal sessions", ArgsUsage: "<environment>", Flags: []command.Flag{&command.BoolFlag{Name: "wide"}, &command.BoolFlag{Name: "json"}}, Action: list, Subcommands: []*command.Spec{
+		{Name: "rename", ArgsUsage: "<environment> <session> <new-name>", Action: func(c *command.Context) error {
 			if c.Args().Len() != 3 {
 				return errors.New("usage: pb sessions rename <environment> <session> <new-name>")
 			}
@@ -921,9 +1208,12 @@ func sessionsCommand() *cli.Command {
 			_, err = renameTerminalSessionForTarget(c.Context, client, target, session.ID, c.Args().Get(2))
 			return friendlyCommandError(err)
 		}},
-		{Name: "close", ArgsUsage: "<environment> <session>", Action: func(c *cli.Context) error {
+		{Name: "close", ArgsUsage: "<environment> <session>", Action: func(c *command.Context) error {
 			if c.Args().Len() != 2 {
-				return errors.New("usage: pb sessions close <environment> <session>")
+				return errors.New("usage: pb sessions close <environment> <session> --yes")
+			}
+			if !c.Bool("yes") {
+				return errors.New("session close requires --yes")
 			}
 			client, err := backendClient(c)
 			if err != nil {
@@ -938,8 +1228,8 @@ func sessionsCommand() *cli.Command {
 				return err
 			}
 			return friendlyCommandError(closeTerminalSessionForTarget(c.Context, client, target, session.ID))
-		}},
-		{Name: "delete", ArgsUsage: "<environment> <session>", Flags: []cli.Flag{&cli.BoolFlag{Name: "yes", Usage: "confirm deletion"}}, Action: func(c *cli.Context) error {
+		}, Flags: []command.Flag{&command.BoolFlag{Name: "yes", Usage: "confirm close"}}},
+		{Name: "delete", ArgsUsage: "<environment> <session>", Flags: []command.Flag{&command.BoolFlag{Name: "yes", Usage: "confirm deletion"}}, Action: func(c *command.Context) error {
 			if c.Args().Len() != 2 {
 				return errors.New("usage: pb sessions delete <environment> <session> [--yes]")
 			}
@@ -1134,26 +1424,29 @@ func friendlyCommandError(err error) error {
 	return err
 }
 
-func actionConnect(c *cli.Context) error {
-	project := c.Args().First()
+func actionConnect(c *command.Context) error {
+	return actionConnectTarget(c, "")
+}
+
+func actionConnectTarget(c *command.Context, requested string) error {
+	project := strings.TrimSpace(requested)
 	if project == "" {
-		if server := strings.TrimSpace(c.String("server")); server != "" {
-			cfg, err := config.Load(c.String("config"))
-			if err != nil {
-				return err
-			}
-			normalized, err := config.NormalizeServerURL(server)
-			if err != nil {
-				return err
-			}
-			cfg.ServerURL = normalized
-			if err := cfg.Save(); err != nil {
-				return err
-			}
-			fmt.Fprintln(os.Stdout, cfg.Path())
-			return nil
+		project = c.Args().First()
+	}
+	if project == "" && strings.TrimSpace(c.String("server")) != "" {
+		cfg, err := config.Load(c.String("config"))
+		if err != nil {
+			return err
 		}
-		return errors.New("missing environment name; usage: pb <environment>")
+		cfg.ServerURL, err = config.NormalizeServerURL(c.String("server"))
+		if err != nil {
+			return err
+		}
+		if err := cfg.Save(); err != nil {
+			return err
+		}
+		fmt.Fprintln(os.Stdout, cfg.Path())
+		return nil
 	}
 	if c.Args().Len() > 1 {
 		return errors.New("expected exactly one environment name")
@@ -1173,6 +1466,20 @@ func actionConnect(c *cli.Context) error {
 	if strings.TrimSpace(d.cfg.ServerURL) == "" {
 		return errors.New("Paperboat server is not configured; set server_url or use --server")
 	}
+	cred, err := d.auth.Credential()
+	if err != nil && !errors.Is(err, config.ErrNoCredentials) {
+		return err
+	}
+	if errors.Is(err, config.ErrNoCredentials) {
+		return errors.New("not signed in to Paperboat; run `pb login`, then retry")
+	}
+	backend := api.New(d.cfg.ServerURL, cred, nil)
+	if project == "" {
+		project, err = defaultEnvironment(c.Context, backend, d.cfg.LastEnvironmentID)
+		if err != nil {
+			return err
+		}
+	}
 	bar := statusbar.New(statusbar.Options{
 		Mode:           d.cfg.StatusBar.Mode,
 		NoticeDuration: time.Duration(d.cfg.StatusBar.NoticeSeconds) * time.Second,
@@ -1189,14 +1496,6 @@ func actionConnect(c *cli.Context) error {
 	d.telemetry, closeTelemetry = connectTelemetry(d.cfg, os.Stderr)
 	defer closeTelemetry()
 
-	cred, err := d.auth.Credential()
-	if err != nil && !errors.Is(err, config.ErrNoCredentials) {
-		return err
-	}
-	if errors.Is(err, config.ErrNoCredentials) {
-		return errors.New("not signed in to Paperboat; run `pb auth login`, then retry")
-	}
-	backend := api.New(d.cfg.ServerURL, cred, nil)
 	terminalSessionID, err := selectTerminalSession(c.Context, backend, project, c.Bool("new"), c.String("name"), c.String("session"))
 	if err != nil {
 		return err
@@ -1257,6 +1556,7 @@ func actionConnect(c *cli.Context) error {
 		info, err = d.resolver.Resolve(ctx, resolver.ConnectRequest{Project: project, Credential: cred, TerminalSessionID: terminalSessionID})
 		if err == nil {
 			if info.Terminal != nil {
+				info.Terminal.RestartIfNotRunning = true
 				info.Terminal.ReplayHistory = true
 				info.Terminal.SequenceSink = recordTerminalSequence
 				info.Terminal.Env = forwardedTerminalEnv(d.cfg.Connect.ForwardTerminalEnv)
@@ -1297,6 +1597,13 @@ func actionConnect(c *cli.Context) error {
 		}
 		return fmt.Errorf("connect to %q: %w", project, err)
 	}
+	if d.cfg.LastEnvironmentID != info.ProjectID {
+		d.cfg.LastEnvironmentID = info.ProjectID
+		if err := d.cfg.Save(); err != nil {
+			_ = conn.Close()
+			return fmt.Errorf("remember connected environment: %w", err)
+		}
+	}
 	if useStatusBar {
 		bar.SetConnection("connected")
 		bar.Notice("Connected")
@@ -1311,9 +1618,14 @@ func actionConnect(c *cli.Context) error {
 		freshResolver := newResolver(freshCred)
 		freshInfo, resolveErr := freshResolver.Resolve(reconnectCtx, resolver.ConnectRequest{Project: info.ProjectID, Credential: freshCred, TerminalSessionID: terminalSessionID})
 		if resolveErr != nil {
+			var apiErr *api.APIError
+			if errors.As(resolveErr, &apiErr) && apiErr.Code == "connected_machine_revoked" {
+				resolveErr = tunnel.StopReconnect(resolveErr)
+			}
 			return nil, resolveErr
 		}
 		if freshInfo.Terminal != nil {
+			freshInfo.Terminal.RestartIfNotRunning = false
 			freshInfo.Terminal.ReplayHistory = false
 			freshInfo.Terminal.AfterSequence = int(lastTerminalSequence.Load())
 			freshInfo.Terminal.SequenceSink = recordTerminalSequence
@@ -1410,7 +1722,124 @@ func actionConnect(c *cli.Context) error {
 	return nil
 }
 
-func requestedSessionLabel(c *cli.Context) string {
+func createProject(c *command.Context) error {
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		return errors.New("pb create requires an interactive terminal")
+	}
+	client, err := backendClient(c)
+	if err != nil {
+		return err
+	}
+	repositories, err := client.ListGitHubRepositories(c.Context)
+	if err != nil {
+		return friendlyCommandError(err)
+	}
+	machineTypes, err := client.ListCatalogMachineTypes(c.Context)
+	if err != nil {
+		return friendlyCommandError(err)
+	}
+	regions, err := client.ListCatalogRegions(c.Context)
+	if err != nil {
+		return friendlyCommandError(err)
+	}
+	idleTimeouts, err := client.ListCatalogIdleTimeouts(c.Context)
+	if err != nil {
+		return friendlyCommandError(err)
+	}
+	if len(repositories) == 0 {
+		return errors.New("no GitHub repositories are available; connect GitHub in the Paperboat dashboard")
+	}
+	reader := bufio.NewReader(os.Stdin)
+	repositoryIndex, err := promptChoice(reader, "Repository", len(repositories), func(index int) string { return repositories[index].FullName })
+	if err != nil {
+		return err
+	}
+	machineCodes := activeMachineCodes(machineTypes)
+	regionCodes := enabledRegionCodes(regions)
+	idleCodes := activeIdleTimeoutCodes(idleTimeouts)
+	if len(machineCodes) == 0 || len(regionCodes) == 0 || len(idleCodes) == 0 {
+		return errors.New("hosted project catalog has no available machine type, region, or idle timeout")
+	}
+	machineIndex, err := promptChoice(reader, "Machine type", len(machineCodes), func(index int) string { return machineCodes[index] })
+	if err != nil {
+		return err
+	}
+	regionIndex, err := promptChoice(reader, "Region", len(regionCodes), func(index int) string { return regionCodes[index] })
+	if err != nil {
+		return err
+	}
+	idleIndex, err := promptChoice(reader, "Idle timeout", len(idleCodes), func(index int) string { return idleCodes[index] })
+	if err != nil {
+		return err
+	}
+	fmt.Fprint(os.Stderr, "Storage (GB): ")
+	storageText, err := reader.ReadString('\n')
+	if err != nil {
+		return errors.New("project creation cancelled")
+	}
+	storageGB, err := strconv.Atoi(strings.TrimSpace(storageText))
+	if err != nil || storageGB <= 0 {
+		return errors.New("storage must be a positive whole number of GB")
+	}
+	repository := repositories[repositoryIndex]
+	project, err := client.CreateProject(c.Context, api.CreateProjectInput{
+		Name: c.Args().First(), RepositoryURL: repository.CloneURL, DefaultBranch: repository.DefaultBranch,
+		StorageGB: storageGB, MachineTypeCode: machineCodes[machineIndex], RegionCode: regionCodes[regionIndex], IdleTimeoutCode: idleCodes[idleIndex],
+	}, newIdempotencyKey())
+	if err != nil {
+		return friendlyCommandError(err)
+	}
+	fmt.Fprintf(os.Stderr, "Created hosted project %s (%s).\n", project.Name, project.ID)
+	return actionConnectTarget(c, project.ID)
+}
+
+func promptChoice(reader *bufio.Reader, label string, count int, value func(int) string) (int, error) {
+	for index := 0; index < count; index++ {
+		fmt.Fprintf(os.Stderr, "%d. %s\n", index+1, value(index))
+	}
+	fmt.Fprintf(os.Stderr, "%s [1-%d]: ", label, count)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return 0, errors.New("project creation cancelled")
+	}
+	selection, err := strconv.Atoi(strings.TrimSpace(line))
+	if err != nil || selection < 1 || selection > count {
+		return 0, fmt.Errorf("%s selection must be between 1 and %d", strings.ToLower(label), count)
+	}
+	return selection - 1, nil
+}
+
+func activeMachineCodes(items []api.CatalogMachineType) []string {
+	var out []string
+	for _, item := range items {
+		if item.Active {
+			out = append(out, item.Code)
+		}
+	}
+	return out
+}
+
+func enabledRegionCodes(items []api.CatalogRegion) []string {
+	var out []string
+	for _, item := range items {
+		if item.Enabled {
+			out = append(out, item.Code)
+		}
+	}
+	return out
+}
+
+func activeIdleTimeoutCodes(items []api.CatalogIdleTimeout) []string {
+	var out []string
+	for _, item := range items {
+		if item.Active {
+			out = append(out, item.Code)
+		}
+	}
+	return out
+}
+
+func requestedSessionLabel(c *command.Context) string {
 	if c.Bool("new") {
 		if name := strings.TrimSpace(c.String("name")); name != "" {
 			return name
@@ -1544,7 +1973,7 @@ func retryableInitialConnectError(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "timed out waiting for the machine") ||
-		strings.Contains(msg, "dial papercode websocket") ||
+		strings.Contains(msg, "dial terminal websocket") ||
 		strings.Contains(msg, "websocket route") ||
 		strings.Contains(msg, "transport lost")
 }
@@ -1653,7 +2082,7 @@ func uploadLimits(cfg *config.Config, target *resolver.UploadTarget) upload.Limi
 	return limits
 }
 
-// terminalEnvKeyPattern mirrors the papercode terminal env schema; an invalid
+// terminalEnvKeyPattern mirrors the terminal RPC environment schema; an invalid
 // key or oversized value would reject the whole attach, so filter locally.
 var terminalEnvKeyPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
@@ -1677,7 +2106,7 @@ func forwardedTerminalEnv(keys []string) map[string]string {
 }
 
 // localTerminalSize returns the current terminal geometry, clamped to the
-// papercode schema bounds, or zeros when stdout is not a terminal.
+// terminal RPC schema bounds, or zeros when stdout is not a terminal.
 func localTerminalSize() (cols, rows uint16) {
 	w, h, err := term.GetSize(int(os.Stdout.Fd()))
 	if err != nil || w <= 0 || h <= 0 {
@@ -1707,14 +2136,22 @@ func expandDirs(dirs []string) []string {
 	return out
 }
 
-func configCommand() *cli.Command {
-	return &cli.Command{
+func configCommand() *command.Spec {
+	return &command.Spec{
 		Name:  "config",
 		Usage: "Inspect the local CLI config",
-		Subcommands: []*cli.Command{
+		Subcommands: []*command.Spec{
+			{
+				Name: "assign", ArgsUsage: "<repository> <environment>", Usage: "Assign a config repository to a hosted environment",
+				Action: configAssign,
+			},
+			{
+				Name: "unassign", ArgsUsage: "<environment>", Usage: "Remove a config repository assignment",
+				Action: configUnassign,
+			},
 			{
 				Name: "set", ArgsUsage: "server <url>", Usage: "Set a local configuration value",
-				Action: func(c *cli.Context) error {
+				Action: func(c *command.Context) error {
 					if c.Args().Len() != 2 || c.Args().First() != "server" {
 						return errors.New("usage: pb config set server <url>")
 					}
@@ -1736,7 +2173,7 @@ func configCommand() *cli.Command {
 			},
 			{
 				Name: "unset", ArgsUsage: "server", Usage: "Remove a local configuration value",
-				Action: func(c *cli.Context) error {
+				Action: func(c *command.Context) error {
 					if c.Args().Len() != 1 || c.Args().First() != "server" {
 						return errors.New("usage: pb config unset server")
 					}
@@ -1755,7 +2192,7 @@ func configCommand() *cli.Command {
 			{
 				Name:  "path",
 				Usage: "Print the config file path",
-				Action: func(c *cli.Context) error {
+				Action: func(c *command.Context) error {
 					d, err := buildDeps(c)
 					if err != nil {
 						return err
@@ -1767,8 +2204,8 @@ func configCommand() *cli.Command {
 			{
 				Name:  "show",
 				Usage: "Print the effective config",
-				Flags: []cli.Flag{&cli.BoolFlag{Name: "json"}},
-				Action: func(c *cli.Context) error {
+				Flags: []command.Flag{&command.BoolFlag{Name: "json"}},
+				Action: func(c *command.Context) error {
 					d, err := buildDeps(c)
 					if err != nil {
 						return err
@@ -1788,13 +2225,114 @@ func configCommand() *cli.Command {
 	}
 }
 
-func doctorCommand() *cli.Command {
-	return &cli.Command{
+func configAssign(c *command.Context) error {
+	client, err := backendClient(c)
+	if err != nil {
+		return err
+	}
+	target, err := resolveEnvironmentTarget(c.Context, client, c.Args().Get(1))
+	if err != nil {
+		return err
+	}
+	if target.kind == environmentConnectedMachine {
+		return errors.New("config assignment for BYOD environments requires dashboard consent and is not available in this release")
+	}
+	repositories, err := client.ListConfigRepositories(c.Context)
+	if err != nil {
+		return friendlyCommandError(err)
+	}
+	repository, err := resolveConfigRepository(repositories, c.Args().First())
+	if err != nil {
+		return err
+	}
+	expectedVersion := int64(0)
+	current, getErr := client.ConfigAssignment(c.Context, target.id)
+	if getErr == nil {
+		expectedVersion = current.Version
+	} else if !api.IsNotFound(getErr) {
+		return friendlyCommandError(getErr)
+	}
+	assignment, err := client.AssignConfig(c.Context, target.id, repository.ID, expectedVersion)
+	if err != nil {
+		return friendlyCommandError(err)
+	}
+	if c.Bool("json") {
+		return json.NewEncoder(c.Writer).Encode(map[string]any{"version": "1", "environment": map[string]string{"id": target.id, "kind": "hosted", "display_name": target.name}, "repository": repository, "assignment": assignment, "outcome": "confirmed"})
+	}
+	fmt.Fprintf(c.Writer, "Assigned config repository %s to %s.\n", repository.DisplayName, target.name)
+	return nil
+}
+
+func configUnassign(c *command.Context) error {
+	if !c.Bool("yes") {
+		return errors.New("config unassign requires --yes")
+	}
+	client, err := backendClient(c)
+	if err != nil {
+		return err
+	}
+	target, err := resolveEnvironmentTarget(c.Context, client, c.Args().First())
+	if err != nil {
+		return err
+	}
+	environmentID := target.id
+	if target.kind == environmentConnectedMachine {
+		machines, listErr := client.ListConnectedMachines(c.Context)
+		if listErr != nil {
+			return friendlyCommandError(listErr)
+		}
+		for _, machine := range machines {
+			if machine.ID == target.id {
+				environmentID = machine.EnvironmentID
+				break
+			}
+		}
+		if environmentID == target.id {
+			return errors.New("connected machine does not expose its environment identity; update paperboat-server")
+		}
+	}
+	assignment, err := client.ConfigAssignment(c.Context, environmentID)
+	if err != nil {
+		return friendlyCommandError(err)
+	}
+	if err := client.UnassignConfig(c.Context, environmentID, assignment.Version); err != nil {
+		return friendlyCommandError(err)
+	}
+	if c.Bool("json") {
+		return json.NewEncoder(c.Writer).Encode(map[string]any{"version": "1", "environment": map[string]string{"id": target.id, "kind": target.kind, "display_name": target.name}, "state": "unassigned", "outcome": "confirmed"})
+	}
+	fmt.Fprintf(c.Writer, "Removed config assignment from %s.\n", target.name)
+	return nil
+}
+
+func resolveConfigRepository(items []api.ConfigRepository, requested string) (api.ConfigRepository, error) {
+	for _, item := range items {
+		if item.ID == requested {
+			return item, nil
+		}
+	}
+	matches := make([]api.ConfigRepository, 0, 1)
+	for _, item := range items {
+		if strings.EqualFold(item.DisplayName, requested) || strings.EqualFold(item.ExternalRef, requested) {
+			matches = append(matches, item)
+		}
+	}
+	if len(matches) == 1 {
+		return matches[0], nil
+	}
+	if len(matches) > 1 {
+		return api.ConfigRepository{}, fmt.Errorf("config repository %q is ambiguous; use a stable repository ID", requested)
+	}
+	return api.ConfigRepository{}, fmt.Errorf("config repository %q was not found", requested)
+}
+
+func doctorCommand() *command.Spec {
+	return &command.Spec{
 		Name:      "doctor",
 		Usage:     "Check authentication and connectivity",
 		ArgsUsage: "[project]",
-		Flags:     []cli.Flag{&cli.BoolFlag{Name: "json"}},
-		Action: func(c *cli.Context) error {
+		Flags:     []command.Flag{&command.BoolFlag{Name: "json"}},
+		Action: func(c *command.Context) error {
 			d, err := buildDeps(c)
 			if err != nil {
 				return err
@@ -1843,11 +2381,11 @@ func doctorCommand() *cli.Command {
 				Credential: cred,
 			})
 			if err != nil {
-				fmt.Printf("papercode:   descriptor unavailable: %v\n", err)
+				fmt.Printf("terminal:    descriptor unavailable: %v\n", err)
 				return fmt.Errorf("doctor: descriptor check failed: %w", err)
 			}
 			if info.Terminal == nil {
-				fmt.Println("papercode:   descriptor missing terminal endpoint")
+				fmt.Println("terminal:    descriptor missing terminal endpoint")
 				return errors.New("doctor: descriptor missing terminal endpoint")
 			}
 			fmt.Printf("environment:  %s (%s) ✓\n", info.ProjectID, firstNonEmpty(info.ProjectState, "ready"))
@@ -1857,19 +2395,19 @@ func doctorCommand() *cli.Command {
 			} else {
 				fmt.Println("fly readiness: ready ✓")
 			}
-			fmt.Println("agentunnel:   route descriptor ready ✓")
-			if err := tunnel.NewPapercodeWSTunnel().Check(c.Context, info.Terminal); err != nil {
-				fmt.Printf("papercode:   websocket unavailable: %v\n", err)
-				return fmt.Errorf("doctor: papercode protocol check failed: %w", err)
+			fmt.Println("transport:    route descriptor ready ✓")
+			if err := tunnel.NewWebSocketTunnel().Check(c.Context, info.Terminal); err != nil {
+				fmt.Printf("terminal:    websocket unavailable: %v\n", err)
+				return fmt.Errorf("doctor: terminal protocol check failed: %w", err)
 			}
-			fmt.Printf("papercode:   websocket route/auth ready for %s ✓\n", info.Project)
+			fmt.Printf("terminal:    websocket route/auth ready for %s ✓\n", info.Project)
 			fmt.Println("protocol:    paperboat-terminal-rpc/v1 ✓")
 			return nil
 		},
 	}
 }
 
-func doctorJSON(c *cli.Context, d *deps) error {
+func doctorJSON(c *command.Context, d *deps) error {
 	result := map[string]any{"config_path": d.cfg.Path(), "server": d.cfg.ServerURL, "auth": "unknown", "backend": "skipped"}
 	cred, credErr := d.auth.Credential()
 	if errors.Is(credErr, config.ErrNoCredentials) {
@@ -1917,12 +2455,12 @@ func doctorJSON(c *cli.Context, d *deps) error {
 		_ = json.NewEncoder(os.Stdout).Encode(result)
 		return errors.New("doctor: descriptor missing terminal endpoint")
 	}
-	if err := tunnel.NewPapercodeWSTunnel().Check(c.Context, info.Terminal); err != nil {
+	if err := tunnel.NewWebSocketTunnel().Check(c.Context, info.Terminal); err != nil {
 		result["project"] = info.ProjectID
 		result["connect"] = "websocket_error"
 		result["connect_error"] = err.Error()
 		_ = json.NewEncoder(os.Stdout).Encode(result)
-		return fmt.Errorf("doctor: papercode protocol check failed: %w", err)
+		return fmt.Errorf("doctor: terminal protocol check failed: %w", err)
 	}
 	result["project"] = map[string]string{"id": info.ProjectID, "name": info.Project, "state": info.ProjectState}
 	result["environment_type"] = info.TargetKind

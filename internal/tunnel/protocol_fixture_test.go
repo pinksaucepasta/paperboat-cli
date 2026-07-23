@@ -119,7 +119,7 @@ func TestPapercodeTerminalProtocolFixture(t *testing.T) {
 		fixture.StreamAcknowledgement.RequestIDField != "requestId" || fixture.StreamAcknowledgement.RequestIDType != "string" {
 		t.Fatalf("stream acknowledgement wire shape changed: %#v", fixture.StreamAcknowledgement)
 	}
-	if !fixture.Reconnect.ReattachSameThreadAndTerminal || !fixture.Reconnect.RestartIfNotRunning || fixture.Reconnect.ReplayFailedWrites {
+	if !fixture.Reconnect.ReattachSameThreadAndTerminal || fixture.Reconnect.RestartIfNotRunning || fixture.Reconnect.ReplayFailedWrites {
 		t.Fatalf("reconnect contract does not match implementation: %#v", fixture.Reconnect)
 	}
 	if fixture.Methods.Attach != rpcTerminalAttach || fixture.Methods.Write != rpcTerminalWrite ||
@@ -133,7 +133,7 @@ func TestPapercodeTerminalProtocolFixture(t *testing.T) {
 		fixture.Fields.Cols != rpcFieldCols {
 		t.Fatalf("field constants do not match fixture: %#v", fixture.Fields)
 	}
-	if !reflect.DeepEqual(fixture.AttachEventTypes, papercodeAttachEventTypes) {
+	if !reflect.DeepEqual(fixture.AttachEventTypes, terminalAttachEventTypes) {
 		t.Fatalf("attach event types do not match implementation: %#v", fixture.AttachEventTypes)
 	}
 }

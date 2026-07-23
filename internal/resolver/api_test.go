@@ -127,6 +127,23 @@ func readyTerminal() *api.Terminal {
 	}
 }
 
+func TestValidateReadyAcceptsEnvironmentTerminalBearer(t *testing.T) {
+	terminal := readyTerminal()
+	terminal.WebSocketBaseURL = "wss://machine.example/v1/runtime"
+	terminal.HTTPBaseURL = ""
+	terminal.Auth = api.AuthMaterial{Method: "bearer", Token: "helper-token", ExpiresAt: time.Now().Add(time.Minute), Scopes: []string{"terminal:operate"}}
+	response := readyConnectedMachineResponse(terminal)
+	response.ExpiresAt = time.Now().Add(2 * time.Minute)
+	response.Terminal.Auth.ExpiresAt = time.Now().Add(time.Minute)
+	response.Upload.Auth.ExpiresAt = time.Now().Add(time.Minute)
+	response.Terminal.HTTPBaseURL = "https://machine.example"
+	response.Upload.HTTPBaseURL = "https://machine.example"
+	response.Upload.Path = "/v1/uploads"
+	if _, err := newTestResolver(&fakeClient{}).validateDescriptor(response, target{kind: targetConnectedMachine, id: "cm_1"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func readyResponse(term *api.Terminal) api.ConnectResponse {
 	expires := time.Now().Add(time.Hour)
 	term.Auth.ExpiresAt = expires.Add(-time.Minute)
@@ -213,6 +230,21 @@ func TestResolveConnectedMachineByDisplayName(t *testing.T) {
 	}
 	if info.TargetKind != targetConnectedMachine || info.ProjectID != "cm_1" || info.Project != "Studio Mac" || info.ProjectState != "online" {
 		t.Fatalf("info = %+v", info)
+	}
+}
+
+func TestResolveConnectedMachineRevocationStopsWithoutPolling(t *testing.T) {
+	fc := &fakeClient{
+		machines:   []api.ConnectedMachine{{ID: "cm_1", DisplayName: "Studio Mac", State: "disconnected"}},
+		connectSeq: []api.ConnectResponse{{ConnectedMachineID: "cm_1", ConnectedMachineState: "disconnected", Status: "connected_machine_revoked", Reason: "access_revoked"}},
+	}
+	_, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "Studio Mac"})
+	var apiErr *api.APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "connected_machine_revoked" {
+		t.Fatalf("err=%v", err)
+	}
+	if fc.statusN != 0 {
+		t.Fatalf("revoked target polled status %d times", fc.statusN)
 	}
 }
 

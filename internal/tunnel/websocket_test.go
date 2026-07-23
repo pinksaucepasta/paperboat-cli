@@ -18,7 +18,7 @@ import (
 	"github.com/pujan-modha/paperboat-cli/internal/resolver"
 )
 
-func TestPapercodeWSTunnelAttachIOResizeAndExit(t *testing.T) {
+func TestWebSocketTunnelAttachIOResizeAndExit(t *testing.T) {
 	requests := make(chan rpcRequestSeen, 8)
 	upgrader := websocket.Upgrader{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -27,6 +27,9 @@ func TestPapercodeWSTunnelAttachIOResizeAndExit(t *testing.T) {
 		}
 		if got := r.URL.Query().Get("wsTicket"); got != "pct_test" {
 			t.Errorf("unexpected wsTicket %q", got)
+		}
+		if got := r.Header.Get("Sec-WebSocket-Protocol"); got != helperWebSocketSubprotocol {
+			t.Errorf("unexpected websocket subprotocol %q", got)
 		}
 		ws, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
@@ -59,7 +62,7 @@ func TestPapercodeWSTunnelAttachIOResizeAndExit(t *testing.T) {
 	defer server.Close()
 
 	target := testTerminalTarget(server.URL)
-	conn, err := NewPapercodeWSTunnel().Dial(context.Background(), resolver.ConnectInfo{Terminal: target})
+	conn, err := NewWebSocketTunnel().Dial(context.Background(), resolver.ConnectInfo{Terminal: target})
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -117,7 +120,7 @@ func TestPapercodeWSTunnelAttachIOResizeAndExit(t *testing.T) {
 	}
 }
 
-func TestPapercodeWSTunnelAttachForwardsEnvAndSize(t *testing.T) {
+func TestWebSocketTunnelAttachForwardsEnvAndSize(t *testing.T) {
 	requests := make(chan rpcRequestSeen, 4)
 	upgrader := websocket.Upgrader{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -147,7 +150,7 @@ func TestPapercodeWSTunnelAttachForwardsEnvAndSize(t *testing.T) {
 	target.Env = map[string]string{"TERM": "xterm-ghostty", "COLORTERM": "truecolor"}
 	target.Cols = 120
 	target.Rows = 40
-	conn, err := NewPapercodeWSTunnel().Dial(context.Background(), resolver.ConnectInfo{Terminal: target})
+	conn, err := NewWebSocketTunnel().Dial(context.Background(), resolver.ConnectInfo{Terminal: target})
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -166,7 +169,7 @@ func TestPapercodeWSTunnelAttachForwardsEnvAndSize(t *testing.T) {
 	}
 }
 
-func TestPapercodeWSTunnelCheckRejectsHandshakeWithoutRPC(t *testing.T) {
+func TestWebSocketTunnelCheckRejectsHandshakeWithoutRPC(t *testing.T) {
 	upgrader := websocket.Upgrader{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ws, err := upgrader.Upgrade(w, r, nil)
@@ -183,13 +186,13 @@ func TestPapercodeWSTunnelCheckRejectsHandshakeWithoutRPC(t *testing.T) {
 	defer server.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	err := NewPapercodeWSTunnel().Check(ctx, testTerminalTarget(server.URL))
+	err := NewWebSocketTunnel().Check(ctx, testTerminalTarget(server.URL))
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Check error = %v", err)
 	}
 }
 
-func TestPapercodeWSTunnelCheckUsesNonAttachingMetadataProbe(t *testing.T) {
+func TestWebSocketTunnelCheckUsesNonAttachingMetadataProbe(t *testing.T) {
 	requests := make(chan rpcRequestSeen, 1)
 	upgrader := websocket.Upgrader{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -210,7 +213,7 @@ func TestPapercodeWSTunnelCheckUsesNonAttachingMetadataProbe(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	if err := NewPapercodeWSTunnel().Check(context.Background(), testTerminalTarget(server.URL)); err != nil {
+	if err := NewWebSocketTunnel().Check(context.Background(), testTerminalTarget(server.URL)); err != nil {
 		t.Fatal(err)
 	}
 	req := <-requests
@@ -219,12 +222,12 @@ func TestPapercodeWSTunnelCheckUsesNonAttachingMetadataProbe(t *testing.T) {
 	}
 }
 
-func TestPapercodeWebSocketRequest(t *testing.T) {
+func TestTerminalWebSocketRequest(t *testing.T) {
 	target := &resolver.TerminalTarget{
 		WebSocketBaseURL: "wss://example.test/project",
 		Auth:             resolver.AuthTarget{Method: "websocket_ticket", Ticket: "pct_1"},
 	}
-	got, headers, err := papercodeWebSocketRequest(target)
+	got, headers, err := terminalWebSocketRequest(target)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,10 +241,18 @@ func TestPapercodeWebSocketRequest(t *testing.T) {
 	if u.Path != "/project/ws" || u.Query().Get("wsTicket") != "pct_1" {
 		t.Fatalf("bad URL %s", got)
 	}
+	target = &resolver.TerminalTarget{WebSocketBaseURL: "wss://machine.example/v1/runtime", Auth: resolver.AuthTarget{Method: "bearer", Token: "helper-token"}}
+	got, headers, err = terminalWebSocketRequest(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "wss://machine.example/v1/runtime" || headers.Get("Authorization") != "Bearer helper-token" {
+		t.Fatalf("helper request URL=%q auth=%q", got, headers.Get("Authorization"))
+	}
 }
 
-func TestPapercodeWSConnHandlesSnapshotHistory(t *testing.T) {
-	c := &papercodeWSConn{out: make(chan []byte, 1), done: make(chan struct{})}
+func TestTerminalWSConnHandlesSnapshotHistory(t *testing.T) {
+	c := &terminalWSConn{out: make(chan []byte, 1), done: make(chan struct{})}
 	c.handleTerminalEvent(terminalEvent{
 		Type: "snapshot",
 		Snapshot: terminalSnapshot{
@@ -265,10 +276,10 @@ func TestPapercodeWSConnHandlesSnapshotHistory(t *testing.T) {
 	}
 }
 
-func TestPapercodeWSConnCanSuppressReconnectHistory(t *testing.T) {
+func TestTerminalWSConnCanSuppressReconnectHistory(t *testing.T) {
 	sequence := 0
 	snapshotSequence := 9
-	c := &papercodeWSConn{out: make(chan []byte, 1), done: make(chan struct{}), target: &resolver.TerminalTarget{ReplayHistory: false, SequenceSink: func(value int) { sequence = value }}}
+	c := &terminalWSConn{out: make(chan []byte, 1), done: make(chan struct{}), target: &resolver.TerminalTarget{ReplayHistory: false, SequenceSink: func(value int) { sequence = value }}}
 	_ = c.handleTerminalEvent(terminalEvent{Type: terminalEventSnapshot, Snapshot: terminalSnapshot{Status: "running", History: "old output\n", Sequence: &snapshotSequence}})
 	select {
 	case <-c.out:
@@ -280,10 +291,10 @@ func TestPapercodeWSConnCanSuppressReconnectHistory(t *testing.T) {
 	}
 }
 
-func TestPapercodeWSConnAdvancesCursorAfterReplayOutputIsQueued(t *testing.T) {
+func TestTerminalWSConnAdvancesCursorAfterReplayOutputIsQueued(t *testing.T) {
 	sequence := 0
 	eventSequence := 7
-	c := &papercodeWSConn{out: make(chan []byte, 1), done: make(chan struct{}), target: &resolver.TerminalTarget{ReplayHistory: false, SequenceSink: func(value int) { sequence = value }}}
+	c := &terminalWSConn{out: make(chan []byte, 1), done: make(chan struct{}), target: &resolver.TerminalTarget{ReplayHistory: false, SequenceSink: func(value int) { sequence = value }}}
 	if err := c.handleTerminalEvent(terminalEvent{Type: terminalEventOutput, Sequence: &eventSequence, Data: "replayed\n"}); err != nil {
 		t.Fatal(err)
 	}
@@ -292,20 +303,20 @@ func TestPapercodeWSConnAdvancesCursorAfterReplayOutputIsQueued(t *testing.T) {
 	}
 }
 
-func TestPapercodeWSConnDoesNotAdvanceCursorWhenReplayQueueCloses(t *testing.T) {
+func TestTerminalWSConnDoesNotAdvanceCursorWhenReplayQueueCloses(t *testing.T) {
 	sequence := 0
 	eventSequence := 7
 	stop := make(chan struct{})
 	close(stop)
-	c := &papercodeWSConn{out: make(chan []byte), done: make(chan struct{}), keepaliveStop: stop, target: &resolver.TerminalTarget{ReplayHistory: false, SequenceSink: func(value int) { sequence = value }}}
+	c := &terminalWSConn{out: make(chan []byte), done: make(chan struct{}), keepaliveStop: stop, target: &resolver.TerminalTarget{ReplayHistory: false, SequenceSink: func(value int) { sequence = value }}}
 	err := c.handleTerminalEvent(terminalEvent{Type: terminalEventOutput, Sequence: &eventSequence, Data: "lost\n"})
 	if !errors.Is(err, ErrTransportLost) || sequence != 0 {
 		t.Fatalf("err=%v sequence=%d, want transport loss without cursor advance", err, sequence)
 	}
 }
 
-func TestPapercodeWSConnResynchronizesFromRestartedSnapshot(t *testing.T) {
-	c := &papercodeWSConn{out: make(chan []byte, 2), done: make(chan struct{}), target: &resolver.TerminalTarget{ReplayHistory: false}}
+func TestTerminalWSConnResynchronizesFromRestartedSnapshot(t *testing.T) {
+	c := &terminalWSConn{out: make(chan []byte, 2), done: make(chan struct{}), target: &resolver.TerminalTarget{ReplayHistory: false}}
 	c.handleTerminalEvent(terminalEvent{Type: terminalEventRestarted, Snapshot: terminalSnapshot{Status: "running", History: "recovered output\n"}})
 	first := <-c.out
 	second := <-c.out
@@ -314,9 +325,9 @@ func TestPapercodeWSConnResynchronizesFromRestartedSnapshot(t *testing.T) {
 	}
 }
 
-func TestPapercodeWSConnHandlesExitedSnapshot(t *testing.T) {
+func TestTerminalWSConnHandlesExitedSnapshot(t *testing.T) {
 	code := 7
-	c := &papercodeWSConn{out: make(chan []byte, 1), done: make(chan struct{})}
+	c := &terminalWSConn{out: make(chan []byte, 1), done: make(chan struct{})}
 	c.handleTerminalEvent(terminalEvent{
 		Type: "snapshot",
 		Snapshot: terminalSnapshot{
@@ -366,12 +377,13 @@ func testTerminalTarget(httpURL string) *resolver.TerminalTarget {
 	u.Scheme = strings.Replace(u.Scheme, "http", "ws", 1)
 	u.Path = "/project"
 	return &resolver.TerminalTarget{
-		WebSocketBaseURL: u.String(),
-		Auth:             resolver.AuthTarget{Method: "websocket_ticket", Ticket: "pct_test"},
-		ThreadID:         "paperboat-cli",
-		TerminalID:       "term-1",
-		CWD:              "/workspace",
-		ReplayHistory:    true,
+		WebSocketBaseURL:    u.String(),
+		Auth:                resolver.AuthTarget{Method: "websocket_ticket", Ticket: "pct_test"},
+		ThreadID:            "paperboat-cli",
+		TerminalID:          "term-1",
+		CWD:                 "/workspace",
+		RestartIfNotRunning: true,
+		ReplayHistory:       true,
 	}
 }
 
@@ -384,8 +396,8 @@ type rpcRequestSeen struct {
 	Headers   [][2]string    `json:"headers"`
 }
 
-func TestPapercodeWSConnReadEOF(t *testing.T) {
-	c := &papercodeWSConn{out: make(chan []byte)}
+func TestTerminalWSConnReadEOF(t *testing.T) {
+	c := &terminalWSConn{out: make(chan []byte)}
 	close(c.out)
 	_, err := c.Read(make([]byte, 1))
 	if err != io.EOF {
@@ -393,8 +405,8 @@ func TestPapercodeWSConnReadEOF(t *testing.T) {
 	}
 }
 
-func TestPapercodeWSConnWaitClosed(t *testing.T) {
-	c := &papercodeWSConn{done: make(chan struct{})}
+func TestTerminalWSConnWaitClosed(t *testing.T) {
+	c := &terminalWSConn{done: make(chan struct{})}
 	c.finish(0, nil)
 	code, err := c.Wait()
 	if err != nil || code != 0 {
@@ -402,7 +414,7 @@ func TestPapercodeWSConnWaitClosed(t *testing.T) {
 	}
 }
 
-func TestPapercodeWSConnUnexpectedReadFailureSurfacesError(t *testing.T) {
+func TestTerminalWSConnUnexpectedReadFailureSurfacesError(t *testing.T) {
 	upgrader := websocket.Upgrader{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ws, err := upgrader.Upgrade(w, r, nil)
@@ -418,7 +430,7 @@ func TestPapercodeWSConnUnexpectedReadFailureSurfacesError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	conn, err := NewPapercodeWSTunnel().Dial(context.Background(), resolver.ConnectInfo{Terminal: testTerminalTarget(server.URL)})
+	conn, err := NewWebSocketTunnel().Dial(context.Background(), resolver.ConnectInfo{Terminal: testTerminalTarget(server.URL)})
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -426,12 +438,12 @@ func TestPapercodeWSConnUnexpectedReadFailureSurfacesError(t *testing.T) {
 	if code != 1 {
 		t.Fatalf("code = %d", code)
 	}
-	if !strings.Contains(err.Error(), "papercode websocket read failed") {
+	if !strings.Contains(err.Error(), "terminal websocket read failed") {
 		t.Fatalf("err = %v", err)
 	}
 }
 
-func TestPapercodeWSConnLocalCloseDoesNotSurfaceReadError(t *testing.T) {
+func TestTerminalWSConnLocalCloseDoesNotSurfaceReadError(t *testing.T) {
 	upgrader := websocket.Upgrader{}
 	var destructiveClose atomic.Bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -455,7 +467,7 @@ func TestPapercodeWSConnLocalCloseDoesNotSurfaceReadError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	conn, err := NewPapercodeWSTunnel().Dial(context.Background(), resolver.ConnectInfo{Terminal: testTerminalTarget(server.URL)})
+	conn, err := NewWebSocketTunnel().Dial(context.Background(), resolver.ConnectInfo{Terminal: testTerminalTarget(server.URL)})
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -471,7 +483,7 @@ func TestPapercodeWSConnLocalCloseDoesNotSurfaceReadError(t *testing.T) {
 	}
 }
 
-func TestPapercodeWSConnMalformedFrameIsTransportLost(t *testing.T) {
+func TestTerminalWSConnMalformedFrameIsTransportLost(t *testing.T) {
 	upgrader := websocket.Upgrader{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ws, err := upgrader.Upgrade(w, r, nil)
@@ -491,7 +503,7 @@ func TestPapercodeWSConnMalformedFrameIsTransportLost(t *testing.T) {
 	}))
 	defer server.Close()
 
-	conn, err := NewPapercodeWSTunnel().Dial(context.Background(), resolver.ConnectInfo{Terminal: testTerminalTarget(server.URL)})
+	conn, err := NewWebSocketTunnel().Dial(context.Background(), resolver.ConnectInfo{Terminal: testTerminalTarget(server.URL)})
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -504,7 +516,7 @@ func TestPapercodeWSConnMalformedFrameIsTransportLost(t *testing.T) {
 	}
 }
 
-func TestPapercodeWSConnExitFailureClassification(t *testing.T) {
+func TestTerminalWSConnExitFailureClassification(t *testing.T) {
 	cases := []struct {
 		name          string
 		message       string
@@ -516,7 +528,7 @@ func TestPapercodeWSConnExitFailureClassification(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			c := &papercodeWSConn{out: make(chan []byte, 1), done: make(chan struct{})}
+			c := &terminalWSConn{out: make(chan []byte, 1), done: make(chan struct{})}
 			raw, err := json.Marshal(map[string]any{"message": tc.message})
 			if err != nil {
 				t.Fatal(err)

@@ -104,6 +104,19 @@ func TestReconnectingConnBoundsFailures(t *testing.T) {
 	}
 }
 
+func TestReconnectingConnStopsOnAuthoritativeFailure(t *testing.T) {
+	first := &reconnectTestConn{Reader: bytes.NewReader(nil), err: ErrTransportLost}
+	attempts := 0
+	c := NewReconnectingConn(context.Background(), first, 6, 0, func(context.Context) (Conn, error) {
+		attempts++
+		return nil, StopReconnect(errors.New("access revoked"))
+	})
+	_, err := c.Wait()
+	if err == nil || attempts != 1 {
+		t.Fatalf("err=%v attempts=%d", err, attempts)
+	}
+}
+
 func TestReconnectingConnDoesNotRetryTerminalFailure(t *testing.T) {
 	first := &reconnectTestConn{Reader: bytes.NewReader(nil), err: errors.New("remote command failed")}
 	reconnects := 0

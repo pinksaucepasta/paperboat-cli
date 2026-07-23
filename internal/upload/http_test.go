@@ -2,6 +2,8 @@ package upload
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"net/http"
@@ -66,8 +68,17 @@ func TestHTTPUploaderUploadsAndReturnsVMPath(t *testing.T) {
 			data, _ := io.ReadAll(part)
 			gotBody[part.FormName()] = string(data)
 		}
-		if gotBody["image"] != "image-bytes" {
+		if gotBody["file"] != "image-bytes" {
 			t.Fatalf("multipart body = %#v", gotBody)
+		}
+		for _, header := range []string{"X-Paperboat-Request-ID", "X-Paperboat-Operation-ID", "X-Paperboat-Deadline-Ms", "X-Paperboat-File-Name", "X-Paperboat-File-Mime", "X-Paperboat-File-Size", "X-Paperboat-File-Sha256"} {
+			if r.Header.Get(header) == "" {
+				t.Fatalf("missing canonical upload header %s", header)
+			}
+		}
+		digest := sha256.Sum256([]byte("image-bytes"))
+		if r.Header.Get("X-Paperboat-File-Name") != "image.png" || r.Header.Get("X-Paperboat-File-Mime") != "image/png" || r.Header.Get("X-Paperboat-File-Size") != "11" || r.Header.Get("X-Paperboat-File-Sha256") != hex.EncodeToString(digest[:]) {
+			t.Fatalf("canonical upload metadata changed: %#v", r.Header)
 		}
 		if _, ok := gotBody["display_filename"]; ok {
 			t.Fatalf("optional display_filename must be omitted: %#v", gotBody)
@@ -168,6 +179,24 @@ func TestHTTPUploaderReturnsStructuredError(t *testing.T) {
 	}
 	if stagedErr.Code != "unsupported_media_type" {
 		t.Fatalf("code = %q", stagedErr.Code)
+	}
+}
+
+func TestHTTPUploaderReturnsCanonicalHelperError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"code":"invalid_request","message":"Bad Request","requestId":"req_123","retryable":false,"details":{"stage":"multipart_metadata"}}`))
+	}))
+	defer srv.Close()
+
+	_, err := NewHTTPUploader(srv.URL, "/api/files/staged-images", Auth{Method: "bearer", Token: "token"}).Upload(context.Background(), Image{Name: "x.png", MimeType: "image/png", Bytes: []byte("x")})
+	var stagedErr *Error
+	if !errors.As(err, &stagedErr) {
+		t.Fatalf("error type = %T, want *upload.Error", err)
+	}
+	if stagedErr.Code != "invalid_request" || stagedErr.Message != "Bad Request" || stagedErr.RequestID != "req_123" || stagedErr.Stage != "multipart_metadata" || stagedErr.Retryable {
+		t.Fatalf("error = %+v", stagedErr)
 	}
 }
 

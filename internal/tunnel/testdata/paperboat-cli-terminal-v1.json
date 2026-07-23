@@ -32,7 +32,7 @@
   },
   "reconnect": {
     "reattach_same_thread_and_terminal": true,
-    "restart_if_not_running": true,
+    "restart_if_not_running": false,
     "replay_failed_writes": false
   },
   "methods": {

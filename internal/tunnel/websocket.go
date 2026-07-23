@@ -52,9 +52,10 @@ const (
 	websocketKeepaliveTimeout     = 10 * time.Second
 	websocketWriteTimeout         = 10 * time.Second
 	terminalOutputQueueChunks     = 256
+	helperWebSocketSubprotocol    = "paperboat.helper.v1"
 )
 
-var papercodeAttachEventTypes = []string{
+var terminalAttachEventTypes = []string{
 	terminalEventSnapshot,
 	terminalEventOutput,
 	terminalEventExited,
@@ -65,34 +66,38 @@ var papercodeAttachEventTypes = []string{
 	terminalEventActivity,
 }
 
-// PapercodeWSTunnel attaches to the VM-local papercode terminal RPC over the
-// agentunnel-provided WebSocket route.
-type PapercodeWSTunnel struct {
+// WebSocketTunnel attaches to the helper terminal RPC over the server-assigned
+// WebSocket route. Legacy descriptor kinds are normalized before reaching this type.
+type WebSocketTunnel struct {
 	Dialer            *websocket.Dialer
 	OutputQueueChunks int
 }
 
-func NewPapercodeWSTunnel() *PapercodeWSTunnel {
-	return &PapercodeWSTunnel{Dialer: websocket.DefaultDialer, OutputQueueChunks: terminalOutputQueueChunks}
+func NewWebSocketTunnel() *WebSocketTunnel {
+	return &WebSocketTunnel{Dialer: websocket.DefaultDialer, OutputQueueChunks: terminalOutputQueueChunks}
 }
 
-func (t *PapercodeWSTunnel) Check(ctx context.Context, target *resolver.TerminalTarget) error {
-	wsURL, headers, err := papercodeWebSocketRequest(target)
+func (t *WebSocketTunnel) Check(ctx context.Context, target *resolver.TerminalTarget) error {
+	wsURL, headers, err := terminalWebSocketRequest(target)
 	if err != nil {
 		return err
 	}
-	dialer := t.Dialer
-	if dialer == nil {
-		dialer = websocket.DefaultDialer
-	}
+	dialer := helperDialer(t.Dialer)
 	ws, resp, err := dialer.DialContext(ctx, wsURL, headers)
 	if err != nil {
 		if resp != nil {
-			return fmt.Errorf("dial papercode websocket: %w (status %d)", err, resp.StatusCode)
+			return fmt.Errorf("dial terminal websocket: %w (status %d)", err, resp.StatusCode)
 		}
-		return fmt.Errorf("dial papercode websocket: %w", err)
+		return fmt.Errorf("dial terminal websocket: %w", err)
 	}
-	c := newPapercodeWSConn(ws, target, t.outputQueueChunks())
+	if target.Kind == "paperboat_terminal_v1" {
+		defer ws.Close()
+		if _, err := helperHandshake(ctx, ws); err != nil {
+			return err
+		}
+		return helperCheck(ctx, ws)
+	}
+	c := newTerminalWSConn(ws, target, t.outputQueueChunks())
 	defer c.Close()
 	if err := c.call(ctx, rpcSubscribeTerminalMetadata, map[string]any{}); err != nil {
 		return err
@@ -100,27 +105,42 @@ func (t *PapercodeWSTunnel) Check(ctx context.Context, target *resolver.Terminal
 	return c.waitProtocol(ctx)
 }
 
-func (t *PapercodeWSTunnel) Dial(ctx context.Context, info resolver.ConnectInfo) (Conn, error) {
+func (t *WebSocketTunnel) Dial(ctx context.Context, info resolver.ConnectInfo) (Conn, error) {
 	if info.Terminal == nil {
-		return nil, errors.New("missing papercode terminal descriptor")
+		return nil, errors.New("missing terminal descriptor")
 	}
 	target := info.Terminal
-	wsURL, headers, err := papercodeWebSocketRequest(target)
+	wsURL, headers, err := terminalWebSocketRequest(target)
 	if err != nil {
 		return nil, err
 	}
-	dialer := t.Dialer
-	if dialer == nil {
-		dialer = websocket.DefaultDialer
-	}
+	dialer := helperDialer(t.Dialer)
 	ws, resp, err := dialer.DialContext(ctx, wsURL, headers)
 	if err != nil {
 		if resp != nil {
-			return nil, fmt.Errorf("dial papercode websocket: %w (status %d)", err, resp.StatusCode)
+			return nil, fmt.Errorf("dial terminal websocket: %w (status %d)", err, resp.StatusCode)
 		}
-		return nil, fmt.Errorf("dial papercode websocket: %w", err)
+		return nil, fmt.Errorf("dial terminal websocket: %w", err)
 	}
-	c := newPapercodeWSConn(ws, target, t.outputQueueChunks())
+	if target.Kind == "paperboat_terminal_v1" {
+		inputStream, err := helperHandshake(ctx, ws)
+		if err != nil {
+			_ = ws.Close()
+			return nil, err
+		}
+		c := newHelperTerminalConn(ws, target, t.outputQueueChunks())
+		c.inputStream = inputStream
+		if err := c.initialize(ctx); err != nil {
+			_ = ws.Close()
+			return nil, err
+		}
+		return c, nil
+	}
+	if target.Kind != "" && target.Kind != "papercode_websocket" {
+		_ = ws.Close()
+		return nil, fmt.Errorf("unsupported terminal transport %q", target.Kind)
+	}
+	c := newTerminalWSConn(ws, target, t.outputQueueChunks())
 	if err := c.attach(ctx); err != nil {
 		_ = c.Close()
 		return nil, err
@@ -132,42 +152,51 @@ func (t *PapercodeWSTunnel) Dial(ctx context.Context, info resolver.ConnectInfo)
 	return c, nil
 }
 
-func papercodeWebSocketRequest(target *resolver.TerminalTarget) (string, http.Header, error) {
+func helperDialer(input *websocket.Dialer) *websocket.Dialer {
+	if input == nil {
+		input = websocket.DefaultDialer
+	}
+	dialer := *input
+	dialer.Subprotocols = []string{helperWebSocketSubprotocol}
+	return &dialer
+}
+
+func terminalWebSocketRequest(target *resolver.TerminalTarget) (string, http.Header, error) {
 	base := strings.TrimRight(target.WebSocketBaseURL, "/")
 	if base == "" {
-		return "", nil, errors.New("missing papercode websocket base URL")
+		return "", nil, errors.New("missing terminal websocket base URL")
 	}
 	u, err := url.Parse(base)
 	if err != nil {
-		return "", nil, fmt.Errorf("parse papercode websocket URL: %w", err)
+		return "", nil, fmt.Errorf("parse terminal websocket URL: %w", err)
 	}
 	if u.Scheme != "ws" && u.Scheme != "wss" {
-		return "", nil, fmt.Errorf("papercode websocket URL must use ws or wss, got %q", u.Scheme)
-	}
-	if !strings.HasSuffix(u.Path, papercodeWebSocketPath) {
-		u.Path = strings.TrimRight(u.Path, "/") + papercodeWebSocketPath
+		return "", nil, fmt.Errorf("terminal websocket URL must use ws or wss, got %q", u.Scheme)
 	}
 	headers := make(http.Header)
 	switch target.Auth.Method {
 	case "websocket_ticket":
 		if target.Auth.Ticket == "" {
-			return "", nil, errors.New("missing papercode websocket ticket")
+			return "", nil, errors.New("missing terminal websocket ticket")
 		}
 		q := u.Query()
 		q.Set(papercodeTicketQueryParameter, target.Auth.Ticket)
 		u.RawQuery = q.Encode()
+		if !strings.HasSuffix(u.Path, papercodeWebSocketPath) {
+			u.Path = strings.TrimRight(u.Path, "/") + papercodeWebSocketPath
+		}
 	case "bearer":
 		if target.Auth.Token == "" {
-			return "", nil, errors.New("missing papercode bearer token")
+			return "", nil, errors.New("missing terminal bearer token")
 		}
 		headers.Set("Authorization", "Bearer "+target.Auth.Token)
 	default:
-		return "", nil, fmt.Errorf("unsupported papercode websocket auth method %q", target.Auth.Method)
+		return "", nil, fmt.Errorf("unsupported terminal websocket auth method %q", target.Auth.Method)
 	}
 	return u.String(), headers, nil
 }
 
-type papercodeWSConn struct {
+type terminalWSConn struct {
 	ws     *websocket.Conn
 	target *resolver.TerminalTarget
 
@@ -195,7 +224,7 @@ type papercodeWSConn struct {
 }
 
 // stallTimer arms the reused slow-path timer and returns its channel.
-func (c *papercodeWSConn) stallTimer(d time.Duration) <-chan time.Time {
+func (c *terminalWSConn) stallTimer(d time.Duration) <-chan time.Time {
 	if c.stall == nil {
 		c.stall = time.NewTimer(d)
 		return c.stall.C
@@ -210,19 +239,19 @@ func (c *papercodeWSConn) stallTimer(d time.Duration) <-chan time.Time {
 	return c.stall.C
 }
 
-func (t *PapercodeWSTunnel) outputQueueChunks() int {
+func (t *WebSocketTunnel) outputQueueChunks() int {
 	if t.OutputQueueChunks > 0 {
 		return t.OutputQueueChunks
 	}
 	return terminalOutputQueueChunks
 }
 
-func newPapercodeWSConn(ws *websocket.Conn, target *resolver.TerminalTarget, configuredQueueChunks ...int) *papercodeWSConn {
+func newTerminalWSConn(ws *websocket.Conn, target *resolver.TerminalTarget, configuredQueueChunks ...int) *terminalWSConn {
 	outputQueueChunks := terminalOutputQueueChunks
 	if len(configuredQueueChunks) > 0 && configuredQueueChunks[0] > 0 {
 		outputQueueChunks = configuredQueueChunks[0]
 	}
-	c := &papercodeWSConn{
+	c := &terminalWSConn{
 		ws:            ws,
 		target:        target,
 		out:           make(chan []byte, outputQueueChunks),
@@ -238,7 +267,7 @@ func newPapercodeWSConn(ws *websocket.Conn, target *resolver.TerminalTarget, con
 	return c
 }
 
-func (c *papercodeWSConn) waitProtocol(ctx context.Context) error {
+func (c *terminalWSConn) waitProtocol(ctx context.Context) error {
 	select {
 	case <-c.protocolReady:
 		return nil
@@ -246,17 +275,17 @@ func (c *papercodeWSConn) waitProtocol(ctx context.Context) error {
 		if c.exitErr != nil {
 			return c.exitErr
 		}
-		return errors.New("papercode terminal attach ended before a protocol frame")
+		return errors.New("terminal attach ended before a protocol frame")
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 }
 
-func (c *papercodeWSConn) attach(ctx context.Context) error {
+func (c *terminalWSConn) attach(ctx context.Context) error {
 	payload := map[string]any{
 		rpcFieldThreadID:            c.target.ThreadID,
 		rpcFieldTerminalID:          c.target.TerminalID,
-		rpcFieldRestartIfNotRunning: true,
+		rpcFieldRestartIfNotRunning: c.target.RestartIfNotRunning,
 	}
 	if c.target.CWD != "" {
 		payload[rpcFieldCWD] = c.target.CWD
@@ -274,7 +303,7 @@ func (c *papercodeWSConn) attach(ctx context.Context) error {
 	return c.call(ctx, rpcTerminalAttach, payload)
 }
 
-func (c *papercodeWSConn) Read(p []byte) (int, error) {
+func (c *terminalWSConn) Read(p []byte) (int, error) {
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
 	// Animated TUIs emit many small PTY updates. Drain output that is already
@@ -282,7 +311,7 @@ func (c *papercodeWSConn) Read(p []byte) (int, error) {
 	return readBufferedChunks(p, &c.pending, c.out)
 }
 
-func (c *papercodeWSConn) Write(p []byte) (int, error) {
+func (c *terminalWSConn) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
@@ -309,11 +338,11 @@ func (c *papercodeWSConn) Write(p []byte) (int, error) {
 
 // CloseWrite reports the protocol limitation instead of pretending EOF was
 // delivered and leaving a non-interactive remote process waiting forever.
-func (c *papercodeWSConn) CloseWrite() error {
+func (c *terminalWSConn) CloseWrite() error {
 	return ErrInputEOFUnsupported
 }
 
-func (c *papercodeWSConn) Resize(rows, cols uint16) error {
+func (c *terminalWSConn) Resize(rows, cols uint16) error {
 	if rows == 0 || cols == 0 {
 		return nil
 	}
@@ -328,7 +357,7 @@ func (c *papercodeWSConn) Resize(rows, cols uint16) error {
 	return c.call(ctx, rpcTerminalResize, payload)
 }
 
-func (c *papercodeWSConn) Close() error {
+func (c *terminalWSConn) Close() error {
 	select {
 	case <-c.closed:
 		return nil
@@ -342,12 +371,12 @@ func (c *papercodeWSConn) Close() error {
 	return c.ws.Close()
 }
 
-func (c *papercodeWSConn) Wait() (int, error) {
+func (c *terminalWSConn) Wait() (int, error) {
 	<-c.done
 	return c.exitCode, c.exitErr
 }
 
-func (c *papercodeWSConn) call(ctx context.Context, method string, payload any) error {
+func (c *terminalWSConn) call(ctx context.Context, method string, payload any) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	select {
@@ -365,7 +394,7 @@ func (c *papercodeWSConn) call(ctx context.Context, method string, payload any) 
 	return c.ws.WriteJSON(msg)
 }
 
-func (c *papercodeWSConn) keepaliveLoop() {
+func (c *terminalWSConn) keepaliveLoop() {
 	_ = c.ws.SetReadDeadline(time.Now().Add(websocketKeepaliveInterval + websocketKeepaliveTimeout))
 	c.ws.SetPongHandler(func(string) error {
 		return c.ws.SetReadDeadline(time.Now().Add(websocketKeepaliveInterval + websocketKeepaliveTimeout))
@@ -391,11 +420,11 @@ func (c *papercodeWSConn) keepaliveLoop() {
 	}
 }
 
-func (c *papercodeWSConn) stopKeepalive() {
+func (c *terminalWSConn) stopKeepalive() {
 	c.keepaliveOnce.Do(func() { close(c.keepaliveStop) })
 }
 
-func (c *papercodeWSConn) readLoop() {
+func (c *terminalWSConn) readLoop() {
 	defer c.stopKeepalive()
 	defer close(c.closed)
 	defer close(c.out)
@@ -405,7 +434,7 @@ func (c *papercodeWSConn) readLoop() {
 			if c.isClosing() {
 				c.finish(0, nil)
 			} else {
-				c.finish(1, errors.Join(ErrTransportLost, fmt.Errorf("papercode websocket read failed: %w", err)))
+				c.finish(1, errors.Join(ErrTransportLost, fmt.Errorf("terminal websocket read failed: %w", err)))
 			}
 			return
 		}
@@ -423,14 +452,14 @@ func (c *papercodeWSConn) readLoop() {
 				// as transport loss so the reconnect supervisor re-attaches
 				// and resyncs from the last committed sequence instead of
 				// killing the session.
-				c.finish(1, errors.Join(ErrTransportLost, fmt.Errorf("papercode frame decode failed: %w", err)))
+				c.finish(1, errors.Join(ErrTransportLost, fmt.Errorf("terminal frame decode failed: %w", err)))
 				_ = c.ws.Close()
 				return
 			}
 		} else {
 			var frame rpcFrame
 			if err := json.Unmarshal(data, &frame); err != nil {
-				c.finish(1, errors.Join(ErrTransportLost, fmt.Errorf("papercode frame decode failed: %w", err)))
+				c.finish(1, errors.Join(ErrTransportLost, fmt.Errorf("terminal frame decode failed: %w", err)))
 				_ = c.ws.Close()
 				return
 			}
@@ -446,13 +475,13 @@ func (c *papercodeWSConn) readLoop() {
 	}
 }
 
-func (c *papercodeWSConn) isClosing() bool {
+func (c *terminalWSConn) isClosing() bool {
 	return c.closing.Load()
 }
 
 // MarkTransportLost terminates the socket as an unexpected transport failure,
 // allowing the reconnect supervisor to distinguish it from an intentional close.
-func (c *papercodeWSConn) MarkTransportLost(err error) {
+func (c *terminalWSConn) MarkTransportLost(err error) {
 	if err == nil {
 		err = ErrTransportLost
 	}
@@ -460,13 +489,13 @@ func (c *papercodeWSConn) MarkTransportLost(err error) {
 	_ = c.ws.Close()
 }
 
-func (c *papercodeWSConn) handleFrame(frame rpcFrame) error {
+func (c *terminalWSConn) handleFrame(frame rpcFrame) error {
 	switch frame.Tag {
 	case rpcChunkTag:
 		for _, raw := range frame.Values {
 			var ev terminalEvent
 			if err := json.Unmarshal(raw, &ev); err != nil {
-				return errors.Join(ErrTransportLost, fmt.Errorf("papercode terminal event decode failed: %w", err))
+				return errors.Join(ErrTransportLost, fmt.Errorf("terminal event decode failed: %w", err))
 			}
 			if err := c.handleTerminalEvent(ev); err != nil {
 				return err
@@ -490,7 +519,7 @@ func (c *papercodeWSConn) handleFrame(frame rpcFrame) error {
 			return errors.New(message)
 		}
 	case rpcClientProtocolErrorTag, rpcDefectTag:
-		return errors.Join(ErrTransportLost, errors.New("papercode websocket protocol error"))
+		return errors.Join(ErrTransportLost, errors.New("terminal websocket protocol error"))
 	}
 	return nil
 }
@@ -512,7 +541,7 @@ func isTransientStreamFailure(message string) bool {
 	return false
 }
 
-func (c *papercodeWSConn) handleTerminalEvent(ev terminalEvent) error {
+func (c *terminalWSConn) handleTerminalEvent(ev terminalEvent) error {
 	commitSequence := func(sequence *int) {
 		if sequence != nil && c.target != nil && c.target.SequenceSink != nil {
 			c.target.SequenceSink(*sequence)
@@ -535,7 +564,7 @@ func (c *papercodeWSConn) handleTerminalEvent(ev terminalEvent) error {
 		case <-c.keepaliveStop:
 			return ErrTransportLost
 		case <-timer:
-			return errors.Join(ErrTransportLost, errors.New("papercode terminal output queue stalled"))
+			return errors.Join(ErrTransportLost, errors.New("terminal output queue stalled"))
 		}
 	}
 	switch ev.Type {
@@ -584,7 +613,7 @@ func (c *papercodeWSConn) handleTerminalEvent(ev terminalEvent) error {
 	return nil
 }
 
-func (c *papercodeWSConn) finishFromStatus(status string, exitCode, exitSignal *int, errMsg string) {
+func (c *terminalWSConn) finishFromStatus(status string, exitCode, exitSignal *int, errMsg string) {
 	switch status {
 	case terminalEventExited:
 		c.finish(exitStatus(exitCode, exitSignal), nil)
@@ -606,7 +635,7 @@ func exitStatus(exitCode, exitSignal *int) int {
 	return 0
 }
 
-func (c *papercodeWSConn) finish(code int, err error) {
+func (c *terminalWSConn) finish(code int, err error) {
 	c.exitOnce.Do(func() {
 		c.exitCode = code
 		c.exitErr = err
@@ -659,7 +688,7 @@ func effectFailureMessage(causes []effectCause) string {
 			return string(cause.Error)
 		}
 	}
-	return "papercode rpc failed"
+	return "terminal RPC failed"
 }
 
 type terminalEvent struct {
@@ -680,5 +709,5 @@ type terminalSnapshot struct {
 	ExitSignal *int   `json:"exitSignal"`
 }
 
-var _ Tunnel = (*PapercodeWSTunnel)(nil)
-var _ Conn = (*papercodeWSConn)(nil)
+var _ Tunnel = (*WebSocketTunnel)(nil)
+var _ Conn = (*terminalWSConn)(nil)

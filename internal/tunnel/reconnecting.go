@@ -13,6 +13,18 @@ import (
 
 type ReconnectFunc func(context.Context) (Conn, error)
 
+type stopReconnectError struct{ error }
+
+func (e stopReconnectError) Unwrap() error { return e.error }
+
+// StopReconnect marks a reconnect failure as authoritative and permanent.
+func StopReconnect(err error) error {
+	if err == nil {
+		return nil
+	}
+	return stopReconnectError{error: err}
+}
+
 type TelemetryContext struct {
 	ProjectID     string
 	EnvironmentID string
@@ -180,6 +192,10 @@ func (c *ReconnectingConn) supervise(conn Conn) {
 			if dialErr != nil {
 				c.record("terminal.reconnect", "failure", attemptStarted)
 				err = errors.Join(err, dialErr)
+				var terminal stopReconnectError
+				if errors.As(dialErr, &terminal) {
+					break
+				}
 				continue
 			}
 			if next == nil {

@@ -1,5 +1,5 @@
 // Package resolver turns a project name into the information needed to connect:
-// which VM and how to reach it through agentunnel. Production resolution calls
+// which environment and how to reach it through `paperboat-tunnel`. Production resolution calls
 // paperboat-server's pre-connect broker.
 package resolver
 
@@ -29,15 +29,15 @@ type ConnectInfo struct {
 	Project      string
 	ProjectState string
 	// TunnelTarget identifies how the tunnel layer should reach the VM. Its
-	// meaning is tunnel-implementation specific (agentunnel tcp-tunnel id in
-	// production).
+	// meaning is tunnel-implementation specific. Legacy descriptor readers may
+	// still carry an Agentunnel tunnel ID during the bounded rollback window.
 	TunnelTarget string
 	// Local is true when this resolves to a local dev target (no real VM).
 	Local bool
-	// Terminal is the papercode WebSocket attach descriptor returned by paperboat-server's
+	// Terminal is the helper WebSocket attach descriptor returned by paperboat-server's
 	// pre-connect broker.
 	Terminal *TerminalTarget
-	// Upload is the papercode image-upload endpoint hint from the broker. Nil
+	// Upload is the helper image-upload endpoint hint from the broker. Nil
 	// when the broker did not return one.
 	Upload *UploadTarget
 }
@@ -51,9 +51,9 @@ type AuthTarget struct {
 	Scopes    []string
 }
 
-// TerminalTarget is the client-safe papercode WebSocket endpoint carried
-// through agentunnel. It carries route metadata and scoped papercode auth, not
-// raw machine addresses, SSH credentials, or agentunnel control tokens.
+// TerminalTarget is the client-safe environment WebSocket endpoint returned
+// by the broker. It carries scoped terminal auth, not
+// raw machine addresses, SSH credentials, or tunnel control tokens.
 type TerminalTarget struct {
 	Kind             string
 	EnvironmentID    string
@@ -62,16 +62,20 @@ type TerminalTarget struct {
 	Auth             AuthTarget
 	ThreadID         string
 	TerminalID       string
+	SessionID        string
 	CWD              string
 	// Env is local-terminal environment forwarded on attach (TERM, COLORTERM,
 	// ...) so the remote PTY spawns with the client's terminal capabilities.
-	// Applied by the papercode server when the PTY (re)starts.
+	// Applied by paperboat-helper when the PTY (re)starts.
 	Env map[string]string
 	// Cols/Rows seed the remote PTY size at attach time so retained history
 	// replays at the local geometry instead of the server default until the
 	// first resize lands.
 	Cols uint16
 	Rows uint16
+	// RestartIfNotRunning is true only for the initial user-requested attach.
+	// Transport reconnects must observe an exited session and its final status.
+	RestartIfNotRunning bool
 	// ReplayHistory controls whether an attach should emit retained terminal
 	// history. Reconnects suppress it because the local session already has it.
 	ReplayHistory bool
@@ -79,8 +83,8 @@ type TerminalTarget struct {
 	SequenceSink  func(int)
 }
 
-// UploadTarget is the papercode-server upload endpoint reachable through
-// agentunnel, with the server-authoritative size/MIME policy.
+// UploadTarget is the helper upload endpoint reachable through
+// `paperboat-tunnel`, with the server-authoritative size/MIME policy.
 type UploadTarget struct {
 	HTTPBaseURL      string
 	Path             string
