@@ -136,6 +136,28 @@ type GitHubRepository struct {
 	DefaultBranch string `json:"default_branch"`
 }
 
+// ClientConfiguration contains server-owned URLs used by Paperboat clients.
+type ClientConfiguration struct {
+	Version              string `json:"version"`
+	CLIVerificationURL   string `json:"cli_verification_url"`
+	ConnectedMachinesURL string `json:"connected_machines_url"`
+}
+
+func (c *Client) ClientConfiguration(ctx context.Context) (ClientConfiguration, error) {
+	var out ClientConfiguration
+	if err := c.do(ctx, http.MethodGet, "/v1/client-configuration", nil, &out); err != nil {
+		return ClientConfiguration{}, err
+	}
+	if out.Version != "1" {
+		return ClientConfiguration{}, fmt.Errorf("paperboat-server returned unsupported client configuration version %q", out.Version)
+	}
+	connectedMachinesURL, err := url.Parse(out.ConnectedMachinesURL)
+	if err != nil || (connectedMachinesURL.Scheme != "http" && connectedMachinesURL.Scheme != "https") || connectedMachinesURL.Host == "" {
+		return ClientConfiguration{}, errors.New("paperboat-server returned an invalid connected-machines URL")
+	}
+	return out, nil
+}
+
 type CatalogMachineType struct {
 	Code   string `json:"code"`
 	Active bool   `json:"active"`

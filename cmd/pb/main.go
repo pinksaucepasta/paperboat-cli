@@ -324,7 +324,11 @@ func machineCobraCommand() *cobra.Command {
 		if strings.TrimSpace(cfg.ServerURL) == "" {
 			return errors.New("Paperboat server is not configured; set server_url or use --server")
 		}
-		target := strings.TrimRight(cfg.ServerURL, "/") + "/dashboard/connected-machines"
+		clientConfiguration, err := api.New(cfg.ServerURL, config.Credential{}, nil).ClientConfiguration(ctx.Context)
+		if err != nil {
+			return friendlyCommandError(fmt.Errorf("load Paperboat client configuration: %w", err))
+		}
+		target := clientConfiguration.ConnectedMachinesURL
 		if err := openBrowser(target); err != nil {
 			fmt.Fprintf(command.ErrOrStderr(), "Could not open a browser: %v\n", err)
 		}
@@ -717,7 +721,7 @@ func drainPendingRevocations(ctx context.Context, issuer string, store config.Pr
 	return errors.Join(errs...)
 }
 
-func openBrowser(target string) error {
+var openBrowser = func(target string) error {
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "darwin":

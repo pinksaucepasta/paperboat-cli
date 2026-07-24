@@ -610,6 +610,44 @@ func TestMachineRevokeJSONOutputContract(t *testing.T) {
 	}
 }
 
+func TestMachineAddUsesServerOwnedConnectedMachinesURL(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/client-configuration" {
+			http.NotFound(w, r)
+			return
+		}
+		if authorization := r.Header.Get("Authorization"); authorization != "" {
+			t.Fatalf("authorization=%q", authorization)
+		}
+		writeAPIData(t, w, api.ClientConfiguration{
+			Version:              "1",
+			CLIVerificationURL:   "https://dashboard.paperboat.test/cli/authorize",
+			ConnectedMachinesURL: "https://dashboard.paperboat.test/dashboard/connected-machines",
+		})
+	}))
+	defer srv.Close()
+	writeTestProfile(t, dir, configPath, srv.URL)
+
+	originalOpenBrowser := openBrowser
+	t.Cleanup(func() { openBrowser = originalOpenBrowser })
+	var opened string
+	openBrowser = func(target string) error {
+		opened = target
+		return nil
+	}
+
+	var output bytes.Buffer
+	if code := run(context.Background(), []string{"--config", configPath, "machine", "add"}, &output, &output); code != 0 {
+		t.Fatalf("exit=%d output=%q", code, output.String())
+	}
+	want := "https://dashboard.paperboat.test/dashboard/connected-machines"
+	if opened != want || !strings.Contains(output.String(), "Continue BYOD enrollment at "+want) {
+		t.Fatalf("opened=%q output=%q", opened, output.String())
+	}
+}
+
 func TestDefaultEnvironmentUsesStableRememberedIDWithoutListing(t *testing.T) {
 	client := api.New("https://api.paperboat.test", config.Credential{AccessToken: "token"}, &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 		t.Fatal("remembered target should not list environments")

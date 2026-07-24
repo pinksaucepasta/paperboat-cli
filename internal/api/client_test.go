@@ -20,6 +20,44 @@ func writeData(w http.ResponseWriter, status int, data any) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"data": data})
 }
 
+func TestClientConfigurationUsesServerOwnedURLWithoutAuthentication(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/client-configuration" {
+			http.NotFound(w, r)
+			return
+		}
+		if authorization := r.Header.Get("Authorization"); authorization != "" {
+			t.Fatalf("authorization=%q", authorization)
+		}
+		writeData(w, http.StatusOK, ClientConfiguration{
+			Version:              "1",
+			CLIVerificationURL:   "https://dashboard.paperboat.test/cli/authorize",
+			ConnectedMachinesURL: "https://dashboard.paperboat.test/dashboard/connected-machines",
+		})
+	}))
+	defer srv.Close()
+
+	got, err := New(srv.URL, config.Credential{}, nil).ClientConfiguration(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ConnectedMachinesURL != "https://dashboard.paperboat.test/dashboard/connected-machines" {
+		t.Fatalf("connected_machines_url=%q", got.ConnectedMachinesURL)
+	}
+}
+
+func TestClientConfigurationRejectsInvalidURL(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeData(w, http.StatusOK, ClientConfiguration{Version: "1", ConnectedMachinesURL: "/dashboard/connected-machines"})
+	}))
+	defer srv.Close()
+
+	_, err := New(srv.URL, config.Credential{}, nil).ClientConfiguration(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "invalid connected-machines URL") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
 func TestListProjectsFollowsPagination(t *testing.T) {
 	var offsets []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
