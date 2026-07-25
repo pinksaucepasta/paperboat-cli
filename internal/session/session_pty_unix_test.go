@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/creack/pty"
-	"github.com/pujan-modha/paperboat-cli/internal/statusbar"
+	"github.com/pinksaucepasta/paperboat-cli/internal/statusbar"
 	"golang.org/x/term"
 )
 

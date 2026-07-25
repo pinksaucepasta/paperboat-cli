@@ -1,6 +1,6 @@
-// Command pb (alias: paperboat) is the invisible terminal wrapper for the
+// Command pb is the invisible terminal wrapper for the
 // Paperboat platform. `pb <environment>` attaches a hosted project or enrolled
-// connected machine through Paperboat auth and bridges local image pastes into
+// user machine through Paperboat auth and bridges local image pastes into
 // remote TUIs. Cross-service calls run behind interfaces so protocol behavior
 // remains independently testable.
 package main
@@ -28,17 +28,17 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/pujan-modha/paperboat-cli/internal/api"
-	sessionauth "github.com/pujan-modha/paperboat-cli/internal/auth"
-	"github.com/pujan-modha/paperboat-cli/internal/command"
-	"github.com/pujan-modha/paperboat-cli/internal/config"
-	"github.com/pujan-modha/paperboat-cli/internal/paste"
-	"github.com/pujan-modha/paperboat-cli/internal/resolver"
-	"github.com/pujan-modha/paperboat-cli/internal/session"
-	"github.com/pujan-modha/paperboat-cli/internal/statusbar"
-	"github.com/pujan-modha/paperboat-cli/internal/telemetry"
-	"github.com/pujan-modha/paperboat-cli/internal/tunnel"
-	"github.com/pujan-modha/paperboat-cli/internal/upload"
+	"github.com/pinksaucepasta/paperboat-cli/internal/api"
+	sessionauth "github.com/pinksaucepasta/paperboat-cli/internal/auth"
+	"github.com/pinksaucepasta/paperboat-cli/internal/command"
+	"github.com/pinksaucepasta/paperboat-cli/internal/config"
+	"github.com/pinksaucepasta/paperboat-cli/internal/paste"
+	"github.com/pinksaucepasta/paperboat-cli/internal/resolver"
+	"github.com/pinksaucepasta/paperboat-cli/internal/session"
+	"github.com/pinksaucepasta/paperboat-cli/internal/statusbar"
+	"github.com/pinksaucepasta/paperboat-cli/internal/telemetry"
+	"github.com/pinksaucepasta/paperboat-cli/internal/tunnel"
+	"github.com/pinksaucepasta/paperboat-cli/internal/upload"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -139,7 +139,7 @@ func newRootCommand() *cobra.Command {
 	projects.Flags().Bool("json", false, "print JSON")
 	root.AddCommand(projects)
 
-	environments := &cobra.Command{Use: "environments", Short: "List hosted projects and connected machines", Args: commandArgs(cobra.NoArgs), RunE: actionRun(environmentsCommand().Action)}
+	environments := &cobra.Command{Use: "environments", Short: "List hosted projects and user machines", Args: commandArgs(cobra.NoArgs), RunE: actionRun(environmentsCommand().Action)}
 	environments.Flags().Bool("json", false, "print JSON")
 	root.AddCommand(environments)
 
@@ -160,7 +160,7 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(specTree(previewCommand(), "preview"))
 	root.AddCommand(sessionsCobraCommand())
 	root.AddCommand(sessionCobraCommand())
-	root.AddCommand(machineCobraCommand())
+	root.AddCommand(userMachineCobraCommand())
 	return root
 }
 
@@ -307,9 +307,9 @@ func sessionCobraCommand() *cobra.Command {
 	return command
 }
 
-func machineCobraCommand() *cobra.Command {
-	machine := &cobra.Command{Use: "machine", Short: "Manage BYOD machines", Args: commandArgs(cobra.NoArgs), RunE: func(command *cobra.Command, _ []string) error { return command.Help() }}
-	add := &cobra.Command{Use: "add", Short: "Start BYOD enrollment in the dashboard", Args: commandArgs(cobra.NoArgs), RunE: func(command *cobra.Command, args []string) error {
+func userMachineCobraCommand() *cobra.Command {
+	machine := &cobra.Command{Use: "user-machine", Short: "Manage user machines", Args: commandArgs(cobra.NoArgs), RunE: func(command *cobra.Command, _ []string) error { return command.Help() }}
+	add := &cobra.Command{Use: "add", Short: "Start user-machine enrollment in the dashboard", Args: commandArgs(cobra.NoArgs), RunE: func(command *cobra.Command, args []string) error {
 		ctx := actionContext(command, args)
 		cfg, err := config.Load(ctx.String("config"))
 		if err != nil {
@@ -328,26 +328,26 @@ func machineCobraCommand() *cobra.Command {
 		if err != nil {
 			return friendlyCommandError(fmt.Errorf("load Paperboat client configuration: %w", err))
 		}
-		target := clientConfiguration.ConnectedMachinesURL
+		target := clientConfiguration.UserMachinesURL
 		if err := openBrowser(target); err != nil {
 			fmt.Fprintf(command.ErrOrStderr(), "Could not open a browser: %v\n", err)
 		}
-		fmt.Fprintf(command.OutOrStdout(), "Continue BYOD enrollment at %s\n", target)
+		fmt.Fprintf(command.OutOrStdout(), "Continue user-machine enrollment at %s\n", target)
 		return nil
 	}}
-	list := &cobra.Command{Use: "list", Short: "List enrolled BYOD machines", Args: commandArgs(cobra.NoArgs), RunE: func(command *cobra.Command, args []string) error {
+	list := &cobra.Command{Use: "list", Short: "List enrolled user machines", Args: commandArgs(cobra.NoArgs), RunE: func(command *cobra.Command, args []string) error {
 		ctx := actionContext(command, args)
 		client, err := backendClient(ctx)
 		if err != nil {
 			return err
 		}
-		machines, err := client.ListConnectedMachines(ctx.Context)
+		machines, err := client.ListUserMachines(ctx.Context)
 		if err != nil {
 			return friendlyCommandError(err)
 		}
 		jsonOutput, _ := command.Flags().GetBool("json")
 		if jsonOutput {
-			return json.NewEncoder(command.OutOrStdout()).Encode(map[string]any{"version": "1", "machines": machines})
+			return json.NewEncoder(command.OutOrStdout()).Encode(map[string]any{"version": "1", "user_machines": machines})
 		}
 		writer := tabwriter.NewWriter(command.OutOrStdout(), 0, 4, 2, ' ', 0)
 		fmt.Fprintln(writer, "NAME\tKIND\tSTATE\tID")
@@ -361,27 +361,27 @@ func machineCobraCommand() *cobra.Command {
 		return writer.Flush()
 	}}
 	list.Flags().Bool("json", false, "print JSON")
-	revoke := &cobra.Command{Use: "revoke <machine>", Short: "Disconnect and revoke a BYOD machine", Args: commandArgs(cobra.ExactArgs(1)), RunE: func(cobraCommand *cobra.Command, args []string) error {
+	revoke := &cobra.Command{Use: "revoke <user-machine>", Short: "Disconnect and revoke a user machine", Args: commandArgs(cobra.ExactArgs(1)), RunE: func(cobraCommand *cobra.Command, args []string) error {
 		if confirmed, _ := cobraCommand.Flags().GetBool("yes"); !confirmed {
-			return errors.New("machine revocation requires --yes")
+			return errors.New("user-machine revocation requires --yes")
 		}
 		ctx := actionContext(cobraCommand, args)
 		client, err := backendClient(ctx)
 		if err != nil {
 			return err
 		}
-		machineID, displayName, err := resolveMachineTarget(ctx.Context, client, args[0])
+		userMachineID, displayName, err := resolveUserMachineTarget(ctx.Context, client, args[0])
 		if err != nil {
 			return err
 		}
-		if err := client.DisconnectConnectedMachine(ctx.Context, machineID); err != nil {
+		if err := client.DisconnectUserMachine(ctx.Context, userMachineID); err != nil {
 			return friendlyCommandError(err)
 		}
 		jsonOutput, _ := cobraCommand.Flags().GetBool("json")
 		if jsonOutput {
-			return json.NewEncoder(cobraCommand.OutOrStdout()).Encode(map[string]any{"version": "1", "machine": map[string]string{"id": machineID, "display_name": displayName, "state": "disconnected"}, "outcome": "confirmed", "retry": "not_required"})
+			return json.NewEncoder(cobraCommand.OutOrStdout()).Encode(map[string]any{"version": "1", "user_machine": map[string]string{"id": userMachineID, "display_name": displayName, "state": "disconnected"}, "outcome": "confirmed", "retry": "not_required"})
 		}
-		fmt.Fprintf(cobraCommand.OutOrStdout(), "Disconnected BYOD machine %s (%s).\n", displayName, machineID)
+		fmt.Fprintf(cobraCommand.OutOrStdout(), "Disconnected user machine %s (%s).\n", displayName, userMachineID)
 		return nil
 	}}
 	revoke.Flags().Bool("yes", false, "confirm revocation")
@@ -390,8 +390,8 @@ func machineCobraCommand() *cobra.Command {
 	return machine
 }
 
-func resolveMachineTarget(ctx context.Context, client *api.Client, requested string) (string, string, error) {
-	machines, err := client.ListConnectedMachines(ctx)
+func resolveUserMachineTarget(ctx context.Context, client *api.Client, requested string) (string, string, error) {
+	machines, err := client.ListUserMachines(ctx)
 	if err != nil {
 		return "", "", friendlyCommandError(err)
 	}
@@ -400,7 +400,7 @@ func resolveMachineTarget(ctx context.Context, client *api.Client, requested str
 			return machine.ID, machine.DisplayName, nil
 		}
 	}
-	matches := make([]api.ConnectedMachine, 0, 1)
+	matches := make([]api.UserMachine, 0, 1)
 	for _, machine := range machines {
 		if strings.EqualFold(machine.DisplayName, requested) {
 			matches = append(matches, machine)
@@ -477,9 +477,6 @@ func requireAuthConfig(c *command.Context) (*config.Config, config.ProfileStore,
 	}
 	if strings.TrimSpace(d.cfg.ServerURL) == "" {
 		return nil, config.ProfileStore{}, errors.New("Paperboat server is not configured; set server_url or use --server")
-	}
-	if d.cfg.PapercodeConfigPath != "" {
-		return nil, config.ProfileStore{}, errors.New("papercode_config_path is obsolete and cannot be migrated as a Paperboat session; run `pb auth login`")
 	}
 	s, err := config.ProfileStoreFor(d.cfg)
 	if err != nil {
@@ -571,12 +568,12 @@ func authLoginMode(c *command.Context, replace bool) error {
 		cred := config.Credential{AccessToken: tokens.AccessToken, RefreshToken: tokens.RefreshToken, TokenType: tokens.TokenType, ExpiresAt: expires}
 		me, err := api.New(cfg.ServerURL, cred, nil).Me(c.Context)
 		if err != nil {
-			return errors.Join(fmt.Errorf("validate new session: %w", err), cleanupIssuedSession(cfg.ServerURL, tokens.ClientSessionID, tokens.RefreshToken, store))
+			return errors.Join(fmt.Errorf("validate new session: %w", err), cleanupIssuedSession(cfg.ServerURL, tokens.CLIClientSessionID, tokens.RefreshToken, store))
 		}
-		p := config.Profile{Issuer: cfg.ServerURL, ClientSessionID: tokens.ClientSessionID, AccessExpiresAt: expires, Account: config.Account{ID: me.ID, Email: me.Email, DisplayName: me.DisplayName}}
+		p := config.Profile{Issuer: cfg.ServerURL, CLIClientSessionID: tokens.CLIClientSessionID, AccessExpiresAt: expires, Account: config.Account{ID: me.ID, Email: me.Email, DisplayName: me.DisplayName}}
 		var saveErr error
 		if previous != nil {
-			saveErr = store.Switch(previous.ClientSessionID, p, cred)
+			saveErr = store.Switch(previous.CLIClientSessionID, p, cred)
 		} else {
 			saveErr = store.Save(p, cred)
 		}
@@ -590,7 +587,7 @@ func authLoginMode(c *command.Context, replace bool) error {
 			}
 		}
 		if saveErr != nil {
-			return errors.Join(saveErr, cleanupIssuedSession(cfg.ServerURL, tokens.ClientSessionID, tokens.RefreshToken, store))
+			return errors.Join(saveErr, cleanupIssuedSession(cfg.ServerURL, tokens.CLIClientSessionID, tokens.RefreshToken, store))
 		}
 		if previous != nil {
 			if err := drainPendingRevocations(context.Background(), cfg.ServerURL, store); err != nil {
@@ -610,8 +607,8 @@ func fileCredentialFallback(cfg *config.Config) (config.ProfileStore, error) {
 	return config.ProfileStoreFor(cfg)
 }
 
-func cleanupIssuedSession(issuer, clientSessionID, refreshToken string, store config.ProfileStore) error {
-	if err := store.QueueRevocation(issuer, clientSessionID, refreshToken); err != nil {
+func cleanupIssuedSession(issuer, cliClientSessionID, refreshToken string, store config.ProfileStore) error {
+	if err := store.QueueRevocation(issuer, cliClientSessionID, refreshToken); err != nil {
 		if revokeErr := api.RevokeToken(context.Background(), issuer, refreshToken, nil); revokeErr != nil {
 			return errors.Join(fmt.Errorf("retain failed session for revocation: %w", err), fmt.Errorf("revoke unretained session: %w", revokeErr))
 		}
@@ -638,9 +635,9 @@ func authStatus(c *command.Context) error {
 		return err
 	}
 	if c.Bool("json") {
-		return json.NewEncoder(os.Stdout).Encode(map[string]any{"signed_in": true, "issuer": p.Issuer, "client_session_id": p.ClientSessionID, "access_expires_at": p.AccessExpiresAt, "account": p.Account})
+		return json.NewEncoder(os.Stdout).Encode(map[string]any{"signed_in": true, "issuer": p.Issuer, "cli_client_session_id": p.CLIClientSessionID, "access_expires_at": p.AccessExpiresAt, "account": p.Account})
 	}
-	fmt.Printf("Signed in as %s\nServer: %s\nSession: %s\nAccess expires: %s\n", firstNonEmpty(p.Account.Email, p.Account.DisplayName, p.Account.ID), p.Issuer, p.ClientSessionID, p.AccessExpiresAt.Format(time.RFC3339))
+	fmt.Printf("Signed in as %s\nServer: %s\nSession: %s\nAccess expires: %s\n", firstNonEmpty(p.Account.Email, p.Account.DisplayName, p.Account.ID), p.Issuer, p.CLIClientSessionID, p.AccessExpiresAt.Format(time.RFC3339))
 	return nil
 }
 
@@ -664,7 +661,7 @@ func authLogout(c *command.Context) error {
 			}
 			currentPending := false
 			for _, record := range records {
-				if record.ClientSessionID == active.ClientSessionID {
+				if record.CLIClientSessionID == active.CLIClientSessionID {
 					currentPending = true
 					break
 				}
@@ -706,7 +703,7 @@ func drainPendingRevocations(ctx context.Context, issuer string, store config.Pr
 			continue
 		}
 		if err := api.RevokeToken(ctx, issuer, cred.RefreshToken, nil); err != nil {
-			errs = append(errs, fmt.Errorf("revoke client session %s: %w", record.ClientSessionID, err))
+			errs = append(errs, fmt.Errorf("revoke client session %s: %w", record.CLIClientSessionID, err))
 			continue
 		}
 		record, err = store.MarkRevocationSucceeded(record)
@@ -845,8 +842,8 @@ type environmentTarget struct {
 }
 
 const (
-	environmentProject          = "project"
-	environmentConnectedMachine = "connected_machine"
+	environmentProject     = "project"
+	environmentUserMachine = "user_machine"
 )
 
 func defaultEnvironment(ctx context.Context, client *api.Client, rememberedID string) (string, error) {
@@ -860,7 +857,7 @@ func defaultEnvironment(ctx context.Context, client *api.Client, rememberedID st
 	if api.IsHostedEntitlementRequired(err) {
 		projects = nil
 	}
-	machines, err := client.ListConnectedMachines(ctx)
+	machines, err := client.ListUserMachines(ctx)
 	if err != nil {
 		return "", friendlyCommandError(err)
 	}
@@ -871,7 +868,7 @@ func defaultEnvironment(ctx context.Context, client *api.Client, rememberedID st
 		return machines[0].ID, nil
 	}
 	if len(projects)+len(machines) == 0 {
-		return "", errors.New("no Paperboat environments are available; run `pb create` or `pb machine add`")
+		return "", errors.New("no Paperboat environments are available; run `pb create` or `pb user-machine add`")
 	}
 	choices := make([]string, 0, len(projects)+len(machines))
 	for _, project := range projects {
@@ -891,47 +888,47 @@ func resolveEnvironmentTarget(ctx context.Context, client *api.Client, requested
 	if !errors.Is(err, resolver.ErrProjectNotFound) && !api.IsHostedEntitlementRequired(err) {
 		return environmentTarget{}, err
 	}
-	machine, machineErr := resolveConnectedMachine(ctx, client, requested)
+	machine, machineErr := resolveUserMachine(ctx, client, requested)
 	if machineErr != nil {
 		if api.IsNotFound(machineErr) {
 			return environmentTarget{}, err
 		}
 		return environmentTarget{}, machineErr
 	}
-	return environmentTarget{kind: environmentConnectedMachine, id: machine.ID, name: machine.DisplayName}, nil
+	return environmentTarget{kind: environmentUserMachine, id: machine.ID, name: machine.DisplayName}, nil
 }
 
 func listTerminalSessionsForTarget(ctx context.Context, client *api.Client, target environmentTarget) ([]api.TerminalSession, error) {
-	if target.kind == environmentConnectedMachine {
-		return client.ListConnectedMachineTerminalSessions(ctx, target.id)
+	if target.kind == environmentUserMachine {
+		return client.ListUserMachineTerminalSessions(ctx, target.id)
 	}
 	return client.ListTerminalSessions(ctx, target.id)
 }
 
 func createTerminalSessionForTarget(ctx context.Context, client *api.Client, target environmentTarget, name, idempotencyKey string) (api.TerminalSession, error) {
-	if target.kind == environmentConnectedMachine {
-		return client.CreateConnectedMachineTerminalSession(ctx, target.id, name, idempotencyKey)
+	if target.kind == environmentUserMachine {
+		return client.CreateUserMachineTerminalSession(ctx, target.id, name, idempotencyKey)
 	}
 	return client.CreateTerminalSession(ctx, target.id, name, idempotencyKey)
 }
 
 func renameTerminalSessionForTarget(ctx context.Context, client *api.Client, target environmentTarget, sessionID, name string) (api.TerminalSession, error) {
-	if target.kind == environmentConnectedMachine {
-		return client.RenameConnectedMachineTerminalSession(ctx, target.id, sessionID, name)
+	if target.kind == environmentUserMachine {
+		return client.RenameUserMachineTerminalSession(ctx, target.id, sessionID, name)
 	}
 	return client.RenameTerminalSession(ctx, target.id, sessionID, name)
 }
 
 func closeTerminalSessionForTarget(ctx context.Context, client *api.Client, target environmentTarget, sessionID string) error {
-	if target.kind == environmentConnectedMachine {
-		return client.CloseConnectedMachineTerminalSession(ctx, target.id, sessionID)
+	if target.kind == environmentUserMachine {
+		return client.CloseUserMachineTerminalSession(ctx, target.id, sessionID)
 	}
 	return client.CloseTerminalSession(ctx, target.id, sessionID)
 }
 
 func deleteTerminalSessionForTarget(ctx context.Context, client *api.Client, target environmentTarget, sessionID string) error {
-	if target.kind == environmentConnectedMachine {
-		return client.DeleteConnectedMachineTerminalSession(ctx, target.id, sessionID)
+	if target.kind == environmentUserMachine {
+		return client.DeleteUserMachineTerminalSession(ctx, target.id, sessionID)
 	}
 	return client.DeleteTerminalSession(ctx, target.id, sessionID)
 }
@@ -984,24 +981,6 @@ func buildDeps(c *command.Context) (*deps, error) {
 	}, nil
 }
 
-func connectCommand() *command.Spec {
-	return &command.Spec{
-		Name:      "connect",
-		Usage:     "Attach to an environment terminal (default action)",
-		ArgsUsage: "<environment>",
-		Flags:     connectFlags(),
-		Action:    actionConnect,
-	}
-}
-
-func connectFlags() []command.Flag {
-	return []command.Flag{
-		&command.BoolFlag{Name: "new", Usage: "create a new terminal session"},
-		&command.StringFlag{Name: "name", Usage: "name for a new terminal session"},
-		&command.StringFlag{Name: "session", Usage: "attach an existing terminal session by name or ID"},
-	}
-}
-
 func projectsCommand() *command.Spec {
 	return &command.Spec{
 		Name:  "projects",
@@ -1035,7 +1014,7 @@ func projectsCommand() *command.Spec {
 func environmentsCommand() *command.Spec {
 	return &command.Spec{
 		Name:  "environments",
-		Usage: "List hosted projects and connected machines",
+		Usage: "List hosted projects and user machines",
 		Flags: []command.Flag{&command.BoolFlag{Name: "json"}},
 		Action: func(c *command.Context) error {
 			client, err := backendClient(c)
@@ -1049,12 +1028,12 @@ func environmentsCommand() *command.Spec {
 			if err != nil {
 				projects = nil
 			}
-			machines, err := client.ListConnectedMachines(c.Context)
+			machines, err := client.ListUserMachines(c.Context)
 			if err != nil {
 				return err
 			}
 			if c.Bool("json") {
-				return json.NewEncoder(os.Stdout).Encode(map[string]any{"projects": projects, "connected_machines": machines})
+				return json.NewEncoder(os.Stdout).Encode(map[string]any{"projects": projects, "user_machines": machines})
 			}
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 			fmt.Fprintln(w, "TYPE\tNAME\tID\tSTATE")
@@ -1066,7 +1045,7 @@ func environmentsCommand() *command.Spec {
 				if machine.Online && state == "" {
 					state = "online"
 				}
-				fmt.Fprintf(w, "connected_machine\t%s\t%s\t%s\n", machine.DisplayName, machine.ID, state)
+				fmt.Fprintf(w, "user_machine\t%s\t%s\t%s\n", machine.DisplayName, machine.ID, state)
 			}
 			return w.Flush()
 		},
@@ -1093,9 +1072,9 @@ func previewListCommand(c *command.Context) error {
 		return json.NewEncoder(c.Writer).Encode(map[string]any{"schema_version": "1.0", "ok": true, "data": map[string]any{"previews": items}})
 	}
 	w := tabwriter.NewWriter(c.Writer, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "NAME\tPROJECT\tMACHINE\tENVIRONMENT\tTYPE\tUSER\tOWNER\tSTATE\tURL\tPORT")
+	fmt.Fprintln(w, "NAME\tPROJECT\tRESOURCE\tENVIRONMENT\tTYPE\tUSER\tOWNER\tSTATE\tURL\tPORT")
 	for _, item := range items {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\n", item.LogicalName, item.ProjectID, item.MachineID, item.EnvironmentName, item.EnvironmentKind, item.UserID, item.OwnerEmail, item.State, item.URL, item.TargetPort)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\n", item.LogicalName, item.ProjectID, item.ResourceID, item.EnvironmentName, item.EnvironmentKind, item.UserID, item.OwnerEmail, item.State, item.URL, item.TargetPort)
 	}
 	return w.Flush()
 }
@@ -1124,7 +1103,7 @@ func previewRemoveCommand(c *command.Context) error {
 		return friendlyCommandError(fmt.Errorf("preview %q was not found", previewID))
 	}
 	fmt.Fprintf(c.ErrWriter, "Preview: %s (%s, %s)\n", selected.LogicalName, selected.EnvironmentName, selected.EnvironmentKind)
-	fmt.Fprintf(c.ErrWriter, "Project: %s  Machine: %s  User: %s\n", selected.ProjectID, selected.MachineID, selected.UserID)
+	fmt.Fprintf(c.ErrWriter, "Project: %s  Resource: %s  User: %s\n", selected.ProjectID, selected.ResourceID, selected.UserID)
 	if !c.Bool("yes") {
 		return errors.New("preview removal requires --yes")
 	}
@@ -1295,17 +1274,17 @@ func selectTerminalSession(ctx context.Context, client *api.Client, projectRef s
 	return session.ID, nil
 }
 
-func resolveConnectedMachine(ctx context.Context, client *api.Client, requested string) (api.ConnectedMachine, error) {
-	machines, err := client.ListConnectedMachines(ctx)
+func resolveUserMachine(ctx context.Context, client *api.Client, requested string) (api.UserMachine, error) {
+	machines, err := client.ListUserMachines(ctx)
 	if err != nil {
-		return api.ConnectedMachine{}, err
+		return api.UserMachine{}, err
 	}
 	for _, machine := range machines {
 		if machine.ID == requested {
 			return machine, nil
 		}
 	}
-	var matches []api.ConnectedMachine
+	var matches []api.UserMachine
 	for _, machine := range machines {
 		if strings.EqualFold(machine.DisplayName, requested) {
 			matches = append(matches, machine)
@@ -1319,9 +1298,9 @@ func resolveConnectedMachine(ctx context.Context, client *api.Client, requested 
 		for _, machine := range matches {
 			ids = append(ids, machine.ID)
 		}
-		return api.ConnectedMachine{}, fmt.Errorf("%w: %q matches connected-machine IDs %s; use an exact ID", resolver.ErrProjectAmbiguous, requested, strings.Join(ids, ", "))
+		return api.UserMachine{}, fmt.Errorf("%w: %q matches user-machine IDs %s; use an exact ID", resolver.ErrProjectAmbiguous, requested, strings.Join(ids, ", "))
 	}
-	return api.ConnectedMachine{}, fmt.Errorf("%w: %q", resolver.ErrProjectNotFound, requested)
+	return api.UserMachine{}, fmt.Errorf("%w: %q", resolver.ErrProjectNotFound, requested)
 }
 
 func resolveTerminalSession(ctx context.Context, client *api.Client, target environmentTarget, ref string) (api.TerminalSession, error) {
@@ -1623,7 +1602,7 @@ func actionConnectTarget(c *command.Context, requested string) error {
 		freshInfo, resolveErr := freshResolver.Resolve(reconnectCtx, resolver.ConnectRequest{Project: info.ProjectID, Credential: freshCred, TerminalSessionID: terminalSessionID})
 		if resolveErr != nil {
 			var apiErr *api.APIError
-			if errors.As(resolveErr, &apiErr) && apiErr.Code == "connected_machine_revoked" {
+			if errors.As(resolveErr, &apiErr) && apiErr.Code == "user_machine_revoked" {
 				resolveErr = tunnel.StopReconnect(resolveErr)
 			}
 			return nil, resolveErr
@@ -2025,10 +2004,10 @@ func friendlyAPIError(err error) string {
 		return "the secure tunnel is not available yet; retry in a moment"
 	case "machine_not_ready":
 		return "the project machine is not ready yet; retry in a moment"
-	case "connected_machine_offline":
-		return "the connected machine is offline; start or repair its Paperboat connector, then retry"
-	case "connected_machine_revoked":
-		return "this connected machine has been disconnected or revoked; repair or reconnect it in the Paperboat dashboard"
+	case "user_machine_offline":
+		return "the user machine is offline; start or repair its Paperboat connector, then retry"
+	case "user_machine_revoked":
+		return "this user machine has been disconnected or revoked; repair or reconnect it in the Paperboat dashboard"
 	}
 	return ""
 }
@@ -2238,7 +2217,7 @@ func configAssign(c *command.Context) error {
 	if err != nil {
 		return err
 	}
-	if target.kind == environmentConnectedMachine {
+	if target.kind == environmentUserMachine {
 		return errors.New("config assignment for BYOD environments requires dashboard consent and is not available in this release")
 	}
 	repositories, err := client.ListConfigRepositories(c.Context)
@@ -2280,8 +2259,8 @@ func configUnassign(c *command.Context) error {
 		return err
 	}
 	environmentID := target.id
-	if target.kind == environmentConnectedMachine {
-		machines, listErr := client.ListConnectedMachines(c.Context)
+	if target.kind == environmentUserMachine {
+		machines, listErr := client.ListUserMachines(c.Context)
 		if listErr != nil {
 			return friendlyCommandError(listErr)
 		}
@@ -2292,7 +2271,7 @@ func configUnassign(c *command.Context) error {
 			}
 		}
 		if environmentID == target.id {
-			return errors.New("connected machine does not expose its environment identity; update paperboat-server")
+			return errors.New("user machine does not expose its environment identity; update paperboat-server")
 		}
 	}
 	assignment, err := client.ConfigAssignment(c.Context, environmentID)
@@ -2394,8 +2373,8 @@ func doctorCommand() *command.Spec {
 			}
 			fmt.Printf("environment:  %s (%s) ✓\n", info.ProjectID, firstNonEmpty(info.ProjectState, "ready"))
 			fmt.Println("entitlement:  connect authorization accepted ✓")
-			if info.TargetKind == "connected_machine" {
-				fmt.Println("connector:    connected machine route ready ✓")
+			if info.TargetKind == "user_machine" {
+				fmt.Println("connector:    user machine route ready ✓")
 			} else {
 				fmt.Println("fly readiness: ready ✓")
 			}

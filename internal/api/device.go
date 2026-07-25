@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/pujan-modha/paperboat-cli/internal/buildinfo"
+	"github.com/pinksaucepasta/paperboat-cli/internal/buildinfo"
 )
 
 const ClientID = "paperboat-cli"
@@ -25,32 +25,32 @@ type DeviceAuthorization struct {
 }
 
 type TokenSet struct {
-	AccessToken     string `json:"access_token"`
-	RefreshToken    string `json:"refresh_token"`
-	TokenType       string `json:"token_type"`
-	ExpiresIn       int    `json:"expires_in"`
-	Scope           string `json:"scope"`
-	ClientSessionID string `json:"client_session_id"`
+	AccessToken        string `json:"access_token"`
+	RefreshToken       string `json:"refresh_token"`
+	TokenType          string `json:"token_type"`
+	ExpiresIn          int    `json:"expires_in"`
+	Scope              string `json:"scope"`
+	CLIClientSessionID string `json:"cli_client_session_id"`
 }
 
 func DeviceAuthorize(ctx context.Context, baseURL, label, deviceType, osName string, hc *http.Client) (DeviceAuthorization, error) {
 	var out DeviceAuthorization
-	err := publicCall(ctx, baseURL, "/api/auth/device/authorize", map[string]any{"client_id": ClientID, "client_label": label, "device_type": deviceType, "os": osName, "scopes": ClientScopes}, "", &out, hc)
+	err := publicCall(ctx, baseURL, "/v1/auth/device/authorize", map[string]any{"client_id": ClientID, "client_label": label, "device_type": deviceType, "os": osName, "scopes": ClientScopes}, "", &out, hc)
 	return out, err
 }
 
 func DeviceToken(ctx context.Context, baseURL, code string, hc *http.Client) (TokenSet, error) {
 	var out TokenSet
-	err := publicCall(ctx, baseURL, "/api/auth/device/token", map[string]any{"client_id": ClientID, "device_code": code}, "", &out, hc)
+	err := publicCall(ctx, baseURL, "/v1/auth/device/token", map[string]any{"client_id": ClientID, "device_code": code}, "", &out, hc)
 	return out, err
 }
 func RevokeToken(ctx context.Context, baseURL, token string, hc *http.Client) error {
-	return publicCall(ctx, baseURL, "/api/auth/token/revoke", nil, token, nil, hc)
+	return publicCall(ctx, baseURL, "/v1/auth/token/revoke", nil, token, nil, hc)
 }
 
 func RefreshToken(ctx context.Context, baseURL, refreshToken string, hc *http.Client) (TokenSet, error) {
 	var out TokenSet
-	err := publicCall(ctx, baseURL, "/api/auth/token/refresh", nil, refreshToken, &out, hc)
+	err := publicCall(ctx, baseURL, "/v1/auth/token/refresh", nil, refreshToken, &out, hc)
 	return out, err
 }
 

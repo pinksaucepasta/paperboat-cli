@@ -9,12 +9,12 @@ import (
 	"testing"
 )
 
-// Synced from papercode/packages/contracts/fixtures/paperboat-cli-terminal-v1.json.
+// Synced from Paperboat/packages/contracts/fixtures/paperboat-cli-terminal-v1.json.
 //
 //go:embed testdata/paperboat-cli-terminal-v1.json
 var terminalProtocolFixture []byte
 
-func TestPapercodeTerminalProtocolFixture(t *testing.T) {
+func TestPaperboatTerminalProtocolFixture(t *testing.T) {
 	var fixture struct {
 		Protocol  string `json:"protocol"`
 		WebSocket struct {
@@ -72,11 +72,11 @@ func TestPapercodeTerminalProtocolFixture(t *testing.T) {
 	if err := decoder.Decode(&fixture); err != nil {
 		t.Fatalf("decode terminal protocol fixture: %v", err)
 	}
-	if fixture.Protocol != papercodeTerminalProtocol {
+	if fixture.Protocol != paperboatTerminalProtocol {
 		t.Fatalf("protocol = %q", fixture.Protocol)
 	}
-	if fixture.WebSocket.Path != papercodeWebSocketPath ||
-		fixture.WebSocket.TicketQueryParameter != papercodeTicketQueryParameter {
+	if fixture.WebSocket.Path != paperboatWebSocketPath ||
+		fixture.WebSocket.TicketQueryParameter != paperboatTicketQueryParameter {
 		t.Fatalf("websocket contract does not match implementation: %#v", fixture.WebSocket)
 	}
 	requestType := reflect.TypeOf(rpcRequest{})

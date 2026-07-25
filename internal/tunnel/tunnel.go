@@ -9,7 +9,7 @@ import (
 	"io"
 	"time"
 
-	"github.com/pujan-modha/paperboat-cli/internal/resolver"
+	"github.com/pinksaucepasta/paperboat-cli/internal/resolver"
 )
 
 var ErrInputEOFUnsupported = errors.New("terminal protocol does not support stdin EOF")

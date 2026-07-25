@@ -128,24 +128,24 @@ type Account struct {
 }
 
 type Profile struct {
-	Version          int       `json:"version"`
-	Issuer           string    `json:"issuer"`
-	Account          Account   `json:"account,omitempty"`
-	ClientSessionID  string    `json:"client_session_id"`
-	AccessExpiresAt  time.Time `json:"access_expires_at"`
-	AccessSecretRef  string    `json:"access_secret_ref"`
-	RefreshSecretRef string    `json:"refresh_secret_ref"`
-	UpdatedAt        time.Time `json:"updated_at"`
+	Version            int       `json:"version"`
+	Issuer             string    `json:"issuer"`
+	Account            Account   `json:"account,omitempty"`
+	CLIClientSessionID string    `json:"cli_client_session_id"`
+	AccessExpiresAt    time.Time `json:"access_expires_at"`
+	AccessSecretRef    string    `json:"access_secret_ref"`
+	RefreshSecretRef   string    `json:"refresh_secret_ref"`
+	UpdatedAt          time.Time `json:"updated_at"`
 }
 
 type PendingRevocation struct {
-	Version          int       `json:"version"`
-	Issuer           string    `json:"issuer"`
-	ClientSessionID  string    `json:"client_session_id"`
-	RefreshSecretRef string    `json:"refresh_secret_ref"`
-	CreatedAt        time.Time `json:"created_at"`
-	ServerRevoked    bool      `json:"server_revoked,omitempty"`
-	Cancelled        bool      `json:"cancelled,omitempty"`
+	Version            int       `json:"version"`
+	Issuer             string    `json:"issuer"`
+	CLIClientSessionID string    `json:"cli_client_session_id"`
+	RefreshSecretRef   string    `json:"refresh_secret_ref"`
+	CreatedAt          time.Time `json:"created_at"`
+	ServerRevoked      bool      `json:"server_revoked,omitempty"`
+	Cancelled          bool      `json:"cancelled,omitempty"`
 }
 
 type SecretStore interface {
@@ -228,29 +228,29 @@ func profileKey(issuer string) string {
 }
 func secretRef(issuer, kind string) string { return "profile-" + profileKey(issuer) + "-" + kind }
 
-func pendingRevocationKey(issuer, clientSessionID string) string {
-	sum := sha256.Sum256([]byte(issuer + "\x00" + clientSessionID))
+func pendingRevocationKey(issuer, cliClientSessionID string) string {
+	sum := sha256.Sum256([]byte(issuer + "\x00" + cliClientSessionID))
 	return hex.EncodeToString(sum[:16])
 }
 
-func pendingRefreshRef(issuer, clientSessionID string) string {
-	return "revocation-" + pendingRevocationKey(issuer, clientSessionID) + "-refresh"
+func pendingRefreshRef(issuer, cliClientSessionID string) string {
+	return "revocation-" + pendingRevocationKey(issuer, cliClientSessionID) + "-refresh"
 }
 
 func (s ProfileStore) profilePath(issuer string) string {
 	return filepath.Join(s.Path, "profiles", profileKey(issuer)+".json")
 }
 
-func (s ProfileStore) pendingRevocationPath(issuer, clientSessionID string) string {
-	return filepath.Join(s.Path, "pending-revocations", profileKey(issuer)+"-"+pendingRevocationKey(issuer, clientSessionID)+".json")
+func (s ProfileStore) pendingRevocationPath(issuer, cliClientSessionID string) string {
+	return filepath.Join(s.Path, "pending-revocations", profileKey(issuer)+"-"+pendingRevocationKey(issuer, cliClientSessionID)+".json")
 }
 
-func (s ProfileStore) existingPendingRevocationPath(issuer, clientSessionID string) string {
-	path := s.pendingRevocationPath(issuer, clientSessionID)
+func (s ProfileStore) existingPendingRevocationPath(issuer, cliClientSessionID string) string {
+	path := s.pendingRevocationPath(issuer, cliClientSessionID)
 	if _, err := os.Stat(path); err == nil || !os.IsNotExist(err) {
 		return path
 	}
-	return filepath.Join(s.Path, "pending-revocations", pendingRevocationKey(issuer, clientSessionID)+".json")
+	return filepath.Join(s.Path, "pending-revocations", pendingRevocationKey(issuer, cliClientSessionID)+".json")
 }
 
 func (s ProfileStore) Load(issuer string) (Profile, error) {
@@ -411,14 +411,14 @@ func (s ProfileStore) Switch(expectedSessionID string, p Profile, cred Credentia
 	if err != nil {
 		return err
 	}
-	if previous.ClientSessionID != expectedSessionID {
+	if previous.CLIClientSessionID != expectedSessionID {
 		return ErrProfileChanged
 	}
 	previousCred, err := s.credentialForProfile(previous)
 	if err != nil {
 		return err
 	}
-	if err := s.QueueRevocation(issuer, previous.ClientSessionID, previousCred.RefreshToken); err != nil {
+	if err := s.QueueRevocation(issuer, previous.CLIClientSessionID, previousCred.RefreshToken); err != nil {
 		return err
 	}
 	rollback := func(cause error) error {
@@ -426,7 +426,7 @@ func (s ProfileStore) Switch(expectedSessionID string, p Profile, cred Credentia
 		rollbackErrs = append(rollbackErrs,
 			s.Secrets.Set(previous.RefreshSecretRef, previousCred.RefreshToken),
 			s.Secrets.Set(previous.AccessSecretRef, previousCred.AccessToken),
-			s.DiscardRevocation(issuer, previous.ClientSessionID),
+			s.DiscardRevocation(issuer, previous.CLIClientSessionID),
 		)
 		return errors.Join(cause, errors.Join(rollbackErrs...))
 	}
@@ -509,15 +509,15 @@ func (s ProfileStore) Remove(issuer string) (Credential, error) {
 
 // QueueRevocation durably retains a refresh token until server revocation is
 // confirmed. Re-queueing the same client session is idempotent.
-func (s ProfileStore) QueueRevocation(issuer, clientSessionID, refreshToken string) error {
+func (s ProfileStore) QueueRevocation(issuer, cliClientSessionID, refreshToken string) error {
 	issuer, err := NormalizeIssuer(issuer)
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(clientSessionID) == "" || strings.TrimSpace(refreshToken) == "" {
+	if strings.TrimSpace(cliClientSessionID) == "" || strings.TrimSpace(refreshToken) == "" {
 		return errors.New("pending revocation requires client session id and refresh token")
 	}
-	path := s.pendingRevocationPath(issuer, clientSessionID)
+	path := s.pendingRevocationPath(issuer, cliClientSessionID)
 	lock := newSharedLock(path + ".lock")
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
@@ -526,11 +526,11 @@ func (s ProfileStore) QueueRevocation(issuer, clientSessionID, refreshToken stri
 		return err
 	}
 	defer lock.Unlock()
-	ref := pendingRefreshRef(issuer, clientSessionID)
+	ref := pendingRefreshRef(issuer, cliClientSessionID)
 	if err := s.Secrets.Set(ref, refreshToken); err != nil {
 		return fmt.Errorf("store pending revocation token: %w", err)
 	}
-	record := PendingRevocation{Version: ProfileVersion, Issuer: issuer, ClientSessionID: clientSessionID, RefreshSecretRef: ref, CreatedAt: time.Now().UTC()}
+	record := PendingRevocation{Version: ProfileVersion, Issuer: issuer, CLIClientSessionID: cliClientSessionID, RefreshSecretRef: ref, CreatedAt: time.Now().UTC()}
 	b, err := json.MarshalIndent(record, "", "  ")
 	if err != nil {
 		return err
@@ -558,27 +558,16 @@ func (s ProfileStore) PendingRevocations(issuer string) ([]PendingRevocation, er
 	var records []PendingRevocation
 	prefix := profileKey(issuer) + "-"
 	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" || !strings.HasPrefix(entry.Name(), prefix) {
 			continue
 		}
-		// Current records are issuer-namespaced in their filename. Legacy
-		// unprefixed records are decoded best-effort for migration compatibility;
-		// malformed legacy records cannot be attributed and therefore cannot block
-		// an unrelated issuer.
-		matchingNamespace := strings.HasPrefix(entry.Name(), prefix)
 		b, err := os.ReadFile(filepath.Join(dir, entry.Name()))
 		if err != nil {
-			if matchingNamespace {
-				return nil, err
-			}
-			continue
+			return nil, err
 		}
 		var record PendingRevocation
 		if err := json.Unmarshal(b, &record); err != nil {
-			if matchingNamespace {
-				return nil, fmt.Errorf("parse pending revocation: %w", err)
-			}
-			continue
+			return nil, fmt.Errorf("parse pending revocation: %w", err)
 		}
 		if record.Issuer == issuer {
 			if record.Version != ProfileVersion {
@@ -599,7 +588,7 @@ func (s ProfileStore) PendingRevocationCredential(record PendingRevocation) (Cre
 }
 
 func (s ProfileStore) CompleteRevocation(record PendingRevocation) error {
-	path := s.existingPendingRevocationPath(record.Issuer, record.ClientSessionID)
+	path := s.existingPendingRevocationPath(record.Issuer, record.CLIClientSessionID)
 	lock := newSharedLock(path + ".lock")
 	if err := lock.Lock(); err != nil {
 		return err
@@ -618,12 +607,12 @@ func (s ProfileStore) CompleteRevocation(record PendingRevocation) error {
 // DiscardRevocation removes a queued copy without revoking the server session.
 // It is used to roll back an account switch whose active-profile replacement
 // did not commit.
-func (s ProfileStore) DiscardRevocation(issuer, clientSessionID string) error {
+func (s ProfileStore) DiscardRevocation(issuer, cliClientSessionID string) error {
 	issuer, err := NormalizeIssuer(issuer)
 	if err != nil {
 		return err
 	}
-	path := s.existingPendingRevocationPath(issuer, clientSessionID)
+	path := s.existingPendingRevocationPath(issuer, cliClientSessionID)
 	lock := newSharedLock(path + ".lock")
 	if err := lock.Lock(); err != nil {
 		return err
@@ -658,7 +647,7 @@ func (s ProfileStore) DiscardRevocation(issuer, clientSessionID string) error {
 }
 
 func (s ProfileStore) MarkRevocationSucceeded(record PendingRevocation) (PendingRevocation, error) {
-	path := s.existingPendingRevocationPath(record.Issuer, record.ClientSessionID)
+	path := s.existingPendingRevocationPath(record.Issuer, record.CLIClientSessionID)
 	lock := newSharedLock(path + ".lock")
 	if err := lock.Lock(); err != nil {
 		return PendingRevocation{}, err
@@ -695,13 +684,13 @@ func (s ProfileStore) QueueActiveRevocation(issuer string) error {
 	if err != nil {
 		return err
 	}
-	pendingPath := s.pendingRevocationPath(p.Issuer, p.ClientSessionID)
+	pendingPath := s.pendingRevocationPath(p.Issuer, p.CLIClientSessionID)
 	if _, err := os.Stat(pendingPath); os.IsNotExist(err) {
 		refreshToken, getErr := s.Secrets.Get(p.RefreshSecretRef)
 		if getErr != nil {
 			return getErr
 		}
-		if err := s.QueueRevocation(p.Issuer, p.ClientSessionID, refreshToken); err != nil {
+		if err := s.QueueRevocation(p.Issuer, p.CLIClientSessionID, refreshToken); err != nil {
 			return err
 		}
 	} else if err != nil {
@@ -772,10 +761,10 @@ func (s ProfileStore) CredentialWithRefresh(issuer string, refreshBefore time.Du
 	if err != nil {
 		return Credential{}, err
 	}
-	if sessionID != p.ClientSessionID {
+	if sessionID != p.CLIClientSessionID {
 		recoverySessionID := sessionID
 		if recoverySessionID == "" {
-			recoverySessionID = p.ClientSessionID
+			recoverySessionID = p.CLIClientSessionID
 		}
 		if queueErr := s.QueueRevocation(issuer, recoverySessionID, next.RefreshToken); queueErr != nil {
 			return Credential{}, errors.Join(errors.New("refreshed credential changed client session"), fmt.Errorf("retain rotated credential: %w", queueErr))

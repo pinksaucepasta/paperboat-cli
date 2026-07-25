@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pujan-modha/paperboat-cli/internal/telemetry"
+	"github.com/pinksaucepasta/paperboat-cli/internal/telemetry"
 )
 
 type eventSink struct{ events []telemetry.Event }
@@ -49,7 +49,7 @@ func TestHTTPUploaderUploadsAndReturnsVMPath(t *testing.T) {
 	var gotAuth string
 	var gotBody = map[string]string{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/project/api/files/staged-images" {
+		if r.Method != http.MethodPost || r.URL.Path != "/project/v1/files/staged-images" {
 			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
 		gotAuth = r.Header.Get("Authorization")
@@ -88,7 +88,7 @@ func TestHTTPUploaderUploadsAndReturnsVMPath(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	u := NewHTTPUploader(srv.URL, "/project/api/files/staged-images", Auth{Method: "bearer", Token: "upload-token"})
+	u := NewHTTPUploader(srv.URL, "/project/v1/files/staged-images", Auth{Method: "bearer", Token: "upload-token"})
 	got, err := u.Upload(context.Background(), Image{
 		Name:     "image.png",
 		MimeType: "image/png",
@@ -159,7 +159,7 @@ func TestHTTPUploaderRequiresAbsoluteVMPath(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := NewHTTPUploader(srv.URL, "/api/files/staged-images", Auth{}).Upload(context.Background(), Image{Name: "image.png"})
+	_, err := NewHTTPUploader(srv.URL, "/v1/files/staged-images", Auth{}).Upload(context.Background(), Image{Name: "image.png"})
 	if err == nil {
 		t.Fatal("expected absolute VM path error")
 	}
@@ -172,7 +172,7 @@ func TestHTTPUploaderReturnsStructuredError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := NewHTTPUploader(srv.URL, "/api/files/staged-images", Auth{Method: "bearer", Token: "token"}).Upload(context.Background(), Image{Name: "x.png", Bytes: []byte("x")})
+	_, err := NewHTTPUploader(srv.URL, "/v1/files/staged-images", Auth{Method: "bearer", Token: "token"}).Upload(context.Background(), Image{Name: "x.png", Bytes: []byte("x")})
 	var stagedErr *Error
 	if !errors.As(err, &stagedErr) {
 		t.Fatalf("error type = %T, want *upload.Error", err)
@@ -190,7 +190,7 @@ func TestHTTPUploaderReturnsCanonicalHelperError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := NewHTTPUploader(srv.URL, "/api/files/staged-images", Auth{Method: "bearer", Token: "token"}).Upload(context.Background(), Image{Name: "x.png", MimeType: "image/png", Bytes: []byte("x")})
+	_, err := NewHTTPUploader(srv.URL, "/v1/files/staged-images", Auth{Method: "bearer", Token: "token"}).Upload(context.Background(), Image{Name: "x.png", MimeType: "image/png", Bytes: []byte("x")})
 	var stagedErr *Error
 	if !errors.As(err, &stagedErr) {
 		t.Fatalf("error type = %T, want *upload.Error", err)
@@ -201,7 +201,7 @@ func TestHTTPUploaderReturnsCanonicalHelperError(t *testing.T) {
 }
 
 func TestHTTPUploaderRejectsTerminalTicket(t *testing.T) {
-	_, err := NewHTTPUploader("https://example.test", "/api/files/staged-images", Auth{Method: "websocket_ticket", Ticket: "ticket"}).Upload(context.Background(), Image{Name: "x.png", Bytes: []byte("x")})
+	_, err := NewHTTPUploader("https://example.test", "/v1/files/staged-images", Auth{Method: "websocket_ticket", Ticket: "ticket"}).Upload(context.Background(), Image{Name: "x.png", Bytes: []byte("x")})
 	if err == nil {
 		t.Fatal("expected auth scope error")
 	}

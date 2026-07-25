@@ -19,8 +19,7 @@ const EnvConfigPath = "PAPERBOAT_CONFIG"
 // UploadConfig controls the local image-paste bridge. All fields are tunable so
 // behavior can change without rebuilding the binary.
 type UploadConfig struct {
-	// Endpoint is the papercode-server upload endpoint (on the VM, reached
-	// through agentunnel). Production uploads use the brokered descriptor.
+	// Endpoint is the helper upload endpoint. Production uploads use the brokered descriptor.
 	Endpoint string `json:"endpoint,omitempty"`
 	// WatchDirs are directories terminals write temp images into on paste.
 	// Absolute paths, or "~"-prefixed for the home dir.
@@ -28,11 +27,11 @@ type UploadConfig struct {
 	// TempFilePatterns optionally restrict terminal-created image names. Patterns
 	// use filepath glob syntax and may match a basename or normalized full path.
 	TempFilePatterns []string `json:"temp_file_patterns,omitempty"`
-	// MaxImageBytes caps a single image. Defaults to 10 MiB (papercode limit).
+	// MaxImageBytes caps a single image. Defaults to 10 MiB.
 	MaxImageBytes int64 `json:"max_image_bytes,omitempty"`
-	// MaxDataURLChars caps the encoded data URL length (papercode limit).
+	// MaxDataURLChars caps the encoded data URL length.
 	MaxDataURLChars int `json:"max_data_url_chars,omitempty"`
-	// MaxAttachments caps images per paste (papercode limit).
+	// MaxAttachments caps images per paste.
 	MaxAttachments int `json:"max_attachments,omitempty"`
 	// MaxQueuedInputBytes bounds local input held behind an image upload.
 	MaxQueuedInputBytes int `json:"max_queued_input_bytes,omitempty"`
@@ -40,9 +39,7 @@ type UploadConfig struct {
 	AllowedMimePrefixes []string `json:"allowed_mime_prefixes,omitempty"`
 }
 
-// Defaults mirror papercode's UploadChatImageAttachment limits in
-// packages/contracts/src/orchestration.ts. They are applied only when a field
-// is left unset, so a config file can always override them.
+// Upload defaults are applied only when a field is left unset.
 const (
 	DefaultMaxImageBytes       = 10 * 1024 * 1024
 	DefaultMaxDataURLChars     = 14_000_000
@@ -55,18 +52,14 @@ type Config struct {
 	// ServerURL is the paperboat-server base URL. It is required for production commands.
 	ServerURL string `json:"server_url,omitempty"`
 	// LastEnvironmentID is the last successfully connected stable project or
-	// BYOD machine ID. Names are never persisted because they may become
+	// user machine ID. Names are never persisted because they may become
 	// ambiguous or change ownership.
-	LastEnvironmentID string `json:"last_environment_id,omitempty"`
-	// PapercodeConfigPath is retained only to detect the obsolete auth setup.
-	PapercodeConfigPath string     `json:"papercode_config_path,omitempty"`
-	Auth                AuthConfig `json:"auth,omitempty"`
+	LastEnvironmentID string     `json:"last_environment_id,omitempty"`
+	Auth              AuthConfig `json:"auth,omitempty"`
 	// Upload configures the image-paste bridge.
 	Upload UploadConfig `json:"upload,omitempty"`
 	// Connect tunes the pre-connect broker + readiness polling.
 	Connect ConnectConfig `json:"connect,omitempty"`
-	// SSH configures the agentunnel SSH transport.
-	SSH SSHConfig `json:"ssh,omitempty"`
 	// Observability controls the local metadata-only event log.
 	Observability ObservabilityConfig `json:"observability,omitempty"`
 	// StatusBar controls the local terminal status line during interactive sessions.
@@ -111,9 +104,7 @@ type AuthConfig struct {
 	ProfileDir string `json:"profile_dir,omitempty"`
 }
 
-// ConnectConfig tunes how the CLI waits for an idle machine to resume and its
-// agentunnel tunnel to come up after cli-connect. Both are data-driven so the
-// wait behavior can change without a rebuild.
+// ConnectConfig tunes how the CLI waits for an idle machine and its helper route.
 type ConnectConfig struct {
 	// ReadyTimeoutSeconds caps how long to poll for the tunnel to become
 	// connectable before giving up. Defaults to DefaultReadyTimeoutSeconds.
@@ -123,10 +114,9 @@ type ConnectConfig struct {
 	PollIntervalSeconds int `json:"poll_interval_seconds,omitempty"`
 	// AllowedRouteHosts restricts descriptor endpoint hosts. Empty preserves
 	// server-authored routing while a managed install can pin its relay hosts.
-	AllowedRouteHosts     []string `json:"allowed_route_hosts,omitempty"`
-	DialRetries           int      `json:"dial_retries"`
-	DialRetrySeconds      int      `json:"dial_retry_seconds,omitempty"`
-	AcceptedTerminalKinds []string `json:"accepted_terminal_kinds,omitempty"`
+	AllowedRouteHosts []string `json:"allowed_route_hosts,omitempty"`
+	DialRetries       int      `json:"dial_retries"`
+	DialRetrySeconds  int      `json:"dial_retry_seconds,omitempty"`
 	// TerminalOutputQueueChunks bounds buffered remote output events.
 	TerminalOutputQueueChunks int `json:"terminal_output_queue_chunks,omitempty"`
 	// TerminalOutputBatchMilliseconds coalesces animation bursts before local rendering.
@@ -143,22 +133,6 @@ type ConnectConfig struct {
 	// withheld before being forwarded to the remote terminal. Negative
 	// disables the flush.
 	InputPartialFlushMilliseconds int `json:"input_partial_flush_milliseconds,omitempty"`
-}
-
-// SSHConfig configures the client side of the agentunnel SSH transport. The CLI
-// authenticates with the user's existing local SSH credentials (agent + key
-// files) exactly like `ssh paperboat@host` — paperboat-server never hands out
-// keys. Everything here is optional; sane SSH defaults apply when unset.
-type SSHConfig struct {
-	// IdentityFile is an explicit private key path to offer. Empty means use the
-	// SSH agent and the user's default keys.
-	IdentityFile string `json:"identity_file,omitempty"`
-	// KnownHostsFile overrides the host-key database. Empty uses
-	// ~/.ssh/known_hosts.
-	KnownHostsFile string `json:"known_hosts_file,omitempty"`
-	// InsecureSkipHostKeyCheck disables host-key verification. Off by default;
-	// only for local/dev tunnels where the host key is not yet pinned.
-	InsecureSkipHostKeyCheck bool `json:"insecure_skip_host_key_check,omitempty"`
 }
 
 const (
@@ -291,9 +265,6 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Connect.DialRetrySeconds == 0 {
 		c.Connect.DialRetrySeconds = DefaultDialRetrySeconds
-	}
-	if len(c.Connect.AcceptedTerminalKinds) == 0 {
-		c.Connect.AcceptedTerminalKinds = []string{"papercode_websocket"}
 	}
 	if c.Connect.TerminalOutputQueueChunks <= 0 {
 		c.Connect.TerminalOutputQueueChunks = DefaultTerminalOutputQueueChunks

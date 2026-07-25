@@ -28,8 +28,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pujan-modha/paperboat-cli/internal/tunnel"
-	"github.com/pujan-modha/paperboat-cli/internal/upload"
+	"github.com/pinksaucepasta/paperboat-cli/internal/tunnel"
+	"github.com/pinksaucepasta/paperboat-cli/internal/upload"
 )
 
 var (
@@ -125,7 +125,6 @@ func WithLifecycle(callback func(LifecycleEvent)) Option {
 }
 
 // WithTimeout sets the per-paste upload timeout.
-func WithTimeout(d time.Duration) Option { return func(i *Interceptor) { i.timeout = d } }
 
 // WithPartialFlushDelay sets how long a partial paste start marker is withheld
 // before being forwarded as ordinary input. Zero or negative disables the
@@ -674,11 +673,6 @@ func parseCandidate(line string) (pathCandidate, bool) {
 		}
 	}
 	return pathCandidate{path: filepath.FromSlash(localPath), start: start, end: end}, true
-}
-
-func candidatePath(line string) (string, bool) {
-	candidate, ok := parseCandidate(line)
-	return candidate.path, ok
 }
 
 // partialSuffix returns the length of the longest suffix of buf that is a

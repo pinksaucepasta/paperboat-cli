@@ -6,7 +6,7 @@ package resolver
 import (
 	"context"
 
-	"github.com/pujan-modha/paperboat-cli/internal/config"
+	"github.com/pinksaucepasta/paperboat-cli/internal/config"
 )
 
 // ConnectRequest describes what the user asked to connect to.
@@ -22,15 +22,13 @@ type ConnectRequest struct {
 // ConnectInfo is what the resolver hands back to the tunnel + session layers.
 type ConnectInfo struct {
 	// TargetKind identifies the Paperboat environment provider. It is
-	// "project" for a hosted Fly environment and "connected_machine" for an
+	// "project" for a hosted Fly environment and "user_machine" for an
 	// enrolled customer machine.
 	TargetKind   string
 	ProjectID    string
 	Project      string
 	ProjectState string
-	// TunnelTarget identifies how the tunnel layer should reach the VM. Its
-	// meaning is tunnel-implementation specific. Legacy descriptor readers may
-	// still carry an Agentunnel tunnel ID during the bounded rollback window.
+	// TunnelTarget identifies how the tunnel layer should reach the helper.
 	TunnelTarget string
 	// Local is true when this resolves to a local dev target (no real VM).
 	Local bool

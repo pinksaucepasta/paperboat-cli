@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/pujan-modha/paperboat-cli/internal/telemetry"
+	"github.com/pinksaucepasta/paperboat-cli/internal/telemetry"
 )
 
 type ReconnectFunc func(context.Context) (Conn, error)

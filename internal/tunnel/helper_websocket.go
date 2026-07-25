@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/pujan-modha/paperboat-cli/internal/resolver"
+	"github.com/pinksaucepasta/paperboat-cli/internal/resolver"
 )
 
 const (

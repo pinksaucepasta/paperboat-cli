@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pujan-modha/paperboat-cli/internal/tunnel"
+	"github.com/pinksaucepasta/paperboat-cli/internal/tunnel"
 )
 
 type testConn struct {

@@ -41,7 +41,7 @@ func (s *faultSecretStore) Delete(ref string) error {
 func TestProfileStoreSeparatesMetadataAndSecrets(t *testing.T) {
 	dir := t.TempDir()
 	store := ProfileStore{Path: dir, Secrets: FileSecretStore{Dir: filepath.Join(dir, "secrets")}}
-	p := Profile{Issuer: "HTTPS://API.Example.COM/", ClientSessionID: "cls_1", AccessExpiresAt: time.Now().UTC()}
+	p := Profile{Issuer: "HTTPS://API.Example.COM/", CLIClientSessionID: "cls_1", AccessExpiresAt: time.Now().UTC()}
 	if err := store.Save(p, Credential{AccessToken: "access-secret", RefreshToken: "refresh-secret"}); err != nil {
 		t.Fatal(err)
 	}
@@ -70,11 +70,11 @@ func TestInitialSaveDoesNotOverwriteProfileCreatedWhileWaiting(t *testing.T) {
 	secrets := &faultSecretStore{values: map[string]string{}}
 	store := ProfileStore{Path: dir, Secrets: secrets}
 	issuer := "https://api.example.com"
-	first := Profile{Issuer: issuer, ClientSessionID: "cls_first"}
+	first := Profile{Issuer: issuer, CLIClientSessionID: "cls_first"}
 	if err := store.Save(first, Credential{AccessToken: "access-first", RefreshToken: "refresh-first"}); err != nil {
 		t.Fatal(err)
 	}
-	second := Profile{Issuer: issuer, ClientSessionID: "cls_second"}
+	second := Profile{Issuer: issuer, CLIClientSessionID: "cls_second"}
 	if err := store.Save(second, Credential{AccessToken: "access-second", RefreshToken: "refresh-second"}); !errors.Is(err, ErrProfileExists) {
 		t.Fatalf("second save err = %v", err)
 	}
@@ -86,7 +86,7 @@ func TestInitialSaveDoesNotOverwriteProfileCreatedWhileWaiting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.ClientSessionID != "cls_first" || cred.AccessToken != "access-first" || cred.RefreshToken != "refresh-first" {
+	if loaded.CLIClientSessionID != "cls_first" || cred.AccessToken != "access-first" || cred.RefreshToken != "refresh-first" {
 		t.Fatalf("profile = %#v, credential = %#v", loaded, cred)
 	}
 }
@@ -95,7 +95,7 @@ func TestInitialSaveAccessFailureRemovesStoredRefreshSecret(t *testing.T) {
 	dir := t.TempDir()
 	secrets := &faultSecretStore{values: map[string]string{}, failAccess: true}
 	store := ProfileStore{Path: dir, Secrets: secrets}
-	p := Profile{Issuer: "https://api.example.com", ClientSessionID: "cls_1"}
+	p := Profile{Issuer: "https://api.example.com", CLIClientSessionID: "cls_1"}
 	if err := store.Save(p, Credential{AccessToken: "access", RefreshToken: "refresh"}); err == nil {
 		t.Fatal("expected access write failure")
 	}
@@ -116,7 +116,7 @@ func TestInitialSaveMetadataFailureRemovesStoredSecrets(t *testing.T) {
 	if err := os.MkdirAll(profilePath, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	p := Profile{Issuer: issuer, ClientSessionID: "cls_1"}
+	p := Profile{Issuer: issuer, CLIClientSessionID: "cls_1"}
 	if err := store.Save(p, Credential{AccessToken: "access", RefreshToken: "refresh"}); err == nil {
 		t.Fatal("expected metadata write failure")
 	}
@@ -170,7 +170,7 @@ func TestRefreshWriteFailurePreservesRotatedRefreshToken(t *testing.T) {
 	secrets := &faultSecretStore{values: map[string]string{}}
 	store := ProfileStore{Path: dir, Secrets: secrets}
 	expired := time.Now().Add(-time.Minute)
-	profile := Profile{Issuer: "https://api.example.com", ClientSessionID: "cls_1", AccessExpiresAt: expired}
+	profile := Profile{Issuer: "https://api.example.com", CLIClientSessionID: "cls_1", AccessExpiresAt: expired}
 	if err := store.Save(profile, Credential{AccessToken: "access-old", RefreshToken: "refresh-old", ExpiresAt: expired}); err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +198,7 @@ func TestRefreshSessionMismatchQuarantinesRotatedCredential(t *testing.T) {
 	secrets := &faultSecretStore{values: map[string]string{}}
 	store := ProfileStore{Path: dir, Secrets: secrets}
 	expired := time.Now().Add(-time.Minute)
-	profile := Profile{Issuer: "https://api.example.com", ClientSessionID: "cls_1", AccessExpiresAt: expired}
+	profile := Profile{Issuer: "https://api.example.com", CLIClientSessionID: "cls_1", AccessExpiresAt: expired}
 	if err := store.Save(profile, Credential{AccessToken: "access-old", RefreshToken: "refresh-old", ExpiresAt: expired}); err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +220,7 @@ func TestRefreshSessionMismatchQuarantinesRotatedCredential(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if records[0].ClientSessionID != "cls_unexpected" || recovery.RefreshToken != "refresh-new" {
+	if records[0].CLIClientSessionID != "cls_unexpected" || recovery.RefreshToken != "refresh-new" {
 		t.Fatalf("record = %#v, credential = %#v", records[0], recovery)
 	}
 }
@@ -229,12 +229,12 @@ func TestReplaceWriteFailureRestoresPreviousCredentials(t *testing.T) {
 	dir := t.TempDir()
 	secrets := &faultSecretStore{values: map[string]string{}}
 	store := ProfileStore{Path: dir, Secrets: secrets}
-	old := Profile{Issuer: "https://api.example.com", ClientSessionID: "cls_old", AccessExpiresAt: time.Now().Add(time.Hour)}
+	old := Profile{Issuer: "https://api.example.com", CLIClientSessionID: "cls_old", AccessExpiresAt: time.Now().Add(time.Hour)}
 	if err := store.Save(old, Credential{AccessToken: "access-old", RefreshToken: "refresh-old"}); err != nil {
 		t.Fatal(err)
 	}
 	secrets.failAccess = true
-	newProfile := Profile{Issuer: old.Issuer, ClientSessionID: "cls_new", AccessExpiresAt: time.Now().Add(time.Hour)}
+	newProfile := Profile{Issuer: old.Issuer, CLIClientSessionID: "cls_new", AccessExpiresAt: time.Now().Add(time.Hour)}
 	if err := store.Replace(newProfile, Credential{AccessToken: "access-new", RefreshToken: "refresh-new"}); err == nil {
 		t.Fatal("expected replacement failure")
 	}
@@ -247,7 +247,7 @@ func TestReplaceWriteFailureRestoresPreviousCredentials(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.ClientSessionID != "cls_old" || cred.AccessToken != "access-old" || cred.RefreshToken != "refresh-old" {
+	if loaded.CLIClientSessionID != "cls_old" || cred.AccessToken != "access-old" || cred.RefreshToken != "refresh-old" {
 		t.Fatalf("profile = %#v, credential = %#v", loaded, cred)
 	}
 }
@@ -257,10 +257,10 @@ func TestSwitchRejectsChangedExpectedSessionWithoutQueueing(t *testing.T) {
 	secrets := &faultSecretStore{values: map[string]string{}}
 	store := ProfileStore{Path: dir, Secrets: secrets}
 	issuer := "https://api.example.com"
-	if err := store.Save(Profile{Issuer: issuer, ClientSessionID: "cls_current"}, Credential{AccessToken: "access-current", RefreshToken: "refresh-current"}); err != nil {
+	if err := store.Save(Profile{Issuer: issuer, CLIClientSessionID: "cls_current"}, Credential{AccessToken: "access-current", RefreshToken: "refresh-current"}); err != nil {
 		t.Fatal(err)
 	}
-	err := store.Switch("cls_stale", Profile{Issuer: issuer, ClientSessionID: "cls_new"}, Credential{AccessToken: "access-new", RefreshToken: "refresh-new"})
+	err := store.Switch("cls_stale", Profile{Issuer: issuer, CLIClientSessionID: "cls_new"}, Credential{AccessToken: "access-new", RefreshToken: "refresh-new"})
 	if !errors.Is(err, ErrProfileChanged) {
 		t.Fatalf("switch err = %v", err)
 	}
@@ -327,7 +327,7 @@ func TestPendingRevocationsIgnoreMalformedForeignNamespace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(records) != 1 || records[0].ClientSessionID != "cls_1" {
+	if len(records) != 1 || records[0].CLIClientSessionID != "cls_1" {
 		t.Fatalf("records = %#v", records)
 	}
 }
@@ -355,7 +355,7 @@ func TestQueueActiveRevocationRetriesAfterPartialSecretDeletion(t *testing.T) {
 	dir := t.TempDir()
 	secrets := &faultSecretStore{values: map[string]string{}}
 	store := ProfileStore{Path: dir, Secrets: secrets}
-	p := Profile{Issuer: "https://api.example.com", ClientSessionID: "cls_1", AccessExpiresAt: time.Now().Add(time.Hour)}
+	p := Profile{Issuer: "https://api.example.com", CLIClientSessionID: "cls_1", AccessExpiresAt: time.Now().Add(time.Hour)}
 	if err := store.Save(p, Credential{AccessToken: "access", RefreshToken: "refresh"}); err != nil {
 		t.Fatal(err)
 	}
@@ -394,7 +394,7 @@ func TestCompleteRevocationKeepsMetadataUntilSecretDeletionSucceeds(t *testing.T
 	if err := store.CompleteRevocation(records[0]); err == nil {
 		t.Fatal("expected secret deletion failure")
 	}
-	if _, err := os.Stat(store.pendingRevocationPath(records[0].Issuer, records[0].ClientSessionID)); err != nil {
+	if _, err := os.Stat(store.pendingRevocationPath(records[0].Issuer, records[0].CLIClientSessionID)); err != nil {
 		t.Fatalf("pending metadata removed early: %v", err)
 	}
 	secrets.failDeleteRef = ""

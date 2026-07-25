@@ -19,7 +19,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pujan-modha/paperboat-cli/internal/telemetry"
+	"github.com/pinksaucepasta/paperboat-cli/internal/telemetry"
 )
 
 type Auth struct {
@@ -48,7 +48,7 @@ func (u *HTTPUploader) ConfigureTelemetry(sink telemetry.Sink, projectID, enviro
 	u.environmentID = environmentID
 }
 
-// Error is the structured error envelope returned by papercode's staged-image
+// Error is the structured error envelope returned by Paperboat's staged-image
 // endpoint. Code lets callers distinguish retryable workspace/storage failures
 // from user input and authorization failures without parsing text.
 type Error struct {

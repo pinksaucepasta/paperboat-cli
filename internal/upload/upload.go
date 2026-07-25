@@ -2,9 +2,9 @@
 // reads the local file, hands it to an Uploader, and rewrites the paste to the
 // returned VM path so the remote agent receives something it can open.
 //
-// Images are staged through papercode's authenticated multipart HTTP contract.
+// Images are staged through Paperboat's authenticated multipart HTTP contract.
 // The interface keeps transport details swappable and paperboat-cli out of
-// papercode's implementation.
+// Paperboat's implementation.
 package upload
 
 import (
@@ -27,7 +27,7 @@ type Image struct {
 	DataURL string
 }
 
-// Limits captures the papercode-compatible upload constraints. They come from
+// Limits captures the Paperboat-compatible upload constraints. They come from
 // config so they stay tunable and in sync with the server.
 type Limits struct {
 	MaxImageBytes       int64
@@ -103,7 +103,7 @@ func PrepareImageFile(f *os.File, displayPath string, limits Limits) (Image, err
 }
 
 // MimeTypeFor infers an image MIME type from the file extension, matching the
-// extensions papercode's attachmentStore accepts.
+// extensions Paperboat's attachmentStore accepts.
 func MimeTypeFor(path string) string {
 	ext := strings.ToLower(filepath.Ext(path))
 	if t, ok := imageMimeByExt[ext]; ok {
@@ -115,7 +115,7 @@ func MimeTypeFor(path string) string {
 	return "application/octet-stream"
 }
 
-// imageMimeByExt covers the safe image extensions papercode allows
+// imageMimeByExt covers the safe image extensions Paperboat allows
 // (apps/server/src/attachmentStore.ts) so behavior stays consistent.
 var imageMimeByExt = map[string]string{
 	".avif": "image/avif",
@@ -138,10 +138,6 @@ var imageMimeByExt = map[string]string{
 func IsImagePath(path string) bool {
 	_, ok := imageMimeByExt[strings.ToLower(filepath.Ext(path))]
 	return ok
-}
-
-func mimeAllowed(mimeType string, prefixes []string) bool {
-	return mimeAllowedByPolicy(mimeType, prefixes, nil)
 }
 
 func mimeAllowedByPolicy(mimeType string, prefixes, exact []string) bool {

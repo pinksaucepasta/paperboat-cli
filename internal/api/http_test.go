@@ -43,7 +43,7 @@ func TestTLSHandshakeRetryTransportRetriesReplayableRequest(t *testing.T) {
 			}, nil
 		}),
 	}
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, "https://paperboat.example/api/auth/token/refresh", bytes.NewBufferString("payload"))
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, "https://paperboat.example/v1/auth/token/refresh", bytes.NewBufferString("payload"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +70,7 @@ func TestTLSHandshakeRetryTransportDoesNotRetryAmbiguousError(t *testing.T) {
 			return nil, want
 		}),
 	}
-	req, err := http.NewRequest(http.MethodGet, "https://paperboat.example/api/me", nil)
+	req, err := http.NewRequest(http.MethodGet, "https://paperboat.example/v1/me", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +95,7 @@ func TestTLSHandshakeRetryTransportRetriesGETHeaderTimeout(t *testing.T) {
 			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("ok")), Header: make(http.Header), Request: req}, nil
 		}),
 	}
-	req, err := http.NewRequest(http.MethodGet, "https://paperboat.example/api/projects", nil)
+	req, err := http.NewRequest(http.MethodGet, "https://paperboat.example/v1/projects", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +118,7 @@ func TestTLSHandshakeRetryTransportDoesNotRetryPOSTHeaderTimeout(t *testing.T) {
 			return nil, timeoutError("context deadline exceeded (Client.Timeout exceeded while awaiting headers)")
 		}),
 	}
-	req, err := http.NewRequest(http.MethodPost, "https://paperboat.example/api/auth/token/refresh", nil)
+	req, err := http.NewRequest(http.MethodPost, "https://paperboat.example/v1/auth/token/refresh", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

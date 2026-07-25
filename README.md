@@ -18,8 +18,8 @@ See [AGENTS.md](AGENTS.md) for repository ownership and engineering requirements
 ## Usage
 
 ```sh
-pb <environment>             # attach a hosted project or connected-machine terminal
-pb environments               # list hosted projects and connected machines
+pb <environment>             # attach a hosted project or user-machine terminal
+pb environments               # list hosted projects and user machines
 pb auth login                # approve this installation in the dashboard
 pb auth status               # show the active account for the configured server
 pb auth switch               # replace the active account for this server
@@ -28,18 +28,18 @@ pb doctor                    # check auth + environment connectivity
 pb config path|show          # inspect the local config
 ```
 
-Flags may appear before or after the environment name. `paperboat` is an alias for `pb`.
-Hosted projects and connected machines use the same durable terminal-session workflow:
+Flags may appear before or after the environment name.
+Hosted projects and user machines use the same durable terminal-session workflow:
 `--new`, `--session`, and `pb sessions` apply to either environment type.
 
-## Connected machines
+## User machines
 
 BYOD enrollment starts in the dashboard. Its single-use command invokes
-`paperboat-helper bootstrap` with the server, enrollment token, machine name, and absolute
+`pbh bootstrap` with the server, enrollment token, user-machine name, and absolute
 workspace scope. The helper exchanges the token, verifies the server-selected signed helper
 artifact, installs its launchd or systemd user service, and waits for authenticated readiness.
 
-`pb` does not install or run a connector. After enrollment is ready, connected machines use
+`pb` does not install or run a connector. After enrollment is ready, user machines use
 the same `pb <environment>` and durable terminal-session workflow as hosted projects.
 
 When no observability path is configured, metadata-only events are appended to
@@ -52,13 +52,17 @@ truncated at `observability.max_event_log_bytes` rather than growing without lim
 ```sh
 make build      # -> bin/pb
 make release-metadata # binary checksum + provenance metadata in dist/
-make install    # install pb + a `paperboat` alias symlink
+make install    # install pb
 make test       # unit tests (paste parser + upload pipeline)
 ```
 
+`YYYY.MM.DD.X` tags publish signed-provenance archives for supported Darwin, Linux, and
+Windows architectures, plus checksums, an SPDX SBOM, and Homebrew/Scoop manifests. Use
+`tools/release-version.sh next` to generate the next tag; tags have no `v` prefix.
+
 ## Stack
 
-Go — distributed as a single static binary (`github.com/urfave/cli/v2`, Go 1.25).
+Go — distributed as a single static binary (Cobra, Go 1.25.7).
 
 ## Layout
 

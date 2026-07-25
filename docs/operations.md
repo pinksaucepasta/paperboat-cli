@@ -27,7 +27,7 @@ owning repositories.
 provenance JSON containing the version, protocol, commit, and Go toolchain. The
 release pipeline must sign these files and attach an SBOM before publishing.
 
-Pushing a `v*` tag runs `.github/workflows/release.yml`. It cross-builds the six
+Pushing a validated `YYYY.MM.DD.X` tag runs `.github/workflows/release.yml`. It cross-builds the six
 supported OS/architecture combinations, creates checksums and SPDX JSON SBOMs,
 attests each archive with GitHub's OIDC-backed artifact attestation, and uploads
 the assets to the GitHub release. Verify an installed archive with `gh

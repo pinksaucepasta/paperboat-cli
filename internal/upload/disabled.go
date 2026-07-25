@@ -5,7 +5,7 @@ import (
 	"errors"
 )
 
-var ErrUnavailable = errors.New("papercode image upload endpoint is not configured")
+var ErrUnavailable = errors.New("Paperboat image upload endpoint is not configured")
 
 // DisabledUploader fails every upload so the paste interceptor preserves the
 // original local path instead of rewriting to a fake VM path in real sessions.

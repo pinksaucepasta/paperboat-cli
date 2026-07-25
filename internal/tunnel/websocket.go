@@ -14,13 +14,13 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/pujan-modha/paperboat-cli/internal/resolver"
+	"github.com/pinksaucepasta/paperboat-cli/internal/resolver"
 )
 
 const (
-	papercodeTerminalProtocol     = "paperboat-terminal-rpc/v1"
-	papercodeWebSocketPath        = "/ws"
-	papercodeTicketQueryParameter = "wsTicket"
+	paperboatTerminalProtocol     = "paperboat-terminal-rpc/v1"
+	paperboatWebSocketPath        = "/ws"
+	paperboatTicketQueryParameter = "wsTicket"
 	rpcRequestTagValue            = "Request"
 	rpcChunkTag                   = "Chunk"
 	rpcExitTag                    = "Exit"
@@ -136,7 +136,7 @@ func (t *WebSocketTunnel) Dial(ctx context.Context, info resolver.ConnectInfo) (
 		}
 		return c, nil
 	}
-	if target.Kind != "" && target.Kind != "papercode_websocket" {
+	if target.Kind != "" && target.Kind != "paperboat_terminal_v1" {
 		_ = ws.Close()
 		return nil, fmt.Errorf("unsupported terminal transport %q", target.Kind)
 	}
@@ -180,10 +180,10 @@ func terminalWebSocketRequest(target *resolver.TerminalTarget) (string, http.Hea
 			return "", nil, errors.New("missing terminal websocket ticket")
 		}
 		q := u.Query()
-		q.Set(papercodeTicketQueryParameter, target.Auth.Ticket)
+		q.Set(paperboatTicketQueryParameter, target.Auth.Ticket)
 		u.RawQuery = q.Encode()
-		if !strings.HasSuffix(u.Path, papercodeWebSocketPath) {
-			u.Path = strings.TrimRight(u.Path, "/") + papercodeWebSocketPath
+		if !strings.HasSuffix(u.Path, paperboatWebSocketPath) {
+			u.Path = strings.TrimRight(u.Path, "/") + paperboatWebSocketPath
 		}
 	case "bearer":
 		if target.Auth.Token == "" {

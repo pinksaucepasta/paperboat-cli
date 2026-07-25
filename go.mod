@@ -1,4 +1,4 @@
-module github.com/pujan-modha/paperboat-cli
+module github.com/pinksaucepasta/paperboat-cli
 
 go 1.25.7
 

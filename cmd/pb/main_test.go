@@ -16,12 +16,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pujan-modha/paperboat-cli/internal/api"
-	"github.com/pujan-modha/paperboat-cli/internal/config"
-	"github.com/pujan-modha/paperboat-cli/internal/resolver"
-	"github.com/pujan-modha/paperboat-cli/internal/statusbar"
-	"github.com/pujan-modha/paperboat-cli/internal/telemetry"
-	"github.com/pujan-modha/paperboat-cli/internal/upload"
+	"github.com/pinksaucepasta/paperboat-cli/internal/api"
+	"github.com/pinksaucepasta/paperboat-cli/internal/config"
+	"github.com/pinksaucepasta/paperboat-cli/internal/resolver"
+	"github.com/pinksaucepasta/paperboat-cli/internal/statusbar"
+	"github.com/pinksaucepasta/paperboat-cli/internal/telemetry"
+	"github.com/pinksaucepasta/paperboat-cli/internal/upload"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -64,13 +64,13 @@ func TestRetryableInitialConnectError(t *testing.T) {
 	}
 }
 
-func TestSelectTerminalSessionDoesNotHideAmbiguousProjectWithConnectedMachine(t *testing.T) {
+func TestSelectTerminalSessionDoesNotHideAmbiguousProjectWithUserMachine(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/projects":
+		case "/v1/projects":
 			_, _ = w.Write([]byte(`{"data":{"items":[{"id":"prj_1","name":"studio"},{"id":"prj_2","name":"Studio"}],"pagination":{"next_offset":null}}}`))
-		case "/api/connected-machines":
-			t.Fatal("connected-machine lookup must not hide an ambiguous project name")
+		case "/v1/user-machines":
+			t.Fatal("user-machine lookup must not hide an ambiguous project name")
 		default:
 			http.NotFound(w, r)
 		}
@@ -135,10 +135,10 @@ func TestPollConfigSyncUsesAttachedProjectState(t *testing.T) {
 			t.Fatalf("request = %s authorization=%q", r.URL.Path, r.Header.Get("Authorization"))
 		}
 		switch r.URL.Path {
-		case "/api/config-sync/status":
+		case "/v1/config-sync/status":
 			_, _ = w.Write([]byte(`{"data":{"state":"healthy","projects":[{"project_id":"other","state":"healthy"},{"project_id":"attached","state":"warning"}]}}`))
 			requested <- struct{}{}
-		case "/api/dashboard/usage-summary":
+		case "/v1/usage-summary":
 			_, _ = w.Write([]byte(`{"data":{"credits":{"balance":"100.000000"},"storage":{"available_gb":12}}}`))
 		default:
 			t.Fatalf("unexpected path %s", r.URL.Path)
@@ -306,7 +306,7 @@ func TestUploadAuthRefreshRebrokersWithFreshControlPlaneCredential(t *testing.T)
 	server = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
-		case "/api/projects":
+		case "/v1/projects":
 			controlPlaneAuth = append(controlPlaneAuth, r.Header.Get("Authorization"))
 			if r.Header.Get("Authorization") != "Bearer control-new" {
 				w.WriteHeader(http.StatusUnauthorized)
@@ -314,7 +314,7 @@ func TestUploadAuthRefreshRebrokersWithFreshControlPlaneCredential(t *testing.T)
 				return
 			}
 			_, _ = w.Write([]byte(`{"data":{"items":[{"id":"prj_1","name":"Demo","state":"running"}],"pagination":{"limit":200,"offset":0,"total":1,"next_offset":null}}}`))
-		case "/api/projects/prj_1/cli-connect":
+		case "/v1/projects/prj_1/connection-descriptor":
 			controlPlaneAuth = append(controlPlaneAuth, r.Header.Get("Authorization"))
 			if r.Header.Get("Authorization") != "Bearer control-new" {
 				w.WriteHeader(http.StatusUnauthorized)
@@ -324,15 +324,15 @@ func TestUploadAuthRefreshRebrokersWithFreshControlPlaneCredential(t *testing.T)
 			now := time.Now().UTC()
 			wsURL := "wss" + strings.TrimPrefix(server.URL, "https")
 			response := map[string]any{"data": map[string]any{
-				"issuer": server.URL, "project_id": "prj_1", "connectable": true, "expires_at": now.Add(5 * time.Minute),
-				"environment": map[string]any{"environment_id": "env_1", "project_id": "prj_1", "project_root": "/workspace"},
-				"terminal":    map[string]any{"kind": "papercode_websocket", "http_base_url": server.URL, "websocket_base_url": wsURL, "auth": map[string]any{"method": "websocket_ticket", "ticket": "terminal-ticket", "expires_at": now.Add(4 * time.Minute), "scopes": []string{"terminal:operate"}}, "thread_id": "paperboat-cli", "terminal_id": "term_1", "cwd": "/workspace"},
-				"upload":      map[string]any{"kind": "papercode_staged_image", "http_base_url": server.URL, "path": "/api/files/staged-images", "auth": map[string]any{"method": "bearer", "token": "upload-new", "expires_at": now.Add(4 * time.Minute), "scopes": []string{"file:stage"}}, "max_bytes": 1024, "allowed_mime_types": []string{"image/png"}, "retention_seconds": 60},
+				"schema": api.ConnectionSchemaV1, "issuer": server.URL, "project_id": "prj_1", "connectable": true, "expires_at": now.Add(5 * time.Minute),
+				"environment": map[string]any{"id": "env_1", "kind": "hosted", "resource_id": "prj_1", "state": "ready", "root": "/workspace"},
+				"terminal":    map[string]any{"endpoint": wsURL + "/v1/runtime", "http_endpoint": server.URL, "auth": map[string]any{"method": "bearer", "token": "terminal-token", "expires_at": now.Add(4 * time.Minute), "scopes": []string{"terminal:operate"}}, "thread_id": "paperboat-cli", "terminal_id": "term_1", "cwd": "/workspace"},
+				"upload":      map[string]any{"endpoint": server.URL + "/v1/files/staged-images", "auth": map[string]any{"method": "bearer", "token": "upload-new", "expires_at": now.Add(4 * time.Minute), "scopes": []string{"file:stage"}}, "max_bytes": 1024, "allowed_mime_types": []string{"image/png"}, "retention_seconds": 60},
 			}}
 			if err := json.NewEncoder(w).Encode(response); err != nil {
 				t.Fatal(err)
 			}
-		case "/api/files/staged-images":
+		case "/v1/files/staged-images":
 			uploadAuth = append(uploadAuth, r.Header.Get("Authorization"))
 			if r.Header.Get("Authorization") != "Bearer upload-new" {
 				w.WriteHeader(http.StatusUnauthorized)
@@ -346,9 +346,9 @@ func TestUploadAuthRefreshRebrokersWithFreshControlPlaneCredential(t *testing.T)
 	}))
 	defer server.Close()
 
-	cfg := &config.Config{ServerURL: server.URL, Connect: config.ConnectConfig{ReadyTimeoutSeconds: 30, PollIntervalSeconds: 1, AcceptedTerminalKinds: []string{"papercode_websocket"}}}
+	cfg := &config.Config{ServerURL: server.URL, Connect: config.ConnectConfig{ReadyTimeoutSeconds: 30, PollIntervalSeconds: 1}}
 	auth := &refreshTestAuth{current: config.Credential{AccessToken: "control-new"}}
-	uploader := upload.NewHTTPUploader(server.URL, "/api/files/staged-images", upload.Auth{Method: "bearer", Token: "upload-expired"})
+	uploader := upload.NewHTTPUploader(server.URL, "/v1/files/staged-images", upload.Auth{Method: "bearer", Token: "upload-expired"})
 	uploader.HTTPClient = server.Client()
 	uploader.RefreshAuth = func(ctx context.Context) (upload.Auth, error) {
 		return refreshUploadAuthorization(ctx, auth, func(credential config.Credential) resolver.ProjectResolver {
@@ -376,7 +376,7 @@ func TestConnectWithServerURLUsesBackendResolver(t *testing.T) {
 	configPath := filepath.Join(dir, "config.json")
 	var sawProjects bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/projects" {
+		if r.URL.Path == "/v1/projects" {
 			sawProjects = true
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"data":{"items":[],"pagination":{"limit":200,"offset":0,"total":0,"next_offset":null}}}`))
@@ -413,9 +413,9 @@ func TestHelpCommandDoesNotCallBackend(t *testing.T) {
 	}
 }
 
-func TestCanonicalPhaseSixCommandsAreDiscoverable(t *testing.T) {
+func TestCanonicalCommandsAreDiscoverable(t *testing.T) {
 	root := newRootCommand()
-	for _, path := range [][]string{{"login"}, {"logout"}, {"create"}, {"session", "attach"}, {"session", "list"}, {"machine", "add"}, {"machine", "list"}, {"machine", "revoke"}, {"preview", "list"}, {"preview", "revoke"}} {
+	for _, path := range [][]string{{"login"}, {"logout"}, {"create"}, {"session", "attach"}, {"session", "list"}, {"user-machine", "add"}, {"user-machine", "list"}, {"user-machine", "revoke"}, {"preview", "list"}, {"preview", "revoke"}} {
 		command, remaining, err := root.Find(path)
 		if err != nil || len(remaining) != 0 || command == root {
 			t.Fatalf("command %q not discoverable: command=%v remaining=%q err=%v", path, command, remaining, err)
@@ -447,7 +447,7 @@ func TestCreateCatalogFiltersUnavailableOptions(t *testing.T) {
 
 func TestMachineRevokeRequiresConfirmationBeforeBackend(t *testing.T) {
 	root := newRootCommand()
-	root.SetArgs([]string{"machine", "revoke", "cm_1"})
+	root.SetArgs([]string{"user-machine", "revoke", "um_1"})
 	err := root.Execute()
 	if err == nil || !strings.Contains(err.Error(), "requires --yes") {
 		t.Fatalf("err=%v, want confirmation error", err)
@@ -463,20 +463,20 @@ func TestPreviewRevokeDisplaysResolvedContextBeforeConfirmation(t *testing.T) {
 		if r.Method != http.MethodGet {
 			t.Fatalf("unexpected mutation before confirmation: %s %s", r.Method, r.URL.Path)
 		}
-		writeAPIData(t, w, []map[string]any{{"id": "prv_1", "environment_id": "env_1", "project_id": "prj_1", "machine_id": "cm_1", "user_id": "usr_1", "logical_name": "web", "environment_name": "studio", "environment_kind": "byod", "owner_email": "owner@example.test", "url": "https://preview.example.test", "state": "ready", "target_port": 3000}})
+		writeAPIData(t, w, []map[string]any{{"id": "prv_1", "environment_id": "env_1", "project_id": "prj_1", "resource_id": "um_1", "user_id": "usr_1", "logical_name": "web", "environment_name": "studio", "environment_kind": "byod", "owner_email": "owner@example.test", "url": "https://preview.example.test", "state": "ready", "target_port": 3000}})
 	}))
 	defer srv.Close()
 	writeTestProfile(t, dir, configPath, srv.URL)
 	var stderr bytes.Buffer
 	code := run(context.Background(), []string{"--config", configPath, "preview", "revoke", "prv_1"}, &bytes.Buffer{}, &stderr)
-	if code != 1 || !strings.Contains(stderr.String(), "Preview: web (studio, byod)") || !strings.Contains(stderr.String(), "Project: prj_1  Machine: cm_1  User: usr_1") || len(requests) != 1 {
+	if code != 1 || !strings.Contains(stderr.String(), "Preview: web (studio, byod)") || !strings.Contains(stderr.String(), "Project: prj_1  Resource: um_1  User: usr_1") || len(requests) != 1 {
 		t.Fatalf("code=%d stderr=%q requests=%v", code, stderr.String(), requests)
 	}
 }
 
 func TestSessionCloseRequiresConfirmationBeforeBackend(t *testing.T) {
 	root := newRootCommand()
-	root.SetArgs([]string{"session", "close", "cm_1", "shell-2"})
+	root.SetArgs([]string{"session", "close", "um_1", "shell-2"})
 	err := root.Execute()
 	if err == nil || !strings.Contains(err.Error(), "requires --yes") {
 		t.Fatalf("err=%v, want confirmation error", err)
@@ -497,11 +497,11 @@ func TestSessionListAcceptsDefaultEnvironment(t *testing.T) {
 func TestResolveMachineTargetRejectsAmbiguousNames(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeAPIData(t, w, map[string]any{"items": []map[string]any{
-			{"id": "cm_1", "display_name": "Studio"}, {"id": "cm_2", "display_name": "studio"},
+			{"id": "um_1", "display_name": "Studio"}, {"id": "um_2", "display_name": "studio"},
 		}, "pagination": map[string]any{"next_offset": nil}})
 	}))
 	defer srv.Close()
-	_, _, err := resolveMachineTarget(context.Background(), api.New(srv.URL, config.Credential{AccessToken: "token"}, srv.Client()), "studio")
+	_, _, err := resolveUserMachineTarget(context.Background(), api.New(srv.URL, config.Credential{AccessToken: "token"}, srv.Client()), "studio")
 	if err == nil || !strings.Contains(err.Error(), "ambiguous") {
 		t.Fatalf("err=%v, want ambiguity", err)
 	}
@@ -531,15 +531,15 @@ func TestConfigAssignHostedJSONContract(t *testing.T) {
 			t.Fatalf("authorization=%q", r.Header.Get("Authorization"))
 		}
 		switch r.Method + " " + r.URL.Path {
-		case "GET /api/projects":
+		case "GET /v1/projects":
 			writeAPIData(t, w, map[string]any{"items": []map[string]any{{"id": "prj_1", "name": "demo", "state": "ready"}}, "pagination": map[string]any{"next_offset": nil}})
-		case "GET /api/config-repositories":
+		case "GET /v1/config-repositories":
 			writeAPIData(t, w, map[string]any{"items": []map[string]any{{"id": "cfgrepo_1", "provider": "github", "external_ref": "acme/config", "display_name": "Shared"}}})
-		case "GET /api/environments/prj_1/config-assignment":
+		case "GET /v1/environments/prj_1/config-assignment":
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusNotFound)
 			_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"code": "not_found_or_forbidden", "message": "not found"}})
-		case "PUT /api/environments/prj_1/config-assignment":
+		case "PUT /v1/environments/prj_1/config-assignment":
 			assigned = true
 			writeAPIData(t, w, map[string]any{"id": "cfgasn_1", "environment_id": "prj_1", "repository_id": "cfgrepo_1", "consent_state": "not_required", "version": 1})
 		default:
@@ -574,9 +574,9 @@ func TestMachineRevokeJSONOutputContract(t *testing.T) {
 			t.Fatalf("authorization=%q", r.Header.Get("Authorization"))
 		}
 		switch r.Method + " " + r.URL.Path {
-		case "GET /api/connected-machines":
-			writeAPIData(t, w, map[string]any{"items": []map[string]any{{"id": "cm_1", "display_name": "Studio"}}, "pagination": map[string]any{"next_offset": nil}})
-		case "POST /api/connected-machines/cm_1/disconnect":
+		case "GET /v1/user-machines":
+			writeAPIData(t, w, map[string]any{"items": []map[string]any{{"id": "um_1", "display_name": "Studio"}}, "pagination": map[string]any{"next_offset": nil}})
+		case "POST /v1/user-machines/um_1/disconnect":
 			disconnected = true
 			writeAPIData(t, w, map[string]bool{"ok": true})
 		default:
@@ -586,31 +586,31 @@ func TestMachineRevokeJSONOutputContract(t *testing.T) {
 	defer srv.Close()
 	writeTestProfile(t, dir, configPath, srv.URL)
 	var output bytes.Buffer
-	if code := run(context.Background(), []string{"--config", configPath, "machine", "revoke", "Studio", "--yes", "--json"}, &output, &output); code != 0 {
+	if code := run(context.Background(), []string{"--config", configPath, "user-machine", "revoke", "Studio", "--yes", "--json"}, &output, &output); code != 0 {
 		t.Fatalf("exit code=%d output=%q", code, output.String())
 	}
 	if !disconnected {
 		t.Fatal("disconnect endpoint was not called")
 	}
 	var got struct {
-		Version string `json:"version"`
-		Machine struct {
+		Version     string `json:"version"`
+		UserMachine struct {
 			ID          string `json:"id"`
 			DisplayName string `json:"display_name"`
 			State       string `json:"state"`
-		} `json:"machine"`
+		} `json:"user_machine"`
 		Outcome string `json:"outcome"`
 		Retry   string `json:"retry"`
 	}
 	if err := json.Unmarshal(output.Bytes(), &got); err != nil {
 		t.Fatalf("decode output %q: %v", output.String(), err)
 	}
-	if got.Version != "1" || got.Machine.ID != "cm_1" || got.Machine.DisplayName != "Studio" || got.Machine.State != "disconnected" || got.Outcome != "confirmed" || got.Retry != "not_required" {
+	if got.Version != "1" || got.UserMachine.ID != "um_1" || got.UserMachine.DisplayName != "Studio" || got.UserMachine.State != "disconnected" || got.Outcome != "confirmed" || got.Retry != "not_required" {
 		t.Fatalf("output=%s", output.String())
 	}
 }
 
-func TestMachineAddUsesServerOwnedConnectedMachinesURL(t *testing.T) {
+func TestMachineAddUsesServerOwnedUserMachinesURL(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.json")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -622,9 +622,9 @@ func TestMachineAddUsesServerOwnedConnectedMachinesURL(t *testing.T) {
 			t.Fatalf("authorization=%q", authorization)
 		}
 		writeAPIData(t, w, api.ClientConfiguration{
-			Version:              "1",
-			CLIVerificationURL:   "https://dashboard.paperboat.test/cli/authorize",
-			ConnectedMachinesURL: "https://dashboard.paperboat.test/dashboard/connected-machines",
+			Version:            "1",
+			CLIVerificationURL: "https://dashboard.paperboat.test/cli/authorize",
+			UserMachinesURL:    "https://dashboard.paperboat.test/dashboard/user-machines",
 		})
 	}))
 	defer srv.Close()
@@ -639,11 +639,11 @@ func TestMachineAddUsesServerOwnedConnectedMachinesURL(t *testing.T) {
 	}
 
 	var output bytes.Buffer
-	if code := run(context.Background(), []string{"--config", configPath, "machine", "add"}, &output, &output); code != 0 {
+	if code := run(context.Background(), []string{"--config", configPath, "user-machine", "add"}, &output, &output); code != 0 {
 		t.Fatalf("exit=%d output=%q", code, output.String())
 	}
-	want := "https://dashboard.paperboat.test/dashboard/connected-machines"
-	if opened != want || !strings.Contains(output.String(), "Continue BYOD enrollment at "+want) {
+	want := "https://dashboard.paperboat.test/dashboard/user-machines"
+	if opened != want || !strings.Contains(output.String(), "Continue user-machine enrollment at "+want) {
 		t.Fatalf("opened=%q output=%q", opened, output.String())
 	}
 }
@@ -653,8 +653,8 @@ func TestDefaultEnvironmentUsesStableRememberedIDWithoutListing(t *testing.T) {
 		t.Fatal("remembered target should not list environments")
 		return nil, nil
 	})})
-	got, err := defaultEnvironment(context.Background(), client, "cm_1")
-	if err != nil || got != "cm_1" {
+	got, err := defaultEnvironment(context.Background(), client, "um_1")
+	if err != nil || got != "um_1" {
 		t.Fatalf("target=%q err=%v", got, err)
 	}
 }
@@ -662,17 +662,17 @@ func TestDefaultEnvironmentUsesStableRememberedIDWithoutListing(t *testing.T) {
 func TestDefaultEnvironmentSelectsOnlyAvailableTarget(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/projects":
+		case "/v1/projects":
 			writeAPIData(t, w, map[string]any{"items": []any{}, "pagination": map[string]any{"limit": 200, "offset": 0, "total": 0}})
-		case "/api/connected-machines":
-			writeAPIData(t, w, map[string]any{"items": []map[string]any{{"id": "cm_1", "display_name": "Studio"}}, "pagination": map[string]any{"limit": 200, "offset": 0, "total": 1}})
+		case "/v1/user-machines":
+			writeAPIData(t, w, map[string]any{"items": []map[string]any{{"id": "um_1", "display_name": "Studio"}}, "pagination": map[string]any{"limit": 200, "offset": 0, "total": 1}})
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer server.Close()
 	got, err := defaultEnvironment(context.Background(), api.New(server.URL, config.Credential{AccessToken: "token"}, server.Client()), "")
-	if err != nil || got != "cm_1" {
+	if err != nil || got != "um_1" {
 		t.Fatalf("target=%q err=%v", got, err)
 	}
 }
@@ -717,9 +717,9 @@ func TestKeepAliveCommandCallsBackend(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				switch r.URL.Path {
-				case "/api/projects":
+				case "/v1/projects":
 					_, _ = w.Write([]byte(`{"data":{"items":[{"id":"prj_1","name":"Demo","state":"running"}],"pagination":{"limit":200,"offset":0,"total":1,"next_offset":null}}}`))
-				case "/api/projects/prj_1/keep-alive":
+				case "/v1/projects/prj_1/keep-alive":
 					gotKeepAlive = true
 					if r.Header.Get("Authorization") != "Bearer token" {
 						t.Fatalf("authorization = %q", r.Header.Get("Authorization"))
@@ -777,7 +777,7 @@ func TestConnectWithoutServerDoesNotRunLocalShell(t *testing.T) {
 func TestDoctorReturnsFailureWhenBackendIsUnconfigured(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
-	if err := os.WriteFile(path, []byte(`{"connect":{"accepted_terminal_kinds":["papercode_websocket"],"ready_timeout_seconds":30,"poll_interval_seconds":1}}`), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"connect":{"ready_timeout_seconds":30,"poll_interval_seconds":1}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := newApp().Run([]string{"pb", "--config", path, "doctor"}); err == nil {
@@ -873,13 +873,13 @@ func quote(value string) string {
 func writeTestProfile(t *testing.T, dir, configPath, serverURL string) {
 	t.Helper()
 	profileDir := filepath.Join(dir, "credentials")
-	configJSON := `{"server_url":` + quote(serverURL) + `,"auth":{"allow_file_fallback":true,"profile_dir":` + quote(profileDir) + `},"connect":{"ready_timeout_seconds":30,"poll_interval_seconds":1,"dial_retries":0,"accepted_terminal_kinds":["papercode_websocket"]}}`
+	configJSON := `{"server_url":` + quote(serverURL) + `,"auth":{"allow_file_fallback":true,"profile_dir":` + quote(profileDir) + `},"connect":{"ready_timeout_seconds":30,"poll_interval_seconds":1,"dial_retries":0}}`
 	if err := os.WriteFile(configPath, []byte(configJSON), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	store := config.ProfileStore{Path: profileDir, Secrets: config.FileSecretStore{Dir: filepath.Join(profileDir, "secrets")}}
 	expires := time.Now().Add(time.Hour)
-	err := store.Save(config.Profile{Issuer: serverURL, ClientSessionID: "cls_test", AccessExpiresAt: expires}, config.Credential{AccessToken: "token", RefreshToken: "refresh", ExpiresAt: expires})
+	err := store.Save(config.Profile{Issuer: serverURL, CLIClientSessionID: "cls_test", AccessExpiresAt: expires}, config.Credential{AccessToken: "token", RefreshToken: "refresh", ExpiresAt: expires})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -916,7 +916,7 @@ func TestAuthLogoutRetainsPendingRevocationUntilRetrySucceeds(t *testing.T) {
 	configPath := filepath.Join(dir, "config.json")
 	attempts := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/auth/token/revoke" {
+		if r.URL.Path != "/v1/auth/token/revoke" {
 			http.NotFound(w, r)
 			return
 		}
@@ -978,7 +978,7 @@ func TestAuthLogoutIgnoresFailedHistoricalRevocationAfterCurrentSucceeds(t *test
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.json")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/auth/token/revoke" {
+		if r.URL.Path != "/v1/auth/token/revoke" {
 			http.NotFound(w, r)
 			return
 		}
@@ -1014,7 +1014,7 @@ func TestAuthLogoutIgnoresFailedHistoricalRevocationAfterCurrentSucceeds(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(pending) != 1 || pending[0].ClientSessionID != "cls_old" {
+	if len(pending) != 1 || pending[0].CLIClientSessionID != "cls_old" {
 		t.Fatalf("pending revocations = %#v", pending)
 	}
 }

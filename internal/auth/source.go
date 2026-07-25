@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/pujan-modha/paperboat-cli/internal/api"
-	"github.com/pujan-modha/paperboat-cli/internal/config"
+	"github.com/pinksaucepasta/paperboat-cli/internal/api"
+	"github.com/pinksaucepasta/paperboat-cli/internal/config"
 )
 
 const refreshBefore = 60 * time.Second
@@ -41,6 +41,6 @@ func (s *Source) credential(refreshWindow time.Duration) (config.Credential, err
 			return config.Credential{}, "", fmt.Errorf("refresh Paperboat session: %w", err)
 		}
 		expires := time.Now().UTC().Add(time.Duration(tokens.ExpiresIn) * time.Second)
-		return config.Credential{AccessToken: tokens.AccessToken, RefreshToken: tokens.RefreshToken, TokenType: tokens.TokenType, ExpiresAt: expires}, tokens.ClientSessionID, nil
+		return config.Credential{AccessToken: tokens.AccessToken, RefreshToken: tokens.RefreshToken, TokenType: tokens.TokenType, ExpiresAt: expires}, tokens.CLIClientSessionID, nil
 	})
 }

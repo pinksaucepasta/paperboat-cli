@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pujan-modha/paperboat-cli/internal/api"
-	"github.com/pujan-modha/paperboat-cli/internal/config"
-	"github.com/pujan-modha/paperboat-cli/internal/telemetry"
+	"github.com/pinksaucepasta/paperboat-cli/internal/api"
+	"github.com/pinksaucepasta/paperboat-cli/internal/config"
+	"github.com/pinksaucepasta/paperboat-cli/internal/telemetry"
 )
 
 type resolverEventSink struct{ events []telemetry.Event }
@@ -19,9 +19,9 @@ func (s *resolverEventSink) Record(e telemetry.Event) { s.events = append(s.even
 type fakeClient struct {
 	projects          []api.Project
 	projectsErr       error
-	machines          []api.ConnectedMachine
-	connectSeq        []api.ConnectResponse // returned by CLIConnect in order
-	statusSeq         []api.ConnectResponse // returned by ConnectionStatus in order
+	machines          []api.UserMachine
+	connectSeq        []api.ConnectionDescriptor // returned by ProjectConnectionDescriptor in order
+	statusSeq         []api.ConnectionDescriptor // returned by ConnectionReadiness in order
 	connectN          int
 	statusN           int
 	connectSessionIDs []string
@@ -32,11 +32,11 @@ func (f *fakeClient) ListProjects(context.Context) ([]api.Project, error) {
 	return f.projects, f.projectsErr
 }
 
-func (f *fakeClient) ListConnectedMachines(context.Context) ([]api.ConnectedMachine, error) {
+func (f *fakeClient) ListUserMachines(context.Context) ([]api.UserMachine, error) {
 	return f.machines, nil
 }
 
-func (f *fakeClient) nextConnect() (api.ConnectResponse, error) {
+func (f *fakeClient) nextConnect() (api.ConnectionDescriptor, error) {
 	i := f.connectN
 	if i >= len(f.connectSeq) {
 		i = len(f.connectSeq) - 1
@@ -45,16 +45,16 @@ func (f *fakeClient) nextConnect() (api.ConnectResponse, error) {
 	return f.connectSeq[i], nil
 }
 
-func (f *fakeClient) CLIConnect(context.Context, string) (api.ConnectResponse, error) {
+func (f *fakeClient) ProjectConnectionDescriptor(context.Context, string) (api.ConnectionDescriptor, error) {
 	return f.nextConnect()
 }
 
-func (f *fakeClient) CLIConnectSession(_ context.Context, _ string, terminalSessionID string) (api.ConnectResponse, error) {
+func (f *fakeClient) ProjectConnectionDescriptorForSession(_ context.Context, _ string, terminalSessionID string) (api.ConnectionDescriptor, error) {
 	f.connectSessionIDs = append(f.connectSessionIDs, terminalSessionID)
 	return f.nextConnect()
 }
 
-func (f *fakeClient) nextStatus() (api.ConnectResponse, error) {
+func (f *fakeClient) nextStatus() (api.ConnectionDescriptor, error) {
 	i := f.statusN
 	if i >= len(f.statusSeq) {
 		i = len(f.statusSeq) - 1
@@ -63,29 +63,29 @@ func (f *fakeClient) nextStatus() (api.ConnectResponse, error) {
 	return f.statusSeq[i], nil
 }
 
-func (f *fakeClient) ConnectionStatus(context.Context, string) (api.ConnectResponse, error) {
+func (f *fakeClient) ConnectionReadiness(context.Context, string) (api.ConnectionDescriptor, error) {
 	return f.nextStatus()
 }
 
-func (f *fakeClient) ConnectionStatusSession(_ context.Context, _ string, terminalSessionID string) (api.ConnectResponse, error) {
+func (f *fakeClient) ProjectConnectionReadinessForSession(_ context.Context, _ string, terminalSessionID string) (api.ConnectionDescriptor, error) {
 	f.statusSessionIDs = append(f.statusSessionIDs, terminalSessionID)
 	return f.nextStatus()
 }
 
-func (f *fakeClient) ConnectConnectedMachine(context.Context, string) (api.ConnectResponse, error) {
+func (f *fakeClient) UserMachineConnectionDescriptor(context.Context, string) (api.ConnectionDescriptor, error) {
 	return f.nextConnect()
 }
 
-func (f *fakeClient) ConnectedMachineConnectionStatus(context.Context, string) (api.ConnectResponse, error) {
+func (f *fakeClient) UserMachineConnectionReadiness(context.Context, string) (api.ConnectionDescriptor, error) {
 	return f.nextStatus()
 }
 
-func (f *fakeClient) ConnectConnectedMachineSession(_ context.Context, _ string, terminalSessionID string) (api.ConnectResponse, error) {
+func (f *fakeClient) UserMachineConnectionDescriptorForSession(_ context.Context, _ string, terminalSessionID string) (api.ConnectionDescriptor, error) {
 	f.connectSessionIDs = append(f.connectSessionIDs, terminalSessionID)
 	return f.nextConnect()
 }
 
-func (f *fakeClient) ConnectedMachineConnectionStatusSession(_ context.Context, _ string, terminalSessionID string) (api.ConnectResponse, error) {
+func (f *fakeClient) UserMachineConnectionReadinessForSession(_ context.Context, _ string, terminalSessionID string) (api.ConnectionDescriptor, error) {
 	f.statusSessionIDs = append(f.statusSessionIDs, terminalSessionID)
 	return f.nextStatus()
 }
@@ -95,31 +95,30 @@ func newTestResolver(fc *fakeClient) *APIResolver {
 	cfg.ServerURL = "https://api.paperboat.test"
 	cfg.Connect.ReadyTimeoutSeconds = 30
 	cfg.Connect.PollIntervalSeconds = 1
-	cfg.Connect.AcceptedTerminalKinds = []string{"papercode_websocket"}
 	r := NewAPIResolver(fc, cfg)
 	r.sleep = func(context.Context, time.Duration) error { return nil } // no real waiting
 	return r
 }
 
-func TestFindTargetAllowsConnectedMachineWithoutHostedPlan(t *testing.T) {
+func TestFindTargetAllowsUserMachineWithoutHostedPlan(t *testing.T) {
 	fc := &fakeClient{
 		projectsErr: &api.APIError{Code: "payment_required"},
-		machines:    []api.ConnectedMachine{{ID: "cm_1", DisplayName: "Studio Mac", State: "online"}},
+		machines:    []api.UserMachine{{ID: "um_1", DisplayName: "Studio Mac", State: "online"}},
 	}
-	target, err := newTestResolver(fc).findTarget(context.Background(), "cm_1")
+	target, err := newTestResolver(fc).findTarget(context.Background(), "um_1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if target.kind != targetConnectedMachine || target.id != "cm_1" {
+	if target.kind != targetUserMachine || target.id != "um_1" {
 		t.Fatalf("target = %+v", target)
 	}
 }
 
 func readyTerminal() *api.Terminal {
 	return &api.Terminal{
-		Kind:             "papercode_websocket",
-		HTTPBaseURL:      "https://agentunnel.dev/projects/prj_1",
-		WebSocketBaseURL: "wss://agentunnel.dev/projects/prj_1",
+		Kind:             "paperboat_terminal_v1",
+		HTTPBaseURL:      "https://edge.paperboat.test/projects/prj_1",
+		WebSocketBaseURL: "wss://edge.paperboat.test/projects/prj_1",
 		Auth:             api.AuthMaterial{Method: "websocket_ticket", Ticket: "pct_1", ExpiresAt: time.Now().Add(time.Hour), Scopes: []string{"terminal:operate"}},
 		ThreadID:         "paperboat-cli",
 		TerminalID:       "term-1",
@@ -132,35 +131,35 @@ func TestValidateReadyAcceptsEnvironmentTerminalBearer(t *testing.T) {
 	terminal.WebSocketBaseURL = "wss://machine.example/v1/runtime"
 	terminal.HTTPBaseURL = ""
 	terminal.Auth = api.AuthMaterial{Method: "bearer", Token: "helper-token", ExpiresAt: time.Now().Add(time.Minute), Scopes: []string{"terminal:operate"}}
-	response := readyConnectedMachineResponse(terminal)
+	response := readyUserMachineResponse(terminal)
 	response.ExpiresAt = time.Now().Add(2 * time.Minute)
 	response.Terminal.Auth.ExpiresAt = time.Now().Add(time.Minute)
 	response.Upload.Auth.ExpiresAt = time.Now().Add(time.Minute)
 	response.Terminal.HTTPBaseURL = "https://machine.example"
 	response.Upload.HTTPBaseURL = "https://machine.example"
 	response.Upload.Path = "/v1/uploads"
-	if _, err := newTestResolver(&fakeClient{}).validateDescriptor(response, target{kind: targetConnectedMachine, id: "cm_1"}); err != nil {
+	if _, err := newTestResolver(&fakeClient{}).validateDescriptor(response, target{kind: targetUserMachine, id: "um_1"}); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func readyResponse(term *api.Terminal) api.ConnectResponse {
+func readyResponse(term *api.Terminal) api.ConnectionDescriptor {
 	expires := time.Now().Add(time.Hour)
 	term.Auth.ExpiresAt = expires.Add(-time.Minute)
-	return api.ConnectResponse{Issuer: "https://api.paperboat.test", ProjectID: "prj_1", Connectable: true, ExpiresAt: expires, Environment: &api.Environment{EnvironmentID: "env_1", ProjectID: "prj_1", ProjectRoot: "/workspace"}, Terminal: term, Upload: &api.Upload{Kind: "papercode_staged_image", HTTPBaseURL: term.HTTPBaseURL, Path: "/projects/prj_1/api/files/staged-images", Auth: api.AuthMaterial{Method: "bearer", Token: "file-token", ExpiresAt: expires.Add(-time.Minute), Scopes: []string{"file:stage"}}, MaxBytes: 1024, AllowedMIMETypes: []string{"image/png"}, RetentionSeconds: 60}}
+	return api.ConnectionDescriptor{Issuer: "https://api.paperboat.test", ProjectID: "prj_1", Connectable: true, ExpiresAt: expires, Environment: &api.Environment{EnvironmentID: "env_1", ProjectID: "prj_1", ProjectRoot: "/workspace"}, Terminal: term, Upload: &api.Upload{Kind: "paperboat_staged_image_v1", HTTPBaseURL: term.HTTPBaseURL, Path: "/projects/prj_1/v1/files/staged-images", Auth: api.AuthMaterial{Method: "bearer", Token: "file-token", ExpiresAt: expires.Add(-time.Minute), Scopes: []string{"file:stage"}}, MaxBytes: 1024, AllowedMIMETypes: []string{"image/png"}, RetentionSeconds: 60}}
 }
 
-func readyConnectedMachineResponse(term *api.Terminal) api.ConnectResponse {
+func readyUserMachineResponse(term *api.Terminal) api.ConnectionDescriptor {
 	expires := time.Now().Add(time.Hour)
 	term.Auth.ExpiresAt = expires.Add(-time.Minute)
-	return api.ConnectResponse{Issuer: "https://api.paperboat.test", ConnectedMachineID: "cm_1", ConnectedMachineState: "online", Connectable: true, ExpiresAt: expires, Environment: &api.Environment{EnvironmentID: "env_cm_1", ConnectedMachineID: "cm_1", ProjectRoot: "/Users/paperboat"}, Terminal: term, Upload: &api.Upload{Kind: "papercode_staged_image", HTTPBaseURL: term.HTTPBaseURL, Path: "/connected-machines/cm_1/api/files/staged-images", Auth: api.AuthMaterial{Method: "bearer", Token: "file-token", ExpiresAt: expires.Add(-time.Minute), Scopes: []string{"file:stage"}}, MaxBytes: 1024, AllowedMIMETypes: []string{"image/png"}, RetentionSeconds: 60}}
+	return api.ConnectionDescriptor{Issuer: "https://api.paperboat.test", UserMachineID: "um_1", UserMachineState: "online", Connectable: true, ExpiresAt: expires, Environment: &api.Environment{EnvironmentID: "env_um_1", UserMachineID: "um_1", ProjectRoot: "/Users/paperboat"}, Terminal: term, Upload: &api.Upload{Kind: "paperboat_staged_image_v1", HTTPBaseURL: term.HTTPBaseURL, Path: "/user-machines/um_1/v1/files/staged-images", Auth: api.AuthMaterial{Method: "bearer", Token: "file-token", ExpiresAt: expires.Add(-time.Minute), Scopes: []string{"file:stage"}}, MaxBytes: 1024, AllowedMIMETypes: []string{"image/png"}, RetentionSeconds: 60}}
 }
 
 func routeOnlyTerminal() *api.Terminal {
 	return &api.Terminal{
-		Kind:             "papercode_websocket",
-		HTTPBaseURL:      "https://agentunnel.dev/projects/prj_1",
-		WebSocketBaseURL: "wss://agentunnel.dev/projects/prj_1",
+		Kind:             "paperboat_terminal_v1",
+		HTTPBaseURL:      "https://edge.paperboat.test/projects/prj_1",
+		WebSocketBaseURL: "wss://edge.paperboat.test/projects/prj_1",
 		ThreadID:         "paperboat-cli",
 		TerminalID:       "term-1",
 		CWD:              "/workspace",
@@ -170,7 +169,7 @@ func routeOnlyTerminal() *api.Terminal {
 func TestResolveImmediatelyConnectable(t *testing.T) {
 	fc := &fakeClient{
 		projects:   []api.Project{{ID: "prj_1", Name: "My App", State: "running"}},
-		connectSeq: []api.ConnectResponse{readyResponse(readyTerminal())},
+		connectSeq: []api.ConnectionDescriptor{readyResponse(readyTerminal())},
 	}
 	r := newTestResolver(fc)
 
@@ -178,7 +177,7 @@ func TestResolveImmediatelyConnectable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	if info.Local || info.Terminal == nil || info.Terminal.WebSocketBaseURL != "wss://agentunnel.dev/projects/prj_1" {
+	if info.Local || info.Terminal == nil || info.Terminal.WebSocketBaseURL != "wss://edge.paperboat.test/projects/prj_1" {
 		t.Fatalf("info = %+v", info)
 	}
 	if info.Project != "My App" {
@@ -187,7 +186,7 @@ func TestResolveImmediatelyConnectable(t *testing.T) {
 }
 
 func TestResolveRecordsMetadataOnlyConnectResult(t *testing.T) {
-	fc := &fakeClient{projects: []api.Project{{ID: "prj_1", Name: "app"}}, connectSeq: []api.ConnectResponse{readyResponse(readyTerminal())}}
+	fc := &fakeClient{projects: []api.Project{{ID: "prj_1", Name: "app"}}, connectSeq: []api.ConnectionDescriptor{readyResponse(readyTerminal())}}
 	r := newTestResolver(fc)
 	sink := &resolverEventSink{}
 	times := []time.Time{time.Unix(20, 0), time.Unix(20, 15_000_000)}
@@ -208,7 +207,7 @@ func TestResolveRecordsMetadataOnlyConnectResult(t *testing.T) {
 func TestResolveMatchesByID(t *testing.T) {
 	fc := &fakeClient{
 		projects:   []api.Project{{ID: "prj_1", Name: "app"}},
-		connectSeq: []api.ConnectResponse{readyResponse(readyTerminal())},
+		connectSeq: []api.ConnectionDescriptor{readyResponse(readyTerminal())},
 	}
 	r := newTestResolver(fc)
 	if _, err := r.Resolve(context.Background(), ConnectRequest{Project: "prj_1"}); err != nil {
@@ -216,31 +215,31 @@ func TestResolveMatchesByID(t *testing.T) {
 	}
 }
 
-func TestResolveConnectedMachineByDisplayName(t *testing.T) {
+func TestResolveUserMachineByDisplayName(t *testing.T) {
 	term := readyTerminal()
-	term.HTTPBaseURL = "https://agentunnel.dev/connected-machines/cm_1"
-	term.WebSocketBaseURL = "wss://agentunnel.dev/connected-machines/cm_1"
+	term.HTTPBaseURL = "https://edge.paperboat.test/user-machines/um_1"
+	term.WebSocketBaseURL = "wss://edge.paperboat.test/user-machines/um_1"
 	fc := &fakeClient{
-		machines:   []api.ConnectedMachine{{ID: "cm_1", DisplayName: "Studio Mac", State: "online", Online: true}},
-		connectSeq: []api.ConnectResponse{readyConnectedMachineResponse(term)},
+		machines:   []api.UserMachine{{ID: "um_1", DisplayName: "Studio Mac", State: "online", Online: true}},
+		connectSeq: []api.ConnectionDescriptor{readyUserMachineResponse(term)},
 	}
 	info, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "studio mac"})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	if info.TargetKind != targetConnectedMachine || info.ProjectID != "cm_1" || info.Project != "Studio Mac" || info.ProjectState != "online" {
+	if info.TargetKind != targetUserMachine || info.ProjectID != "um_1" || info.Project != "Studio Mac" || info.ProjectState != "online" {
 		t.Fatalf("info = %+v", info)
 	}
 }
 
-func TestResolveConnectedMachineRevocationStopsWithoutPolling(t *testing.T) {
+func TestResolveUserMachineRevocationStopsWithoutPolling(t *testing.T) {
 	fc := &fakeClient{
-		machines:   []api.ConnectedMachine{{ID: "cm_1", DisplayName: "Studio Mac", State: "disconnected"}},
-		connectSeq: []api.ConnectResponse{{ConnectedMachineID: "cm_1", ConnectedMachineState: "disconnected", Status: "connected_machine_revoked", Reason: "access_revoked"}},
+		machines:   []api.UserMachine{{ID: "um_1", DisplayName: "Studio Mac", State: "disconnected"}},
+		connectSeq: []api.ConnectionDescriptor{{UserMachineID: "um_1", UserMachineState: "disconnected", Status: "user_machine_revoked", Reason: "access_revoked"}},
 	}
 	_, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "Studio Mac"})
 	var apiErr *api.APIError
-	if !errors.As(err, &apiErr) || apiErr.Code != "connected_machine_revoked" {
+	if !errors.As(err, &apiErr) || apiErr.Code != "user_machine_revoked" {
 		t.Fatalf("err=%v", err)
 	}
 	if fc.statusN != 0 {
@@ -248,35 +247,35 @@ func TestResolveConnectedMachineRevocationStopsWithoutPolling(t *testing.T) {
 	}
 }
 
-func TestResolveRejectsConnectedMachineDescriptorForDifferentMachine(t *testing.T) {
+func TestResolveRejectsUserMachineDescriptorForDifferentMachine(t *testing.T) {
 	term := readyTerminal()
-	term.HTTPBaseURL = "https://agentunnel.dev/connected-machines/cm_1"
-	term.WebSocketBaseURL = "wss://agentunnel.dev/connected-machines/cm_1"
-	response := readyConnectedMachineResponse(term)
-	response.ConnectedMachineID = "cm_other"
+	term.HTTPBaseURL = "https://edge.paperboat.test/user-machines/um_1"
+	term.WebSocketBaseURL = "wss://edge.paperboat.test/user-machines/um_1"
+	response := readyUserMachineResponse(term)
+	response.UserMachineID = "um_other"
 	fc := &fakeClient{
-		machines:   []api.ConnectedMachine{{ID: "cm_1", DisplayName: "Studio Mac"}},
-		connectSeq: []api.ConnectResponse{response},
+		machines:   []api.UserMachine{{ID: "um_1", DisplayName: "Studio Mac"}},
+		connectSeq: []api.ConnectionDescriptor{response},
 	}
-	_, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "cm_1"})
-	if err == nil || !strings.Contains(err.Error(), "wrong connected machine") {
+	_, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "um_1"})
+	if err == nil || !strings.Contains(err.Error(), "wrong user machine") {
 		t.Fatalf("err = %v", err)
 	}
 }
 
-func TestResolveConnectedMachineRebrokersAfterReadiness(t *testing.T) {
+func TestResolveUserMachineRebrokersAfterReadiness(t *testing.T) {
 	term := readyTerminal()
-	term.HTTPBaseURL = "https://agentunnel.dev/connected-machines/cm_1"
-	term.WebSocketBaseURL = "wss://agentunnel.dev/connected-machines/cm_1"
+	term.HTTPBaseURL = "https://edge.paperboat.test/user-machines/um_1"
+	term.WebSocketBaseURL = "wss://edge.paperboat.test/user-machines/um_1"
 	fc := &fakeClient{
-		machines: []api.ConnectedMachine{{ID: "cm_1", DisplayName: "Studio Mac"}},
-		connectSeq: []api.ConnectResponse{
-			{ConnectedMachineID: "cm_1", Connectable: false, Status: "connector_connecting"},
-			readyConnectedMachineResponse(term),
+		machines: []api.UserMachine{{ID: "um_1", DisplayName: "Studio Mac"}},
+		connectSeq: []api.ConnectionDescriptor{
+			{UserMachineID: "um_1", Connectable: false, Status: "connector_connecting"},
+			readyUserMachineResponse(term),
 		},
-		statusSeq: []api.ConnectResponse{{ConnectedMachineID: "cm_1", Connectable: true}},
+		statusSeq: []api.ConnectionDescriptor{{UserMachineID: "um_1", Connectable: true}},
 	}
-	info, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "cm_1"})
+	info, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "um_1"})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -285,34 +284,34 @@ func TestResolveConnectedMachineRebrokersAfterReadiness(t *testing.T) {
 	}
 }
 
-func TestResolveKeepsSelectedConnectedMachineSessionThroughReadinessPolling(t *testing.T) {
+func TestResolveKeepsSelectedUserMachineSessionThroughReadinessPolling(t *testing.T) {
 	term := readyTerminal()
-	term.HTTPBaseURL = "https://agentunnel.dev/connected-machines/cm_1"
-	term.WebSocketBaseURL = "wss://agentunnel.dev/connected-machines/cm_1"
+	term.HTTPBaseURL = "https://edge.paperboat.test/user-machines/um_1"
+	term.WebSocketBaseURL = "wss://edge.paperboat.test/user-machines/um_1"
 	fc := &fakeClient{
-		machines: []api.ConnectedMachine{{ID: "cm_1", DisplayName: "Studio Mac"}},
-		connectSeq: []api.ConnectResponse{
-			{ConnectedMachineID: "cm_1", Connectable: false, Status: "connector_connecting"},
-			readyConnectedMachineResponse(term),
+		machines: []api.UserMachine{{ID: "um_1", DisplayName: "Studio Mac"}},
+		connectSeq: []api.ConnectionDescriptor{
+			{UserMachineID: "um_1", Connectable: false, Status: "connector_connecting"},
+			readyUserMachineResponse(term),
 		},
-		statusSeq: []api.ConnectResponse{{ConnectedMachineID: "cm_1", Connectable: true}},
+		statusSeq: []api.ConnectionDescriptor{{UserMachineID: "um_1", Connectable: true}},
 	}
-	if _, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "cm_1", TerminalSessionID: "pts_api"}); err != nil {
+	if _, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "um_1", TerminalSessionID: "pts_api"}); err != nil {
 		t.Fatal(err)
 	}
 	if got := strings.Join(fc.connectSessionIDs, ","); got != "pts_api,pts_api" {
-		t.Fatalf("connected-machine connect session IDs = %q", got)
+		t.Fatalf("user-machine connect session IDs = %q", got)
 	}
 	if got := strings.Join(fc.statusSessionIDs, ","); got != "pts_api" {
-		t.Fatalf("connected-machine status session IDs = %q", got)
+		t.Fatalf("user-machine status session IDs = %q", got)
 	}
 }
 
 func TestResolvePollsUntilReady(t *testing.T) {
 	fc := &fakeClient{
 		projects:   []api.Project{{ID: "prj_1", Name: "app"}},
-		connectSeq: []api.ConnectResponse{{Connectable: false, Status: "starting", Reason: "machine_start_queued"}},
-		statusSeq: []api.ConnectResponse{
+		connectSeq: []api.ConnectionDescriptor{{Connectable: false, Status: "starting", Reason: "machine_start_queued"}},
+		statusSeq: []api.ConnectionDescriptor{
 			{Connectable: false, Status: "starting"},
 			{Connectable: false, Status: "starting"},
 			readyResponse(readyTerminal()),
@@ -323,7 +322,7 @@ func TestResolvePollsUntilReady(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	if info.Terminal == nil || info.Terminal.WebSocketBaseURL != "wss://agentunnel.dev/projects/prj_1" {
+	if info.Terminal == nil || info.Terminal.WebSocketBaseURL != "wss://edge.paperboat.test/projects/prj_1" {
 		t.Fatalf("info = %+v", info)
 	}
 	if fc.statusN < 3 {
@@ -334,11 +333,11 @@ func TestResolvePollsUntilReady(t *testing.T) {
 func TestResolveRebrokersWhenStatusLacksTerminalDescriptor(t *testing.T) {
 	fc := &fakeClient{
 		projects: []api.Project{{ID: "prj_1", Name: "app"}},
-		connectSeq: []api.ConnectResponse{
+		connectSeq: []api.ConnectionDescriptor{
 			{Connectable: false, Status: "starting"}, // initial cli-connect
 			readyResponse(readyTerminal()),           // re-broker after ready
 		},
-		statusSeq: []api.ConnectResponse{{Connectable: true, Terminal: nil}}, // ready but no routing detail
+		statusSeq: []api.ConnectionDescriptor{{Connectable: true, Terminal: nil}}, // ready but no routing detail
 	}
 	r := newTestResolver(fc)
 	info, err := r.Resolve(context.Background(), ConnectRequest{Project: "app"})
@@ -349,18 +348,18 @@ func TestResolveRebrokersWhenStatusLacksTerminalDescriptor(t *testing.T) {
 		t.Fatalf("expected re-broker terminal, got %+v", info.Terminal)
 	}
 	if fc.connectN != 2 {
-		t.Fatalf("expected 2 CLIConnect calls (initial + re-broker), got %d", fc.connectN)
+		t.Fatalf("expected 2 ProjectConnectionDescriptor calls (initial + re-broker), got %d", fc.connectN)
 	}
 }
 
 func TestResolveKeepsSelectedSessionThroughReadinessPollingAndRebroker(t *testing.T) {
 	fc := &fakeClient{
 		projects: []api.Project{{ID: "prj_1", Name: "app"}},
-		connectSeq: []api.ConnectResponse{
+		connectSeq: []api.ConnectionDescriptor{
 			{Connectable: false, Status: "starting"},
 			readyResponse(readyTerminal()),
 		},
-		statusSeq: []api.ConnectResponse{{Connectable: true, Terminal: nil}},
+		statusSeq: []api.ConnectionDescriptor{{Connectable: true, Terminal: nil}},
 	}
 	if _, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "app", TerminalSessionID: "pts_api"}); err != nil {
 		t.Fatal(err)
@@ -376,12 +375,12 @@ func TestResolveKeepsSelectedSessionThroughReadinessPollingAndRebroker(t *testin
 func TestResolveKeepsPollingWhenRebrokerRegressesToNotReady(t *testing.T) {
 	fc := &fakeClient{
 		projects: []api.Project{{ID: "prj_1", Name: "app"}},
-		connectSeq: []api.ConnectResponse{
+		connectSeq: []api.ConnectionDescriptor{
 			{Connectable: false, Status: "starting"},
 			{Connectable: false, Status: "reconciling"},
 			readyResponse(readyTerminal()),
 		},
-		statusSeq: []api.ConnectResponse{
+		statusSeq: []api.ConnectionDescriptor{
 			{Connectable: true, Terminal: nil},
 			{Connectable: true, Terminal: nil},
 		},
@@ -402,11 +401,11 @@ func TestResolveKeepsPollingWhenRebrokerRegressesToNotReady(t *testing.T) {
 func TestResolveRebrokersWhenStatusLacksAuthMaterial(t *testing.T) {
 	fc := &fakeClient{
 		projects: []api.Project{{ID: "prj_1", Name: "app"}},
-		connectSeq: []api.ConnectResponse{
+		connectSeq: []api.ConnectionDescriptor{
 			{Connectable: false, Status: "starting"}, // initial cli-connect
 			readyResponse(readyTerminal()),           // re-broker after route-only status
 		},
-		statusSeq: []api.ConnectResponse{{Connectable: true, Terminal: routeOnlyTerminal()}},
+		statusSeq: []api.ConnectionDescriptor{{Connectable: true, Terminal: routeOnlyTerminal()}},
 	}
 	r := newTestResolver(fc)
 	info, err := r.Resolve(context.Background(), ConnectRequest{Project: "app"})
@@ -417,19 +416,19 @@ func TestResolveRebrokersWhenStatusLacksAuthMaterial(t *testing.T) {
 		t.Fatalf("expected re-brokered auth material, got %+v", info.Terminal)
 	}
 	if fc.connectN != 2 {
-		t.Fatalf("expected 2 CLIConnect calls (initial + re-broker), got %d", fc.connectN)
+		t.Fatalf("expected 2 ProjectConnectionDescriptor calls (initial + re-broker), got %d", fc.connectN)
 	}
 }
 
 func TestResolveKeepsPollingWhenRebrokerIsStillStarting(t *testing.T) {
 	fc := &fakeClient{
 		projects: []api.Project{{ID: "prj_1", Name: "app"}},
-		connectSeq: []api.ConnectResponse{
+		connectSeq: []api.ConnectionDescriptor{
 			{Connectable: false, Status: "starting"},
-			{Connectable: false, Status: "papercode_starting", Reason: "papercode_unhealthy"},
+			{Connectable: false, Status: "Paperboat_starting", Reason: "Paperboat_unhealthy"},
 			readyResponse(readyTerminal()),
 		},
-		statusSeq: []api.ConnectResponse{
+		statusSeq: []api.ConnectionDescriptor{
 			{Connectable: true, Terminal: routeOnlyTerminal()},
 			readyResponse(readyTerminal()),
 		},
@@ -470,7 +469,7 @@ func TestResolveAcceptsDistinctEnvironmentIdentity(t *testing.T) {
 	response.Environment.EnvironmentID = "env_other"
 	fc := &fakeClient{
 		projects:   []api.Project{{ID: "prj_1", Name: "app"}},
-		connectSeq: []api.ConnectResponse{response},
+		connectSeq: []api.ConnectionDescriptor{response},
 	}
 	if _, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "app"}); err != nil {
 		t.Fatalf("Resolve: %v", err)
@@ -480,7 +479,7 @@ func TestResolveAcceptsDistinctEnvironmentIdentity(t *testing.T) {
 func TestResolveRejectsEnvironmentOwnedByAnotherProject(t *testing.T) {
 	response := readyResponse(readyTerminal())
 	response.Environment.ProjectID = "prj_other"
-	fc := &fakeClient{projects: []api.Project{{ID: "prj_1", Name: "app"}}, connectSeq: []api.ConnectResponse{response}}
+	fc := &fakeClient{projects: []api.Project{{ID: "prj_1", Name: "app"}}, connectSeq: []api.ConnectionDescriptor{response}}
 	_, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "app"})
 	if err == nil || !strings.Contains(err.Error(), "invalid environment") {
 		t.Fatalf("err = %v", err)
@@ -493,7 +492,7 @@ func TestResolveRejectsNonWSSTerminal(t *testing.T) {
 	response := readyResponse(term)
 	fc := &fakeClient{
 		projects:   []api.Project{{ID: "prj_1", Name: "app"}},
-		connectSeq: []api.ConnectResponse{response},
+		connectSeq: []api.ConnectionDescriptor{response},
 	}
 	_, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "app"})
 	if err == nil || !strings.Contains(err.Error(), "WebSocket endpoint") {
@@ -503,13 +502,12 @@ func TestResolveRejectsNonWSSTerminal(t *testing.T) {
 
 func TestResolveEnforcesConfiguredRouteHostPolicy(t *testing.T) {
 	term := readyTerminal()
-	fc := &fakeClient{projects: []api.Project{{ID: "prj_1", Name: "app"}}, connectSeq: []api.ConnectResponse{readyResponse(term)}}
+	fc := &fakeClient{projects: []api.Project{{ID: "prj_1", Name: "app"}}, connectSeq: []api.ConnectionDescriptor{readyResponse(term)}}
 	cfg := &config.Config{}
 	cfg.ServerURL = "https://api.paperboat.test"
 	cfg.Connect.ReadyTimeoutSeconds = 30
 	cfg.Connect.PollIntervalSeconds = 1
 	cfg.Connect.AllowedRouteHosts = []string{"relay.example.com"}
-	cfg.Connect.AcceptedTerminalKinds = []string{"papercode_websocket"}
 	r := NewAPIResolver(fc, cfg)
 	_, err := r.Resolve(context.Background(), ConnectRequest{Project: "app"})
 	if err == nil || !strings.Contains(err.Error(), "host is not allowed") {
@@ -520,7 +518,7 @@ func TestResolveEnforcesConfiguredRouteHostPolicy(t *testing.T) {
 func TestResolveRejectsUnexpectedIssuer(t *testing.T) {
 	response := readyResponse(readyTerminal())
 	response.Issuer = "https://evil.example"
-	fc := &fakeClient{projects: []api.Project{{ID: "prj_1", Name: "app"}}, connectSeq: []api.ConnectResponse{response}}
+	fc := &fakeClient{projects: []api.Project{{ID: "prj_1", Name: "app"}}, connectSeq: []api.ConnectionDescriptor{response}}
 	_, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "app"})
 	if err == nil || !strings.Contains(err.Error(), "unexpected issuer") {
 		t.Fatalf("err = %v", err)
@@ -530,7 +528,7 @@ func TestResolveRejectsUnexpectedIssuer(t *testing.T) {
 func TestResolveRejectsInvalidUploadDescriptor(t *testing.T) {
 	response := readyResponse(readyTerminal())
 	response.Upload.Auth.Scopes = []string{"terminal:operate"}
-	fc := &fakeClient{projects: []api.Project{{ID: "prj_1", Name: "app"}}, connectSeq: []api.ConnectResponse{response}}
+	fc := &fakeClient{projects: []api.Project{{ID: "prj_1", Name: "app"}}, connectSeq: []api.ConnectionDescriptor{response}}
 	_, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "app"})
 	if err == nil || !strings.Contains(err.Error(), "upload descriptor") {
 		t.Fatalf("err = %v", err)
@@ -541,8 +539,8 @@ func TestResolveAcceptsFrozenTerminalWithoutHTTPBaseURL(t *testing.T) {
 	term := readyTerminal()
 	term.HTTPBaseURL = ""
 	response := readyResponse(term)
-	response.Upload.HTTPBaseURL = "https://agentunnel.dev/projects/prj_1"
-	fc := &fakeClient{projects: []api.Project{{ID: "prj_1", Name: "app"}}, connectSeq: []api.ConnectResponse{response}}
+	response.Upload.HTTPBaseURL = "https://edge.paperboat.test/projects/prj_1"
+	fc := &fakeClient{projects: []api.Project{{ID: "prj_1", Name: "app"}}, connectSeq: []api.ConnectionDescriptor{response}}
 	if _, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "app"}); err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -550,10 +548,10 @@ func TestResolveAcceptsFrozenTerminalWithoutHTTPBaseURL(t *testing.T) {
 
 func TestResolveRejectsTerminalHTTPPortMismatch(t *testing.T) {
 	term := readyTerminal()
-	term.HTTPBaseURL = "https://agentunnel.dev:8443/projects/prj_1"
+	term.HTTPBaseURL = "https://edge.paperboat.test:8443/projects/prj_1"
 	response := readyResponse(term)
 	response.Upload.HTTPBaseURL = term.HTTPBaseURL
-	fc := &fakeClient{projects: []api.Project{{ID: "prj_1", Name: "app"}}, connectSeq: []api.ConnectResponse{response}}
+	fc := &fakeClient{projects: []api.Project{{ID: "prj_1", Name: "app"}}, connectSeq: []api.ConnectionDescriptor{response}}
 	_, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "app"})
 	if err == nil || !strings.Contains(err.Error(), "hosts do not match") {
 		t.Fatalf("err = %v, want origin mismatch", err)
@@ -562,8 +560,8 @@ func TestResolveRejectsTerminalHTTPPortMismatch(t *testing.T) {
 
 func TestResolveRejectsUploadPortMismatch(t *testing.T) {
 	response := readyResponse(readyTerminal())
-	response.Upload.HTTPBaseURL = "https://agentunnel.dev:8443/projects/prj_1"
-	fc := &fakeClient{projects: []api.Project{{ID: "prj_1", Name: "app"}}, connectSeq: []api.ConnectResponse{response}}
+	response.Upload.HTTPBaseURL = "https://edge.paperboat.test:8443/projects/prj_1"
+	fc := &fakeClient{projects: []api.Project{{ID: "prj_1", Name: "app"}}, connectSeq: []api.ConnectionDescriptor{response}}
 	_, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "app"})
 	if err == nil || !strings.Contains(err.Error(), "validated terminal route") {
 		t.Fatalf("err = %v, want upload origin mismatch", err)
@@ -579,7 +577,7 @@ func TestResolveRequiresProfileConnectionPolicy(t *testing.T) {
 }
 
 func TestResolveCapsRetryHintAtReadyDeadline(t *testing.T) {
-	fc := &fakeClient{projects: []api.Project{{ID: "prj_1", Name: "app"}}, connectSeq: []api.ConnectResponse{{ProjectID: "prj_1", Connectable: false, RetryAfterSeconds: 300, Status: "starting"}}}
+	fc := &fakeClient{projects: []api.Project{{ID: "prj_1", Name: "app"}}, connectSeq: []api.ConnectionDescriptor{{ProjectID: "prj_1", Connectable: false, RetryAfterSeconds: 300, Status: "starting"}}}
 	r := newTestResolver(fc)
 	r.readyTimeout = 30 * time.Second
 	var waited time.Duration

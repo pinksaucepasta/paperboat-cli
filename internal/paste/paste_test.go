@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pujan-modha/paperboat-cli/internal/tunnel"
-	"github.com/pujan-modha/paperboat-cli/internal/upload"
+	"github.com/pinksaucepasta/paperboat-cli/internal/tunnel"
+	"github.com/pinksaucepasta/paperboat-cli/internal/upload"
 )
 
 // fixedUploader returns a constant VM path.
