@@ -4,7 +4,7 @@ set -eu
 dist=${1:?dist directory is required}
 repo=${2:?GitHub repository is required}
 tag=${3:?release tag is required}
-if ! printf '%s\n' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
+if ! printf '%s\n' "$tag" | grep -Eq '^[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.(0|[1-9][0-9]*)$'; then
   echo "invalid release tag: $tag" >&2
   exit 1
 fi
@@ -29,7 +29,7 @@ cat > "$dist/paperboat.rb" <<EOF
 class Paperboat < Formula
   desc "Connect to Paperboat cloud project terminals"
   homepage "https://github.com/$repo"
-  version "${tag#v}"
+  version "$tag"
   on_macos do
     if Hardware::CPU.arm?
       url "$base/$darwin_arm64"
@@ -63,7 +63,7 @@ EOF
 
 cat > "$dist/paperboat.json" <<EOF
 {
-  "version": "${tag#v}",
+  "version": "$tag",
   "description": "Connect to Paperboat cloud project terminals",
   "homepage": "https://github.com/$repo",
   "architecture": {
