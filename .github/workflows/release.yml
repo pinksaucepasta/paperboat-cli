@@ -46,7 +46,7 @@ jobs:
             fi
             rm "stage/pb$suffix"
           done
-          tools/package-manifests.sh dist "${GITHUB_REPOSITORY}" "$VERSION"
+          bash tools/package-manifests.sh dist "${GITHUB_REPOSITORY}" "$VERSION"
           (cd dist && sha256sum paperboat-cli_* > SHA256SUMS)
       - name: Generate SBOM
         uses: anchore/sbom-action@v0
