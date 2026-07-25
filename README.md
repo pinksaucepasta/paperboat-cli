@@ -67,8 +67,8 @@ make install    # install pb
 make test       # unit tests (paste parser + upload pipeline)
 ```
 
-`YYYY.MM.DD.X` tags publish signed-provenance archives for supported Darwin, Linux, and
-Windows architectures, plus checksums, an SPDX SBOM, and Homebrew/Scoop manifests. Use
+`YYYY.MM.DD.X` tags publish signed-provenance archives for supported Android, Darwin,
+Linux, and Windows architectures, plus checksums, an SPDX SBOM, and Homebrew/Scoop manifests. Use
 `tools/release-version.sh next` to generate the next tag; tags have no `v` prefix.
 
 ## Stack
