@@ -47,16 +47,15 @@ import (
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	executable, _ := os.Executable()
-	os.Exit(run(ctx, commandLineArgs(runtime.GOOS, executable, os.Args), os.Stdout, os.Stderr))
+	os.Exit(run(ctx, commandLineArgs(runtime.GOOS, os.Getenv("TERMUX_EXEC__PROC_SELF_EXE"), os.Args), os.Stdout, os.Stderr))
 }
 
-func commandLineArgs(goos, executable string, argv []string) []string {
+func commandLineArgs(goos, termuxExecutable string, argv []string) []string {
 	if len(argv) == 0 {
 		return nil
 	}
 	args := argv[1:]
-	if goos == "android" && len(args) > 0 && executable != "" && args[0] == executable {
+	if goos == "android" && len(args) > 0 && termuxExecutable != "" && args[0] == termuxExecutable {
 		return args[1:]
 	}
 	return args
