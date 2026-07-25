@@ -42,7 +42,7 @@ func writeAPIData(t *testing.T, writer http.ResponseWriter, data any) {
 
 func TestCommandLineArgsNormalizesAndroidPIEArgv(t *testing.T) {
 	executable := "/data/data/com.termux/files/home/.local/bin/pb"
-	got := commandLineArgs("android", []string{executable, executable, "auth", "login"})
+	got := commandLineArgs("android", executable, []string{"/system/bin/linker64", executable, "auth", "login"})
 	if !slices.Equal(got, []string{"auth", "login"}) {
 		t.Fatalf("Android args = %v", got)
 	}
@@ -56,7 +56,7 @@ func TestCommandLineArgsNormalizesAndroidPIEArgv(t *testing.T) {
 		"empty argv":                  {goos: "android"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if got := commandLineArgs(test.goos, test.argv); !slices.Equal(got, test.want) {
+			if got := commandLineArgs(test.goos, executable, test.argv); !slices.Equal(got, test.want) {
 				t.Fatalf("args = %v, want %v", got, test.want)
 			}
 		})
