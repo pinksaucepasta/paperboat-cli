@@ -4,6 +4,9 @@ PREFIX      ?= /usr/local
 BINDIR      := $(PREFIX)/bin
 VERSION     ?= $(shell ./tools/release-version.sh current)
 PROTOCOL_VERSION ?= 1
+ANDROID_API ?= 24
+ANDROID_NDK_HOME ?= $(HOME)/Library/Android/sdk/ndk/27.1.12297006
+ANDROID_CC ?= $(ANDROID_NDK_HOME)/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android$(ANDROID_API)-clang
 GO_VERSION  := 1.25.7
 GO          := GOTOOLCHAIN=local go
 GOFMT       := $(shell GOTOOLCHAIN=local go env GOROOT 2>/dev/null)/bin/gofmt
@@ -23,7 +26,8 @@ build:
 
 cross-build: verify-toolchain
 	@mkdir -p dist
-	CGO_ENABLED=0 GOOS=android GOARCH=arm64 $(GO) build -trimpath -buildmode=pie -ldflags "$(LDFLAGS)" -o dist/$(BINARY)-android-arm64 $(PKG)
+	@test -x "$(ANDROID_CC)" || { echo "Android NDK compiler not found: $(ANDROID_CC)" >&2; exit 1; }
+	CGO_ENABLED=1 GOOS=android GOARCH=arm64 CC="$(ANDROID_CC)" $(GO) build -trimpath -buildmode=pie -ldflags "$(LDFLAGS)" -o dist/$(BINARY)-android-arm64 $(PKG)
 	CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o dist/$(BINARY)-darwin-amd64 $(PKG)
 	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o dist/$(BINARY)-darwin-arm64 $(PKG)
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o dist/$(BINARY)-linux-amd64 $(PKG)

@@ -24,6 +24,8 @@ jobs:
         run: ./tools/release-version.sh validate "${GITHUB_REF_NAME}"
       - name: Test
         run: make check
+      - name: Install Android NDK
+        run: sdkmanager "ndk;27.1.12297006" >/dev/null
       - name: Build archives
         env:
           VERSION: ${{ github.ref_name }}
@@ -38,7 +40,14 @@ jobs:
             [ "$os" = windows ] && suffix=".exe"
             build_mode=()
             [ "$os" = android ] && build_mode=(-buildmode=pie)
-            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath "${build_mode[@]}" \
+            cgo_enabled=0
+            cc=cc
+            if [ "$os" = android ]; then
+              cgo_enabled=1
+              cc="$ANDROID_HOME/ndk/27.1.12297006/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+              test -x "$cc"
+            fi
+            CGO_ENABLED="$cgo_enabled" GOOS="$os" GOARCH="$arch" CC="$cc" go build -trimpath "${build_mode[@]}" \
               -ldflags="-s -w -X github.com/pinksaucepasta/paperboat-cli/internal/buildinfo.Version=$version -X github.com/pinksaucepasta/paperboat-cli/internal/buildinfo.ProtocolVersion=1" \
               -o "stage/pb$suffix" ./cmd/pb
             if [ "$os" = windows ]; then
