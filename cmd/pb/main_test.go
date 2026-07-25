@@ -40,6 +40,29 @@ func writeAPIData(t *testing.T, writer http.ResponseWriter, data any) {
 	}
 }
 
+func TestCommandLineArgsNormalizesAndroidPIEArgv(t *testing.T) {
+	executable := "/data/data/com.termux/files/home/.local/bin/pb"
+	got := commandLineArgs("android", []string{executable, executable, "auth", "login"})
+	if !slices.Equal(got, []string{"auth", "login"}) {
+		t.Fatalf("Android args = %v", got)
+	}
+	for name, test := range map[string]struct {
+		goos string
+		argv []string
+		want []string
+	}{
+		"ordinary Android invocation": {goos: "android", argv: []string{executable, "pb"}, want: []string{"pb"}},
+		"other platforms":             {goos: "linux", argv: []string{executable, executable, "auth"}, want: []string{executable, "auth"}},
+		"empty argv":                  {goos: "android"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := commandLineArgs(test.goos, test.argv); !slices.Equal(got, test.want) {
+				t.Fatalf("args = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestConnectTelemetryFailsOpenWithWarning(t *testing.T) {
 	blockedParent := filepath.Join(t.TempDir(), "not-a-directory")
 	if err := os.WriteFile(blockedParent, []byte("x"), 0o600); err != nil {

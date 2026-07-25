@@ -47,7 +47,18 @@ import (
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	os.Exit(run(ctx, os.Args[1:], os.Stdout, os.Stderr))
+	os.Exit(run(ctx, commandLineArgs(runtime.GOOS, os.Args), os.Stdout, os.Stderr))
+}
+
+func commandLineArgs(goos string, argv []string) []string {
+	if len(argv) == 0 {
+		return nil
+	}
+	args := argv[1:]
+	if goos == "android" && len(args) > 0 && args[0] == argv[0] {
+		return args[1:]
+	}
+	return args
 }
 
 var errUsage = errors.New("command usage error")
