@@ -166,7 +166,7 @@ func TestWriteDefersRedrawUntilSplitANSICompletes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Count(string(raw), "\x1b[3;1H"); got != 4 { // initial draw, completed sequence draw, reset redraw, cleanup
+	if got := strings.Count(string(raw), "\x1b[3;1H"); got != 3 { // initial draw, reset redraw, cleanup
 		t.Fatalf("bottom-row operations = %d, raw=%q", got, raw)
 	}
 	if !strings.Contains(string(raw), "\x1b[2Jhello") {
@@ -183,6 +183,24 @@ func TestWriteDefersRedrawUntilSplitANSICompletes(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), "\x1b[7m") || !strings.Contains(string(raw), "\x1b[27m") {
 		t.Fatalf("renderer did not apply and restore its reverse-video background: %q", raw)
+	}
+}
+
+func TestPlainRemoteOutputDoesNotRedrawStatusBar(t *testing.T) {
+	bar, reader := newTestBar(t, ModeAuto, "xterm-256color", 40, 3, true, time.Second)
+	if _, err := bar.Write([]byte("plain remote output")); err != nil {
+		t.Fatal(err)
+	}
+	_ = bar.Close()
+	if output, ok := bar.out.(*os.File); ok {
+		_ = output.Close()
+	}
+	raw, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(raw), "\x1b[3;1H"); got != 2 { // initial draw and cleanup
+		t.Fatalf("plain output caused status redraw: count=%d raw=%q", got, raw)
 	}
 }
 
@@ -327,5 +345,53 @@ func TestRemoteSizeRestoresAndReappliesMarginAcrossSmallResize(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), "\x1b[1;4r") || !strings.Contains(string(raw), "\x1b[5;1H") || !strings.Contains(string(raw), "\x1b[4;1H") {
 		t.Fatalf("status bar did not redraw after resize: %q", raw)
+	}
+}
+
+func BenchmarkWritePlainRemoteOutput(b *testing.B) {
+	output, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer output.Close()
+	input, err := os.Open(os.DevNull)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer input.Close()
+	bar := New(Options{Mode: ModeOn, Term: "xterm-256color", Input: input, Output: output, IsTerminal: func(int) bool { return true }, GetSize: func(int) (int, int, error) { return 120, 40, nil }})
+	defer bar.Close()
+	payload := []byte("terminal output without control sequences\r\n")
+	b.ReportAllocs()
+	b.SetBytes(int64(len(payload)))
+	b.ResetTimer()
+	for range b.N {
+		if _, err := bar.Write(payload); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkWriteANSIRemoteOutput(b *testing.B) {
+	output, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer output.Close()
+	input, err := os.Open(os.DevNull)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer input.Close()
+	bar := New(Options{Mode: ModeOn, Term: "xterm-256color", Input: input, Output: output, IsTerminal: func(int) bool { return true }, GetSize: func(int) (int, int, error) { return 120, 40, nil }})
+	defer bar.Close()
+	payload := []byte("\x1b[38;5;42mcolored terminal output\x1b[0m\r\n")
+	b.ReportAllocs()
+	b.SetBytes(int64(len(payload)))
+	b.ResetTimer()
+	for range b.N {
+		if _, err := bar.Write(payload); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

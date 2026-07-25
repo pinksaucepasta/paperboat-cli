@@ -33,7 +33,7 @@ type TelemetryContext struct {
 var ErrWriteUncertain = errors.New("terminal write outcome is uncertain")
 var ErrTransportLost = errors.New("terminal transport lost")
 
-const terminalOutputBatchWindow = time.Millisecond
+const terminalOutputBatchWindow = time.Duration(0)
 
 type ReconnectingOption func(*reconnectingOptions)
 

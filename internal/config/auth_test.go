@@ -308,6 +308,36 @@ func TestQueueRevocationPersistsSeparateSecretReference(t *testing.T) {
 	}
 }
 
+func TestDiscardPendingRevocationsRemovesValidAndMalformedRecords(t *testing.T) {
+	dir := t.TempDir()
+	secrets := FileSecretStore{Dir: filepath.Join(dir, "secrets")}
+	store := ProfileStore{Path: dir, Secrets: secrets}
+	issuer := "https://api.example.com"
+	if err := store.QueueRevocation(issuer, "cls_valid", "refresh-valid"); err != nil {
+		t.Fatal(err)
+	}
+	pendingDir := filepath.Join(dir, "pending-revocations")
+	malformedPath := filepath.Join(pendingDir, profileKey(issuer)+"-malformed.json")
+	if err := os.WriteFile(malformedPath, []byte(`{"issuer":"https://api.example.com"`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DiscardPendingRevocations(issuer); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(pendingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), profileKey(issuer)+"-") {
+			t.Fatalf("issuer revocation metadata remains: %s", entry.Name())
+		}
+	}
+	if _, err := secrets.Get(pendingRefreshRef(issuer, "cls_valid")); err == nil {
+		t.Fatal("valid pending refresh secret remains")
+	}
+}
+
 func TestPendingRevocationsIgnoreMalformedForeignNamespace(t *testing.T) {
 	dir := t.TempDir()
 	store := ProfileStore{Path: dir, Secrets: &faultSecretStore{values: map[string]string{}}}

@@ -44,7 +44,7 @@ const DefaultUploadTimeout = 30 * time.Second
 // start marker (e.g. a bare ESC keypress) are withheld while waiting for the
 // rest of the marker. Without this flush, a lone ESC would not reach the
 // remote TUI until the next keypress.
-const DefaultPartialFlushDelay = 25 * time.Millisecond
+const DefaultPartialFlushDelay = time.Millisecond
 
 const (
 	defaultQueueChunkSize = 32 * 1024

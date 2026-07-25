@@ -77,7 +77,9 @@ func TestCanonicalHelperTerminalFramingIOResizeAndExit(t *testing.T) {
 					writeHelperTestFrame(t, ws, helperFrame{Type: "response", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"result":{"id":"ses_bound","generation":1},"replay":false}`)})
 				case "attach":
 					writeHelperTestFrame(t, ws, helperFrame{Type: "response", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"result":{"attachment_id":"att_1","session":{"snapshot":{"generation":1}}},"replay":false}`)})
-					writeHelperTestBinary(t, ws, 0, []byte("hello"))
+					writeHelperTestBinary(t, ws, 0, []byte("h"))
+					writeHelperTestBinary(t, ws, 1, []byte("el"))
+					writeHelperTestBinary(t, ws, 3, []byte("lo"))
 				case "resize":
 					writeHelperTestFrame(t, ws, helperFrame{Type: "response", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"result":{},"replay":false}`)})
 					writeHelperTestFrame(t, ws, helperFrame{Type: "event", RequestID: "stream", Version: helperProtocolVersion, Capability: "terminal.v1", Payload: json.RawMessage(`{"event":"terminal_stream_end","session_id":"ses_bound","state":"exited","final_sequence":5,"exit":{"code":7}}`)})
@@ -115,12 +117,14 @@ func TestCanonicalHelperTerminalFramingIOResizeAndExit(t *testing.T) {
 	}
 
 	var sawCreate, sawAttach, sawAck, sawResize bool
+	ackCount := 0
 	for len(requests) > 0 {
 		frame := <-requests
 		var payload map[string]any
 		_ = json.Unmarshal(frame.Payload, &payload)
 		switch {
 		case frame.Type == "ack":
+			ackCount++
 			sawAck = payload["session_id"] == "ses_bound" && payload["attachment_id"] == "att_1" && payload["next_sequence"] == float64(5)
 		case payload["action"] == "create":
 			sawCreate = payload["session_id"] == "ses_bound" && payload["columns"] == float64(100) && payload["rows"] == float64(30)
@@ -130,8 +134,8 @@ func TestCanonicalHelperTerminalFramingIOResizeAndExit(t *testing.T) {
 			sawResize = payload["columns"] == float64(120) && payload["rows"] == float64(40)
 		}
 	}
-	if !sawCreate || !sawAttach || !sawAck || !sawResize {
-		t.Fatalf("create=%v attach=%v ack=%v resize=%v", sawCreate, sawAttach, sawAck, sawResize)
+	if !sawCreate || !sawAttach || !sawAck || !sawResize || ackCount != 1 {
+		t.Fatalf("create=%v attach=%v ack=%v ack_count=%d resize=%v", sawCreate, sawAttach, sawAck, ackCount, sawResize)
 	}
 }
 

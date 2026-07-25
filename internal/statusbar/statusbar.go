@@ -76,6 +76,7 @@ type Bar struct {
 	appCursorSaved bool
 	appInverse     bool
 	synchronized   bool
+	redrawPending  bool
 	isTerminal     func(int) bool
 	getSize        func(int) (int, int, error)
 }
@@ -378,29 +379,41 @@ func (b *Bar) Write(p []byte) (int, error) {
 	defer b.mu.Unlock()
 	n, err := b.out.Write(p)
 	if n > 0 {
-		b.consumeANSI(p[:n])
-		if !b.closed && b.ansiState == byte(parser.GroundState) {
+		invalidated := b.consumeANSI(p[:n])
+		if !b.closed && b.ansiState == byte(parser.GroundState) && (invalidated || b.redrawPending) {
 			b.drawLocked()
 		}
 	}
 	return n, err
 }
 
-func (b *Bar) consumeANSI(data []byte) {
+func (b *Bar) consumeANSI(data []byte) (invalidated bool) {
+	if b.ansiState == byte(parser.GroundState) && !bytes.ContainsRune(data, '\x1b') {
+		return false
+	}
 	for len(data) > 0 {
 		_, _, n, state := ansi.DecodeSequence(data, b.ansiState, b.parser)
 		if n <= 0 {
-			return
+			return invalidated
 		}
 		if b.resetsScrollRegion(data[:n]) {
 			b.scrollDirty = true
+			invalidated = true
 		}
+		if b.erasesStatusRow(data[:n]) {
+			invalidated = true
+		}
+		wasSynchronized := b.synchronized
 		b.trackRemoteCursorSave(data[:n])
 		b.trackRemoteSGR(data[:n])
 		b.trackSynchronizedOutput(data[:n])
+		if wasSynchronized && !b.synchronized {
+			invalidated = true
+		}
 		b.ansiState = state
 		data = data[n:]
 	}
+	return invalidated
 }
 
 func (b *Bar) trackSynchronizedOutput(sequence []byte) {
@@ -468,12 +481,13 @@ func (b *Bar) drawLocked() {
 	if b.closed {
 		return
 	}
-	b.refreshViewportLocked()
+	w, h := b.refreshViewportLocked()
 	if !b.enabled || b.ansiState != byte(parser.GroundState) || b.appCursorSaved || b.synchronized {
+		b.redrawPending = true
 		return
 	}
-	w, h, err := b.getSize(b.outputFD)
-	if err != nil || w <= 0 || h < 2 {
+	if w <= 0 || h < 2 {
+		b.redrawPending = true
 		return
 	}
 	text := b.layoutLocked(w)
@@ -486,6 +500,7 @@ func (b *Bar) drawLocked() {
 		restoreInverse = "\x1b[7m"
 	}
 	_, _ = fmt.Fprintf(b.out, "\x1b[s\x1b[%d;1H\x1b[2K\x1b[7m%s%s\x1b[u", h, text, restoreInverse)
+	b.redrawPending = false
 }
 
 func (b *Bar) ensureScrollRegionLocked(rows int) {
@@ -675,6 +690,14 @@ func (b *Bar) resetsScrollRegion(sequence []byte) bool {
 		return true
 	}
 	return (last == 'h' || last == 'l') && bytes.Contains(sequence, []byte("?1049"))
+}
+
+func (b *Bar) erasesStatusRow(sequence []byte) bool {
+	if len(sequence) < 3 || !bytes.HasPrefix(sequence, []byte("\x1b[")) {
+		return false
+	}
+	// ED can erase outside the remote scroll region, including the status row.
+	return sequence[len(sequence)-1] == 'J'
 }
 
 // Close clears the reserved row. It is safe to call more than once.

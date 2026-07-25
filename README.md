@@ -32,6 +32,17 @@ Flags may appear before or after the environment name.
 Hosted projects and user machines use the same durable terminal-session workflow:
 `--new`, `--session`, and `pb sessions` apply to either environment type.
 
+Interactive attaches use the `fast` terminal profile by default. It mirrors OpenSSH PTY
+environment forwarding by preserving `TERM` and locale without advertising extra
+terminal-program capabilities. Set `connect.terminal_profile` to `full` to additionally
+forward `COLORTERM`, `TERM_PROGRAM`, and `TERM_PROGRAM_VERSION`. An explicit
+`connect.forward_terminal_env` list overrides either profile.
+
+```sh
+pb config set terminal-profile full  # opt into terminal-specific capabilities
+pb config set terminal-profile fast  # restore the SSH-compatible default
+```
+
 ## User machines
 
 BYOD enrollment starts in the dashboard. Its single-use command invokes

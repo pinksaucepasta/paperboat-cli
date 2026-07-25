@@ -646,6 +646,52 @@ func (s ProfileStore) DiscardRevocation(issuer, cliClientSessionID string) error
 	return nil
 }
 
+// DiscardPendingRevocations removes every local revocation record for issuer.
+// Logout uses this after abandoning best-effort server revocation. It tolerates
+// partially written metadata so corrupt historical entries cannot trap a user
+// in a locally signed-in state.
+func (s ProfileStore) DiscardPendingRevocations(issuer string) error {
+	issuer, err := NormalizeIssuer(issuer)
+	if err != nil {
+		return err
+	}
+	dir := filepath.Join(s.Path, "pending-revocations")
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	prefix := profileKey(issuer) + "-"
+	var errs []error
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" || !strings.HasPrefix(entry.Name(), prefix) {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		lock := newSharedLock(path + ".lock")
+		if lockErr := lock.Lock(); lockErr != nil {
+			errs = append(errs, lockErr)
+			continue
+		}
+		func() {
+			defer lock.Unlock()
+			var record PendingRevocation
+			if data, readErr := os.ReadFile(path); readErr == nil {
+				_ = json.Unmarshal(data, &record)
+			}
+			if strings.HasPrefix(record.RefreshSecretRef, "revocation-") {
+				errs = append(errs, s.Secrets.Delete(record.RefreshSecretRef))
+			}
+			if removeErr := os.Remove(path); removeErr != nil && !os.IsNotExist(removeErr) {
+				errs = append(errs, removeErr)
+			}
+		}()
+	}
+	return errors.Join(errs...)
+}
+
 func (s ProfileStore) MarkRevocationSucceeded(record PendingRevocation) (PendingRevocation, error) {
 	path := s.existingPendingRevocationPath(record.Issuer, record.CLIClientSessionID)
 	lock := newSharedLock(path + ".lock")

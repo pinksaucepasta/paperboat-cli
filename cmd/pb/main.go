@@ -30,6 +30,7 @@ import (
 
 	"github.com/pinksaucepasta/paperboat-cli/internal/api"
 	sessionauth "github.com/pinksaucepasta/paperboat-cli/internal/auth"
+	"github.com/pinksaucepasta/paperboat-cli/internal/buildinfo"
 	"github.com/pinksaucepasta/paperboat-cli/internal/command"
 	"github.com/pinksaucepasta/paperboat-cli/internal/config"
 	"github.com/pinksaucepasta/paperboat-cli/internal/paste"
@@ -121,6 +122,10 @@ func newRootCommand() *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
+	root.Version = buildinfo.Version
+	root.SetVersionTemplate("pb {{.Version}}\n")
+	root.InitDefaultVersionFlag()
+	root.Flags().Lookup("version").Shorthand = "v"
 	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return invocationError(err) })
 	root.PersistentFlags().String("config", "", "path to the CLI config file")
 	root.PersistentFlags().String("server", "", "paperboat-server base URL override")
@@ -646,33 +651,47 @@ func authLogout(c *command.Context) error {
 	if err != nil {
 		return err
 	}
-	active, loadErr := store.Load(cfg.ServerURL)
-	if loadErr != nil && !errors.Is(loadErr, config.ErrNoCredentials) {
-		return loadErr
+	var refreshTokens []string
+	if credential, credentialErr := store.CredentialFor(cfg.ServerURL); credentialErr == nil && strings.TrimSpace(credential.RefreshToken) != "" {
+		refreshTokens = append(refreshTokens, credential.RefreshToken)
 	}
-	if err := store.QueueActiveRevocation(cfg.ServerURL); err != nil && !errors.Is(err, config.ErrNoCredentials) {
-		return err
+	if records, recordsErr := store.PendingRevocations(cfg.ServerURL); recordsErr == nil {
+		for _, record := range records {
+			credential, credentialErr := store.PendingRevocationCredential(record)
+			if credentialErr == nil && strings.TrimSpace(credential.RefreshToken) != "" {
+				refreshTokens = append(refreshTokens, credential.RefreshToken)
+			}
+		}
 	}
-	if err := drainPendingRevocations(c.Context, cfg.ServerURL, store); err != nil {
-		if loadErr == nil {
-			records, listErr := store.PendingRevocations(cfg.ServerURL)
-			if listErr != nil {
-				return errors.Join(err, listErr)
-			}
-			currentPending := false
-			for _, record := range records {
-				if record.CLIClientSessionID == active.CLIClientSessionID {
-					currentPending = true
-					break
-				}
-			}
-			if !currentPending {
-				fmt.Fprintln(os.Stderr, "WARNING: an earlier session revocation remains pending:", err)
+	if _, removeErr := store.Remove(cfg.ServerURL); removeErr != nil && !errors.Is(removeErr, config.ErrNoCredentials) {
+		// Remove may report an unreadable credential after successfully deleting
+		// the profile. Only fail when local profile metadata still exists.
+		if _, remainingErr := store.Load(cfg.ServerURL); !errors.Is(remainingErr, config.ErrNoCredentials) {
+			return fmt.Errorf("remove local Paperboat session: %w", removeErr)
+		}
+	}
+	if err := store.DiscardPendingRevocations(cfg.ServerURL); err != nil {
+		return fmt.Errorf("clear local pending revocations: %w", err)
+	}
+	if len(refreshTokens) > 0 {
+		revokeCtx, cancel := context.WithTimeout(c.Context, 2*time.Second)
+		done := make(chan struct{}, len(refreshTokens))
+		for _, refreshToken := range refreshTokens {
+			go func(token string) {
+				_ = api.RevokeToken(revokeCtx, cfg.ServerURL, token, nil)
+				done <- struct{}{}
+			}(refreshToken)
+		}
+		for range refreshTokens {
+			select {
+			case <-done:
+			case <-revokeCtx.Done():
+				cancel()
 				fmt.Println("Signed out")
 				return nil
 			}
 		}
-		return fmt.Errorf("sign-out revocation remains pending; retry `pb auth logout`: %w", err)
+		cancel()
 	}
 	fmt.Println("Signed out")
 	return nil
@@ -1247,6 +1266,11 @@ func sessionsCommand() *command.Spec {
 }
 
 func selectTerminalSession(ctx context.Context, client *api.Client, projectRef string, create bool, name, ref string) (string, error) {
+	if !create && strings.TrimSpace(ref) == "" {
+		// The descriptor endpoint owns default-session resolution. Avoid resolving
+		// the environment once here and again immediately before dialing.
+		return "", nil
+	}
 	target, err := resolveEnvironmentTarget(ctx, client, projectRef)
 	if err != nil {
 		return "", err
@@ -1263,9 +1287,6 @@ func selectTerminalSession(ctx context.Context, client *api.Client, projectRef s
 			fmt.Fprintf(os.Stderr, "Session: %s\n", session.Name)
 		}
 		return session.ID, nil
-	}
-	if strings.TrimSpace(ref) == "" {
-		return "", nil
 	}
 	session, err := resolveTerminalSession(ctx, client, target, ref)
 	if err != nil {
@@ -2133,20 +2154,32 @@ func configCommand() *command.Spec {
 				Action: configUnassign,
 			},
 			{
-				Name: "set", ArgsUsage: "server <url>", Usage: "Set a local configuration value",
+				Name: "set", ArgsUsage: "<key> <value>", Usage: "Set a local configuration value",
 				Action: func(c *command.Context) error {
-					if c.Args().Len() != 2 || c.Args().First() != "server" {
-						return errors.New("usage: pb config set server <url>")
+					if c.Args().Len() != 2 {
+						return errors.New("usage: pb config set server <url> | terminal-profile <fast|full>")
 					}
 					cfg, err := config.Load(c.String("config"))
 					if err != nil {
 						return err
 					}
-					server, err := config.NormalizeServerURL(c.Args().Get(1))
-					if err != nil {
-						return err
+					switch c.Args().First() {
+					case "server":
+						server, err := config.NormalizeServerURL(c.Args().Get(1))
+						if err != nil {
+							return err
+						}
+						cfg.ServerURL = server
+					case "terminal-profile":
+						profile := strings.ToLower(strings.TrimSpace(c.Args().Get(1)))
+						if profile != "fast" && profile != "full" {
+							return errors.New("terminal profile must be fast or full")
+						}
+						cfg.Connect.TerminalProfile = profile
+						cfg.Connect.ForwardTerminalEnv = nil
+					default:
+						return errors.New("usage: pb config set server <url> | terminal-profile <fast|full>")
 					}
-					cfg.ServerURL = server
 					if err := cfg.Save(); err != nil {
 						return err
 					}
@@ -2194,10 +2227,11 @@ func configCommand() *command.Spec {
 						return err
 					}
 					if c.Bool("json") {
-						return json.NewEncoder(os.Stdout).Encode(map[string]any{"path": d.cfg.Path(), "server_url": d.cfg.ServerURL, "auth_file_fallback": d.cfg.Auth.AllowFileFallback, "upload_endpoint": d.cfg.Upload.Endpoint, "upload_max_image_bytes": d.cfg.Upload.MaxImageBytes, "upload_max_attachments": d.cfg.Upload.MaxAttachments})
+						return json.NewEncoder(os.Stdout).Encode(map[string]any{"path": d.cfg.Path(), "server_url": d.cfg.ServerURL, "auth_file_fallback": d.cfg.Auth.AllowFileFallback, "terminal_profile": d.cfg.Connect.TerminalProfile, "upload_endpoint": d.cfg.Upload.Endpoint, "upload_max_image_bytes": d.cfg.Upload.MaxImageBytes, "upload_max_attachments": d.cfg.Upload.MaxAttachments})
 					}
 					fmt.Printf("server_url: %s\n", orNone(d.cfg.ServerURL))
 					fmt.Printf("auth.file_fallback: %t\n", d.cfg.Auth.AllowFileFallback)
+					fmt.Printf("connect.terminal_profile: %s\n", d.cfg.Connect.TerminalProfile)
 					fmt.Printf("upload.endpoint: %s\n", orNone(d.cfg.Upload.Endpoint))
 					fmt.Printf("upload.max_image_bytes: %d\n", d.cfg.Upload.MaxImageBytes)
 					fmt.Printf("upload.max_attachments: %d\n", d.cfg.Upload.MaxAttachments)

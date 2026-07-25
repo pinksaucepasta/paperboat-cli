@@ -12,11 +12,13 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/pinksaucepasta/paperboat-cli/internal/api"
+	"github.com/pinksaucepasta/paperboat-cli/internal/buildinfo"
 	"github.com/pinksaucepasta/paperboat-cli/internal/config"
 	"github.com/pinksaucepasta/paperboat-cli/internal/resolver"
 	"github.com/pinksaucepasta/paperboat-cli/internal/statusbar"
@@ -77,9 +79,23 @@ func TestSelectTerminalSessionDoesNotHideAmbiguousProjectWithUserMachine(t *test
 	}))
 	defer server.Close()
 
-	_, err := selectTerminalSession(context.Background(), api.New(server.URL, config.Credential{AccessToken: "token"}, server.Client()), "studio", false, "", "")
+	_, err := selectTerminalSession(context.Background(), api.New(server.URL, config.Credential{AccessToken: "token"}, server.Client()), "studio", false, "", "named")
 	if !errors.Is(err, resolver.ErrProjectAmbiguous) {
 		t.Fatalf("err = %v, want project ambiguity", err)
+	}
+}
+
+func TestSelectDefaultTerminalSessionDefersToDescriptor(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	got, err := selectTerminalSession(context.Background(), api.New(server.URL, config.Credential{AccessToken: "token"}, server.Client()), "studio", false, "", "")
+	if err != nil || got != "" || requests != 0 {
+		t.Fatalf("select default = %q, %v; requests=%d", got, err, requests)
 	}
 }
 
@@ -413,6 +429,18 @@ func TestHelpCommandDoesNotCallBackend(t *testing.T) {
 	}
 }
 
+func TestVersionFlags(t *testing.T) {
+	previous := buildinfo.Version
+	buildinfo.Version = "2026.07.25.0"
+	t.Cleanup(func() { buildinfo.Version = previous })
+	for _, flag := range []string{"--version", "-v"} {
+		var stdout, stderr bytes.Buffer
+		if code := run(context.Background(), []string{flag}, &stdout, &stderr); code != 0 || stdout.String() != "pb 2026.07.25.0\n" || stderr.Len() != 0 {
+			t.Fatalf("%s: code=%d stdout=%q stderr=%q", flag, code, stdout.String(), stderr.String())
+		}
+	}
+}
+
 func TestCanonicalCommandsAreDiscoverable(t *testing.T) {
 	root := newRootCommand()
 	for _, path := range [][]string{{"login"}, {"logout"}, {"create"}, {"session", "attach"}, {"session", "list"}, {"user-machine", "add"}, {"user-machine", "list"}, {"user-machine", "revoke"}, {"preview", "list"}, {"preview", "revoke"}} {
@@ -519,6 +547,22 @@ func TestConfigCommandsAreDiscoverableAndUnassignRequiresConfirmation(t *testing
 	err := root.ExecuteContext(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "requires --yes") {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestConfigSetTerminalProfile(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	root := newRootCommand()
+	root.SetArgs([]string{"--config", configPath, "config", "set", "terminal-profile", "full"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Connect.TerminalProfile != "full" || !slices.Contains(cfg.Connect.ForwardTerminalEnv, "TERM_PROGRAM") {
+		t.Fatalf("full terminal profile not persisted: %+v", cfg.Connect)
 	}
 }
 
@@ -911,7 +955,7 @@ func TestUploadLimitsHonorBrokeredUploadPolicy(t *testing.T) {
 	}
 }
 
-func TestAuthLogoutRetainsPendingRevocationUntilRetrySucceeds(t *testing.T) {
+func TestAuthLogoutIsLocalEvenWhenRemoteRevocationFails(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.json")
 	attempts := 0
@@ -922,19 +966,14 @@ func TestAuthLogoutRetainsPendingRevocationUntilRetrySucceeds(t *testing.T) {
 		}
 		attempts++
 		w.Header().Set("Content-Type", "application/json")
-		if attempts == 1 {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = w.Write([]byte(`{"error":{"code":"unavailable","message":"try again"}}`))
-			return
-		}
-		_, _ = w.Write([]byte(`{"data":{}}`))
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":{"code":"unavailable","message":"try again"}}`))
 	}))
 	defer server.Close()
 	writeTestProfile(t, dir, configPath, server.URL)
 
-	err := newApp().Run([]string{"pb", "--config", configPath, "auth", "logout"})
-	if err == nil || !strings.Contains(err.Error(), "remains pending") {
-		t.Fatalf("first logout err = %v", err)
+	if err := newApp().Run([]string{"pb", "--config", configPath, "auth", "logout"}); err != nil {
+		t.Fatalf("logout err = %v", err)
 	}
 	cfg, err := config.Load(configPath)
 	if err != nil {
@@ -951,26 +990,11 @@ func TestAuthLogoutRetainsPendingRevocationUntilRetrySucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(pending) != 1 {
+	if len(pending) != 0 {
 		t.Fatalf("pending revocations = %d", len(pending))
 	}
-	credential, err := store.PendingRevocationCredential(pending[0])
-	if err != nil {
-		t.Fatal(err)
-	}
-	if credential.RefreshToken != "refresh" {
-		t.Fatalf("pending refresh token = %q", credential.RefreshToken)
-	}
-
-	if err := newApp().Run([]string{"pb", "--config", configPath, "auth", "logout"}); err != nil {
-		t.Fatal(err)
-	}
-	pending, err = store.PendingRevocations(server.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(pending) != 0 {
-		t.Fatalf("pending revocations after retry = %d", len(pending))
+	if attempts != 1 {
+		t.Fatalf("remote revocation attempts = %d", attempts)
 	}
 }
 
@@ -1014,7 +1038,7 @@ func TestAuthLogoutIgnoresFailedHistoricalRevocationAfterCurrentSucceeds(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(pending) != 1 || pending[0].CLIClientSessionID != "cls_old" {
+	if len(pending) != 0 {
 		t.Fatalf("pending revocations = %#v", pending)
 	}
 }

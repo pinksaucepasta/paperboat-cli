@@ -85,6 +85,10 @@ type helperTerminalConn struct {
 	generation   uint64
 	inputStream  bool
 	inputSeq     atomic.Uint64
+	ackLatest    atomic.Uint64
+	ackSent      atomic.Uint64
+	ackNotify    chan struct{}
+	ackMu        sync.Mutex
 	replayRedraw atomic.Bool
 	closing      atomic.Bool
 	finishOnce   sync.Once
@@ -97,7 +101,7 @@ func newHelperTerminalConn(ws *websocket.Conn, target *resolver.TerminalTarget, 
 	if queue < 1 {
 		queue = terminalOutputQueueChunks
 	}
-	return &helperTerminalConn{ws: ws, target: target, out: make(chan helperOutput, queue), done: make(chan struct{}), responses: make(map[string]chan helperFrame)}
+	return &helperTerminalConn{ws: ws, target: target, out: make(chan helperOutput, queue), done: make(chan struct{}), ackNotify: make(chan struct{}, 1), responses: make(map[string]chan helperFrame)}
 }
 
 func helperHandshake(ctx context.Context, ws *websocket.Conn) (bool, error) {
@@ -241,6 +245,7 @@ func (c *helperTerminalConn) initialize(ctx context.Context) error {
 		c.replayRedraw.Store(true)
 	}
 	go c.readLoop()
+	go c.ackLoop()
 	return nil
 }
 
@@ -414,6 +419,7 @@ func (c *helperTerminalConn) handleEvent(frame helperFrame) bool {
 	if c.target.SequenceSink != nil {
 		c.target.SequenceSink(int(event.FinalSequence))
 	}
+	c.flushAck()
 	code := 0
 	if event.Exit != nil {
 		code = event.Exit.Code
@@ -443,17 +449,71 @@ func (c *helperTerminalConn) Read(p []byte) (int, error) {
 	if len(c.current.data) == 0 {
 		sequence := c.current.endSequence
 		c.current = nil
-		c.ack(sequence)
+		c.queueAck(sequence)
 	}
 	return n, nil
 }
 
-func (c *helperTerminalConn) ack(sequence uint64) {
+func (c *helperTerminalConn) queueAck(sequence uint64) {
 	if c.target.SequenceSink != nil {
 		c.target.SequenceSink(int(sequence))
 	}
+	for {
+		current := c.ackLatest.Load()
+		if sequence <= current || c.ackLatest.CompareAndSwap(current, sequence) {
+			break
+		}
+	}
+	select {
+	case c.ackNotify <- struct{}{}:
+	default:
+	}
+}
+
+func (c *helperTerminalConn) ackLoop() {
+	const (
+		ackDebounce = 5 * time.Millisecond
+		ackBytes    = 64 << 10
+	)
+	for {
+		select {
+		case <-c.ackNotify:
+			latest := c.ackLatest.Load()
+			if latest-c.ackSent.Load() < ackBytes {
+				timer := time.NewTimer(ackDebounce)
+				select {
+				case <-timer.C:
+				case <-c.done:
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					c.flushAck()
+					return
+				}
+			}
+			c.flushAck()
+		case <-c.done:
+			c.flushAck()
+			return
+		}
+	}
+}
+
+func (c *helperTerminalConn) flushAck() {
+	c.ackMu.Lock()
+	defer c.ackMu.Unlock()
+	latest := c.ackLatest.Load()
+	if latest > c.ackSent.Load() && c.sendAck(latest) == nil {
+		c.ackSent.Store(latest)
+	}
+}
+
+func (c *helperTerminalConn) sendAck(sequence uint64) error {
 	payload, _ := json.Marshal(map[string]any{"session_id": c.target.SessionID, "attachment_id": c.attachmentID, "next_sequence": sequence})
-	_ = c.writeFrame(helperFrame{Type: "ack", RequestID: helperID("req_"), Version: helperProtocolVersion, Payload: payload})
+	return c.writeFrame(helperFrame{Type: "ack", RequestID: helperID("req_"), Version: helperProtocolVersion, Payload: payload})
 }
 
 func (c *helperTerminalConn) Write(p []byte) (int, error) {
@@ -499,6 +559,9 @@ func (c *helperTerminalConn) Resize(rows, cols uint16) error {
 	if rows == 0 || cols == 0 {
 		return nil
 	}
+	// Preserve control ordering while allowing ordinary output bursts to share
+	// one cumulative acknowledgement.
+	c.flushAck()
 	redraw := c.replayRedraw.Swap(false)
 	_, err := c.request("terminal.v1", map[string]any{"action": "resize", "session_id": c.target.SessionID, "attachment_id": c.attachmentID, "columns": cols, "rows": rows})
 	if err != nil || !redraw {
