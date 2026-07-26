@@ -467,11 +467,78 @@ func TestVersionFlags(t *testing.T) {
 
 func TestCanonicalCommandsAreDiscoverable(t *testing.T) {
 	root := newRootCommand()
-	for _, path := range [][]string{{"login"}, {"logout"}, {"create"}, {"session", "attach"}, {"session", "list"}, {"user-machine", "add"}, {"user-machine", "list"}, {"user-machine", "revoke"}, {"preview", "list"}, {"preview", "revoke"}} {
+	for _, path := range [][]string{{"login"}, {"logout"}, {"create"}, {"session", "attach"}, {"session", "list"}, {"user-machine", "add"}, {"user-machine", "list"}, {"user-machine", "revoke"}, {"user-machine", "availability"}, {"preview", "list"}, {"preview", "revoke"}} {
 		command, remaining, err := root.Find(path)
 		if err != nil || len(remaining) != 0 || command == root {
 			t.Fatalf("command %q not discoverable: command=%v remaining=%q err=%v", path, command, remaining, err)
 		}
+	}
+}
+
+func TestMachineAvailabilityRequiresConfirmationAndReturnsAppliedJSON(t *testing.T) {
+	root := newRootCommand()
+	root.SetArgs([]string{"user-machine", "availability", "um_1", "--mode", "keep-awake"})
+	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), "requires --yes") {
+		t.Fatalf("confirmation error=%v", err)
+	}
+
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "GET /v1/user-machines":
+			writeAPIData(t, w, map[string]any{"items": []map[string]any{{"id": "um_1", "display_name": "Studio", "availability": map[string]any{"schema": "paperboat.availability-policy/v1", "desired_mode": "allow_sleep", "desired_version": 3, "observed_version": 3, "status": "applied"}}}, "pagination": map[string]any{"next_offset": nil}})
+		case "PUT /v1/user-machines/um_1/availability-policy":
+			if r.Header.Get("Idempotency-Key") == "" {
+				t.Fatal("missing idempotency key")
+			}
+			writeAPIData(t, w, map[string]any{"schema": "paperboat.availability-policy/v1", "desired_mode": "keep_awake", "desired_version": 4, "observed_mode": "keep_awake", "observed_version": 4, "status": "applied", "observed_at": "2026-07-26T12:00:00Z", "host_service_version": "test", "host_service_scope": "system"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	writeTestProfile(t, dir, configPath, srv.URL)
+	var stdout, stderr bytes.Buffer
+	if code := run(context.Background(), []string{"--config", configPath, "user-machine", "availability", "Studio", "--mode", "keep-awake", "--yes", "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	var output struct {
+		Version      string                 `json:"version"`
+		Outcome      string                 `json:"outcome"`
+		Retry        string                 `json:"retry"`
+		Availability api.AvailabilityPolicy `json:"availability"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &output); err != nil || output.Version != "1" || output.Outcome != "applied" || output.Retry != "automatic" || output.Availability.DesiredVersion != 4 {
+		t.Fatalf("output=%q decoded=%+v err=%v", stdout.String(), output, err)
+	}
+	if !strings.Contains(stderr.String(), "User machine: Studio (um_1)") {
+		t.Fatalf("stderr=%q", stderr.String())
+	}
+}
+
+func TestUserMachineDoctorStateCoversBootConnectorAndAvailability(t *testing.T) {
+	ready := api.UserMachine{
+		RuntimeDiagnostics: api.RuntimeDiagnostics{WorkerGeneration: 7, OSBootID: "boot-1", WorkerServiceScope: "system", ConnectorState: "ready", ConnectorGeneration: 3},
+		Availability:       api.AvailabilityPolicy{DesiredMode: "keep_awake", DesiredVersion: 2, ObservedMode: "keep_awake", ObservedVersion: 2, Status: "applied"},
+	}
+	if state, code := userMachineDoctorState(ready); state != "ready" || code != "" {
+		t.Fatalf("ready state=%q code=%q", state, code)
+	}
+	legacy := ready
+	legacy.RuntimeDiagnostics.WorkerServiceScope = "user"
+	if state, code := userMachineDoctorState(legacy); state != "error" || code != "boot_service_not_system" {
+		t.Fatalf("legacy state=%q code=%q", state, code)
+	}
+	recovering := ready
+	recovering.RuntimeDiagnostics.ConnectorState = "unavailable"
+	if state, code := userMachineDoctorState(recovering); state != "degraded" || code != "connector_recovering" {
+		t.Fatalf("connector state=%q code=%q", state, code)
+	}
+	drift := ready
+	drift.Availability.ObservedVersion = 1
+	if state, code := userMachineDoctorState(drift); state != "degraded" || code != "availability_drift" {
+		t.Fatalf("availability state=%q code=%q", state, code)
 	}
 }
 
@@ -574,19 +641,12 @@ func TestConfigCommandsAreDiscoverableAndUnassignRequiresConfirmation(t *testing
 	}
 }
 
-func TestConfigSetTerminalProfile(t *testing.T) {
-	configPath := filepath.Join(t.TempDir(), "config.json")
+func TestConfigSetRejectsRemovedTerminalProfile(t *testing.T) {
 	root := newRootCommand()
-	root.SetArgs([]string{"--config", configPath, "config", "set", "terminal-profile", "full"})
-	if err := root.ExecuteContext(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := config.Load(configPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Connect.TerminalProfile != "full" || !slices.Contains(cfg.Connect.ForwardTerminalEnv, "TERM_PROGRAM") {
-		t.Fatalf("full terminal profile not persisted: %+v", cfg.Connect)
+	root.SetArgs([]string{"--config", filepath.Join(t.TempDir(), "config.json"), "config", "set", "terminal-profile", "full"})
+	err := root.ExecuteContext(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "usage: pb config set server <url>") {
+		t.Fatalf("err=%v", err)
 	}
 }
 

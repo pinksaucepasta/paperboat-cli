@@ -402,8 +402,81 @@ func userMachineCobraCommand() *cobra.Command {
 	}}
 	revoke.Flags().Bool("yes", false, "confirm revocation")
 	revoke.Flags().Bool("json", false, "print JSON")
-	machine.AddCommand(add, list, revoke)
+	availability := &cobra.Command{Use: "availability <user-machine>", Short: "Set user-machine sleep availability", Args: commandArgs(cobra.ExactArgs(1)), RunE: func(command *cobra.Command, args []string) error {
+		modeFlag, _ := command.Flags().GetString("mode")
+		mode := strings.ReplaceAll(strings.TrimSpace(modeFlag), "-", "_")
+		if mode != "allow_sleep" && mode != "keep_awake" {
+			return errors.New("availability --mode must be allow-sleep or keep-awake")
+		}
+		confirmed, _ := command.Flags().GetBool("yes")
+		if mode == "keep_awake" && !confirmed {
+			return errors.New("keep-awake availability requires --yes because it can increase battery use and heat and may keep a closed-lid machine awake")
+		}
+		ctx := actionContext(command, args)
+		client, err := backendClient(ctx)
+		if err != nil {
+			return err
+		}
+		machine, err := resolveUserMachine(ctx.Context, client, args[0])
+		if err != nil {
+			return friendlyCommandError(err)
+		}
+		fmt.Fprintf(command.ErrOrStderr(), "User machine: %s (%s)\n", machine.DisplayName, machine.ID)
+		policy, err := client.SetUserMachineAvailability(ctx.Context, machine.ID, mode, newIdempotencyKey(), machine.Availability.DesiredVersion)
+		if err != nil {
+			return friendlyCommandError(err)
+		}
+		policy = waitForAvailabilityObservation(ctx.Context, client, machine.ID, policy, 5*time.Second)
+		outcome := "pending"
+		if policy.Status == "applied" && policy.ObservedVersion == policy.DesiredVersion && policy.ObservedMode == policy.DesiredMode {
+			outcome = "applied"
+		}
+		jsonOutput, _ := command.Flags().GetBool("json")
+		if jsonOutput {
+			return json.NewEncoder(command.OutOrStdout()).Encode(map[string]any{"version": "1", "user_machine": map[string]string{"id": machine.ID, "display_name": machine.DisplayName}, "availability": policy, "outcome": outcome, "retry": "automatic"})
+		}
+		if outcome == "applied" {
+			fmt.Fprintf(command.OutOrStdout(), "Availability %s applied to %s.\n", strings.ReplaceAll(mode, "_", "-"), machine.DisplayName)
+		} else {
+			fmt.Fprintf(command.OutOrStdout(), "Availability %s saved for %s; application is durably %s.\n", strings.ReplaceAll(mode, "_", "-"), machine.DisplayName, policy.Status)
+		}
+		return nil
+	}}
+	availability.Flags().String("mode", "", "availability mode: allow-sleep or keep-awake")
+	availability.Flags().Bool("yes", false, "confirm keep-awake power behavior")
+	availability.Flags().Bool("json", false, "print JSON")
+	machine.AddCommand(add, list, revoke, availability)
 	return machine
+}
+
+func waitForAvailabilityObservation(ctx context.Context, client *api.Client, machineID string, current api.AvailabilityPolicy, timeout time.Duration) api.AvailabilityPolicy {
+	if current.Status == "applied" && current.ObservedVersion == current.DesiredVersion && current.ObservedMode == current.DesiredMode {
+		return current
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-waitCtx.Done():
+			return current
+		case <-ticker.C:
+			machines, err := client.ListUserMachines(waitCtx)
+			if err != nil {
+				continue
+			}
+			for _, machine := range machines {
+				if machine.ID != machineID || machine.Availability.DesiredVersion != current.DesiredVersion {
+					continue
+				}
+				current = machine.Availability
+				if current.Status == "applied" || current.Status == "unsupported" || current.Status == "error" || current.Status == "offline" {
+					return current
+				}
+			}
+		}
+	}
 }
 
 func resolveUserMachineTarget(ctx context.Context, client *api.Client, requested string) (string, string, error) {
@@ -1574,7 +1647,7 @@ func actionConnectTarget(c *command.Context, requested string) error {
 				info.Terminal.RestartIfNotRunning = true
 				info.Terminal.ReplayHistory = true
 				info.Terminal.SequenceSink = recordTerminalSequence
-				info.Terminal.Env = forwardedTerminalEnv(d.cfg.Connect.ForwardTerminalEnv)
+				info.Terminal.Env = forwardedTerminalEnv(config.TerminalEnv)
 				info.Terminal.Cols, info.Terminal.Rows = remoteSize()
 			}
 			d.uploader = uploaderForTarget(info.Upload)
@@ -1644,7 +1717,7 @@ func actionConnectTarget(c *command.Context, requested string) error {
 			freshInfo.Terminal.ReplayHistory = false
 			freshInfo.Terminal.AfterSequence = int(lastTerminalSequence.Load())
 			freshInfo.Terminal.SequenceSink = recordTerminalSequence
-			freshInfo.Terminal.Env = forwardedTerminalEnv(d.cfg.Connect.ForwardTerminalEnv)
+			freshInfo.Terminal.Env = forwardedTerminalEnv(config.TerminalEnv)
 			freshInfo.Terminal.Cols, freshInfo.Terminal.Rows = remoteSize()
 		}
 		freshConn, dialErr := d.tunnel.Dial(reconnectCtx, freshInfo)
@@ -2168,7 +2241,7 @@ func configCommand() *command.Spec {
 				Name: "set", ArgsUsage: "<key> <value>", Usage: "Set a local configuration value",
 				Action: func(c *command.Context) error {
 					if c.Args().Len() != 2 {
-						return errors.New("usage: pb config set server <url> | terminal-profile <fast|full>")
+						return errors.New("usage: pb config set server <url>")
 					}
 					cfg, err := config.Load(c.String("config"))
 					if err != nil {
@@ -2181,15 +2254,8 @@ func configCommand() *command.Spec {
 							return err
 						}
 						cfg.ServerURL = server
-					case "terminal-profile":
-						profile := strings.ToLower(strings.TrimSpace(c.Args().Get(1)))
-						if profile != "fast" && profile != "full" {
-							return errors.New("terminal profile must be fast or full")
-						}
-						cfg.Connect.TerminalProfile = profile
-						cfg.Connect.ForwardTerminalEnv = nil
 					default:
-						return errors.New("usage: pb config set server <url> | terminal-profile <fast|full>")
+						return errors.New("usage: pb config set server <url>")
 					}
 					if err := cfg.Save(); err != nil {
 						return err
@@ -2238,11 +2304,10 @@ func configCommand() *command.Spec {
 						return err
 					}
 					if c.Bool("json") {
-						return json.NewEncoder(os.Stdout).Encode(map[string]any{"path": d.cfg.Path(), "server_url": d.cfg.ServerURL, "auth_file_fallback": d.cfg.Auth.AllowFileFallback, "terminal_profile": d.cfg.Connect.TerminalProfile, "upload_endpoint": d.cfg.Upload.Endpoint, "upload_max_image_bytes": d.cfg.Upload.MaxImageBytes, "upload_max_attachments": d.cfg.Upload.MaxAttachments})
+						return json.NewEncoder(os.Stdout).Encode(map[string]any{"path": d.cfg.Path(), "server_url": d.cfg.ServerURL, "auth_file_fallback": d.cfg.Auth.AllowFileFallback, "upload_endpoint": d.cfg.Upload.Endpoint, "upload_max_image_bytes": d.cfg.Upload.MaxImageBytes, "upload_max_attachments": d.cfg.Upload.MaxAttachments})
 					}
 					fmt.Printf("server_url: %s\n", orNone(d.cfg.ServerURL))
 					fmt.Printf("auth.file_fallback: %t\n", d.cfg.Auth.AllowFileFallback)
-					fmt.Printf("connect.terminal_profile: %s\n", d.cfg.Connect.TerminalProfile)
 					fmt.Printf("upload.endpoint: %s\n", orNone(d.cfg.Upload.Endpoint))
 					fmt.Printf("upload.max_image_bytes: %d\n", d.cfg.Upload.MaxImageBytes)
 					fmt.Printf("upload.max_attachments: %d\n", d.cfg.Upload.MaxAttachments)
@@ -2418,8 +2483,15 @@ func doctorCommand() *command.Spec {
 			}
 			fmt.Printf("environment:  %s (%s) ✓\n", info.ProjectID, firstNonEmpty(info.ProjectState, "ready"))
 			fmt.Println("entitlement:  connect authorization accepted ✓")
+			diagnosticState := "ready"
 			if info.TargetKind == "user_machine" {
-				fmt.Println("connector:    user machine route ready ✓")
+				machine, machineErr := doctorUserMachine(c.Context, api.New(d.cfg.ServerURL, cred, nil), info.ProjectID)
+				if machineErr != nil {
+					fmt.Printf("diagnostics:  unavailable: %v\n", machineErr)
+					return fmt.Errorf("doctor: user-machine diagnostics failed: %w", machineErr)
+				}
+				printUserMachineDoctor(machine)
+				diagnosticState, _ = userMachineDoctorState(machine)
 			} else {
 				fmt.Println("fly readiness: ready ✓")
 			}
@@ -2430,6 +2502,9 @@ func doctorCommand() *command.Spec {
 			}
 			fmt.Printf("terminal:    websocket route/auth ready for %s ✓\n", info.Project)
 			fmt.Println("protocol:    paperboat-terminal-rpc/v1 ✓")
+			if diagnosticState != "ready" {
+				return errors.New("doctor: user-machine runtime diagnostics require attention")
+			}
 			return nil
 		},
 	}
@@ -2492,9 +2567,80 @@ func doctorJSON(c *command.Context, d *deps) error {
 	}
 	result["project"] = map[string]string{"id": info.ProjectID, "name": info.Project, "state": info.ProjectState}
 	result["environment_type"] = info.TargetKind
+	diagnosticState := "ready"
+	if info.TargetKind == "user_machine" {
+		machine, machineErr := doctorUserMachine(c.Context, client, info.ProjectID)
+		if machineErr != nil {
+			result["user_machine_diagnostics"] = map[string]any{"state": "error", "error_code": "diagnostics_unavailable"}
+			_ = json.NewEncoder(os.Stdout).Encode(result)
+			return fmt.Errorf("doctor: user-machine diagnostics failed: %w", machineErr)
+		}
+		result["user_machine_diagnostics"] = userMachineDoctorJSON(machine)
+		diagnosticState, _ = userMachineDoctorState(machine)
+	}
 	result["connect"] = "ready"
 	result["protocol"] = "paperboat-terminal-rpc/v1"
-	return json.NewEncoder(os.Stdout).Encode(result)
+	if err := json.NewEncoder(os.Stdout).Encode(result); err != nil {
+		return err
+	}
+	if diagnosticState != "ready" {
+		return errors.New("doctor: user-machine runtime diagnostics require attention")
+	}
+	return nil
+}
+
+func doctorUserMachine(ctx context.Context, client *api.Client, machineID string) (api.UserMachine, error) {
+	machines, err := client.ListUserMachines(ctx)
+	if err != nil {
+		return api.UserMachine{}, err
+	}
+	for _, machine := range machines {
+		if machine.ID == machineID {
+			return machine, nil
+		}
+	}
+	return api.UserMachine{}, errors.New("resolved user machine is missing from the account")
+}
+
+func printUserMachineDoctor(machine api.UserMachine) {
+	diagnostics := machine.RuntimeDiagnostics
+	availability := machine.Availability
+	fmt.Printf("boot service: %s\n", firstNonEmpty(diagnostics.WorkerServiceScope, "unknown"))
+	fmt.Printf("worker:      generation %d, OS boot %s\n", diagnostics.WorkerGeneration, firstNonEmpty(diagnostics.OSBootID, "unknown"))
+	fmt.Printf("connector:   %s (generation %d)\n", firstNonEmpty(diagnostics.ConnectorState, "unavailable"), diagnostics.ConnectorGeneration)
+	fmt.Printf("availability: desired %s v%d, observed %s v%d (%s)\n", availability.DesiredMode, availability.DesiredVersion, firstNonEmpty(availability.ObservedMode, "unknown"), availability.ObservedVersion, availability.Status)
+	if diagnostics.WorkerServiceScope != "system" {
+		fmt.Println("recovery:     run pbh bootstrap to install the boot-level system service")
+	}
+	if availability.Status != "applied" || availability.ObservedVersion != availability.DesiredVersion || availability.ObservedMode != availability.DesiredMode {
+		fmt.Println("recovery:     inspect pbh doctor --json and paperboat-host-service logs; policy retry is automatic")
+	}
+}
+
+func userMachineDoctorJSON(machine api.UserMachine) map[string]any {
+	diagnostics := machine.RuntimeDiagnostics
+	availability := machine.Availability
+	state, errorCode := userMachineDoctorState(machine)
+	return map[string]any{
+		"state": state, "error_code": errorCode,
+		"boot_service_scope": diagnostics.WorkerServiceScope,
+		"worker_generation":  diagnostics.WorkerGeneration, "os_boot_id": diagnostics.OSBootID,
+		"connector_state": diagnostics.ConnectorState, "connector_generation": diagnostics.ConnectorGeneration,
+		"availability": availability,
+	}
+}
+
+func userMachineDoctorState(machine api.UserMachine) (string, string) {
+	diagnostics := machine.RuntimeDiagnostics
+	availability := machine.Availability
+	if diagnostics.WorkerServiceScope != "system" || diagnostics.WorkerGeneration < 1 {
+		return "error", "boot_service_not_system"
+	} else if diagnostics.ConnectorState != "ready" {
+		return "degraded", "connector_recovering"
+	} else if availability.Status != "applied" || availability.ObservedVersion != availability.DesiredVersion || availability.ObservedMode != availability.DesiredMode {
+		return "degraded", "availability_drift"
+	}
+	return "ready", ""
 }
 
 func firstNonEmpty(vals ...string) string {

@@ -79,8 +79,8 @@ func TestLoadAppliesDialRetryDefaultWhenOmitted(t *testing.T) {
 		cfg.Connect.TerminalOutputBufferBytes != DefaultTerminalOutputBufferBytes {
 		t.Fatalf("terminal output defaults = %+v", cfg.Connect)
 	}
-	if cfg.Connect.TerminalProfile != "fast" || strings.Join(cfg.Connect.ForwardTerminalEnv, ",") != "TERM,LANG,LC_ALL,LC_CTYPE" {
-		t.Fatalf("fast terminal profile defaults = %+v", cfg.Connect)
+	if got := strings.Join(TerminalEnv, ","); got != "TERM,COLORTERM,TERM_PROGRAM,TERM_PROGRAM_VERSION,LANG,LC_ALL,LC_CTYPE" {
+		t.Fatalf("terminal environment = %q", got)
 	}
 	if cfg.StatusBar.Mode != DefaultStatusBarMode || cfg.StatusBar.NoticeSeconds != DefaultStatusBarNoticeSeconds || cfg.StatusBar.SyncPollSeconds != DefaultStatusBarSyncPollSeconds {
 		t.Fatalf("status bar defaults = %+v", cfg.StatusBar)
@@ -96,34 +96,9 @@ func TestLoadAppliesDialRetryDefaultWhenOmitted(t *testing.T) {
 	}
 }
 
-func TestLoadFullTerminalProfileAndExplicitEnvironmentOverride(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "config.json")
-	if err := os.WriteFile(path, []byte(`{"connect":{"terminal_profile":"full"}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := strings.Join(cfg.Connect.ForwardTerminalEnv, ","); got != strings.Join(FullTerminalEnv, ",") {
-		t.Fatalf("full terminal environment = %q", got)
-	}
-	if err := os.WriteFile(path, []byte(`{"connect":{"terminal_profile":"fast","forward_terminal_env":[]}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err = Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Connect.ForwardTerminalEnv == nil || len(cfg.Connect.ForwardTerminalEnv) != 0 {
-		t.Fatalf("explicit terminal environment override was replaced: %#v", cfg.Connect.ForwardTerminalEnv)
-	}
-}
-
 func TestLoadRejectsInvalidTerminalPerformanceConfiguration(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	for _, raw := range []string{
-		`{"connect":{"terminal_profile":"rich"}}`,
 		`{"connect":{"terminal_output_batch_milliseconds":-1}}`,
 		`{"connect":{"input_partial_flush_milliseconds":-1}}`,
 	} {

@@ -142,6 +142,9 @@ func IsImagePath(path string) bool {
 
 func mimeAllowedByPolicy(mimeType string, prefixes, exact []string) bool {
 	for _, allowed := range exact {
+		if strings.EqualFold(strings.TrimSpace(allowed), "image/*") && strings.HasPrefix(strings.ToLower(mimeType), "image/") {
+			return true
+		}
 		if strings.EqualFold(mimeType, allowed) {
 			return true
 		}

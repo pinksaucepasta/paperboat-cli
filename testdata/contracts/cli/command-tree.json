@@ -19,6 +19,7 @@
     {"name":"preview revoke","aliases":["preview remove"],"args":["<preview>"],"flags":["--yes"],"destructive":true},
     {"name":"user-machine add","aliases":[],"args":[],"interactive":true},
     {"name":"user-machine list","aliases":[],"args":[],"json":true},
+    {"name":"user-machine availability","aliases":[],"args":["<user-machine>"],"flags":["--mode","--yes","--json"],"json":true},
     {"name":"user-machine revoke","aliases":[],"args":["<user-machine>"],"flags":["--yes"],"destructive":true},
     {"name":"config assign","aliases":[],"args":["<repository>","<environment>"],"interactive":true},
     {"name":"config unassign","aliases":[],"args":["<environment>"],"flags":["--yes"],"destructive":true},

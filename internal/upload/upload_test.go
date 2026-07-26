@@ -76,6 +76,22 @@ func TestPrepareImageHonorsExactAllowedMIMETypes(t *testing.T) {
 	}
 }
 
+func TestPrepareImageAllowsAdvertisedTIFF(t *testing.T) {
+	dir := t.TempDir()
+	path := write(t, dir, "clipboard.tiff", 4)
+	if _, err := PrepareImage(path, Limits{AllowedMIMETypes: []string{"image/tiff"}}); err != nil {
+		t.Fatalf("TIFF should be allowed: %v", err)
+	}
+}
+
+func TestPrepareImageHonorsImageWildcard(t *testing.T) {
+	dir := t.TempDir()
+	path := write(t, dir, "photo.avif", 4)
+	if _, err := PrepareImage(path, Limits{AllowedMIMETypes: []string{"image/*"}}); err != nil {
+		t.Fatalf("image wildcard should allow AVIF: %v", err)
+	}
+}
+
 func TestPrepareImageIgnoresLegacyDataURLLimit(t *testing.T) {
 	dir := t.TempDir()
 	p := write(t, dir, "m.png", 1000)

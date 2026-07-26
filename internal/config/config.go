@@ -106,9 +106,6 @@ type AuthConfig struct {
 
 // ConnectConfig tunes how the CLI waits for an idle machine and its helper route.
 type ConnectConfig struct {
-	// TerminalProfile controls terminal capability forwarding. Fast mirrors
-	// OpenSSH's PTY environment; full also exposes terminal-specific metadata.
-	TerminalProfile string `json:"terminal_profile,omitempty"`
 	// ReadyTimeoutSeconds caps how long to poll for the tunnel to become
 	// connectable before giving up. Defaults to DefaultReadyTimeoutSeconds.
 	ReadyTimeoutSeconds int `json:"ready_timeout_seconds,omitempty"`
@@ -126,11 +123,6 @@ type ConnectConfig struct {
 	TerminalOutputBatchMilliseconds int `json:"terminal_output_batch_milliseconds,omitempty"`
 	// TerminalOutputBufferBytes controls each local terminal output read.
 	TerminalOutputBufferBytes int `json:"terminal_output_buffer_bytes,omitempty"`
-	// ForwardTerminalEnv lists local environment variables forwarded to the
-	// remote PTY on attach so it inherits the client terminal's capabilities
-	// (color depth, terminal program, locale). Unset variables are skipped.
-	// When set, this overrides TerminalProfile.
-	ForwardTerminalEnv []string `json:"forward_terminal_env,omitempty"`
 	// InputPartialFlushMilliseconds bounds how long input bytes that could
 	// begin a bracketed-paste start marker (e.g. a bare ESC keypress) are
 	// withheld before being forwarded to the remote terminal. Negative
@@ -148,7 +140,6 @@ const (
 	DefaultTerminalOutputBatchMilliseconds = 0
 	DefaultTerminalOutputBufferBytes       = 128 * 1024
 	DefaultInputPartialFlushMilliseconds   = 1
-	DefaultTerminalProfile                 = "fast"
 	DefaultStatusBarMode                   = "auto"
 	DefaultStatusBarNoticeSeconds          = 5
 	DefaultStatusBarSyncPollSeconds        = 30
@@ -160,17 +151,8 @@ var (
 	DefaultStatusBarRight  = []string{"credits", "connection"}
 )
 
-// FastTerminalEnv matches OpenSSH's default PTY behavior: TERM is always sent,
-// while locale forwarding remains useful and does not increase render density.
-var FastTerminalEnv = []string{
-	"TERM",
-	"LANG",
-	"LC_ALL",
-	"LC_CTYPE",
-}
-
-// FullTerminalEnv additionally exposes terminal-specific rendering features.
-var FullTerminalEnv = []string{
+// TerminalEnv is the complete supported PTY capability environment.
+var TerminalEnv = []string{
 	"TERM",
 	"COLORTERM",
 	"TERM_PROGRAM",
@@ -284,16 +266,6 @@ func (c *Config) applyDefaults() {
 	if c.Connect.TerminalOutputBufferBytes <= 0 {
 		c.Connect.TerminalOutputBufferBytes = DefaultTerminalOutputBufferBytes
 	}
-	if c.Connect.TerminalProfile == "" {
-		c.Connect.TerminalProfile = DefaultTerminalProfile
-	}
-	if c.Connect.ForwardTerminalEnv == nil {
-		environment := FastTerminalEnv
-		if strings.EqualFold(strings.TrimSpace(c.Connect.TerminalProfile), "full") {
-			environment = FullTerminalEnv
-		}
-		c.Connect.ForwardTerminalEnv = append([]string(nil), environment...)
-	}
 	if c.Connect.InputPartialFlushMilliseconds == 0 {
 		c.Connect.InputPartialFlushMilliseconds = DefaultInputPartialFlushMilliseconds
 	}
@@ -318,11 +290,6 @@ func (c *Config) applyDefaults() {
 }
 
 func (c *Config) validate() error {
-	switch strings.ToLower(strings.TrimSpace(c.Connect.TerminalProfile)) {
-	case "fast", "full":
-	default:
-		return fmt.Errorf("connect.terminal_profile must be fast or full")
-	}
 	if c.Connect.TerminalOutputBatchMilliseconds < 0 {
 		return fmt.Errorf("connect.terminal_output_batch_milliseconds cannot be negative")
 	}

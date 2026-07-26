@@ -297,6 +297,24 @@ func TestUserMachineRevokeRequestsUseBearer(t *testing.T) {
 	}
 }
 
+func TestSetUserMachineAvailabilityUsesIdempotencyAndVersion(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut || r.URL.Path != "/v1/user-machines/um_1/availability-policy" || r.Header.Get("Authorization") != "Bearer token" || r.Header.Get("Idempotency-Key") != "availability-1" {
+			t.Fatalf("request=%s %s auth=%q idempotency=%q", r.Method, r.URL.Path, r.Header.Get("Authorization"), r.Header.Get("Idempotency-Key"))
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body["mode"] != "keep_awake" || body["expected_version"] != float64(4) {
+			t.Fatalf("body=%v err=%v", body, err)
+		}
+		writeData(w, http.StatusOK, AvailabilityPolicy{Schema: "paperboat.availability-policy/v1", DesiredMode: "keep_awake", DesiredVersion: 5, Status: "pending"})
+	}))
+	defer server.Close()
+	result, err := New(server.URL, config.Credential{AccessToken: "token"}, server.Client()).SetUserMachineAvailability(context.Background(), "um_1", "keep_awake", "availability-1", 4)
+	if err != nil || result.DesiredVersion != 5 || result.Status != "pending" {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+}
+
 func TestUserMachineTerminalSessionRequests(t *testing.T) {
 	var seen []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

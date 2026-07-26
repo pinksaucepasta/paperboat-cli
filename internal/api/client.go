@@ -232,13 +232,38 @@ type ProjectPage struct {
 // connector rather than a Paperboat-managed Fly VM. The control plane owns its
 // lifecycle and authorization; the CLI only needs enough metadata to select it.
 type UserMachine struct {
-	ID            string `json:"id"`
-	EnvironmentID string `json:"environment_id"`
-	DisplayName   string `json:"display_name"`
-	State         string `json:"state"`
-	Online        bool   `json:"online"`
-	Platform      string `json:"platform"`
-	Architecture  string `json:"architecture"`
+	ID                 string             `json:"id"`
+	EnvironmentID      string             `json:"environment_id"`
+	DisplayName        string             `json:"display_name"`
+	State              string             `json:"state"`
+	Online             bool               `json:"online"`
+	Platform           string             `json:"platform"`
+	Architecture       string             `json:"architecture"`
+	Availability       AvailabilityPolicy `json:"availability"`
+	RuntimeDiagnostics RuntimeDiagnostics `json:"runtime_diagnostics"`
+}
+
+type RuntimeDiagnostics struct {
+	WorkerGeneration    uint64     `json:"worker_generation"`
+	OSBootID            string     `json:"os_boot_id,omitempty"`
+	WorkerServiceScope  string     `json:"worker_service_scope"`
+	ConnectorState      string     `json:"connector_state"`
+	ConnectorGeneration uint64     `json:"connector_generation"`
+	ObservedAt          *time.Time `json:"observed_at,omitempty"`
+}
+
+type AvailabilityPolicy struct {
+	Schema             string     `json:"schema"`
+	DesiredMode        string     `json:"desired_mode"`
+	DesiredVersion     int64      `json:"desired_version"`
+	ObservedMode       string     `json:"observed_mode,omitempty"`
+	ObservedVersion    int64      `json:"observed_version"`
+	ObservedAt         *time.Time `json:"observed_at,omitempty"`
+	Status             string     `json:"status"`
+	ErrorCode          string     `json:"error_code,omitempty"`
+	HostServiceVersion string     `json:"host_service_version,omitempty"`
+	HostServiceScope   string     `json:"host_service_scope,omitempty"`
+	UpdateRollbacks    int64      `json:"update_rollbacks"`
 }
 
 type ConfigRepository struct {
@@ -564,6 +589,16 @@ func (c *Client) DisconnectUserMachine(ctx context.Context, machineID string) er
 		return errors.New("user-machine ID is required")
 	}
 	return c.do(ctx, http.MethodPost, "/v1/user-machines/"+url.PathEscape(machineID)+"/disconnect", nil, nil)
+}
+
+func (c *Client) SetUserMachineAvailability(ctx context.Context, machineID, mode, idempotencyKey string, expectedVersion int64) (AvailabilityPolicy, error) {
+	if strings.TrimSpace(machineID) == "" || (mode != "allow_sleep" && mode != "keep_awake") || strings.TrimSpace(idempotencyKey) == "" || expectedVersion < 0 {
+		return AvailabilityPolicy{}, errors.New("valid user-machine availability input is required")
+	}
+	var out AvailabilityPolicy
+	path := "/v1/user-machines/" + url.PathEscape(machineID) + "/availability-policy"
+	err := c.doWithHeaders(ctx, http.MethodPut, path, map[string]any{"expected_version": expectedVersion, "mode": mode}, &out, http.Header{"Idempotency-Key": []string{idempotencyKey}})
+	return out, err
 }
 
 func (c *Client) DeleteUserMachine(ctx context.Context, machineID string) error {
