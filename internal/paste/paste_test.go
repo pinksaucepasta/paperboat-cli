@@ -147,7 +147,7 @@ func TestImagePastePreservesWhitespaceAndQuotes(t *testing.T) {
 	var dest bytes.Buffer
 	i := New(&dest, fixedUploader{"/vm/quoted.png"}, defaultLimits(), WithPartialFlushDelay(time.Hour))
 	writeInChunks(t, i, wrap("  \""+img+"\"\t"), 4)
-	if got, want := dest.String(), wrap("  \"/vm/quoted.png\"\t"); got != want {
+	if got, want := dest.String(), wrap("  /vm/quoted.png\t"); got != want {
 		t.Fatalf("got %q want %q", got, want)
 	}
 }
@@ -160,6 +160,91 @@ func TestFileURLImagePaste(t *testing.T) {
 	i := New(&dest, fixedUploader{"/vm/url.png"}, defaultLimits(), WithPartialFlushDelay(time.Hour))
 	writeInChunks(t, i, wrap(fileURL), 3)
 	if got, want := dest.String(), wrap("/vm/url.png"); got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
+func TestFileLocalhostURLImagePaste(t *testing.T) {
+	dir := t.TempDir()
+	img := makeImage(t, dir, "url special #.png")
+	fileURL := "file://localhost" + strings.ReplaceAll(strings.ReplaceAll(img, " ", "%20"), "#", "%23")
+	var dest bytes.Buffer
+	i := New(&dest, fixedUploader{"/vm/localhost.png"}, defaultLimits(), WithPartialFlushDelay(time.Hour))
+	writeInChunks(t, i, wrap(fileURL), 2)
+	if got, want := dest.String(), wrap("/vm/localhost.png"); got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
+func TestShellEscapedAndPOSIXQuotedImagePastes(t *testing.T) {
+	dir := t.TempDir()
+	escaped := makeImage(t, dir, "wezterm image.png")
+	quoted := makeImage(t, dir, "quoted $& image.png")
+	for name, body := range map[string]string{
+		"escaped spaces": strings.ReplaceAll(escaped, " ", "\\ "),
+		"single quoted":  "'" + quoted + "'",
+	} {
+		t.Run(name, func(t *testing.T) {
+			var dest bytes.Buffer
+			i := New(&dest, fixedUploader{"/vm/staged.png"}, defaultLimits(), WithPartialFlushDelay(time.Hour))
+			writeInChunks(t, i, wrap(body), 3)
+			if got, want := dest.String(), wrap("/vm/staged.png"); got != want {
+				t.Fatalf("got %q want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestUnsupportedPathSyntaxPassesThroughExactly(t *testing.T) {
+	dir := t.TempDir()
+	img := makeImage(t, dir, "ordinary.png")
+	for name, body := range map[string]string{
+		"relative path":       "ordinary.png",
+		"shell operator":      img + "; echo no",
+		"expansion":           "$HOME/ordinary.png",
+		"malformed quote":     "'" + img,
+		"malformed escape":    img + "\\\\",
+		"file query":          "file://" + img + "?x=1",
+		"windows quoted path": `"C:\Users\Jane Doe\image.png"`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var dest bytes.Buffer
+			i := New(&dest, fixedUploader{"/vm/unexpected.png"}, defaultLimits(), WithPartialFlushDelay(time.Hour))
+			writeInChunks(t, i, wrap(body), 2)
+			if got, want := dest.String(), wrap(body); got != want {
+				t.Fatalf("got %q want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestDecodePOSIXWordPreservesWindowsBackslashesInDoubleQuotes(t *testing.T) {
+	got, _, ok := decodePOSIXWord(`"C:\Users\Jane Doe\image.png"`)
+	if !ok || got != `C:\Users\Jane Doe\image.png` {
+		t.Fatalf("decodePOSIXWord = %q, %v", got, ok)
+	}
+}
+
+func TestUnframedImagePathPassesThroughExactly(t *testing.T) {
+	dir := t.TempDir()
+	img := makeImage(t, dir, "ordinary.png")
+	var dest bytes.Buffer
+	i := New(&dest, fixedUploader{"/vm/unexpected.png"}, defaultLimits(), WithPartialFlushDelay(time.Hour))
+	writeInChunks(t, i, img, 2)
+	if got := dest.String(); got != img {
+		t.Fatalf("got %q want %q", got, img)
+	}
+}
+
+func TestFragmentedMultiLineEscapedImagePastes(t *testing.T) {
+	dir := t.TempDir()
+	a := makeImage(t, dir, "one image.png")
+	b := makeImage(t, dir, "two image.png")
+	body := strings.ReplaceAll(a, " ", "\\ ") + "\n'" + b + "'"
+	var dest bytes.Buffer
+	i := New(&dest, fixedUploader{"/vm/staged.png"}, defaultLimits(), WithPartialFlushDelay(time.Hour))
+	writeInChunks(t, i, wrap(body), 1)
+	if got, want := dest.String(), wrap("/vm/staged.png\n/vm/staged.png"); got != want {
 		t.Fatalf("got %q want %q", got, want)
 	}
 }

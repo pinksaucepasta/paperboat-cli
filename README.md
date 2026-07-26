@@ -35,6 +35,15 @@ Hosted projects and user machines use the same durable terminal-session workflow
 Interactive attaches forward `TERM`, `COLORTERM`, `TERM_PROGRAM`,
 `TERM_PROGRAM_VERSION`, and locale variables when they are set locally.
 
+## Image drag and drop
+
+Interactive `pb` attaches enable the standard terminal bracketed-paste mode. A
+framed paste containing only absolute local image paths is staged and rewritten
+to remote paths. Supported path forms include `file://` URIs, quoted paths, and
+POSIX shell-escaped paths such as the escaped-space format emitted by WezTerm.
+Every other input, including unframed drag-and-drop text, is forwarded exactly
+as received; this prevents ordinary typed paths from triggering an upload.
+
 ## User machines
 
 BYOD enrollment starts in the dashboard. Its single-use command invokes

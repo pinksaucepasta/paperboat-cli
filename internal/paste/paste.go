@@ -635,9 +635,11 @@ type pathCandidate struct {
 	start, end int
 }
 
-// parseCandidate accepts exactly one path token with optional surrounding
-// whitespace and one matching quote pair. start/end identify only that token
-// so rewriting preserves the rest of the original paste line byte-for-byte.
+// parseCandidate accepts exactly one POSIX shell word with optional surrounding
+// whitespace. It deliberately decodes only syntax that has one unambiguous
+// literal value, rejecting operators, expansions, and malformed quoting.
+// start/end identify the complete source word so staged paths replace any
+// source quoting; staged names are safe absolute paths generated remotely.
 func parseCandidate(line string) (pathCandidate, bool) {
 	trimmedLeft := strings.TrimLeft(line, " \t\r")
 	start := len(line) - len(trimmedLeft)
@@ -646,22 +648,12 @@ func parseCandidate(line string) (pathCandidate, bool) {
 	if start == end {
 		return pathCandidate{}, false
 	}
-	if trimmed[0] == '\'' || trimmed[0] == '"' {
-		if len(trimmed) < 2 || trimmed[len(trimmed)-1] != trimmed[0] {
-			return pathCandidate{}, false
-		}
-		start++
-		end--
-		trimmed = trimmed[1 : len(trimmed)-1]
-	} else if trimmed[len(trimmed)-1] == '\'' || trimmed[len(trimmed)-1] == '"' {
+	localPath, hasUnquotedGlob, ok := decodePOSIXWord(trimmed)
+	if !ok || localPath == "" {
 		return pathCandidate{}, false
 	}
-	if trimmed == "" {
-		return pathCandidate{}, false
-	}
-	localPath := trimmed
-	if strings.HasPrefix(strings.ToLower(trimmed), "file:") {
-		u, err := url.Parse(trimmed)
+	if strings.HasPrefix(strings.ToLower(localPath), "file:") {
+		u, err := url.Parse(localPath)
 		if err != nil || !strings.EqualFold(u.Scheme, "file") ||
 			(u.Host != "" && !strings.EqualFold(u.Host, "localhost")) ||
 			u.RawQuery != "" || u.Fragment != "" || u.Path == "" {
@@ -671,8 +663,76 @@ func parseCandidate(line string) (pathCandidate, bool) {
 		if runtime.GOOS == "windows" && len(localPath) >= 3 && localPath[0] == '/' && localPath[2] == ':' {
 			localPath = localPath[1:]
 		}
+	} else if hasUnquotedGlob {
+		return pathCandidate{}, false
 	}
-	return pathCandidate{path: filepath.FromSlash(localPath), start: start, end: end}, true
+	localPath = filepath.FromSlash(localPath)
+	if !filepath.IsAbs(localPath) {
+		return pathCandidate{}, false
+	}
+	return pathCandidate{path: localPath, start: start, end: end}, true
+}
+
+// decodePOSIXWord decodes one shell word without invoking a shell. The return
+// value records unquoted glob characters, which are only allowed for file URIs
+// long enough to reject their query/fragment syntax separately.
+func decodePOSIXWord(word string) (decoded string, hasUnquotedGlob bool, ok bool) {
+	var out strings.Builder
+	for pos := 0; pos < len(word); {
+		switch word[pos] {
+		case '\'', '"':
+			quote := word[pos]
+			pos++
+			closed := false
+			for pos < len(word) {
+				ch := word[pos]
+				if ch == quote {
+					pos++
+					closed = true
+					break
+				}
+				if quote == '"' && (ch == '$' || ch == '`') {
+					return "", false, false
+				}
+				if ch == '\\' {
+					if pos+1 >= len(word) || word[pos+1] == '\n' {
+						return "", false, false
+					}
+					if quote == '"' && !strings.ContainsRune("$`\"\\", rune(word[pos+1])) {
+						out.WriteByte(ch)
+						pos++
+						continue
+					}
+					pos++
+					out.WriteByte(word[pos])
+					pos++
+					continue
+				}
+				out.WriteByte(ch)
+				pos++
+			}
+			if !closed {
+				return "", false, false
+			}
+		case '\\':
+			if pos+1 >= len(word) || word[pos+1] == '\n' {
+				return "", false, false
+			}
+			pos++
+			out.WriteByte(word[pos])
+			pos++
+		case ' ', '\t', '\r', '\n', '$', '`', '|', '&', ';', '<', '>', '(', ')', '{', '}', '~':
+			return "", false, false
+		case '*', '?', '[':
+			hasUnquotedGlob = true
+			out.WriteByte(word[pos])
+			pos++
+		default:
+			out.WriteByte(word[pos])
+			pos++
+		}
+	}
+	return out.String(), hasUnquotedGlob, true
 }
 
 // partialSuffix returns the length of the longest suffix of buf that is a

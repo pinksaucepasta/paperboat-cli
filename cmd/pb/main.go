@@ -1782,7 +1782,10 @@ func actionConnectTarget(c *command.Context, requested string) error {
 		defer cancelPoll()
 		go pollConfigSync(pollCtx, d.cfg.ServerURL, d.auth, info.ProjectID, time.Duration(d.cfg.StatusBar.SyncPollSeconds)*time.Second, bar)
 	}
-	runOptions := []session.RunOption{session.WithOutputBufferBytes(d.cfg.Connect.TerminalOutputBufferBytes)}
+	runOptions := []session.RunOption{
+		session.WithOutputBufferBytes(d.cfg.Connect.TerminalOutputBufferBytes),
+		session.WithBracketedPaste(),
+	}
 	if useStatusBar {
 		runOptions = append(runOptions, session.WithOutput(bar), session.WithRemoteSize(remoteSize))
 	}
