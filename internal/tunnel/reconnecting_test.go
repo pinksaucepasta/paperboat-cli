@@ -85,12 +85,33 @@ func TestReconnectingConnRecordsOutputPerformance(t *testing.T) {
 	c.ObserveLocalWrite(6, 12*time.Millisecond)
 	c.maxQueueChunks.Store(4)
 	c.recordOutputPerformance("success")
-	if len(sink.events) != 1 {
+	if len(sink.events) != 2 {
 		t.Fatalf("events = %+v", sink.events)
 	}
 	output := sink.events[0]
 	if output.Name != "terminal.output" || output.SizeBytes != 6 || output.LatencyMS != 12 || output.Count != 4 {
 		t.Fatalf("output event = %+v", output)
+	}
+	stage := sink.events[1]
+	if stage.Name != "terminal.stage" || stage.Stage != "socket_read_to_stdout" || stage.SizeBytes != 6 || stage.LatencyMS != 12 || stage.Count != 1 {
+		t.Fatalf("output stage = %+v", stage)
+	}
+}
+
+func TestReconnectingConnRecordsInputAndEchoStages(t *testing.T) {
+	sink := &tunnelEventSink{}
+	c := &ReconnectingConn{telemetry: sink, now: time.Now}
+	c.ObserveInputWrite(4, 7*time.Millisecond)
+	c.ObserveLocalWrite(4, 3*time.Millisecond)
+	c.recordOutputPerformance("success")
+	if len(sink.events) != 4 {
+		t.Fatalf("events = %+v", sink.events)
+	}
+	if input := sink.events[1]; input.Name != "terminal.stage" || input.Stage != "stdin_to_socket" || input.SizeBytes != 4 || input.LatencyMS != 7 || input.Count != 1 {
+		t.Fatalf("input stage = %+v", input)
+	}
+	if echo := sink.events[3]; echo.Name != "terminal.stage" || echo.Stage != "input_to_next_output" || echo.SizeBytes != 0 || echo.Count != 1 {
+		t.Fatalf("echo stage = %+v", echo)
 	}
 }
 

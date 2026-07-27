@@ -23,7 +23,11 @@ func NewContext(set *flag.FlagSet) *Context {
 
 func (c *Context) String(name string) string { return c.set.Lookup(name).Value.String() }
 func (c *Context) Bool(name string) bool {
-	value, ok := c.set.Lookup(name).Value.(flag.Getter)
+	entry := c.set.Lookup(name)
+	if entry == nil {
+		return false
+	}
+	value, ok := entry.Value.(flag.Getter)
 	if !ok {
 		return false
 	}

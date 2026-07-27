@@ -62,6 +62,7 @@ type TerminalTarget struct {
 	TerminalID       string
 	SessionID        string
 	CWD              string
+	TerminalMode     string
 	// Env is local-terminal environment forwarded on attach (TERM, COLORTERM,
 	// ...) so the remote PTY spawns with the client's terminal capabilities.
 	// Applied by paperboat-helper when the PTY (re)starts.
@@ -79,6 +80,7 @@ type TerminalTarget struct {
 	ReplayHistory bool
 	AfterSequence int
 	SequenceSink  func(int)
+	ReplayGapSink func(requested, earliest, latest uint64)
 }
 
 // UploadTarget is the helper upload endpoint reachable through

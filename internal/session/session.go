@@ -11,7 +11,6 @@ import (
 	"io"
 	"os"
 	"os/signal"
-	"sync"
 	"time"
 
 	"github.com/pinksaucepasta/paperboat-cli/internal/tunnel"
@@ -67,13 +66,7 @@ func WithBracketedPaste() RunOption {
 // copied into — typically the paste interceptor wrapping conn. Run blocks until
 // the remote session ends (or ctx is cancelled) and returns the remote exit
 // code.
-func Run(ctx context.Context, conn tunnel.Conn, stdinSink io.WriteCloser) (int, error) {
-	return RunWithActivity(ctx, conn, stdinSink, nil)
-}
-
-// RunWithActivity is Run with an optional, non-blocking activity callback.
-// The callback is rate-limited and runs asynchronously so it cannot stall PTY I/O.
-func RunWithActivity(ctx context.Context, conn tunnel.Conn, stdinSink io.WriteCloser, activity func(source string), opts ...RunOption) (int, error) {
+func Run(ctx context.Context, conn tunnel.Conn, stdinSink io.WriteCloser, opts ...RunOption) (int, error) {
 	options := runOptions{outputBufferBytes: terminalOutputBufferBytes, output: os.Stdout}
 	for _, option := range opts {
 		option(&options)
@@ -106,21 +99,6 @@ func RunWithActivity(ctx context.Context, conn tunnel.Conn, stdinSink io.WriteCl
 
 	// Remote -> local. Ends when the remote PTY closes; that is normal EOF, not
 	// an error, so it does not by itself end the session — conn.Wait does.
-	var activityMu sync.Mutex
-	lastActivity := time.Time{}
-	report := func(source string) {
-		if activity == nil {
-			return
-		}
-		activityMu.Lock()
-		if time.Since(lastActivity) < time.Second {
-			activityMu.Unlock()
-			return
-		}
-		lastActivity = time.Now()
-		activityMu.Unlock()
-		go activity(source)
-	}
 	outputDone := make(chan struct{})
 	streamErr := make(chan error, 2)
 	go func() {
@@ -137,7 +115,6 @@ func RunWithActivity(ctx context.Context, conn tunnel.Conn, stdinSink io.WriteCl
 				if observer, ok := conn.(interface{ ObserveLocalWrite(int, time.Duration) }); ok {
 					observer.ObserveLocalWrite(n, time.Since(started))
 				}
-				report("agent_output")
 			}
 			if err != nil {
 				return
@@ -153,6 +130,7 @@ func RunWithActivity(ctx context.Context, conn tunnel.Conn, stdinSink io.WriteCl
 		for {
 			n, readErr := readLocalInput(inputCtx, os.Stdin, buf)
 			if n > 0 {
+				started := time.Now()
 				if _, writeErr := stdinSink.Write(buf[:n]); writeErr != nil {
 					if errors.Is(writeErr, tunnel.ErrWriteUncertain) {
 						if discarder, ok := stdinSink.(interface{ Discard() }); ok {
@@ -163,7 +141,9 @@ func RunWithActivity(ctx context.Context, conn tunnel.Conn, stdinSink io.WriteCl
 					streamErr <- fmt.Errorf("send terminal input: %w", writeErr)
 					return
 				}
-				report("human_input")
+				if observer, ok := conn.(interface{ ObserveInputWrite(int, time.Duration) }); ok {
+					observer.ObserveInputWrite(n, time.Since(started))
+				}
 			}
 			if readErr != nil {
 				break

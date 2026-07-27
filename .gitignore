@@ -5,6 +5,7 @@
 *.dylib
 /bin/
 /dist/
+/.codex-build/
 
 # Test & coverage
 *.out

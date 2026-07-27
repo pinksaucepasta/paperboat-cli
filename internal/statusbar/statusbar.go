@@ -215,6 +215,44 @@ func (b *Bar) PrepareRemoteViewport() {
 	_, _ = fmt.Fprintf(b.out, "\x1b[%d;1H", h-1)
 }
 
+// ClearRemoteViewport starts an attached session on a clean local screen while
+// preserving the reserved status row.
+func (b *Bar) ClearRemoteViewport() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return
+	}
+	_, _ = fmt.Fprint(b.out, "\x1b[2J\x1b[H")
+	_, h := b.refreshViewportLocked()
+	if !b.enabled || h < 2 {
+		return
+	}
+	b.ensureScrollRegionLocked(h - 1)
+	b.drawLocked()
+	_, _ = fmt.Fprintf(b.out, "\x1b[%d;1H", h-1)
+}
+
+// ClearForExit restores the full viewport and leaves the host terminal at a
+// clean home position after the remote shell exits normally.
+func (b *Bar) ClearForExit() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return
+	}
+	if b.timer != nil {
+		b.timer.Stop()
+		b.timer = nil
+	}
+	b.stopSpinnerLocked()
+	b.scrollRows = 0
+	b.scrollDirty = true
+	b.enabled = false
+	b.closed = true
+	_, _ = fmt.Fprint(b.out, "\x1b[r\x1b[2J\x1b[H")
+}
+
 func clamp(value, max int) uint16 {
 	if value <= 0 {
 		return 0
@@ -385,6 +423,20 @@ func (b *Bar) Write(p []byte) (int, error) {
 		}
 	}
 	return n, err
+}
+
+// ResetRemoteState discards parser state that cannot safely cross a transport
+// discontinuity. The reattached application will redraw after its PTY resize.
+func (b *Bar) ResetRemoteState() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.parser = ansi.NewParser()
+	b.ansiState = byte(parser.GroundState)
+	b.appCursorSaved = false
+	b.appInverse = false
+	b.synchronized = false
+	b.scrollDirty = true
+	b.redrawPending = true
 }
 
 func (b *Bar) consumeANSI(data []byte) (invalidated bool) {

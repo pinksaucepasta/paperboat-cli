@@ -114,8 +114,8 @@ func TestRunEnablesBracketedPasteAfterCleanupAndRestoresIt(t *testing.T) {
 	defer func() { os.Stdin, os.Stdout = oldIn, oldOut; _ = outR.Close(); _ = outW.Close() }()
 	c := &testConn{Reader: bytes.NewBuffer(nil), wait: make(chan struct{}), code: 0}
 	close(c.wait)
-	if code, err := RunWithActivity(context.Background(), c, &sink{}, nil, WithBracketedPaste()); err != nil || code != 0 {
-		t.Fatalf("RunWithActivity = %d, %v", code, err)
+	if code, err := Run(context.Background(), c, &sink{}, WithBracketedPaste()); err != nil || code != 0 {
+		t.Fatalf("Run = %d, %v", code, err)
 	}
 	_ = outW.Close()
 	output, err := io.ReadAll(outR)
@@ -145,8 +145,8 @@ func TestRunBracketedPasteRestoresOnCancellation(t *testing.T) {
 	c := &testConn{Reader: bytes.NewBuffer(nil), wait: make(chan struct{})}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
-	if code, err := RunWithActivity(ctx, c, &sink{}, nil, WithBracketedPaste()); err != nil || code != 130 {
-		t.Fatalf("RunWithActivity = %d, %v", code, err)
+	if code, err := Run(ctx, c, &sink{}, WithBracketedPaste()); err != nil || code != 130 {
+		t.Fatalf("Run = %d, %v", code, err)
 	}
 	_ = outW.Close()
 	output, err := io.ReadAll(outR)
@@ -174,9 +174,9 @@ func TestRunBracketedPasteRestoresOnInputFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := &testConn{Reader: bytes.NewBuffer(nil), wait: make(chan struct{})}
-	code, runErr := RunWithActivity(context.Background(), c, failingSink{}, nil, WithBracketedPaste())
+	code, runErr := Run(context.Background(), c, failingSink{}, WithBracketedPaste())
 	if code != 1 || runErr == nil || !strings.Contains(runErr.Error(), "send terminal input") {
-		t.Fatalf("RunWithActivity = %d, %v", code, runErr)
+		t.Fatalf("Run = %d, %v", code, runErr)
 	}
 	_ = outW.Close()
 	output, err := io.ReadAll(outR)
@@ -201,9 +201,9 @@ func TestRunBracketedPasteRestoresOnOutputFailure(t *testing.T) {
 	defer func() { os.Stdin = oldIn }()
 	output := &controlThenFailWriter{}
 	c := &testConn{Reader: bytes.NewBufferString("agent output"), wait: make(chan struct{})}
-	code, runErr := RunWithActivity(context.Background(), c, &sink{}, nil, WithOutput(output), WithBracketedPaste())
+	code, runErr := Run(context.Background(), c, &sink{}, WithOutput(output), WithBracketedPaste())
 	if code != 1 || runErr == nil || !strings.Contains(runErr.Error(), "write terminal output") {
-		t.Fatalf("RunWithActivity = %d, %v", code, runErr)
+		t.Fatalf("Run = %d, %v", code, runErr)
 	}
 	want := terminalCleanupSequence + bracketedPasteEnableSequence + terminalCleanupSequence
 	if got := output.writes.String(); got != want {
@@ -242,9 +242,9 @@ func TestRunWithStatusBarReservesRemoteRowWithoutRemoteStatusBytes(t *testing.T)
 		chunks:   [][]byte{[]byte("\x1b["), []byte("?1049hfull-screen\x1b[?1049l")},
 		readDone: make(chan struct{}),
 	}
-	code, err := RunWithActivity(context.Background(), conn, &sink{}, nil, WithOutput(bar), WithRemoteSize(bar.RemoteSize), WithBracketedPaste())
+	code, err := Run(context.Background(), conn, &sink{}, WithOutput(bar), WithRemoteSize(bar.RemoteSize), WithBracketedPaste())
 	if err != nil || code != 0 {
-		t.Fatalf("RunWithActivity = %d, %v", code, err)
+		t.Fatalf("Run = %d, %v", code, err)
 	}
 	conn.resizeMu.Lock()
 	rows, cols := conn.rows, conn.cols

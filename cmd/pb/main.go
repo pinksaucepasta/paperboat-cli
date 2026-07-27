@@ -159,11 +159,6 @@ func newRootCommand() *cobra.Command {
 	environments.Flags().Bool("json", false, "print JSON")
 	root.AddCommand(environments)
 
-	keepAlive := &cobra.Command{Use: "keep-alive <project>", Args: commandArgs(cobra.ExactArgs(1)), RunE: actionRun(keepAliveCommand().Action)}
-	keepAlive.Flags().Float64("hours", 0, "duration in hours")
-	keepAlive.Flags().Bool("clear", false, "clear keep-alive")
-	root.AddCommand(keepAlive)
-
 	doctor := &cobra.Command{Use: "doctor [project]", Short: "Check authentication and connectivity", Args: commandArgs(cobra.MaximumNArgs(1)), RunE: actionRun(doctorCommand().Action)}
 	doctor.Flags().Bool("json", false, "print JSON")
 	root.AddCommand(doctor)
@@ -184,17 +179,22 @@ func addConnectFlags(command *cobra.Command) {
 	command.Flags().Bool("new", false, "create a new terminal session")
 	command.Flags().String("name", "", "name for a new terminal session")
 	command.Flags().String("session", "", "attach an existing terminal session by name or ID")
+	command.Flags().Bool("no-herdr", false, "start the new terminal session with the configured shell")
 }
 
 func validateConnectInvocation(command *cobra.Command) error {
 	newSession, _ := command.Flags().GetBool("new")
 	name, _ := command.Flags().GetString("name")
 	ref, _ := command.Flags().GetString("session")
+	noHerdr, _ := command.Flags().GetBool("no-herdr")
 	if newSession && strings.TrimSpace(ref) != "" {
 		return invocationError(errors.New("--new and --session cannot be used together"))
 	}
 	if !newSession && strings.TrimSpace(name) != "" {
 		return invocationError(errors.New("--name requires --new"))
+	}
+	if noHerdr && !newSession {
+		return invocationError(errors.New("--no-herdr requires --new"))
 	}
 	server, _ := command.Flags().GetString("server")
 	if strings.TrimSpace(server) != "" {
@@ -518,7 +518,7 @@ func actionContext(cobraCommand *cobra.Command, args []string) *command.Context 
 	}
 	hours, _ := cobraCommand.Flags().GetFloat64("hours")
 	set.Float64("hours", hours, "")
-	for _, name := range []string{"new", "json", "wide", "yes", "clear"} {
+	for _, name := range []string{"new", "no-herdr", "json", "wide", "yes", "clear"} {
 		value, _ := cobraCommand.Flags().GetBool(name)
 		values[name] = strconv.FormatBool(value)
 		set.Bool(name, value, "")
@@ -834,54 +834,6 @@ var openBrowser = func(target string) error {
 	return cmd.Start()
 }
 
-func keepAliveCommand() *command.Spec {
-	return &command.Spec{
-		Name:      "keep-alive",
-		Usage:     "Keep a project VM running temporarily",
-		ArgsUsage: "<project>",
-		Flags: []command.Flag{
-			&command.Float64Flag{Name: "hours", Usage: "hours to keep the project running"},
-			&command.BoolFlag{Name: "clear", Usage: "clear the current keep-alive pin"},
-		},
-		Action: func(c *command.Context) error {
-			project := c.Args().First()
-			if project == "" {
-				return errors.New("missing project name; usage: pb keep-alive <project> --hours <n>")
-			}
-			client, err := backendClient(c)
-			if err != nil {
-				return err
-			}
-			clear := c.Bool("clear")
-			hours := c.Float64("hours")
-			if !clear && hours <= 0 {
-				return errors.New("set --hours to a positive value, or use --clear")
-			}
-			if clear && hours > 0 {
-				return errors.New("use either --hours or --clear, not both")
-			}
-			resolved, err := resolveProjectID(c.Context, client, project)
-			if err != nil {
-				return err
-			}
-			seconds := int(math.Ceil((time.Duration(hours * float64(time.Hour))).Seconds()))
-			resp, err := client.SetKeepAlive(c.Context, resolved.ID, seconds, clear)
-			if err != nil {
-				if msg := friendlyAPIError(err); msg != "" {
-					return errors.New(msg)
-				}
-				return err
-			}
-			if clear {
-				fmt.Fprintf(os.Stdout, "Keep-alive cleared for %s\n", firstNonEmpty(resp.Project.Name, resolved.Name, resolved.ID))
-				return nil
-			}
-			fmt.Fprintf(os.Stdout, "Keeping %s running until %s\n", firstNonEmpty(resp.Project.Name, resolved.Name, resolved.ID), resp.KeepAliveUntil.Local().Format(time.RFC1123))
-			return nil
-		},
-	}
-}
-
 func backendClient(c *command.Context) (*api.Client, error) {
 	d, err := buildDeps(c)
 	if err != nil {
@@ -1009,10 +961,14 @@ func listTerminalSessionsForTarget(ctx context.Context, client *api.Client, targ
 }
 
 func createTerminalSessionForTarget(ctx context.Context, client *api.Client, target environmentTarget, name, idempotencyKey string) (api.TerminalSession, error) {
+	return createTerminalSessionForTargetWithMode(ctx, client, target, name, "herdr", idempotencyKey)
+}
+
+func createTerminalSessionForTargetWithMode(ctx context.Context, client *api.Client, target environmentTarget, name, terminalMode, idempotencyKey string) (api.TerminalSession, error) {
 	if target.kind == environmentUserMachine {
-		return client.CreateUserMachineTerminalSession(ctx, target.id, name, idempotencyKey)
+		return client.CreateUserMachineTerminalSessionWithMode(ctx, target.id, name, terminalMode, idempotencyKey)
 	}
-	return client.CreateTerminalSession(ctx, target.id, name, idempotencyKey)
+	return client.CreateTerminalSessionWithMode(ctx, target.id, name, terminalMode, idempotencyKey)
 }
 
 func renameTerminalSessionForTarget(ctx context.Context, client *api.Client, target environmentTarget, sessionID, name string) (api.TerminalSession, error) {
@@ -1350,6 +1306,10 @@ func sessionsCommand() *command.Spec {
 }
 
 func selectTerminalSession(ctx context.Context, client *api.Client, projectRef string, create bool, name, ref string) (string, error) {
+	return selectTerminalSessionWithMode(ctx, client, projectRef, create, name, ref, "herdr")
+}
+
+func selectTerminalSessionWithMode(ctx context.Context, client *api.Client, projectRef string, create bool, name, ref, terminalMode string) (string, error) {
 	if !create && strings.TrimSpace(ref) == "" {
 		// The descriptor endpoint owns default-session resolution. Avoid resolving
 		// the environment once here and again immediately before dialing.
@@ -1363,12 +1323,9 @@ func selectTerminalSession(ctx context.Context, client *api.Client, projectRef s
 		if err := validateSessionNameOptional(name); err != nil {
 			return "", err
 		}
-		session, err := createTerminalSessionForTarget(ctx, client, target, name, newIdempotencyKey())
+		session, err := createTerminalSessionForTargetWithMode(ctx, client, target, name, terminalMode, newIdempotencyKey())
 		if err != nil {
 			return "", friendlyCommandError(err)
-		}
-		if name == "" {
-			fmt.Fprintf(os.Stderr, "Session: %s\n", session.Name)
 		}
 		return session.ID, nil
 	}
@@ -1584,7 +1541,11 @@ func actionConnectTarget(c *command.Context, requested string) error {
 	d.telemetry, closeTelemetry = connectTelemetry(d.cfg, os.Stderr)
 	defer closeTelemetry()
 
-	terminalSessionID, err := selectTerminalSession(c.Context, backend, project, c.Bool("new"), c.String("name"), c.String("session"))
+	terminalMode := "herdr"
+	if c.Bool("no-herdr") {
+		terminalMode = "shell"
+	}
+	terminalSessionID, err := selectTerminalSessionWithMode(c.Context, backend, project, c.Bool("new"), c.String("name"), c.String("session"), terminalMode)
 	if err != nil {
 		return err
 	}
@@ -1624,6 +1585,19 @@ func actionConnectTarget(c *command.Context, requested string) error {
 			}
 		}
 	}
+	recordReplayGap := func(requested, earliest, _ uint64) {
+		missing := uint64(0)
+		if earliest > requested {
+			missing = earliest - requested
+		}
+		event := telemetry.Event{Name: "terminal.replay_gap", At: time.Now(), Outcome: "recovered", ProjectID: info.ProjectID, Count: int64(min(missing, math.MaxInt64))}
+		if info.Terminal != nil {
+			event.EnvironmentID = info.Terminal.EnvironmentID
+		}
+		if event.Validate() == nil {
+			d.telemetry.Record(event)
+		}
+	}
 	configureUploadRefresh := func(u upload.Uploader) {
 		httpUploader, ok := u.(*upload.HTTPUploader)
 		if !ok {
@@ -1647,6 +1621,7 @@ func actionConnectTarget(c *command.Context, requested string) error {
 				info.Terminal.RestartIfNotRunning = true
 				info.Terminal.ReplayHistory = true
 				info.Terminal.SequenceSink = recordTerminalSequence
+				info.Terminal.ReplayGapSink = recordReplayGap
 				info.Terminal.Env = forwardedTerminalEnv(config.TerminalEnv)
 				info.Terminal.Cols, info.Terminal.Rows = remoteSize()
 			}
@@ -1695,7 +1670,9 @@ func actionConnectTarget(c *command.Context, requested string) error {
 	if useStatusBar {
 		bar.SetConnection("connected")
 		bar.Notice("Connected")
-		bar.PrepareRemoteViewport()
+		bar.ClearRemoteViewport()
+	} else if term.IsTerminal(int(os.Stdout.Fd())) {
+		_, _ = fmt.Fprint(os.Stdout, "\x1b[2J\x1b[H")
 	}
 	var pastePolicy *paste.Policy
 	conn = tunnel.NewObservedReconnectingConn(ctx, conn, d.cfg.Connect.DialRetries, time.Duration(d.cfg.Connect.DialRetrySeconds)*time.Second, func(reconnectCtx context.Context) (tunnel.Conn, error) {
@@ -1717,6 +1694,7 @@ func actionConnectTarget(c *command.Context, requested string) error {
 			freshInfo.Terminal.ReplayHistory = false
 			freshInfo.Terminal.AfterSequence = int(lastTerminalSequence.Load())
 			freshInfo.Terminal.SequenceSink = recordTerminalSequence
+			freshInfo.Terminal.ReplayGapSink = recordReplayGap
 			freshInfo.Terminal.Env = forwardedTerminalEnv(config.TerminalEnv)
 			freshInfo.Terminal.Cols, freshInfo.Terminal.Rows = remoteSize()
 		}
@@ -1734,6 +1712,11 @@ func actionConnectTarget(c *command.Context, requested string) error {
 		d.cfg.Connect.TerminalOutputQueueChunks,
 		time.Duration(d.cfg.Connect.TerminalOutputBatchMilliseconds)*time.Millisecond,
 	), tunnel.WithReconnectObserver(func(event tunnel.ReconnectEvent) {
+		if event == tunnel.ReconnectRecovered {
+			bar.ResetRemoteState()
+			cols, rows := remoteSize()
+			forceTerminalRedraw(conn, rows, cols)
+		}
 		if !useStatusBar {
 			return
 		}
@@ -1754,6 +1737,7 @@ func actionConnectTarget(c *command.Context, requested string) error {
 	// Wrap remote input with the image-paste interceptor.
 	pastePolicy = paste.NewPolicy(d.uploader, uploadLimits(d.cfg, info.Upload))
 	interceptor := paste.NewWithPolicy(conn, pastePolicy,
+		paste.WithDirectInput(),
 		paste.WithNotifier(statusNotifier(useStatusBar)),
 		paste.WithLifecycle(func(event paste.LifecycleEvent) {
 			if !useStatusBar {
@@ -1789,21 +1773,14 @@ func actionConnectTarget(c *command.Context, requested string) error {
 	if useStatusBar {
 		runOptions = append(runOptions, session.WithOutput(bar), session.WithRemoteSize(remoteSize))
 	}
-	code, err := session.RunWithActivity(ctx, conn, interceptor, func(source string) {
-		if info.TargetKind != "project" {
-			return
+	code, err := session.Run(ctx, conn, interceptor, runOptions...)
+	if err == nil {
+		if useStatusBar {
+			bar.ClearForExit()
+		} else if term.IsTerminal(int(os.Stdout.Fd())) {
+			_, _ = fmt.Fprint(os.Stdout, "\x1b[r\x1b[2J\x1b[H")
 		}
-		activityCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		activityErr := reportActivity(activityCtx, d.cfg.ServerURL, d.auth, info.ProjectID, source)
-		if activityErr != nil {
-			if useStatusBar {
-				bar.Notice("Activity reporting unavailable")
-			} else {
-				fmt.Fprintf(os.Stderr, "warning: activity report failed: %v\n", activityErr)
-			}
-		}
-	}, runOptions...)
+	}
 	if err != nil {
 		return err
 	}
@@ -1811,6 +1788,19 @@ func actionConnectTarget(c *command.Context, requested string) error {
 		return exitCodeError{code: code}
 	}
 	return nil
+}
+
+func forceTerminalRedraw(conn tunnel.Conn, rows, cols uint16) {
+	probeRows, probeCols := rows, cols
+	if probeRows > 1 {
+		probeRows--
+	} else if probeCols > 1 {
+		probeCols--
+	}
+	if probeRows != rows || probeCols != cols {
+		_ = conn.Resize(probeRows, probeCols)
+	}
+	_ = conn.Resize(rows, cols)
 }
 
 func createProject(c *command.Context) error {
@@ -1833,10 +1823,6 @@ func createProject(c *command.Context) error {
 	if err != nil {
 		return friendlyCommandError(err)
 	}
-	idleTimeouts, err := client.ListCatalogIdleTimeouts(c.Context)
-	if err != nil {
-		return friendlyCommandError(err)
-	}
 	if len(repositories) == 0 {
 		return errors.New("no GitHub repositories are available; connect GitHub in the Paperboat dashboard")
 	}
@@ -1847,19 +1833,14 @@ func createProject(c *command.Context) error {
 	}
 	machineCodes := activeMachineCodes(machineTypes)
 	regionCodes := enabledRegionCodes(regions)
-	idleCodes := activeIdleTimeoutCodes(idleTimeouts)
-	if len(machineCodes) == 0 || len(regionCodes) == 0 || len(idleCodes) == 0 {
-		return errors.New("hosted project catalog has no available machine type, region, or idle timeout")
+	if len(machineCodes) == 0 || len(regionCodes) == 0 {
+		return errors.New("hosted project catalog has no available machine type or region")
 	}
 	machineIndex, err := promptChoice(reader, "Machine type", len(machineCodes), func(index int) string { return machineCodes[index] })
 	if err != nil {
 		return err
 	}
 	regionIndex, err := promptChoice(reader, "Region", len(regionCodes), func(index int) string { return regionCodes[index] })
-	if err != nil {
-		return err
-	}
-	idleIndex, err := promptChoice(reader, "Idle timeout", len(idleCodes), func(index int) string { return idleCodes[index] })
 	if err != nil {
 		return err
 	}
@@ -1875,7 +1856,7 @@ func createProject(c *command.Context) error {
 	repository := repositories[repositoryIndex]
 	project, err := client.CreateProject(c.Context, api.CreateProjectInput{
 		Name: c.Args().First(), RepositoryURL: repository.CloneURL, DefaultBranch: repository.DefaultBranch,
-		StorageGB: storageGB, MachineTypeCode: machineCodes[machineIndex], RegionCode: regionCodes[regionIndex], IdleTimeoutCode: idleCodes[idleIndex],
+		StorageGB: storageGB, MachineTypeCode: machineCodes[machineIndex], RegionCode: regionCodes[regionIndex],
 	}, newIdempotencyKey())
 	if err != nil {
 		return friendlyCommandError(err)
@@ -1914,16 +1895,6 @@ func enabledRegionCodes(items []api.CatalogRegion) []string {
 	var out []string
 	for _, item := range items {
 		if item.Enabled {
-			out = append(out, item.Code)
-		}
-	}
-	return out
-}
-
-func activeIdleTimeoutCodes(items []api.CatalogIdleTimeout) []string {
-	var out []string
-	for _, item := range items {
-		if item.Active {
 			out = append(out, item.Code)
 		}
 	}
@@ -2069,31 +2040,6 @@ func retryableInitialConnectError(err error) bool {
 		strings.Contains(msg, "transport lost")
 }
 
-type refreshableAuthSource interface {
-	config.AuthSource
-	Refresh() (config.Credential, error)
-}
-
-func reportActivity(ctx context.Context, serverURL string, source config.AuthSource, projectID, event string) error {
-	cred, err := source.Credential()
-	if err != nil {
-		return err
-	}
-	err = api.New(serverURL, cred, nil).Activity(ctx, projectID, event)
-	if !errors.Is(err, api.ErrUnauthenticated) {
-		return err
-	}
-	refreshable, ok := source.(refreshableAuthSource)
-	if !ok {
-		return err
-	}
-	cred, refreshErr := refreshable.Refresh()
-	if refreshErr != nil {
-		return errors.Join(err, refreshErr)
-	}
-	return api.New(serverURL, cred, nil).Activity(ctx, projectID, event)
-}
-
 func friendlyAPIError(err error) string {
 	var apiErr *api.APIError
 	if !errors.As(err, &apiErr) {
@@ -2104,10 +2050,6 @@ func friendlyAPIError(err error) string {
 		return "credits are exhausted; top up credits in Paperboat, then retry"
 	case "entitlement_lost", "payment_required":
 		return "your Paperboat plan is inactive; restore billing access, then retry"
-	case "idle_timeout":
-		return "the project stopped after reaching its idle timeout; retry to resume it"
-	case "activity_reporter_lost":
-		return "the project stopped because activity reporting was lost; retry after the VM restarts"
 	case "tunnel_unavailable":
 		return "the secure tunnel is not available yet; retry in a moment"
 	case "machine_not_ready":

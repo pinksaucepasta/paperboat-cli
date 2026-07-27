@@ -99,7 +99,7 @@ func TestCreateProjectUsesBearerAndIdempotencyKey(t *testing.T) {
 	}))
 	defer srv.Close()
 	project, err := New(srv.URL, config.Credential{AccessToken: "token"}, nil).CreateProject(context.Background(), CreateProjectInput{
-		RepositoryURL: "https://github.com/acme/app.git", StorageGB: 20, MachineTypeCode: "shared-2x", RegionCode: "iad", IdleTimeoutCode: "30m",
+		RepositoryURL: "https://github.com/acme/app.git", StorageGB: 20, MachineTypeCode: "shared-2x", RegionCode: "iad",
 	}, "create-1")
 	if err != nil || project.ID != "prj_1" {
 		t.Fatalf("project=%+v err=%v", project, err)
@@ -204,8 +204,6 @@ func TestCreateProjectChoicesDecodeFromScopedRoutes(t *testing.T) {
 			writeData(w, http.StatusOK, []CatalogMachineType{{Code: "shared-2x", Active: true}})
 		case "/v1/catalog/regions":
 			writeData(w, http.StatusOK, []CatalogRegion{{Code: "iad", Enabled: true}})
-		case "/v1/catalog/idle-timeouts":
-			writeData(w, http.StatusOK, []CatalogIdleTimeout{{Code: "30m", Active: true}})
 		default:
 			http.NotFound(w, r)
 		}
@@ -224,11 +222,7 @@ func TestCreateProjectChoicesDecodeFromScopedRoutes(t *testing.T) {
 	if err != nil || len(regions) != 1 || regions[0].Code != "iad" {
 		t.Fatalf("regions=%v err=%v", regions, err)
 	}
-	idle, err := c.ListCatalogIdleTimeouts(context.Background())
-	if err != nil || len(idle) != 1 || idle[0].Code != "30m" {
-		t.Fatalf("idle=%v err=%v", idle, err)
-	}
-	if len(seen) != 4 {
+	if len(seen) != 3 {
 		t.Fatalf("routes=%v", seen)
 	}
 }
@@ -493,27 +487,6 @@ func TestClientRejectsUnsafeRequestID(t *testing.T) {
 	}
 }
 
-func TestClientMutationUsesBearerWithoutCSRF(t *testing.T) {
-	var gotAuthorization string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/projects/prj_1/keep-alive" {
-			gotAuthorization = r.Header.Get("Authorization")
-			writeData(w, http.StatusOK, KeepAliveResponse{Project: Project{ID: "prj_1", Name: "Demo", State: "running"}})
-		} else {
-			http.NotFound(w, r)
-		}
-	}))
-	defer srv.Close()
-
-	c := New(srv.URL, config.Credential{AccessToken: "initial-session"}, nil)
-	if _, err := c.SetKeepAlive(context.Background(), "prj_1", 3600, false); err != nil {
-		t.Fatalf("SetKeepAlive: %v", err)
-	}
-	if gotAuthorization != "Bearer initial-session" {
-		t.Fatalf("authorization = %q", gotAuthorization)
-	}
-}
-
 func TestProjectConnectionDescriptorDecodesPaperboatWebSocketTerminal(t *testing.T) {
 	var body []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -526,7 +499,7 @@ func TestProjectConnectionDescriptorDecodesPaperboatWebSocketTerminal(t *testing
 			ProjectID:   "prj_1",
 			Connectable: true,
 			Terminal: &Terminal{
-				Kind:             "paperboat_terminal_v1",
+				Kind:             "paperboat_terminal_v2",
 				HTTPBaseURL:      "https://edge.paperboat.test/projects/prj_1",
 				WebSocketBaseURL: "wss://edge.paperboat.test/projects/prj_1",
 				Auth:             AuthMaterial{Method: "websocket_ticket", Ticket: "pct_1", Scopes: []string{"terminal:operate"}},
@@ -544,7 +517,7 @@ func TestProjectConnectionDescriptorDecodesPaperboatWebSocketTerminal(t *testing
 	if err != nil {
 		t.Fatalf("ProjectConnectionDescriptor: %v", err)
 	}
-	if !resp.Connectable || resp.Terminal == nil || resp.Terminal.Kind != "paperboat_terminal_v1" || resp.Terminal.WebSocketBaseURL != "wss://edge.paperboat.test/projects/prj_1" {
+	if !resp.Connectable || resp.Terminal == nil || resp.Terminal.Kind != "paperboat_terminal_v2" || resp.Terminal.WebSocketBaseURL != "wss://edge.paperboat.test/projects/prj_1" {
 		t.Fatalf("resp = %+v", resp)
 	}
 	if resp.Terminal.Auth.Method != "websocket_ticket" || resp.Terminal.Auth.Ticket != "pct_1" {
@@ -560,11 +533,15 @@ func TestProjectConnectionDescriptorDecodesPaperboatWebSocketTerminal(t *testing
 
 func TestTerminalSessionRequests(t *testing.T) {
 	var createKey string
+	var createMode string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.Method + " " + r.URL.Path {
 		case "POST /v1/projects/prj_1/terminal-sessions":
 			createKey = r.Header.Get("Idempotency-Key")
+			var body map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			createMode = body["terminal_mode"]
 			_, _ = w.Write([]byte(`{"data":{"id":"pts_1","name":"api","state":"running","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}}`))
 		case "GET /v1/projects/prj_1/terminal-sessions":
 			_, _ = w.Write([]byte(`{"data":{"items":[{"id":"pts_1","name":"api","state":"running","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}],"pagination":{"limit":200,"offset":0,"total":1,"next_offset":null}}}`))
@@ -574,8 +551,8 @@ func TestTerminalSessionRequests(t *testing.T) {
 	}))
 	defer srv.Close()
 	c := New(srv.URL, config.Credential{AccessToken: "token"}, nil)
-	created, err := c.CreateTerminalSession(context.Background(), "prj_1", "api", "key-1")
-	if err != nil || created.ID != "pts_1" || createKey != "key-1" {
+	created, err := c.CreateTerminalSessionWithMode(context.Background(), "prj_1", "api", "shell", "key-1")
+	if err != nil || created.ID != "pts_1" || createKey != "key-1" || createMode != "shell" {
 		t.Fatalf("created=%+v key=%q err=%v", created, createKey, err)
 	}
 	sessions, err := c.ListTerminalSessions(context.Background(), "prj_1")
@@ -616,7 +593,7 @@ func TestNormalizeCanonicalConnectionDescriptor(t *testing.T) {
 	if response.UserMachineID != "um_1" || response.Environment.EnvironmentID != "env_1" || response.Environment.ProjectRoot != "/Users/paperboat" {
 		t.Fatalf("canonical environment was not normalized: %#v", response)
 	}
-	if response.Terminal.Kind != "paperboat_terminal_v1" || response.Terminal.WebSocketBaseURL != response.Terminal.Endpoint {
+	if response.Terminal.Kind != "paperboat_terminal_v2" || response.Terminal.WebSocketBaseURL != response.Terminal.Endpoint {
 		t.Fatalf("canonical terminal was not normalized: %#v", response.Terminal)
 	}
 	if response.Upload.Kind != "paperboat_staged_image_v1" || response.Upload.HTTPBaseURL != "https://edge.paperboat.test" || response.Upload.Path != "/e/env_1/uploads" {

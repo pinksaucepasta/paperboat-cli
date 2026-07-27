@@ -82,6 +82,37 @@ func wrap(body string) string {
 	return "\x1b[200~" + body + "\x1b[201~"
 }
 
+func BenchmarkDirectInput4KiB(b *testing.B) {
+	payload := bytes.Repeat([]byte("x"), 4<<10)
+	interceptor := New(io.Discard, fixedUploader{"/unused"}, defaultLimits(),
+		WithDirectInput(), WithPartialFlushDelay(time.Hour))
+	b.Cleanup(func() { _ = interceptor.Close() })
+	b.ReportAllocs()
+	b.SetBytes(int64(len(payload)))
+	b.ResetTimer()
+	for range b.N {
+		if _, err := interceptor.Write(payload); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkBracketedTextPaste4KiB(b *testing.B) {
+	payload := []byte(wrap(string(bytes.Repeat([]byte("x"), 4<<10))))
+	b.ReportAllocs()
+	b.SetBytes(4 << 10)
+	for range b.N {
+		interceptor := New(io.Discard, fixedUploader{"/unused"}, defaultLimits(),
+			WithDirectInput(), WithPartialFlushDelay(time.Hour))
+		if _, err := interceptor.Write(payload); err != nil {
+			b.Fatal(err)
+		}
+		if err := interceptor.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // writeInChunks feeds s to the interceptor split at each chunk boundary.
 func writeInChunks(t *testing.T, i *Interceptor, s string, chunk int) {
 	t.Helper()
@@ -377,6 +408,59 @@ func TestSlowUploadDoesNotBlockInitialWriteAndPreservesOrder(t *testing.T) {
 	}
 	if got, want := dest.String(), wrap("/vm/slow.png")+"after"; got != want {
 		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
+func TestDirectInputWritesOrdinaryBytesInline(t *testing.T) {
+	var dest bytes.Buffer
+	i := New(&dest, fixedUploader{"/vm/x.png"}, defaultLimits(), WithDirectInput(), WithPartialFlushDelay(time.Hour))
+	if _, err := i.Write([]byte("ordinary input")); err != nil {
+		t.Fatal(err)
+	}
+	if got := dest.String(); got != "ordinary input" {
+		t.Fatalf("destination before Write returned = %q", got)
+	}
+	if err := i.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDirectInputRetainsOnlyPossiblePastePrefix(t *testing.T) {
+	var dest bytes.Buffer
+	i := New(&dest, fixedUploader{"/vm/x.png"}, defaultLimits(), WithDirectInput(), WithPartialFlushDelay(time.Hour))
+	if _, err := i.Write([]byte("a\x1b[2J")); err != nil {
+		t.Fatal(err)
+	}
+	if got := dest.String(); got != "a\x1b[2J" {
+		t.Fatalf("ordinary ANSI sequence was buffered: %q", got)
+	}
+	if _, err := i.Write([]byte("\x1b[20")); err != nil {
+		t.Fatal(err)
+	}
+	if got := dest.String(); got != "a\x1b[2J" {
+		t.Fatalf("possible marker prefix was emitted: %q", got)
+	}
+	if err := i.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := dest.String(); got != "a\x1b[2J\x1b[20" {
+		t.Fatalf("close did not flush retained prefix: %q", got)
+	}
+}
+
+func TestDirectInputOrdinaryWriteAllocations(t *testing.T) {
+	i := New(io.Discard, fixedUploader{"/vm/x.png"}, defaultLimits(), WithDirectInput(), WithPartialFlushDelay(time.Hour))
+	p := []byte("x")
+	allocations := testing.AllocsPerRun(1000, func() {
+		if _, err := i.Write(p); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if allocations != 0 {
+		t.Fatalf("ordinary input allocations = %v, want 0", allocations)
+	}
+	if err := i.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

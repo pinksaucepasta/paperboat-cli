@@ -52,7 +52,7 @@ const (
 	websocketKeepaliveTimeout     = 10 * time.Second
 	websocketWriteTimeout         = 10 * time.Second
 	terminalOutputQueueChunks     = 256
-	helperWebSocketSubprotocol    = "paperboat.helper.v1"
+	helperWebSocketSubprotocol    = "paperboat.terminal.v2"
 )
 
 var terminalAttachEventTypes = []string{
@@ -90,7 +90,7 @@ func (t *WebSocketTunnel) Check(ctx context.Context, target *resolver.TerminalTa
 		}
 		return fmt.Errorf("dial terminal websocket: %w", err)
 	}
-	if target.Kind == "paperboat_terminal_v1" {
+	if target.Kind == "paperboat_terminal_v2" {
 		defer ws.Close()
 		if _, err := helperHandshake(ctx, ws); err != nil {
 			return err
@@ -122,21 +122,20 @@ func (t *WebSocketTunnel) Dial(ctx context.Context, info resolver.ConnectInfo) (
 		}
 		return nil, fmt.Errorf("dial terminal websocket: %w", err)
 	}
-	if target.Kind == "paperboat_terminal_v1" {
-		inputStream, err := helperHandshake(ctx, ws)
+	if target.Kind == "paperboat_terminal_v2" {
+		_, err := helperHandshake(ctx, ws)
 		if err != nil {
 			_ = ws.Close()
 			return nil, err
 		}
 		c := newHelperTerminalConn(ws, target, t.outputQueueChunks())
-		c.inputStream = inputStream
 		if err := c.initialize(ctx); err != nil {
 			_ = ws.Close()
 			return nil, err
 		}
 		return c, nil
 	}
-	if target.Kind != "" && target.Kind != "paperboat_terminal_v1" {
+	if target.Kind != "" && target.Kind != "paperboat_terminal_v2" {
 		_ = ws.Close()
 		return nil, fmt.Errorf("unsupported terminal transport %q", target.Kind)
 	}

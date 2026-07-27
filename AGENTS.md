@@ -6,7 +6,7 @@ Inherit [`../AGENTS.md`](../AGENTS.md). CLI, `pb`, and client CLI mean this repo
 ## Ownership
 
 Device auth, account/environment/session selection, raw terminal lifecycle, resize,
-signals, reconnect/replay, local image upload/paste rewriting, human activity,
+signals, reconnect/replay, local image upload/paste rewriting,
 diagnostics, output, and OS credential storage. Never run frpc, own remote PTYs, enforce
 server policy, or receive reusable infrastructure credentials.
 

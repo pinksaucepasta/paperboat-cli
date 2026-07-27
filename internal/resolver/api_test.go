@@ -116,7 +116,7 @@ func TestFindTargetAllowsUserMachineWithoutHostedPlan(t *testing.T) {
 
 func readyTerminal() *api.Terminal {
 	return &api.Terminal{
-		Kind:             "paperboat_terminal_v1",
+		Kind:             "paperboat_terminal_v2",
 		HTTPBaseURL:      "https://edge.paperboat.test/projects/prj_1",
 		WebSocketBaseURL: "wss://edge.paperboat.test/projects/prj_1",
 		Auth:             api.AuthMaterial{Method: "websocket_ticket", Ticket: "pct_1", ExpiresAt: time.Now().Add(time.Hour), Scopes: []string{"terminal:operate"}},
@@ -157,7 +157,7 @@ func readyUserMachineResponse(term *api.Terminal) api.ConnectionDescriptor {
 
 func routeOnlyTerminal() *api.Terminal {
 	return &api.Terminal{
-		Kind:             "paperboat_terminal_v1",
+		Kind:             "paperboat_terminal_v2",
 		HTTPBaseURL:      "https://edge.paperboat.test/projects/prj_1",
 		WebSocketBaseURL: "wss://edge.paperboat.test/projects/prj_1",
 		ThreadID:         "paperboat-cli",

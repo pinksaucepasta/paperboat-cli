@@ -17,6 +17,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spf13/cobra"
+
 	"github.com/pinksaucepasta/paperboat-cli/internal/api"
 	"github.com/pinksaucepasta/paperboat-cli/internal/buildinfo"
 	"github.com/pinksaucepasta/paperboat-cli/internal/config"
@@ -123,6 +125,29 @@ func TestSelectDefaultTerminalSessionDefersToDescriptor(t *testing.T) {
 	}
 }
 
+func TestNoHerdrRequiresNewSession(t *testing.T) {
+	command := newRootCommand()
+	command.SetArgs([]string{"Victus", "--no-herdr"})
+	err := command.ExecuteContext(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "--no-herdr requires --new") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestActionContextPreservesNoHerdr(t *testing.T) {
+	command := newRootCommand()
+	command.SetArgs([]string{"Victus", "--new", "--no-herdr"})
+	command.RunE = func(command *cobra.Command, args []string) error {
+		if !actionContext(command, args).Bool("no-herdr") {
+			t.Fatal("no-herdr flag was not preserved in the action context")
+		}
+		return nil
+	}
+	if err := command.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 type refreshTestAuth struct {
 	current   config.Credential
 	refreshed config.Credential
@@ -133,39 +158,6 @@ func (a *refreshTestAuth) Credential() (config.Credential, error) { return a.cur
 func (a *refreshTestAuth) Refresh() (config.Credential, error) {
 	a.refreshes++
 	return a.refreshed, nil
-}
-
-func TestReportActivityRefreshesAndRetriesUnauthorized(t *testing.T) {
-	var authHeaders []string
-	var bodies []map[string]any
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		authHeaders = append(authHeaders, r.Header.Get("Authorization"))
-		var body map[string]any
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		bodies = append(bodies, body)
-		w.Header().Set("Content-Type", "application/json")
-		if len(authHeaders) == 1 {
-			w.WriteHeader(http.StatusUnauthorized)
-			_, _ = w.Write([]byte(`{"error":{"code":"unauthenticated","message":"expired"}}`))
-			return
-		}
-		_, _ = w.Write([]byte(`{"data":{"accepted":true}}`))
-	}))
-	defer srv.Close()
-	auth := &refreshTestAuth{current: config.Credential{AccessToken: "old"}, refreshed: config.Credential{AccessToken: "new"}}
-	if err := reportActivity(context.Background(), srv.URL, auth, "prj_1", "human_input"); err != nil {
-		t.Fatal(err)
-	}
-	if auth.refreshes != 1 || strings.Join(authHeaders, ",") != "Bearer old,Bearer new" {
-		t.Fatalf("refreshes=%d headers=%v", auth.refreshes, authHeaders)
-	}
-	if bodies[1]["source"] != "cli_activity" {
-		t.Fatalf("body=%#v", bodies[1])
-	}
-	metadata, _ := bodies[1]["metadata"].(map[string]any)
-	if metadata["event"] != "human_input" {
-		t.Fatalf("metadata=%#v", metadata)
-	}
 }
 
 func TestPollConfigSyncUsesAttachedProjectState(t *testing.T) {
@@ -559,9 +551,6 @@ func TestCreateCatalogFiltersUnavailableOptions(t *testing.T) {
 	if got := enabledRegionCodes([]api.CatalogRegion{{Code: "off"}, {Code: "on", Enabled: true}}); len(got) != 1 || got[0] != "on" {
 		t.Fatalf("region codes=%v", got)
 	}
-	if got := activeIdleTimeoutCodes([]api.CatalogIdleTimeout{{Code: "off"}, {Code: "on", Active: true}}); len(got) != 1 || got[0] != "on" {
-		t.Fatalf("idle codes=%v", got)
-	}
 }
 
 func TestMachineRevokeRequiresConfirmationBeforeBackend(t *testing.T) {
@@ -826,56 +815,6 @@ func TestCobraRootWithoutArgumentsAttemptsPrimaryWorkflow(t *testing.T) {
 	}
 	if strings.Contains(output.String(), "Usage:") {
 		t.Fatalf("root stopped at generic help: %q", output.String())
-	}
-}
-
-func TestKeepAliveCommandCallsBackend(t *testing.T) {
-	for _, tc := range []struct {
-		name        string
-		hours       string
-		wantSeconds int
-	}{
-		{name: "two hours", hours: "2", wantSeconds: 7200},
-		{name: "tiny positive", hours: "0.0000001", wantSeconds: 1},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			configPath := filepath.Join(dir, "config.json")
-			var gotKeepAlive bool
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
-				switch r.URL.Path {
-				case "/v1/projects":
-					_, _ = w.Write([]byte(`{"data":{"items":[{"id":"prj_1","name":"Demo","state":"running"}],"pagination":{"limit":200,"offset":0,"total":1,"next_offset":null}}}`))
-				case "/v1/projects/prj_1/keep-alive":
-					gotKeepAlive = true
-					if r.Header.Get("Authorization") != "Bearer token" {
-						t.Fatalf("authorization = %q", r.Header.Get("Authorization"))
-					}
-					var body struct {
-						DurationSeconds int  `json:"duration_seconds"`
-						Clear           bool `json:"clear"`
-					}
-					if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-						t.Fatal(err)
-					}
-					if body.DurationSeconds != tc.wantSeconds || body.Clear {
-						t.Fatalf("keep-alive body = %#v, want duration %d", body, tc.wantSeconds)
-					}
-					_, _ = w.Write([]byte(`{"data":{"project":{"id":"prj_1","name":"Demo","state":"running"},"keep_alive_until":"2026-07-08T12:00:00Z"}}`))
-				default:
-					http.NotFound(w, r)
-				}
-			}))
-			defer server.Close()
-			writeTestProfile(t, dir, configPath, server.URL)
-			if code := run(context.Background(), []string{"keep-alive", "Demo", "--hours", tc.hours, "--config", configPath, "--server", server.URL}, os.Stdout, os.Stderr); code != 0 {
-				t.Fatalf("exit code = %d", code)
-			}
-			if !gotKeepAlive {
-				t.Fatal("expected keep-alive request")
-			}
-		})
 	}
 }
 

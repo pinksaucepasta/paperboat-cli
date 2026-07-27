@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/x/ansi"
+	"github.com/charmbracelet/x/ansi/parser"
 )
 
 func newTestBar(t *testing.T, mode, terminal string, width, height int, terminalOK bool, notice time.Duration) (*Bar, *os.File) {
@@ -183,6 +184,39 @@ func TestWriteDefersRedrawUntilSplitANSICompletes(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), "\x1b[7m") || !strings.Contains(string(raw), "\x1b[27m") {
 		t.Fatalf("renderer did not apply and restore its reverse-video background: %q", raw)
+	}
+}
+
+func TestResetRemoteStateDiscardsPartialANSIAndSavedState(t *testing.T) {
+	bar, _ := newTestBar(t, ModeAuto, "xterm-256color", 40, 3, true, time.Second)
+	if _, err := bar.Write([]byte("\x1b[")); err != nil {
+		t.Fatal(err)
+	}
+	bar.mu.Lock()
+	bar.appCursorSaved = true
+	bar.appInverse = true
+	bar.synchronized = true
+	bar.mu.Unlock()
+	bar.ResetRemoteState()
+	bar.mu.Lock()
+	defer bar.mu.Unlock()
+	if bar.ansiState != byte(parser.GroundState) || bar.appCursorSaved || bar.appInverse || bar.synchronized || !bar.scrollDirty || !bar.redrawPending {
+		t.Fatalf("state was not reset: %#v", bar)
+	}
+}
+
+func TestClearForExitRestoresAndClearsFullViewport(t *testing.T) {
+	bar, reader := newTestBar(t, ModeAuto, "xterm-256color", 40, 3, true, time.Second)
+	bar.ClearForExit()
+	if output, ok := bar.out.(*os.File); ok {
+		_ = output.Close()
+	}
+	raw, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(string(raw), "\x1b[r\x1b[2J\x1b[H") || !bar.closed || bar.enabled {
+		t.Fatalf("exit clear state closed=%v enabled=%v raw=%q", bar.closed, bar.enabled, raw)
 	}
 }
 

@@ -26,6 +26,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pinksaucepasta/paperboat-cli/internal/tunnel"
@@ -71,6 +72,8 @@ type Interceptor struct {
 	lifecycleMu    sync.RWMutex
 	closed         bool
 	pressureOnce   sync.Once
+	queued         atomic.Int64
+	directInput    bool
 	lifecycle      func(LifecycleEvent)
 	stateMu        sync.Mutex
 	errMu          sync.Mutex
@@ -156,6 +159,10 @@ func WithMaxQueuedBytes(n int) Option {
 	}
 }
 
+// WithDirectInput sends ordinary non-paste bytes to the destination inline.
+// Only possible bracketed-paste markers enter the asynchronous upload queue.
+func WithDirectInput() Option { return func(i *Interceptor) { i.directInput = true } }
+
 // New builds an Interceptor writing rewritten output to dest.
 func New(dest io.Writer, up upload.Uploader, limits upload.Limits, opts ...Option) *Interceptor {
 	return NewWithPolicy(dest, NewPolicy(up, limits), opts...)
@@ -204,6 +211,23 @@ func (i *Interceptor) Write(p []byte) (int, error) {
 	if i.closed {
 		return 0, io.ErrClosedPipe
 	}
+	if i.directInput && len(p) > 0 && i.queued.Load() == 0 && i.stateMu.TryLock() {
+		if !i.inPaste && len(i.buf) == 0 && bytes.Index(p, startMarker) < 0 && partialSuffix(p, startMarker) == 0 {
+			n, err := i.dest.Write(p)
+			i.stateMu.Unlock()
+			if errors.Is(err, tunnel.ErrWriteUncertain) {
+				if discarder, ok := i.dest.(interface{ Discard() }); ok {
+					discarder.Discard()
+				}
+				return len(p), nil
+			}
+			if err != nil {
+				i.setError(err)
+			}
+			return n, err
+		}
+		i.stateMu.Unlock()
+	}
 	written := 0
 	for len(p) > 0 {
 		select {
@@ -216,6 +240,7 @@ func (i *Interceptor) Write(p []byte) (int, error) {
 			n = i.queueChunkSize
 		}
 		chunk := append([]byte(nil), p[:n]...)
+		i.queued.Add(1)
 		select {
 		case i.input <- chunk:
 			written += n
@@ -241,8 +266,10 @@ func (i *Interceptor) Write(p []byte) (int, error) {
 			default:
 			}
 		case <-i.done:
+			i.queued.Add(-1)
 			return written, i.result()
 		case <-i.ctx.Done():
+			i.queued.Add(-1)
 			return written, i.ctx.Err()
 		}
 	}
@@ -334,6 +361,7 @@ func (i *Interceptor) run() {
 			}
 			i.stateMu.Lock()
 			i.buf = append(i.buf, p...)
+			processed := int64(1)
 			// Coalesce input that queued up while this worker was busy (e.g.
 			// behind a slow destination write) so the backlog is forwarded in
 			// one destination write instead of one write per chunk.
@@ -347,6 +375,7 @@ func (i *Interceptor) run() {
 						break coalesce
 					}
 					i.buf = append(i.buf, q...)
+					processed++
 				default:
 					break coalesce
 				}
@@ -356,6 +385,7 @@ func (i *Interceptor) run() {
 				err = i.flush()
 			}
 			i.stateMu.Unlock()
+			i.queued.Add(-processed)
 			if err != nil && handleWriteErr(err) {
 				return
 			}

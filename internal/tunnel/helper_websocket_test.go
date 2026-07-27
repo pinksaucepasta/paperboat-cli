@@ -20,6 +20,8 @@ import (
 func TestCanonicalHelperTerminalFramingIOResizeAndExit(t *testing.T) {
 	requests := make(chan helperFrame, 12)
 	inputs := make(chan []byte, 1)
+	acks := make(chan uint64, 1)
+	resizes := make(chan [2]uint16, 1)
 	upgrader := websocket.Upgrader{Subprotocols: []string{helperWebSocketSubprotocol}}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/runtime" || r.Header.Get("Authorization") != "Bearer helper-token" {
@@ -37,19 +39,21 @@ func TestCanonicalHelperTerminalFramingIOResizeAndExit(t *testing.T) {
 				return
 			}
 			if messageType == websocket.BinaryMessage {
-				if len(data) < 25 || data[4] != 3 || binary.BigEndian.Uint64(data[5:13]) != 1 {
-					t.Errorf("invalid input frame: %x", data)
-					return
+				switch data[0] {
+				case 1:
+					if len(data) < 14 || binary.BigEndian.Uint32(data[1:5]) != 7 || binary.BigEndian.Uint64(data[5:13]) != 1 {
+						t.Errorf("invalid input frame: %x", data)
+						return
+					}
+					inputs <- append([]byte(nil), data[13:]...)
+				case 3:
+					acks <- binary.BigEndian.Uint64(data[5:13])
+				case 4:
+					resizes <- [2]uint16{binary.BigEndian.Uint16(data[5:7]), binary.BigEndian.Uint16(data[7:9])}
+					writeHelperTestFrame(t, ws, helperFrame{Type: "event", RequestID: "stream", Version: helperProtocolVersion, Capability: "terminal.v2", Payload: json.RawMessage(`{"event":"terminal_stream_end","session_id":"ses_bound","state":"exited","final_sequence":5,"exit":{"code":7}}`)})
+				default:
+					t.Errorf("invalid binary frame: %x", data)
 				}
-				sessionLength := int(binary.BigEndian.Uint16(data[13:15]))
-				attachmentLength := int(binary.BigEndian.Uint16(data[15:17]))
-				generation := binary.BigEndian.Uint64(data[17:25])
-				bodyStart := 25 + sessionLength + attachmentLength
-				if generation != 1 || string(data[25:25+sessionLength]) != "ses_bound" || string(data[25+sessionLength:bodyStart]) != "att_1" {
-					t.Errorf("invalid input binding: %x", data)
-					return
-				}
-				inputs <- append([]byte(nil), data[bodyStart:]...)
 				continue
 			}
 			if messageType != websocket.TextMessage {
@@ -64,7 +68,7 @@ func TestCanonicalHelperTerminalFramingIOResizeAndExit(t *testing.T) {
 			requests <- frame
 			switch frame.Type {
 			case "hello":
-				writeHelperTestFrame(t, ws, helperFrame{Type: "welcome", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"version":"1.0","capabilities":["health.v1","terminal.v1","terminal.input-stream.v1"]}`)})
+				writeHelperTestFrame(t, ws, helperFrame{Type: "welcome", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"version":"2.0","capabilities":["health.v1","terminal.v2"]}`)})
 			case "ack", "detach":
 				writeHelperTestFrame(t, ws, helperFrame{Type: "response", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"result":{},"replay":false}`)})
 			case "request":
@@ -76,13 +80,10 @@ func TestCanonicalHelperTerminalFramingIOResizeAndExit(t *testing.T) {
 				case "create":
 					writeHelperTestFrame(t, ws, helperFrame{Type: "response", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"result":{"id":"ses_bound","generation":1},"replay":false}`)})
 				case "attach":
-					writeHelperTestFrame(t, ws, helperFrame{Type: "response", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"result":{"attachment_id":"att_1","session":{"snapshot":{"generation":1}}},"replay":false}`)})
-					writeHelperTestBinary(t, ws, 0, []byte("h"))
-					writeHelperTestBinary(t, ws, 1, []byte("el"))
-					writeHelperTestBinary(t, ws, 3, []byte("lo"))
-				case "resize":
-					writeHelperTestFrame(t, ws, helperFrame{Type: "response", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"result":{},"replay":false}`)})
-					writeHelperTestFrame(t, ws, helperFrame{Type: "event", RequestID: "stream", Version: helperProtocolVersion, Capability: "terminal.v1", Payload: json.RawMessage(`{"event":"terminal_stream_end","session_id":"ses_bound","state":"exited","final_sequence":5,"exit":{"code":7}}`)})
+					writeHelperTestFrame(t, ws, helperFrame{Type: "response", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"result":{"stream_id":7,"attachment_id":"att_1","session":{"snapshot":{"generation":1}}},"replay":false}`)})
+					writeHelperTestBinary(t, ws, 7, 0, []byte("h"))
+					writeHelperTestBinary(t, ws, 7, 1, []byte("el"))
+					writeHelperTestBinary(t, ws, 7, 3, []byte("lo"))
 				}
 			}
 		}
@@ -92,7 +93,7 @@ func TestCanonicalHelperTerminalFramingIOResizeAndExit(t *testing.T) {
 	u, _ := url.Parse(server.URL)
 	u.Scheme = strings.Replace(u.Scheme, "http", "ws", 1)
 	u.Path = "/v1/runtime"
-	target := &resolver.TerminalTarget{Kind: "paperboat_terminal_v1", WebSocketBaseURL: u.String(), Auth: resolver.AuthTarget{Method: "bearer", Token: "helper-token"}, SessionID: "ses_bound", TerminalID: "default", CWD: "/workspace", Cols: 100, Rows: 30}
+	target := &resolver.TerminalTarget{Kind: "paperboat_terminal_v2", WebSocketBaseURL: u.String(), Auth: resolver.AuthTarget{Method: "bearer", Token: "helper-token"}, SessionID: "ses_bound", TerminalID: "default", CWD: "/workspace", Cols: 100, Rows: 30, Env: map[string]string{"TERM": "xterm-ghostty", "COLORTERM": "truecolor"}}
 	conn, err := NewWebSocketTunnel().Dial(context.Background(), resolver.ConnectInfo{Terminal: target})
 	if err != nil {
 		t.Fatal(err)
@@ -116,26 +117,45 @@ func TestCanonicalHelperTerminalFramingIOResizeAndExit(t *testing.T) {
 		t.Fatalf("Wait()=%d,%v", code, err)
 	}
 
-	var sawCreate, sawAttach, sawAck, sawResize bool
-	ackCount := 0
+	var sawCreate, sawAttach bool
 	for len(requests) > 0 {
 		frame := <-requests
 		var payload map[string]any
 		_ = json.Unmarshal(frame.Payload, &payload)
 		switch {
-		case frame.Type == "ack":
-			ackCount++
-			sawAck = payload["session_id"] == "ses_bound" && payload["attachment_id"] == "att_1" && payload["next_sequence"] == float64(5)
 		case payload["action"] == "create":
-			sawCreate = payload["session_id"] == "ses_bound" && payload["columns"] == float64(100) && payload["rows"] == float64(30)
+			environment, _ := payload["environment"].(map[string]any)
+			sawCreate = payload["session_id"] == "ses_bound" && payload["name"] == "ses_bound" && payload["columns"] == float64(100) && payload["rows"] == float64(30) && environment["TERM"] == "xterm-ghostty" && environment["COLORTERM"] == "truecolor"
 		case payload["action"] == "attach":
 			sawAttach = payload["session_id"] == "ses_bound"
-		case payload["action"] == "resize":
-			sawResize = payload["columns"] == float64(120) && payload["rows"] == float64(40)
 		}
 	}
-	if !sawCreate || !sawAttach || !sawAck || !sawResize || ackCount != 1 {
-		t.Fatalf("create=%v attach=%v ack=%v ack_count=%d resize=%v", sawCreate, sawAttach, sawAck, ackCount, sawResize)
+	if ack := <-acks; ack != 5 {
+		t.Fatalf("ack=%d", ack)
+	}
+	if resize := <-resizes; resize != [2]uint16{120, 40} {
+		t.Fatalf("resize=%v", resize)
+	}
+	if !sawCreate || !sawAttach {
+		t.Fatalf("create=%v attach=%v", sawCreate, sawAttach)
+	}
+}
+
+func TestHelperBinaryOutputRetainsOwnedWebSocketPayload(t *testing.T) {
+	conn := &helperTerminalConn{streamID: 7}
+	message := make([]byte, 14+3)
+	message[0], message[1] = 2, 1
+	binary.BigEndian.PutUint32(message[2:6], 7)
+	binary.BigEndian.PutUint64(message[6:14], 11)
+	copy(message[14:], "abc")
+
+	output, err := conn.decodeHelperBinary(message)
+	if err != nil || output.endSequence != 14 || string(output.data) != "abc" {
+		t.Fatalf("output=%#v err=%v", output, err)
+	}
+	message[14] = 'z'
+	if string(output.data) != "zbc" {
+		t.Fatal("binary output payload was copied")
 	}
 }
 
@@ -156,7 +176,12 @@ func TestCanonicalHelperExistingSessionRequestsFreshRedraw(t *testing.T) {
 				return
 			}
 			if messageType == websocket.BinaryMessage {
-				redrawInputs <- helperTestInputBody(t, data)
+				switch data[0] {
+				case 1:
+					redrawInputs <- helperTestInputBody(t, data)
+				case 4:
+					resizeColumns <- int(binary.BigEndian.Uint16(data[5:7]))
+				}
 				continue
 			}
 			frame, err := decodeHelperFrame(data)
@@ -166,7 +191,7 @@ func TestCanonicalHelperExistingSessionRequestsFreshRedraw(t *testing.T) {
 			}
 			switch frame.Type {
 			case "hello":
-				writeHelperTestFrame(t, ws, helperFrame{Type: "welcome", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"version":"1.0","capabilities":["health.v1","terminal.v1","terminal.input-stream.v1"]}`)})
+				writeHelperTestFrame(t, ws, helperFrame{Type: "welcome", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"version":"2.0","capabilities":["health.v1","terminal.v2"]}`)})
 			case "detach":
 				return
 			case "request":
@@ -176,10 +201,7 @@ func TestCanonicalHelperExistingSessionRequestsFreshRedraw(t *testing.T) {
 				case "snapshot":
 					writeHelperTestFrame(t, ws, helperFrame{Type: "response", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"result":{"state":"running","generation":1,"earliest_sequence":100,"latest_sequence":200},"replay":false}`)})
 				case "attach":
-					writeHelperTestFrame(t, ws, helperFrame{Type: "response", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"result":{"attachment_id":"att_live","session":{"snapshot":{"generation":1}}},"replay":false}`)})
-				case "resize":
-					resizeColumns <- int(payload["columns"].(float64))
-					writeHelperTestFrame(t, ws, helperFrame{Type: "response", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"result":{},"replay":false}`)})
+					writeHelperTestFrame(t, ws, helperFrame{Type: "response", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"result":{"stream_id":8,"attachment_id":"att_live","session":{"snapshot":{"generation":1}}},"replay":false}`)})
 				}
 			}
 		}
@@ -189,7 +211,7 @@ func TestCanonicalHelperExistingSessionRequestsFreshRedraw(t *testing.T) {
 	u, _ := url.Parse(server.URL)
 	u.Scheme = strings.Replace(u.Scheme, "http", "ws", 1)
 	u.Path = "/v1/runtime"
-	target := &resolver.TerminalTarget{Kind: "paperboat_terminal_v1", WebSocketBaseURL: u.String(), Auth: resolver.AuthTarget{Method: "bearer", Token: "helper-token"}, SessionID: "ses_gap", TerminalID: "default", CWD: "/workspace"}
+	target := &resolver.TerminalTarget{Kind: "paperboat_terminal_v2", WebSocketBaseURL: u.String(), Auth: resolver.AuthTarget{Method: "bearer", Token: "helper-token"}, SessionID: "ses_gap", TerminalID: "default", CWD: "/workspace"}
 	conn, err := NewWebSocketTunnel().Dial(context.Background(), resolver.ConnectInfo{Terminal: target})
 	if err != nil {
 		t.Fatal(err)
@@ -259,7 +281,7 @@ func TestCanonicalHelperRestartIsLimitedToInitialAttach(t *testing.T) {
 						return
 					}
 					if frame.Type == "hello" {
-						writeHelperTestFrame(t, ws, helperFrame{Type: "welcome", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"version":"1.0","capabilities":["health.v1","terminal.v1"]}`)})
+						writeHelperTestFrame(t, ws, helperFrame{Type: "welcome", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"version":"2.0","capabilities":["health.v1","terminal.v2"]}`)})
 						continue
 					}
 					if frame.Type != "request" {
@@ -278,10 +300,10 @@ func TestCanonicalHelperRestartIsLimitedToInitialAttach(t *testing.T) {
 					case "restart":
 						writeHelperTestFrame(t, ws, helperFrame{Type: "response", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"result":{"state":"running","generation":4},"replay":false}`)})
 					case "attach":
-						response := fmt.Sprintf(`{"result":{"attachment_id":%q,"session":{"snapshot":{"generation":%d}}},"replay":false}`, test.attachmentID, test.generation)
+						response := fmt.Sprintf(`{"result":{"stream_id":9,"attachment_id":%q,"session":{"snapshot":{"generation":%d}}},"replay":false}`, test.attachmentID, test.generation)
 						writeHelperTestFrame(t, ws, helperFrame{Type: "response", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(response)})
 						event := fmt.Sprintf(`{"event":"terminal_stream_end","session_id":"ses_retained","state":"exited","final_sequence":17,"exit":{"code":%d}}`, test.wantExitCode)
-						writeHelperTestFrame(t, ws, helperFrame{Type: "event", RequestID: "stream", Version: helperProtocolVersion, Capability: "terminal.v1", Payload: json.RawMessage(event)})
+						writeHelperTestFrame(t, ws, helperFrame{Type: "event", RequestID: "stream", Version: helperProtocolVersion, Capability: "terminal.v2", Payload: json.RawMessage(event)})
 					}
 				}
 			}))
@@ -290,7 +312,7 @@ func TestCanonicalHelperRestartIsLimitedToInitialAttach(t *testing.T) {
 			u, _ := url.Parse(server.URL)
 			u.Scheme = strings.Replace(u.Scheme, "http", "ws", 1)
 			u.Path = "/v1/runtime"
-			target := &resolver.TerminalTarget{Kind: "paperboat_terminal_v1", WebSocketBaseURL: u.String(), Auth: resolver.AuthTarget{Method: "bearer", Token: "helper-token"}, SessionID: "ses_retained", TerminalID: "default", RestartIfNotRunning: test.restart, AfterSequence: 9}
+			target := &resolver.TerminalTarget{Kind: "paperboat_terminal_v2", WebSocketBaseURL: u.String(), Auth: resolver.AuthTarget{Method: "bearer", Token: "helper-token"}, SessionID: "ses_retained", TerminalID: "default", RestartIfNotRunning: test.restart, AfterSequence: 9}
 			conn, err := NewWebSocketTunnel().Dial(context.Background(), resolver.ConnectInfo{Terminal: target})
 			if err != nil {
 				t.Fatal(err)
@@ -341,7 +363,7 @@ func TestCanonicalHelperStaleCursorJoinsAtLiveBoundary(t *testing.T) {
 				return
 			}
 			if frame.Type == "hello" {
-				writeHelperTestFrame(t, ws, helperFrame{Type: "welcome", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"version":"1.0","capabilities":["health.v1","terminal.v1"]}`)})
+				writeHelperTestFrame(t, ws, helperFrame{Type: "welcome", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"version":"2.0","capabilities":["health.v1","terminal.v2"]}`)})
 				continue
 			}
 			if frame.Type != "request" {
@@ -361,9 +383,9 @@ func TestCanonicalHelperStaleCursorJoinsAtLiveBoundary(t *testing.T) {
 					writeHelperTestFrame(t, ws, helperFrame{Type: "error", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"code":"replay_gap","message":"operation failed","retryable":false,"details":{"requested_sequence":2,"earliest_sequence":10,"latest_sequence":18}}`)})
 					continue
 				}
-				writeHelperTestFrame(t, ws, helperFrame{Type: "response", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"result":{"attachment_id":"att_recovered","session":{"snapshot":{"generation":1}}},"replay":true}`)})
-				writeHelperTestBinary(t, ws, 18, []byte("fresh\n"))
-				writeHelperTestFrame(t, ws, helperFrame{Type: "event", RequestID: "stream", Version: helperProtocolVersion, Capability: "terminal.v1", Payload: json.RawMessage(`{"event":"terminal_stream_end","session_id":"ses_gap","state":"exited","final_sequence":24,"exit":{"code":0}}`)})
+				writeHelperTestFrame(t, ws, helperFrame{Type: "response", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"result":{"stream_id":10,"attachment_id":"att_recovered","session":{"snapshot":{"generation":1}}},"replay":true}`)})
+				writeHelperTestBinary(t, ws, 10, 18, []byte("fresh\n"))
+				writeHelperTestFrame(t, ws, helperFrame{Type: "event", RequestID: "stream", Version: helperProtocolVersion, Capability: "terminal.v2", Payload: json.RawMessage(`{"event":"terminal_stream_end","session_id":"ses_gap","state":"exited","final_sequence":24,"exit":{"code":0}}`)})
 			}
 		}
 	}))
@@ -373,7 +395,7 @@ func TestCanonicalHelperStaleCursorJoinsAtLiveBoundary(t *testing.T) {
 	u.Scheme = strings.Replace(u.Scheme, "http", "ws", 1)
 	u.Path = "/v1/runtime"
 	var cursor atomic.Int64
-	target := &resolver.TerminalTarget{Kind: "paperboat_terminal_v1", WebSocketBaseURL: u.String(), Auth: resolver.AuthTarget{Method: "bearer", Token: "helper-token"}, SessionID: "ses_gap", TerminalID: "default", AfterSequence: 2, SequenceSink: func(value int) { cursor.Store(int64(value)) }}
+	target := &resolver.TerminalTarget{Kind: "paperboat_terminal_v2", WebSocketBaseURL: u.String(), Auth: resolver.AuthTarget{Method: "bearer", Token: "helper-token"}, SessionID: "ses_gap", TerminalID: "default", AfterSequence: 2, SequenceSink: func(value int) { cursor.Store(int64(value)) }}
 	conn, err := NewWebSocketTunnel().Dial(context.Background(), resolver.ConnectInfo{Terminal: target})
 	if err != nil {
 		t.Fatal(err)
@@ -400,21 +422,19 @@ func writeHelperTestFrame(t *testing.T, ws *websocket.Conn, frame helperFrame) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	data := make([]byte, 4+len(encoded))
-	binary.BigEndian.PutUint32(data[:4], uint32(len(encoded)))
-	copy(data[4:], encoded)
-	if err := ws.WriteMessage(websocket.TextMessage, data); err != nil {
+	if err := ws.WriteMessage(websocket.TextMessage, encoded); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func writeHelperTestBinary(t *testing.T, ws *websocket.Conn, sequence uint64, body []byte) {
+func writeHelperTestBinary(t *testing.T, ws *websocket.Conn, streamID uint32, sequence uint64, body []byte) {
 	t.Helper()
-	data := make([]byte, 13+len(body))
-	binary.BigEndian.PutUint32(data[:4], uint32(9+len(body)))
-	data[4] = 1
-	binary.BigEndian.PutUint64(data[5:13], sequence)
-	copy(data[13:], body)
+	data := make([]byte, 14+len(body))
+	data[0] = 2
+	data[1] = 1
+	binary.BigEndian.PutUint32(data[2:6], streamID)
+	binary.BigEndian.PutUint64(data[6:14], sequence)
+	copy(data[14:], body)
 	if err := ws.WriteMessage(websocket.BinaryMessage, data); err != nil {
 		t.Fatal(err)
 	}
@@ -422,14 +442,8 @@ func writeHelperTestBinary(t *testing.T, ws *websocket.Conn, sequence uint64, bo
 
 func helperTestInputBody(t *testing.T, data []byte) []byte {
 	t.Helper()
-	if len(data) < 25 || data[4] != 3 {
+	if len(data) < 14 || data[0] != 1 {
 		t.Fatalf("invalid terminal input frame: %x", data)
 	}
-	sessionLength := int(binary.BigEndian.Uint16(data[13:15]))
-	attachmentLength := int(binary.BigEndian.Uint16(data[15:17]))
-	bodyStart := 25 + sessionLength + attachmentLength
-	if bodyStart >= len(data) {
-		t.Fatalf("invalid terminal input binding: %x", data)
-	}
-	return append([]byte(nil), data[bodyStart:]...)
+	return append([]byte(nil), data[13:]...)
 }

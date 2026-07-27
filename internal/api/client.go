@@ -166,10 +166,6 @@ type CatalogRegion struct {
 	Code    string `json:"code"`
 	Enabled bool   `json:"enabled"`
 }
-type CatalogIdleTimeout struct {
-	Code   string `json:"code"`
-	Active bool   `json:"active"`
-}
 
 func (c *Client) ListGitHubRepositories(ctx context.Context) ([]GitHubRepository, error) {
 	var out []GitHubRepository
@@ -189,12 +185,6 @@ func (c *Client) ListCatalogRegions(ctx context.Context) ([]CatalogRegion, error
 	return out, err
 }
 
-func (c *Client) ListCatalogIdleTimeouts(ctx context.Context) ([]CatalogIdleTimeout, error) {
-	var out []CatalogIdleTimeout
-	err := c.do(ctx, http.MethodGet, "/v1/catalog/idle-timeouts", nil, &out)
-	return out, err
-}
-
 type CreateProjectInput struct {
 	Name            string   `json:"name"`
 	RepositoryURL   string   `json:"repository_url"`
@@ -203,7 +193,6 @@ type CreateProjectInput struct {
 	MachineTypeCode string   `json:"machine_type_code"`
 	RegionCode      string   `json:"region_code"`
 	PresetCodes     []string `json:"preset_codes,omitempty"`
-	IdleTimeoutCode string   `json:"idle_timeout_code"`
 	SetupScript     string   `json:"setup_script,omitempty"`
 }
 
@@ -358,6 +347,7 @@ type TerminalSession struct {
 	LastActiveAt  *time.Time `json:"last_active_at"`
 	CreatedAt     time.Time  `json:"created_at"`
 	UpdatedAt     time.Time  `json:"updated_at"`
+	TerminalMode  string     `json:"terminal_mode"`
 }
 
 type TerminalSessionPage struct {
@@ -405,6 +395,7 @@ type Terminal struct {
 	ThreadID         string       `json:"thread_id"`
 	TerminalID       string       `json:"terminal_id"`
 	CWD              string       `json:"cwd"`
+	TerminalMode     string       `json:"terminal_mode"`
 }
 
 // Upload is the Paperboat image-upload endpoint hint from cli-connect.
@@ -460,7 +451,7 @@ func (r *ConnectionDescriptor) NormalizeConnectionDescriptor() error {
 		return fmt.Errorf("invalid environment kind %q", e.Kind)
 	}
 	if r.Terminal != nil {
-		r.Terminal.Kind = "paperboat_terminal_v1"
+		r.Terminal.Kind = "paperboat_terminal_v2"
 		r.Terminal.WebSocketBaseURL = r.Terminal.Endpoint
 		r.Terminal.HTTPBaseURL = r.Terminal.HTTPEndpoint
 	}
@@ -475,11 +466,6 @@ func (r *ConnectionDescriptor) NormalizeConnectionDescriptor() error {
 		r.Upload.HTTPBaseURL = strings.TrimSuffix(u.String(), "/")
 	}
 	return nil
-}
-
-type KeepAliveResponse struct {
-	Project        Project   `json:"project"`
-	KeepAliveUntil time.Time `json:"keep_alive_until,omitempty"`
 }
 
 // ConfigSyncStatus is the account-wide status response. The CLI selects the
@@ -509,12 +495,6 @@ type UsageSummary struct {
 		Running int `json:"running"`
 		Total   int `json:"total"`
 	} `json:"projects"`
-}
-
-// Activity records human/agent activity for server-owned idle detection.
-func (c *Client) Activity(ctx context.Context, projectID, source string) error {
-	body := map[string]any{"source": "cli_activity", "metadata": map[string]any{"event": source}}
-	return c.do(ctx, http.MethodPost, "/v1/projects/"+url.PathEscape(projectID)+"/activity", body, nil)
 }
 
 // ConfigSyncStatus gets the authenticated account's configuration sync state.
@@ -700,8 +680,12 @@ func (c *Client) listTerminalSessions(ctx context.Context, basePath string) ([]T
 }
 
 func (c *Client) CreateTerminalSession(ctx context.Context, projectID, name, idempotencyKey string) (TerminalSession, error) {
+	return c.CreateTerminalSessionWithMode(ctx, projectID, name, "herdr", idempotencyKey)
+}
+
+func (c *Client) CreateTerminalSessionWithMode(ctx context.Context, projectID, name, terminalMode, idempotencyKey string) (TerminalSession, error) {
 	var out TerminalSession
-	body := map[string]string{}
+	body := map[string]string{"terminal_mode": terminalMode}
 	if name != "" {
 		body["name"] = name
 	}
@@ -731,8 +715,12 @@ func (c *Client) ListUserMachineTerminalSessions(ctx context.Context, machineID 
 }
 
 func (c *Client) CreateUserMachineTerminalSession(ctx context.Context, machineID, name, idempotencyKey string) (TerminalSession, error) {
+	return c.CreateUserMachineTerminalSessionWithMode(ctx, machineID, name, "herdr", idempotencyKey)
+}
+
+func (c *Client) CreateUserMachineTerminalSessionWithMode(ctx context.Context, machineID, name, terminalMode, idempotencyKey string) (TerminalSession, error) {
 	var out TerminalSession
-	body := map[string]string{}
+	body := map[string]string{"terminal_mode": terminalMode}
 	if name != "" {
 		body["name"] = name
 	}
@@ -775,16 +763,6 @@ func (c *Client) ProjectConnectionReadinessForSession(ctx context.Context, proje
 	if err == nil {
 		err = out.NormalizeConnectionDescriptor()
 	}
-	return out, err
-}
-
-func (c *Client) SetKeepAlive(ctx context.Context, projectID string, durationSeconds int, clear bool) (KeepAliveResponse, error) {
-	var out KeepAliveResponse
-	body := map[string]any{
-		"duration_seconds": durationSeconds,
-		"clear":            clear,
-	}
-	err := c.do(ctx, http.MethodPost, "/v1/projects/"+url.PathEscape(projectID)+"/keep-alive", body, &out)
 	return out, err
 }
 

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -20,7 +19,7 @@ import (
 )
 
 const (
-	helperProtocolVersion = "1.0"
+	helperProtocolVersion = "2.0"
 	helperMaxFrame        = 256 << 10
 	helperRequestTimeout  = 30 * time.Second
 	helperReplayGapMarker = "\r\n[paperboat] Earlier terminal output is unavailable; showing retained output.\r\n"
@@ -67,24 +66,34 @@ type helperOutput struct {
 	endSequence uint64
 }
 
+type helperWrite struct {
+	messageType int
+	data        []byte
+	result      chan error
+}
+
 type helperTerminalConn struct {
 	ws     *websocket.Conn
 	target *resolver.TerminalTarget
 
-	writeMu sync.Mutex
-	readMu  sync.Mutex
-	pending []byte
-	current *helperOutput
-	out     chan helperOutput
-	done    chan struct{}
+	readMu        sync.Mutex
+	pending       []byte
+	current       *helperOutput
+	out           chan helperOutput
+	done          chan struct{}
+	inputWrites   chan helperWrite
+	controlWrites chan helperWrite
+	detachWrites  chan helperWrite
+	ackWrites     chan helperWrite
 
 	pendingMu sync.Mutex
 	responses map[string]chan helperFrame
 
 	attachmentID string
+	streamID     uint32
 	generation   uint64
-	inputStream  bool
 	inputSeq     atomic.Uint64
+	resizeSeq    atomic.Uint64
 	ackLatest    atomic.Uint64
 	ackSent      atomic.Uint64
 	ackNotify    chan struct{}
@@ -101,11 +110,11 @@ func newHelperTerminalConn(ws *websocket.Conn, target *resolver.TerminalTarget, 
 	if queue < 1 {
 		queue = terminalOutputQueueChunks
 	}
-	return &helperTerminalConn{ws: ws, target: target, out: make(chan helperOutput, queue), done: make(chan struct{}), ackNotify: make(chan struct{}, 1), responses: make(map[string]chan helperFrame)}
+	return &helperTerminalConn{ws: ws, target: target, out: make(chan helperOutput, queue), done: make(chan struct{}), inputWrites: make(chan helperWrite, 64), controlWrites: make(chan helperWrite, 16), detachWrites: make(chan helperWrite, 1), ackWrites: make(chan helperWrite, 1), ackNotify: make(chan struct{}, 1), responses: make(map[string]chan helperFrame)}
 }
 
 func helperHandshake(ctx context.Context, ws *websocket.Conn) (bool, error) {
-	payload, _ := json.Marshal(map[string]any{"min_version": helperProtocolVersion, "max_version": helperProtocolVersion, "capabilities": []string{"terminal.v1", "terminal.input-stream.v1", "health.v1"}})
+	payload, _ := json.Marshal(map[string]any{"min_version": helperProtocolVersion, "max_version": helperProtocolVersion, "capabilities": []string{"terminal.v2", "health.v1"}})
 	requestID := helperID("req_")
 	if err := writeHelperFrame(ctx, ws, helperFrame{Type: "hello", RequestID: requestID, Version: helperProtocolVersion, Payload: payload}); err != nil {
 		return false, err
@@ -124,10 +133,10 @@ func helperHandshake(ctx context.Context, ws *websocket.Conn) (bool, error) {
 		Version      string   `json:"version"`
 		Capabilities []string `json:"capabilities"`
 	}
-	if json.Unmarshal(frame.Payload, &welcome) != nil || welcome.Version != helperProtocolVersion || !containsString(welcome.Capabilities, "terminal.v1") || !containsString(welcome.Capabilities, "health.v1") {
+	if json.Unmarshal(frame.Payload, &welcome) != nil || welcome.Version != helperProtocolVersion || !containsString(welcome.Capabilities, "terminal.v2") || !containsString(welcome.Capabilities, "health.v1") {
 		return false, errors.New("helper did not negotiate required capabilities")
 	}
-	return containsString(welcome.Capabilities, "terminal.input-stream.v1"), nil
+	return true, nil
 }
 
 func helperCheck(ctx context.Context, ws *websocket.Conn) error {
@@ -146,7 +155,7 @@ func (c *helperTerminalConn) initialize(ctx context.Context) error {
 		return errors.New("canonical terminal descriptor is missing session ID")
 	}
 	snapshotPayload, _ := json.Marshal(map[string]any{"action": "snapshot", "session_id": c.target.SessionID})
-	frame, err := helperRequestSync(ctx, c.ws, "terminal.v1", snapshotPayload)
+	frame, err := helperRequestSync(ctx, c.ws, "terminal.v2", snapshotPayload)
 	existingSession := err == nil
 	var snapshotLatest uint64
 	if err != nil {
@@ -161,9 +170,12 @@ func (c *helperTerminalConn) initialize(ctx context.Context) error {
 		if rows == 0 {
 			rows = 24
 		}
-		name := canonicalSessionName(c.target.TerminalID)
-		createPayload, _ := json.Marshal(map[string]any{"action": "create", "session_id": c.target.SessionID, "name": name, "cwd": c.target.CWD, "columns": cols, "rows": rows})
-		frame, err = helperRequestSync(ctx, c.ws, "terminal.v1", createPayload)
+		// The server-bound session ID remains unique across machine re-enrollment.
+		// Terminal IDs such as "term-1" can be reused and collide with durable
+		// helper history left by the previous machine identity.
+		name := canonicalSessionName(c.target.SessionID)
+		createPayload, _ := json.Marshal(map[string]any{"action": "create", "session_id": c.target.SessionID, "name": name, "cwd": c.target.CWD, "terminal_mode": c.target.TerminalMode, "columns": cols, "rows": rows, "environment": c.target.Env})
+		frame, err = helperRequestSync(ctx, c.ws, "terminal.v2", createPayload)
 		if err != nil {
 			return fmt.Errorf("create helper terminal session: %w", err)
 		}
@@ -173,7 +185,7 @@ func (c *helperTerminalConn) initialize(ctx context.Context) error {
 		snapshotLatest = latestSequence
 		if c.target.RestartIfNotRunning && (state == "exited" || state == "closed") {
 			restartPayload, _ := json.Marshal(map[string]any{"action": "restart", "session_id": c.target.SessionID})
-			frame, err = helperRequestSync(ctx, c.ws, "terminal.v1", restartPayload)
+			frame, err = helperRequestSync(ctx, c.ws, "terminal.v2", restartPayload)
 			if err != nil {
 				return fmt.Errorf("restart helper terminal session: %w", err)
 			}
@@ -196,7 +208,7 @@ func (c *helperTerminalConn) initialize(ctx context.Context) error {
 	}
 	attach := func(sequence uint64) (helperFrame, error) {
 		payload, _ := json.Marshal(map[string]any{"action": "attach", "session_id": c.target.SessionID, "from_sequence": sequence, "at_live_boundary": existingSession})
-		return helperRequestSync(ctx, c.ws, "terminal.v1", payload)
+		return helperRequestSync(ctx, c.ws, "terminal.v2", payload)
 	}
 	frame, err = attach(fromSequence)
 	for attempt := 0; err != nil; attempt++ {
@@ -214,6 +226,9 @@ func (c *helperTerminalConn) initialize(ctx context.Context) error {
 			c.target.SequenceSink(int(remote.Details.EarliestSequence))
 		}
 		if attempt == 0 {
+			if c.target.ReplayGapSink != nil {
+				c.target.ReplayGapSink(remote.Details.RequestedSequence, remote.Details.EarliestSequence, remote.Details.LatestSequence)
+			}
 			c.initial = append(c.initial, helperOutput{data: []byte(helperReplayGapMarker), endSequence: remote.Details.EarliestSequence})
 			c.replayRedraw.Store(true)
 		}
@@ -221,6 +236,7 @@ func (c *helperTerminalConn) initialize(ctx context.Context) error {
 	}
 	var response struct {
 		Result struct {
+			StreamID     uint32 `json:"stream_id"`
 			AttachmentID string `json:"attachment_id"`
 			Session      struct {
 				Snapshot struct {
@@ -229,10 +245,11 @@ func (c *helperTerminalConn) initialize(ctx context.Context) error {
 			} `json:"session"`
 		} `json:"result"`
 	}
-	if json.Unmarshal(frame.Payload, &response) != nil || response.Result.AttachmentID == "" {
+	if json.Unmarshal(frame.Payload, &response) != nil || response.Result.StreamID == 0 || response.Result.AttachmentID == "" {
 		return errors.New("helper returned an invalid terminal attachment")
 	}
 	c.attachmentID = response.Result.AttachmentID
+	c.streamID = response.Result.StreamID
 	if response.Result.Session.Snapshot.Generation != 0 {
 		c.generation = response.Result.Session.Snapshot.Generation
 	}
@@ -244,6 +261,7 @@ func (c *helperTerminalConn) initialize(ctx context.Context) error {
 		// Ask it to repaint after the caller applies the local terminal size.
 		c.replayRedraw.Store(true)
 	}
+	go c.writeLoop()
 	go c.readLoop()
 	go c.ackLoop()
 	return nil
@@ -334,11 +352,68 @@ func (c *helperTerminalConn) request(capability string, payload any) (helperFram
 }
 
 func (c *helperTerminalConn) writeFrame(frame helperFrame) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	ctx, cancel := context.WithTimeout(context.Background(), websocketWriteTimeout)
-	defer cancel()
-	return writeHelperFrame(ctx, c.ws, frame)
+	encoded, err := json.Marshal(frame)
+	if err != nil || len(encoded) == 0 || len(encoded) > 64<<10 {
+		return errors.New("helper structured frame is invalid")
+	}
+	queue := c.controlWrites
+	if frame.Type == "detach" {
+		queue = c.detachWrites
+	}
+	return c.queueWrite(queue, helperWrite{messageType: websocket.TextMessage, data: encoded, result: make(chan error, 1)})
+}
+
+func (c *helperTerminalConn) queueWrite(queue chan helperWrite, write helperWrite) error {
+	select {
+	case queue <- write:
+	case <-c.done:
+		return c.terminalError()
+	}
+	select {
+	case err := <-write.result:
+		return err
+	case <-c.done:
+		return c.terminalError()
+	}
+}
+
+func (c *helperTerminalConn) writeLoop() {
+	for {
+		write, ok := c.nextWrite()
+		if !ok {
+			return
+		}
+		_ = c.ws.SetWriteDeadline(time.Now().Add(websocketWriteTimeout))
+		err := c.ws.WriteMessage(write.messageType, write.data)
+		_ = c.ws.SetWriteDeadline(time.Time{})
+		write.result <- err
+		if err != nil {
+			c.finish(1, errors.Join(ErrTransportLost, err))
+			return
+		}
+	}
+}
+
+func (c *helperTerminalConn) nextWrite() (helperWrite, bool) {
+	for _, queue := range []chan helperWrite{c.inputWrites, c.controlWrites, c.detachWrites, c.ackWrites} {
+		select {
+		case write := <-queue:
+			return write, true
+		default:
+		}
+	}
+	select {
+	case write := <-c.inputWrites:
+		return write, true
+	case write := <-c.controlWrites:
+		return write, true
+	case write := <-c.detachWrites:
+		return write, true
+	case write := <-c.ackWrites:
+		return write, true
+	case <-c.done:
+		return helperWrite{}, false
+	}
 }
 
 func (c *helperTerminalConn) readLoop() {
@@ -384,7 +459,7 @@ func (c *helperTerminalConn) readLoop() {
 				response <- frame
 			}
 		case websocket.BinaryMessage:
-			output, err := decodeHelperBinary(data)
+			output, err := c.decodeHelperBinary(data)
 			if err != nil {
 				c.finish(1, errors.Join(ErrTransportLost, err))
 				return
@@ -512,43 +587,27 @@ func (c *helperTerminalConn) flushAck() {
 }
 
 func (c *helperTerminalConn) sendAck(sequence uint64) error {
-	payload, _ := json.Marshal(map[string]any{"session_id": c.target.SessionID, "attachment_id": c.attachmentID, "next_sequence": sequence})
-	return c.writeFrame(helperFrame{Type: "ack", RequestID: helperID("req_"), Version: helperProtocolVersion, Payload: payload})
+	message := make([]byte, 13)
+	message[0] = 3
+	binary.BigEndian.PutUint32(message[1:5], c.streamID)
+	binary.BigEndian.PutUint64(message[5:13], sequence)
+	return c.queueWrite(c.ackWrites, helperWrite{messageType: websocket.BinaryMessage, data: message, result: make(chan error, 1)})
 }
 
 func (c *helperTerminalConn) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	if !c.inputStream {
-		inputID := fmt.Sprintf("input_%016x", c.inputSeq.Add(1))
-		_, err := c.request("terminal.v1", map[string]any{"action": "input", "session_id": c.target.SessionID, "attachment_id": c.attachmentID, "generation": c.generation, "input_id": inputID, "bytes_base64": base64.StdEncoding.EncodeToString(p)})
-		if err != nil {
-			return 0, err
-		}
-		return len(p), nil
-	}
-	if len(c.target.SessionID) > 128 || len(c.attachmentID) > 128 || len(p) > helperMaxFrame-9-12-len(c.target.SessionID)-len(c.attachmentID) {
+	if c.streamID == 0 || len(p) > helperMaxFrame-13 {
 		return 0, errors.New("terminal input frame is invalid")
 	}
 	sequence := c.inputSeq.Add(1)
-	body := make([]byte, 12+len(c.target.SessionID)+len(c.attachmentID)+len(p))
-	binary.BigEndian.PutUint16(body[:2], uint16(len(c.target.SessionID)))
-	binary.BigEndian.PutUint16(body[2:4], uint16(len(c.attachmentID)))
-	binary.BigEndian.PutUint64(body[4:12], c.generation)
-	copy(body[12:], c.target.SessionID)
-	copy(body[12+len(c.target.SessionID):], c.attachmentID)
-	copy(body[12+len(c.target.SessionID)+len(c.attachmentID):], p)
-	message := make([]byte, 13+len(body))
-	binary.BigEndian.PutUint32(message[:4], uint32(9+len(body)))
-	message[4] = 3 // paperboat terminal-input binary channel
+	message := make([]byte, 13+len(p))
+	message[0] = 1
+	binary.BigEndian.PutUint32(message[1:5], c.streamID)
 	binary.BigEndian.PutUint64(message[5:13], sequence)
-	copy(message[13:], body)
-	c.writeMu.Lock()
-	_ = c.ws.SetWriteDeadline(time.Now().Add(websocketWriteTimeout))
-	err := c.ws.WriteMessage(websocket.BinaryMessage, message)
-	_ = c.ws.SetWriteDeadline(time.Time{})
-	c.writeMu.Unlock()
+	copy(message[13:], p)
+	err := c.queueWrite(c.inputWrites, helperWrite{messageType: websocket.BinaryMessage, data: message, result: make(chan error, 1)})
 	if err != nil {
 		return 0, err
 	}
@@ -559,11 +618,14 @@ func (c *helperTerminalConn) Resize(rows, cols uint16) error {
 	if rows == 0 || cols == 0 {
 		return nil
 	}
-	// Preserve control ordering while allowing ordinary output bursts to share
-	// one cumulative acknowledgement.
-	c.flushAck()
 	redraw := c.replayRedraw.Swap(false)
-	_, err := c.request("terminal.v1", map[string]any{"action": "resize", "session_id": c.target.SessionID, "attachment_id": c.attachmentID, "columns": cols, "rows": rows})
+	message := make([]byte, 17)
+	message[0] = 4
+	binary.BigEndian.PutUint32(message[1:5], c.streamID)
+	binary.BigEndian.PutUint16(message[5:7], cols)
+	binary.BigEndian.PutUint16(message[7:9], rows)
+	binary.BigEndian.PutUint64(message[9:17], c.resizeSeq.Add(1))
+	err := c.queueWrite(c.controlWrites, helperWrite{messageType: websocket.BinaryMessage, data: message, result: make(chan error, 1)})
 	if err != nil || !redraw {
 		if err != nil && redraw {
 			c.replayRedraw.Store(true)
@@ -616,15 +678,12 @@ func writeHelperFrame(ctx context.Context, ws *websocket.Conn, frame helperFrame
 	if len(encoded) == 0 || len(encoded) > 64<<10 {
 		return errors.New("helper structured frame is invalid")
 	}
-	message := make([]byte, 4+len(encoded))
-	binary.BigEndian.PutUint32(message[:4], uint32(len(encoded)))
-	copy(message[4:], encoded)
 	deadline, ok := ctx.Deadline()
 	if ok {
 		_ = ws.SetWriteDeadline(deadline)
 		defer ws.SetWriteDeadline(time.Time{})
 	}
-	return ws.WriteMessage(websocket.TextMessage, message)
+	return ws.WriteMessage(websocket.TextMessage, encoded)
 }
 
 func readHelperStructured(ctx context.Context, ws *websocket.Conn) (helperFrame, error) {
@@ -643,14 +702,10 @@ func readHelperStructured(ctx context.Context, ws *websocket.Conn) (helperFrame,
 }
 
 func decodeHelperFrame(data []byte) (helperFrame, error) {
-	if len(data) < 5 {
+	if len(data) == 0 || len(data) > 64<<10 {
 		return helperFrame{}, errors.New("helper structured frame is truncated")
 	}
-	length := int(binary.BigEndian.Uint32(data[:4]))
-	if length != len(data)-4 || length > 64<<10 {
-		return helperFrame{}, errors.New("helper structured frame has invalid length")
-	}
-	decoder := json.NewDecoder(bytes.NewReader(data[4:]))
+	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	var frame helperFrame
 	if err := decoder.Decode(&frame); err != nil {
@@ -662,16 +717,15 @@ func decodeHelperFrame(data []byte) (helperFrame, error) {
 	return frame, nil
 }
 
-func decodeHelperBinary(data []byte) (helperOutput, error) {
-	if len(data) < 13 {
+func (c *helperTerminalConn) decodeHelperBinary(data []byte) (helperOutput, error) {
+	if len(data) <= 14 {
 		return helperOutput{}, errors.New("helper binary frame is truncated")
 	}
-	length := int(binary.BigEndian.Uint32(data[:4]))
-	if length != len(data)-4 || length > helperMaxFrame || (data[4] != 1 && data[4] != 2) {
+	if len(data) > helperMaxFrame || data[0] != 2 || (data[1] != 1 && data[1] != 2) || binary.BigEndian.Uint32(data[2:6]) != c.streamID {
 		return helperOutput{}, errors.New("helper binary frame is invalid")
 	}
-	start := binary.BigEndian.Uint64(data[5:13])
-	body := append([]byte(nil), data[13:]...)
+	start := binary.BigEndian.Uint64(data[6:14])
+	body := data[14:]
 	return helperOutput{data: body, endSequence: start + uint64(len(body))}, nil
 }
 

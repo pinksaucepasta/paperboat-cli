@@ -91,8 +91,15 @@ type ReconnectingConn struct {
 	now               func() time.Time
 	correlation       TelemetryContext
 	outputBytes       atomic.Int64
+	outputFrames      atomic.Int64
+	inputBytes        atomic.Int64
+	inputFrames       atomic.Int64
+	lastInputAt       atomic.Int64
+	echoSamples       atomic.Int64
 	maxQueueChunks    atomic.Int64
 	maxWriteLatencyMS atomic.Int64
+	maxInputLatencyMS atomic.Int64
+	maxEchoLatencyMS  atomic.Int64
 	outputBatchWindow time.Duration
 	observer          func(ReconnectEvent)
 }
@@ -291,8 +298,26 @@ func (c *ReconnectingConn) Read(p []byte) (int, error) {
 func (c *ReconnectingConn) ObserveLocalWrite(size int, duration time.Duration) {
 	if size > 0 {
 		c.outputBytes.Add(int64(size))
+		c.outputFrames.Add(1)
 	}
 	updateAtomicMax(&c.maxWriteLatencyMS, duration.Milliseconds())
+	if started := c.lastInputAt.Swap(0); started > 0 {
+		latency := time.Since(time.Unix(0, started))
+		if latency >= 0 {
+			c.echoSamples.Add(1)
+			updateAtomicMax(&c.maxEchoLatencyMS, latency.Milliseconds())
+		}
+	}
+}
+
+func (c *ReconnectingConn) ObserveInputWrite(size int, duration time.Duration) {
+	if size <= 0 {
+		return
+	}
+	c.inputBytes.Add(int64(size))
+	c.inputFrames.Add(1)
+	updateAtomicMax(&c.maxInputLatencyMS, duration.Milliseconds())
+	c.lastInputAt.Store(time.Now().UnixNano())
 }
 
 func (c *ReconnectingConn) recordOutputPerformance(outcome string) {
@@ -309,6 +334,19 @@ func (c *ReconnectingConn) recordOutputPerformance(outcome string) {
 		LatencyMS:     c.maxWriteLatencyMS.Load(),
 		Count:         c.maxQueueChunks.Load(),
 	}
+	if e.Validate() == nil {
+		c.telemetry.Record(e)
+	}
+	c.recordTerminalStage("stdin_to_socket", c.inputBytes.Load(), c.inputFrames.Load(), c.maxInputLatencyMS.Load(), outcome)
+	c.recordTerminalStage("socket_read_to_stdout", c.outputBytes.Load(), c.outputFrames.Load(), c.maxWriteLatencyMS.Load(), outcome)
+	c.recordTerminalStage("input_to_next_output", 0, c.echoSamples.Load(), c.maxEchoLatencyMS.Load(), outcome)
+}
+
+func (c *ReconnectingConn) recordTerminalStage(stage string, bytes, count, latencyMS int64, outcome string) {
+	if c.telemetry == nil || count == 0 {
+		return
+	}
+	e := telemetry.Event{Name: "terminal.stage", At: c.now(), ProjectID: c.correlation.ProjectID, EnvironmentID: c.correlation.EnvironmentID, Outcome: outcome, Stage: stage, SizeBytes: bytes, LatencyMS: latencyMS, Count: count}
 	if e.Validate() == nil {
 		c.telemetry.Record(e)
 	}

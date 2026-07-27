@@ -8,6 +8,7 @@ require (
 	github.com/danieljoos/wincred v1.2.3
 	github.com/godbus/dbus/v5 v5.2.2
 	github.com/gorilla/websocket v1.5.3
+	github.com/hinshun/vt10x v0.0.0-20220301184237-5011da428d02
 	github.com/spf13/cobra v1.10.2
 	github.com/zalando/go-keyring v0.2.8
 	golang.org/x/sys v0.46.0

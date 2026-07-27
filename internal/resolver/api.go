@@ -127,6 +127,7 @@ func (r *APIResolver) Resolve(ctx context.Context, req ConnectRequest) (ConnectI
 			TerminalID:       resp.Terminal.TerminalID,
 			SessionID:        resp.Terminal.SessionID,
 			CWD:              resp.Terminal.CWD,
+			TerminalMode:     resp.Terminal.TerminalMode,
 			ReplayHistory:    true,
 		},
 	}
@@ -426,7 +427,7 @@ func (r *APIResolver) validateDescriptor(resp api.ConnectionDescriptor, target t
 	if !completeTerminalDescriptor(resp.Terminal) {
 		return api.ConnectionDescriptor{}, errors.New("server returned an incomplete terminal descriptor")
 	}
-	if resp.Terminal.Kind != "paperboat_terminal_v1" || resp.Environment == nil || strings.TrimSpace(resp.Environment.EnvironmentID) == "" || !environmentMatchesTarget(resp.Environment, target) {
+	if resp.Terminal.Kind != "paperboat_terminal_v2" || resp.Environment == nil || strings.TrimSpace(resp.Environment.EnvironmentID) == "" || !environmentMatchesTarget(resp.Environment, target) {
 		return api.ConnectionDescriptor{}, errors.New("server returned an invalid environment descriptor")
 	}
 	if strings.TrimSpace(resp.Environment.ProjectRoot) == "" || strings.TrimSpace(resp.Terminal.ThreadID) == "" || strings.TrimSpace(resp.Terminal.TerminalID) == "" || strings.TrimSpace(resp.Terminal.CWD) == "" {
