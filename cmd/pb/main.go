@@ -1327,6 +1327,9 @@ func selectTerminalSessionWithMode(ctx context.Context, client *api.Client, proj
 		if err != nil {
 			return "", friendlyCommandError(err)
 		}
+		if session.EvictedSession != nil {
+			fmt.Fprintf(os.Stderr, "Session limit reached; removed least-recent session %q (%s).\n", session.EvictedSession.Name, session.EvictedSession.State)
+		}
 		return session.ID, nil
 	}
 	session, err := resolveTerminalSession(ctx, client, target, ref)

@@ -339,15 +339,16 @@ type UserMachinePage struct {
 // TerminalSession is the durable session catalog record returned by the
 // control plane. Runtime-only fields may be unavailable while a VM is stopped.
 type TerminalSession struct {
-	ID            string     `json:"id"`
-	Name          string     `json:"name"`
-	IsDefault     bool       `json:"is_default"`
-	State         string     `json:"state"`
-	AttachedCount *int       `json:"attached_count"`
-	LastActiveAt  *time.Time `json:"last_active_at"`
-	CreatedAt     time.Time  `json:"created_at"`
-	UpdatedAt     time.Time  `json:"updated_at"`
-	TerminalMode  string     `json:"terminal_mode"`
+	ID             string           `json:"id"`
+	Name           string           `json:"name"`
+	IsDefault      bool             `json:"is_default"`
+	State          string           `json:"state"`
+	AttachedCount  *int             `json:"attached_count"`
+	LastActiveAt   *time.Time       `json:"last_active_at"`
+	CreatedAt      time.Time        `json:"created_at"`
+	UpdatedAt      time.Time        `json:"updated_at"`
+	TerminalMode   string           `json:"terminal_mode"`
+	EvictedSession *TerminalSession `json:"evicted_session,omitempty"`
 }
 
 type TerminalSessionPage struct {
