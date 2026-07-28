@@ -40,12 +40,18 @@ type HTTPUploader struct {
 	telemetry     telemetry.Sink
 	projectID     string
 	environmentID string
+	progress      func(sent, total int64)
 }
 
 func (u *HTTPUploader) ConfigureTelemetry(sink telemetry.Sink, projectID, environmentID string) {
 	u.telemetry = sink
 	u.projectID = projectID
 	u.environmentID = environmentID
+}
+
+// ConfigureProgress installs a synchronous, rate-limited byte progress sink.
+func (u *HTTPUploader) ConfigureProgress(progress func(sent, total int64)) {
+	u.progress = progress
 }
 
 // Error is the structured error envelope returned by Paperboat's staged-image
@@ -89,13 +95,19 @@ func NewHTTPUploader(baseURL, uploadPath string, auth Auth) *HTTPUploader {
 
 func (u *HTTPUploader) Upload(ctx context.Context, img Image) (string, error) {
 	started := u.now()
-	operationDigest := sha256.Sum256(append(append([]byte(img.Name+"\x00"+img.MimeType+"\x00"), img.Bytes...), byte(0)))
-	key := "upload_" + hex.EncodeToString(operationDigest[:])
+	if img.Reader == nil || img.Size < 1 {
+		return "", fmt.Errorf("staged-image upload requires a prepared image source")
+	}
+	operationHash := sha256.New()
+	_, _ = io.WriteString(operationHash, img.Name+"\x00"+img.MimeType+"\x00"+strconv.FormatInt(img.Size, 10)+"\x00")
+	_, _ = operationHash.Write(img.SHA256[:])
+	operationDigest := operationHash.Sum(nil)
+	key := "upload_" + hex.EncodeToString(operationDigest)
 	for attempt := 0; attempt < 2; attempt++ {
 		auth := u.currentAuth()
 		path, err := u.uploadOnce(ctx, img, key, auth)
 		if err == nil {
-			u.recordUpload("success", int64(len(img.Bytes)), started)
+			u.recordUpload("success", img.Size, started)
 			return path, nil
 		}
 		var stagedErr *Error
@@ -115,10 +127,10 @@ func (u *HTTPUploader) Upload(ctx context.Context, img Image) (string, error) {
 			}
 			err = errors.Join(err, fmt.Errorf("refresh upload authorization: %w", refreshErr))
 		}
-		u.recordUpload("failure", int64(len(img.Bytes)), started)
+		u.recordUpload("failure", img.Size, started)
 		return "", err
 	}
-	u.recordUpload("failure", int64(len(img.Bytes)), started)
+	u.recordUpload("failure", img.Size, started)
 	return "", fmt.Errorf("upload retry exhausted")
 }
 
@@ -160,47 +172,21 @@ func (u *HTTPUploader) uploadOnce(ctx context.Context, img Image, idempotencyKey
 	if auth.Method != "bearer" || auth.Token == "" {
 		return "", fmt.Errorf("staged-image upload requires bearer file:stage auth")
 	}
-	pipeReader, pipeWriter := io.Pipe()
-	mw := multipart.NewWriter(pipeWriter)
-	contentType := mw.FormDataContentType()
-	contentDigest := sha256.Sum256(img.Bytes)
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		header := make(textproto.MIMEHeader)
-		header.Set("Content-Disposition", mime.FormatMediaType("form-data", map[string]string{"name": "file", "filename": img.Name}))
-		header.Set("Content-Type", img.MimeType)
-		part, err := mw.CreatePart(header)
-		if err == nil {
-			_, err = io.Copy(part, bytes.NewReader(img.Bytes))
-		}
-		if err == nil {
-			err = mw.Close()
-		}
-		if err != nil {
-			_ = pipeWriter.CloseWithError(err)
-			return
-		}
-		_ = pipeWriter.Close()
-	}()
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = pipeWriter.CloseWithError(ctx.Err())
-		case <-done:
-		}
-	}()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, pipeReader)
+	if _, err := img.Reader.Seek(0, io.SeekStart); err != nil {
+		return "", fmt.Errorf("rewind staged image: %w", err)
+	}
+	prefix, suffix, contentType, err := multipartEnvelope(img.Name, img.MimeType)
 	if err != nil {
-		_ = pipeWriter.CloseWithError(err)
-		_ = pipeReader.Close()
-		<-done
 		return "", err
 	}
-	defer func() {
-		_ = pipeReader.Close()
-		<-done
-	}()
+	fileReader := &progressReader{reader: io.LimitReader(img.Reader, img.Size), total: img.Size, report: u.progress, nextPercent: 5}
+	body := io.MultiReader(bytes.NewReader(prefix), fileReader, bytes.NewReader(suffix))
+	trackedBody := newTrackedBody(body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, trackedBody)
+	if err != nil {
+		return "", err
+	}
+	req.ContentLength = int64(len(prefix)) + img.Size + int64(len(suffix))
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("Authorization", "Bearer "+auth.Token)
@@ -210,13 +196,19 @@ func (u *HTTPUploader) uploadOnce(ctx context.Context, img Image, idempotencyKey
 	req.Header.Set("X-Paperboat-Deadline-Ms", "30000")
 	req.Header.Set("X-Paperboat-File-Name", img.Name)
 	req.Header.Set("X-Paperboat-File-Mime", img.MimeType)
-	req.Header.Set("X-Paperboat-File-Size", strconv.FormatInt(int64(len(img.Bytes)), 10))
-	req.Header.Set("X-Paperboat-File-Sha256", hex.EncodeToString(contentDigest[:]))
+	req.Header.Set("X-Paperboat-File-Size", strconv.FormatInt(img.Size, 10))
+	req.Header.Set("X-Paperboat-File-Sha256", hex.EncodeToString(img.SHA256[:]))
 	client := u.HTTPClient
 	if client == nil {
 		client = http.DefaultClient
 	}
 	resp, err := client.Do(req)
+	if waitErr := trackedBody.wait(ctx); waitErr != nil && err == nil {
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		return "", waitErr
+	}
 	if err != nil {
 		return "", err
 	}
@@ -251,6 +243,70 @@ func (u *HTTPUploader) uploadOnce(ctx context.Context, img Image, idempotencyKey
 		return out.Path, nil
 	}
 	return "", fmt.Errorf("upload response did not include an absolute VM path")
+}
+
+type trackedBody struct {
+	io.Reader
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newTrackedBody(reader io.Reader) *trackedBody {
+	return &trackedBody{Reader: reader, closed: make(chan struct{})}
+}
+
+func (b *trackedBody) Close() error {
+	b.once.Do(func() { close(b.closed) })
+	return nil
+}
+
+func (b *trackedBody) wait(ctx context.Context) error {
+	select {
+	case <-b.closed:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func multipartEnvelope(name, mimeType string) (prefix, suffix []byte, contentType string, err error) {
+	var framing bytes.Buffer
+	writer := multipart.NewWriter(&framing)
+	header := make(textproto.MIMEHeader)
+	header.Set("Content-Disposition", mime.FormatMediaType("form-data", map[string]string{"name": "file", "filename": name}))
+	header.Set("Content-Type", mimeType)
+	if _, err = writer.CreatePart(header); err != nil {
+		return nil, nil, "", fmt.Errorf("create multipart image part: %w", err)
+	}
+	prefix = append([]byte(nil), framing.Bytes()...)
+	prefixLength := framing.Len()
+	contentType = writer.FormDataContentType()
+	if err = writer.Close(); err != nil {
+		return nil, nil, "", fmt.Errorf("close multipart image body: %w", err)
+	}
+	suffix = append([]byte(nil), framing.Bytes()[prefixLength:]...)
+	return prefix, suffix, contentType, nil
+}
+
+type progressReader struct {
+	reader      io.Reader
+	total       int64
+	sent        int64
+	nextPercent int64
+	report      func(sent, total int64)
+}
+
+func (r *progressReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if n > 0 {
+		r.sent += int64(n)
+		percent := r.sent * 100 / r.total
+		if r.report != nil && (percent >= r.nextPercent || r.sent == r.total) {
+			r.report(r.sent, r.total)
+			r.nextPercent = (percent/5 + 1) * 5
+		}
+	}
+	return n, err
 }
 
 func uploadURL(base, uploadPath string) (string, error) {

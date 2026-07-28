@@ -9,6 +9,7 @@ package upload
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"mime"
@@ -17,21 +18,29 @@ import (
 	"strings"
 )
 
-// Image is a prepared, in-memory image ready to upload.
+// Image is a prepared, seekable image descriptor ready to upload.
 type Image struct {
 	Name     string
 	MimeType string
-	Bytes    []byte
-	// DataURL is retained for callers that prepare images for older integrations;
-	// staged-image HTTP uploads send Bytes as a multipart stream.
-	DataURL string
+	Size     int64
+	SHA256   [sha256.Size]byte
+	Reader   io.ReadSeeker
+	close    io.Closer
+}
+
+// Close releases an image opened by PrepareImage. Images prepared from a
+// caller-owned descriptor do not take ownership of that descriptor.
+func (i Image) Close() error {
+	if i.close == nil {
+		return nil
+	}
+	return i.close.Close()
 }
 
 // Limits captures the Paperboat-compatible upload constraints. They come from
 // config so they stay tunable and in sync with the server.
 type Limits struct {
 	MaxImageBytes       int64
-	MaxDataURLChars     int
 	MaxAttachments      int
 	AllowedMimePrefixes []string
 	AllowedMIMETypes    []string
@@ -44,8 +53,8 @@ type Uploader interface {
 	Upload(ctx context.Context, img Image) (vmPath string, err error)
 }
 
-// PrepareImage reads a local file, infers its MIME type, enforces limits, and
-// prepares raw bytes for the streaming multipart uploader. It returns an error
+// PrepareImage opens a local file, infers its MIME type, enforces limits, and
+// prepares a descriptor for the streaming multipart uploader. It returns an error
 // if the file is not an allowed image or exceeds a limit — callers fail open
 // (keep the original paste text).
 func PrepareImage(path string, limits Limits) (Image, error) {
@@ -53,8 +62,13 @@ func PrepareImage(path string, limits Limits) (Image, error) {
 	if err != nil {
 		return Image{}, fmt.Errorf("open image: %w", err)
 	}
-	defer f.Close()
-	return PrepareImageFile(f, path, limits)
+	image, err := PrepareImageFile(f, path, limits)
+	if err != nil {
+		_ = f.Close()
+		return Image{}, err
+	}
+	image.close = f
+	return image, nil
 }
 
 // PrepareImageFile validates and reads an already-open image descriptor. The
@@ -80,25 +94,36 @@ func PrepareImageFile(f *os.File, displayPath string, limits Limits) (Image, err
 		return Image{}, fmt.Errorf("seek image: %w", err)
 	}
 
-	// Read through the already-open descriptor so a path replacement after the
-	// validation above cannot cause us to upload a different file. The extra
-	// byte makes the post-read limit check allocation-bounded.
+	// Hash through the already-open descriptor so a path replacement after the
+	// validation above cannot change the selected file. The upload later rewinds
+	// and streams this same descriptor without retaining a second in-memory copy.
 	var reader io.Reader = f
 	if limits.MaxImageBytes > 0 {
 		reader = io.LimitReader(f, limits.MaxImageBytes+1)
 	}
-	data, err := io.ReadAll(reader)
+	hash := sha256.New()
+	read, err := io.CopyBuffer(hash, reader, make([]byte, 32<<10))
 	if err != nil {
-		return Image{}, fmt.Errorf("read image: %w", err)
+		return Image{}, fmt.Errorf("hash image: %w", err)
 	}
-	if limits.MaxImageBytes > 0 && int64(len(data)) > limits.MaxImageBytes {
-		return Image{}, fmt.Errorf("image %s is %d bytes, over limit %d", displayPath, len(data), limits.MaxImageBytes)
+	if limits.MaxImageBytes > 0 && read > limits.MaxImageBytes {
+		return Image{}, fmt.Errorf("image %s is %d bytes, over limit %d", displayPath, read, limits.MaxImageBytes)
 	}
+	if read != info.Size() {
+		return Image{}, fmt.Errorf("image %s changed while it was being prepared", displayPath)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return Image{}, fmt.Errorf("rewind image: %w", err)
+	}
+	var digest [sha256.Size]byte
+	copy(digest[:], hash.Sum(nil))
 
 	return Image{
 		Name:     filepath.Base(displayPath),
 		MimeType: mimeType,
-		Bytes:    data,
+		Size:     read,
+		SHA256:   digest,
+		Reader:   f,
 	}, nil
 }
 

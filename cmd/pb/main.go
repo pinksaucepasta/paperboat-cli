@@ -167,7 +167,9 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(&cobra.Command{Use: "login", Short: "Sign in through the Paperboat dashboard", Args: commandArgs(cobra.NoArgs), RunE: actionRun(authLogin)})
 	root.AddCommand(&cobra.Command{Use: "logout", Short: "Revoke and remove the active client session", Args: commandArgs(cobra.NoArgs), RunE: actionRun(authLogout)})
 	root.AddCommand(&cobra.Command{Use: "create [name]", Short: "Create and attach to a hosted project", Args: commandArgs(cobra.MaximumNArgs(1)), RunE: actionRun(createProject)})
-	root.AddCommand(specTree(configCommand(), "config"))
+	configTree := specTree(configCommand(), "config")
+	configTree.AddCommand(statusBarConfigCommand())
+	root.AddCommand(configTree)
 	root.AddCommand(specTree(previewCommand(), "preview"))
 	root.AddCommand(sessionsCobraCommand())
 	root.AddCommand(sessionCobraCommand())
@@ -180,6 +182,13 @@ func addConnectFlags(command *cobra.Command) {
 	command.Flags().String("name", "", "name for a new terminal session")
 	command.Flags().String("session", "", "attach an existing terminal session by name or ID")
 	command.Flags().Bool("no-herdr", false, "start the new terminal session with the configured shell")
+	addStatusBarFlags(command)
+}
+
+func addStatusBarFlags(command *cobra.Command) {
+	command.Flags().String("status-bar", "", "status bar for this attach: auto, on, or off")
+	command.Flags().String("status-bar-fullscreen", "", "status bar in full-screen applications: hide or show")
+	command.Flags().String("status-bar-theme", "", "status bar theme: terminal, dark, light, or mono")
 }
 
 func validateConnectInvocation(command *cobra.Command) error {
@@ -195,6 +204,16 @@ func validateConnectInvocation(command *cobra.Command) error {
 	}
 	if noHerdr && !newSession {
 		return invocationError(errors.New("--no-herdr requires --new"))
+	}
+	for name, allowed := range map[string][]string{
+		"status-bar":            {"auto", "on", "off"},
+		"status-bar-fullscreen": {"hide", "show"},
+		"status-bar-theme":      {"terminal", "dark", "light", "mono"},
+	} {
+		value, _ := command.Flags().GetString(name)
+		if value != "" && !containsString(allowed, strings.ToLower(strings.TrimSpace(value))) {
+			return invocationError(fmt.Errorf("--%s must be one of %s", name, strings.Join(allowed, ", ")))
+		}
 	}
 	server, _ := command.Flags().GetString("server")
 	if strings.TrimSpace(server) != "" {
@@ -293,6 +312,9 @@ func sessionCobraCommand() *cobra.Command {
 	source := sessionsCommand()
 	command := &cobra.Command{Use: "session", Short: source.Usage, Args: commandArgs(cobra.NoArgs), RunE: func(command *cobra.Command, _ []string) error { return command.Help() }}
 	attach := &cobra.Command{Use: "attach <name>", Short: "Attach to a durable terminal session", Args: commandArgs(cobra.ExactArgs(1)), RunE: func(cobraCommand *cobra.Command, args []string) error {
+		if err := validateConnectInvocation(cobraCommand); err != nil {
+			return err
+		}
 		if err := cobraCommand.Flags().Set("session", args[0]); err != nil {
 			return err
 		}
@@ -300,6 +322,7 @@ func sessionCobraCommand() *cobra.Command {
 	}}
 	attach.Flags().String("session", "", "")
 	_ = attach.Flags().MarkHidden("session")
+	addStatusBarFlags(attach)
 	command.AddCommand(attach)
 	list := &cobra.Command{Use: "list [environment]", Short: "List durable terminal sessions", Args: commandArgs(cobra.MaximumNArgs(1)), RunE: actionRun(source.Action)}
 	list.Flags().Bool("wide", false, "include immutable IDs")
@@ -511,7 +534,7 @@ func actionRun(action command.Action) func(*cobra.Command, []string) error {
 func actionContext(cobraCommand *cobra.Command, args []string) *command.Context {
 	set := flag.NewFlagSet("pb", flag.ContinueOnError)
 	values := map[string]string{}
-	for _, name := range []string{"config", "server", "name", "session"} {
+	for _, name := range []string{"config", "server", "name", "session", "status-bar", "status-bar-fullscreen", "status-bar-theme"} {
 		value, _ := cobraCommand.Flags().GetString(name)
 		values[name] = value
 		set.String(name, value, "")
@@ -529,6 +552,15 @@ func actionContext(cobraCommand *cobra.Command, args []string) *command.Context 
 	context.Writer = cobraCommand.OutOrStdout()
 	context.ErrWriter = cobraCommand.ErrOrStderr()
 	return context
+}
+
+func containsString(values []string, wanted string) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 func newApp() *command.App {
@@ -1528,8 +1560,29 @@ func actionConnectTarget(c *command.Context, requested string) error {
 			return err
 		}
 	}
+	statusConfig := d.cfg.StatusBar
+	if value := strings.TrimSpace(c.String("status-bar")); value != "" {
+		statusConfig.Mode = strings.ToLower(value)
+	}
+	if value := strings.TrimSpace(c.String("status-bar-fullscreen")); value != "" {
+		statusConfig.Fullscreen = strings.ToLower(value)
+	}
+	if value := strings.TrimSpace(c.String("status-bar-theme")); value != "" {
+		statusConfig.Theme = strings.ToLower(value)
+	}
 	bar := statusbar.New(statusbar.Options{
-		Mode:           d.cfg.StatusBar.Mode,
+		Mode:          statusConfig.Mode,
+		Fullscreen:    statusConfig.Fullscreen,
+		Theme:         statusConfig.Theme,
+		Privacy:       statusConfig.Privacy,
+		TerminalTitle: statusConfig.TerminalTitle,
+		Colors: statusbar.Colors{
+			Foreground: statusConfig.Colors.Foreground,
+			Background: statusConfig.Colors.Background,
+			Accent:     statusConfig.Colors.Accent,
+			Warning:    statusConfig.Colors.Warning,
+			Error:      statusConfig.Colors.Error,
+		},
 		NoticeDuration: time.Duration(d.cfg.StatusBar.NoticeSeconds) * time.Second,
 		Layout: statusbar.Layout{
 			Left:   d.cfg.StatusBar.Left,
@@ -1611,6 +1664,13 @@ func actionConnectTarget(c *command.Context, requested string) error {
 			environmentID = info.Terminal.EnvironmentID
 		}
 		httpUploader.ConfigureTelemetry(d.telemetry, projectID, environmentID)
+		if useStatusBar {
+			httpUploader.ConfigureProgress(func(sent, total int64) {
+				if total > 0 {
+					bar.Loading(fmt.Sprintf("Uploading image %d%%", sent*100/total))
+				}
+			})
+		}
 		httpUploader.RefreshAuth = func(refreshCtx context.Context) (upload.Auth, error) {
 			return refreshUploadAuthorization(refreshCtx, d.auth, func(credential config.Credential) resolver.ProjectResolver {
 				return newResolver(credential)
@@ -1767,13 +1827,18 @@ func actionConnectTarget(c *command.Context, requested string) error {
 	if useStatusBar && info.TargetKind == "project" {
 		pollCtx, cancelPoll := context.WithCancel(ctx)
 		defer cancelPoll()
-		go pollConfigSync(pollCtx, d.cfg.ServerURL, d.auth, info.ProjectID, time.Duration(d.cfg.StatusBar.SyncPollSeconds)*time.Second, bar)
+		go pollConfigSync(pollCtx, d.cfg.ServerURL, d.auth, info.ProjectID, 30*time.Second, bar)
 	}
 	runOptions := []session.RunOption{
 		session.WithOutputBufferBytes(d.cfg.Connect.TerminalOutputBufferBytes),
 		session.WithBracketedPaste(),
 	}
 	if useStatusBar {
+		bar.SetViewportChanged(func(cols, rows uint16) {
+			if cols > 0 && rows > 0 {
+				_ = conn.Resize(rows, cols)
+			}
+		})
 		runOptions = append(runOptions, session.WithOutput(bar), session.WithRemoteSize(remoteSize))
 	}
 	code, err := session.Run(ctx, conn, interceptor, runOptions...)
@@ -2102,7 +2167,6 @@ func uploaderForTarget(target *resolver.UploadTarget) upload.Uploader {
 func uploadLimits(cfg *config.Config, target *resolver.UploadTarget) upload.Limits {
 	limits := upload.Limits{
 		MaxImageBytes:       cfg.Upload.MaxImageBytes,
-		MaxDataURLChars:     cfg.Upload.MaxDataURLChars,
 		MaxAttachments:      cfg.Upload.MaxAttachments,
 		AllowedMimePrefixes: cfg.Upload.AllowedMimePrefixes,
 	}
@@ -2252,18 +2316,211 @@ func configCommand() *command.Spec {
 						return err
 					}
 					if c.Bool("json") {
-						return json.NewEncoder(os.Stdout).Encode(map[string]any{"path": d.cfg.Path(), "server_url": d.cfg.ServerURL, "auth_file_fallback": d.cfg.Auth.AllowFileFallback, "upload_endpoint": d.cfg.Upload.Endpoint, "upload_max_image_bytes": d.cfg.Upload.MaxImageBytes, "upload_max_attachments": d.cfg.Upload.MaxAttachments})
+						return json.NewEncoder(os.Stdout).Encode(map[string]any{"path": d.cfg.Path(), "server_url": d.cfg.ServerURL, "auth_file_fallback": d.cfg.Auth.AllowFileFallback, "upload_endpoint": d.cfg.Upload.Endpoint, "upload_max_image_bytes": d.cfg.Upload.MaxImageBytes, "upload_max_attachments": d.cfg.Upload.MaxAttachments, "status_bar": d.cfg.StatusBar})
 					}
 					fmt.Printf("server_url: %s\n", orNone(d.cfg.ServerURL))
 					fmt.Printf("auth.file_fallback: %t\n", d.cfg.Auth.AllowFileFallback)
 					fmt.Printf("upload.endpoint: %s\n", orNone(d.cfg.Upload.Endpoint))
 					fmt.Printf("upload.max_image_bytes: %d\n", d.cfg.Upload.MaxImageBytes)
 					fmt.Printf("upload.max_attachments: %d\n", d.cfg.Upload.MaxAttachments)
+					fmt.Printf("status_bar.mode: %s\n", d.cfg.StatusBar.Mode)
+					fmt.Printf("status_bar.fullscreen: %s\n", d.cfg.StatusBar.Fullscreen)
+					fmt.Printf("status_bar.theme: %s\n", d.cfg.StatusBar.Theme)
 					return nil
 				},
 			},
 		},
 	}
+}
+
+func statusBarConfigCommand() *cobra.Command {
+	status := &cobra.Command{
+		Use:   "status-bar",
+		Short: "Configure the interactive terminal status bar",
+		Args:  commandArgs(cobra.NoArgs),
+		RunE:  func(command *cobra.Command, _ []string) error { return command.Help() },
+	}
+	show := &cobra.Command{Use: "show", Short: "Show the effective status-bar configuration", Args: commandArgs(cobra.NoArgs), RunE: func(command *cobra.Command, _ []string) error {
+		cfg, err := config.Load(configPathFlag(command))
+		if err != nil {
+			return err
+		}
+		jsonOutput, _ := command.Flags().GetBool("json")
+		if jsonOutput {
+			return json.NewEncoder(command.OutOrStdout()).Encode(cfg.StatusBar)
+		}
+		return printStatusBarConfig(command.OutOrStdout(), cfg.StatusBar)
+	}}
+	show.Flags().Bool("json", false, "print JSON")
+	set := &cobra.Command{Use: "set <key> <value>", Short: "Set a status-bar preference", Args: commandArgs(cobra.ExactArgs(2)), RunE: func(command *cobra.Command, args []string) error {
+		cfg, err := config.Load(configPathFlag(command))
+		if err != nil {
+			return err
+		}
+		if err := setStatusBarValue(&cfg.StatusBar, args[0], args[1]); err != nil {
+			return invocationError(err)
+		}
+		if err := cfg.Save(); err != nil {
+			return err
+		}
+		fmt.Fprintln(command.OutOrStdout(), cfg.Path())
+		return nil
+	}}
+	reset := &cobra.Command{Use: "reset", Short: "Restore status-bar defaults", Args: commandArgs(cobra.NoArgs), RunE: func(command *cobra.Command, _ []string) error {
+		cfg, err := config.Load(configPathFlag(command))
+		if err != nil {
+			return err
+		}
+		cfg.StatusBar = config.DefaultStatusBarConfig()
+		if err := cfg.Save(); err != nil {
+			return err
+		}
+		fmt.Fprintln(command.OutOrStdout(), cfg.Path())
+		return nil
+	}}
+	preview := &cobra.Command{Use: "preview", Short: "Preview the configured status bar", Args: commandArgs(cobra.NoArgs), RunE: func(command *cobra.Command, _ []string) error {
+		cfg, err := config.Load(configPathFlag(command))
+		if err != nil {
+			return err
+		}
+		width, _ := command.Flags().GetInt("width")
+		if width == 0 {
+			width = 80
+			if term.IsTerminal(int(os.Stdout.Fd())) {
+				if detected, _, sizeErr := term.GetSize(int(os.Stdout.Fd())); sizeErr == nil {
+					width = detected
+				}
+			}
+		}
+		bar := newConfiguredStatusBar(cfg.StatusBar, statusbar.ModeOff)
+		defer bar.Close()
+		bar.SetIdentity("paperboat", "default")
+		bar.SetUsage("100", "12 GB")
+		bar.SetConfigSync("healthy")
+		bar.SetConnection("connected")
+		fmt.Fprintln(command.OutOrStdout(), bar.Render(width))
+		bar.SetConnection("reconnecting")
+		bar.Loading("Reconnecting")
+		fmt.Fprintln(command.OutOrStdout(), bar.Render(width))
+		bar.SetConnection("failed")
+		bar.FailureFor("preview", "Connection lost")
+		fmt.Fprintln(command.OutOrStdout(), bar.Render(width))
+		return nil
+	}}
+	preview.Flags().Int("width", 0, "preview width (20-500 columns)")
+	preview.PreRunE = func(command *cobra.Command, _ []string) error {
+		width, _ := command.Flags().GetInt("width")
+		if width != 0 && (width < 20 || width > 500) {
+			return invocationError(errors.New("--width must be between 20 and 500"))
+		}
+		return nil
+	}
+	status.AddCommand(show, set, reset, preview)
+	return status
+}
+
+func configPathFlag(command *cobra.Command) string {
+	value, _ := command.Flags().GetString("config")
+	return value
+}
+
+func printStatusBarConfig(writer io.Writer, value config.StatusBarConfig) error {
+	_, err := fmt.Fprintf(writer, "mode: %s\nfullscreen: %s\ntheme: %s\nprivacy: %t\nterminal_title: %t\nnotice_seconds: %d\nleft: %s\ncenter: %s\nright: %s\nforeground: %s\nbackground: %s\naccent: %s\nwarning: %s\nerror: %s\n",
+		value.Mode, value.Fullscreen, value.Theme, value.Privacy, value.TerminalTitle, value.NoticeSeconds,
+		formatWidgetList(value.Left), formatWidgetList(value.Center), formatWidgetList(value.Right),
+		inheritedColor(value.Colors.Foreground), inheritedColor(value.Colors.Background), inheritedColor(value.Colors.Accent), inheritedColor(value.Colors.Warning), inheritedColor(value.Colors.Error))
+	return err
+}
+
+func inheritedColor(value string) string {
+	if value == "" {
+		return "inherit"
+	}
+	return value
+}
+
+func formatWidgetList(values []string) string {
+	if len(values) == 0 {
+		return "none"
+	}
+	return strings.Join(values, ",")
+}
+
+func setStatusBarValue(value *config.StatusBarConfig, key, raw string) error {
+	key = strings.ToLower(strings.TrimSpace(key))
+	raw = strings.TrimSpace(raw)
+	switch key {
+	case "mode":
+		value.Mode = strings.ToLower(raw)
+	case "fullscreen":
+		value.Fullscreen = strings.ToLower(raw)
+	case "theme":
+		value.Theme = strings.ToLower(raw)
+	case "privacy", "terminal-title":
+		parsed, err := strconv.ParseBool(raw)
+		if err != nil {
+			return fmt.Errorf("%s must be true or false", key)
+		}
+		if key == "privacy" {
+			value.Privacy = parsed
+		} else {
+			value.TerminalTitle = parsed
+		}
+	case "notice-seconds":
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > 60 {
+			return errors.New("notice-seconds must be between 1 and 60")
+		}
+		value.NoticeSeconds = parsed
+	case "left", "center", "right":
+		widgets := parseWidgetList(raw)
+		switch key {
+		case "left":
+			value.Left = widgets
+		case "center":
+			value.Center = widgets
+		case "right":
+			value.Right = widgets
+		}
+	case "foreground", "background", "accent", "warning", "error":
+		switch key {
+		case "foreground":
+			value.Colors.Foreground = raw
+		case "background":
+			value.Colors.Background = raw
+		case "accent":
+			value.Colors.Accent = raw
+		case "warning":
+			value.Colors.Warning = raw
+		case "error":
+			value.Colors.Error = raw
+		}
+	default:
+		return fmt.Errorf("unknown status-bar key %q", key)
+	}
+	probe := &config.Config{StatusBar: *value}
+	return probe.Validate()
+}
+
+func parseWidgetList(raw string) []string {
+	if raw == "" || strings.EqualFold(raw, "none") {
+		return []string{}
+	}
+	parts := strings.Split(raw, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		result = append(result, strings.ToLower(strings.TrimSpace(part)))
+	}
+	return result
+}
+
+func newConfiguredStatusBar(value config.StatusBarConfig, mode string) *statusbar.Bar {
+	return statusbar.New(statusbar.Options{
+		Mode: mode, Fullscreen: value.Fullscreen, Theme: value.Theme, Privacy: value.Privacy, TerminalTitle: false,
+		Colors:         statusbar.Colors{Foreground: value.Colors.Foreground, Background: value.Colors.Background, Accent: value.Colors.Accent, Warning: value.Colors.Warning, Error: value.Colors.Error},
+		NoticeDuration: time.Duration(value.NoticeSeconds) * time.Second,
+		Layout:         statusbar.Layout{Left: value.Left, Center: value.Center, Right: value.Right},
+	})
 }
 
 func configAssign(c *command.Context) error {

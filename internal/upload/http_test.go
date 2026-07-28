@@ -1,6 +1,7 @@
 package upload
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -20,6 +21,11 @@ type eventSink struct{ events []telemetry.Event }
 
 func (s *eventSink) Record(e telemetry.Event) { s.events = append(s.events, e) }
 
+func memoryImage(name, mimeType string, data []byte) Image {
+	digest := sha256.Sum256(data)
+	return Image{Name: name, MimeType: mimeType, Size: int64(len(data)), SHA256: digest, Reader: bytes.NewReader(data)}
+}
+
 func TestUploadRecordsMetadataOnlyResult(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -32,7 +38,7 @@ func TestUploadRecordsMetadataOnlyResult(t *testing.T) {
 	u := NewHTTPUploader(srv.URL, "/upload", Auth{Method: "bearer", Token: "secret"})
 	u.ConfigureTelemetry(sink, "prj_1", "env_1")
 	u.Now = func() time.Time { v := times[0]; times = times[1:]; return v }
-	_, err := u.Upload(context.Background(), Image{Name: "private.png", Bytes: []byte("abc"), MimeType: "image/png"})
+	_, err := u.Upload(context.Background(), memoryImage("private.png", "image/png", []byte("abc")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,6 +59,9 @@ func TestHTTPUploaderUploadsAndReturnsVMPath(t *testing.T) {
 			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
 		gotAuth = r.Header.Get("Authorization")
+		if r.ContentLength <= int64(len("image-bytes")) || len(r.TransferEncoding) != 0 {
+			t.Fatalf("content length=%d transfer encoding=%v", r.ContentLength, r.TransferEncoding)
+		}
 		mr, err := r.MultipartReader()
 		if err != nil {
 			t.Fatal(err)
@@ -89,11 +98,9 @@ func TestHTTPUploaderUploadsAndReturnsVMPath(t *testing.T) {
 	defer srv.Close()
 
 	u := NewHTTPUploader(srv.URL, "/project/v1/files/staged-images", Auth{Method: "bearer", Token: "upload-token"})
-	got, err := u.Upload(context.Background(), Image{
-		Name:     "image.png",
-		MimeType: "image/png",
-		Bytes:    []byte("image-bytes"),
-	})
+	var progress [][2]int64
+	u.ConfigureProgress(func(sent, total int64) { progress = append(progress, [2]int64{sent, total}) })
+	got, err := u.Upload(context.Background(), memoryImage("image.png", "image/png", []byte("image-bytes")))
 	if err != nil {
 		t.Fatalf("Upload: %v", err)
 	}
@@ -102,6 +109,9 @@ func TestHTTPUploaderUploadsAndReturnsVMPath(t *testing.T) {
 	}
 	if gotAuth != "Bearer upload-token" {
 		t.Fatalf("auth = %q", gotAuth)
+	}
+	if len(progress) == 0 || progress[len(progress)-1] != [2]int64{11, 11} {
+		t.Fatalf("progress = %#v", progress)
 	}
 	_ = gotBody
 }
@@ -136,7 +146,7 @@ func TestHTTPUploaderSerializesConcurrentAuthRefresh(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := u.Upload(context.Background(), Image{Name: "image.png", Bytes: []byte("bytes")})
+			_, err := u.Upload(context.Background(), memoryImage("image.png", "image/png", []byte("bytes")))
 			errs <- err
 		}()
 	}
@@ -149,6 +159,47 @@ func TestHTTPUploaderSerializesConcurrentAuthRefresh(t *testing.T) {
 	}
 	if refreshes.Load() != 1 {
 		t.Fatalf("refreshes = %d, want 1", refreshes.Load())
+	}
+}
+
+func TestHTTPUploaderRewindsDescriptorForAuthorizedRetry(t *testing.T) {
+	var bodies [][]byte
+	var requests int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		part, err := r.MultipartReader()
+		if err != nil {
+			t.Fatal(err)
+		}
+		file, err := part.NextPart()
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bodies = append(bodies, body)
+		requests++
+		w.Header().Set("Content-Type", "application/json")
+		if requests == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":{"code":"unauthenticated","message":"expired"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"path":"/remote/upload.png"}`))
+	}))
+	defer srv.Close()
+	uploader := NewHTTPUploader(srv.URL, "/upload", Auth{Method: "bearer", Token: "old"})
+	uploader.RefreshAuth = func(context.Context) (Auth, error) {
+		return Auth{Method: "bearer", Token: "new"}, nil
+	}
+	image := memoryImage("upload.png", "image/png", []byte("same-image-on-every-attempt"))
+	path, err := uploader.Upload(context.Background(), image)
+	if err != nil || path != "/remote/upload.png" {
+		t.Fatalf("path=%q err=%v", path, err)
+	}
+	if len(bodies) != 2 || !bytes.Equal(bodies[0], bodies[1]) || !bytes.Equal(bodies[0], []byte("same-image-on-every-attempt")) {
+		t.Fatalf("retry bodies = %q", bodies)
 	}
 }
 
@@ -172,7 +223,7 @@ func TestHTTPUploaderReturnsStructuredError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := NewHTTPUploader(srv.URL, "/v1/files/staged-images", Auth{Method: "bearer", Token: "token"}).Upload(context.Background(), Image{Name: "x.png", Bytes: []byte("x")})
+	_, err := NewHTTPUploader(srv.URL, "/v1/files/staged-images", Auth{Method: "bearer", Token: "token"}).Upload(context.Background(), memoryImage("x.png", "image/png", []byte("x")))
 	var stagedErr *Error
 	if !errors.As(err, &stagedErr) {
 		t.Fatalf("error type = %T, want *upload.Error", err)
@@ -190,7 +241,7 @@ func TestHTTPUploaderReturnsCanonicalHelperError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := NewHTTPUploader(srv.URL, "/v1/files/staged-images", Auth{Method: "bearer", Token: "token"}).Upload(context.Background(), Image{Name: "x.png", MimeType: "image/png", Bytes: []byte("x")})
+	_, err := NewHTTPUploader(srv.URL, "/v1/files/staged-images", Auth{Method: "bearer", Token: "token"}).Upload(context.Background(), memoryImage("x.png", "image/png", []byte("x")))
 	var stagedErr *Error
 	if !errors.As(err, &stagedErr) {
 		t.Fatalf("error type = %T, want *upload.Error", err)
@@ -201,7 +252,7 @@ func TestHTTPUploaderReturnsCanonicalHelperError(t *testing.T) {
 }
 
 func TestHTTPUploaderRejectsTerminalTicket(t *testing.T) {
-	_, err := NewHTTPUploader("https://example.test", "/v1/files/staged-images", Auth{Method: "websocket_ticket", Ticket: "ticket"}).Upload(context.Background(), Image{Name: "x.png", Bytes: []byte("x")})
+	_, err := NewHTTPUploader("https://example.test", "/v1/files/staged-images", Auth{Method: "websocket_ticket", Ticket: "ticket"}).Upload(context.Background(), memoryImage("x.png", "image/png", []byte("x")))
 	if err == nil {
 		t.Fatal("expected auth scope error")
 	}

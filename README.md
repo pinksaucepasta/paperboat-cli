@@ -35,6 +35,45 @@ Hosted projects and user machines use the same durable terminal-session workflow
 Interactive attaches forward `TERM`, `COLORTERM`, `TERM_PROGRAM`,
 `TERM_PROGRAM_VERSION`, and locale variables when they are set locally.
 
+## Interactive status bar
+
+Compatible interactive terminals reserve one bottom row for local Paperboat context. The
+remote PTY receives the remaining rows, and no status-bar bytes are sent remotely. By
+default the bar inherits the terminal palette and temporarily releases its row when a
+remote application enters the alternate screen, preventing editors and other full-screen
+TUIs from losing or covering content.
+
+```sh
+pb config status-bar show
+pb config status-bar preview
+pb config status-bar set mode auto                 # auto, on, off
+pb config status-bar set fullscreen hide           # hide, show
+pb config status-bar set theme terminal             # terminal, dark, light, mono
+pb config status-bar set privacy true
+pb config status-bar set terminal-title true
+pb config status-bar set left project,session
+pb config status-bar set center activity
+pb config status-bar set right credits,connection
+pb config status-bar set accent '#00d7af'
+pb config status-bar reset
+```
+
+Use `none` to empty a widget region. Supported widgets are `project`, `session`,
+`connection`, `activity`, `config_sync`, `credits`, and `storage`; a widget can appear in
+only one region. Color overrides accept ANSI names such as `bright_cyan`, `default`, or
+`#RRGGBB`. `NO_COLOR` disables status-bar colors without disabling the bar.
+
+Attach flags override saved behavior for one session:
+
+```sh
+pb demo --status-bar=off
+pb demo --status-bar-fullscreen=show --status-bar-theme=mono
+```
+
+The bar automatically drops storage, credits, config-sync, session, and project widgets
+in that order as width becomes constrained. Connection and active failure state retain
+priority. Terminals narrower than 20 columns receive the full viewport without a bar.
+
 ## Image drag and drop
 
 Interactive `pb` attaches enable the standard terminal bracketed-paste mode. A
@@ -43,6 +82,13 @@ to remote paths. Supported path forms include `file://` URIs, quoted paths, and
 POSIX shell-escaped paths such as the escaped-space format emitted by WezTerm.
 Every other input, including unframed drag-and-drop text, is forwarded exactly
 as received; this prevents ordinary typed paths from triggering an upload.
+
+Images are hashed once through the validated local descriptor, rewound, and streamed
+directly as a known-length multipart request. The CLI does not retain a full in-memory
+copy. Upload progress appears in the status bar, retries reuse the same descriptor and
+digest, and failed uploads preserve the original pasted path. The helper publishes private
+random filenames under the operating system's cache directory and removes them after the
+bounded retention period.
 
 ## User machines
 

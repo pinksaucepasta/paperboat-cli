@@ -72,7 +72,6 @@ func (u *blockingUploader) Upload(ctx context.Context, _ upload.Image) (string, 
 func defaultLimits() upload.Limits {
 	return upload.Limits{
 		MaxImageBytes:       10 << 20,
-		MaxDataURLChars:     14_000_000,
 		MaxAttachments:      8,
 		AllowedMimePrefixes: []string{"image/"},
 	}

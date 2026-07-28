@@ -1,6 +1,8 @@
 package upload
 
 import (
+	"crypto/sha256"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,13 +21,12 @@ func write(t *testing.T, dir, name string, n int) string {
 func baseLimits() Limits {
 	return Limits{
 		MaxImageBytes:       10 << 20,
-		MaxDataURLChars:     14_000_000,
 		MaxAttachments:      8,
 		AllowedMimePrefixes: []string{"image/"},
 	}
 }
 
-func TestPrepareImageReturnsRawBytes(t *testing.T) {
+func TestPrepareImageReturnsSeekableDescriptorAndDigest(t *testing.T) {
 	dir := t.TempDir()
 	p := write(t, dir, "x.png", 4)
 	img, err := PrepareImage(p, baseLimits())
@@ -35,11 +36,20 @@ func TestPrepareImageReturnsRawBytes(t *testing.T) {
 	if img.MimeType != "image/png" {
 		t.Fatalf("mime=%q", img.MimeType)
 	}
-	if len(img.Bytes) != 4 || img.DataURL != "" {
-		t.Fatalf("payload bytes=%d dataurl=%q", len(img.Bytes), img.DataURL)
+	defer img.Close()
+	if img.Size != 4 || img.Reader == nil {
+		t.Fatalf("size=%d reader=%T", img.Size, img.Reader)
 	}
 	if img.Name != "x.png" {
 		t.Fatalf("name=%q", img.Name)
+	}
+	want := sha256.Sum256(make([]byte, 4))
+	if img.SHA256 != want {
+		t.Fatalf("digest=%x want=%x", img.SHA256, want)
+	}
+	data, err := io.ReadAll(img.Reader)
+	if err != nil || len(data) != 4 {
+		t.Fatalf("streamed bytes=%d err=%v", len(data), err)
 	}
 }
 
@@ -89,16 +99,6 @@ func TestPrepareImageHonorsImageWildcard(t *testing.T) {
 	path := write(t, dir, "photo.avif", 4)
 	if _, err := PrepareImage(path, Limits{AllowedMIMETypes: []string{"image/*"}}); err != nil {
 		t.Fatalf("image wildcard should allow AVIF: %v", err)
-	}
-}
-
-func TestPrepareImageIgnoresLegacyDataURLLimit(t *testing.T) {
-	dir := t.TempDir()
-	p := write(t, dir, "m.png", 1000)
-	lim := baseLimits()
-	lim.MaxDataURLChars = 100
-	if _, err := PrepareImage(p, lim); err != nil {
-		t.Fatalf("raw multipart upload should ignore legacy data URL limit: %v", err)
 	}
 }
 

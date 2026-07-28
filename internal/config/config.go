@@ -29,8 +29,6 @@ type UploadConfig struct {
 	TempFilePatterns []string `json:"temp_file_patterns,omitempty"`
 	// MaxImageBytes caps a single image. Defaults to 10 MiB.
 	MaxImageBytes int64 `json:"max_image_bytes,omitempty"`
-	// MaxDataURLChars caps the encoded data URL length.
-	MaxDataURLChars int `json:"max_data_url_chars,omitempty"`
 	// MaxAttachments caps images per paste.
 	MaxAttachments int `json:"max_attachments,omitempty"`
 	// MaxQueuedInputBytes bounds local input held behind an image upload.
@@ -42,7 +40,6 @@ type UploadConfig struct {
 // Upload defaults are applied only when a field is left unset.
 const (
 	DefaultMaxImageBytes       = 10 * 1024 * 1024
-	DefaultMaxDataURLChars     = 14_000_000
 	DefaultMaxAttachments      = 8
 	DefaultMaxQueuedInputBytes = 1024 * 1024
 )
@@ -75,16 +72,36 @@ type Config struct {
 type StatusBarConfig struct {
 	// Mode is auto, on, or off. Auto enables only on compatible interactive terminals.
 	Mode string `json:"mode,omitempty"`
+	// Fullscreen controls whether the bar hides while a remote application owns
+	// the terminal's alternate screen. Hide is the safe default.
+	Fullscreen string `json:"fullscreen,omitempty"`
+	// Theme is terminal, dark, light, or mono. Terminal inherits the user's
+	// configured terminal foreground and background colors.
+	Theme string `json:"theme,omitempty"`
+	// Privacy hides environment, session, credits, and storage values.
+	Privacy bool `json:"privacy,omitempty"`
+	// TerminalTitle publishes environment/session context in the terminal title.
+	TerminalTitle bool `json:"terminal_title,omitempty"`
+	// Colors optionally override semantic colors supplied by the selected theme.
+	Colors StatusBarColors `json:"colors,omitempty"`
 	// NoticeSeconds controls how long non-error event notices remain visible.
 	NoticeSeconds int `json:"notice_seconds,omitempty"`
-	// SyncPollSeconds controls config-sync status polling while attached.
-	SyncPollSeconds int `json:"sync_poll_seconds,omitempty"`
 	// Left, Center, and Right select ordered widgets for each status-bar region.
 	// Supported widgets: project, session, connection, activity, config_sync,
 	// credits, and storage. An explicit empty list hides that region.
-	Left   []string `json:"left,omitempty"`
-	Center []string `json:"center,omitempty"`
-	Right  []string `json:"right,omitempty"`
+	Left   []string `json:"left"`
+	Center []string `json:"center"`
+	Right  []string `json:"right"`
+}
+
+// StatusBarColors contains validated ANSI color names or #RRGGBB true-color values.
+// Empty values inherit from the selected theme.
+type StatusBarColors struct {
+	Foreground string `json:"foreground,omitempty"`
+	Background string `json:"background,omitempty"`
+	Accent     string `json:"accent,omitempty"`
+	Warning    string `json:"warning,omitempty"`
+	Error      string `json:"error,omitempty"`
 }
 
 type ObservabilityConfig struct {
@@ -141,8 +158,9 @@ const (
 	DefaultTerminalOutputBufferBytes       = 128 * 1024
 	DefaultInputPartialFlushMilliseconds   = 1
 	DefaultStatusBarMode                   = "auto"
+	DefaultStatusBarFullscreen             = "hide"
+	DefaultStatusBarTheme                  = "terminal"
 	DefaultStatusBarNoticeSeconds          = 5
-	DefaultStatusBarSyncPollSeconds        = 30
 )
 
 var (
@@ -150,6 +168,19 @@ var (
 	DefaultStatusBarCenter = []string{"activity"}
 	DefaultStatusBarRight  = []string{"credits", "connection"}
 )
+
+// DefaultStatusBarConfig returns an independent copy of the product defaults.
+func DefaultStatusBarConfig() StatusBarConfig {
+	return StatusBarConfig{
+		Mode:          DefaultStatusBarMode,
+		Fullscreen:    DefaultStatusBarFullscreen,
+		Theme:         DefaultStatusBarTheme,
+		NoticeSeconds: DefaultStatusBarNoticeSeconds,
+		Left:          append([]string(nil), DefaultStatusBarLeft...),
+		Center:        append([]string(nil), DefaultStatusBarCenter...),
+		Right:         append([]string(nil), DefaultStatusBarRight...),
+	}
+}
 
 // TerminalEnv is the complete supported PTY capability environment.
 var TerminalEnv = []string{
@@ -223,7 +254,7 @@ func Load(path string) (*Config, error) {
 	}
 
 	cfg.applyDefaults()
-	if err := cfg.validate(); err != nil {
+	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 	return cfg, nil
@@ -235,9 +266,6 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Upload.MaxImageBytes == 0 {
 		c.Upload.MaxImageBytes = DefaultMaxImageBytes
-	}
-	if c.Upload.MaxDataURLChars == 0 {
-		c.Upload.MaxDataURLChars = DefaultMaxDataURLChars
 	}
 	if c.Upload.MaxAttachments == 0 {
 		c.Upload.MaxAttachments = DefaultMaxAttachments
@@ -272,11 +300,14 @@ func (c *Config) applyDefaults() {
 	if c.StatusBar.Mode == "" {
 		c.StatusBar.Mode = DefaultStatusBarMode
 	}
+	if c.StatusBar.Fullscreen == "" {
+		c.StatusBar.Fullscreen = DefaultStatusBarFullscreen
+	}
+	if c.StatusBar.Theme == "" {
+		c.StatusBar.Theme = DefaultStatusBarTheme
+	}
 	if c.StatusBar.NoticeSeconds == 0 {
 		c.StatusBar.NoticeSeconds = DefaultStatusBarNoticeSeconds
-	}
-	if c.StatusBar.SyncPollSeconds == 0 {
-		c.StatusBar.SyncPollSeconds = DefaultStatusBarSyncPollSeconds
 	}
 	if c.StatusBar.Left == nil {
 		c.StatusBar.Left = append([]string(nil), DefaultStatusBarLeft...)
@@ -287,9 +318,29 @@ func (c *Config) applyDefaults() {
 	if c.StatusBar.Right == nil {
 		c.StatusBar.Right = append([]string(nil), DefaultStatusBarRight...)
 	}
+	c.StatusBar.Mode = strings.ToLower(strings.TrimSpace(c.StatusBar.Mode))
+	c.StatusBar.Fullscreen = strings.ToLower(strings.TrimSpace(c.StatusBar.Fullscreen))
+	c.StatusBar.Theme = strings.ToLower(strings.TrimSpace(c.StatusBar.Theme))
+	c.StatusBar.Left = normalizeStatusWidgets(c.StatusBar.Left)
+	c.StatusBar.Center = normalizeStatusWidgets(c.StatusBar.Center)
+	c.StatusBar.Right = normalizeStatusWidgets(c.StatusBar.Right)
+	c.StatusBar.Colors.Foreground = strings.ToLower(strings.TrimSpace(c.StatusBar.Colors.Foreground))
+	c.StatusBar.Colors.Background = strings.ToLower(strings.TrimSpace(c.StatusBar.Colors.Background))
+	c.StatusBar.Colors.Accent = strings.ToLower(strings.TrimSpace(c.StatusBar.Colors.Accent))
+	c.StatusBar.Colors.Warning = strings.ToLower(strings.TrimSpace(c.StatusBar.Colors.Warning))
+	c.StatusBar.Colors.Error = strings.ToLower(strings.TrimSpace(c.StatusBar.Colors.Error))
 }
 
-func (c *Config) validate() error {
+func normalizeStatusWidgets(values []string) []string {
+	for index := range values {
+		values[index] = strings.ToLower(strings.TrimSpace(values[index]))
+	}
+	return values
+}
+
+// Validate checks the complete effective configuration. Callers that mutate a
+// loaded Config can use it before presenting success.
+func (c *Config) Validate() error {
 	if c.Connect.TerminalOutputBatchMilliseconds < 0 {
 		return fmt.Errorf("connect.terminal_output_batch_milliseconds cannot be negative")
 	}
@@ -301,11 +352,29 @@ func (c *Config) validate() error {
 	default:
 		return fmt.Errorf("status_bar.mode must be auto, on, or off")
 	}
-	if c.StatusBar.NoticeSeconds < 1 {
-		return fmt.Errorf("status_bar.notice_seconds must be positive")
+	switch strings.ToLower(strings.TrimSpace(c.StatusBar.Fullscreen)) {
+	case "hide", "show":
+	default:
+		return fmt.Errorf("status_bar.fullscreen must be hide or show")
 	}
-	if c.StatusBar.SyncPollSeconds < 1 {
-		return fmt.Errorf("status_bar.sync_poll_seconds must be positive")
+	switch strings.ToLower(strings.TrimSpace(c.StatusBar.Theme)) {
+	case "terminal", "dark", "light", "mono":
+	default:
+		return fmt.Errorf("status_bar.theme must be terminal, dark, light, or mono")
+	}
+	if c.StatusBar.NoticeSeconds < 1 || c.StatusBar.NoticeSeconds > 60 {
+		return fmt.Errorf("status_bar.notice_seconds must be between 1 and 60")
+	}
+	for field, value := range map[string]string{
+		"foreground": c.StatusBar.Colors.Foreground,
+		"background": c.StatusBar.Colors.Background,
+		"accent":     c.StatusBar.Colors.Accent,
+		"warning":    c.StatusBar.Colors.Warning,
+		"error":      c.StatusBar.Colors.Error,
+	} {
+		if !validStatusColor(value) {
+			return fmt.Errorf("status_bar.colors.%s must be an ANSI color name or #RRGGBB", field)
+		}
 	}
 	seen := make(map[string]string, len(c.StatusBar.Left)+len(c.StatusBar.Center)+len(c.StatusBar.Right))
 	for region, widgets := range map[string][]string{"left": c.StatusBar.Left, "center": c.StatusBar.Center, "right": c.StatusBar.Right} {
@@ -325,8 +394,33 @@ func (c *Config) validate() error {
 	return nil
 }
 
+func validStatusColor(value string) bool {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" || value == "default" {
+		return true
+	}
+	if len(value) == 7 && value[0] == '#' {
+		for _, r := range value[1:] {
+			if !strings.ContainsRune("0123456789abcdef", r) {
+				return false
+			}
+		}
+		return true
+	}
+	_, ok := map[string]struct{}{
+		"black": {}, "red": {}, "green": {}, "yellow": {}, "blue": {}, "magenta": {}, "cyan": {}, "white": {},
+		"bright_black": {}, "bright_red": {}, "bright_green": {}, "bright_yellow": {}, "bright_blue": {},
+		"bright_magenta": {}, "bright_cyan": {}, "bright_white": {},
+	}[value]
+	return ok
+}
+
 // Save writes the config to its path, creating parent dirs as needed.
 func (c *Config) Save() error {
+	c.applyDefaults()
+	if err := c.Validate(); err != nil {
+		return err
+	}
 	if c.path == "" {
 		p, err := DefaultPath()
 		if err != nil {

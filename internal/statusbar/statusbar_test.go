@@ -119,6 +119,21 @@ func TestLayoutUsesConfiguredRegionsAndAccountWidgets(t *testing.T) {
 	}
 }
 
+func TestResponsiveLayoutKeepsConnectionAndDropsUsageFirst(t *testing.T) {
+	bar, _ := newTestBar(t, ModeAuto, "xterm-256color", 30, 24, true, time.Second)
+	bar.layout = Layout{Left: []string{"project", "session"}, Center: []string{"activity"}, Right: []string{"storage", "credits", "connection"}}
+	bar.SetIdentity("long-project", "default")
+	bar.SetUsage("1000", "999 GB")
+	bar.SetConnection("reconnecting")
+	line := bar.Render(30)
+	if !strings.Contains(line, "reconnecting") || strings.Contains(line, "storage") || strings.Contains(line, "credits") {
+		t.Fatalf("responsive layout = %q", line)
+	}
+	if ansi.StringWidth(line) != 30 {
+		t.Fatalf("responsive width = %d", ansi.StringWidth(line))
+	}
+}
+
 func TestLayoutAllowsExplicitlyEmptyRegions(t *testing.T) {
 	bar, _ := newTestBar(t, ModeAuto, "xterm-256color", 30, 24, true, time.Second)
 	bar.layout = Layout{Left: []string{}, Center: []string{}, Right: []string{"connection"}}
@@ -128,6 +143,95 @@ func TestLayoutAllowsExplicitlyEmptyRegions(t *testing.T) {
 	bar.mu.Unlock()
 	if !strings.HasSuffix(line, "connected") || ansi.StringWidth(line) != 30 {
 		t.Fatalf("empty-region layout = %q", line)
+	}
+}
+
+func TestFullscreenHideReleasesAndReacquiresRemoteRow(t *testing.T) {
+	input, _, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer input.Close()
+	reader, output, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	defer output.Close()
+	var sizes [][2]uint16
+	bar := New(Options{
+		Mode: ModeAuto, Fullscreen: FullscreenHide, Term: "xterm-256color", Input: input, Output: output,
+		IsTerminal: func(int) bool { return true }, GetSize: func(int) (int, int, error) { return 80, 24, nil },
+		ViewportChanged: func(cols, rows uint16) { sizes = append(sizes, [2]uint16{cols, rows}) },
+	})
+	if _, rows := bar.RemoteSize(); rows != 23 {
+		t.Fatalf("initial rows = %d", rows)
+	}
+	_, _ = bar.Write([]byte("\x1b[?1049h"))
+	if _, rows := bar.RemoteSize(); rows != 24 || !bar.suspended {
+		t.Fatalf("fullscreen rows = %d suspended=%t", rows, bar.suspended)
+	}
+	_, _ = bar.Write([]byte("\x1bc"))
+	if _, rows := bar.RemoteSize(); rows != 23 || bar.suspended || bar.alternate {
+		t.Fatalf("hard-reset rows = %d suspended=%t alternate=%t", rows, bar.suspended, bar.alternate)
+	}
+	_, _ = bar.Write([]byte("\x1b[?1049h"))
+	_, _ = bar.Write([]byte("\x1b[?1049l"))
+	if _, rows := bar.RemoteSize(); rows != 23 || bar.suspended {
+		t.Fatalf("restored rows = %d suspended=%t", rows, bar.suspended)
+	}
+	if len(sizes) != 4 || sizes[0] != [2]uint16{80, 24} || sizes[1] != [2]uint16{80, 23} || sizes[2] != [2]uint16{80, 24} || sizes[3] != [2]uint16{80, 23} {
+		t.Fatalf("viewport notifications = %#v", sizes)
+	}
+}
+
+func TestFullscreenShowKeepsReservedRow(t *testing.T) {
+	bar, _ := newTestBar(t, ModeAuto, "xterm-256color", 80, 24, true, time.Second)
+	bar.fullscreen = FullscreenShow
+	_, _ = bar.Write([]byte("\x1b[?1049h"))
+	if _, rows := bar.RemoteSize(); rows != 23 || bar.suspended {
+		t.Fatalf("rows = %d suspended=%t", rows, bar.suspended)
+	}
+}
+
+func TestThemePrivacyAndSemanticColors(t *testing.T) {
+	t.Setenv("NO_COLOR", "")
+	input, _, _ := os.Pipe()
+	reader, output, _ := os.Pipe()
+	defer input.Close()
+	defer reader.Close()
+	defer output.Close()
+	bar := New(Options{
+		Mode: ModeAuto, Theme: ThemeDark, Privacy: true, Colors: Colors{Accent: "#00ff88"}, Term: "xterm", Input: input, Output: output,
+		IsTerminal: func(int) bool { return true }, GetSize: func(int) (int, int, error) { return 80, 24, nil },
+	})
+	bar.SetIdentity("secret-project", "secret-session")
+	bar.SetUsage("100", "12 GB")
+	bar.SetConnection("connected")
+	line := bar.Render(80)
+	if strings.Contains(line, "secret") || strings.Contains(line, "credits") || strings.Contains(line, "storage") {
+		t.Fatalf("privacy leaked data: %q", line)
+	}
+	if !strings.Contains(line, "\x1b[") || ansi.StringWidth(line) != 80 {
+		t.Fatalf("themed line = %q width=%d", line, ansi.StringWidth(line))
+	}
+}
+
+func TestTerminalTitleIsPushedAndRestored(t *testing.T) {
+	input, _, _ := os.Pipe()
+	reader, output, _ := os.Pipe()
+	defer input.Close()
+	defer reader.Close()
+	bar := New(Options{
+		Mode: ModeAuto, TerminalTitle: true, Term: "xterm", Input: input, Output: output,
+		IsTerminal: func(int) bool { return true }, GetSize: func(int) (int, int, error) { return 80, 24, nil },
+	})
+	bar.SetIdentity("demo", "default")
+	_ = bar.Close()
+	_ = output.Close()
+	raw, _ := io.ReadAll(reader)
+	if !strings.Contains(string(raw), "\x1b[22;0t\x1b]0;Paperboat - demo / default\x07") || !strings.Contains(string(raw), "\x1b[23;0t") {
+		t.Fatalf("title lifecycle = %q", raw)
 	}
 }
 

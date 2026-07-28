@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -388,7 +389,9 @@ func TestUploadAuthRefreshRebrokersWithFreshControlPlaneCredential(t *testing.T)
 		}, "Demo", "prj_1", "")
 	}
 
-	path, err := uploader.Upload(context.Background(), upload.Image{Name: "image.png", MimeType: "image/png", Bytes: []byte("image-bytes")})
+	imageBytes := []byte("image-bytes")
+	imageDigest := sha256.Sum256(imageBytes)
+	path, err := uploader.Upload(context.Background(), upload.Image{Name: "image.png", MimeType: "image/png", Size: int64(len(imageBytes)), SHA256: imageDigest, Reader: bytes.NewReader(imageBytes)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -636,6 +639,52 @@ func TestConfigSetRejectsRemovedTerminalProfile(t *testing.T) {
 	err := root.ExecuteContext(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "usage: pb config set server <url>") {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestStatusBarConfigCommandsPersistValidatePreviewAndReset(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	for _, args := range [][]string{
+		{"--config", path, "config", "status-bar", "set", "theme", "dark"},
+		{"--config", path, "config", "status-bar", "set", "privacy", "true"},
+		{"--config", path, "config", "status-bar", "set", "center", "none"},
+		{"--config", path, "config", "status-bar", "set", "right", "activity,connection"},
+	} {
+		if code := run(context.Background(), args, &bytes.Buffer{}, &bytes.Buffer{}); code != 0 {
+			t.Fatalf("%v exited %d", args, code)
+		}
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.StatusBar.Theme != "dark" || !cfg.StatusBar.Privacy || strings.Join(cfg.StatusBar.Right, ",") != "activity,connection" {
+		t.Fatalf("persisted status bar = %+v", cfg.StatusBar)
+	}
+	var preview bytes.Buffer
+	if code := run(context.Background(), []string{"--config", path, "config", "status-bar", "preview", "--width", "60"}, &preview, &preview); code != 0 {
+		t.Fatalf("preview exited %d: %q", code, preview.String())
+	}
+	if lines := strings.Count(strings.TrimSpace(preview.String()), "\n") + 1; lines != 3 {
+		t.Fatalf("preview lines = %d: %q", lines, preview.String())
+	}
+	var invalid bytes.Buffer
+	if code := run(context.Background(), []string{"--config", path, "config", "status-bar", "set", "accent", "not-a-color"}, &invalid, &invalid); code != 2 {
+		t.Fatalf("invalid color exited %d: %q", code, invalid.String())
+	}
+	if code := run(context.Background(), []string{"--config", path, "config", "status-bar", "reset"}, &bytes.Buffer{}, &bytes.Buffer{}); code != 0 {
+		t.Fatalf("reset exited %d", code)
+	}
+	cfg, err = config.Load(path)
+	if err != nil || cfg.StatusBar.Theme != config.DefaultStatusBarTheme || cfg.StatusBar.Privacy {
+		t.Fatalf("reset status bar = %+v err=%v", cfg.StatusBar, err)
+	}
+}
+
+func TestConnectStatusBarOverridesAreValidated(t *testing.T) {
+	var output bytes.Buffer
+	if code := run(context.Background(), []string{"connect", "demo", "--status-bar-theme", "rainbow"}, &output, &output); code != 2 {
+		t.Fatalf("exit=%d output=%q", code, output.String())
 	}
 }
 
@@ -955,7 +1004,6 @@ func writeTestProfile(t *testing.T, dir, configPath, serverURL string) {
 func TestUploadLimitsHonorBrokeredUploadPolicy(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Upload.MaxImageBytes = 1
-	cfg.Upload.MaxDataURLChars = 100
 	cfg.Upload.MaxAttachments = 2
 	cfg.Upload.AllowedMimePrefixes = []string{"image/"}
 
@@ -973,7 +1021,7 @@ func TestUploadLimitsHonorBrokeredUploadPolicy(t *testing.T) {
 	if strings.Join(limits.AllowedMIMETypes, ",") != "image/png,image/webp" {
 		t.Fatalf("AllowedMIMETypes = %#v", limits.AllowedMIMETypes)
 	}
-	if limits.MaxDataURLChars != 100 || limits.MaxAttachments != 2 {
+	if limits.MaxAttachments != 2 {
 		t.Fatalf("local-only limits changed: %#v", limits)
 	}
 }

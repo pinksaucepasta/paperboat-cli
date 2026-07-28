@@ -82,7 +82,7 @@ func TestLoadAppliesDialRetryDefaultWhenOmitted(t *testing.T) {
 	if got := strings.Join(TerminalEnv, ","); got != "TERM,COLORTERM,TERM_PROGRAM,TERM_PROGRAM_VERSION,LANG,LC_ALL,LC_CTYPE" {
 		t.Fatalf("terminal environment = %q", got)
 	}
-	if cfg.StatusBar.Mode != DefaultStatusBarMode || cfg.StatusBar.NoticeSeconds != DefaultStatusBarNoticeSeconds || cfg.StatusBar.SyncPollSeconds != DefaultStatusBarSyncPollSeconds {
+	if cfg.StatusBar.Mode != DefaultStatusBarMode || cfg.StatusBar.Fullscreen != DefaultStatusBarFullscreen || cfg.StatusBar.Theme != DefaultStatusBarTheme || cfg.StatusBar.NoticeSeconds != DefaultStatusBarNoticeSeconds {
 		t.Fatalf("status bar defaults = %+v", cfg.StatusBar)
 	}
 	if got, want := strings.Join(cfg.StatusBar.Left, ","), "project,session"; got != want {
@@ -143,6 +143,30 @@ func TestLoadRejectsInvalidStatusBarMode(t *testing.T) {
 	}
 	if _, err := Load(path); err == nil {
 		t.Fatal("Load accepted invalid status_bar.mode")
+	}
+}
+
+func TestLoadValidatesStatusBarBehaviorAndColors(t *testing.T) {
+	for _, raw := range []string{
+		`{"status_bar":{"fullscreen":"sometimes"}}`,
+		`{"status_bar":{"theme":"rainbow"}}`,
+		`{"status_bar":{"colors":{"accent":"javascript"}}}`,
+		`{"status_bar":{"colors":{"error":"#xyzxyz"}}}`,
+	} {
+		path := filepath.Join(t.TempDir(), "config.json")
+		if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(path); err == nil {
+			t.Fatalf("Load accepted invalid config: %s", raw)
+		}
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"status_bar":{"fullscreen":"show","theme":"dark","colors":{"accent":"bright_cyan","error":"#ff0033"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err != nil {
+		t.Fatalf("Load rejected valid status bar config: %v", err)
 	}
 }
 

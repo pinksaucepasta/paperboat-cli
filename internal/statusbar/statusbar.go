@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +22,15 @@ const (
 	ModeAuto = "auto"
 	ModeOn   = "on"
 	ModeOff  = "off"
+
+	FullscreenHide = "hide"
+	FullscreenShow = "show"
+
+	ThemeTerminal = "terminal"
+	ThemeDark     = "dark"
+	ThemeLight    = "light"
+	ThemeMono     = "mono"
+	minimumWidth  = 20
 )
 
 // Layout controls which widgets appear in each status-bar region.
@@ -30,10 +40,25 @@ type Layout struct {
 	Right  []string
 }
 
+// Colors optionally override colors supplied by a theme. Values are validated
+// configuration inputs: ANSI color names, "default", or #RRGGBB.
+type Colors struct {
+	Foreground string
+	Background string
+	Accent     string
+	Warning    string
+	Error      string
+}
+
 // Options are deliberately small: the renderer only needs terminal
 // capability, an output stream, and the configured notice duration.
 type Options struct {
 	Mode           string
+	Fullscreen     string
+	Theme          string
+	Privacy        bool
+	TerminalTitle  bool
+	Colors         Colors
 	NoticeDuration time.Duration
 	Layout         Layout
 	Output         *os.File
@@ -41,44 +66,59 @@ type Options struct {
 	Term           string
 	IsTerminal     func(int) bool
 	GetSize        func(int) (int, int, error)
+	// ViewportChanged is called when alternate-screen suspension changes the
+	// number of rows available to the remote PTY.
+	ViewportChanged func(cols, rows uint16)
 }
 
 // Bar serializes remote output with local redraws. It is also an io.Writer so
 // session can give it sole ownership of stdout for the attached session.
 type Bar struct {
-	mu             sync.Mutex
-	out            io.Writer
-	outputFD       int
-	eligible       bool
-	enabled        bool
-	closed         bool
-	lastRows       int
-	scrollRows     int
-	scrollDirty    bool
-	noticeDuration time.Duration
-	project        string
-	session        string
-	connection     string
-	credits        string
-	storage        string
-	configSync     string
-	layout         Layout
-	notice         string
-	noticeUntil    time.Time
-	loading        bool
-	spinner        int
-	failures       map[string]failure
-	failureOrder   uint64
-	timer          *time.Timer
-	spinnerTimer   *time.Timer
-	parser         *ansi.Parser
-	ansiState      byte
-	appCursorSaved bool
-	appInverse     bool
-	synchronized   bool
-	redrawPending  bool
-	isTerminal     func(int) bool
-	getSize        func(int) (int, int, error)
+	mu              sync.Mutex
+	out             io.Writer
+	outputFD        int
+	eligible        bool
+	enabled         bool
+	suspended       bool
+	alternate       bool
+	closed          bool
+	lastRows        int
+	scrollRows      int
+	scrollDirty     bool
+	noticeDuration  time.Duration
+	project         string
+	session         string
+	connection      string
+	credits         string
+	storage         string
+	configSync      string
+	layout          Layout
+	notice          string
+	noticeUntil     time.Time
+	loading         bool
+	spinner         int
+	failures        map[string]failure
+	failureOrder    uint64
+	timer           *time.Timer
+	spinnerTimer    *time.Timer
+	parser          *ansi.Parser
+	ansiState       byte
+	appCursorSaved  bool
+	appInverse      bool
+	appSGR          []byte
+	appSGROverflow  bool
+	synchronized    bool
+	redrawPending   bool
+	isTerminal      func(int) bool
+	getSize         func(int) (int, int, error)
+	viewportChanged func(cols, rows uint16)
+	fullscreen      string
+	theme           string
+	privacy         bool
+	colors          Colors
+	noColor         bool
+	terminalTitle   bool
+	titlePushed     bool
 }
 
 type failure struct {
@@ -120,24 +160,39 @@ func New(options Options) *Bar {
 		options.NoticeDuration = 5 * time.Second
 	}
 	b := &Bar{
-		out:            output,
-		outputFD:       int(output.Fd()),
-		eligible:       eligible,
-		noticeDuration: options.NoticeDuration,
-		connection:     "connecting",
-		failures:       make(map[string]failure),
-		parser:         ansi.NewParser(),
-		ansiState:      byte(parser.GroundState),
-		scrollDirty:    true,
-		isTerminal:     isTerminal,
-		getSize:        getSize,
-		layout:         normalizeLayout(options.Layout),
+		out:             output,
+		outputFD:        int(output.Fd()),
+		eligible:        eligible,
+		noticeDuration:  options.NoticeDuration,
+		connection:      "connecting",
+		failures:        make(map[string]failure),
+		parser:          ansi.NewParser(),
+		ansiState:       byte(parser.GroundState),
+		scrollDirty:     true,
+		isTerminal:      isTerminal,
+		getSize:         getSize,
+		layout:          normalizeLayout(options.Layout),
+		viewportChanged: options.ViewportChanged,
+		fullscreen:      normalized(options.Fullscreen, FullscreenHide),
+		theme:           normalized(options.Theme, ThemeTerminal),
+		privacy:         options.Privacy,
+		colors:          options.Colors,
+		noColor:         os.Getenv("NO_COLOR") != "",
+		terminalTitle:   options.TerminalTitle,
 	}
 	b.mu.Lock()
 	b.refreshViewportLocked()
 	b.drawLocked()
 	b.mu.Unlock()
 	return b
+}
+
+func normalized(value, fallback string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return fallback
+	}
+	return value
 }
 
 func normalizeLayout(layout Layout) Layout {
@@ -188,10 +243,10 @@ func (b *Bar) RemoteSize() (cols, rows uint16) {
 	if w <= 0 || h <= 0 {
 		return 0, 0
 	}
-	if b.enabled && (!wasEnabled || wasRows != h) {
+	if b.activeLocked() && (!wasEnabled || wasRows != h) {
 		b.drawLocked()
 	}
-	if b.enabled {
+	if b.activeLocked() {
 		h--
 	}
 	return clamp(w, 1000), clamp(h, 500)
@@ -208,7 +263,7 @@ func (b *Bar) PrepareRemoteViewport() {
 		return
 	}
 	_, h := b.refreshViewportLocked()
-	if !b.enabled || h < 2 {
+	if !b.activeLocked() || h < 2 {
 		return
 	}
 	b.ensureScrollRegionLocked(h - 1)
@@ -225,7 +280,7 @@ func (b *Bar) ClearRemoteViewport() {
 	}
 	_, _ = fmt.Fprint(b.out, "\x1b[2J\x1b[H")
 	_, h := b.refreshViewportLocked()
-	if !b.enabled || h < 2 {
+	if !b.activeLocked() || h < 2 {
 		return
 	}
 	b.ensureScrollRegionLocked(h - 1)
@@ -251,6 +306,7 @@ func (b *Bar) ClearForExit() {
 	b.enabled = false
 	b.closed = true
 	_, _ = fmt.Fprint(b.out, "\x1b[r\x1b[2J\x1b[H")
+	b.restoreTitleLocked()
 }
 
 func clamp(value, max int) uint16 {
@@ -267,8 +323,39 @@ func (b *Bar) SetIdentity(project, session string) {
 	b.mu.Lock()
 	b.project = safeLabel(project)
 	b.session = safeLabel(session)
+	b.updateTitleLocked()
 	b.drawLocked()
 	b.mu.Unlock()
+}
+
+// SetViewportChanged installs the live PTY resize callback after the remote
+// connection has been established.
+func (b *Bar) SetViewportChanged(callback func(cols, rows uint16)) {
+	b.mu.Lock()
+	b.viewportChanged = callback
+	b.mu.Unlock()
+}
+
+func (b *Bar) updateTitleLocked() {
+	if !b.terminalTitle || b.closed {
+		return
+	}
+	if !b.titlePushed {
+		_, _ = fmt.Fprint(b.out, "\x1b[22;0t")
+		b.titlePushed = true
+	}
+	project, session, _ := b.identityLocked()
+	if b.privacy {
+		project, session = "private", "session"
+	}
+	_, _ = fmt.Fprintf(b.out, "\x1b]0;Paperboat - %s / %s\x07", project, session)
+}
+
+func (b *Bar) restoreTitleLocked() {
+	if b.titlePushed {
+		_, _ = fmt.Fprint(b.out, "\x1b[23;0t")
+		b.titlePushed = false
+	}
 }
 
 func (b *Bar) SetConnection(state string) {
@@ -434,6 +521,10 @@ func (b *Bar) ResetRemoteState() {
 	b.ansiState = byte(parser.GroundState)
 	b.appCursorSaved = false
 	b.appInverse = false
+	b.appSGR = nil
+	b.appSGROverflow = false
+	b.alternate = false
+	b.suspended = false
 	b.synchronized = false
 	b.scrollDirty = true
 	b.redrawPending = true
@@ -451,6 +542,13 @@ func (b *Bar) consumeANSI(data []byte) (invalidated bool) {
 		if b.resetsScrollRegion(data[:n]) {
 			b.scrollDirty = true
 			invalidated = true
+			if b.hardResetRestoresViewport(data[:n]) {
+				b.alternate = false
+				if b.suspended {
+					b.suspended = false
+					b.notifyViewportLocked()
+				}
+			}
 		}
 		if b.erasesStatusRow(data[:n]) {
 			invalidated = true
@@ -459,6 +557,9 @@ func (b *Bar) consumeANSI(data []byte) (invalidated bool) {
 		b.trackRemoteCursorSave(data[:n])
 		b.trackRemoteSGR(data[:n])
 		b.trackSynchronizedOutput(data[:n])
+		if b.trackAlternateScreen(data[:n]) {
+			invalidated = true
+		}
 		if wasSynchronized && !b.synchronized {
 			invalidated = true
 		}
@@ -466,6 +567,37 @@ func (b *Bar) consumeANSI(data []byte) (invalidated bool) {
 		data = data[n:]
 	}
 	return invalidated
+}
+
+func (b *Bar) hardResetRestoresViewport(sequence []byte) bool {
+	return len(sequence) == 2 && sequence[0] == '\x1b' && sequence[1] == 'c'
+}
+
+func (b *Bar) trackAlternateScreen(sequence []byte) bool {
+	if b.fullscreen != FullscreenHide || len(sequence) < 6 || sequence[0] != '\x1b' {
+		return false
+	}
+	raw := string(sequence)
+	if !(strings.Contains(raw, "?1049") || strings.Contains(raw, "?1047") || strings.Contains(raw, "?47")) {
+		return false
+	}
+	entering := sequence[len(sequence)-1] == 'h'
+	leaving := sequence[len(sequence)-1] == 'l'
+	if (!entering && !leaving) || b.alternate == entering {
+		return false
+	}
+	b.alternate = entering
+	if entering {
+		_, _ = fmt.Fprint(b.out, "\x1b[r")
+		b.scrollRows = 0
+		b.scrollDirty = true
+		b.suspended = true
+	} else {
+		b.suspended = false
+		b.scrollDirty = true
+	}
+	b.notifyViewportLocked()
+	return true
 }
 
 func (b *Bar) trackSynchronizedOutput(sequence []byte) {
@@ -491,6 +623,14 @@ func (b *Bar) trackRemoteSGR(sequence []byte) {
 		return
 	}
 	params := strings.TrimSuffix(strings.TrimPrefix(string(sequence), "\x1b["), "m")
+	if params == "" || params == "0" {
+		b.appSGR = append(b.appSGR[:0], sequence...)
+		b.appSGROverflow = false
+	} else if len(b.appSGR)+len(sequence) <= 4096 {
+		b.appSGR = append(b.appSGR, sequence...)
+	} else {
+		b.appSGROverflow = true
+	}
 	if params == "" {
 		b.appInverse = false
 		return
@@ -507,6 +647,22 @@ func (b *Bar) trackRemoteSGR(sequence []byte) {
 	}
 }
 
+func (b *Bar) activeLocked() bool { return b.enabled && !b.suspended }
+
+func (b *Bar) notifyViewportLocked() {
+	if b.viewportChanged == nil {
+		return
+	}
+	w, h, err := b.getSize(b.outputFD)
+	if err != nil || w <= 0 || h <= 0 {
+		return
+	}
+	if b.activeLocked() {
+		h--
+	}
+	b.viewportChanged(clamp(w, 1000), clamp(h, 500))
+}
+
 func (b *Bar) refreshViewportLocked() (int, int) {
 	if !b.eligible {
 		b.enabled = false
@@ -517,7 +673,7 @@ func (b *Bar) refreshViewportLocked() (int, int) {
 		return w, h
 	}
 	w, h, err := b.getSize(b.outputFD)
-	if err != nil || w <= 0 || h < 2 {
+	if err != nil || w < minimumWidth || h < 2 {
 		if b.enabled {
 			b.clearLocked()
 		}
@@ -534,7 +690,7 @@ func (b *Bar) drawLocked() {
 		return
 	}
 	w, h := b.refreshViewportLocked()
-	if !b.enabled || b.ansiState != byte(parser.GroundState) || b.appCursorSaved || b.synchronized {
+	if !b.activeLocked() || b.ansiState != byte(parser.GroundState) || b.appCursorSaved || b.synchronized {
 		b.redrawPending = true
 		return
 	}
@@ -544,14 +700,8 @@ func (b *Bar) drawLocked() {
 	}
 	text := b.layoutLocked(w)
 	b.ensureScrollRegionLocked(h - 1)
-	// CSI s/u avoids DEC's saved-cursor slot, which full-screen applications
-	// commonly use. Reverse-video is restored with SGR 7/27 only, preserving
-	// the application's colors and other active SGR attributes.
-	restoreInverse := "\x1b[27m"
-	if b.appInverse {
-		restoreInverse = "\x1b[7m"
-	}
-	_, _ = fmt.Fprintf(b.out, "\x1b[s\x1b[%d;1H\x1b[2K\x1b[7m%s%s\x1b[u", h, text, restoreInverse)
+	style, restore := b.barStyleLocked()
+	_, _ = fmt.Fprintf(b.out, "\x1b[s\x1b[%d;1H\x1b[2K%s%s%s\x1b[u", h, style, text, restore)
 	b.redrawPending = false
 }
 
@@ -566,6 +716,9 @@ func (b *Bar) ensureScrollRegionLocked(rows int) {
 
 func (b *Bar) textLocked() string {
 	project, session, connection := b.identityLocked()
+	if b.privacy {
+		project, session = "private", "session"
+	}
 	identity := " " + project + " / " + session + " / " + connection
 	if failure := b.currentFailureLocked(); failure != "" {
 		return identity + " / " + failure + " "
@@ -591,12 +744,17 @@ func (b *Bar) identityLocked() (project, session, connection string) {
 }
 
 func (b *Bar) layoutLocked(width int) string {
-	left := b.regionLocked(b.layout.Left)
-	center := b.regionLocked(b.layout.Center)
-	right := b.regionLocked(b.layout.Right)
-	if activity := b.activityLocked(); activity != "" && !containsWidget(b.layout.Left, "activity") && !containsWidget(b.layout.Center, "activity") && !containsWidget(b.layout.Right, "activity") {
-		center = joinWidgets(center, activity)
+	layout := Layout{Left: append([]string(nil), b.layout.Left...), Center: append([]string(nil), b.layout.Center...), Right: append([]string(nil), b.layout.Right...)}
+	for _, disposable := range []string{"storage", "credits", "config_sync", "session", "project"} {
+		left, center, right := b.layoutRegionsLocked(layout)
+		if ansi.StringWidth(left)+ansi.StringWidth(center)+ansi.StringWidth(right)+4 <= width {
+			break
+		}
+		layout.Left = withoutWidget(layout.Left, disposable)
+		layout.Center = withoutWidget(layout.Center, disposable)
+		layout.Right = withoutWidget(layout.Right, disposable)
 	}
+	left, center, right := b.layoutRegionsLocked(layout)
 	left = ansi.Truncate(left, width, "")
 	right = ansi.Truncate(right, width, "")
 	center = ansi.Truncate(center, width, "")
@@ -605,7 +763,7 @@ func (b *Bar) layoutLocked(width int) string {
 		return fillStatusWidth(left, "", right, width)
 	}
 	if lw+rw+cw+4 > width {
-		compact := ansi.Truncate(left+" | "+center+" | "+right, width, "")
+		compact := ansi.Truncate(joinWidgets(left, center, right), width, "")
 		return compact + strings.Repeat(" ", max(0, width-ansi.StringWidth(compact)))
 	}
 	centerStart := (width - cw) / 2
@@ -617,6 +775,26 @@ func (b *Bar) layoutLocked(width int) string {
 		centerStart = rightStart - cw - 2
 	}
 	return left + strings.Repeat(" ", centerStart-lw) + center + strings.Repeat(" ", rightStart-centerStart-cw) + right
+}
+
+func (b *Bar) layoutRegionsLocked(layout Layout) (left, center, right string) {
+	left = b.regionLocked(layout.Left)
+	center = b.regionLocked(layout.Center)
+	right = b.regionLocked(layout.Right)
+	if activity := b.activityLocked(); activity != "" && !containsWidget(layout.Left, "activity") && !containsWidget(layout.Center, "activity") && !containsWidget(layout.Right, "activity") {
+		center = joinWidgets(center, activity)
+	}
+	return left, center, right
+}
+
+func withoutWidget(widgets []string, unwanted string) []string {
+	result := widgets[:0]
+	for _, widget := range widgets {
+		if widget != unwanted {
+			result = append(result, widget)
+		}
+	}
+	return result
 }
 
 func (b *Bar) regionLocked(widgets []string) string {
@@ -633,11 +811,23 @@ func (b *Bar) widgetLocked(widget string) string {
 	project, session, connection := b.identityLocked()
 	switch widget {
 	case "project":
-		return project
+		if b.privacy {
+			return ""
+		}
+		return b.semanticLocked(project, "accent")
 	case "session":
+		if b.privacy {
+			return ""
+		}
 		return session
 	case "connection":
-		return connection
+		semantic := "accent"
+		if connection == "failed" || connection == "disconnected" {
+			semantic = "error"
+		} else if connection == "connecting" || connection == "reconnecting" {
+			semantic = "warning"
+		}
+		return b.semanticLocked(connection, semantic)
 	case "activity":
 		return b.activityLocked()
 	case "config_sync":
@@ -646,12 +836,12 @@ func (b *Bar) widgetLocked(widget string) string {
 		}
 		return "sync " + b.configSync
 	case "credits":
-		if b.credits == "" {
+		if b.privacy || b.credits == "" {
 			return ""
 		}
 		return "credits " + b.credits
 	case "storage":
-		if b.storage == "" {
+		if b.privacy || b.storage == "" {
 			return ""
 		}
 		return "storage " + b.storage
@@ -662,13 +852,114 @@ func (b *Bar) widgetLocked(widget string) string {
 
 func (b *Bar) activityLocked() string {
 	if failure := b.currentFailureLocked(); failure != "" {
-		return "! " + failure
+		return b.semanticLocked("! "+failure, "error")
 	}
 	if b.notice != "" && b.noticeUntil.After(time.Now()) {
 		if b.loading {
 			return string("|/-\\"[b.spinner]) + " " + b.notice
 		}
 		return b.notice
+	}
+	return ""
+}
+
+func (b *Bar) barStyleLocked() (style, restore string) {
+	if b.noColor || b.theme == ThemeMono || (b.theme == ThemeTerminal && !b.hasColorOverridesLocked()) || b.appSGROverflow {
+		restore = "\x1b[27m"
+		if b.appInverse {
+			restore = "\x1b[7m"
+		}
+		return "\x1b[7m", restore
+	}
+	style = b.baseStyleLocked()
+	restore = "\x1b[0m" + string(b.appSGR)
+	return style, restore
+}
+
+func (b *Bar) baseStyleLocked() string {
+	if b.theme == ThemeTerminal {
+		if b.colors.Foreground == "" && b.colors.Background == "" {
+			return "\x1b[39m\x1b[49m\x1b[7m"
+		}
+		return colorSequence(firstNonEmpty(b.colors.Foreground, "default"), false) + colorSequence(firstNonEmpty(b.colors.Background, "default"), true)
+	}
+	foreground, background := "bright_white", "black"
+	if b.theme == ThemeLight {
+		foreground, background = "black", "bright_white"
+	}
+	if b.colors.Foreground != "" {
+		foreground = b.colors.Foreground
+	}
+	if b.colors.Background != "" {
+		background = b.colors.Background
+	}
+	return colorSequence(foreground, false) + colorSequence(background, true)
+}
+
+func (b *Bar) semanticLocked(value, semantic string) string {
+	if value == "" || b.noColor || b.theme == ThemeMono || (b.theme == ThemeTerminal && !b.hasColorOverridesLocked()) {
+		return value
+	}
+	color := ""
+	switch semantic {
+	case "accent":
+		color = firstNonEmpty(b.colors.Accent, "bright_cyan")
+	case "warning":
+		color = firstNonEmpty(b.colors.Warning, "bright_yellow")
+	case "error":
+		color = firstNonEmpty(b.colors.Error, "bright_red")
+	}
+	if color == "" {
+		return value
+	}
+	return colorSequence(color, false) + value + b.baseStyleLocked()
+}
+
+func (b *Bar) hasColorOverridesLocked() bool {
+	return b.colors.Foreground != "" || b.colors.Background != "" || b.colors.Accent != "" || b.colors.Warning != "" || b.colors.Error != ""
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func colorSequence(value string, background bool) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	base := 30
+	if background {
+		base = 40
+	}
+	if value == "" || value == "default" {
+		if background {
+			return "\x1b[49m"
+		}
+		return "\x1b[39m"
+	}
+	if strings.HasPrefix(value, "#") && len(value) == 7 {
+		r, _ := strconv.ParseUint(value[1:3], 16, 8)
+		g, _ := strconv.ParseUint(value[3:5], 16, 8)
+		bl, _ := strconv.ParseUint(value[5:7], 16, 8)
+		prefix := 38
+		if background {
+			prefix = 48
+		}
+		return fmt.Sprintf("\x1b[%d;2;%d;%d;%dm", prefix, r, g, bl)
+	}
+	names := []string{"black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"}
+	bright := strings.HasPrefix(value, "bright_")
+	value = strings.TrimPrefix(value, "bright_")
+	for index, name := range names {
+		if value == name {
+			if bright {
+				base += 60
+			}
+			return fmt.Sprintf("\x1b[%dm", base+index)
+		}
 	}
 	return ""
 }
@@ -765,6 +1056,7 @@ func (b *Bar) Close() error {
 	}
 	b.stopSpinnerLocked()
 	b.clearLocked()
+	b.restoreTitleLocked()
 	b.enabled = false
 	b.closed = true
 	return nil
