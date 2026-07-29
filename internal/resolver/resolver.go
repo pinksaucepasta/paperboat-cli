@@ -61,7 +61,6 @@ type TerminalTarget struct {
 	TerminalID    string
 	SessionID     string
 	CWD           string
-	TerminalMode  string
 	// Env is local-terminal environment forwarded on attach (TERM, COLORTERM,
 	// ...) so the remote PTY spawns with the client's terminal capabilities.
 	// Applied by paperboat-helper when the PTY (re)starts.

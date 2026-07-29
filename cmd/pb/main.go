@@ -186,7 +186,6 @@ func addConnectFlags(command *cobra.Command) {
 	command.Flags().Bool("new", false, "create a new terminal session")
 	command.Flags().String("name", "", "name for a new terminal session")
 	command.Flags().String("session", "", "attach an existing terminal session by name or ID")
-	command.Flags().Bool("no-herdr", false, "start the new terminal session with the configured shell")
 	addStatusBarFlags(command)
 }
 
@@ -200,15 +199,11 @@ func validateConnectInvocation(command *cobra.Command) error {
 	newSession, _ := command.Flags().GetBool("new")
 	name, _ := command.Flags().GetString("name")
 	ref, _ := command.Flags().GetString("session")
-	noHerdr, _ := command.Flags().GetBool("no-herdr")
 	if newSession && strings.TrimSpace(ref) != "" {
 		return invocationError(errors.New("--new and --session cannot be used together"))
 	}
 	if !newSession && strings.TrimSpace(name) != "" {
 		return invocationError(errors.New("--name requires --new"))
-	}
-	if noHerdr && !newSession {
-		return invocationError(errors.New("--no-herdr requires --new"))
 	}
 	for name, allowed := range map[string][]string{
 		"transport":             {"auto", "quic", "wss"},
@@ -557,7 +552,7 @@ func actionContext(cobraCommand *cobra.Command, args []string) *command.Context 
 	}
 	hours, _ := cobraCommand.Flags().GetFloat64("hours")
 	set.Float64("hours", hours, "")
-	for _, name := range []string{"new", "no-herdr", "json", "wide", "yes", "clear", "all"} {
+	for _, name := range []string{"new", "json", "wide", "yes", "clear", "all"} {
 		value, _ := cobraCommand.Flags().GetBool(name)
 		values[name] = strconv.FormatBool(value)
 		set.Bool(name, value, "")
@@ -1009,14 +1004,10 @@ func listTerminalSessionsForTarget(ctx context.Context, client *api.Client, targ
 }
 
 func createTerminalSessionForTarget(ctx context.Context, client *api.Client, target environmentTarget, name, idempotencyKey string) (api.TerminalSession, error) {
-	return createTerminalSessionForTargetWithMode(ctx, client, target, name, "herdr", idempotencyKey)
-}
-
-func createTerminalSessionForTargetWithMode(ctx context.Context, client *api.Client, target environmentTarget, name, terminalMode, idempotencyKey string) (api.TerminalSession, error) {
 	if target.kind == environmentUserMachine {
-		return client.CreateUserMachineTerminalSessionWithMode(ctx, target.id, name, terminalMode, idempotencyKey)
+		return client.CreateUserMachineTerminalSession(ctx, target.id, name, idempotencyKey)
 	}
-	return client.CreateTerminalSessionWithMode(ctx, target.id, name, terminalMode, idempotencyKey)
+	return client.CreateTerminalSession(ctx, target.id, name, idempotencyKey)
 }
 
 func renameTerminalSessionForTarget(ctx context.Context, client *api.Client, target environmentTarget, sessionID, name string) (api.TerminalSession, error) {
@@ -1393,10 +1384,6 @@ func sessionsCommand() *command.Spec {
 }
 
 func selectTerminalSession(ctx context.Context, client *api.Client, projectRef string, create bool, name, ref string) (string, error) {
-	return selectTerminalSessionWithMode(ctx, client, projectRef, create, name, ref, "herdr")
-}
-
-func selectTerminalSessionWithMode(ctx context.Context, client *api.Client, projectRef string, create bool, name, ref, terminalMode string) (string, error) {
 	if !create && strings.TrimSpace(ref) == "" {
 		// The descriptor endpoint owns default-session resolution. Avoid resolving
 		// the environment once here and again immediately before dialing.
@@ -1410,7 +1397,7 @@ func selectTerminalSessionWithMode(ctx context.Context, client *api.Client, proj
 		if err := validateSessionNameOptional(name); err != nil {
 			return "", err
 		}
-		session, err := createTerminalSessionForTargetWithMode(ctx, client, target, name, terminalMode, newIdempotencyKey())
+		session, err := createTerminalSessionForTarget(ctx, client, target, name, newIdempotencyKey())
 		if err != nil {
 			return "", friendlyCommandError(err)
 		}
@@ -1659,11 +1646,7 @@ func actionConnectTarget(c *command.Context, requested string) error {
 		}
 	}
 
-	terminalMode := "herdr"
-	if c.Bool("no-herdr") {
-		terminalMode = "shell"
-	}
-	terminalSessionID, err := selectTerminalSessionWithMode(c.Context, backend, project, c.Bool("new"), c.String("name"), c.String("session"), terminalMode)
+	terminalSessionID, err := selectTerminalSession(c.Context, backend, project, c.Bool("new"), c.String("name"), c.String("session"))
 	if err != nil {
 		return err
 	}

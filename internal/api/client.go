@@ -347,7 +347,6 @@ type TerminalSession struct {
 	LastActiveAt   *time.Time       `json:"last_active_at"`
 	CreatedAt      time.Time        `json:"created_at"`
 	UpdatedAt      time.Time        `json:"updated_at"`
-	TerminalMode   string           `json:"terminal_mode"`
 	EvictedSession *TerminalSession `json:"evicted_session,omitempty"`
 }
 
@@ -386,14 +385,13 @@ type Environment struct {
 // cli-connect. It carries client-safe Paperboat route URLs, not raw VM
 // addresses or SSH credentials.
 type Terminal struct {
-	Protocol     string            `json:"protocol"`
-	Endpoints    TerminalEndpoints `json:"endpoints"`
-	SessionID    string            `json:"session_id"`
-	Auth         AuthMaterial      `json:"auth"`
-	ThreadID     string            `json:"thread_id"`
-	TerminalID   string            `json:"terminal_id"`
-	CWD          string            `json:"cwd"`
-	TerminalMode string            `json:"terminal_mode"`
+	Protocol   string            `json:"protocol"`
+	Endpoints  TerminalEndpoints `json:"endpoints"`
+	SessionID  string            `json:"session_id"`
+	Auth       AuthMaterial      `json:"auth"`
+	ThreadID   string            `json:"thread_id"`
+	TerminalID string            `json:"terminal_id"`
+	CWD        string            `json:"cwd"`
 }
 
 type TerminalEndpoints struct {
@@ -685,12 +683,8 @@ func (c *Client) listTerminalSessions(ctx context.Context, basePath string) ([]T
 }
 
 func (c *Client) CreateTerminalSession(ctx context.Context, projectID, name, idempotencyKey string) (TerminalSession, error) {
-	return c.CreateTerminalSessionWithMode(ctx, projectID, name, "herdr", idempotencyKey)
-}
-
-func (c *Client) CreateTerminalSessionWithMode(ctx context.Context, projectID, name, terminalMode, idempotencyKey string) (TerminalSession, error) {
 	var out TerminalSession
-	body := map[string]string{"terminal_mode": terminalMode}
+	body := map[string]string{}
 	if name != "" {
 		body["name"] = name
 	}
@@ -720,12 +714,8 @@ func (c *Client) ListUserMachineTerminalSessions(ctx context.Context, machineID 
 }
 
 func (c *Client) CreateUserMachineTerminalSession(ctx context.Context, machineID, name, idempotencyKey string) (TerminalSession, error) {
-	return c.CreateUserMachineTerminalSessionWithMode(ctx, machineID, name, "herdr", idempotencyKey)
-}
-
-func (c *Client) CreateUserMachineTerminalSessionWithMode(ctx context.Context, machineID, name, terminalMode, idempotencyKey string) (TerminalSession, error) {
 	var out TerminalSession
-	body := map[string]string{"terminal_mode": terminalMode}
+	body := map[string]string{}
 	if name != "" {
 		body["name"] = name
 	}

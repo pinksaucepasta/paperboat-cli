@@ -131,7 +131,7 @@ func measure(parent context.Context, cfg config, transport string, runIndex int)
 	} else {
 		pbSession = fmt.Sprintf("cmatrix-bench-%s-%d-%d", transport[3:], time.Now().UnixNano(), runIndex)
 		defer deletePBSession(cfg.pb, cfg.target, pbSession)
-		command = exec.CommandContext(ctx, cfg.pb, "connect", cfg.target, "--transport", transport[3:], "--new", "--no-herdr", "--name", pbSession, "--status-bar", "off")
+		command = exec.CommandContext(ctx, cfg.pb, "connect", cfg.target, "--transport", transport[3:], "--new", "--name", pbSession, "--status-bar", "off")
 	}
 	terminal, err := pty.StartWithSize(command, &pty.Winsize{Rows: 40, Cols: 120})
 	if err != nil {

@@ -25,11 +25,11 @@ const (
 	helperRequestTimeout  = 30 * time.Second
 	helperReplayGapMarker = "\r\n[paperboat] Earlier terminal output is unavailable; showing retained output.\r\n"
 	// Existing sessions have already emitted their terminal-mode setup, but a
-	// newly attached local terminal has not seen it. Restore the modes Herdr
+	// newly attached local terminal has not seen it. Restore the modes a TUI
 	// establishes before asking the application to redraw. Without this, mouse
 	// input becomes local scrollback and full-screen TUIs lose interactivity.
 	helperTerminalResume = "\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h\x1b[?2004h\x1b[?1004h"
-	helperReplayRedraw   = "\x1b[I" // Focus gained: Herdr's supported full-host redraw trigger.
+	helperReplayRedraw   = "\x1b[I" // Focus gained asks full-screen applications to redraw.
 )
 
 type helperFrame struct {
@@ -228,7 +228,7 @@ func (c *helperTerminalConn) initialize(ctx context.Context) error {
 		// Terminal IDs such as "term-1" can be reused and collide with durable
 		// helper history left by the previous machine identity.
 		name := canonicalSessionName(c.target.SessionID)
-		createPayload, _ := json.Marshal(map[string]any{"action": "create", "session_id": c.target.SessionID, "name": name, "cwd": c.target.CWD, "terminal_mode": c.target.TerminalMode, "columns": cols, "rows": rows, "environment": c.target.Env})
+		createPayload, _ := json.Marshal(map[string]any{"action": "create", "session_id": c.target.SessionID, "name": name, "cwd": c.target.CWD, "columns": cols, "rows": rows, "environment": c.target.Env})
 		frame, err = c.requestSync(ctx, "terminal.v2", createPayload)
 		if err != nil {
 			return fmt.Errorf("create helper terminal session: %w", err)
@@ -748,7 +748,7 @@ func (c *helperTerminalConn) Resize(rows, cols uint16) error {
 		return err
 	}
 	// Resize alone does not make every TUI repaint. Report focus gained once so
-	// Herdr redraws its complete host surface after attaching an existing session.
+	// Full-screen applications can use focus gained to redraw after reattachment.
 	if _, err = c.Write([]byte(helperReplayRedraw)); err != nil {
 		c.replayRedraw.Store(true)
 	}

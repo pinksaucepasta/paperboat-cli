@@ -17,8 +17,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/spf13/cobra"
-
 	"github.com/pinksaucepasta/paperboat-cli/internal/api"
 	"github.com/pinksaucepasta/paperboat-cli/internal/buildinfo"
 	"github.com/pinksaucepasta/paperboat-cli/internal/config"
@@ -121,29 +119,6 @@ func TestSelectDefaultTerminalSessionDefersToDescriptor(t *testing.T) {
 	got, err := selectTerminalSession(context.Background(), api.New(server.URL, config.Credential{AccessToken: "token"}, server.Client()), "studio", false, "", "")
 	if err != nil || got != "" || requests != 0 {
 		t.Fatalf("select default = %q, %v; requests=%d", got, err, requests)
-	}
-}
-
-func TestNoHerdrRequiresNewSession(t *testing.T) {
-	command := newRootCommand()
-	command.SetArgs([]string{"Victus", "--no-herdr"})
-	err := command.ExecuteContext(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "--no-herdr requires --new") {
-		t.Fatalf("err = %v", err)
-	}
-}
-
-func TestActionContextPreservesNoHerdr(t *testing.T) {
-	command := newRootCommand()
-	command.SetArgs([]string{"Victus", "--new", "--no-herdr"})
-	command.RunE = func(command *cobra.Command, args []string) error {
-		if !actionContext(command, args).Bool("no-herdr") {
-			t.Fatal("no-herdr flag was not preserved in the action context")
-		}
-		return nil
-	}
-	if err := command.ExecuteContext(context.Background()); err != nil {
-		t.Fatal(err)
 	}
 }
 

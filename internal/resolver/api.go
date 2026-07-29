@@ -127,7 +127,6 @@ func (r *APIResolver) Resolve(ctx context.Context, req ConnectRequest) (ConnectI
 			TerminalID:    resp.Terminal.TerminalID,
 			SessionID:     resp.Terminal.SessionID,
 			CWD:           resp.Terminal.CWD,
-			TerminalMode:  resp.Terminal.TerminalMode,
 			ReplayHistory: true,
 		},
 	}

@@ -532,15 +532,13 @@ func TestProjectConnectionDescriptorDecodesPaperboatWebSocketTerminal(t *testing
 
 func TestTerminalSessionRequests(t *testing.T) {
 	var createKey string
-	var createMode string
+	var createBody map[string]string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.Method + " " + r.URL.Path {
 		case "POST /v1/projects/prj_1/terminal-sessions":
 			createKey = r.Header.Get("Idempotency-Key")
-			var body map[string]string
-			_ = json.NewDecoder(r.Body).Decode(&body)
-			createMode = body["terminal_mode"]
+			_ = json.NewDecoder(r.Body).Decode(&createBody)
 			_, _ = w.Write([]byte(`{"data":{"id":"pts_1","name":"api","state":"running","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}}`))
 		case "GET /v1/projects/prj_1/terminal-sessions":
 			_, _ = w.Write([]byte(`{"data":{"items":[{"id":"pts_1","name":"api","state":"running","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}],"pagination":{"limit":200,"offset":0,"total":1,"next_offset":null}}}`))
@@ -550,8 +548,8 @@ func TestTerminalSessionRequests(t *testing.T) {
 	}))
 	defer srv.Close()
 	c := New(srv.URL, config.Credential{AccessToken: "token"}, nil)
-	created, err := c.CreateTerminalSessionWithMode(context.Background(), "prj_1", "api", "shell", "key-1")
-	if err != nil || created.ID != "pts_1" || createKey != "key-1" || createMode != "shell" {
+	created, err := c.CreateTerminalSession(context.Background(), "prj_1", "api", "key-1")
+	if err != nil || created.ID != "pts_1" || createKey != "key-1" || len(createBody) != 1 || createBody["name"] != "api" {
 		t.Fatalf("created=%+v key=%q err=%v", created, createKey, err)
 	}
 	sessions, err := c.ListTerminalSessions(context.Background(), "prj_1")

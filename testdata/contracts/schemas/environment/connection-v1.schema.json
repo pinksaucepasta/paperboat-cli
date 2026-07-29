@@ -35,7 +35,7 @@
     "capabilities": {
       "type": "array",
       "uniqueItems": true,
-      "items": {"enum": ["terminal", "herdr", "file_transfer", "preview"]}
+      "items": {"enum": ["terminal", "file_transfer", "preview"]}
     },
     "terminal": {
       "type": "object",
@@ -56,8 +56,7 @@
         "session_id": {"type": "string", "minLength": 1},
         "thread_id": {"type": "string", "minLength": 1},
         "terminal_id": {"type": "string", "minLength": 1},
-        "cwd": {"type": "string", "minLength": 1},
-        "terminal_mode": {"type": "string", "minLength": 1}
+        "cwd": {"type": "string", "minLength": 1}
       }
     },
     "file_transfer": {
