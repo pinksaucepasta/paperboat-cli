@@ -96,6 +96,14 @@ func wrap(body string) string {
 	return "\x1b[200~" + body + "\x1b[201~"
 }
 
+func TestDefaultUploadTimeoutSupportsMaximumSizeTransfers(t *testing.T) {
+	i := New(io.Discard, fixedUploader{"/unused"}, defaultLimits())
+	t.Cleanup(func() { _ = i.Close() })
+	if i.timeout != 10*time.Minute {
+		t.Fatalf("default upload timeout = %s, want 10m", i.timeout)
+	}
+}
+
 func BenchmarkDirectInput4KiB(b *testing.B) {
 	payload := bytes.Repeat([]byte("x"), 4<<10)
 	interceptor := New(io.Discard, fixedUploader{"/unused"}, defaultLimits(),

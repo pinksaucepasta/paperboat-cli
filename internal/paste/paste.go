@@ -39,7 +39,7 @@ var (
 )
 
 // DefaultUploadTimeout bounds how long a single paste is held for upload.
-const DefaultUploadTimeout = 30 * time.Second
+const DefaultUploadTimeout = 10 * time.Minute
 
 // DefaultPartialFlushDelay bounds how long bytes that could begin a paste
 // start marker (e.g. a bare ESC keypress) are withheld while waiting for the
