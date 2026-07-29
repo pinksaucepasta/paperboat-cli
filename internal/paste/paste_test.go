@@ -71,9 +71,9 @@ func (u *blockingUploader) Upload(ctx context.Context, _ upload.Image) (string, 
 
 func defaultLimits() upload.Limits {
 	return upload.Limits{
-		MaxImageBytes:       10 << 20,
+		MaxImageBytes:       50 << 20,
 		MaxAttachments:      8,
-		AllowedMimePrefixes: []string{"image/"},
+		AllowedMimePrefixes: []string{"*"},
 	}
 }
 
@@ -168,6 +168,20 @@ func TestImagePasteRewritten(t *testing.T) {
 	want := wrap("/vm/attach/shot.png")
 	if dest.String() != want {
 		t.Fatalf("got %q want %q", dest.String(), want)
+	}
+}
+
+func TestNonImageFilePasteRewritten(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "notes.txt")
+	if err := os.WriteFile(file, []byte("notes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var dest bytes.Buffer
+	i := New(&dest, fixedUploader{"/vm/attach/notes.txt"}, defaultLimits(), WithPartialFlushDelay(time.Hour))
+	writeInChunks(t, i, wrap(file), 3)
+	if got, want := dest.String(), wrap("/vm/attach/notes.txt"); got != want {
+		t.Fatalf("got %q want %q", got, want)
 	}
 }
 
@@ -355,7 +369,7 @@ func TestUploadFailureFailsOpen(t *testing.T) {
 	if got := dest.String(); got != wrap(img) {
 		t.Fatalf("fail-open: got %q want original %q", got, wrap(img))
 	}
-	if !strings.Contains(notice.String(), "image upload failed: boom; pasting original path") {
+	if !strings.Contains(notice.String(), "file upload failed: boom; pasting original path") {
 		t.Fatalf("expected the upload error in the visible notice, got %q", notice.String())
 	}
 }

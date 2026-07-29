@@ -20,9 +20,9 @@ func write(t *testing.T, dir, name string, n int) string {
 
 func baseLimits() Limits {
 	return Limits{
-		MaxImageBytes:       10 << 20,
+		MaxImageBytes:       50 << 20,
 		MaxAttachments:      8,
-		AllowedMimePrefixes: []string{"image/"},
+		AllowedMimePrefixes: []string{"*"},
 	}
 }
 
@@ -102,11 +102,11 @@ func TestPrepareImageHonorsImageWildcard(t *testing.T) {
 	}
 }
 
-func TestPrepareImageRejectsNonImage(t *testing.T) {
+func TestPrepareImageAcceptsNonImage(t *testing.T) {
 	dir := t.TempDir()
 	p := write(t, dir, "notes.txt", 10)
-	if _, err := PrepareImage(p, baseLimits()); err == nil {
-		t.Fatal("expected non-image rejection")
+	if _, err := PrepareImage(p, baseLimits()); err != nil {
+		t.Fatalf("non-image file rejected: %v", err)
 	}
 }
 

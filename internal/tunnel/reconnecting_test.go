@@ -85,7 +85,7 @@ func TestReconnectingConnRecordsOutputPerformance(t *testing.T) {
 	c.ObserveLocalWrite(6, 12*time.Millisecond)
 	c.maxQueueChunks.Store(4)
 	c.recordOutputPerformance("success")
-	if len(sink.events) != 2 {
+	if len(sink.events) != 3 {
 		t.Fatalf("events = %+v", sink.events)
 	}
 	output := sink.events[0]
@@ -96,21 +96,27 @@ func TestReconnectingConnRecordsOutputPerformance(t *testing.T) {
 	if stage.Name != "terminal.stage" || stage.Stage != "socket_read_to_stdout" || stage.SizeBytes != 6 || stage.LatencyMS != 12 || stage.Count != 1 {
 		t.Fatalf("output stage = %+v", stage)
 	}
+	if queue := sink.events[2]; queue.Stage != "socket_read_to_queue" || queue.SizeBytes != 6 || queue.Count != 1 {
+		t.Fatalf("queue stage = %+v", queue)
+	}
 }
 
 func TestReconnectingConnRecordsInputAndEchoStages(t *testing.T) {
 	sink := &tunnelEventSink{}
 	c := &ReconnectingConn{telemetry: sink, now: time.Now}
-	c.ObserveInputWrite(4, 7*time.Millisecond)
+	c.ObserveInputWrite(4, 70*time.Millisecond)
 	c.ObserveLocalWrite(4, 3*time.Millisecond)
 	c.recordOutputPerformance("success")
-	if len(sink.events) != 4 {
+	if len(sink.events) != 6 {
 		t.Fatalf("events = %+v", sink.events)
 	}
-	if input := sink.events[1]; input.Name != "terminal.stage" || input.Stage != "stdin_to_socket" || input.SizeBytes != 4 || input.LatencyMS != 7 || input.Count != 1 {
+	if input := sink.events[1]; input.Name != "terminal.stage" || input.Stage != "stdin_to_socket" || input.SizeBytes != 4 || input.LatencyMS != 70 || input.Count != 1 {
 		t.Fatalf("input stage = %+v", input)
 	}
-	if echo := sink.events[3]; echo.Name != "terminal.stage" || echo.Stage != "input_to_next_output" || echo.SizeBytes != 0 || echo.Count != 1 {
+	if stall := sink.events[4]; stall.Stage != "flow_control_stall" || stall.LatencyMS != 70 || stall.Count != 1 {
+		t.Fatalf("flow-control stage = %+v", stall)
+	}
+	if echo := sink.events[5]; echo.Name != "terminal.stage" || echo.Stage != "input_to_next_output" || echo.SizeBytes != 0 || echo.Count != 1 {
 		t.Fatalf("echo stage = %+v", echo)
 	}
 }

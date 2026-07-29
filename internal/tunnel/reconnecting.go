@@ -71,6 +71,8 @@ type transportFailureMarker interface {
 	MarkTransportLost(error)
 }
 
+const flowControlStallThreshold = 50 * time.Millisecond
+
 // ReconnectingConn supervises unexpected transport loss while one session
 // loop retains ownership of stdin. Failed writes are never replayed.
 type ReconnectingConn struct {
@@ -97,8 +99,11 @@ type ReconnectingConn struct {
 	lastInputAt       atomic.Int64
 	echoSamples       atomic.Int64
 	maxQueueChunks    atomic.Int64
+	maxQueueDelayMS   atomic.Int64
 	maxWriteLatencyMS atomic.Int64
 	maxInputLatencyMS atomic.Int64
+	flowControlStalls atomic.Int64
+	maxFlowStallMS    atomic.Int64
 	maxEchoLatencyMS  atomic.Int64
 	outputBatchWindow time.Duration
 	observer          func(ReconnectEvent)
@@ -159,9 +164,11 @@ func (c *ReconnectingConn) supervise(conn Conn) {
 				n, err := conn.Read(buf)
 				if n > 0 {
 					b := append([]byte(nil), buf[:n]...)
+					queuedAt := time.Now()
 					select {
 					case c.out <- b:
 						updateAtomicMax(&c.maxQueueChunks, int64(len(c.out)))
+						updateAtomicMax(&c.maxQueueDelayMS, time.Since(queuedAt).Milliseconds())
 					case <-c.closed:
 						return
 					}
@@ -317,6 +324,10 @@ func (c *ReconnectingConn) ObserveInputWrite(size int, duration time.Duration) {
 	c.inputBytes.Add(int64(size))
 	c.inputFrames.Add(1)
 	updateAtomicMax(&c.maxInputLatencyMS, duration.Milliseconds())
+	if duration >= flowControlStallThreshold {
+		c.flowControlStalls.Add(1)
+		updateAtomicMax(&c.maxFlowStallMS, duration.Milliseconds())
+	}
 	c.lastInputAt.Store(time.Now().UnixNano())
 }
 
@@ -339,6 +350,8 @@ func (c *ReconnectingConn) recordOutputPerformance(outcome string) {
 	}
 	c.recordTerminalStage("stdin_to_socket", c.inputBytes.Load(), c.inputFrames.Load(), c.maxInputLatencyMS.Load(), outcome)
 	c.recordTerminalStage("socket_read_to_stdout", c.outputBytes.Load(), c.outputFrames.Load(), c.maxWriteLatencyMS.Load(), outcome)
+	c.recordTerminalStage("socket_read_to_queue", c.outputBytes.Load(), c.outputFrames.Load(), c.maxQueueDelayMS.Load(), outcome)
+	c.recordTerminalStage("flow_control_stall", 0, c.flowControlStalls.Load(), c.maxFlowStallMS.Load(), outcome)
 	c.recordTerminalStage("input_to_next_output", 0, c.echoSamples.Load(), c.maxEchoLatencyMS.Load(), outcome)
 }
 

@@ -76,6 +76,7 @@ type Options struct {
 type Bar struct {
 	mu              sync.Mutex
 	out             io.Writer
+	serializedOut   io.Writer
 	outputFD        int
 	eligible        bool
 	enabled         bool
@@ -119,6 +120,31 @@ type Bar struct {
 	noColor         bool
 	terminalTitle   bool
 	titlePushed     bool
+	remoteWrites    chan outputWrite
+	redraw          chan struct{}
+	ownerStop       chan struct{}
+	ownerDone       chan struct{}
+	ownerStopOnce   sync.Once
+}
+
+type outputWrite struct {
+	data   []byte
+	result chan outputResult
+}
+type outputResult struct {
+	n   int
+	err error
+}
+
+type serializedWriter struct {
+	mu  sync.Mutex
+	out io.Writer
+}
+
+func (w *serializedWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.out.Write(p)
 }
 
 type failure struct {
@@ -159,8 +185,10 @@ func New(options Options) *Bar {
 	if options.NoticeDuration <= 0 {
 		options.NoticeDuration = 5 * time.Second
 	}
+	serializedOut := &serializedWriter{out: output}
 	b := &Bar{
 		out:             output,
+		serializedOut:   serializedOut,
 		outputFD:        int(output.Fd()),
 		eligible:        eligible,
 		noticeDuration:  options.NoticeDuration,
@@ -179,12 +207,68 @@ func New(options Options) *Bar {
 		colors:          options.Colors,
 		noColor:         os.Getenv("NO_COLOR") != "",
 		terminalTitle:   options.TerminalTitle,
+		remoteWrites:    make(chan outputWrite, 64),
+		redraw:          make(chan struct{}, 1),
+		ownerStop:       make(chan struct{}),
+		ownerDone:       make(chan struct{}),
 	}
 	b.mu.Lock()
 	b.refreshViewportLocked()
-	b.drawLocked()
+	b.drawNowLocked()
 	b.mu.Unlock()
+	go b.runOutputOwner()
 	return b
+}
+
+func (b *Bar) runOutputOwner() {
+	defer close(b.ownerDone)
+	var redrawTimer *time.Timer
+	var redrawC <-chan time.Time
+	for {
+		select {
+		case request := <-b.remoteWrites:
+			n, err := b.serializedOut.Write(request.data)
+			if n > 0 {
+				b.mu.Lock()
+				invalidated := b.consumeANSI(request.data[:n])
+				if !b.closed && b.ansiState == byte(parser.GroundState) && (invalidated || b.redrawPending) {
+					b.drawLocked()
+				}
+				b.mu.Unlock()
+			}
+			request.result <- outputResult{n: n, err: err}
+			continue
+		default:
+		}
+		select {
+		case request := <-b.remoteWrites:
+			n, err := b.serializedOut.Write(request.data)
+			if n > 0 {
+				b.mu.Lock()
+				invalidated := b.consumeANSI(request.data[:n])
+				if !b.closed && b.ansiState == byte(parser.GroundState) && (invalidated || b.redrawPending) {
+					b.drawLocked()
+				}
+				b.mu.Unlock()
+			}
+			request.result <- outputResult{n: n, err: err}
+		case <-b.redraw:
+			if redrawTimer == nil {
+				redrawTimer = time.NewTimer(time.Second / 60)
+				redrawC = redrawTimer.C
+			}
+		case <-redrawC:
+			redrawTimer = nil
+			redrawC = nil
+			b.mu.Lock()
+			if !b.closed {
+				b.drawNowLocked()
+			}
+			b.mu.Unlock()
+		case <-b.ownerStop:
+			return
+		}
+	}
 }
 
 func normalized(value, fallback string) string {
@@ -267,7 +351,7 @@ func (b *Bar) PrepareRemoteViewport() {
 		return
 	}
 	b.ensureScrollRegionLocked(h - 1)
-	_, _ = fmt.Fprintf(b.out, "\x1b[%d;1H", h-1)
+	_, _ = fmt.Fprintf(b.serializedOut, "\x1b[%d;1H", h-1)
 }
 
 // ClearRemoteViewport starts an attached session on a clean local screen while
@@ -278,14 +362,14 @@ func (b *Bar) ClearRemoteViewport() {
 	if b.closed {
 		return
 	}
-	_, _ = fmt.Fprint(b.out, "\x1b[2J\x1b[H")
+	_, _ = fmt.Fprint(b.serializedOut, "\x1b[2J\x1b[H")
 	_, h := b.refreshViewportLocked()
 	if !b.activeLocked() || h < 2 {
 		return
 	}
 	b.ensureScrollRegionLocked(h - 1)
 	b.drawLocked()
-	_, _ = fmt.Fprintf(b.out, "\x1b[%d;1H", h-1)
+	_, _ = fmt.Fprintf(b.serializedOut, "\x1b[%d;1H", h-1)
 }
 
 // ClearForExit restores the full viewport and leaves the host terminal at a
@@ -305,7 +389,7 @@ func (b *Bar) ClearForExit() {
 	b.scrollDirty = true
 	b.enabled = false
 	b.closed = true
-	_, _ = fmt.Fprint(b.out, "\x1b[r\x1b[2J\x1b[H")
+	_, _ = fmt.Fprint(b.serializedOut, "\x1b[r\x1b[2J\x1b[H")
 	b.restoreTitleLocked()
 }
 
@@ -341,19 +425,19 @@ func (b *Bar) updateTitleLocked() {
 		return
 	}
 	if !b.titlePushed {
-		_, _ = fmt.Fprint(b.out, "\x1b[22;0t")
+		_, _ = fmt.Fprint(b.serializedOut, "\x1b[22;0t")
 		b.titlePushed = true
 	}
 	project, session, _ := b.identityLocked()
 	if b.privacy {
 		project, session = "private", "session"
 	}
-	_, _ = fmt.Fprintf(b.out, "\x1b]0;Paperboat - %s / %s\x07", project, session)
+	_, _ = fmt.Fprintf(b.serializedOut, "\x1b]0;Paperboat - %s / %s\x07", project, session)
 }
 
 func (b *Bar) restoreTitleLocked() {
 	if b.titlePushed {
-		_, _ = fmt.Fprint(b.out, "\x1b[23;0t")
+		_, _ = fmt.Fprint(b.serializedOut, "\x1b[23;0t")
 		b.titlePushed = false
 	}
 }
@@ -500,16 +584,21 @@ func (b *Bar) stopSpinnerLocked() {
 // ANSI sequence. That prevents the cursor movement used for the local line
 // from being inserted in the middle of a split escape sequence.
 func (b *Bar) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	n, err := b.out.Write(p)
-	if n > 0 {
-		invalidated := b.consumeANSI(p[:n])
-		if !b.closed && b.ansiState == byte(parser.GroundState) && (invalidated || b.redrawPending) {
-			b.drawLocked()
-		}
+	if !b.eligible {
+		return b.out.Write(p)
 	}
-	return n, err
+	request := outputWrite{data: append([]byte(nil), p...), result: make(chan outputResult, 1)}
+	select {
+	case b.remoteWrites <- request:
+	case <-b.ownerDone:
+		return 0, io.ErrClosedPipe
+	}
+	select {
+	case result := <-request.result:
+		return result.n, result.err
+	case <-b.ownerDone:
+		return 0, io.ErrClosedPipe
+	}
 }
 
 // ResetRemoteState discards parser state that cannot safely cross a transport
@@ -588,7 +677,7 @@ func (b *Bar) trackAlternateScreen(sequence []byte) bool {
 	}
 	b.alternate = entering
 	if entering {
-		_, _ = fmt.Fprint(b.out, "\x1b[r")
+		_, _ = fmt.Fprint(b.serializedOut, "\x1b[r")
 		b.scrollRows = 0
 		b.scrollDirty = true
 		b.suspended = true
@@ -686,6 +775,14 @@ func (b *Bar) refreshViewportLocked() (int, int) {
 }
 
 func (b *Bar) drawLocked() {
+	b.redrawPending = true
+	select {
+	case b.redraw <- struct{}{}:
+	default:
+	}
+}
+
+func (b *Bar) drawNowLocked() {
 	if b.closed {
 		return
 	}
@@ -701,15 +798,24 @@ func (b *Bar) drawLocked() {
 	text := b.layoutLocked(w)
 	b.ensureScrollRegionLocked(h - 1)
 	style, restore := b.barStyleLocked()
-	_, _ = fmt.Fprintf(b.out, "\x1b[s\x1b[%d;1H\x1b[2K%s%s%s\x1b[u", h, style, text, restore)
+	_, _ = fmt.Fprintf(b.serializedOut, "\x1b[s\x1b[%d;1H\x1b[2K%s%s%s\x1b[u", h, style, text, restore)
 	b.redrawPending = false
+}
+
+func (b *Bar) flushPendingRedrawLocked() {
+	if !b.redrawPending || b.ansiState != byte(parser.GroundState) || b.appCursorSaved || b.synchronized {
+		return
+	}
+	b.closed = false
+	b.drawNowLocked()
+	b.closed = true
 }
 
 func (b *Bar) ensureScrollRegionLocked(rows int) {
 	if rows < 1 || (!b.scrollDirty && b.scrollRows == rows) {
 		return
 	}
-	_, _ = fmt.Fprintf(b.out, "\x1b[s\x1b[1;%dr\x1b[u", rows)
+	_, _ = fmt.Fprintf(b.serializedOut, "\x1b[s\x1b[1;%dr\x1b[u", rows)
 	b.scrollRows = rows
 	b.scrollDirty = false
 }
@@ -1011,7 +1117,7 @@ func (b *Bar) clearLocked() {
 	if b.lastRows < 1 {
 		return
 	}
-	_, _ = fmt.Fprintf(b.out, "\x1b[s\x1b[%d;1H\x1b[2K\x1b[r\x1b[u", b.lastRows)
+	_, _ = fmt.Fprintf(b.serializedOut, "\x1b[s\x1b[%d;1H\x1b[2K\x1b[r\x1b[u", b.lastRows)
 	b.scrollRows = 0
 	b.scrollDirty = true
 }
@@ -1046,8 +1152,10 @@ func (b *Bar) erasesStatusRow(sequence []byte) bool {
 // Close clears the reserved row. It is safe to call more than once.
 func (b *Bar) Close() error {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	if b.closed {
+		b.mu.Unlock()
+		b.ownerStopOnce.Do(func() { close(b.ownerStop) })
+		<-b.ownerDone
 		return nil
 	}
 	if b.timer != nil {
@@ -1055,10 +1163,17 @@ func (b *Bar) Close() error {
 		b.timer = nil
 	}
 	b.stopSpinnerLocked()
+	b.enabled = false
+	b.closed = true
+	b.mu.Unlock()
+	b.ownerStopOnce.Do(func() { close(b.ownerStop) })
+	<-b.ownerDone
+	b.mu.Lock()
+	b.flushPendingRedrawLocked()
 	b.clearLocked()
 	b.restoreTitleLocked()
 	b.enabled = false
-	b.closed = true
+	b.mu.Unlock()
 	return nil
 }
 

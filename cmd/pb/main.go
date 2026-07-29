@@ -1,6 +1,6 @@
 // Command pb is the invisible terminal wrapper for the
 // Paperboat platform. `pb <environment>` attaches a hosted project or enrolled
-// user machine through Paperboat auth and bridges local image pastes into
+// user machine through Paperboat auth and bridges local file pastes into
 // remote TUIs. Cross-service calls run behind interfaces so protocol behavior
 // remains independently testable.
 package main
@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -178,6 +179,7 @@ func newRootCommand() *cobra.Command {
 }
 
 func addConnectFlags(command *cobra.Command) {
+	command.Flags().String("transport", "", "terminal transport for this attach: auto, quic, or wss")
 	command.Flags().Bool("new", false, "create a new terminal session")
 	command.Flags().String("name", "", "name for a new terminal session")
 	command.Flags().String("session", "", "attach an existing terminal session by name or ID")
@@ -206,6 +208,7 @@ func validateConnectInvocation(command *cobra.Command) error {
 		return invocationError(errors.New("--no-herdr requires --new"))
 	}
 	for name, allowed := range map[string][]string{
+		"transport":             {"auto", "quic", "wss"},
 		"status-bar":            {"auto", "on", "off"},
 		"status-bar-fullscreen": {"hide", "show"},
 		"status-bar-theme":      {"terminal", "dark", "light", "mono"},
@@ -296,12 +299,17 @@ func sessionsCobraCommand() *cobra.Command {
 		switch child.Name {
 		case "rename":
 			args = cobra.ExactArgs(3)
-		case "close", "delete":
+		case "close":
+			args = cobra.RangeArgs(1, 2)
+		case "delete":
 			args = cobra.ExactArgs(2)
 		}
 		entry := &cobra.Command{Use: child.Name, Short: child.Usage, Args: commandArgs(args), RunE: actionRun(child.Action)}
 		if child.Name == "close" || child.Name == "delete" {
 			entry.Flags().Bool("yes", false, "confirm "+child.Name)
+		}
+		if child.Name == "close" {
+			entry.Flags().Bool("all", false, "close all sessions in the environment")
 		}
 		command.AddCommand(entry)
 	}
@@ -334,12 +342,17 @@ func sessionCobraCommand() *cobra.Command {
 		switch child.Name {
 		case "rename":
 			args = cobra.ExactArgs(3)
-		case "close", "delete":
+		case "close":
+			args = cobra.RangeArgs(1, 2)
+		case "delete":
 			args = cobra.ExactArgs(2)
 		}
 		entry := &cobra.Command{Use: child.Name, Short: child.Usage, Args: commandArgs(args), RunE: actionRun(child.Action)}
 		if child.Name == "close" || child.Name == "delete" {
 			entry.Flags().Bool("yes", false, "confirm "+child.Name)
+		}
+		if child.Name == "close" {
+			entry.Flags().Bool("all", false, "close all sessions in the environment")
 		}
 		command.AddCommand(entry)
 	}
@@ -534,14 +547,14 @@ func actionRun(action command.Action) func(*cobra.Command, []string) error {
 func actionContext(cobraCommand *cobra.Command, args []string) *command.Context {
 	set := flag.NewFlagSet("pb", flag.ContinueOnError)
 	values := map[string]string{}
-	for _, name := range []string{"config", "server", "name", "session", "status-bar", "status-bar-fullscreen", "status-bar-theme"} {
+	for _, name := range []string{"config", "server", "name", "session", "transport", "status-bar", "status-bar-fullscreen", "status-bar-theme"} {
 		value, _ := cobraCommand.Flags().GetString(name)
 		values[name] = value
 		set.String(name, value, "")
 	}
 	hours, _ := cobraCommand.Flags().GetFloat64("hours")
 	set.Float64("hours", hours, "")
-	for _, name := range []string{"new", "no-herdr", "json", "wide", "yes", "clear"} {
+	for _, name := range []string{"new", "no-herdr", "json", "wide", "yes", "clear", "all"} {
 		value, _ := cobraCommand.Flags().GetBool(name)
 		values[name] = strconv.FormatBool(value)
 		set.Bool(name, value, "")
@@ -1026,12 +1039,13 @@ func deleteTerminalSessionForTarget(ctx context.Context, client *api.Client, tar
 
 // deps bundles production dependencies for a command.
 type deps struct {
-	cfg       *config.Config
-	auth      config.AuthSource
-	resolver  resolver.ProjectResolver
-	tunnel    tunnel.Tunnel
-	uploader  upload.Uploader
-	telemetry telemetry.Sink
+	cfg              *config.Config
+	auth             config.AuthSource
+	resolver         resolver.ProjectResolver
+	tunnel           tunnel.Tunnel
+	terminalSelector *tunnel.TerminalTransportSelector
+	uploader         upload.Uploader
+	telemetry        telemetry.Sink
 }
 
 func buildDeps(c *command.Context) (*deps, error) {
@@ -1054,7 +1068,23 @@ func buildDeps(c *command.Context) (*deps, error) {
 	}
 	websocketTunnel := tunnel.NewWebSocketTunnel()
 	websocketTunnel.OutputQueueChunks = cfg.Connect.TerminalOutputQueueChunks
-	var termTunnel tunnel.Tunnel = websocketTunnel
+	quicTunnel := tunnel.NewQUICTunnel()
+	quicTunnel.OutputQueueChunks = cfg.Connect.TerminalOutputQueueChunks
+	transportMode := cfg.Connect.TerminalTransport
+	if override := strings.TrimSpace(c.String("transport")); override != "" {
+		transportMode = override
+	}
+	mode, err := tunnel.ParseTerminalTransport(transportMode)
+	if err != nil {
+		return nil, err
+	}
+	termTunnel, err := tunnel.NewTerminalTransportSelector(mode, quicTunnel, websocketTunnel)
+	if err != nil {
+		return nil, err
+	}
+	if err := termTunnel.SetPreferencePath(filepath.Join(filepath.Dir(cfg.Path()), "terminal-transport.json")); err != nil {
+		return nil, fmt.Errorf("load terminal transport preference: %w", err)
+	}
 	var uploader upload.Uploader = upload.NewDisabledUploader()
 	var authSource config.AuthSource = config.NoCredentialsSource{}
 	if cfg.ServerURL != "" {
@@ -1064,11 +1094,12 @@ func buildDeps(c *command.Context) (*deps, error) {
 		}
 	}
 	return &deps{
-		cfg:      cfg,
-		auth:     authSource,
-		resolver: nil,
-		tunnel:   termTunnel,
-		uploader: uploader,
+		cfg:              cfg,
+		auth:             authSource,
+		resolver:         nil,
+		tunnel:           termTunnel,
+		terminalSelector: termTunnel,
+		uploader:         uploader,
 	}, nil
 }
 
@@ -1282,9 +1313,10 @@ func sessionsCommand() *command.Spec {
 			_, err = renameTerminalSessionForTarget(c.Context, client, target, session.ID, c.Args().Get(2))
 			return friendlyCommandError(err)
 		}},
-		{Name: "close", ArgsUsage: "<environment> <session>", Action: func(c *command.Context) error {
-			if c.Args().Len() != 2 {
-				return errors.New("usage: pb sessions close <environment> <session> --yes")
+		{Name: "close", ArgsUsage: "<environment> [<session>]", Action: func(c *command.Context) error {
+			all := c.Bool("all")
+			if c.Args().Len() < 1 || c.Args().Len() > 2 || all == (c.Args().Len() == 2) {
+				return errors.New("usage: pb session close <environment> <session> --yes OR pb session close <environment> --all --yes")
 			}
 			if !c.Bool("yes") {
 				return errors.New("session close requires --yes")
@@ -1297,12 +1329,35 @@ func sessionsCommand() *command.Spec {
 			if err != nil {
 				return err
 			}
+			if all {
+				sessions, err := listTerminalSessionsForTarget(c.Context, client, target)
+				if err != nil {
+					return friendlyCommandError(err)
+				}
+				var closeErrors []error
+				closed := 0
+				for _, session := range sessions {
+					if session.State == "closed" {
+						continue
+					}
+					if err := closeTerminalSessionForTarget(c.Context, client, target, session.ID); err != nil {
+						closeErrors = append(closeErrors, fmt.Errorf("close session %s: %w", session.Name, err))
+						continue
+					}
+					closed++
+				}
+				if len(closeErrors) > 0 {
+					return fmt.Errorf("closed %d sessions in %s; remote state changed: %w", closed, target.name, errors.Join(closeErrors...))
+				}
+				fmt.Fprintf(c.Writer, "Closed %d sessions in %s.\n", closed, target.name)
+				return nil
+			}
 			session, err := resolveTerminalSession(c.Context, client, target, c.Args().Get(1))
 			if err != nil {
 				return err
 			}
 			return friendlyCommandError(closeTerminalSessionForTarget(c.Context, client, target, session.ID))
-		}, Flags: []command.Flag{&command.BoolFlag{Name: "yes", Usage: "confirm close"}}},
+		}, Flags: []command.Flag{&command.BoolFlag{Name: "yes", Usage: "confirm close"}, &command.BoolFlag{Name: "all", Usage: "close all sessions in the environment"}}},
 		{Name: "delete", ArgsUsage: "<environment> <session>", Flags: []command.Flag{&command.BoolFlag{Name: "yes", Usage: "confirm deletion"}}, Action: func(c *command.Context) error {
 			if c.Args().Len() != 2 {
 				return errors.New("usage: pb sessions delete <environment> <session> [--yes]")
@@ -1596,6 +1651,13 @@ func actionConnectTarget(c *command.Context, requested string) error {
 	var closeTelemetry func()
 	d.telemetry, closeTelemetry = connectTelemetry(d.cfg, os.Stderr)
 	defer closeTelemetry()
+	d.terminalSelector.Observer = func(selection tunnel.TerminalTransportSelection, outcome string) {
+		stage := fmt.Sprintf("requested.%s.selected.%s.fallback.%s", selection.Requested, firstNonEmpty(selection.Selected, "none"), selection.Fallback)
+		event := telemetry.Event{Name: "terminal.transport", At: time.Now(), Outcome: outcome, Stage: stage}
+		if event.Validate() == nil {
+			d.telemetry.Record(event)
+		}
+	}
 
 	terminalMode := "herdr"
 	if c.Bool("no-herdr") {
@@ -1763,6 +1825,9 @@ func actionConnectTarget(c *command.Context, requested string) error {
 		}
 		freshConn, dialErr := d.tunnel.Dial(reconnectCtx, freshInfo)
 		if dialErr != nil {
+			if !tunnel.FallbackEligible(dialErr) {
+				return nil, tunnel.StopReconnect(dialErr)
+			}
 			return nil, dialErr
 		}
 		if pastePolicy != nil {
@@ -1808,7 +1873,7 @@ func actionConnectTarget(c *command.Context, requested string) error {
 			}
 			switch event {
 			case paste.ImageDetected:
-				bar.Loading("Image detected")
+				bar.Loading("File detected")
 			case paste.ImageUploading:
 				bar.Loading("Uploading image")
 			case paste.ImageComplete:
@@ -2498,7 +2563,7 @@ func setStatusBarValue(value *config.StatusBarConfig, key, raw string) error {
 	default:
 		return fmt.Errorf("unknown status-bar key %q", key)
 	}
-	probe := &config.Config{StatusBar: *value}
+	probe := &config.Config{Connect: config.ConnectConfig{TerminalTransport: config.DefaultTerminalTransport}, StatusBar: *value}
 	return probe.Validate()
 }
 
@@ -2700,13 +2765,14 @@ func doctorCommand() *command.Spec {
 			} else {
 				fmt.Println("fly readiness: ready ✓")
 			}
-			fmt.Println("transport:    route descriptor ready ✓")
-			if err := tunnel.NewWebSocketTunnel().Check(c.Context, info.Terminal); err != nil {
-				fmt.Printf("terminal:    websocket unavailable: %v\n", err)
-				return fmt.Errorf("doctor: terminal protocol check failed: %w", err)
+			selection, err := d.terminalSelector.Check(c.Context, info.Terminal)
+			if err != nil {
+				fmt.Printf("transport:    requested %s, selected %s, fallback %s\n", selection.Requested, firstNonEmpty(selection.Selected, "none"), selection.Fallback)
+				return errors.New("doctor: terminal transport or protocol check failed")
 			}
-			fmt.Printf("terminal:    websocket route/auth ready for %s ✓\n", info.Project)
-			fmt.Println("protocol:    paperboat-terminal-rpc/v1 ✓")
+			fmt.Printf("transport:    requested %s, selected %s, fallback %s ✓\n", selection.Requested, selection.Selected, selection.Fallback)
+			fmt.Printf("terminal:    route/auth ready for %s ✓\n", info.Project)
+			fmt.Println("protocol:    paperboat.terminal.v2 ✓")
 			if diagnosticState != "ready" {
 				return errors.New("doctor: user-machine runtime diagnostics require attention")
 			}
@@ -2763,12 +2829,14 @@ func doctorJSON(c *command.Context, d *deps) error {
 		_ = json.NewEncoder(os.Stdout).Encode(result)
 		return errors.New("doctor: descriptor missing terminal endpoint")
 	}
-	if err := tunnel.NewWebSocketTunnel().Check(c.Context, info.Terminal); err != nil {
+	selection, err := d.terminalSelector.Check(c.Context, info.Terminal)
+	result["terminal_transport"] = map[string]string{"requested": string(selection.Requested), "selected": selection.Selected, "fallback": selection.Fallback}
+	if err != nil {
 		result["project"] = info.ProjectID
-		result["connect"] = "websocket_error"
-		result["connect_error"] = err.Error()
+		result["connect"] = "transport_error"
+		result["connect_error"] = "terminal transport or protocol check failed"
 		_ = json.NewEncoder(os.Stdout).Encode(result)
-		return fmt.Errorf("doctor: terminal protocol check failed: %w", err)
+		return errors.New("doctor: terminal transport or protocol check failed")
 	}
 	result["project"] = map[string]string{"id": info.ProjectID, "name": info.Project, "state": info.ProjectState}
 	result["environment_type"] = info.TargetKind

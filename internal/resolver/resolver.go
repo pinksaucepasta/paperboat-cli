@@ -53,16 +53,16 @@ type AuthTarget struct {
 // by the broker. It carries scoped terminal auth, not
 // raw machine addresses, SSH credentials, or tunnel control tokens.
 type TerminalTarget struct {
-	Kind             string
-	EnvironmentID    string
-	HTTPBaseURL      string
-	WebSocketBaseURL string
-	Auth             AuthTarget
-	ThreadID         string
-	TerminalID       string
-	SessionID        string
-	CWD              string
-	TerminalMode     string
+	Protocol      string
+	EnvironmentID string
+	QUICEndpoint  string
+	WSSEndpoint   string
+	Auth          AuthTarget
+	ThreadID      string
+	TerminalID    string
+	SessionID     string
+	CWD           string
+	TerminalMode  string
 	// Env is local-terminal environment forwarded on attach (TERM, COLORTERM,
 	// ...) so the remote PTY spawns with the client's terminal capabilities.
 	// Applied by paperboat-helper when the PTY (re)starts.

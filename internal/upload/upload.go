@@ -1,4 +1,4 @@
-// Package upload bridges a local pasted image to a VM-side path. The wrapper
+// Package upload bridges a local pasted file to a VM-side path. The wrapper
 // reads the local file, hands it to an Uploader, and rewrites the paste to the
 // returned VM path so the remote agent receives something it can open.
 //
@@ -167,6 +167,9 @@ func IsImagePath(path string) bool {
 
 func mimeAllowedByPolicy(mimeType string, prefixes, exact []string) bool {
 	for _, allowed := range exact {
+		if strings.TrimSpace(allowed) == "*/*" {
+			return true
+		}
 		if strings.EqualFold(strings.TrimSpace(allowed), "image/*") && strings.HasPrefix(strings.ToLower(mimeType), "image/") {
 			return true
 		}
@@ -178,9 +181,12 @@ func mimeAllowedByPolicy(mimeType string, prefixes, exact []string) bool {
 		return false
 	}
 	if len(prefixes) == 0 {
-		prefixes = []string{"image/"}
+		prefixes = []string{"*"}
 	}
 	for _, p := range prefixes {
+		if strings.TrimSpace(p) == "*" {
+			return true
+		}
 		if strings.HasPrefix(mimeType, p) {
 			return true
 		}

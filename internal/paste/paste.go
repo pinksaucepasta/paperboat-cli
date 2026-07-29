@@ -4,7 +4,7 @@
 // center of the CLI and is covered by unit tests.
 //
 // Guarantees (see AGENTS.md):
-//   - Non-image pastes pass through byte-for-byte untouched.
+//   - Pasted text that is not a validated absolute file path passes through untouched.
 //   - Paste framing (ESC[200~ … ESC[201~) and ordering are preserved.
 //   - Upload holds only the affected paste; the rest of the stream keeps
 //     flowing, and remote output runs on a separate goroutine so the PTY never
@@ -53,7 +53,7 @@ const (
 )
 
 // Interceptor wraps the writer feeding the remote PTY. Feed stdin bytes to it
-// via Write; it forwards them to dest, rewriting image pastes along the way.
+// via Write; it forwards them to dest, rewriting local file-path pastes along the way.
 type Interceptor struct {
 	ctx            context.Context
 	cancel         context.CancelFunc
@@ -145,7 +145,7 @@ func WithTempFilePatterns(patterns []string) Option {
 	return func(i *Interceptor) { i.tempPatterns = append([]string(nil), patterns...) }
 }
 
-// WithMaxQueuedBytes bounds input held behind an in-flight image upload.
+// WithMaxQueuedBytes bounds input held behind an in-flight file upload.
 func WithMaxQueuedBytes(n int) Option {
 	return func(i *Interceptor) {
 		if n <= 0 {
@@ -253,7 +253,7 @@ func (i *Interceptor) Write(p []byte) (int, error) {
 			continue
 		default:
 			i.pressureOnce.Do(func() {
-				i.warn("local input queue is full; waiting for image upload")
+				i.warn("local input queue is full; waiting for file upload")
 			})
 		}
 		select {
@@ -506,7 +506,7 @@ func (i *Interceptor) drainPaste() (done bool, err error) {
 }
 
 // rewrite returns the paste body to emit. If the body is one-or-more local
-// image paths, each is uploaded and replaced by its VM path. Any failure falls
+// file paths, each is uploaded and replaced by its VM path. Any failure falls
 // back to the original body (fail open) with a local notice.
 func (i *Interceptor) rewrite(body []byte) []byte {
 	lines := strings.Split(string(body), "\n")
@@ -526,9 +526,9 @@ func (i *Interceptor) rewrite(body []byte) []byte {
 		nonEmpty++
 		candidate, ok := parseCandidate(ln)
 		if !ok {
-			return body // not a pure image paste — leave untouched
+			return body // not a pure file-path paste; leave untouched
 		}
-		resolved, file, ok := i.openLocalImage(candidate.path)
+		resolved, file, ok := i.openLocalFile(candidate.path)
 		if !ok {
 			return body
 		}
@@ -542,7 +542,7 @@ func (i *Interceptor) rewrite(body []byte) []byte {
 	}
 	uploader, limits := i.policy.snapshot()
 	if limits.MaxAttachments > 0 && nonEmpty > limits.MaxAttachments {
-		i.warn("paste has %d images, over the limit of %d; sending as-is", nonEmpty, limits.MaxAttachments)
+		i.warn("paste has %d files, over the limit of %d; sending as-is", nonEmpty, limits.MaxAttachments)
 		return body
 	}
 
@@ -564,7 +564,7 @@ func (i *Interceptor) rewrite(body []byte) []byte {
 		vmPath, err := uploadOne(ctx, uploader, limits, candidate)
 		if err != nil {
 			i.report(ImageFailed)
-			i.warn("image upload failed: %v; pasting original path", err)
+			i.warn("file upload failed: %v; pasting original path", err)
 			return body // fail open for the whole paste
 		}
 		out[idx] = ln[:candidate.start] + vmPath + ln[candidate.end:]
@@ -589,10 +589,7 @@ func uploadOne(ctx context.Context, uploader upload.Uploader, limits upload.Limi
 
 // isLocalImage reports whether p points at an existing local image file,
 // honoring configured watch dirs when set.
-func (i *Interceptor) openLocalImage(p string) (string, *os.File, bool) {
-	if !upload.IsImagePath(p) {
-		return "", nil, false
-	}
+func (i *Interceptor) openLocalFile(p string) (string, *os.File, bool) {
 	file, err := os.Open(p)
 	if err != nil {
 		return "", nil, false

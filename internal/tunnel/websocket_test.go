@@ -1,10 +1,12 @@
 package tunnel
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -17,6 +19,33 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/pinksaucepasta/paperboat-cli/internal/resolver"
 )
+
+func TestPreparedWebSocketProxyConnectsWithoutTerminalCredential(t *testing.T) {
+	client, server := net.Pipe()
+	done := make(chan error, 1)
+	go func() {
+		defer server.Close()
+		request, err := http.ReadRequest(bufio.NewReader(server))
+		if err == nil && (request.Method != http.MethodConnect || request.Host != "helper.example.test:443" || request.Header.Get("Proxy-Authorization") != "Basic dXNlcjpwYXNz") {
+			err = errors.New("invalid proxy CONNECT request")
+		}
+		if err == nil && request.Header.Get("Authorization") != "" {
+			err = errors.New("terminal credential leaked into proxy CONNECT")
+		}
+		if err == nil {
+			_, err = io.WriteString(server, "HTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\n")
+		}
+		done <- err
+	}()
+	proxy, _ := url.Parse("http://user:pass@proxy.example.test")
+	if err := connectWebSocketProxy(context.Background(), client, "helper.example.test:443", proxy); err != nil {
+		t.Fatal(err)
+	}
+	_ = client.Close()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestWebSocketTunnelAttachIOResizeAndExit(t *testing.T) {
 	requests := make(chan rpcRequestSeen, 8)
@@ -224,8 +253,8 @@ func TestWebSocketTunnelCheckUsesNonAttachingMetadataProbe(t *testing.T) {
 
 func TestTerminalWebSocketRequest(t *testing.T) {
 	target := &resolver.TerminalTarget{
-		WebSocketBaseURL: "wss://example.test/project",
-		Auth:             resolver.AuthTarget{Method: "websocket_ticket", Ticket: "pct_1"},
+		WSSEndpoint: "wss://example.test/project",
+		Auth:        resolver.AuthTarget{Method: "websocket_ticket", Ticket: "pct_1"},
 	}
 	got, headers, err := terminalWebSocketRequest(target)
 	if err != nil {
@@ -241,7 +270,7 @@ func TestTerminalWebSocketRequest(t *testing.T) {
 	if u.Path != "/project/ws" || u.Query().Get("wsTicket") != "pct_1" {
 		t.Fatalf("bad URL %s", got)
 	}
-	target = &resolver.TerminalTarget{WebSocketBaseURL: "wss://machine.example/v1/runtime", Auth: resolver.AuthTarget{Method: "bearer", Token: "helper-token"}}
+	target = &resolver.TerminalTarget{WSSEndpoint: "wss://machine.example/v1/runtime", Auth: resolver.AuthTarget{Method: "bearer", Token: "helper-token"}}
 	got, headers, err = terminalWebSocketRequest(target)
 	if err != nil {
 		t.Fatal(err)
@@ -377,7 +406,7 @@ func testTerminalTarget(httpURL string) *resolver.TerminalTarget {
 	u.Scheme = strings.Replace(u.Scheme, "http", "ws", 1)
 	u.Path = "/project"
 	return &resolver.TerminalTarget{
-		WebSocketBaseURL:    u.String(),
+		WSSEndpoint:         u.String(),
 		Auth:                resolver.AuthTarget{Method: "websocket_ticket", Ticket: "pct_test"},
 		ThreadID:            "paperboat-cli",
 		TerminalID:          "term-1",
@@ -544,5 +573,24 @@ func TestTerminalWSConnExitFailureClassification(t *testing.T) {
 				t.Fatalf("reconnectable = %v, want %v (err %v)", got, tc.wantReconnect, frameErr)
 			}
 		})
+	}
+}
+
+func TestWebSocketUpgradeFailureClassification(t *testing.T) {
+	for _, test := range []struct {
+		status    int
+		retryable bool
+	}{
+		{status: http.StatusBadGateway, retryable: true},
+		{status: http.StatusServiceUnavailable, retryable: true},
+		{status: http.StatusGatewayTimeout, retryable: true},
+		{status: http.StatusUnauthorized, retryable: false},
+		{status: http.StatusForbidden, retryable: false},
+		{status: http.StatusNotFound, retryable: false},
+	} {
+		err := classifyWebSocketUpgradeError(context.Background(), errors.New("bad handshake"), &http.Response{StatusCode: test.status})
+		if got := FallbackEligible(err); got != test.retryable {
+			t.Errorf("status %d retryable=%v, want %v: %v", test.status, got, test.retryable, err)
+		}
 	}
 }

@@ -359,7 +359,7 @@ func TestUploadAuthRefreshRebrokersWithFreshControlPlaneCredential(t *testing.T)
 			response := map[string]any{"data": map[string]any{
 				"schema": api.ConnectionSchemaV1, "issuer": server.URL, "project_id": "prj_1", "connectable": true, "expires_at": now.Add(5 * time.Minute),
 				"environment": map[string]any{"id": "env_1", "kind": "hosted", "resource_id": "prj_1", "state": "ready", "root": "/workspace"},
-				"terminal":    map[string]any{"endpoint": wsURL + "/v1/runtime", "http_endpoint": server.URL, "auth": map[string]any{"method": "bearer", "token": "terminal-token", "expires_at": now.Add(4 * time.Minute), "scopes": []string{"terminal:operate"}}, "thread_id": "paperboat-cli", "terminal_id": "term_1", "cwd": "/workspace"},
+				"terminal":    map[string]any{"protocol": "paperboat.terminal.v2", "endpoints": map[string]any{"quic": "quic" + strings.TrimPrefix(server.URL, "https"), "wss": wsURL + "/v1/runtime"}, "auth": map[string]any{"method": "bearer", "token": "terminal-token", "expires_at": now.Add(4 * time.Minute), "scopes": []string{"terminal:operate"}}, "thread_id": "paperboat-cli", "terminal_id": "term_1", "cwd": "/workspace"},
 				"upload":      map[string]any{"endpoint": server.URL + "/v1/files/staged-images", "auth": map[string]any{"method": "bearer", "token": "upload-new", "expires_at": now.Add(4 * time.Minute), "scopes": []string{"file:stage"}}, "max_bytes": 1024, "allowed_mime_types": []string{"image/png"}, "retention_seconds": 60},
 			}}
 			if err := json.NewEncoder(w).Encode(response); err != nil {
@@ -591,6 +591,52 @@ func TestSessionCloseRequiresConfirmationBeforeBackend(t *testing.T) {
 	err := root.Execute()
 	if err == nil || !strings.Contains(err.Error(), "requires --yes") {
 		t.Fatalf("err=%v, want confirmation error", err)
+	}
+}
+
+func TestSessionCloseAllRequiresConfirmationAndRejectsSessionArgument(t *testing.T) {
+	root := newRootCommand()
+	root.SetArgs([]string{"session", "close", "um_1", "--all"})
+	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), "requires --yes") {
+		t.Fatalf("err=%v, want confirmation error", err)
+	}
+
+	root = newRootCommand()
+	root.SetArgs([]string{"session", "close", "um_1", "shell-2", "--all", "--yes"})
+	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), "usage: pb session close") {
+		t.Fatalf("err=%v, want mutually exclusive usage error", err)
+	}
+}
+
+func TestSessionCloseAllClosesEveryOpenSession(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	var closed []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/projects":
+			writeAPIData(t, w, map[string]any{"items": []map[string]any{{"id": "prj_1", "name": "demo", "state": "ready"}}, "pagination": map[string]any{"next_offset": nil}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/projects/prj_1/terminal-sessions":
+			writeAPIData(t, w, map[string]any{"items": []map[string]any{{"id": "ses_1", "name": "default", "state": "open"}, {"id": "ses_2", "name": "api", "state": "open"}, {"id": "ses_3", "name": "old", "state": "closed"}}, "pagination": map[string]any{"next_offset": nil}})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/close"):
+			closed = append(closed, r.URL.Path)
+			writeAPIData(t, w, map[string]any{})
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer srv.Close()
+	writeTestProfile(t, dir, configPath, srv.URL)
+
+	var output bytes.Buffer
+	if code := run(context.Background(), []string{"--config", configPath, "session", "close", "demo", "--all", "--yes"}, &output, &output); code != 0 {
+		t.Fatalf("code=%d output=%q", code, output.String())
+	}
+	if len(closed) != 2 || !strings.Contains(closed[0], "ses_1") || !strings.Contains(closed[1], "ses_2") {
+		t.Fatalf("closed=%v", closed)
+	}
+	if !strings.Contains(output.String(), "Closed 2 sessions in demo.") {
+		t.Fatalf("output=%q", output.String())
 	}
 }
 

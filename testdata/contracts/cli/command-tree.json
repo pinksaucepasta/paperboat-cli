@@ -13,7 +13,7 @@
     {"name":"connect","aliases":[],"args":["<environment>"],"flags":["--new","--name <name>","--session <name-or-id>"]},
     {"name":"session list","aliases":["sessions"],"args":["[environment]"],"flags":["--wide"],"json":true},
     {"name":"session rename","aliases":["sessions rename"],"args":["<environment>","<session>","<new-name>"]},
-    {"name":"session close","aliases":["sessions close"],"args":["<environment>","<session>"],"flags":["--yes"]},
+    {"name":"session close","aliases":["sessions close"],"args":["<environment>","[<session>]"],"flags":["--all","--yes"]},
     {"name":"session delete","aliases":["sessions delete"],"args":["<environment>","<session>"],"flags":["--yes"],"destructive":true},
     {"name":"preview list","aliases":["previews"],"args":[],"json":true},
     {"name":"preview revoke","aliases":["preview remove"],"args":["<preview>"],"flags":["--yes"],"destructive":true},

@@ -27,7 +27,7 @@ type UploadConfig struct {
 	// TempFilePatterns optionally restrict terminal-created image names. Patterns
 	// use filepath glob syntax and may match a basename or normalized full path.
 	TempFilePatterns []string `json:"temp_file_patterns,omitempty"`
-	// MaxImageBytes caps a single image. Defaults to 10 MiB.
+	// MaxImageBytes caps a single staged file. The key is retained for compatibility.
 	MaxImageBytes int64 `json:"max_image_bytes,omitempty"`
 	// MaxAttachments caps images per paste.
 	MaxAttachments int `json:"max_attachments,omitempty"`
@@ -39,7 +39,7 @@ type UploadConfig struct {
 
 // Upload defaults are applied only when a field is left unset.
 const (
-	DefaultMaxImageBytes       = 10 * 1024 * 1024
+	DefaultMaxImageBytes       = 50 * 1024 * 1024
 	DefaultMaxAttachments      = 8
 	DefaultMaxQueuedInputBytes = 1024 * 1024
 )
@@ -123,6 +123,9 @@ type AuthConfig struct {
 
 // ConnectConfig tunes how the CLI waits for an idle machine and its helper route.
 type ConnectConfig struct {
+	// TerminalTransport selects auto, quic, or wss. Auto prefers native QUIC and
+	// falls back to WSS only when the transport cannot connect.
+	TerminalTransport string `json:"terminal_transport,omitempty"`
 	// ReadyTimeoutSeconds caps how long to poll for the tunnel to become
 	// connectable before giving up. Defaults to DefaultReadyTimeoutSeconds.
 	ReadyTimeoutSeconds int `json:"ready_timeout_seconds,omitempty"`
@@ -157,6 +160,7 @@ const (
 	DefaultTerminalOutputBatchMilliseconds = 0
 	DefaultTerminalOutputBufferBytes       = 128 * 1024
 	DefaultInputPartialFlushMilliseconds   = 1
+	DefaultTerminalTransport               = "auto"
 	DefaultStatusBarMode                   = "auto"
 	DefaultStatusBarFullscreen             = "hide"
 	DefaultStatusBarTheme                  = "terminal"
@@ -261,6 +265,10 @@ func Load(path string) (*Config, error) {
 }
 
 func (c *Config) applyDefaults() {
+	if strings.TrimSpace(c.Connect.TerminalTransport) == "" {
+		c.Connect.TerminalTransport = DefaultTerminalTransport
+	}
+	c.Connect.TerminalTransport = strings.ToLower(strings.TrimSpace(c.Connect.TerminalTransport))
 	if c.Observability.MaxEventLogBytes == 0 {
 		c.Observability.MaxEventLogBytes = DefaultTelemetryMaxBytes
 	}
@@ -274,7 +282,7 @@ func (c *Config) applyDefaults() {
 		c.Upload.MaxQueuedInputBytes = DefaultMaxQueuedInputBytes
 	}
 	if len(c.Upload.AllowedMimePrefixes) == 0 {
-		c.Upload.AllowedMimePrefixes = []string{"image/"}
+		c.Upload.AllowedMimePrefixes = []string{"*"}
 	}
 	if c.Connect.ReadyTimeoutSeconds == 0 {
 		c.Connect.ReadyTimeoutSeconds = DefaultReadyTimeoutSeconds
@@ -341,6 +349,11 @@ func normalizeStatusWidgets(values []string) []string {
 // Validate checks the complete effective configuration. Callers that mutate a
 // loaded Config can use it before presenting success.
 func (c *Config) Validate() error {
+	switch c.Connect.TerminalTransport {
+	case "auto", "quic", "wss":
+	default:
+		return fmt.Errorf("connect.terminal_transport must be auto, quic, or wss")
+	}
 	if c.Connect.TerminalOutputBatchMilliseconds < 0 {
 		return fmt.Errorf("connect.terminal_output_batch_milliseconds cannot be negative")
 	}

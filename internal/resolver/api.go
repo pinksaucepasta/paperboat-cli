@@ -115,20 +115,20 @@ func (r *APIResolver) Resolve(ctx context.Context, req ConnectRequest) (ConnectI
 		ProjectID:    target.id,
 		Project:      target.name,
 		ProjectState: targetState(target, resp),
-		TunnelTarget: resp.Terminal.WebSocketBaseURL,
+		TunnelTarget: resp.Terminal.Endpoints.WSS,
 		Local:        false,
 		Terminal: &TerminalTarget{
-			Kind:             resp.Terminal.Kind,
-			EnvironmentID:    resp.Environment.EnvironmentID,
-			HTTPBaseURL:      resp.Terminal.HTTPBaseURL,
-			WebSocketBaseURL: resp.Terminal.WebSocketBaseURL,
-			Auth:             mapAuth(resp.Terminal.Auth),
-			ThreadID:         resp.Terminal.ThreadID,
-			TerminalID:       resp.Terminal.TerminalID,
-			SessionID:        resp.Terminal.SessionID,
-			CWD:              resp.Terminal.CWD,
-			TerminalMode:     resp.Terminal.TerminalMode,
-			ReplayHistory:    true,
+			Protocol:      resp.Terminal.Protocol,
+			EnvironmentID: resp.Environment.EnvironmentID,
+			QUICEndpoint:  resp.Terminal.Endpoints.QUIC,
+			WSSEndpoint:   resp.Terminal.Endpoints.WSS,
+			Auth:          mapAuth(resp.Terminal.Auth),
+			ThreadID:      resp.Terminal.ThreadID,
+			TerminalID:    resp.Terminal.TerminalID,
+			SessionID:     resp.Terminal.SessionID,
+			CWD:           resp.Terminal.CWD,
+			TerminalMode:  resp.Terminal.TerminalMode,
+			ReplayHistory: true,
 		},
 	}
 	if resp.Upload != nil && strings.TrimSpace(resp.Upload.HTTPBaseURL) != "" {
@@ -427,24 +427,22 @@ func (r *APIResolver) validateDescriptor(resp api.ConnectionDescriptor, target t
 	if !completeTerminalDescriptor(resp.Terminal) {
 		return api.ConnectionDescriptor{}, errors.New("server returned an incomplete terminal descriptor")
 	}
-	if resp.Terminal.Kind != "paperboat_terminal_v2" || resp.Environment == nil || strings.TrimSpace(resp.Environment.EnvironmentID) == "" || !environmentMatchesTarget(resp.Environment, target) {
+	if resp.Terminal.Protocol != "paperboat.terminal.v2" || resp.Environment == nil || strings.TrimSpace(resp.Environment.EnvironmentID) == "" || !environmentMatchesTarget(resp.Environment, target) {
 		return api.ConnectionDescriptor{}, errors.New("server returned an invalid environment descriptor")
 	}
 	if strings.TrimSpace(resp.Environment.ProjectRoot) == "" || strings.TrimSpace(resp.Terminal.ThreadID) == "" || strings.TrimSpace(resp.Terminal.TerminalID) == "" || strings.TrimSpace(resp.Terminal.CWD) == "" {
 		return api.ConnectionDescriptor{}, errors.New("server returned incomplete environment or terminal identity")
 	}
-	wsURL, err := secureEndpoint(resp.Terminal.WebSocketBaseURL, "wss")
+	wsURL, err := secureEndpoint(resp.Terminal.Endpoints.WSS, "wss")
 	if err != nil {
 		return api.ConnectionDescriptor{}, fmt.Errorf("invalid terminal WebSocket endpoint: %w", err)
 	}
-	if resp.Terminal.HTTPBaseURL != "" {
-		httpURL, httpErr := secureEndpoint(resp.Terminal.HTTPBaseURL, "https")
-		if httpErr != nil || endpointAuthority(httpURL) != endpointAuthority(wsURL) {
-			return api.ConnectionDescriptor{}, errors.New("terminal HTTP and WebSocket hosts do not match")
-		}
+	quicURL, quicErr := secureEndpoint(resp.Terminal.Endpoints.QUIC, "quic")
+	if quicErr != nil || endpointAuthority(quicURL) != endpointAuthority(wsURL) {
+		return api.ConnectionDescriptor{}, errors.New("terminal QUIC and WSS hosts do not match")
 	}
 	if len(r.cfg.Connect.AllowedRouteHosts) > 0 {
-		if !allowedHost(resp.Terminal.WebSocketBaseURL, r.cfg.Connect.AllowedRouteHosts) || (resp.Terminal.HTTPBaseURL != "" && !allowedHost(resp.Terminal.HTTPBaseURL, r.cfg.Connect.AllowedRouteHosts)) {
+		if !allowedHost(resp.Terminal.Endpoints.WSS, r.cfg.Connect.AllowedRouteHosts) || !allowedHost(resp.Terminal.Endpoints.QUIC, r.cfg.Connect.AllowedRouteHosts) {
 			return api.ConnectionDescriptor{}, errors.New("terminal descriptor host is not allowed by local policy")
 		}
 	}
@@ -600,7 +598,7 @@ func mapAuth(auth api.AuthMaterial) AuthTarget {
 }
 
 func completeTerminalDescriptor(term *api.Terminal) bool {
-	if term == nil || strings.TrimSpace(term.WebSocketBaseURL) == "" {
+	if term == nil || strings.TrimSpace(term.Protocol) == "" || strings.TrimSpace(term.Endpoints.QUIC) == "" || strings.TrimSpace(term.Endpoints.WSS) == "" {
 		return false
 	}
 	if strings.TrimSpace(term.Auth.Method) == "" {

@@ -386,17 +386,19 @@ type Environment struct {
 // cli-connect. It carries client-safe Paperboat route URLs, not raw VM
 // addresses or SSH credentials.
 type Terminal struct {
-	Endpoint         string       `json:"endpoint"`
-	HTTPEndpoint     string       `json:"http_endpoint"`
-	SessionID        string       `json:"session_id"`
-	Kind             string       `json:"kind"`
-	HTTPBaseURL      string       `json:"http_base_url"`
-	WebSocketBaseURL string       `json:"websocket_base_url"`
-	Auth             AuthMaterial `json:"auth"`
-	ThreadID         string       `json:"thread_id"`
-	TerminalID       string       `json:"terminal_id"`
-	CWD              string       `json:"cwd"`
-	TerminalMode     string       `json:"terminal_mode"`
+	Protocol     string            `json:"protocol"`
+	Endpoints    TerminalEndpoints `json:"endpoints"`
+	SessionID    string            `json:"session_id"`
+	Auth         AuthMaterial      `json:"auth"`
+	ThreadID     string            `json:"thread_id"`
+	TerminalID   string            `json:"terminal_id"`
+	CWD          string            `json:"cwd"`
+	TerminalMode string            `json:"terminal_mode"`
+}
+
+type TerminalEndpoints struct {
+	QUIC string `json:"quic"`
+	WSS  string `json:"wss"`
 }
 
 // Upload is the Paperboat image-upload endpoint hint from cli-connect.
@@ -452,9 +454,9 @@ func (r *ConnectionDescriptor) NormalizeConnectionDescriptor() error {
 		return fmt.Errorf("invalid environment kind %q", e.Kind)
 	}
 	if r.Terminal != nil {
-		r.Terminal.Kind = "paperboat_terminal_v2"
-		r.Terminal.WebSocketBaseURL = r.Terminal.Endpoint
-		r.Terminal.HTTPBaseURL = r.Terminal.HTTPEndpoint
+		if r.Terminal.Protocol != "paperboat.terminal.v2" {
+			return errors.New("invalid canonical terminal protocol")
+		}
 	}
 	if r.Upload != nil {
 		r.Upload.Kind = "paperboat_staged_image_v1"

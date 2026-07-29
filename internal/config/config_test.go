@@ -79,6 +79,9 @@ func TestLoadAppliesDialRetryDefaultWhenOmitted(t *testing.T) {
 		cfg.Connect.TerminalOutputBufferBytes != DefaultTerminalOutputBufferBytes {
 		t.Fatalf("terminal output defaults = %+v", cfg.Connect)
 	}
+	if cfg.Connect.TerminalTransport != DefaultTerminalTransport {
+		t.Fatalf("terminal transport = %q", cfg.Connect.TerminalTransport)
+	}
 	if got := strings.Join(TerminalEnv, ","); got != "TERM,COLORTERM,TERM_PROGRAM,TERM_PROGRAM_VERSION,LANG,LC_ALL,LC_CTYPE" {
 		t.Fatalf("terminal environment = %q", got)
 	}
@@ -93,6 +96,16 @@ func TestLoadAppliesDialRetryDefaultWhenOmitted(t *testing.T) {
 	}
 	if got, want := strings.Join(cfg.StatusBar.Right, ","), "credits,connection"; got != want {
 		t.Fatalf("status bar right = %q, want %q", got, want)
+	}
+}
+
+func TestLoadRejectsInvalidTerminalTransport(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"connect":{"terminal_transport":"tcp"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "terminal_transport") {
+		t.Fatalf("err=%v", err)
 	}
 }
 

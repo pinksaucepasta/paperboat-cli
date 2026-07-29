@@ -116,26 +116,23 @@ func TestFindTargetAllowsUserMachineWithoutHostedPlan(t *testing.T) {
 
 func readyTerminal() *api.Terminal {
 	return &api.Terminal{
-		Kind:             "paperboat_terminal_v2",
-		HTTPBaseURL:      "https://edge.paperboat.test/projects/prj_1",
-		WebSocketBaseURL: "wss://edge.paperboat.test/projects/prj_1",
-		Auth:             api.AuthMaterial{Method: "websocket_ticket", Ticket: "pct_1", ExpiresAt: time.Now().Add(time.Hour), Scopes: []string{"terminal:operate"}},
-		ThreadID:         "paperboat-cli",
-		TerminalID:       "term-1",
-		CWD:              "/workspace",
+		Protocol:   "paperboat.terminal.v2",
+		Endpoints:  api.TerminalEndpoints{QUIC: "quic://edge.paperboat.test:443", WSS: "wss://edge.paperboat.test/v1/runtime"},
+		Auth:       api.AuthMaterial{Method: "websocket_ticket", Ticket: "pct_1", ExpiresAt: time.Now().Add(time.Hour), Scopes: []string{"terminal:operate"}},
+		ThreadID:   "paperboat-cli",
+		TerminalID: "term-1",
+		CWD:        "/workspace",
 	}
 }
 
 func TestValidateReadyAcceptsEnvironmentTerminalBearer(t *testing.T) {
 	terminal := readyTerminal()
-	terminal.WebSocketBaseURL = "wss://machine.example/v1/runtime"
-	terminal.HTTPBaseURL = ""
+	terminal.Endpoints = api.TerminalEndpoints{QUIC: "quic://machine.example:443", WSS: "wss://machine.example/v1/runtime"}
 	terminal.Auth = api.AuthMaterial{Method: "bearer", Token: "helper-token", ExpiresAt: time.Now().Add(time.Minute), Scopes: []string{"terminal:operate"}}
 	response := readyUserMachineResponse(terminal)
 	response.ExpiresAt = time.Now().Add(2 * time.Minute)
 	response.Terminal.Auth.ExpiresAt = time.Now().Add(time.Minute)
 	response.Upload.Auth.ExpiresAt = time.Now().Add(time.Minute)
-	response.Terminal.HTTPBaseURL = "https://machine.example"
 	response.Upload.HTTPBaseURL = "https://machine.example"
 	response.Upload.Path = "/v1/uploads"
 	if _, err := newTestResolver(&fakeClient{}).validateDescriptor(response, target{kind: targetUserMachine, id: "um_1"}); err != nil {
@@ -146,23 +143,22 @@ func TestValidateReadyAcceptsEnvironmentTerminalBearer(t *testing.T) {
 func readyResponse(term *api.Terminal) api.ConnectionDescriptor {
 	expires := time.Now().Add(time.Hour)
 	term.Auth.ExpiresAt = expires.Add(-time.Minute)
-	return api.ConnectionDescriptor{Issuer: "https://api.paperboat.test", ProjectID: "prj_1", Connectable: true, ExpiresAt: expires, Environment: &api.Environment{EnvironmentID: "env_1", ProjectID: "prj_1", ProjectRoot: "/workspace"}, Terminal: term, Upload: &api.Upload{Kind: "paperboat_staged_image_v1", HTTPBaseURL: term.HTTPBaseURL, Path: "/projects/prj_1/v1/files/staged-images", Auth: api.AuthMaterial{Method: "bearer", Token: "file-token", ExpiresAt: expires.Add(-time.Minute), Scopes: []string{"file:stage"}}, MaxBytes: 1024, AllowedMIMETypes: []string{"image/png"}, RetentionSeconds: 60}}
+	return api.ConnectionDescriptor{Issuer: "https://api.paperboat.test", ProjectID: "prj_1", Connectable: true, ExpiresAt: expires, Environment: &api.Environment{EnvironmentID: "env_1", ProjectID: "prj_1", ProjectRoot: "/workspace"}, Terminal: term, Upload: &api.Upload{Kind: "paperboat_staged_image_v1", HTTPBaseURL: "https://edge.paperboat.test", Path: "/projects/prj_1/v1/files/staged-images", Auth: api.AuthMaterial{Method: "bearer", Token: "file-token", ExpiresAt: expires.Add(-time.Minute), Scopes: []string{"file:stage"}}, MaxBytes: 1024, AllowedMIMETypes: []string{"image/png"}, RetentionSeconds: 60}}
 }
 
 func readyUserMachineResponse(term *api.Terminal) api.ConnectionDescriptor {
 	expires := time.Now().Add(time.Hour)
 	term.Auth.ExpiresAt = expires.Add(-time.Minute)
-	return api.ConnectionDescriptor{Issuer: "https://api.paperboat.test", UserMachineID: "um_1", UserMachineState: "online", Connectable: true, ExpiresAt: expires, Environment: &api.Environment{EnvironmentID: "env_um_1", UserMachineID: "um_1", ProjectRoot: "/Users/paperboat"}, Terminal: term, Upload: &api.Upload{Kind: "paperboat_staged_image_v1", HTTPBaseURL: term.HTTPBaseURL, Path: "/user-machines/um_1/v1/files/staged-images", Auth: api.AuthMaterial{Method: "bearer", Token: "file-token", ExpiresAt: expires.Add(-time.Minute), Scopes: []string{"file:stage"}}, MaxBytes: 1024, AllowedMIMETypes: []string{"image/png"}, RetentionSeconds: 60}}
+	return api.ConnectionDescriptor{Issuer: "https://api.paperboat.test", UserMachineID: "um_1", UserMachineState: "online", Connectable: true, ExpiresAt: expires, Environment: &api.Environment{EnvironmentID: "env_um_1", UserMachineID: "um_1", ProjectRoot: "/Users/paperboat"}, Terminal: term, Upload: &api.Upload{Kind: "paperboat_staged_image_v1", HTTPBaseURL: "https://edge.paperboat.test", Path: "/user-machines/um_1/v1/files/staged-images", Auth: api.AuthMaterial{Method: "bearer", Token: "file-token", ExpiresAt: expires.Add(-time.Minute), Scopes: []string{"file:stage"}}, MaxBytes: 1024, AllowedMIMETypes: []string{"image/png"}, RetentionSeconds: 60}}
 }
 
 func routeOnlyTerminal() *api.Terminal {
 	return &api.Terminal{
-		Kind:             "paperboat_terminal_v2",
-		HTTPBaseURL:      "https://edge.paperboat.test/projects/prj_1",
-		WebSocketBaseURL: "wss://edge.paperboat.test/projects/prj_1",
-		ThreadID:         "paperboat-cli",
-		TerminalID:       "term-1",
-		CWD:              "/workspace",
+		Protocol:   "paperboat.terminal.v2",
+		Endpoints:  api.TerminalEndpoints{QUIC: "quic://edge.paperboat.test:443", WSS: "wss://edge.paperboat.test/v1/runtime"},
+		ThreadID:   "paperboat-cli",
+		TerminalID: "term-1",
+		CWD:        "/workspace",
 	}
 }
 
@@ -177,7 +173,7 @@ func TestResolveImmediatelyConnectable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	if info.Local || info.Terminal == nil || info.Terminal.WebSocketBaseURL != "wss://edge.paperboat.test/projects/prj_1" {
+	if info.Local || info.Terminal == nil || info.Terminal.WSSEndpoint != "wss://edge.paperboat.test/v1/runtime" {
 		t.Fatalf("info = %+v", info)
 	}
 	if info.Project != "My App" {
@@ -217,8 +213,7 @@ func TestResolveMatchesByID(t *testing.T) {
 
 func TestResolveUserMachineByDisplayName(t *testing.T) {
 	term := readyTerminal()
-	term.HTTPBaseURL = "https://edge.paperboat.test/user-machines/um_1"
-	term.WebSocketBaseURL = "wss://edge.paperboat.test/user-machines/um_1"
+	term.Endpoints = api.TerminalEndpoints{QUIC: "quic://edge.paperboat.test:443", WSS: "wss://edge.paperboat.test/v1/runtime"}
 	fc := &fakeClient{
 		machines:   []api.UserMachine{{ID: "um_1", DisplayName: "Studio Mac", State: "online", Online: true}},
 		connectSeq: []api.ConnectionDescriptor{readyUserMachineResponse(term)},
@@ -249,8 +244,7 @@ func TestResolveUserMachineRevocationStopsWithoutPolling(t *testing.T) {
 
 func TestResolveRejectsUserMachineDescriptorForDifferentMachine(t *testing.T) {
 	term := readyTerminal()
-	term.HTTPBaseURL = "https://edge.paperboat.test/user-machines/um_1"
-	term.WebSocketBaseURL = "wss://edge.paperboat.test/user-machines/um_1"
+	term.Endpoints = api.TerminalEndpoints{QUIC: "quic://edge.paperboat.test:443", WSS: "wss://edge.paperboat.test/v1/runtime"}
 	response := readyUserMachineResponse(term)
 	response.UserMachineID = "um_other"
 	fc := &fakeClient{
@@ -265,8 +259,7 @@ func TestResolveRejectsUserMachineDescriptorForDifferentMachine(t *testing.T) {
 
 func TestResolveUserMachineRebrokersAfterReadiness(t *testing.T) {
 	term := readyTerminal()
-	term.HTTPBaseURL = "https://edge.paperboat.test/user-machines/um_1"
-	term.WebSocketBaseURL = "wss://edge.paperboat.test/user-machines/um_1"
+	term.Endpoints = api.TerminalEndpoints{QUIC: "quic://edge.paperboat.test:443", WSS: "wss://edge.paperboat.test/v1/runtime"}
 	fc := &fakeClient{
 		machines: []api.UserMachine{{ID: "um_1", DisplayName: "Studio Mac"}},
 		connectSeq: []api.ConnectionDescriptor{
@@ -286,8 +279,7 @@ func TestResolveUserMachineRebrokersAfterReadiness(t *testing.T) {
 
 func TestResolveKeepsSelectedUserMachineSessionThroughReadinessPolling(t *testing.T) {
 	term := readyTerminal()
-	term.HTTPBaseURL = "https://edge.paperboat.test/user-machines/um_1"
-	term.WebSocketBaseURL = "wss://edge.paperboat.test/user-machines/um_1"
+	term.Endpoints = api.TerminalEndpoints{QUIC: "quic://edge.paperboat.test:443", WSS: "wss://edge.paperboat.test/v1/runtime"}
 	fc := &fakeClient{
 		machines: []api.UserMachine{{ID: "um_1", DisplayName: "Studio Mac"}},
 		connectSeq: []api.ConnectionDescriptor{
@@ -322,7 +314,7 @@ func TestResolvePollsUntilReady(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	if info.Terminal == nil || info.Terminal.WebSocketBaseURL != "wss://edge.paperboat.test/projects/prj_1" {
+	if info.Terminal == nil || info.Terminal.WSSEndpoint != "wss://edge.paperboat.test/v1/runtime" {
 		t.Fatalf("info = %+v", info)
 	}
 	if fc.statusN < 3 {
@@ -488,7 +480,7 @@ func TestResolveRejectsEnvironmentOwnedByAnotherProject(t *testing.T) {
 
 func TestResolveRejectsNonWSSTerminal(t *testing.T) {
 	term := readyTerminal()
-	term.WebSocketBaseURL = "https://route.example"
+	term.Endpoints.WSS = "https://route.example"
 	response := readyResponse(term)
 	fc := &fakeClient{
 		projects:   []api.Project{{ID: "prj_1", Name: "app"}},
@@ -537,7 +529,7 @@ func TestResolveRejectsInvalidUploadDescriptor(t *testing.T) {
 
 func TestResolveAcceptsFrozenTerminalWithoutHTTPBaseURL(t *testing.T) {
 	term := readyTerminal()
-	term.HTTPBaseURL = ""
+	term.Endpoints = api.TerminalEndpoints{QUIC: "quic://edge.paperboat.test:443", WSS: "wss://edge.paperboat.test/v1/runtime"}
 	response := readyResponse(term)
 	response.Upload.HTTPBaseURL = "https://edge.paperboat.test/projects/prj_1"
 	fc := &fakeClient{projects: []api.Project{{ID: "prj_1", Name: "app"}}, connectSeq: []api.ConnectionDescriptor{response}}
@@ -548,9 +540,9 @@ func TestResolveAcceptsFrozenTerminalWithoutHTTPBaseURL(t *testing.T) {
 
 func TestResolveRejectsTerminalHTTPPortMismatch(t *testing.T) {
 	term := readyTerminal()
-	term.HTTPBaseURL = "https://edge.paperboat.test:8443/projects/prj_1"
+	term.Endpoints = api.TerminalEndpoints{QUIC: "quic://edge.paperboat.test:8443", WSS: "wss://edge.paperboat.test/v1/runtime"}
 	response := readyResponse(term)
-	response.Upload.HTTPBaseURL = term.HTTPBaseURL
+	response.Upload.HTTPBaseURL = "https://edge.paperboat.test:8443"
 	fc := &fakeClient{projects: []api.Project{{ID: "prj_1", Name: "app"}}, connectSeq: []api.ConnectionDescriptor{response}}
 	_, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "app"})
 	if err == nil || !strings.Contains(err.Error(), "hosts do not match") {

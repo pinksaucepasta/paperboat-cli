@@ -4,6 +4,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -312,6 +313,16 @@ func TestResetRemoteStateDiscardsPartialANSIAndSavedState(t *testing.T) {
 func TestClearForExitRestoresAndClearsFullViewport(t *testing.T) {
 	bar, reader := newTestBar(t, ModeAuto, "xterm-256color", 40, 3, true, time.Second)
 	bar.ClearForExit()
+	closeDone := make(chan struct{})
+	go func() {
+		_ = bar.Close()
+		close(closeDone)
+	}()
+	select {
+	case <-closeDone:
+	case <-time.After(time.Second):
+		t.Fatal("Close blocked after ClearForExit")
+	}
 	if output, ok := bar.out.(*os.File); ok {
 		_ = output.Close()
 	}
@@ -399,6 +410,79 @@ func TestDefersRedrawDuringSynchronizedOutput(t *testing.T) {
 	if !strings.Contains(transcript[end+len("\x1b[?2026l"):], "\x1b[3;1H") {
 		t.Fatalf("status bar did not redraw after synchronized frame: %q", transcript)
 	}
+}
+
+func TestStatusUpdatesCoalesceToOneDisplayFrame(t *testing.T) {
+	bar, reader := newTestBar(t, ModeAuto, "xterm-256color", 40, 3, true, time.Second)
+	for i := 0; i < 100; i++ {
+		bar.SetConnection("connecting")
+	}
+	time.Sleep(30 * time.Millisecond)
+	_ = bar.Close()
+	if output, ok := bar.out.(*os.File); ok {
+		_ = output.Close()
+	}
+	raw, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(raw), "\x1b[3;1H"); got != 3 { // initial, one coalesced frame, cleanup
+		t.Fatalf("status updates rendered %d frames: %q", got, raw)
+	}
+}
+
+func TestRemoteOutputPrecedesPendingStatusFrame(t *testing.T) {
+	bar, reader := newTestBar(t, ModeAuto, "xterm-256color", 40, 3, true, time.Second)
+	bar.Notice("pending")
+	if _, err := bar.Write([]byte("REMOTE")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(30 * time.Millisecond)
+	_ = bar.Close()
+	if output, ok := bar.out.(*os.File); ok {
+		_ = output.Close()
+	}
+	raw, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transcript := string(raw)
+	remote := strings.Index(transcript, "REMOTE")
+	pending := strings.Index(transcript, "pending")
+	if remote < 0 || pending < 0 || remote > pending {
+		t.Fatalf("remote output was not prioritized: %q", transcript)
+	}
+}
+
+func TestSlowOutputAppliesBoundedBackpressure(t *testing.T) {
+	bar, reader := newTestBar(t, ModeAuto, "xterm-256color", 40, 3, true, time.Second)
+	payload := make([]byte, 64<<10)
+	const writers = 70
+	var wg sync.WaitGroup
+	wg.Add(writers)
+	done := make(chan struct{}, writers)
+	for range writers {
+		go func() {
+			defer wg.Done()
+			_, _ = bar.Write(payload)
+			done <- struct{}{}
+		}()
+	}
+	time.Sleep(30 * time.Millisecond)
+	if completed := len(done); completed == writers {
+		t.Fatal("slow stdout did not apply backpressure")
+	}
+	drainDone := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(io.Discard, reader)
+		close(drainDone)
+	}()
+	wg.Wait()
+	_ = bar.Close()
+	if output, ok := bar.out.(*os.File); ok {
+		_ = output.Close()
+	}
+	<-drainDone
 }
 
 func TestTruncationAndFallbackModes(t *testing.T) {

@@ -1,7 +1,7 @@
 # paperboat-cli
 
 The Paperboat command-line client. `pb` authenticates the user, selects an environment,
-attaches to helper-managed terminal sessions, and bridges local image pastes into remote
+attaches to helper-managed terminal sessions, and bridges local file pastes into remote
 agent workflows.
 
 The CLI uses Paperboat device sessions and stores secrets in the operating-system
@@ -68,22 +68,29 @@ Attach flags override saved behavior for one session:
 ```sh
 pb demo --status-bar=off
 pb demo --status-bar-fullscreen=show --status-bar-theme=mono
+pb demo --transport=quic
 ```
+
+Terminal attachments use `connect.terminal_transport`, with `auto` (the default), `quic`,
+or `wss`. `auto` tries native QUIC over UDP 443 first and falls back to WSS over TCP 443 only
+when QUIC cannot connect. `--transport` overrides the mode for one command without
+rewriting configuration. Authentication, certificate, route, and protocol failures do not
+fall back.
 
 The bar automatically drops storage, credits, config-sync, session, and project widgets
 in that order as width becomes constrained. Connection and active failure state retain
 priority. Terminals narrower than 20 columns receive the full viewport without a bar.
 
-## Image drag and drop
+## File drag and drop
 
 Interactive `pb` attaches enable the standard terminal bracketed-paste mode. A
-framed paste containing only absolute local image paths is staged and rewritten
+framed paste containing only absolute local file paths is staged and rewritten
 to remote paths. Supported path forms include `file://` URIs, quoted paths, and
 POSIX shell-escaped paths such as the escaped-space format emitted by WezTerm.
 Every other input, including unframed drag-and-drop text, is forwarded exactly
 as received; this prevents ordinary typed paths from triggering an upload.
 
-Images are hashed once through the validated local descriptor, rewound, and streamed
+Files are hashed once through the validated local descriptor, rewound, and streamed
 directly as a known-length multipart request. The CLI does not retain a full in-memory
 copy. Upload progress appears in the status bar, retries reuse the same descriptor and
 digest, and failed uploads preserve the original pasted path. The helper publishes private
@@ -128,7 +135,7 @@ Go — distributed as a single static binary (Cobra, Go 1.25.7).
 - `cmd/pb` — CLI entrypoint (commands, flags, wiring).
 - `internal/config` — local policy and secure, versioned credential profiles.
 - `internal/resolver` — paginated environment resolution and validated connect descriptors.
-- `internal/tunnel` — Paperboat terminal WebSocket RPC and bounded reconnect supervision.
+- `internal/tunnel` — native QUIC-first and WSS terminal-v2 transports with bounded reconnect supervision.
 - `internal/session` — transparent PTY wrapper (raw mode, resize, exit-code passthrough).
 - `internal/paste` — bracketed-paste interceptor + image-path rewriter (the risk center).
 - `internal/upload` — authenticated staged-image multipart transport.
