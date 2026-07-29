@@ -90,12 +90,15 @@ POSIX shell-escaped paths such as the escaped-space format emitted by WezTerm.
 Every other input, including unframed drag-and-drop text, is forwarded exactly
 as received; this prevents ordinary typed paths from triggering an upload.
 
-Files are hashed once through the validated local descriptor, rewound, and streamed
-directly as a known-length multipart request. The CLI does not retain a full in-memory
-copy. Upload progress appears in the status bar, retries reuse the same descriptor and
-digest, and failed uploads preserve the original pasted path. The helper publishes private
-random filenames under the operating system's cache directory and removes them after the
-bounded retention period.
+Files are hashed once through the validated local descriptor, rewound, and streamed through
+the resumable `/v1/file-transfers` API. Mixed and empty files are supported without MIME
+restrictions. A paste is rewritten only after the whole batch publishes atomically; retries
+reuse transfer IDs and confirmed offsets, and failures preserve the exact original paste.
+Published remote files remain for seven days.
+
+Remote processes can run `pbh send <path>...`. The active `pb` writer downloads the pinned
+batch into `Downloads/Paperboat Inbox`, verifies size and SHA-256, fsyncs it, avoids name
+collisions, and sends a durable receipt. Inbox files remain until the user removes them.
 
 ## User machines
 
@@ -118,7 +121,7 @@ truncated at `observability.max_event_log_bytes` rather than growing without lim
 make build      # -> bin/pb
 make release-metadata # binary checksum + provenance metadata in dist/
 make install    # install pb
-make test       # unit tests (paste parser + upload pipeline)
+make test       # unit tests (paste parser + file-transfer pipeline)
 ```
 
 `YYYY.MM.DD.X` tags publish signed-provenance archives for supported Android, Darwin,
@@ -137,8 +140,9 @@ Go — distributed as a single static binary (Cobra, Go 1.25.7).
 - `internal/resolver` — paginated environment resolution and validated connect descriptors.
 - `internal/tunnel` — native QUIC-first and WSS terminal-v2 transports with bounded reconnect supervision.
 - `internal/session` — transparent PTY wrapper (raw mode, resize, exit-code passthrough).
-- `internal/paste` — bracketed-paste interceptor + image-path rewriter (the risk center).
-- `internal/upload` — authenticated staged-image multipart transport.
+- `internal/paste` — bracketed-paste interceptor and atomic file-path batch rewriter.
+- `internal/filetransfer` — resumable HTTP/3-first, HTTP/2-fallback file transport.
+- `internal/inbox` — durable Paperboat Inbox download and receipt handling.
 
 ## License
 

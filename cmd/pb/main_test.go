@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,7 +25,6 @@ import (
 	"github.com/pinksaucepasta/paperboat-cli/internal/resolver"
 	"github.com/pinksaucepasta/paperboat-cli/internal/statusbar"
 	"github.com/pinksaucepasta/paperboat-cli/internal/telemetry"
-	"github.com/pinksaucepasta/paperboat-cli/internal/upload"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -330,79 +328,6 @@ func TestFormatStatusCredits(t *testing.T) {
 		if got := formatStatusCredits(raw); got != want {
 			t.Fatalf("formatStatusCredits(%q) = %q, want %q", raw, got, want)
 		}
-	}
-}
-
-func TestUploadAuthRefreshRebrokersWithFreshControlPlaneCredential(t *testing.T) {
-	var controlPlaneAuth, uploadAuth []string
-	var server *httptest.Server
-	server = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		switch r.URL.Path {
-		case "/v1/projects":
-			controlPlaneAuth = append(controlPlaneAuth, r.Header.Get("Authorization"))
-			if r.Header.Get("Authorization") != "Bearer control-new" {
-				w.WriteHeader(http.StatusUnauthorized)
-				_, _ = w.Write([]byte(`{"error":{"code":"unauthenticated","message":"expired"}}`))
-				return
-			}
-			_, _ = w.Write([]byte(`{"data":{"items":[{"id":"prj_1","name":"Demo","state":"running"}],"pagination":{"limit":200,"offset":0,"total":1,"next_offset":null}}}`))
-		case "/v1/projects/prj_1/connection-descriptor":
-			controlPlaneAuth = append(controlPlaneAuth, r.Header.Get("Authorization"))
-			if r.Header.Get("Authorization") != "Bearer control-new" {
-				w.WriteHeader(http.StatusUnauthorized)
-				_, _ = w.Write([]byte(`{"error":{"code":"unauthenticated","message":"expired"}}`))
-				return
-			}
-			now := time.Now().UTC()
-			wsURL := "wss" + strings.TrimPrefix(server.URL, "https")
-			response := map[string]any{"data": map[string]any{
-				"schema": api.ConnectionSchemaV1, "issuer": server.URL, "project_id": "prj_1", "connectable": true, "expires_at": now.Add(5 * time.Minute),
-				"environment": map[string]any{"id": "env_1", "kind": "hosted", "resource_id": "prj_1", "state": "ready", "root": "/workspace"},
-				"terminal":    map[string]any{"protocol": "paperboat.terminal.v2", "endpoints": map[string]any{"quic": "quic" + strings.TrimPrefix(server.URL, "https"), "wss": wsURL + "/v1/runtime"}, "auth": map[string]any{"method": "bearer", "token": "terminal-token", "expires_at": now.Add(4 * time.Minute), "scopes": []string{"terminal:operate"}}, "thread_id": "paperboat-cli", "terminal_id": "term_1", "cwd": "/workspace"},
-				"upload":      map[string]any{"endpoint": server.URL + "/v1/files/staged-images", "auth": map[string]any{"method": "bearer", "token": "upload-new", "expires_at": now.Add(4 * time.Minute), "scopes": []string{"file:stage"}}, "max_bytes": 1024, "allowed_mime_types": []string{"image/png"}, "retention_seconds": 60},
-			}}
-			if err := json.NewEncoder(w).Encode(response); err != nil {
-				t.Fatal(err)
-			}
-		case "/v1/files/staged-images":
-			uploadAuth = append(uploadAuth, r.Header.Get("Authorization"))
-			if r.Header.Get("Authorization") != "Bearer upload-new" {
-				w.WriteHeader(http.StatusUnauthorized)
-				_, _ = w.Write([]byte(`{"error":{"code":"unauthorized","message":"server rejected the credential"}}`))
-				return
-			}
-			_, _ = w.Write([]byte(`{"path":"/workspace/.paperboat/staged/image.png"}`))
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer server.Close()
-
-	cfg := &config.Config{ServerURL: server.URL, Connect: config.ConnectConfig{ReadyTimeoutSeconds: 30, PollIntervalSeconds: 1}}
-	auth := &refreshTestAuth{current: config.Credential{AccessToken: "control-new"}}
-	uploader := upload.NewHTTPUploader(server.URL, "/v1/files/staged-images", upload.Auth{Method: "bearer", Token: "upload-expired"})
-	uploader.HTTPClient = server.Client()
-	uploader.RefreshAuth = func(ctx context.Context) (upload.Auth, error) {
-		return refreshUploadAuthorization(ctx, auth, func(credential config.Credential) resolver.ProjectResolver {
-			return resolver.NewAPIResolver(api.New(server.URL, credential, server.Client()), cfg)
-		}, "Demo", "prj_1", "")
-	}
-
-	imageBytes := []byte("image-bytes")
-	imageDigest := sha256.Sum256(imageBytes)
-	path, err := uploader.Upload(context.Background(), upload.Image{Name: "image.png", MimeType: "image/png", Size: int64(len(imageBytes)), SHA256: imageDigest, Reader: bytes.NewReader(imageBytes)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if path != "/workspace/.paperboat/staged/image.png" {
-		t.Fatalf("path = %q", path)
-	}
-	if got := strings.Join(controlPlaneAuth, ","); got != "Bearer control-new,Bearer control-new" {
-		t.Fatalf("control-plane authorization = %q", got)
-	}
-	if got := strings.Join(uploadAuth, ","); got != "Bearer upload-expired,Bearer upload-new" {
-		t.Fatalf("upload authorization = %q", got)
 	}
 }
 
@@ -1044,31 +969,6 @@ func writeTestProfile(t *testing.T, dir, configPath, serverURL string) {
 	err := store.Save(config.Profile{Issuer: serverURL, CLIClientSessionID: "cls_test", AccessExpiresAt: expires}, config.Credential{AccessToken: "token", RefreshToken: "refresh", ExpiresAt: expires})
 	if err != nil {
 		t.Fatal(err)
-	}
-}
-
-func TestUploadLimitsHonorBrokeredUploadPolicy(t *testing.T) {
-	cfg := &config.Config{}
-	cfg.Upload.MaxImageBytes = 1
-	cfg.Upload.MaxAttachments = 2
-	cfg.Upload.AllowedMimePrefixes = []string{"image/"}
-
-	limits := uploadLimits(cfg, &resolver.UploadTarget{
-		MaxBytes:         4096,
-		AllowedMIMETypes: []string{"image/png", "image/webp"},
-	})
-
-	if limits.MaxImageBytes != 4096 {
-		t.Fatalf("MaxImageBytes = %d", limits.MaxImageBytes)
-	}
-	if len(limits.AllowedMimePrefixes) != 0 {
-		t.Fatalf("AllowedMimePrefixes = %#v", limits.AllowedMimePrefixes)
-	}
-	if strings.Join(limits.AllowedMIMETypes, ",") != "image/png,image/webp" {
-		t.Fatalf("AllowedMIMETypes = %#v", limits.AllowedMIMETypes)
-	}
-	if limits.MaxAttachments != 2 {
-		t.Fatalf("local-only limits changed: %#v", limits)
 	}
 }
 

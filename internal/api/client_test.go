@@ -506,7 +506,7 @@ func TestProjectConnectionDescriptorDecodesPaperboatWebSocketTerminal(t *testing
 				TerminalID: "term-1",
 				CWD:        "/workspace",
 			},
-			Upload: &Upload{Kind: "paperboat_staged_image_v1", HTTPBaseURL: "https://edge.paperboat.test/projects/prj_1", Path: "/projects/prj_1/v1/files/staged-images", MaxBytes: 10485760, RetentionSeconds: 604800},
+			FileTransfer: &FileTransfer{Endpoint: "https://edge.paperboat.test/v1/file-transfers"},
 		})
 	}))
 	defer srv.Close()
@@ -522,8 +522,8 @@ func TestProjectConnectionDescriptorDecodesPaperboatWebSocketTerminal(t *testing
 	if resp.Terminal.Auth.Method != "websocket_ticket" || resp.Terminal.Auth.Ticket != "pct_1" {
 		t.Fatalf("terminal auth = %+v", resp.Terminal.Auth)
 	}
-	if resp.Upload == nil || resp.Upload.Kind != "paperboat_staged_image_v1" || resp.Upload.HTTPBaseURL != "https://edge.paperboat.test/projects/prj_1" || resp.Upload.Path != "/projects/prj_1/v1/files/staged-images" || resp.Upload.RetentionSeconds != 604800 {
-		t.Fatalf("upload = %+v", resp.Upload)
+	if resp.FileTransfer == nil || resp.FileTransfer.Endpoint != "https://edge.paperboat.test/v1/file-transfers" {
+		t.Fatalf("file transfer = %+v", resp.FileTransfer)
 	}
 	if len(body) != 0 {
 		t.Fatalf("cli-connect request body = %q, want empty", string(body))
@@ -582,9 +582,9 @@ func TestNormalizeCanonicalConnectionDescriptor(t *testing.T) {
 	expires := time.Now().Add(time.Minute).UTC()
 	response := ConnectionDescriptor{
 		Schema: ConnectionSchemaV1, Issuer: "https://api.paperboat.test", Connectable: true, ExpiresAt: expires,
-		Environment: &Environment{ID: "env_1", Kind: "byod", ResourceID: "um_1", DisplayName: "Studio", State: "ready", Root: "/Users/paperboat"},
-		Terminal:    &Terminal{Protocol: "paperboat.terminal.v2", Endpoints: TerminalEndpoints{QUIC: "quic://edge.paperboat.test:443", WSS: "wss://edge.paperboat.test/v1/runtime"}, SessionID: "session_1"},
-		Upload:      &Upload{Endpoint: "https://edge.paperboat.test/e/env_1/uploads"},
+		Environment:  &Environment{ID: "env_1", Kind: "byod", ResourceID: "um_1", DisplayName: "Studio", State: "ready", Root: "/Users/paperboat"},
+		Terminal:     &Terminal{Protocol: "paperboat.terminal.v2", Endpoints: TerminalEndpoints{QUIC: "quic://edge.paperboat.test:443", WSS: "wss://edge.paperboat.test/v1/runtime"}, SessionID: "session_1"},
+		FileTransfer: &FileTransfer{Endpoint: "https://edge.paperboat.test/v1/file-transfers"},
 	}
 	if err := response.NormalizeConnectionDescriptor(); err != nil {
 		t.Fatal(err)
@@ -595,8 +595,8 @@ func TestNormalizeCanonicalConnectionDescriptor(t *testing.T) {
 	if response.Terminal.Protocol != "paperboat.terminal.v2" || response.Terminal.Endpoints.WSS == "" {
 		t.Fatalf("canonical terminal was not normalized: %#v", response.Terminal)
 	}
-	if response.Upload.Kind != "paperboat_staged_image_v1" || response.Upload.HTTPBaseURL != "https://edge.paperboat.test" || response.Upload.Path != "/e/env_1/uploads" {
-		t.Fatalf("canonical upload was not normalized: %#v", response.Upload)
+	if response.FileTransfer.Endpoint != "https://edge.paperboat.test/v1/file-transfers" {
+		t.Fatalf("file transfer was not normalized: %#v", response.FileTransfer)
 	}
 }
 
@@ -612,9 +612,9 @@ func TestProjectConnectionDescriptorDecodesCanonicalDescriptor(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		writeData(w, http.StatusOK, map[string]any{
 			"schema": ConnectionSchemaV1, "issuer": "https://api.paperboat.test", "connectable": true, "expires_at": expires,
-			"environment": map[string]any{"id": "env_1", "kind": "hosted", "resource_id": "prj_1", "state": "ready", "root": "/workspace"},
-			"terminal":    map[string]any{"protocol": "paperboat.terminal.v2", "endpoints": map[string]any{"quic": "quic://edge.paperboat.test:443", "wss": "wss://edge.paperboat.test/v1/runtime"}, "session_id": "session_1", "thread_id": "thread_1", "terminal_id": "term_1", "cwd": "/workspace"},
-			"upload":      map[string]any{"endpoint": "https://edge.paperboat.test/e/env_1/uploads"},
+			"environment":   map[string]any{"id": "env_1", "kind": "hosted", "resource_id": "prj_1", "state": "ready", "root": "/workspace"},
+			"terminal":      map[string]any{"protocol": "paperboat.terminal.v2", "endpoints": map[string]any{"quic": "quic://edge.paperboat.test:443", "wss": "wss://edge.paperboat.test/v1/runtime"}, "session_id": "session_1", "thread_id": "thread_1", "terminal_id": "term_1", "cwd": "/workspace"},
+			"file_transfer": map[string]any{"endpoint": "https://edge.paperboat.test/v1/file-transfers"},
 		})
 	}))
 	defer server.Close()
@@ -624,7 +624,7 @@ func TestProjectConnectionDescriptorDecodesCanonicalDescriptor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if response.ProjectID != "prj_1" || response.Terminal.Endpoints.WSS != "wss://edge.paperboat.test/v1/runtime" || response.Upload.Path != "/e/env_1/uploads" {
+	if response.ProjectID != "prj_1" || response.Terminal.Endpoints.WSS != "wss://edge.paperboat.test/v1/runtime" || response.FileTransfer.Endpoint != "https://edge.paperboat.test/v1/file-transfers" {
 		t.Fatalf("canonical response not decoded: %#v", response)
 	}
 }

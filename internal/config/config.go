@@ -16,33 +16,20 @@ import (
 // EnvConfigPath overrides the config file location when set.
 const EnvConfigPath = "PAPERBOAT_CONFIG"
 
-// UploadConfig controls the local image-paste bridge. All fields are tunable so
+// FilePasteConfig controls local file-paste detection. All fields are tunable so
 // behavior can change without rebuilding the binary.
-type UploadConfig struct {
-	// Endpoint is the helper upload endpoint. Production uploads use the brokered descriptor.
-	Endpoint string `json:"endpoint,omitempty"`
-	// WatchDirs are directories terminals write temp images into on paste.
+type FilePasteConfig struct {
+	// WatchDirs are directories terminals write temporary files into on paste.
 	// Absolute paths, or "~"-prefixed for the home dir.
 	WatchDirs []string `json:"watch_dirs,omitempty"`
-	// TempFilePatterns optionally restrict terminal-created image names. Patterns
+	// TempFilePatterns optionally restrict terminal-created file names. Patterns
 	// use filepath glob syntax and may match a basename or normalized full path.
 	TempFilePatterns []string `json:"temp_file_patterns,omitempty"`
-	// MaxImageBytes caps a single staged file. The key is retained for compatibility.
-	MaxImageBytes int64 `json:"max_image_bytes,omitempty"`
-	// MaxAttachments caps images per paste.
-	MaxAttachments int `json:"max_attachments,omitempty"`
-	// MaxQueuedInputBytes bounds local input held behind an image upload.
+	// MaxQueuedInputBytes bounds local input held behind a file transfer.
 	MaxQueuedInputBytes int `json:"max_queued_input_bytes,omitempty"`
-	// AllowedMimePrefixes gates which files are treated as images.
-	AllowedMimePrefixes []string `json:"allowed_mime_prefixes,omitempty"`
 }
 
-// Upload defaults are applied only when a field is left unset.
-const (
-	DefaultMaxImageBytes       = 50 * 1024 * 1024
-	DefaultMaxAttachments      = 8
-	DefaultMaxQueuedInputBytes = 1024 * 1024
-)
+const DefaultMaxQueuedInputBytes = 1024 * 1024
 
 // Config is the on-disk CLI configuration.
 type Config struct {
@@ -53,8 +40,8 @@ type Config struct {
 	// ambiguous or change ownership.
 	LastEnvironmentID string     `json:"last_environment_id,omitempty"`
 	Auth              AuthConfig `json:"auth,omitempty"`
-	// Upload configures the image-paste bridge.
-	Upload UploadConfig `json:"upload,omitempty"`
+	// FilePaste configures generic file-paste detection.
+	FilePaste FilePasteConfig `json:"file_paste,omitempty"`
 	// Connect tunes the pre-connect broker + readiness polling.
 	Connect ConnectConfig `json:"connect,omitempty"`
 	// Observability controls the local metadata-only event log.
@@ -272,17 +259,8 @@ func (c *Config) applyDefaults() {
 	if c.Observability.MaxEventLogBytes == 0 {
 		c.Observability.MaxEventLogBytes = DefaultTelemetryMaxBytes
 	}
-	if c.Upload.MaxImageBytes == 0 {
-		c.Upload.MaxImageBytes = DefaultMaxImageBytes
-	}
-	if c.Upload.MaxAttachments == 0 {
-		c.Upload.MaxAttachments = DefaultMaxAttachments
-	}
-	if c.Upload.MaxQueuedInputBytes == 0 {
-		c.Upload.MaxQueuedInputBytes = DefaultMaxQueuedInputBytes
-	}
-	if len(c.Upload.AllowedMimePrefixes) == 0 {
-		c.Upload.AllowedMimePrefixes = []string{"*"}
+	if c.FilePaste.MaxQueuedInputBytes == 0 {
+		c.FilePaste.MaxQueuedInputBytes = DefaultMaxQueuedInputBytes
 	}
 	if c.Connect.ReadyTimeoutSeconds == 0 {
 		c.Connect.ReadyTimeoutSeconds = DefaultReadyTimeoutSeconds

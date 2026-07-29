@@ -6,7 +6,7 @@ Inherit [`../AGENTS.md`](../AGENTS.md). CLI, `pb`, and client CLI mean this repo
 ## Ownership
 
 Device auth, account/environment/session selection, raw terminal lifecycle, resize,
-signals, reconnect/replay, local image upload/paste rewriting,
+signals, reconnect/replay, local file transfer/paste rewriting,
 diagnostics, output, and OS credential storage. Never run frpc, own remote PTYs, enforce
 server policy, or receive reusable infrastructure credentials.
 
@@ -25,7 +25,7 @@ Go `1.25.7`; Cobra; standard HTTP; Gorilla WebSocket; `x/term`; OS credential ad
   replay uncertain input.
 - Readiness, reconnect, refresh, and replay are automatic only when safe, bounded,
   cancellable, and visible.
-- Rewrite image paste only after validation and successful helper staging.
+- Rewrite file paste only after validation and atomic helper publication.
 - Hide Fly, frp, Caddy, route, node, and connector details outside diagnostics.
 
 ## Verify

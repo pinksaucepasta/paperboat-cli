@@ -12,22 +12,37 @@ import (
 	"testing"
 	"time"
 
+	transfer "github.com/pinksaucepasta/paperboat-cli/internal/filetransfer"
 	"github.com/pinksaucepasta/paperboat-cli/internal/tunnel"
-	"github.com/pinksaucepasta/paperboat-cli/internal/upload"
 )
 
 // fixedUploader returns a constant VM path.
 type fixedUploader struct{ vmPath string }
 
-func (u fixedUploader) Upload(_ context.Context, _ upload.Image) (string, error) {
-	return u.vmPath, nil
+func (u fixedUploader) UploadBatch(_ context.Context, _, _ string, sources []transfer.Source) (transfer.Batch, error) {
+	paths := make([]string, len(sources))
+	for i := range paths {
+		paths[i] = u.vmPath
+	}
+	return transfer.Batch{Paths: paths}, nil
 }
 
 // failUploader always errors, exercising fail-open.
 type failUploader struct{}
 
-func (failUploader) Upload(_ context.Context, _ upload.Image) (string, error) {
-	return "", errors.New("boom")
+func (failUploader) UploadBatch(context.Context, string, string, []transfer.Source) (transfer.Batch, error) {
+	return transfer.Batch{}, errors.New("boom")
+}
+
+type batchUploader struct {
+	sources []transfer.Source
+	result  transfer.Batch
+	err     error
+}
+
+func (u *batchUploader) UploadBatch(_ context.Context, _ string, _ string, sources []transfer.Source) (transfer.Batch, error) {
+	u.sources = append([]transfer.Source(nil), sources...)
+	return u.result, u.err
 }
 
 type blockingUploader struct {
@@ -59,22 +74,22 @@ func (w *uncertainWriter) Write(p []byte) (int, error) {
 func (w *uncertainWriter) Discard()       { w.mu.Lock(); w.discarded++; w.mu.Unlock() }
 func (w *uncertainWriter) String() string { w.mu.Lock(); defer w.mu.Unlock(); return w.buf.String() }
 
-func (u *blockingUploader) Upload(ctx context.Context, _ upload.Image) (string, error) {
+func (u *blockingUploader) UploadBatch(ctx context.Context, _, _ string, sources []transfer.Source) (transfer.Batch, error) {
 	u.once.Do(func() { close(u.started) })
 	select {
 	case <-u.release:
-		return "/vm/slow.png", nil
+		return fixedUploader{"/vm/slow.png"}.UploadBatch(ctx, "", "", sources)
 	case <-ctx.Done():
-		return "", ctx.Err()
+		return transfer.Batch{}, ctx.Err()
 	}
 }
 
-func defaultLimits() upload.Limits {
-	return upload.Limits{
-		MaxImageBytes:       50 << 20,
-		MaxAttachments:      8,
-		AllowedMimePrefixes: []string{"*"},
-	}
+func defaultLimits() transfer.Limits {
+	return transfer.Limits{MaxFileBytes: 50 << 20, MaxBatchFiles: 8, MaxBatchBytes: 500 << 20}
+}
+
+func New(dest io.Writer, uploader BatchUploader, limits transfer.Limits, opts ...Option) *Interceptor {
+	return NewWithPolicy(dest, NewPolicy(uploader, "ses_test", limits), opts...)
 }
 
 func wrap(body string) string {
@@ -335,15 +350,55 @@ func TestPolicyUpdateChangesUploaderForSubsequentPastes(t *testing.T) {
 	dir := t.TempDir()
 	img := makeImage(t, dir, "shot.png")
 	var dest bytes.Buffer
-	policy := NewPolicy(fixedUploader{"/vm/old.png"}, defaultLimits())
+	policy := NewPolicy(fixedUploader{"/vm/old.png"}, "ses_1", defaultLimits())
 	i := NewWithPolicy(&dest, policy, WithPartialFlushDelay(time.Hour))
 	writeInChunks(t, i, wrap(img), 8)
-	policy.Update(fixedUploader{"/vm/new.png"}, defaultLimits())
+	policy.Update(fixedUploader{"/vm/new.png"}, "ses_1", defaultLimits())
 	dest.Reset()
 	i = NewWithPolicy(&dest, policy, WithPartialFlushDelay(time.Hour))
 	writeInChunks(t, i, wrap(img), 8)
 	if got := dest.String(); got != wrap("/vm/new.png") {
 		t.Fatalf("got %q", got)
+	}
+}
+
+func TestFileTransferPolicyUploadsMixedBatchBeforeRewriting(t *testing.T) {
+	dir := t.TempDir()
+	empty := filepath.Join(dir, "empty")
+	binary := filepath.Join(dir, "archive.bin")
+	if err := os.WriteFile(empty, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(binary, []byte{0, 1, 2}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	uploader := &batchUploader{result: transfer.Batch{Paths: []string{"/remote/empty", "/remote/archive.bin"}}}
+	policy := NewPolicy(uploader, "ses_1", transfer.Limits{MaxFileBytes: 50 << 20, MaxBatchFiles: 10, MaxBatchBytes: 500 << 20})
+	var dest bytes.Buffer
+	i := NewWithPolicy(&dest, policy, WithPartialFlushDelay(time.Hour))
+	writeInChunks(t, i, wrap(empty+"\n"+binary), 5)
+	if got := dest.String(); got != wrap("/remote/empty\n/remote/archive.bin") {
+		t.Fatalf("got=%q", got)
+	}
+	if len(uploader.sources) != 2 || uploader.sources[0].Size != 0 || uploader.sources[1].Size != 3 {
+		t.Fatalf("sources=%#v", uploader.sources)
+	}
+}
+
+func TestFileTransferBatchFailurePreservesEveryOriginalPath(t *testing.T) {
+	dir := t.TempDir()
+	first := filepath.Join(dir, "a.txt")
+	second := filepath.Join(dir, "b.bin")
+	_ = os.WriteFile(first, []byte("a"), 0o600)
+	_ = os.WriteFile(second, []byte("b"), 0o600)
+	uploader := &batchUploader{err: errors.New("failed")}
+	policy := NewPolicy(uploader, "ses_1", transfer.Limits{MaxBatchFiles: 10})
+	var dest bytes.Buffer
+	i := NewWithPolicy(&dest, policy, WithPartialFlushDelay(time.Hour))
+	original := first + "\n" + second
+	writeInChunks(t, i, wrap(original), 7)
+	if got := dest.String(); got != wrap(original) {
+		t.Fatalf("got=%q", got)
 	}
 }
 

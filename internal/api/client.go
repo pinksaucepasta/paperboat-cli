@@ -401,37 +401,42 @@ type TerminalEndpoints struct {
 	WSS  string `json:"wss"`
 }
 
-// Upload is the Paperboat image-upload endpoint hint from cli-connect.
-type Upload struct {
-	Endpoint         string       `json:"endpoint"`
-	Kind             string       `json:"kind"`
-	HTTPBaseURL      string       `json:"http_base_url"`
-	Path             string       `json:"path"`
-	Auth             AuthMaterial `json:"auth"`
-	MaxBytes         int64        `json:"max_bytes"`
-	AllowedMIMETypes []string     `json:"allowed_mime_types"`
-	RetentionSeconds int64        `json:"retention_seconds"`
+type FileTransferPolicy struct {
+	Revision               string `json:"revision"`
+	MaxFileBytes           int64  `json:"max_file_bytes"`
+	MaxBatchFiles          int    `json:"max_batch_files"`
+	MaxBatchBytes          int64  `json:"max_batch_bytes"`
+	MaxConcurrentTransfers int    `json:"max_concurrent_transfers"`
+	RetentionSeconds       int64  `json:"retention_seconds"`
+	DeliveryTimeoutSeconds int64  `json:"delivery_timeout_seconds"`
+	MaxPendingSpoolBytes   int64  `json:"max_pending_spool_bytes"`
+}
+
+type FileTransfer struct {
+	Endpoint string             `json:"endpoint"`
+	Auth     AuthMaterial       `json:"auth"`
+	Policy   FileTransferPolicy `json:"policy"`
 }
 
 // ConnectionDescriptor is the cli-connect / connection-status descriptor. When
 // Connectable is false the machine is not ready yet; Status/Reason explain why
 // and the caller should poll ConnectionReadiness.
 type ConnectionDescriptor struct {
-	Schema            string       `json:"schema"`
-	Issuer            string       `json:"issuer,omitempty"`
-	ProjectID         string       `json:"project_id"`
-	ProjectState      string       `json:"project_state"`
-	UserMachineID     string       `json:"user_machine_id"`
-	UserMachineState  string       `json:"user_machine_state"`
-	Connectable       bool         `json:"connectable"`
-	ExpiresAt         time.Time    `json:"expires_at"`
-	Environment       *Environment `json:"environment,omitempty"`
-	Terminal          *Terminal    `json:"terminal,omitempty"`
-	Upload            *Upload      `json:"upload,omitempty"`
-	Status            string       `json:"status,omitempty"`
-	Reason            string       `json:"reason,omitempty"`
-	RetryAfterSeconds int          `json:"retry_after_seconds,omitempty"`
-	Capabilities      []string     `json:"capabilities,omitempty"`
+	Schema            string        `json:"schema"`
+	Issuer            string        `json:"issuer,omitempty"`
+	ProjectID         string        `json:"project_id"`
+	ProjectState      string        `json:"project_state"`
+	UserMachineID     string        `json:"user_machine_id"`
+	UserMachineState  string        `json:"user_machine_state"`
+	Connectable       bool          `json:"connectable"`
+	ExpiresAt         time.Time     `json:"expires_at"`
+	Environment       *Environment  `json:"environment,omitempty"`
+	Terminal          *Terminal     `json:"terminal,omitempty"`
+	FileTransfer      *FileTransfer `json:"file_transfer,omitempty"`
+	Status            string        `json:"status,omitempty"`
+	Reason            string        `json:"reason,omitempty"`
+	RetryAfterSeconds int           `json:"retry_after_seconds,omitempty"`
+	Capabilities      []string      `json:"capabilities,omitempty"`
 }
 
 // NormalizeConnectionDescriptor maps the canonical wire contract onto the
@@ -458,15 +463,12 @@ func (r *ConnectionDescriptor) NormalizeConnectionDescriptor() error {
 			return errors.New("invalid canonical terminal protocol")
 		}
 	}
-	if r.Upload != nil {
-		r.Upload.Kind = "paperboat_staged_image_v1"
-		u, err := url.Parse(r.Upload.Endpoint)
-		if err != nil || u.Scheme == "" || u.Host == "" || u.Path == "" {
-			return errors.New("invalid canonical upload endpoint")
+	if r.FileTransfer != nil {
+		u, err := url.Parse(r.FileTransfer.Endpoint)
+		if err != nil || u.Scheme == "" || u.Host == "" || strings.TrimRight(u.Path, "/") == "" {
+			return errors.New("invalid canonical file transfer endpoint")
 		}
-		r.Upload.Path = u.EscapedPath()
-		u.Path, u.RawPath, u.RawQuery, u.Fragment = "", "", "", ""
-		r.Upload.HTTPBaseURL = strings.TrimSuffix(u.String(), "/")
+		r.FileTransfer.Endpoint = strings.TrimRight(r.FileTransfer.Endpoint, "/")
 	}
 	return nil
 }

@@ -9,10 +9,10 @@
   only in the terminal and browser URL; tokens are never placed in URLs.
 - The CLI treats project descriptors, route URLs, VM paths, and server error
   messages as untrusted input. Descriptor validation and issuer binding happen
-  before a terminal or upload connection is opened.
-- Terminal bytes and image bytes cross the `paperboat-tunnel` data boundary to
+  before a terminal or file-transfer connection is opened.
+- Terminal bytes and opaque file bytes cross the `paperboat-tunnel` data boundary to
   `paperboat-helper`. The CLI
-  does not log, inspect, or proxy them beyond the required terminal/upload
+  does not log or inspect them beyond the required terminal/file-transfer
   operation.
 
 ## Threats and controls
@@ -22,8 +22,8 @@
 | Device-code phishing or brute force | Server-authoritative expiry/interval; user sees the complete URL and short code; no token in output | Server/dashboard rate limits and approval UX |
 | Token theft or refresh replay | OS credential store, issuer-namespaced profiles, refresh rotation, durable revoke queue | Server session-family revocation |
 | Malicious route or descriptor | HTTPS/WSS scheme and issuer/environment/scope/expiry validation; no raw VM or SSH fallback | Server route authorization and `paperboat-tunnel` enforcement |
-| Terminal injection | Non-image bytes pass through unchanged; image rewriting is limited to a bracketed paste frame | `paperboat-helper` terminal authorization |
-| Upload traversal/polyglots | Server-selected staging destination; descriptor MIME/size policy; local file opened and validated before upload | `paperboat-helper` staging and cleanup |
+| Terminal injection | Non-file bytes pass through unchanged; rewriting is limited to a bracketed paste frame | `paperboat-helper` terminal authorization |
+| File traversal or substitution | Absolute regular files only; symlinks/traversal rejected; one descriptor is hashed and streamed; signed size policy | `paperboat-helper` transfer verification and cleanup |
 | Compromised VM | CLI receives only short-lived, scoped terminal/file credentials | VM isolation and server revocation |
 
 ## Incident actions

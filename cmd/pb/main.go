@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -24,6 +25,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"text/tabwriter"
@@ -34,13 +36,14 @@ import (
 	"github.com/pinksaucepasta/paperboat-cli/internal/buildinfo"
 	"github.com/pinksaucepasta/paperboat-cli/internal/command"
 	"github.com/pinksaucepasta/paperboat-cli/internal/config"
+	filetransfer "github.com/pinksaucepasta/paperboat-cli/internal/filetransfer"
+	"github.com/pinksaucepasta/paperboat-cli/internal/inbox"
 	"github.com/pinksaucepasta/paperboat-cli/internal/paste"
 	"github.com/pinksaucepasta/paperboat-cli/internal/resolver"
 	"github.com/pinksaucepasta/paperboat-cli/internal/session"
 	"github.com/pinksaucepasta/paperboat-cli/internal/statusbar"
 	"github.com/pinksaucepasta/paperboat-cli/internal/telemetry"
 	"github.com/pinksaucepasta/paperboat-cli/internal/tunnel"
-	"github.com/pinksaucepasta/paperboat-cli/internal/upload"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -1044,7 +1047,6 @@ type deps struct {
 	resolver         resolver.ProjectResolver
 	tunnel           tunnel.Tunnel
 	terminalSelector *tunnel.TerminalTransportSelector
-	uploader         upload.Uploader
 	telemetry        telemetry.Sink
 }
 
@@ -1085,7 +1087,6 @@ func buildDeps(c *command.Context) (*deps, error) {
 	if err := termTunnel.SetPreferencePath(filepath.Join(filepath.Dir(cfg.Path()), "terminal-transport.json")); err != nil {
 		return nil, fmt.Errorf("load terminal transport preference: %w", err)
 	}
-	var uploader upload.Uploader = upload.NewDisabledUploader()
 	var authSource config.AuthSource = config.NoCredentialsSource{}
 	if cfg.ServerURL != "" {
 		authSource, err = sessionauth.NewSource(cfg)
@@ -1099,7 +1100,6 @@ func buildDeps(c *command.Context) (*deps, error) {
 		resolver:         nil,
 		tunnel:           termTunnel,
 		terminalSelector: termTunnel,
-		uploader:         uploader,
 	}, nil
 }
 
@@ -1716,29 +1716,30 @@ func actionConnectTarget(c *command.Context, requested string) error {
 			d.telemetry.Record(event)
 		}
 	}
-	configureUploadRefresh := func(u upload.Uploader) {
-		httpUploader, ok := u.(*upload.HTTPUploader)
-		if !ok {
+	configureFileTransferRefresh := func(client *filetransfer.Client) {
+		if client == nil {
 			return
 		}
-		projectID, environmentID := info.ProjectID, ""
-		if info.Terminal != nil {
-			environmentID = info.Terminal.EnvironmentID
-		}
-		httpUploader.ConfigureTelemetry(d.telemetry, projectID, environmentID)
-		if useStatusBar {
-			httpUploader.ConfigureProgress(func(sent, total int64) {
-				if total > 0 {
-					bar.Loading(fmt.Sprintf("Uploading image %d%%", sent*100/total))
-				}
-			})
-		}
-		httpUploader.RefreshAuth = func(refreshCtx context.Context) (upload.Auth, error) {
-			return refreshUploadAuthorization(refreshCtx, d.auth, func(credential config.Credential) resolver.ProjectResolver {
-				return newResolver(credential)
-			}, project, info.ProjectID, terminalSessionID)
+		client.RefreshAuth = func(refreshCtx context.Context) (filetransfer.Auth, error) {
+			freshCred, err := d.auth.Credential()
+			if err != nil {
+				return filetransfer.Auth{}, err
+			}
+			projectToken := project
+			if info.ProjectID != "" {
+				projectToken = info.ProjectID
+			}
+			freshInfo, err := newResolver(freshCred).Resolve(refreshCtx, resolver.ConnectRequest{Project: projectToken, Credential: freshCred, TerminalSessionID: terminalSessionID})
+			if err != nil {
+				return filetransfer.Auth{}, fmt.Errorf("refresh file transfer descriptor: %w", err)
+			}
+			if freshInfo.FileTransfer == nil {
+				return filetransfer.Auth{}, errors.New("refresh file transfer descriptor: target missing")
+			}
+			return filetransfer.Auth{Token: freshInfo.FileTransfer.Auth.Token, ExpiresAt: parseAuthExpiry(freshInfo.FileTransfer.Auth.ExpiresAt)}, nil
 		}
 	}
+	var transferClient *filetransfer.Client
 	for attempt := 0; attempt <= d.cfg.Connect.DialRetries; attempt++ {
 		info, err = d.resolver.Resolve(ctx, resolver.ConnectRequest{Project: project, Credential: cred, TerminalSessionID: terminalSessionID})
 		if err == nil {
@@ -1750,8 +1751,21 @@ func actionConnectTarget(c *command.Context, requested string) error {
 				info.Terminal.Env = forwardedTerminalEnv(config.TerminalEnv)
 				info.Terminal.Cols, info.Terminal.Rows = remoteSize()
 			}
-			d.uploader = uploaderForTarget(info.Upload)
-			configureUploadRefresh(d.uploader)
+			if transferClient != nil {
+				_ = transferClient.Close()
+			}
+			transferClient = fileTransferClientForTarget(info.FileTransfer)
+			configureFileTransferRefresh(transferClient)
+			if transferClient != nil {
+				if policyErr := transferClient.VerifyPolicy(ctx, descriptorFileTransferPolicy(info.FileTransfer)); policyErr != nil {
+					transferClient = nil
+					if useStatusBar {
+						bar.FailureFor("file_transfer", "File transfer unavailable")
+					} else {
+						fmt.Fprintln(os.Stderr, "File transfer unavailable:", policyErr)
+					}
+				}
+			}
 			conn, err = d.tunnel.Dial(ctx, info)
 		}
 		if err == nil {
@@ -1785,6 +1799,11 @@ func actionConnectTarget(c *command.Context, requested string) error {
 		}
 		return fmt.Errorf("connect to %q: %w", project, err)
 	}
+	defer func() {
+		if transferClient != nil {
+			_ = transferClient.Close()
+		}
+	}()
 	if d.cfg.LastEnvironmentID != info.ProjectID {
 		d.cfg.LastEnvironmentID = info.ProjectID
 		if err := d.cfg.Save(); err != nil {
@@ -1799,6 +1818,40 @@ func actionConnectTarget(c *command.Context, requested string) error {
 	} else if term.IsTerminal(int(os.Stdout.Fd())) {
 		_, _ = fmt.Fprint(os.Stdout, "\x1b[2J\x1b[H")
 	}
+	var inboxMu sync.Mutex
+	var cancelInbox context.CancelFunc
+	stopInbox := func() {
+		inboxMu.Lock()
+		if cancelInbox != nil {
+			cancelInbox()
+			cancelInbox = nil
+		}
+		inboxMu.Unlock()
+	}
+	startInbox := func(client *filetransfer.Client, sessionID string) {
+		stopInbox()
+		if client == nil || sessionID == "" {
+			return
+		}
+		notify := func(message string) {
+			if useStatusBar {
+				bar.Notice(message)
+				return
+			}
+			fmt.Fprintln(os.Stderr, message)
+		}
+		receiver, inboxErr := inbox.New(inbox.Config{Client: client, SessionID: sessionID, Notify: notify})
+		if inboxErr != nil {
+			notify("File delivery unavailable: " + inboxErr.Error())
+			return
+		}
+		pollCtx, cancel := context.WithCancel(ctx)
+		inboxMu.Lock()
+		cancelInbox = cancel
+		inboxMu.Unlock()
+		go func() { _ = receiver.Run(pollCtx) }()
+	}
+	defer stopInbox()
 	var pastePolicy *paste.Policy
 	conn = tunnel.NewObservedReconnectingConn(ctx, conn, d.cfg.Connect.DialRetries, time.Duration(d.cfg.Connect.DialRetrySeconds)*time.Second, func(reconnectCtx context.Context) (tunnel.Conn, error) {
 		freshCred, credErr := d.auth.Credential()
@@ -1831,9 +1884,21 @@ func actionConnectTarget(c *command.Context, requested string) error {
 			return nil, dialErr
 		}
 		if pastePolicy != nil {
-			freshUploader := uploaderForTarget(freshInfo.Upload)
-			configureUploadRefresh(freshUploader)
-			pastePolicy.Update(freshUploader, uploadLimits(d.cfg, freshInfo.Upload))
+			freshTransfer := transferClient
+			if freshInfo.FileTransfer == nil {
+				freshTransfer = nil
+			} else if freshTransfer == nil {
+				freshTransfer = fileTransferClientForTarget(freshInfo.FileTransfer)
+				transferClient = freshTransfer
+				configureFileTransferRefresh(freshTransfer)
+			} else {
+				freshTransfer.UpdateAuth(filetransfer.Auth{Token: freshInfo.FileTransfer.Auth.Token, ExpiresAt: parseAuthExpiry(freshInfo.FileTransfer.Auth.ExpiresAt)})
+				if policyErr := freshTransfer.VerifyPolicy(reconnectCtx, descriptorFileTransferPolicy(freshInfo.FileTransfer)); policyErr != nil {
+					freshTransfer = nil
+				}
+			}
+			pastePolicy.Update(freshTransfer, freshInfo.Terminal.SessionID, fileTransferLimits(freshInfo.FileTransfer))
+			startInbox(freshTransfer, freshInfo.Terminal.SessionID)
 		}
 		return freshConn, nil
 	}, d.telemetry, nil, tunnel.TelemetryContext{ProjectID: info.ProjectID, EnvironmentID: info.Terminal.EnvironmentID}, tunnel.WithReconnectingOutput(
@@ -1862,8 +1927,8 @@ func actionConnectTarget(c *command.Context, requested string) error {
 		}
 	}))
 
-	// Wrap remote input with the image-paste interceptor.
-	pastePolicy = paste.NewPolicy(d.uploader, uploadLimits(d.cfg, info.Upload))
+	// Wrap remote input with the file-paste interceptor.
+	pastePolicy = paste.NewPolicy(transferClient, info.Terminal.SessionID, fileTransferLimits(info.FileTransfer))
 	interceptor := paste.NewWithPolicy(conn, pastePolicy,
 		paste.WithDirectInput(),
 		paste.WithNotifier(statusNotifier(useStatusBar)),
@@ -1872,22 +1937,23 @@ func actionConnectTarget(c *command.Context, requested string) error {
 				return
 			}
 			switch event {
-			case paste.ImageDetected:
+			case paste.FileDetected:
 				bar.Loading("File detected")
-			case paste.ImageUploading:
-				bar.Loading("Uploading image")
-			case paste.ImageComplete:
+			case paste.FileUploading:
+				bar.Loading("Uploading file")
+			case paste.FileComplete:
 				bar.RecoverFailureFor("upload")
-				bar.Notice("Image uploaded")
-			case paste.ImageFailed:
-				bar.FailureFor("upload", "Image upload failed; pasted original")
+				bar.Notice("File uploaded")
+			case paste.FileFailed:
+				bar.FailureFor("upload", "File upload failed; pasted original")
 			}
 		}),
-		paste.WithWatchDirs(expandDirs(d.cfg.Upload.WatchDirs)),
-		paste.WithTempFilePatterns(d.cfg.Upload.TempFilePatterns),
-		paste.WithMaxQueuedBytes(d.cfg.Upload.MaxQueuedInputBytes),
+		paste.WithWatchDirs(expandDirs(d.cfg.FilePaste.WatchDirs)),
+		paste.WithTempFilePatterns(d.cfg.FilePaste.TempFilePatterns),
+		paste.WithMaxQueuedBytes(d.cfg.FilePaste.MaxQueuedInputBytes),
 		paste.WithPartialFlushDelay(time.Duration(d.cfg.Connect.InputPartialFlushMilliseconds)*time.Millisecond),
 	)
+	startInbox(transferClient, info.Terminal.SessionID)
 
 	if useStatusBar && info.TargetKind == "project" {
 		pollCtx, cancelPoll := context.WithCancel(ctx)
@@ -2195,56 +2261,36 @@ func friendlyAPIError(err error) string {
 	return ""
 }
 
-// refreshUploadAuthorization re-brokers an upload descriptor with a newly
-// constructed control-plane client. API clients bind their bearer token at
-// construction, so reusing the resolver from the initial terminal attach
-// would retry with an expired credential.
-func refreshUploadAuthorization(ctx context.Context, source config.AuthSource, newResolver func(config.Credential) resolver.ProjectResolver, project, projectID, terminalSessionID string) (upload.Auth, error) {
-	freshCred, err := source.Credential()
+func fileTransferClientForTarget(target *resolver.FileTransferTarget) *filetransfer.Client {
+	if target == nil || target.Endpoint == "" || target.Auth.Method != "bearer" || target.Auth.Token == "" {
+		return nil
+	}
+	selector, err := filetransfer.NewTransportSelector(filetransfer.TransportSelectorConfig{})
 	if err != nil {
-		return upload.Auth{}, err
+		return nil
 	}
-	projectToken := project
-	if projectID != "" {
-		projectToken = projectID
-	}
-	freshInfo, err := newResolver(freshCred).Resolve(ctx, resolver.ConnectRequest{Project: projectToken, Credential: freshCred, TerminalSessionID: terminalSessionID})
-	if err != nil {
-		return upload.Auth{}, fmt.Errorf("refresh upload descriptor: %w", err)
-	}
-	if freshInfo.Upload == nil {
-		return upload.Auth{}, errors.New("refresh upload descriptor: upload target missing")
-	}
-	return upload.Auth{Method: freshInfo.Upload.Auth.Method, Token: freshInfo.Upload.Auth.Token, Ticket: freshInfo.Upload.Auth.Ticket}, nil
+	client := &http.Client{Transport: selector, Timeout: 5 * time.Minute}
+	return filetransfer.NewClient(target.Endpoint, filetransfer.Auth{Token: target.Auth.Token, ExpiresAt: parseAuthExpiry(target.Auth.ExpiresAt)}, client)
 }
 
-func uploaderForTarget(target *resolver.UploadTarget) upload.Uploader {
-	if target == nil || target.HTTPBaseURL == "" {
-		return upload.NewDisabledUploader()
+func fileTransferLimits(target *resolver.FileTransferTarget) filetransfer.Limits {
+	if target == nil {
+		return filetransfer.Limits{MaxFileBytes: 50 << 20, MaxBatchFiles: 10, MaxBatchBytes: 500 << 20}
 	}
-	return upload.NewHTTPUploader(target.HTTPBaseURL, target.Path, upload.Auth{
-		Method: target.Auth.Method,
-		Token:  target.Auth.Token,
-		Ticket: target.Auth.Ticket,
-	})
+	return filetransfer.Limits{MaxFileBytes: target.Policy.MaxFileBytes, MaxBatchFiles: target.Policy.MaxBatchFiles, MaxBatchBytes: target.Policy.MaxBatchBytes}
 }
 
-func uploadLimits(cfg *config.Config, target *resolver.UploadTarget) upload.Limits {
-	limits := upload.Limits{
-		MaxImageBytes:       cfg.Upload.MaxImageBytes,
-		MaxAttachments:      cfg.Upload.MaxAttachments,
-		AllowedMimePrefixes: cfg.Upload.AllowedMimePrefixes,
+func descriptorFileTransferPolicy(target *resolver.FileTransferTarget) filetransfer.Policy {
+	if target == nil {
+		return filetransfer.Policy{}
 	}
-	if target != nil {
-		if target.MaxBytes > 0 {
-			limits.MaxImageBytes = target.MaxBytes
-		}
-		if len(target.AllowedMIMETypes) > 0 {
-			limits.AllowedMimePrefixes = nil
-			limits.AllowedMIMETypes = append([]string(nil), target.AllowedMIMETypes...)
-		}
-	}
-	return limits
+	policy := target.Policy
+	return filetransfer.Policy{Revision: policy.Revision, MaxFileBytes: policy.MaxFileBytes, MaxBatchFiles: policy.MaxBatchFiles, MaxBatchBytes: policy.MaxBatchBytes, MaxConcurrentTransfers: policy.MaxConcurrentTransfers, RetentionSeconds: policy.RetentionSeconds, DeliveryTimeoutSeconds: policy.DeliveryTimeoutSeconds, MaxPendingSpoolBytes: policy.MaxPendingSpoolBytes}
+}
+
+func parseAuthExpiry(value string) time.Time {
+	parsed, _ := time.Parse(time.RFC3339, value)
+	return parsed
 }
 
 // terminalEnvKeyPattern mirrors the terminal RPC environment schema; an invalid
@@ -2381,13 +2427,11 @@ func configCommand() *command.Spec {
 						return err
 					}
 					if c.Bool("json") {
-						return json.NewEncoder(os.Stdout).Encode(map[string]any{"path": d.cfg.Path(), "server_url": d.cfg.ServerURL, "auth_file_fallback": d.cfg.Auth.AllowFileFallback, "upload_endpoint": d.cfg.Upload.Endpoint, "upload_max_image_bytes": d.cfg.Upload.MaxImageBytes, "upload_max_attachments": d.cfg.Upload.MaxAttachments, "status_bar": d.cfg.StatusBar})
+						return json.NewEncoder(os.Stdout).Encode(map[string]any{"path": d.cfg.Path(), "server_url": d.cfg.ServerURL, "auth_file_fallback": d.cfg.Auth.AllowFileFallback, "file_paste": d.cfg.FilePaste, "status_bar": d.cfg.StatusBar})
 					}
 					fmt.Printf("server_url: %s\n", orNone(d.cfg.ServerURL))
 					fmt.Printf("auth.file_fallback: %t\n", d.cfg.Auth.AllowFileFallback)
-					fmt.Printf("upload.endpoint: %s\n", orNone(d.cfg.Upload.Endpoint))
-					fmt.Printf("upload.max_image_bytes: %d\n", d.cfg.Upload.MaxImageBytes)
-					fmt.Printf("upload.max_attachments: %d\n", d.cfg.Upload.MaxAttachments)
+					fmt.Printf("file_paste.max_queued_input_bytes: %d\n", d.cfg.FilePaste.MaxQueuedInputBytes)
 					fmt.Printf("status_bar.mode: %s\n", d.cfg.StatusBar.Mode)
 					fmt.Printf("status_bar.fullscreen: %s\n", d.cfg.StatusBar.Fullscreen)
 					fmt.Printf("status_bar.theme: %s\n", d.cfg.StatusBar.Theme)

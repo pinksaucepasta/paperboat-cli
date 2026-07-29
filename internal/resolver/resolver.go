@@ -6,6 +6,7 @@ package resolver
 import (
 	"context"
 
+	"github.com/pinksaucepasta/paperboat-cli/internal/api"
 	"github.com/pinksaucepasta/paperboat-cli/internal/config"
 )
 
@@ -34,10 +35,8 @@ type ConnectInfo struct {
 	Local bool
 	// Terminal is the helper WebSocket attach descriptor returned by paperboat-server's
 	// pre-connect broker.
-	Terminal *TerminalTarget
-	// Upload is the helper image-upload endpoint hint from the broker. Nil
-	// when the broker did not return one.
-	Upload *UploadTarget
+	Terminal     *TerminalTarget
+	FileTransfer *FileTransferTarget
 }
 
 // AuthTarget is short-lived, scoped auth material returned by the broker.
@@ -83,15 +82,10 @@ type TerminalTarget struct {
 	ReplayGapSink func(requested, earliest, latest uint64)
 }
 
-// UploadTarget is the helper upload endpoint reachable through
-// `paperboat-tunnel`, with the server-authoritative size/MIME policy.
-type UploadTarget struct {
-	HTTPBaseURL      string
-	Path             string
-	Auth             AuthTarget
-	MaxBytes         int64
-	AllowedMIMETypes []string
-	RetentionSeconds int64
+type FileTransferTarget struct {
+	Endpoint string
+	Auth     AuthTarget
+	Policy   api.FileTransferPolicy
 }
 
 // ProjectResolver resolves a project name to connect info.

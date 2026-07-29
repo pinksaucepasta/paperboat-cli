@@ -132,9 +132,8 @@ func TestValidateReadyAcceptsEnvironmentTerminalBearer(t *testing.T) {
 	response := readyUserMachineResponse(terminal)
 	response.ExpiresAt = time.Now().Add(2 * time.Minute)
 	response.Terminal.Auth.ExpiresAt = time.Now().Add(time.Minute)
-	response.Upload.Auth.ExpiresAt = time.Now().Add(time.Minute)
-	response.Upload.HTTPBaseURL = "https://machine.example"
-	response.Upload.Path = "/v1/uploads"
+	response.FileTransfer.Endpoint = "https://machine.example/v1/file-transfers"
+	response.FileTransfer.Auth.ExpiresAt = time.Now().Add(time.Minute)
 	if _, err := newTestResolver(&fakeClient{}).validateDescriptor(response, target{kind: targetUserMachine, id: "um_1"}); err != nil {
 		t.Fatal(err)
 	}
@@ -143,13 +142,48 @@ func TestValidateReadyAcceptsEnvironmentTerminalBearer(t *testing.T) {
 func readyResponse(term *api.Terminal) api.ConnectionDescriptor {
 	expires := time.Now().Add(time.Hour)
 	term.Auth.ExpiresAt = expires.Add(-time.Minute)
-	return api.ConnectionDescriptor{Issuer: "https://api.paperboat.test", ProjectID: "prj_1", Connectable: true, ExpiresAt: expires, Environment: &api.Environment{EnvironmentID: "env_1", ProjectID: "prj_1", ProjectRoot: "/workspace"}, Terminal: term, Upload: &api.Upload{Kind: "paperboat_staged_image_v1", HTTPBaseURL: "https://edge.paperboat.test", Path: "/projects/prj_1/v1/files/staged-images", Auth: api.AuthMaterial{Method: "bearer", Token: "file-token", ExpiresAt: expires.Add(-time.Minute), Scopes: []string{"file:stage"}}, MaxBytes: 1024, AllowedMIMETypes: []string{"image/png"}, RetentionSeconds: 60}}
+	return api.ConnectionDescriptor{Issuer: "https://api.paperboat.test", ProjectID: "prj_1", Connectable: true, ExpiresAt: expires, Environment: &api.Environment{EnvironmentID: "env_1", ProjectID: "prj_1", ProjectRoot: "/workspace"}, Terminal: term, FileTransfer: readyFileTransfer(expires)}
 }
 
 func readyUserMachineResponse(term *api.Terminal) api.ConnectionDescriptor {
 	expires := time.Now().Add(time.Hour)
 	term.Auth.ExpiresAt = expires.Add(-time.Minute)
-	return api.ConnectionDescriptor{Issuer: "https://api.paperboat.test", UserMachineID: "um_1", UserMachineState: "online", Connectable: true, ExpiresAt: expires, Environment: &api.Environment{EnvironmentID: "env_um_1", UserMachineID: "um_1", ProjectRoot: "/Users/paperboat"}, Terminal: term, Upload: &api.Upload{Kind: "paperboat_staged_image_v1", HTTPBaseURL: "https://edge.paperboat.test", Path: "/user-machines/um_1/v1/files/staged-images", Auth: api.AuthMaterial{Method: "bearer", Token: "file-token", ExpiresAt: expires.Add(-time.Minute), Scopes: []string{"file:stage"}}, MaxBytes: 1024, AllowedMIMETypes: []string{"image/png"}, RetentionSeconds: 60}}
+	return api.ConnectionDescriptor{Issuer: "https://api.paperboat.test", UserMachineID: "um_1", UserMachineState: "online", Connectable: true, ExpiresAt: expires, Environment: &api.Environment{EnvironmentID: "env_um_1", UserMachineID: "um_1", ProjectRoot: "/Users/paperboat"}, Terminal: term, FileTransfer: readyFileTransfer(expires)}
+}
+
+func readyFileTransfer(expires time.Time) *api.FileTransfer {
+	return &api.FileTransfer{Endpoint: "https://edge.paperboat.test/v1/file-transfers", Auth: api.AuthMaterial{Method: "bearer", Token: "file-token", ExpiresAt: expires.Add(-time.Minute), Scopes: []string{"file:transfer"}}, Policy: api.FileTransferPolicy{Revision: "file-transfer-v1", MaxFileBytes: 50 << 20, MaxBatchFiles: 10, MaxBatchBytes: 500 << 20, MaxConcurrentTransfers: 2, RetentionSeconds: 604800, DeliveryTimeoutSeconds: 600, MaxPendingSpoolBytes: 1 << 30}}
+}
+
+func TestValidateFileTransferRequiresExactRouteScopeAndPolicy(t *testing.T) {
+	expires := time.Now().Add(time.Hour)
+	transfer := &api.FileTransfer{
+		Endpoint: "https://edge.paperboat.test/v1/file-transfers",
+		Auth:     api.AuthMaterial{Method: "bearer", Token: "transfer-token", ExpiresAt: expires.Add(-time.Minute), Scopes: []string{"file:transfer"}},
+		Policy:   api.FileTransferPolicy{Revision: "file-transfer-v1", MaxFileBytes: 50 << 20, MaxBatchFiles: 10, MaxBatchBytes: 500 << 20, MaxConcurrentTransfers: 2, RetentionSeconds: 604800, DeliveryTimeoutSeconds: 600, MaxPendingSpoolBytes: 1 << 30},
+	}
+	terminalURL, _ := secureEndpoint("wss://edge.paperboat.test/v1/runtime", "wss")
+	r := newTestResolver(&fakeClient{})
+	if err := r.validateFileTransfer(transfer, terminalURL, expires); err != nil {
+		t.Fatal(err)
+	}
+	bad := *transfer
+	bad.Auth = transfer.Auth
+	bad.Auth.Scopes = []string{"file:stage"}
+	if err := r.validateFileTransfer(&bad, terminalURL, expires); err == nil {
+		t.Fatal("accepted legacy scope")
+	}
+	bad = *transfer
+	bad.Endpoint = "https://other.paperboat.test/v1/file-transfers"
+	if err := r.validateFileTransfer(&bad, terminalURL, expires); err == nil {
+		t.Fatal("accepted mismatched route")
+	}
+	bad = *transfer
+	bad.Policy = transfer.Policy
+	bad.Policy.MaxBatchFiles = 11
+	if err := r.validateFileTransfer(&bad, terminalURL, expires); err == nil {
+		t.Fatal("accepted policy outside bounds")
+	}
 }
 
 func routeOnlyTerminal() *api.Terminal {
@@ -517,12 +551,12 @@ func TestResolveRejectsUnexpectedIssuer(t *testing.T) {
 	}
 }
 
-func TestResolveRejectsInvalidUploadDescriptor(t *testing.T) {
+func TestResolveRejectsInvalidFileTransferDescriptor(t *testing.T) {
 	response := readyResponse(readyTerminal())
-	response.Upload.Auth.Scopes = []string{"terminal:operate"}
+	response.FileTransfer.Auth.Scopes = []string{"terminal:operate"}
 	fc := &fakeClient{projects: []api.Project{{ID: "prj_1", Name: "app"}}, connectSeq: []api.ConnectionDescriptor{response}}
 	_, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "app"})
-	if err == nil || !strings.Contains(err.Error(), "upload descriptor") {
+	if err == nil || !strings.Contains(err.Error(), "file transfer descriptor") {
 		t.Fatalf("err = %v", err)
 	}
 }
@@ -531,7 +565,6 @@ func TestResolveAcceptsFrozenTerminalWithoutHTTPBaseURL(t *testing.T) {
 	term := readyTerminal()
 	term.Endpoints = api.TerminalEndpoints{QUIC: "quic://edge.paperboat.test:443", WSS: "wss://edge.paperboat.test/v1/runtime"}
 	response := readyResponse(term)
-	response.Upload.HTTPBaseURL = "https://edge.paperboat.test/projects/prj_1"
 	fc := &fakeClient{projects: []api.Project{{ID: "prj_1", Name: "app"}}, connectSeq: []api.ConnectionDescriptor{response}}
 	if _, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "app"}); err != nil {
 		t.Fatalf("Resolve: %v", err)
@@ -542,7 +575,7 @@ func TestResolveRejectsTerminalHTTPPortMismatch(t *testing.T) {
 	term := readyTerminal()
 	term.Endpoints = api.TerminalEndpoints{QUIC: "quic://edge.paperboat.test:8443", WSS: "wss://edge.paperboat.test/v1/runtime"}
 	response := readyResponse(term)
-	response.Upload.HTTPBaseURL = "https://edge.paperboat.test:8443"
+	response.FileTransfer.Endpoint = "https://edge.paperboat.test:8443/v1/file-transfers"
 	fc := &fakeClient{projects: []api.Project{{ID: "prj_1", Name: "app"}}, connectSeq: []api.ConnectionDescriptor{response}}
 	_, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "app"})
 	if err == nil || !strings.Contains(err.Error(), "hosts do not match") {
@@ -550,13 +583,13 @@ func TestResolveRejectsTerminalHTTPPortMismatch(t *testing.T) {
 	}
 }
 
-func TestResolveRejectsUploadPortMismatch(t *testing.T) {
+func TestResolveRejectsFileTransferPortMismatch(t *testing.T) {
 	response := readyResponse(readyTerminal())
-	response.Upload.HTTPBaseURL = "https://edge.paperboat.test:8443/projects/prj_1"
+	response.FileTransfer.Endpoint = "https://edge.paperboat.test:8443/v1/file-transfers"
 	fc := &fakeClient{projects: []api.Project{{ID: "prj_1", Name: "app"}}, connectSeq: []api.ConnectionDescriptor{response}}
 	_, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "app"})
 	if err == nil || !strings.Contains(err.Error(), "validated terminal route") {
-		t.Fatalf("err = %v, want upload origin mismatch", err)
+		t.Fatalf("err = %v, want file transfer origin mismatch", err)
 	}
 }
 

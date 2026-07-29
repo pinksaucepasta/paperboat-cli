@@ -32,7 +32,7 @@ dialing fails across projects.
 1. Use `pb doctor <environment>` to distinguish route readiness from helper health.
 2. Stop reconnect storms and honor configured retry bounds.
 3. Do not expose a Fly port or fall back to SSH.
-4. After recovery, verify terminal attach, reconnect, staged upload, and revoked-route rejection.
+4. After recovery, verify terminal attach, reconnect, resumable file transfer, and revoked-route rejection.
 
 ## Fly start or machine failure
 
@@ -47,12 +47,12 @@ or times out before route/helper checks.
 ## Helper authorization mismatch
 
 Detection: route and runtime are healthy but mint, token exchange, WebSocket ticket,
-terminal scope, or file-stage scope is rejected.
+terminal scope, or `file:transfer` scope is rejected.
 
 1. Compare issuer, environment ID, owner ID, audience, scope, and clock configuration.
 2. Revoke the affected downstream sessions; never broaden a credential scope to diagnose.
 3. Reconcile the VM identity configuration and re-broker a new descriptor.
-4. Verify terminal-only credentials cannot upload and file-only credentials cannot attach.
+4. Verify terminal-only credentials cannot transfer files and file-only credentials cannot attach.
 
 ## Stuck device grant
 
@@ -71,15 +71,15 @@ grant cannot be consumed exactly once.
 3. Run `pb auth logout` on the device if recovered so queued local cleanup completes.
 4. Review metadata-only access events; rotate unrelated account credentials only if evidence warrants it.
 
-## Staged-upload cleanup failure
+## File-transfer cleanup failure
 
-Detection: retained staged files exceed configured age/space bounds or cleanup
+Detection: staged or pending files exceed configured age/space bounds or cleanup
 reports repeated failures.
 
-1. Stop accepting uploads if storage safety limits are threatened; terminal access remains separately scoped.
-2. Inspect counts, sizes, ages, and environment IDs only, never image contents or paths.
+1. Stop accepting transfers if storage safety limits are threatened; terminal access remains separately scoped.
+2. Inspect counts, sizes, ages, and environment IDs only, never file contents or source paths.
 3. Restore the helper cleanup worker and run its idempotent cleanup operation.
-4. Verify expired files are gone, active files remain readable, traversal is rejected, and new uploads obey retention.
+4. Verify expired files are gone, active files remain readable, traversal is rejected, and new transfers obey retention.
 
 ## Recovery evidence
 

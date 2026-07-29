@@ -29,8 +29,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	transfer "github.com/pinksaucepasta/paperboat-cli/internal/filetransfer"
 	"github.com/pinksaucepasta/paperboat-cli/internal/tunnel"
-	"github.com/pinksaucepasta/paperboat-cli/internal/upload"
 )
 
 var (
@@ -85,24 +85,33 @@ type Interceptor struct {
 }
 
 type Policy struct {
-	mu       sync.RWMutex
-	uploader upload.Uploader
-	limits   upload.Limits
+	mu             sync.RWMutex
+	transfer       BatchUploader
+	transferLimits transfer.Limits
+	sessionID      string
 }
 
-func NewPolicy(uploader upload.Uploader, limits upload.Limits) *Policy {
-	return &Policy{uploader: uploader, limits: limits}
+type BatchUploader interface {
+	UploadBatch(context.Context, string, string, []transfer.Source) (transfer.Batch, error)
 }
-func (p *Policy) Update(uploader upload.Uploader, limits upload.Limits) {
+type policySnapshot struct {
+	transfer       BatchUploader
+	transferLimits transfer.Limits
+	sessionID      string
+}
+
+func NewPolicy(uploader BatchUploader, sessionID string, limits transfer.Limits) *Policy {
+	return &Policy{transfer: uploader, sessionID: sessionID, transferLimits: limits}
+}
+func (p *Policy) Update(uploader BatchUploader, sessionID string, limits transfer.Limits) {
 	p.mu.Lock()
-	p.uploader = uploader
-	p.limits = limits
+	p.transfer, p.sessionID, p.transferLimits = uploader, sessionID, limits
 	p.mu.Unlock()
 }
-func (p *Policy) snapshot() (upload.Uploader, upload.Limits) {
+func (p *Policy) snapshot() policySnapshot {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.uploader, p.limits
+	return policySnapshot{p.transfer, p.transferLimits, p.sessionID}
 }
 
 // Option configures an Interceptor.
@@ -113,10 +122,10 @@ type Option func(*Interceptor)
 type LifecycleEvent string
 
 const (
-	ImageDetected  LifecycleEvent = "detected"
-	ImageUploading LifecycleEvent = "uploading"
-	ImageComplete  LifecycleEvent = "complete"
-	ImageFailed    LifecycleEvent = "failed"
+	FileDetected  LifecycleEvent = "detected"
+	FileUploading LifecycleEvent = "uploading"
+	FileComplete  LifecycleEvent = "complete"
+	FileFailed    LifecycleEvent = "failed"
 )
 
 // WithNotifier sets where user-facing (fail-open) messages are written.
@@ -162,11 +171,6 @@ func WithMaxQueuedBytes(n int) Option {
 // WithDirectInput sends ordinary non-paste bytes to the destination inline.
 // Only possible bracketed-paste markers enter the asynchronous upload queue.
 func WithDirectInput() Option { return func(i *Interceptor) { i.directInput = true } }
-
-// New builds an Interceptor writing rewritten output to dest.
-func New(dest io.Writer, up upload.Uploader, limits upload.Limits, opts ...Option) *Interceptor {
-	return NewWithPolicy(dest, NewPolicy(up, limits), opts...)
-}
 
 func NewWithPolicy(dest io.Writer, policy *Policy, opts ...Option) *Interceptor {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -535,42 +539,71 @@ func (i *Interceptor) rewrite(body []byte) []byte {
 		candidate.path = resolved
 		candidate.file = file
 		candidates[idx] = candidate
-		i.report(ImageDetected)
+		i.report(FileDetected)
 	}
 	if nonEmpty == 0 {
 		return body
 	}
-	uploader, limits := i.policy.snapshot()
-	if limits.MaxAttachments > 0 && nonEmpty > limits.MaxAttachments {
-		i.warn("paste has %d files, over the limit of %d; sending as-is", nonEmpty, limits.MaxAttachments)
+	policy := i.policy.snapshot()
+	maxFiles := policy.transferLimits.MaxBatchFiles
+	if maxFiles > 0 && nonEmpty > maxFiles {
+		i.warn("paste has %d files, over the limit of %d; sending as-is", nonEmpty, maxFiles)
 		return body
 	}
-
 	ctx := i.ctx
 	if i.timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, i.timeout)
 		defer cancel()
 	}
-
-	out := make([]string, len(lines))
-	for idx, ln := range lines {
-		if strings.TrimSpace(ln) == "" {
-			out[idx] = ln
-			continue
+	if policy.transfer != nil {
+		paths := make([]string, 0, nonEmpty)
+		files := make([]*os.File, 0, nonEmpty)
+		for _, candidate := range candidates {
+			if candidate.file != nil {
+				paths = append(paths, candidate.path)
+				files = append(files, candidate.file)
+			}
 		}
-		candidate := candidates[idx]
-		i.report(ImageUploading)
-		vmPath, err := uploadOne(ctx, uploader, limits, candidate)
+		sources, err := transfer.PrepareDescriptors(paths, files, policy.transferLimits)
 		if err != nil {
-			i.report(ImageFailed)
+			i.report(FileFailed)
 			i.warn("file upload failed: %v; pasting original path", err)
-			return body // fail open for the whole paste
+			return body
 		}
-		out[idx] = ln[:candidate.start] + vmPath + ln[candidate.end:]
+		i.report(FileUploading)
+		batchID, err := transfer.NewBatchID()
+		if err != nil {
+			i.report(FileFailed)
+			i.warn("file upload failed: %v; pasting original path", err)
+			return body
+		}
+		batch, err := policy.transfer.UploadBatch(ctx, batchID, policy.sessionID, sources)
+		if err != nil || len(batch.Paths) != nonEmpty {
+			if err == nil {
+				err = errors.New("helper returned incomplete file batch")
+			}
+			i.report(FileFailed)
+			i.warn("file upload failed: %v; pasting original path", err)
+			return body
+		}
+		out := make([]string, len(lines))
+		result := 0
+		for idx, line := range lines {
+			if strings.TrimSpace(line) == "" {
+				out[idx] = line
+				continue
+			}
+			candidate := candidates[idx]
+			out[idx] = line[:candidate.start] + batch.Paths[result] + line[candidate.end:]
+			result++
+		}
+		i.report(FileComplete)
+		return []byte(strings.Join(out, "\n"))
 	}
-	i.report(ImageComplete)
-	return []byte(strings.Join(out, "\n"))
+
+	i.warn("file transfer unavailable; pasting original path")
+	return body
 }
 
 func (i *Interceptor) report(event LifecycleEvent) {
@@ -579,17 +612,16 @@ func (i *Interceptor) report(event LifecycleEvent) {
 	}
 }
 
-func uploadOne(ctx context.Context, uploader upload.Uploader, limits upload.Limits, candidate pathCandidate) (string, error) {
-	img, err := upload.PrepareImageFile(candidate.file, candidate.path, limits)
-	if err != nil {
-		return "", err
-	}
-	return uploader.Upload(ctx, img)
-}
-
-// isLocalImage reports whether p points at an existing local image file,
+// openLocalFile reports whether p points at an existing local regular file,
 // honoring configured watch dirs when set.
 func (i *Interceptor) openLocalFile(p string) (string, *os.File, bool) {
+	if !filepath.IsAbs(p) || filepath.Clean(p) != p {
+		return "", nil, false
+	}
+	pathInfo, err := os.Lstat(p)
+	if err != nil || pathInfo.Mode()&os.ModeSymlink != 0 || !pathInfo.Mode().IsRegular() {
+		return "", nil, false
+	}
 	file, err := os.Open(p)
 	if err != nil {
 		return "", nil, false
@@ -599,19 +631,12 @@ func (i *Interceptor) openLocalFile(p string) (string, *os.File, bool) {
 		return "", nil, false
 	}
 	openedInfo, err := file.Stat()
-	if err != nil || !openedInfo.Mode().IsRegular() {
+	if err != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(pathInfo, openedInfo) {
 		return fail()
 	}
-	resolved, err := filepath.EvalSymlinks(p)
-	if err != nil {
-		return fail()
-	}
-	resolved, err = filepath.Abs(resolved)
-	if err != nil {
-		return fail()
-	}
-	resolvedInfo, err := os.Stat(resolved)
-	if err != nil || !resolvedInfo.Mode().IsRegular() || !os.SameFile(openedInfo, resolvedInfo) {
+	resolved := p
+	watchPath, watchErr := filepath.EvalSymlinks(p)
+	if watchErr != nil {
 		return fail()
 	}
 	if len(i.watchDirs) == 0 {
@@ -626,7 +651,7 @@ func (i *Interceptor) openLocalFile(p string) (string, *os.File, bool) {
 			continue
 		}
 		resolvedDir, dirErr = filepath.Abs(resolvedDir)
-		if dirErr == nil && within(resolvedDir, resolved) {
+		if dirErr == nil && within(resolvedDir, watchPath) {
 			if i.matchesTempPattern(resolved) {
 				return resolved, file, true
 			}

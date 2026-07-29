@@ -131,15 +131,8 @@ func (r *APIResolver) Resolve(ctx context.Context, req ConnectRequest) (ConnectI
 			ReplayHistory: true,
 		},
 	}
-	if resp.Upload != nil && strings.TrimSpace(resp.Upload.HTTPBaseURL) != "" {
-		info.Upload = &UploadTarget{
-			HTTPBaseURL:      resp.Upload.HTTPBaseURL,
-			Path:             resp.Upload.Path,
-			Auth:             mapAuth(resp.Upload.Auth),
-			MaxBytes:         resp.Upload.MaxBytes,
-			AllowedMIMETypes: resp.Upload.AllowedMIMETypes,
-			RetentionSeconds: resp.Upload.RetentionSeconds,
-		}
+	if resp.FileTransfer != nil {
+		info.FileTransfer = &FileTransferTarget{Endpoint: resp.FileTransfer.Endpoint, Auth: mapAuth(resp.FileTransfer.Auth), Policy: resp.FileTransfer.Policy}
 	}
 	outcome = "success"
 	return info, nil
@@ -453,10 +446,34 @@ func (r *APIResolver) validateDescriptor(resp api.ConnectionDescriptor, target t
 	if resp.Terminal.Auth.ExpiresAt.IsZero() || !time.Now().Before(resp.Terminal.Auth.ExpiresAt) || resp.Terminal.Auth.ExpiresAt.After(resp.ExpiresAt) {
 		return api.ConnectionDescriptor{}, errors.New("terminal credential is expired")
 	}
-	if err := r.validateUpload(resp.Upload, wsURL, resp.ExpiresAt); err != nil {
+	if err := r.validateFileTransfer(resp.FileTransfer, wsURL, resp.ExpiresAt); err != nil {
 		return api.ConnectionDescriptor{}, err
 	}
 	return resp, nil
+}
+
+func (r *APIResolver) validateFileTransfer(transfer *api.FileTransfer, terminalURL *url.URL, descriptorExpiry time.Time) error {
+	if transfer == nil {
+		return errors.New("server returned an incomplete file transfer descriptor")
+	}
+	u, err := secureEndpoint(transfer.Endpoint, "https")
+	if err != nil || endpointAuthority(u) != endpointAuthority(terminalURL) || strings.TrimRight(u.Path, "/") != "/v1/file-transfers" {
+		return errors.New("file transfer endpoint is not on the validated terminal route")
+	}
+	if len(r.cfg.Connect.AllowedRouteHosts) > 0 && !allowedHost(transfer.Endpoint, r.cfg.Connect.AllowedRouteHosts) {
+		return errors.New("file transfer descriptor host is not allowed by local policy")
+	}
+	if transfer.Auth.Method != "bearer" || strings.TrimSpace(transfer.Auth.Token) == "" || !exactScopes(transfer.Auth.Scopes, "file:transfer") {
+		return errors.New("file transfer descriptor has invalid scope or auth")
+	}
+	if transfer.Auth.ExpiresAt.IsZero() || !time.Now().Before(transfer.Auth.ExpiresAt) || transfer.Auth.ExpiresAt.After(descriptorExpiry) {
+		return errors.New("file transfer credential is expired")
+	}
+	p := transfer.Policy
+	if p.Revision == "" || p.MaxFileBytes <= 0 || p.MaxFileBytes > 50<<20 || p.MaxBatchFiles < 1 || p.MaxBatchFiles > 10 || p.MaxBatchBytes < p.MaxFileBytes || p.MaxBatchBytes > 500<<20 || p.MaxConcurrentTransfers < 1 || p.MaxConcurrentTransfers > 2 || p.RetentionSeconds != 7*24*60*60 || p.DeliveryTimeoutSeconds != 600 || p.MaxPendingSpoolBytes != 1<<30 {
+		return errors.New("file transfer descriptor has invalid policy")
+	}
+	return nil
 }
 
 func environmentMatchesTarget(environment *api.Environment, target target) bool {
@@ -478,41 +495,6 @@ func targetState(target target, resp api.ConnectionDescriptor) string {
 		return resp.ProjectState
 	}
 	return target.state
-}
-
-func (r *APIResolver) validateUpload(up *api.Upload, terminalURL *url.URL, descriptorExpiry time.Time) error {
-	if up == nil || up.Kind != "paperboat_staged_image_v1" || up.Path == "" || up.MaxBytes <= 0 || up.RetentionSeconds <= 0 {
-		return errors.New("server returned an incomplete upload descriptor")
-	}
-	u, err := secureEndpoint(up.HTTPBaseURL, "https")
-	if err != nil || endpointAuthority(u) != endpointAuthority(terminalURL) {
-		return errors.New("upload endpoint is not on the validated terminal route")
-	}
-	if len(r.cfg.Connect.AllowedRouteHosts) > 0 && !allowedHost(up.HTTPBaseURL, r.cfg.Connect.AllowedRouteHosts) {
-		return errors.New("upload descriptor host is not allowed by local policy")
-	}
-	if up.Auth.Method != "bearer" || strings.TrimSpace(up.Auth.Token) == "" || !exactScopes(up.Auth.Scopes, "file:stage") {
-		return errors.New("upload descriptor has invalid scope or auth")
-	}
-	if up.Auth.ExpiresAt.IsZero() || !time.Now().Before(up.Auth.ExpiresAt) || up.Auth.ExpiresAt.After(descriptorExpiry) {
-		return errors.New("upload credential is expired")
-	}
-	if len(up.AllowedMIMETypes) == 0 {
-		return errors.New("upload descriptor has no allowed MIME types")
-	}
-	seen := map[string]bool{}
-	for _, mime := range up.AllowedMIMETypes {
-		mime = strings.TrimSpace(mime)
-		if !strings.HasPrefix(mime, "image/") || seen[mime] {
-			return errors.New("upload descriptor has invalid MIME policy")
-		}
-		seen[mime] = true
-	}
-	path, err := url.Parse(up.Path)
-	if err != nil || path.IsAbs() || path.Host != "" || path.RawQuery != "" || path.Fragment != "" || !strings.HasPrefix(path.Path, "/") {
-		return errors.New("upload descriptor has invalid path")
-	}
-	return nil
 }
 
 func endpointAuthority(u *url.URL) string {
