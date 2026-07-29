@@ -369,7 +369,7 @@ func TestUploadAuthRefreshRebrokersWithFreshControlPlaneCredential(t *testing.T)
 			uploadAuth = append(uploadAuth, r.Header.Get("Authorization"))
 			if r.Header.Get("Authorization") != "Bearer upload-new" {
 				w.WriteHeader(http.StatusUnauthorized)
-				_, _ = w.Write([]byte(`{"error":{"code":"unauthenticated","message":"server rejected the credential"}}`))
+				_, _ = w.Write([]byte(`{"error":{"code":"unauthorized","message":"server rejected the credential"}}`))
 				return
 			}
 			_, _ = w.Write([]byte(`{"path":"/workspace/.paperboat/staged/image.png"}`))

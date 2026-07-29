@@ -58,11 +58,12 @@ func (u *HTTPUploader) ConfigureProgress(progress func(sent, total int64)) {
 // endpoint. Code lets callers distinguish retryable workspace/storage failures
 // from user input and authorization failures without parsing text.
 type Error struct {
-	Code      string
-	Message   string
-	RequestID string
-	Stage     string
-	Retryable bool
+	Code       string
+	Message    string
+	StatusCode int
+	RequestID  string
+	Stage      string
+	Retryable  bool
 }
 
 func (e *Error) Error() string {
@@ -111,7 +112,7 @@ func (u *HTTPUploader) Upload(ctx context.Context, img Image) (string, error) {
 			return path, nil
 		}
 		var stagedErr *Error
-		if attempt == 0 && u.RefreshAuth != nil && errors.As(err, &stagedErr) && (stagedErr.Code == "unauthenticated" || stagedErr.Code == "insufficient_scope") {
+		if attempt == 0 && u.RefreshAuth != nil && errors.As(err, &stagedErr) && (stagedErr.StatusCode == http.StatusUnauthorized || stagedErr.Code == "unauthenticated" || stagedErr.Code == "unauthorized" || stagedErr.Code == "insufficient_scope") {
 			u.refreshMu.Lock()
 			if u.currentAuth() != auth {
 				u.refreshMu.Unlock()
@@ -232,10 +233,10 @@ func (u *HTTPUploader) uploadOnce(ctx context.Context, img Image, idempotencyKey
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		if out.Code != "" || out.Message != "" {
-			return "", &Error{Code: out.Code, Message: out.Message, RequestID: out.RequestID, Stage: out.Details.Stage, Retryable: out.Retryable}
+			return "", &Error{Code: out.Code, Message: out.Message, StatusCode: resp.StatusCode, RequestID: out.RequestID, Stage: out.Details.Stage, Retryable: out.Retryable}
 		}
 		if out.Error.Code != "" || out.Error.Message != "" {
-			return "", &Error{Code: out.Error.Code, Message: out.Error.Message}
+			return "", &Error{Code: out.Error.Code, Message: out.Error.Message, StatusCode: resp.StatusCode}
 		}
 		return "", fmt.Errorf("upload failed with status %d", resp.StatusCode)
 	}

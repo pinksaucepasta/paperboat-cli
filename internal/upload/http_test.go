@@ -128,7 +128,7 @@ func TestHTTPUploaderSerializesConcurrentAuthRefresh(t *testing.T) {
 			}
 			<-oldRequestsReady
 			w.WriteHeader(http.StatusUnauthorized)
-			_, _ = w.Write([]byte(`{"error":{"code":"unauthenticated","message":"expired"}}`))
+			_, _ = w.Write([]byte(`{"error":{"code":"unauthorized","message":"expired"}}`))
 			return
 		}
 		_, _ = w.Write([]byte(`{"path":"/workspace/staged.png"}`))
