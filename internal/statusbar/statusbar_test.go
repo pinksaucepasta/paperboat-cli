@@ -72,6 +72,25 @@ func TestIdentityNoticeAndStickyRecovery(t *testing.T) {
 	}
 }
 
+func TestPersistentLoadingSurvivesNoticeTimeout(t *testing.T) {
+	bar, _ := newTestBar(t, ModeAuto, "xterm-256color", 80, 24, true, 15*time.Millisecond)
+	bar.SetIdentity("demo", "default")
+	bar.SetConnection("connected")
+	bar.LoadingPersistent("Uploading file")
+	time.Sleep(40 * time.Millisecond)
+	if got := textOf(t, bar); !strings.Contains(got, "Uploading file") {
+		t.Fatalf("persistent loading expired: %q", got)
+	}
+	bar.Notice("File uploaded")
+	if got := textOf(t, bar); !strings.Contains(got, "File uploaded") {
+		t.Fatalf("completion did not replace loading: %q", got)
+	}
+	time.Sleep(40 * time.Millisecond)
+	if got := textOf(t, bar); got != " demo / default / connected " {
+		t.Fatalf("completion notice did not expire: %q", got)
+	}
+}
+
 func TestLayoutAnchorsIdentityActivityAndConnection(t *testing.T) {
 	bar, _ := newTestBar(t, ModeAuto, "xterm-256color", 80, 24, true, time.Second)
 	bar.SetIdentity("demo", "default")

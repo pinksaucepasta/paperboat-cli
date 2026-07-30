@@ -325,7 +325,7 @@ func TestTempFilePatterns(t *testing.T) {
 		WithWatchDirs([]string{dir}), WithTempFilePatterns([]string{"terminal-paste-*.png"}),
 		WithPartialFlushDelay(time.Hour))
 	writeInChunks(t, i, wrap(allowed)+wrap(rejected), 5)
-	if got, want := dest.String(), wrap("/vm/allowed.png")+wrap(rejected); got != want {
+	if got, want := dest.String(), wrap(rejected)+wrap("/vm/allowed.png"); got != want {
 		t.Fatalf("got %q want %q", got, want)
 	}
 }
@@ -444,22 +444,22 @@ func TestAdjacentPastes(t *testing.T) {
 	i := New(&dest, fixedUploader{"/vm/c.png"}, defaultLimits(), WithPartialFlushDelay(time.Hour))
 	in := "x" + wrap(img) + "y" + wrap("plain") + "z"
 	writeInChunks(t, i, in, 3)
-	want := "x" + wrap("/vm/c.png") + "y" + wrap("plain") + "z"
+	want := "xy" + wrap("plain") + "z" + wrap("/vm/c.png")
 	if dest.String() != want {
 		t.Fatalf("got %q want %q", dest.String(), want)
 	}
 }
 
-func TestSlowUploadDoesNotBlockInitialWriteAndPreservesOrder(t *testing.T) {
+func TestSlowUploadDoesNotBlockTerminalInput(t *testing.T) {
 	dir := t.TempDir()
 	img := makeImage(t, dir, "slow.png")
 	var dest bytes.Buffer
 	uploader := &blockingUploader{started: make(chan struct{}), release: make(chan struct{})}
-	i := New(&dest, uploader, defaultLimits(), WithPartialFlushDelay(time.Hour))
+	i := New(&dest, uploader, defaultLimits(), WithDirectInput(), WithPartialFlushDelay(time.Hour))
 
 	writeDone := make(chan error, 1)
 	go func() {
-		_, err := i.Write([]byte(wrap(img) + "after"))
+		_, err := i.Write([]byte(wrap(img)))
 		writeDone <- err
 	}()
 	select {
@@ -475,14 +475,17 @@ func TestSlowUploadDoesNotBlockInitialWriteAndPreservesOrder(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("upload did not start")
 	}
-	if got := dest.String(); got != "" {
-		t.Fatalf("subsequent input overtook paste: %q", got)
+	if _, err := i.Write([]byte("typed-during-upload")); err != nil {
+		t.Fatal(err)
+	}
+	if got := dest.String(); got != "typed-during-upload" {
+		t.Fatalf("terminal input was blocked during upload: %q", got)
 	}
 	close(uploader.release)
 	if err := i.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := dest.String(), wrap("/vm/slow.png")+"after"; got != want {
+	if got, want := dest.String(), "typed-during-upload"+wrap("/vm/slow.png"); got != want {
 		t.Fatalf("got %q want %q", got, want)
 	}
 }
@@ -617,12 +620,12 @@ func TestFatalDestinationWriteIsReportedAsynchronously(t *testing.T) {
 	}
 }
 
-func TestSlowUploadAppliesBoundedBackpressure(t *testing.T) {
+func TestSlowUploadDoesNotApplyInputBackpressure(t *testing.T) {
 	dir := t.TempDir()
 	img := makeImage(t, dir, "bounded.png")
-	var dest, notice bytes.Buffer
+	var dest bytes.Buffer
 	uploader := &blockingUploader{started: make(chan struct{}), release: make(chan struct{})}
-	i := New(&dest, uploader, defaultLimits(), WithMaxQueuedBytes(8), WithNotifier(&notice))
+	i := New(&dest, uploader, defaultLimits(), WithMaxQueuedBytes(8))
 	if _, err := i.Write([]byte(wrap(img))); err != nil {
 		t.Fatal(err)
 	}
@@ -639,25 +642,17 @@ func TestSlowUploadAppliesBoundedBackpressure(t *testing.T) {
 	}()
 	select {
 	case err := <-writeDone:
-		t.Fatalf("queued write bypassed backpressure: %v", err)
-	case <-time.After(50 * time.Millisecond):
-	}
-	if !strings.Contains(notice.String(), "local input queue is full") {
-		t.Fatalf("missing backpressure notice: %q", notice.String())
-	}
-	close(uploader.release)
-	select {
-	case err := <-writeDone:
 		if err != nil {
 			t.Fatal(err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("queued write did not resume")
+		t.Fatal("terminal input blocked behind upload")
 	}
+	close(uploader.release)
 	if err := i.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := dest.String(), wrap("/vm/slow.png")+"sixteen-bytes!!!"; got != want {
+	if got, want := dest.String(), "sixteen-bytes!!!"+wrap("/vm/slow.png"); got != want {
 		t.Fatalf("got %q want %q", got, want)
 	}
 }

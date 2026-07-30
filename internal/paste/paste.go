@@ -67,12 +67,16 @@ type Interceptor struct {
 	queueChunkSize int
 	queueChunks    int
 	input          chan []byte
+	completed      chan uploadCompletion
 	done           chan struct{}
 	closeOnce      sync.Once
 	lifecycleMu    sync.RWMutex
 	closed         bool
 	pressureOnce   sync.Once
 	queued         atomic.Int64
+	pendingUploads atomic.Int64
+	uploadSeq      atomic.Uint64
+	destMu         sync.Mutex
 	directInput    bool
 	lifecycle      func(LifecycleEvent)
 	stateMu        sync.Mutex
@@ -93,6 +97,11 @@ type Policy struct {
 
 type BatchUploader interface {
 	UploadBatch(context.Context, string, string, []transfer.Source) (transfer.Batch, error)
+}
+type uploadCompletion struct {
+	seq    uint64
+	framed []byte
+	err    error
 }
 type policySnapshot struct {
 	transfer       BatchUploader
@@ -189,6 +198,7 @@ func NewWithPolicy(dest io.Writer, policy *Policy, opts ...Option) *Interceptor 
 		o(i)
 	}
 	i.input = make(chan []byte, i.queueChunks)
+	i.completed = make(chan uploadCompletion, 16)
 	i.done = make(chan struct{})
 	i.errCh = make(chan error, 1)
 	go i.run()
@@ -217,7 +227,7 @@ func (i *Interceptor) Write(p []byte) (int, error) {
 	}
 	if i.directInput && len(p) > 0 && i.queued.Load() == 0 && i.stateMu.TryLock() {
 		if !i.inPaste && len(i.buf) == 0 && bytes.Index(p, startMarker) < 0 && partialSuffix(p, startMarker) == 0 {
-			n, err := i.dest.Write(p)
+			n, err := i.writeDest(p)
 			i.stateMu.Unlock()
 			if errors.Is(err, tunnel.ErrWriteUncertain) {
 				if discarder, ok := i.dest.(interface{ Discard() }); ok {
@@ -308,6 +318,10 @@ func (i *Interceptor) run() {
 	}
 	defer flushTimer.Stop()
 	timerArmed := false
+	inputClosed := false
+	input := i.input
+	nextCompletion := uint64(0)
+	completionBuffer := make(map[uint64]uploadCompletion)
 	rearmFlush := func() {
 		if timerArmed {
 			if !flushTimer.Stop() {
@@ -349,19 +363,46 @@ func (i *Interceptor) run() {
 			if !i.inPaste && len(i.buf) > 0 {
 				out := i.buf
 				i.buf = nil
-				_, err = i.dest.Write(out)
+				_, err = i.writeDest(out)
 			}
 			i.stateMu.Unlock()
 			if err != nil && handleWriteErr(err) {
 				return
 			}
-		case p, ok := <-i.input:
+		case completion := <-i.completed:
+			completionBuffer[completion.seq] = completion
+			for {
+				ready, ok := completionBuffer[nextCompletion]
+				if !ok {
+					break
+				}
+				delete(completionBuffer, nextCompletion)
+				nextCompletion++
+				if _, err := i.writeDest(ready.framed); err != nil && handleWriteErr(err) {
+					return
+				}
+				if ready.err != nil {
+					i.report(FileFailed)
+				} else {
+					i.report(FileComplete)
+				}
+				i.pendingUploads.Add(-1)
+			}
+			if inputClosed && i.pendingUploads.Load() == 0 {
+				return
+			}
+		case p, ok := <-input:
 			if !ok {
+				inputClosed = true
+				input = nil
 				i.stateMu.Lock()
 				err := i.flush()
 				i.stateMu.Unlock()
 				i.setError(err)
-				return
+				if i.pendingUploads.Load() == 0 {
+					return
+				}
+				continue
 			}
 			i.stateMu.Lock()
 			i.buf = append(i.buf, p...)
@@ -369,13 +410,13 @@ func (i *Interceptor) run() {
 			// Coalesce input that queued up while this worker was busy (e.g.
 			// behind a slow destination write) so the backlog is forwarded in
 			// one destination write instead of one write per chunk.
-			inputClosed := false
+			batchInputClosed := false
 		coalesce:
 			for {
 				select {
 				case q, more := <-i.input:
 					if !more {
-						inputClosed = true
+						batchInputClosed = true
 						break coalesce
 					}
 					i.buf = append(i.buf, q...)
@@ -385,7 +426,7 @@ func (i *Interceptor) run() {
 				}
 			}
 			err := i.drain()
-			if err == nil && inputClosed {
+			if err == nil && batchInputClosed {
 				err = i.flush()
 			}
 			i.stateMu.Unlock()
@@ -393,12 +434,22 @@ func (i *Interceptor) run() {
 			if err != nil && handleWriteErr(err) {
 				return
 			}
-			if inputClosed {
+			if batchInputClosed {
+				inputClosed = true
+				input = nil
+			}
+			if inputClosed && i.pendingUploads.Load() == 0 {
 				return
 			}
 			rearmFlush()
 		}
 	}
+}
+
+func (i *Interceptor) writeDest(p []byte) (int, error) {
+	i.destMu.Lock()
+	defer i.destMu.Unlock()
+	return i.dest.Write(p)
 }
 
 func (i *Interceptor) flush() error {
@@ -414,7 +465,7 @@ func (i *Interceptor) flush() error {
 	out = append(out, i.buf...)
 	i.buf = nil
 	i.inPaste = false
-	_, err := i.dest.Write(out)
+	_, err := i.writeDest(out)
 	return err
 }
 
@@ -467,7 +518,7 @@ func (i *Interceptor) drainNormal() (done bool, err error) {
 		keep := partialSuffix(i.buf, startMarker)
 		flush := i.buf[:len(i.buf)-keep]
 		if len(flush) > 0 {
-			if _, err := i.dest.Write(flush); err != nil {
+			if _, err := i.writeDest(flush); err != nil {
 				return false, err
 			}
 		}
@@ -477,7 +528,7 @@ func (i *Interceptor) drainNormal() (done bool, err error) {
 	// Emit the normal bytes before the marker, then enter paste mode. The start
 	// marker itself is consumed here and re-emitted when the paste is flushed.
 	if idx > 0 {
-		if _, err := i.dest.Write(i.buf[:idx]); err != nil {
+		if _, err := i.writeDest(i.buf[:idx]); err != nil {
 			return false, err
 		}
 	}
@@ -498,12 +549,15 @@ func (i *Interceptor) drainPaste() (done bool, err error) {
 	i.buf = append(i.buf[:0], i.buf[idx+len(endMarker):]...)
 	i.inPaste = false
 
-	out := i.rewrite(body)
+	out, pending := i.rewrite(body)
+	if pending {
+		return true, nil
+	}
 	framed := make([]byte, 0, len(startMarker)+len(out)+len(endMarker))
 	framed = append(framed, startMarker...)
 	framed = append(framed, out...)
 	framed = append(framed, endMarker...)
-	if _, err := i.dest.Write(framed); err != nil {
+	if _, err := i.writeDest(framed); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -512,14 +566,13 @@ func (i *Interceptor) drainPaste() (done bool, err error) {
 // rewrite returns the paste body to emit. If the body is one-or-more local
 // file paths, each is uploaded and replaced by its VM path. Any failure falls
 // back to the original body (fail open) with a local notice.
-func (i *Interceptor) rewrite(body []byte) []byte {
+func (i *Interceptor) rewrite(body []byte) ([]byte, bool) {
 	lines := strings.Split(string(body), "\n")
 	candidates := make([]pathCandidate, len(lines))
+	owned := true
 	defer func() {
-		for _, candidate := range candidates {
-			if candidate.file != nil {
-				_ = candidate.file.Close()
-			}
+		if owned {
+			closeCandidates(candidates)
 		}
 	}()
 	nonEmpty := 0
@@ -530,11 +583,11 @@ func (i *Interceptor) rewrite(body []byte) []byte {
 		nonEmpty++
 		candidate, ok := parseCandidate(ln)
 		if !ok {
-			return body // not a pure file-path paste; leave untouched
+			return body, false // not a pure file-path paste; leave untouched
 		}
 		resolved, file, ok := i.openLocalFile(candidate.path)
 		if !ok {
-			return body
+			return body, false
 		}
 		candidate.path = resolved
 		candidate.file = file
@@ -542,19 +595,13 @@ func (i *Interceptor) rewrite(body []byte) []byte {
 		i.report(FileDetected)
 	}
 	if nonEmpty == 0 {
-		return body
+		return body, false
 	}
 	policy := i.policy.snapshot()
 	maxFiles := policy.transferLimits.MaxBatchFiles
 	if maxFiles > 0 && nonEmpty > maxFiles {
 		i.warn("paste has %d files, over the limit of %d; sending as-is", nonEmpty, maxFiles)
-		return body
-	}
-	ctx := i.ctx
-	if i.timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, i.timeout)
-		defer cancel()
+		return body, false
 	}
 	if policy.transfer != nil {
 		paths := make([]string, 0, nonEmpty)
@@ -565,45 +612,79 @@ func (i *Interceptor) rewrite(body []byte) []byte {
 				files = append(files, candidate.file)
 			}
 		}
-		sources, err := transfer.PrepareDescriptors(paths, files, policy.transferLimits)
-		if err != nil {
-			i.report(FileFailed)
-			i.warn("file upload failed: %v; pasting original path", err)
-			return body
-		}
 		i.report(FileUploading)
-		batchID, err := transfer.NewBatchID()
-		if err != nil {
-			i.report(FileFailed)
-			i.warn("file upload failed: %v; pasting original path", err)
-			return body
-		}
-		batch, err := policy.transfer.UploadBatch(ctx, batchID, policy.sessionID, sources)
-		if err != nil || len(batch.Paths) != nonEmpty {
-			if err == nil {
-				err = errors.New("helper returned incomplete file batch")
-			}
-			i.report(FileFailed)
-			i.warn("file upload failed: %v; pasting original path", err)
-			return body
-		}
-		out := make([]string, len(lines))
-		result := 0
-		for idx, line := range lines {
-			if strings.TrimSpace(line) == "" {
-				out[idx] = line
-				continue
-			}
-			candidate := candidates[idx]
-			out[idx] = line[:candidate.start] + batch.Paths[result] + line[candidate.end:]
-			result++
-		}
-		i.report(FileComplete)
-		return []byte(strings.Join(out, "\n"))
+		bodyCopy := append([]byte(nil), body...)
+		linesCopy := append([]string(nil), lines...)
+		candidateCopy := append([]pathCandidate(nil), candidates...)
+		i.pendingUploads.Add(1)
+		seq := i.uploadSeq.Add(1) - 1
+		owned = false
+		go i.uploadAsync(seq, policy, paths, files, bodyCopy, linesCopy, candidateCopy, nonEmpty)
+		return nil, true
 	}
 
 	i.warn("file transfer unavailable; pasting original path")
-	return body
+	return body, false
+}
+
+func closeCandidates(candidates []pathCandidate) {
+	for _, candidate := range candidates {
+		if candidate.file != nil {
+			_ = candidate.file.Close()
+		}
+	}
+}
+
+func (i *Interceptor) uploadAsync(seq uint64, policy policySnapshot, paths []string, files []*os.File, body []byte, lines []string, candidates []pathCandidate, nonEmpty int) {
+	defer func() {
+		for _, file := range files {
+			_ = file.Close()
+		}
+	}()
+	ctx := i.ctx
+	if i.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, i.timeout)
+		defer cancel()
+	}
+	sources, err := transfer.PrepareDescriptors(paths, files, policy.transferLimits)
+	if err == nil {
+		batchID, batchErr := transfer.NewBatchID()
+		if batchErr != nil {
+			err = batchErr
+		} else {
+			var batch transfer.Batch
+			batch, err = policy.transfer.UploadBatch(ctx, batchID, policy.sessionID, sources)
+			if err == nil && len(batch.Paths) != nonEmpty {
+				err = errors.New("helper returned incomplete file batch")
+			}
+			if err == nil {
+				out := make([]string, len(lines))
+				result := 0
+				for idx, line := range lines {
+					if strings.TrimSpace(line) == "" {
+						out[idx] = line
+						continue
+					}
+					candidate := candidates[idx]
+					out[idx] = line[:candidate.start] + batch.Paths[result] + line[candidate.end:]
+					result++
+				}
+				body = []byte(strings.Join(out, "\n"))
+			}
+		}
+	}
+	if err != nil {
+		i.warn("file upload failed: %v; pasting original path", err)
+	}
+	framed := make([]byte, 0, len(startMarker)+len(body)+len(endMarker))
+	framed = append(framed, startMarker...)
+	framed = append(framed, body...)
+	framed = append(framed, endMarker...)
+	select {
+	case i.completed <- uploadCompletion{seq: seq, framed: framed, err: err}:
+	case <-i.ctx.Done():
+	}
 }
 
 func (i *Interceptor) report(event LifecycleEvent) {

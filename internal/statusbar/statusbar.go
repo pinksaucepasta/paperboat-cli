@@ -511,6 +511,21 @@ func (b *Bar) Loading(message string) {
 	b.mu.Unlock()
 }
 
+// LoadingPersistent shows active work until another notice or failure replaces it.
+func (b *Bar) LoadingPersistent(message string) {
+	b.mu.Lock()
+	b.notice = safeLabel(message)
+	b.noticeUntil = time.Time{}
+	b.loading = true
+	if b.timer != nil {
+		b.timer.Stop()
+		b.timer = nil
+	}
+	b.startSpinnerLocked()
+	b.drawLocked()
+	b.mu.Unlock()
+}
+
 func (b *Bar) Failure(message string) {
 	b.FailureFor("general", message)
 }
@@ -564,13 +579,17 @@ func (b *Bar) startSpinnerLocked() {
 	b.spinnerTimer = time.AfterFunc(120*time.Millisecond, func() {
 		b.mu.Lock()
 		b.spinnerTimer = nil
-		if b.loading && !b.closed && b.noticeUntil.After(time.Now()) {
+		if b.loading && !b.closed && b.noticeActiveLocked() {
 			b.spinner = (b.spinner + 1) % 4
 			b.drawLocked()
 			b.startSpinnerLocked()
 		}
 		b.mu.Unlock()
 	})
+}
+
+func (b *Bar) noticeActiveLocked() bool {
+	return b.notice != "" && (b.noticeUntil.IsZero() || b.noticeUntil.After(time.Now()))
 }
 
 func (b *Bar) stopSpinnerLocked() {
@@ -829,7 +848,7 @@ func (b *Bar) textLocked() string {
 	if failure := b.currentFailureLocked(); failure != "" {
 		return identity + " / " + failure + " "
 	}
-	if b.notice != "" && b.noticeUntil.After(time.Now()) {
+	if b.noticeActiveLocked() {
 		return " Paperboat: " + b.notice + " "
 	}
 	return identity + " "
@@ -960,7 +979,7 @@ func (b *Bar) activityLocked() string {
 	if failure := b.currentFailureLocked(); failure != "" {
 		return b.semanticLocked("! "+failure, "error")
 	}
-	if b.notice != "" && b.noticeUntil.After(time.Now()) {
+	if b.noticeActiveLocked() {
 		if b.loading {
 			return string("|/-\\"[b.spinner]) + " " + b.notice
 		}

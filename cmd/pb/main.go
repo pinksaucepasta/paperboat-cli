@@ -1921,9 +1921,9 @@ func actionConnectTarget(c *command.Context, requested string) error {
 			}
 			switch event {
 			case paste.FileDetected:
-				bar.Loading("File detected")
+				bar.LoadingPersistent("Preparing file")
 			case paste.FileUploading:
-				bar.Loading("Uploading file")
+				bar.LoadingPersistent("Uploading file")
 			case paste.FileComplete:
 				bar.RecoverFailureFor("upload")
 				bar.Notice("File uploaded")
