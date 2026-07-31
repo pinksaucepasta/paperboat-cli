@@ -4,10 +4,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -17,12 +19,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pinksaucepasta/paperboat-cli/internal/api"
-	"github.com/pinksaucepasta/paperboat-cli/internal/buildinfo"
-	"github.com/pinksaucepasta/paperboat-cli/internal/config"
-	"github.com/pinksaucepasta/paperboat-cli/internal/resolver"
-	"github.com/pinksaucepasta/paperboat-cli/internal/statusbar"
-	"github.com/pinksaucepasta/paperboat-cli/internal/telemetry"
+	"github.com/pinksaucepasta/paperboat/internal/api"
+	"github.com/pinksaucepasta/paperboat/internal/buildinfo"
+	"github.com/pinksaucepasta/paperboat/internal/config"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/identity"
+	"github.com/pinksaucepasta/paperboat/internal/resolver"
+	"github.com/pinksaucepasta/paperboat/internal/statusbar"
+	"github.com/pinksaucepasta/paperboat/internal/telemetry"
+	"github.com/pinksaucepasta/paperboat/internal/tunnel"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -63,6 +67,116 @@ func TestCommandLineArgsNormalizesAndroidPIEArgv(t *testing.T) {
 	}
 }
 
+func TestUserFacingErrorSanitizesInfrastructureFailures(t *testing.T) {
+	tests := []struct {
+		name   string
+		err    error
+		want   string
+		forbid []string
+	}{
+		{
+			name:   "network details",
+			err:    fmt.Errorf("list projects: call GET /v1/projects: %w", &net.DNSError{Err: "no such host", Name: "api.secret.example"}),
+			want:   "Paperboat is unreachable.",
+			forbid: []string{"GET", "/v1/projects", "api.secret.example"},
+		},
+		{
+			name:   "server outage",
+			err:    &api.APIError{Status: http.StatusBadGateway, RequestID: "req_123"},
+			want:   "Paperboat is temporarily unavailable.",
+			forbid: []string{"status 502", "paperboat-server"},
+		},
+		{
+			name:   "terminal loss",
+			err:    errors.Join(tunnel.ErrTransportLost, errors.New("Application error 0x5042 (remote): server draining")),
+			want:   "The terminal connection was lost",
+			forbid: []string{"0x5042", "server draining", "transport lost"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := userFacingError(test.err)
+			if !strings.Contains(got, test.want) {
+				t.Fatalf("message = %q, want %q", got, test.want)
+			}
+			for _, forbidden := range test.forbid {
+				if strings.Contains(got, forbidden) {
+					t.Fatalf("message = %q contains %q", got, forbidden)
+				}
+			}
+		})
+	}
+}
+
+func TestRunTreatsCancellationAsUserCancellation(t *testing.T) {
+	if got := userFacingError(context.Canceled); got != "Operation canceled." {
+		t.Fatalf("message = %q", got)
+	}
+}
+
+func TestCollectLocalDoctorDoesNotCreateUnconfiguredIdentity(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "missing-state")
+	t.Setenv("PAPERBOAT_RUNTIME_STATE_ROOT", root)
+	report := collectLocalDoctor()
+	if report.SetupState != "not_set_up" || report.IdentityState != "missing" || !slices.Contains(report.RecoveryActions, "run pb setup") {
+		t.Fatalf("report=%+v", report)
+	}
+	if _, err := os.Stat(root); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("doctor mutated unconfigured state: %v", err)
+	}
+}
+
+func TestCollectLocalDoctorReportsMachineInboxCredentialAndPreviews(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("PAPERBOAT_RUNTIME_STATE_ROOT", root)
+	store, err := identity.Open(identity.Config{StateRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inboxPath := filepath.Join(root, "Paperboat Inbox")
+	if err := os.Mkdir(inboxPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	key := store.Current()
+	registration := identity.Registration{ServerURL: "https://api.example.test", MachineID: "machine_local", EnvironmentID: "env_local", PublicKeyID: key.ID, PublicIdentityKey: base64.RawURLEncoding.EncodeToString(key.Public()), InboxPath: inboxPath, InstallationGeneration: 4, SetupRoles: []string{"interactive", "host"}, UpdatedAt: time.Now().UTC()}
+	if err := store.SaveRegistration(registration); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveMachineControl(identity.MachineControl{MachineID: registration.MachineID, EnvironmentID: registration.EnvironmentID, InstallationGeneration: registration.InstallationGeneration, Credential: strings.Repeat("x", 32), ExpiresAt: time.Now().UTC().Add(time.Hour), KeyID: key.ID}); err != nil {
+		t.Fatal(err)
+	}
+	active := filepath.Join(root, "previews", "active")
+	if err := os.MkdirAll(active, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	expires := time.Now().UTC().Add(time.Hour)
+	descriptor, _ := json.Marshal(map[string]any{"schema": "paperboat.preview-runtime/v1", "name": "docs", "port": 3000, "indefinite": false, "expires_at": expires, "service_definition": ""})
+	if err := os.WriteFile(filepath.Join(active, "docs.json"), descriptor, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	report := collectLocalDoctor()
+	if report.SetupState != "configured" || report.IdentityState != "valid" || report.MachineID != "machine_local" || report.InstallationGeneration != 4 || !slices.Equal(report.SetupRoles, []string{"interactive", "host"}) || report.InboxState != "ready" || report.CredentialState != "valid" || report.ActivePreviews != 1 || report.InvalidPreviews != 0 {
+		t.Fatalf("report=%+v", report)
+	}
+}
+
+func TestHostRuntimeEntryPointIsHiddenAndStrict(t *testing.T) {
+	root := newRootCommand()
+	command, _, err := root.Find([]string{"__runtime-host"})
+	if err != nil || command == nil || !command.Hidden {
+		t.Fatalf("runtime command = %#v, %v", command, err)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := run(context.Background(), []string{"__runtime-host", "extra"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := run(context.Background(), []string{"help"}, &stdout, &stderr); code != 0 || strings.Contains(stdout.String(), "__runtime-host") {
+		t.Fatalf("help exposed runtime command: code=%d output=%q", code, stdout.String())
+	}
+}
+
 func TestConnectTelemetryFailsOpenWithWarning(t *testing.T) {
 	blockedParent := filepath.Join(t.TempDir(), "not-a-directory")
 	if err := os.WriteFile(blockedParent, []byte("x"), 0o600); err != nil {
@@ -94,8 +208,8 @@ func TestSelectTerminalSessionDoesNotHideAmbiguousProjectWithUserMachine(t *test
 		switch r.URL.Path {
 		case "/v1/projects":
 			_, _ = w.Write([]byte(`{"data":{"items":[{"id":"prj_1","name":"studio"},{"id":"prj_2","name":"Studio"}],"pagination":{"next_offset":null}}}`))
-		case "/v1/user-machines":
-			t.Fatal("user-machine lookup must not hide an ambiguous project name")
+		case "/v1/machines":
+			t.Fatal("machine lookup must not hide an ambiguous project name")
 		default:
 			http.NotFound(w, r)
 		}
@@ -142,7 +256,7 @@ func TestPollConfigSyncUsesAttachedProjectState(t *testing.T) {
 		}
 		switch r.URL.Path {
 		case "/v1/config-sync/status":
-			_, _ = w.Write([]byte(`{"data":{"state":"healthy","projects":[{"project_id":"other","state":"healthy"},{"project_id":"attached","state":"warning"}]}}`))
+			_, _ = w.Write([]byte(`{"data":{"state":"healthy","environments":[{"environment_id":"other","state":"healthy","mode":"pull_only","manifest_health":"empty"},{"environment_id":"attached","state":"warning","mode":"bidirectional","manifest_health":"healthy","managed_path_count":2,"pending_clean_path_count":1}]}}`))
 			requested <- struct{}{}
 		case "/v1/usage-summary":
 			_, _ = w.Write([]byte(`{"data":{"credits":{"balance":"100.000000"},"storage":{"available_gb":12}}}`))
@@ -189,7 +303,7 @@ func TestPollConfigSyncUsesAttachedProjectState(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	if got := bar.Text(); !strings.Contains(got, "Config sync needs attention") {
-		t.Fatalf("active project state was not selected: %q", got)
+		t.Fatalf("attached environment state was not selected: %q", got)
 	}
 	deadline = time.Now().Add(time.Second)
 	for !strings.Contains(bar.Render(80), "credits 100") && time.Now().Before(deadline) {
@@ -308,6 +422,19 @@ func TestFormatStatusCredits(t *testing.T) {
 
 func TestConnectWithServerURLUsesBackendResolver(t *testing.T) {
 	dir := t.TempDir()
+	stateRoot := filepath.Join(dir, "runtime")
+	t.Setenv("PAPERBOAT_RUNTIME_STATE_ROOT", stateRoot)
+	identityStore, err := identity.Open(identity.Config{StateRoot: stateRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inboxPath := filepath.Join(dir, "Paperboat Inbox")
+	if err := os.MkdirAll(inboxPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := identityStore.SaveRegistration(identity.Registration{ServerURL: "https://api.example.test", MachineID: "machine_source", EnvironmentID: "env_source", PublicKeyID: identityStore.Current().ID, PublicIdentityKey: base64.RawURLEncoding.EncodeToString(identityStore.Current().Public()), InboxPath: inboxPath, InstallationGeneration: 1, SetupRoles: []string{"interactive"}, UpdatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
 	configPath := filepath.Join(dir, "config.json")
 	var sawProjects bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -323,7 +450,7 @@ func TestConnectWithServerURLUsesBackendResolver(t *testing.T) {
 
 	writeTestProfile(t, dir, configPath, server.URL)
 
-	err := newApp().Run([]string{"pb", "--config", configPath, "--server", server.URL, "demo"})
+	err = newApp().Run([]string{"pb", "--config", configPath, "--server", server.URL, "demo"})
 	if err == nil {
 		t.Fatal("expected project lookup error")
 	}
@@ -362,7 +489,7 @@ func TestVersionFlags(t *testing.T) {
 
 func TestCanonicalCommandsAreDiscoverable(t *testing.T) {
 	root := newRootCommand()
-	for _, path := range [][]string{{"login"}, {"logout"}, {"create"}, {"session", "attach"}, {"session", "list"}, {"user-machine", "add"}, {"user-machine", "list"}, {"user-machine", "revoke"}, {"user-machine", "availability"}, {"preview", "list"}, {"preview", "revoke"}} {
+	for _, path := range [][]string{{"login"}, {"logout"}, {"create"}, {"pair"}, {"session", "attach"}, {"session", "list"}, {"machine", "add"}, {"machine", "list"}, {"machine", "revoke"}, {"machine", "availability"}, {"preview", "list"}, {"preview", "revoke"}} {
 		command, remaining, err := root.Find(path)
 		if err != nil || len(remaining) != 0 || command == root {
 			t.Fatalf("command %q not discoverable: command=%v remaining=%q err=%v", path, command, remaining, err)
@@ -372,7 +499,7 @@ func TestCanonicalCommandsAreDiscoverable(t *testing.T) {
 
 func TestMachineAvailabilityRequiresConfirmationAndReturnsAppliedJSON(t *testing.T) {
 	root := newRootCommand()
-	root.SetArgs([]string{"user-machine", "availability", "um_1", "--mode", "keep-awake"})
+	root.SetArgs([]string{"machine", "availability", "um_1", "--mode", "keep-awake"})
 	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), "requires --yes") {
 		t.Fatalf("confirmation error=%v", err)
 	}
@@ -381,9 +508,9 @@ func TestMachineAvailabilityRequiresConfirmationAndReturnsAppliedJSON(t *testing
 	configPath := filepath.Join(dir, "config.json")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method + " " + r.URL.Path {
-		case "GET /v1/user-machines":
+		case "GET /v1/machines":
 			writeAPIData(t, w, map[string]any{"items": []map[string]any{{"id": "um_1", "display_name": "Studio", "availability": map[string]any{"schema": "paperboat.availability-policy/v1", "desired_mode": "allow_sleep", "desired_version": 3, "observed_version": 3, "status": "applied"}}}, "pagination": map[string]any{"next_offset": nil}})
-		case "PUT /v1/user-machines/um_1/availability-policy":
+		case "PUT /v1/machines/um_1/availability-policy":
 			if r.Header.Get("Idempotency-Key") == "" {
 				t.Fatal("missing idempotency key")
 			}
@@ -395,7 +522,7 @@ func TestMachineAvailabilityRequiresConfirmationAndReturnsAppliedJSON(t *testing
 	defer srv.Close()
 	writeTestProfile(t, dir, configPath, srv.URL)
 	var stdout, stderr bytes.Buffer
-	if code := run(context.Background(), []string{"--config", configPath, "user-machine", "availability", "Studio", "--mode", "keep-awake", "--yes", "--json"}, &stdout, &stderr); code != 0 {
+	if code := run(context.Background(), []string{"--config", configPath, "machine", "availability", "Studio", "--mode", "keep-awake", "--yes", "--json"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
 	var output struct {
@@ -407,7 +534,7 @@ func TestMachineAvailabilityRequiresConfirmationAndReturnsAppliedJSON(t *testing
 	if err := json.Unmarshal(stdout.Bytes(), &output); err != nil || output.Version != "1" || output.Outcome != "applied" || output.Retry != "automatic" || output.Availability.DesiredVersion != 4 {
 		t.Fatalf("output=%q decoded=%+v err=%v", stdout.String(), output, err)
 	}
-	if !strings.Contains(stderr.String(), "User machine: Studio (um_1)") {
+	if !strings.Contains(stderr.String(), "Machine: Studio (um_1)") {
 		t.Fatalf("stderr=%q", stderr.String())
 	}
 }
@@ -458,7 +585,7 @@ func TestCreateCatalogFiltersUnavailableOptions(t *testing.T) {
 
 func TestMachineRevokeRequiresConfirmationBeforeBackend(t *testing.T) {
 	root := newRootCommand()
-	root.SetArgs([]string{"user-machine", "revoke", "um_1"})
+	root.SetArgs([]string{"machine", "revoke", "um_1"})
 	err := root.Execute()
 	if err == nil || !strings.Contains(err.Error(), "requires --yes") {
 		t.Fatalf("err=%v, want confirmation error", err)
@@ -495,13 +622,28 @@ func TestSessionCloseRequiresConfirmationBeforeBackend(t *testing.T) {
 }
 
 func TestSessionCloseAllRequiresConfirmationAndRejectsSessionArgument(t *testing.T) {
-	root := newRootCommand()
-	root.SetArgs([]string{"session", "close", "um_1", "--all"})
-	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), "requires --yes") {
-		t.Fatalf("err=%v, want confirmation error", err)
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	mutated := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/projects":
+			writeAPIData(t, w, map[string]any{"items": []map[string]any{{"id": "prj_1", "name": "demo", "state": "ready"}}, "pagination": map[string]any{"next_offset": nil}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/projects/prj_1/terminal-sessions":
+			writeAPIData(t, w, map[string]any{"items": []map[string]any{{"id": "ses_1", "name": "default", "state": "open"}}, "pagination": map[string]any{"next_offset": nil}})
+		default:
+			mutated = true
+			t.Fatalf("unexpected request before confirmation: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+	writeTestProfile(t, dir, configPath, srv.URL)
+	var output bytes.Buffer
+	if code := run(context.Background(), []string{"--config", configPath, "sessions", "close", "demo", "--all"}, &output, &output); code != 1 || mutated || !strings.Contains(output.String(), "Environment: demo (prj_1)") || !strings.Contains(output.String(), "Open sessions to close: 1") || !strings.Contains(output.String(), "requires --yes") {
+		t.Fatalf("code=%d mutated=%t output=%q", code, mutated, output.String())
 	}
 
-	root = newRootCommand()
+	root := newRootCommand()
 	root.SetArgs([]string{"session", "close", "um_1", "shell-2", "--all", "--yes"})
 	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), "usage: pb session close") {
 		t.Fatalf("err=%v, want mutually exclusive usage error", err)
@@ -537,6 +679,75 @@ func TestSessionCloseAllClosesEveryOpenSession(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), "Closed 2 sessions in demo.") {
 		t.Fatalf("output=%q", output.String())
+	}
+}
+
+func TestSessionsCloseAllClosesEveryOpenSessionAndRetainsHistory(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	var closed []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/projects":
+			writeAPIData(t, w, map[string]any{"items": []map[string]any{{"id": "prj_1", "name": "demo", "state": "ready"}}, "pagination": map[string]any{"next_offset": nil}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/projects/prj_1/terminal-sessions":
+			writeAPIData(t, w, map[string]any{"items": []map[string]any{{"id": "ses_1", "name": "default", "state": "open"}, {"id": "ses_2", "name": "api", "state": "open"}, {"id": "ses_3", "name": "old", "state": "closed"}}, "pagination": map[string]any{"next_offset": nil}})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/close"):
+			closed = append(closed, r.URL.Path)
+			writeAPIData(t, w, map[string]any{})
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer srv.Close()
+	writeTestProfile(t, dir, configPath, srv.URL)
+
+	var output bytes.Buffer
+	if code := run(context.Background(), []string{"--config", configPath, "sessions", "close", "demo", "--all", "--yes"}, &output, &output); code != 0 {
+		t.Fatalf("code=%d output=%q", code, output.String())
+	}
+	if len(closed) != 2 || !strings.Contains(output.String(), "Open sessions to close: 2") || !strings.Contains(output.String(), "Session history was retained") {
+		t.Fatalf("closed=%v output=%q", closed, output.String())
+	}
+}
+
+func TestPreviewsListsAndPurgesOnlySelectedEnvironment(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	var revoked []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/projects":
+			writeAPIData(t, w, map[string]any{"items": []map[string]any{{"id": "prj_1", "name": "demo", "state": "ready"}}, "pagination": map[string]any{"next_offset": nil}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/previews":
+			writeAPIData(t, w, []map[string]any{
+				{"id": "prv_1", "environment_id": "prj_1", "project_id": "prj_1", "logical_name": "web", "environment_name": "demo", "state": "ready", "url": "https://one.example.test", "target_port": 3000},
+				{"id": "prv_2", "environment_id": "prj_2", "project_id": "prj_2", "logical_name": "other", "environment_name": "other", "state": "ready", "url": "https://two.example.test", "target_port": 4000},
+			})
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/v1/previews/"):
+			revoked = append(revoked, r.URL.Path)
+			writeAPIData(t, w, map[string]any{"id": "prv_1", "state": "removed"})
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer srv.Close()
+	writeTestProfile(t, dir, configPath, srv.URL)
+
+	var output bytes.Buffer
+	if code := run(context.Background(), []string{"--config", configPath, "previews"}, &output, &output); code != 0 || !strings.Contains(output.String(), "web") || !strings.Contains(output.String(), "other") {
+		t.Fatalf("list code=%d output=%q", code, output.String())
+	}
+	output.Reset()
+	if code := run(context.Background(), []string{"--config", configPath, "previews", "revoke", "demo", "--all"}, &output, &output); code != 1 || len(revoked) != 0 || !strings.Contains(output.String(), "Active previews to revoke: 1") || !strings.Contains(output.String(), "requires --yes") {
+		t.Fatalf("unconfirmed revoke code=%d revoked=%v output=%q", code, revoked, output.String())
+	}
+	output.Reset()
+	if code := run(context.Background(), []string{"--config", configPath, "previews", "revoke", "demo", "--all", "--yes", "--json"}, &output, &output); code != 0 {
+		t.Fatalf("revoke code=%d output=%q", code, output.String())
+	}
+	if len(revoked) != 1 || revoked[0] != "/v1/previews/prv_1" || !strings.Contains(output.String(), `"revoked":1`) {
+		t.Fatalf("revoked=%v output=%q", revoked, output.String())
 	}
 }
 
@@ -576,6 +787,29 @@ func TestConfigCommandsAreDiscoverableAndUnassignRequiresConfirmation(t *testing
 	err := root.ExecuteContext(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "requires --yes") {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestCompatibilityOnlyCommandsAreAbsent(t *testing.T) {
+	root := newRootCommand()
+	for parentName, removed := range map[string][]string{
+		"config":   {"enable", "disable"},
+		"preview":  {"remove", "purge"},
+		"previews": {"purge"},
+		"session":  {"purge"},
+		"sessions": {"purge"},
+	} {
+		parent, _, err := root.Find([]string{parentName})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, removedName := range removed {
+			for _, child := range parent.Commands() {
+				if child.Name() == removedName {
+					t.Fatalf("compatibility-only command %q is still registered under %q", removedName, parentName)
+				}
+			}
+		}
 	}
 }
 
@@ -634,7 +868,7 @@ func TestConnectStatusBarOverridesAreValidated(t *testing.T) {
 	}
 }
 
-func TestConfigAssignHostedJSONContract(t *testing.T) {
+func TestConfigAssignHostedMachineJSONContract(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.json")
 	var assigned bool
@@ -644,16 +878,22 @@ func TestConfigAssignHostedJSONContract(t *testing.T) {
 		}
 		switch r.Method + " " + r.URL.Path {
 		case "GET /v1/projects":
-			writeAPIData(t, w, map[string]any{"items": []map[string]any{{"id": "prj_1", "name": "demo", "state": "ready"}}, "pagination": map[string]any{"next_offset": nil}})
+			writeAPIData(t, w, map[string]any{"items": []any{}, "pagination": map[string]any{"next_offset": nil}})
+		case "GET /v1/machines":
+			writeAPIData(t, w, map[string]any{"items": []map[string]any{{"id": "mch_1", "environment_id": "prj_1", "display_name": "demo", "machine_kind": "hosted", "setup_roles": []string{"host"}}}, "pagination": map[string]any{"next_offset": nil}})
 		case "GET /v1/config-repositories":
 			writeAPIData(t, w, map[string]any{"items": []map[string]any{{"id": "cfgrepo_1", "provider": "github", "external_ref": "acme/config", "display_name": "Shared"}}})
-		case "GET /v1/environments/prj_1/config-assignment":
+		case "GET /v1/machines/mch_1/config-assignment":
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusNotFound)
 			_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"code": "not_found_or_forbidden", "message": "not found"}})
-		case "PUT /v1/environments/prj_1/config-assignment":
+		case "PUT /v1/machines/mch_1/config-assignment":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body["mode"] != "push_only" {
+				t.Fatalf("assignment body=%v err=%v", body, err)
+			}
 			assigned = true
-			writeAPIData(t, w, map[string]any{"id": "cfgasn_1", "environment_id": "prj_1", "repository_id": "cfgrepo_1", "consent_state": "not_required", "version": 1})
+			writeAPIData(t, w, map[string]any{"id": "cfgasn_1", "machine_id": "mch_1", "environment_id": "prj_1", "repository_id": "cfgrepo_1", "mode": "push_only", "consent_state": "not_required", "version": 1})
 		default:
 			http.NotFound(w, r)
 		}
@@ -661,7 +901,7 @@ func TestConfigAssignHostedJSONContract(t *testing.T) {
 	defer srv.Close()
 	writeTestProfile(t, dir, configPath, srv.URL)
 	var output bytes.Buffer
-	if code := run(context.Background(), []string{"--config", configPath, "config", "assign", "Shared", "demo", "--json"}, &output, &output); code != 0 {
+	if code := run(context.Background(), []string{"--config", configPath, "config", "assign", "Shared", "demo", "--mode", "push-only", "--yes", "--json"}, &output, &output); code != 0 {
 		t.Fatalf("exit=%d output=%q", code, output.String())
 	}
 	if !assigned {
@@ -672,8 +912,55 @@ func TestConfigAssignHostedJSONContract(t *testing.T) {
 		Outcome    string               `json:"outcome"`
 		Assignment api.ConfigAssignment `json:"assignment"`
 	}
-	if err := json.Unmarshal(output.Bytes(), &got); err != nil || got.Version != "1" || got.Outcome != "confirmed" || got.Assignment.EnvironmentID != "prj_1" {
+	if err := json.Unmarshal(output.Bytes(), &got); err != nil || got.Version != "1" || got.Outcome != "confirmed" || got.Assignment.EnvironmentID != "prj_1" || got.Assignment.Mode != "push_only" {
 		t.Fatalf("output=%q decoded=%+v err=%v", output.String(), got, err)
+	}
+}
+
+func TestConfigAssignMachineRequiresPlaintextConsentAndAcceptsExactRevision(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	mutations := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "GET /v1/projects":
+			writeAPIData(t, w, map[string]any{"items": []any{}, "pagination": map[string]any{"next_offset": nil}})
+		case "GET /v1/machines":
+			writeAPIData(t, w, map[string]any{"items": []map[string]any{{"id": "um_1", "environment_id": "env_1", "display_name": "Studio"}}, "pagination": map[string]any{"next_offset": nil}})
+		case "GET /v1/config-repositories":
+			writeAPIData(t, w, map[string]any{"items": []map[string]any{{"id": "cfgrepo_1", "display_name": "Dotfiles"}}})
+		case "GET /v1/machines/um_1/config-assignment":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":{"code":"not_found_or_forbidden","message":"not found"}}`))
+		case "PUT /v1/machines/um_1/config-assignment":
+			mutations++
+			writeAPIData(t, w, map[string]any{"id": "cfgasn_1", "environment_id": "env_1", "repository_id": "cfgrepo_1", "mode": "bidirectional", "consent_state": "pending", "warning_revision": "plain-v1", "version": 1})
+		case "GET /v1/machines/um_1/config-assignment/warning":
+			writeAPIData(t, w, map[string]any{"revision": "plain-v1", "machine_name": "Studio", "repository_name": "Dotfiles", "repository_visibility": "ordinary plaintext", "history_retention": "Git history retains versions", "access_consequence": "repository access may read content"})
+		case "POST /v1/machines/um_1/config-assignment/consent":
+			mutations++
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body["warning_revision"] != "plain-v1" || body["expected_version"] != float64(1) {
+				t.Fatalf("consent body=%v err=%v", body, err)
+			}
+			writeAPIData(t, w, map[string]any{"id": "cfgasn_1", "environment_id": "env_1", "repository_id": "cfgrepo_1", "mode": "bidirectional", "consent_state": "accepted", "warning_revision": "plain-v1", "version": 2})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	writeTestProfile(t, dir, configPath, srv.URL)
+
+	var rejected bytes.Buffer
+	if code := run(context.Background(), []string{"--config", configPath, "config", "assign", "Dotfiles", "Studio", "--mode", "bidirectional"}, &rejected, &rejected); code == 0 || mutations != 0 || !strings.Contains(rejected.String(), "ordinary plaintext") {
+		t.Fatalf("exit=%d mutations=%d output=%q", code, mutations, rejected.String())
+	}
+	var accepted bytes.Buffer
+	if code := run(context.Background(), []string{"--config", configPath, "config", "assign", "Dotfiles", "Studio", "--mode", "bidirectional", "--yes", "--json"}, &accepted, &accepted); code != 0 {
+		t.Fatalf("exit=%d output=%q", code, accepted.String())
+	}
+	if mutations != 2 || !strings.Contains(accepted.String(), `"consent_state":"accepted"`) {
+		t.Fatalf("mutations=%d output=%q", mutations, accepted.String())
 	}
 }
 
@@ -686,9 +973,9 @@ func TestMachineRevokeJSONOutputContract(t *testing.T) {
 			t.Fatalf("authorization=%q", r.Header.Get("Authorization"))
 		}
 		switch r.Method + " " + r.URL.Path {
-		case "GET /v1/user-machines":
+		case "GET /v1/machines":
 			writeAPIData(t, w, map[string]any{"items": []map[string]any{{"id": "um_1", "display_name": "Studio"}}, "pagination": map[string]any{"next_offset": nil}})
-		case "POST /v1/user-machines/um_1/disconnect":
+		case "POST /v1/machines/um_1/disconnect":
 			disconnected = true
 			writeAPIData(t, w, map[string]bool{"ok": true})
 		default:
@@ -698,7 +985,7 @@ func TestMachineRevokeJSONOutputContract(t *testing.T) {
 	defer srv.Close()
 	writeTestProfile(t, dir, configPath, srv.URL)
 	var output bytes.Buffer
-	if code := run(context.Background(), []string{"--config", configPath, "user-machine", "revoke", "Studio", "--yes", "--json"}, &output, &output); code != 0 {
+	if code := run(context.Background(), []string{"--config", configPath, "machine", "revoke", "Studio", "--yes", "--json"}, &output, &output); code != 0 {
 		t.Fatalf("exit code=%d output=%q", code, output.String())
 	}
 	if !disconnected {
@@ -710,7 +997,7 @@ func TestMachineRevokeJSONOutputContract(t *testing.T) {
 			ID          string `json:"id"`
 			DisplayName string `json:"display_name"`
 			State       string `json:"state"`
-		} `json:"user_machine"`
+		} `json:"machine"`
 		Outcome string `json:"outcome"`
 		Retry   string `json:"retry"`
 	}
@@ -722,7 +1009,7 @@ func TestMachineRevokeJSONOutputContract(t *testing.T) {
 	}
 }
 
-func TestMachineAddUsesServerOwnedUserMachinesURL(t *testing.T) {
+func TestMachineAddUsesServerOwnedMachinesURL(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.json")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -736,7 +1023,7 @@ func TestMachineAddUsesServerOwnedUserMachinesURL(t *testing.T) {
 		writeAPIData(t, w, api.ClientConfiguration{
 			Version:            "1",
 			CLIVerificationURL: "https://dashboard.paperboat.test/cli/authorize",
-			UserMachinesURL:    "https://dashboard.paperboat.test/dashboard/user-machines",
+			MachinesURL:        "https://dashboard.paperboat.test/dashboard/machines",
 		})
 	}))
 	defer srv.Close()
@@ -751,11 +1038,11 @@ func TestMachineAddUsesServerOwnedUserMachinesURL(t *testing.T) {
 	}
 
 	var output bytes.Buffer
-	if code := run(context.Background(), []string{"--config", configPath, "user-machine", "add"}, &output, &output); code != 0 {
+	if code := run(context.Background(), []string{"--config", configPath, "machine", "add"}, &output, &output); code != 0 {
 		t.Fatalf("exit=%d output=%q", code, output.String())
 	}
-	want := "https://dashboard.paperboat.test/dashboard/user-machines"
-	if opened != want || !strings.Contains(output.String(), "Continue user-machine enrollment at "+want) {
+	want := "https://dashboard.paperboat.test/dashboard/machines"
+	if opened != want || !strings.Contains(output.String(), "Continue machine enrollment at "+want) {
 		t.Fatalf("opened=%q output=%q", opened, output.String())
 	}
 }
@@ -776,7 +1063,7 @@ func TestDefaultEnvironmentSelectsOnlyAvailableTarget(t *testing.T) {
 		switch r.URL.Path {
 		case "/v1/projects":
 			writeAPIData(t, w, map[string]any{"items": []any{}, "pagination": map[string]any{"limit": 200, "offset": 0, "total": 0}})
-		case "/v1/user-machines":
+		case "/v1/machines":
 			writeAPIData(t, w, map[string]any{"items": []map[string]any{{"id": "um_1", "display_name": "Studio"}}, "pagination": map[string]any{"limit": 200, "offset": 0, "total": 1}})
 		default:
 			http.NotFound(w, r)

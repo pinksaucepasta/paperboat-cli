@@ -110,6 +110,26 @@ func TestLayoutAnchorsIdentityActivityAndConnection(t *testing.T) {
 	}
 }
 
+func TestTransportIndicatorIsAlwaysLast(t *testing.T) {
+	bar, _ := newTestBar(t, ModeAuto, "xterm-256color", 80, 24, true, time.Second)
+	bar.layout = Layout{Left: []string{"project"}, Center: []string{}, Right: []string{"connection"}}
+	bar.SetIdentity("demo", "default")
+	bar.SetConnection("connected")
+
+	bar.SetTransport("quic")
+	if line := bar.Render(80); !strings.HasSuffix(line, "connected  Q") {
+		t.Fatalf("QUIC indicator is not last: %q", line)
+	}
+	bar.SetTransport("wss")
+	if line := bar.Render(80); !strings.HasSuffix(line, "connected  W") {
+		t.Fatalf("WSS indicator is not last: %q", line)
+	}
+	bar.SetTransport("unknown")
+	if line := bar.Render(80); !strings.HasSuffix(line, "connected") {
+		t.Fatalf("unknown transport should be hidden: %q", line)
+	}
+}
+
 func TestLayoutUsesConfiguredRegionsAndAccountWidgets(t *testing.T) {
 	bar, _ := newTestBar(t, ModeAuto, "xterm-256color", 96, 24, true, time.Second)
 	bar.layout = Layout{

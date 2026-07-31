@@ -90,6 +90,7 @@ type Bar struct {
 	project         string
 	session         string
 	connection      string
+	transport       string
 	credits         string
 	storage         string
 	configSync      string
@@ -445,6 +446,22 @@ func (b *Bar) restoreTitleLocked() {
 func (b *Bar) SetConnection(state string) {
 	b.mu.Lock()
 	b.connection = safeLabel(state)
+	b.drawLocked()
+	b.mu.Unlock()
+}
+
+// SetTransport records the transport used by the active terminal connection.
+// It is rendered as the final Q/W marker independently of configurable widgets.
+func (b *Bar) SetTransport(transport string) {
+	b.mu.Lock()
+	switch strings.ToLower(strings.TrimSpace(transport)) {
+	case "quic", "q":
+		b.transport = "Q"
+	case "wss", "w":
+		b.transport = "W"
+	default:
+		b.transport = ""
+	}
 	b.drawLocked()
 	b.mu.Unlock()
 }
@@ -906,6 +923,9 @@ func (b *Bar) layoutRegionsLocked(layout Layout) (left, center, right string) {
 	left = b.regionLocked(layout.Left)
 	center = b.regionLocked(layout.Center)
 	right = b.regionLocked(layout.Right)
+	if b.transport != "" {
+		right = joinWidgets(right, b.semanticLocked(b.transport, "accent"))
+	}
 	if activity := b.activityLocked(); activity != "" && !containsWidget(layout.Left, "activity") && !containsWidget(layout.Center, "activity") && !containsWidget(layout.Right, "activity") {
 		center = joinWidgets(center, activity)
 	}

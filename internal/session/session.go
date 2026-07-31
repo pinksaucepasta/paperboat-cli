@@ -13,7 +13,7 @@ import (
 	"os/signal"
 	"time"
 
-	"github.com/pinksaucepasta/paperboat-cli/internal/tunnel"
+	"github.com/pinksaucepasta/paperboat/internal/tunnel"
 	"golang.org/x/term"
 )
 

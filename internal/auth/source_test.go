@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pinksaucepasta/paperboat-cli/internal/config"
+	"github.com/pinksaucepasta/paperboat/internal/config"
 )
 
 func TestConcurrentCredentialRefreshUsesTokenOnce(t *testing.T) {

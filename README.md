@@ -1,4 +1,4 @@
-# paperboat-cli
+# paperboat
 
 The Paperboat command-line client. `pb` authenticates the user, selects an environment,
 attaches to helper-managed terminal sessions, and bridges local file pastes into remote
@@ -18,8 +18,8 @@ See [AGENTS.md](AGENTS.md) for repository ownership and engineering requirements
 ## Usage
 
 ```sh
-pb <environment>             # attach a hosted project or user-machine terminal
-pb environments               # list hosted projects and user machines
+pb <environment>             # attach a hosted project or machine terminal
+pb environments               # list hosted projects and machines
 pb auth login                # approve this installation in the dashboard
 pb auth status               # show the active account for the configured server
 pb auth switch               # replace the active account for this server
@@ -29,7 +29,7 @@ pb config path|show          # inspect the local config
 ```
 
 Flags may appear before or after the environment name.
-Hosted projects and user machines use the same durable terminal-session workflow:
+Hosted projects and machines use the same durable terminal-session workflow:
 `--new`, `--session`, and `pb sessions` apply to either environment type.
 
 Interactive attaches forward `TERM`, `COLORTERM`, `TERM_PROGRAM`,
@@ -96,19 +96,21 @@ restrictions. A paste is rewritten only after the whole batch publishes atomical
 reuse transfer IDs and confirmed offsets, and failures preserve the exact original paste.
 Published remote files remain for seven days.
 
-Remote processes can run `pbh send <path>...`. The active `pb` writer downloads the pinned
-batch into `Downloads/Paperboat Inbox`, verifies size and SHA-256, fsyncs it, avoids name
-collisions, and sends a durable receipt. Inbox files remain until the user removes them.
+Use `pb send <path>... --to <machine>` to deliver files to another machine's configured
+Paperboat Inbox. Session and user defaults are explicit, multi-attachment ambiguity never
+selects the latest writer, and the sender exits successfully only after the destination
+verifies size and SHA-256, fsyncs the file, avoids name collisions, and records a durable
+receipt. Inbox files remain until the user removes them.
 
-## User machines
+## Machines
 
-BYOD enrollment starts in the dashboard. Its single-use command invokes
-`pbh bootstrap` with the server, enrollment token, user-machine name, and absolute
-workspace scope. The helper exchanges the token, verifies the server-selected signed helper
-artifact, installs its launchd or systemd user service, and waits for authenticated readiness.
+Run `pb setup` to register the interactive installation and its Paperboat Inbox. Run
+`pb pair` to add the host role to the same stable machine identity. Pairing verifies the
+server-selected signed `pb` artifact, installs the minimum launchd or systemd services,
+and waits for authenticated readiness.
 
-`pb` does not install or run a connector. After enrollment is ready, user machines use
-the same `pb <environment>` and durable terminal-session workflow as hosted projects.
+Interactive-only setup does not run a terminal host or connector. After pairing, machines
+use the same `pb <environment>` and durable terminal-session workflow as hosted projects.
 
 When no observability path is configured, metadata-only events are appended to
 `telemetry.jsonl` beside the CLI config with mode `0600`. Set
@@ -138,7 +140,7 @@ Go — distributed as a single static binary (Cobra, Go 1.25.7).
 - `cmd/pb` — CLI entrypoint (commands, flags, wiring).
 - `internal/config` — local policy and secure, versioned credential profiles.
 - `internal/resolver` — paginated environment resolution and validated connect descriptors.
-- `internal/tunnel` — native QUIC-first and WSS terminal-v2 transports with bounded reconnect supervision.
+- `internal/tunnel` — native QUIC-first and WSS terminal-v1 transports with bounded reconnect supervision.
 - `internal/session` — transparent PTY wrapper (raw mode, resize, exit-code passthrough).
 - `internal/paste` — bracketed-paste interceptor and atomic file-path batch rewriter.
 - `internal/filetransfer` — resumable HTTP/3-first, HTTP/2-fallback file transport.

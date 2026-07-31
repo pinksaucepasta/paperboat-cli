@@ -3,6 +3,7 @@ PKG         := ./cmd/pb
 PREFIX      ?= /usr/local
 BINDIR      := $(PREFIX)/bin
 VERSION     ?= $(shell ./tools/release-version.sh current)
+COMMIT      ?= $(shell git rev-parse --verify HEAD 2>/dev/null || echo unknown)
 PROTOCOL_VERSION ?= 1
 ANDROID_API ?= 24
 ANDROID_NDK_HOME ?= $(HOME)/Library/Android/sdk/ndk/27.1.12297006
@@ -11,7 +12,7 @@ GO_VERSION  := 1.25.7
 GO          := GOTOOLCHAIN=local go
 GOFMT       := $(shell GOTOOLCHAIN=local go env GOROOT 2>/dev/null)/bin/gofmt
 GO_FILES    := $(shell find . -path ./.git -prune -o -name '*.go' -print)
-LDFLAGS     := -X github.com/pinksaucepasta/paperboat-cli/internal/buildinfo.Version=$(VERSION) -X github.com/pinksaucepasta/paperboat-cli/internal/buildinfo.ProtocolVersion=$(PROTOCOL_VERSION)
+LDFLAGS     := -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Version=$(VERSION) -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Commit=$(COMMIT) -X github.com/pinksaucepasta/paperboat/internal/buildinfo.ProtocolVersion=$(PROTOCOL_VERSION)
 
 .PHONY: build check clean complete contracts cross-build fmt fmt-check generate install lint race release-metadata test tidy uninstall verify-toolchain vet
 
@@ -42,9 +43,9 @@ release-metadata: build
 	@cp bin/$(BINARY) dist/$(BINARY)-$(VERSION)
 	@shasum -a 256 dist/$(BINARY)-$(VERSION) > dist/$(BINARY)-$(VERSION).sha256
 	@{ \
-		printf '{"name":"paperboat-cli","version":"%s","protocol_version":"%s","commit":"%s","go_version":"%s"}\n' \
+		printf '{"name":"paperboat","version":"%s","protocol_version":"%s","commit":"%s","go_version":"%s"}\n' \
 		"$(VERSION)" "$(PROTOCOL_VERSION)" \
-		"$(shell git rev-parse HEAD 2>/dev/null || echo unknown)" "$(shell go version | awk '{print $$3}')"; \
+		"$(COMMIT)" "$(shell go version | awk '{print $$3}')"; \
 	} > dist/$(BINARY)-$(VERSION).provenance.json
 
 install: build

@@ -183,3 +183,14 @@ func TestRunMeasuresEchoingSubprocess(t *testing.T) {
 		t.Fatalf("result = %+v", got)
 	}
 }
+
+func TestRunStartsUnrecordedLoadBeforeProbes(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	err := run(context.Background(), []string{"-samples=1", "-warmup=0", "-startup-delay=0", "-load-warmup=0", "-load-command=printf load-started", "-interval=0", "-probe-timeout=1s", "-mode=quic", "--", "sh"}, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("run: %v stderr=%q", err, stderr.String())
+	}
+	if bytes.Contains(stdout.Bytes(), []byte("load-started")) || bytes.Contains(stdout.Bytes(), []byte("printf")) {
+		t.Fatalf("result exposed load command or output: %s", stdout.Bytes())
+	}
+}

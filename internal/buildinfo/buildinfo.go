@@ -5,6 +5,9 @@ package buildinfo
 // Version is the CLI version. Replaced by release builds.
 var Version = "dev"
 
+// Commit is the source revision. Replaced by release builds.
+var Commit = "unknown"
+
 // ProtocolVersion is the control-plane contract understood by this binary.
 var ProtocolVersion = "1"
 

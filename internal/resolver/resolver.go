@@ -6,8 +6,8 @@ package resolver
 import (
 	"context"
 
-	"github.com/pinksaucepasta/paperboat-cli/internal/api"
-	"github.com/pinksaucepasta/paperboat-cli/internal/config"
+	"github.com/pinksaucepasta/paperboat/internal/api"
+	"github.com/pinksaucepasta/paperboat/internal/config"
 )
 
 // ConnectRequest describes what the user asked to connect to.
@@ -16,14 +16,14 @@ type ConnectRequest struct {
 	// Credential is the current Paperboat client-session access credential.
 	Credential config.Credential
 	// TerminalSessionID is the immutable server catalog ID. Empty selects the
-	// project's default session for backward-compatible attaches.
+	// project's durable default session.
 	TerminalSessionID string
 }
 
 // ConnectInfo is what the resolver hands back to the tunnel + session layers.
 type ConnectInfo struct {
 	// TargetKind identifies the Paperboat environment provider. It is
-	// "project" for a hosted Fly environment and "user_machine" for an
+	// "project" for a hosted Fly environment and "machine" for an
 	// enrolled customer machine.
 	TargetKind   string
 	ProjectID    string
@@ -63,7 +63,7 @@ type TerminalTarget struct {
 	CWD           string
 	// Env is local-terminal environment forwarded on attach (TERM, COLORTERM,
 	// ...) so the remote PTY spawns with the client's terminal capabilities.
-	// Applied by paperboat-helper when the PTY (re)starts.
+	// Applied by the Paperboat host runtime when the PTY (re)starts.
 	Env map[string]string
 	// Cols/Rows seed the remote PTY size at attach time so retained history
 	// replays at the local geometry instead of the server default until the
@@ -82,9 +82,12 @@ type TerminalTarget struct {
 }
 
 type FileTransferTarget struct {
-	Endpoint string
-	Auth     AuthTarget
-	Policy   api.FileTransferPolicy
+	Endpoint             string
+	SourceMachineID      string
+	DestinationMachineID string
+	InitiatingUserID     string
+	Auth                 AuthTarget
+	Policy               api.FileTransferPolicy
 }
 
 // ProjectResolver resolves a project name to connect info.

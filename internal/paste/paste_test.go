@@ -12,14 +12,14 @@ import (
 	"testing"
 	"time"
 
-	transfer "github.com/pinksaucepasta/paperboat-cli/internal/filetransfer"
-	"github.com/pinksaucepasta/paperboat-cli/internal/tunnel"
+	transfer "github.com/pinksaucepasta/paperboat/internal/filetransfer"
+	"github.com/pinksaucepasta/paperboat/internal/tunnel"
 )
 
 // fixedUploader returns a constant VM path.
 type fixedUploader struct{ vmPath string }
 
-func (u fixedUploader) UploadBatch(_ context.Context, _, _ string, sources []transfer.Source) (transfer.Batch, error) {
+func (u fixedUploader) SendBatch(_ context.Context, _, _ string, sources []transfer.Source) (transfer.Batch, error) {
 	paths := make([]string, len(sources))
 	for i := range paths {
 		paths[i] = u.vmPath
@@ -30,7 +30,7 @@ func (u fixedUploader) UploadBatch(_ context.Context, _, _ string, sources []tra
 // failUploader always errors, exercising fail-open.
 type failUploader struct{}
 
-func (failUploader) UploadBatch(context.Context, string, string, []transfer.Source) (transfer.Batch, error) {
+func (failUploader) SendBatch(context.Context, string, string, []transfer.Source) (transfer.Batch, error) {
 	return transfer.Batch{}, errors.New("boom")
 }
 
@@ -40,7 +40,7 @@ type batchUploader struct {
 	err     error
 }
 
-func (u *batchUploader) UploadBatch(_ context.Context, _ string, _ string, sources []transfer.Source) (transfer.Batch, error) {
+func (u *batchUploader) SendBatch(_ context.Context, _ string, _ string, sources []transfer.Source) (transfer.Batch, error) {
 	u.sources = append([]transfer.Source(nil), sources...)
 	return u.result, u.err
 }
@@ -74,11 +74,11 @@ func (w *uncertainWriter) Write(p []byte) (int, error) {
 func (w *uncertainWriter) Discard()       { w.mu.Lock(); w.discarded++; w.mu.Unlock() }
 func (w *uncertainWriter) String() string { w.mu.Lock(); defer w.mu.Unlock(); return w.buf.String() }
 
-func (u *blockingUploader) UploadBatch(ctx context.Context, _, _ string, sources []transfer.Source) (transfer.Batch, error) {
+func (u *blockingUploader) SendBatch(ctx context.Context, _, _ string, sources []transfer.Source) (transfer.Batch, error) {
 	u.once.Do(func() { close(u.started) })
 	select {
 	case <-u.release:
-		return fixedUploader{"/vm/slow.png"}.UploadBatch(ctx, "", "", sources)
+		return fixedUploader{"/vm/slow.png"}.SendBatch(ctx, "", "", sources)
 	case <-ctx.Done():
 		return transfer.Batch{}, ctx.Err()
 	}

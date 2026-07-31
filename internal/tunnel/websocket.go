@@ -5,73 +5,27 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/pinksaucepasta/paperboat-cli/internal/resolver"
+	"github.com/pinksaucepasta/paperboat/internal/resolver"
 )
 
 const (
-	paperboatTerminalProtocol     = "paperboat-terminal-rpc/v1"
-	paperboatWebSocketPath        = "/ws"
-	paperboatTicketQueryParameter = "wsTicket"
-	rpcRequestTagValue            = "Request"
-	rpcChunkTag                   = "Chunk"
-	rpcExitTag                    = "Exit"
-	rpcClientProtocolErrorTag     = "ClientProtocolError"
-	rpcDefectTag                  = "Defect"
-	rpcTerminalAttach             = "terminal.attach"
-	rpcTerminalWrite              = "terminal.write"
-	rpcTerminalResize             = "terminal.resize"
-	rpcTerminalClose              = "terminal.close"
-	rpcSubscribeTerminalMetadata  = "subscribeTerminalMetadata"
-	rpcFieldThreadID              = "threadId"
-	rpcFieldTerminalID            = "terminalId"
-	rpcFieldRestartIfNotRunning   = "restartIfNotRunning"
-	rpcFieldCWD                   = "cwd"
-	rpcFieldEnv                   = "env"
-	rpcFieldAfterSequence         = "afterSequence"
-	rpcFieldData                  = "data"
-	rpcFieldRows                  = "rows"
-	rpcFieldCols                  = "cols"
-	terminalEventSnapshot         = "snapshot"
-	terminalEventOutput           = "output"
-	terminalEventExited           = "exited"
-	terminalEventClosed           = "closed"
-	terminalEventError            = "error"
-	terminalEventCleared          = "cleared"
-	terminalEventRestarted        = "restarted"
-	terminalEventActivity         = "activity"
-	websocketKeepaliveInterval    = 30 * time.Second
-	websocketKeepaliveTimeout     = 10 * time.Second
-	websocketWriteTimeout         = 10 * time.Second
-	terminalOutputQueueChunks     = 256
-	helperWebSocketSubprotocol    = "paperboat.terminal.v2"
+	websocketWriteTimeout      = 10 * time.Second
+	terminalOutputQueueChunks  = 256
+	helperWebSocketSubprotocol = "paperboat.terminal.v1"
 )
 
-var terminalAttachEventTypes = []string{
-	terminalEventSnapshot,
-	terminalEventOutput,
-	terminalEventExited,
-	terminalEventClosed,
-	terminalEventError,
-	terminalEventCleared,
-	terminalEventRestarted,
-	terminalEventActivity,
-}
-
 // WebSocketTunnel attaches to the helper terminal RPC over the server-assigned
-// WebSocket route. Legacy descriptor kinds are normalized before reaching this type.
+// WebSocket route.
 type WebSocketTunnel struct {
 	Dialer            *websocket.Dialer
 	OutputQueueChunks int
@@ -83,6 +37,13 @@ func NewWebSocketTunnel() *WebSocketTunnel {
 	dialer := *websocket.DefaultDialer
 	dialer.TLSClientConfig = &tls.Config{ClientSessionCache: tls.NewLRUClientSessionCache(64)}
 	return &WebSocketTunnel{Dialer: &dialer, OutputQueueChunks: terminalOutputQueueChunks}
+}
+
+func (t *WebSocketTunnel) outputQueueChunks() int {
+	if t.OutputQueueChunks > 0 {
+		return t.OutputQueueChunks
+	}
+	return terminalOutputQueueChunks
 }
 
 type preparedWebSocketTerminal struct {
@@ -156,76 +117,25 @@ func (t *WebSocketTunnel) Check(ctx context.Context, target *resolver.TerminalTa
 	if err != nil {
 		return classifyWebSocketUpgradeError(ctx, err, resp)
 	}
-	if target.Protocol == "paperboat.terminal.v2" {
-		defer ws.Close()
-		message := &helperWebSocketConnection{ws: ws}
-		if _, err := helperHandshake(ctx, message); err != nil {
-			return err
-		}
-		return helperCheck(ctx, message)
-	}
-	c := newTerminalWSConn(ws, target, t.outputQueueChunks())
-	defer c.Close()
-	if err := c.call(ctx, rpcSubscribeTerminalMetadata, map[string]any{}); err != nil {
+	defer ws.Close()
+	message := &helperWebSocketConnection{ws: ws}
+	if _, err := helperHandshake(ctx, message); err != nil {
 		return err
 	}
-	return c.waitProtocol(ctx)
+	return helperCheck(ctx, message)
 }
 
 func (t *WebSocketTunnel) Dial(ctx context.Context, info resolver.ConnectInfo) (Conn, error) {
-	if info.Terminal != nil && info.Terminal.Protocol == "paperboat.terminal.v2" {
-		prepared, err := t.Establish(ctx, info)
-		if err != nil {
-			return nil, err
-		}
-		return prepared.Attach(ctx)
-	}
-	if info.Terminal == nil {
-		return nil, errors.New("missing terminal descriptor")
-	}
-	target := info.Terminal
-	wsURL, headers, err := terminalWebSocketRequest(target)
+	prepared, err := t.Establish(ctx, info)
 	if err != nil {
 		return nil, err
 	}
-	dialer := helperDialer(t.Dialer)
-	ws, resp, err := dialer.DialContext(ctx, wsURL, headers)
-	if err != nil {
-		return nil, classifyWebSocketUpgradeError(ctx, err, resp)
-	}
-	if target.Protocol == "paperboat.terminal.v2" {
-		message := &helperWebSocketConnection{ws: ws}
-		_, err := helperHandshake(ctx, message)
-		if err != nil {
-			_ = ws.Close()
-			return nil, err
-		}
-		c := newHelperTerminalConn(message, target, t.outputQueueChunks())
-		if err := c.initialize(ctx); err != nil {
-			_ = ws.Close()
-			return nil, err
-		}
-		return c, nil
-	}
-	if target.Protocol != "" && target.Protocol != "paperboat.terminal.v2" {
-		_ = ws.Close()
-		return nil, fmt.Errorf("unsupported terminal transport %q", target.Protocol)
-	}
-	c := newTerminalWSConn(ws, target, t.outputQueueChunks())
-	if err := c.attach(ctx); err != nil {
-		_ = c.Close()
-		return nil, err
-	}
-	if err := c.waitProtocol(ctx); err != nil {
-		_ = c.Close()
-		return nil, err
-	}
-	return c, nil
+	return prepared.Attach(ctx)
 }
 
 func (t *WebSocketTunnel) Establish(ctx context.Context, info resolver.ConnectInfo) (preparedTerminal, error) {
-	if info.Terminal == nil || info.Terminal.Protocol != "paperboat.terminal.v2" {
-		return nil, errors.New("WSS requires terminal protocol v2")
+	if info.Terminal == nil || info.Terminal.Protocol != "paperboat.terminal.v1" {
+		return nil, errors.New("WSS requires terminal protocol v1")
 	}
 	wsURL, headers, err := terminalWebSocketRequest(info.Terminal)
 	if err != nil {
@@ -403,540 +313,11 @@ func terminalWebSocketRequest(target *resolver.TerminalTarget) (string, http.Hea
 		return "", nil, fmt.Errorf("terminal websocket URL must use ws or wss, got %q", u.Scheme)
 	}
 	headers := make(http.Header)
-	switch target.Auth.Method {
-	case "websocket_ticket":
-		if target.Auth.Ticket == "" {
-			return "", nil, errors.New("missing terminal websocket ticket")
-		}
-		q := u.Query()
-		q.Set(paperboatTicketQueryParameter, target.Auth.Ticket)
-		u.RawQuery = q.Encode()
-		if !strings.HasSuffix(u.Path, paperboatWebSocketPath) {
-			u.Path = strings.TrimRight(u.Path, "/") + paperboatWebSocketPath
-		}
-	case "bearer":
-		if target.Auth.Token == "" {
-			return "", nil, errors.New("missing terminal bearer token")
-		}
-		headers.Set("Authorization", "Bearer "+target.Auth.Token)
-	default:
-		return "", nil, fmt.Errorf("unsupported terminal websocket auth method %q", target.Auth.Method)
+	if target.Auth.Method != "bearer" || target.Auth.Token == "" {
+		return "", nil, errors.New("terminal WebSocket requires a bearer credential")
 	}
+	headers.Set("Authorization", "Bearer "+target.Auth.Token)
 	return u.String(), headers, nil
 }
 
-type terminalWSConn struct {
-	ws     *websocket.Conn
-	target *resolver.TerminalTarget
-
-	writeMu sync.Mutex
-	readMu  sync.Mutex
-	pending []byte
-	out     chan []byte
-	done    chan struct{}
-	closed  chan struct{}
-
-	exitOnce sync.Once
-	exitCode int
-	exitErr  error
-
-	nextID        int
-	closing       atomic.Bool
-	protocolReady chan struct{}
-	protocolOnce  sync.Once
-	keepaliveStop chan struct{}
-	keepaliveOnce sync.Once
-
-	// stall is the reused slow-path timer for pushOutput. Only the readLoop
-	// goroutine touches it, so no locking is needed.
-	stall *time.Timer
-}
-
-// stallTimer arms the reused slow-path timer and returns its channel.
-func (c *terminalWSConn) stallTimer(d time.Duration) <-chan time.Time {
-	if c.stall == nil {
-		c.stall = time.NewTimer(d)
-		return c.stall.C
-	}
-	if !c.stall.Stop() {
-		select {
-		case <-c.stall.C:
-		default:
-		}
-	}
-	c.stall.Reset(d)
-	return c.stall.C
-}
-
-func (t *WebSocketTunnel) outputQueueChunks() int {
-	if t.OutputQueueChunks > 0 {
-		return t.OutputQueueChunks
-	}
-	return terminalOutputQueueChunks
-}
-
-func newTerminalWSConn(ws *websocket.Conn, target *resolver.TerminalTarget, configuredQueueChunks ...int) *terminalWSConn {
-	outputQueueChunks := terminalOutputQueueChunks
-	if len(configuredQueueChunks) > 0 && configuredQueueChunks[0] > 0 {
-		outputQueueChunks = configuredQueueChunks[0]
-	}
-	c := &terminalWSConn{
-		ws:            ws,
-		target:        target,
-		out:           make(chan []byte, outputQueueChunks),
-		done:          make(chan struct{}),
-		closed:        make(chan struct{}),
-		exitCode:      0,
-		nextID:        1,
-		protocolReady: make(chan struct{}),
-		keepaliveStop: make(chan struct{}),
-	}
-	go c.readLoop()
-	go c.keepaliveLoop()
-	return c
-}
-
-func (c *terminalWSConn) waitProtocol(ctx context.Context) error {
-	select {
-	case <-c.protocolReady:
-		return nil
-	case <-c.done:
-		if c.exitErr != nil {
-			return c.exitErr
-		}
-		return errors.New("terminal attach ended before a protocol frame")
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-func (c *terminalWSConn) attach(ctx context.Context) error {
-	payload := map[string]any{
-		rpcFieldThreadID:            c.target.ThreadID,
-		rpcFieldTerminalID:          c.target.TerminalID,
-		rpcFieldRestartIfNotRunning: c.target.RestartIfNotRunning,
-	}
-	if c.target.CWD != "" {
-		payload[rpcFieldCWD] = c.target.CWD
-	}
-	if len(c.target.Env) > 0 {
-		payload[rpcFieldEnv] = c.target.Env
-	}
-	if c.target.Cols > 0 && c.target.Rows > 0 {
-		payload[rpcFieldCols] = c.target.Cols
-		payload[rpcFieldRows] = c.target.Rows
-	}
-	if c.target.AfterSequence > 0 {
-		payload[rpcFieldAfterSequence] = c.target.AfterSequence
-	}
-	return c.call(ctx, rpcTerminalAttach, payload)
-}
-
-func (c *terminalWSConn) Read(p []byte) (int, error) {
-	c.readMu.Lock()
-	defer c.readMu.Unlock()
-	// Animated TUIs emit many small PTY updates. Drain output that is already
-	// available so one local write can render a burst without dropping bytes.
-	return readBufferedChunks(p, &c.pending, c.out)
-}
-
-func (c *terminalWSConn) Write(p []byte) (int, error) {
-	if len(p) == 0 {
-		return 0, nil
-	}
-	// Terminal input is latency-sensitive: send it without the per-call
-	// context/timer setup and map-payload allocation of the generic call path.
-	payload := terminalWritePayload{
-		ThreadID:   c.target.ThreadID,
-		TerminalID: c.target.TerminalID,
-		Data:       string(p),
-	}
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	id := c.nextID
-	c.nextID++
-	msg := rpcRequest{Type: rpcRequestTagValue, Tag: rpcTerminalWrite, ID: strconv.Itoa(id), Payload: payload, Headers: [][2]string{}}
-	_ = c.ws.SetWriteDeadline(time.Now().Add(websocketWriteTimeout))
-	err := c.ws.WriteJSON(msg)
-	_ = c.ws.SetWriteDeadline(time.Time{})
-	if err != nil {
-		return 0, err
-	}
-	return len(p), nil
-}
-
-// CloseWrite reports the protocol limitation instead of pretending EOF was
-// delivered and leaving a non-interactive remote process waiting forever.
-func (c *terminalWSConn) CloseWrite() error {
-	return ErrInputEOFUnsupported
-}
-
-func (c *terminalWSConn) Resize(rows, cols uint16) error {
-	if rows == 0 || cols == 0 {
-		return nil
-	}
-	payload := map[string]any{
-		rpcFieldThreadID:   c.target.ThreadID,
-		rpcFieldTerminalID: c.target.TerminalID,
-		rpcFieldRows:       rows,
-		rpcFieldCols:       cols,
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), websocketWriteTimeout)
-	defer cancel()
-	return c.call(ctx, rpcTerminalResize, payload)
-}
-
-func (c *terminalWSConn) Close() error {
-	select {
-	case <-c.closed:
-		return nil
-	default:
-	}
-	c.closing.Store(true)
-	c.stopKeepalive()
-	// Closing the client detaches the transport. terminal.close is destructive:
-	// it stops and unregisters the remote PTY, which would break reconnect and
-	// make `pb doctor` terminate a user's session.
-	return c.ws.Close()
-}
-
-func (c *terminalWSConn) Wait() (int, error) {
-	<-c.done
-	return c.exitCode, c.exitErr
-}
-
-func (c *terminalWSConn) call(ctx context.Context, method string, payload any) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-	}
-	id := c.nextID
-	c.nextID++
-	msg := rpcRequest{Type: rpcRequestTagValue, Tag: method, ID: fmt.Sprintf("%d", id), Payload: payload, Headers: [][2]string{}}
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = c.ws.SetWriteDeadline(deadline)
-		defer c.ws.SetWriteDeadline(time.Time{})
-	}
-	return c.ws.WriteJSON(msg)
-}
-
-func (c *terminalWSConn) keepaliveLoop() {
-	_ = c.ws.SetReadDeadline(time.Now().Add(websocketKeepaliveInterval + websocketKeepaliveTimeout))
-	c.ws.SetPongHandler(func(string) error {
-		return c.ws.SetReadDeadline(time.Now().Add(websocketKeepaliveInterval + websocketKeepaliveTimeout))
-	})
-	ticker := time.NewTicker(websocketKeepaliveInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			c.writeMu.Lock()
-			_ = c.ws.SetWriteDeadline(time.Now().Add(websocketKeepaliveTimeout))
-			err := c.ws.WriteControl(websocket.PingMessage, nil, time.Now().Add(websocketKeepaliveTimeout))
-			_ = c.ws.SetWriteDeadline(time.Time{})
-			c.writeMu.Unlock()
-			if err != nil {
-				c.finish(1, errors.Join(ErrTransportLost, err))
-				_ = c.ws.Close()
-				return
-			}
-		case <-c.keepaliveStop:
-			return
-		}
-	}
-}
-
-func (c *terminalWSConn) stopKeepalive() {
-	c.keepaliveOnce.Do(func() { close(c.keepaliveStop) })
-}
-
-func (c *terminalWSConn) readLoop() {
-	defer c.stopKeepalive()
-	defer close(c.closed)
-	defer close(c.out)
-	for {
-		_, data, err := c.ws.ReadMessage()
-		if err != nil {
-			if c.isClosing() {
-				c.finish(0, nil)
-			} else {
-				c.finish(1, errors.Join(ErrTransportLost, fmt.Errorf("terminal websocket read failed: %w", err)))
-			}
-			return
-		}
-		// Any successful read proves the transport is alive. Extend the read
-		// deadline here as well as in the pong handler: under a sustained
-		// output flood the server's pongs can lag behind queued data frames,
-		// and a healthy connection must not be killed by the keepalive
-		// deadline while it is actively delivering bytes.
-		_ = c.ws.SetReadDeadline(time.Now().Add(websocketKeepaliveInterval + websocketKeepaliveTimeout))
-		var frames []rpcFrame
-		if len(data) > 0 && data[0] == '[' {
-			if err := json.Unmarshal(data, &frames); err != nil {
-				// A frame that fails to decode means the transport delivered
-				// corrupt bytes (or the server restarted mid-frame). Treat it
-				// as transport loss so the reconnect supervisor re-attaches
-				// and resyncs from the last committed sequence instead of
-				// killing the session.
-				c.finish(1, errors.Join(ErrTransportLost, fmt.Errorf("terminal frame decode failed: %w", err)))
-				_ = c.ws.Close()
-				return
-			}
-		} else {
-			var frame rpcFrame
-			if err := json.Unmarshal(data, &frame); err != nil {
-				c.finish(1, errors.Join(ErrTransportLost, fmt.Errorf("terminal frame decode failed: %w", err)))
-				_ = c.ws.Close()
-				return
-			}
-			frames = []rpcFrame{frame}
-		}
-		for _, frame := range frames {
-			if err := c.handleFrame(frame); err != nil {
-				c.finish(1, err)
-				_ = c.ws.Close()
-				return
-			}
-		}
-	}
-}
-
-func (c *terminalWSConn) isClosing() bool {
-	return c.closing.Load()
-}
-
-// MarkTransportLost terminates the socket as an unexpected transport failure,
-// allowing the reconnect supervisor to distinguish it from an intentional close.
-func (c *terminalWSConn) MarkTransportLost(err error) {
-	if err == nil {
-		err = ErrTransportLost
-	}
-	c.finish(1, errors.Join(ErrTransportLost, err))
-	_ = c.ws.Close()
-}
-
-func (c *terminalWSConn) handleFrame(frame rpcFrame) error {
-	switch frame.Tag {
-	case rpcChunkTag:
-		for _, raw := range frame.Values {
-			var ev terminalEvent
-			if err := json.Unmarshal(raw, &ev); err != nil {
-				return errors.Join(ErrTransportLost, fmt.Errorf("terminal event decode failed: %w", err))
-			}
-			if err := c.handleTerminalEvent(ev); err != nil {
-				return err
-			}
-		}
-		c.protocolOnce.Do(func() {
-			if c.protocolReady != nil {
-				close(c.protocolReady)
-			}
-		})
-	case rpcExitTag:
-		if frame.Exit.Tag == "Failure" {
-			message := effectFailureMessage(frame.Exit.Cause)
-			if isTransientStreamFailure(message) {
-				// The server intentionally failed the attach stream for a
-				// recoverable reason (e.g. the attach buffer overflowed under
-				// heavy output). Reconnecting resyncs from the last committed
-				// sequence; only auth/lookup failures stay fatal.
-				return errors.Join(ErrTransportLost, errors.New(message))
-			}
-			return errors.New(message)
-		}
-	case rpcClientProtocolErrorTag, rpcDefectTag:
-		return errors.Join(ErrTransportLost, errors.New("terminal websocket protocol error"))
-	}
-	return nil
-}
-
-// isTransientStreamFailure classifies server-side stream failures that a
-// re-attach can recover from. Overflow/history errors mean the client fell
-// behind the output stream, not that the terminal is gone.
-func isTransientStreamFailure(message string) bool {
-	lowered := strings.ToLower(message)
-	for _, marker := range []string{
-		"terminal attach stream overflow",
-		"terminalhistoryerror",
-		"history",
-	} {
-		if strings.Contains(lowered, marker) {
-			return true
-		}
-	}
-	return false
-}
-
-func (c *terminalWSConn) handleTerminalEvent(ev terminalEvent) error {
-	commitSequence := func(sequence *int) {
-		if sequence != nil && c.target != nil && c.target.SequenceSink != nil {
-			c.target.SequenceSink(*sequence)
-		}
-	}
-	pushOutput := func(data []byte) error {
-		if len(data) == 0 {
-			return nil
-		}
-		// Fast path: no timer allocation while the local consumer keeps up.
-		select {
-		case c.out <- data:
-			return nil
-		default:
-		}
-		timer := c.stallTimer(websocketWriteTimeout)
-		select {
-		case c.out <- data:
-			return nil
-		case <-c.keepaliveStop:
-			return ErrTransportLost
-		case <-timer:
-			return errors.Join(ErrTransportLost, errors.New("terminal output queue stalled"))
-		}
-	}
-	switch ev.Type {
-	case terminalEventSnapshot, terminalEventRestarted:
-		replayHistory := ev.Type == terminalEventRestarted || c.target == nil || c.target.ReplayHistory
-		if ev.Snapshot.History != "" && replayHistory {
-			if ev.Type == terminalEventRestarted && c.target != nil && !c.target.ReplayHistory {
-				if err := pushOutput([]byte("\x1b[2J\x1b[H")); err != nil {
-					return err
-				}
-			}
-			if err := pushOutput([]byte(ev.Snapshot.History)); err != nil {
-				return err
-			}
-		}
-		if replayHistory {
-			commitSequence(ev.Snapshot.Sequence)
-		}
-		if replayHistory {
-			c.finishFromStatus(ev.Snapshot.Status, ev.Snapshot.ExitCode, ev.Snapshot.ExitSignal, "")
-		}
-	case terminalEventOutput:
-		if ev.Data != "" {
-			if err := pushOutput([]byte(ev.Data)); err != nil {
-				return err
-			}
-		}
-		commitSequence(ev.Sequence)
-	case terminalEventExited:
-		commitSequence(ev.Sequence)
-		c.finish(exitStatus(ev.ExitCode, ev.ExitSignal), nil)
-	case terminalEventClosed:
-		commitSequence(ev.Sequence)
-		c.finish(0, nil)
-	case terminalEventError:
-		commitSequence(ev.Sequence)
-		c.finish(1, errors.New(ev.Message))
-	case terminalEventCleared:
-		if err := pushOutput([]byte("\x1b[2J\x1b[H")); err != nil {
-			return err
-		}
-		commitSequence(ev.Sequence)
-	case terminalEventActivity:
-		commitSequence(ev.Sequence)
-	}
-	return nil
-}
-
-func (c *terminalWSConn) finishFromStatus(status string, exitCode, exitSignal *int, errMsg string) {
-	switch status {
-	case terminalEventExited:
-		c.finish(exitStatus(exitCode, exitSignal), nil)
-	case terminalEventError:
-		if errMsg == "" {
-			errMsg = "terminal is in error state"
-		}
-		c.finish(1, errors.New(errMsg))
-	}
-}
-
-func exitStatus(exitCode, exitSignal *int) int {
-	if exitCode != nil {
-		return *exitCode
-	}
-	if exitSignal != nil {
-		return 128 + *exitSignal
-	}
-	return 0
-}
-
-func (c *terminalWSConn) finish(code int, err error) {
-	c.exitOnce.Do(func() {
-		c.exitCode = code
-		c.exitErr = err
-		close(c.done)
-	})
-}
-
-// terminalWritePayload mirrors the map payload used by call() for
-// terminal.write, with identical JSON field names (frozen wire contract).
-type terminalWritePayload struct {
-	ThreadID   string `json:"threadId"`
-	TerminalID string `json:"terminalId"`
-	Data       string `json:"data"`
-}
-
-type rpcRequest struct {
-	Tag     string      `json:"tag"`
-	ID      string      `json:"id"`
-	Payload any         `json:"payload"`
-	Headers [][2]string `json:"headers"`
-	Type    string      `json:"_tag"`
-}
-
-type rpcFrame struct {
-	Tag    string            `json:"_tag"`
-	Values []json.RawMessage `json:"values"`
-	Exit   effectExit        `json:"exit"`
-}
-
-type effectExit struct {
-	Tag   string        `json:"_tag"`
-	Cause []effectCause `json:"cause"`
-}
-
-type effectCause struct {
-	Tag    string          `json:"_tag"`
-	Error  json.RawMessage `json:"error"`
-	Defect json.RawMessage `json:"defect"`
-}
-
-func effectFailureMessage(causes []effectCause) string {
-	for _, cause := range causes {
-		if cause.Tag == "Fail" && len(cause.Error) > 0 {
-			var msg struct {
-				Message string `json:"message"`
-			}
-			if json.Unmarshal(cause.Error, &msg) == nil && msg.Message != "" {
-				return msg.Message
-			}
-			return string(cause.Error)
-		}
-	}
-	return "terminal RPC failed"
-}
-
-type terminalEvent struct {
-	Type       string           `json:"type"`
-	Sequence   *int             `json:"sequence"`
-	Data       string           `json:"data"`
-	Message    string           `json:"message"`
-	ExitCode   *int             `json:"exitCode"`
-	ExitSignal *int             `json:"exitSignal"`
-	Snapshot   terminalSnapshot `json:"snapshot"`
-}
-
-type terminalSnapshot struct {
-	Status     string `json:"status"`
-	History    string `json:"history"`
-	Sequence   *int   `json:"sequence"`
-	ExitCode   *int   `json:"exitCode"`
-	ExitSignal *int   `json:"exitSignal"`
-}
-
 var _ Tunnel = (*WebSocketTunnel)(nil)
-var _ Conn = (*terminalWSConn)(nil)

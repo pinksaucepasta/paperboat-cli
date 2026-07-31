@@ -29,8 +29,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	transfer "github.com/pinksaucepasta/paperboat-cli/internal/filetransfer"
-	"github.com/pinksaucepasta/paperboat-cli/internal/tunnel"
+	transfer "github.com/pinksaucepasta/paperboat/internal/filetransfer"
+	"github.com/pinksaucepasta/paperboat/internal/tunnel"
 )
 
 var (
@@ -96,7 +96,7 @@ type Policy struct {
 }
 
 type BatchUploader interface {
-	UploadBatch(context.Context, string, string, []transfer.Source) (transfer.Batch, error)
+	SendBatch(context.Context, string, string, []transfer.Source) (transfer.Batch, error)
 }
 type uploadCompletion struct {
 	seq    uint64
@@ -654,7 +654,7 @@ func (i *Interceptor) uploadAsync(seq uint64, policy policySnapshot, paths []str
 			err = batchErr
 		} else {
 			var batch transfer.Batch
-			batch, err = policy.transfer.UploadBatch(ctx, batchID, policy.sessionID, sources)
+			batch, err = policy.transfer.SendBatch(ctx, batchID, policy.sessionID, sources)
 			if err == nil && len(batch.Paths) != nonEmpty {
 				err = errors.New("helper returned incomplete file batch")
 			}

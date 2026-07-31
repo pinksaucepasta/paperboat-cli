@@ -29,7 +29,7 @@ an unknown key or signature error.
 Detection: control-plane authorization succeeds but route readiness or WSS/HTTPS
 dialing fails across projects.
 
-1. Use `pb doctor <environment>` to distinguish route readiness from helper health.
+1. Use `pb doctor <environment>` to distinguish route readiness from host-runtime health.
 2. Stop reconnect storms and honor configured retry bounds.
 3. Do not expose a Fly port or fall back to SSH.
 4. After recovery, verify terminal attach, reconnect, resumable file transfer, and revoked-route rejection.

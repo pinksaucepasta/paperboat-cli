@@ -42,7 +42,7 @@
       "additionalProperties": false,
       "required": ["protocol", "endpoints", "auth", "session_id", "thread_id", "terminal_id", "cwd"],
       "properties": {
-        "protocol": {"const": "paperboat.terminal.v2"},
+        "protocol": {"const": "paperboat.terminal.v1"},
         "endpoints": {
           "type": "object",
           "additionalProperties": false,

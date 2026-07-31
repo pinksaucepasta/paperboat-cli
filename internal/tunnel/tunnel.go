@@ -9,7 +9,7 @@ import (
 	"io"
 	"time"
 
-	"github.com/pinksaucepasta/paperboat-cli/internal/resolver"
+	"github.com/pinksaucepasta/paperboat/internal/resolver"
 )
 
 var ErrInputEOFUnsupported = errors.New("terminal protocol does not support stdin EOF")
@@ -26,6 +26,16 @@ type Conn interface {
 
 type InputHalfCloser interface {
 	CloseWrite() error
+}
+
+type TerminalCompressionTelemetry struct {
+	RawFrames, ZstdFrames       uint64
+	DecodedBytes, EncodedBytes  uint64
+	DecodeNanos, DecodeFailures uint64
+}
+
+type terminalCompressionReporter interface {
+	TerminalCompressionTelemetry() TerminalCompressionTelemetry
 }
 
 func readBufferedChunks(p []byte, pending *[]byte, out <-chan []byte) (int, error) {

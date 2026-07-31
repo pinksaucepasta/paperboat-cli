@@ -11,7 +11,7 @@
   messages as untrusted input. Descriptor validation and issuer binding happen
   before a terminal or file-transfer connection is opened.
 - Terminal bytes and opaque file bytes cross the `paperboat-tunnel` data boundary to
-  `paperboat-helper`. The CLI
+  the unified `pb` host runtime. The CLI
   does not log or inspect them beyond the required terminal/file-transfer
   operation.
 
@@ -22,8 +22,9 @@
 | Device-code phishing or brute force | Server-authoritative expiry/interval; user sees the complete URL and short code; no token in output | Server/dashboard rate limits and approval UX |
 | Token theft or refresh replay | OS credential store, issuer-namespaced profiles, refresh rotation, durable revoke queue | Server session-family revocation |
 | Malicious route or descriptor | HTTPS/WSS scheme and issuer/environment/scope/expiry validation; no raw VM or SSH fallback | Server route authorization and `paperboat-tunnel` enforcement |
-| Terminal injection | Non-file bytes pass through unchanged; rewriting is limited to a bracketed paste frame | `paperboat-helper` terminal authorization |
-| File traversal or substitution | Absolute regular files only; symlinks/traversal rejected; one descriptor is hashed and streamed; signed size policy | `paperboat-helper` transfer verification and cleanup |
+| Terminal injection | Non-file bytes pass through unchanged; rewriting is limited to a bracketed paste frame | `pb` host-runtime terminal authorization |
+| Compression side channel or decompression exhaustion | Each output event is an independent Zstandard frame with no dictionary or cross-session state; declared decoded size, frame content size, decoder memory, and concurrent codecs are bounded before delivery or ACK | A user controlling and observing the same authenticated terminal can still correlate its own input and output sizes |
+| File traversal or substitution | Absolute regular files only; symlinks/traversal rejected; one descriptor is hashed and streamed; signed size policy | `pb` host-runtime transfer verification and cleanup |
 | Compromised VM | CLI receives only short-lived, scoped terminal/file credentials | VM isolation and server revocation |
 
 ## Incident actions
@@ -35,5 +36,5 @@ upgrade from a verified release. Never bypass `paperboat-tunnel` or use SSH as a
 data path.
 
 The CLI intentionally cannot prove downstream revocation propagation;
-`paperboat-server`, `paperboat-tunnel`, and `paperboat-helper` must provide that evidence
+`paperboat-server`, `paperboat-tunnel`, and `paperboat` must provide that evidence
 in the release review.

@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -13,9 +14,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/pinksaucepasta/paperboat-cli/internal/resolver"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/protocol"
+	"github.com/pinksaucepasta/paperboat/internal/resolver"
 )
 
 type capturedHelperMessageConnection struct {
@@ -40,8 +43,9 @@ type earlyOutputMessageConnection struct {
 		kind helperMessageType
 		data []byte
 	}
-	closed chan struct{}
-	once   sync.Once
+	closed       chan struct{}
+	once         sync.Once
+	attachBinary [][]byte
 }
 
 func newEarlyOutputMessageConnection() *earlyOutputMessageConnection {
@@ -80,14 +84,17 @@ func (c *earlyOutputMessageConnection) WriteMessage(_ context.Context, kind help
 	case "create":
 		response.Payload = json.RawMessage(`{"result":{"generation":1}}`)
 	case "attach":
-		binaryFrame := make([]byte, 14+len("early"))
-		binaryFrame[0], binaryFrame[1] = 2, 1
-		binary.BigEndian.PutUint32(binaryFrame[2:6], 7)
-		copy(binaryFrame[14:], "early")
-		c.reads <- struct {
-			kind helperMessageType
-			data []byte
-		}{helperBinaryMessage, binaryFrame}
+		frames := c.attachBinary
+		if len(frames) == 0 {
+			binaryFrame, _ := protocol.EncodeTerminalOutput(protocol.TerminalOutputFrame{Channel: protocol.TerminalStdout, StreamID: 7, Data: []byte("early")}, nil)
+			frames = [][]byte{binaryFrame}
+		}
+		for _, binaryFrame := range frames {
+			c.reads <- struct {
+				kind helperMessageType
+				data []byte
+			}{helperBinaryMessage, binaryFrame}
+		}
 		response.Payload = json.RawMessage(`{"result":{"stream_id":7,"attachment_id":"att_early","session":{"snapshot":{"generation":1}}}}`)
 	}
 	encoded, _ := json.Marshal(response)
@@ -116,6 +123,26 @@ func TestNativeTerminalBuffersOutputThatPrecedesAttachResponse(t *testing.T) {
 	}
 	_ = message.Close()
 	connection.finish(0, nil)
+}
+
+func TestPreAttachCompressedOutputIsBoundedByDecodedBytes(t *testing.T) {
+	message := newEarlyOutputMessageConnection()
+	data := bytes.Repeat([]byte("x"), protocol.MaxTerminalOutputBytes)
+	for sequence := uint64(0); sequence < uint64(5*len(data)); sequence += uint64(len(data)) {
+		wire, err := protocol.EncodeTerminalOutputAdaptive(protocol.TerminalOutputFrame{Channel: protocol.TerminalStdout, StreamID: 7, StartSequence: sequence, Data: data}, nil)
+		if err != nil || wire[2] != protocol.TerminalOutputZstd {
+			t.Fatalf("encoding=%d err=%v", wire[2], err)
+		}
+		message.attachBinary = append(message.attachBinary, wire)
+	}
+	connection := newHelperTerminalConn(message, &resolver.TerminalTarget{SessionID: "ses_bound", CWD: "/workspace"}, 4)
+	err := connection.initialize(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "excessive output") {
+		t.Fatalf("err=%v", err)
+	}
+	if len(connection.initial) != 0 {
+		t.Fatalf("decoded output admitted: %d", len(connection.initial))
+	}
 }
 
 func TestHelperTerminalLargeInputUses32KiBRecords(t *testing.T) {
@@ -162,7 +189,7 @@ func TestWebSocketEstablishDoesNotSendAuthenticationOrHTTPUpgrade(t *testing.T) 
 	u, _ := url.Parse(server.URL)
 	u.Scheme = "ws"
 	u.Path = "/v1/runtime"
-	target := &resolver.TerminalTarget{Protocol: "paperboat.terminal.v2", WSSEndpoint: u.String(), Auth: resolver.AuthTarget{Method: "bearer", Token: "helper-token"}}
+	target := &resolver.TerminalTarget{Protocol: "paperboat.terminal.v1", WSSEndpoint: u.String(), Auth: resolver.AuthTarget{Method: "bearer", Token: "helper-token"}}
 	prepared, err := NewWebSocketTunnel().Establish(context.Background(), resolver.ConnectInfo{Terminal: target})
 	if err != nil {
 		t.Fatal(err)
@@ -208,7 +235,7 @@ func TestCanonicalHelperTerminalFramingIOResizeAndExit(t *testing.T) {
 					acks <- binary.BigEndian.Uint64(data[5:13])
 				case 4:
 					resizes <- [2]uint16{binary.BigEndian.Uint16(data[5:7]), binary.BigEndian.Uint16(data[7:9])}
-					writeHelperTestFrame(t, ws, helperFrame{Type: "event", RequestID: "stream", Version: helperProtocolVersion, Capability: "terminal.v2", Payload: json.RawMessage(`{"event":"terminal_stream_end","session_id":"ses_bound","state":"exited","final_sequence":5,"exit":{"code":7}}`)})
+					writeHelperTestFrame(t, ws, helperFrame{Type: "event", RequestID: "stream", Version: helperProtocolVersion, Capability: "terminal.v1", Payload: json.RawMessage(`{"event":"terminal_stream_end","session_id":"ses_bound","state":"exited","final_sequence":5,"exit":{"code":7}}`)})
 				default:
 					t.Errorf("invalid binary frame: %x", data)
 				}
@@ -226,7 +253,7 @@ func TestCanonicalHelperTerminalFramingIOResizeAndExit(t *testing.T) {
 			requests <- frame
 			switch frame.Type {
 			case "hello":
-				writeHelperTestFrame(t, ws, helperFrame{Type: "welcome", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"version":"2.0","capabilities":["health.v1","terminal.v2"]}`)})
+				writeHelperTestFrame(t, ws, helperFrame{Type: "welcome", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"version":"1.0","capabilities":["health.v1","terminal.v1"]}`)})
 			case "ack", "detach":
 				writeHelperTestFrame(t, ws, helperFrame{Type: "response", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"result":{},"replay":false}`)})
 			case "request":
@@ -251,7 +278,7 @@ func TestCanonicalHelperTerminalFramingIOResizeAndExit(t *testing.T) {
 	u, _ := url.Parse(server.URL)
 	u.Scheme = strings.Replace(u.Scheme, "http", "ws", 1)
 	u.Path = "/v1/runtime"
-	target := &resolver.TerminalTarget{Protocol: "paperboat.terminal.v2", WSSEndpoint: u.String(), Auth: resolver.AuthTarget{Method: "bearer", Token: "helper-token"}, SessionID: "ses_bound", TerminalID: "default", CWD: "/workspace", Cols: 100, Rows: 30, Env: map[string]string{"TERM": "xterm-ghostty", "COLORTERM": "truecolor"}}
+	target := &resolver.TerminalTarget{Protocol: "paperboat.terminal.v1", WSSEndpoint: u.String(), Auth: resolver.AuthTarget{Method: "bearer", Token: "helper-token"}, SessionID: "ses_bound", TerminalID: "default", CWD: "/workspace", Cols: 100, Rows: 30, Env: map[string]string{"TERM": "xterm-ghostty", "COLORTERM": "truecolor"}}
 	conn, err := NewWebSocketTunnel().Dial(context.Background(), resolver.ConnectInfo{Terminal: target})
 	if err != nil {
 		t.Fatal(err)
@@ -301,19 +328,49 @@ func TestCanonicalHelperTerminalFramingIOResizeAndExit(t *testing.T) {
 
 func TestHelperBinaryOutputRetainsOwnedWebSocketPayload(t *testing.T) {
 	conn := &helperTerminalConn{streamID: 7}
-	message := make([]byte, 14+3)
-	message[0], message[1] = 2, 1
-	binary.BigEndian.PutUint32(message[2:6], 7)
-	binary.BigEndian.PutUint64(message[6:14], 11)
-	copy(message[14:], "abc")
+	message, err := protocol.EncodeTerminalOutput(protocol.TerminalOutputFrame{Channel: protocol.TerminalStdout, StreamID: 7, StartSequence: 11, Data: []byte("abc")}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	output, err := conn.decodeHelperBinary(message)
 	if err != nil || output.endSequence != 14 || string(output.data) != "abc" {
 		t.Fatalf("output=%#v err=%v", output, err)
 	}
-	message[14] = 'z'
+	message[19] = 'z'
 	if string(output.data) != "zbc" {
 		t.Fatal("binary output payload was copied")
+	}
+	stats := conn.TerminalCompressionTelemetry()
+	if stats.RawFrames != 1 || stats.ZstdFrames != 0 || stats.DecodedBytes != 3 || stats.EncodedBytes != 3 || stats.DecodeNanos == 0 || stats.DecodeFailures != 0 {
+		t.Fatalf("compression telemetry=%+v", stats)
+	}
+}
+
+func TestCorruptCompressedOutputIsNeverQueuedOrAcknowledged(t *testing.T) {
+	message := newEarlyOutputMessageConnection()
+	conn := newHelperTerminalConn(message, &resolver.TerminalTarget{SessionID: "ses_corrupt"}, 1)
+	conn.streamID = 7
+	wire, err := protocol.EncodeTerminalOutputAdaptive(protocol.TerminalOutputFrame{Channel: protocol.TerminalStdout, StreamID: 7, StartSequence: 20, Data: bytes.Repeat([]byte("agent output\r\n"), 200)}, nil)
+	if err != nil || wire[2] != protocol.TerminalOutputZstd {
+		t.Fatalf("wire encoding=%d err=%v", wire[2], err)
+	}
+	wire[len(wire)-1] ^= 0xff
+	message.reads <- struct {
+		kind helperMessageType
+		data []byte
+	}{helperBinaryMessage, wire}
+	go conn.readLoop()
+	select {
+	case <-conn.done:
+	case <-time.After(time.Second):
+		t.Fatal("corrupt frame did not close connection")
+	}
+	if got := conn.ackLatest.Load(); got != 0 {
+		t.Fatalf("ack advanced to %d", got)
+	}
+	if output, ok := <-conn.out; ok {
+		t.Fatalf("corrupt output queued: %#v", output)
 	}
 }
 
@@ -349,7 +406,7 @@ func TestCanonicalHelperExistingSessionRequestsFreshRedraw(t *testing.T) {
 			}
 			switch frame.Type {
 			case "hello":
-				writeHelperTestFrame(t, ws, helperFrame{Type: "welcome", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"version":"2.0","capabilities":["health.v1","terminal.v2"]}`)})
+				writeHelperTestFrame(t, ws, helperFrame{Type: "welcome", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"version":"1.0","capabilities":["health.v1","terminal.v1"]}`)})
 			case "detach":
 				return
 			case "request":
@@ -369,7 +426,7 @@ func TestCanonicalHelperExistingSessionRequestsFreshRedraw(t *testing.T) {
 	u, _ := url.Parse(server.URL)
 	u.Scheme = strings.Replace(u.Scheme, "http", "ws", 1)
 	u.Path = "/v1/runtime"
-	target := &resolver.TerminalTarget{Protocol: "paperboat.terminal.v2", WSSEndpoint: u.String(), Auth: resolver.AuthTarget{Method: "bearer", Token: "helper-token"}, SessionID: "ses_gap", TerminalID: "default", CWD: "/workspace"}
+	target := &resolver.TerminalTarget{Protocol: "paperboat.terminal.v1", WSSEndpoint: u.String(), Auth: resolver.AuthTarget{Method: "bearer", Token: "helper-token"}, SessionID: "ses_gap", TerminalID: "default", CWD: "/workspace"}
 	conn, err := NewWebSocketTunnel().Dial(context.Background(), resolver.ConnectInfo{Terminal: target})
 	if err != nil {
 		t.Fatal(err)
@@ -439,7 +496,7 @@ func TestCanonicalHelperRestartIsLimitedToInitialAttach(t *testing.T) {
 						return
 					}
 					if frame.Type == "hello" {
-						writeHelperTestFrame(t, ws, helperFrame{Type: "welcome", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"version":"2.0","capabilities":["health.v1","terminal.v2"]}`)})
+						writeHelperTestFrame(t, ws, helperFrame{Type: "welcome", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"version":"1.0","capabilities":["health.v1","terminal.v1"]}`)})
 						continue
 					}
 					if frame.Type != "request" {
@@ -461,7 +518,7 @@ func TestCanonicalHelperRestartIsLimitedToInitialAttach(t *testing.T) {
 						response := fmt.Sprintf(`{"result":{"stream_id":9,"attachment_id":%q,"session":{"snapshot":{"generation":%d}}},"replay":false}`, test.attachmentID, test.generation)
 						writeHelperTestFrame(t, ws, helperFrame{Type: "response", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(response)})
 						event := fmt.Sprintf(`{"event":"terminal_stream_end","session_id":"ses_retained","state":"exited","final_sequence":17,"exit":{"code":%d}}`, test.wantExitCode)
-						writeHelperTestFrame(t, ws, helperFrame{Type: "event", RequestID: "stream", Version: helperProtocolVersion, Capability: "terminal.v2", Payload: json.RawMessage(event)})
+						writeHelperTestFrame(t, ws, helperFrame{Type: "event", RequestID: "stream", Version: helperProtocolVersion, Capability: "terminal.v1", Payload: json.RawMessage(event)})
 					}
 				}
 			}))
@@ -470,7 +527,7 @@ func TestCanonicalHelperRestartIsLimitedToInitialAttach(t *testing.T) {
 			u, _ := url.Parse(server.URL)
 			u.Scheme = strings.Replace(u.Scheme, "http", "ws", 1)
 			u.Path = "/v1/runtime"
-			target := &resolver.TerminalTarget{Protocol: "paperboat.terminal.v2", WSSEndpoint: u.String(), Auth: resolver.AuthTarget{Method: "bearer", Token: "helper-token"}, SessionID: "ses_retained", TerminalID: "default", RestartIfNotRunning: test.restart, AfterSequence: 9}
+			target := &resolver.TerminalTarget{Protocol: "paperboat.terminal.v1", WSSEndpoint: u.String(), Auth: resolver.AuthTarget{Method: "bearer", Token: "helper-token"}, SessionID: "ses_retained", TerminalID: "default", RestartIfNotRunning: test.restart, AfterSequence: 9}
 			conn, err := NewWebSocketTunnel().Dial(context.Background(), resolver.ConnectInfo{Terminal: target})
 			if err != nil {
 				t.Fatal(err)
@@ -522,7 +579,7 @@ func TestCanonicalHelperStaleReconnectCursorReportsReplayGap(t *testing.T) {
 				return
 			}
 			if frame.Type == "hello" {
-				writeHelperTestFrame(t, ws, helperFrame{Type: "welcome", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"version":"2.0","capabilities":["health.v1","terminal.v2"]}`)})
+				writeHelperTestFrame(t, ws, helperFrame{Type: "welcome", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"version":"1.0","capabilities":["health.v1","terminal.v1"]}`)})
 				continue
 			}
 			if frame.Type != "request" {
@@ -546,7 +603,7 @@ func TestCanonicalHelperStaleReconnectCursorReportsReplayGap(t *testing.T) {
 				}
 				writeHelperTestFrame(t, ws, helperFrame{Type: "response", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"result":{"stream_id":10,"attachment_id":"att_recovered","session":{"snapshot":{"generation":1}}},"replay":true}`)})
 				writeHelperTestBinary(t, ws, 10, 18, []byte("fresh\n"))
-				writeHelperTestFrame(t, ws, helperFrame{Type: "event", RequestID: "stream", Version: helperProtocolVersion, Capability: "terminal.v2", Payload: json.RawMessage(`{"event":"terminal_stream_end","session_id":"ses_gap","state":"exited","final_sequence":24,"exit":{"code":0}}`)})
+				writeHelperTestFrame(t, ws, helperFrame{Type: "event", RequestID: "stream", Version: helperProtocolVersion, Capability: "terminal.v1", Payload: json.RawMessage(`{"event":"terminal_stream_end","session_id":"ses_gap","state":"exited","final_sequence":24,"exit":{"code":0}}`)})
 			}
 		}
 	}))
@@ -556,7 +613,7 @@ func TestCanonicalHelperStaleReconnectCursorReportsReplayGap(t *testing.T) {
 	u.Scheme = strings.Replace(u.Scheme, "http", "ws", 1)
 	u.Path = "/v1/runtime"
 	var cursor atomic.Int64
-	target := &resolver.TerminalTarget{Protocol: "paperboat.terminal.v2", WSSEndpoint: u.String(), Auth: resolver.AuthTarget{Method: "bearer", Token: "helper-token"}, SessionID: "ses_gap", TerminalID: "default", AfterSequence: 2, SequenceSink: func(value int) { cursor.Store(int64(value)) }}
+	target := &resolver.TerminalTarget{Protocol: "paperboat.terminal.v1", WSSEndpoint: u.String(), Auth: resolver.AuthTarget{Method: "bearer", Token: "helper-token"}, SessionID: "ses_gap", TerminalID: "default", AfterSequence: 2, SequenceSink: func(value int) { cursor.Store(int64(value)) }}
 	conn, err := NewWebSocketTunnel().Dial(context.Background(), resolver.ConnectInfo{Terminal: target})
 	if err != nil {
 		t.Fatal(err)
@@ -596,12 +653,10 @@ func writeHelperTestFrame(t *testing.T, ws *websocket.Conn, frame helperFrame) {
 
 func writeHelperTestBinary(t *testing.T, ws *websocket.Conn, streamID uint32, sequence uint64, body []byte) {
 	t.Helper()
-	data := make([]byte, 14+len(body))
-	data[0] = 2
-	data[1] = 1
-	binary.BigEndian.PutUint32(data[2:6], streamID)
-	binary.BigEndian.PutUint64(data[6:14], sequence)
-	copy(data[14:], body)
+	data, err := protocol.EncodeTerminalOutputAdaptive(protocol.TerminalOutputFrame{Channel: protocol.TerminalStdout, StreamID: streamID, StartSequence: sequence, Data: body}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := ws.WriteMessage(websocket.BinaryMessage, data); err != nil {
 		t.Fatal(err)
 	}

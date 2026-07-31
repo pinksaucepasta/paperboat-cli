@@ -15,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pinksaucepasta/paperboat-cli/internal/resolver"
+	"github.com/pinksaucepasta/paperboat/internal/resolver"
 	"github.com/quic-go/quic-go"
 )
 
@@ -84,6 +84,8 @@ type terminalTransportError struct {
 	cause     error
 }
 
+var errInvalidNativeWelcome = errors.New("helper returned an invalid native protocol welcome")
+
 func (e *terminalTransportError) Error() string {
 	return fmt.Sprintf("%s terminal transport unavailable: %v", e.transport, e.cause)
 }
@@ -102,8 +104,8 @@ func (t *QUICTunnel) Dial(ctx context.Context, info resolver.ConnectInfo) (Conn,
 }
 
 func (t *QUICTunnel) Establish(ctx context.Context, info resolver.ConnectInfo) (preparedTerminal, error) {
-	if info.Terminal == nil || info.Terminal.Protocol != "paperboat.terminal.v2" {
-		return nil, errors.New("native QUIC requires terminal protocol v2")
+	if info.Terminal == nil || info.Terminal.Protocol != "paperboat.terminal.v1" {
+		return nil, errors.New("native QUIC requires terminal protocol v1")
 	}
 	connection, err := t.dialTransport(ctx, info.Terminal)
 	if err != nil {
@@ -186,13 +188,13 @@ func authenticateNativeConnection(ctx context.Context, connection *quic.Conn, ta
 	}
 	if err := writeNativePreface(control, nativeRoleControl, id, nil, target.Auth.Token); err != nil {
 		_ = connection.CloseWithError(1, "preface_failed")
-		return nil, err
+		return nil, classifyNativeHandshakeError(ctx, err)
 	}
 	message := newNativeMessageConnection(connection, control)
 	binding, err := nativeHandshake(ctx, message)
 	if err != nil {
 		_ = message.Close()
-		return nil, err
+		return nil, classifyNativeHandshakeError(ctx, err)
 	}
 	input, err := connection.OpenStreamSync(ctx)
 	if err == nil {
@@ -212,6 +214,20 @@ func authenticateNativeConnection(ctx context.Context, connection *quic.Conn, ta
 	}
 	message.attach(input, output)
 	return message, nil
+}
+
+func classifyNativeHandshakeError(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	var remote *helperRemoteError
+	if errors.As(err, &remote) && !remote.Retryable || errors.Is(err, errInvalidNativeWelcome) {
+		return err
+	}
+	return &terminalTransportError{transport: "QUIC", cause: err}
 }
 
 func nativeEndpoint(target *resolver.TerminalTarget) (string, string, error) {
@@ -237,7 +253,7 @@ func certificateError(err error) bool {
 }
 
 func nativeHandshake(ctx context.Context, message helperMessageConnection) ([]byte, error) {
-	payload, _ := json.Marshal(map[string]any{"min_version": helperProtocolVersion, "max_version": helperProtocolVersion, "capabilities": []string{"terminal.v2", "health.v1"}})
+	payload, _ := json.Marshal(map[string]any{"min_version": helperProtocolVersion, "max_version": helperProtocolVersion, "capabilities": []string{"terminal.v1", "health.v1"}})
 	id := helperID("req_")
 	if err := writeHelperFrame(ctx, message, helperFrame{Type: "hello", RequestID: id, Version: helperProtocolVersion, Payload: payload}); err != nil {
 		return nil, err
@@ -254,8 +270,8 @@ func nativeHandshake(ctx context.Context, message helperMessageConnection) ([]by
 		Capabilities []string `json:"capabilities"`
 		Binding      []byte   `json:"binding_secret"`
 	}
-	if frame.Type != "welcome" || frame.RequestID != id || json.Unmarshal(frame.Payload, &welcome) != nil || welcome.Version != helperProtocolVersion || len(welcome.Binding) != nativeBindingSize || !containsString(welcome.Capabilities, "terminal.v2") || !containsString(welcome.Capabilities, "health.v1") {
-		return nil, errors.New("helper returned an invalid native protocol welcome")
+	if frame.Type != "welcome" || frame.RequestID != id || json.Unmarshal(frame.Payload, &welcome) != nil || welcome.Version != helperProtocolVersion || len(welcome.Binding) != nativeBindingSize || !containsString(welcome.Capabilities, "terminal.v1") || !containsString(welcome.Capabilities, "health.v1") {
+		return nil, errInvalidNativeWelcome
 	}
 	return welcome.Binding, nil
 }

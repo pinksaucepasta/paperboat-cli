@@ -25,6 +25,11 @@ type Auth struct {
 	Token     string
 	ExpiresAt time.Time
 }
+type Binding struct {
+	SourceMachineID      string
+	DestinationMachineID string
+	InitiatingUserID     string
+}
 type Policy struct {
 	Revision               string `json:"revision"`
 	MaxFileBytes           int64  `json:"max_file_bytes"`
@@ -42,19 +47,21 @@ type Source struct {
 	Reader   io.ReadSeeker
 }
 type Manifest struct {
-	TransferID      string    `json:"transfer_id"`
-	BatchID         string    `json:"batch_id"`
-	Direction       string    `json:"direction"`
-	SessionID       string    `json:"session_id"`
-	Basename        string    `json:"basename"`
-	Size            int64     `json:"size"`
-	SHA256          string    `json:"sha256"`
-	CommittedOffset int64     `json:"committed_offset"`
-	State           string    `json:"state"`
-	ResultCode      string    `json:"result_code,omitempty"`
-	ReceiptPath     string    `json:"receipt_path,omitempty"`
-	CreatedAt       time.Time `json:"created_at"`
-	ExpiresAt       time.Time `json:"expires_at"`
+	TransferID           string    `json:"transfer_id"`
+	BatchID              string    `json:"batch_id"`
+	SourceMachineID      string    `json:"source_machine_id"`
+	DestinationMachineID string    `json:"destination_machine_id"`
+	InitiatingUserID     string    `json:"initiating_user_id"`
+	SessionID            string    `json:"session_id,omitempty"`
+	Basename             string    `json:"basename"`
+	Size                 int64     `json:"size"`
+	SHA256               string    `json:"sha256"`
+	CommittedOffset      int64     `json:"committed_offset"`
+	State                string    `json:"state"`
+	ResultCode           string    `json:"result_code,omitempty"`
+	ReceiptPath          string    `json:"receipt_path,omitempty"`
+	CreatedAt            time.Time `json:"created_at"`
+	ExpiresAt            time.Time `json:"expires_at"`
 }
 type Batch struct {
 	BatchID   string     `json:"batch_id"`
@@ -85,20 +92,22 @@ func (e *Error) Error() string {
 }
 
 type Client struct {
-	Endpoint      string
-	HTTPClient    *http.Client
-	RefreshAuth   func(context.Context) (Auth, error)
-	MaxConcurrent int
-	authMu        sync.RWMutex
-	refreshMu     sync.Mutex
-	auth          Auth
+	Endpoint        string
+	HTTPClient      *http.Client
+	RefreshAuth     func(context.Context) (Auth, error)
+	MaxConcurrent   int
+	DeliveryTimeout time.Duration
+	authMu          sync.RWMutex
+	refreshMu       sync.Mutex
+	auth            Auth
+	binding         Binding
 }
 
-func NewClient(endpoint string, auth Auth, client *http.Client) *Client {
+func NewClient(endpoint string, auth Auth, binding Binding, client *http.Client) *Client {
 	if client == nil {
 		client = &http.Client{Timeout: 5 * time.Minute}
 	}
-	return &Client{Endpoint: strings.TrimRight(endpoint, "/"), HTTPClient: client, MaxConcurrent: 2, auth: auth}
+	return &Client{Endpoint: strings.TrimRight(endpoint, "/"), HTTPClient: client, MaxConcurrent: 2, DeliveryTimeout: 10 * time.Minute, auth: auth, binding: binding}
 }
 
 func (c *Client) UpdateAuth(auth Auth) { c.setAuth(auth) }
@@ -140,14 +149,8 @@ func (c *Client) VerifyPolicy(ctx context.Context, expected Policy) error {
 	return nil
 }
 
-func (c *Client) UploadBatch(ctx context.Context, batchID, sessionID string, sources []Source) (Batch, error) {
-	return c.uploadBatch(ctx, batchID, sessionID, "pb_to_pbh", sources)
-}
 func (c *Client) SendBatch(ctx context.Context, batchID, sessionID string, sources []Source) (Batch, error) {
-	return c.uploadBatch(ctx, batchID, sessionID, "pbh_to_pb", sources)
-}
-func (c *Client) uploadBatch(ctx context.Context, batchID, sessionID, direction string, sources []Source) (Batch, error) {
-	if len(sources) < 1 || len(sources) > 10 {
+	if c.binding.SourceMachineID == "" || c.binding.DestinationMachineID == "" || c.binding.InitiatingUserID == "" || c.binding.SourceMachineID == c.binding.DestinationMachineID || len(sources) < 1 || len(sources) > 10 {
 		return Batch{}, errors.New("file transfer batch must contain one through ten files")
 	}
 	files := make([]map[string]any, len(sources))
@@ -157,7 +160,7 @@ func (c *Client) uploadBatch(ctx context.Context, batchID, sessionID, direction 
 		}
 		files[i] = map[string]any{"basename": source.Basename, "size": source.Size, "sha256": hex.EncodeToString(source.SHA256[:])}
 	}
-	payload, _ := json.Marshal(map[string]any{"batch_id": batchID, "direction": direction, "session_id": sessionID, "files": files})
+	payload, _ := json.Marshal(map[string]any{"batch_id": batchID, "source_machine_id": c.binding.SourceMachineID, "destination_machine_id": c.binding.DestinationMachineID, "initiating_user_id": c.binding.InitiatingUserID, "session_id": sessionID, "files": files})
 	var batch Batch
 	if err := c.retryJSONRequest(ctx, http.MethodPost, c.Endpoint, operationID("create", batchID), "application/json", 0, payload, &batch); err != nil {
 		return Batch{}, err
@@ -213,13 +216,26 @@ func (c *Client) uploadBatch(ctx context.Context, batchID, sessionID, direction 
 			c.cancelBatch(batch.Transfers)
 			return Batch{}, err
 		}
-		if direction == "pb_to_pbh" && (completed.Result.Code != "published" || completed.Result.Path == "") || direction == "pbh_to_pb" && completed.Result.Code != "pending" {
+		if completed.Result.Code != "published" && completed.Result.Code != "pending" {
 			c.cancelBatch(batch.Transfers)
-			return Batch{}, errors.New("helper did not publish completed transfer")
+			return Batch{}, errors.New("helper rejected completed transfer")
 		}
 		batch.Transfers[i] = completed.Transfer
-		if direction == "pb_to_pbh" {
-			batch.Paths[i] = completed.Result.Path
+		batch.Paths[i] = completed.Result.Path
+		if completed.Result.Code == "pending" {
+			waitDuration := c.DeliveryTimeout
+			if waitDuration <= 0 {
+				waitDuration = 10 * time.Minute
+			}
+			waitCtx, cancel := context.WithTimeout(ctx, waitDuration)
+			delivered, waitErr := c.WaitReceipt(waitCtx, completed.Transfer.TransferID)
+			cancel()
+			if waitErr != nil {
+				c.cancelBatch(batch.Transfers)
+				return Batch{}, waitErr
+			}
+			batch.Transfers[i] = delivered
+			batch.Paths[i] = delivered.ReceiptPath
 		}
 	}
 	return batch, nil
@@ -388,6 +404,27 @@ func (c *Client) Offset(ctx context.Context, id string) (int64, error) {
 
 func (c *Client) Cancel(ctx context.Context, id string) error {
 	return c.rawRequest(ctx, http.MethodDelete, c.Endpoint+"/"+id, operationID("cancel", id), "", 0, nil, nil)
+}
+
+func (c *Client) Status(ctx context.Context, id string) (Manifest, error) {
+	var manifest Manifest
+	err := c.retryJSONRequest(ctx, http.MethodGet, c.Endpoint+"/"+id, operationID("status", id), "", 0, nil, &manifest)
+	return manifest, err
+}
+
+func (c *Client) List(ctx context.Context, sessionID string, limit int) ([]Manifest, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	values := url.Values{"limit": {strconv.Itoa(limit)}}
+	if sessionID != "" {
+		values.Set("session_id", sessionID)
+	}
+	var page struct {
+		Items []Manifest `json:"items"`
+	}
+	err := c.retryJSONRequest(ctx, http.MethodGet, c.Endpoint+"?"+values.Encode(), operationID("list", c.binding.DestinationMachineID), "", 0, nil, &page)
+	return page.Items, err
 }
 
 func (c *Client) patchRequest(ctx context.Context, id string, offset int64, source Source) error {

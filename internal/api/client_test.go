@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pinksaucepasta/paperboat-cli/internal/config"
+	"github.com/pinksaucepasta/paperboat/internal/config"
 )
 
 func writeData(w http.ResponseWriter, status int, data any) {
@@ -32,7 +32,7 @@ func TestClientConfigurationUsesServerOwnedURLWithoutAuthentication(t *testing.T
 		writeData(w, http.StatusOK, ClientConfiguration{
 			Version:            "1",
 			CLIVerificationURL: "https://dashboard.paperboat.test/cli/authorize",
-			UserMachinesURL:    "https://dashboard.paperboat.test/dashboard/user-machines",
+			MachinesURL:        "https://dashboard.paperboat.test/dashboard/machines",
 		})
 	}))
 	defer srv.Close()
@@ -41,19 +41,19 @@ func TestClientConfigurationUsesServerOwnedURLWithoutAuthentication(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.UserMachinesURL != "https://dashboard.paperboat.test/dashboard/user-machines" {
-		t.Fatalf("user_machines_url=%q", got.UserMachinesURL)
+	if got.MachinesURL != "https://dashboard.paperboat.test/dashboard/machines" {
+		t.Fatalf("machines_url=%q", got.MachinesURL)
 	}
 }
 
 func TestClientConfigurationRejectsInvalidURL(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		writeData(w, http.StatusOK, ClientConfiguration{Version: "1", UserMachinesURL: "/dashboard/user-machines"})
+		writeData(w, http.StatusOK, ClientConfiguration{Version: "1", MachinesURL: "/dashboard/machines"})
 	}))
 	defer srv.Close()
 
 	_, err := New(srv.URL, config.Credential{}, nil).ClientConfiguration(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "invalid user-machines URL") {
+	if err == nil || !strings.Contains(err.Error(), "invalid machines URL") {
 		t.Fatalf("err=%v", err)
 	}
 }
@@ -116,18 +116,18 @@ func TestConfigAssignmentRequestsUseBearerAndSnakeCase(t *testing.T) {
 		switch r.Method + " " + r.URL.Path {
 		case "GET /v1/config-repositories":
 			writeData(w, http.StatusOK, map[string]any{"items": []map[string]any{{"id": "cfgrepo_1", "provider": "github", "external_ref": "acme/config", "display_name": "Config"}}})
-		case "GET /v1/environments/prj_1/config-assignment":
-			writeData(w, http.StatusOK, map[string]any{"id": "cfgasn_1", "environment_id": "prj_1", "repository_id": "cfgrepo_1", "consent_state": "not_required", "version": 2})
-		case "PUT /v1/environments/prj_1/config-assignment":
+		case "GET /v1/machines/mch_1/config-assignment":
+			writeData(w, http.StatusOK, map[string]any{"id": "cfgasn_1", "environment_id": "mch_1", "repository_id": "cfgrepo_1", "consent_state": "not_required", "version": 2})
+		case "PUT /v1/machines/mch_1/config-assignment":
 			var body map[string]any
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatal(err)
 			}
-			if body["repository_id"] != "cfgrepo_1" || body["expected_version"] != float64(2) {
+			if body["repository_id"] != "cfgrepo_1" || body["mode"] != "push_only" || body["expected_version"] != float64(2) {
 				t.Fatalf("body=%v", body)
 			}
-			writeData(w, http.StatusOK, map[string]any{"id": "cfgasn_1", "environment_id": "prj_1", "repository_id": "cfgrepo_1", "consent_state": "not_required", "version": 3})
-		case "DELETE /v1/environments/prj_1/config-assignment":
+			writeData(w, http.StatusOK, map[string]any{"id": "cfgasn_1", "environment_id": "mch_1", "repository_id": "cfgrepo_1", "consent_state": "not_required", "version": 3})
+		case "DELETE /v1/machines/mch_1/config-assignment":
 			w.WriteHeader(http.StatusNoContent)
 		default:
 			http.NotFound(w, r)
@@ -139,17 +139,17 @@ func TestConfigAssignmentRequestsUseBearerAndSnakeCase(t *testing.T) {
 	if err != nil || len(repos) != 1 || repos[0].ID != "cfgrepo_1" {
 		t.Fatalf("repos=%v err=%v", repos, err)
 	}
-	assignment, err := c.ConfigAssignment(context.Background(), "prj_1")
+	assignment, err := c.ConfigAssignment(context.Background(), "mch_1")
 	if err != nil || assignment.Version != 2 || assignment.RepositoryID == nil {
 		t.Fatalf("assignment=%+v err=%v", assignment, err)
 	}
-	if _, err := c.AssignConfig(context.Background(), "prj_1", "cfgrepo_1", 2); err != nil {
+	if _, err := c.AssignConfig(context.Background(), "mch_1", "cfgrepo_1", "push_only", 2); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.UnassignConfig(context.Background(), "prj_1", 3); err != nil {
+	if err := c.UnassignConfig(context.Background(), "mch_1", 3); err != nil {
 		t.Fatal(err)
 	}
-	if got := requests[len(requests)-1]; got != "DELETE /v1/environments/prj_1/config-assignment?expected_version=3" {
+	if got := requests[len(requests)-1]; got != "DELETE /v1/machines/mch_1/config-assignment?expected_version=3" {
 		t.Fatalf("last request=%q", got)
 	}
 }
@@ -233,14 +233,18 @@ func TestUserMachineRequestsUseScopedRoutes(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		paths = append(paths, r.Method+" "+r.URL.RequestURI())
 		switch r.URL.Path {
-		case "/v1/user-machines":
+		case "/v1/machines":
 			writeData(w, http.StatusOK, UserMachinePage{Items: []UserMachine{{ID: "um_1", DisplayName: "Studio Mac", Online: true}}, Pagination: Pagination{}})
-		case "/v1/user-machines/um_1/connection-descriptor":
+		case "/v1/machines/um_1/connection-descriptor":
 			body, _ := io.ReadAll(r.Body)
 			connectBodies = append(connectBodies, string(body))
 			writeData(w, http.StatusOK, ConnectionDescriptor{Schema: ConnectionSchemaV1, UserMachineID: "um_1", Connectable: false})
-		case "/v1/user-machines/um_1/connection-readiness":
+		case "/v1/machines/um_1/connection-readiness":
 			writeData(w, http.StatusOK, ConnectionDescriptor{Schema: ConnectionSchemaV1, UserMachineID: "um_1", Connectable: false})
+		case "/v1/machines/um_1/file-transfer-descriptor":
+			body, _ := io.ReadAll(r.Body)
+			connectBodies = append(connectBodies, string(body))
+			writeData(w, http.StatusOK, FileTransfer{Endpoint: "https://machine.test/v1/file-transfers", SourceMachineID: "um_source", DestinationMachineID: "um_1", InitiatingUserID: "usr_1"})
 		default:
 			http.NotFound(w, r)
 		}
@@ -264,10 +268,13 @@ func TestUserMachineRequestsUseScopedRoutes(t *testing.T) {
 	if _, err := c.UserMachineConnectionReadinessForSession(context.Background(), "um_1", "pts_1"); err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(paths, ","); !strings.Contains(got, "GET /v1/user-machines?limit=200&offset=0&sort=display_name") || !strings.Contains(got, "POST /v1/user-machines/um_1/connection-descriptor") || !strings.Contains(got, "GET /v1/user-machines/um_1/connection-readiness?terminal_session_id=pts_1") {
+	if descriptor, err := c.MachineFileTransferDescriptor(context.Background(), "um_1", "um_source", "pts_1"); err != nil || descriptor.SourceMachineID != "um_source" {
+		t.Fatalf("transfer descriptor=%+v err=%v", descriptor, err)
+	}
+	if got := strings.Join(paths, ","); !strings.Contains(got, "GET /v1/machines?limit=200&offset=0&sort=display_name") || !strings.Contains(got, "POST /v1/machines/um_1/connection-descriptor") || !strings.Contains(got, "GET /v1/machines/um_1/connection-readiness?terminal_session_id=pts_1") {
 		t.Fatalf("paths=%q", got)
 	}
-	if got := strings.Join(connectBodies, ","); got != `,{"terminal_session_id":"pts_1"}` {
+	if got := strings.Join(connectBodies, ","); got != `,{"terminal_session_id":"pts_1"},{"session_id":"pts_1","source_machine_id":"um_source"}` {
 		t.Fatalf("connect bodies=%q", got)
 	}
 }
@@ -286,14 +293,14 @@ func TestUserMachineRevokeRequestsUseBearer(t *testing.T) {
 	if err := c.DeleteUserMachine(context.Background(), "um_1"); err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(seen, ","); got != "POST /v1/user-machines/um_1/disconnect Bearer token,DELETE /v1/user-machines/um_1 Bearer token" {
+	if got := strings.Join(seen, ","); got != "POST /v1/machines/um_1/disconnect Bearer token,DELETE /v1/machines/um_1 Bearer token" {
 		t.Fatalf("requests=%q", got)
 	}
 }
 
 func TestSetUserMachineAvailabilityUsesIdempotencyAndVersion(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPut || r.URL.Path != "/v1/user-machines/um_1/availability-policy" || r.Header.Get("Authorization") != "Bearer token" || r.Header.Get("Idempotency-Key") != "availability-1" {
+		if r.Method != http.MethodPut || r.URL.Path != "/v1/machines/um_1/availability-policy" || r.Header.Get("Authorization") != "Bearer token" || r.Header.Get("Idempotency-Key") != "availability-1" {
 			t.Fatalf("request=%s %s auth=%q idempotency=%q", r.Method, r.URL.Path, r.Header.Get("Authorization"), r.Header.Get("Idempotency-Key"))
 		}
 		var body map[string]any
@@ -314,16 +321,16 @@ func TestUserMachineTerminalSessionRequests(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seen = append(seen, r.Method+" "+r.URL.Path)
 		switch r.Method + " " + r.URL.Path {
-		case "POST /v1/user-machines/um_1/terminal-sessions":
+		case "POST /v1/machines/um_1/terminal-sessions":
 			if r.Header.Get("Idempotency-Key") != "key-1" {
 				t.Fatalf("missing idempotency key")
 			}
 			_, _ = w.Write([]byte(`{"data":{"id":"pts_1","name":"api","state":"running","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}}`))
-		case "GET /v1/user-machines/um_1/terminal-sessions":
+		case "GET /v1/machines/um_1/terminal-sessions":
 			_, _ = w.Write([]byte(`{"data":{"items":[{"id":"pts_1","name":"api","state":"running","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}],"pagination":{"next_offset":null}}}`))
-		case "PATCH /v1/user-machines/um_1/terminal-sessions/pts_1":
+		case "PATCH /v1/machines/um_1/terminal-sessions/pts_1":
 			_, _ = w.Write([]byte(`{"data":{"id":"pts_1","name":"renamed","state":"running","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}}`))
-		case "POST /v1/user-machines/um_1/terminal-sessions/pts_1/close", "DELETE /v1/user-machines/um_1/terminal-sessions/pts_1":
+		case "POST /v1/machines/um_1/terminal-sessions/pts_1/close", "DELETE /v1/machines/um_1/terminal-sessions/pts_1":
 			writeData(w, http.StatusOK, map[string]bool{"ok": true})
 		default:
 			http.NotFound(w, r)
@@ -499,10 +506,10 @@ func TestProjectConnectionDescriptorDecodesPaperboatWebSocketTerminal(t *testing
 			ProjectID:   "prj_1",
 			Connectable: true,
 			Terminal: &Terminal{
-				Protocol:   "paperboat.terminal.v2",
+				Protocol:   "paperboat.terminal.v1",
 				Endpoints:  TerminalEndpoints{QUIC: "quic://edge.paperboat.test:443", WSS: "wss://edge.paperboat.test/v1/runtime"},
 				Auth:       AuthMaterial{Method: "websocket_ticket", Ticket: "pct_1", Scopes: []string{"terminal:operate"}},
-				ThreadID:   "paperboat-cli",
+				ThreadID:   "paperboat",
 				TerminalID: "term-1",
 				CWD:        "/workspace",
 			},
@@ -516,7 +523,7 @@ func TestProjectConnectionDescriptorDecodesPaperboatWebSocketTerminal(t *testing
 	if err != nil {
 		t.Fatalf("ProjectConnectionDescriptor: %v", err)
 	}
-	if !resp.Connectable || resp.Terminal == nil || resp.Terminal.Protocol != "paperboat.terminal.v2" || resp.Terminal.Endpoints.WSS != "wss://edge.paperboat.test/v1/runtime" {
+	if !resp.Connectable || resp.Terminal == nil || resp.Terminal.Protocol != "paperboat.terminal.v1" || resp.Terminal.Endpoints.WSS != "wss://edge.paperboat.test/v1/runtime" {
 		t.Fatalf("resp = %+v", resp)
 	}
 	if resp.Terminal.Auth.Method != "websocket_ticket" || resp.Terminal.Auth.Ticket != "pct_1" {
@@ -581,7 +588,7 @@ func TestNormalizeCanonicalConnectionDescriptor(t *testing.T) {
 	response := ConnectionDescriptor{
 		Schema: ConnectionSchemaV1, Issuer: "https://api.paperboat.test", Connectable: true, ExpiresAt: expires,
 		Environment:  &Environment{ID: "env_1", Kind: "byod", ResourceID: "um_1", DisplayName: "Studio", State: "ready", Root: "/Users/paperboat"},
-		Terminal:     &Terminal{Protocol: "paperboat.terminal.v2", Endpoints: TerminalEndpoints{QUIC: "quic://edge.paperboat.test:443", WSS: "wss://edge.paperboat.test/v1/runtime"}, SessionID: "session_1"},
+		Terminal:     &Terminal{Protocol: "paperboat.terminal.v1", Endpoints: TerminalEndpoints{QUIC: "quic://edge.paperboat.test:443", WSS: "wss://edge.paperboat.test/v1/runtime"}, SessionID: "session_1"},
 		FileTransfer: &FileTransfer{Endpoint: "https://edge.paperboat.test/v1/file-transfers"},
 	}
 	if err := response.NormalizeConnectionDescriptor(); err != nil {
@@ -590,7 +597,7 @@ func TestNormalizeCanonicalConnectionDescriptor(t *testing.T) {
 	if response.UserMachineID != "um_1" || response.Environment.EnvironmentID != "env_1" || response.Environment.ProjectRoot != "/Users/paperboat" {
 		t.Fatalf("canonical environment was not normalized: %#v", response)
 	}
-	if response.Terminal.Protocol != "paperboat.terminal.v2" || response.Terminal.Endpoints.WSS == "" {
+	if response.Terminal.Protocol != "paperboat.terminal.v1" || response.Terminal.Endpoints.WSS == "" {
 		t.Fatalf("canonical terminal was not normalized: %#v", response.Terminal)
 	}
 	if response.FileTransfer.Endpoint != "https://edge.paperboat.test/v1/file-transfers" {
@@ -599,7 +606,7 @@ func TestNormalizeCanonicalConnectionDescriptor(t *testing.T) {
 }
 
 func TestNormalizeConnectionDescriptorRejectsUnknownSchema(t *testing.T) {
-	response := ConnectionDescriptor{Schema: "paperboat.environment-connection/v2"}
+	response := ConnectionDescriptor{Schema: "paperboat.environment-connection/unknown"}
 	if err := response.NormalizeConnectionDescriptor(); err == nil {
 		t.Fatal("expected unknown schema to fail closed")
 	}
@@ -611,7 +618,7 @@ func TestProjectConnectionDescriptorDecodesCanonicalDescriptor(t *testing.T) {
 		writeData(w, http.StatusOK, map[string]any{
 			"schema": ConnectionSchemaV1, "issuer": "https://api.paperboat.test", "connectable": true, "expires_at": expires,
 			"environment":   map[string]any{"id": "env_1", "kind": "hosted", "resource_id": "prj_1", "state": "ready", "root": "/workspace"},
-			"terminal":      map[string]any{"protocol": "paperboat.terminal.v2", "endpoints": map[string]any{"quic": "quic://edge.paperboat.test:443", "wss": "wss://edge.paperboat.test/v1/runtime"}, "session_id": "session_1", "thread_id": "thread_1", "terminal_id": "term_1", "cwd": "/workspace"},
+			"terminal":      map[string]any{"protocol": "paperboat.terminal.v1", "endpoints": map[string]any{"quic": "quic://edge.paperboat.test:443", "wss": "wss://edge.paperboat.test/v1/runtime"}, "session_id": "session_1", "thread_id": "thread_1", "terminal_id": "term_1", "cwd": "/workspace"},
 			"file_transfer": map[string]any{"endpoint": "https://edge.paperboat.test/v1/file-transfers"},
 		})
 	}))

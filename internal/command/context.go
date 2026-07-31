@@ -6,6 +6,7 @@ import (
 	"context"
 	"flag"
 	"io"
+	"time"
 )
 
 type Action func(*Context) error
@@ -40,6 +41,22 @@ func (c *Context) Float64(name string) float64 {
 		return 0
 	}
 	result, _ := value.Get().(float64)
+	return result
+}
+func (c *Context) Uint(name string) uint {
+	value, ok := c.set.Lookup(name).Value.(flag.Getter)
+	if !ok {
+		return 0
+	}
+	result, _ := value.Get().(uint)
+	return result
+}
+func (c *Context) Duration(name string) time.Duration {
+	value, ok := c.set.Lookup(name).Value.(flag.Getter)
+	if !ok {
+		return 0
+	}
+	result, _ := value.Get().(time.Duration)
 	return result
 }
 func (c *Context) Args() Args { return Args{values: c.set.Args()} }

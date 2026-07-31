@@ -5,11 +5,12 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/pinksaucepasta/paperboat-cli/internal/telemetry"
+	"github.com/pinksaucepasta/paperboat/internal/telemetry"
 )
 
 type tunnelEventSink struct{ events []telemetry.Event }
@@ -28,6 +29,15 @@ type reconnectTestConn struct {
 	code   int
 	err    error
 	writes bytes.Buffer
+}
+
+type compressionTestConn struct {
+	*reconnectTestConn
+	compression TerminalCompressionTelemetry
+}
+
+func (c *compressionTestConn) TerminalCompressionTelemetry() TerminalCompressionTelemetry {
+	return c.compression
 }
 
 func (c *reconnectTestConn) Write(p []byte) (int, error) { return c.writes.Write(p) }
@@ -98,6 +108,36 @@ func TestReconnectingConnRecordsOutputPerformance(t *testing.T) {
 	}
 	if queue := sink.events[2]; queue.Stage != "socket_read_to_queue" || queue.SizeBytes != 6 || queue.Count != 1 {
 		t.Fatalf("queue stage = %+v", queue)
+	}
+}
+
+func TestReconnectingConnRecordsCompressionWithoutContentOrIdentity(t *testing.T) {
+	conn := &compressionTestConn{reconnectTestConn: &reconnectTestConn{Reader: bytes.NewReader(nil)}, compression: TerminalCompressionTelemetry{RawFrames: 2, ZstdFrames: 3, DecodedBytes: 4096, EncodedBytes: 1024, DecodeNanos: 9000, DecodeFailures: 1}}
+	sink := &tunnelEventSink{}
+	c := NewObservedReconnectingConn(context.Background(), conn, 0, 0, nil, sink, time.Now, TelemetryContext{ProjectID: "prj_private", EnvironmentID: "env_private"})
+	_, _ = io.ReadAll(c)
+	_, _ = c.Wait()
+	compressionEvents := 0
+	for _, event := range sink.events {
+		if event.Name != "terminal.compression" {
+			continue
+		}
+		compressionEvents++
+		if event.ProjectID != "" || event.EnvironmentID != "" || event.SessionID != "" || event.RequestID != "" {
+			t.Fatalf("compression event contains identity: %+v", event)
+		}
+	}
+	if compressionEvents != 6 {
+		t.Fatalf("compression events=%d all=%+v", compressionEvents, sink.events)
+	}
+}
+
+func TestCompressionTelemetryCountersSaturate(t *testing.T) {
+	if got := telemetryInt64(math.MaxUint64); got != math.MaxInt64 {
+		t.Fatalf("counter=%d", got)
+	}
+	if got := telemetryInt64SaturatingAdd(math.MaxInt64, 1); got != math.MaxInt64 {
+		t.Fatalf("sum=%d", got)
 	}
 }
 

@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pinksaucepasta/paperboat-cli/internal/resolver"
+	"github.com/pinksaucepasta/paperboat/internal/resolver"
 )
 
 type TerminalTransport string

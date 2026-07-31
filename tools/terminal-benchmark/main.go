@@ -34,7 +34,9 @@ type config struct {
 	readyTimeout  time.Duration
 	readyInterval time.Duration
 	startupDelay  time.Duration
+	loadWarmup    time.Duration
 	interval      time.Duration
+	loadCommand   string
 	mode          string
 	scenario      string
 	rttMS         int
@@ -132,6 +134,8 @@ func run(parent context.Context, args []string, stdout, stderr io.Writer) error 
 	flags.DurationVar(&cfg.readyTimeout, "ready-timeout", time.Minute, "maximum time to wait for a responsive shell")
 	flags.DurationVar(&cfg.readyInterval, "ready-interval", time.Second, "interval between shell readiness probes")
 	flags.DurationVar(&cfg.startupDelay, "startup-delay", 2*time.Second, "delay before the first probe")
+	flags.StringVar(&cfg.loadCommand, "load-command", "", "shell command to start after readiness; never recorded")
+	flags.DurationVar(&cfg.loadWarmup, "load-warmup", 500*time.Millisecond, "delay between starting load and probing")
 	flags.DurationVar(&cfg.interval, "interval", 20*time.Millisecond, "delay between probes")
 	flags.StringVar(&cfg.mode, "mode", "unknown", "transport label")
 	flags.StringVar(&cfg.scenario, "scenario", "idle", "load scenario label")
@@ -142,7 +146,7 @@ func run(parent context.Context, args []string, stdout, stderr io.Writer) error 
 		return err
 	}
 	command := flags.Args()
-	if cfg.samples < 1 || cfg.warmup < 0 || cfg.samples+cfg.warmup > 1<<16 || cfg.probeTimeout <= 0 || cfg.probeAttempts < 1 || cfg.probeAttempts > 16 || cfg.readyTimeout <= 0 || cfg.readyInterval <= 0 || cfg.startupDelay < 0 || cfg.interval < 0 || len(command) == 0 {
+	if cfg.samples < 1 || cfg.warmup < 0 || cfg.samples+cfg.warmup > 1<<16 || cfg.probeTimeout <= 0 || cfg.probeAttempts < 1 || cfg.probeAttempts > 16 || cfg.readyTimeout <= 0 || cfg.readyInterval <= 0 || cfg.startupDelay < 0 || cfg.loadWarmup < 0 || cfg.interval < 0 || strings.ContainsAny(cfg.loadCommand, "\r\n") || len(command) == 0 {
 		return errors.New("invalid arguments; provide a command after --")
 	}
 	if !validLabel(cfg.mode) || !validLabel(cfg.scenario) || cfg.rttMS < 0 || cfg.lossPercent < 0 || cfg.lossPercent > 100 {
@@ -210,6 +214,16 @@ func run(parent context.Context, args []string, stdout, stderr io.Writer) error 
 		cancel()
 		return err
 	}
+	if cfg.loadCommand != "" {
+		if _, err := io.WriteString(stdin, cfg.loadCommand+"\n"); err != nil {
+			cancel()
+			return fmt.Errorf("start terminal load: %w", err)
+		}
+		if err := waitDuration(ctx, cfg.loadWarmup); err != nil {
+			cancel()
+			return err
+		}
+	}
 	latencies := make([]time.Duration, 0, cfg.samples)
 	probeAttempts := 0
 	probeTimeouts := 0
@@ -266,6 +280,17 @@ func run(parent context.Context, args []string, stdout, stderr io.Writer) error 
 	encoder := json.NewEncoder(stdout)
 	encoder.SetEscapeHTML(false)
 	return encoder.Encode(measurement)
+}
+
+func waitDuration(ctx context.Context, duration time.Duration) error {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func runProbe(ctx context.Context, writer io.Writer, matcher *streamMatcher, runPrefix string, index, maxAttempts int, timeout time.Duration) (time.Duration, int, error) {

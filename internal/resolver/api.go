@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pinksaucepasta/paperboat-cli/internal/api"
-	"github.com/pinksaucepasta/paperboat-cli/internal/config"
-	"github.com/pinksaucepasta/paperboat-cli/internal/telemetry"
+	"github.com/pinksaucepasta/paperboat/internal/api"
+	"github.com/pinksaucepasta/paperboat/internal/config"
+	"github.com/pinksaucepasta/paperboat/internal/telemetry"
 )
 
 // ErrProjectNotFound means no project matched the requested name or id for this
@@ -47,7 +47,7 @@ type target struct {
 
 const (
 	targetProject     = "project"
-	targetUserMachine = "user_machine"
+	targetUserMachine = "machine"
 )
 
 // APIResolver resolves projects against paperboat-server: it matches the
@@ -131,7 +131,7 @@ func (r *APIResolver) Resolve(ctx context.Context, req ConnectRequest) (ConnectI
 		},
 	}
 	if resp.FileTransfer != nil {
-		info.FileTransfer = &FileTransferTarget{Endpoint: resp.FileTransfer.Endpoint, Auth: mapAuth(resp.FileTransfer.Auth), Policy: resp.FileTransfer.Policy}
+		info.FileTransfer = &FileTransferTarget{Endpoint: resp.FileTransfer.Endpoint, SourceMachineID: resp.FileTransfer.SourceMachineID, DestinationMachineID: resp.FileTransfer.DestinationMachineID, InitiatingUserID: resp.FileTransfer.InitiatingUserID, Auth: mapAuth(resp.FileTransfer.Auth), Policy: resp.FileTransfer.Policy}
 	}
 	outcome = "success"
 	return info, nil
@@ -159,12 +159,12 @@ func (r *APIResolver) connect(ctx context.Context, target target, terminalSessio
 	case targetUserMachine:
 		client, ok := r.client.(userMachineClient)
 		if !ok {
-			return api.ConnectionDescriptor{}, errors.New("this server client does not support user machines")
+			return api.ConnectionDescriptor{}, errors.New("this server client does not support machines")
 		}
 		if terminalSessionID != "" {
 			sessionClient, ok := r.client.(userMachineSessionClient)
 			if !ok {
-				return api.ConnectionDescriptor{}, errors.New("this server client does not support selected user-machine terminal sessions")
+				return api.ConnectionDescriptor{}, errors.New("this server client does not support selected machine terminal sessions")
 			}
 			return sessionClient.UserMachineConnectionDescriptorForSession(ctx, target.id, terminalSessionID)
 		}
@@ -188,12 +188,12 @@ func (r *APIResolver) connectionStatus(ctx context.Context, target target, termi
 	case targetUserMachine:
 		client, ok := r.client.(userMachineClient)
 		if !ok {
-			return api.ConnectionDescriptor{}, errors.New("this server client does not support user machines")
+			return api.ConnectionDescriptor{}, errors.New("this server client does not support machines")
 		}
 		if terminalSessionID != "" {
 			sessionClient, ok := r.client.(userMachineSessionClient)
 			if !ok {
-				return api.ConnectionDescriptor{}, errors.New("this server client does not support selected user-machine terminal sessions")
+				return api.ConnectionDescriptor{}, errors.New("this server client does not support selected machine terminal sessions")
 			}
 			return sessionClient.UserMachineConnectionReadinessForSession(ctx, target.id, terminalSessionID)
 		}
@@ -288,12 +288,12 @@ func (r *APIResolver) findTarget(ctx context.Context, requested string) (target,
 	}
 	machines, listErr := client.ListUserMachines(ctx)
 	if listErr != nil {
-		// User machines are additive. Older control planes do not expose
+		// Machines are additive. Older control planes do not expose
 		// this catalog yet, so preserve the historical project-not-found result.
 		if api.IsNotFound(listErr) {
 			return target{}, projectErr
 		}
-		return target{}, fmt.Errorf("list user machines: %w", listErr)
+		return target{}, fmt.Errorf("list machines: %w", listErr)
 	}
 	want := strings.TrimSpace(requested)
 	for _, machine := range machines {
@@ -316,7 +316,7 @@ func (r *APIResolver) findTarget(ctx context.Context, requested string) (target,
 		for _, machine := range matches {
 			ids = append(ids, machine.ID)
 		}
-		return target{}, fmt.Errorf("%w: %q matches user-machine IDs %s; connect using an exact ID", ErrProjectAmbiguous, requested, strings.Join(ids, ", "))
+		return target{}, fmt.Errorf("%w: %q matches machine IDs %s; connect using an exact ID", ErrProjectAmbiguous, requested, strings.Join(ids, ", "))
 	}
 	return target{}, projectErr
 }
@@ -389,8 +389,8 @@ func (r *APIResolver) waitConnectable(ctx context.Context, target target, termin
 
 func terminalConnectionError(resp api.ConnectionDescriptor) error {
 	switch resp.Status {
-	case "user_machine_revoked":
-		return &api.APIError{Code: resp.Status, Message: "user machine access was revoked"}
+	case "machine_revoked":
+		return &api.APIError{Code: resp.Status, Message: "machine access was revoked"}
 	}
 	return nil
 }
@@ -411,7 +411,7 @@ func (r *APIResolver) validateDescriptor(resp api.ConnectionDescriptor, target t
 		return api.ConnectionDescriptor{}, errors.New("server returned a descriptor for the wrong project")
 	}
 	if target.kind == targetUserMachine && resp.UserMachineID != target.id {
-		return api.ConnectionDescriptor{}, errors.New("server returned a descriptor for the wrong user machine")
+		return api.ConnectionDescriptor{}, errors.New("server returned a descriptor for the wrong machine")
 	}
 	if resp.ExpiresAt.IsZero() || !time.Now().Before(resp.ExpiresAt) {
 		return api.ConnectionDescriptor{}, errors.New("server returned an expired connection descriptor")
@@ -419,7 +419,7 @@ func (r *APIResolver) validateDescriptor(resp api.ConnectionDescriptor, target t
 	if !completeTerminalDescriptor(resp.Terminal) {
 		return api.ConnectionDescriptor{}, errors.New("server returned an incomplete terminal descriptor")
 	}
-	if resp.Terminal.Protocol != "paperboat.terminal.v2" || resp.Environment == nil || strings.TrimSpace(resp.Environment.EnvironmentID) == "" || !environmentMatchesTarget(resp.Environment, target) {
+	if resp.Terminal.Protocol != "paperboat.terminal.v1" || resp.Environment == nil || strings.TrimSpace(resp.Environment.EnvironmentID) == "" || !environmentMatchesTarget(resp.Environment, target) {
 		return api.ConnectionDescriptor{}, errors.New("server returned an invalid environment descriptor")
 	}
 	if strings.TrimSpace(resp.Environment.ProjectRoot) == "" || strings.TrimSpace(resp.Terminal.ThreadID) == "" || strings.TrimSpace(resp.Terminal.TerminalID) == "" || strings.TrimSpace(resp.Terminal.CWD) == "" {

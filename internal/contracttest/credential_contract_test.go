@@ -21,8 +21,9 @@ func TestCredentialContractVector(t *testing.T) {
 			Public string `json:"public_base64url"`
 		} `json:"key"`
 		Claims struct {
-			Audience string   `json:"aud"`
-			Scopes   []string `json:"scope"`
+			Audience  string   `json:"aud"`
+			MachineID string   `json:"machine_id"`
+			Scopes    []string `json:"scope"`
 		} `json:"claims"`
 		Token string `json:"token"`
 	}
@@ -30,7 +31,7 @@ func TestCredentialContractVector(t *testing.T) {
 		t.Fatal(err)
 	}
 	parts := strings.Split(vector.Token, ".")
-	if !vector.TestOnly || len(parts) != 3 || vector.Claims.Audience != "paperboat-helper" || len(vector.Claims.Scopes) != 1 || vector.Claims.Scopes[0] != "terminal:operate" {
+	if !vector.TestOnly || len(parts) != 3 || vector.Claims.Audience != "paperboat-machine" || vector.Claims.MachineID == "" || len(vector.Claims.Scopes) != 1 || vector.Claims.Scopes[0] != "terminal:operate" {
 		t.Fatalf("invalid terminal credential vector")
 	}
 	publicKey, err := base64.RawURLEncoding.DecodeString(vector.Key.Public)

@@ -8,10 +8,10 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/pinksaucepasta/paperboat-cli/internal/buildinfo"
+	"github.com/pinksaucepasta/paperboat/internal/buildinfo"
 )
 
-const ClientID = "paperboat-cli"
+const ClientID = "paperboat"
 
 var ClientScopes = []string{"account:read", "clients:revoke", "projects:read", "projects:connect", "session:refresh"}
 
@@ -71,7 +71,7 @@ func publicCall(ctx context.Context, baseURL, path string, body any, bearer stri
 		return err
 	}
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "paperboat-cli/"+buildinfo.Version)
+	req.Header.Set("User-Agent", "paperboat/"+buildinfo.Version)
 	req.Header.Set("X-Paperboat-Client", ClientID)
 	req.Header.Set("X-Paperboat-Protocol", buildinfo.ProtocolVersion)
 	if body != nil {

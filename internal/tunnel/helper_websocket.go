@@ -15,15 +15,17 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/pinksaucepasta/paperboat-cli/internal/resolver"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/protocol"
+	"github.com/pinksaucepasta/paperboat/internal/resolver"
 )
 
 const (
-	helperProtocolVersion = "2.0"
-	helperMaxFrame        = 256 << 10
-	helperInputChunkBytes = 32 << 10
-	helperRequestTimeout  = 30 * time.Second
-	helperReplayGapMarker = "\r\n[paperboat] Earlier terminal output is unavailable; showing retained output.\r\n"
+	helperProtocolVersion         = "1.0"
+	helperMaxFrame                = 256 << 10
+	helperInputChunkBytes         = 32 << 10
+	helperOutputQueueDecodedLimit = terminalOutputQueueChunks * protocol.MaxTerminalOutputBytes
+	helperRequestTimeout          = 30 * time.Second
+	helperReplayGapMarker         = "\r\n[paperboat] Earlier terminal output is unavailable; showing retained output.\r\n"
 	// Existing sessions have already emitted their terminal-mode setup, but a
 	// newly attached local terminal has not seen it. Restore the modes a TUI
 	// establishes before asking the application to redraw. Without this, mouse
@@ -141,23 +143,30 @@ type helperTerminalConn struct {
 	pendingMu sync.Mutex
 	responses map[string]chan helperFrame
 
-	attachmentID  string
-	streamID      uint32
-	generation    uint64
-	inputSeq      atomic.Uint64
-	resizeSeq     atomic.Uint64
-	ackLatest     atomic.Uint64
-	ackSent       atomic.Uint64
-	ackNotify     chan struct{}
-	ackMu         sync.Mutex
-	replayRedraw  atomic.Bool
-	closing       atomic.Bool
-	finishOnce    sync.Once
-	exitCode      int
-	exitErr       error
-	initial       []helperOutput
-	initialBinary [][]byte
-	initialBytes  int
+	attachmentID              string
+	streamID                  uint32
+	generation                uint64
+	inputSeq                  atomic.Uint64
+	resizeSeq                 atomic.Uint64
+	ackLatest                 atomic.Uint64
+	ackSent                   atomic.Uint64
+	ackNotify                 chan struct{}
+	ackMu                     sync.Mutex
+	replayRedraw              atomic.Bool
+	closing                   atomic.Bool
+	finishOnce                sync.Once
+	exitCode                  int
+	exitErr                   error
+	initial                   []helperOutput
+	initialBinary             [][]byte
+	initialEncodedBytes       int
+	initialDecodedBytes       int
+	compressionRawFrames      atomic.Uint64
+	compressionZstdFrames     atomic.Uint64
+	compressionDecodedBytes   atomic.Uint64
+	compressionEncodedBytes   atomic.Uint64
+	compressionDecodeNanos    atomic.Uint64
+	compressionDecodeFailures atomic.Uint64
 }
 
 func newHelperTerminalConn(message helperMessageConnection, target *resolver.TerminalTarget, queue int) *helperTerminalConn {
@@ -168,7 +177,7 @@ func newHelperTerminalConn(message helperMessageConnection, target *resolver.Ter
 }
 
 func helperHandshake(ctx context.Context, message helperMessageConnection) (bool, error) {
-	payload, _ := json.Marshal(map[string]any{"min_version": helperProtocolVersion, "max_version": helperProtocolVersion, "capabilities": []string{"terminal.v2", "health.v1"}})
+	payload, _ := json.Marshal(map[string]any{"min_version": helperProtocolVersion, "max_version": helperProtocolVersion, "capabilities": []string{"terminal.v1", "health.v1"}})
 	requestID := helperID("req_")
 	if err := writeHelperFrame(ctx, message, helperFrame{Type: "hello", RequestID: requestID, Version: helperProtocolVersion, Payload: payload}); err != nil {
 		return false, err
@@ -187,7 +196,7 @@ func helperHandshake(ctx context.Context, message helperMessageConnection) (bool
 		Version      string   `json:"version"`
 		Capabilities []string `json:"capabilities"`
 	}
-	if json.Unmarshal(frame.Payload, &welcome) != nil || welcome.Version != helperProtocolVersion || !containsString(welcome.Capabilities, "terminal.v2") || !containsString(welcome.Capabilities, "health.v1") {
+	if json.Unmarshal(frame.Payload, &welcome) != nil || welcome.Version != helperProtocolVersion || !containsString(welcome.Capabilities, "terminal.v1") || !containsString(welcome.Capabilities, "health.v1") {
 		return false, errors.New("helper did not negotiate required capabilities")
 	}
 	return true, nil
@@ -209,7 +218,7 @@ func (c *helperTerminalConn) initialize(ctx context.Context) error {
 		return errors.New("canonical terminal descriptor is missing session ID")
 	}
 	snapshotPayload, _ := json.Marshal(map[string]any{"action": "snapshot", "session_id": c.target.SessionID})
-	frame, err := c.requestSync(ctx, "terminal.v2", snapshotPayload)
+	frame, err := c.requestSync(ctx, "terminal.v1", snapshotPayload)
 	existingSession := err == nil
 	var snapshotLatest uint64
 	if err != nil {
@@ -229,7 +238,7 @@ func (c *helperTerminalConn) initialize(ctx context.Context) error {
 		// helper history left by the previous machine identity.
 		name := canonicalSessionName(c.target.SessionID)
 		createPayload, _ := json.Marshal(map[string]any{"action": "create", "session_id": c.target.SessionID, "name": name, "cwd": c.target.CWD, "columns": cols, "rows": rows, "environment": c.target.Env})
-		frame, err = c.requestSync(ctx, "terminal.v2", createPayload)
+		frame, err = c.requestSync(ctx, "terminal.v1", createPayload)
 		if err != nil {
 			return fmt.Errorf("create helper terminal session: %w", err)
 		}
@@ -239,7 +248,7 @@ func (c *helperTerminalConn) initialize(ctx context.Context) error {
 		snapshotLatest = latestSequence
 		if c.target.RestartIfNotRunning && (state == "exited" || state == "closed") {
 			restartPayload, _ := json.Marshal(map[string]any{"action": "restart", "session_id": c.target.SessionID})
-			frame, err = c.requestSync(ctx, "terminal.v2", restartPayload)
+			frame, err = c.requestSync(ctx, "terminal.v1", restartPayload)
 			if err != nil {
 				return fmt.Errorf("restart helper terminal session: %w", err)
 			}
@@ -263,7 +272,7 @@ func (c *helperTerminalConn) initialize(ctx context.Context) error {
 	}
 	attach := func(sequence uint64, liveBoundary bool) (helperFrame, error) {
 		payload, _ := json.Marshal(map[string]any{"action": "attach", "session_id": c.target.SessionID, "from_sequence": sequence, "at_live_boundary": liveBoundary})
-		return c.requestSync(ctx, "terminal.v2", payload)
+		return c.requestSync(ctx, "terminal.v1", payload)
 	}
 	frame, err = attach(fromSequence, existingSession && c.target.AfterSequence <= 0)
 	for attempt := 0; err != nil; attempt++ {
@@ -320,7 +329,8 @@ func (c *helperTerminalConn) initialize(ctx context.Context) error {
 		c.initial = append(c.initial, output)
 	}
 	c.initialBinary = nil
-	c.initialBytes = 0
+	c.initialEncodedBytes = 0
+	c.initialDecodedBytes = 0
 	if existingSession {
 		// An attached TUI may be idle and therefore emit no pixels on reconnect.
 		// Ask it to repaint after the caller applies the local terminal size.
@@ -349,11 +359,14 @@ func (c *helperTerminalConn) requestSync(ctx context.Context, capability string,
 			return helperFrame{}, err
 		}
 		if messageType == helperBinaryMessage {
-			if len(data) == 0 || len(data) > helperMaxFrame || len(c.initialBinary) >= 64 || c.initialBytes > 4*helperMaxFrame-len(data) {
+			info, inspectErr := protocol.InspectTerminalOutput(data)
+			decodedBytes := int(info.UncompressedLength)
+			if inspectErr != nil || len(c.initialBinary) >= 64 || c.initialEncodedBytes > 4*helperMaxFrame-len(data) || c.initialDecodedBytes > 4*helperMaxFrame-decodedBytes {
 				return helperFrame{}, errors.New("helper sent excessive output before terminal attachment")
 			}
 			c.initialBinary = append(c.initialBinary, bytes.Clone(data))
-			c.initialBytes += len(data)
+			c.initialEncodedBytes += len(data)
+			c.initialDecodedBytes += decodedBytes
 			continue
 		}
 		if messageType != helperStructuredMessage {
@@ -827,15 +840,29 @@ func decodeHelperFrame(data []byte) (helperFrame, error) {
 }
 
 func (c *helperTerminalConn) decodeHelperBinary(data []byte) (helperOutput, error) {
-	if len(data) <= 14 {
-		return helperOutput{}, errors.New("helper binary frame is truncated")
-	}
-	if len(data) > helperMaxFrame || data[0] != 2 || (data[1] != 1 && data[1] != 2) || binary.BigEndian.Uint32(data[2:6]) != c.streamID {
+	started := time.Now()
+	frame, err := protocol.DecodeTerminalOutput(data)
+	c.compressionDecodeNanos.Add(uint64(time.Since(started).Nanoseconds()))
+	if err != nil || frame.StreamID != c.streamID {
+		c.compressionDecodeFailures.Add(1)
 		return helperOutput{}, errors.New("helper binary frame is invalid")
 	}
-	start := binary.BigEndian.Uint64(data[6:14])
-	body := data[14:]
-	return helperOutput{data: body, endSequence: start + uint64(len(body))}, nil
+	c.compressionDecodedBytes.Add(uint64(len(frame.Data)))
+	c.compressionEncodedBytes.Add(uint64(len(data) - protocol.TerminalOutputHeaderBytes))
+	if frame.Encoding == protocol.TerminalOutputZstd {
+		c.compressionZstdFrames.Add(1)
+	} else {
+		c.compressionRawFrames.Add(1)
+	}
+	return helperOutput{data: frame.Data, endSequence: frame.StartSequence + uint64(len(frame.Data))}, nil
+}
+
+func (c *helperTerminalConn) TerminalCompressionTelemetry() TerminalCompressionTelemetry {
+	return TerminalCompressionTelemetry{
+		RawFrames: c.compressionRawFrames.Load(), ZstdFrames: c.compressionZstdFrames.Load(),
+		DecodedBytes: c.compressionDecodedBytes.Load(), EncodedBytes: c.compressionEncodedBytes.Load(),
+		DecodeNanos: c.compressionDecodeNanos.Load(), DecodeFailures: c.compressionDecodeFailures.Load(),
+	}
 }
 
 func decodeHelperError(frame helperFrame) error {

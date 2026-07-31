@@ -1,0 +1,178 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os/exec"
+	"strings"
+	"time"
+)
+
+type Runner interface {
+	Run(context.Context, string, ...string) error
+}
+
+type ExecRunner struct{}
+
+func (ExecRunner) Run(ctx context.Context, name string, arguments ...string) error {
+	output := &boundedCommandOutput{limit: 8 << 10}
+	command := exec.CommandContext(ctx, name, arguments...)
+	command.Stdout, command.Stderr = output, output
+	if err := command.Run(); err != nil {
+		return &CommandError{Tool: name, Output: output.String(), Cause: err}
+	}
+	return nil
+}
+
+type CommandError struct {
+	Tool   string
+	Output string
+	Cause  error
+}
+
+func (e *CommandError) Error() string {
+	if e.Output == "" {
+		return fmt.Sprintf("%s: %v", e.Tool, e.Cause)
+	}
+	return fmt.Sprintf("%s: %v: %s", e.Tool, e.Cause, e.Output)
+}
+func (e *CommandError) Unwrap() error { return e.Cause }
+
+type boundedCommandOutput struct {
+	bytes []byte
+	limit int
+}
+
+func (w *boundedCommandOutput) Write(data []byte) (int, error) {
+	consumed := len(data)
+	remaining := w.limit - len(w.bytes)
+	if remaining > 0 {
+		if len(data) > remaining {
+			data = data[:remaining]
+		}
+		w.bytes = append(w.bytes, data...)
+	}
+	return consumed, nil
+}
+func (w *boundedCommandOutput) String() string { return string(w.bytes) }
+
+type SystemdController struct {
+	Runner Runner
+	Unit   string
+	User   bool
+}
+
+func (c SystemdController) unit() string {
+	if c.Unit != "" {
+		return c.Unit
+	}
+	return "paperboat-runtime-host.service"
+}
+
+func (c SystemdController) Apply(ctx context.Context, _ string, upgrading bool) error {
+	if c.Runner == nil {
+		return ErrInvalidDefinition
+	}
+	args := func(values ...string) []string {
+		if c.User {
+			return append([]string{"--user"}, values...)
+		}
+		return values
+	}
+	if err := c.Runner.Run(ctx, "systemctl", args("daemon-reload")...); err != nil {
+		return err
+	}
+	if err := c.Runner.Run(ctx, "systemctl", args("enable", "--now", c.unit())...); err != nil {
+		return err
+	}
+	if upgrading {
+		if err := c.Runner.Run(ctx, "systemctl", args("restart", c.unit())...); err != nil {
+			return err
+		}
+	}
+	return c.Runner.Run(ctx, "systemctl", args("is-active", "--quiet", c.unit())...)
+}
+
+func (c SystemdController) Remove(ctx context.Context, _ string) error {
+	if c.Runner == nil {
+		return ErrInvalidDefinition
+	}
+	args := func(values ...string) []string {
+		if c.User {
+			return append([]string{"--user"}, values...)
+		}
+		return values
+	}
+	if err := c.Runner.Run(ctx, "systemctl", args("disable", "--now", c.unit())...); err != nil {
+		return err
+	}
+	return c.Runner.Run(ctx, "systemctl", args("daemon-reload")...)
+}
+
+type LaunchdController struct {
+	Runner     Runner
+	UID        int
+	Label      string
+	UserDomain bool
+}
+
+func (c LaunchdController) label() string {
+	if c.Label != "" {
+		return c.Label
+	}
+	return Label
+}
+
+func (c LaunchdController) Apply(ctx context.Context, path string, upgrading bool) error {
+	if c.Runner == nil || c.UID < 0 {
+		return ErrInvalidDefinition
+	}
+	domain := "system"
+	if c.UserDomain {
+		domain = fmt.Sprintf("gui/%d", c.UID)
+	}
+	service := domain + "/" + c.label()
+	if upgrading {
+		if err := c.Runner.Run(ctx, "launchctl", "bootout", service); err != nil && !strings.Contains(err.Error(), "No such process") {
+			return err
+		}
+	}
+	for {
+		err := c.Runner.Run(ctx, "launchctl", "bootstrap", domain, path)
+		if err == nil {
+			break
+		}
+		// launchd can keep a recently booted-out label reserved briefly. It can
+		// also return an error after loading the job, so verify state before retrying.
+		if c.Runner.Run(ctx, "launchctl", "print", service) == nil {
+			break
+		}
+		timer := time.NewTimer(500 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return errors.Join(err, ctx.Err())
+		case <-timer.C:
+		}
+	}
+	if err := c.Runner.Run(ctx, "launchctl", "kickstart", "-k", service); err != nil {
+		return err
+	}
+	return c.Runner.Run(ctx, "launchctl", "print", service)
+}
+
+func (c LaunchdController) Remove(ctx context.Context, _ string) error {
+	if c.Runner == nil || c.UID < 0 {
+		return ErrInvalidDefinition
+	}
+	domain := "system"
+	if c.UserDomain {
+		domain = fmt.Sprintf("gui/%d", c.UID)
+	}
+	err := c.Runner.Run(ctx, "launchctl", "bootout", domain+"/"+c.label())
+	if err != nil && strings.Contains(err.Error(), "No such process") {
+		return nil
+	}
+	return err
+}

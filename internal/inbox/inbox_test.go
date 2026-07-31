@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pinksaucepasta/paperboat-cli/internal/filetransfer"
+	"github.com/pinksaucepasta/paperboat/internal/filetransfer"
 )
 
 type fakeClient struct {
@@ -39,14 +39,14 @@ func (f *fakeClient) Content(_ context.Context, _ filetransfer.Manifest, offset 
 
 func manifest(id, name string, data []byte) filetransfer.Manifest {
 	digest := sha256.Sum256(data)
-	return filetransfer.Manifest{TransferID: id, BatchID: "batch_1", Direction: "pbh_to_pb", SessionID: "session_1", Basename: name, Size: int64(len(data)), SHA256: hex.EncodeToString(digest[:]), State: "pending"}
+	return filetransfer.Manifest{TransferID: id, BatchID: "batch_1", SourceMachineID: "machine_host", DestinationMachineID: "machine_local", InitiatingUserID: "user_1", SessionID: "session_1", Basename: name, Size: int64(len(data)), SHA256: hex.EncodeToString(digest[:]), State: "pending"}
 }
 
 func TestDeliverResumesPartialAcrossPBRestartAndReturnsDurableRelativePath(t *testing.T) {
 	downloads := t.TempDir()
 	data := []byte("exact transfer bytes")
 	client := &fakeClient{data: data}
-	receiver, err := New(Config{Client: client, SessionID: "session_1", Downloads: downloads})
+	receiver, err := New(Config{Client: client, MachineID: "machine_local", SessionID: "session_1", Path: filepath.Join(downloads, "Paperboat Inbox")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +58,7 @@ func TestDeliverResumesPartialAcrossPBRestartAndReturnsDurableRelativePath(t *te
 		t.Fatal(err)
 	}
 	// A new Inbox has no process-local state from the instance that wrote the partial.
-	receiver, err = New(Config{Client: client, SessionID: "session_1", Downloads: downloads})
+	receiver, err = New(Config{Client: client, MachineID: "machine_local", SessionID: "session_1", Path: filepath.Join(downloads, "Paperboat Inbox")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +86,7 @@ func TestDeliverUsesCollisionNameAndDeduplicatesTransfer(t *testing.T) {
 	}
 	data := []byte("new")
 	client := &fakeClient{data: data}
-	receiver, _ := New(Config{Client: client, SessionID: "session_1", Downloads: downloads})
+	receiver, _ := New(Config{Client: client, MachineID: "machine_local", SessionID: "session_1", Path: filepath.Join(downloads, "Paperboat Inbox")})
 	item := manifest("ft_duplicate", "report.txt", data)
 	first, err := receiver.Deliver(context.Background(), item)
 	if err != nil {
@@ -119,7 +119,7 @@ func TestDeliverMixedTenFileBatchPreservesExactBytesWithoutDuplicates(t *testing
 	paths := make([]string, len(contents))
 	for index, content := range contents {
 		client := &fakeClient{data: content}
-		receiver, err := New(Config{Client: client, SessionID: "session_1", Downloads: downloads})
+		receiver, err := New(Config{Client: client, MachineID: "machine_local", SessionID: "session_1", Path: filepath.Join(downloads, "Paperboat Inbox")})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -159,7 +159,7 @@ func TestDeliverRejectsAlteredJournaledFile(t *testing.T) {
 	downloads := t.TempDir()
 	data := []byte("original")
 	client := &fakeClient{data: data}
-	receiver, _ := New(Config{Client: client, SessionID: "session_1", Downloads: downloads})
+	receiver, _ := New(Config{Client: client, MachineID: "machine_local", SessionID: "session_1", Path: filepath.Join(downloads, "Paperboat Inbox")})
 	item := manifest("ft_altered", "report.txt", data)
 	path, err := receiver.Deliver(context.Background(), item)
 	if err != nil {
@@ -189,7 +189,7 @@ func TestDeliverRecoversJournalBeforeLinkCrash(t *testing.T) {
 		t.Fatal(err)
 	}
 	client := &fakeClient{data: data}
-	receiver, _ := New(Config{Client: client, SessionID: "session_1", Downloads: downloads})
+	receiver, _ := New(Config{Client: client, MachineID: "machine_local", SessionID: "session_1", Path: filepath.Join(downloads, "Paperboat Inbox")})
 	path, err := receiver.Deliver(context.Background(), item)
 	if err != nil {
 		t.Fatal(err)
@@ -206,7 +206,7 @@ func TestDeliverRecoversJournalBeforeLinkCrash(t *testing.T) {
 func TestDeliverSupportsEmptyFileWithoutDownload(t *testing.T) {
 	client := &fakeClient{}
 	downloads := t.TempDir()
-	receiver, _ := New(Config{Client: client, SessionID: "session_1", Downloads: downloads})
+	receiver, _ := New(Config{Client: client, MachineID: "machine_local", SessionID: "session_1", Path: filepath.Join(downloads, "Paperboat Inbox")})
 	path, err := receiver.Deliver(context.Background(), manifest("ft_empty", "empty", nil))
 	if err != nil {
 		t.Fatal(err)
@@ -223,7 +223,7 @@ func TestDeliverSupportsEmptyFileWithoutDownload(t *testing.T) {
 func TestDeliverRejectsDigestMismatchAndRemovesPartial(t *testing.T) {
 	downloads := t.TempDir()
 	client := &fakeClient{data: []byte("wrong")}
-	receiver, _ := New(Config{Client: client, SessionID: "session_1", Downloads: downloads})
+	receiver, _ := New(Config{Client: client, MachineID: "machine_local", SessionID: "session_1", Path: filepath.Join(downloads, "Paperboat Inbox")})
 	item := manifest("ft_bad", "bad.bin", []byte("right"))
 	if _, err := receiver.Deliver(context.Background(), item); err == nil || errorCode(err) != "digest_mismatch" {
 		t.Fatalf("err=%v", err)

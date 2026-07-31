@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pinksaucepasta/paperboat-cli/internal/api"
-	"github.com/pinksaucepasta/paperboat-cli/internal/config"
-	"github.com/pinksaucepasta/paperboat-cli/internal/telemetry"
+	"github.com/pinksaucepasta/paperboat/internal/api"
+	"github.com/pinksaucepasta/paperboat/internal/config"
+	"github.com/pinksaucepasta/paperboat/internal/telemetry"
 )
 
 type resolverEventSink struct{ events []telemetry.Event }
@@ -116,10 +116,10 @@ func TestFindTargetAllowsUserMachineWithoutHostedPlan(t *testing.T) {
 
 func readyTerminal() *api.Terminal {
 	return &api.Terminal{
-		Protocol:   "paperboat.terminal.v2",
+		Protocol:   "paperboat.terminal.v1",
 		Endpoints:  api.TerminalEndpoints{QUIC: "quic://edge.paperboat.test:443", WSS: "wss://edge.paperboat.test/v1/runtime"},
 		Auth:       api.AuthMaterial{Method: "websocket_ticket", Ticket: "pct_1", ExpiresAt: time.Now().Add(time.Hour), Scopes: []string{"terminal:operate"}},
-		ThreadID:   "paperboat-cli",
+		ThreadID:   "paperboat",
 		TerminalID: "term-1",
 		CWD:        "/workspace",
 	}
@@ -188,9 +188,9 @@ func TestValidateFileTransferRequiresExactRouteScopeAndPolicy(t *testing.T) {
 
 func routeOnlyTerminal() *api.Terminal {
 	return &api.Terminal{
-		Protocol:   "paperboat.terminal.v2",
+		Protocol:   "paperboat.terminal.v1",
 		Endpoints:  api.TerminalEndpoints{QUIC: "quic://edge.paperboat.test:443", WSS: "wss://edge.paperboat.test/v1/runtime"},
-		ThreadID:   "paperboat-cli",
+		ThreadID:   "paperboat",
 		TerminalID: "term-1",
 		CWD:        "/workspace",
 	}
@@ -264,11 +264,11 @@ func TestResolveUserMachineByDisplayName(t *testing.T) {
 func TestResolveUserMachineRevocationStopsWithoutPolling(t *testing.T) {
 	fc := &fakeClient{
 		machines:   []api.UserMachine{{ID: "um_1", DisplayName: "Studio Mac", State: "disconnected"}},
-		connectSeq: []api.ConnectionDescriptor{{UserMachineID: "um_1", UserMachineState: "disconnected", Status: "user_machine_revoked", Reason: "access_revoked"}},
+		connectSeq: []api.ConnectionDescriptor{{UserMachineID: "um_1", UserMachineState: "disconnected", Status: "machine_revoked", Reason: "access_revoked"}},
 	}
 	_, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "Studio Mac"})
 	var apiErr *api.APIError
-	if !errors.As(err, &apiErr) || apiErr.Code != "user_machine_revoked" {
+	if !errors.As(err, &apiErr) || apiErr.Code != "machine_revoked" {
 		t.Fatalf("err=%v", err)
 	}
 	if fc.statusN != 0 {
@@ -286,7 +286,7 @@ func TestResolveRejectsUserMachineDescriptorForDifferentMachine(t *testing.T) {
 		connectSeq: []api.ConnectionDescriptor{response},
 	}
 	_, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "um_1"})
-	if err == nil || !strings.Contains(err.Error(), "wrong user machine") {
+	if err == nil || !strings.Contains(err.Error(), "wrong machine") {
 		t.Fatalf("err = %v", err)
 	}
 }
@@ -326,10 +326,10 @@ func TestResolveKeepsSelectedUserMachineSessionThroughReadinessPolling(t *testin
 		t.Fatal(err)
 	}
 	if got := strings.Join(fc.connectSessionIDs, ","); got != "pts_api,pts_api" {
-		t.Fatalf("user-machine connect session IDs = %q", got)
+		t.Fatalf("machine connect session IDs = %q", got)
 	}
 	if got := strings.Join(fc.statusSessionIDs, ","); got != "pts_api" {
-		t.Fatalf("user-machine status session IDs = %q", got)
+		t.Fatalf("machine status session IDs = %q", got)
 	}
 }
 

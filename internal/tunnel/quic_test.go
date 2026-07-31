@@ -2,11 +2,36 @@ package tunnel
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"io"
 	"testing"
 
-	"github.com/pinksaucepasta/paperboat-cli/internal/resolver"
+	"github.com/pinksaucepasta/paperboat/internal/resolver"
 )
+
+func TestNativeHandshakeErrorClassification(t *testing.T) {
+	transient := errors.New("edge route is rebuilding")
+	if err := classifyNativeHandshakeError(context.Background(), transient); !FallbackEligible(err) {
+		t.Fatalf("transient handshake error is not retryable: %v", err)
+	}
+	retryableRemote := &helperRemoteError{Code: "route_unavailable", Retryable: true}
+	if err := classifyNativeHandshakeError(context.Background(), retryableRemote); !FallbackEligible(err) {
+		t.Fatalf("retryable remote error is not retryable: %v", err)
+	}
+	permanent := &helperRemoteError{Code: "not_found_or_forbidden", Retryable: false}
+	if err := classifyNativeHandshakeError(context.Background(), permanent); FallbackEligible(err) || !errors.Is(err, permanent) {
+		t.Fatalf("permanent remote error was reclassified: %v", err)
+	}
+	if err := classifyNativeHandshakeError(context.Background(), errInvalidNativeWelcome); FallbackEligible(err) || !errors.Is(err, errInvalidNativeWelcome) {
+		t.Fatalf("invalid welcome was reclassified: %v", err)
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := classifyNativeHandshakeError(canceled, transient); !errors.Is(err, context.Canceled) || FallbackEligible(err) {
+		t.Fatalf("cancellation was reclassified: %v", err)
+	}
+}
 
 type oneByteReader struct{ data []byte }
 

@@ -4,11 +4,12 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/pinksaucepasta/paperboat-cli/internal/telemetry"
+	"github.com/pinksaucepasta/paperboat/internal/telemetry"
 )
 
 type ReconnectFunc func(context.Context) (Conn, error)
@@ -181,6 +182,7 @@ func (c *ReconnectingConn) supervise(conn Conn) {
 		code, err := conn.Wait()
 		_ = conn.Close()
 		<-readDone
+		c.recordCompression(conn)
 		if err == nil || !errors.Is(err, ErrTransportLost) || c.reconnect == nil || c.maxRetries <= 0 {
 			if err == nil {
 				lifetimeOutcome = "success"
@@ -363,6 +365,47 @@ func (c *ReconnectingConn) recordTerminalStage(stage string, bytes, count, laten
 	if e.Validate() == nil {
 		c.telemetry.Record(e)
 	}
+}
+
+func (c *ReconnectingConn) recordCompression(conn Conn) {
+	if c.telemetry == nil {
+		return
+	}
+	reporter, ok := conn.(terminalCompressionReporter)
+	if !ok {
+		return
+	}
+	stats := reporter.TerminalCompressionTelemetry()
+	events := []telemetry.Event{
+		{Name: "terminal.compression", At: c.now(), Stage: "raw_frames", Count: telemetryInt64(stats.RawFrames)},
+		{Name: "terminal.compression", At: c.now(), Stage: "zstd_frames", Count: telemetryInt64(stats.ZstdFrames)},
+		{Name: "terminal.compression", At: c.now(), Stage: "decoded_bytes", SizeBytes: telemetryInt64(stats.DecodedBytes)},
+		{Name: "terminal.compression", At: c.now(), Stage: "encoded_bytes", SizeBytes: telemetryInt64(stats.EncodedBytes)},
+		{Name: "terminal.compression", At: c.now(), Stage: "decode", Count: telemetryInt64SaturatingAdd(stats.RawFrames, stats.ZstdFrames), DurationNS: telemetryInt64(stats.DecodeNanos)},
+		{Name: "terminal.compression", At: c.now(), Stage: "decode_failures", Outcome: "failure", Count: telemetryInt64(stats.DecodeFailures)},
+	}
+	for _, event := range events {
+		if event.Count == 0 && event.SizeBytes == 0 && event.DurationNS == 0 {
+			continue
+		}
+		if event.Validate() == nil {
+			c.telemetry.Record(event)
+		}
+	}
+}
+
+func telemetryInt64(value uint64) int64 {
+	if value > math.MaxInt64 {
+		return math.MaxInt64
+	}
+	return int64(value)
+}
+
+func telemetryInt64SaturatingAdd(left, right uint64) int64 {
+	if left > math.MaxInt64 || right > uint64(math.MaxInt64)-left {
+		return math.MaxInt64
+	}
+	return int64(left + right)
 }
 
 func updateAtomicMax(value *atomic.Int64, candidate int64) {

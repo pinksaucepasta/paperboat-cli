@@ -19,6 +19,10 @@ import (
 	"time"
 )
 
+func testBinding() Binding {
+	return Binding{SourceMachineID: "machine_source", DestinationMachineID: "machine_destination", InitiatingUserID: "user_1"}
+}
+
 func source(data []byte) Source {
 	sum := sha256.Sum256(data)
 	return Source{Basename: "data.bin", Size: int64(len(data)), SHA256: sum, Reader: bytes.NewReader(data)}
@@ -38,7 +42,7 @@ func TestUploadBatchResumesAndRefreshesWithoutChangingTransferID(t *testing.T) {
 		writer.Header().Set("Content-Type", "application/json")
 		switch {
 		case request.Method == http.MethodPost && request.URL.Path == "/v1/file-transfers":
-			_ = json.NewEncoder(writer).Encode(Batch{BatchID: "fb_1", Transfers: []Manifest{{TransferID: "ft_1", BatchID: "fb_1", Direction: "pb_to_pbh", SessionID: "ses_1", Basename: "data.bin", Size: int64(len(data)), SHA256: sourceDigest(data), CommittedOffset: 0, State: "created"}}})
+			_ = json.NewEncoder(writer).Encode(Batch{BatchID: "fb_1", Transfers: []Manifest{{TransferID: "ft_1", BatchID: "fb_1", SourceMachineID: "machine_source", DestinationMachineID: "machine_destination", InitiatingUserID: "user_1", SessionID: "ses_1", Basename: "data.bin", Size: int64(len(data)), SHA256: sourceDigest(data), CommittedOffset: 0, State: "created"}}})
 		case request.Method == http.MethodHead && strings.HasSuffix(request.URL.Path, "/content"):
 			writer.Header().Set("Upload-Offset", strconv.FormatInt(committed, 10))
 			writer.WriteHeader(http.StatusNoContent)
@@ -69,12 +73,12 @@ func TestUploadBatchResumesAndRefreshesWithoutChangingTransferID(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	client := NewClient(server.URL+"/v1/file-transfers", Auth{Token: "old"}, server.Client())
+	client := NewClient(server.URL+"/v1/file-transfers", Auth{Token: "old"}, testBinding(), server.Client())
 	client.RefreshAuth = func(context.Context) (Auth, error) {
 		refreshes++
 		return Auth{Token: "fresh", ExpiresAt: time.Now().Add(time.Minute)}, nil
 	}
-	batch, err := client.UploadBatch(context.Background(), "fb_1", "ses_1", []Source{source(data)})
+	batch, err := client.SendBatch(context.Background(), "fb_1", "ses_1", []Source{source(data)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,8 +102,8 @@ func TestUploadBatchCancelsEveryManifestAfterFailure(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	client := NewClient(server.URL, Auth{Token: "token"}, server.Client())
-	_, err := client.UploadBatch(context.Background(), "fb", "ses", []Source{source([]byte("a")), source([]byte("b"))})
+	client := NewClient(server.URL, Auth{Token: "token"}, testBinding(), server.Client())
+	_, err := client.SendBatch(context.Background(), "fb", "ses", []Source{source([]byte("a")), source([]byte("b"))})
 	if err == nil {
 		t.Fatal("expected failure")
 	}
@@ -118,7 +122,7 @@ func TestUploadBatchCancelsEveryManifestAfterInvalidCompletion(t *testing.T) {
 			writer.Header().Set("Upload-Offset", "0")
 			writer.WriteHeader(http.StatusNoContent)
 		case request.Method == http.MethodPost && strings.HasSuffix(request.URL.Path, "/complete"):
-			_ = json.NewEncoder(writer).Encode(map[string]any{"transfer": Manifest{TransferID: path.Base(path.Dir(request.URL.Path)), State: "published"}, "result": map[string]any{"code": "pending"}})
+			_ = json.NewEncoder(writer).Encode(map[string]any{"transfer": Manifest{TransferID: path.Base(path.Dir(request.URL.Path)), State: "published"}, "result": map[string]any{"code": "rejected"}})
 		case request.Method == http.MethodDelete:
 			canceled = append(canceled, path.Base(request.URL.Path))
 			writer.WriteHeader(http.StatusNoContent)
@@ -128,13 +132,46 @@ func TestUploadBatchCancelsEveryManifestAfterInvalidCompletion(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	client := NewClient(server.URL+"/v1/file-transfers", Auth{Token: "token"}, server.Client())
-	_, err := client.UploadBatch(context.Background(), "fb", "ses", []Source{source(nil), source(nil)})
+	client := NewClient(server.URL+"/v1/file-transfers", Auth{Token: "token"}, testBinding(), server.Client())
+	_, err := client.SendBatch(context.Background(), "fb", "ses", []Source{source(nil), source(nil)})
 	if err == nil {
 		t.Fatal("expected invalid completion failure")
 	}
 	if len(canceled) != 2 {
 		t.Fatalf("canceled=%v", canceled)
+	}
+}
+
+func TestSendBatchWaitsForPendingDeliveryReceipt(t *testing.T) {
+	statusCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch {
+		case request.Method == http.MethodPost && request.URL.Path == "/v1/file-transfers":
+			_ = json.NewEncoder(writer).Encode(Batch{BatchID: "fb", Transfers: []Manifest{{TransferID: "ft_1", Size: 0, SHA256: sourceDigest(nil)}}})
+		case request.Method == http.MethodHead && strings.HasSuffix(request.URL.Path, "/content"):
+			writer.Header().Set("Upload-Offset", "0")
+			writer.WriteHeader(http.StatusNoContent)
+		case request.Method == http.MethodPost && strings.HasSuffix(request.URL.Path, "/complete"):
+			_ = json.NewEncoder(writer).Encode(map[string]any{"transfer": Manifest{TransferID: "ft_1", State: "pending"}, "result": map[string]any{"code": "pending"}})
+		case request.Method == http.MethodGet && request.URL.Path == "/v1/file-transfers/ft_1":
+			statusCalls++
+			_ = json.NewEncoder(writer).Encode(Manifest{TransferID: "ft_1", State: "delivered", ReceiptPath: "/Paperboat Inbox/data.bin"})
+		default:
+			t.Errorf("unexpected %s %s", request.Method, request.URL.Path)
+			writer.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL+"/v1/file-transfers", Auth{Token: "token"}, testBinding(), server.Client())
+	client.DeliveryTimeout = time.Second
+	batch, err := client.SendBatch(context.Background(), "fb", "ses", []Source{source(nil)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if statusCalls != 1 || len(batch.Transfers) != 1 || batch.Transfers[0].State != "delivered" || len(batch.Paths) != 1 || batch.Paths[0] != "/Paperboat Inbox/data.bin" {
+		t.Fatalf("status_calls=%d batch=%#v", statusCalls, batch)
 	}
 }
 
@@ -157,7 +194,7 @@ func TestProactiveRefreshAppliesToBodyAndHeaderOnlyOperations(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	client := NewClient(server.URL+"/v1/file-transfers", Auth{Token: "expiring", ExpiresAt: time.Now().Add(10 * time.Second)}, server.Client())
+	client := NewClient(server.URL+"/v1/file-transfers", Auth{Token: "expiring", ExpiresAt: time.Now().Add(10 * time.Second)}, testBinding(), server.Client())
 	refreshes := 0
 	client.RefreshAuth = func(context.Context) (Auth, error) {
 		refreshes++
@@ -177,7 +214,7 @@ func TestProactiveRefreshAppliesToBodyAndHeaderOnlyOperations(t *testing.T) {
 func TestCreateRetriesResponseLossWithSameOperationAndBody(t *testing.T) {
 	calls := 0
 	var operation string
-	client := NewClient("https://route.example/v1/file-transfers", Auth{Token: "token"}, &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+	client := NewClient("https://route.example/v1/file-transfers", Auth{Token: "token"}, testBinding(), &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		calls++
 		if calls == 1 {
 			operation = request.Header.Get("X-Paperboat-Operation-ID")
@@ -235,7 +272,7 @@ func TestEveryFileOperationRefreshesOnceAfterUnauthorized(t *testing.T) {
 				}
 			}))
 			defer server.Close()
-			client := NewClient(server.URL+"/v1/file-transfers", Auth{Token: "expired"}, server.Client())
+			client := NewClient(server.URL+"/v1/file-transfers", Auth{Token: "expired"}, testBinding(), server.Client())
 			refreshes := 0
 			client.RefreshAuth = func(context.Context) (Auth, error) {
 				refreshes++

@@ -14,12 +14,12 @@ checksum() {
   shasum -a 256 "$1" | awk '{print $1}'
 }
 
-darwin_amd64="paperboat-cli_${tag}_darwin_amd64.tar.gz"
-darwin_arm64="paperboat-cli_${tag}_darwin_arm64.tar.gz"
-linux_amd64="paperboat-cli_${tag}_linux_amd64.tar.gz"
-linux_arm64="paperboat-cli_${tag}_linux_arm64.tar.gz"
-windows_amd64="paperboat-cli_${tag}_windows_amd64.zip"
-windows_arm64="paperboat-cli_${tag}_windows_arm64.zip"
+darwin_amd64="paperboat_${tag}_darwin_amd64.tar.gz"
+darwin_arm64="paperboat_${tag}_darwin_arm64.tar.gz"
+linux_amd64="paperboat_${tag}_linux_amd64.tar.gz"
+linux_arm64="paperboat_${tag}_linux_arm64.tar.gz"
+windows_amd64="paperboat_${tag}_windows_amd64.zip"
+windows_arm64="paperboat_${tag}_windows_arm64.zip"
 
 for file in "$darwin_amd64" "$darwin_arm64" "$linux_amd64" "$linux_arm64" "$windows_amd64" "$windows_arm64"; do
   test -f "$dist/$file"

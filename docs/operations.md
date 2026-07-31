@@ -1,6 +1,6 @@
 # CLI Security And Operations
 
-The CLI sends `X-Paperboat-Client: paperboat-cli` and
+The CLI sends `X-Paperboat-Client: paperboat` and
 `X-Paperboat-Protocol: 1` on control-plane requests. Release builds also send a
 versioned `User-Agent`. Unsupported protocols must be rejected with HTTP 426 or
 `incompatible_client_version`; `pb` reports the upgrade message and does not
@@ -19,6 +19,24 @@ credentials, terminal bytes, image data, or local/VM paths. Its configured size
 limit bounds disk usage; the oldest accumulated events are truncated when the
 next record would exceed that limit.
 
+Terminal output compression is application framing shared by QUIC and WSS. Terminal
+sequence, replay, queue, and PTY byte counters describe decoded user bytes; connector
+and edge wire counters describe encoded bytes and therefore need not match. Repeated
+terminal codec failures indicate an incompatible or corrupt peer: stop reconnecting,
+retain only typed diagnostics and counters, and upgrade both runtime endpoints. Never
+capture a terminal payload for diagnosis.
+
+Each ended or replaced client transport connection records metadata-only
+`terminal.compression` events for raw/Zstandard frame counts, decoded and encoded bytes,
+decode nanoseconds, and typed failure count. These events intentionally omit project,
+environment, session, request, and user identifiers and never include payload bytes.
+
+The client output queue is bounded by 256 complete decoded events. Each event is bounded
+by `MaxTerminalOutputBytes`, so its worst-case decoded admission is
+`helperOutputQueueDecodedLimit` (about 64 MiB) regardless of encoded size. Output received
+before attach completion is separately bounded to 64 events, 1 MiB encoded, and 1 MiB
+decoded before any payload is queued.
+
 Threat-model sign-off, cross-service metrics and audit events, artifact signing,
 SBOM/provenance, and revocation propagation evidence remain release work in the
 owning repositories.
@@ -35,3 +53,22 @@ attestation verify <archive> --repo <owner>/<repo>` and its adjacent checksum
 before installation.
 
 Incident procedures are maintained in [runbooks.md](runbooks.md).
+
+## Machine runtime services
+
+`pb pair` installs the terminal host and its `runtime` connector. Configuration sync is a
+separate per-user `__runtime-config` service and starts only while the local machine has an
+assignment. Neither process initializes preview monitoring.
+
+`pb preview create` starts one per-user service per preview. `--machine` resolves an owned,
+online paired machine and uses a two-minute `preview_launch` credential to ask that
+machine's host runtime to install the same isolated service. Each runner owns one preview
+connector whose connector ID is the server-issued preview key. Its durable descriptor
+stores the original absolute expiry; after reboot the runner resumes only a matching,
+active server record and uses the remaining lifetime. Expiry or server revocation removes
+the route, descriptor, and service definition. A crash retains the descriptor so the OS
+service can retry without extending expiry.
+
+Machine-control credentials renew in memory and are bound to the enrolled Ed25519 key and
+installation generation. Reinstall, unpair, or machine revocation invalidates them. Never
+copy a runtime state directory to another machine or edit preview service descriptors.

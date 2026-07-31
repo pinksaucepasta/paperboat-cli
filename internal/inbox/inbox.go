@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pinksaucepasta/paperboat-cli/internal/filetransfer"
+	"github.com/pinksaucepasta/paperboat/internal/filetransfer"
 )
 
 const (
@@ -32,8 +32,9 @@ type Client interface {
 
 type Config struct {
 	Client      Client
+	MachineID   string
 	SessionID   string
-	Downloads   string
+	Path        string
 	Notify      func(string)
 	PollSeconds int
 }
@@ -55,18 +56,11 @@ type journal struct {
 }
 
 func New(config Config) (*Inbox, error) {
-	if config.Client == nil || config.SessionID == "" {
+	if config.Client == nil || config.MachineID == "" || config.SessionID == "" {
 		return nil, errors.New("invalid inbox configuration")
 	}
-	if config.Downloads == "" {
-		var err error
-		config.Downloads, err = DownloadsDir()
-		if err != nil {
-			return nil, err
-		}
-	}
-	if !filepath.IsAbs(config.Downloads) {
-		return nil, errors.New("downloads directory must be absolute")
+	if err := EnsurePath(config.Path); err != nil {
+		return nil, err
 	}
 	if config.PollSeconds == 0 {
 		config.PollSeconds = 30
@@ -111,10 +105,10 @@ func (i *Inbox) Run(ctx context.Context) error {
 func (i *Inbox) Deliver(ctx context.Context, manifest filetransfer.Manifest) (string, error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	if err := validateManifest(manifest); err != nil {
+	if err := i.validateManifest(manifest); err != nil {
 		return "", err
 	}
-	root := filepath.Join(i.config.Downloads, "Paperboat Inbox")
+	root := i.config.Path
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return "", storageError(err)
 	}
@@ -241,6 +235,60 @@ func (i *Inbox) Deliver(ctx context.Context, manifest filetransfer.Manifest) (st
 	return relativePath, nil
 }
 
+func DefaultPath() (string, error) {
+	downloads, err := DownloadsDir()
+	if err == nil && filepath.IsAbs(downloads) {
+		return filepath.Join(downloads, "Paperboat Inbox"), nil
+	}
+	home, homeErr := os.UserHomeDir()
+	if homeErr != nil {
+		return "", errors.Join(err, homeErr)
+	}
+	return filepath.Join(home, "Documents", "Paperboat Inbox"), nil
+}
+
+func EnsurePath(path string) error {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return errors.New("inbox path must be an absolute clean path")
+	}
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return err
+	}
+	if err := os.Chmod(path, 0o700); err != nil {
+		return err
+	}
+	return ValidatePath(path)
+}
+
+func ValidatePath(path string) error {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return errors.New("inbox path must be an absolute clean path")
+	}
+	info, err := os.Lstat(path)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("inbox path must be an existing non-symlink directory")
+	}
+	if !ownedByCurrentUser(info) {
+		return errors.New("inbox path must be owned by the current user")
+	}
+	if info.Mode().Perm()&0o022 != 0 {
+		return errors.New("inbox path must not be writable by group or other users")
+	}
+	probe, err := os.CreateTemp(path, ".paperboat-inbox-probe-*")
+	if err != nil {
+		return errors.New("inbox path is not writable")
+	}
+	probePath := probe.Name()
+	if closeErr := probe.Close(); closeErr != nil {
+		_ = os.Remove(probePath)
+		return closeErr
+	}
+	if err := os.Remove(probePath); err != nil {
+		return err
+	}
+	return nil
+}
+
 func fileDigestMatches(path, expected string) (bool, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -254,8 +302,8 @@ func fileDigestMatches(path, expected string) (bool, error) {
 	return hex.EncodeToString(hash.Sum(nil)) == expected, nil
 }
 
-func validateManifest(manifest filetransfer.Manifest) error {
-	if manifest.TransferID == "" || manifest.Direction != "pbh_to_pb" || manifest.Size < 0 || manifest.Size > 50<<20 || len(manifest.SHA256) != 64 {
+func (i *Inbox) validateManifest(manifest filetransfer.Manifest) error {
+	if manifest.TransferID == "" || manifest.DestinationMachineID != i.config.MachineID || manifest.Size < 0 || manifest.Size > 50<<20 || len(manifest.SHA256) != 64 {
 		return errors.New("invalid_size")
 	}
 	if _, err := hex.DecodeString(manifest.SHA256); err != nil || manifest.SHA256 != strings.ToLower(manifest.SHA256) {

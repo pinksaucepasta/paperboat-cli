@@ -4,6 +4,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pinksaucepasta/paperboat-cli/internal/buildinfo"
-	"github.com/pinksaucepasta/paperboat-cli/internal/config"
+	"github.com/pinksaucepasta/paperboat/internal/buildinfo"
+	"github.com/pinksaucepasta/paperboat/internal/config"
 )
 
 // ErrUnauthenticated means the server rejected the reused credential. Callers
@@ -68,7 +69,7 @@ func IsNotFound(err error) bool {
 }
 
 // IsHostedEntitlementRequired reports the hosted-project billing gate. Callers
-// that also expose separately entitled user machines may skip projects
+// that also expose separately entitled machines may skip projects
 // while preserving every other API failure.
 func IsHostedEntitlementRequired(err error) bool {
 	var apiErr *APIError
@@ -91,10 +92,15 @@ func (e *APIError) Error() string {
 
 // Client talks to paperboat-server with a Paperboat client-session access token.
 type Client struct {
-	baseURL     string
-	cred        config.Credential
-	http        *http.Client
-	accessToken string
+	baseURL         string
+	cred            config.Credential
+	http            *http.Client
+	accessToken     string
+	sourceMachineID string
+}
+
+func (c *Client) SetSourceMachineID(machineID string) {
+	c.sourceMachineID = strings.TrimSpace(machineID)
 }
 
 // New builds a client. baseURL is the paperboat-server base (e.g.
@@ -140,7 +146,7 @@ type GitHubRepository struct {
 type ClientConfiguration struct {
 	Version            string `json:"version"`
 	CLIVerificationURL string `json:"cli_verification_url"`
-	UserMachinesURL    string `json:"user_machines_url"`
+	MachinesURL        string `json:"machines_url"`
 }
 
 func (c *Client) ClientConfiguration(ctx context.Context) (ClientConfiguration, error) {
@@ -151,9 +157,9 @@ func (c *Client) ClientConfiguration(ctx context.Context) (ClientConfiguration, 
 	if out.Version != "1" {
 		return ClientConfiguration{}, fmt.Errorf("paperboat-server returned unsupported client configuration version %q", out.Version)
 	}
-	userMachinesURL, err := url.Parse(out.UserMachinesURL)
-	if err != nil || (userMachinesURL.Scheme != "http" && userMachinesURL.Scheme != "https") || userMachinesURL.Host == "" {
-		return ClientConfiguration{}, errors.New("paperboat-server returned an invalid user-machines URL")
+	machinesURL, err := url.Parse(out.MachinesURL)
+	if err != nil || (machinesURL.Scheme != "http" && machinesURL.Scheme != "https") || machinesURL.Host == "" {
+		return ClientConfiguration{}, errors.New("paperboat-server returned an invalid machines URL")
 	}
 	return out, nil
 }
@@ -221,15 +227,60 @@ type ProjectPage struct {
 // connector rather than a Paperboat-managed Fly VM. The control plane owns its
 // lifecycle and authorization; the CLI only needs enough metadata to select it.
 type UserMachine struct {
-	ID                 string             `json:"id"`
-	EnvironmentID      string             `json:"environment_id"`
-	DisplayName        string             `json:"display_name"`
-	State              string             `json:"state"`
-	Online             bool               `json:"online"`
-	Platform           string             `json:"platform"`
-	Architecture       string             `json:"architecture"`
-	Availability       AvailabilityPolicy `json:"availability"`
-	RuntimeDiagnostics RuntimeDiagnostics `json:"runtime_diagnostics"`
+	ID                     string             `json:"id"`
+	EnvironmentID          string             `json:"environment_id"`
+	DisplayName            string             `json:"display_name"`
+	State                  string             `json:"state"`
+	Online                 bool               `json:"online"`
+	Platform               string             `json:"platform"`
+	Architecture           string             `json:"architecture"`
+	WorkspaceRoot          string             `json:"workspace_root"`
+	SetupRoles             []string           `json:"setup_roles"`
+	PublicIdentityKey      string             `json:"public_identity_key"`
+	InstallationGeneration int64              `json:"installation_generation"`
+	Availability           AvailabilityPolicy `json:"availability"`
+	RuntimeDiagnostics     RuntimeDiagnostics `json:"runtime_diagnostics"`
+}
+
+type MachineSetupInput struct {
+	DisplayName       string            `json:"display_name"`
+	Platform          string            `json:"platform"`
+	Architecture      string            `json:"architecture"`
+	WorkspaceRoot     string            `json:"workspace_root"`
+	PublicIdentityKey string            `json:"public_identity_key"`
+	RuntimeVersions   map[string]string `json:"runtime_versions"`
+}
+
+func (c *Client) SetupMachine(ctx context.Context, input MachineSetupInput) (UserMachine, error) {
+	var out UserMachine
+	err := c.do(ctx, http.MethodPost, "/v1/machines/setup", input, &out)
+	return out, err
+}
+
+type MachineControlCredential struct {
+	Credential string    `json:"credential"`
+	ExpiresAt  time.Time `json:"expires_at"`
+}
+
+func (c *Client) IssueMachineControlCredential(ctx context.Context, machineID, operationID string, proof []byte) (MachineControlCredential, error) {
+	if strings.TrimSpace(machineID) == "" || len(operationID) < 8 || len(proof) == 0 {
+		return MachineControlCredential{}, errors.New("machine control credential request is invalid")
+	}
+	var out MachineControlCredential
+	path := "/v1/machines/" + url.PathEscape(machineID) + "/control-credentials"
+	err := c.doWithHeaders(ctx, http.MethodPost, path, struct {
+		OperationID string `json:"operation_id"`
+	}{operationID}, &out, http.Header{"X-Paperboat-Machine-Proof": []string{base64.RawURLEncoding.EncodeToString(proof)}})
+	return out, err
+}
+
+func (c *Client) UnpairMachine(ctx context.Context, machineID string) (UserMachine, error) {
+	if strings.TrimSpace(machineID) == "" {
+		return UserMachine{}, errors.New("machine ID is required")
+	}
+	var out UserMachine
+	err := c.do(ctx, http.MethodPost, "/v1/machines/"+url.PathEscape(machineID)+"/unpair", nil, &out)
+	return out, err
 }
 
 type RuntimeDiagnostics struct {
@@ -264,11 +315,29 @@ type ConfigRepository struct {
 
 type ConfigAssignment struct {
 	ID              string  `json:"id"`
+	MachineID       string  `json:"machine_id"`
 	EnvironmentID   string  `json:"environment_id"`
 	RepositoryID    *string `json:"repository_id"`
 	ConsentState    string  `json:"consent_state"`
+	Mode            string  `json:"mode"`
 	WarningRevision *string `json:"warning_revision"`
 	Version         int64   `json:"version"`
+}
+
+type ConfigWarningFacts struct {
+	Revision             string `json:"revision"`
+	MachineName          string `json:"machine_name"`
+	RepositoryName       string `json:"repository_name"`
+	CanonicalScope       string `json:"canonical_scope"`
+	Mode                 string `json:"mode"`
+	ManifestScope        string `json:"manifest_scope"`
+	RepositoryVisibility string `json:"repository_visibility"`
+	HistoryRetention     string `json:"history_retention"`
+	ConflictBehavior     string `json:"conflict_behavior"`
+	ForceBehavior        string `json:"force_behavior"`
+	DisableAction        string `json:"disable_action"`
+	OfflineBehavior      string `json:"offline_behavior"`
+	AccessConsequence    string `json:"access_consequence"`
 }
 
 type Preview struct {
@@ -314,26 +383,83 @@ func (c *Client) ListConfigRepositories(ctx context.Context) ([]ConfigRepository
 	return page.Items, err
 }
 
-func (c *Client) ConfigAssignment(ctx context.Context, environmentID string) (ConfigAssignment, error) {
+func (c *Client) ConfigAssignment(ctx context.Context, machineID string) (ConfigAssignment, error) {
 	var out ConfigAssignment
-	err := c.do(ctx, http.MethodGet, "/v1/environments/"+url.PathEscape(environmentID)+"/config-assignment", nil, &out)
+	err := c.do(ctx, http.MethodGet, "/v1/machines/"+url.PathEscape(machineID)+"/config-assignment", nil, &out)
 	return out, err
 }
 
-func (c *Client) AssignConfig(ctx context.Context, environmentID, repositoryID string, expectedVersion int64) (ConfigAssignment, error) {
+func (c *Client) AssignConfig(ctx context.Context, machineID, repositoryID, mode string, expectedVersion int64) (ConfigAssignment, error) {
 	var out ConfigAssignment
-	err := c.do(ctx, http.MethodPut, "/v1/environments/"+url.PathEscape(environmentID)+"/config-assignment", map[string]any{"repository_id": repositoryID, "warning_revision": "", "expected_version": expectedVersion}, &out)
+	err := c.do(ctx, http.MethodPut, "/v1/machines/"+url.PathEscape(machineID)+"/config-assignment", map[string]any{"repository_id": repositoryID, "mode": mode, "warning_revision": "", "expected_version": expectedVersion}, &out)
 	return out, err
 }
 
-func (c *Client) UnassignConfig(ctx context.Context, environmentID string, expectedVersion int64) error {
-	path := fmt.Sprintf("/v1/environments/%s/config-assignment?expected_version=%d", url.PathEscape(environmentID), expectedVersion)
+func (c *Client) UnassignConfig(ctx context.Context, machineID string, expectedVersion int64) error {
+	path := fmt.Sprintf("/v1/machines/%s/config-assignment?expected_version=%d", url.PathEscape(machineID), expectedVersion)
 	return c.do(ctx, http.MethodDelete, path, nil, nil)
+}
+
+func (c *Client) ConfigWarning(ctx context.Context, machineID string) (ConfigWarningFacts, error) {
+	var out ConfigWarningFacts
+	err := c.do(ctx, http.MethodGet, "/v1/machines/"+url.PathEscape(machineID)+"/config-assignment/warning", nil, &out)
+	return out, err
+}
+
+func (c *Client) AcceptConfigConsent(ctx context.Context, machineID, warningRevision string, expectedVersion int64) (ConfigAssignment, error) {
+	var out ConfigAssignment
+	err := c.do(ctx, http.MethodPost, "/v1/machines/"+url.PathEscape(machineID)+"/config-assignment/consent", map[string]any{"warning_revision": warningRevision, "expected_version": expectedVersion}, &out)
+	return out, err
 }
 
 type UserMachinePage struct {
 	Items      []UserMachine `json:"items"`
 	Pagination Pagination    `json:"pagination"`
+}
+
+type TransferDestinationDefault struct {
+	Configured bool         `json:"configured"`
+	Machine    *UserMachine `json:"machine"`
+}
+
+func (c *Client) TransferDestinationDefault(ctx context.Context) (TransferDestinationDefault, error) {
+	var out TransferDestinationDefault
+	err := c.do(ctx, http.MethodGet, "/v1/transfer-destination-default", nil, &out)
+	return out, err
+}
+
+func (c *Client) SetTransferDestinationDefault(ctx context.Context, machineID string) (TransferDestinationDefault, error) {
+	var out TransferDestinationDefault
+	err := c.do(ctx, http.MethodPut, "/v1/transfer-destination-default", map[string]string{"machine_id": machineID}, &out)
+	return out, err
+}
+
+func (c *Client) ClearTransferDestinationDefault(ctx context.Context) error {
+	return c.do(ctx, http.MethodDelete, "/v1/transfer-destination-default", nil, nil)
+}
+
+func (c *Client) TerminalSessionTransferDestination(ctx context.Context, sessionID string) (TransferDestinationDefault, error) {
+	var out TransferDestinationDefault
+	err := c.do(ctx, http.MethodGet, "/v1/terminal-sessions/"+url.PathEscape(sessionID)+"/transfer-destination", nil, &out)
+	return out, err
+}
+
+func (c *Client) SetTerminalSessionTransferDestination(ctx context.Context, sessionID, machineID string) (TransferDestinationDefault, error) {
+	var out TransferDestinationDefault
+	err := c.do(ctx, http.MethodPut, "/v1/terminal-sessions/"+url.PathEscape(sessionID)+"/transfer-destination", map[string]string{"machine_id": machineID}, &out)
+	return out, err
+}
+
+func (c *Client) ClearTerminalSessionTransferDestination(ctx context.Context, sessionID string) error {
+	return c.do(ctx, http.MethodDelete, "/v1/terminal-sessions/"+url.PathEscape(sessionID)+"/transfer-destination", nil, nil)
+}
+
+func (c *Client) EligibleTerminalSessionTransferDestinations(ctx context.Context, sessionID string) ([]UserMachine, error) {
+	var page struct {
+		Items []UserMachine `json:"items"`
+	}
+	err := c.do(ctx, http.MethodGet, "/v1/terminal-sessions/"+url.PathEscape(sessionID)+"/transfer-destinations", nil, &page)
+	return page.Items, err
 }
 
 // TerminalSession is the durable session catalog record returned by the
@@ -367,7 +493,7 @@ type AuthMaterial struct {
 
 const ConnectionSchemaV1 = "paperboat.environment-connection/v1"
 
-// Environment identifies either a hosted project or a user machine.
+// Environment identifies either a hosted project or a machine.
 type Environment struct {
 	ID            string `json:"id"`
 	Kind          string `json:"kind"`
@@ -376,7 +502,7 @@ type Environment struct {
 	Root          string `json:"root"`
 	EnvironmentID string `json:"environment_id"`
 	ProjectID     string `json:"project_id"`
-	UserMachineID string `json:"user_machine_id"`
+	UserMachineID string `json:"machine_id"`
 	DisplayName   string `json:"display_name"`
 	ProjectRoot   string `json:"project_root"`
 }
@@ -411,9 +537,34 @@ type FileTransferPolicy struct {
 }
 
 type FileTransfer struct {
-	Endpoint string             `json:"endpoint"`
-	Auth     AuthMaterial       `json:"auth"`
-	Policy   FileTransferPolicy `json:"policy"`
+	Endpoint             string             `json:"endpoint"`
+	SourceMachineID      string             `json:"source_machine_id"`
+	DestinationMachineID string             `json:"destination_machine_id"`
+	InitiatingUserID     string             `json:"initiating_user_id"`
+	Auth                 AuthMaterial       `json:"auth"`
+	Policy               FileTransferPolicy `json:"policy"`
+}
+
+type PreviewLaunchDescriptor struct {
+	Endpoint  string       `json:"endpoint"`
+	MachineID string       `json:"machine_id"`
+	ExpiresAt time.Time    `json:"expires_at"`
+	Auth      AuthMaterial `json:"auth"`
+}
+
+type PreviewLaunchRequest struct {
+	Name            string `json:"name"`
+	Port            uint16 `json:"port"`
+	DurationSeconds int64  `json:"duration_seconds,omitempty"`
+	Indefinite      bool   `json:"indefinite,omitempty"`
+}
+
+type PreviewRecord struct {
+	PreviewKey  string     `json:"preview_key"`
+	LogicalName string     `json:"logical_name"`
+	URL         string     `json:"url"`
+	State       string     `json:"state"`
+	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
 }
 
 // ConnectionDescriptor is the cli-connect / connection-status descriptor. When
@@ -424,8 +575,8 @@ type ConnectionDescriptor struct {
 	Issuer            string        `json:"issuer,omitempty"`
 	ProjectID         string        `json:"project_id"`
 	ProjectState      string        `json:"project_state"`
-	UserMachineID     string        `json:"user_machine_id"`
-	UserMachineState  string        `json:"user_machine_state"`
+	UserMachineID     string        `json:"machine_id"`
+	UserMachineState  string        `json:"machine_state"`
 	Connectable       bool          `json:"connectable"`
 	ExpiresAt         time.Time     `json:"expires_at"`
 	Environment       *Environment  `json:"environment,omitempty"`
@@ -457,7 +608,7 @@ func (r *ConnectionDescriptor) NormalizeConnectionDescriptor() error {
 		return fmt.Errorf("invalid environment kind %q", e.Kind)
 	}
 	if r.Terminal != nil {
-		if r.Terminal.Protocol != "paperboat.terminal.v2" {
+		if r.Terminal.Protocol != "paperboat.terminal.v1" {
 			return errors.New("invalid canonical terminal protocol")
 		}
 	}
@@ -475,14 +626,31 @@ func (r *ConnectionDescriptor) NormalizeConnectionDescriptor() error {
 // entry matching the attached project and intentionally ignores path/error
 // details when rendering its local status line.
 type ConfigSyncStatus struct {
-	State    string                   `json:"state"`
-	Projects []ConfigSyncProjectState `json:"projects"`
+	State        string                       `json:"state"`
+	Environments []ConfigSyncEnvironmentState `json:"environments"`
 }
 
-type ConfigSyncProjectState struct {
-	ProjectID        string `json:"project_id"`
-	State            string `json:"state"`
-	PendingPathCount int    `json:"pending_path_count"`
+type ConfigSyncEnvironmentState struct {
+	EnvironmentID         string                  `json:"environment_id"`
+	DisplayName           string                  `json:"display_name"`
+	State                 string                  `json:"state"`
+	Mode                  string                  `json:"mode"`
+	AssignmentVersion     int64                   `json:"assignment_version"`
+	RemoteRevision        string                  `json:"remote_revision"`
+	ManifestHealth        string                  `json:"manifest_health"`
+	ManifestRevision      string                  `json:"manifest_revision"`
+	ManagedPathCount      int                     `json:"managed_path_count"`
+	PendingCleanPathCount int                     `json:"pending_clean_path_count"`
+	LastAppliedRevision   string                  `json:"last_applied_revision"`
+	LastPublishedRevision string                  `json:"last_published_revision"`
+	Conflicts             []ConfigSyncPathSummary `json:"conflicts"`
+}
+
+type ConfigSyncPathSummary struct {
+	Path     string `json:"path"`
+	Bytes    int64  `json:"bytes,omitempty"`
+	Reason   string `json:"reason"`
+	Revision string `json:"revision,omitempty"`
 }
 
 // UsageSummary is the account-level, server-authoritative usage payload used
@@ -504,6 +672,43 @@ type UsageSummary struct {
 func (c *Client) ConfigSyncStatus(ctx context.Context) (ConfigSyncStatus, error) {
 	var out ConfigSyncStatus
 	err := c.do(ctx, http.MethodGet, "/v1/config-sync/status", nil, &out)
+	return out, err
+}
+
+type ConfigConflictRequest struct {
+	Path                      string `json:"path"`
+	ConflictRevision          string `json:"conflict_revision"`
+	ExpectedRemoteRevision    string `json:"expected_remote_revision"`
+	ExpectedAssignmentVersion int64  `json:"expected_assignment_version"`
+	Action                    string `json:"action"`
+}
+
+type ConfigOperation struct {
+	ID     string `json:"id"`
+	Path   string `json:"path"`
+	Scope  string `json:"scope"`
+	Action string `json:"action"`
+}
+
+func (c *Client) ResolveConfigConflict(ctx context.Context, machineID string, request ConfigConflictRequest) (ConfigOperation, error) {
+	var out ConfigOperation
+	err := c.do(ctx, http.MethodPost, "/v1/config-sync/environments/"+url.PathEscape(machineID)+"/conflict-resolutions", request, &out)
+	return out, err
+}
+
+type ConfigForceRequest struct {
+	Scope                     string `json:"scope"`
+	Path                      string `json:"path,omitempty"`
+	ConflictRevision          string `json:"conflict_revision,omitempty"`
+	ExpectedRemoteRevision    string `json:"expected_remote_revision"`
+	ExpectedAssignmentVersion int64  `json:"expected_assignment_version"`
+	Action                    string `json:"action"`
+	Confirmation              string `json:"confirmation"`
+}
+
+func (c *Client) ForceConfig(ctx context.Context, machineID string, request ConfigForceRequest) (ConfigOperation, error) {
+	var out ConfigOperation
+	err := c.do(ctx, http.MethodPost, "/v1/config-sync/environments/"+url.PathEscape(machineID)+"/force", request, &out)
 	return out, err
 }
 
@@ -552,7 +757,7 @@ func (c *Client) ListUserMachines(ctx context.Context) ([]UserMachine, error) {
 	offset := 0
 	for {
 		var page UserMachinePage
-		path := fmt.Sprintf("/v1/user-machines?limit=%d&offset=%d&sort=display_name", pageSize, offset)
+		path := fmt.Sprintf("/v1/machines?limit=%d&offset=%d&sort=display_name", pageSize, offset)
 		if err := c.do(ctx, http.MethodGet, path, nil, &page); err != nil {
 			return nil, err
 		}
@@ -561,7 +766,7 @@ func (c *Client) ListUserMachines(ctx context.Context) ([]UserMachine, error) {
 			return machines, nil
 		}
 		if *page.Pagination.NextOffset <= offset {
-			return nil, errors.New("user-machine pagination did not advance")
+			return nil, errors.New("machine pagination did not advance")
 		}
 		offset = *page.Pagination.NextOffset
 	}
@@ -569,26 +774,26 @@ func (c *Client) ListUserMachines(ctx context.Context) ([]UserMachine, error) {
 
 func (c *Client) DisconnectUserMachine(ctx context.Context, machineID string) error {
 	if strings.TrimSpace(machineID) == "" {
-		return errors.New("user-machine ID is required")
+		return errors.New("machine ID is required")
 	}
-	return c.do(ctx, http.MethodPost, "/v1/user-machines/"+url.PathEscape(machineID)+"/disconnect", nil, nil)
+	return c.do(ctx, http.MethodPost, "/v1/machines/"+url.PathEscape(machineID)+"/disconnect", nil, nil)
 }
 
 func (c *Client) SetUserMachineAvailability(ctx context.Context, machineID, mode, idempotencyKey string, expectedVersion int64) (AvailabilityPolicy, error) {
 	if strings.TrimSpace(machineID) == "" || (mode != "allow_sleep" && mode != "keep_awake") || strings.TrimSpace(idempotencyKey) == "" || expectedVersion < 0 {
-		return AvailabilityPolicy{}, errors.New("valid user-machine availability input is required")
+		return AvailabilityPolicy{}, errors.New("valid machine availability input is required")
 	}
 	var out AvailabilityPolicy
-	path := "/v1/user-machines/" + url.PathEscape(machineID) + "/availability-policy"
+	path := "/v1/machines/" + url.PathEscape(machineID) + "/availability-policy"
 	err := c.doWithHeaders(ctx, http.MethodPut, path, map[string]any{"expected_version": expectedVersion, "mode": mode}, &out, http.Header{"Idempotency-Key": []string{idempotencyKey}})
 	return out, err
 }
 
 func (c *Client) DeleteUserMachine(ctx context.Context, machineID string) error {
 	if strings.TrimSpace(machineID) == "" {
-		return errors.New("user-machine ID is required")
+		return errors.New("machine ID is required")
 	}
-	return c.do(ctx, http.MethodDelete, "/v1/user-machines/"+url.PathEscape(machineID), nil, nil)
+	return c.do(ctx, http.MethodDelete, "/v1/machines/"+url.PathEscape(machineID), nil, nil)
 }
 
 // ProjectConnectionDescriptor runs the pre-connect broker: it authorizes, provisions/reconciles
@@ -603,9 +808,19 @@ func (c *Client) ProjectConnectionDescriptor(ctx context.Context, projectID stri
 // session ID preserves the default-session behavior for older servers/clients.
 func (c *Client) ProjectConnectionDescriptorForSession(ctx context.Context, projectID, terminalSessionID string) (ConnectionDescriptor, error) {
 	var out ConnectionDescriptor
-	var body any
+	var values map[string]string
+	if c.sourceMachineID != "" {
+		values = map[string]string{"source_machine_id": c.sourceMachineID}
+	}
 	if terminalSessionID != "" {
-		body = map[string]string{"terminal_session_id": terminalSessionID}
+		if values == nil {
+			values = make(map[string]string)
+		}
+		values["terminal_session_id"] = terminalSessionID
+	}
+	var body any
+	if values != nil {
+		body = values
 	}
 	err := c.do(ctx, http.MethodPost, "/v1/projects/"+url.PathEscape(projectID)+"/connection-descriptor", body, &out)
 	if err == nil {
@@ -622,18 +837,88 @@ func (c *Client) UserMachineConnectionDescriptor(ctx context.Context, machineID 
 }
 
 // UserMachineConnectionDescriptorForSession connects a durable terminal session belonging
-// to an enrolled user machine.
+// to an enrolled machine.
 func (c *Client) UserMachineConnectionDescriptorForSession(ctx context.Context, machineID, terminalSessionID string) (ConnectionDescriptor, error) {
 	var out ConnectionDescriptor
-	var body any
-	if terminalSessionID != "" {
-		body = map[string]string{"terminal_session_id": terminalSessionID}
+	var values map[string]string
+	if c.sourceMachineID != "" {
+		values = map[string]string{"source_machine_id": c.sourceMachineID}
 	}
-	err := c.do(ctx, http.MethodPost, "/v1/user-machines/"+url.PathEscape(machineID)+"/connection-descriptor", body, &out)
+	if terminalSessionID != "" {
+		if values == nil {
+			values = make(map[string]string)
+		}
+		values["terminal_session_id"] = terminalSessionID
+	}
+	var body any
+	if values != nil {
+		body = values
+	}
+	err := c.do(ctx, http.MethodPost, "/v1/machines/"+url.PathEscape(machineID)+"/connection-descriptor", body, &out)
 	if err == nil {
 		err = out.NormalizeConnectionDescriptor()
 	}
 	return out, err
+}
+
+func (c *Client) MachineFileTransferDescriptor(ctx context.Context, destinationMachineID, sourceMachineID, sessionID string) (FileTransfer, error) {
+	if strings.TrimSpace(destinationMachineID) == "" || strings.TrimSpace(sourceMachineID) == "" {
+		return FileTransfer{}, errors.New("source and destination machine IDs are required")
+	}
+	var out FileTransfer
+	err := c.do(ctx, http.MethodPost, "/v1/machines/"+url.PathEscape(destinationMachineID)+"/file-transfer-descriptor", map[string]string{
+		"source_machine_id": sourceMachineID,
+		"session_id":        sessionID,
+	}, &out)
+	return out, err
+}
+
+func (c *Client) MachinePreviewLaunchDescriptor(ctx context.Context, machineID string) (PreviewLaunchDescriptor, error) {
+	if strings.TrimSpace(machineID) == "" {
+		return PreviewLaunchDescriptor{}, errors.New("machine ID is required")
+	}
+	var out PreviewLaunchDescriptor
+	err := c.do(ctx, http.MethodPost, "/v1/machines/"+url.PathEscape(machineID)+"/preview-launch-descriptor", nil, &out)
+	if err != nil {
+		return PreviewLaunchDescriptor{}, err
+	}
+	u, parseErr := url.Parse(out.Endpoint)
+	if parseErr != nil || u.Scheme != "https" || u.Host == "" || u.Path != "/v1/preview-launches" || out.MachineID != machineID || out.Auth.Method != "bearer" || out.Auth.Token == "" {
+		return PreviewLaunchDescriptor{}, errors.New("paperboat-server returned an invalid preview launch descriptor")
+	}
+	return out, nil
+}
+
+func LaunchMachinePreview(ctx context.Context, descriptor PreviewLaunchDescriptor, input PreviewLaunchRequest, transport http.RoundTripper) (PreviewRecord, error) {
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	body, err := json.Marshal(input)
+	if err != nil {
+		return PreviewRecord{}, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, descriptor.Endpoint, bytes.NewReader(body))
+	if err != nil {
+		return PreviewRecord{}, err
+	}
+	request.Header.Set("Authorization", "Bearer "+descriptor.Auth.Token)
+	request.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Transport: transport, Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("preview launch endpoint redirected") }}
+	response, err := client.Do(request)
+	if err != nil {
+		return PreviewRecord{}, fmt.Errorf("launch preview on machine: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return PreviewRecord{}, fmt.Errorf("remote preview launch failed with status %d", response.StatusCode)
+	}
+	var record PreviewRecord
+	decoder := json.NewDecoder(io.LimitReader(response.Body, 64<<10))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&record) != nil || decoder.Decode(&struct{}{}) != io.EOF || record.URL == "" || record.LogicalName == "" {
+		return PreviewRecord{}, errors.New("machine returned an invalid preview launch response")
+	}
+	return record, nil
 }
 
 // UserMachineConnectionReadiness polls readiness without minting a fresh
@@ -647,7 +932,7 @@ func (c *Client) UserMachineConnectionReadiness(ctx context.Context, machineID s
 // session through readiness polling, exactly as hosted-project polling does.
 func (c *Client) UserMachineConnectionReadinessForSession(ctx context.Context, machineID, terminalSessionID string) (ConnectionDescriptor, error) {
 	var out ConnectionDescriptor
-	path := "/v1/user-machines/" + url.PathEscape(machineID) + "/connection-readiness"
+	path := "/v1/machines/" + url.PathEscape(machineID) + "/connection-readiness"
 	if terminalSessionID != "" {
 		path += "?terminal_session_id=" + url.QueryEscape(terminalSessionID)
 	}
@@ -707,10 +992,10 @@ func (c *Client) DeleteTerminalSession(ctx context.Context, projectID, sessionID
 }
 
 // ListUserMachineTerminalSessions lists the durable Paperboat sessions
-// for a user machine. Session records remain server-owned, so the CLI
+// for a machine. Session records remain server-owned, so the CLI
 // never discovers local paths or connector state through this endpoint.
 func (c *Client) ListUserMachineTerminalSessions(ctx context.Context, machineID string) ([]TerminalSession, error) {
-	return c.listTerminalSessions(ctx, "/v1/user-machines/"+url.PathEscape(machineID)+"/terminal-sessions")
+	return c.listTerminalSessions(ctx, "/v1/machines/"+url.PathEscape(machineID)+"/terminal-sessions")
 }
 
 func (c *Client) CreateUserMachineTerminalSession(ctx context.Context, machineID, name, idempotencyKey string) (TerminalSession, error) {
@@ -719,24 +1004,24 @@ func (c *Client) CreateUserMachineTerminalSession(ctx context.Context, machineID
 	if name != "" {
 		body["name"] = name
 	}
-	path := "/v1/user-machines/" + url.PathEscape(machineID) + "/terminal-sessions"
+	path := "/v1/machines/" + url.PathEscape(machineID) + "/terminal-sessions"
 	return out, c.doWithHeaders(ctx, http.MethodPost, path, body, &out, http.Header{"Idempotency-Key": []string{idempotencyKey}})
 }
 
 func (c *Client) RenameUserMachineTerminalSession(ctx context.Context, machineID, sessionID, name string) (TerminalSession, error) {
 	var out TerminalSession
-	path := "/v1/user-machines/" + url.PathEscape(machineID) + "/terminal-sessions/" + url.PathEscape(sessionID)
+	path := "/v1/machines/" + url.PathEscape(machineID) + "/terminal-sessions/" + url.PathEscape(sessionID)
 	err := c.do(ctx, http.MethodPatch, path, map[string]string{"name": name}, &out)
 	return out, err
 }
 
 func (c *Client) CloseUserMachineTerminalSession(ctx context.Context, machineID, sessionID string) error {
-	path := "/v1/user-machines/" + url.PathEscape(machineID) + "/terminal-sessions/" + url.PathEscape(sessionID) + "/close"
+	path := "/v1/machines/" + url.PathEscape(machineID) + "/terminal-sessions/" + url.PathEscape(sessionID) + "/close"
 	return c.do(ctx, http.MethodPost, path, nil, &struct{}{})
 }
 
 func (c *Client) DeleteUserMachineTerminalSession(ctx context.Context, machineID, sessionID string) error {
-	path := "/v1/user-machines/" + url.PathEscape(machineID) + "/terminal-sessions/" + url.PathEscape(sessionID)
+	path := "/v1/machines/" + url.PathEscape(machineID) + "/terminal-sessions/" + url.PathEscape(sessionID)
 	return c.do(ctx, http.MethodDelete, path, nil, &struct{}{})
 }
 
@@ -784,8 +1069,8 @@ func (c *Client) doWithHeaders(ctx context.Context, method, path string, body, o
 		return err
 	}
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "paperboat-cli/"+buildinfo.Version)
-	req.Header.Set("X-Paperboat-Client", "paperboat-cli")
+	req.Header.Set("User-Agent", "paperboat/"+buildinfo.Version)
+	req.Header.Set("X-Paperboat-Client", "paperboat")
 	req.Header.Set("X-Paperboat-Protocol", buildinfo.ProtocolVersion)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")

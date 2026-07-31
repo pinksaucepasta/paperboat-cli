@@ -1,14 +1,15 @@
-# AGENTS.md - paperboat-cli
+# AGENTS.md - paperboat
 
-Inherit [`../AGENTS.md`](../AGENTS.md). CLI, `pb`, and client CLI mean this repo.
+Inherit [`../AGENTS.md`](../AGENTS.md). Unified runtime, CLI, and `pb` mean this repo.
 `../DX.md` is the interaction and scripting contract.
 
 ## Ownership
 
-Device auth, account/environment/session selection, raw terminal lifecycle, resize,
-signals, reconnect/replay, local file transfer/paste rewriting,
-diagnostics, output, and OS credential storage. Never run frpc, own remote PTYs, enforce
-server policy, or receive reusable infrastructure credentials.
+Device auth, machine identity and setup roles, account/environment/session selection,
+terminal client and host lifecycle, resize, signals, reconnect/replay, machine-addressed
+transfer and inbox behavior, preview runners, config sync, connectors, diagnostics,
+updates, output, and OS credential storage. Server policy and reusable infrastructure
+credentials remain outside this repository.
 
 ## Stack
 
