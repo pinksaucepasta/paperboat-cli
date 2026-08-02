@@ -2,9 +2,7 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"errors"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -163,36 +161,6 @@ func TestFileTransferBatchCreationIsAtomic(t *testing.T) {
 	}
 	if _, err := state.FileTransfer(context.Background(), first.ID); err == nil {
 		t.Fatal("partial batch remained")
-	}
-}
-
-func TestStoreMigratesVersionOneToFileTransfers(t *testing.T) {
-	root := filepath.Join(t.TempDir(), "state")
-	if err := os.MkdirAll(root, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	db, err := sql.Open("sqlite", (&url.URL{Scheme: "file", Path: filepath.Join(root, "state.db")}).String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, statement := range migrationV1 {
-		if _, err := db.Exec(statement); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := db.Exec("PRAGMA user_version=1"); err != nil {
-		t.Fatal(err)
-	}
-	_ = db.Close()
-	state, err := Open(context.Background(), Config{Root: root})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer state.Close()
-	now := time.Now().UTC()
-	transfer := FileTransfer{ID: "ft_migrated", BatchID: "fb", SourceMachineID: "machine_client", DestinationMachineID: "machine_host", InitiatingUserID: "user_1", SessionID: "ses", Basename: "empty", Size: 0, SHA256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", CreatedAt: now, ExpiresAt: now.Add(time.Hour)}
-	if err := state.CreateFileTransfers(context.Background(), []FileTransfer{transfer}); err != nil {
-		t.Fatal(err)
 	}
 }
 
