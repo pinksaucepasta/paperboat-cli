@@ -39,12 +39,11 @@
       "id": "compatibility.matrix",
       "path": "compatibility/matrix.json",
       "type": "matrix",
-      "sha256": "e64823ef8af1b4cbef5d7eec035b4f5c01f733bd7ad8464bc8d2957130418ac8",
+      "sha256": "3e8d78a687c39024fc823232e000ca8daa7e941d284a290b697ab3b488d4e871",
       "owner": "platform",
       "review": "initial-review",
       "consumers": [
         "paperboat",
-        "paperboat-helper",
         "paperboat-server",
         "paperboat-tunnel"
       ]
@@ -58,7 +57,6 @@
       "review": "initial-review",
       "consumers": [
         "paperboat",
-        "paperboat-helper",
         "paperboat-server",
         "paperboat-tunnel"
       ]
@@ -72,7 +70,6 @@
       "review": "initial-review",
       "consumers": [
         "paperboat",
-        "paperboat-helper",
         "paperboat-server",
         "paperboat-tunnel"
       ]
@@ -85,7 +82,6 @@
       "owner": "tunnel",
       "review": "initial-review",
       "consumers": [
-        "paperboat-helper",
         "paperboat-server",
         "paperboat-tunnel"
       ]
@@ -121,7 +117,6 @@
       "review": "initial-review",
       "consumers": [
         "paperboat",
-        "paperboat-helper",
         "paperboat-server",
         "paperboat-tunnel"
       ]
@@ -135,7 +130,6 @@
       "review": "approved-review",
       "consumers": [
         "paperboat",
-        "paperboat-helper",
         "paperboat-server"
       ]
     },
@@ -148,7 +142,6 @@
       "review": "initial-review",
       "consumers": [
         "paperboat",
-        "paperboat-helper",
         "paperboat-server",
         "paperboat-tunnel"
       ]
@@ -162,7 +155,6 @@
       "review": "initial-review",
       "consumers": [
         "paperboat",
-        "paperboat-helper",
         "paperboat-server",
         "paperboat-tunnel"
       ]
@@ -176,7 +168,6 @@
       "review": "initial-review",
       "consumers": [
         "paperboat",
-        "paperboat-helper",
         "paperboat-server",
         "paperboat-tunnel"
       ]
@@ -190,7 +181,6 @@
       "review": "initial-review",
       "consumers": [
         "paperboat",
-        "paperboat-helper",
         "paperboat-tunnel"
       ]
     },
@@ -203,7 +193,6 @@
       "review": "initial-review",
       "consumers": [
         "paperboat",
-        "paperboat-helper",
         "paperboat-server"
       ]
     },
@@ -216,7 +205,6 @@
       "review": "protocol-1-review",
       "consumers": [
         "paperboat",
-        "paperboat-helper",
         "paperboat-server",
         "paperboat-tunnel"
       ]
@@ -230,7 +218,6 @@
       "review": "terminal-compression-review",
       "consumers": [
         "paperboat",
-        "paperboat-helper",
         "paperboat-tunnel"
       ]
     },
@@ -243,7 +230,6 @@
       "review": "initial-review",
       "consumers": [
         "paperboat",
-        "paperboat-helper",
         "paperboat-server",
         "paperboat-tunnel"
       ]
@@ -257,7 +243,6 @@
       "review": "initial-review",
       "consumers": [
         "paperboat",
-        "paperboat-helper",
         "paperboat-server"
       ]
     },
@@ -270,7 +255,6 @@
       "review": "initial-review",
       "consumers": [
         "paperboat",
-        "paperboat-helper",
         "paperboat-server"
       ]
     },
@@ -283,7 +267,6 @@
       "review": "initial-review",
       "consumers": [
         "paperboat",
-        "paperboat-helper",
         "paperboat-server"
       ]
     },
@@ -296,7 +279,6 @@
       "review": "preview-ownership-review",
       "consumers": [
         "paperboat",
-        "paperboat-helper",
         "paperboat-server",
         "paperboat-tunnel"
       ]
@@ -309,7 +291,6 @@
       "owner": "helper",
       "review": "initial-review",
       "consumers": [
-        "paperboat-helper",
         "paperboat-server"
       ]
     },
@@ -322,7 +303,6 @@
       "review": "initial-review",
       "consumers": [
         "paperboat",
-        "paperboat-helper",
         "paperboat-tunnel"
       ]
     },
@@ -335,7 +315,6 @@
       "review": "initial-review",
       "consumers": [
         "paperboat",
-        "paperboat-helper",
         "paperboat-server",
         "paperboat-tunnel"
       ]
@@ -360,7 +339,6 @@
       "review": "initial-review",
       "consumers": [
         "paperboat",
-        "paperboat-helper",
         "paperboat-server",
         "paperboat-tunnel"
       ]
@@ -374,7 +352,6 @@
       "review": "initial-review",
       "consumers": [
         "paperboat",
-        "paperboat-helper",
         "paperboat-server",
         "paperboat-tunnel"
       ]
@@ -387,7 +364,6 @@
       "owner": "tunnel",
       "review": "initial-review",
       "consumers": [
-        "paperboat-helper",
         "paperboat-server",
         "paperboat-tunnel"
       ]
@@ -400,7 +376,6 @@
       "owner": "tunnel",
       "review": "initial-review",
       "consumers": [
-        "paperboat-helper",
         "paperboat-server",
         "paperboat-tunnel"
       ]
@@ -438,7 +413,6 @@
       "review": "initial-review",
       "consumers": [
         "paperboat",
-        "paperboat-helper",
         "paperboat-tunnel"
       ]
     },
@@ -451,7 +425,6 @@
       "review": "initial-review",
       "consumers": [
         "paperboat",
-        "paperboat-helper",
         "paperboat-server"
       ]
     },
@@ -464,7 +437,6 @@
       "review": "initial-review",
       "consumers": [
         "paperboat",
-        "paperboat-helper",
         "paperboat-server"
       ]
     },
@@ -477,7 +449,6 @@
       "review": "initial-review",
       "consumers": [
         "paperboat",
-        "paperboat-helper",
         "paperboat-server"
       ]
     },
@@ -490,7 +461,6 @@
       "review": "initial-review",
       "consumers": [
         "paperboat",
-        "paperboat-helper",
         "paperboat-server",
         "paperboat-tunnel"
       ]
@@ -503,8 +473,7 @@
       "owner": "helper",
       "review": "initial-review",
       "consumers": [
-        "paperboat",
-        "paperboat-helper"
+        "paperboat"
       ]
     },
     {
@@ -516,7 +485,6 @@
       "review": "preview-ownership-review",
       "consumers": [
         "paperboat",
-        "paperboat-helper",
         "paperboat-server",
         "paperboat-tunnel"
       ]
@@ -530,7 +498,6 @@
       "review": "initial-review",
       "consumers": [
         "paperboat",
-        "paperboat-helper",
         "paperboat-server"
       ]
     },
