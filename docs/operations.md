@@ -76,7 +76,7 @@ acquires a bounded `local_runtime_control/1.0` management lease from the loopbac
 using an owner-only local token, renews it while attached, and stops the workload if renewal
 fails. The runtime expires abandoned leases and reconciles the preview route. The CLI owns
 an ephemeral `127.0.0.1` static listener and drains it before canceling the preview runner.
-`--detach` installs `__runtime-serve`; its schema-v2 descriptor contains
+`--detach` installs `__runtime-serve`; its v1 descriptor contains
 only the canonical source path and filesystem identity, file/directory kind, SPA policy,
 bind address, assigned loopback port, owner mode, preview record, service definition,
 service generation, and original absolute expiry. It contains no credential. The detached

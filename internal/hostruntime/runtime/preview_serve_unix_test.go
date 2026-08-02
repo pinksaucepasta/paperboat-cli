@@ -35,7 +35,7 @@ func TestServeRuntimeDescriptorRoundTrip(t *testing.T) {
 	identity, _ := source.Identity()
 	expires := time.Now().UTC().Add(time.Hour)
 	descriptor := PreviewRuntimeDescriptor{
-		Schema: "paperboat.preview-runtime/v2", Name: "docs", Indefinite: false, ExpiresAt: &expires,
+		Schema: "paperboat.preview-runtime/v1", Name: "docs", Indefinite: false, ExpiresAt: &expires,
 		BindAddress:       "127.0.0.1",
 		ServiceGeneration: 1,
 		ServiceDefinition: filepath.Join(root, "paperboat-preview.service"),
@@ -70,8 +70,8 @@ func TestServeRuntimeDescriptorRequiresCurrentSchemaFields(t *testing.T) {
 	}
 	expires := time.Now().UTC().Add(time.Hour)
 	for _, descriptor := range []PreviewRuntimeDescriptor{
-		{Schema: "paperboat.preview-runtime/v2", Name: "docs", ExpiresAt: &expires, ServiceGeneration: 1, Serve: &ServeRuntimeDescriptor{SourcePath: source.Path, SourceKind: source.Kind, SourceIdentity: identityValue, OwnerMode: "detached"}},
-		{Schema: "paperboat.preview-runtime/v2", Name: "docs", ExpiresAt: &expires, BindAddress: "127.0.0.1", Serve: &ServeRuntimeDescriptor{SourcePath: source.Path, SourceKind: source.Kind, SourceIdentity: identityValue, OwnerMode: "detached"}},
+		{Schema: "paperboat.preview-runtime/v1", Name: "docs", ExpiresAt: &expires, ServiceGeneration: 1, Serve: &ServeRuntimeDescriptor{SourcePath: source.Path, SourceKind: source.Kind, SourceIdentity: identityValue, OwnerMode: "detached"}},
+		{Schema: "paperboat.preview-runtime/v1", Name: "docs", ExpiresAt: &expires, BindAddress: "127.0.0.1", Serve: &ServeRuntimeDescriptor{SourcePath: source.Path, SourceKind: source.Kind, SourceIdentity: identityValue, OwnerMode: "detached"}},
 	} {
 		path := filepath.Join(root, fmt.Sprintf("descriptor-%d.json", descriptor.ServiceGeneration))
 		if err := writePreviewRuntimeDescriptor(path, descriptor); err != nil {
@@ -200,7 +200,7 @@ func writeTestServeDescriptor(t *testing.T, root, name string, expires time.Time
 		t.Fatal(err)
 	}
 	path := filepath.Join(root, "previews", "active", name+".json")
-	descriptor := PreviewRuntimeDescriptor{Schema: "paperboat.preview-runtime/v2", Name: name, BindAddress: "127.0.0.1", ServiceGeneration: 1, ExpiresAt: &expires, Serve: &ServeRuntimeDescriptor{SourcePath: source.Path, SourceKind: source.Kind, SourceIdentity: identityValue, OwnerMode: "detached"}}
+	descriptor := PreviewRuntimeDescriptor{Schema: "paperboat.preview-runtime/v1", Name: name, BindAddress: "127.0.0.1", ServiceGeneration: 1, ExpiresAt: &expires, Serve: &ServeRuntimeDescriptor{SourcePath: source.Path, SourceKind: source.Kind, SourceIdentity: identityValue, OwnerMode: "detached"}}
 	if err := writePreviewRuntimeDescriptor(path, descriptor); err != nil {
 		t.Fatal(err)
 	}
@@ -271,7 +271,7 @@ func TestServeWorkerRejectsReplacedSourceBeforeListener(t *testing.T) {
 	expires := time.Now().UTC().Add(time.Hour)
 	descriptorPath := filepath.Join(root, "descriptor.json")
 	descriptor := PreviewRuntimeDescriptor{
-		Schema: "paperboat.preview-runtime/v2", Name: "report", BindAddress: "127.0.0.1", ServiceGeneration: 1, ExpiresAt: &expires,
+		Schema: "paperboat.preview-runtime/v1", Name: "report", BindAddress: "127.0.0.1", ServiceGeneration: 1, ExpiresAt: &expires,
 		Serve: &ServeRuntimeDescriptor{SourcePath: source.Path, SourceKind: source.Kind, SourceIdentity: identity, OwnerMode: "detached"},
 	}
 	if err := writePreviewRuntimeDescriptor(descriptorPath, descriptor); err != nil {

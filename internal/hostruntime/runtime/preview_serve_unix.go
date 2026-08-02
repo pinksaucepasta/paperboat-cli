@@ -40,7 +40,7 @@ func RunProductionServeWorker(ctx context.Context, config ProductionServeWorkerC
 		return ErrProductionInvalid
 	}
 	descriptor, err := readPreviewRuntimeDescriptor(config.DescriptorPath)
-	if err != nil || descriptor.Schema != "paperboat.preview-runtime/v2" || descriptor.Name != config.Name ||
+	if err != nil || descriptor.Schema != "paperboat.preview-runtime/v1" || descriptor.Name != config.Name ||
 		descriptor.ServiceDefinition != config.ServiceDefinition || descriptor.Indefinite != config.Indefinite ||
 		!samePreviewExpiry(descriptor.ExpiresAt, config.ExpiresAt) || !validServeRuntimeDescriptor(descriptor.Serve) {
 		return errors.Join(ErrProductionInvalid, err)

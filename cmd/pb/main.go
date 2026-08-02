@@ -4676,7 +4676,7 @@ func enrichLocalServeSources(items []api.Preview) []api.Preview {
 			}
 		}
 		closeErr := file.Close()
-		if decodeErr != nil || closeErr != nil || descriptor.Schema != "paperboat.preview-runtime/v2" || descriptor.Record == nil || descriptor.Record.ID == "" || descriptor.Serve == nil || !filepath.IsAbs(descriptor.Serve.SourcePath) {
+		if decodeErr != nil || closeErr != nil || descriptor.Schema != "paperboat.preview-runtime/v1" || descriptor.Record == nil || descriptor.Record.ID == "" || descriptor.Serve == nil || !filepath.IsAbs(descriptor.Serve.SourcePath) {
 			continue
 		}
 		paths[descriptor.Record.ID] = filepath.Clean(descriptor.Serve.SourcePath)
@@ -7183,14 +7183,14 @@ func inspectLocalPreviewDescriptors(report *localDoctorReport, directory string,
 		var extra any
 		extraErr := decoder.Decode(&extra)
 		file.Close()
-		validV1 := descriptor.Schema == "paperboat.preview-runtime/v1" && descriptor.Serve == nil && descriptor.Port != 0
-		validV2 := descriptor.Schema == "paperboat.preview-runtime/v2" && descriptor.BindAddress == "127.0.0.1" && descriptor.ServiceGeneration > 0 && descriptor.Serve != nil && filepath.IsAbs(descriptor.Serve.SourcePath) && descriptor.Serve.SourceIdentity != "" && descriptor.Serve.OwnerMode == "detached" &&
+		validPreview := descriptor.Serve == nil && descriptor.Port != 0
+		validServe := descriptor.BindAddress == "127.0.0.1" && descriptor.ServiceGeneration > 0 && descriptor.Serve != nil && filepath.IsAbs(descriptor.Serve.SourcePath) && descriptor.Serve.SourceIdentity != "" && descriptor.Serve.OwnerMode == "detached" &&
 			(descriptor.Serve.SourceKind == servepkg.SourceFile || descriptor.Serve.SourceKind == servepkg.SourceDirectory) && (!descriptor.Serve.SPA || descriptor.Serve.SourceKind == servepkg.SourceDirectory)
-		if decodeErr != nil || extraErr != io.EOF || !validV1 && !validV2 || descriptor.Name == "" || descriptor.Indefinite == (descriptor.ExpiresAt != nil) {
+		if decodeErr != nil || extraErr != io.EOF || descriptor.Schema != "paperboat.preview-runtime/v1" || !validPreview && !validServe || descriptor.Name == "" || descriptor.Indefinite == (descriptor.ExpiresAt != nil) {
 			report.InvalidPreviews++
 			continue
 		}
-		if validV2 {
+		if validServe {
 			report.ServedPreviews++
 			if _, sourceErr := servepkg.ResolvePinnedSource(descriptor.Serve.SourcePath, descriptor.Serve.SourceKind, descriptor.Serve.SourceIdentity); sourceErr != nil {
 				report.InvalidServeSources++
@@ -7211,7 +7211,7 @@ func inspectLocalPreviewDescriptors(report *localDoctorReport, directory string,
 			report.ExpiredPreviews++
 		} else {
 			report.ActivePreviews++
-			if validV2 {
+			if validServe {
 				report.ActiveServedPreviews++
 			}
 		}

@@ -100,11 +100,7 @@ func installPreviewService(ctx context.Context, executable, stateRoot, name stri
 	default:
 		return PreviewRuntimeDescriptor{}, hostservice.ErrUnsupportedPlatform
 	}
-	schema := "paperboat.preview-runtime/v1"
-	if served != nil {
-		schema = "paperboat.preview-runtime/v2"
-	}
-	descriptor := PreviewRuntimeDescriptor{Schema: schema, Name: name, BindAddress: "127.0.0.1", Port: port, ServiceGeneration: uint64(time.Now().UTC().UnixNano()), Indefinite: indefinite, ExpiresAt: expiresAt, ServiceDefinition: definitionPath, Serve: served}
+	descriptor := PreviewRuntimeDescriptor{Schema: "paperboat.preview-runtime/v1", Name: name, BindAddress: "127.0.0.1", Port: port, ServiceGeneration: uint64(time.Now().UTC().UnixNano()), Indefinite: indefinite, ExpiresAt: expiresAt, ServiceDefinition: definitionPath, Serve: served}
 	if err := writePreviewRuntimeDescriptor(descriptorPath, descriptor); err != nil {
 		return PreviewRuntimeDescriptor{}, err
 	}
@@ -370,9 +366,9 @@ func readPreviewRuntimeDescriptor(path string) (PreviewRuntimeDescriptor, error)
 	if decoder.Decode(&descriptor) != nil || decoder.Decode(&struct{}{}) != io.EOF {
 		return PreviewRuntimeDescriptor{}, ErrProductionInvalid
 	}
-	validV1 := descriptor.Schema == "paperboat.preview-runtime/v1" && descriptor.Serve == nil && descriptor.Port != 0
-	validV2 := descriptor.Schema == "paperboat.preview-runtime/v2" && validServeRuntimeDescriptor(descriptor.Serve) && descriptor.BindAddress == "127.0.0.1" && descriptor.ServiceGeneration > 0
-	if !validV1 && !validV2 || descriptor.Name == "" || descriptor.ServiceDefinition != "" && !filepath.IsAbs(descriptor.ServiceDefinition) || descriptor.Indefinite == (descriptor.ExpiresAt != nil) {
+	validPreview := descriptor.Serve == nil && descriptor.Port != 0
+	validServe := validServeRuntimeDescriptor(descriptor.Serve) && descriptor.BindAddress == "127.0.0.1" && descriptor.ServiceGeneration > 0
+	if descriptor.Schema != "paperboat.preview-runtime/v1" || !validPreview && !validServe || descriptor.Name == "" || descriptor.ServiceDefinition != "" && !filepath.IsAbs(descriptor.ServiceDefinition) || descriptor.Indefinite == (descriptor.ExpiresAt != nil) {
 		return PreviewRuntimeDescriptor{}, ErrProductionInvalid
 	}
 	return descriptor, nil

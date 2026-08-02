@@ -172,7 +172,7 @@ func TestDoctorValidatesServedPreviewSourceWithoutReportingPath(t *testing.T) {
 	identityValue, _ := source.Identity()
 	expires := time.Now().UTC().Add(time.Hour)
 	descriptor, _ := json.Marshal(map[string]any{
-		"schema": "paperboat.preview-runtime/v2", "name": "site", "bind_address": "127.0.0.1", "port": 32000, "service_generation": 1, "indefinite": false, "expires_at": expires, "service_definition": "",
+		"schema": "paperboat.preview-runtime/v1", "name": "site", "bind_address": "127.0.0.1", "port": 32000, "service_generation": 1, "indefinite": false, "expires_at": expires, "service_definition": "",
 		"serve": map[string]any{"source_path": source.Path, "source_kind": source.Kind, "source_identity": identityValue, "spa": false, "owner_mode": "detached"},
 	})
 	directory := filepath.Join(root, "previews", "active")
@@ -1807,7 +1807,7 @@ func TestEnrichLocalServeSources(t *testing.T) {
 	}
 	source := filepath.Join(t.TempDir(), "site")
 	descriptor := func(id, path string) []byte {
-		return []byte(fmt.Sprintf(`{"schema":"paperboat.preview-runtime/v2","record":{"id":%q},"serve":{"source_path":%q}}`, id, path))
+		return []byte(fmt.Sprintf(`{"schema":"paperboat.preview-runtime/v1","record":{"id":%q},"serve":{"source_path":%q}}`, id, path))
 	}
 	if err := os.WriteFile(filepath.Join(directory, "valid.json"), descriptor("served", source), 0o600); err != nil {
 		t.Fatal(err)

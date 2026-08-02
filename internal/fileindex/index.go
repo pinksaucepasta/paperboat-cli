@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const cacheVersion = 2
+const cacheVersion = 1
 
 var activeRefreshes sync.Map
 
@@ -40,7 +40,7 @@ func CachePath() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(root, "paperboat", "file-index-v2.json"), nil
+	return filepath.Join(root, "paperboat", "file-index.json"), nil
 }
 
 func Load(root, cachePath string) ([]string, bool) {
