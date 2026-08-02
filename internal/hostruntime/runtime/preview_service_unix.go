@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/user"
@@ -19,22 +20,47 @@ import (
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/preview"
 	hostservice "github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
+	servepkg "github.com/pinksaucepasta/paperboat/internal/serve"
 )
 
+type ServeRuntimeDescriptor struct {
+	SourcePath     string              `json:"source_path"`
+	SourceKind     servepkg.SourceKind `json:"source_kind"`
+	SourceIdentity string              `json:"source_identity"`
+	SPA            bool                `json:"spa"`
+	OwnerMode      string              `json:"owner_mode"`
+}
+
 type PreviewRuntimeDescriptor struct {
-	Schema            string                 `json:"schema"`
-	Name              string                 `json:"name"`
-	Port              uint16                 `json:"port"`
-	Indefinite        bool                   `json:"indefinite"`
-	ExpiresAt         *time.Time             `json:"expires_at,omitempty"`
-	ServiceDefinition string                 `json:"service_definition"`
-	Record            *preview.ControlRecord `json:"record,omitempty"`
+	Schema            string                  `json:"schema"`
+	Name              string                  `json:"name"`
+	BindAddress       string                  `json:"bind_address,omitempty"`
+	Port              uint16                  `json:"port"`
+	ServiceGeneration uint64                  `json:"service_generation,omitempty"`
+	Indefinite        bool                    `json:"indefinite"`
+	ExpiresAt         *time.Time              `json:"expires_at,omitempty"`
+	ServiceDefinition string                  `json:"service_definition"`
+	Record            *preview.ControlRecord  `json:"record,omitempty"`
+	Serve             *ServeRuntimeDescriptor `json:"serve,omitempty"`
 }
 
 var ErrPreviewAlreadyActive = errors.New("preview name is already active")
 
 func InstallPreviewService(ctx context.Context, executable, stateRoot, name string, port uint16, expiresAt *time.Time, indefinite bool) (PreviewRuntimeDescriptor, error) {
-	if !filepath.IsAbs(executable) || !filepath.IsAbs(stateRoot) || name == "" || port == 0 || indefinite == (expiresAt != nil) {
+	return installPreviewService(ctx, executable, stateRoot, name, port, expiresAt, indefinite, nil)
+}
+
+func InstallServeService(ctx context.Context, executable, stateRoot, name string, source servepkg.Source, spa bool, expiresAt *time.Time, indefinite bool) (PreviewRuntimeDescriptor, error) {
+	identity, err := source.Identity()
+	if err != nil {
+		return PreviewRuntimeDescriptor{}, err
+	}
+	descriptor := &ServeRuntimeDescriptor{SourcePath: source.Path, SourceKind: source.Kind, SourceIdentity: identity, SPA: spa, OwnerMode: "detached"}
+	return installPreviewService(ctx, executable, stateRoot, name, 0, expiresAt, indefinite, descriptor)
+}
+
+func installPreviewService(ctx context.Context, executable, stateRoot, name string, port uint16, expiresAt *time.Time, indefinite bool, served *ServeRuntimeDescriptor) (PreviewRuntimeDescriptor, error) {
+	if !filepath.IsAbs(executable) || !filepath.IsAbs(stateRoot) || name == "" || port == 0 && served == nil || port != 0 && served != nil || indefinite == (expiresAt != nil) {
 		return PreviewRuntimeDescriptor{}, ErrProductionInvalid
 	}
 	home, err := os.UserHomeDir()
@@ -74,11 +100,21 @@ func InstallPreviewService(ctx context.Context, executable, stateRoot, name stri
 	default:
 		return PreviewRuntimeDescriptor{}, hostservice.ErrUnsupportedPlatform
 	}
-	descriptor := PreviewRuntimeDescriptor{Schema: "paperboat.preview-runtime/v1", Name: name, Port: port, Indefinite: indefinite, ExpiresAt: expiresAt, ServiceDefinition: definitionPath}
+	schema := "paperboat.preview-runtime/v1"
+	if served != nil {
+		schema = "paperboat.preview-runtime/v2"
+	}
+	descriptor := PreviewRuntimeDescriptor{Schema: schema, Name: name, BindAddress: "127.0.0.1", Port: port, ServiceGeneration: uint64(time.Now().UTC().UnixNano()), Indefinite: indefinite, ExpiresAt: expiresAt, ServiceDefinition: definitionPath, Serve: served}
 	if err := writePreviewRuntimeDescriptor(descriptorPath, descriptor); err != nil {
 		return PreviewRuntimeDescriptor{}, err
 	}
-	args := []string{"__runtime-preview", "--state-root", stateRoot, "--name", name, "--port", strconv.Itoa(int(port)), "--descriptor", descriptorPath, "--service-definition", definitionPath}
+	entrypoint := "__runtime-preview"
+	args := []string{entrypoint, "--state-root", stateRoot, "--name", name, "--descriptor", descriptorPath, "--service-definition", definitionPath}
+	if served == nil {
+		args = append(args, "--port", strconv.Itoa(int(port)))
+	} else {
+		args[0] = "__runtime-serve"
+	}
 	if indefinite {
 		args = append(args, "--indefinite")
 	} else {
@@ -96,6 +132,19 @@ func InstallPreviewService(ctx context.Context, executable, stateRoot, name stri
 	if err := installer.Install(ctx); err != nil {
 		_ = os.Remove(descriptorPath)
 		return PreviewRuntimeDescriptor{}, err
+	}
+	if served != nil {
+		if runtime.GOOS == "linux" {
+			if err := runner.Run(ctx, "systemctl", "--user", "disable", "paperboat-preview-"+instance+".service"); err != nil {
+				_ = installer.Uninstall(ctx)
+				_ = os.Remove(descriptorPath)
+				return PreviewRuntimeDescriptor{}, err
+			}
+		} else if err := os.Remove(definitionPath); err != nil {
+			_ = installer.Uninstall(ctx)
+			_ = os.Remove(descriptorPath)
+			return PreviewRuntimeDescriptor{}, err
+		}
 	}
 	return descriptor, nil
 }
@@ -140,7 +189,7 @@ func retirePreviewService(ctx context.Context, name, definition string, runner h
 	if runtime.GOOS == "linux" {
 		unit := "paperboat-preview-" + previewServiceInstance(name) + ".service"
 		return errors.Join(
-			runner.Run(ctx, "systemctl", "--user", "disable", unit),
+			runner.Run(ctx, "systemctl", "--user", "disable", "--now", unit),
 			removeDefinition(),
 			runner.Run(ctx, "systemctl", "--user", "daemon-reload"),
 		)
@@ -154,6 +203,109 @@ func retirePreviewService(ctx context.Context, name, definition string, runner h
 		return err
 	}
 	return errors.Join(removeDefinition(), runner.Run(ctx, "launchctl", "bootout", "gui/"+strconv.Itoa(uid)+"/"+label))
+}
+
+func retireCompletedServeService(ctx context.Context, name, descriptorPath, definition string, runner hostservice.Runner) error {
+	if ctx == nil || name == "" || !filepath.IsAbs(descriptorPath) || definition != "" && !filepath.IsAbs(definition) {
+		return ErrProductionInvalid
+	}
+	if definition == "" {
+		err := os.Remove(descriptorPath)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if runner == nil {
+		runner = hostservice.ExecRunner{}
+	}
+	home, homeErr := os.UserHomeDir()
+	expected, _, err := previewServiceDefinition(home, name, runtime.GOOS)
+	err = errors.Join(err, homeErr)
+	if err != nil || definition != expected {
+		return errors.Join(ErrProductionInvalid, err)
+	}
+	removeDescriptorErr := os.Remove(descriptorPath)
+	if errors.Is(removeDescriptorErr, os.ErrNotExist) {
+		removeDescriptorErr = nil
+	}
+	removeDefinitionErr := os.Remove(definition)
+	if errors.Is(removeDefinitionErr, os.ErrNotExist) {
+		removeDefinitionErr = nil
+	}
+	if runtime.GOOS == "linux" {
+		unit := "paperboat-preview-" + previewServiceInstance(name) + ".service"
+		return errors.Join(removeDescriptorErr, removeDefinitionErr, runner.Run(ctx, "systemctl", "--user", "daemon-reload"), runner.Run(ctx, "systemctl", "--user", "reset-failed", unit))
+	}
+	return errors.Join(removeDescriptorErr, removeDefinitionErr)
+}
+
+func RemovePreviewService(ctx context.Context, stateRoot, name string) error {
+	return removePreviewService(ctx, stateRoot, name, hostservice.ExecRunner{})
+}
+
+func removePreviewService(ctx context.Context, stateRoot, name string, runner hostservice.Runner) error {
+	if ctx == nil || !filepath.IsAbs(stateRoot) || name == "" {
+		return ErrProductionInvalid
+	}
+	digest := sha256.Sum256([]byte(name))
+	path := filepath.Join(stateRoot, "previews", "active", hex.EncodeToString(digest[:8])+".json")
+	descriptor, err := readPreviewRuntimeDescriptor(path)
+	if err != nil {
+		return err
+	}
+	if descriptor.Name != name || descriptor.ServiceDefinition == "" {
+		return ErrProductionInvalid
+	}
+	if err := retirePreviewService(ctx, name, descriptor.ServiceDefinition, runner); err != nil {
+		return err
+	}
+	removeErr := os.Remove(path)
+	if errors.Is(removeErr, os.ErrNotExist) {
+		return nil
+	}
+	return removeErr
+}
+
+func RemoveAllPreviewServices(ctx context.Context, stateRoot string) error {
+	return removeAllPreviewServices(ctx, stateRoot, hostservice.ExecRunner{})
+}
+
+func removeAllPreviewServices(ctx context.Context, stateRoot string, runner hostservice.Runner) error {
+	if ctx == nil || !filepath.IsAbs(stateRoot) || runner == nil {
+		return ErrProductionInvalid
+	}
+	directory := filepath.Join(stateRoot, "previews", "active")
+	entries, err := os.ReadDir(directory)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var result error
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		path := filepath.Join(directory, entry.Name())
+		descriptor, readErr := readPreviewRuntimeDescriptor(path)
+		if readErr != nil {
+			result = errors.Join(result, fmt.Errorf("read preview service %s: %w", entry.Name(), readErr))
+			continue
+		}
+		if descriptor.ServiceDefinition == "" {
+			continue
+		}
+		if retireErr := retirePreviewService(ctx, descriptor.Name, descriptor.ServiceDefinition, runner); retireErr != nil {
+			result = errors.Join(result, fmt.Errorf("retire preview service %s: %w", entry.Name(), retireErr))
+			continue
+		}
+		if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			result = errors.Join(result, fmt.Errorf("remove preview service %s: %w", entry.Name(), removeErr))
+		}
+	}
+	return result
 }
 
 func WaitPreviewServiceReady(ctx context.Context, stateRoot, name string) (preview.ControlRecord, error) {
@@ -215,8 +367,19 @@ func readPreviewRuntimeDescriptor(path string) (PreviewRuntimeDescriptor, error)
 	var descriptor PreviewRuntimeDescriptor
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
-	if decoder.Decode(&descriptor) != nil || decoder.Decode(&struct{}{}) != io.EOF || descriptor.Schema != "paperboat.preview-runtime/v1" || descriptor.Name == "" || descriptor.Port == 0 || descriptor.ServiceDefinition != "" && !filepath.IsAbs(descriptor.ServiceDefinition) || descriptor.Indefinite == (descriptor.ExpiresAt != nil) {
+	if decoder.Decode(&descriptor) != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		return PreviewRuntimeDescriptor{}, ErrProductionInvalid
+	}
+	validV1 := descriptor.Schema == "paperboat.preview-runtime/v1" && descriptor.Serve == nil && descriptor.Port != 0
+	validV2 := descriptor.Schema == "paperboat.preview-runtime/v2" && validServeRuntimeDescriptor(descriptor.Serve) && descriptor.BindAddress == "127.0.0.1" && descriptor.ServiceGeneration > 0
+	if !validV1 && !validV2 || descriptor.Name == "" || descriptor.ServiceDefinition != "" && !filepath.IsAbs(descriptor.ServiceDefinition) || descriptor.Indefinite == (descriptor.ExpiresAt != nil) {
 		return PreviewRuntimeDescriptor{}, ErrProductionInvalid
 	}
 	return descriptor, nil
+}
+
+func validServeRuntimeDescriptor(value *ServeRuntimeDescriptor) bool {
+	return value != nil && filepath.IsAbs(value.SourcePath) && value.SourceIdentity != "" &&
+		(value.SourceKind == servepkg.SourceFile || value.SourceKind == servepkg.SourceDirectory) &&
+		value.OwnerMode == "detached" && (!value.SPA || value.SourceKind == servepkg.SourceDirectory)
 }

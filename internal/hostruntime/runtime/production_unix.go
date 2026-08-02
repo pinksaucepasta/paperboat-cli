@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -24,6 +25,7 @@ import (
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/auth"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/availability"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/codexsession"
 	runtimeconfig "github.com/pinksaucepasta/paperboat/internal/hostruntime/config"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/connector"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/enrollment"
@@ -32,7 +34,9 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hosted"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostservice"
 	runtimeidentity "github.com/pinksaucepasta/paperboat/internal/hostruntime/identity"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/machinecontrol"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/observability"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/servelease"
 )
 
 var ErrProductionInvalid = errors.New("invalid production host configuration")
@@ -58,6 +62,15 @@ func NewProductionHost(ctx context.Context, version string, environ func(string)
 		return nil, err
 	}
 	_ = metrics.Record("paperboat_runtime_restart_total", float64(bootState.Generation), nil)
+	if runtimeConfig.Profile == runtimeconfig.BYOD {
+		store, openErr := runtimeidentity.Open(runtimeidentity.Config{StateRoot: runtimeConfig.StateRoot})
+		if openErr == nil {
+			registration, registrationErr := store.Registration()
+			if registrationErr == nil && shouldRunReceiveCoordinator(registration.SetupMode, environ("PAPERBOAT_SETUP_MODE")) {
+				return newProductionReceiveCoordinator(ctx, version, environ, runtimeConfig, bootState, recoveryExitSignal, metrics, registration)
+			}
+		}
+	}
 	var hostedConfig hosted.Config
 	if runtimeConfig.Profile == runtimeconfig.Hosted {
 		hostedConfig, err = hosted.FromEnv(environ)
@@ -278,6 +291,10 @@ func NewProductionHost(ctx context.Context, version string, environ func(string)
 		}
 	}
 	listen := valueOrRuntime(environ("PAPERBOAT_RUNTIME_LISTEN_ADDRESS"), "127.0.0.1:8080")
+	localControlToken, err := writeLocalControlToken(runtimeConfig.StateRoot)
+	if err != nil {
+		return nil, err
+	}
 	if err := writeWorkerLocal(runtimeConfig.StateRoot, listen); err != nil {
 		return nil, err
 	}
@@ -290,11 +307,210 @@ func NewProductionHost(ctx context.Context, version string, environ func(string)
 		return nil, err
 	}
 	previewManager := &CoordinatorPreviewManager{Executable: executable, StateRoot: runtimeConfig.StateRoot}
-	dependencies := HostDependencies{Authorizer: authorizer, AuthorizationService: authorizationRefresh, Connector: connectorService, PreviewLauncher: previewManager, PreviewRecovery: previewManager, RuntimeObservationService: runtimeService, Updates: updateClient, Metrics: metrics}
+	_ = metrics.Record("paperboat_runtime_active_resources", float64(activeDetachedServeCount(runtimeConfig.StateRoot, time.Now().UTC())), map[string]string{"kind": "serves_detached"})
+	serveLeases, err := newServeLeaseManager(controlURL.String(), runtimeConfig.StateRoot, machineID, bootState.Generation, transport, metrics)
+	if err != nil {
+		return nil, err
+	}
+	codexManager, err := codexsession.New(codexsession.Config{
+		StateRoot: filepath.Join(runtimeConfig.StateRoot, "codex"), WorkspaceRoot: workspaceRoot,
+		Environment: agentEnvironment, CodexPath: valueOrRuntime(environ("PAPERBOAT_CODEX_PATH"), "codex"), MaxSessions: 4,
+	})
+	if err != nil {
+		return nil, err
+	}
+	dependencies := HostDependencies{Authorizer: authorizer, AuthorizationService: authorizationRefresh, Connector: connectorService, PreviewLauncher: previewManager, PreviewRecovery: previewManager, RuntimeObservationService: runtimeService, Updates: updateClient, Metrics: metrics, CodexSessions: codexManager, ServeLeases: serveLeases, LocalControlToken: localControlToken}
 	if runtimeConfig.Profile == runtimeconfig.Hosted {
 		dependencies.HostedLifecycle = hostedLifecycle
 	}
 	return NewHost(ctx, HostConfig{Runtime: runtimeConfig, ListenAddress: listen, WorkspaceRoot: workspaceRoot, ShellPath: agentShell, AgentEnvironment: agentEnvironment, EnvironmentID: identity.EnvironmentID, MachineID: machineID, InboxPath: inboxPath, ShutdownTimeout: shutdownTimeout, RecoveryExitSignal: recoveryExitSignal, FileTransferPolicy: transferPolicy}, dependencies)
+}
+
+func shouldRunReceiveCoordinator(registrationMode, installedMode string) bool {
+	return registrationMode == "receive" && installedMode != "host"
+}
+
+func newProductionReceiveCoordinator(ctx context.Context, version string, environ func(string) string, runtimeConfig runtimeconfig.Config, bootState workerBootState, recoveryExitSignal string, metrics *observability.Registry, registration runtimeidentity.Registration) (*Host, error) {
+	controlURL, err := validatedControlURL(environ("PAPERBOAT_CONTROL_URL"))
+	if err != nil || registration.MachineID != environ("PAPERBOAT_MACHINE_ID") || registration.EnvironmentID == "" {
+		return nil, errors.Join(ErrProductionInvalid, err)
+	}
+	issuer := strings.TrimRight(valueOrRuntime(environ("PAPERBOAT_CONTROL_ISSUER"), controlURL.String()), "/")
+	transport, err := productionTransport(environ("PAPERBOAT_CONTROL_CA_FILE"))
+	if err != nil {
+		return nil, err
+	}
+	operationID := func() (string, error) {
+		value := make([]byte, 16)
+		if _, err := rand.Read(value); err != nil {
+			return "", err
+		}
+		return "op_receive_" + hex.EncodeToString(value), nil
+	}
+	control, err := machinecontrol.NewSource(machinecontrol.Config{ControlURL: controlURL.String(), StateRoot: runtimeConfig.StateRoot, Transport: transport, Timeout: 15 * time.Second, RenewBefore: 10 * time.Minute, OperationID: operationID})
+	if err != nil {
+		return nil, err
+	}
+	fetcher, err := auth.NewHTTPJWKSFetcher(controlURL.ResolveReference(&url.URL{Path: "/.well-known/jwks.json"}).String(), []string{controlURL.Hostname()}, transport)
+	if err != nil {
+		return nil, err
+	}
+	cache, err := auth.NewJWKSCache(auth.JWKSConfig{Fetcher: fetcher, Clock: productionClock{}, TTL: 5 * time.Minute, RetainMissing: auth.DefaultRetainMissing, PersistencePath: filepath.Join(runtimeConfig.StateRoot, "authorization", "jwks.json")})
+	if err != nil {
+		return nil, err
+	}
+	refreshCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	_ = cache.Refresh(refreshCtx)
+	cancel()
+	revocations := auth.NewRevocationCache()
+	revocationRefresh, err := newRevocationRefreshService(controlURL.ResolveReference(&url.URL{Path: "/v1/helper-trust/revocations"}).String(), control, control, operationID, revocations, transport, 15*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	authorizationRefresh := serviceGroup{&jwksRefreshService{cache: cache, interval: time.Minute}, revocationRefresh}
+	verifier := auth.Verifier{Keys: cache, Clock: productionClock{}, Replays: auth.NewReplayCache(4096, productionClock{}), Revocations: revocations, ClockSkew: 30 * time.Second, RefreshTimeout: 2 * time.Second}
+	authorizer, err := NewCredentialAuthorizer(CredentialAuthConfig{Issuer: issuer, EnvironmentID: registration.EnvironmentID, MachineID: registration.MachineID, HelperID: "machine-control", Verifier: verifier, Revocations: revocations})
+	if err != nil {
+		return nil, err
+	}
+	admissions, err := connector.NewHTTPSAdmissionSource(connector.AdmissionSourceConfig{
+		Endpoint: controlURL.ResolveReference(&url.URL{Path: "/v1/connectors/admission"}).String(), AllowedHosts: []string{controlURL.Hostname()}, Tokens: control, Proofs: control,
+		Verifier: verifier, Clock: productionClock{}, Issuer: issuer, EnvironmentID: registration.EnvironmentID, MachineID: registration.MachineID,
+		ConnectorID: "runtime", EdgePool: valueOrRuntime(environ("PAPERBOAT_EDGE_POOL"), "default"), OperationID: operationID, Transport: transport,
+	})
+	if err != nil {
+		return nil, err
+	}
+	dialer, err := connector.NewFRPDialer(connector.FRPDialerConfig{ReadyTimeout: durationRuntime(environ("PAPERBOAT_CONNECTOR_READY_TIMEOUT_SECONDS"), 15*time.Second), RouteKinds: []string{"runtime_https_wss"}, PreferencePath: filepath.Join(runtimeConfig.StateRoot, "connector", "transport.json")})
+	if err != nil {
+		return nil, err
+	}
+	transferPolicy := filetransfer.NewPolicyStore(filetransfer.DefaultPolicy)
+	manager, err := connector.New(connector.Config{EnvironmentID: registration.EnvironmentID, MachineID: registration.MachineID, ConnectorID: "runtime", EdgePool: valueOrRuntime(environ("PAPERBOAT_EDGE_POOL"), "default"), Dialer: dialer, DrainTimeout: 10 * time.Second, Transport: productionConnectorTransport(environ("PAPERBOAT_CONNECTOR_TERMINAL_TRANSPORT")), AdmissionAccepted: func(policy auth.FileTransferPolicy) {
+		_ = transferPolicy.Update(filetransfer.Policy{Revision: policy.Revision, MaxFileBytes: policy.MaxFileBytes, MaxBatchFiles: policy.MaxBatchFiles, MaxBatchBytes: policy.MaxBatchBytes, MaxConcurrentTransfers: policy.MaxConcurrentTransfers, RetentionSeconds: policy.RetentionSeconds, DeliveryTimeoutSeconds: policy.DeliveryTimeoutSeconds, MaxPendingSpoolBytes: policy.MaxPendingSpoolBytes})
+	}})
+	if err != nil {
+		return nil, err
+	}
+	supervisor, err := connector.NewSupervisor(connector.SupervisorConfig{Manager: manager, Admissions: admissions, InitialBackoff: time.Second, MaxBackoff: 45 * time.Second, Metrics: metrics})
+	if err != nil {
+		return nil, err
+	}
+	networkChanges, err := newNetworkChangeService(2*time.Second, supervisor.NetworkChanged)
+	if err != nil {
+		return nil, err
+	}
+	connectorService := &connectorReadinessService{supervisor: supervisor, manager: manager, networkChanges: networkChanges}
+	scope := environ("PAPERBOAT_RUNTIME_SERVICE_SCOPE")
+	if scope != "system" && scope != "user" {
+		scope = "unknown"
+	}
+	sender := &runtimeObservationSender{endpoint: controlURL.ResolveReference(&url.URL{Path: "/v1/runtime-observations"}).String(), tokens: control, proofs: control, operationID: operationID, environmentID: registration.EnvironmentID, machineID: registration.MachineID, reporterVersion: version, client: &http.Client{Transport: transport, Timeout: 10 * time.Second}, receiptPath: filepath.Join(runtimeConfig.StateRoot, "runtime", "server-heartbeat.json"), workerGeneration: bootState.Generation, osBootID: bootState.OSBootID, serviceScope: scope, connector: manager, capabilities: []string{"file_receive", "preview_launch"}}
+	observation := &runtimeObservationService{sender: sender, interval: runtimeConfig.Limits.HeartbeatInterval, timeout: 10 * time.Second}
+	listen := valueOrRuntime(environ("PAPERBOAT_RUNTIME_LISTEN_ADDRESS"), "127.0.0.1:8080")
+	localControlToken, err := writeLocalControlToken(runtimeConfig.StateRoot)
+	if err != nil {
+		return nil, err
+	}
+	if err := writeWorkerLocal(runtimeConfig.StateRoot, listen); err != nil {
+		return nil, err
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+	previewManager := &CoordinatorPreviewManager{Executable: executable, StateRoot: runtimeConfig.StateRoot}
+	_ = metrics.Record("paperboat_runtime_active_resources", float64(activeDetachedServeCount(runtimeConfig.StateRoot, time.Now().UTC())), map[string]string{"kind": "serves_detached"})
+	serveLeases, err := newServeLeaseManager(controlURL.String(), runtimeConfig.StateRoot, registration.MachineID, bootState.Generation, transport, metrics)
+	if err != nil {
+		return nil, err
+	}
+	return NewReceiveCoordinator(ctx, HostConfig{Runtime: runtimeConfig, ListenAddress: listen, WorkspaceRoot: registration.InboxPath, EnvironmentID: registration.EnvironmentID, MachineID: registration.MachineID, InboxPath: registration.InboxPath, ShutdownTimeout: 30 * time.Second, RecoveryExitSignal: recoveryExitSignal, FileTransferPolicy: transferPolicy}, HostDependencies{Authorizer: authorizer, AuthorizationService: authorizationRefresh, Connector: connectorService, PreviewLauncher: previewManager, PreviewRecovery: previewManager, RuntimeObservationService: observation, Metrics: metrics, ServeLeases: serveLeases, LocalControlToken: localControlToken})
+}
+
+func activeDetachedServeCount(stateRoot string, now time.Time) int {
+	entries, err := os.ReadDir(filepath.Join(stateRoot, "previews", "active"))
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		descriptor, err := readPreviewRuntimeDescriptor(filepath.Join(stateRoot, "previews", "active", entry.Name()))
+		if err == nil && descriptor.Serve != nil && descriptor.Serve.OwnerMode == "detached" && (descriptor.Indefinite || descriptor.ExpiresAt != nil && descriptor.ExpiresAt.After(now)) {
+			count++
+		}
+	}
+	return count
+}
+
+type serveRuntimeEvents struct {
+	logger     *observability.Logger
+	machineID  string
+	generation uint64
+}
+
+func (e serveRuntimeEvents) Record(ctx context.Context, operation, result string) {
+	if e.logger != nil {
+		_ = e.logger.Log(ctx, observability.Event{Component: "serve", Operation: operation, Result: result, MachineID: e.machineID, State: result, Role: "foreground", Generation: e.generation})
+	}
+}
+
+func newServeLeaseManager(controlURL, stateRoot, machineID string, generation uint64, transport http.RoundTripper, metrics *observability.Registry) (*servelease.Manager, error) {
+	logger, err := observability.NewLogger(slog.Default())
+	if err != nil {
+		return nil, err
+	}
+	return servelease.New(servelease.Config{
+		TTL: 15 * time.Second, Interval: time.Second, Metrics: metrics, StatePath: filepath.Join(stateRoot, "runtime", "serve-leases.json"),
+		Events: serveRuntimeEvents{logger: logger, machineID: machineID, generation: generation},
+		Expired: func(expireCtx context.Context, lease servelease.Lease) error {
+			return revokeProductionPreviewByName(expireCtx, controlURL, stateRoot, lease.Name, transport)
+		},
+	})
+}
+
+func writeLocalControlToken(stateRoot string) (string, error) {
+	if !filepath.IsAbs(stateRoot) {
+		return "", ErrProductionInvalid
+	}
+	value := make([]byte, 32)
+	if _, err := rand.Read(value); err != nil {
+		return "", err
+	}
+	token := base64.RawURLEncoding.EncodeToString(value)
+	directory := filepath.Join(stateRoot, "runtime")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return "", err
+	}
+	path := filepath.Join(directory, "local-control-token")
+	temporary, err := os.CreateTemp(directory, ".local-control-token-*")
+	if err != nil {
+		return "", err
+	}
+	name := temporary.Name()
+	defer os.Remove(name)
+	if err := temporary.Chmod(0o600); err != nil {
+		temporary.Close()
+		return "", err
+	}
+	if _, err := temporary.WriteString(token); err != nil {
+		temporary.Close()
+		return "", err
+	}
+	if err := temporary.Sync(); err != nil {
+		temporary.Close()
+		return "", err
+	}
+	if err := temporary.Close(); err != nil {
+		return "", err
+	}
+	if err := os.Rename(name, path); err != nil {
+		return "", err
+	}
+	return token, nil
 }
 
 func writeWorkerLocal(stateRoot, listenAddress string) error {
@@ -471,6 +687,7 @@ type runtimeObservationSender struct {
 	osBootID         string
 	serviceScope     string
 	connector        interface{ Status() connector.Status }
+	capabilities     []string
 }
 
 func (s *runtimeObservationSender) Send(ctx context.Context) error {
@@ -521,6 +738,7 @@ func (s *runtimeObservationSender) Send(ctx context.Context) error {
 }
 
 type runtimeDiagnosticsObservation struct {
+	Capabilities        []string  `json:"capabilities"`
 	WorkerGeneration    uint64    `json:"worker_generation"`
 	OSBootID            string    `json:"os_boot_id"`
 	ConnectorState      string    `json:"connector_state"`
@@ -540,7 +758,11 @@ func (s *runtimeObservationSender) runtimeDiagnostics(observedAt time.Time) *run
 	} else if status.Stopping {
 		state = "degraded"
 	}
-	return &runtimeDiagnosticsObservation{WorkerGeneration: s.workerGeneration, OSBootID: s.osBootID, ConnectorState: state, ConnectorGeneration: status.Generation, WorkerServiceScope: s.serviceScope, ObservedAt: observedAt}
+	capabilities := s.capabilities
+	if len(capabilities) == 0 {
+		capabilities = []string{"file_receive", "preview_launch", "terminal_host", "codex_host", "session_host", "keep_awake"}
+	}
+	return &runtimeDiagnosticsObservation{Capabilities: append([]string(nil), capabilities...), WorkerGeneration: s.workerGeneration, OSBootID: s.osBootID, ConnectorState: state, ConnectorGeneration: status.Generation, WorkerServiceScope: s.serviceScope, ObservedAt: observedAt}
 }
 
 type serverHeartbeatReceipt struct {

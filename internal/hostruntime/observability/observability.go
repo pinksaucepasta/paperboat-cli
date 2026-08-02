@@ -36,6 +36,10 @@ type Event struct {
 	Duration      time.Duration
 	Bytes         uint64
 	Count         uint64
+	MachineID     string
+	State         string
+	Role          string
+	Generation    uint64
 }
 type Logger struct{ logger *slog.Logger }
 
@@ -49,7 +53,7 @@ func (l *Logger) Log(ctx context.Context, event Event) error {
 	if event.Component == "" || event.Operation == "" || event.Result == "" {
 		return ErrUnsafeValue
 	}
-	for _, value := range []string{event.Component, event.Operation, event.Result, event.ErrorCode, event.CorrelationID, event.ResourceID} {
+	for _, value := range []string{event.Component, event.Operation, event.Result, event.ErrorCode, event.CorrelationID, event.ResourceID, event.MachineID, event.State, event.Role} {
 		if value != "" && !safeValue(value) {
 			return ErrUnsafeValue
 		}
@@ -64,6 +68,18 @@ func (l *Logger) Log(ctx context.Context, event Event) error {
 	if event.ResourceID != "" {
 		attributes = append(attributes, "resource_id", event.ResourceID)
 	}
+	if event.MachineID != "" {
+		attributes = append(attributes, "machine_id", event.MachineID)
+	}
+	if event.State != "" {
+		attributes = append(attributes, "state", event.State)
+	}
+	if event.Role != "" {
+		attributes = append(attributes, "role", event.Role)
+	}
+	if event.Generation != 0 {
+		attributes = append(attributes, "generation", event.Generation)
+	}
 	l.logger.InfoContext(ctx, "runtime_event", attributes...)
 	return nil
 }
@@ -71,8 +87,9 @@ func (l *Logger) Log(ctx context.Context, event Event) error {
 type Kind string
 
 const (
-	Counter Kind = "counter"
-	Gauge   Kind = "gauge"
+	Counter   Kind = "counter"
+	Gauge     Kind = "gauge"
+	Histogram Kind = "histogram"
 )
 
 type Descriptor struct {
@@ -89,15 +106,26 @@ type Registry struct {
 	mu             sync.Mutex
 	descriptors    map[string]Descriptor
 	series         map[string]Series
+	histograms     map[string]histogramSeries
 	terminalFrames [2]atomic.Uint64
 	terminalBytes  [2]atomic.Uint64
 	terminalNanos  [2]atomic.Uint64
 }
 
+type histogramSeries struct {
+	Name    string
+	Labels  map[string]string
+	Count   uint64
+	Sum     float64
+	Buckets [9]uint64
+}
+
+var histogramBounds = [...]float64{0.01, 0.05, 0.1, 0.5, 1, 5, 15, 30, math.Inf(1)}
+
 func NewRegistry(descriptors []Descriptor) (*Registry, error) {
-	registry := &Registry{descriptors: make(map[string]Descriptor), series: make(map[string]Series)}
+	registry := &Registry{descriptors: make(map[string]Descriptor), series: make(map[string]Series), histograms: make(map[string]histogramSeries)}
 	for _, descriptor := range descriptors {
-		if !safeMetricName(descriptor.Name) || descriptor.Kind != Counter && descriptor.Kind != Gauge || registry.descriptors[descriptor.Name].Name != "" {
+		if !safeMetricName(descriptor.Name) || descriptor.Kind != Counter && descriptor.Kind != Gauge && descriptor.Kind != Histogram || registry.descriptors[descriptor.Name].Name != "" {
 			return nil, ErrUnknownMetric
 		}
 		for label, values := range descriptor.Labels {
@@ -149,6 +177,22 @@ func (r *Registry) Record(name string, value float64, labels map[string]string) 
 	series := r.series[key.String()]
 	series.Name = name
 	series.Labels = copied
+	if descriptor.Kind == Histogram {
+		if value < 0 {
+			return ErrInvalidLabels
+		}
+		histogram := r.histograms[key.String()]
+		histogram.Name, histogram.Labels = name, copied
+		histogram.Count++
+		histogram.Sum += value
+		for index, bound := range histogramBounds {
+			if value <= bound {
+				histogram.Buckets[index]++
+			}
+		}
+		r.histograms[key.String()] = histogram
+		return nil
+	}
 	if descriptor.Kind == Counter {
 		if value < 0 {
 			return ErrInvalidLabels
@@ -171,6 +215,23 @@ func (r *Registry) Snapshot() []Series {
 		}
 		series.Labels = copyLabels
 		result = append(result, series)
+	}
+	for _, histogram := range r.histograms {
+		for index, bound := range histogramBounds {
+			labels := make(map[string]string, len(histogram.Labels)+1)
+			for key, value := range histogram.Labels {
+				labels[key] = value
+			}
+			labels["le"] = "+Inf"
+			if !math.IsInf(bound, 1) {
+				labels["le"] = strconv.FormatFloat(bound, 'g', -1, 64)
+			}
+			result = append(result, Series{Name: histogram.Name + "_bucket", Labels: labels, Value: float64(histogram.Buckets[index])})
+		}
+		result = append(result,
+			Series{Name: histogram.Name + "_sum", Labels: histogram.Labels, Value: histogram.Sum},
+			Series{Name: histogram.Name + "_count", Labels: histogram.Labels, Value: float64(histogram.Count)},
+		)
 	}
 	for index, stage := range []string{"socket_to_pty", "pty_to_socket"} {
 		frames := r.terminalFrames[index].Load()
@@ -223,7 +284,7 @@ func (r *Registry) RecordTerminalStage(stage string, duration time.Duration, byt
 func DefaultDescriptors() []Descriptor {
 	return []Descriptor{
 		{Name: "paperboat_runtime_operations_total", Kind: Counter, Labels: map[string]map[string]bool{"component": set("protocol", "auth", "session", "upload", "preview", "connector", "update", "service", "storage"), "result": set("ok", "replayed", "rejected", "conflict", "canceled", "deadline", "unavailable")}},
-		{Name: "paperboat_runtime_active_resources", Kind: Gauge, Labels: map[string]map[string]bool{"kind": set("sessions", "attachments", "processes", "uploads", "previews", "connectors")}},
+		{Name: "paperboat_runtime_active_resources", Kind: Gauge, Labels: map[string]map[string]bool{"kind": set("sessions", "attachments", "processes", "uploads", "previews", "connectors", "serves_foreground", "serves_detached")}},
 		{Name: "paperboat_runtime_readiness", Kind: Gauge, Labels: map[string]map[string]bool{"capability": set("terminal", "upload", "preview", "health", "connector", "update"), "state": set("ready", "degraded", "unavailable")}},
 		{Name: "paperboat_runtime_connector_retries_total", Kind: Counter, Labels: map[string]map[string]bool{"transport": set("quic", "tcp_dedicated", "tcp_mux", "none"), "result": set("connected", "failed", "replaced", "canceled")}},
 		{Name: "paperboat_runtime_restart_total", Kind: Counter},
@@ -242,6 +303,8 @@ func DefaultDescriptors() []Descriptor {
 		{Name: "paperboat_runtime_terminal_compression_failures_total", Kind: Counter, Labels: map[string]map[string]bool{"stage": set("encode", "decode")}},
 		{Name: "paperboat_runtime_delivery_total", Kind: Counter, Labels: map[string]map[string]bool{"kind": set("runtime", "preview"), "result": set("delivered", "failed", "canceled")}},
 		{Name: "paperboat_runtime_cleanup_total", Kind: Counter, Labels: map[string]map[string]bool{"kind": set("upload", "update", "session"), "result": set("removed", "preserved", "failed")}},
+		{Name: "paperboat_runtime_serve_events_total", Kind: Counter, Labels: map[string]map[string]bool{"event": set("selection", "validation", "listener_start", "listener_stop", "preview_registration", "readiness", "ownership_transfer", "lease_acquire", "lease_renew", "lease_release", "lease_loss", "restart", "source_invalidation", "revoke", "drain", "cleanup", "orphan_cleanup"), "result": set("ok", "failed", "canceled", "timeout", "expired", "removed", "preserved")}},
+		{Name: "paperboat_runtime_serve_latency_seconds", Kind: Histogram, Labels: map[string]map[string]bool{"stage": set("selection", "validation", "readiness", "drain", "reconciliation"), "owner": set("foreground", "detached"), "result": set("ok", "failed", "canceled", "timeout")}},
 	}
 }
 

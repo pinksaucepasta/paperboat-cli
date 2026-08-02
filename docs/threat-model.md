@@ -25,6 +25,8 @@
 | Terminal injection | Non-file bytes pass through unchanged; rewriting is limited to a bracketed paste frame | `pb` host-runtime terminal authorization |
 | Compression side channel or decompression exhaustion | Each output event is an independent Zstandard frame with no dictionary or cross-session state; declared decoded size, frame content size, decoder memory, and concurrent codecs are bounded before delivery or ACK | A user controlling and observing the same authenticated terminal can still correlate its own input and output sizes |
 | File traversal or substitution | Absolute regular files only; symlinks/traversal rejected; one descriptor is hashed and streamed; signed size policy | `pb` host-runtime transfer verification and cleanup |
+| Static-serve traversal or source substitution | Loopback-only listener; pinned canonical source identity; root-scoped opens; dotfile, listing, traversal, and symlink-escape denial; identity revalidation before start and on every request | A user with local filesystem write access can make the source unavailable, but cannot silently replace the pinned source |
+| Static-serve path disclosure | Source paths and browsing activity stay in owner-only local state and are omitted from control-plane, dashboard, telemetry, and diagnostics | An authorized local user can inspect their own descriptor and served path |
 | Compromised VM | CLI receives only short-lived, scoped terminal/file credentials | VM isolation and server revocation |
 
 ## Incident actions

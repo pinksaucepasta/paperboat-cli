@@ -11,6 +11,8 @@ retry.
 - Upload failures are fail-open only for the affected paste. Image bytes and paths are never logged.
 - For a stolen device, revoke its client session in the dashboard, then run `pb auth logout`.
 - During outages, use `pb doctor`; never bypass `paperboat-tunnel` or attach over SSH.
+- `pb codex` credentials, remote paths, command arguments, and Codex output are never
+  written to logs. The remote environment owns its Codex login and configuration.
 
 Production connection metrics are written as validated JSONL to
 `observability.event_log_path`, or `telemetry.jsonl` beside the CLI config by
@@ -68,6 +70,24 @@ stores the original absolute expiry; after reboot the runner resumes only a matc
 active server record and uses the remaining lifetime. Expiry or server revocation removes
 the route, descriptor, and service definition. A crash retains the descriptor so the OS
 service can retry without extending expiry.
+
+`pb serve` uses the same preview service namespace and inventory. Foreground mode first
+acquires a bounded `local_runtime_control/1.0` management lease from the loopback runtime
+using an owner-only local token, renews it while attached, and stops the workload if renewal
+fails. The runtime expires abandoned leases and reconciles the preview route. The CLI owns
+an ephemeral `127.0.0.1` static listener and drains it before canceling the preview runner.
+`--detach` installs `__runtime-serve`; its schema-v2 descriptor contains
+only the canonical source path and filesystem identity, file/directory kind, SPA policy,
+bind address, assigned loopback port, owner mode, preview record, service definition,
+service generation, and original absolute expiry. It contains no credential. The detached
+unit is active only for the current machine runtime and is not enabled for the next boot.
+Server revocation and capacity eviction are observed by the existing
+preview reconciliation loop and stop the listener, descriptor, and service. Successfully
+ingested Inbox files remain user-owned.
+
+`pb doctor` verifies the local lease protocol and compares served descriptors with their
+loopback listeners without returning source paths. Session-mode transitions, unpair, and
+uninstall retire all durable preview services before authority or state is removed.
 
 Machine-control credentials renew in memory and are bound to the enrolled Ed25519 key and
 installation generation. Reinstall, unpair, or machine revocation invalidates them. Never

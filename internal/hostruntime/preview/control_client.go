@@ -24,6 +24,7 @@ type ControlTokenSource interface {
 	Token(context.Context) (string, error)
 }
 type ControlRecord struct {
+	OperationID   string     `json:"operation_id,omitempty"`
 	ID            string     `json:"id"`
 	EnvironmentID string     `json:"environment_id"`
 	LogicalName   string     `json:"logical_name"`
@@ -78,12 +79,20 @@ func (c *ControlClient) List(ctx context.Context) ([]ControlRecord, error) {
 	return value, err
 }
 func (c *ControlClient) Register(ctx context.Context, logical string, target Target, ack bool, lifetime time.Duration, indefinite bool) (ControlRecord, error) {
+	return c.RegisterWithMetadata(ctx, logical, target, ack, lifetime, indefinite, "application", "runtime")
+}
+
+func (c *ControlClient) RegisterWithMetadata(ctx context.Context, logical string, target Target, ack bool, lifetime time.Duration, indefinite bool, sourceKind, ownerMode string) (ControlRecord, error) {
 	payload := map[string]any{"action": "register", "logical_name": logical, "target_host": target.Host, "target_port": target.Port, "public_acknowledgement": ack}
 	if lifetime > 0 {
 		payload["duration_seconds"] = int64(lifetime / time.Second)
 	}
 	if indefinite {
 		payload["indefinite"] = true
+	}
+	if sourceKind != "application" || ownerMode != "runtime" {
+		payload["source_kind"] = sourceKind
+		payload["owner_mode"] = ownerMode
 	}
 	return c.callOne(ctx, payload)
 }
@@ -158,6 +167,7 @@ func (c *ControlClient) call(ctx context.Context, payload map[string]any, list b
 		if json.Unmarshal(envelope.Data, &value) != nil {
 			return nil, ErrControlClientInvalid
 		}
+		value.OperationID = op
 		values = []ControlRecord{value}
 	}
 	for _, v := range values {

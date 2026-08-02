@@ -43,7 +43,7 @@ func TestExpiredPreviewDescriptorCleansWithoutExtendingLifetime(t *testing.T) {
 		}
 	}
 	joined := strings.Join(runner.calls, "\n")
-	if runtime.GOOS == "linux" && (!strings.Contains(joined, "systemctl --user disable paperboat-preview-") || !strings.Contains(joined, "systemctl --user daemon-reload")) {
+	if runtime.GOOS == "linux" && (!strings.Contains(joined, "systemctl --user disable --now paperboat-preview-") || !strings.Contains(joined, "systemctl --user daemon-reload")) {
 		t.Fatalf("retirement calls=%v", runner.calls)
 	}
 	if runtime.GOOS == "darwin" && !strings.Contains(joined, "launchctl bootout gui/") {
@@ -77,6 +77,73 @@ type recordingPreviewRunner struct{ calls []string }
 func (r *recordingPreviewRunner) Run(_ context.Context, name string, args ...string) error {
 	r.calls = append(r.calls, strings.Join(append([]string{name}, args...), " "))
 	return nil
+}
+
+func TestRemoveAllPreviewServicesRetiresOnlyDurableEntries(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	expires := time.Now().UTC().Add(time.Hour)
+	for _, name := range []string{"docs", "report"} {
+		definition, _, err := previewServiceDefinition(root, name, runtime.GOOS)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Dir(definition), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(definition, []byte("service"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(root, "previews", "active", name+".json")
+		if err := writePreviewRuntimeDescriptor(path, PreviewRuntimeDescriptor{Schema: "paperboat.preview-runtime/v1", Name: name, Port: 3000, ExpiresAt: &expires, ServiceDefinition: definition}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	coordinatorPath := filepath.Join(root, "previews", "active", "coordinator.json")
+	if err := writePreviewRuntimeDescriptor(coordinatorPath, PreviewRuntimeDescriptor{Schema: "paperboat.preview-runtime/v1", Name: "local", Port: 3001, ExpiresAt: &expires}); err != nil {
+		t.Fatal(err)
+	}
+	runner := &recordingPreviewRunner{}
+	if err := removeAllPreviewServices(context.Background(), root, runner); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.calls) == 0 {
+		t.Fatal("durable services were not retired")
+	}
+	for _, name := range []string{"docs", "report"} {
+		if _, err := os.Stat(filepath.Join(root, "previews", "active", name+".json")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("durable descriptor %s remains: %v", name, err)
+		}
+	}
+	if _, err := os.Stat(coordinatorPath); err != nil {
+		t.Fatalf("coordinator descriptor was removed: %v", err)
+	}
+}
+
+type failingPreviewRunner struct{}
+
+func (*failingPreviewRunner) Run(context.Context, string, ...string) error {
+	return errors.New("service control failed")
+}
+
+func TestRemoveAllPreviewServicesRetainsDescriptorWhenStopFails(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	expires := time.Now().UTC().Add(time.Hour)
+	definition, _, err := previewServiceDefinition(root, "docs", runtime.GOOS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "previews", "active", "docs.json")
+	if err := writePreviewRuntimeDescriptor(path, PreviewRuntimeDescriptor{Schema: "paperboat.preview-runtime/v1", Name: "docs", Port: 3000, ExpiresAt: &expires, ServiceDefinition: definition}); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeAllPreviewServices(context.Background(), root, &failingPreviewRunner{}); err == nil {
+		t.Fatal("service stop failure was hidden")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("descriptor was not retained for retry: %v", err)
+	}
 }
 
 func TestCoordinatorPreviewRecoveryOwnsChildrenAndContinuesPastBadDescriptors(t *testing.T) {
@@ -136,4 +203,14 @@ func waitForPreviewChildren(t *testing.T, manager *CoordinatorPreviewManager, wa
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("preview child count did not reach %d", want)
+}
+
+func TestReadPreviewReadySkipsBoundedProcessLogs(t *testing.T) {
+	record, err := readPreviewReady(strings.NewReader("frp connecting\n" + `{"preview_key":"p-test","url":"https://preview.example.test"}` + "\n"))
+	if err != nil || record.PreviewKey != "p-test" || record.URL != "https://preview.example.test" {
+		t.Fatalf("record=%+v err=%v", record, err)
+	}
+	if _, err := readPreviewReady(strings.NewReader("only logs\n")); err == nil {
+		t.Fatal("log-only output was accepted")
+	}
 }

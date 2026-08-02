@@ -5,6 +5,7 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -31,6 +32,15 @@ type FilePasteConfig struct {
 
 const DefaultMaxQueuedInputBytes = 1024 * 1024
 
+const MaxFavorites = 5
+
+var ErrFavoriteLimit = errors.New("favorite limit reached")
+
+type Favorite struct {
+	Kind string `json:"kind"`
+	ID   string `json:"id"`
+}
+
 // Config is the on-disk CLI configuration.
 type Config struct {
 	// ServerURL is the paperboat-server base URL. It is required for production commands.
@@ -39,6 +49,7 @@ type Config struct {
 	// user machine ID. Names are never persisted because they may become
 	// ambiguous or change ownership.
 	LastEnvironmentID string     `json:"last_environment_id,omitempty"`
+	Favorites         []Favorite `json:"favorites,omitempty"`
 	Auth              AuthConfig `json:"auth,omitempty"`
 	// FilePaste configures generic file-paste detection.
 	FilePaste FilePasteConfig `json:"file_paste,omitempty"`
@@ -327,6 +338,23 @@ func normalizeStatusWidgets(values []string) []string {
 // Validate checks the complete effective configuration. Callers that mutate a
 // loaded Config can use it before presenting success.
 func (c *Config) Validate() error {
+	if len(c.Favorites) > MaxFavorites {
+		return fmt.Errorf("favorites cannot contain more than %d items", MaxFavorites)
+	}
+	seenFavorites := make(map[string]struct{}, len(c.Favorites))
+	for _, favorite := range c.Favorites {
+		if favorite.Kind != "machine" && favorite.Kind != "session" && favorite.Kind != "preview" {
+			return fmt.Errorf("favorites contains unsupported kind %q", favorite.Kind)
+		}
+		if strings.TrimSpace(favorite.ID) == "" {
+			return fmt.Errorf("favorites contains an empty id")
+		}
+		key := favorite.Kind + ":" + favorite.ID
+		if _, exists := seenFavorites[key]; exists {
+			return fmt.Errorf("favorites contains duplicate %q", key)
+		}
+		seenFavorites[key] = struct{}{}
+	}
 	switch c.Connect.TerminalTransport {
 	case "auto", "quic", "wss":
 	default:
@@ -382,6 +410,35 @@ func (c *Config) Validate() error {
 			seen[widget] = region
 		}
 	}
+	return nil
+}
+
+func (c *Config) IsFavorite(kind, id string) bool {
+	for _, favorite := range c.Favorites {
+		if favorite.Kind == kind && favorite.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Config) SetFavorite(kind, id string, favorite bool) error {
+	for index, item := range c.Favorites {
+		if item.Kind != kind || item.ID != id {
+			continue
+		}
+		if !favorite {
+			c.Favorites = append(c.Favorites[:index], c.Favorites[index+1:]...)
+		}
+		return nil
+	}
+	if !favorite {
+		return nil
+	}
+	if len(c.Favorites) >= MaxFavorites {
+		return ErrFavoriteLimit
+	}
+	c.Favorites = append(c.Favorites, Favorite{Kind: kind, ID: id})
 	return nil
 }
 

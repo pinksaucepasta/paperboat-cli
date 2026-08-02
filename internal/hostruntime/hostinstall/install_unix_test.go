@@ -188,7 +188,8 @@ func validRequest(t *testing.T) Request {
 		t.Fatal(err)
 	}
 	return Request{
-		Schema: SchemaV1, Platform: runtime.GOOS, User: account.Username, UID: uid, Group: group.Name, GID: gid,
+		SetupMode: "host",
+		Schema:    SchemaV1, Platform: runtime.GOOS, User: account.Username, UID: uid, Group: group.Name, GID: gid,
 		Executable: executable, Artifact: manifest, ArtifactPublicKey: base64.RawURLEncoding.EncodeToString(public),
 		Home: account.HomeDir, Path: "/usr/bin:/bin", StateRoot: state, WorkspaceRoot: account.HomeDir,
 		ControlURL: "https://control.example.test", UserMachineID: "um_test", Shell: shell,

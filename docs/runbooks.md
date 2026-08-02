@@ -34,6 +34,15 @@ dialing fails across projects.
 3. Do not expose a Fly port or fall back to SSH.
 4. After recovery, verify terminal attach, reconnect, resumable file transfer, and revoked-route rejection.
 
+## Codex session interruption
+
+Detection: `pb codex` reports a bridge interruption or Codex exits after a remote WebSocket loss.
+
+1. Do not replay app-server frames or expose a fallback TCP/SSH route.
+2. Confirm the environment connector and authenticated runtime route are healthy without recording paths, arguments, credentials, or Codex output.
+3. Refresh the descriptor, relaunch local Codex, and use its normal resume picker.
+4. If the abandoned lease expired, create a new session and verify the previous runtime state was cleaned.
+
 ## Fly start or machine failure
 
 Detection: readiness remains in a machine-starting state, reports machine failure,
@@ -80,6 +89,22 @@ reports repeated failures.
 2. Inspect counts, sizes, ages, and environment IDs only, never file contents or source paths.
 3. Restore the helper cleanup worker and run its idempotent cleanup operation.
 4. Verify expired files are gone, active files remain readable, traversal is rejected, and new transfers obey retention.
+
+## Served preview workload drift
+
+Detection: a served preview has no ready local listener, a detached listener has no active
+preview, a source identity is invalid, or an expired descriptor remains installed.
+
+1. Identify the preview, machine, operation, and descriptor generation without recording
+   the source path, directory entries, public URL, or contents.
+2. Use `pb preview revoke <id>` to converge public and local state. Do not kill only the
+   listener or delete only the descriptor.
+3. For a replaced or escaping source, keep the workload stopped; have the owning user
+   select the intended source again. Never update a descriptor to accept a new identity.
+4. If shutdown cleanup was interrupted, revoke the preview before removing the inactive
+   service definition and descriptor.
+5. Verify no loopback listener, service definition, descriptor, credential renewal loop,
+   or public route remains. Preserve successfully copied `Paperboat Inbox/serve` files.
 
 ## Recovery evidence
 

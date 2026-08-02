@@ -1,11 +1,42 @@
 package config
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestFavoritesEnforceSharedLimitAndPersist(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	cfg := &Config{path: path}
+	for index := range MaxFavorites {
+		if err := cfg.SetFavorite("machine", fmt.Sprintf("m%d", index), true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := cfg.SetFavorite("session", "extra", true); !errors.Is(err, ErrFavoriteLimit) {
+		t.Fatalf("limit error=%v", err)
+	}
+	if err := cfg.SetFavorite("machine", "m0", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.SetFavorite("session", "s0", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.IsFavorite("machine", "m0") || !reloaded.IsFavorite("session", "s0") || len(reloaded.Favorites) != MaxFavorites {
+		t.Fatalf("favorites=%+v", reloaded.Favorites)
+	}
+}
 
 func TestNormalizeServerURL(t *testing.T) {
 	for _, tc := range []struct {

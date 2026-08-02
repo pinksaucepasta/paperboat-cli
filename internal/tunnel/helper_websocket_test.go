@@ -26,6 +26,13 @@ type capturedHelperMessageConnection struct {
 	writes [][]byte
 }
 
+func TestHelperResponseTerminalModesRestoresOnlyRecordedModes(t *testing.T) {
+	frame := helperFrame{Payload: json.RawMessage(`{"result":{"session":{"snapshot":{"terminal_modes":{"alternate_screen":true,"mouse_sgr":true,"bracketed_paste":true}}}}}`)}
+	if got, want := helperResponseTerminalModes(frame), "\x1b[?1049h\x1b[?1006h\x1b[?2004h"; got != want {
+		t.Fatalf("modes = %q, want %q", got, want)
+	}
+}
+
 func (c *capturedHelperMessageConnection) ReadMessage(ctx context.Context) (helperMessageType, []byte, error) {
 	<-ctx.Done()
 	return 0, nil, ctx.Err()
@@ -374,7 +381,7 @@ func TestCorruptCompressedOutputIsNeverQueuedOrAcknowledged(t *testing.T) {
 	}
 }
 
-func TestCanonicalHelperExistingSessionRequestsFreshRedraw(t *testing.T) {
+func TestCanonicalHelperExistingSessionDoesNotInjectTerminalInput(t *testing.T) {
 	resizeColumns := make(chan int, 1)
 	redrawInputs := make(chan []byte, 1)
 	upgrader := websocket.Upgrader{Subprotocols: []string{helperWebSocketSubprotocol}}
@@ -436,17 +443,10 @@ func TestCanonicalHelperExistingSessionRequestsFreshRedraw(t *testing.T) {
 	if !ok {
 		t.Fatalf("connection type %T", conn)
 	}
-	foundResume := false
 	for _, output := range helperConn.initial {
-		if strings.Contains(string(output.data), "Earlier terminal output is unavailable") {
-			t.Fatalf("normal live-boundary reconnect emitted replay-gap marker: %q", output.data)
+		if strings.Contains(string(output.data), "\x1b[?") {
+			t.Fatalf("connection synthesized terminal modes: %q", output.data)
 		}
-		if string(output.data) == helperTerminalResume {
-			foundResume = true
-		}
-	}
-	if !foundResume {
-		t.Fatal("existing session did not restore terminal interaction modes")
 	}
 	if err := conn.Resize(40, 120); err != nil {
 		t.Fatal(err)
@@ -454,8 +454,10 @@ func TestCanonicalHelperExistingSessionRequestsFreshRedraw(t *testing.T) {
 	if columns := <-resizeColumns; columns != 120 {
 		t.Fatalf("resize columns=%d", columns)
 	}
-	if input := <-redrawInputs; string(input) != helperReplayRedraw {
-		t.Fatalf("redraw input=%q", input)
+	select {
+	case input := <-redrawInputs:
+		t.Fatalf("connection injected terminal input=%q", input)
+	default:
 	}
 }
 
@@ -623,7 +625,7 @@ func TestCanonicalHelperStaleReconnectCursorReportsReplayGap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(string(output), helperTerminalResume) || !strings.Contains(string(output), "Earlier terminal output is unavailable") || !strings.HasSuffix(string(output), "fresh\n") {
+	if !strings.Contains(string(output), "Earlier terminal output is unavailable") || !strings.HasSuffix(string(output), "fresh\n") {
 		t.Fatalf("output=%q", output)
 	}
 	if boundary := <-attachFrom; boundary != 2 {

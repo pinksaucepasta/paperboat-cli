@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,12 +27,6 @@ const (
 	helperOutputQueueDecodedLimit = terminalOutputQueueChunks * protocol.MaxTerminalOutputBytes
 	helperRequestTimeout          = 30 * time.Second
 	helperReplayGapMarker         = "\r\n[paperboat] Earlier terminal output is unavailable; showing retained output.\r\n"
-	// Existing sessions have already emitted their terminal-mode setup, but a
-	// newly attached local terminal has not seen it. Restore the modes a TUI
-	// establishes before asking the application to redraw. Without this, mouse
-	// input becomes local scrollback and full-screen TUIs lose interactivity.
-	helperTerminalResume = "\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h\x1b[?2004h\x1b[?1004h"
-	helperReplayRedraw   = "\x1b[I" // Focus gained asks full-screen applications to redraw.
 )
 
 type helperFrame struct {
@@ -152,7 +147,6 @@ type helperTerminalConn struct {
 	ackSent                   atomic.Uint64
 	ackNotify                 chan struct{}
 	ackMu                     sync.Mutex
-	replayRedraw              atomic.Bool
 	closing                   atomic.Bool
 	finishOnce                sync.Once
 	exitCode                  int
@@ -256,9 +250,6 @@ func (c *helperTerminalConn) initialize(ctx context.Context) error {
 	}
 	c.generation = helperResponseGeneration(frame)
 	fromSequence := uint64(max(0, c.target.AfterSequence))
-	if existingSession {
-		c.initial = append(c.initial, helperOutput{data: []byte(helperTerminalResume), endSequence: snapshotLatest})
-	}
 	if existingSession && c.target.AfterSequence <= 0 && snapshotLatest > fromSequence {
 		// A bounded raw byte tail is not a terminal snapshot: it can begin inside
 		// an ANSI sequence or alternate-screen update and render as a blank pane.
@@ -295,7 +286,6 @@ func (c *helperTerminalConn) initialize(ctx context.Context) error {
 				c.target.ReplayGapSink(remote.Details.RequestedSequence, remote.Details.EarliestSequence, remote.Details.LatestSequence)
 			}
 			c.initial = append(c.initial, helperOutput{data: []byte(helperReplayGapMarker), endSequence: remote.Details.LatestSequence})
-			c.replayRedraw.Store(true)
 		}
 		frame, err = attach(remote.Details.LatestSequence, true)
 	}
@@ -312,6 +302,11 @@ func (c *helperTerminalConn) initialize(ctx context.Context) error {
 	}
 	if json.Unmarshal(frame.Payload, &response) != nil || response.Result.StreamID == 0 || response.Result.AttachmentID == "" {
 		return errors.New("helper returned an invalid terminal attachment")
+	}
+	if existingSession && c.target.AfterSequence <= 0 {
+		if modes := helperResponseTerminalModes(frame); modes != "" {
+			c.initial = append([]helperOutput{{data: []byte(modes), endSequence: snapshotLatest}}, c.initial...)
+		}
 	}
 	c.attachmentID = response.Result.AttachmentID
 	c.streamID = response.Result.StreamID
@@ -331,11 +326,6 @@ func (c *helperTerminalConn) initialize(ctx context.Context) error {
 	c.initialBinary = nil
 	c.initialEncodedBytes = 0
 	c.initialDecodedBytes = 0
-	if existingSession {
-		// An attached TUI may be idle and therefore emit no pixels on reconnect.
-		// Ask it to repaint after the caller applies the local terminal size.
-		c.replayRedraw.Store(true)
-	}
 	go c.writeLoop()
 	go c.readLoop()
 	go c.ackLoop()
@@ -410,6 +400,43 @@ func helperResponseGeneration(frame helperFrame) uint64 {
 	}
 	_ = json.Unmarshal(frame.Payload, &response)
 	return response.Result.Generation
+}
+
+func helperResponseTerminalModes(frame helperFrame) string {
+	var response struct {
+		Result struct {
+			Session struct {
+				Snapshot struct {
+					TerminalModes struct {
+						AlternateScreen bool `json:"alternate_screen"`
+						MouseClick      bool `json:"mouse_click"`
+						MouseDrag       bool `json:"mouse_drag"`
+						MouseMotion     bool `json:"mouse_motion"`
+						MouseURXVT      bool `json:"mouse_urxvt"`
+						MouseSGR        bool `json:"mouse_sgr"`
+						FocusEvents     bool `json:"focus_events"`
+						BracketedPaste  bool `json:"bracketed_paste"`
+					} `json:"terminal_modes"`
+				} `json:"snapshot"`
+			} `json:"session"`
+		} `json:"result"`
+	}
+	if json.Unmarshal(frame.Payload, &response) != nil {
+		return ""
+	}
+	m := response.Result.Session.Snapshot.TerminalModes
+	var out strings.Builder
+	for _, item := range []struct {
+		on bool
+		id string
+	}{{m.AlternateScreen, "1049"}, {m.MouseClick, "1000"}, {m.MouseDrag, "1002"}, {m.MouseMotion, "1003"}, {m.MouseURXVT, "1015"}, {m.MouseSGR, "1006"}, {m.BracketedPaste, "2004"}, {m.FocusEvents, "1004"}} {
+		if item.on {
+			out.WriteString("\x1b[?")
+			out.WriteString(item.id)
+			out.WriteByte('h')
+		}
+	}
+	return out.String()
 }
 
 func helperRequestSync(ctx context.Context, message helperMessageConnection, capability string, payload json.RawMessage) (helperFrame, error) {
@@ -746,7 +773,6 @@ func (c *helperTerminalConn) Resize(rows, cols uint16) error {
 	if rows == 0 || cols == 0 {
 		return nil
 	}
-	redraw := c.replayRedraw.Swap(false)
 	message := make([]byte, 17)
 	message[0] = 4
 	binary.BigEndian.PutUint32(message[1:5], c.streamID)
@@ -754,17 +780,6 @@ func (c *helperTerminalConn) Resize(rows, cols uint16) error {
 	binary.BigEndian.PutUint16(message[7:9], rows)
 	binary.BigEndian.PutUint64(message[9:17], c.resizeSeq.Add(1))
 	err := c.queueWrite(c.controlWrites, helperWrite{messageType: helperBinaryMessage, data: message, result: make(chan error, 1)})
-	if err != nil || !redraw {
-		if err != nil && redraw {
-			c.replayRedraw.Store(true)
-		}
-		return err
-	}
-	// Resize alone does not make every TUI repaint. Report focus gained once so
-	// Full-screen applications can use focus gained to redraw after reattachment.
-	if _, err = c.Write([]byte(helperReplayRedraw)); err != nil {
-		c.replayRedraw.Store(true)
-	}
 	return err
 }
 

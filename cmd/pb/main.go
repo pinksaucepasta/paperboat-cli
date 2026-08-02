@@ -7,6 +7,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -35,21 +36,30 @@ import (
 	"text/tabwriter"
 	"time"
 
+	shlex "github.com/anmitsu/go-shlex"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/pinksaucepasta/paperboat/internal/api"
 	sessionauth "github.com/pinksaucepasta/paperboat/internal/auth"
 	"github.com/pinksaucepasta/paperboat/internal/buildinfo"
+	codexsession "github.com/pinksaucepasta/paperboat/internal/codexsession"
 	"github.com/pinksaucepasta/paperboat/internal/command"
 	"github.com/pinksaucepasta/paperboat/internal/config"
+	"github.com/pinksaucepasta/paperboat/internal/fileindex"
 	filetransfer "github.com/pinksaucepasta/paperboat/internal/filetransfer"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/bootstrap"
 	helperconfig "github.com/pinksaucepasta/paperboat/internal/hostruntime/config"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/identity"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/preview"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/servelease"
 	service "github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntimecmd"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntimeentry"
 	"github.com/pinksaucepasta/paperboat/internal/inbox"
 	"github.com/pinksaucepasta/paperboat/internal/paste"
+	"github.com/pinksaucepasta/paperboat/internal/prompt"
 	"github.com/pinksaucepasta/paperboat/internal/resolver"
+	"github.com/pinksaucepasta/paperboat/internal/selector"
+	servepkg "github.com/pinksaucepasta/paperboat/internal/serve"
 	"github.com/pinksaucepasta/paperboat/internal/session"
 	"github.com/pinksaucepasta/paperboat/internal/statusbar"
 	"github.com/pinksaucepasta/paperboat/internal/telemetry"
@@ -100,6 +110,18 @@ func commandArgs(args cobra.PositionalArgs) cobra.PositionalArgs {
 	}
 }
 
+func terminalArgs(minimum int) cobra.PositionalArgs {
+	return func(_ *cobra.Command, values []string) error {
+		if len(values) < minimum || len(values) > 2 {
+			return fmt.Errorf("accepts between %d and 2 arg(s), received %d", minimum, len(values))
+		}
+		if len(values) == 2 && values[1] != "new" {
+			return fmt.Errorf("second argument must be `new`")
+		}
+		return nil
+	}
+}
+
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	root := newRootCommand()
 	root.SetOut(stdout)
@@ -107,6 +129,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	root.SetArgs(args)
 	err := root.ExecuteContext(ctx)
 	if err == nil {
+		return 0
+	}
+	if errors.Is(err, selector.ErrCanceled) || errors.Is(err, selector.ErrInterrupted) {
 		return 0
 	}
 	if errors.Is(err, context.Canceled) {
@@ -343,13 +368,17 @@ func previewRuntimeCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return hostruntimeentry.RunPreviewWorker(command.Context(), hostruntimeentry.PreviewWorkerConfig{
+			err = hostruntimeentry.RunPreviewWorker(command.Context(), hostruntimeentry.PreviewWorkerConfig{
 				ControlURL: registration.ServerURL, StateRoot: stateRoot, Name: name, Port: port,
 				Duration: duration, Indefinite: indefinite, ExpiresAt: expiresAt, DescriptorPath: descriptorPath, ServiceDefinition: serviceDefinition,
 				Ready: func(record preview.ControlRecord) error {
 					return json.NewEncoder(command.OutOrStdout()).Encode(record)
 				},
 			})
+			if err != nil {
+				fmt.Fprintf(command.ErrOrStderr(), "preview worker: %v\n", err)
+			}
+			return err
 		},
 		SilenceUsage: true, SilenceErrors: true,
 	}
@@ -357,6 +386,57 @@ func previewRuntimeCommand() *cobra.Command {
 	command.Flags().String("name", "", "preview name")
 	command.Flags().Uint16("port", 0, "local target port")
 	command.Flags().Duration("duration", 0, "preview lifetime")
+	command.Flags().String("expires-at", "", "absolute preview expiry")
+	command.Flags().String("descriptor", "", "durable preview descriptor")
+	command.Flags().String("service-definition", "", "preview service definition")
+	command.Flags().Bool("indefinite", false, "run until explicitly revoked")
+	return command
+}
+
+func serveRuntimeCommand() *cobra.Command {
+	command := &cobra.Command{
+		Use:    "__runtime-serve",
+		Hidden: true,
+		Args:   commandArgs(cobra.NoArgs),
+		RunE: func(command *cobra.Command, _ []string) error {
+			stateRoot, _ := command.Flags().GetString("state-root")
+			name, _ := command.Flags().GetString("name")
+			indefinite, _ := command.Flags().GetBool("indefinite")
+			expiresAtValue, _ := command.Flags().GetString("expires-at")
+			descriptorPath, _ := command.Flags().GetString("descriptor")
+			serviceDefinition, _ := command.Flags().GetString("service-definition")
+			var expiresAt *time.Time
+			if expiresAtValue != "" {
+				parsed, parseErr := time.Parse(time.RFC3339Nano, expiresAtValue)
+				if parseErr != nil {
+					return invocationError(errors.New("invalid serve runtime expiry"))
+				}
+				expiresAt = &parsed
+			}
+			if stateRoot == "" || name == "" || !filepath.IsAbs(descriptorPath) || indefinite == (expiresAt != nil) {
+				return invocationError(errors.New("invalid serve runtime descriptor"))
+			}
+			store, err := identity.Open(identity.Config{StateRoot: stateRoot})
+			if err != nil {
+				return err
+			}
+			registration, err := store.Registration()
+			if err != nil {
+				return err
+			}
+			err = hostruntimeentry.RunServeWorker(command.Context(), hostruntimeentry.ServeWorkerConfig{
+				ControlURL: registration.ServerURL, StateRoot: stateRoot, Name: name, ExpiresAt: expiresAt,
+				Indefinite: indefinite, DescriptorPath: descriptorPath, ServiceDefinition: serviceDefinition,
+			})
+			if err != nil {
+				fmt.Fprintf(command.ErrOrStderr(), "serve worker: %v\n", err)
+			}
+			return err
+		},
+		SilenceUsage: true, SilenceErrors: true,
+	}
+	command.Flags().String("state-root", "", "runtime state directory")
+	command.Flags().String("name", "", "preview name")
 	command.Flags().String("expires-at", "", "absolute preview expiry")
 	command.Flags().String("descriptor", "", "durable preview descriptor")
 	command.Flags().String("service-definition", "", "preview service definition")
@@ -436,6 +516,7 @@ func pairCommand() *cobra.Command {
 			registration.EnvironmentID = machine.EnvironmentID
 			registration.InstallationGeneration = machine.InstallationGeneration
 			registration.SetupRoles = append([]string(nil), machine.SetupRoles...)
+			registration.SetupMode = "host"
 			registration.UpdatedAt = time.Now().UTC()
 			if err := identityStore.SaveRegistration(registration); err != nil {
 				return fmt.Errorf("save paired machine registration: %w", err)
@@ -458,6 +539,14 @@ func setupCommand() *cobra.Command {
 		Short: "Set up this machine for Paperboat",
 		Args:  commandArgs(cobra.NoArgs),
 		RunE: func(command *cobra.Command, _ []string) error {
+			mode, err := command.Flags().GetString("mode")
+			if err != nil {
+				return err
+			}
+			mode, err = resolveSetupMode(mode, term.IsTerminal(int(os.Stdin.Fd())), command.ErrOrStderr())
+			if err != nil {
+				return err
+			}
 			ctx := actionContext(command, nil)
 			client, err := backendClient(ctx)
 			if err != nil {
@@ -501,13 +590,20 @@ func setupCommand() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("resolve Paperboat Inbox: %w", err)
 			}
+			previousMode := ""
 			if existing, registrationErr := identityStore.Registration(); registrationErr == nil {
 				inboxPath = existing.InboxPath
+				previousMode = existing.SetupMode
 			}
 			if err := inbox.EnsurePath(inboxPath); err != nil {
 				return fmt.Errorf("prepare Paperboat Inbox: %w", err)
 			}
+			setupAPIMode := mode
+			if setupAPIMode == "host" {
+				setupAPIMode = "receive"
+			}
 			machine, err := client.SetupMachine(command.Context(), api.MachineSetupInput{
+				SetupMode:   setupAPIMode,
 				DisplayName: strings.TrimSpace(name), Platform: runtime.GOOS, Architecture: runtime.GOARCH,
 				WorkspaceRoot: workspaceRoot, PublicIdentityKey: publicIdentityKey,
 				RuntimeVersions: map[string]string{"pb": buildinfo.Version},
@@ -527,9 +623,22 @@ func setupCommand() *cobra.Command {
 				PublicKeyID: key.ID, PublicIdentityKey: publicIdentityKey,
 				InboxPath:              inboxPath,
 				InstallationGeneration: machine.InstallationGeneration, SetupRoles: machine.SetupRoles,
+				SetupMode: setupAPIMode,
 				UpdatedAt: time.Now().UTC(),
 			}); err != nil {
 				return fmt.Errorf("save machine registration: %w", err)
+			}
+			if mode == "session" {
+				if previousMode != "" && previousMode != "session" {
+					if err := hostruntimeentry.RemoveAllPreviewServices(command.Context(), stateRoot); err != nil {
+						return fmt.Errorf("stop durable previews before session-mode transition: %w", err)
+					}
+					if code := hostruntimecmd.Execute(command.Context(), []string{"service", "uninstall"}, command.InOrStdin(), command.OutOrStdout(), command.ErrOrStderr()); code != 0 {
+						return errors.New("session mode was saved, but persistent service removal failed; retry `pb setup --mode session`")
+					}
+				}
+				fmt.Fprintf(command.OutOrStdout(), "Set up %s (%s) in session mode\n", machine.DisplayName, machine.ID)
+				return nil
 			}
 			operationID := "machine-control-" + strings.TrimPrefix(newIdempotencyKey(), "pb-")
 			controlBody, err := json.Marshal(struct {
@@ -554,14 +663,120 @@ func setupCommand() *cobra.Command {
 			}); err != nil {
 				return fmt.Errorf("save machine control credential: %w", err)
 			}
-			fmt.Fprintf(command.OutOrStdout(), "Set up %s (%s)\n", machine.DisplayName, machine.ID)
+			if mode == "receive" {
+				if machine.Installation == nil {
+					return errors.New("server did not return signed receive installation material")
+				}
+				artifact := bootstrap.ArtifactManifest{
+					Schema: machine.Installation.Artifact.Schema, Kind: machine.Installation.Artifact.Kind,
+					Version: machine.Installation.Artifact.Version, Platform: machine.Installation.Artifact.Platform,
+					Architecture: machine.Installation.Artifact.Architecture, URL: machine.Installation.Artifact.URL,
+					ByteLength: machine.Installation.Artifact.ByteLength, SHA256: machine.Installation.Artifact.SHA256,
+					Signature: machine.Installation.Artifact.Signature,
+				}
+				installErr := hostruntimecmd.InstallReceive(command.Context(), hostruntimecmd.ReceiveInstallConfig{
+					StateRoot: stateRoot, WorkspaceRoot: workspaceRoot, ControlURL: machine.Installation.ControlURL,
+					MachineID: machine.ID, ListenAddress: machine.Installation.HelperListenAddress,
+					Artifact: artifact, ArtifactPublicKey: machine.Installation.ArtifactPublicKey,
+				}, command.InOrStdin(), command.OutOrStdout(), command.ErrOrStderr())
+				if installErr != nil {
+					rollbackCtx, cancelRollback := setupRollbackContext(command.Context())
+					defer cancelRollback()
+					rolledBack, rollbackErr := client.SetupMachine(rollbackCtx, api.MachineSetupInput{
+						SetupMode: "session", DisplayName: strings.TrimSpace(name), Platform: runtime.GOOS, Architecture: runtime.GOARCH,
+						WorkspaceRoot: workspaceRoot, PublicIdentityKey: publicIdentityKey, RuntimeVersions: map[string]string{"pb": buildinfo.Version},
+					})
+					if rollbackErr == nil {
+						registration, loadErr := identityStore.Registration()
+						if loadErr == nil {
+							registration.SetupMode, registration.SetupRoles = "session", append([]string(nil), rolledBack.SetupRoles...)
+							registration.InstallationGeneration, registration.UpdatedAt = rolledBack.InstallationGeneration, time.Now().UTC()
+							rollbackErr = identityStore.SaveRegistration(registration)
+						} else {
+							rollbackErr = loadErr
+						}
+					}
+					return errors.Join(fmt.Errorf("install receive service: %w", installErr), rollbackErr)
+				}
+			}
+			if mode == "host" {
+				arguments := []string{"bootstrap", "--server", d.cfg.ServerURL, "--state-root", stateRoot, "--name", strings.TrimSpace(name)}
+				if code := hostruntimecmd.Execute(command.Context(), arguments, command.InOrStdin(), command.OutOrStdout(), command.ErrOrStderr()); code != 0 {
+					bootstrapErr := error(exitCodeError{code: code})
+					if previousMode != "receive" && previousMode != "host" {
+						rollbackCtx, cancelRollback := setupRollbackContext(command.Context())
+						defer cancelRollback()
+						rolledBack, rollbackErr := client.SetupMachine(rollbackCtx, api.MachineSetupInput{
+							SetupMode: "session", DisplayName: strings.TrimSpace(name), Platform: runtime.GOOS, Architecture: runtime.GOARCH,
+							WorkspaceRoot: workspaceRoot, PublicIdentityKey: publicIdentityKey, RuntimeVersions: map[string]string{"pb": buildinfo.Version},
+						})
+						if rollbackErr == nil {
+							registration, loadErr := identityStore.Registration()
+							if loadErr == nil {
+								registration.SetupMode, registration.SetupRoles = "session", append([]string(nil), rolledBack.SetupRoles...)
+								registration.InstallationGeneration, registration.UpdatedAt = rolledBack.InstallationGeneration, time.Now().UTC()
+								rollbackErr = identityStore.SaveRegistration(registration)
+							} else {
+								rollbackErr = loadErr
+							}
+						}
+						bootstrapErr = errors.Join(bootstrapErr, rollbackErr)
+					}
+					return bootstrapErr
+				}
+				machine, err = doctorUserMachine(command.Context(), client, machine.ID)
+				if err != nil {
+					return fmt.Errorf("verify host readiness: %w", err)
+				}
+				registration, err := identityStore.Registration()
+				if err != nil {
+					return err
+				}
+				registration.SetupMode, registration.SetupRoles = "host", append([]string(nil), machine.SetupRoles...)
+				registration.InstallationGeneration, registration.UpdatedAt = machine.InstallationGeneration, time.Now().UTC()
+				if err := identityStore.SaveRegistration(registration); err != nil {
+					return fmt.Errorf("save host registration: %w", err)
+				}
+			}
+			fmt.Fprintf(command.OutOrStdout(), "Set up %s (%s) in %s mode\n", machine.DisplayName, machine.ID, mode)
 			return nil
 		},
 		SilenceUsage: true, SilenceErrors: true,
 	}
 	command.Flags().String("name", "", "machine name")
+	command.Flags().String("mode", "", "installation mode: receive, session, or host")
 	command.Flags().String("state-root", "", "runtime state directory")
 	return command
+}
+
+func resolveSetupMode(value string, interactive bool, output io.Writer) (string, error) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value != "" {
+		if slices.Contains([]string{"receive", "session", "host"}, value) {
+			return value, nil
+		}
+		return "", invocationError(errors.New("--mode must be receive, session, or host"))
+	}
+	if !interactive {
+		return "", invocationError(errors.New("non-interactive setup requires --mode receive, session, or host"))
+	}
+	choice, err := selector.Choose(selector.Options{
+		Title: "Set up this machine", Subtitle: "Choose what Paperboat may do on this machine",
+		Items: []selector.Item{
+			{ID: "receive", Title: "Receive", Description: "Receive files and launch previews in the background"},
+			{ID: "session", Title: "Session", Description: "Use only while this terminal session is attached"},
+			{ID: "host", Title: "Host", Description: "Run terminals and Codex, receive files, and launch previews"},
+		},
+		Stdin: os.Stdin, Output: output, Footer: "enter select  esc cancel",
+	})
+	if err != nil {
+		return "", err
+	}
+	return choice.ID, nil
+}
+
+func setupRollbackContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(parent), 15*time.Second)
 }
 
 func unpairCommand() *cobra.Command {
@@ -606,12 +821,16 @@ func unpairCommand() *cobra.Command {
 			if registration.ServerURL != d.cfg.ServerURL {
 				return errors.New("this machine is registered to a different Paperboat server")
 			}
+			if err := hostruntimeentry.RemoveAllPreviewServices(command.Context(), stateRoot); err != nil {
+				return fmt.Errorf("stop durable previews before unpairing: %w", err)
+			}
 			machine, err := client.UnpairMachine(command.Context(), registration.MachineID)
 			if err != nil {
 				return err
 			}
 			registration.InstallationGeneration = machine.InstallationGeneration
 			registration.SetupRoles = machine.SetupRoles
+			registration.SetupMode = "receive"
 			registration.UpdatedAt = time.Now().UTC()
 			if err := identityStore.SaveRegistration(registration); err != nil {
 				return fmt.Errorf("save machine registration: %w", err)
@@ -619,6 +838,14 @@ func unpairCommand() *cobra.Command {
 			code := hostruntimecmd.Execute(command.Context(), []string{"service", "uninstall"}, command.InOrStdin(), command.OutOrStdout(), command.ErrOrStderr())
 			if code != 0 {
 				return errors.New("host authority was revoked, but local service removal failed; retry `pb unpair`")
+			}
+			receiveSetup := setupCommand()
+			receiveSetup.SetIn(command.InOrStdin())
+			receiveSetup.SetOut(command.OutOrStdout())
+			receiveSetup.SetErr(command.ErrOrStderr())
+			receiveSetup.SetArgs([]string{"--mode", "receive", "--name", machine.DisplayName, "--state-root", stateRoot})
+			if err := receiveSetup.ExecuteContext(command.Context()); err != nil {
+				return fmt.Errorf("host authority was revoked, but receive service setup failed: %w", err)
 			}
 			fmt.Fprintf(command.OutOrStdout(), "Unpaired %s (%s)\n", machine.DisplayName, machine.ID)
 			return nil
@@ -657,6 +884,9 @@ func uninstallCommand() *cobra.Command {
 			if strings.TrimSpace(second) != hostname {
 				return errors.New("hostname confirmation did not match")
 			}
+			if err := cleanupDurablePreviewServices(command); err != nil {
+				return fmt.Errorf("stop durable previews before uninstalling: %w", err)
+			}
 			if code := hostruntimecmd.Execute(command.Context(), []string{"purge"}, command.InOrStdin(), command.OutOrStdout(), command.ErrOrStderr()); code != 0 {
 				return errors.New("system Paperboat removal failed")
 			}
@@ -670,6 +900,34 @@ func uninstallCommand() *cobra.Command {
 	}
 	command.Flags().String("state-root", "", "additional Paperboat runtime state directory to remove")
 	return command
+}
+
+func cleanupDurablePreviewServices(command *cobra.Command) error {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		return nil
+	}
+	roots := make(map[string]struct{})
+	if root := strings.TrimSpace(os.Getenv("PAPERBOAT_RUNTIME_STATE_ROOT")); root != "" {
+		roots[filepath.Clean(root)] = struct{}{}
+	}
+	if root, err := helperconfig.DefaultStateRoot(os.Getenv); err == nil {
+		roots[filepath.Clean(root)] = struct{}{}
+	}
+	if root, _ := command.Flags().GetString("state-root"); strings.TrimSpace(root) != "" {
+		root, err := filepath.Abs(root)
+		if err != nil {
+			return err
+		}
+		roots[filepath.Clean(root)] = struct{}{}
+	}
+	var result error
+	for root := range roots {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(command.Context()), 30*time.Second)
+		err := hostruntimeentry.RemoveAllPreviewServices(cleanupCtx, root)
+		cancel()
+		result = errors.Join(result, err)
+	}
+	return result
 }
 
 func purgeUserPaperboatState(command *cobra.Command) error {
@@ -717,10 +975,16 @@ func purgeUserPaperboatState(command *cobra.Command) error {
 
 func newRootCommand() *cobra.Command {
 	root := &cobra.Command{
-		Use:   "pb [environment]",
-		Short: "Connect to a Paperboat environment terminal",
-		Args:  commandArgs(cobra.MaximumNArgs(1)),
+		Use:   "pb [environment] [new]",
+		Short: "Open Paperboat or connect to an environment terminal",
+		Args:  commandArgs(terminalArgs(0)),
 		RunE: func(command *cobra.Command, args []string) error {
+			if len(args) == 0 {
+				if server, _ := command.Flags().GetString("server"); strings.TrimSpace(server) != "" {
+					return actionConnect(actionContext(command, args))
+				}
+				return actionHome(command)
+			}
 			if err := validateConnectInvocation(command); err != nil {
 				return err
 			}
@@ -730,7 +994,7 @@ func newRootCommand() *cobra.Command {
 		SilenceErrors: true,
 	}
 	root.Version = buildinfo.Version
-	root.SetVersionTemplate("pb {{.Version}}\n")
+	root.SetVersionTemplate(versionDisplay(buildinfo.Version))
 	root.InitDefaultVersionFlag()
 	root.Flags().Lookup("version").Shorthand = "v"
 	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return invocationError(err) })
@@ -738,7 +1002,7 @@ func newRootCommand() *cobra.Command {
 	root.PersistentFlags().String("server", "", "paperboat-server base URL override")
 	addConnectFlags(root)
 
-	connect := &cobra.Command{Use: "connect <environment>", Short: "Attach to an environment terminal", Args: commandArgs(cobra.ExactArgs(1)), RunE: func(command *cobra.Command, args []string) error {
+	connect := &cobra.Command{Use: "connect <environment> [new]", Short: "Create and attach to an environment terminal session", Args: commandArgs(terminalArgs(1)), RunE: func(command *cobra.Command, args []string) error {
 		if err := validateConnectInvocation(command); err != nil {
 			return err
 		}
@@ -746,12 +1010,28 @@ func newRootCommand() *cobra.Command {
 	}}
 	addConnectFlags(connect)
 	root.AddCommand(connect)
+	codex := &cobra.Command{Use: "codex [environment] [-- <codex-args...>]", Short: "Run local Codex against a remote environment", Args: commandArgs(cobra.ArbitraryArgs), RunE: func(command *cobra.Command, args []string) error {
+		selectTarget := len(args) == 0 || command.ArgsLenAtDash() == 0
+		_ = command.Flags().Set("select-environment", strconv.FormatBool(selectTarget))
+		if selectTarget {
+			// Preserve the omitted environment as a positional boundary so the
+			// injected flag set cannot consume forwarded Codex flags.
+			args = append([]string{""}, args...)
+		}
+		return actionRun(actionCodex)(command, args)
+	}}
+	codex.Flags().String("path", "", "remote working directory")
+	codex.Flags().Bool("select-environment", false, "")
+	_ = codex.Flags().MarkHidden("select-environment")
+	root.AddCommand(codex)
 
-	projects := &cobra.Command{Use: "projects", Short: "List projects available to this account", Args: commandArgs(cobra.NoArgs), RunE: actionRun(projectsCommand().Action)}
-	projects.Flags().Bool("json", false, "print JSON")
-	root.AddCommand(projects)
-
-	environments := &cobra.Command{Use: "environments", Short: "List hosted projects and machines", Args: commandArgs(cobra.NoArgs), RunE: actionRun(environmentsCommand().Action)}
+	environments := &cobra.Command{Use: "environments", Short: "List machines available to this account", Args: commandArgs(cobra.NoArgs), RunE: func(command *cobra.Command, args []string) error {
+		jsonOutput, _ := command.Flags().GetBool("json")
+		if !jsonOutput && term.IsTerminal(int(os.Stdin.Fd())) {
+			return actionEnvironmentsList(command)
+		}
+		return actionRun(environmentsCommand().Action)(command, args)
+	}}
 	environments.Flags().Bool("json", false, "print JSON")
 	root.AddCommand(environments)
 
@@ -759,14 +1039,34 @@ func newRootCommand() *cobra.Command {
 	doctor.Flags().Bool("json", false, "print JSON")
 	root.AddCommand(doctor)
 
-	root.AddCommand(specTree(authCommand(), "auth"))
+	authTree := specTree(authCommand(), "auth")
+	authTree.RunE = func(command *cobra.Command, _ []string) error {
+		if !term.IsTerminal(int(os.Stdin.Fd())) {
+			return command.Help()
+		}
+		return actionHomeAccount(command)
+	}
+	root.AddCommand(authTree)
 	root.AddCommand(&cobra.Command{Use: "login", Short: "Sign in through the Paperboat dashboard", Args: commandArgs(cobra.NoArgs), RunE: actionRun(authLogin)})
 	root.AddCommand(&cobra.Command{Use: "logout", Short: "Revoke and remove the active client session", Args: commandArgs(cobra.NoArgs), RunE: actionRun(authLogout)})
-	root.AddCommand(&cobra.Command{Use: "create [name]", Short: "Create and attach to a hosted project", Args: commandArgs(cobra.MaximumNArgs(1)), RunE: actionRun(createProject)})
 	configTree := specTree(configCommand(), "config")
+	configTree.RunE = func(command *cobra.Command, _ []string) error {
+		if !term.IsTerminal(int(os.Stdin.Fd())) {
+			return command.Help()
+		}
+		return actionHomeConfig(command)
+	}
 	configTree.AddCommand(statusBarConfigCommand(), configConflictCobraCommand(), configForceCobraCommand())
 	root.AddCommand(configTree)
-	root.AddCommand(specTree(previewCommand(), "preview"))
+	previewTree := specTree(previewCommand(), "preview")
+	previewTree.RunE = func(command *cobra.Command, _ []string) error {
+		if !term.IsTerminal(int(os.Stdin.Fd())) {
+			return command.Help()
+		}
+		return actionHomePreviews(command)
+	}
+	root.AddCommand(previewTree)
+	root.AddCommand(serveCommand())
 	root.AddCommand(previewsCobraCommand())
 	root.AddCommand(specTree(inboxCommand(), "inbox"))
 	root.AddCommand(sessionCobraCommand())
@@ -780,10 +1080,1352 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(transferCommand())
 	root.AddCommand(hostRuntimeCommand())
 	root.AddCommand(previewRuntimeCommand())
+	root.AddCommand(serveRuntimeCommand())
 	root.AddCommand(privilegedHostServiceCommand())
 	root.AddCommand(privilegedServiceOperationCommand())
 	root.AddCommand(configRuntimeCommand())
 	return root
+}
+
+func actionHome(command *cobra.Command) error {
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		return errors.New("pb requires a command or environment when used without an interactive terminal")
+	}
+	endScreen := selector.BeginScreen(command.ErrOrStderr())
+	defer endScreen()
+	if prefetch, prefetchErr := startHomePrefetch(command); prefetchErr == nil {
+		command.SetContext(context.WithValue(command.Context(), homePrefetchContextKey{}, prefetch))
+	}
+	primeHomeFileIndex()
+	revealEmail := false
+	for {
+		emailAction := "ctrl+e show email"
+		if revealEmail {
+			emailAction = "ctrl+e hide email"
+		}
+		selection, err := selector.ChooseWithAction(selector.Options{
+			Header:        homeBrand(command, revealEmail),
+			Title:         "What do you want to do?",
+			Stdin:         os.Stdin,
+			Output:        command.ErrOrStderr(),
+			Footer:        "↑/↓ move  enter/click select  " + emailAction + "  esc exit",
+			Actions:       map[string]string{"ctrl+e": "toggle-email"},
+			HeaderActions: map[int]string{2: "toggle-email"},
+			Items: []selector.Item{
+				{ID: "serve", Title: "Serve a file or directory", Description: "Publish static content from this device"},
+				{ID: "machines", Title: "Machines", Description: "Open terminals, run Codex, create previews, send files, or manage computers"},
+				{ID: "sessions", Title: "Terminal sessions", Description: "Attach, inspect, close, rename, or delete durable sessions"},
+				{ID: "previews", Title: "Public previews", Description: "Inspect or revoke application preview URLs"},
+				{ID: "config", Title: "Configuration", Description: "Inspect sync status, CLI settings, and status bar preferences"},
+				{ID: "doctor", Title: "Diagnostics", Description: "Check local setup, authentication, and connectivity"},
+				{ID: "account", Title: "Account", Description: "View, sign in, switch, or sign out"},
+			},
+		})
+		if err != nil {
+			if errors.Is(err, selector.ErrCanceled) || errors.Is(err, selector.ErrInterrupted) {
+				return nil
+			}
+			return err
+		}
+		if selection.Action == "toggle-email" {
+			revealEmail = !revealEmail
+			continue
+		}
+		err = runHomeAction(command, selection.Item.ID)
+		if errors.Is(err, selector.ErrInterrupted) {
+			return nil
+		}
+		if errors.Is(err, selector.ErrCanceled) || err == nil {
+			continue
+		}
+		_ = showInformation(command, "Could not complete that action", sentence(userFacingError(err)), nil)
+	}
+}
+
+const homePrefetchFreshness = 5 * time.Second
+
+type homePrefetchContextKey struct{}
+
+type asyncHomeValue[T any] struct {
+	done      chan struct{}
+	value     T
+	err       error
+	fetchedAt time.Time
+}
+
+func startAsyncHomeValue[T any](ctx context.Context, load func(context.Context) (T, error)) *asyncHomeValue[T] {
+	value := &asyncHomeValue[T]{done: make(chan struct{})}
+	go func() {
+		defer close(value.done)
+		value.value, value.err = load(ctx)
+		value.fetchedAt = time.Now()
+	}()
+	return value
+}
+
+func (v *asyncHomeValue[T]) ready() bool {
+	select {
+	case <-v.done:
+		return true
+	default:
+		return false
+	}
+}
+
+func (v *asyncHomeValue[T]) await(ctx context.Context) (T, error) {
+	select {
+	case <-v.done:
+		return v.value, v.err
+	case <-ctx.Done():
+		var zero T
+		return zero, ctx.Err()
+	}
+}
+
+func (v *asyncHomeValue[T]) fresh() bool {
+	return v.ready() && v.err == nil && time.Since(v.fetchedAt) <= homePrefetchFreshness
+}
+
+type homePrefetch struct {
+	favorites *asyncHomeValue[favoriteSet]
+	machines  *asyncHomeValue[[]api.UserMachine]
+	sessions  *asyncHomeValue[[]machineSession]
+	previews  *asyncHomeValue[[]api.Preview]
+
+	machinesClaimed atomic.Bool
+	sessionsClaimed atomic.Bool
+	previewsClaimed atomic.Bool
+}
+
+func startHomePrefetch(command *cobra.Command) (*homePrefetch, error) {
+	client, err := backendForCommand(command)
+	if err != nil {
+		return nil, err
+	}
+	ctx := command.Context()
+	prefetch := &homePrefetch{
+		favorites: startAsyncHomeValue(ctx, func(ctx context.Context) (favoriteSet, error) { return loadFavorites(ctx, client) }),
+		machines:  startAsyncHomeValue(ctx, client.ListUserMachines),
+		previews:  startAsyncHomeValue(ctx, client.ListPreviews),
+	}
+	prefetch.sessions = startAsyncHomeValue(ctx, func(ctx context.Context) ([]machineSession, error) {
+		machines, loadErr := prefetch.machines.await(ctx)
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		return listMachineSessionsForMachines(ctx, client, machines)
+	})
+	return prefetch, nil
+}
+
+func homePrefetchFor(command *cobra.Command) *homePrefetch {
+	value, _ := command.Context().Value(homePrefetchContextKey{}).(*homePrefetch)
+	return value
+}
+
+func primeHomeFileIndex() {
+	go func() {
+		root, rootErr := os.UserHomeDir()
+		cachePath, cacheErr := fileindex.CachePath()
+		if rootErr == nil && cacheErr == nil {
+			fileindex.RefreshInBackground(root, cachePath)
+		}
+	}()
+}
+
+func runHomeAction(command *cobra.Command, action string) error {
+	switch action {
+	case "serve":
+		return executeInteractiveCommand(command, []string{"serve"})
+	case "sessions":
+		return actionHomeSessions(command)
+	case "previews":
+		return actionHomePreviews(command)
+	case "machines":
+		return actionHomeMachines(command)
+	case "config":
+		return actionHomeConfig(command)
+	case "doctor":
+		return actionHomeDoctor(command)
+	case "account":
+		return actionHomeAccount(command)
+	default:
+		return errors.New("unknown Paperboat action")
+	}
+}
+
+func versionDisplay(version string) string {
+	return brandDisplay(version, "") + "\n"
+}
+
+func homeBrand(command *cobra.Command, revealEmail bool) string {
+	account := "Not signed in"
+	configPath, _ := command.Flags().GetString("config")
+	cfg, err := config.Load(configPath)
+	if err == nil {
+		if server, _ := command.Flags().GetString("server"); strings.TrimSpace(server) != "" {
+			cfg.ServerURL, err = config.NormalizeServerURL(server)
+		}
+	}
+	if err == nil && cfg.ServerURL != "" {
+		if store, storeErr := config.ProfileStoreFor(cfg); storeErr == nil {
+			if profile, profileErr := store.Load(cfg.ServerURL); profileErr == nil {
+				account = firstNonEmpty(profile.Account.Email, profile.Account.DisplayName, profile.Account.ID, account)
+			}
+		}
+	}
+	if !revealEmail {
+		account = maskEmail(account)
+	}
+	return brandDisplay(buildinfo.Version, account)
+}
+
+func maskEmail(value string) string {
+	local, domain, ok := strings.Cut(value, "@")
+	if !ok {
+		return value
+	}
+	maskPart := func(part string) string {
+		return strings.Repeat("█", len([]rune(part)))
+	}
+	domainParts := strings.Split(domain, ".")
+	for index, part := range domainParts {
+		domainParts[index] = maskPart(part)
+	}
+	return maskPart(local) + "@" + strings.Join(domainParts, ".")
+}
+
+func brandDisplay(version, account string) string {
+	art := []string{"      ▄█▄", "  ▄▄▝▀▀▀▀▀▘▄▄", "   ▀███████▀"}
+	details := []string{"Paperboat", "Version " + version, account}
+	artWidth := 0
+	for _, line := range art {
+		artWidth = max(artWidth, ansi.StringWidth(line))
+	}
+	lines := make([]string, len(art))
+	for index, line := range art {
+		lines[index] = line
+		if details[index] != "" {
+			lines[index] += strings.Repeat(" ", artWidth-ansi.StringWidth(line)+3) + details[index]
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func actionProjectsList(command *cobra.Command) error {
+	client, err := backendForCommand(command)
+	if err != nil {
+		return err
+	}
+	projects, err := client.ListProjects(command.Context())
+	if err != nil && !api.IsHostedEntitlementRequired(err) {
+		return friendlyCommandError(err)
+	}
+	items := make([]selector.Item, 0, len(projects))
+	for _, project := range projects {
+		items = append(items, selector.Item{ID: project.ID, Title: project.Name, Description: "Hosted project  ·  " + firstNonEmpty(project.State, "unknown"), Search: project.ID})
+	}
+	_, err = selector.Choose(selector.Options{Title: "Projects", Subtitle: "Hosted environments", Items: items, Empty: "No hosted projects yet", Footer: "↑/↓ inspect  type to filter  esc back", Stdin: os.Stdin, Output: command.ErrOrStderr()})
+	return err
+}
+
+func actionEnvironmentsList(command *cobra.Command) error {
+	client, err := backendForCommand(command)
+	if err != nil {
+		return err
+	}
+	machines, err := client.ListUserMachines(command.Context())
+	if err != nil {
+		return friendlyCommandError(err)
+	}
+	currentMachineID, _ := configuredMachineID()
+	sortMachinesForDisplay(machines, nil, currentMachineID)
+	items := make([]selector.Item, 0, len(machines))
+	for _, machine := range machines {
+		items = append(items, selector.Item{ID: machine.ID, Title: machineDisplayTitle(machine, currentMachineID), Description: machineStatusSummary(machine), Search: machine.ID + " " + machine.WorkspaceRoot + " " + machineStatusSearch(machine)})
+	}
+	_, err = selector.Choose(selector.Options{Title: "Machines", Subtitle: "Computers available to this account", Items: items, Empty: "No machines yet", Footer: "↑/↓ inspect  type to filter  esc back", Stdin: os.Stdin, Output: command.ErrOrStderr()})
+	return err
+}
+
+func actionHomeSessions(command *cobra.Command) error {
+	client, err := backendForCommand(command)
+	if err != nil {
+		return err
+	}
+	usePrefetch := true
+	for {
+		var favorites favoriteSet
+		var sessions []machineSession
+		var listErr error
+		loaded := false
+		if usePrefetch {
+			usePrefetch = false
+			if prefetch := homePrefetchFor(command); prefetch != nil && prefetch.sessionsClaimed.CompareAndSwap(false, true) {
+				work := func(ctx context.Context) error {
+					var loadErr error
+					favorites, loadErr = prefetch.favorites.await(ctx)
+					if loadErr == nil {
+						sessions, loadErr = prefetch.sessions.await(ctx)
+					}
+					return loadErr
+				}
+				listErr = runPrefetchedHomeLoad(command, "Terminal sessions", "Loading sessions", prefetch.favorites.ready() && prefetch.sessions.ready(), work)
+				loaded = listErr == nil && prefetch.favorites.fresh() && prefetch.sessions.fresh()
+			}
+		}
+		if !loaded {
+			listErr = homeLoading(command, "Terminal sessions", "Loading sessions", func(ctx context.Context) error {
+				var err error
+				favorites, err = loadFavorites(ctx, client)
+				if err != nil {
+					return err
+				}
+				sessions, err = listMachineSessions(ctx, client)
+				return err
+			})
+		}
+		if listErr != nil {
+			return friendlyCommandError(listErr)
+		}
+		selected, selectErr := selectMachineSession(sessions, favorites)
+		if errors.Is(selectErr, favoriteToggleError) {
+			if favoriteErr := setFavorite(command.Context(), client, "session", machineSessionFavoriteID(selected), !favorites.IsFavorite("session", machineSessionFavoriteID(selected))); favoriteErr != nil {
+				return favoriteErr
+			}
+			continue
+		}
+		if selectErr != nil {
+			return selectErr
+		}
+		target, session := selected.target, selected.session
+		for {
+			actions := []selector.Item{
+				{ID: "attach", Title: "Attach", Description: "Open this durable terminal session"},
+				{ID: "rename", Title: "Rename", Description: "Change the name shown in the session catalog"},
+			}
+			if session.State != "closed" {
+				actions = append(actions, selector.Item{ID: "close", Title: "Close", Description: "Stop its process while retaining history"})
+			}
+			if session.State == "closed" && !session.IsDefault {
+				actions = append(actions, selector.Item{ID: "delete", Title: "Delete", Description: "Permanently remove this session and its history"})
+			}
+			action, actionErr := chooseHomeAction(command, session.Name, actions)
+			if errors.Is(actionErr, selector.ErrCanceled) {
+				continue
+			}
+			if actionErr != nil {
+				return actionErr
+			}
+			if action.ID == "attach" {
+				if attachErr := executeInteractiveCommand(command, []string{"session", "attach", target.id, session.ID}); attachErr != nil {
+					return attachErr
+				}
+				break
+			}
+			if action.ID == "rename" {
+				name, promptErr := prompt.Text(prompt.TextOptions{Title: "Rename session", Description: target.name + "  ·  " + session.Name, Placeholder: session.Name, Stdin: os.Stdin, Output: command.ErrOrStderr(), Validate: func(value string) error {
+					if strings.TrimSpace(value) == "" {
+						return errors.New("session name is required")
+					}
+					return nil
+				}})
+				if errors.Is(promptErr, prompt.ErrCanceled) {
+					continue
+				}
+				if promptErr != nil {
+					return promptErr
+				}
+				if mutationErr := executeInteractiveCommand(command, []string{"sessions", "rename", target.id, session.ID, name}); mutationErr != nil {
+					return mutationErr
+				}
+				break
+			}
+			if mutationErr := executeInteractiveCommand(command, []string{"sessions", action.ID, target.id, session.ID}); mutationErr != nil {
+				return mutationErr
+			}
+			break
+		}
+	}
+}
+
+type machineSession struct {
+	target  environmentTarget
+	session api.TerminalSession
+}
+
+func listMachineSessions(ctx context.Context, client *api.Client) ([]machineSession, error) {
+	machines, err := client.ListUserMachines(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return listMachineSessionsForMachines(ctx, client, machines)
+}
+
+func listMachineSessionsForMachines(ctx context.Context, client *api.Client, machines []api.UserMachine) ([]machineSession, error) {
+	machines = slices.Clone(machines)
+	machines = slices.DeleteFunc(machines, func(machine api.UserMachine) bool {
+		return !machine.Capabilities.TerminalHost.Configured
+	})
+	results := make(chan []machineSession, len(machines))
+	errorsOut := make(chan error, len(machines))
+	workers := make(chan struct{}, 4)
+	var group sync.WaitGroup
+	for _, machine := range machines {
+		machine := machine
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			select {
+			case workers <- struct{}{}:
+				defer func() { <-workers }()
+			case <-ctx.Done():
+				errorsOut <- ctx.Err()
+				return
+			}
+			items, loadErr := client.ListUserMachineTerminalSessions(ctx, machine.ID)
+			if loadErr != nil {
+				errorsOut <- loadErr
+				return
+			}
+			target := environmentTarget{kind: environmentUserMachine, id: machine.ID, name: machine.DisplayName}
+			mapped := make([]machineSession, 0, len(items))
+			for _, session := range items {
+				mapped = append(mapped, machineSession{target: target, session: session})
+			}
+			results <- mapped
+		}()
+	}
+	group.Wait()
+	close(results)
+	close(errorsOut)
+	if loadErr, ok := <-errorsOut; ok {
+		return nil, loadErr
+	}
+	var sessions []machineSession
+	for result := range results {
+		sessions = append(sessions, result...)
+	}
+	slices.SortStableFunc(sessions, func(a, b machineSession) int {
+		return b.activity().Compare(a.activity())
+	})
+	return sessions, nil
+}
+
+func (s machineSession) activity() time.Time {
+	if s.session.LastActiveAt != nil {
+		return *s.session.LastActiveAt
+	}
+	if !s.session.UpdatedAt.IsZero() {
+		return s.session.UpdatedAt
+	}
+	return s.session.CreatedAt
+}
+
+func selectMachineSession(sessions []machineSession, favorites favoriteSet) (machineSession, error) {
+	slices.SortStableFunc(sessions, func(a, b machineSession) int {
+		return compareFavorites(favorites.IsFavorite("session", machineSessionFavoriteID(a)), favorites.IsFavorite("session", machineSessionFavoriteID(b)))
+	})
+	items := make([]selector.Item, 0, len(sessions))
+	byID := make(map[string]machineSession, len(sessions))
+	for _, entry := range sessions {
+		attached := "no attachments"
+		if entry.session.AttachedCount != nil {
+			attached = fmt.Sprintf("%d attached", *entry.session.AttachedCount)
+		}
+		key := entry.target.id + ":" + entry.session.ID
+		activity := entry.activity()
+		description := strings.Join([]string{entry.target.name, entry.session.State, attached, "last active " + relativeTime(&activity)}, "  ·  ")
+		favorite := favorites.IsFavorite("session", machineSessionFavoriteID(entry))
+		items = append(items, selector.Item{ID: key, Title: entry.session.Name, Description: description, Search: entry.target.name + " " + entry.target.id + " favorite starred", Favorite: favorite})
+		byID[key] = entry
+	}
+	selected, err := selector.ChooseWithAction(selector.Options{Title: "Terminal sessions", Subtitle: "All machine sessions, newest first", Items: items, Empty: "no terminal sessions are available", Footer: "↑/↓ move  enter open  ctrl+f favorite  esc back", Actions: map[string]string{"ctrl+f": "favorite"}, Stdin: os.Stdin, Output: os.Stderr})
+	entry := byID[selected.Item.ID]
+	if err == nil && selected.Action == "favorite" {
+		err = favoriteToggleError
+	}
+	return entry, err
+}
+
+func machineSessionFavoriteID(entry machineSession) string {
+	return entry.target.id + ":" + entry.session.ID
+}
+
+func actionHomePreviews(command *cobra.Command) error {
+	client, err := backendForCommand(command)
+	if err != nil {
+		return err
+	}
+	usePrefetch := true
+	for {
+		var favorites favoriteSet
+		var previews []api.Preview
+		var err error
+		loaded := false
+		if usePrefetch {
+			usePrefetch = false
+			if prefetch := homePrefetchFor(command); prefetch != nil && prefetch.previewsClaimed.CompareAndSwap(false, true) {
+				work := func(ctx context.Context) error {
+					var loadErr error
+					favorites, loadErr = prefetch.favorites.await(ctx)
+					if loadErr == nil {
+						previews, loadErr = prefetch.previews.await(ctx)
+					}
+					return loadErr
+				}
+				err = runPrefetchedHomeLoad(command, "Public previews", "Loading previews", prefetch.favorites.ready() && prefetch.previews.ready(), work)
+				loaded = err == nil && prefetch.favorites.fresh() && prefetch.previews.fresh()
+			}
+		}
+		if !loaded {
+			err = homeLoading(command, "Public previews", "Loading previews", func(ctx context.Context) error {
+				var loadErr error
+				favorites, loadErr = loadFavorites(ctx, client)
+				if loadErr != nil {
+					return loadErr
+				}
+				previews, loadErr = client.ListPreviews(ctx)
+				return loadErr
+			})
+		}
+		if err != nil {
+			return friendlyCommandError(err)
+		}
+		previews = enrichLocalServeSources(previews)
+		slices.SortStableFunc(previews, func(a, b api.Preview) int {
+			return compareFavorites(favorites.IsFavorite("preview", a.ID), favorites.IsFavorite("preview", b.ID))
+		})
+		items := make([]selector.Item, 0, len(previews))
+		byID := make(map[string]api.Preview, len(previews))
+		for _, preview := range previews {
+			expiry := "indefinite"
+			if preview.ExpiresAt != nil {
+				expiry = "expires " + relativeTime(preview.ExpiresAt)
+			}
+			favorite := favorites.IsFavorite("preview", preview.ID)
+			source := preview.SourceKind
+			if source == "" {
+				source = "application"
+			}
+			descriptionParts := []string{preview.EnvironmentName, preview.State, source, expiry}
+			if preview.SourcePath != "" {
+				descriptionParts = append(descriptionParts, preview.SourcePath)
+			}
+			items = append(items, selector.Item{ID: preview.ID, Title: preview.LogicalName, Description: strings.Join(descriptionParts, "  ·  "), Search: preview.URL + " " + preview.EnvironmentKind + " " + preview.OwnerMode + " " + preview.SourcePath + " favorite starred", Favorite: favorite})
+			byID[preview.ID] = preview
+		}
+		selection, selectErr := selector.ChooseWithAction(selector.Options{Title: "Public previews", Subtitle: "Anyone with a listed URL can access it", Items: items, Empty: "No public previews yet", Footer: "↑/↓ move  enter open  ctrl+f favorite  esc back", Actions: map[string]string{"ctrl+f": "favorite"}, Stdin: os.Stdin, Output: command.ErrOrStderr()})
+		if selectErr != nil {
+			return selectErr
+		}
+		preview := byID[selection.Item.ID]
+		if selection.Action == "favorite" {
+			if favoriteErr := setFavorite(command.Context(), client, "preview", preview.ID, !favorites.IsFavorite("preview", preview.ID)); favoriteErr != nil {
+				return favoriteErr
+			}
+			continue
+		}
+		revokeTitle := "Revoke preview"
+		revokeDescription := "Remove this public URL"
+		if preview.SourceKind == "file" || preview.SourceKind == "directory" {
+			revokeTitle = "Stop serving"
+			revokeDescription = "Stop the local static server and remove its public URL"
+		}
+		action, actionErr := chooseHomeAction(command, preview.LogicalName, []selector.Item{
+			{ID: "open", Title: "Open preview", Description: preview.URL},
+			{ID: "revoke", Title: revokeTitle, Description: revokeDescription},
+		})
+		if errors.Is(actionErr, selector.ErrCanceled) {
+			continue
+		}
+		if actionErr != nil {
+			return actionErr
+		}
+		if action.ID == "open" {
+			if openErr := openBrowser(preview.URL); openErr != nil {
+				return openErr
+			}
+			continue
+		}
+		if revokeErr := executeInteractiveCommand(command, []string{"preview", "revoke", preview.ID}); revokeErr != nil {
+			return revokeErr
+		}
+	}
+}
+
+func actionHomeMachines(command *cobra.Command) error {
+	client, err := backendForCommand(command)
+	if err != nil {
+		return err
+	}
+	usePrefetch := true
+	for {
+		var favorites favoriteSet
+		var machines []api.UserMachine
+		var err error
+		loaded := false
+		if usePrefetch {
+			usePrefetch = false
+			if prefetch := homePrefetchFor(command); prefetch != nil && prefetch.machinesClaimed.CompareAndSwap(false, true) {
+				work := func(ctx context.Context) error {
+					var loadErr error
+					favorites, loadErr = prefetch.favorites.await(ctx)
+					if loadErr == nil {
+						machines, loadErr = prefetch.machines.await(ctx)
+					}
+					return loadErr
+				}
+				err = runPrefetchedHomeLoad(command, "Machines", "Loading machines", prefetch.favorites.ready() && prefetch.machines.ready(), work)
+				loaded = err == nil && prefetch.favorites.fresh() && prefetch.machines.fresh()
+			}
+		}
+		if !loaded {
+			err = homeLoading(command, "Machines", "Loading machines", func(ctx context.Context) error {
+				var loadErr error
+				favorites, loadErr = loadFavorites(ctx, client)
+				if loadErr != nil {
+					return loadErr
+				}
+				machines, loadErr = client.ListUserMachines(ctx)
+				return loadErr
+			})
+		}
+		if err != nil {
+			return friendlyCommandError(err)
+		}
+		currentMachineID, _ := configuredMachineID()
+		sortMachinesForDisplay(machines, favorites, currentMachineID)
+		items := make([]selector.Item, 0, len(machines)+1)
+		byID := make(map[string]api.UserMachine, len(machines))
+		for _, machine := range machines {
+			if machine.ID == currentMachineID {
+				continue
+			}
+			favorite := favorites.IsFavorite("machine", machine.ID)
+			items = append(items, selector.Item{ID: machine.ID, Title: machine.DisplayName, Description: machineStatusSummary(machine), Search: machine.WorkspaceRoot + " " + machineStatusSearch(machine) + " favorite starred", Favorite: favorite})
+			byID[machine.ID] = machine
+		}
+		for _, machine := range machines {
+			if machine.ID != currentMachineID {
+				continue
+			}
+			favorite := favorites.IsFavorite("machine", machine.ID)
+			items = append(items, selector.Item{ID: machine.ID, Title: machineDisplayTitle(machine, currentMachineID), Description: machineStatusSummary(machine), Search: machine.WorkspaceRoot + " " + machineStatusSearch(machine) + " this device favorite starred", Favorite: favorite})
+			byID[machine.ID] = machine
+		}
+		items = append(items, selector.Item{ID: "add", Title: "+ Add machine", Description: "Set up another computer", Search: "new pair enroll", Action: true})
+		selection, selectErr := selector.ChooseWithAction(selector.Options{Title: "Machines", Subtitle: "Paired computers", Items: items, Footer: "↑/↓ move  enter open  ctrl+f favorite  esc back", Actions: map[string]string{"ctrl+f": "favorite"}, Stdin: os.Stdin, Output: command.ErrOrStderr()})
+		if selectErr != nil {
+			return selectErr
+		}
+		choice := selection.Item
+		if choice.ID == "add" && selection.Action == "favorite" {
+			continue
+		}
+		if choice.ID == "add" {
+			if addErr := executeInteractiveCommand(command, []string{"machine", "add"}); addErr != nil {
+				return addErr
+			}
+			continue
+		}
+		machine := byID[choice.ID]
+		if selection.Action == "favorite" {
+			if favoriteErr := setFavorite(command.Context(), client, "machine", machine.ID, !favorites.IsFavorite("machine", machine.ID)); favoriteErr != nil {
+				return favoriteErr
+			}
+			continue
+		}
+		for {
+			action, actionErr := chooseMachineHomeAction(command, machine)
+			if errors.Is(actionErr, selector.ErrCanceled) {
+				break
+			}
+			if actionErr != nil {
+				return actionErr
+			}
+			var runErr error
+			switch action.ID {
+			case "terminal":
+				runErr = executeInteractiveCommand(command, []string{"connect", machine.ID, "new"})
+			case "codex":
+				runErr = executeInteractiveCommand(command, []string{"codex", machine.ID})
+			case "sessions":
+				runErr = actionHomeMachineSessions(command, client, machine)
+				if errors.Is(runErr, selector.ErrCanceled) {
+					runErr = nil
+				}
+			case "preview":
+				runErr = actionHomeCreateMachinePreview(command, machine)
+			case "previews":
+				runErr = actionHomeMachinePreviews(command, client, machine)
+			case "send":
+				runErr = actionHomeSendToMachine(command, machine)
+			case "allow-sleep":
+				runErr = executeInteractiveCommand(command, []string{"machine", "availability", machine.ID, "--mode", "allow-sleep"})
+			case "keep-awake":
+				runErr = executeInteractiveCommand(command, []string{"machine", "availability", machine.ID, "--mode", "keep-awake", "--yes"})
+			default:
+				runErr = errors.New("unknown machine action")
+			}
+			if errors.Is(runErr, selector.ErrCanceled) {
+				continue
+			}
+			if runErr != nil {
+				return runErr
+			}
+		}
+	}
+}
+
+func machineHomeActions(machine api.UserMachine) []selector.Item {
+	actions := make([]selector.Item, 0, 8)
+	if machine.Capabilities.TerminalHost.Configured {
+		actions = append(actions,
+			selector.Item{ID: "terminal", Title: "Create terminal session", Description: "Start and attach to a new durable session"},
+			selector.Item{ID: "codex", Title: "Create Codex session", Description: "Choose a remote folder and start a managed Codex session"},
+		)
+	}
+	if machine.Capabilities.FileReceive.Configured {
+		if sourceMachineID, err := configuredMachineID(); err != nil || sourceMachineID != machine.ID {
+			actions = append(actions, selector.Item{ID: "send", Title: "Send files", Description: "Search, select, drop, or paste files for this machine"})
+		}
+	}
+	if machine.Capabilities.PreviewLaunch.Configured {
+		actions = append(actions, selector.Item{ID: "preview", Title: "Create preview", Description: "Publish an application port from this machine"})
+	}
+	if machine.Capabilities.TerminalHost.Configured {
+		actions = append(actions, selector.Item{ID: "sessions", Title: "Sessions", Description: "List durable terminal sessions on this machine"})
+	}
+	if machine.Capabilities.PreviewLaunch.Configured {
+		actions = append(actions, selector.Item{ID: "previews", Title: "Previews", Description: "Open or revoke previews created on this machine"})
+	}
+	if machine.SetupMode == "host" {
+		actions = append(actions,
+			selector.Item{ID: "allow-sleep", Title: "Allow sleep", Description: "Let normal operating-system sleep policy apply"},
+			selector.Item{ID: "keep-awake", Title: "Keep awake", Description: "Request availability even when idle"},
+		)
+	}
+	return actions
+}
+
+func chooseMachineHomeAction(command *cobra.Command, machine api.UserMachine) (selector.Item, error) {
+	return selector.Choose(selector.Options{Title: machine.DisplayName, Subtitle: machineStatusSummary(machine), Items: machineHomeActions(machine), Stdin: os.Stdin, Output: command.ErrOrStderr()})
+}
+
+func machineStatusSummary(machine api.UserMachine) string {
+	mode := effectiveMachineMode(machine)
+	if mode == "session" {
+		return "Session only"
+	}
+	return machineAvailabilityLabel(machine) + "  ·  " + machineModeLabel(machine)
+}
+
+func machineStatusSearch(machine api.UserMachine) string {
+	return strings.Join([]string{machineAvailabilityLabel(machine), machineModeLabel(machine), machine.SetupMode}, " ")
+}
+
+func machineAvailabilityLabel(machine api.UserMachine) string {
+	if machine.Online {
+		return "Online"
+	}
+	switch strings.ToLower(strings.TrimSpace(machine.State)) {
+	case "revoked", "deleted":
+		return "Unavailable"
+	default:
+		return "Offline"
+	}
+}
+
+func machineModeLabel(machine api.UserMachine) string {
+	switch effectiveMachineMode(machine) {
+	case "host":
+		return "Host"
+	case "receive":
+		return "Receive only"
+	case "session":
+		return "Session only"
+	default:
+		return "Limited"
+	}
+}
+
+func machineDisplayTitle(machine api.UserMachine, currentMachineID string) string {
+	if machine.ID == currentMachineID {
+		return machine.DisplayName + " (this device)"
+	}
+	return machine.DisplayName
+}
+
+func sortMachinesForDisplay(machines []api.UserMachine, favorites favoriteSet, currentMachineID string) {
+	slices.SortStableFunc(machines, func(a, b api.UserMachine) int {
+		aCurrent, bCurrent := a.ID == currentMachineID, b.ID == currentMachineID
+		if aCurrent != bCurrent {
+			if aCurrent {
+				return 1
+			}
+			return -1
+		}
+		return compareFavorites(favorites.IsFavorite("machine", a.ID), favorites.IsFavorite("machine", b.ID))
+	})
+}
+
+func effectiveMachineMode(machine api.UserMachine) string {
+	switch machine.SetupMode {
+	case "host", "receive", "session":
+		return machine.SetupMode
+	}
+	if machine.Capabilities.TerminalHost.Configured || machine.Capabilities.CodexHost.Configured {
+		return "host"
+	}
+	if machine.Capabilities.FileReceive.Configured || machine.Capabilities.PreviewLaunch.Configured {
+		return "receive"
+	}
+	return ""
+}
+
+func actionHomeMachinePreviews(command *cobra.Command, client *api.Client, machine api.UserMachine) error {
+	var previews []api.Preview
+	var favorites favoriteSet
+	err := homeLoading(command, "Previews", "Loading previews from "+machine.DisplayName, func(ctx context.Context) error {
+		var loadErr error
+		favorites, loadErr = loadFavorites(ctx, client)
+		if loadErr != nil {
+			return loadErr
+		}
+		items, loadErr := client.ListPreviews(ctx)
+		if loadErr != nil {
+			return loadErr
+		}
+		for _, preview := range items {
+			if preview.EnvironmentID == machine.EnvironmentID {
+				previews = append(previews, preview)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return friendlyCommandError(err)
+	}
+	for {
+		slices.SortStableFunc(previews, func(a, b api.Preview) int {
+			return compareFavorites(favorites.IsFavorite("preview", a.ID), favorites.IsFavorite("preview", b.ID))
+		})
+		items := make([]selector.Item, 0, len(previews))
+		byID := make(map[string]api.Preview, len(previews))
+		for _, preview := range previews {
+			favorite := favorites.IsFavorite("preview", preview.ID)
+			items = append(items, selector.Item{ID: preview.ID, Title: preview.LogicalName, Description: fmt.Sprintf("%s  ·  :%d  ·  %s", preview.State, preview.TargetPort, preview.URL), Search: preview.URL, Favorite: favorite})
+			byID[preview.ID] = preview
+		}
+		selection, selectErr := selector.ChooseWithAction(selector.Options{Title: "Previews", Subtitle: machine.DisplayName, Items: items, Empty: "No previews for this machine", Footer: "↑/↓ move  enter open  ctrl+f favorite  esc back", Actions: map[string]string{"ctrl+f": "favorite"}, Stdin: os.Stdin, Output: command.ErrOrStderr()})
+		if selectErr != nil {
+			return selectErr
+		}
+		preview := byID[selection.Item.ID]
+		if selection.Action == "favorite" {
+			favorite := !favorites.IsFavorite("preview", preview.ID)
+			if err := setFavorite(command.Context(), client, "preview", preview.ID, favorite); err != nil {
+				return err
+			}
+			favorites.Set("preview", preview.ID, favorite)
+			continue
+		}
+		action, actionErr := chooseHomeAction(command, preview.LogicalName, []selector.Item{{ID: "open", Title: "Open preview", Description: preview.URL}, {ID: "revoke", Title: "Revoke preview", Description: "Remove this public URL"}})
+		if actionErr != nil {
+			return actionErr
+		}
+		if action.ID == "open" {
+			if err := openBrowser(preview.URL); err != nil {
+				return err
+			}
+			continue
+		}
+		return executeInteractiveCommand(command, []string{"preview", "revoke", preview.ID})
+	}
+}
+
+func actionHomeCreateMachinePreview(command *cobra.Command, machine api.UserMachine) error {
+	portText, err := prompt.Text(prompt.TextOptions{Title: "Application port", Description: "Port where the application is already listening on " + machine.DisplayName, Placeholder: "3000", Stdin: os.Stdin, Output: command.ErrOrStderr(), Validate: func(value string) error {
+		port, parseErr := strconv.ParseUint(value, 10, 16)
+		if parseErr != nil || port == 0 {
+			return errors.New("port must be between 1 and 65535")
+		}
+		return nil
+	}})
+	if errors.Is(err, prompt.ErrCanceled) {
+		return selector.ErrCanceled
+	}
+	if err != nil {
+		return err
+	}
+	name := "preview-" + portText
+	return executeInteractiveCommand(command, []string{"preview", "create", "--machine", machine.ID, "--name", name, "--port", portText, "--public"})
+}
+
+func actionHomeSendToMachine(command *cobra.Command, machine api.UserMachine) error {
+	var candidates []string
+	searchRoot, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	cachePath, err := fileindex.CachePath()
+	if err != nil {
+		return err
+	}
+	loadIndex := func(ctx context.Context) error {
+		var refreshErr error
+		candidates, refreshErr = fileindex.Current(ctx, searchRoot, cachePath)
+		return refreshErr
+	}
+	if fileindex.RefreshReady(cachePath) {
+		err = loadIndex(command.Context())
+	} else {
+		err = homeLoading(command, "Send files", "Refreshing files", loadIndex)
+	}
+	if err != nil {
+		return err
+	}
+	defer fileindex.RefreshInBackground(searchRoot, cachePath)
+	items := make([]selector.Item, 0, len(candidates)+1)
+	for _, path := range candidates {
+		info, statErr := os.Stat(path)
+		if statErr != nil {
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			continue
+		}
+		display := path
+		if relative, relativeErr := filepath.Rel(searchRoot, path); relativeErr == nil {
+			display = filepath.Join("~", relative)
+		}
+		items = append(items, selector.Item{ID: path, Title: display, Description: "File"})
+	}
+	selection, err := selector.ChooseWithAction(selector.Options{Title: "Send files to " + machine.DisplayName, Subtitle: "Type to fuzzy-search files in your home folder", Items: items, Empty: "Start typing to search", RequireFilter: true, Footer: "type to search  enter/click send  ctrl+p paste or drop paths  esc back", Actions: map[string]string{"ctrl+p": "paths"}, Stdin: os.Stdin, Output: command.ErrOrStderr()})
+	if err != nil {
+		return err
+	}
+	if selection.Action != "paths" {
+		return executeInteractiveCommand(command, []string{"send", selection.Item.ID, "--to", machine.ID})
+	}
+	value, err := prompt.Text(prompt.TextOptions{Title: "Send files to " + machine.DisplayName, Description: "Drag files here or paste one or more file or folder paths", Placeholder: "/path/to/file", Stdin: os.Stdin, Output: command.ErrOrStderr(), Validate: func(value string) error {
+		_, parseErr := droppedFilePaths(value)
+		return parseErr
+	}})
+	if errors.Is(err, prompt.ErrCanceled) {
+		return selector.ErrCanceled
+	}
+	if err != nil {
+		return err
+	}
+	paths, err := droppedFilePaths(value)
+	if err != nil {
+		return err
+	}
+	arguments := append([]string{"send"}, paths...)
+	arguments = append(arguments, "--to", machine.ID)
+	return executeInteractiveCommand(command, arguments)
+}
+
+func droppedFilePaths(value string) ([]string, error) {
+	paths, err := shlex.Split(strings.TrimSpace(value), true)
+	if err != nil || len(paths) == 0 {
+		return nil, errors.New("drop or paste at least one valid file or folder path")
+	}
+	for index, path := range paths {
+		path = filepath.Clean(path)
+		if !filepath.IsAbs(path) {
+			absolute, absoluteErr := filepath.Abs(path)
+			if absoluteErr != nil {
+				return nil, absoluteErr
+			}
+			path = absolute
+		}
+		if _, statErr := os.Stat(path); statErr != nil {
+			return nil, fmt.Errorf("%s is not available", path)
+		}
+		paths[index] = path
+	}
+	return paths, nil
+}
+
+func homeLoading(command *cobra.Command, title, detail string, work func(context.Context) error) error {
+	return selector.Loading(command.Context(), title, detail, os.Stdin, command.ErrOrStderr(), work)
+}
+
+func runPrefetchedHomeLoad(command *cobra.Command, title, detail string, ready bool, work func(context.Context) error) error {
+	if ready {
+		return work(command.Context())
+	}
+	return homeLoading(command, title, detail, work)
+}
+
+func actionHomeMachineSessions(command *cobra.Command, client *api.Client, machine api.UserMachine) error {
+	target := environmentTarget{kind: environmentUserMachine, id: machine.ID, name: machine.DisplayName}
+	var records []api.TerminalSession
+	var favorites favoriteSet
+	err := homeLoading(command, "Terminal sessions", "Loading sessions", func(ctx context.Context) error {
+		var loadErr error
+		favorites, loadErr = loadFavorites(ctx, client)
+		if loadErr != nil {
+			return loadErr
+		}
+		records, loadErr = listTerminalSessionsForTarget(ctx, client, target)
+		return loadErr
+	})
+	if err != nil {
+		return friendlyCommandError(err)
+	}
+	for {
+		sessions := make([]machineSession, 0, len(records))
+		for _, session := range records {
+			sessions = append(sessions, machineSession{target: target, session: session})
+		}
+		selected, selectErr := selectMachineSession(sessions, favorites)
+		if errors.Is(selectErr, favoriteToggleError) {
+			id := machineSessionFavoriteID(selected)
+			favorite := !favorites.IsFavorite("session", id)
+			if err := setFavorite(command.Context(), client, "session", id, favorite); err != nil {
+				return err
+			}
+			favorites.Set("session", id, favorite)
+			continue
+		}
+		if selectErr != nil {
+			return selectErr
+		}
+		return executeInteractiveCommand(command, []string{"session", "attach", machine.ID, selected.session.ID})
+	}
+}
+
+func actionHomeAccount(command *cobra.Command) error {
+	for {
+		ctx := actionContext(command, nil)
+		d, err := buildDeps(ctx)
+		if err != nil {
+			return err
+		}
+		items := []selector.Item{{ID: "status", Title: "Account status", Description: "Not signed in"}, {ID: "login", Title: "Sign in", Description: "Authenticate through the Paperboat dashboard"}}
+		if _, credentialErr := d.auth.Credential(); credentialErr == nil {
+			items = []selector.Item{
+				{ID: "status", Title: "Account status", Description: "Signed in"},
+				{ID: "switch", Title: "Switch account", Description: "Replace the account used for this server"},
+				{ID: "logout", Title: "Sign out", Description: "Revoke this CLI session"},
+			}
+		}
+		choice, err := chooseHomeAction(command, "Account", items)
+		if err != nil {
+			return err
+		}
+		switch choice.ID {
+		case "status":
+			client, clientErr := backendForCommand(command)
+			if clientErr != nil {
+				if infoErr := showInformation(command, "Account", "Not signed in", nil); infoErr != nil && !errors.Is(infoErr, selector.ErrCanceled) {
+					return infoErr
+				}
+				continue
+			}
+			var me api.Me
+			meErr := homeLoading(command, "Account", "Loading account", func(ctx context.Context) error {
+				var loadErr error
+				me, loadErr = client.Me(ctx)
+				return loadErr
+			})
+			if meErr != nil {
+				return friendlyCommandError(meErr)
+			}
+			if infoErr := showInformation(command, "Account", firstNonEmpty(me.Email, me.DisplayName, me.ID), []selector.Item{{ID: "server", Title: "Paperboat server", Description: d.cfg.ServerURL}}); infoErr != nil && !errors.Is(infoErr, selector.ErrCanceled) {
+				return infoErr
+			}
+		case "login":
+			if err := executeInteractiveCommand(command, []string{"auth", "login"}); err != nil {
+				return err
+			}
+		case "switch":
+			if err := executeInteractiveCommand(command, []string{"auth", "switch"}); err != nil {
+				return err
+			}
+		case "logout":
+			if err := executeInteractiveCommand(command, []string{"auth", "logout"}); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func actionHomeConfig(command *cobra.Command) error {
+	for {
+		cfg, loadErr := config.Load(configPathFlag(command))
+		if loadErr != nil {
+			return loadErr
+		}
+		choice, err := chooseHomeAction(command, "Configuration", []selector.Item{
+			{ID: "server", Title: "Paperboat server", Description: orNone(cfg.ServerURL), Search: "edit url endpoint"},
+			{ID: "auth", Title: "File credential fallback", Description: onOff(cfg.Auth.AllowFileFallback), Search: "toggle auth credentials"},
+			{ID: "status-bar", Title: "Status bar", Description: cfg.StatusBar.Mode + "  ·  " + cfg.StatusBar.Theme + "  ·  fullscreen " + cfg.StatusBar.Fullscreen},
+			{ID: "status", Title: "Sync status", Description: "Inspect environment configuration synchronization"},
+			{ID: "path", Title: "Configuration file", Description: cfg.Path()},
+		})
+		if err != nil {
+			return err
+		}
+		switch choice.ID {
+		case "server":
+			value, inputErr := prompt.Text(prompt.TextOptions{Title: "Paperboat server", Description: "Control-plane URL used by this CLI", Placeholder: "https://api.pprbt.dev", Initial: cfg.ServerURL, Stdin: os.Stdin, Output: command.ErrOrStderr(), Validate: func(value string) error {
+				if strings.TrimSpace(value) == "" {
+					return nil
+				}
+				_, normalizeErr := config.NormalizeServerURL(value)
+				return normalizeErr
+			}})
+			if errors.Is(inputErr, prompt.ErrCanceled) {
+				continue
+			}
+			if inputErr != nil {
+				return inputErr
+			}
+			if strings.TrimSpace(value) == "" {
+				cfg.ServerURL = ""
+			} else {
+				cfg.ServerURL, loadErr = config.NormalizeServerURL(value)
+				if loadErr != nil {
+					return loadErr
+				}
+			}
+			if saveErr := cfg.Save(); saveErr != nil {
+				return saveErr
+			}
+		case "auth":
+			cfg.Auth.AllowFileFallback = !cfg.Auth.AllowFileFallback
+			if saveErr := cfg.Save(); saveErr != nil {
+				return saveErr
+			}
+		case "status-bar":
+			if statusErr := actionHomeStatusBar(command); statusErr != nil && !errors.Is(statusErr, selector.ErrCanceled) {
+				return statusErr
+			}
+		case "status":
+			client, clientErr := backendForCommand(command)
+			if clientErr != nil {
+				return clientErr
+			}
+			var status api.ConfigSyncStatus
+			statusErr := homeLoading(command, "Configuration sync", "Loading sync status", func(ctx context.Context) error {
+				var loadErr error
+				status, loadErr = client.ConfigSyncStatus(ctx)
+				return loadErr
+			})
+			if statusErr != nil {
+				return friendlyCommandError(statusErr)
+			}
+			items := make([]selector.Item, 0, len(status.Environments))
+			for _, environment := range status.Environments {
+				items = append(items, selector.Item{ID: environment.EnvironmentID, Title: environment.DisplayName, Description: fmt.Sprintf("%s  ·  %s  ·  %d managed paths  ·  %d conflicts", environment.State, environment.Mode, environment.ManagedPathCount, len(environment.Conflicts))})
+			}
+			if infoErr := showInformation(command, "Configuration sync", "Account state  ·  "+status.State, items); infoErr != nil && !errors.Is(infoErr, selector.ErrCanceled) {
+				return infoErr
+			}
+		case "path":
+			if infoErr := showInformation(command, "Configuration file", cfg.Path(), nil); infoErr != nil && !errors.Is(infoErr, selector.ErrCanceled) {
+				return infoErr
+			}
+		}
+	}
+}
+
+func actionHomeStatusBar(command *cobra.Command) error {
+	for {
+		cfg, err := config.Load(configPathFlag(command))
+		if err != nil {
+			return err
+		}
+		choice, err := chooseHomeAction(command, "Status bar", []selector.Item{
+			{ID: "mode", Title: "Mode", Description: cfg.StatusBar.Mode},
+			{ID: "fullscreen", Title: "Full-screen applications", Description: cfg.StatusBar.Fullscreen},
+			{ID: "theme", Title: "Theme", Description: cfg.StatusBar.Theme},
+			{ID: "privacy", Title: "Privacy", Description: onOff(cfg.StatusBar.Privacy)},
+			{ID: "title", Title: "Terminal title", Description: onOff(cfg.StatusBar.TerminalTitle)},
+			{ID: "reset", Title: "Restore defaults", Description: "Reset all status-bar preferences"},
+		})
+		if err != nil {
+			return err
+		}
+		switch choice.ID {
+		case "mode":
+			cfg.StatusBar.Mode, err = chooseValue(command, "Status bar mode", cfg.StatusBar.Mode, []string{"auto", "on", "off"})
+		case "fullscreen":
+			cfg.StatusBar.Fullscreen, err = chooseValue(command, "Full-screen applications", cfg.StatusBar.Fullscreen, []string{"hide", "show"})
+		case "theme":
+			cfg.StatusBar.Theme, err = chooseValue(command, "Status bar theme", cfg.StatusBar.Theme, []string{"terminal", "dark", "light", "mono"})
+		case "privacy":
+			cfg.StatusBar.Privacy = !cfg.StatusBar.Privacy
+		case "title":
+			cfg.StatusBar.TerminalTitle = !cfg.StatusBar.TerminalTitle
+		case "reset":
+			cfg.StatusBar = config.DefaultStatusBarConfig()
+		}
+		if errors.Is(err, selector.ErrCanceled) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if err := cfg.Save(); err != nil {
+			return err
+		}
+	}
+}
+
+func chooseValue(command *cobra.Command, title, current string, values []string) (string, error) {
+	items := make([]selector.Item, 0, len(values))
+	for _, value := range values {
+		description := ""
+		if value == current {
+			description = "Current"
+		}
+		items = append(items, selector.Item{ID: value, Title: value, Description: description})
+	}
+	choice, err := selector.Choose(selector.Options{Title: title, Subtitle: "Choose a value", Items: items, Initial: current, Stdin: os.Stdin, Output: command.ErrOrStderr()})
+	return choice.ID, err
+}
+
+func onOff(value bool) string {
+	if value {
+		return "on"
+	}
+	return "off"
+}
+
+func actionHomeDoctor(command *cobra.Command) error {
+	report := collectLocalDoctor()
+	items := []selector.Item{
+		{ID: "setup", Title: "Local setup", Description: report.SetupState},
+		{ID: "identity", Title: "Machine identity", Description: report.IdentityState},
+		{ID: "credential", Title: "Machine credential", Description: report.CredentialState},
+		{ID: "inbox", Title: "Paperboat Inbox", Description: report.InboxState + "  ·  " + report.InboxPath},
+		{ID: "config", Title: "Configuration service", Description: report.ConfigService},
+		{ID: "runtime", Title: "Host runtime", Description: report.HostRuntime},
+		{ID: "workloads", Title: "Local workloads", Description: fmt.Sprintf("%s  ·  %d sessions  ·  %d previews  ·  %d transfers", report.WorkloadCounts, report.ActiveSessions, report.ActivePreviews, report.ActiveTransfers)},
+	}
+	ctx := actionContext(command, nil)
+	d, err := buildDeps(ctx)
+	if err == nil {
+		credential, credentialErr := d.auth.Credential()
+		if credentialErr != nil {
+			items = append(items, selector.Item{ID: "auth", Title: "Account", Description: "not signed in"})
+		} else if strings.TrimSpace(d.cfg.ServerURL) == "" {
+			items = append(items, selector.Item{ID: "backend", Title: "Control plane", Description: "server not configured"})
+		} else {
+			var me api.Me
+			meErr := homeLoading(command, "Diagnostics", "Checking control plane", func(ctx context.Context) error {
+				var loadErr error
+				me, loadErr = api.New(d.cfg.ServerURL, credential, nil).Me(ctx)
+				return loadErr
+			})
+			if meErr != nil {
+				items = append(items, selector.Item{ID: "backend", Title: "Control plane", Description: "unavailable  ·  " + meErr.Error()})
+			} else {
+				items = append(items, selector.Item{ID: "auth", Title: "Account", Description: firstNonEmpty(me.Email, me.DisplayName, me.ID)}, selector.Item{ID: "backend", Title: "Control plane", Description: "authenticated"})
+			}
+		}
+	}
+	for index, recovery := range report.RecoveryActions {
+		items = append(items, selector.Item{ID: fmt.Sprintf("recovery-%d", index), Title: "Needs attention", Description: recovery})
+	}
+	return showInformation(command, "Diagnostics", "Local setup and Paperboat connectivity", items)
+}
+
+func showInformation(command *cobra.Command, title, subtitle string, items []selector.Item) error {
+	_, err := selector.Choose(selector.Options{Title: title, Subtitle: subtitle, Items: items, Empty: "Press Esc to go back", Footer: "↑/↓ inspect  type to filter  esc back", Stdin: os.Stdin, Output: command.ErrOrStderr()})
+	return err
+}
+
+func chooseHomeAction(command *cobra.Command, title string, items []selector.Item) (selector.Item, error) {
+	choice, err := selector.Choose(selector.Options{Title: title, Subtitle: "Choose an action", Items: items, Stdin: os.Stdin, Output: command.ErrOrStderr()})
+	return choice, err
+}
+
+func compareFavorites(a, b bool) int {
+	if a == b {
+		return 0
+	}
+	if a {
+		return -1
+	}
+	return 1
+}
+
+type favoriteSet map[string]struct{}
+
+func (f favoriteSet) IsFavorite(kind, id string) bool {
+	_, ok := f[kind+":"+id]
+	return ok
+}
+
+func (f favoriteSet) Set(kind, id string, favorite bool) {
+	key := kind + ":" + id
+	if favorite {
+		f[key] = struct{}{}
+		return
+	}
+	delete(f, key)
+}
+
+func loadFavorites(ctx context.Context, client *api.Client) (favoriteSet, error) {
+	items, err := client.ListFavorites(ctx)
+	if err != nil {
+		return nil, friendlyCommandError(err)
+	}
+	favorites := make(favoriteSet, len(items))
+	for _, item := range items {
+		favorites[item.Kind+":"+item.ResourceID] = struct{}{}
+	}
+	return favorites, nil
+}
+
+var favoriteToggleError = errors.New("favorite toggle requested")
+
+func setFavorite(ctx context.Context, client *api.Client, kind, id string, favorite bool) error {
+	_, err := client.SetFavorite(ctx, kind, id, favorite)
+	if err == nil {
+		return nil
+	}
+	var apiErr *api.APIError
+	if errors.As(err, &apiErr) && apiErr.Code == "favorite_limit_reached" {
+		return errors.New("you can favorite up to five items; unfavorite another machine, session, or preview first")
+	}
+	return friendlyCommandError(err)
+}
+
+func selectEnvironmentForCommand(command *cobra.Command, title string) (string, error) {
+	client, err := backendForCommand(command)
+	if err != nil {
+		return "", err
+	}
+	return selectEnvironment(command.Context(), client, title)
+}
+
+func backendForCommand(command *cobra.Command) (*api.Client, error) {
+	ctx := actionContext(command, nil)
+	d, err := buildDeps(ctx)
+	if err != nil {
+		return nil, err
+	}
+	credential, err := d.auth.Credential()
+	if err != nil {
+		return nil, err
+	}
+	return api.New(d.cfg.ServerURL, credential, nil), nil
+}
+
+func executeInteractiveCommand(parent *cobra.Command, args []string) error {
+	command := newRootCommand()
+	command.SetOut(parent.OutOrStdout())
+	command.SetErr(parent.ErrOrStderr())
+	command.SetArgs(args)
+	return command.ExecuteContext(parent.Context())
 }
 
 func sendCommand() *cobra.Command {
@@ -842,7 +2484,10 @@ func sendCommand() *cobra.Command {
 							}
 							return fmt.Errorf("transfer destination is ambiguous; use --to or set a default; eligible machines: %s", strings.Join(summaries, ", "))
 						}
-						index, promptErr := promptChoice(bufio.NewReader(os.Stdin), "Destination", len(eligible), func(index int) string { return eligible[index].DisplayName + " (" + eligible[index].ID + ")" })
+						index, promptErr := chooseIndex("Choose a transfer destination", "Eligible machines for this session", len(eligible), func(index int) selector.Item {
+							machine := eligible[index]
+							return selector.Item{ID: machine.ID, Title: machine.DisplayName, Description: machineStatusSummary(machine), Search: machineStatusSearch(machine)}
+						})
 						if promptErr != nil {
 							return promptErr
 						}
@@ -858,11 +2503,11 @@ func sendCommand() *cobra.Command {
 			if destination.State == "revoked" || destination.State == "disconnected" || destination.State == "deleted" {
 				return errors.New("destination machine is revoked")
 			}
-			if sessionID == "" && !destination.Online {
-				return errors.New("destination machine is offline")
+			if sessionID == "" && !destination.Capabilities.FileReceive.Configured {
+				return &api.APIError{Code: "machine_capability_unavailable", Message: "This machine is not configured to receive files."}
 			}
-			if sessionID == "" && !slices.Contains(destination.SetupRoles, "host") {
-				return errors.New("destination machine is not paired for hosting")
+			if sessionID == "" && (!destination.Online || !destination.Capabilities.FileReceive.Observed) {
+				return &api.APIError{Code: "machine_offline", Message: "The destination machine is offline."}
 			}
 			fmt.Fprintf(cobraCommand.ErrOrStderr(), "Sending to %s (%s)\n", destination.DisplayName, destination.ID)
 			descriptor, err := client.MachineFileTransferDescriptor(ctx.Context, destination.ID, sourceMachineID, sessionID)
@@ -1098,8 +2743,7 @@ func transferClientForCommand(cobraCommand *cobra.Command, args []string) (*file
 
 func addConnectFlags(command *cobra.Command) {
 	command.Flags().String("transport", "", "terminal transport for this attach: auto, quic, or wss")
-	command.Flags().Bool("new", false, "create a new terminal session")
-	command.Flags().String("name", "", "name for a new terminal session")
+	command.Flags().String("name", "", "name for the fresh terminal session")
 	command.Flags().String("session", "", "attach an existing terminal session by name or ID")
 	addStatusBarFlags(command)
 }
@@ -1111,14 +2755,10 @@ func addStatusBarFlags(command *cobra.Command) {
 }
 
 func validateConnectInvocation(command *cobra.Command) error {
-	newSession, _ := command.Flags().GetBool("new")
 	name, _ := command.Flags().GetString("name")
 	ref, _ := command.Flags().GetString("session")
-	if newSession && strings.TrimSpace(ref) != "" {
-		return invocationError(errors.New("--new and --session cannot be used together"))
-	}
-	if !newSession && strings.TrimSpace(name) != "" {
-		return invocationError(errors.New("--name requires --new"))
+	if strings.TrimSpace(name) != "" && strings.TrimSpace(ref) != "" {
+		return invocationError(errors.New("--name and --session cannot be used together"))
 	}
 	for name, allowed := range map[string][]string{
 		"transport":             {"auto", "quic", "wss"},
@@ -1213,7 +2853,7 @@ func specCommandArgs(parent, name string) cobra.PositionalArgs {
 		case "list":
 			return cobra.NoArgs
 		case "revoke":
-			return cobra.ExactArgs(1)
+			return cobra.MaximumNArgs(1)
 		}
 	}
 	return cobra.NoArgs
@@ -1221,7 +2861,13 @@ func specCommandArgs(parent, name string) cobra.PositionalArgs {
 
 func sessionsCobraCommand() *cobra.Command {
 	source := sessionsCommand()
-	command := &cobra.Command{Use: "sessions [environment]", Args: commandArgs(cobra.MaximumNArgs(1)), RunE: actionRun(source.Action)}
+	command := &cobra.Command{Use: "sessions [environment]", Args: commandArgs(cobra.MaximumNArgs(1)), RunE: func(command *cobra.Command, args []string) error {
+		jsonOutput, _ := command.Flags().GetBool("json")
+		if len(args) == 0 && !jsonOutput && term.IsTerminal(int(os.Stdin.Fd())) {
+			return actionHomeSessions(command)
+		}
+		return actionRun(source.Action)(command, args)
+	}}
 	command.Flags().Bool("wide", false, "include immutable IDs")
 	command.Flags().Bool("json", false, "print JSON")
 	for _, child := range source.Subcommands {
@@ -1236,8 +2882,8 @@ func sessionsCobraCommand() *cobra.Command {
 			args = cobra.RangeArgs(1, 2)
 			use += " <environment> [<session>]"
 		case "delete":
-			args = cobra.ExactArgs(2)
-			use += " <environment> <session>"
+			args = cobra.RangeArgs(1, 2)
+			use += " <environment> [<session>]"
 		}
 		entry := &cobra.Command{Use: use, Short: child.Usage, Args: commandArgs(args), RunE: actionRun(child.Action)}
 		if child.Name == "close" || child.Name == "delete" {
@@ -1253,15 +2899,59 @@ func sessionsCobraCommand() *cobra.Command {
 
 func sessionCobraCommand() *cobra.Command {
 	source := sessionsCommand()
-	command := &cobra.Command{Use: "session", Short: source.Usage, Args: commandArgs(cobra.NoArgs), RunE: func(command *cobra.Command, _ []string) error { return command.Help() }}
-	attach := &cobra.Command{Use: "attach <name>", Short: "Attach to a durable terminal session", Args: commandArgs(cobra.ExactArgs(1)), RunE: func(cobraCommand *cobra.Command, args []string) error {
+	command := &cobra.Command{Use: "session", Short: source.Usage, Args: commandArgs(cobra.NoArgs), RunE: func(command *cobra.Command, _ []string) error {
+		if term.IsTerminal(int(os.Stdin.Fd())) {
+			return actionHomeSessions(command)
+		}
+		return command.Help()
+	}}
+	attach := &cobra.Command{Use: "attach [environment] [session]", Short: "Choose and attach to a durable terminal session", Args: commandArgs(cobra.MaximumNArgs(2)), RunE: func(cobraCommand *cobra.Command, args []string) error {
 		if err := validateConnectInvocation(cobraCommand); err != nil {
 			return err
 		}
-		if err := cobraCommand.Flags().Set("session", args[0]); err != nil {
+		ctx := actionContext(cobraCommand, args)
+		d, err := buildDeps(ctx)
+		if err != nil {
 			return err
 		}
-		return actionConnect(actionContext(cobraCommand, nil))
+		credential, err := d.auth.Credential()
+		if err != nil {
+			return err
+		}
+		client := api.New(d.cfg.ServerURL, credential, nil)
+		environmentRef := ""
+		sessionRef := ""
+		switch len(args) {
+		case 2:
+			environmentRef, sessionRef = args[0], args[1]
+		case 1:
+			sessionRef = args[0]
+			environmentRef, err = defaultEnvironment(ctx.Context, client, d.cfg.LastEnvironmentID)
+		default:
+			environmentRef, err = selectEnvironment(ctx.Context, client, "Choose an environment")
+		}
+		if err != nil {
+			return err
+		}
+		target, err := resolveTerminalEnvironmentTarget(ctx.Context, client, environmentRef)
+		if err != nil {
+			return err
+		}
+		if sessionRef == "" {
+			sessions, listErr := listTerminalSessionsForTarget(ctx.Context, client, target)
+			if listErr != nil {
+				return friendlyCommandError(listErr)
+			}
+			selected, selectErr := selectSession(target, sessions, "Choose a terminal session")
+			if selectErr != nil {
+				return selectErr
+			}
+			sessionRef = selected.ID
+		}
+		if err := cobraCommand.Flags().Set("session", sessionRef); err != nil {
+			return err
+		}
+		return actionConnectTarget(actionContext(cobraCommand, nil), environmentRef)
 	}}
 	attach.Flags().String("session", "", "")
 	_ = attach.Flags().MarkHidden("session")
@@ -1280,7 +2970,7 @@ func sessionCobraCommand() *cobra.Command {
 		case "close":
 			args = cobra.RangeArgs(1, 2)
 		case "delete":
-			args = cobra.ExactArgs(2)
+			args = cobra.RangeArgs(1, 2)
 		}
 		entry := &cobra.Command{Use: child.Name, Short: child.Usage, Args: commandArgs(args), RunE: actionRun(child.Action)}
 		if child.Name == "close" || child.Name == "delete" {
@@ -1295,7 +2985,13 @@ func sessionCobraCommand() *cobra.Command {
 }
 
 func previewsCobraCommand() *cobra.Command {
-	command := &cobra.Command{Use: "previews", Short: "List public previews", Args: commandArgs(cobra.NoArgs), RunE: actionRun(previewListCommand)}
+	command := &cobra.Command{Use: "previews", Short: "List public previews", Args: commandArgs(cobra.NoArgs), RunE: func(command *cobra.Command, args []string) error {
+		jsonOutput, _ := command.Flags().GetBool("json")
+		if !jsonOutput && term.IsTerminal(int(os.Stdin.Fd())) {
+			return actionHomePreviews(command)
+		}
+		return actionRun(previewListCommand)(command, args)
+	}}
 	command.Flags().Bool("json", false, "print JSON")
 	entry := &cobra.Command{Use: "revoke <environment>", Short: "Revoke previews in an environment", Args: commandArgs(cobra.ExactArgs(1)), RunE: func(command *cobra.Command, args []string) error {
 		all, _ := command.Flags().GetBool("all")
@@ -1312,7 +3008,12 @@ func previewsCobraCommand() *cobra.Command {
 }
 
 func userMachineCobraCommand() *cobra.Command {
-	machine := &cobra.Command{Use: "machine", Short: "Manage machines", Args: commandArgs(cobra.NoArgs), RunE: func(command *cobra.Command, _ []string) error { return command.Help() }}
+	machine := &cobra.Command{Use: "machine", Short: "Manage machines", Args: commandArgs(cobra.NoArgs), RunE: func(command *cobra.Command, _ []string) error {
+		if term.IsTerminal(int(os.Stdin.Fd())) {
+			return actionHomeMachines(command)
+		}
+		return command.Help()
+	}}
 	add := &cobra.Command{Use: "add", Short: "Start machine enrollment in the dashboard", Args: commandArgs(cobra.NoArgs), RunE: func(command *cobra.Command, args []string) error {
 		ctx := actionContext(command, args)
 		cfg, err := config.Load(ctx.String("config"))
@@ -1499,14 +3200,14 @@ func actionRun(action command.Action) func(*cobra.Command, []string) error {
 func actionContext(cobraCommand *cobra.Command, args []string) *command.Context {
 	set := flag.NewFlagSet("pb", flag.ContinueOnError)
 	values := map[string]string{}
-	for _, name := range []string{"config", "server", "name", "machine", "session", "transport", "status-bar", "status-bar-fullscreen", "status-bar-theme", "mode"} {
+	for _, name := range []string{"config", "server", "name", "machine", "session", "transport", "status-bar", "status-bar-fullscreen", "status-bar-theme", "mode", "path"} {
 		value, _ := cobraCommand.Flags().GetString(name)
 		values[name] = value
 		set.String(name, value, "")
 	}
 	hours, _ := cobraCommand.Flags().GetFloat64("hours")
 	set.Float64("hours", hours, "")
-	for _, name := range []string{"new", "json", "wide", "yes", "clear", "all", "indefinite", "public"} {
+	for _, name := range []string{"json", "wide", "yes", "clear", "all", "indefinite", "public", "select-environment"} {
 		value, _ := cobraCommand.Flags().GetBool(name)
 		values[name] = strconv.FormatBool(value)
 		set.Bool(name, value, "")
@@ -1903,36 +3604,81 @@ const (
 	environmentUserMachine = "machine"
 )
 
+func selectEnvironment(ctx context.Context, client *api.Client, title string) (string, error) {
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		return "", errors.New("an environment is required in non-interactive use")
+	}
+	var machines []api.UserMachine
+	load := func(loadCtx context.Context) error {
+		var err error
+		machines, err = client.ListUserMachines(loadCtx)
+		return friendlyCommandError(err)
+	}
+	var err error
+	if selector.ScreenActive() {
+		err = selector.Loading(ctx, title, "Loading environments", os.Stdin, os.Stderr, load)
+	} else {
+		err = load(ctx)
+	}
+	if err != nil {
+		return "", err
+	}
+	machines = terminalHostMachines(machines)
+	items := make([]selector.Item, 0, len(machines))
+	for _, machine := range machines {
+		if !machine.Capabilities.TerminalHost.Configured || !machine.Capabilities.TerminalHost.Observed {
+			continue
+		}
+		items = append(items, selector.Item{ID: machine.ID, Title: machine.DisplayName, Description: machineStatusSummary(machine), Search: "machine " + machineStatusSearch(machine)})
+	}
+	selected, err := selector.Choose(selector.Options{Title: title, Subtitle: "Terminal-capable machines", Items: items, Empty: "no terminal hosts are available; run `pb setup --mode host` or `pb machine add`", Stdin: os.Stdin, Output: os.Stderr})
+	return selected.ID, err
+}
+
+func selectSession(target environmentTarget, sessions []api.TerminalSession, title string) (api.TerminalSession, error) {
+	items := make([]selector.Item, 0, len(sessions))
+	byID := make(map[string]api.TerminalSession, len(sessions))
+	for _, session := range sessions {
+		attached := "no attachments"
+		if session.AttachedCount != nil {
+			attached = fmt.Sprintf("%d attached", *session.AttachedCount)
+		}
+		activity := "last active " + relativeTime(session.LastActiveAt)
+		created := "created " + relativeTimestamp(session.CreatedAt)
+		description := strings.Join([]string{session.State, attached, activity, created}, "  ·  ")
+		items = append(items, selector.Item{ID: session.ID, Title: session.Name, Description: description, Search: target.name + " " + session.State})
+		byID[session.ID] = session
+	}
+	selected, err := selector.Choose(selector.Options{Title: title, Subtitle: target.name + "  ·  " + target.kind, Items: items, Empty: "no terminal sessions are available", Stdin: os.Stdin, Output: os.Stderr})
+	return byID[selected.ID], err
+}
+
+func relativeTimestamp(at time.Time) string {
+	if at.IsZero() {
+		return "unknown"
+	}
+	value := at
+	return relativeTime(&value)
+}
+
 func defaultEnvironment(ctx context.Context, client *api.Client, rememberedID string) (string, error) {
 	if rememberedID = strings.TrimSpace(rememberedID); rememberedID != "" {
 		return rememberedID, nil
-	}
-	projects, err := client.ListProjects(ctx)
-	if err != nil && !api.IsHostedEntitlementRequired(err) {
-		return "", friendlyCommandError(err)
-	}
-	if api.IsHostedEntitlementRequired(err) {
-		projects = nil
 	}
 	machines, err := client.ListUserMachines(ctx)
 	if err != nil {
 		return "", friendlyCommandError(err)
 	}
-	if len(projects)+len(machines) == 1 {
-		if len(projects) == 1 {
-			return projects[0].ID, nil
-		}
+	machines = terminalHostMachines(machines)
+	if len(machines) == 1 {
 		return machines[0].ID, nil
 	}
-	if len(projects)+len(machines) == 0 {
-		return "", errors.New("no Paperboat environments are available; run `pb create` or `pb machine add`")
+	if len(machines) == 0 {
+		return "", errors.New("no terminal hosts are available; run `pb setup --mode host` or `pb machine add`")
 	}
-	choices := make([]string, 0, len(projects)+len(machines))
-	for _, project := range projects {
-		choices = append(choices, fmt.Sprintf("%s (hosted, %s)", project.Name, project.ID))
-	}
+	choices := make([]string, 0, len(machines))
 	for _, machine := range machines {
-		choices = append(choices, fmt.Sprintf("%s (BYOD, %s)", machine.DisplayName, machine.ID))
+		choices = append(choices, fmt.Sprintf("%s (%s)", machine.DisplayName, machine.ID))
 	}
 	return "", fmt.Errorf("multiple environments are available: %s; choose one with `pb <environment>`", strings.Join(choices, ", "))
 }
@@ -1953,6 +3699,41 @@ func resolveEnvironmentTarget(ctx context.Context, client *api.Client, requested
 		return environmentTarget{}, machineErr
 	}
 	return environmentTarget{kind: environmentUserMachine, id: machine.ID, name: machine.DisplayName}, nil
+}
+
+func resolveTerminalEnvironmentTarget(ctx context.Context, client *api.Client, requested string) (environmentTarget, error) {
+	target, err := resolveEnvironmentTarget(ctx, client, requested)
+	if err != nil || target.kind != environmentUserMachine {
+		return target, err
+	}
+	machine, err := resolveUserMachine(ctx, client, target.id)
+	if err != nil {
+		return environmentTarget{}, err
+	}
+	if err := terminalHostError(machine); err != nil {
+		return environmentTarget{}, err
+	}
+	return target, nil
+}
+
+func terminalHostMachines(machines []api.UserMachine) []api.UserMachine {
+	eligible := make([]api.UserMachine, 0, len(machines))
+	for _, machine := range machines {
+		if terminalHostError(machine) == nil {
+			eligible = append(eligible, machine)
+		}
+	}
+	return eligible
+}
+
+func terminalHostError(machine api.UserMachine) error {
+	if !machine.Capabilities.TerminalHost.Configured {
+		return &api.APIError{Code: "machine_capability_unavailable", Message: "This machine is not configured to host terminals."}
+	}
+	if !machine.Online || !machine.Capabilities.TerminalHost.Observed {
+		return &api.APIError{Code: "machine_offline", Message: "This terminal host is offline."}
+	}
+	return nil
 }
 
 func listTerminalSessionsForTarget(ctx context.Context, client *api.Client, target environmentTarget) ([]api.TerminalSession, error) {
@@ -2086,38 +3867,29 @@ func projectsCommand() *command.Spec {
 func environmentsCommand() *command.Spec {
 	return &command.Spec{
 		Name:  "environments",
-		Usage: "List hosted projects and machines",
+		Usage: "List machines available to this account",
 		Flags: []command.Flag{&command.BoolFlag{Name: "json"}},
 		Action: func(c *command.Context) error {
 			client, err := backendClient(c)
 			if err != nil {
 				return err
 			}
-			projects, err := client.ListProjects(c.Context)
-			if err != nil && !api.IsHostedEntitlementRequired(err) {
-				return err
-			}
-			if err != nil {
-				projects = nil
-			}
 			machines, err := client.ListUserMachines(c.Context)
 			if err != nil {
 				return err
 			}
 			if c.Bool("json") {
-				return json.NewEncoder(os.Stdout).Encode(map[string]any{"projects": projects, "machines": machines})
+				return json.NewEncoder(os.Stdout).Encode(map[string]any{"machines": machines})
 			}
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-			fmt.Fprintln(w, "TYPE\tNAME\tID\tSTATE")
-			for _, project := range projects {
-				fmt.Fprintf(w, "project\t%s\t%s\t%s\n", project.Name, project.ID, project.State)
-			}
+			fmt.Fprintln(w, "NAME\tSTATE\tPLATFORM\tID")
 			for _, machine := range machines {
 				state := machine.State
 				if machine.Online && state == "" {
 					state = "online"
 				}
-				fmt.Fprintf(w, "machine\t%s\t%s\t%s\n", machine.DisplayName, machine.ID, state)
+				platform := strings.Trim(strings.Join([]string{machine.Platform, machine.Architecture}, "/"), "/")
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", machine.DisplayName, state, platform, machine.ID)
 			}
 			return w.Flush()
 		},
@@ -2130,6 +3902,484 @@ func previewCommand() *command.Spec {
 		{Name: "list", Flags: []command.Flag{&command.BoolFlag{Name: "json"}}, Action: previewListCommand},
 		{Name: "revoke", ArgsUsage: "<preview>", Flags: []command.Flag{&command.BoolFlag{Name: "yes"}, &command.BoolFlag{Name: "json"}}, Action: previewRemoveCommand},
 	}}
+}
+
+func serveCommand() *cobra.Command {
+	command := &cobra.Command{
+		Use:   "serve [path]",
+		Short: "Serve a local file or directory through a public preview",
+		Args:  commandArgs(cobra.MaximumNArgs(1)),
+		RunE: func(command *cobra.Command, args []string) error {
+			err := runServeCommand(command, args)
+			jsonOutput, _ := command.Flags().GetBool("json")
+			if err == nil || !jsonOutput {
+				return err
+			}
+			if encodeErr := json.NewEncoder(command.OutOrStdout()).Encode(map[string]any{"schema_version": "1.0", "ok": false, "error": serveErrorEnvelope(err)}); encodeErr != nil {
+				return encodeErr
+			}
+			exitCode := 1
+			if errors.Is(err, errUsage) {
+				exitCode = 2
+			}
+			return exitCodeError{code: exitCode}
+		},
+	}
+	command.Flags().String("name", "", "stable preview name")
+	command.Flags().Duration("duration", 24*time.Hour, "preview lifetime")
+	command.Flags().Bool("indefinite", false, "keep until explicitly revoked")
+	command.Flags().Bool("detach", false, "continue serving after this command exits")
+	command.Flags().Bool("spa", false, "fall back to index.html for navigation requests")
+	command.Flags().Bool("public", false, "acknowledge public access")
+	command.Flags().Bool("json", false, "print JSON")
+	return command
+}
+
+func serveErrorEnvelope(err error) map[string]any {
+	code, category, retryable, recovery := "serve_failed", "local_io", false, "Run `pb doctor`, correct the reported problem, then retry."
+	switch {
+	case errors.Is(err, errUsage):
+		code, category, recovery = "serve_invocation_invalid", "usage", "Correct the command arguments and retry."
+	case errors.Is(err, servepkg.ErrInvalidSource):
+		code, recovery = "serve_source_invalid", "Select an existing regular file or directory on this device."
+	case errors.Is(err, servepkg.ErrSourceChanged):
+		code, recovery = "serve_source_changed", "Select the source again so Paperboat can pin its current identity."
+	case errors.Is(err, errServeProtocolIncompatible):
+		code, category, recovery = "protocol_incompatible", "protocol", "Upgrade and restart the local Paperboat runtime, then retry."
+	case errors.Is(err, context.DeadlineExceeded):
+		code, category, retryable, recovery = "readiness_timeout", "unavailable_retryable", true, "Inspect `pb preview list` before retrying with the same name."
+	case errors.Is(err, context.Canceled):
+		code, category, recovery = "serve_canceled", "canceled", "No retry is needed."
+	default:
+		var apiErr *api.APIError
+		if errors.As(err, &apiErr) && apiErr.Code != "" {
+			code = apiErr.Code
+			category = "unavailable_retryable"
+			retryable = apiErr.Code == "machine_offline" || apiErr.Status >= 500
+			if apiErr.Code == "machine_capability_unavailable" {
+				category, retryable = "authorization_or_entitlement", false
+			}
+		}
+	}
+	message := sentence(userFacingError(err))
+	if len(message) > 240 {
+		message = message[:237] + "..."
+	}
+	return map[string]any{
+		"code": code, "category": category, "message": message, "retryable": retryable,
+		"state_changed": "unknown", "outcome_uncertain": false, "recovery": recovery,
+		"public_state_created": "unknown", "local_state_created": "unknown", "cleanup": "not_required",
+	}
+}
+
+var errServeProtocolIncompatible = errors.New("local runtime does not support pb serve")
+
+func runServeCommand(command *cobra.Command, args []string) error {
+	interactive := term.IsTerminal(int(os.Stdin.Fd()))
+	jsonOutput, _ := command.Flags().GetBool("json")
+	if jsonOutput {
+		interactive = false
+	}
+	if len(args) == 0 && !interactive {
+		return invocationError(errors.New("pb serve requires <path> without an interactive terminal"))
+	}
+	configPath, _ := command.Flags().GetString("config")
+	cfg, configErr := config.Load(configPath)
+	if configErr != nil {
+		return configErr
+	}
+	serveTelemetry, closeTelemetry := connectTelemetry(cfg, io.Discard)
+	defer closeTelemetry()
+	emit := func(stage, outcome string, started time.Time) {
+		event := telemetry.Event{Name: "serve.lifecycle", At: time.Now().UTC(), Stage: stage, Outcome: outcome, LatencyMS: time.Since(started).Milliseconds()}
+		if event.Validate() == nil {
+			serveTelemetry.Record(event)
+		}
+	}
+	var source servepkg.Source
+	var stagedDrop bool
+	var err error
+	selectionStarted := time.Now()
+	if len(args) == 1 {
+		source, err = servepkg.ResolveSource(args[0])
+	} else {
+		source, stagedDrop, err = selectServeSource(command)
+	}
+	if err != nil {
+		emit("selection", eventResultForTelemetry(err), selectionStarted)
+		return err
+	}
+	emit("selection", "ok", selectionStarted)
+	validationStarted := time.Now()
+	if err := source.Revalidate(); err != nil {
+		emit("validation", "failed", validationStarted)
+		return fmt.Errorf("validate serve source: %w", err)
+	}
+	emit("validation", "ok", validationStarted)
+	spa, _ := command.Flags().GetBool("spa")
+	if spa && source.Kind != servepkg.SourceDirectory {
+		return invocationError(errors.New("--spa requires a directory source"))
+	}
+	duration, _ := command.Flags().GetDuration("duration")
+	indefinite, _ := command.Flags().GetBool("indefinite")
+	if indefinite && command.Flags().Changed("duration") || !indefinite && (duration < time.Second || duration > 365*24*time.Hour) {
+		return invocationError(errors.New("use a positive --duration up to 365 days, or --indefinite"))
+	}
+	public, _ := command.Flags().GetBool("public")
+	var inboxPath, plannedInboxPath string
+	if stagedDrop {
+		inboxPath, err = configuredInboxPath()
+		if err != nil {
+			return err
+		}
+		plannedInboxPath, err = servepkg.PlanInboxCopy(source, inboxPath)
+		if err != nil {
+			return err
+		}
+	}
+	if !public {
+		if !interactive {
+			return invocationError(errors.New("serve URLs are public; pass --public to acknowledge that anyone with the URL can access the file or directory"))
+		}
+		lifetime := duration.String()
+		if indefinite {
+			lifetime = "until explicitly stopped"
+		}
+		description := source.Path + "\nPublic access: anyone with the URL can access it\nLifetime: " + lifetime
+		if stagedDrop {
+			description += "\nInbox copy: " + plannedInboxPath
+		}
+		confirmed, confirmErr := prompt.Confirm(prompt.ConfirmOptions{
+			Title:       "Publish this " + string(source.Kind) + "?",
+			Description: description,
+			Stdin:       os.Stdin, Output: command.ErrOrStderr(),
+		})
+		if confirmErr != nil {
+			return confirmErr
+		}
+		if !confirmed {
+			return selector.ErrCanceled
+		}
+	}
+	if stagedDrop {
+		copied, copyErr := servepkg.CopyFileToInbox(command.Context(), source, inboxPath)
+		if copyErr != nil {
+			return copyErr
+		}
+		if copied.Path != plannedInboxPath {
+			return errors.New("the planned Inbox filename was taken before the copy completed; the collision-safe copy remains in the Inbox, so select it and retry")
+		}
+		source, err = servepkg.ResolveSource(copied.Path)
+		if err != nil {
+			return err
+		}
+	}
+	name, _ := command.Flags().GetString("name")
+	name = normalizeServeName(name, filepath.Base(source.Path))
+	if name == "" {
+		return invocationError(errors.New("serve preview name must contain a letter or number"))
+	}
+	detach, _ := command.Flags().GetBool("detach")
+	stateRoot := strings.TrimSpace(os.Getenv("PAPERBOAT_RUNTIME_STATE_ROOT"))
+	if stateRoot == "" {
+		stateRoot, err = helperconfig.DefaultStateRoot(os.Getenv)
+		if err != nil {
+			return err
+		}
+	}
+	registrationStore, err := identity.Open(identity.Config{StateRoot: stateRoot})
+	if err != nil {
+		return err
+	}
+	registration, err := registrationStore.Registration()
+	if err != nil {
+		return errors.New("run `pb setup` before serving a file or directory")
+	}
+	if err := validateLocalServeCapability(command, registration); err != nil {
+		return err
+	}
+	var record preview.ControlRecord
+	execution := "foreground"
+	var foreground *servepkg.Foreground
+	var managementLease *servelease.Keeper
+	if detach {
+		execution = "detached"
+		executable, executableErr := os.Executable()
+		if executableErr != nil {
+			return executableErr
+		}
+		executable, executableErr = filepath.EvalSymlinks(executable)
+		if executableErr != nil {
+			return executableErr
+		}
+		var expiresAt *time.Time
+		if !indefinite {
+			value := time.Now().UTC().Add(duration)
+			expiresAt = &value
+		}
+		if err := hostruntimeentry.InstallServeService(command.Context(), executable, stateRoot, name, source, spa, expiresAt, indefinite); err != nil {
+			return err
+		}
+		readyCtx, cancelReady := context.WithTimeout(command.Context(), 30*time.Second)
+		defer cancelReady()
+		record, err = hostruntimeentry.WaitPreviewServiceReady(readyCtx, stateRoot, name)
+		if err != nil {
+			cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancelCleanup()
+			cleanupErr := hostruntimeentry.RemovePreviewService(cleanupCtx, stateRoot, name)
+			message := "serve registration timed out; the detached service was stopped"
+			if cleanupErr != nil {
+				message = "serve registration timed out; detached service cleanup also failed"
+			}
+			return errors.Join(errors.New(message), err, cleanupErr)
+		}
+	} else {
+		managementLease, err = acquireServeManagementLease(command.Context(), stateRoot, name)
+		if err != nil {
+			emit("lease_acquire", "failed", time.Now())
+			return fmt.Errorf("acquire foreground management lease: %w", err)
+		}
+		emit("lease_acquire", "ok", time.Now())
+		foreground, err = servepkg.StartForeground(command.Context(), servepkg.ForegroundConfig{
+			Source: source, Name: name, Duration: duration, Indefinite: indefinite, SPA: spa,
+			Lease: managementLease,
+			Observe: func(event servepkg.LifecycleEvent) {
+				telemetryEvent := telemetry.Event{Name: "serve.lifecycle", At: time.Now().UTC(), Stage: event.Operation, Outcome: event.Result, DurationNS: event.Duration.Nanoseconds(), EnvironmentID: registration.EnvironmentID}
+				if telemetryEvent.Validate() == nil {
+					serveTelemetry.Record(telemetryEvent)
+				}
+			},
+			Preview: func(ctx context.Context, run servepkg.PreviewRunConfig) error {
+				return hostruntimeentry.RunPreviewWorker(ctx, hostruntimeentry.PreviewWorkerConfig{
+					ControlURL: registration.ServerURL, StateRoot: stateRoot, Name: run.Name, Port: run.Port,
+					Duration: run.Duration, Indefinite: run.Indefinite, Ready: run.Ready,
+					SourceKind: string(source.Kind), OwnerMode: "foreground",
+				})
+			},
+		})
+		if err != nil {
+			releaseCtx, cancelRelease := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = managementLease.Release(releaseCtx)
+			cancelRelease()
+			return err
+		}
+		record = foreground.Record
+	}
+	if jsonOutput {
+		data := map[string]any{
+			"operation_id": record.OperationID, "preview_id": record.ID,
+			"name": name, "machine_id": registration.MachineID, "source_path": source.Path,
+			"source_kind": source.Kind, "url": record.URL, "state": record.State,
+			"execution": execution, "expires_at": record.ExpiresAt,
+		}
+		if err := json.NewEncoder(command.OutOrStdout()).Encode(map[string]any{"schema_version": "1.0", "ok": true, "data": data}); err != nil {
+			return err
+		}
+	} else {
+		lifetime := duration.String()
+		if indefinite {
+			lifetime = "until stopped"
+		}
+		fmt.Fprintf(command.OutOrStdout(), "Serving: %s\nAccess:  Public for %s\nURL:     %s\n", source.Path, lifetime, record.URL)
+	}
+	if foreground != nil {
+		return foreground.Wait()
+	}
+	emit("ownership_transfer", "ok", time.Now())
+	return nil
+}
+
+func eventResultForTelemetry(err error) string {
+	if errors.Is(err, context.Canceled) || errors.Is(err, selector.ErrCanceled) {
+		return "canceled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	return "failed"
+}
+
+func acquireServeManagementLease(ctx context.Context, stateRoot, name string) (*servelease.Keeper, error) {
+	var local struct {
+		Schema        string `json:"schema"`
+		ListenAddress string `json:"listen_address"`
+	}
+	if err := readOwnerOnlyJSON(filepath.Join(stateRoot, "runtime", "worker-local.json"), &local); err != nil {
+		return nil, err
+	}
+	host, port, splitErr := net.SplitHostPort(local.ListenAddress)
+	if local.Schema != "paperboat.worker-local/v1" || splitErr != nil || host != "127.0.0.1" || port == "" {
+		return nil, servelease.ErrInvalid
+	}
+	tokenPath := filepath.Join(stateRoot, "runtime", "local-control-token")
+	token, err := readOwnerOnlyFile(tokenPath, 1024)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, errServeProtocolIncompatible
+		}
+		return nil, err
+	}
+	client, err := servelease.NewClient("http://"+local.ListenAddress+"/v1/serve-leases", strings.TrimSpace(string(token)), nil)
+	if err != nil {
+		return nil, err
+	}
+	lease, err := client.Acquire(ctx, name)
+	if err != nil {
+		if errors.Is(err, servelease.ErrInvalid) {
+			return nil, errServeProtocolIncompatible
+		}
+		return nil, err
+	}
+	return &servelease.Keeper{Client: client, Lease: lease, Interval: 5 * time.Second}, nil
+}
+
+func readOwnerOnlyJSON(path string, target any) error {
+	data, err := readOwnerOnlyFile(path, 16<<10)
+	if err != nil {
+		return err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(target) != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		return servelease.ErrInvalid
+	}
+	return nil
+}
+
+func readOwnerOnlyFile(path string, limit int64) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+		return nil, errors.Join(servelease.ErrInvalid, err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil || !os.SameFile(info, opened) || !opened.Mode().IsRegular() || opened.Mode().Perm()&0o077 != 0 {
+		return nil, errors.Join(servelease.ErrInvalid, err)
+	}
+	data, err := io.ReadAll(io.LimitReader(file, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, servelease.ErrInvalid
+	}
+	return data, nil
+}
+
+func validateLocalServeCapability(command *cobra.Command, registration identity.Registration) error {
+	client, err := backendForCommand(command)
+	if err != nil {
+		return err
+	}
+	machines, err := client.ListUserMachines(command.Context())
+	if err != nil {
+		return friendlyCommandError(err)
+	}
+	for _, machine := range machines {
+		if machine.ID != registration.MachineID {
+			continue
+		}
+		if !machine.Capabilities.PreviewLaunch.Configured {
+			return &api.APIError{Code: "machine_capability_unavailable", Message: "This device is not configured to launch previews. Run `pb setup --mode receive` or `pb pair`."}
+		}
+		if !machine.Online || !machine.Capabilities.PreviewLaunch.Observed {
+			return &api.APIError{Code: "machine_offline", Message: "This device's preview runtime is offline. Run `pb doctor`, then retry."}
+		}
+		return nil
+	}
+	return &api.APIError{Code: "machine_offline", Message: "This device is not registered with the active Paperboat account. Run `pb setup`, then retry."}
+}
+
+func selectServeSource(command *cobra.Command) (servepkg.Source, bool, error) {
+	root, err := os.Getwd()
+	if err != nil {
+		return servepkg.Source{}, false, err
+	}
+	const parentID = "\x00serve-parent"
+	for {
+		sources, discoverErr := servepkg.DiscoverSources(command.Context(), root, servepkg.DefaultDiscoveryLimit, 1)
+		if discoverErr != nil {
+			return servepkg.Source{}, false, discoverErr
+		}
+		items := make([]selector.Item, 0, len(sources)+1)
+		byPath := make(map[string]servepkg.Source, len(sources))
+		parent := filepath.Dir(root)
+		if parent != root {
+			items = append(items, selector.Item{ID: parentID, Title: ".. (parent directory)", Description: "Open directory", Search: "parent up"})
+		}
+		for index, source := range sources {
+			title := filepath.Base(source.Path)
+			description := string(source.Kind)
+			if index == 0 {
+				title = ". (serve this directory)"
+			} else if source.Kind == servepkg.SourceDirectory {
+				description = "directory  ·  open"
+			}
+			items = append(items, selector.Item{ID: source.Path, Title: title, Description: description, Search: source.Path + " " + title})
+			byPath[source.Path] = source
+		}
+		var dropped servepkg.Source
+		choice, chooseErr := selector.Choose(selector.Options{
+			Title: "Serve a file or directory", Subtitle: "This device  ·  " + root,
+			Items: items, Empty: "No files or directories are available", Footer: "type to filter  enter select/open  esc cancel",
+			Stdin: os.Stdin, Output: command.ErrOrStderr(), InputSelection: func(value string) (selector.Item, bool) {
+				source, ok := servepkg.ParseDroppedFile(value)
+				if !ok {
+					return selector.Item{}, false
+				}
+				dropped = source
+				return selector.Item{ID: source.Path, Title: filepath.Base(source.Path)}, true
+			},
+		})
+		if chooseErr != nil {
+			return servepkg.Source{}, false, chooseErr
+		}
+		if dropped.Path != "" && choice.ID == dropped.Path {
+			return dropped, true, dropped.Revalidate()
+		}
+		if choice.ID == parentID {
+			root = parent
+			continue
+		}
+		selected, ok := byPath[choice.ID]
+		if !ok {
+			return servepkg.Source{}, false, errors.New("selected serve source is no longer available")
+		}
+		if selected.Kind == servepkg.SourceDirectory && selected.Path != root {
+			root = selected.Path
+			continue
+		}
+		if err := selected.Revalidate(); err != nil {
+			return servepkg.Source{}, false, err
+		}
+		return selected, false, nil
+	}
+}
+
+func normalizeServeName(explicit, fallback string) string {
+	value := strings.ToLower(strings.TrimSpace(explicit))
+	if value == "" {
+		value = strings.ToLower(strings.TrimSpace(fallback))
+	}
+	var result strings.Builder
+	lastSeparator := false
+	for _, character := range value {
+		valid := character >= 'a' && character <= 'z' || character >= '0' && character <= '9' || character == '_' || character == '-'
+		if valid {
+			if result.Len() < 128 {
+				result.WriteRune(character)
+			}
+			lastSeparator = character == '-' || character == '_'
+		} else if result.Len() > 0 && !lastSeparator {
+			result.WriteByte('-')
+			lastSeparator = true
+		}
+	}
+	return strings.Trim(result.String(), "-_")
 }
 
 func previewCreateCommand(c *command.Context) error {
@@ -2168,14 +4418,30 @@ func previewCreateCommand(c *command.Context) error {
 		if len(matches) > 1 {
 			return errors.New("machine name is ambiguous; use the machine ID")
 		}
+		if !matches[0].Capabilities.PreviewLaunch.Configured {
+			return &api.APIError{Code: "machine_capability_unavailable", Message: "This machine is not configured to launch previews."}
+		}
+		if !matches[0].Online || !matches[0].Capabilities.PreviewLaunch.Observed {
+			return &api.APIError{Code: "machine_offline", Message: "The selected machine is offline."}
+		}
 		descriptor, err := client.MachinePreviewLaunchDescriptor(c.Context, matches[0].ID)
 		if err != nil {
 			return err
 		}
 		launchCtx, cancel := context.WithTimeout(c.Context, 35*time.Second)
 		defer cancel()
-		record, err := api.LaunchMachinePreview(launchCtx, descriptor, api.PreviewLaunchRequest{Name: name, Port: uint16(port), DurationSeconds: int64(duration / time.Second), Indefinite: indefinite}, nil)
+		record, err := api.LaunchMachinePreview(launchCtx, descriptor, api.PreviewLaunchRequest{OperationID: newIdempotencyKey(), Name: name, Port: uint16(port), DurationSeconds: int64(duration / time.Second), Indefinite: indefinite}, nil)
 		if err != nil {
+			var launchErr *api.PreviewLaunchError
+			if errors.As(err, &launchErr) {
+				if c.Bool("json") {
+					if encodeErr := json.NewEncoder(c.Writer).Encode(map[string]any{"schema_version": "1.0", "ok": false, "error": launchErr}); encodeErr != nil {
+						return encodeErr
+					}
+					return exitCodeError{code: 1}
+				}
+				return fmt.Errorf("%s Recovery: %s", launchErr.Message, launchErr.Recovery)
+			}
 			return err
 		}
 		if c.Bool("json") {
@@ -2339,35 +4605,130 @@ func previewListCommand(c *command.Context) error {
 	if err != nil {
 		return friendlyCommandError(err)
 	}
+	items = enrichLocalServeSources(items)
 	if c.Bool("json") {
 		return json.NewEncoder(c.Writer).Encode(map[string]any{"schema_version": "1.0", "ok": true, "data": map[string]any{"previews": items}})
 	}
 	w := tabwriter.NewWriter(c.Writer, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "NAME\tPROJECT\tRESOURCE\tENVIRONMENT\tTYPE\tUSER\tOWNER\tSTATE\tURL\tPORT")
+	fmt.Fprintln(w, "NAME\tENVIRONMENT\tTYPE\tSOURCE\tOWNER\tPATH\tSTATE\tEXPIRES\tURL")
 	for _, item := range items {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\n", item.LogicalName, item.ProjectID, item.ResourceID, item.EnvironmentName, item.EnvironmentKind, item.UserID, item.OwnerEmail, item.State, item.URL, item.TargetPort)
+		expires := "indefinite"
+		if item.ExpiresAt != nil {
+			expires = relativeTime(item.ExpiresAt)
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", item.LogicalName, item.EnvironmentName, item.EnvironmentKind, item.SourceKind, item.OwnerMode, item.SourcePath, item.State, expires, item.URL)
 	}
 	return w.Flush()
 }
 
+func enrichLocalServeSources(items []api.Preview) []api.Preview {
+	stateRoot := strings.TrimSpace(os.Getenv("PAPERBOAT_RUNTIME_STATE_ROOT"))
+	if stateRoot == "" {
+		var err error
+		stateRoot, err = helperconfig.DefaultStateRoot(os.Getenv)
+		if err != nil {
+			return items
+		}
+	}
+	directory, err := os.Open(filepath.Join(stateRoot, "previews", "active"))
+	if err != nil {
+		return items
+	}
+	defer directory.Close()
+	entries, err := directory.ReadDir(-1)
+	if err != nil {
+		return items
+	}
+	paths := make(map[string]string)
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		path := filepath.Join(stateRoot, "previews", "active", entry.Name())
+		info, statErr := os.Lstat(path)
+		if statErr != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+			continue
+		}
+		file, openErr := os.Open(path)
+		if openErr != nil {
+			continue
+		}
+		openedInfo, openedStatErr := file.Stat()
+		if openedStatErr != nil || !openedInfo.Mode().IsRegular() || openedInfo.Mode().Perm()&0o077 != 0 || !os.SameFile(info, openedInfo) {
+			file.Close()
+			continue
+		}
+		var descriptor struct {
+			Schema string `json:"schema"`
+			Record *struct {
+				ID string `json:"id"`
+			} `json:"record"`
+			Serve *struct {
+				SourcePath string `json:"source_path"`
+			} `json:"serve"`
+		}
+		decoder := json.NewDecoder(io.LimitReader(file, 1<<20))
+		decodeErr := decoder.Decode(&descriptor)
+		if decodeErr == nil {
+			var trailing any
+			if trailingErr := decoder.Decode(&trailing); trailingErr != io.EOF {
+				decodeErr = errors.New("preview descriptor contains trailing data")
+			}
+		}
+		closeErr := file.Close()
+		if decodeErr != nil || closeErr != nil || descriptor.Schema != "paperboat.preview-runtime/v2" || descriptor.Record == nil || descriptor.Record.ID == "" || descriptor.Serve == nil || !filepath.IsAbs(descriptor.Serve.SourcePath) {
+			continue
+		}
+		paths[descriptor.Record.ID] = filepath.Clean(descriptor.Serve.SourcePath)
+	}
+	for index := range items {
+		if path := paths[items[index].ID]; path != "" && (items[index].SourceKind == "file" || items[index].SourceKind == "directory") {
+			items[index].SourcePath = path
+		}
+	}
+	return items
+}
+
 func previewRemoveCommand(c *command.Context) error {
-	if c.Args().Len() != 1 {
-		return errors.New("usage: pb preview revoke <preview-id> --yes")
+	if c.Args().Len() > 1 {
+		return errors.New("usage: pb preview revoke [preview-id] --yes")
 	}
 	client, err := backendClient(c)
 	if err != nil {
 		return err
 	}
-	previewID := c.Args().First()
 	items, err := client.ListPreviews(c.Context)
 	if err != nil {
 		return friendlyCommandError(err)
 	}
+	previewID := c.Args().First()
 	var selected api.Preview
-	for _, item := range items {
-		if item.ID == previewID {
-			selected = item
-			break
+	if previewID == "" {
+		choices := make([]selector.Item, 0, len(items))
+		byID := make(map[string]api.Preview, len(items))
+		for _, item := range items {
+			expiry := "indefinite"
+			if item.ExpiresAt != nil {
+				expiry = "expires " + relativeTime(item.ExpiresAt)
+			}
+			description := fmt.Sprintf("%s  ·  %s  ·  :%d  ·  %s", item.EnvironmentName, item.State, item.TargetPort, expiry)
+			choices = append(choices, selector.Item{ID: item.ID, Title: item.LogicalName, Description: description, Search: item.EnvironmentKind + " " + item.URL})
+			byID[item.ID] = item
+		}
+		choice, selectErr := selector.Choose(selector.Options{Title: "Choose a preview to revoke", Subtitle: "Public preview URLs", Items: choices, Empty: "no previews are available", Stdin: os.Stdin, Output: os.Stderr})
+		if selectErr != nil {
+			if errors.Is(selectErr, selector.ErrCanceled) {
+				return errors.New("preview selection canceled")
+			}
+			return selectErr
+		}
+		selected, previewID = byID[choice.ID], choice.ID
+	} else {
+		for _, item := range items {
+			if item.ID == previewID {
+				selected = item
+				break
+			}
 		}
 	}
 	if selected.ID == "" {
@@ -2376,7 +4737,17 @@ func previewRemoveCommand(c *command.Context) error {
 	fmt.Fprintf(c.ErrWriter, "Preview: %s (%s, %s)\n", selected.LogicalName, selected.EnvironmentName, selected.EnvironmentKind)
 	fmt.Fprintf(c.ErrWriter, "Project: %s  Resource: %s  User: %s\n", selected.ProjectID, selected.ResourceID, selected.UserID)
 	if !c.Bool("yes") {
-		return errors.New("preview removal requires --yes")
+		action := "Revoke public preview"
+		if selected.SourceKind == "file" || selected.SourceKind == "directory" {
+			action = "Stop serving"
+		}
+		confirmed, confirmErr := confirmAction(fmt.Sprintf("%s %q?", action, selected.LogicalName))
+		if confirmErr != nil {
+			return confirmErr
+		}
+		if !confirmed {
+			return errors.New("preview revocation canceled")
+		}
 	}
 	item, err := client.RemovePreview(c.Context, previewID, newIdempotencyKey())
 	if err != nil {
@@ -2385,7 +4756,11 @@ func previewRemoveCommand(c *command.Context) error {
 	if c.Bool("json") {
 		return json.NewEncoder(c.Writer).Encode(map[string]any{"schema_version": "1.0", "ok": true, "data": map[string]any{"preview_id": item.ID, "state": item.State}})
 	}
-	fmt.Fprintf(c.Writer, "Removed preview %s.\n", item.LogicalName)
+	if selected.SourceKind == "file" || selected.SourceKind == "directory" {
+		fmt.Fprintf(c.Writer, "Stopped serving %s.\n", item.LogicalName)
+	} else {
+		fmt.Fprintf(c.Writer, "Removed preview %s.\n", item.LogicalName)
+	}
 	return nil
 }
 
@@ -2449,7 +4824,7 @@ func sessionsCommand() *command.Spec {
 				return err
 			}
 		}
-		target, err := resolveEnvironmentTarget(c.Context, client, requested)
+		target, err := resolveTerminalEnvironmentTarget(c.Context, client, requested)
 		if err != nil {
 			return err
 		}
@@ -2462,9 +4837,9 @@ func sessionsCommand() *command.Spec {
 		}
 		w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 		if c.Bool("wide") {
-			fmt.Fprintln(w, "NAME\tID\tSTATE\tATTACHED\tLAST ACTIVE")
+			fmt.Fprintln(w, "NAME\tID\tSTATE\tATTACHED\tLAST ACTIVE\tCREATED")
 		} else {
-			fmt.Fprintln(w, "NAME\tSTATE\tATTACHED\tLAST ACTIVE")
+			fmt.Fprintln(w, "NAME\tSTATE\tATTACHED\tLAST ACTIVE\tCREATED")
 		}
 		for _, s := range sessions {
 			attached := "-"
@@ -2472,9 +4847,9 @@ func sessionsCommand() *command.Spec {
 				attached = fmt.Sprintf("%d", *s.AttachedCount)
 			}
 			if c.Bool("wide") {
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", s.Name, s.ID, s.State, attached, relativeTime(s.LastActiveAt))
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", s.Name, s.ID, s.State, attached, relativeTime(s.LastActiveAt), relativeTimestamp(s.CreatedAt))
 			} else {
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", s.Name, s.State, attached, relativeTime(s.LastActiveAt))
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", s.Name, s.State, attached, relativeTime(s.LastActiveAt), relativeTimestamp(s.CreatedAt))
 			}
 		}
 		return w.Flush()
@@ -2491,7 +4866,7 @@ func sessionsCommand() *command.Spec {
 			if err != nil {
 				return err
 			}
-			target, err := resolveEnvironmentTarget(c.Context, client, c.Args().First())
+			target, err := resolveTerminalEnvironmentTarget(c.Context, client, c.Args().First())
 			if err != nil {
 				return err
 			}
@@ -2507,17 +4882,17 @@ func sessionsCommand() *command.Spec {
 		}},
 		{Name: "close", ArgsUsage: "<environment> [<session>]", Usage: "Close one or all terminal sessions", Action: func(c *command.Context) error {
 			all := c.Bool("all")
-			if c.Args().Len() < 1 || c.Args().Len() > 2 || all == (c.Args().Len() == 2) {
+			if c.Args().Len() < 1 || c.Args().Len() > 2 || all && c.Args().Len() != 1 {
 				return errors.New("usage: pb session close <environment> <session> --yes OR pb session close <environment> --all --yes")
 			}
-			if !all && !c.Bool("yes") {
-				return errors.New("session close requires --yes")
+			if !all && !c.Bool("yes") && !term.IsTerminal(int(os.Stdin.Fd())) {
+				return errors.New("session close requires --yes in non-interactive use")
 			}
 			client, err := backendClient(c)
 			if err != nil {
 				return err
 			}
-			target, err := resolveEnvironmentTarget(c.Context, client, c.Args().First())
+			target, err := resolveTerminalEnvironmentTarget(c.Context, client, c.Args().First())
 			if err != nil {
 				return err
 			}
@@ -2552,25 +4927,52 @@ func sessionsCommand() *command.Spec {
 				fmt.Fprintf(c.Writer, "Closed %d sessions in %s. Session history was retained.\n", closed, target.name)
 				return nil
 			}
-			session, err := resolveTerminalSession(c.Context, client, target, c.Args().Get(1))
+			var session api.TerminalSession
+			if c.Args().Len() == 1 {
+				sessions, listErr := listTerminalSessionsForTarget(c.Context, client, target)
+				if listErr != nil {
+					return friendlyCommandError(listErr)
+				}
+				session, err = selectSession(target, slices.DeleteFunc(sessions, func(item api.TerminalSession) bool { return item.State == "closed" }), "Choose a session to close")
+			} else {
+				session, err = resolveTerminalSession(c.Context, client, target, c.Args().Get(1))
+			}
 			if err != nil {
 				return err
 			}
+			if !c.Bool("yes") {
+				confirmed, confirmErr := confirmAction(fmt.Sprintf("Close terminal session %q? History will be retained.", session.Name))
+				if confirmErr != nil {
+					return confirmErr
+				}
+				if !confirmed {
+					return errors.New("session close canceled")
+				}
+			}
 			return friendlyCommandError(closeTerminalSessionForTarget(c.Context, client, target, session.ID))
 		}, Flags: []command.Flag{&command.BoolFlag{Name: "yes", Usage: "confirm close"}, &command.BoolFlag{Name: "all", Usage: "close all sessions in the environment"}}},
-		{Name: "delete", ArgsUsage: "<environment> <session>", Usage: "Delete a closed terminal session and its history", Flags: []command.Flag{&command.BoolFlag{Name: "yes", Usage: "confirm deletion"}}, Action: func(c *command.Context) error {
-			if c.Args().Len() != 2 {
-				return errors.New("usage: pb sessions delete <environment> <session> [--yes]")
+		{Name: "delete", ArgsUsage: "<environment> [<session>]", Usage: "Delete a closed terminal session and its history", Flags: []command.Flag{&command.BoolFlag{Name: "yes", Usage: "confirm deletion"}}, Action: func(c *command.Context) error {
+			if c.Args().Len() < 1 || c.Args().Len() > 2 {
+				return errors.New("usage: pb sessions delete <environment> [<session>] [--yes]")
 			}
 			client, err := backendClient(c)
 			if err != nil {
 				return err
 			}
-			target, err := resolveEnvironmentTarget(c.Context, client, c.Args().First())
+			target, err := resolveTerminalEnvironmentTarget(c.Context, client, c.Args().First())
 			if err != nil {
 				return err
 			}
-			session, err := resolveTerminalSession(c.Context, client, target, c.Args().Get(1))
+			var session api.TerminalSession
+			if c.Args().Len() == 1 {
+				sessions, listErr := listTerminalSessionsForTarget(c.Context, client, target)
+				if listErr != nil {
+					return friendlyCommandError(listErr)
+				}
+				session, err = selectSession(target, slices.DeleteFunc(sessions, func(item api.TerminalSession) bool { return item.State != "closed" || item.IsDefault }), "Choose a session to delete")
+			} else {
+				session, err = resolveTerminalSession(c.Context, client, target, c.Args().Get(1))
+			}
 			if err != nil {
 				return err
 			}
@@ -2581,9 +4983,11 @@ func sessionsCommand() *command.Spec {
 				if !term.IsTerminal(int(os.Stdin.Fd())) {
 					return errors.New("refusing non-interactive deletion without --yes")
 				}
-				fmt.Fprintf(os.Stderr, "Delete terminal session %q? [y/N] ", session.Name)
-				var answer string
-				if _, err := fmt.Fscanln(os.Stdin, &answer); err != nil || !strings.EqualFold(answer, "y") && !strings.EqualFold(answer, "yes") {
+				confirmed, confirmErr := confirmAction(fmt.Sprintf("Delete terminal session %q and its history?", session.Name))
+				if confirmErr != nil {
+					return confirmErr
+				}
+				if !confirmed {
 					return errors.New("deletion cancelled")
 				}
 			}
@@ -2592,34 +4996,29 @@ func sessionsCommand() *command.Spec {
 	}}
 }
 
-func selectTerminalSession(ctx context.Context, client *api.Client, projectRef string, create bool, name, ref string) (string, error) {
-	if !create && strings.TrimSpace(ref) == "" {
-		// The descriptor endpoint owns default-session resolution. Avoid resolving
-		// the environment once here and again immediately before dialing.
-		return "", nil
-	}
+func selectTerminalSession(ctx context.Context, client *api.Client, projectRef, name, ref string) (api.TerminalSession, error) {
 	target, err := resolveEnvironmentTarget(ctx, client, projectRef)
 	if err != nil {
-		return "", err
+		return api.TerminalSession{}, err
 	}
-	if create {
+	if strings.TrimSpace(ref) == "" {
 		if err := validateSessionNameOptional(name); err != nil {
-			return "", err
+			return api.TerminalSession{}, err
 		}
 		session, err := createTerminalSessionForTarget(ctx, client, target, name, newIdempotencyKey())
 		if err != nil {
-			return "", friendlyCommandError(err)
+			return api.TerminalSession{}, friendlyCommandError(err)
 		}
 		if session.EvictedSession != nil {
 			fmt.Fprintf(os.Stderr, "Session limit reached; removed least-recent session %q (%s).\n", session.EvictedSession.Name, session.EvictedSession.State)
 		}
-		return session.ID, nil
+		return session, nil
 	}
 	session, err := resolveTerminalSession(ctx, client, target, ref)
 	if err != nil {
-		return "", err
+		return api.TerminalSession{}, err
 	}
-	return session.ID, nil
+	return session, nil
 }
 
 func resolveUserMachine(ctx context.Context, client *api.Client, requested string) (api.UserMachine, error) {
@@ -2674,7 +5073,7 @@ func resolveTerminalSession(ctx context.Context, client *api.Client, target envi
 	if len(suggestions) > 0 {
 		message += "; did you mean " + strings.Join(suggestions, ", ") + "?"
 	}
-	message += "; create one with --new --name"
+	message += "; create one with `pb <environment> new`"
 	return api.TerminalSession{}, errors.New(message)
 }
 
@@ -2759,6 +5158,45 @@ func actionConnect(c *command.Context) error {
 	return actionConnectTarget(c, "")
 }
 
+func actionCodex(c *command.Context) error {
+	selectTarget := c.Bool("select-environment")
+	forwardedStart := 1
+	forwarded := make([]string, 0, max(0, c.Args().Len()-forwardedStart))
+	for index := forwardedStart; index < c.Args().Len(); index++ {
+		forwarded = append(forwarded, c.Args().Get(index))
+	}
+	if err := codexsession.ValidateForwardedArgs(forwarded); err != nil {
+		return invocationError(err)
+	}
+	d, err := buildDeps(c)
+	if err != nil {
+		return err
+	}
+	credential, err := d.auth.Credential()
+	if errors.Is(err, config.ErrNoCredentials) {
+		return errors.New("not signed in to Paperboat; run `pb login`, then retry")
+	}
+	if err != nil {
+		return err
+	}
+	backend := api.New(d.cfg.ServerURL, credential, nil)
+	requested := c.Args().First()
+	if selectTarget {
+		requested, err = selectEnvironment(c.Context, backend, "Choose where Codex should run")
+		if err != nil {
+			return err
+		}
+	}
+	identity, err := resolver.NewAPIResolver(backend, d.cfg).ResolveEnvironment(c.Context, requested)
+	if err != nil {
+		return friendlyCommandError(err)
+	}
+	return codexsession.Run(c.Context, codexsession.Options{
+		Backend: backend, EnvironmentID: identity.EnvironmentID, Path: c.String("path"), Args: forwarded,
+		Stdin: os.Stdin, Stdout: c.Writer, Stderr: c.ErrWriter,
+	})
+}
+
 func actionConnectTarget(c *command.Context, requested string) error {
 	project := strings.TrimSpace(requested)
 	if project == "" {
@@ -2779,14 +5217,17 @@ func actionConnectTarget(c *command.Context, requested string) error {
 		fmt.Fprintln(os.Stdout, cfg.Path())
 		return nil
 	}
-	if c.Args().Len() > 1 {
-		return errors.New("expected exactly one environment name")
+	if c.Args().Len() > 2 {
+		return errors.New("expected an environment and optional `new`")
 	}
-	if c.Bool("new") && strings.TrimSpace(c.String("session")) != "" {
-		return errors.New("--new and --session cannot be used together")
+	if c.Args().Len() == 2 && c.Args().Get(1) != "new" {
+		return errors.New("second argument must be `new`")
 	}
-	if !c.Bool("new") && strings.TrimSpace(c.String("name")) != "" {
-		return errors.New("--name requires --new")
+	if c.Args().Len() == 2 && strings.TrimSpace(c.String("session")) != "" {
+		return errors.New("`new` and --session cannot be used together")
+	}
+	if strings.TrimSpace(c.String("name")) != "" && strings.TrimSpace(c.String("session")) != "" {
+		return errors.New("--name and --session cannot be used together")
 	}
 
 	d, err := buildDeps(c)
@@ -2846,7 +5287,6 @@ func actionConnectTarget(c *command.Context, requested string) error {
 			Right:  d.cfg.StatusBar.Right,
 		},
 	})
-	bar.SetIdentity(project, requestedSessionLabel(c))
 	defer func() { _ = bar.Close() }()
 	useStatusBar := bar.Enabled()
 	var closeTelemetry func()
@@ -2858,15 +5298,15 @@ func actionConnectTarget(c *command.Context, requested string) error {
 		if event.Validate() == nil {
 			d.telemetry.Record(event)
 		}
-		if outcome == "success" {
-			bar.SetTransport(selection.Selected)
-		}
+		updateSelectedTransport(bar, selection, outcome)
 	}
 
-	terminalSessionID, err := selectTerminalSession(c.Context, backend, project, c.Bool("new"), c.String("name"), c.String("session"))
+	terminalSession, err := selectTerminalSession(c.Context, backend, project, c.String("name"), c.String("session"))
 	if err != nil {
 		return err
 	}
+	terminalSessionID := terminalSession.ID
+	bar.SetIdentity(project, terminalSession.Name)
 	newResolver := func(credential config.Credential) *resolver.APIResolver {
 		client := api.New(d.cfg.ServerURL, credential, nil)
 		client.SetSourceMachineID(sourceMachineID)
@@ -3201,6 +5641,12 @@ func actionConnectTarget(c *command.Context, requested string) error {
 	return nil
 }
 
+func updateSelectedTransport(bar *statusbar.Bar, selection tunnel.TerminalTransportSelection, outcome string) {
+	if outcome == "selected" {
+		bar.SetTransport(selection.Selected)
+	}
+}
+
 func forceTerminalRedraw(conn tunnel.Conn, rows, cols uint16) {
 	probeRows, probeCols := rows, cols
 	if probeRows > 1 {
@@ -3217,6 +5663,22 @@ func forceTerminalRedraw(conn tunnel.Conn, rows, cols uint16) {
 func createProject(c *command.Context) error {
 	if !term.IsTerminal(int(os.Stdin.Fd())) {
 		return errors.New("pb create requires an interactive terminal")
+	}
+	var err error
+	projectName := strings.TrimSpace(c.Args().First())
+	if projectName == "" {
+		projectName, err = prompt.Text(prompt.TextOptions{Title: "Name your project", Description: "A short name shown throughout Paperboat", Placeholder: "my-project", Stdin: os.Stdin, Output: os.Stderr, Validate: func(value string) error {
+			if value == "" {
+				return errors.New("project name is required")
+			}
+			return nil
+		}})
+		if errors.Is(err, prompt.ErrCanceled) {
+			return errors.New("project creation canceled")
+		}
+		if err != nil {
+			return err
+		}
 	}
 	client, err := backendClient(c)
 	if err != nil {
@@ -3237,8 +5699,10 @@ func createProject(c *command.Context) error {
 	if len(repositories) == 0 {
 		return errors.New("no GitHub repositories are available; connect GitHub in the Paperboat dashboard")
 	}
-	reader := bufio.NewReader(os.Stdin)
-	repositoryIndex, err := promptChoice(reader, "Repository", len(repositories), func(index int) string { return repositories[index].FullName })
+	repositoryIndex, err := chooseIndex("Choose a repository", "The project will be created from this GitHub repository", len(repositories), func(index int) selector.Item {
+		repository := repositories[index]
+		return selector.Item{ID: strconv.Itoa(index), Title: repository.FullName, Description: "Default branch  ·  " + repository.DefaultBranch}
+	})
 	if err != nil {
 		return err
 	}
@@ -3247,18 +5711,30 @@ func createProject(c *command.Context) error {
 	if len(machineCodes) == 0 || len(regionCodes) == 0 {
 		return errors.New("hosted project catalog has no available machine type or region")
 	}
-	machineIndex, err := promptChoice(reader, "Machine type", len(machineCodes), func(index int) string { return machineCodes[index] })
+	machineIndex, err := chooseIndex("Choose a machine type", "Compute for the hosted project", len(machineCodes), func(index int) selector.Item {
+		return selector.Item{ID: strconv.Itoa(index), Title: machineCodes[index], Description: "Available machine type"}
+	})
 	if err != nil {
 		return err
 	}
-	regionIndex, err := promptChoice(reader, "Region", len(regionCodes), func(index int) string { return regionCodes[index] })
+	regionIndex, err := chooseIndex("Choose a region", "Location for project compute and storage", len(regionCodes), func(index int) selector.Item {
+		return selector.Item{ID: strconv.Itoa(index), Title: regionCodes[index], Description: "Available region"}
+	})
 	if err != nil {
 		return err
 	}
-	fmt.Fprint(os.Stderr, "Storage (GB): ")
-	storageText, err := reader.ReadString('\n')
-	if err != nil {
+	storageText, err := prompt.Text(prompt.TextOptions{Title: "Storage", Description: "Persistent project storage in GB", Placeholder: "20", Stdin: os.Stdin, Output: os.Stderr, Validate: func(value string) error {
+		storage, parseErr := strconv.Atoi(value)
+		if parseErr != nil || storage <= 0 {
+			return errors.New("storage must be a positive whole number of GB")
+		}
+		return nil
+	}})
+	if errors.Is(err, prompt.ErrCanceled) {
 		return errors.New("project creation cancelled")
+	}
+	if err != nil {
+		return err
 	}
 	storageGB, err := strconv.Atoi(strings.TrimSpace(storageText))
 	if err != nil || storageGB <= 0 {
@@ -3266,7 +5742,7 @@ func createProject(c *command.Context) error {
 	}
 	repository := repositories[repositoryIndex]
 	project, err := client.CreateProject(c.Context, api.CreateProjectInput{
-		Name: c.Args().First(), RepositoryURL: repository.CloneURL, DefaultBranch: repository.DefaultBranch,
+		Name: projectName, RepositoryURL: repository.CloneURL, DefaultBranch: repository.DefaultBranch,
 		StorageGB: storageGB, MachineTypeCode: machineCodes[machineIndex], RegionCode: regionCodes[regionIndex],
 	}, newIdempotencyKey())
 	if err != nil {
@@ -3276,20 +5752,28 @@ func createProject(c *command.Context) error {
 	return actionConnectTarget(c, project.ID)
 }
 
-func promptChoice(reader *bufio.Reader, label string, count int, value func(int) string) (int, error) {
-	for index := 0; index < count; index++ {
-		fmt.Fprintf(os.Stderr, "%d. %s\n", index+1, value(index))
+func chooseIndex(title, subtitle string, count int, item func(int) selector.Item) (int, error) {
+	items := make([]selector.Item, count)
+	indexes := make(map[string]int, count)
+	for index := range count {
+		items[index] = item(index)
+		if items[index].ID == "" {
+			items[index].ID = strconv.Itoa(index)
+		}
+		indexes[items[index].ID] = index
 	}
-	fmt.Fprintf(os.Stderr, "%s [1-%d]: ", label, count)
-	line, err := reader.ReadString('\n')
-	if err != nil {
-		return 0, errors.New("project creation cancelled")
+	selected, err := selector.Choose(selector.Options{Title: title, Subtitle: subtitle, Items: items, Stdin: os.Stdin, Output: os.Stderr})
+	if errors.Is(err, selector.ErrCanceled) {
+		return 0, errors.New("selection canceled")
 	}
-	selection, err := strconv.Atoi(strings.TrimSpace(line))
-	if err != nil || selection < 1 || selection > count {
-		return 0, fmt.Errorf("%s selection must be between 1 and %d", strings.ToLower(label), count)
+	return indexes[selected.ID], err
+}
+
+func confirmAction(message string) (bool, error) {
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		return false, errors.New("confirmation requires --yes in non-interactive use")
 	}
-	return selection - 1, nil
+	return prompt.Confirm(prompt.ConfirmOptions{Title: "Confirm action", Description: message, Stdin: os.Stdin, Output: os.Stderr})
 }
 
 func activeMachineCodes(items []api.CatalogMachineType) []string {
@@ -3310,19 +5794,6 @@ func enabledRegionCodes(items []api.CatalogRegion) []string {
 		}
 	}
 	return out
-}
-
-func requestedSessionLabel(c *command.Context) string {
-	if c.Bool("new") {
-		if name := strings.TrimSpace(c.String("name")); name != "" {
-			return name
-		}
-		return "new session"
-	}
-	if session := strings.TrimSpace(c.String("session")); session != "" {
-		return session
-	}
-	return "default"
 }
 
 func statusNotifier(enabled bool) io.Writer {
@@ -4367,7 +6838,8 @@ func doctorCommand() *command.Spec {
 }
 
 func doctorJSON(c *command.Context, d *deps) error {
-	result := map[string]any{"config_path": d.cfg.Path(), "server": d.cfg.ServerURL, "auth": "unknown", "backend": "skipped", "local_machine": collectLocalDoctor()}
+	localReport := collectLocalDoctor()
+	result := map[string]any{"config_path": d.cfg.Path(), "server": d.cfg.ServerURL, "auth": "unknown", "backend": "skipped", "local_machine": localReport}
 	cred, credErr := d.auth.Credential()
 	if errors.Is(credErr, config.ErrNoCredentials) {
 		result["auth"] = "not_signed_in"
@@ -4395,6 +6867,15 @@ func doctorJSON(c *command.Context, d *deps) error {
 	}
 	result["backend"] = "authenticated"
 	result["account"] = firstNonEmpty(me.Email, me.DisplayName, me.ID)
+	if localReport.MachineID != "" {
+		if previews, listErr := client.ListPreviews(c.Context); listErr == nil {
+			compareLocalServedPreviewRoutes(&localReport, previews)
+		} else {
+			localReport.RouteReadiness = "unavailable"
+			localReport.RecoveryActions = append(localReport.RecoveryActions, "retry pb doctor when preview inventory is available")
+		}
+		result["local_machine"] = localReport
+	}
 	project := c.Args().First()
 	if project == "" {
 		result["project"] = nil
@@ -4448,31 +6929,42 @@ func doctorJSON(c *command.Context, d *deps) error {
 }
 
 type localDoctorReport struct {
-	StateRoot              string   `json:"state_root,omitempty"`
-	SetupState             string   `json:"setup_state"`
-	MachineID              string   `json:"machine_id,omitempty"`
-	EnvironmentID          string   `json:"environment_id,omitempty"`
-	InstallationGeneration int64    `json:"installation_generation,omitempty"`
-	SetupRoles             []string `json:"setup_roles,omitempty"`
-	IdentityState          string   `json:"identity_state"`
-	CredentialState        string   `json:"machine_control_credential"`
-	InboxPath              string   `json:"inbox_path,omitempty"`
-	InboxState             string   `json:"inbox_state"`
-	ConfigService          string   `json:"config_service"`
-	HostRuntime            string   `json:"host_runtime"`
-	ActivePreviews         int      `json:"active_previews"`
-	ExpiredPreviews        int      `json:"expired_previews"`
-	InvalidPreviews        int      `json:"invalid_previews"`
-	ActiveSessions         uint64   `json:"active_sessions"`
-	ActiveProcesses        uint64   `json:"active_processes"`
-	ActiveAttachments      uint64   `json:"active_attachments"`
-	ActiveTransfers        uint64   `json:"active_transfers"`
-	WorkloadCounts         string   `json:"workload_counts_state"`
-	RecoveryActions        []string `json:"recovery_actions,omitempty"`
+	StateRoot               string   `json:"state_root,omitempty"`
+	SetupState              string   `json:"setup_state"`
+	MachineID               string   `json:"machine_id,omitempty"`
+	EnvironmentID           string   `json:"environment_id,omitempty"`
+	InstallationGeneration  int64    `json:"installation_generation,omitempty"`
+	SetupRoles              []string `json:"setup_roles,omitempty"`
+	SetupMode               string   `json:"setup_mode,omitempty"`
+	IdentityState           string   `json:"identity_state"`
+	CredentialState         string   `json:"machine_control_credential"`
+	InboxPath               string   `json:"inbox_path,omitempty"`
+	InboxState              string   `json:"inbox_state"`
+	ConfigService           string   `json:"config_service"`
+	HostRuntime             string   `json:"host_runtime"`
+	ActivePreviews          int      `json:"active_previews"`
+	ExpiredPreviews         int      `json:"expired_previews"`
+	InvalidPreviews         int      `json:"invalid_previews"`
+	ServedPreviews          int      `json:"served_previews"`
+	ActiveServedPreviews    int      `json:"active_served_previews"`
+	InvalidServeSources     int      `json:"invalid_serve_sources"`
+	ActiveServeListeners    int      `json:"active_serve_listeners"`
+	MissingServeListeners   int      `json:"missing_serve_listeners"`
+	ServeLeaseAuthority     string   `json:"serve_lease_authority"`
+	RuntimeForegroundServes uint64   `json:"runtime_foreground_serves"`
+	RuntimeDetachedServes   uint64   `json:"runtime_detached_serves"`
+	RemoteServedPreviews    int      `json:"remote_served_previews"`
+	RouteReadiness          string   `json:"route_readiness"`
+	ActiveSessions          uint64   `json:"active_sessions"`
+	ActiveProcesses         uint64   `json:"active_processes"`
+	ActiveAttachments       uint64   `json:"active_attachments"`
+	ActiveTransfers         uint64   `json:"active_transfers"`
+	WorkloadCounts          string   `json:"workload_counts_state"`
+	RecoveryActions         []string `json:"recovery_actions,omitempty"`
 }
 
 func collectLocalDoctor() localDoctorReport {
-	report := localDoctorReport{SetupState: "not_set_up", IdentityState: "missing", CredentialState: "missing", InboxState: "unconfigured", ConfigService: "not_installed", HostRuntime: "not_paired", WorkloadCounts: "unavailable"}
+	report := localDoctorReport{SetupState: "not_set_up", IdentityState: "missing", CredentialState: "missing", InboxState: "unconfigured", ConfigService: "not_installed", HostRuntime: "not_paired", WorkloadCounts: "unavailable", ServeLeaseAuthority: "unavailable", RouteReadiness: "unavailable"}
 	stateRoot := strings.TrimSpace(os.Getenv("PAPERBOAT_RUNTIME_STATE_ROOT"))
 	if stateRoot == "" {
 		root, err := helperconfig.DefaultStateRoot(os.Getenv)
@@ -4511,6 +7003,7 @@ func collectLocalDoctor() localDoctorReport {
 	report.MachineID, report.EnvironmentID = registration.MachineID, registration.EnvironmentID
 	report.InstallationGeneration = registration.InstallationGeneration
 	report.SetupRoles = append([]string(nil), registration.SetupRoles...)
+	report.SetupMode = registration.SetupMode
 	report.InboxPath = registration.InboxPath
 	if err := inbox.ValidatePath(registration.InboxPath); err != nil {
 		report.InboxState = "unsafe_or_unavailable"
@@ -4524,7 +7017,7 @@ func collectLocalDoctor() localDoctorReport {
 		} else {
 			report.CredentialState = "valid"
 		}
-	} else if slices.Contains(registration.SetupRoles, "host") {
+	} else if registration.SetupMode == "host" || registration.SetupMode == "receive" {
 		report.CredentialState = "invalid_or_expired"
 		report.RecoveryActions = append(report.RecoveryActions, "run pb pair to renew host authority")
 	}
@@ -4543,6 +7036,9 @@ func collectLocalDoctor() localDoctorReport {
 	}
 	inspectLocalRuntimeHealth(&report, stateRoot)
 	inspectLocalPreviewDescriptors(&report, filepath.Join(stateRoot, "previews", "active"), time.Now().UTC())
+	if report.RuntimeDetachedServes != uint64(report.ActiveServedPreviews) {
+		report.RecoveryActions = append(report.RecoveryActions, "restart the local runtime to reconcile detached serve workload inventory")
+	}
 	return report
 }
 
@@ -4611,6 +7107,37 @@ func inspectLocalRuntimeHealth(report *localDoctorReport, stateRoot string) {
 	report.ActiveProcesses = health.Workloads["processes"]
 	report.ActiveAttachments = health.Workloads["attachments"]
 	report.ActiveTransfers = health.Workloads["transfers"]
+	report.RuntimeForegroundServes = health.Workloads["serves_foreground"]
+	report.RuntimeDetachedServes = health.Workloads["serves_detached"]
+	inspectServeLeaseAuthority(report, stateRoot, local.ListenAddress, client)
+}
+
+func inspectServeLeaseAuthority(report *localDoctorReport, stateRoot, listenAddress string, client *http.Client) {
+	token, err := readOwnerOnlyFile(filepath.Join(stateRoot, "runtime", "local-control-token"), 1024)
+	if err != nil {
+		report.ServeLeaseAuthority = "invalid_or_missing"
+		report.RecoveryActions = append(report.RecoveryActions, "restart the local runtime to restore foreground serve lease authority")
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	request, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+listenAddress+"/v1/serve-leases", nil)
+	request.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(token)))
+	response, err := client.Do(request)
+	if err != nil {
+		report.ServeLeaseAuthority = "unavailable"
+		return
+	}
+	defer response.Body.Close()
+	var status struct {
+		Schema string `json:"schema_version"`
+	}
+	if response.StatusCode != http.StatusOK || json.NewDecoder(io.LimitReader(response.Body, 4096)).Decode(&status) != nil || status.Schema != servelease.ProtocolVersion {
+		report.ServeLeaseAuthority = "protocol_incompatible"
+		report.RecoveryActions = append(report.RecoveryActions, "upgrade and restart the local runtime before using foreground serve")
+		return
+	}
+	report.ServeLeaseAuthority = "ready"
 }
 
 func inspectLocalPreviewDescriptors(report *localDoctorReport, directory string, now time.Time) {
@@ -4635,11 +7162,20 @@ func inspectLocalPreviewDescriptors(report *localDoctorReport, directory string,
 		var descriptor struct {
 			Schema            string          `json:"schema"`
 			Name              string          `json:"name"`
+			BindAddress       string          `json:"bind_address"`
 			Port              uint16          `json:"port"`
+			ServiceGeneration uint64          `json:"service_generation"`
 			Indefinite        bool            `json:"indefinite"`
 			ExpiresAt         *time.Time      `json:"expires_at"`
 			ServiceDefinition string          `json:"service_definition"`
 			Record            json.RawMessage `json:"record"`
+			Serve             *struct {
+				SourcePath     string              `json:"source_path"`
+				SourceKind     servepkg.SourceKind `json:"source_kind"`
+				SourceIdentity string              `json:"source_identity"`
+				SPA            bool                `json:"spa"`
+				OwnerMode      string              `json:"owner_mode"`
+			} `json:"serve"`
 		}
 		decoder := json.NewDecoder(io.LimitReader(file, 64<<10))
 		decoder.DisallowUnknownFields()
@@ -4647,25 +7183,73 @@ func inspectLocalPreviewDescriptors(report *localDoctorReport, directory string,
 		var extra any
 		extraErr := decoder.Decode(&extra)
 		file.Close()
-		if decodeErr != nil || extraErr != io.EOF || descriptor.Schema != "paperboat.preview-runtime/v1" || descriptor.Name == "" || descriptor.Port == 0 || descriptor.Indefinite == (descriptor.ExpiresAt != nil) {
+		validV1 := descriptor.Schema == "paperboat.preview-runtime/v1" && descriptor.Serve == nil && descriptor.Port != 0
+		validV2 := descriptor.Schema == "paperboat.preview-runtime/v2" && descriptor.BindAddress == "127.0.0.1" && descriptor.ServiceGeneration > 0 && descriptor.Serve != nil && filepath.IsAbs(descriptor.Serve.SourcePath) && descriptor.Serve.SourceIdentity != "" && descriptor.Serve.OwnerMode == "detached" &&
+			(descriptor.Serve.SourceKind == servepkg.SourceFile || descriptor.Serve.SourceKind == servepkg.SourceDirectory) && (!descriptor.Serve.SPA || descriptor.Serve.SourceKind == servepkg.SourceDirectory)
+		if decodeErr != nil || extraErr != io.EOF || !validV1 && !validV2 || descriptor.Name == "" || descriptor.Indefinite == (descriptor.ExpiresAt != nil) {
 			report.InvalidPreviews++
 			continue
+		}
+		if validV2 {
+			report.ServedPreviews++
+			if _, sourceErr := servepkg.ResolvePinnedSource(descriptor.Serve.SourcePath, descriptor.Serve.SourceKind, descriptor.Serve.SourceIdentity); sourceErr != nil {
+				report.InvalidServeSources++
+			}
+			if descriptor.Port != 0 && (descriptor.ExpiresAt == nil || descriptor.ExpiresAt.After(now)) {
+				connection, dialErr := net.DialTimeout("tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(descriptor.Port))), 200*time.Millisecond)
+				if connection != nil {
+					connection.Close()
+				}
+				if dialErr == nil {
+					report.ActiveServeListeners++
+				} else {
+					report.MissingServeListeners++
+				}
+			}
 		}
 		if descriptor.ExpiresAt != nil && !descriptor.ExpiresAt.After(now) {
 			report.ExpiredPreviews++
 		} else {
 			report.ActivePreviews++
+			if validV2 {
+				report.ActiveServedPreviews++
+			}
 		}
 	}
-	if report.ExpiredPreviews > 0 || report.InvalidPreviews > 0 {
+	if report.ExpiredPreviews > 0 || report.InvalidPreviews > 0 || report.InvalidServeSources > 0 || report.MissingServeListeners > 0 {
 		report.RecoveryActions = append(report.RecoveryActions, "restart the paired host runtime or recreate affected previews to reconcile descriptors")
+	}
+}
+
+func compareLocalServedPreviewRoutes(report *localDoctorReport, previews []api.Preview) {
+	ready := 0
+	for _, item := range previews {
+		served := item.SourceKind == "file" || item.SourceKind == "directory"
+		if item.ResourceID != report.MachineID || !served || item.State == "removed" || item.State == "expired" {
+			continue
+		}
+		report.RemoteServedPreviews++
+		if item.State == "ready" {
+			ready++
+		}
+	}
+	local := report.ActiveServedPreviews + int(report.RuntimeForegroundServes)
+	switch {
+	case report.RemoteServedPreviews != local:
+		report.RouteReadiness = "workload_route_drift"
+		report.RecoveryActions = append(report.RecoveryActions, "revoke orphan served previews and restart the local runtime to reconcile workload and route state")
+	case ready != report.RemoteServedPreviews:
+		report.RouteReadiness = "not_ready"
+		report.RecoveryActions = append(report.RecoveryActions, "inspect served preview readiness and connector health before retrying")
+	default:
+		report.RouteReadiness = "ready"
 	}
 }
 
 func printLocalDoctor(report localDoctorReport) {
 	fmt.Printf("local setup:  %s", report.SetupState)
 	if report.MachineID != "" {
-		fmt.Printf(" (%s, roles %s)", report.MachineID, strings.Join(report.SetupRoles, ","))
+		fmt.Printf(" (%s, mode %s)", report.MachineID, report.SetupMode)
 	}
 	fmt.Println()
 	fmt.Printf("local inbox:  %s", report.InboxState)
@@ -4675,7 +7259,12 @@ func printLocalDoctor(report localDoctorReport) {
 	fmt.Println()
 	fmt.Printf("local config: %s\n", report.ConfigService)
 	fmt.Printf("host runtime: %s\n", report.HostRuntime)
-	fmt.Printf("previews:     %d active, %d expired, %d invalid\n", report.ActivePreviews, report.ExpiredPreviews, report.InvalidPreviews)
+	fmt.Printf("serve leases: %s\n", report.ServeLeaseAuthority)
+	fmt.Printf("serve routes: %s\n", report.RouteReadiness)
+	fmt.Printf("previews:     %d active, %d served, %d expired, %d invalid, %d invalid sources\n", report.ActivePreviews, report.ServedPreviews, report.ExpiredPreviews, report.InvalidPreviews, report.InvalidServeSources)
+	if report.ServedPreviews > 0 {
+		fmt.Printf("serve routes: %d listeners active, %d missing\n", report.ActiveServeListeners, report.MissingServeListeners)
+	}
 	if report.WorkloadCounts == "available" {
 		fmt.Printf("workloads:    %d sessions, %d processes, %d attachments, %d transfers\n", report.ActiveSessions, report.ActiveProcesses, report.ActiveAttachments, report.ActiveTransfers)
 	}
@@ -4700,14 +7289,19 @@ func doctorUserMachine(ctx context.Context, client *api.Client, machineID string
 func printUserMachineDoctor(machine api.UserMachine) {
 	diagnostics := machine.RuntimeDiagnostics
 	availability := machine.Availability
+	fmt.Printf("machine:      %s\n", machineStatusSummary(machine))
+	fmt.Printf("setup mode:   %s\n", firstNonEmpty(machine.SetupMode, "unknown"))
+	fmt.Printf("capabilities: files %s, previews %s, terminal %s, Codex %s\n", capabilityState(machine.Capabilities.FileReceive), capabilityState(machine.Capabilities.PreviewLaunch), capabilityState(machine.Capabilities.TerminalHost), capabilityState(machine.Capabilities.CodexHost))
 	fmt.Printf("boot service: %s\n", firstNonEmpty(diagnostics.WorkerServiceScope, "unknown"))
 	fmt.Printf("worker:      generation %d, OS boot %s\n", diagnostics.WorkerGeneration, firstNonEmpty(diagnostics.OSBootID, "unknown"))
 	fmt.Printf("connector:   %s (generation %d)\n", firstNonEmpty(diagnostics.ConnectorState, "unavailable"), diagnostics.ConnectorGeneration)
-	fmt.Printf("availability: desired %s v%d, observed %s v%d (%s)\n", availability.DesiredMode, availability.DesiredVersion, firstNonEmpty(availability.ObservedMode, "unknown"), availability.ObservedVersion, availability.Status)
+	if machine.SetupMode == "host" {
+		fmt.Printf("availability: desired %s v%d, observed %s v%d (%s)\n", availability.DesiredMode, availability.DesiredVersion, firstNonEmpty(availability.ObservedMode, "unknown"), availability.ObservedVersion, availability.Status)
+	}
 	if diagnostics.WorkerServiceScope != "system" {
 		fmt.Println("recovery:     run pb pair to install the boot-level system service")
 	}
-	if availability.Status != "applied" || availability.ObservedVersion != availability.DesiredVersion || availability.ObservedMode != availability.DesiredMode {
+	if machine.SetupMode == "host" && (availability.Status != "applied" || availability.ObservedVersion != availability.DesiredVersion || availability.ObservedMode != availability.DesiredMode) {
 		fmt.Println("recovery:     inspect pb doctor --json and Paperboat host service logs; policy retry is automatic")
 	}
 }
@@ -4718,6 +7312,7 @@ func userMachineDoctorJSON(machine api.UserMachine) map[string]any {
 	state, errorCode := userMachineDoctorState(machine)
 	return map[string]any{
 		"state": state, "error_code": errorCode,
+		"setup_mode": machine.SetupMode, "capabilities": machine.Capabilities,
 		"boot_service_scope": diagnostics.WorkerServiceScope,
 		"worker_generation":  diagnostics.WorkerGeneration, "os_boot_id": diagnostics.OSBootID,
 		"connector_state": diagnostics.ConnectorState, "connector_generation": diagnostics.ConnectorGeneration,
@@ -4732,10 +7327,20 @@ func userMachineDoctorState(machine api.UserMachine) (string, string) {
 		return "error", "boot_service_not_system"
 	} else if diagnostics.ConnectorState != "ready" {
 		return "degraded", "connector_recovering"
-	} else if availability.Status != "applied" || availability.ObservedVersion != availability.DesiredVersion || availability.ObservedMode != availability.DesiredMode {
+	} else if machine.SetupMode == "host" && (availability.Status != "applied" || availability.ObservedVersion != availability.DesiredVersion || availability.ObservedMode != availability.DesiredMode) {
 		return "degraded", "availability_drift"
 	}
 	return "ready", ""
+}
+
+func capabilityState(capability api.MachineCapability) string {
+	if !capability.Configured {
+		return "disabled"
+	}
+	if capability.Observed {
+		return "ready"
+	}
+	return "offline"
 }
 
 func firstNonEmpty(vals ...string) string {

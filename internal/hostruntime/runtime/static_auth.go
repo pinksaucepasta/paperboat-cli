@@ -95,6 +95,14 @@ type staticPolicyResolver struct {
 func (r staticPolicyResolver) Policy(frame protocol.Frame) (auth.Policy, error) {
 	base := auth.Policy{Issuer: r.issuer, Audience: "paperboat-machine", EnvironmentID: r.environmentID, MachineID: r.machineID}
 	switch frame.Capability {
+	case "codex.connect.v1":
+		base.CredentialClass = "codex_connect"
+		base.Scopes = []string{"codex:connect"}
+		base.MaxLifetime = 5 * time.Minute
+	case "codex.manage.v1":
+		base.CredentialClass = "codex_manage"
+		base.Scopes = []string{"codex:prepare", "codex:browse", "codex:renew", "codex:stop"}
+		base.MaxLifetime = 5 * time.Minute
 	case "terminal.v1", "health.v1", "preview.public.v1":
 		base.CredentialClass = "terminal_operation"
 		base.Scopes = []string{"terminal:operate"}

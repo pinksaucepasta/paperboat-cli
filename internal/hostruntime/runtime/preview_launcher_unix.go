@@ -3,6 +3,7 @@
 package runtime
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -10,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -69,7 +71,16 @@ func (m *CoordinatorPreviewManager) Shutdown(ctx context.Context) error {
 
 func (m *CoordinatorPreviewManager) Launch(ctx context.Context, input server.PreviewLaunchRequest) (preview.ControlRecord, error) {
 	if !filepath.IsAbs(m.Executable) || !filepath.IsAbs(m.StateRoot) {
-		return preview.ControlRecord{}, ErrProductionInvalid
+		return preview.ControlRecord{}, launchFailure("preview_runner_launch_failure", "Preview runtime configuration is invalid.", false, false, "none", "Run `pb doctor` and repair the receive service.")
+	}
+	probeCtx, cancelProbe := context.WithTimeout(ctx, 2*time.Second)
+	connection, probeErr := (&net.Dialer{}).DialContext(probeCtx, "tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(input.Port))))
+	cancelProbe()
+	if connection != nil {
+		_ = connection.Close()
+	}
+	if probeErr != nil {
+		return preview.ControlRecord{}, launchFailure("preview_target_not_listening", "The target application is not listening on the requested port.", true, false, "not_needed", "Start the application on the requested port, then retry.")
 	}
 	var expiresAt *time.Time
 	if !input.Indefinite {
@@ -78,17 +89,24 @@ func (m *CoordinatorPreviewManager) Launch(ctx context.Context, input server.Pre
 	}
 	descriptorPath, err := writeCoordinatorPreviewDescriptor(m.StateRoot, input.Name, input.Port, expiresAt, input.Indefinite)
 	if err != nil {
-		return preview.ControlRecord{}, err
+		code := "preview_runner_launch_failure"
+		if errors.Is(err, ErrPreviewAlreadyActive) {
+			code = "preview_name_conflict"
+		}
+		if errors.Is(err, os.ErrPermission) {
+			code = "preview_permission_failure"
+		}
+		return preview.ControlRecord{}, launchFailure(code, "Preview state could not be prepared.", code != "preview_permission_failure", false, "not_needed", "Resolve the reported state or permission issue, then retry.")
 	}
 	command, ready, logFile, err := previewProcess(m.Executable, m.StateRoot, descriptorPath, PreviewRuntimeDescriptor{Schema: "paperboat.preview-runtime/v1", Name: input.Name, Port: input.Port, Indefinite: input.Indefinite, ExpiresAt: expiresAt}, true)
 	if err != nil {
 		_ = os.Remove(descriptorPath)
-		return preview.ControlRecord{}, err
+		return preview.ControlRecord{}, launchFailure("preview_runner_launch_failure", "Preview runner command could not be prepared.", true, true, "complete", "Retry the preview launch.")
 	}
 	if err := command.Start(); err != nil {
 		_ = logFile.Close()
 		_ = os.Remove(descriptorPath)
-		return preview.ControlRecord{}, err
+		return preview.ControlRecord{}, launchFailure("preview_runner_launch_failure", "Preview runner process could not start.", true, true, "complete", "Check execute permissions and retry.")
 	}
 	child := m.track(descriptorPath, command)
 	_ = logFile.Close()
@@ -101,7 +119,7 @@ func (m *CoordinatorPreviewManager) Launch(ctx context.Context, input server.Pre
 			record preview.ControlRecord
 			err    error
 		}
-		value.err = json.NewDecoder(io.LimitReader(ready, 64<<10)).Decode(&value.record)
+		value.record, value.err = readPreviewReady(ready)
 		result <- value
 	}()
 	select {
@@ -109,14 +127,46 @@ func (m *CoordinatorPreviewManager) Launch(ctx context.Context, input server.Pre
 		if value.err != nil || value.record.URL == "" {
 			_ = command.Process.Kill()
 			<-child.done
-			return preview.ControlRecord{}, errors.New("preview runner failed before registration")
+			cleanup := removePreviewDescriptor(descriptorPath)
+			return preview.ControlRecord{}, launchFailure("preview_registration_failure", "Preview runner failed before registration and readiness confirmation.", true, true, cleanup, "Retry; if this persists, run `pb doctor`.")
 		}
 		return value.record, nil
 	case <-ctx.Done():
 		_ = command.Process.Kill()
 		<-child.done
-		return preview.ControlRecord{}, ctx.Err()
+		cleanup := removePreviewDescriptor(descriptorPath)
+		code, message := "preview_canceled", "Preview launch was canceled."
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			code, message = "preview_deadline", "Preview launch exceeded its deadline."
+		}
+		return preview.ControlRecord{}, launchFailure(code, message, true, true, cleanup, "Retry the preview launch.")
 	}
+}
+
+func removePreviewDescriptor(path string) string {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "failed"
+	}
+	return "complete"
+}
+
+func readPreviewReady(reader io.Reader) (preview.ControlRecord, error) {
+	scanner := bufio.NewScanner(io.LimitReader(reader, 64<<10))
+	scanner.Buffer(make([]byte, 4096), 64<<10)
+	for scanner.Scan() {
+		var record preview.ControlRecord
+		if json.Unmarshal(scanner.Bytes(), &record) == nil && record.URL != "" && record.PreviewKey != "" {
+			return record, nil
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return preview.ControlRecord{}, err
+	}
+	return preview.ControlRecord{}, io.EOF
+}
+
+func launchFailure(code, message string, retryable, created bool, cleanup, recovery string) error {
+	return &server.PreviewLaunchError{Code: code, Message: message, Retryable: retryable, StateCreated: created, Cleanup: cleanup, Recovery: recovery}
 }
 
 func (m *CoordinatorPreviewManager) recover() error {

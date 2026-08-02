@@ -319,14 +319,18 @@ func TestInstallSecuresExistingServiceDefinitionDirectory(t *testing.T) {
 }
 
 type commandRunner struct {
-	calls [][]string
-	errAt int
+	calls       [][]string
+	errAt       int
+	customError error
 }
 
 func (r *commandRunner) Run(_ context.Context, name string, args ...string) error {
 	call := append([]string{name}, args...)
 	r.calls = append(r.calls, call)
 	if r.errAt == len(r.calls) {
+		if r.customError != nil {
+			return r.customError
+		}
 		return errors.New("command failed")
 	}
 	return nil
@@ -364,6 +368,26 @@ func TestNativeControllerCommandSequences(t *testing.T) {
 	runner = &commandRunner{errAt: 3}
 	if err := (LaunchdController{Runner: runner, UID: 501}).Apply(context.Background(), "/tmp/helper.plist", false); err == nil {
 		t.Fatal("inactive launchd service reported success")
+	}
+}
+
+func TestSystemdRemoveIgnoresOnlyAbsentUnitReset(t *testing.T) {
+	definition := filepath.Join(t.TempDir(), "paperboat.service")
+	if err := os.WriteFile(definition, []byte("unit"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &commandRunner{errAt: 3}
+	runnerError := &CommandError{Tool: "systemctl", Cause: errors.New("exit status 1"), Output: "Failed to reset failed state of unit paperboat.service: Unit paperboat.service not loaded."}
+	runner.customError = runnerError
+	if err := (SystemdController{Runner: runner}).Remove(context.Background(), definition); err != nil {
+		t.Fatalf("absent unit reset error=%v", err)
+	}
+	if _, err := os.Stat(definition); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("definition still exists: %v", err)
+	}
+	runner = &commandRunner{errAt: 3, customError: &CommandError{Tool: "systemctl", Cause: errors.New("exit status 1"), Output: "Access denied"}}
+	if err := (SystemdController{Runner: runner}).Remove(context.Background(), filepath.Join(t.TempDir(), "missing.service")); err == nil {
+		t.Fatal("non-absent reset failure was ignored")
 	}
 }
 

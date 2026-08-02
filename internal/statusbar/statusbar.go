@@ -648,8 +648,8 @@ func (b *Bar) ResetRemoteState() {
 	b.appInverse = false
 	b.appSGR = nil
 	b.appSGROverflow = false
-	b.alternate = false
-	b.suspended = false
+	// The local terminal survives a transport reconnect. Preserve the last
+	// complete alternate-screen state instead of guessing from a new stream.
 	b.synchronized = false
 	b.scrollDirty = true
 	b.redrawPending = true

@@ -90,6 +90,7 @@ type managedSession struct {
 	persistStop   chan struct{}
 	persistDone   chan error
 	persistErr    error
+	modes         terminalModeTracker
 }
 
 // liveProcess is immutable after publication. Terminal v1 input can therefore
@@ -115,6 +116,7 @@ type Snapshot struct {
 	EarliestSequence uint64          `json:"earliest_sequence"`
 	LatestSequence   uint64          `json:"latest_sequence"`
 	Exit             *pty.ExitResult `json:"exit,omitempty"`
+	TerminalModes    TerminalModes   `json:"terminal_modes"`
 }
 
 type AttachResult struct {
@@ -815,6 +817,7 @@ func (m *Manager) capture(session *managedSession, process PTYProcess) {
 		n, err := process.Read(buffer)
 		if n > 0 {
 			session.opMu.Lock()
+			session.modes.Consume(buffer[:n])
 			event, appendErr := session.history.AppendBuffer(1, buffer[:n])
 			if appendErr == nil {
 				_, _ = session.fanout.PublishOwned(event)
@@ -972,7 +975,7 @@ func (m *Manager) get(sessionID string) (*managedSession, error) {
 func (s *managedSession) snapshotLocked() Snapshot {
 	state, generation := s.lifecycle.Snapshot()
 	earliest, latest, _ := s.history.Bounds()
-	snapshot := Snapshot{ID: s.id, Name: s.name, CWD: s.command.CWD, Dimensions: s.command.Dimensions, State: state, Generation: generation, EarliestSequence: earliest, LatestSequence: latest}
+	snapshot := Snapshot{ID: s.id, Name: s.name, CWD: s.command.CWD, Dimensions: s.command.Dimensions, State: state, Generation: generation, EarliestSequence: earliest, LatestSequence: latest, TerminalModes: s.modes.Modes()}
 	if s.exit != nil {
 		exit := *s.exit
 		snapshot.Exit = &exit

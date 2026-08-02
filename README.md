@@ -26,11 +26,35 @@ pb auth switch               # replace the active account for this server
 pb auth logout               # revoke and remove this installation's session
 pb doctor                    # check auth + environment connectivity
 pb config path|show          # inspect the local config
+pb serve ./dist --public     # publish a local file or static directory
 ```
 
 Flags may appear before or after the environment name.
 Hosted projects and machines use the same durable terminal-session workflow:
 `--new`, `--session`, and `pb sessions` apply to either environment type.
+
+## Serve a file or directory
+
+`pb serve [path]` publishes a regular file or static directory from the current device
+through a public Paperboat preview. It binds the static server only to loopback, waits for
+the public route to become ready before printing its URL, and stops both the listener and
+preview on cancellation or expiry.
+
+```sh
+pb serve ./report.html --public
+pb serve ./dist --public --spa --duration 1h
+pb serve ./demo.pdf --public --detach
+```
+
+Without a path in an interactive terminal, `pb serve` opens the local file-and-directory
+picker. Pasting or dropping one file stages a verified, collision-safe copy under
+`Paperboat Inbox/serve` after public-access confirmation. The Inbox copy remains after the
+preview stops. `--detach` transfers ownership to the local Paperboat runtime so serving
+survives CLI exit, but local runtime or machine shutdown stops it. Stop either mode through
+`pb preview revoke`.
+
+Non-interactive and JSON invocations require both a path and `--public`. Use `--indefinite`
+instead of `--duration` only when the preview should remain until explicitly revoked.
 
 Interactive attaches forward `TERM`, `COLORTERM`, `TERM_PROGRAM`,
 `TERM_PROGRAM_VERSION`, and locale variables when they are set locally.

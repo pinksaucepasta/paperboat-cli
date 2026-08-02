@@ -50,7 +50,7 @@ func TestPreviewLaunchHTTPAuthorizesAndReturnsConfirmedRecord(t *testing.T) {
 		}
 		return preview.ControlRecord{LogicalName: input.Name, URL: "https://docs.preview.test", State: "active"}, nil
 	})
-	request := httptest.NewRequest(http.MethodPost, "/v1/preview-launches", bytes.NewBufferString(`{"name":"docs","port":3000,"duration_seconds":3600}`))
+	request := httptest.NewRequest(http.MethodPost, "/v1/preview-launches", bytes.NewBufferString(`{"operation_id":"preview-op-1","name":"docs","port":3000,"duration_seconds":3600}`))
 	request.Header.Set("Authorization", "Bearer valid")
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
@@ -70,10 +70,10 @@ func TestPreviewLaunchHTTPFailsClosed(t *testing.T) {
 		body      string
 		want      int
 	}{
-		"missing auth":  {"machine_1", "", `{"name":"docs","port":3000,"duration_seconds":60}`, http.StatusUnauthorized},
-		"wrong machine": {"machine_2", "valid", `{"name":"docs","port":3000,"duration_seconds":60}`, http.StatusForbidden},
-		"bad name":      {"machine_1", "valid", `{"name":"../docs","port":3000,"duration_seconds":60}`, http.StatusBadRequest},
-		"bad lifetime":  {"machine_1", "valid", `{"name":"docs","port":3000}`, http.StatusBadRequest},
+		"missing auth":  {"machine_1", "", `{"operation_id":"preview-op-1","name":"docs","port":3000,"duration_seconds":60}`, http.StatusUnauthorized},
+		"wrong machine": {"machine_2", "valid", `{"operation_id":"preview-op-1","name":"docs","port":3000,"duration_seconds":60}`, http.StatusForbidden},
+		"bad name":      {"machine_1", "valid", `{"operation_id":"preview-op-1","name":"../docs","port":3000,"duration_seconds":60}`, http.StatusBadRequest},
+		"bad lifetime":  {"machine_1", "valid", `{"operation_id":"preview-op-1","name":"docs","port":3000}`, http.StatusBadRequest},
 	} {
 		t.Run(name, func(t *testing.T) {
 			handler := previewLaunchHandler(t, tc.machineID, launcher)
@@ -94,7 +94,7 @@ func TestPreviewLaunchHTTPReportsLauncherConflict(t *testing.T) {
 	handler := previewLaunchHandler(t, "machine_1", func(context.Context, PreviewLaunchRequest) (preview.ControlRecord, error) {
 		return preview.ControlRecord{}, errors.New("duplicate preview")
 	})
-	request := httptest.NewRequest(http.MethodPost, "/v1/preview-launches", bytes.NewBufferString(`{"name":"docs","port":3000,"indefinite":true}`))
+	request := httptest.NewRequest(http.MethodPost, "/v1/preview-launches", bytes.NewBufferString(`{"operation_id":"preview-op-1","name":"docs","port":3000,"indefinite":true}`))
 	request.Header.Set("Authorization", "Bearer valid")
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)

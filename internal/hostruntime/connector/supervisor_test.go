@@ -234,7 +234,7 @@ func TestRouteChangeRefreshesActiveAdmission(t *testing.T) {
 	}
 }
 
-func TestCredentialExpiryRefreshesHealthyConnector(t *testing.T) {
+func TestCredentialExpiryDoesNotReplaceHealthyConnector(t *testing.T) {
 	now := time.Now()
 	dialer := &recoveringDialer{}
 	manager := manager(t, dialer, now)
@@ -251,27 +251,44 @@ func TestCredentialExpiryRefreshesHealthyConnector(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("initial admission was not requested")
 	}
+	deadline := time.Now().Add(time.Second)
+	for !manager.Status().Connected && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	first := manager.Status().Generation
+	if first == 0 {
+		t.Fatal("initial connector was not accepted")
+	}
 	select {
 	case generation := <-source.calls:
-		if generation < 2 {
-			t.Fatalf("refreshed generation=%d", generation)
+		t.Fatalf("credential expiry replaced healthy connector with generation %d", generation)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if status := manager.Status(); !status.Connected || status.Generation != first {
+		t.Fatalf("connector changed after admission expiry: %#v", status)
+	}
+	dialer.mu.Lock()
+	active := dialer.connections[0]
+	dialer.mu.Unlock()
+	active.done <- errors.New("connection lost after admission expiry")
+	select {
+	case generation := <-source.calls:
+		if generation != first+1 {
+			t.Fatalf("reconnect generation=%d want=%d", generation, first+1)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("healthy connector admission was not refreshed before expiry")
+		t.Fatal("connection loss did not request fresh admission")
+	}
+	deadline = time.Now().Add(time.Second)
+	for manager.Status().Generation != first+1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if status := manager.Status(); !status.Connected || status.Generation != first+1 {
+		t.Fatalf("connector did not recover after expired admission: %#v", status)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	if err := supervisor.Shutdown(ctx); err != nil {
 		t.Fatal(err)
-	}
-}
-
-func TestConnectorRenewalDelayKeepsSafetyMargin(t *testing.T) {
-	now := time.Now()
-	if got := connectorRenewalDelay(now.Add(5*time.Minute), now); got != 4*time.Minute+30*time.Second {
-		t.Fatalf("five minute renewal delay=%s", got)
-	}
-	if got := connectorRenewalDelay(now.Add(25*time.Millisecond), now); got != 20*time.Millisecond {
-		t.Fatalf("short renewal delay=%s", got)
 	}
 }

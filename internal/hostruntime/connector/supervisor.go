@@ -155,22 +155,12 @@ func (s *Supervisor) loop(ctx context.Context) {
 				waitCtx, cancelWait := context.WithCancel(ctx)
 				waitResult := make(chan error, 1)
 				go func() { waitResult <- s.config.Manager.WaitDisconnected(waitCtx, result.Generation) }()
-				renew := time.NewTimer(connectorRenewalDelay(admission.ExpiresAt, time.Now()))
 				var waitErr error
 				select {
 				case waitErr = <-waitResult:
 				case <-s.routes:
 					cancelWait()
 					waitErr = <-waitResult
-				case <-renew.C:
-					cancelWait()
-					waitErr = <-waitResult
-				}
-				if !renew.Stop() {
-					select {
-					case <-renew.C:
-					default:
-					}
 				}
 				cancelWait()
 				if errors.Is(waitErr, context.Canceled) && ctx.Err() == nil {
@@ -199,18 +189,6 @@ func (s *Supervisor) loop(ctx context.Context) {
 			backoff = s.config.MaxBackoff
 		}
 	}
-}
-
-func connectorRenewalDelay(expiresAt, now time.Time) time.Duration {
-	remaining := expiresAt.Sub(now)
-	if remaining <= 0 {
-		return 0
-	}
-	margin := remaining / 5
-	if margin > 30*time.Second {
-		margin = 30 * time.Second
-	}
-	return remaining - margin
 }
 
 func (s *Supervisor) recordRetry(transport, result string) {

@@ -4,6 +4,7 @@
     "fixture_manifest": {"supported": ["1"], "owner": "platform"},
     "server_http": {"supported": ["1.0"], "owner": "paperboat-server"},
     "runtime_application": {"supported": ["1.0"], "owner": "paperboat"},
+    "local_runtime_control": {"supported": ["1.0"], "owner": "paperboat"},
     "edge_control": {"supported": ["1.0"], "owner": "paperboat-server,paperboat-tunnel"},
     "frp_wire": {"supported": ["v0.70.1@fa3bcca2ed54bcf80a5d98c8c76f40f72c6b5291"], "owner": "paperboat-tunnel"}
   },
@@ -11,6 +12,7 @@
     "paperboat": {
       "server_http": ["1.0"],
       "runtime_application": ["1.0"],
+      "local_runtime_control": ["1.0"],
       "edge_control": ["1.0"],
       "frp_wire": ["v0.70.1@fa3bcca2ed54bcf80a5d98c8c76f40f72c6b5291"]
     },
@@ -21,6 +23,7 @@
   "adjacent_pairs": [
     {"producer": "paperboat-server", "consumer": "paperboat", "interface": "server_http", "versions": ["1.0"]},
     {"producer": "paperboat", "consumer": "paperboat", "interface": "runtime_application", "versions": ["1.0"]},
+    {"producer": "paperboat", "consumer": "paperboat", "interface": "local_runtime_control", "versions": ["1.0"]},
     {"producer": "paperboat-server", "consumer": "paperboat", "interface": "edge_control", "versions": ["1.0"]},
     {"producer": "paperboat-server", "consumer": "paperboat-tunnel", "interface": "edge_control", "versions": ["1.0"]},
     {"producer": "paperboat", "consumer": "paperboat-tunnel", "interface": "frp_wire", "versions": ["v0.70.1@fa3bcca2ed54bcf80a5d98c8c76f40f72c6b5291"]}

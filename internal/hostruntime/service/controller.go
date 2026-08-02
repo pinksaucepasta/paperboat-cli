@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -94,7 +95,7 @@ func (c SystemdController) Apply(ctx context.Context, _ string, upgrading bool) 
 	return c.Runner.Run(ctx, "systemctl", args("is-active", "--quiet", c.unit())...)
 }
 
-func (c SystemdController) Remove(ctx context.Context, _ string) error {
+func (c SystemdController) Remove(ctx context.Context, definitionPath string) error {
 	if c.Runner == nil {
 		return ErrInvalidDefinition
 	}
@@ -107,7 +108,25 @@ func (c SystemdController) Remove(ctx context.Context, _ string) error {
 	if err := c.Runner.Run(ctx, "systemctl", args("disable", "--now", c.unit())...); err != nil {
 		return err
 	}
-	return c.Runner.Run(ctx, "systemctl", args("daemon-reload")...)
+	if err := os.Remove(definitionPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := c.Runner.Run(ctx, "systemctl", args("daemon-reload")...); err != nil {
+		return err
+	}
+	if err := c.Runner.Run(ctx, "systemctl", args("reset-failed", c.unit())...); err != nil && !systemdUnitAbsent(err) {
+		return err
+	}
+	return nil
+}
+
+func systemdUnitAbsent(err error) bool {
+	var commandErr *CommandError
+	if !errors.As(err, &commandErr) {
+		return false
+	}
+	output := strings.ToLower(commandErr.Output)
+	return strings.Contains(output, "unit") && (strings.Contains(output, "not loaded") || strings.Contains(output, "not found"))
 }
 
 type LaunchdController struct {

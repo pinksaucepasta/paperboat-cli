@@ -84,6 +84,30 @@ func TestManagerMirrorsReplayAndDeduplicatesInput(t *testing.T) {
 	}
 }
 
+func TestManagerTracksTerminalModesFromPTYOutput(t *testing.T) {
+	manager, root, shell := realManager(t)
+	created, err := manager.Create(context.Background(), CreateRequest{Name: "modes", Command: shellCommand(shell, root, "printf '\\033[?1049h\\033[?1003h\\033[?1006h\\033[?2004h'; sleep 1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		snapshot, snapshotErr := manager.Snapshot(created.ID)
+		if snapshotErr != nil {
+			t.Fatal(snapshotErr)
+		}
+		modes := snapshot.TerminalModes
+		if modes.AlternateScreen && modes.MouseMotion && modes.MouseSGR && modes.BracketedPaste {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("terminal modes were not tracked: %+v", modes)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	_, _ = manager.Close(context.Background(), created.ID)
+}
+
 func TestManagerStreamInputPreservesBytesWithoutIdempotencyRows(t *testing.T) {
 	manager, root, shell := realManager(t)
 	created, err := manager.Create(context.Background(), CreateRequest{Name: "stream-input", Command: shellCommand(shell, root, "read line; printf 'got:%s' \"$line\"; read line")})

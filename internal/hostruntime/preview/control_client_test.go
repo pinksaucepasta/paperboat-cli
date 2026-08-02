@@ -3,6 +3,7 @@ package preview
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -42,12 +43,13 @@ func TestControlClientSignsRegisterAndAcceptsCanonicalIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	record, err := client.Register(context.Background(), "web", Target{Host: "127.0.0.1", Port: 3000}, true, 0, false)
-	if err != nil || record.PreviewKey != "p-abcdefghijklmnopqrstuvwxyz" || record.EnvironmentID != "env_1" {
+	record, err := client.RegisterWithMetadata(context.Background(), "web", Target{Host: "127.0.0.1", Port: 3000}, true, 0, false, "directory", "detached")
+	if err != nil || record.PreviewKey != "p-abcdefghijklmnopqrstuvwxyz" || record.EnvironmentID != "env_1" || record.OperationID == "" {
 		t.Fatalf("record=%#v err=%v", record, err)
 	}
-	if gotBody == "" {
-		t.Fatal("missing request body")
+	var payload map[string]any
+	if json.Unmarshal([]byte(gotBody), &payload) != nil || payload["source_kind"] != "directory" || payload["owner_mode"] != "detached" {
+		t.Fatalf("request body = %s", gotBody)
 	}
 }
 

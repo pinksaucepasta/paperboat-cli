@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -43,6 +44,34 @@ type target struct {
 	id    string
 	name  string
 	state string
+}
+
+type EnvironmentIdentity struct {
+	Kind          string
+	ResourceID    string
+	EnvironmentID string
+	Name          string
+}
+
+func (r *APIResolver) ResolveEnvironment(ctx context.Context, requested string) (EnvironmentIdentity, error) {
+	target, err := r.findTarget(ctx, requested)
+	if err != nil {
+		return EnvironmentIdentity{}, err
+	}
+	environmentID := target.id
+	if target.kind == targetUserMachine {
+		machines, listErr := r.client.(userMachineClient).ListUserMachines(ctx)
+		if listErr != nil {
+			return EnvironmentIdentity{}, listErr
+		}
+		for _, machine := range machines {
+			if machine.ID == target.id {
+				environmentID = machine.EnvironmentID
+				break
+			}
+		}
+	}
+	return EnvironmentIdentity{Kind: target.kind, ResourceID: target.id, EnvironmentID: environmentID, Name: target.name}, nil
 }
 
 const (
@@ -298,6 +327,9 @@ func (r *APIResolver) findTarget(ctx context.Context, requested string) (target,
 	want := strings.TrimSpace(requested)
 	for _, machine := range machines {
 		if machine.ID == want {
+			if err := terminalCapabilityError(machine); err != nil {
+				return target{}, err
+			}
 			return target{kind: targetUserMachine, id: machine.ID, name: machine.DisplayName, state: machine.State}, nil
 		}
 	}
@@ -309,6 +341,9 @@ func (r *APIResolver) findTarget(ctx context.Context, requested string) (target,
 	}
 	if len(matches) == 1 {
 		machine := matches[0]
+		if err := terminalCapabilityError(machine); err != nil {
+			return target{}, err
+		}
 		return target{kind: targetUserMachine, id: machine.ID, name: machine.DisplayName, state: machine.State}, nil
 	}
 	if len(matches) > 1 {
@@ -319,6 +354,19 @@ func (r *APIResolver) findTarget(ctx context.Context, requested string) (target,
 		return target{}, fmt.Errorf("%w: %q matches machine IDs %s; connect using an exact ID", ErrProjectAmbiguous, requested, strings.Join(ids, ", "))
 	}
 	return target{}, projectErr
+}
+
+func terminalCapabilityError(machine api.UserMachine) error {
+	if !machine.Capabilities.TerminalHost.Configured {
+		return &api.APIError{Code: "machine_capability_unavailable", Message: "This machine is not configured to host terminals."}
+	}
+	if slices.Contains([]string{"revoked", "disconnected", "deleted"}, machine.State) {
+		return nil
+	}
+	if !machine.Online || !machine.Capabilities.TerminalHost.Observed {
+		return &api.APIError{Code: "machine_offline", Message: "This terminal host is offline."}
+	}
+	return nil
 }
 
 // waitConnectable polls connection-status until the tunnel is connectable or the

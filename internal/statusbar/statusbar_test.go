@@ -333,6 +333,10 @@ func TestWriteDefersRedrawUntilSplitANSICompletes(t *testing.T) {
 
 func TestResetRemoteStateDiscardsPartialANSIAndSavedState(t *testing.T) {
 	bar, _ := newTestBar(t, ModeAuto, "xterm-256color", 40, 3, true, time.Second)
+	bar.fullscreen = FullscreenHide
+	if _, err := bar.Write([]byte("\x1b[?1049h")); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := bar.Write([]byte("\x1b[")); err != nil {
 		t.Fatal(err)
 	}
@@ -344,7 +348,7 @@ func TestResetRemoteStateDiscardsPartialANSIAndSavedState(t *testing.T) {
 	bar.ResetRemoteState()
 	bar.mu.Lock()
 	defer bar.mu.Unlock()
-	if bar.ansiState != byte(parser.GroundState) || bar.appCursorSaved || bar.appInverse || bar.synchronized || !bar.scrollDirty || !bar.redrawPending {
+	if bar.ansiState != byte(parser.GroundState) || bar.appCursorSaved || bar.appInverse || bar.synchronized || !bar.alternate || !bar.suspended || !bar.scrollDirty || !bar.redrawPending {
 		t.Fatalf("state was not reset: %#v", bar)
 	}
 }

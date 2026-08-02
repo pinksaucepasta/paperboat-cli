@@ -35,6 +35,8 @@ type ProductionPreviewWorkerConfig struct {
 	Transport         http.RoundTripper
 	Ready             func(preview.ControlRecord) error
 	ServiceRunner     hostservice.Runner
+	SourceKind        string
+	OwnerMode         string
 }
 
 func RunProductionPreviewWorker(ctx context.Context, config ProductionPreviewWorkerConfig) (runErr error) {
@@ -53,7 +55,7 @@ func RunProductionPreviewWorker(ctx context.Context, config ProductionPreviewWor
 		}
 		durable = &descriptor
 	}
-	if config.ServiceDefinition != "" {
+	if config.ServiceDefinition != "" && (durable == nil || durable.Serve == nil) {
 		home, homeErr := os.UserHomeDir()
 		expected, _, pathErr := previewServiceDefinition(home, config.Name, runtime.GOOS)
 		if homeErr != nil || pathErr != nil || config.ServiceDefinition != expected {
@@ -106,14 +108,18 @@ func RunProductionPreviewWorker(ctx context.Context, config ProductionPreviewWor
 	items, listErr := control.List(ctx)
 	if listErr == nil {
 		for _, item := range items {
-			if item.LogicalName == config.Name && item.TargetPort == int32(config.Port) && item.State != "removed" && item.State != "expired" && (config.Indefinite || item.ExpiresAt != nil && item.ExpiresAt.After(time.Now().UTC())) {
+			if item.LogicalName == config.Name && item.State != "removed" && item.State != "expired" && (config.Indefinite || item.ExpiresAt != nil && item.ExpiresAt.After(time.Now().UTC())) {
 				remote = item
 				break
 			}
 		}
 	}
-	if remote.PreviewKey == "" {
-		remote, err = control.Register(ctx, config.Name, target, true, config.Duration, config.Indefinite)
+	if remote.PreviewKey == "" || remote.TargetPort != int32(config.Port) {
+		if config.SourceKind == "" && config.OwnerMode == "" {
+			remote, err = control.Register(ctx, config.Name, target, true, config.Duration, config.Indefinite)
+		} else {
+			remote, err = control.RegisterWithMetadata(ctx, config.Name, target, true, config.Duration, config.Indefinite, config.SourceKind, config.OwnerMode)
+		}
 		if err != nil {
 			return err
 		}
@@ -190,6 +196,16 @@ func RunProductionPreviewWorker(ctx context.Context, config ProductionPreviewWor
 		return err
 	}
 	defer shutdownPreviewComponent(connectorService.Shutdown)
+	if err = monitor.RunOnce(ctx); err != nil {
+		return err
+	}
+	if _, err = reporter.DeliverOnce(ctx); err != nil {
+		return err
+	}
+	if err = waitForPreviewConnector(ctx, manager); err != nil {
+		return err
+	}
+	remote.State = "ready"
 	if config.Ready != nil {
 		if err = config.Ready(remote); err != nil {
 			return err
@@ -212,7 +228,14 @@ func RunProductionPreviewWorker(ctx context.Context, config ProductionPreviewWor
 	var expiry <-chan time.Time
 	var expiryTimer *time.Timer
 	if !config.Indefinite {
-		expiryTimer = time.NewTimer(config.Duration)
+		remaining := config.Duration
+		if remote.ExpiresAt != nil {
+			remaining = time.Until(remote.ExpiresAt.UTC())
+		}
+		if remaining < 0 {
+			remaining = 0
+		}
+		expiryTimer = time.NewTimer(remaining)
 		defer expiryTimer.Stop()
 		expiry = expiryTimer.C
 	}
@@ -241,6 +264,21 @@ func RunProductionPreviewWorker(ctx context.Context, config ProductionPreviewWor
 				_, _ = registry.Remove(remote.PreviewKey)
 				return nil
 			}
+		}
+	}
+}
+
+func waitForPreviewConnector(ctx context.Context, manager *connector.Manager) error {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if manager.Status().Connected {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
 		}
 	}
 }

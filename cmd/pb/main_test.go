@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -15,15 +14,18 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/x/ansi"
 	"github.com/pinksaucepasta/paperboat/internal/api"
 	"github.com/pinksaucepasta/paperboat/internal/buildinfo"
 	"github.com/pinksaucepasta/paperboat/internal/config"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/identity"
 	"github.com/pinksaucepasta/paperboat/internal/resolver"
+	servepkg "github.com/pinksaucepasta/paperboat/internal/serve"
 	"github.com/pinksaucepasta/paperboat/internal/statusbar"
 	"github.com/pinksaucepasta/paperboat/internal/telemetry"
 	"github.com/pinksaucepasta/paperboat/internal/tunnel"
@@ -160,6 +162,54 @@ func TestCollectLocalDoctorReportsMachineInboxCredentialAndPreviews(t *testing.T
 	}
 }
 
+func TestDoctorValidatesServedPreviewSourceWithoutReportingPath(t *testing.T) {
+	root := t.TempDir()
+	sourcePath := filepath.Join(root, "site")
+	if err := os.Mkdir(sourcePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	source, _ := servepkg.ResolveSource(sourcePath)
+	identityValue, _ := source.Identity()
+	expires := time.Now().UTC().Add(time.Hour)
+	descriptor, _ := json.Marshal(map[string]any{
+		"schema": "paperboat.preview-runtime/v2", "name": "site", "bind_address": "127.0.0.1", "port": 32000, "service_generation": 1, "indefinite": false, "expires_at": expires, "service_definition": "",
+		"serve": map[string]any{"source_path": source.Path, "source_kind": source.Kind, "source_identity": identityValue, "spa": false, "owner_mode": "detached"},
+	})
+	directory := filepath.Join(root, "previews", "active")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "site.json"), descriptor, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	report := localDoctorReport{}
+	inspectLocalPreviewDescriptors(&report, directory, time.Now().UTC())
+	if report.ActivePreviews != 1 || report.ServedPreviews != 1 || report.InvalidPreviews != 0 || report.InvalidServeSources != 0 {
+		t.Fatalf("report = %#v", report)
+	}
+	encoded, _ := json.Marshal(report)
+	if bytes.Contains(encoded, []byte(source.Path)) {
+		t.Fatalf("doctor leaked source path: %s", encoded)
+	}
+}
+
+func TestDoctorComparesServedRoutesWithLocalWorkloads(t *testing.T) {
+	report := localDoctorReport{MachineID: "machine_local", ActiveServedPreviews: 1, RuntimeForegroundServes: 1}
+	compareLocalServedPreviewRoutes(&report, []api.Preview{
+		{ID: "detached", ResourceID: "machine_local", SourceKind: "directory", State: "ready"},
+		{ID: "foreground", ResourceID: "machine_local", SourceKind: "file", State: "ready"},
+		{ID: "other", ResourceID: "machine_other", SourceKind: "file", State: "ready"},
+	})
+	if report.RouteReadiness != "ready" || report.RemoteServedPreviews != 2 {
+		t.Fatalf("report=%+v", report)
+	}
+	report = localDoctorReport{MachineID: "machine_local", ActiveServedPreviews: 1}
+	compareLocalServedPreviewRoutes(&report, []api.Preview{{ID: "orphan", ResourceID: "machine_local", SourceKind: "file", State: "ready"}, {ID: "orphan2", ResourceID: "machine_local", SourceKind: "file", State: "ready"}})
+	if report.RouteReadiness != "workload_route_drift" || len(report.RecoveryActions) == 0 {
+		t.Fatalf("drift report=%+v", report)
+	}
+}
+
 func TestHostRuntimeEntryPointIsHiddenAndStrict(t *testing.T) {
 	root := newRootCommand()
 	command, _, err := root.Find([]string{"__runtime-host"})
@@ -216,23 +266,42 @@ func TestSelectTerminalSessionDoesNotHideAmbiguousProjectWithUserMachine(t *test
 	}))
 	defer server.Close()
 
-	_, err := selectTerminalSession(context.Background(), api.New(server.URL, config.Credential{AccessToken: "token"}, server.Client()), "studio", false, "", "named")
+	_, err := selectTerminalSession(context.Background(), api.New(server.URL, config.Credential{AccessToken: "token"}, server.Client()), "studio", "", "named")
 	if !errors.Is(err, resolver.ErrProjectAmbiguous) {
 		t.Fatalf("err = %v, want project ambiguity", err)
 	}
 }
 
-func TestSelectDefaultTerminalSessionDefersToDescriptor(t *testing.T) {
-	requests := 0
+func TestSelectTerminalSessionCreatesFreshSessionByDefault(t *testing.T) {
+	created := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests++
-		http.NotFound(w, r)
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/projects":
+			writeAPIData(t, w, map[string]any{"items": []map[string]any{{"id": "prj_1", "name": "studio", "state": "ready"}}, "pagination": map[string]any{"next_offset": nil}})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/projects/prj_1/terminal-sessions":
+			created = true
+			writeAPIData(t, w, map[string]any{"id": "pts_1", "name": "quiet-harbor", "state": "open", "created_at": time.Now(), "updated_at": time.Now()})
+		default:
+			http.NotFound(w, r)
+		}
 	}))
 	defer server.Close()
 
-	got, err := selectTerminalSession(context.Background(), api.New(server.URL, config.Credential{AccessToken: "token"}, server.Client()), "studio", false, "", "")
-	if err != nil || got != "" || requests != 0 {
-		t.Fatalf("select default = %q, %v; requests=%d", got, err, requests)
+	got, err := selectTerminalSession(context.Background(), api.New(server.URL, config.Credential{AccessToken: "token"}, server.Client()), "studio", "", "")
+	if err != nil || got.ID != "pts_1" || got.Name != "quiet-harbor" || !created {
+		t.Fatalf("fresh session = %+v, %v; created=%t", got, err, created)
+	}
+}
+
+func TestTerminalArgsAcceptsOnlyOptionalNewKeyword(t *testing.T) {
+	validate := terminalArgs(0)
+	for _, values := range [][]string{nil, {"studio"}, {"studio", "new"}} {
+		if err := validate(nil, values); err != nil {
+			t.Fatalf("values %q rejected: %v", values, err)
+		}
+	}
+	if err := validate(nil, []string{"studio", "attach"}); err == nil {
+		t.Fatal("unexpected second keyword accepted")
 	}
 }
 
@@ -481,19 +550,119 @@ func TestVersionFlags(t *testing.T) {
 	t.Cleanup(func() { buildinfo.Version = previous })
 	for _, flag := range []string{"--version", "-v"} {
 		var stdout, stderr bytes.Buffer
-		if code := run(context.Background(), []string{flag}, &stdout, &stderr); code != 0 || stdout.String() != "pb 2026.07.25.0\n" || stderr.Len() != 0 {
+		if code := run(context.Background(), []string{flag}, &stdout, &stderr); code != 0 || stdout.String() != versionDisplay("2026.07.25.0") || stderr.Len() != 0 {
 			t.Fatalf("%s: code=%d stdout=%q stderr=%q", flag, code, stdout.String(), stderr.String())
 		}
 	}
 }
 
+func TestVersionDisplayIncludesBrandAndVersion(t *testing.T) {
+	display := versionDisplay("2026.08.02.0")
+	if !strings.Contains(display, "Paperboat") || !strings.Contains(display, "Version 2026.08.02.0") {
+		t.Fatalf("version display = %q", display)
+	}
+}
+
+func TestBrandDisplayAlignsMetadataByTerminalCellWidth(t *testing.T) {
+	display := brandDisplay("2026.08.02.0", "person@example.com")
+	details := []string{"Paperboat", "Version 2026.08.02.0", "person@example.com"}
+	lines := strings.Split(display, "\n")
+	if len(lines) != len(details) {
+		t.Fatalf("brand lines = %q", lines)
+	}
+	column := -1
+	for index, detail := range details {
+		position := strings.Index(lines[index], detail)
+		if position < 0 {
+			t.Fatalf("line %d missing %q: %q", index, detail, lines[index])
+		}
+		cell := ansi.StringWidth(lines[index][:position])
+		if column < 0 {
+			column = cell
+		} else if cell != column {
+			t.Fatalf("line %d metadata column = %d, want %d: %q", index, cell, column, lines[index])
+		}
+	}
+}
+
+func TestUpdateSelectedTransportUsesSelectorOutcome(t *testing.T) {
+	bar := statusbar.New(statusbar.Options{
+		Mode:   statusbar.ModeOff,
+		Layout: statusbar.Layout{Right: []string{"connection"}},
+	})
+	bar.SetConnection("connected")
+
+	updateSelectedTransport(bar, tunnel.TerminalTransportSelection{Selected: "quic"}, "selected")
+	if line := bar.Render(40); !strings.HasSuffix(line, "connected  Q") {
+		t.Fatalf("selected QUIC transport missing from status bar: %q", line)
+	}
+	updateSelectedTransport(bar, tunnel.TerminalTransportSelection{Selected: "wss"}, "selected")
+	if line := bar.Render(40); !strings.HasSuffix(line, "connected  W") {
+		t.Fatalf("selected WSS transport missing from status bar: %q", line)
+	}
+	updateSelectedTransport(bar, tunnel.TerminalTransportSelection{Selected: "quic"}, "failure")
+	if line := bar.Render(40); !strings.HasSuffix(line, "connected  W") {
+		t.Fatalf("failed selection changed status bar transport: %q", line)
+	}
+}
+
 func TestCanonicalCommandsAreDiscoverable(t *testing.T) {
 	root := newRootCommand()
-	for _, path := range [][]string{{"login"}, {"logout"}, {"create"}, {"pair"}, {"session", "attach"}, {"session", "list"}, {"machine", "add"}, {"machine", "list"}, {"machine", "revoke"}, {"machine", "availability"}, {"preview", "list"}, {"preview", "revoke"}} {
+	for _, path := range [][]string{{"login"}, {"logout"}, {"pair"}, {"session", "attach"}, {"session", "list"}, {"machine", "add"}, {"machine", "list"}, {"machine", "revoke"}, {"machine", "availability"}, {"preview", "list"}, {"preview", "revoke"}} {
 		command, remaining, err := root.Find(path)
 		if err != nil || len(remaining) != 0 || command == root {
 			t.Fatalf("command %q not discoverable: command=%v remaining=%q err=%v", path, command, remaining, err)
 		}
+	}
+	for _, removed := range []string{"create", "projects"} {
+		command, remaining, err := root.Find([]string{removed})
+		if err != nil || command != root || len(remaining) != 1 {
+			t.Fatalf("removed command %q is still discoverable: command=%v remaining=%q err=%v", removed, command, remaining, err)
+		}
+	}
+}
+
+func TestMachineSessionActivityUsesNewestAvailableTimestamp(t *testing.T) {
+	created := time.Unix(10, 0)
+	updated := time.Unix(20, 0)
+	active := time.Unix(30, 0)
+	if got := (machineSession{session: api.TerminalSession{CreatedAt: created, UpdatedAt: updated, LastActiveAt: &active}}).activity(); !got.Equal(active) {
+		t.Fatalf("activity=%v want=%v", got, active)
+	}
+	if got := (machineSession{session: api.TerminalSession{CreatedAt: created, UpdatedAt: updated}}).activity(); !got.Equal(updated) {
+		t.Fatalf("activity=%v want=%v", got, updated)
+	}
+	if got := (machineSession{session: api.TerminalSession{CreatedAt: created}}).activity(); !got.Equal(created) {
+		t.Fatalf("activity=%v want=%v", got, created)
+	}
+}
+
+func TestFavoritesSortFirstWithoutReorderingPeers(t *testing.T) {
+	values := []struct {
+		id       string
+		favorite bool
+	}{{"first", false}, {"star-a", true}, {"second", false}, {"star-b", true}}
+	slices.SortStableFunc(values, func(a, b struct {
+		id       string
+		favorite bool
+	}) int {
+		return compareFavorites(a.favorite, b.favorite)
+	})
+	got := make([]string, 0, len(values))
+	for _, value := range values {
+		got = append(got, value.id)
+	}
+	if strings.Join(got, ",") != "star-a,star-b,first,second" {
+		t.Fatalf("order=%v", got)
+	}
+}
+
+func TestMaskEmailHidesAddressUntilExplicitReveal(t *testing.T) {
+	if got := maskEmail("person@example.com"); got != "██████@███████.███" {
+		t.Fatalf("masked email=%q", got)
+	}
+	if got := maskEmail("Not signed in"); got != "Not signed in" {
+		t.Fatalf("non-email=%q", got)
 	}
 }
 
@@ -541,6 +710,7 @@ func TestMachineAvailabilityRequiresConfirmationAndReturnsAppliedJSON(t *testing
 
 func TestUserMachineDoctorStateCoversBootConnectorAndAvailability(t *testing.T) {
 	ready := api.UserMachine{
+		SetupMode:          "host",
 		RuntimeDiagnostics: api.RuntimeDiagnostics{WorkerGeneration: 7, OSBootID: "boot-1", WorkerServiceScope: "system", ConnectorState: "ready", ConnectorGeneration: 3},
 		Availability:       api.AvailabilityPolicy{DesiredMode: "keep_awake", DesiredVersion: 2, ObservedMode: "keep_awake", ObservedVersion: 2, Status: "applied"},
 	}
@@ -561,16 +731,6 @@ func TestUserMachineDoctorStateCoversBootConnectorAndAvailability(t *testing.T) 
 	drift.Availability.ObservedVersion = 1
 	if state, code := userMachineDoctorState(drift); state != "degraded" || code != "availability_drift" {
 		t.Fatalf("availability state=%q code=%q", state, code)
-	}
-}
-
-func TestPromptChoiceRejectsOutOfRangeAndSelectsStableIndex(t *testing.T) {
-	if _, err := promptChoice(bufio.NewReader(strings.NewReader("0\n")), "Region", 2, func(index int) string { return []string{"iad", "lhr"}[index] }); err == nil {
-		t.Fatal("out-of-range selection was accepted")
-	}
-	got, err := promptChoice(bufio.NewReader(strings.NewReader("2\n")), "Region", 2, func(index int) string { return []string{"iad", "lhr"}[index] })
-	if err != nil || got != 1 {
-		t.Fatalf("selection=%d err=%v", got, err)
 	}
 }
 
@@ -772,6 +932,159 @@ func TestResolveMachineTargetRejectsAmbiguousNames(t *testing.T) {
 	_, _, err := resolveUserMachineTarget(context.Background(), api.New(srv.URL, config.Credential{AccessToken: "token"}, srv.Client()), "studio")
 	if err == nil || !strings.Contains(err.Error(), "ambiguous") {
 		t.Fatalf("err=%v, want ambiguity", err)
+	}
+}
+
+func TestResolveSetupModeRequiresExplicitModeWithoutTTY(t *testing.T) {
+	if _, err := resolveSetupMode("", false, io.Discard); err == nil || !strings.Contains(err.Error(), "requires --mode") {
+		t.Fatalf("err=%v, want non-interactive mode requirement", err)
+	}
+	for _, mode := range []string{"receive", "session", "host"} {
+		got, err := resolveSetupMode(mode, false, io.Discard)
+		if err != nil || got != mode {
+			t.Fatalf("resolveSetupMode(%q)=(%q,%v)", mode, got, err)
+		}
+	}
+	if _, err := resolveSetupMode("interactive", false, io.Discard); err == nil || !strings.Contains(err.Error(), "receive, session, or host") {
+		t.Fatalf("err=%v, want supported modes", err)
+	}
+}
+
+func TestMachineHomeActionsFollowConfiguredCapabilities(t *testing.T) {
+	machine := api.UserMachine{ID: "machine_actions", SetupMode: "receive", Capabilities: api.MachineCapabilities{
+		FileReceive: api.MachineCapability{Configured: true}, PreviewLaunch: api.MachineCapability{Configured: true},
+	}}
+	actions := machineHomeActions(machine)
+	ids := make([]string, len(actions))
+	for index, action := range actions {
+		ids[index] = action.ID
+	}
+	if !slices.Equal(ids, []string{"send", "preview", "previews"}) {
+		t.Fatalf("receive actions=%v", ids)
+	}
+	machine.SetupMode = "host"
+	machine.Capabilities.TerminalHost.Configured = true
+	actions = machineHomeActions(machine)
+	ids = ids[:0]
+	for _, action := range actions {
+		ids = append(ids, action.ID)
+	}
+	if !slices.Equal(ids, []string{"terminal", "codex", "send", "preview", "sessions", "previews", "allow-sleep", "keep-awake"}) {
+		t.Fatalf("host actions=%v", ids)
+	}
+}
+
+func TestMachineStatusSummarySeparatesAvailabilityFromMode(t *testing.T) {
+	tests := []struct {
+		name    string
+		machine api.UserMachine
+		want    string
+	}{
+		{
+			name:    "online host",
+			machine: api.UserMachine{Online: true, SetupMode: "host", Platform: "linux", Architecture: "arm64"},
+			want:    "Online  ·  Host",
+		},
+		{
+			name:    "offline receive",
+			machine: api.UserMachine{SetupMode: "receive", Platform: "darwin", Architecture: "arm64"},
+			want:    "Offline  ·  Receive only",
+		},
+		{
+			name:    "inactive session",
+			machine: api.UserMachine{SetupMode: "session"},
+			want:    "Session only",
+		},
+		{
+			name:    "legacy host inferred from capability",
+			machine: api.UserMachine{State: "disconnected", Capabilities: api.MachineCapabilities{TerminalHost: api.MachineCapability{Configured: true}}},
+			want:    "Offline  ·  Host",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := machineStatusSummary(test.machine); got != test.want {
+				t.Fatalf("summary=%q want=%q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestAsyncHomeValueStartsImmediatelyAndTracksFreshness(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	value := startAsyncHomeValue(context.Background(), func(context.Context) (string, error) {
+		close(started)
+		<-release
+		return "ready", nil
+	})
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("background load did not start")
+	}
+	if value.ready() {
+		t.Fatal("blocked load reported ready")
+	}
+	close(release)
+	got, err := value.await(context.Background())
+	if err != nil || got != "ready" || !value.fresh() {
+		t.Fatalf("value=%q err=%v fresh=%t", got, err, value.fresh())
+	}
+	value.fetchedAt = time.Now().Add(-homePrefetchFreshness - time.Second)
+	if value.fresh() {
+		t.Fatal("expired prefetch remained fresh")
+	}
+}
+
+func TestMachinesSortCurrentDeviceLast(t *testing.T) {
+	machines := []api.UserMachine{{ID: "current", DisplayName: "Local"}, {ID: "favorite", DisplayName: "Favorite"}, {ID: "remote", DisplayName: "Remote"}}
+	favorites := favoriteSet{}
+	favorites.Set("machine", "current", true)
+	favorites.Set("machine", "favorite", true)
+	sortMachinesForDisplay(machines, favorites, "current")
+	if got := []string{machines[0].ID, machines[1].ID, machines[2].ID}; !slices.Equal(got, []string{"favorite", "remote", "current"}) {
+		t.Fatalf("machine order=%v", got)
+	}
+	if got := machineDisplayTitle(machines[2], "current"); got != "Local (this device)" {
+		t.Fatalf("current title=%q", got)
+	}
+}
+
+func TestDroppedFilePathsParsesQuotedAndEscapedPaths(t *testing.T) {
+	directory := t.TempDir()
+	first := filepath.Join(directory, "first file.txt")
+	second := filepath.Join(directory, "second.txt")
+	for _, path := range []string{first, second} {
+		if err := os.WriteFile(path, []byte("test"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	value := strconv.Quote(first) + " " + strings.ReplaceAll(second, " ", "\\ ")
+	paths, err := droppedFilePaths(value)
+	if err != nil || !slices.Equal(paths, []string{first, second}) {
+		t.Fatalf("paths=%v err=%v", paths, err)
+	}
+	if _, err := droppedFilePaths(filepath.Join(directory, "missing")); err == nil {
+		t.Fatal("missing dropped file was accepted")
+	}
+}
+
+func TestSetupRollbackContextSurvivesCanceledCommand(t *testing.T) {
+	type contextKey string
+	parent, cancelParent := context.WithCancel(context.WithValue(context.Background(), contextKey("operation"), "setup"))
+	cancelParent()
+
+	rollback, cancelRollback := setupRollbackContext(parent)
+	defer cancelRollback()
+	if err := rollback.Err(); err != nil {
+		t.Fatalf("rollback context inherited cancellation: %v", err)
+	}
+	if got := rollback.Value(contextKey("operation")); got != "setup" {
+		t.Fatalf("rollback context value=%v", got)
+	}
+	if deadline, ok := rollback.Deadline(); !ok || time.Until(deadline) <= 0 || time.Until(deadline) > 15*time.Second {
+		t.Fatalf("rollback deadline=(%v,%t)", deadline, ok)
 	}
 }
 
@@ -1064,7 +1377,7 @@ func TestDefaultEnvironmentSelectsOnlyAvailableTarget(t *testing.T) {
 		case "/v1/projects":
 			writeAPIData(t, w, map[string]any{"items": []any{}, "pagination": map[string]any{"limit": 200, "offset": 0, "total": 0}})
 		case "/v1/machines":
-			writeAPIData(t, w, map[string]any{"items": []map[string]any{{"id": "um_1", "display_name": "Studio"}}, "pagination": map[string]any{"limit": 200, "offset": 0, "total": 1}})
+			writeAPIData(t, w, map[string]any{"items": []map[string]any{{"id": "um_1", "display_name": "Studio", "online": true, "capabilities": map[string]any{"terminal_host": map[string]any{"configured": true, "observed": true}}}}, "pagination": map[string]any{"limit": 200, "offset": 0, "total": 1}})
 		default:
 			http.NotFound(w, r)
 		}
@@ -1385,5 +1698,142 @@ func TestForwardedTerminalEnvFiltersInvalidAndUnset(t *testing.T) {
 	env := forwardedTerminalEnv([]string{"PB_TEST_TERM", "PB_TEST_EMPTY", "PB_TEST_UNSET_VAR", "bad-key!"})
 	if len(env) != 1 || env["PB_TEST_TERM"] != "xterm-256color" {
 		t.Fatalf("env = %#v", env)
+	}
+}
+
+func TestTerminalHostErrorDistinguishesCapabilityAndAvailability(t *testing.T) {
+	receive := api.UserMachine{Online: true}
+	var apiErr *api.APIError
+	if err := terminalHostError(receive); !errors.As(err, &apiErr) || apiErr.Code != "machine_capability_unavailable" {
+		t.Fatalf("receive error = %#v", err)
+	}
+	host := receive
+	host.Capabilities.TerminalHost.Configured = true
+	if err := terminalHostError(host); !errors.As(err, &apiErr) || apiErr.Code != "machine_offline" {
+		t.Fatalf("offline host error = %#v", err)
+	}
+	host.Capabilities.TerminalHost.Observed = true
+	if err := terminalHostError(host); err != nil {
+		t.Fatalf("ready host error = %v", err)
+	}
+}
+
+func TestServeCommandContractValidation(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "index.html")
+	if err := os.WriteFile(file, []byte("ready"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "missing path", args: []string{"serve"}, want: "requires <path>"},
+		{name: "public acknowledgement", args: []string{"serve", file}, want: "pass --public"},
+		{name: "duration conflict", args: []string{"serve", file, "--public", "--duration", "1h", "--indefinite"}, want: "--duration"},
+		{name: "spa file", args: []string{"serve", file, "--public", "--spa"}, want: "--spa requires a directory"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := newRootCommand()
+			root.SetArgs(test.args)
+			err := root.ExecuteContext(context.Background())
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestServeCommandIsLocalOnly(t *testing.T) {
+	root := newRootCommand()
+	serveEntry, _, err := root.Find([]string{"serve"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if serveEntry.Flags().Lookup("machine") != nil {
+		t.Fatal("serve exposes a machine selector")
+	}
+	for _, name := range []string{"name", "duration", "indefinite", "detach", "spa", "public", "json"} {
+		if serveEntry.Flags().Lookup(name) == nil {
+			t.Errorf("missing --%s", name)
+		}
+	}
+}
+
+func TestServeJSONInvocationFailureUsesEnvelope(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run(context.Background(), []string{"serve", "--json"}, &stdout, &stderr)
+	if code != 2 || stderr.Len() != 0 {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	var envelope struct {
+		SchemaVersion string `json:"schema_version"`
+		OK            bool   `json:"ok"`
+		Error         struct {
+			Code               string `json:"code"`
+			Category           string `json:"category"`
+			PublicStateCreated any    `json:"public_state_created"`
+			Cleanup            string `json:"cleanup"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(stdout.Bytes(), &envelope) != nil || envelope.SchemaVersion != "1.0" || envelope.OK || envelope.Error.Code != "serve_invocation_invalid" || envelope.Error.Category != "usage" || envelope.Error.PublicStateCreated != "unknown" || envelope.Error.Cleanup != "not_required" {
+		t.Fatalf("envelope = %#v", envelope)
+	}
+}
+
+func TestServeProtocolIncompatibleUsesTypedEnvelope(t *testing.T) {
+	envelope := serveErrorEnvelope(errServeProtocolIncompatible)
+	if envelope["code"] != "protocol_incompatible" || envelope["category"] != "protocol" {
+		t.Fatalf("envelope = %#v", envelope)
+	}
+}
+
+func TestNormalizeServeName(t *testing.T) {
+	if got := normalizeServeName("", "My Report (Final).HTML"); got != "my-report-final-html" {
+		t.Fatalf("derived name = %q", got)
+	}
+	if got := normalizeServeName("docs_v2", "ignored"); got != "docs_v2" {
+		t.Fatalf("explicit name = %q", got)
+	}
+}
+
+func TestEnrichLocalServeSources(t *testing.T) {
+	stateRoot := t.TempDir()
+	t.Setenv("PAPERBOAT_RUNTIME_STATE_ROOT", stateRoot)
+	directory := filepath.Join(stateRoot, "previews", "active")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(t.TempDir(), "site")
+	descriptor := func(id, path string) []byte {
+		return []byte(fmt.Sprintf(`{"schema":"paperboat.preview-runtime/v2","record":{"id":%q},"serve":{"source_path":%q}}`, id, path))
+	}
+	if err := os.WriteFile(filepath.Join(directory, "valid.json"), descriptor("served", source), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "permissive.json"), descriptor("unsafe", "/private/unsafe"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(directory, "target")
+	if err := os.WriteFile(target, descriptor("linked", "/private/linked"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(directory, "linked.json")); err != nil {
+		t.Fatal(err)
+	}
+	items := enrichLocalServeSources([]api.Preview{
+		{ID: "served", SourceKind: "directory"},
+		{ID: "unsafe", SourceKind: "file"},
+		{ID: "linked", SourceKind: "file"},
+		{ID: "served", SourceKind: "application"},
+	})
+	if items[0].SourcePath != filepath.Clean(source) {
+		t.Fatalf("valid source path = %q", items[0].SourcePath)
+	}
+	for index := 1; index < len(items); index++ {
+		if items[index].SourcePath != "" {
+			t.Fatalf("unsafe item %d was enriched with %q", index, items[index].SourcePath)
+		}
 	}
 }

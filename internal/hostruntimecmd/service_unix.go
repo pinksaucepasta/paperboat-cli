@@ -21,6 +21,11 @@ func runServiceCommand(ctx context.Context, args []string, stdin io.Reader, _, _
 		return errors.New("service requires install, commit, or uninstall")
 	}
 	if args[0] == "uninstall" && os.Geteuid() != 0 {
+		if _, err := os.Stat(systemWorkerExecutable()); errors.Is(err, os.ErrNotExist) {
+			return removeSystemWorkerCommand()
+		} else if err != nil {
+			return err
+		}
 		if err := authorizePersistedUninstall(ctx); err != nil {
 			return err
 		}

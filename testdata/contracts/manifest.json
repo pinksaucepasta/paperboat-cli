@@ -6,7 +6,7 @@
       "id": "cli.behavior",
       "path": "cli/behavior.json",
       "type": "command-behavior",
-      "sha256": "0c52606834b8309a404a999d7c672d6e5feb77ae298da743f11cc6bc1251a14c",
+      "sha256": "7719ccf266d523e9e443ffe1c500f2410d6066a404ac61f4860bb0fc676bc464",
       "owner": "cli",
       "review": "preview-ownership-review",
       "consumers": [
@@ -17,7 +17,7 @@
       "id": "cli.command-tree",
       "path": "cli/command-tree.json",
       "type": "command-tree",
-      "sha256": "fc449e0c425abdb7bbc06e68fa2a0b421a0b931ccebc5fdbc340432a60f2ce17",
+      "sha256": "a579b1395c18e949ff4d977fdf742d1ff160cb8e8ae9b6caac941d04a465e520",
       "owner": "cli",
       "review": "preview-ownership-review",
       "consumers": [
@@ -39,7 +39,7 @@
       "id": "compatibility.matrix",
       "path": "compatibility/matrix.json",
       "type": "matrix",
-      "sha256": "363eaeff1e345a7f82bb836d38d7a43ee4f33af84427302bc4ca32f845f9d6d5",
+      "sha256": "e64823ef8af1b4cbef5d7eec035b4f5c01f733bd7ad8464bc8d2957130418ac8",
       "owner": "platform",
       "review": "initial-review",
       "consumers": [
@@ -344,7 +344,7 @@
       "id": "cli.output",
       "path": "schemas/cli/output.schema.json",
       "type": "json-schema",
-      "sha256": "33dfb08ba1f175ab260e6893ab953a7a16278bc04e15fb7bbf3eefa6a16b1355",
+      "sha256": "a01a360b35408433b2fee718f4808e4706cf457a064f679afa9a2ce2a68c7635",
       "owner": "cli",
       "review": "initial-review",
       "consumers": [
@@ -511,7 +511,7 @@
       "id": "preview.state",
       "path": "states/preview.json",
       "type": "state-table",
-      "sha256": "31be7fa3f648c68c69b06291b8766b4ded2526d69b5d7891ae1a242309620cca",
+      "sha256": "0133268d4c588bbd107467d899e35b87baa0240b3fa1360936288bfe2f4e7d39",
       "owner": "server",
       "review": "preview-ownership-review",
       "consumers": [
@@ -538,7 +538,7 @@
       "id": "cli.command.transcripts",
       "path": "transcripts/cli/commands.json",
       "type": "transcripts",
-      "sha256": "705fac8de454ca3d04c0a37a1eb09377de5eaff66fe47bda95a0f9aa5079ce6e",
+      "sha256": "d2e7879339b8ccdaa0b59cd2f4a25b3db960903a6a3075f607ccdba73af79764",
       "owner": "cli",
       "review": "preview-ownership-review",
       "consumers": [

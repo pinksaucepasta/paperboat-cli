@@ -138,6 +138,7 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 		Executable: executable, Artifact: *material.Artifact, ArtifactPublicKey: material.ArtifactPublicKey,
 		Home: home, Path: servicePath, StateRoot: *stateRoot, WorkspaceRoot: workspace, ControlURL: material.ControlURL,
 		UserMachineID: material.UserMachineID, Shell: resolvedShell, HelperListenAddress: material.HelperListenAddress,
+		SetupMode: "host",
 	}
 	previousGeneration := workerGeneration(*stateRoot)
 	fmt.Fprintln(stderr, "Paperboat must run before login and while this account is logged out.")
@@ -580,7 +581,7 @@ func installService(ctx context.Context, installer serviceInstaller, attempts in
 
 func prepareInstallation(ctx context.Context, material *bootstrap.Material, stateRoot string, artifactHTTP *http.Client, client enrollmentClient) (string, error) {
 	if material.ReuseIdentity {
-		identity, err := enrollment.LoadRuntimeIdentity(stateRoot, time.Now().UTC())
+		identity, err := enrollment.LoadRuntimeIdentityForRenewal(stateRoot, time.Now().UTC())
 		if err != nil || identity.HelperID != material.HelperID || identity.EnvironmentID != material.EnvironmentID {
 			return "", bootstrap.ErrInvalid
 		}

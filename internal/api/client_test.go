@@ -227,6 +227,33 @@ func TestCreateProjectChoicesDecodeFromScopedRoutes(t *testing.T) {
 	}
 }
 
+func TestFavoritesRoundTrip(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/favorites" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method == http.MethodPut {
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["kind"] != "machine" || body["resource_id"] != "mch_1" || body["favorite"] != true {
+				t.Fatalf("body=%v", body)
+			}
+		}
+		writeData(w, http.StatusOK, []Favorite{{Kind: "machine", ResourceID: "mch_1"}})
+	}))
+	defer srv.Close()
+	client := New(srv.URL, config.Credential{AccessToken: "token"}, srv.Client())
+	if items, err := client.ListFavorites(context.Background()); err != nil || len(items) != 1 || items[0].ResourceID != "mch_1" {
+		t.Fatalf("list=%v err=%v", items, err)
+	}
+	if items, err := client.SetFavorite(context.Background(), "machine", "mch_1", true); err != nil || len(items) != 1 {
+		t.Fatalf("set=%v err=%v", items, err)
+	}
+}
+
 func TestUserMachineRequestsUseScopedRoutes(t *testing.T) {
 	var paths []string
 	var connectBodies []string
@@ -631,5 +658,19 @@ func TestProjectConnectionDescriptorDecodesCanonicalDescriptor(t *testing.T) {
 	}
 	if response.ProjectID != "prj_1" || response.Terminal.Endpoints.WSS != "wss://edge.paperboat.test/v1/runtime" || response.FileTransfer.Endpoint != "https://edge.paperboat.test/v1/file-transfers" {
 		t.Fatalf("canonical response not decoded: %#v", response)
+	}
+}
+
+func TestLaunchMachinePreviewAcceptsCanonicalRuntimeRecord(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "prv_1", "environment_id": "env_1", "logical_name": "web", "preview_key": "p-test",
+			"url": "https://web.preview.example.test", "target_port": 3000, "state": "ready",
+		})
+	}))
+	defer server.Close()
+	record, err := LaunchMachinePreview(context.Background(), PreviewLaunchDescriptor{Endpoint: server.URL, Auth: AuthMaterial{Token: "token"}}, PreviewLaunchRequest{Name: "web", Port: 3000}, server.Client().Transport)
+	if err != nil || record.ID != "prv_1" || record.EnvironmentID != "env_1" || record.TargetPort != 3000 {
+		t.Fatalf("record=%+v err=%v", record, err)
 	}
 }

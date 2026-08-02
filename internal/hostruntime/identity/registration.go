@@ -20,15 +20,19 @@ type Registration struct {
 	PublicIdentityKey      string    `json:"public_identity_key"`
 	InboxPath              string    `json:"inbox_path"`
 	InstallationGeneration int64     `json:"installation_generation"`
+	SetupMode              string    `json:"setup_mode"`
 	SetupRoles             []string  `json:"setup_roles"`
 	UpdatedAt              time.Time `json:"updated_at"`
 }
 
 func (s *Store) SaveRegistration(value Registration) error {
+	if value.SetupMode == "" {
+		value.SetupMode = setupModeFromRoles(value.SetupRoles)
+	}
 	if strings.TrimSpace(value.ServerURL) == "" || strings.TrimSpace(value.MachineID) == "" ||
 		strings.TrimSpace(value.EnvironmentID) == "" || value.PublicKeyID != s.key.ID ||
 		strings.TrimSpace(value.PublicIdentityKey) == "" || !filepath.IsAbs(value.InboxPath) || value.InstallationGeneration < 1 ||
-		value.UpdatedAt.IsZero() {
+		!validSetupMode(value.SetupMode) || value.UpdatedAt.IsZero() {
 		return ErrInvalidStore
 	}
 	value.Version = 1
@@ -71,6 +75,19 @@ func (s *Store) SaveRegistration(value Registration) error {
 	return syncDirectory(s.config.StateRoot)
 }
 
+func validSetupMode(mode string) bool {
+	return mode == "receive" || mode == "session" || mode == "host"
+}
+
+func setupModeFromRoles(roles []string) string {
+	for _, role := range roles {
+		if role == "host" {
+			return "host"
+		}
+	}
+	return "session"
+}
+
 func (s *Store) Registration() (Registration, error) {
 	path := filepath.Join(s.config.StateRoot, "machine-registration.json")
 	info, err := os.Lstat(path)
@@ -94,6 +111,12 @@ func (s *Store) Registration() (Registration, error) {
 	if err := decoder.Decode(&extra); err != io.EOF || value.Version != 1 ||
 		value.PublicKeyID != s.key.ID || strings.TrimSpace(value.MachineID) == "" ||
 		strings.TrimSpace(value.ServerURL) == "" || !filepath.IsAbs(value.InboxPath) || value.InstallationGeneration < 1 {
+		return Registration{}, ErrInvalidStore
+	}
+	if value.SetupMode == "" {
+		value.SetupMode = setupModeFromRoles(value.SetupRoles)
+	}
+	if !validSetupMode(value.SetupMode) {
 		return Registration{}, ErrInvalidStore
 	}
 	return value, nil

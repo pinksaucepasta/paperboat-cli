@@ -227,22 +227,59 @@ type ProjectPage struct {
 // connector rather than a Paperboat-managed Fly VM. The control plane owns its
 // lifecycle and authorization; the CLI only needs enough metadata to select it.
 type UserMachine struct {
-	ID                     string             `json:"id"`
-	EnvironmentID          string             `json:"environment_id"`
-	DisplayName            string             `json:"display_name"`
-	State                  string             `json:"state"`
-	Online                 bool               `json:"online"`
-	Platform               string             `json:"platform"`
-	Architecture           string             `json:"architecture"`
-	WorkspaceRoot          string             `json:"workspace_root"`
-	SetupRoles             []string           `json:"setup_roles"`
-	PublicIdentityKey      string             `json:"public_identity_key"`
-	InstallationGeneration int64              `json:"installation_generation"`
-	Availability           AvailabilityPolicy `json:"availability"`
-	RuntimeDiagnostics     RuntimeDiagnostics `json:"runtime_diagnostics"`
+	ID                     string               `json:"id"`
+	EnvironmentID          string               `json:"environment_id"`
+	DisplayName            string               `json:"display_name"`
+	State                  string               `json:"state"`
+	Online                 bool                 `json:"online"`
+	Platform               string               `json:"platform"`
+	Architecture           string               `json:"architecture"`
+	WorkspaceRoot          string               `json:"workspace_root"`
+	SetupRoles             []string             `json:"setup_roles"`
+	SetupMode              string               `json:"setup_mode"`
+	Capabilities           MachineCapabilities  `json:"capabilities"`
+	PublicIdentityKey      string               `json:"public_identity_key"`
+	InstallationGeneration int64                `json:"installation_generation"`
+	Availability           AvailabilityPolicy   `json:"availability"`
+	RuntimeDiagnostics     RuntimeDiagnostics   `json:"runtime_diagnostics"`
+	Installation           *ReceiveInstallation `json:"installation,omitempty"`
+}
+
+type MachineArtifact struct {
+	Schema       string `json:"schema"`
+	Kind         string `json:"kind"`
+	Version      string `json:"version"`
+	Platform     string `json:"platform"`
+	Architecture string `json:"architecture"`
+	URL          string `json:"url"`
+	ByteLength   int64  `json:"byte_length"`
+	SHA256       string `json:"sha256"`
+	Signature    string `json:"signature"`
+}
+
+type ReceiveInstallation struct {
+	ControlURL          string          `json:"control_url"`
+	HelperListenAddress string          `json:"helper_listen_address"`
+	Artifact            MachineArtifact `json:"artifact"`
+	ArtifactPublicKey   string          `json:"artifact_public_key"`
+}
+
+type MachineCapability struct {
+	Configured bool `json:"configured"`
+	Observed   bool `json:"observed"`
+}
+
+type MachineCapabilities struct {
+	FileReceive   MachineCapability `json:"file_receive"`
+	PreviewLaunch MachineCapability `json:"preview_launch"`
+	TerminalHost  MachineCapability `json:"terminal_host"`
+	CodexHost     MachineCapability `json:"codex_host"`
+	SessionHost   MachineCapability `json:"session_host"`
+	KeepAwake     MachineCapability `json:"keep_awake"`
 }
 
 type MachineSetupInput struct {
+	SetupMode         string            `json:"setup_mode"`
 	DisplayName       string            `json:"display_name"`
 	Platform          string            `json:"platform"`
 	Architecture      string            `json:"architecture"`
@@ -357,6 +394,27 @@ type Preview struct {
 	EnvironmentName string     `json:"environment_name"`
 	EnvironmentKind string     `json:"environment_kind"`
 	OwnerEmail      string     `json:"owner_email"`
+	SourceKind      string     `json:"source_kind"`
+	OwnerMode       string     `json:"owner_mode"`
+	SourcePath      string     `json:"source_path,omitempty"`
+}
+
+type Favorite struct {
+	Kind       string    `json:"kind"`
+	ResourceID string    `json:"resource_id"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
+func (c *Client) ListFavorites(ctx context.Context) ([]Favorite, error) {
+	var out []Favorite
+	err := c.do(ctx, http.MethodGet, "/v1/favorites", nil, &out)
+	return out, err
+}
+
+func (c *Client) SetFavorite(ctx context.Context, kind, resourceID string, favorite bool) ([]Favorite, error) {
+	var out []Favorite
+	err := c.do(ctx, http.MethodPut, "/v1/favorites", map[string]any{"kind": kind, "resource_id": resourceID, "favorite": favorite}, &out)
+	return out, err
 }
 
 func (c *Client) ListPreviews(ctx context.Context) ([]Preview, error) {
@@ -507,6 +565,43 @@ type Environment struct {
 	ProjectRoot   string `json:"project_root"`
 }
 
+type CodexSession struct {
+	ID                 string    `json:"id"`
+	EnvironmentID      string    `json:"environment_id"`
+	MachineID          string    `json:"machine_id"`
+	State              string    `json:"state"`
+	LeaseExpiresAt     time.Time `json:"lease_expires_at"`
+	RemoteCodexVersion string    `json:"remote_codex_version,omitempty"`
+	FailureCode        string    `json:"failure_code,omitempty"`
+}
+type CodexDescriptor struct {
+	Session             CodexSession `json:"session"`
+	ManagementURL       string       `json:"management_url"`
+	WebSocketURL        string       `json:"websocket_url"`
+	ManageCredential    string       `json:"manage_credential"`
+	ConnectCredential   string       `json:"connect_credential"`
+	CredentialsExpireAt time.Time    `json:"credentials_expire_at"`
+}
+
+func (c *Client) CreateCodexSession(ctx context.Context, environmentID, idempotencyKey string) (CodexSession, error) {
+	var out CodexSession
+	err := c.doWithHeaders(ctx, http.MethodPost, "/v1/codex-sessions", map[string]string{"environment_id": environmentID}, &out, http.Header{"Idempotency-Key": []string{idempotencyKey}})
+	return out, err
+}
+func (c *Client) CodexSessionDescriptor(ctx context.Context, id string) (CodexDescriptor, error) {
+	var out CodexDescriptor
+	err := c.do(ctx, http.MethodGet, "/v1/codex-sessions/"+url.PathEscape(id)+"/descriptor", nil, &out)
+	return out, err
+}
+func (c *Client) RenewCodexSession(ctx context.Context, id string) (CodexSession, error) {
+	var out CodexSession
+	err := c.do(ctx, http.MethodPost, "/v1/codex-sessions/"+url.PathEscape(id)+"/renew", nil, &out)
+	return out, err
+}
+func (c *Client) DeleteCodexSession(ctx context.Context, id string) error {
+	return c.do(ctx, http.MethodDelete, "/v1/codex-sessions/"+url.PathEscape(id), nil, nil)
+}
+
 // Terminal is the CLI-safe Paperboat WebSocket attach descriptor from
 // cli-connect. It carries client-safe Paperboat route URLs, not raw VM
 // addresses or SSH credentials.
@@ -553,18 +648,36 @@ type PreviewLaunchDescriptor struct {
 }
 
 type PreviewLaunchRequest struct {
+	OperationID     string `json:"operation_id"`
 	Name            string `json:"name"`
 	Port            uint16 `json:"port"`
 	DurationSeconds int64  `json:"duration_seconds,omitempty"`
 	Indefinite      bool   `json:"indefinite,omitempty"`
 }
 
+type PreviewLaunchError struct {
+	Code         string `json:"code"`
+	Message      string `json:"message"`
+	Retryable    bool   `json:"retryable"`
+	MachineID    string `json:"machine_id"`
+	Name         string `json:"name"`
+	Port         uint16 `json:"port"`
+	StateCreated bool   `json:"state_created"`
+	Cleanup      string `json:"cleanup"`
+	Recovery     string `json:"recovery"`
+}
+
+func (e *PreviewLaunchError) Error() string { return e.Message }
+
 type PreviewRecord struct {
-	PreviewKey  string     `json:"preview_key"`
-	LogicalName string     `json:"logical_name"`
-	URL         string     `json:"url"`
-	State       string     `json:"state"`
-	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
+	ID            string     `json:"id"`
+	EnvironmentID string     `json:"environment_id"`
+	PreviewKey    string     `json:"preview_key"`
+	LogicalName   string     `json:"logical_name"`
+	URL           string     `json:"url"`
+	TargetPort    int32      `json:"target_port"`
+	State         string     `json:"state"`
+	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
 }
 
 // ConnectionDescriptor is the cli-connect / connection-status descriptor. When
@@ -910,6 +1023,14 @@ func LaunchMachinePreview(ctx context.Context, descriptor PreviewLaunchDescripto
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		var envelope struct {
+			Error PreviewLaunchError `json:"error"`
+		}
+		decoder := json.NewDecoder(io.LimitReader(response.Body, 64<<10))
+		decoder.DisallowUnknownFields()
+		if decoder.Decode(&envelope) == nil && envelope.Error.Code != "" && envelope.Error.Message != "" {
+			return PreviewRecord{}, &envelope.Error
+		}
 		return PreviewRecord{}, fmt.Errorf("remote preview launch failed with status %d", response.StatusCode)
 	}
 	var record PreviewRecord

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/bootstrap"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/codexsession"
 	runtimeconfig "github.com/pinksaucepasta/paperboat/internal/hostruntime/config"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/configapply"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/filetransfer"
@@ -27,6 +28,7 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/process"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/protocol"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/pty"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/servelease"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/server"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/session"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/store"
@@ -72,6 +74,9 @@ type HostDependencies struct {
 	HostedLifecycle        HostedLifecycle
 	SessionLauncherFactory func(*session.Manager) (server.SessionLauncher, error)
 	Metrics                *observability.Registry
+	CodexSessions          *codexsession.Manager
+	ServeLeases            *servelease.Manager
+	LocalControlToken      string
 }
 
 type HostedLifecycle interface {
@@ -84,6 +89,120 @@ type Host struct {
 	http     *HTTPService
 	handler  http.Handler
 	sessions *session.Manager
+}
+
+func NewReceiveCoordinator(ctx context.Context, config HostConfig, dependencies HostDependencies) (_ *Host, resultErr error) {
+	if err := config.Runtime.Validate(); err != nil || !LoopbackAddress(config.ListenAddress) || !filepath.IsAbs(config.WorkspaceRoot) || config.MachineID == "" || dependencies.Authorizer == nil || dependencies.Connector == nil || dependencies.RuntimeObservationService == nil {
+		return nil, errors.Join(ErrHostInvalid, err)
+	}
+	if config.ShutdownTimeout <= 0 {
+		config.ShutdownTimeout = 30 * time.Second
+	}
+	if config.FileTransferPolicy == nil {
+		config.FileTransferPolicy = filetransfer.NewPolicyStore(filetransfer.DefaultPolicy)
+	}
+	durable, err := store.Open(ctx, store.Config{Root: config.Runtime.StateRoot})
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if resultErr != nil {
+			resultErr = errors.Join(resultErr, durable.Close())
+		}
+	}()
+	resources := config.Runtime.Resources
+	if resources == (runtimeconfig.ResourceLimits{}) {
+		resources = runtimeconfig.DefaultResources
+	}
+	journal, err := operation.NewPersistentJournal(ctx, resources.MaxConcurrentOps*32, durable, time.Hour, nil)
+	if err != nil {
+		return nil, err
+	}
+	transferService, err := filetransfer.New(filetransfer.Config{Root: filepath.Join(config.Runtime.StateRoot, "file-transfers"), LocalMachineID: config.MachineID, Store: durable, PublishRoot: config.InboxPath, Random: rand.Reader, Policy: config.FileTransferPolicy})
+	if err != nil {
+		return nil, err
+	}
+	transferHandler, err := server.NewFileTransferHandler(server.FileTransferHandlerConfig{
+		Service: transferService, Journal: journal, Authorizer: dependencies.Authorizer,
+		AuthorizeCreate: func(authorization server.Authorization, request server.CreateFileTransferRequest) bool {
+			return authorization.MachineID == config.MachineID && authorization.UserID != "" && request.SourceMachineID == authorization.SourceMachineID && request.InitiatingUserID == authorization.UserID && request.DestinationMachineID == config.MachineID && request.SessionID == ""
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	mux := http.NewServeMux()
+	if dependencies.ServeLeases != nil && dependencies.LocalControlToken != "" {
+		mux.Handle("/v1/serve-leases", servelease.Handler{Manager: dependencies.ServeLeases, Token: dependencies.LocalControlToken})
+	}
+	mux.Handle("/v1/file-transfers", transferHandler)
+	mux.Handle("/v1/file-transfers/", transferHandler)
+	if dependencies.PreviewLauncher != nil {
+		handler, launchErr := server.NewPreviewLaunchHandler(server.PreviewLaunchHandlerConfig{Authorizer: dependencies.Authorizer, Launcher: dependencies.PreviewLauncher, MachineID: config.MachineID})
+		if launchErr != nil {
+			return nil, launchErr
+		}
+		mux.Handle("/v1/preview-launches", handler)
+	}
+	healthSource := &runtimeHealthSource{}
+	mux.HandleFunc("/healthz", func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		writer.Header().Set("Cache-Control", "no-store")
+		workloads := map[string]uint64{"transfers": transferWorkloadCount(filepath.Join(config.Runtime.StateRoot, "file-transfers")), "serves_detached": uint64(activeDetachedServeCount(config.Runtime.StateRoot, time.Now().UTC()))}
+		if dependencies.ServeLeases != nil {
+			workloads["serves_foreground"] = uint64(dependencies.ServeLeases.Count())
+		}
+		_ = json.NewEncoder(writer).Encode(struct {
+			health.Snapshot
+			FileTransferPolicy filetransfer.Policy `json:"file_transfer_policy"`
+			Workloads          map[string]uint64   `json:"workloads"`
+		}{Snapshot: healthSource.Snapshot(), FileTransferPolicy: config.FileTransferPolicy.Current(), Workloads: workloads})
+	})
+	if dependencies.Metrics != nil {
+		mux.Handle("/metrics", dependencies.Metrics.Handler())
+	}
+	httpService, err := NewHTTPService(HTTPConfig{Address: config.ListenAddress, Handler: mux, Listener: dependencies.Listener})
+	if err != nil {
+		return nil, err
+	}
+	components := []Component{
+		{Capability: "storage", Required: true, Service: shutdownService{shutdown: func(context.Context) error { return durable.Close() }}},
+		{Capability: "file_transfer_cleanup", Required: true, Service: &filetransfer.CleanupWorker{Service: transferService}},
+	}
+	if dependencies.AuthorizationService != nil {
+		components = append(components, Component{Capability: "authorization", Required: false, Service: dependencies.AuthorizationService})
+	}
+	if dependencies.PreviewRecovery != nil {
+		components = append(components, Component{Capability: "preview_recovery", Required: false, Service: dependencies.PreviewRecovery})
+	}
+	if dependencies.ServeLeases != nil {
+		components = append(components, Component{Capability: "serve_lease", Required: false, Service: dependencies.ServeLeases})
+	}
+	components = append(components,
+		Component{Capability: "runtime_observation", Required: true, Service: dependencies.RuntimeObservationService},
+		Component{Capability: "edge", Required: true, Service: dependencies.Connector},
+		Component{Capability: "control_plane", Required: true, Service: httpService},
+	)
+	runtime, err := NewRuntime(Config{Version: config.Runtime.Version, Components: components, ShutdownTimeout: config.ShutdownTimeout})
+	if err != nil {
+		return nil, err
+	}
+	healthSource.set(runtime, components)
+	return &Host{runtime: runtime, http: httpService, handler: mux}, nil
+}
+
+func transferWorkloadCount(root string) uint64 {
+	entries, err := os.ReadDir(root)
+	if errors.Is(err, os.ErrNotExist) || err != nil {
+		return 0
+	}
+	var count uint64
+	for _, entry := range entries {
+		if !entry.IsDir() && filepath.Ext(entry.Name()) == ".content" {
+			count++
+		}
+	}
+	return count
 }
 
 func NewHost(ctx context.Context, config HostConfig, dependencies HostDependencies) (_ *Host, resultErr error) {
@@ -262,7 +381,25 @@ func NewHost(ctx context.Context, config HostConfig, dependencies HostDependenci
 		return nil, err
 	}
 	mux := http.NewServeMux()
+	if dependencies.ServeLeases != nil && dependencies.LocalControlToken != "" {
+		mux.Handle("/v1/serve-leases", servelease.Handler{Manager: dependencies.ServeLeases, Token: dependencies.LocalControlToken})
+	}
 	mux.Handle("/v1/runtime", websocketHandler)
+	if dependencies.CodexSessions != nil {
+		codexHandler, codexErr := codexsession.NewHandler(codexsession.HandlerConfig{Manager: dependencies.CodexSessions, Authorizer: dependencies.Authorizer})
+		if codexErr != nil {
+			return nil, codexErr
+		}
+		mux.Handle("/v1/codex-sessions/{session_id}/ws", codexHandler)
+		managementHandler, managementErr := codexsession.NewManagementHandler(dependencies.CodexSessions, dependencies.Authorizer)
+		if managementErr != nil {
+			return nil, managementErr
+		}
+		mux.Handle("POST /v1/codex-sessions/{session_id}", managementHandler)
+		mux.Handle("POST /v1/codex-sessions/{session_id}/renew", managementHandler)
+		mux.Handle("GET /v1/codex-sessions/{session_id}/directories", managementHandler)
+		mux.Handle("DELETE /v1/codex-sessions/{session_id}", managementHandler)
+	}
 	mux.Handle("/v1/file-transfers", transferHandler)
 	mux.Handle("/v1/file-transfers/", transferHandler)
 	if dependencies.PreviewLauncher != nil {
@@ -283,11 +420,16 @@ func NewHost(ctx context.Context, config HostConfig, dependencies HostDependenci
 		writer.Header().Set("Content-Type", "application/json")
 		writer.Header().Set("Cache-Control", "no-store")
 		snapshot := healthSource.Snapshot()
+		workloads := hostWorkloadCounts(sessions, filepath.Join(config.Runtime.StateRoot, "file-transfers"))
+		workloads["serves_detached"] = uint64(activeDetachedServeCount(config.Runtime.StateRoot, time.Now().UTC()))
+		if dependencies.ServeLeases != nil {
+			workloads["serves_foreground"] = uint64(dependencies.ServeLeases.Count())
+		}
 		_ = json.NewEncoder(writer).Encode(struct {
 			health.Snapshot
 			FileTransferPolicy filetransfer.Policy `json:"file_transfer_policy"`
 			Workloads          map[string]uint64   `json:"workloads"`
-		}{Snapshot: snapshot, FileTransferPolicy: config.FileTransferPolicy.Current(), Workloads: hostWorkloadCounts(sessions, filepath.Join(config.Runtime.StateRoot, "file-transfers"))})
+		}{Snapshot: snapshot, FileTransferPolicy: config.FileTransferPolicy.Current(), Workloads: workloads})
 	})
 	if dependencies.Metrics != nil {
 		mux.Handle("/metrics", dependencies.Metrics.Handler())
@@ -303,6 +445,9 @@ func NewHost(ctx context.Context, config HostConfig, dependencies HostDependenci
 		Component{Capability: "sessions", Required: true, Service: shutdownService{shutdown: sessions.ShutdownForRecovery}},
 		Component{Capability: "file_transfer_cleanup", Required: true, Service: transferCleanup},
 	)
+	if dependencies.CodexSessions != nil {
+		components = append(components, Component{Capability: "codex.v1", Required: false, Service: &codexSessionService{manager: dependencies.CodexSessions}})
+	}
 	if dependencies.AuthorizationService != nil {
 		components = append(components, Component{Capability: "authorization", Required: false, Service: dependencies.AuthorizationService})
 	}
@@ -318,6 +463,9 @@ func NewHost(ctx context.Context, config HostConfig, dependencies HostDependenci
 	}
 	if dependencies.PreviewRecovery != nil {
 		components = append(components, Component{Capability: "preview_recovery", Required: false, Service: dependencies.PreviewRecovery})
+	}
+	if dependencies.ServeLeases != nil {
+		components = append(components, Component{Capability: "serve_lease", Required: false, Service: dependencies.ServeLeases})
 	}
 	if dependencies.RuntimeObservationService != nil {
 		components = append(components, Component{Capability: "runtime_observation", Required: false, Service: dependencies.RuntimeObservationService})

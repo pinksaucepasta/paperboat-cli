@@ -145,6 +145,23 @@ func TestPrepareInstallationVerifiesArtifactBeforeEnrollment(t *testing.T) {
 
 func TestPrepareInstallationReusesMatchingPersistedIdentity(t *testing.T) {
 	stateRoot := enrolledStateRoot(t, "helper_reuse", "env_reuse")
+	identityPath := filepath.Join(stateRoot, "runtime-identity.json")
+	identityBody, err := os.ReadFile(identityPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persistedIdentity enrollment.RuntimeIdentity
+	if err := json.Unmarshal(identityBody, &persistedIdentity); err != nil {
+		t.Fatal(err)
+	}
+	persistedIdentity.ExpiresAt = time.Now().UTC().Add(-time.Hour)
+	identityBody, err = json.Marshal(persistedIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(identityPath, identityBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	body := []byte("verified helper")
 	artifactServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(body) }))
 	defer artifactServer.Close()

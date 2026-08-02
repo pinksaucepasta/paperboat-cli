@@ -15,8 +15,8 @@ type ConnectRequest struct {
 	Project string
 	// Credential is the current Paperboat client-session access credential.
 	Credential config.Credential
-	// TerminalSessionID is the immutable server catalog ID. Empty selects the
-	// project's durable default session.
+	// TerminalSessionID is the immutable server catalog ID. It is required for
+	// terminal connections; pb creates a fresh session before resolving.
 	TerminalSessionID string
 }
 

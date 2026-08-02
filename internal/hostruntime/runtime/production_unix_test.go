@@ -76,6 +76,18 @@ func TestProductionHelperRequiresHTTPSControl(t *testing.T) {
 	}
 }
 
+func TestInstalledHostModeOverridesReceiveRegistrationDuringUpgrade(t *testing.T) {
+	if shouldRunReceiveCoordinator("receive", "host") {
+		t.Fatal("host installation started the receive coordinator")
+	}
+	if !shouldRunReceiveCoordinator("receive", "receive") {
+		t.Fatal("receive installation did not start the receive coordinator")
+	}
+	if shouldRunReceiveCoordinator("host", "host") {
+		t.Fatal("host registration started the receive coordinator")
+	}
+}
+
 func TestValidatedBYODShellRequiresExecutableAbsoluteFile(t *testing.T) {
 	shell := filepath.Join(t.TempDir(), "shell")
 	if err := os.WriteFile(shell, []byte("#!/bin/sh\n"), 0o700); err != nil {

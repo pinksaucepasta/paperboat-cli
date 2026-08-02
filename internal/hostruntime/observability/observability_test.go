@@ -96,6 +96,7 @@ func TestDefaultMetricVocabularyHasFixedCardinality(t *testing.T) {
 		{"paperboat_runtime_terminal_events_total", map[string]string{"event": "slow_consumer"}},
 		{"paperboat_runtime_delivery_total", map[string]string{"kind": "preview", "result": "failed"}},
 		{"paperboat_runtime_cleanup_total", map[string]string{"kind": "upload", "result": "preserved"}},
+		{"paperboat_runtime_serve_events_total", map[string]string{"event": "lease_loss", "result": "expired"}},
 	}
 	for _, metric := range valid {
 		if err := registry.Record(metric.name, 1, metric.labels); err != nil {
@@ -107,6 +108,28 @@ func TestDefaultMetricVocabularyHasFixedCardinality(t *testing.T) {
 	}
 	if err := registry.Record("paperboat_runtime_delivery_total", 1, map[string]string{"kind": "customer_123", "result": "failed"}); !errors.Is(err, ErrInvalidLabels) {
 		t.Fatalf("unbounded label err=%v", err)
+	}
+}
+
+func TestServeLatencyIsPrometheusHistogram(t *testing.T) {
+	registry, err := NewRegistry(DefaultDescriptors())
+	if err != nil {
+		t.Fatal(err)
+	}
+	labels := map[string]string{"stage": "readiness", "owner": "detached", "result": "ok"}
+	if err := registry.Record("paperboat_runtime_serve_latency_seconds", 0.2, labels); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Record("paperboat_runtime_serve_latency_seconds", 2, labels); err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	registry.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := response.Body.String()
+	for _, expected := range []string{"paperboat_runtime_serve_latency_seconds_bucket", "le=\"0.5\"", "paperboat_runtime_serve_latency_seconds_sum", "paperboat_runtime_serve_latency_seconds_count"} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("metrics missing %q:\n%s", expected, body)
+		}
 	}
 }
 

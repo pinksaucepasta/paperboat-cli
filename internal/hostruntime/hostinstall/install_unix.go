@@ -57,6 +57,7 @@ type Request struct {
 	UserMachineID       string                     `json:"machine_id"`
 	Shell               string                     `json:"shell"`
 	HelperListenAddress string                     `json:"helper_listen_address"`
+	SetupMode           string                     `json:"setup_mode"`
 }
 
 func Decode(reader io.Reader) (Request, error) {
@@ -102,11 +103,32 @@ func Install(ctx context.Context, request Request) error {
 	if err != nil {
 		return errors.Join(ErrInvalidRequest, err)
 	}
-	if err := host.Install(ctx); err != nil {
-		return errors.Join(err, rollbackFiles(paths, journal))
+	if host != nil {
+		if err := host.Install(ctx); err != nil {
+			return errors.Join(err, rollbackFiles(paths, journal))
+		}
 	}
 	if err := worker.Install(ctx); err != nil {
-		return errors.Join(err, host.Uninstall(ctx), rollbackFiles(paths, journal))
+		var hostErr error
+		if host != nil {
+			hostErr = host.Uninstall(ctx)
+		}
+		return errors.Join(err, hostErr, rollbackFiles(paths, journal))
+	}
+	if request.SetupMode == "receive" {
+		obsoleteHost, hostErr := hostInstaller(request, paths)
+		if hostErr != nil {
+			return errors.Join(hostErr, worker.Uninstall(ctx), rollbackFiles(paths, journal))
+		}
+		_, statErr := os.Lstat(obsoleteHost.DefinitionPath())
+		if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+			return errors.Join(statErr, worker.Uninstall(ctx), rollbackFiles(paths, journal))
+		}
+		if statErr == nil {
+			if err := obsoleteHost.Uninstall(ctx); err != nil {
+				return errors.Join(err, worker.Uninstall(ctx), rollbackFiles(paths, journal))
+			}
+		}
 	}
 	journal.Stage, journal.UpdatedAt = "services_started", time.Now().UTC()
 	return writeJournal(paths.journal, journal)
@@ -162,8 +184,12 @@ func uninstallValidated(ctx context.Context, request Request, paths installPaths
 	if err != nil {
 		return errors.Join(ErrInvalidRequest, err)
 	}
-	serviceErr := errors.Join(worker.Uninstall(ctx), host.Uninstall(ctx))
-	restoreErr := hostservice.NewPlatformApplier(filepath.Join(paths.state, "power-baseline.json")).Apply(ctx, hostservice.AllowSleep)
+	serviceErr := worker.Uninstall(ctx)
+	var restoreErr error
+	if host != nil {
+		serviceErr = errors.Join(serviceErr, host.Uninstall(ctx))
+		restoreErr = hostservice.NewPlatformApplier(filepath.Join(paths.state, "power-baseline.json")).Apply(ctx, hostservice.AllowSleep)
+	}
 	journal, journalErr := loadJournal(paths.journal)
 	if journalErr == nil {
 		return errors.Join(serviceErr, restoreErr, rollbackFiles(paths, journal))
@@ -176,12 +202,8 @@ func uninstallValidated(ctx context.Context, request Request, paths installPaths
 
 func installers(request Request, paths installPaths) (*service.Installer, *service.Installer, error) {
 	workerController := service.Controller(service.SystemdController{Runner: service.ExecRunner{}})
-	hostController := service.Controller(service.SystemdController{Runner: service.ExecRunner{}, Unit: "paperboat-runtime-privileged.service"})
-	rootGroup := "root"
 	if runtime.GOOS == "darwin" {
-		rootGroup = "wheel"
 		workerController = service.LaunchdController{Runner: service.ExecRunner{}, UID: request.UID}
-		hostController = service.LaunchdController{Runner: service.ExecRunner{}, UID: request.UID, Label: service.HostLabel}
 	}
 	worker, err := service.New(service.Config{
 		Platform: request.Platform, Kind: service.WorkerKind, ConfigRoot: string(os.PathSeparator), Executable: paths.worker,
@@ -191,6 +213,23 @@ func installers(request Request, paths installPaths) (*service.Installer, *servi
 	if err != nil {
 		return nil, nil, err
 	}
+	if request.SetupMode == "receive" {
+		return worker, nil, nil
+	}
+	host, err := hostInstaller(request, paths)
+	if err != nil {
+		return nil, nil, err
+	}
+	return worker, host, nil
+}
+
+func hostInstaller(request Request, paths installPaths) (*service.Installer, error) {
+	hostController := service.Controller(service.SystemdController{Runner: service.ExecRunner{}, Unit: "paperboat-runtime-privileged.service"})
+	rootGroup := "root"
+	if runtime.GOOS == "darwin" {
+		rootGroup = "wheel"
+		hostController = service.LaunchdController{Runner: service.ExecRunner{}, UID: request.UID, Label: service.HostLabel}
+	}
 	host, err := service.New(service.Config{
 		Platform: request.Platform, Kind: service.HostKind, ConfigRoot: string(os.PathSeparator), Executable: paths.worker,
 		User: "root", Group: rootGroup, Arguments: []string{
@@ -199,9 +238,9 @@ func installers(request Request, paths installPaths) (*service.Installer, *servi
 		}, Controller: hostController,
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return worker, host, nil
+	return host, nil
 }
 
 type installPaths struct{ root, state, worker, workerNext, workerRollback, workerPrevious, journal, metadata string }
@@ -374,7 +413,9 @@ func recoverInterrupted(ctx context.Context, request Request, paths installPaths
 	if regularFile(paths.worker) {
 		if worker, host, installErr := installers(request, paths); installErr == nil {
 			_ = worker.Uninstall(ctx)
-			_ = host.Uninstall(ctx)
+			if host != nil {
+				_ = host.Uninstall(ctx)
+			}
 		}
 	}
 	return rollbackFiles(paths, journal)
@@ -485,7 +526,7 @@ func secureRootDirectory(path string, mode os.FileMode) error {
 
 func Validate(request Request, sudoUID int) error {
 	if request.Schema != SchemaV1 || request.Platform != runtime.GOOS || !validRunIdentity(request) || sudoUID != request.UID ||
-		request.UserMachineID == "" || strings.ContainsAny(request.UserMachineID, "\x00\r\n") {
+		request.UserMachineID == "" || !slices.Contains([]string{"receive", "host"}, request.SetupMode) || strings.ContainsAny(request.UserMachineID, "\x00\r\n") {
 		return ErrInvalidRequest
 	}
 	account, err := user.Lookup(request.User)
@@ -535,6 +576,7 @@ func workerEnvironment(request Request) map[string]string {
 		"PAPERBOAT_CONTROL_URL": request.ControlURL, "PAPERBOAT_MACHINE_ID": request.UserMachineID,
 		"PAPERBOAT_SHELL": request.Shell, "PAPERBOAT_RUNTIME_LISTEN_ADDRESS": request.HelperListenAddress,
 		"PAPERBOAT_RUNTIME_SERVICE_SCOPE": "system",
+		"PAPERBOAT_SETUP_MODE":            request.SetupMode,
 	}
 }
 
