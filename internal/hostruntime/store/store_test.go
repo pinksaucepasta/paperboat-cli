@@ -339,6 +339,10 @@ func TestInterruptedInitialMigrationRollsBackAndReopensCleanly(t *testing.T) {
 	if err := store.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != CurrentVersion {
 		t.Fatalf("version=%d err=%v", version, err)
 	}
+	var applied bool
+	if err := store.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM goose_db_version WHERE version_id=1 AND is_applied=1)`).Scan(&applied); err != nil || !applied {
+		t.Fatalf("goose baseline applied=%t err=%v", applied, err)
+	}
 	if err := store.CreateSession(context.Background(), testSession()); err != nil {
 		t.Fatal(err)
 	}

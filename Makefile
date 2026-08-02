@@ -9,12 +9,13 @@ ANDROID_API ?= 24
 ANDROID_NDK_HOME ?= $(HOME)/Library/Android/sdk/ndk/27.1.12297006
 ANDROID_CC ?= $(ANDROID_NDK_HOME)/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android$(ANDROID_API)-clang
 GO_VERSION  := 1.25.7
+SQLC_VERSION := v1.30.0
 GO          := GOTOOLCHAIN=local go
 GOFMT       := $(shell GOTOOLCHAIN=local go env GOROOT 2>/dev/null)/bin/gofmt
 GO_FILES    := $(shell find . -path ./.git -prune -o -name '*.go' -print)
 LDFLAGS     := -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Version=$(VERSION) -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Commit=$(COMMIT) -X github.com/pinksaucepasta/paperboat/internal/buildinfo.ProtocolVersion=$(PROTOCOL_VERSION)
 
-.PHONY: build check clean complete contracts cross-build fmt fmt-check generate install lint race release-metadata test tidy uninstall verify-toolchain vet
+.PHONY: build check clean complete contracts cross-build fmt fmt-check generate generate-check install lint race release-metadata test tidy uninstall verify-toolchain vet
 
 contracts:
 	@./testdata/contracts/validate.sh
@@ -71,14 +72,18 @@ fmt-check:
 	@test -z "$$($(GOFMT) -l $(GO_FILES))" || { $(GOFMT) -l $(GO_FILES); echo "Go files are not formatted" >&2; exit 1; }
 
 generate:
+	$(GO) run github.com/sqlc-dev/sqlc/cmd/sqlc@$(SQLC_VERSION) generate
 	$(GO) generate ./...
+
+generate-check:
+	@before="$$(git diff -- internal/hostruntime/store/storesqlc)"; $(MAKE) generate >/dev/null; test "$$(git diff -- internal/hostruntime/store/storesqlc)" = "$$before" || { echo "generated sqlc output is stale; run make generate" >&2; git diff -- internal/hostruntime/store/storesqlc; exit 1; }
 
 lint: fmt-check vet
 
 tidy:
 	$(GO) mod tidy
 
-check: verify-toolchain contracts fmt-check vet test build
+check: verify-toolchain contracts fmt-check generate-check vet test build
 
 complete: check race cross-build
 

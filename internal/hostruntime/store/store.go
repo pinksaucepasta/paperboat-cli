@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/store/storesqlc"
 	_ "modernc.org/sqlite"
 )
 
@@ -34,6 +35,7 @@ type Config struct {
 }
 type Store struct {
 	db   *sql.DB
+	q    *storesqlc.Queries
 	hook func(string) error
 }
 
@@ -161,28 +163,24 @@ func (s *Store) CreateFileTransfersWithinLimits(ctx context.Context, transfers [
 }
 
 func (s *Store) FileTransfer(ctx context.Context, id string) (FileTransfer, error) {
-	return scanFileTransfer(s.db.QueryRowContext(ctx, fileTransferSelect+` WHERE id=?`, id))
+	row, err := s.q.FileTransfer(ctx, id)
+	if err != nil {
+		return FileTransfer{}, err
+	}
+	return fileTransferFromSQLC(row), nil
 }
 
 func (s *Store) FileTransfersByBatch(ctx context.Context, batchID string) ([]FileTransfer, error) {
 	if batchID == "" {
 		return nil, ErrConflict
 	}
-	rows, err := s.db.QueryContext(ctx, fileTransferSelect+` WHERE batch_id=? ORDER BY created_at,id`, batchID)
+	rows, err := s.q.FileTransfersByBatch(ctx, batchID)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var transfers []FileTransfer
-	for rows.Next() {
-		transfer, err := scanFileTransfer(rows)
-		if err != nil {
-			return nil, err
-		}
-		transfers = append(transfers, transfer)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
+	transfers := make([]FileTransfer, 0, len(rows))
+	for _, row := range rows {
+		transfers = append(transfers, fileTransferFromSQLC(row))
 	}
 	if len(transfers) == 0 {
 		return nil, ErrConflict
@@ -300,37 +298,30 @@ func (s *Store) PendingFileTransfers(ctx context.Context, clientID, sessionID st
 	if clientID == "" || sessionID == "" || limit < 1 || limit > 10 {
 		return nil, ErrConflict
 	}
-	rows, err := s.db.QueryContext(ctx, fileTransferSelect+` WHERE delivery_client_id=? AND session_id=? AND state='pending' AND expires_at>? ORDER BY created_at,id LIMIT ?`, clientID, sessionID, now.UnixNano(), limit)
+	rows, err := s.q.PendingFileTransfers(ctx, storesqlc.PendingFileTransfersParams{
+		DeliveryClientID: nullableSQLString(clientID), SessionID: nullableSQLString(sessionID),
+		ExpiresAt: now.UnixNano(), Limit: int64(limit),
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var transfers []FileTransfer
-	for rows.Next() {
-		transfer, err := scanFileTransfer(rows)
-		if err != nil {
-			return nil, err
-		}
-		transfers = append(transfers, transfer)
+	transfers := make([]FileTransfer, 0, len(rows))
+	for _, row := range rows {
+		transfers = append(transfers, fileTransferFromSQLC(row))
 	}
-	return transfers, rows.Err()
+	return transfers, nil
 }
 
 func (s *Store) ExpiredFileTransfers(ctx context.Context, now time.Time) ([]FileTransfer, error) {
-	rows, err := s.db.QueryContext(ctx, fileTransferSelect+` WHERE expires_at<=? AND state IN ('created','uploading','published','pending') ORDER BY expires_at,id LIMIT 100`, now.UnixNano())
+	rows, err := s.q.ExpiredFileTransfers(ctx, now.UnixNano())
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var transfers []FileTransfer
-	for rows.Next() {
-		transfer, err := scanFileTransfer(rows)
-		if err != nil {
-			return nil, err
-		}
-		transfers = append(transfers, transfer)
+	transfers := make([]FileTransfer, 0, len(rows))
+	for _, row := range rows {
+		transfers = append(transfers, fileTransferFromSQLC(row))
 	}
-	return transfers, rows.Err()
+	return transfers, nil
 }
 
 func (s *Store) ExpireFileTransfers(ctx context.Context, transfers []FileTransfer) error {
@@ -401,6 +392,17 @@ func scanFileTransfer(row scanner) (FileTransfer, error) {
 	return transfer, nil
 }
 
+func fileTransferFromSQLC(row storesqlc.FileTransfer) FileTransfer {
+	return FileTransfer{
+		ID: row.ID, BatchID: row.BatchID, SourceMachineID: row.SourceMachineID,
+		DestinationMachineID: row.DestinationMachineID, InitiatingUserID: row.InitiatingUserID,
+		SessionID: row.SessionID.String, DeliveryClientID: row.DeliveryClientID.String,
+		Basename: row.Basename, Size: row.Size, SHA256: row.Sha256, CommittedOffset: row.CommittedOffset,
+		State: row.State, ResultCode: row.ResultCode.String, ReceiptPath: row.ReceiptPath.String,
+		CreatedAt: time.Unix(0, row.CreatedAt).UTC(), ExpiresAt: time.Unix(0, row.ExpiresAt).UTC(),
+	}
+}
+
 func Open(ctx context.Context, config Config) (*Store, error) {
 	if !filepath.IsAbs(config.Root) {
 		return nil, ErrCorrupt
@@ -421,7 +423,7 @@ func Open(ctx context.Context, config Config) (*Store, error) {
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	store := &Store{db: db, hook: config.FailureHook}
+	store := &Store{db: db, q: storesqlc.New(db), hook: config.FailureHook}
 	if err := store.configure(ctx); err != nil {
 		db.Close()
 		return nil, classifyDBError(err)
@@ -461,25 +463,31 @@ func (s *Store) CreateSession(ctx context.Context, session Session) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO sessions(id,name,cwd,command_path,command_args,command_env,columns,rows,state,generation,exit_code,exit_signal,exited_at,earliest_sequence,latest_sequence,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, session.ID, session.Name, session.CWD, session.CommandPath, args, environment, session.Columns, session.Rows, session.State, session.Generation, session.ExitCode, nullableString(session.ExitSignal), nullableTime(session.ExitedAt), session.EarliestSequence, session.LatestSequence, session.CreatedAt.UnixNano(), session.UpdatedAt.UnixNano())
+	err = s.q.CreateSession(ctx, storesqlc.CreateSessionParams{
+		ID: session.ID, Name: session.Name, Cwd: session.CWD, CommandPath: session.CommandPath,
+		CommandArgs: args, CommandEnv: environment, Columns: int64(session.Columns), Rows: int64(session.Rows),
+		State: session.State, Generation: int64(session.Generation), ExitCode: nullableInt(session.ExitCode),
+		ExitSignal: nullableSQLString(session.ExitSignal), ExitedAt: nullableTimestamp(session.ExitedAt),
+		EarliestSequence: int64(session.EarliestSequence), LatestSequence: int64(session.LatestSequence),
+		CreatedAt: session.CreatedAt.UnixNano(), UpdatedAt: session.UpdatedAt.UnixNano(),
+	})
 	return classify(err)
 }
 
 func (s *Store) Sessions(ctx context.Context) ([]Session, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,name,cwd,command_path,command_args,command_env,columns,rows,state,generation,exit_code,COALESCE(exit_signal,''),exited_at,earliest_sequence,latest_sequence,created_at,updated_at FROM sessions ORDER BY name`)
+	rows, err := s.q.ListSessions(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var sessions []Session
-	for rows.Next() {
-		session, err := scanSession(rows)
+	sessions := make([]Session, 0, len(rows))
+	for _, row := range rows {
+		session, err := sessionFromSQLC(row)
 		if err != nil {
 			return nil, err
 		}
 		sessions = append(sessions, session)
 	}
-	return sessions, rows.Err()
+	return sessions, nil
 }
 
 func (s *Store) UpdateSession(ctx context.Context, id, expectedState string, next Session) error {
@@ -519,8 +527,8 @@ func (s *Store) ClearOutput(ctx context.Context, sessionID string, nextSequence 
 }
 
 func (s *Store) OutputBounds(ctx context.Context, sessionID string) (earliest, latest uint64, err error) {
-	err = s.db.QueryRowContext(ctx, `SELECT earliest_sequence,latest_sequence FROM sessions WHERE id=?`, sessionID).Scan(&earliest, &latest)
-	return earliest, latest, err
+	row, err := s.q.SessionBounds(ctx, sessionID)
+	return uint64(row.EarliestSequence), uint64(row.LatestSequence), err
 }
 
 // AdvanceOutput drops a persistence tail that has already fallen behind the
@@ -552,11 +560,10 @@ func (s *Store) AdvanceOutput(ctx context.Context, sessionID string, expectedLat
 }
 
 func (s *Store) DeleteSession(ctx context.Context, id string) error {
-	result, err := s.db.ExecContext(ctx, `DELETE FROM sessions WHERE id=? AND state IN ('exited','closed')`, id)
+	changed, err := s.q.DeleteClosedSession(ctx, id)
 	if err != nil {
 		return err
 	}
-	changed, _ := result.RowsAffected()
 	if changed != 1 {
 		return ErrConflict
 	}
@@ -627,8 +634,8 @@ func (s *Store) AppendOutput(ctx context.Context, sessionID string, channel byte
 }
 
 func (s *Store) Replay(ctx context.Context, sessionID string, from, limit uint64) ([]OutputEvent, uint64, uint64, error) {
-	var earliest, latest uint64
-	if err := s.db.QueryRowContext(ctx, `SELECT earliest_sequence,latest_sequence FROM sessions WHERE id=?`, sessionID).Scan(&earliest, &latest); err != nil {
+	earliest, latest, err := s.OutputBounds(ctx, sessionID)
+	if err != nil {
 		return nil, 0, 0, err
 	}
 	if from < earliest {
@@ -637,18 +644,14 @@ func (s *Store) Replay(ctx context.Context, sessionID string, from, limit uint64
 	if from > latest {
 		return nil, earliest, latest, ErrConflict
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT channel,start_sequence,end_sequence,data FROM output_events WHERE session_id=? AND end_sequence>? ORDER BY start_sequence`, sessionID, from)
+	rows, err := s.q.ReplayOutput(ctx, storesqlc.ReplayOutputParams{SessionID: sessionID, EndSequence: int64(from)})
 	if err != nil {
 		return nil, earliest, latest, err
 	}
-	defer rows.Close()
 	var events []OutputEvent
 	remaining := limit
-	for rows.Next() {
-		var event OutputEvent
-		if err := rows.Scan(&event.Channel, &event.StartSequence, &event.EndSequence, &event.Data); err != nil {
-			return nil, earliest, latest, err
-		}
+	for _, row := range rows {
+		event := OutputEvent{Channel: byte(row.Channel), StartSequence: uint64(row.StartSequence), EndSequence: uint64(row.EndSequence), Data: row.Data}
 		start := max(from, event.StartSequence)
 		end := event.EndSequence
 		if limit > 0 && end-start > remaining {
@@ -669,7 +672,7 @@ func (s *Store) Replay(ctx context.Context, sessionID string, from, limit uint64
 			}
 		}
 	}
-	return events, earliest, latest, rows.Err()
+	return events, earliest, latest, nil
 }
 
 // TrimOutput compacts a session's retained output to maxRetained bytes. It is
@@ -732,22 +735,20 @@ func (s *Store) PutInputDecision(ctx context.Context, decision InputDecision) (b
 }
 
 func (s *Store) InputDecisions(ctx context.Context, sessionID string) ([]InputDecision, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT session_id,client_id,attachment_id,generation,input_id,request_hash,status,bytes_written,COALESCE(error_code,''),created_at FROM input_decisions WHERE session_id=? ORDER BY generation,created_at`, sessionID)
+	rows, err := s.q.ListInputDecisions(ctx, sessionID)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var decisions []InputDecision
-	for rows.Next() {
-		var decision InputDecision
-		var created int64
-		if err := rows.Scan(&decision.SessionID, &decision.ClientID, &decision.AttachmentID, &decision.Generation, &decision.InputID, &decision.Hash, &decision.Status, &decision.BytesWritten, &decision.ErrorCode, &created); err != nil {
-			return nil, err
-		}
-		decision.CreatedAt = time.Unix(0, created).UTC()
-		decisions = append(decisions, decision)
+	decisions := make([]InputDecision, 0, len(rows))
+	for _, row := range rows {
+		decisions = append(decisions, InputDecision{
+			SessionID: row.SessionID, ClientID: row.ClientID, AttachmentID: row.AttachmentID,
+			Generation: uint64(row.Generation), InputID: row.InputID, Hash: row.RequestHash,
+			Status: row.Status, BytesWritten: int(row.BytesWritten), ErrorCode: row.ErrorCode,
+			CreatedAt: time.Unix(0, row.CreatedAt).UTC(),
+		})
 	}
-	return decisions, rows.Err()
+	return decisions, nil
 }
 
 func (s *Store) UpdateInputDecision(ctx context.Context, decision InputDecision) error {
@@ -815,41 +816,39 @@ func (s *Store) CompleteOperation(ctx context.Context, operation OperationResult
 }
 
 func (s *Store) DeleteExpiredOperations(ctx context.Context, now time.Time) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM operation_results WHERE expires_at<=?`, now.UnixNano())
-	return err
+	return s.q.DeleteExpiredOperations(ctx, now.UnixNano())
 }
 
 func (s *Store) Operations(ctx context.Context, now time.Time, limit int) ([]OperationResult, error) {
 	if limit < 1 {
 		return nil, ErrConflict
 	}
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM operation_results WHERE expires_at<=?`, now.UnixNano()); err != nil {
+	if err := s.q.DeleteExpiredOperations(ctx, now.UnixNano()); err != nil {
 		return nil, err
 	}
 	// Older helpers persisted terminal replay inside attach outcomes. Discard
 	// those oversized payloads without releasing the operation ID for reuse:
 	// pending makes a retry uncertain instead of rerunning a mutation.
-	if _, err := s.db.ExecContext(ctx, `UPDATE operation_results SET state='pending',result=NULL,error_code=NULL,completed_at=NULL WHERE length(result)>?`, MaxOperationResultBytes); err != nil {
+	if err := s.q.ResetOversizedOperations(ctx, MaxOperationResultBytes); err != nil {
 		return nil, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT operation_id,request_hash,state,result,COALESCE(error_code,''),completed_at,expires_at FROM operation_results ORDER BY CASE state WHEN 'pending' THEN 0 ELSE 1 END,completed_at ASC LIMIT ?`, limit)
+	rows, err := s.q.ListOperations(ctx, int64(limit))
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var operations []OperationResult
-	for rows.Next() {
-		operation, err := scanOperation(rows)
-		if err != nil {
-			return nil, err
-		}
-		operations = append(operations, operation)
+	operations := make([]OperationResult, 0, len(rows))
+	for _, row := range rows {
+		operations = append(operations, operationFromSQLC(row.OperationID, row.RequestHash, row.State, row.Result, row.ErrorCode, row.CompletedAt, row.ExpiresAt))
 	}
-	return operations, rows.Err()
+	return operations, nil
 }
 
 func (s *Store) operation(ctx context.Context, operationID string) (OperationResult, error) {
-	return scanOperationRow(s.db.QueryRowContext(ctx, `SELECT operation_id,request_hash,state,result,COALESCE(error_code,''),completed_at,expires_at FROM operation_results WHERE operation_id=?`, operationID))
+	row, err := s.q.GetOperation(ctx, operationID)
+	if err != nil {
+		return OperationResult{}, err
+	}
+	return operationFromSQLC(row.OperationID, row.RequestHash, row.State, row.Result, row.ErrorCode, row.CompletedAt, row.ExpiresAt), nil
 }
 
 func (s *Store) configure(ctx context.Context) error {
@@ -861,37 +860,7 @@ func (s *Store) configure(ctx context.Context) error {
 	return nil
 }
 func (s *Store) migrate(ctx context.Context) error {
-	var version int
-	if err := s.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
-		return err
-	}
-	if version > CurrentVersion {
-		return ErrIncompatible
-	}
-	if version == CurrentVersion {
-		return nil
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if version < 1 {
-		for _, statement := range migrationV1 {
-			if _, err := tx.ExecContext(ctx, statement); err != nil {
-				return err
-			}
-		}
-	}
-	if _, err := tx.ExecContext(ctx, "PRAGMA user_version=1"); err != nil {
-		return err
-	}
-	if s.hook != nil {
-		if err := s.hook("migration_before_commit"); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
+	return migrateDatabase(ctx, s.db, s.hook)
 }
 func (s *Store) check(ctx context.Context) error {
 	var result string
@@ -904,60 +873,58 @@ func (s *Store) check(ctx context.Context) error {
 	return nil
 }
 
-var migrationV1 = []string{
-	`CREATE TABLE sessions(id TEXT PRIMARY KEY,name TEXT NOT NULL UNIQUE,cwd TEXT NOT NULL,command_path TEXT NOT NULL,command_args BLOB NOT NULL,command_env BLOB NOT NULL,columns INTEGER NOT NULL CHECK(columns BETWEEN 1 AND 1000),rows INTEGER NOT NULL CHECK(rows BETWEEN 1 AND 1000),state TEXT NOT NULL,generation INTEGER NOT NULL CHECK(generation>=0),exit_code INTEGER,exit_signal TEXT,exited_at INTEGER,earliest_sequence INTEGER NOT NULL CHECK(earliest_sequence>=0),latest_sequence INTEGER NOT NULL CHECK(latest_sequence>=earliest_sequence),created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL) STRICT`,
-	`CREATE TABLE output_events(session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,start_sequence INTEGER NOT NULL,end_sequence INTEGER NOT NULL,channel INTEGER NOT NULL CHECK(channel IN (1,2)),data BLOB NOT NULL CHECK(length(data)=end_sequence-start_sequence),PRIMARY KEY(session_id,start_sequence)) STRICT`,
-	`CREATE TABLE input_decisions(session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,client_id TEXT NOT NULL,attachment_id TEXT NOT NULL,generation INTEGER NOT NULL,input_id TEXT NOT NULL,request_hash BLOB NOT NULL,status TEXT NOT NULL,bytes_written INTEGER NOT NULL,error_code TEXT,created_at INTEGER NOT NULL,PRIMARY KEY(session_id,client_id,attachment_id,generation,input_id)) STRICT`,
-	`CREATE TABLE operation_results(operation_id TEXT PRIMARY KEY,request_hash BLOB NOT NULL,state TEXT NOT NULL CHECK(state IN ('pending','completed')),result BLOB,error_code TEXT,completed_at INTEGER,expires_at INTEGER NOT NULL) STRICT`,
-	`CREATE TABLE file_transfers(id TEXT PRIMARY KEY,batch_id TEXT NOT NULL,source_machine_id TEXT NOT NULL,destination_machine_id TEXT NOT NULL,initiating_user_id TEXT NOT NULL,session_id TEXT,delivery_client_id TEXT,basename TEXT NOT NULL,size INTEGER NOT NULL CHECK(size BETWEEN 0 AND 52428800),sha256 TEXT NOT NULL CHECK(length(sha256)=64),committed_offset INTEGER NOT NULL CHECK(committed_offset BETWEEN 0 AND size),state TEXT NOT NULL CHECK(state IN ('created','uploading','published','pending','delivered','failed','canceled')),result_code TEXT,receipt_path TEXT,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL) STRICT`,
-	`CREATE INDEX file_transfers_pending ON file_transfers(delivery_client_id,session_id,created_at) WHERE state='pending'`,
-	`CREATE INDEX file_transfers_expiry ON file_transfers(expires_at)`,
-}
-
 type scanner interface{ Scan(...any) error }
 
-func scanOperation(row scanner) (OperationResult, error) { return scanOperationRow(row) }
-
-func scanOperationRow(row scanner) (OperationResult, error) {
-	var operation OperationResult
-	var completed sql.NullInt64
-	var expires int64
-	if err := row.Scan(&operation.OperationID, &operation.RequestHash, &operation.State, &operation.Result, &operation.ErrorCode, &completed, &expires); err != nil {
-		return OperationResult{}, err
-	}
+func operationFromSQLC(operationID string, requestHash []byte, state string, result []byte, errorCode string, completed sql.NullInt64, expires int64) OperationResult {
+	operation := OperationResult{OperationID: operationID, RequestHash: requestHash, State: state, Result: result, ErrorCode: errorCode}
 	if completed.Valid {
 		operation.CompletedAt = time.Unix(0, completed.Int64).UTC()
 	}
 	operation.ExpiresAt = time.Unix(0, expires).UTC()
-	return operation, nil
+	return operation
 }
 
-func scanSession(row scanner) (Session, error) {
-	var session Session
-	var exitCode sql.NullInt64
-	var exitedAt sql.NullInt64
-	var args, environment []byte
-	var created, updated int64
-	if err := row.Scan(&session.ID, &session.Name, &session.CWD, &session.CommandPath, &args, &environment, &session.Columns, &session.Rows, &session.State, &session.Generation, &exitCode, &session.ExitSignal, &exitedAt, &session.EarliestSequence, &session.LatestSequence, &created, &updated); err != nil {
-		return Session{}, err
+func sessionFromSQLC(row storesqlc.ListSessionsRow) (Session, error) {
+	session := Session{
+		ID: row.ID, Name: row.Name, CWD: row.Cwd, CommandPath: row.CommandPath,
+		Columns: uint16(row.Columns), Rows: uint16(row.Rows), State: row.State,
+		Generation: uint64(row.Generation), ExitSignal: row.ExitSignal,
+		EarliestSequence: uint64(row.EarliestSequence), LatestSequence: uint64(row.LatestSequence),
+		CreatedAt: time.Unix(0, row.CreatedAt).UTC(), UpdatedAt: time.Unix(0, row.UpdatedAt).UTC(),
 	}
-	if err := json.Unmarshal(args, &session.CommandArgs); err != nil {
+	if err := json.Unmarshal(row.CommandArgs, &session.CommandArgs); err != nil {
 		return Session{}, fmt.Errorf("%w: command args", ErrCorrupt)
 	}
-	if err := json.Unmarshal(environment, &session.CommandEnv); err != nil {
+	if err := json.Unmarshal(row.CommandEnv, &session.CommandEnv); err != nil {
 		return Session{}, fmt.Errorf("%w: command environment", ErrCorrupt)
 	}
-	if exitCode.Valid {
-		value := int(exitCode.Int64)
+	if row.ExitCode.Valid {
+		value := int(row.ExitCode.Int64)
 		session.ExitCode = &value
 	}
-	if exitedAt.Valid {
-		value := time.Unix(0, exitedAt.Int64).UTC()
+	if row.ExitedAt.Valid {
+		value := time.Unix(0, row.ExitedAt.Int64).UTC()
 		session.ExitedAt = &value
 	}
-	session.CreatedAt = time.Unix(0, created).UTC()
-	session.UpdatedAt = time.Unix(0, updated).UTC()
 	return session, nil
+}
+
+func nullableInt(value *int) sql.NullInt64 {
+	if value == nil {
+		return sql.NullInt64{}
+	}
+	return sql.NullInt64{Int64: int64(*value), Valid: true}
+}
+
+func nullableSQLString(value string) sql.NullString {
+	return sql.NullString{String: value, Valid: value != ""}
+}
+
+func nullableTimestamp(value *time.Time) sql.NullInt64 {
+	if value == nil {
+		return sql.NullInt64{}
+	}
+	return sql.NullInt64{Int64: value.UnixNano(), Valid: true}
 }
 func nullableString(value string) any {
 	if value == "" {

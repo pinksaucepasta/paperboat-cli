@@ -1,0 +1,13 @@
+version: "2"
+sql:
+  - engine: "sqlite"
+    schema: "internal/hostruntime/store/migrations"
+    queries: "internal/hostruntime/store/queries"
+    gen:
+      go:
+        package: "storesqlc"
+        out: "internal/hostruntime/store/storesqlc"
+        sql_package: "database/sql"
+        emit_json_tags: false
+        initialisms:
+          - id
