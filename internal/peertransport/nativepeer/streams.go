@@ -19,6 +19,32 @@ type Initiator struct {
 	Authority  peersession.Authority
 }
 
+// OpenCandidateControl opens the authenticated physical-candidate ownership
+// channel. It is distinct from native application streams.
+func (i Initiator) OpenCandidateControl(ctx context.Context, payload []byte) (net.Conn, []byte, error) {
+	if ctx == nil || i.Connection == nil {
+		return nil, nil, ErrInvalid
+	}
+	authority, err := i.Authority.Initiator("candidate-control")
+	if err != nil {
+		return nil, nil, errors.Join(ErrInvalid, err)
+	}
+	config, err := relaycarrier.PeerInitiatorConfig(authority, i.Connection.Carrier(), "candidate-control", payload)
+	if err != nil {
+		return nil, nil, errors.Join(ErrInvalid, err)
+	}
+	stream, response, err := i.Connection.Initiate(ctx, config)
+	if err != nil {
+		return nil, nil, err
+	}
+	connection, err := relaycarrier.NewSecureConn(stream, i.Authority.LocalEndpointID(), i.Authority.PeerEndpointID())
+	if err != nil {
+		_ = stream.Close()
+		return nil, nil, errors.Join(ErrInvalid, err)
+	}
+	return connection, response, nil
+}
+
 func (i Initiator) OpenAuthorized(ctx context.Context, header streamauth.Header) (net.Conn, error) {
 	if ctx == nil || i.Connection == nil {
 		return nil, ErrInvalid
@@ -85,6 +111,30 @@ func (i Initiator) Close() error {
 type Responder struct {
 	Connection *relaycarrier.Connection
 	Authority  peersession.Authority
+}
+
+func (r Responder) AcceptCandidateControl(ctx context.Context, authorize func(context.Context, []byte) ([]byte, error)) (net.Conn, []byte, error) {
+	if ctx == nil || r.Connection == nil || authorize == nil {
+		return nil, nil, ErrInvalid
+	}
+	authority, err := r.Authority.Responder("candidate-control")
+	if err != nil {
+		return nil, nil, errors.Join(ErrInvalid, err)
+	}
+	config, err := relaycarrier.PeerResponderConfig(authority, r.Connection.Carrier(), "candidate-control", authorize)
+	if err != nil {
+		return nil, nil, errors.Join(ErrInvalid, err)
+	}
+	stream, payload, err := r.Connection.Accept(ctx, config)
+	if err != nil {
+		return nil, nil, err
+	}
+	connection, err := relaycarrier.NewSecureConn(stream, r.Authority.LocalEndpointID(), r.Authority.PeerEndpointID())
+	if err != nil {
+		_ = stream.Close()
+		return nil, nil, errors.Join(ErrInvalid, err)
+	}
+	return connection, payload, nil
 }
 
 func (r Responder) AcceptAuthorized(ctx context.Context, authorize func(context.Context, streamauth.Header) error) (net.Conn, streamauth.Header, error) {

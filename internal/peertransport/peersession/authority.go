@@ -195,6 +195,9 @@ func (a Authority) Responder(streamID string) (StreamAuthority, error) {
 
 func (a Authority) stream(streamID string) ([16]byte, error) {
 	valid := streamID == "native-health"
+	if a.Context.Consumer == "peer_transport" {
+		valid = valid || streamID == "candidate-control"
+	}
 	if a.Context.Consumer == "health_probe" {
 		valid = streamID == "native-health"
 	} else if a.Context.Consumer == "private_preview" {
