@@ -19,6 +19,7 @@ type StreamRouterConfig struct {
 	PendingConsumers    int
 	MaximumClassifiers  int
 	ClassificationLimit time.Duration
+	CandidateControl    func(context.Context, *quic.Stream) error
 }
 
 func DevelopmentStreamRouterConfig() StreamRouterConfig {
@@ -158,6 +159,12 @@ func (r *StreamRouter) classify(stream *quic.Stream) {
 	}
 	if bytes.Equal(prefix[:], lifetimeProbeMagic[:]) {
 		r.serveHealth(stream, prefix)
+		return
+	}
+	if bytes.Equal(prefix[:], candidateControlMagic[:]) && r.config.CandidateControl != nil {
+		if err := r.config.CandidateControl(r.ctx, stream); err != nil {
+			_ = stream.Close()
+		}
 		return
 	}
 	routed := &RoutedStream{Stream: stream, prefix: append([]byte(nil), prefix[:]...)}

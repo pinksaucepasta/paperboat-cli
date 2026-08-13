@@ -24,6 +24,11 @@ const (
 )
 
 var lifetimeProbeMagic = [4]byte{'P', 'B', 'L', 'P'}
+
+// candidateControlMagic reserves a direct QUIC stream for physical candidate
+// ownership messages. It is distinct from the health probe and application
+// stream framing.
+var candidateControlMagic = [4]byte{'P', 'B', 'C', 'L'}
 var ErrLifetimeProbeUnreachable = errors.New("QUIC lifetime probe unreachable after idle")
 
 type probeStream interface {
