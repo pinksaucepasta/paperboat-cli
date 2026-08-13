@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -18,6 +19,44 @@ func openStore(t testing.TB, hook func(string) error) (*Store, string) {
 		t.Fatal(err)
 	}
 	return store, root
+}
+
+func TestConcurrentOperationWritesWaitForSQLiteWriter(t *testing.T) {
+	state, _ := openStore(t, nil)
+	defer state.Close()
+
+	tx, err := state.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(context.Background(), `INSERT INTO operation_results(operation_id,request_hash,state,expires_at) VALUES(?,?,'pending',?)`, "lock-operation", []byte("lock"), time.Now().Add(time.Hour).UnixNano()); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	var started sync.WaitGroup
+	started.Add(1)
+	go func() {
+		started.Done()
+		_, _, reserveErr := state.ReserveOperation(context.Background(), "concurrent-operation", []byte("request"), time.Now().Add(time.Hour))
+		result <- reserveErr
+	}()
+	started.Wait()
+	select {
+	case err := <-result:
+		t.Fatalf("concurrent write returned before lock release: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("concurrent write after lock release: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("concurrent write did not complete")
+	}
 }
 
 func testSession() Session {
@@ -316,6 +355,23 @@ func TestStoreRejectsCorruptDatabaseWithTypedError(t *testing.T) {
 	}
 	if _, err := Open(context.Background(), Config{Root: root}); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("corrupt err=%v", err)
+	}
+}
+
+func TestStoreRejectsSchemaDrift(t *testing.T) {
+	root := t.TempDir()
+	state, err := Open(context.Background(), Config{Root: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.db.Exec(`CREATE TABLE unexpected_state(value TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(context.Background(), Config{Root: root}); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("error=%v", err)
 	}
 }
 

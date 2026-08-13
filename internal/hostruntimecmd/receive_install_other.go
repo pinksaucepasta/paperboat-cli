@@ -12,8 +12,7 @@ import (
 
 type ReceiveInstallConfig struct {
 	StateRoot, WorkspaceRoot, ControlURL, MachineID, ListenAddress string
-	Artifact                                                       bootstrap.ArtifactManifest
-	ArtifactPublicKey                                              string
+	Artifact                                                       bootstrap.ArtifactTarget
 }
 
 func InstallReceive(context.Context, ReceiveInstallConfig, io.Reader, io.Writer, io.Writer) error {

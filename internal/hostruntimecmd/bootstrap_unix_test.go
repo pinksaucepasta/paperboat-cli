@@ -6,11 +6,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -127,17 +122,22 @@ func TestPrepareInstallationVerifiesArtifactBeforeEnrollment(t *testing.T) {
 		_, _ = w.Write([]byte("tampered helper"))
 	}))
 	defer server.Close()
-	manifest, _, publicKey := signedBootstrapArtifacts(t, server.URL+"/pb", expected)
-	material := bootstrap.Material{Artifact: &manifest, ArtifactPublicKey: publicKey, EnrollmentCredential: "credential-that-must-not-be-consumed", ControlURL: "https://control.example.test"}
+	manifest, _, _ := signedBootstrapArtifacts(t, server.URL+"/pb", expected)
+	material := bootstrap.Material{Artifact: &manifest, EnrollmentCredential: "credential-that-must-not-be-consumed", ControlURL: "https://control.example.test"}
 	root := t.TempDir()
 	client := &recordingEnrollmentClient{}
+	previousFetcher := fetchBootstrapArtifact
+	fetchBootstrapArtifact = func(context.Context, bootstrap.ArtifactTarget, string, *http.Client) (string, error) {
+		return "", bootstrap.ErrArtifactMismatch
+	}
+	defer func() { fetchBootstrapArtifact = previousFetcher }()
 	if _, err := prepareInstallation(context.Background(), &material, root, server.Client(), client); err != bootstrap.ErrArtifactMismatch {
 		t.Fatalf("error = %v", err)
 	}
 	if client.calls != 0 || material.EnrollmentCredential == "" {
 		t.Fatalf("enrollment calls=%d credential_cleared=%v", client.calls, material.EnrollmentCredential == "")
 	}
-	entries, err := os.ReadDir(filepath.Join(root, "artifacts"))
+	entries, err := os.ReadDir(root)
 	if err != nil || len(entries) != 0 {
 		t.Fatalf("artifact entries=%v error=%v", entries, err)
 	}
@@ -165,14 +165,26 @@ func TestPrepareInstallationReusesMatchingPersistedIdentity(t *testing.T) {
 	body := []byte("verified helper")
 	artifactServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(body) }))
 	defer artifactServer.Close()
-	manifest, _, publicKey := signedBootstrapArtifacts(t, artifactServer.URL+"/pb", body)
-	material := bootstrap.Material{UserMachineID: "um_reuse", UserMachineEnrollmentID: "ume_reuse", EnvironmentID: "env_reuse", HelperID: "helper_reuse", ReuseIdentity: true, Artifact: &manifest, ArtifactPublicKey: publicKey}
+	manifest, _, _ := signedBootstrapArtifacts(t, artifactServer.URL+"/pb", body)
+	material := bootstrap.Material{UserMachineID: "um_reuse", UserMachineEnrollmentID: "ume_reuse", EnvironmentID: "env_reuse", HelperID: "helper_reuse", ReuseIdentity: true, Artifact: &manifest}
 	client := &recordingEnrollmentClient{}
+	artifactPath := filepath.Join(stateRoot, "tuf", "targets", "pb")
+	if err := os.MkdirAll(filepath.Dir(artifactPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(artifactPath, body, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	previousFetcher := fetchBootstrapArtifact
+	fetchBootstrapArtifact = func(context.Context, bootstrap.ArtifactTarget, string, *http.Client) (string, error) {
+		return artifactPath, nil
+	}
+	defer func() { fetchBootstrapArtifact = previousFetcher }()
 	path, err := prepareInstallation(context.Background(), &material, stateRoot, artifactServer.Client(), client)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if client.calls != 0 || !strings.HasPrefix(path, filepath.Join(stateRoot, "artifacts")) {
+	if client.calls != 0 || path != artifactPath {
 		t.Fatalf("enrollment calls=%d path=%q", client.calls, path)
 	}
 	material.HelperID = "helper_other"
@@ -258,12 +270,12 @@ func TestArtifactHTTPClientAllowsOnlyGitHubReleaseAssetRedirect(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			request := httptest.NewRequest(http.MethodGet, target, nil)
-			if err := check(request, []*http.Request{origin}); !errors.Is(err, bootstrap.ErrArtifactManifest) {
+			if err := check(request, []*http.Request{origin}); !errors.Is(err, bootstrap.ErrArtifactTarget) {
 				t.Fatalf("redirect error = %v", err)
 			}
 		})
 	}
-	if err := check(allowed, []*http.Request{origin, allowed}); !errors.Is(err, bootstrap.ErrArtifactManifest) {
+	if err := check(allowed, []*http.Request{origin, allowed}); !errors.Is(err, bootstrap.ErrArtifactTarget) {
 		t.Fatalf("second redirect error = %v", err)
 	}
 }
@@ -285,32 +297,12 @@ func enrolledStateRoot(t *testing.T, helperID, environmentID string) string {
 	return root
 }
 
-func signedBootstrapArtifacts(t *testing.T, artifactURL string, body []byte) (bootstrap.ArtifactManifest, bootstrap.ArtifactManifest, string) {
+func signedBootstrapArtifacts(t *testing.T, artifactURL string, body []byte) (bootstrap.ArtifactTarget, bootstrap.ArtifactTarget, string) {
 	t.Helper()
-	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sign := func(kind string) bootstrap.ArtifactManifest {
-		digest := sha256.Sum256(body)
-		manifest := bootstrap.ArtifactManifest{Schema: bootstrap.ArtifactSchemaV1, Kind: kind, Version: "test", Platform: runtime.GOOS, Architecture: runtime.GOARCH, URL: artifactURL, ByteLength: int64(len(body)), SHA256: hex.EncodeToString(digest[:])}
-		payload, err := json.Marshal(struct {
-			Architecture string `json:"architecture"`
-			ByteLength   int64  `json:"byte_length"`
-			Kind         string `json:"kind"`
-			Platform     string `json:"platform"`
-			Schema       string `json:"schema"`
-			SHA256       string `json:"sha256"`
-			URL          string `json:"url"`
-			Version      string `json:"version"`
-		}{manifest.Architecture, manifest.ByteLength, manifest.Kind, manifest.Platform, manifest.Schema, manifest.SHA256, manifest.URL, manifest.Version})
-		if err != nil {
-			t.Fatal(err)
-		}
-		manifest.Signature = base64.RawURLEncoding.EncodeToString(ed25519.Sign(privateKey, payload))
-		return manifest
-	}
-	return sign(bootstrap.ArtifactKindPB), sign(bootstrap.ArtifactKindPB), base64.RawURLEncoding.EncodeToString(publicKey)
+	_ = artifactURL
+	_ = body
+	target := bootstrap.ArtifactTarget{Schema: bootstrap.ArtifactTargetSchemaV1, Kind: bootstrap.ArtifactKindPB, Version: "test", Platform: runtime.GOOS, Architecture: runtime.GOARCH, RepositoryURL: "https://updates.example.test/paperboat", TargetPath: "pb-" + runtime.GOOS + "-" + runtime.GOARCH}
+	return target, target, ""
 }
 
 func TestBootstrapHealthMatchesSignedArtifactVersion(t *testing.T) {

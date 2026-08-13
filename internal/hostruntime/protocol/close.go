@@ -7,6 +7,7 @@ const (
 	CloseUnauthorized = 4401
 	CloseForbidden    = 4403
 	CloseIncompatible = 4406
+	CloseReplayGap    = 4407
 	CloseSlowConsumer = 4408
 	CloseMalformed    = 4409
 	CloseCanceled     = 4410

@@ -21,7 +21,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/identity"
+	"github.com/pinksaucepasta/paperboat/internal/httptransport"
 )
 
 var (
@@ -91,7 +93,7 @@ func (s ProofSource) proof(operationID, method, path string, body []byte, allowE
 	} else {
 		value, err = LoadRuntimeIdentity(s.StateRoot, now)
 	}
-	if err != nil || len(operationID) < 8 || len(operationID) > 128 || method != http.MethodPost || path == "" || len(body) > 1<<20 {
+	if err != nil || len(operationID) < 8 || len(operationID) > 128 || method != http.MethodPost && method != http.MethodPut || path == "" || len(body) > 1<<20 {
 		return nil, ErrInvalid
 	}
 	store, err := identity.Open(identity.Config{StateRoot: s.StateRoot})
@@ -420,7 +422,9 @@ func controlTransport(caPath string) (http.RoundTripper, error) {
 		}
 		tlsConfig.RootCAs = roots
 	}
-	return &http.Transport{TLSClientConfig: tlsConfig}, nil
+	transportConfig := httptransport.DevelopmentConfig()
+	transportConfig.TLSConfig = tlsConfig
+	return httptransport.New(transportConfig)
 }
 
 func writeIdentity(root string, value RuntimeIdentity) error {
@@ -428,36 +432,7 @@ func writeIdentity(root string, value RuntimeIdentity) error {
 	if err != nil {
 		return err
 	}
-	temporary, err := os.CreateTemp(root, ".runtime-identity-*")
-	if err != nil {
-		return err
-	}
-	path := temporary.Name()
-	defer os.Remove(path)
-	if err := temporary.Chmod(0o600); err != nil {
-		temporary.Close()
-		return err
-	}
-	if _, err := temporary.Write(encoded); err != nil {
-		temporary.Close()
-		return err
-	}
-	if err := temporary.Sync(); err != nil {
-		temporary.Close()
-		return err
-	}
-	if err := temporary.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(path, filepath.Join(root, "runtime-identity.json")); err != nil {
-		return err
-	}
-	directory, err := os.Open(root)
-	if err != nil {
-		return err
-	}
-	defer directory.Close()
-	return directory.Sync()
+	return atomicfile.Write(filepath.Join(root, "runtime-identity.json"), encoded, atomicfile.Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1})
 }
 
 func LoadRuntimeIdentity(root string, now time.Time) (RuntimeIdentity, error) {

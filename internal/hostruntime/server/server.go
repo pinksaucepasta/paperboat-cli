@@ -2,8 +2,11 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -22,6 +25,8 @@ var (
 	ErrServerStopped         = errors.New("server stopped")
 	ErrStreamClosed          = errors.New("output stream closed")
 )
+
+var errTerminalStreamClosed = errors.New("terminal stream is closed")
 
 type Connection interface {
 	io.Reader
@@ -85,6 +90,10 @@ type Handler interface {
 	Handle(context.Context, Authorization, string, json.RawMessage) operation.Outcome
 }
 
+type OperationHandler interface {
+	HandleOperation(context.Context, Authorization, string, string, json.RawMessage) operation.Outcome
+}
+
 type OutputStream interface {
 	Next(context.Context) (protocol.BinaryFrame, error)
 	Close() error
@@ -118,8 +127,20 @@ type TerminalDataHandler interface {
 	HandleTerminalResize(context.Context, Authorization, string, string, uint16, uint16) error
 }
 
+type ExecDataHandler interface {
+	HandleExecInput(context.Context, Authorization, string, []byte) error
+	HandleExecResize(context.Context, Authorization, string, uint16, uint16) error
+}
+
+type SSHDataHandler interface {
+	HandleSSHInput(context.Context, Authorization, string, []byte) error
+	HandleSSHEOF(context.Context, Authorization, string) error
+}
+
 type terminalStreamBinding struct {
+	kind           string
 	authorization  Authorization
+	operationID    string
 	sessionID      string
 	attachmentID   string
 	generation     uint64
@@ -132,6 +153,8 @@ type terminalConnectionState struct {
 	mu         sync.RWMutex
 	nextID     uint32
 	streams    map[uint32]*terminalStreamBinding
+	closed     map[uint32]struct{}
+	closedIDs  []uint32
 	revoked    *atomic.Bool
 	expired    chan struct{}
 	expireOnce sync.Once
@@ -143,7 +166,7 @@ func newTerminalConnectionState(revoked ...*atomic.Bool) *terminalConnectionStat
 	if len(revoked) != 0 && revoked[0] != nil {
 		flag = revoked[0]
 	}
-	return &terminalConnectionState{streams: make(map[uint32]*terminalStreamBinding), expired: make(chan struct{}), revoked: flag}
+	return &terminalConnectionState{streams: make(map[uint32]*terminalStreamBinding), closed: make(map[uint32]struct{}), expired: make(chan struct{}), revoked: flag}
 }
 
 type Config struct {
@@ -153,7 +176,6 @@ type Config struct {
 	Handler           Handler
 	MaxConcurrent     int
 	HeartbeatInterval time.Duration
-	PeerTimeout       time.Duration
 	MutationDeadline  time.Duration
 	Metrics           MetricRecorder
 }
@@ -184,7 +206,7 @@ func New(config Config) (*Server, error) {
 		config.MaxConcurrent = helperconfig.DefaultResources.MaxConcurrentOps
 	}
 	if config.Journal == nil || config.Handler == nil || config.MaxConcurrent < 1 ||
-		config.HeartbeatInterval <= 0 || config.PeerTimeout < config.HeartbeatInterval ||
+		config.HeartbeatInterval <= 0 ||
 		config.MutationDeadline <= 0 || config.MutationDeadline > 5*time.Minute {
 		return nil, ErrInvalidConfiguration
 	}
@@ -247,7 +269,7 @@ func (s *Server) ServeAuthenticated(conn Connection, authorizer Authorizer) (ser
 	defer cancelConnection()
 	first, binaryMessage, err := readApplication(conn)
 	if err != nil {
-		return err
+		return fmt.Errorf("native application read hello: %w", err)
 	}
 	if len(binaryMessage) != 0 || first.Type != "hello" {
 		_ = writer.write(errorFrame(first.RequestID, "protocol_incompatible", "hello required", false))
@@ -276,7 +298,7 @@ func (s *Server) ServeAuthenticated(conn Connection, authorizer Authorizer) (ser
 	}
 	payload, _ := json.Marshal(welcomeFields)
 	if err := writer.write(protocol.Frame{Type: "welcome", RequestID: first.RequestID, Version: protocol.ProtocolVersion, Payload: payload}); err != nil {
-		return err
+		return fmt.Errorf("native application write welcome: %w", err)
 	}
 	selected := make(map[string]bool, len(welcome.Capabilities))
 	for _, capability := range welcome.Capabilities {
@@ -295,16 +317,12 @@ func (s *Server) ServeAuthenticated(conn Connection, authorizer Authorizer) (ser
 	go readFrames(conn, frames, readerDone)
 	heartbeat := time.NewTicker(s.config.HeartbeatInterval)
 	defer heartbeat.Stop()
-	timeout := time.NewTimer(s.config.PeerTimeout)
-	defer timeout.Stop()
 	for {
 		select {
 		case <-s.ctx.Done():
 			return ErrServerStopped
 		case <-terminalState.expired:
 			return &protocol.Error{Code: protocol.CredentialExpired, Cause: errors.New("terminal credential expired")}
-		case <-timeout.C:
-			return context.DeadlineExceeded
 		case <-heartbeat.C:
 			requestID := "heartbeat"
 			if err := writer.write(protocol.Frame{Type: "heartbeat", RequestID: requestID, Version: protocol.ProtocolVersion}); err != nil {
@@ -314,7 +332,6 @@ func (s *Server) ServeAuthenticated(conn Connection, authorizer Authorizer) (ser
 			if result.err != nil {
 				return result.err
 			}
-			resetTimer(timeout, s.config.PeerTimeout)
 			if len(result.binary) != 0 {
 				if err := s.handleTerminalData(connectionCtx, result.binary, terminalState); err != nil {
 					return err
@@ -350,10 +367,6 @@ func (s *Server) ServeAuthenticated(conn Connection, authorizer Authorizer) (ser
 }
 
 func (s *Server) handleTerminalData(ctx context.Context, message []byte, state *terminalConnectionState) error {
-	handler, ok := s.config.Handler.(TerminalDataHandler)
-	if !ok {
-		return ErrCapabilityUnavailable
-	}
 	opcode, err := protocol.TerminalOpcode(message)
 	if err != nil {
 		return err
@@ -369,6 +382,9 @@ func (s *Server) handleTerminalData(ctx context.Context, message []byte, state *
 		streamID = frame.StreamID
 		binding, bindErr := state.binding(streamID)
 		if bindErr != nil {
+			if errors.Is(bindErr, errTerminalStreamClosed) {
+				return nil
+			}
 			return bindErr
 		}
 		if frame.Sequence != binding.inputSequence+1 {
@@ -377,11 +393,65 @@ func (s *Server) handleTerminalData(ctx context.Context, message []byte, state *
 		if err := validateTerminalBinding(binding); err != nil {
 			return err
 		}
-		if err := handler.HandleTerminalInput(ctx, binding.authorization, binding.sessionID, binding.attachmentID, binding.generation, frame.Data); err != nil {
-			return err
+		if binding.kind == "exec" {
+			handler, ok := s.config.Handler.(ExecDataHandler)
+			if !ok {
+				return ErrCapabilityUnavailable
+			}
+			if err := handler.HandleExecInput(ctx, binding.authorization, binding.operationID, frame.Data); err != nil {
+				return err
+			}
+		} else if binding.kind == "ssh" {
+			handler, ok := s.config.Handler.(SSHDataHandler)
+			if !ok {
+				return ErrCapabilityUnavailable
+			}
+			if err := handler.HandleSSHInput(ctx, binding.authorization, binding.operationID, frame.Data); err != nil {
+				return err
+			}
+		} else {
+			handler, ok := s.config.Handler.(TerminalDataHandler)
+			if !ok {
+				return ErrCapabilityUnavailable
+			}
+			if err := handler.HandleTerminalInput(ctx, binding.authorization, binding.sessionID, binding.attachmentID, binding.generation, frame.Data); err != nil {
+				return err
+			}
 		}
 		if metrics, ok := s.config.Metrics.(terminalMetricRecorder); ok {
 			metrics.RecordTerminalStage("socket_to_pty", time.Since(started), len(frame.Data))
+		}
+		state.mu.Lock()
+		if current := state.streams[streamID]; current == binding {
+			current.inputSequence = frame.Sequence
+		}
+		state.mu.Unlock()
+		return nil
+	case protocol.TerminalEOFOpcode:
+		frame, decodeErr := protocol.DecodeTerminalEOF(message)
+		if decodeErr != nil {
+			return decodeErr
+		}
+		streamID = frame.StreamID
+		binding, bindErr := state.binding(streamID)
+		if bindErr != nil {
+			if errors.Is(bindErr, errTerminalStreamClosed) {
+				return nil
+			}
+			return bindErr
+		}
+		if frame.Sequence != binding.inputSequence+1 || binding.kind != "ssh" {
+			return &protocol.Error{Code: protocol.InvalidFrame, Cause: errors.New("SSH EOF sequence is not contiguous")}
+		}
+		if err := validateTerminalBinding(binding); err != nil {
+			return err
+		}
+		handler, ok := s.config.Handler.(SSHDataHandler)
+		if !ok {
+			return ErrCapabilityUnavailable
+		}
+		if err := handler.HandleSSHEOF(ctx, binding.authorization, binding.operationID); err != nil {
+			return err
 		}
 		state.mu.Lock()
 		if current := state.streams[streamID]; current == binding {
@@ -396,10 +466,20 @@ func (s *Server) handleTerminalData(ctx context.Context, message []byte, state *
 		}
 		binding, bindErr := state.binding(frame.StreamID)
 		if bindErr != nil {
+			if errors.Is(bindErr, errTerminalStreamClosed) {
+				return nil
+			}
 			return bindErr
 		}
 		if err := validateTerminalBinding(binding); err != nil {
 			return err
+		}
+		if binding.kind == "exec" {
+			return &protocol.Error{Code: protocol.InvalidFrame, Cause: errors.New("exec output does not use terminal acknowledgements")}
+		}
+		handler, ok := s.config.Handler.(TerminalDataHandler)
+		if !ok {
+			return ErrCapabilityUnavailable
 		}
 		return handler.HandleTerminalACK(ctx, binding.authorization, binding.sessionID, binding.attachmentID, frame.NextSequence)
 	case protocol.TerminalResizeOpcode:
@@ -410,6 +490,9 @@ func (s *Server) handleTerminalData(ctx context.Context, message []byte, state *
 		streamID = frame.StreamID
 		binding, bindErr := state.binding(streamID)
 		if bindErr != nil {
+			if errors.Is(bindErr, errTerminalStreamClosed) {
+				return nil
+			}
 			return bindErr
 		}
 		if frame.Sequence != binding.resizeSequence+1 {
@@ -418,8 +501,22 @@ func (s *Server) handleTerminalData(ctx context.Context, message []byte, state *
 		if err := validateTerminalBinding(binding); err != nil {
 			return err
 		}
-		if err := handler.HandleTerminalResize(ctx, binding.authorization, binding.sessionID, binding.attachmentID, frame.Columns, frame.Rows); err != nil {
-			return err
+		if binding.kind == "exec" {
+			handler, ok := s.config.Handler.(ExecDataHandler)
+			if !ok {
+				return ErrCapabilityUnavailable
+			}
+			if err := handler.HandleExecResize(ctx, binding.authorization, binding.operationID, frame.Columns, frame.Rows); err != nil {
+				return err
+			}
+		} else {
+			handler, ok := s.config.Handler.(TerminalDataHandler)
+			if !ok {
+				return ErrCapabilityUnavailable
+			}
+			if err := handler.HandleTerminalResize(ctx, binding.authorization, binding.sessionID, binding.attachmentID, frame.Columns, frame.Rows); err != nil {
+				return err
+			}
 		}
 		state.mu.Lock()
 		if current := state.streams[streamID]; current == binding {
@@ -433,7 +530,7 @@ func (s *Server) handleTerminalData(ctx context.Context, message []byte, state *
 }
 
 func validateTerminalBinding(binding *terminalStreamBinding) error {
-	if binding == nil || binding.authorization.ClientID == "" || binding.sessionID == "" || binding.attachmentID == "" || binding.generation == 0 {
+	if binding == nil || binding.authorization.ClientID == "" || (binding.kind == "" || binding.kind == "terminal") && (binding.sessionID == "" || binding.attachmentID == "" || binding.generation == 0) || (binding.kind == "exec" || binding.kind == "ssh") && binding.operationID == "" || binding.kind != "" && binding.kind != "terminal" && binding.kind != "exec" && binding.kind != "ssh" {
 		return &protocol.Error{Code: protocol.InvalidFrame, Cause: errors.New("terminal stream is not bound")}
 	}
 	if binding.revoked != nil && binding.revoked.Load() {
@@ -448,8 +545,12 @@ func (s *terminalConnectionState) binding(streamID uint32) (*terminalStreamBindi
 	}
 	s.mu.RLock()
 	binding := s.streams[streamID]
+	_, closed := s.closed[streamID]
 	s.mu.RUnlock()
 	if binding == nil {
+		if closed {
+			return nil, errTerminalStreamClosed
+		}
 		return nil, &protocol.Error{Code: protocol.InvalidFrame, Cause: errors.New("unknown terminal stream")}
 	}
 	return binding, nil
@@ -523,7 +624,8 @@ func (s *Server) startRequest(frame protocol.Frame, writer *lockedWriter, author
 			_ = writer.write(errorFrame(frame.RequestID, "not_found_or_forbidden", "resource was not found or is not available", false))
 			return
 		}
-		activeKey := operationKey(authorization.JournalBinding, frame.OperationID)
+		journalOperationID := requestJournalOperationID(frame)
+		activeKey := operationKey(authorization.JournalBinding, journalOperationID)
 		owner, ok := s.registerOperation(activeKey, cancel)
 		if !ok {
 			cancel()
@@ -545,7 +647,10 @@ func (s *Server) startRequest(frame protocol.Frame, writer *lockedWriter, author
 			_ = writer.write(errorFrame(frame.RequestID, "invalid_request", "invalid operation", false))
 			return
 		}
-		outcome, replay, err := s.config.Journal.Execute(opCtx, frame.OperationID, journalRequest, func(ctx context.Context) operation.Outcome {
+		outcome, replay, err := s.config.Journal.Execute(opCtx, journalOperationID, journalRequest, func(ctx context.Context) operation.Outcome {
+			if handler, ok := s.config.Handler.(OperationHandler); ok {
+				return handler.HandleOperation(ctx, authorization, frame.Capability, frame.OperationID, frame.Payload)
+			}
 			return s.config.Handler.Handle(ctx, authorization, frame.Capability, frame.Payload)
 		})
 		if err != nil {
@@ -594,16 +699,45 @@ func (s *Server) startRequest(frame protocol.Frame, writer *lockedWriter, author
 		}
 		if hasStream {
 			s.wg.Add(1)
-			go s.stream(connectionCtx, writer, conn, stream, terminalState, streamID)
+			go s.stream(connectionCtx, writer, conn, stream, terminalState, streamID, frame.Capability)
 		}
 	}()
+}
+
+func requestJournalOperationID(frame protocol.Frame) string {
+	if frame.Capability != "exec.v1" || frame.RequestID == "" {
+		return frame.OperationID
+	}
+	var request struct {
+		Action string `json:"action"`
+	}
+	if json.Unmarshal(frame.Payload, &request) != nil || request.Action == "start" || request.Action == "" {
+		return frame.OperationID
+	}
+	digest := sha256.Sum256([]byte(frame.OperationID + "\x00" + frame.RequestID))
+	return "op_exec_control_" + hex.EncodeToString(digest[:16])
 }
 
 func (s *terminalConnectionState) bind(authorization Authorization, frame protocol.Frame, outcome operation.Outcome) (uint32, error) {
 	var request terminalRequest
 	var response terminalAttachResponse
-	if frame.Capability != "terminal.v1" || decodeStrict(frame.Payload, &request) != nil || request.Action != "attach" || json.Unmarshal(outcome.Result, &response) != nil || request.SessionID == "" || response.AttachmentID == "" || response.Session.Snapshot.Generation == 0 {
-		return 0, errors.New("invalid terminal attachment binding")
+	binding := &terminalStreamBinding{authorization: authorization}
+	if frame.Capability == "terminal.v1" && decodeStrict(frame.Payload, &request) == nil && request.Action == "attach" && json.Unmarshal(outcome.Result, &response) == nil && request.SessionID != "" && response.AttachmentID != "" && response.Session.Snapshot.Generation != 0 {
+		binding.kind, binding.sessionID, binding.attachmentID, binding.generation = "terminal", request.SessionID, response.AttachmentID, response.Session.Snapshot.Generation
+	} else if frame.Capability == "exec.v1" {
+		var execRequest execRequest
+		if decodeStrict(frame.Payload, &execRequest) != nil || execRequest.OperationID == "" || execRequest.Action != "start" && execRequest.Action != "attach" {
+			return 0, errors.New("invalid exec stream binding")
+		}
+		binding.kind, binding.operationID = "exec", execRequest.OperationID
+	} else if frame.Capability == "ssh.v1" {
+		var sshRequest sshRequest
+		if decodeStrict(frame.Payload, &sshRequest) != nil || sshRequest.OperationID == "" || sshRequest.Generation == 0 {
+			return 0, errors.New("invalid SSH stream binding")
+		}
+		binding.kind, binding.operationID = "ssh", sshRequest.OperationID
+	} else {
+		return 0, errors.New("invalid stream binding")
 	}
 	if !authorization.ExpiresAt.IsZero() && !time.Now().UTC().Before(authorization.ExpiresAt) {
 		return 0, &protocol.Error{Code: protocol.CredentialExpired}
@@ -623,7 +757,7 @@ func (s *terminalConnectionState) bind(authorization Authorization, frame protoc
 		if revoked == nil {
 			revoked = s.revoked
 		}
-		binding := &terminalStreamBinding{authorization: authorization, sessionID: request.SessionID, attachmentID: response.AttachmentID, generation: response.Session.Snapshot.Generation, revoked: revoked}
+		binding.revoked = revoked
 		s.streams[streamID] = binding
 		if authorization.RevokedSignal != nil {
 			go func(signal <-chan struct{}) {
@@ -642,6 +776,15 @@ func (s *terminalConnectionState) bind(authorization Authorization, frame protoc
 func (s *terminalConnectionState) remove(streamID uint32) {
 	s.mu.Lock()
 	delete(s.streams, streamID)
+	if _, exists := s.closed[streamID]; !exists {
+		s.closed[streamID] = struct{}{}
+		s.closedIDs = append(s.closedIDs, streamID)
+		if len(s.closedIDs) > 1024 {
+			oldest := s.closedIDs[0]
+			s.closedIDs = s.closedIDs[1:]
+			delete(s.closed, oldest)
+		}
+	}
 	s.mu.Unlock()
 }
 
@@ -662,7 +805,7 @@ func (s *Server) openStream(ctx context.Context, authorization Authorization, fr
 	return handler.OpenStream(ctx, authorization, frame.Capability, frame.Payload, outcome, replay)
 }
 
-func (s *Server) stream(ctx context.Context, writer *lockedWriter, conn Connection, stream OutputStream, state *terminalConnectionState, streamID uint32) {
+func (s *Server) stream(ctx context.Context, writer *lockedWriter, conn Connection, stream OutputStream, state *terminalConnectionState, streamID uint32, capability string) {
 	defer s.wg.Done()
 	defer state.remove(streamID)
 	defer stream.Close()
@@ -671,7 +814,7 @@ func (s *Server) stream(ctx context.Context, writer *lockedWriter, conn Connecti
 		if err != nil {
 			var streamEnd *StreamEnd
 			if errors.As(err, &streamEnd) {
-				_ = writer.write(protocol.Frame{Type: "event", RequestID: "stream", Version: protocol.ProtocolVersion, Capability: "terminal.v1", Payload: streamEnd.Payload})
+				_ = writer.write(protocol.Frame{Type: "event", RequestID: "stream", Version: protocol.ProtocolVersion, Capability: capability, Payload: streamEnd.Payload})
 				return
 			}
 			var streamError *StreamError
@@ -752,11 +895,6 @@ func (p helloPayload) validate() error {
 		seen[capability] = true
 	}
 	return nil
-}
-
-type welcomePayload struct {
-	Version      string   `json:"version"`
-	Capabilities []string `json:"capabilities"`
 }
 
 type readResult struct {
@@ -861,15 +999,6 @@ func (w *lockedWriter) write(frame protocol.Frame) error {
 			return connection.WriteStructured(frame)
 		}
 		return protocol.WriteFrame(w.writer, frame)
-	})
-}
-
-func (w *lockedWriter) writeBinary(frame protocol.BinaryFrame) error {
-	return w.enqueue(func() error {
-		if connection, ok := w.connection.(FramedConnection); ok {
-			return connection.WriteBinary(frame)
-		}
-		return protocol.WriteBinaryFrame(w.writer, frame)
 	})
 }
 
@@ -1028,7 +1157,7 @@ func componentForCapability(capability string) string {
 		return "session"
 	case "preview.public.v1":
 		return "preview"
-	case "update.signed.v1":
+	case "update.tuf.v1":
 		return "update"
 	default:
 		return "protocol"

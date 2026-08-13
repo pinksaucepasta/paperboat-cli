@@ -52,6 +52,103 @@ type Foreground struct {
 	once   sync.Once
 }
 
+type Local struct {
+	URL    string
+	server *Server
+	done   chan error
+	once   sync.Once
+}
+
+type LocalConfig struct {
+	Source       Source
+	SPA          bool
+	ListenPort   uint16
+	Duration     time.Duration
+	Indefinite   bool
+	DrainTimeout time.Duration
+	Ready        func(string) error
+	Observe      func(LifecycleEvent)
+}
+
+// StartLocal serves a pinned source only on the initiating device's IPv4
+// loopback interface. It has no control-plane or machine-runtime dependency.
+func StartLocal(ctx context.Context, config LocalConfig) (*Local, error) {
+	startedAt := time.Now()
+	emit := func(operation, result string, since time.Time) {
+		if config.Observe != nil {
+			config.Observe(LifecycleEvent{Operation: operation, Result: result, Duration: time.Since(since)})
+		}
+	}
+	if ctx == nil || config.Indefinite == (config.Duration > 0) {
+		emit("validation", "failed", startedAt)
+		return nil, ErrInvalidSource
+	}
+	if config.DrainTimeout <= 0 {
+		config.DrainTimeout = DefaultDrainTimeout
+	}
+	handler, err := NewHandler(HandlerConfig{Source: config.Source, SPA: config.SPA})
+	if err != nil {
+		emit("validation", "failed", startedAt)
+		return nil, err
+	}
+	emit("validation", "ok", startedAt)
+	listenerStartedAt := time.Now()
+	server, err := StartLoopback(handler, config.ListenPort)
+	if err != nil {
+		emit("listener_start", "failed", listenerStartedAt)
+		return nil, fmt.Errorf("start private serve listener: %w", err)
+	}
+	emit("listener_start", "ok", listenerStartedAt)
+	local := &Local{URL: fmt.Sprintf("http://127.0.0.1:%d", server.Port()), server: server, done: make(chan error, 1)}
+	if config.Ready != nil {
+		if err := config.Ready(local.URL); err != nil {
+			drainCtx, cancel := context.WithTimeout(context.Background(), config.DrainTimeout)
+			shutdownErr := server.Shutdown(drainCtx)
+			cancel()
+			return nil, errors.Join(err, shutdownErr)
+		}
+	}
+	go func() {
+		var primary error
+		var expiry <-chan time.Time
+		var timer *time.Timer
+		if !config.Indefinite {
+			timer = time.NewTimer(config.Duration)
+			expiry = timer.C
+			defer timer.Stop()
+		}
+		select {
+		case primary = <-server.Done():
+		case <-expiry:
+		case <-ctx.Done():
+			primary = ctx.Err()
+		}
+		local.done <- local.stop(config.DrainTimeout, primary, config.Observe)
+		close(local.done)
+	}()
+	return local, nil
+}
+
+func (l *Local) Wait() error { return <-l.done }
+
+func (l *Local) stop(timeout time.Duration, primary error, observe func(LifecycleEvent)) error {
+	var result error
+	l.once.Do(func() {
+		startedAt := time.Now()
+		drainCtx, cancel := context.WithTimeout(context.Background(), timeout)
+		shutdownErr := l.server.Shutdown(drainCtx)
+		cancel()
+		if errors.Is(primary, context.Canceled) {
+			primary = nil
+		}
+		result = errors.Join(primary, shutdownErr)
+		if observe != nil {
+			observe(LifecycleEvent{Operation: "listener_stop", Result: eventResult(result), Duration: time.Since(startedAt)})
+		}
+	})
+	return result
+}
+
 func StartForeground(ctx context.Context, config ForegroundConfig) (*Foreground, error) {
 	startedAt := time.Now()
 	emit := func(operation, result string, since time.Time) {
@@ -140,6 +237,9 @@ func StartForeground(ctx context.Context, config ForegroundConfig) (*Foreground,
 		}
 		emit("readiness", "ok", startedAt)
 	case err = <-previewDone:
+		if err == nil {
+			err = errors.New("preview stopped before readiness")
+		}
 		return nil, cleanup(fmt.Errorf("create preview: %w", err))
 	case err = <-server.Done():
 		return nil, cleanup(fmt.Errorf("static server stopped before readiness: %w", err))

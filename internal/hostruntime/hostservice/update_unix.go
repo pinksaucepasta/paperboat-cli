@@ -5,8 +5,6 @@ package hostservice
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,8 +20,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/binarytarget"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/bootstrap"
+	"github.com/pinksaucepasta/paperboat/internal/httptransport"
 )
 
 var (
@@ -34,7 +34,7 @@ var (
 const updateJournalSchemaV1 = "paperboat.host-update/v1"
 
 type updateFetcher interface {
-	Fetch(context.Context, bootstrap.ArtifactManifest, string, string) (string, error)
+	Fetch(context.Context, bootstrap.ArtifactTarget, string) (string, error)
 }
 
 type updateServices interface {
@@ -49,7 +49,6 @@ type updateHealth interface {
 type UpdateConfig struct {
 	StateRoot      string
 	BinaryPath     string
-	PublicKey      string
 	CurrentVersion string
 	ListenAddress  string
 }
@@ -76,7 +75,7 @@ type updateJournal struct {
 }
 
 func NewUpdateManager(config UpdateConfig) (*UpdateManager, error) {
-	client := &http.Client{Timeout: 2 * time.Minute, CheckRedirect: secureUpdateRedirect}
+	client := &http.Client{Transport: httptransport.Default(), Timeout: 2 * time.Minute, CheckRedirect: secureUpdateRedirect}
 	manager := &UpdateManager{
 		config: config, ownerUID: 0, fetcher: artifactUpdateFetcher{client: client},
 		services: platformUpdateServices{}, health: HTTPUpdateHealth{Address: config.ListenAddress},
@@ -91,14 +90,14 @@ func NewUpdateManager(config UpdateConfig) (*UpdateManager, error) {
 	return manager, nil
 }
 
-func (m *UpdateManager) Activate(ctx context.Context, artifact bootstrap.ArtifactManifest) (string, error) {
+func (m *UpdateManager) Activate(ctx context.Context, artifact bootstrap.ArtifactTarget) (string, error) {
 	if os.Geteuid() != 0 {
 		return "", ErrUpdateInvalid
 	}
 	return m.activate(ctx, artifact)
 }
 
-func (m *UpdateManager) activate(ctx context.Context, artifact bootstrap.ArtifactManifest) (string, error) {
+func (m *UpdateManager) activate(ctx context.Context, artifact bootstrap.ArtifactTarget) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if err := verifyUpdate(m.config, artifact); err != nil {
@@ -115,7 +114,7 @@ func (m *UpdateManager) activate(ctx context.Context, artifact bootstrap.Artifac
 	if comparison < 0 {
 		return "", ErrUpdateInvalid
 	}
-	staged, err := m.fetcher.Fetch(ctx, artifact, m.config.PublicKey, filepath.Dir(m.config.BinaryPath))
+	staged, err := m.fetcher.Fetch(ctx, artifact, filepath.Join(m.config.StateRoot, "tuf"))
 	if err != nil {
 		return "", err
 	}
@@ -160,26 +159,47 @@ func (m *UpdateManager) activate(ctx context.Context, artifact bootstrap.Artifac
 }
 
 func (m *UpdateManager) validate() error {
-	if !filepath.IsAbs(m.config.StateRoot) || !filepath.IsAbs(m.config.BinaryPath) || m.config.PublicKey == "" || !validReleaseVersion(m.config.CurrentVersion) || m.config.ListenAddress == "" {
-		return ErrUpdateInvalid
+	if !filepath.IsAbs(m.config.StateRoot) {
+		return fmt.Errorf("%w: state root is not absolute", ErrUpdateInvalid)
+	}
+	if !filepath.IsAbs(m.config.BinaryPath) {
+		return fmt.Errorf("%w: binary path is not absolute", ErrUpdateInvalid)
+	}
+	if !validReleaseVersion(m.config.CurrentVersion) {
+		return fmt.Errorf("%w: current version %q is invalid", ErrUpdateInvalid, m.config.CurrentVersion)
+	}
+	if m.config.ListenAddress == "" {
+		return fmt.Errorf("%w: health listen address is empty", ErrUpdateInvalid)
 	}
 	for _, path := range []string{m.config.StateRoot, filepath.Dir(m.config.BinaryPath)} {
 		info, err := os.Lstat(path)
-		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || fileOwnerUID(info) != m.ownerUID {
-			return ErrUpdateInvalid
+		if err != nil {
+			return fmt.Errorf("%w: inspect directory %s: %v", ErrUpdateInvalid, path, err)
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%w: %s is not a real directory", ErrUpdateInvalid, path)
+		}
+		if owner := fileOwnerUID(info); owner != m.ownerUID {
+			return fmt.Errorf("%w: directory %s owner is %d, want %d", ErrUpdateInvalid, path, owner, m.ownerUID)
 		}
 	}
 	for _, path := range []string{m.config.BinaryPath} {
 		info, err := os.Lstat(path)
-		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || fileOwnerUID(info) != m.ownerUID {
-			return ErrUpdateInvalid
+		if err != nil {
+			return fmt.Errorf("%w: inspect binary %s: %v", ErrUpdateInvalid, path, err)
+		}
+		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%w: %s is not a real regular file", ErrUpdateInvalid, path)
+		}
+		if owner := fileOwnerUID(info); owner != m.ownerUID {
+			return fmt.Errorf("%w: binary %s owner is %d, want %d", ErrUpdateInvalid, path, owner, m.ownerUID)
 		}
 	}
 	return nil
 }
 
-func verifyUpdate(config UpdateConfig, artifact bootstrap.ArtifactManifest) error {
-	if bootstrap.VerifyArtifactManifest(artifact, config.PublicKey) != nil || artifact.Schema != bootstrap.ArtifactSchemaV1 || artifact.Kind != bootstrap.ArtifactKindPB {
+func verifyUpdate(config UpdateConfig, artifact bootstrap.ArtifactTarget) error {
+	if bootstrap.VerifyArtifactTarget(artifact) != nil {
 		return ErrUpdateInvalid
 	}
 	if artifact.Platform != runtime.GOOS || artifact.Architecture != runtime.GOARCH {
@@ -188,18 +208,11 @@ func verifyUpdate(config UpdateConfig, artifact bootstrap.ArtifactManifest) erro
 	return nil
 }
 
-func verifyInstalledArtifact(path string, manifest bootstrap.ArtifactManifest, ownerUID int) error {
+func verifyInstalledArtifact(path string, manifest bootstrap.ArtifactTarget, ownerUID int) error {
 	if err := safeUpdateRegular(path, ownerUID); err != nil {
 		return err
 	}
-	file, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	hash := sha256.New()
-	written, err := io.Copy(hash, io.LimitReader(file, manifest.ByteLength+1))
-	if err != nil || written != manifest.ByteLength || !strings.EqualFold(hex.EncodeToString(hash.Sum(nil)), manifest.SHA256) {
+	if binarytarget.Validate(path, manifest.Platform, manifest.Architecture) != nil {
 		return ErrUpdateInvalid
 	}
 	return nil
@@ -219,10 +232,13 @@ func replaceUpdateBinary(current, staged string, ownerUID int) error {
 	if err := os.Remove(rollback); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
+	//paperboat:allow-source-policy atomic-replacement owner=host-updater reason=current-binary-rollback-stage
 	if err := os.Rename(current, rollback); err != nil {
 		return err
 	}
+	//paperboat:allow-source-policy atomic-replacement owner=host-updater reason=verified-binary-activation
 	if err := os.Rename(staged, current); err != nil {
+		//paperboat:allow-source-policy atomic-replacement owner=host-updater reason=activation-failure-rollback
 		_ = os.Rename(rollback, current)
 		return err
 	}
@@ -230,6 +246,13 @@ func replaceUpdateBinary(current, staged string, ownerUID int) error {
 }
 
 func (m *UpdateManager) rollback(ctx context.Context) error {
+	return m.rollbackTo(ctx, m.config.CurrentVersion, true)
+}
+
+func (m *UpdateManager) rollbackTo(ctx context.Context, version string, restartWorker bool) error {
+	if !validReleaseVersion(version) {
+		return fmt.Errorf("%w: rollback version %q is invalid", ErrUpdateRollback, version)
+	}
 	var result error
 	for _, current := range []string{m.config.BinaryPath} {
 		rollback := current + ".rollback"
@@ -238,6 +261,7 @@ func (m *UpdateManager) rollback(ctx context.Context) error {
 				result = errors.Join(result, removeErr)
 				continue
 			}
+			//paperboat:allow-source-policy atomic-replacement owner=host-updater reason=health-failure-rollback
 			if renameErr := os.Rename(rollback, current); renameErr != nil {
 				result = errors.Join(result, renameErr)
 			}
@@ -246,7 +270,11 @@ func (m *UpdateManager) rollback(ctx context.Context) error {
 		}
 	}
 	if result == nil {
-		result = errors.Join(result, m.writeCurrent(m.config.CurrentVersion), m.services.RestartWorker(ctx), os.Remove(m.journal))
+		result = errors.Join(result, m.writeCurrent(version))
+		if restartWorker {
+			result = errors.Join(result, m.services.RestartWorker(ctx))
+		}
+		result = errors.Join(result, os.Remove(m.journal))
 	}
 	if result != nil {
 		return fmt.Errorf("%w: %v", ErrUpdateRollback, result)
@@ -272,6 +300,27 @@ func (m *UpdateManager) RollbackCount() uint64 {
 	return value.Count
 }
 
+// UpdateHealth exposes only a bounded category. Update details remain in the
+// root-owned journal and never cross the host-service boundary.
+func (m *UpdateManager) UpdateHealth() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.RollbackCount() > 1 {
+		return "recovery_required"
+	}
+	entry, err := m.loadJournal()
+	if errors.Is(err, os.ErrNotExist) {
+		return "healthy"
+	}
+	if err != nil {
+		return "recovery_required"
+	}
+	if entry.Stage == "committed" {
+		return "healthy"
+	}
+	return "recovery_required"
+}
+
 func (m *UpdateManager) incrementRollbackCount() error {
 	value := struct {
 		Schema string `json:"schema"`
@@ -293,14 +342,22 @@ func (m *UpdateManager) recover(ctx context.Context) error {
 		return err
 	}
 	if entry.Stage == "committed" {
-		if err := m.health.Check(ctx, entry.Version); err != nil {
-			m.config.CurrentVersion = entry.PreviousVersion
-			return errors.Join(err, m.rollback(ctx))
-		}
 		if err := m.finalizePrevious(); err != nil {
 			return err
 		}
-		m.config.CurrentVersion = entry.Version
+		// A committed activation already passed worker health before the journal
+		// was advanced. The privileged listener is not running while this
+		// constructor executes, so probing it here would deterministically fail
+		// every first restart and incorrectly roll back a healthy binary.
+		if m.config.CurrentVersion == entry.Version {
+			return nil
+		}
+		// A root-owned out-of-band replacement supersedes the completed
+		// transaction. Keep the running build authoritative and discard only the
+		// stale transaction metadata.
+		if err := errors.Join(m.writeCurrent(m.config.CurrentVersion), os.Remove(m.journal)); err != nil {
+			return err
+		}
 		return nil
 	}
 	for _, staged := range []string{entry.Staged} {
@@ -308,7 +365,14 @@ func (m *UpdateManager) recover(ctx context.Context) error {
 			_ = os.Remove(staged)
 		}
 	}
-	return m.rollback(ctx)
+	if entry.Stage == "staged" {
+		return os.Remove(m.journal)
+	}
+	// The service manager is already starting the worker during boot. A nested
+	// restart from this constructor races that transaction and can make the
+	// privileged service fail once before systemd retries it. Restore durable
+	// state here; live activation rollback still restarts the running worker.
+	return m.rollbackTo(ctx, entry.PreviousVersion, false)
 }
 
 func (m *UpdateManager) finalizePrevious() error {
@@ -322,6 +386,7 @@ func (m *UpdateManager) finalizePrevious() error {
 		if err := os.Remove(previous); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
+		//paperboat:allow-source-policy atomic-replacement owner=host-updater reason=verified-previous-retention
 		if err := os.Rename(rollback, previous); err != nil {
 			return err
 		}
@@ -365,8 +430,8 @@ func (m *UpdateManager) writeCurrent(version string) error {
 
 type artifactUpdateFetcher struct{ client *http.Client }
 
-func (f artifactUpdateFetcher) Fetch(ctx context.Context, manifest bootstrap.ArtifactManifest, key, directory string) (string, error) {
-	return bootstrap.FetchVerifiedArtifact(ctx, manifest, key, directory, f.client)
+func (f artifactUpdateFetcher) Fetch(ctx context.Context, manifest bootstrap.ArtifactTarget, directory string) (string, error) {
+	return bootstrap.FetchVerifiedArtifact(ctx, manifest, directory, f.client)
 }
 
 type platformUpdateServices struct{}
@@ -381,6 +446,7 @@ func (platformUpdateServices) RestartWorker(ctx context.Context) error {
 func (platformUpdateServices) RestartHost() {
 	go func() {
 		// Let the activation response flush before this process replaces itself.
+		//paperboat:allow-source-policy sleep owner=runtime-update reason=flush-activation-response-before-self-restart
 		time.Sleep(2 * time.Second)
 		if runtime.GOOS == "linux" {
 			_ = exec.Command("/usr/bin/systemctl", "restart", "--no-block", "paperboat-runtime-privileged.service").Run()
@@ -426,37 +492,19 @@ func secureUpdateRedirect(request *http.Request, via []*http.Request) error {
 }
 
 func atomicRootWrite(path string, body []byte) error {
-	temporary, err := os.CreateTemp(filepath.Dir(path), ".paperboat-update-*")
-	if err != nil {
-		return err
-	}
-	name := temporary.Name()
-	defer os.Remove(name)
-	if err := temporary.Chmod(0o600); err != nil {
-		temporary.Close()
-		return err
-	}
-	if _, err := temporary.Write(body); err != nil {
-		temporary.Close()
-		return err
-	}
-	if err := temporary.Sync(); err != nil {
-		temporary.Close()
-		return err
-	}
-	if err := temporary.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(name, path); err != nil {
-		return err
-	}
-	return syncUpdateDirectory(filepath.Dir(path))
+	return atomicfile.Write(path, body, atomicfile.Options{Mode: 0o600, OwnerUID: os.Geteuid(), OwnerGID: -1})
 }
 
 func safeUpdateRegular(path string, ownerUID int) error {
 	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || fileOwnerUID(info) != ownerUID {
-		return ErrUpdateInvalid
+	if err != nil {
+		return fmt.Errorf("%w: inspect %s: %v", ErrUpdateInvalid, path, err)
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%w: %s is not a real regular file", ErrUpdateInvalid, path)
+	}
+	if owner := fileOwnerUID(info); owner != ownerUID {
+		return fmt.Errorf("%w: %s owner is %d, want %d", ErrUpdateInvalid, path, owner, ownerUID)
 	}
 	return nil
 }

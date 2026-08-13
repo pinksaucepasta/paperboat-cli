@@ -12,6 +12,7 @@ import (
 
 	frpclient "github.com/fatedier/frp/client"
 	v1 "github.com/fatedier/frp/pkg/config/v1"
+	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
 )
 
 type transportPreference struct {
@@ -29,6 +30,7 @@ type racingConnector struct {
 	closed         bool
 	newConnector   func(context.Context, *v1.ClientCommonConfig) frpclient.Connector
 	onSelected     func(Transport)
+	preferenceErr  error
 }
 
 func newRacingConnector(ctx context.Context, cfg *v1.ClientCommonConfig, preferencePath string) frpclient.Connector {
@@ -102,7 +104,10 @@ func (c *racingConnector) Open() error {
 				if c.onSelected != nil {
 					c.onSelected(result.transport)
 				}
-				c.savePreference(result.transport)
+				preferenceErr := c.savePreference(result.transport)
+				c.mu.Lock()
+				c.preferenceErr = preferenceErr
+				c.mu.Unlock()
 				for _, candidate := range candidates {
 					if candidate.connector != result.connector {
 						candidate.cancel()
@@ -115,8 +120,7 @@ func (c *racingConnector) Open() error {
 			_ = result.connector.Close()
 			failures = errors.Join(failures, result.err)
 			if !startedSecond {
-				if timer.Stop() {
-				}
+				_ = timer.Stop()
 				start(second)
 				startedSecond = true
 			}
@@ -179,30 +183,17 @@ func (c *racingConnector) loadPreference() Transport {
 	}
 	return value.Transport
 }
-func (c *racingConnector) savePreference(transport Transport) {
+func (c *racingConnector) savePreference(transport Transport) error {
 	if c.preferencePath == "" {
-		return
+		return nil
 	}
-	data, _ := json.Marshal(transportPreference{Transport: transport, ExpiresAt: time.Now().Add(30 * time.Minute)})
-	dir := filepath.Dir(c.preferencePath)
-	if os.MkdirAll(dir, 0700) != nil {
-		return
-	}
-	file, err := os.CreateTemp(dir, "connector-transport-*")
+	data, err := json.Marshal(transportPreference{Transport: transport, ExpiresAt: time.Now().Add(30 * time.Minute)})
 	if err != nil {
-		return
+		return err
 	}
-	name := file.Name()
-	defer os.Remove(name)
-	_ = file.Chmod(0600)
-	_, err = file.Write(data)
-	if err == nil {
-		err = file.Sync()
+	dir := filepath.Dir(c.preferencePath)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
 	}
-	if closeErr := file.Close(); err == nil {
-		err = closeErr
-	}
-	if err == nil {
-		_ = os.Rename(name, c.preferencePath)
-	}
+	return atomicfile.Write(c.preferencePath, data, atomicfile.Options{Mode: 0o600, OwnerUID: os.Geteuid(), OwnerGID: os.Getegid()})
 }

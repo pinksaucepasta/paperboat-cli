@@ -2,6 +2,8 @@ package filetransfer
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"io"
 	"net"
@@ -10,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/pinksaucepasta/paperboat/internal/httptransport"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -65,6 +69,25 @@ func TestTransportProbeFallsBackOnlyAfterH3NetworkFailure(t *testing.T) {
 	_ = got.Body.Close()
 	if h3Calls != 1 || h2Calls != 2 {
 		t.Fatalf("h3=%d h2=%d", h3Calls, h2Calls)
+	}
+}
+
+func TestTransportProbeNeverDowngradesSecurityOrProtocolFailure(t *testing.T) {
+	for name, failure := range map[string]error{
+		"certificate authority": x509.UnknownAuthorityError{},
+		"certificate hostname":  x509.HostnameError{Host: "wrong.test"},
+		"TLS record":            tls.RecordHeaderError{},
+		"proxy authentication":  &httptransport.ProxyError{Failure: httptransport.ProxyAuthenticationRequired},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h2Calls := 0
+			selector, _ := NewTransportSelector(TransportSelectorConfig{H3: roundTripFunc(func(*http.Request) (*http.Response, error) { return nil, failure }), H2: roundTripFunc(func(*http.Request) (*http.Response, error) { h2Calls++; return nil, nil }), Stagger: time.Hour})
+			err := selector.Probe(context.Background(), "https://route.example/v1/file-transfers")
+			var transportErr *TransportError
+			if !errors.As(err, &transportErr) || transportErr.Transport != TransportH3 || h2Calls != 0 {
+				t.Fatalf("err=%v h2=%d", err, h2Calls)
+			}
+		})
 	}
 }
 

@@ -3,7 +3,6 @@ package filetransfer
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/pinksaucepasta/paperboat/internal/httptransport"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 )
@@ -22,8 +22,9 @@ import (
 type Transport string
 
 const (
-	TransportH3 Transport = "h3"
-	TransportH2 Transport = "h2"
+	TransportDirect Transport = "direct"
+	TransportH3     Transport = "h3"
+	TransportH2     Transport = "h2"
 )
 
 type TransportError struct {
@@ -72,7 +73,16 @@ func NewTransportSelector(config TransportSelectorConfig) (*TransportSelector, e
 	}
 	if config.H2 == nil {
 		dialer := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
-		config.H2 = &http.Transport{Proxy: http.ProxyFromEnvironment, DialContext: dialer.DialContext, ForceAttemptHTTP2: true, TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, ClientSessionCache: tls.NewLRUClientSessionCache(32)}, TLSHandshakeTimeout: 5 * time.Second, ResponseHeaderTimeout: 30 * time.Second, ExpectContinueTimeout: time.Second, IdleConnTimeout: 90 * time.Second, MaxConnsPerHost: 4, MaxIdleConnsPerHost: 4, MaxResponseHeaderBytes: 32 << 10}
+		h2Config := httptransport.DevelopmentConfig()
+		h2Config.DialContext = dialer.DialContext
+		h2Config.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12, ClientSessionCache: tls.NewLRUClientSessionCache(32)}
+		h2Config.MaxConnsPerHost = 4
+		h2Config.MaxIdleConnsPerHost = 4
+		h2, err := httptransport.New(h2Config)
+		if err != nil {
+			return nil, err
+		}
+		config.H2 = h2
 	}
 	if config.Stagger < 0 || config.Cooldown <= 0 || config.ProbeTimeout <= 0 {
 		return nil, errors.New("invalid file transfer transport configuration")
@@ -216,22 +226,6 @@ func fallbackEligibleTransportError(err error) bool {
 	}
 	var network net.Error
 	if errors.As(err, &network) {
-		return true
-	}
-	var record tls.RecordHeaderError
-	if errors.As(err, &record) {
-		return true
-	}
-	var unknown x509.UnknownAuthorityError
-	if errors.As(err, &unknown) {
-		return true
-	}
-	var hostname x509.HostnameError
-	if errors.As(err, &hostname) {
-		return true
-	}
-	var invalid x509.CertificateInvalidError
-	if errors.As(err, &invalid) {
 		return true
 	}
 	return errors.Is(err, syscall.ENETUNREACH) || errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET)

@@ -10,7 +10,7 @@ import (
 
 type recordingUpdateClient struct{ calls int }
 
-func (c *recordingUpdateClient) Activate(_ context.Context, artifact bootstrap.ArtifactManifest) (string, error) {
+func (c *recordingUpdateClient) Activate(_ context.Context, artifact bootstrap.ArtifactTarget) (string, error) {
 	c.calls++
 	return artifact.Version, nil
 }
@@ -21,18 +21,18 @@ func TestDispatcherForwardsOnlyTypedPairedUpdateManifests(t *testing.T) {
 	capabilities := dispatcher.Capabilities()
 	found := false
 	for _, capability := range capabilities {
-		found = found || capability == "update.signed.v1"
+		found = found || capability == "update.tuf.v1"
 	}
 	if !found {
 		t.Fatal("signed update capability was not advertised")
 	}
-	payload, _ := json.Marshal(signedUpdateRequest{Artifact: bootstrap.ArtifactManifest{Kind: bootstrap.ArtifactKindPB, Version: "2026.07.25.5"}})
-	result := dispatcher.Handle(context.Background(), Authorization{}, "update.signed.v1", payload)
+	payload, _ := json.Marshal(signedUpdateRequest{Artifact: bootstrap.ArtifactTarget{Kind: bootstrap.ArtifactKindPB, Version: "2026.07.25.5"}})
+	result := dispatcher.Handle(context.Background(), Authorization{}, "update.tuf.v1", payload)
 	if result.ErrorCode != "" || client.calls != 1 {
 		t.Fatalf("result=%+v calls=%d", result, client.calls)
 	}
 	hostile := append(payload[:len(payload)-1], []byte(`,"path":"/tmp/pbh"}`)...)
-	result = dispatcher.Handle(context.Background(), Authorization{}, "update.signed.v1", hostile)
+	result = dispatcher.Handle(context.Background(), Authorization{}, "update.tuf.v1", hostile)
 	if result.ErrorCode != "invalid_request" || client.calls != 1 {
 		t.Fatalf("hostile result=%+v calls=%d", result, client.calls)
 	}

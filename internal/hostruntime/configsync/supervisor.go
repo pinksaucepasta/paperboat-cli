@@ -79,17 +79,6 @@ func (s *Supervisor) Shutdown(ctx context.Context) error {
 	}
 }
 
-func (s *Supervisor) Apply(ctx context.Context) error {
-	s.mu.Lock()
-	runtime := s.active
-	s.mu.Unlock()
-	trigger, ok := runtime.(interface{ Apply(context.Context) error })
-	if !ok {
-		return ErrAuthorization
-	}
-	return trigger.Apply(ctx)
-}
-
 func (s *Supervisor) run(ctx context.Context) error {
 	timer := time.NewTimer(0)
 	defer timer.Stop()

@@ -7,6 +7,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/pinksaucepasta/paperboat/internal/doctor"
 )
 
 func TestCommandTreeHasUniqueNamesAndAliases(t *testing.T) {
@@ -87,6 +89,32 @@ func TestJSONOutputFixturesSeparateDataAndError(t *testing.T) {
 		if envelope.SchemaVersion != "1.0" || (envelope.Data != nil) == (envelope.Error != nil) || envelope.OK != (envelope.Data != nil) {
 			t.Errorf("invalid output envelope %s", name)
 		}
+	}
+}
+
+func TestDoctorResultVectorsMatchProductionContract(t *testing.T) {
+	file, err := os.Open("../../testdata/contracts/fixtures/cli/doctor-results.ndjson")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	count := 0
+	for scanner.Scan() {
+		count++
+		var report doctor.Report
+		if err := json.Unmarshal(scanner.Bytes(), &report); err != nil {
+			t.Fatalf("vector %d: %v", count, err)
+		}
+		if err := report.Validate(); err != nil {
+			t.Fatalf("vector %d: %v", count, err)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if count < 2 {
+		t.Fatalf("doctor vectors=%d", count)
 	}
 }
 
@@ -209,8 +237,11 @@ func TestEveryCommandHasBehaviorAndTranscript(t *testing.T) {
 		if slices.Contains(transcript.Argv, "--json") {
 			var envelope struct {
 				SchemaVersion string `json:"schema_version"`
+				Schema        string `json:"schema"`
 			}
-			if strings.Contains(transcript.Stdout, "\x1b") || json.Unmarshal([]byte(strings.TrimSpace(transcript.Stdout)), &envelope) != nil || envelope.SchemaVersion != "1.0" {
+			decodeErr := json.Unmarshal([]byte(strings.TrimSpace(transcript.Stdout)), &envelope)
+			validSchema := envelope.SchemaVersion == "1.0" || strings.HasPrefix(envelope.Schema, "paperboat.") && strings.HasSuffix(envelope.Schema, "/v1")
+			if strings.Contains(transcript.Stdout, "\x1b") || decodeErr != nil || !validSchema {
 				t.Errorf("%s has invalid JSON stdout", transcript.Command)
 			}
 		}

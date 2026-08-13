@@ -6,7 +6,7 @@
       "id": "cli.behavior",
       "path": "cli/behavior.json",
       "type": "command-behavior",
-      "sha256": "7719ccf266d523e9e443ffe1c500f2410d6066a404ac61f4860bb0fc676bc464",
+      "sha256": "267ba44aeba1d8c90872d673875e14f1a66bac7b805a39004c9944686b265db9",
       "owner": "cli",
       "review": "preview-ownership-review",
       "consumers": [
@@ -17,7 +17,7 @@
       "id": "cli.command-tree",
       "path": "cli/command-tree.json",
       "type": "command-tree",
-      "sha256": "a579b1395c18e949ff4d977fdf742d1ff160cb8e8ae9b6caac941d04a465e520",
+      "sha256": "c6c16ece447e77f9fb9b6c240d8362b19187e41c9544514e7093724d32bd58ea",
       "owner": "cli",
       "review": "preview-ownership-review",
       "consumers": [
@@ -52,7 +52,7 @@
       "id": "credentials.classes",
       "path": "credentials/classes.json",
       "type": "credential-matrix",
-      "sha256": "5ab120cf54db1e13b9e27756e4339c823a74fa0415acbe87a4597f523422fa82",
+      "sha256": "b8b7cd161ca475bdff78496d28ebb8277655b6aab03f2bf04fb7932c042f386b",
       "owner": "server",
       "review": "initial-review",
       "consumers": [
@@ -104,6 +104,17 @@
       "sha256": "3cd89fa19cf0aa201c9b4a48387aedb38791689ae61fe5d1d1713de273d32303",
       "owner": "cli",
       "review": "initial-review",
+      "consumers": [
+        "paperboat"
+      ]
+    },
+    {
+      "id": "cli.wait-results",
+      "path": "fixtures/cli/wait-results.ndjson",
+      "type": "result-vectors",
+      "sha256": "228724adbcac1483d493e03680dc7ceafad9491c7a0b95bca3f41a677997774d",
+      "owner": "cli",
+      "review": "local-daemon-review",
       "consumers": [
         "paperboat"
       ]
@@ -357,6 +368,51 @@
       ]
     },
     {
+      "id": "diagnostics.bugreport",
+      "path": "schemas/diagnostics/bugreport.schema.json",
+      "type": "json-schema",
+      "sha256": "c683f41856c14ea8db576a65cf9135230e16c8d598bafc115e3d449344b57109",
+      "owner": "cli",
+      "review": "diagnostics-review",
+      "consumers": [
+        "paperboat"
+      ]
+    },
+    {
+      "id": "diagnostics.bundle",
+      "path": "schemas/diagnostics/bundle.schema.json",
+      "type": "json-schema",
+      "sha256": "b1714a45c16d18a83b3c88f7b7d9fa44e4d7f66d490731885228c858968362e4",
+      "owner": "cli",
+      "review": "diagnostics-review",
+      "consumers": [
+        "paperboat"
+      ]
+    },
+    {
+      "id": "diagnostics.event",
+      "path": "schemas/diagnostics/event.schema.json",
+      "type": "json-schema",
+      "sha256": "24d48ad15facb791ca1fb0434cc1a62c8cda08383cda4f6025f9121e7f4f6928",
+      "owner": "cli",
+      "review": "diagnostics-review",
+      "consumers": [
+        "paperboat"
+      ]
+    },
+    {
+      "id": "diagnostics.upload-intent",
+      "path": "schemas/diagnostics/upload-intent.schema.json",
+      "type": "json-schema",
+      "sha256": "4a7db2a659cb413fbe23ab3490c40864fe8b08956d49364fcd5803d14fce912e",
+      "owner": "server",
+      "review": "diagnostics-review",
+      "consumers": [
+        "paperboat",
+        "paperboat-server"
+      ]
+    },
+    {
       "id": "edge.admission",
       "path": "schemas/edge/admission.schema.json",
       "type": "json-schema",
@@ -505,7 +561,7 @@
       "id": "cli.command.transcripts",
       "path": "transcripts/cli/commands.json",
       "type": "transcripts",
-      "sha256": "d2e7879339b8ccdaa0b59cd2f4a25b3db960903a6a3075f607ccdba73af79764",
+      "sha256": "b853bfcc7a2005d88b62f49c0574755edb337c79ada3cb373dc1381a2cb76cf7",
       "owner": "cli",
       "review": "preview-ownership-review",
       "consumers": [
@@ -530,6 +586,28 @@
       "sha256": "71c5cec39df9b91c877b03ecb5748eb7ba4055148e89a2fb2c38261c42d6214b",
       "owner": "cli",
       "review": "initial-review",
+      "consumers": [
+        "paperboat"
+      ]
+    },
+    {
+      "id": "cli.doctor-results",
+      "path": "fixtures/cli/doctor-results.ndjson",
+      "type": "result-vectors",
+      "sha256": "20c4b5a6140cf392ad2357887e496206867923eaa33444f1a68b50f9a510ce5a",
+      "owner": "cli",
+      "review": "diagnostics-review",
+      "consumers": [
+        "paperboat"
+      ]
+    },
+    {
+      "id": "diagnostics.doctor",
+      "path": "schemas/diagnostics/doctor.schema.json",
+      "type": "json-schema",
+      "sha256": "4f3948250870429a2782a58f9be90f4bd6b78d78097d88f19f6cf2611dee1104",
+      "owner": "cli",
+      "review": "diagnostics-review",
       "consumers": [
         "paperboat"
       ]

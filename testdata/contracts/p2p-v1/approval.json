@@ -1,0 +1,14 @@
+{
+  "contract_family": "paperboat.p2p",
+  "contract_version": "1.0.0",
+  "status": "approved",
+  "manifest_sha256": "461658a111c28a59f78f44211a63ddaa776ca1f53512ac4dc5364ee22d5f6081",
+  "approval": {
+    "owner": "pujan-modha",
+    "authority": "workspace owner",
+    "reviewed_at": "2026-08-05T22:44:54Z",
+    "decision": "approved",
+    "scope": ["product", "server", "tunnel", "security", "operations", "release"]
+  },
+  "rule": "Any artifact change requires a new manifest digest and a new explicit workspace-owner approval. Existing contracts/approvals.json and contracts/freeze-candidate.json remain immutable."
+}

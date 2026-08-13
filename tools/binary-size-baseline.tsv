@@ -1,0 +1,6 @@
+# Reviewed 2026-08-05 after the P2P/ICE, E2EE, transfer, preview, SSH, and diagnostics cutover.
+# Updating a size requires package/dependency attribution in the reviewing change.
+darwin	amd64	54334336
+darwin	arm64	50330994
+linux	amd64	54210658
+linux	arm64	49652276

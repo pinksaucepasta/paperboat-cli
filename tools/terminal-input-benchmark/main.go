@@ -123,7 +123,7 @@ func measure(parent context.Context, cfg config, transport string, runIndex int)
 	} else {
 		pbSession = fmt.Sprintf("input-bench-%s-%d-%d", transport[3:], time.Now().UnixNano(), runIndex)
 		defer deletePBSession(cfg.pb, cfg.target, pbSession)
-		command = exec.CommandContext(ctx, cfg.pb, "connect", cfg.target, "--transport", transport[3:], "--new", "--name", pbSession, "--status-bar", "off")
+		command = exec.CommandContext(ctx, cfg.pb, "connect", cfg.target, "new", "--path", paperboatPath(transport), "--name", pbSession, "--status-bar", "off")
 	}
 	terminal, err := pty.StartWithSize(command, &pty.Winsize{Rows: 40, Cols: 120})
 	if err != nil {
@@ -170,6 +170,17 @@ func measure(parent context.Context, cfg config, transport string, runIndex int)
 		<-processDone
 	}
 	return summarize(transport, runIndex, values), nil
+}
+
+func paperboatPath(transport string) string {
+	switch transport {
+	case "pb_quic":
+		return "q"
+	case "pb_wss":
+		return "w"
+	default:
+		return ""
+	}
 }
 
 func (m *streamMatcher) waitAny(timeout time.Duration, markers ...[]byte) error {

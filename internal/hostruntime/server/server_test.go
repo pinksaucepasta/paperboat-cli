@@ -25,6 +25,29 @@ func (f authorizerFunc) Authorize(ctx context.Context, frame protocol.Frame) (Au
 	return f(ctx, frame)
 }
 
+func TestExecControlUsesDistinctInternalJournalOperation(t *testing.T) {
+	start := protocol.Frame{RequestID: "req_start", OperationID: "exec_operation_1", Capability: "exec.v1", Payload: json.RawMessage(`{"action":"start"}`)}
+	attach := protocol.Frame{RequestID: "req_attach", OperationID: start.OperationID, Capability: "exec.v1", Payload: json.RawMessage(`{"action":"attach","operation_id":"exec_operation_1","from_sequence":2}`)}
+	cancel := protocol.Frame{RequestID: "req_cancel", OperationID: start.OperationID, Capability: "exec.v1", Payload: json.RawMessage(`{"action":"cancel","operation_id":"exec_operation_1"}`)}
+	if got := requestJournalOperationID(start); got != start.OperationID {
+		t.Fatalf("start journal operation = %q", got)
+	}
+	if got := requestJournalOperationID(attach); got == "" || got == start.OperationID {
+		t.Fatalf("attach journal operation = %q", got)
+	}
+	first := requestJournalOperationID(cancel)
+	if first == "" || first == start.OperationID {
+		t.Fatalf("control journal operation = %q", first)
+	}
+	if again := requestJournalOperationID(cancel); again != first {
+		t.Fatalf("control journal operation changed: %q != %q", again, first)
+	}
+	cancel.RequestID = "req_cancel_retry"
+	if retry := requestJournalOperationID(cancel); retry == first {
+		t.Fatalf("distinct control request reused journal operation %q", retry)
+	}
+}
+
 func TestTerminalBindingSurvivesCredentialExpiry(t *testing.T) {
 	attach := protocol.Frame{Type: "request", RequestID: "req_attach", Version: "1.0", OperationID: "op_attach_0001", Capability: "terminal.v1", DeadlineMS: 1000, Payload: json.RawMessage(`{"action":"attach","session_id":"ses_1"}`)}
 	outcome := operation.Outcome{Result: json.RawMessage(`{"attachment_id":"att_1","session":{"snapshot":{"generation":1}}}`)}
@@ -72,7 +95,7 @@ func testServer(t *testing.T, authorize authorizerFunc, handle handlerFunc, maxC
 	server, err := New(Config{
 		Negotiator: protocol.Negotiator{Profile: config.BYOD, Available: map[string]bool{"terminal.v1": true, "health.v1": true}},
 		Journal:    journal, Authorizer: authorize, Handler: handle, MaxConcurrent: maxConcurrent,
-		HeartbeatInterval: time.Hour, PeerTimeout: 2 * time.Hour, MutationDeadline: 5 * time.Minute,
+		HeartbeatInterval: time.Hour, MutationDeadline: 5 * time.Minute,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -101,6 +124,40 @@ func hello(t *testing.T, conn net.Conn) protocol.Frame {
 		t.Fatalf("welcome=%#v", frame)
 	}
 	return frame
+}
+
+func TestServeDoesNotApplyApplicationIdleTimeout(t *testing.T) {
+	journal, err := operation.NewJournal(8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := New(Config{
+		Negotiator: protocol.Negotiator{Profile: config.BYOD, Available: map[string]bool{"terminal.v1": true, "health.v1": true}},
+		Journal:    journal,
+		Authorizer: authorizerFunc(func(context.Context, protocol.Frame) (Authorization, error) {
+			return Authorization{JournalBinding: "idle-test"}, nil
+		}),
+		Handler: handlerFunc(func(context.Context, Authorization, string, json.RawMessage) operation.Outcome {
+			return operation.Outcome{}
+		}),
+		MaxConcurrent:     1,
+		HeartbeatInterval: time.Hour,
+		MutationDeadline:  time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, peer := net.Pipe()
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(peer) }()
+	hello(t, client)
+	select {
+	case err := <-done:
+		t.Fatalf("idle peer was closed: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	_ = client.Close()
+	<-done
 }
 
 func request(id, operationID string, payload json.RawMessage) protocol.Frame {
@@ -226,7 +283,7 @@ func TestTerminalStreamReleasesOutputAfterWrite(t *testing.T) {
 	server := &Server{}
 	var released atomic.Int64
 	server.wg.Add(1)
-	server.stream(context.Background(), &lockedWriter{writer: connection, connection: connection}, connection, &releasingOutputStream{released: &released}, newTerminalConnectionState(), 1)
+	server.stream(context.Background(), &lockedWriter{writer: connection, connection: connection}, connection, &releasingOutputStream{released: &released}, newTerminalConnectionState(), 1, "terminal.v1")
 	if got := released.Load(); got != 1 {
 		t.Fatalf("release calls = %d", got)
 	}
@@ -237,7 +294,7 @@ func TestSlowConsumerStreamSendsBoundedErrorBefore4408Close(t *testing.T) {
 	connection := &streamTestConnection{}
 	server := &Server{}
 	server.wg.Add(1)
-	server.stream(context.Background(), &lockedWriter{writer: connection, connection: connection}, connection, errorOutputStream{&StreamError{Code: "slow_consumer", Details: details, CloseCode: protocol.CloseSlowConsumer}}, newTerminalConnectionState(), 1)
+	server.stream(context.Background(), &lockedWriter{writer: connection, connection: connection}, connection, errorOutputStream{&StreamError{Code: "slow_consumer", Details: details, CloseCode: protocol.CloseSlowConsumer}}, newTerminalConnectionState(), 1, "terminal.v1")
 	if connection.closeCode != protocol.CloseSlowConsumer || len(connection.structured) != 1 {
 		t.Fatalf("code=%d frames=%#v", connection.closeCode, connection.structured)
 	}
@@ -258,7 +315,7 @@ func TestTerminalStreamEndEmitsStructuredEvent(t *testing.T) {
 	connection := &streamTestConnection{}
 	server := &Server{}
 	server.wg.Add(1)
-	server.stream(context.Background(), &lockedWriter{writer: connection, connection: connection}, connection, errorOutputStream{&StreamEnd{Payload: payload}}, newTerminalConnectionState(), 1)
+	server.stream(context.Background(), &lockedWriter{writer: connection, connection: connection}, connection, errorOutputStream{&StreamEnd{Payload: payload}}, newTerminalConnectionState(), 1, "terminal.v1")
 	if connection.closeCode != 0 || len(connection.structured) != 1 {
 		t.Fatalf("code=%d frames=%#v", connection.closeCode, connection.structured)
 	}

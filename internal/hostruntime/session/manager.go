@@ -569,6 +569,12 @@ func (m *Manager) Close(ctx context.Context, sessionID string) (Snapshot, error)
 		if err := session.lifecycle.Transition(Closing); err != nil {
 			return Snapshot{}, err
 		}
+		// Drain the asynchronous history writer before the lifecycle update. Both
+		// operations write SQLite; ordering them avoids SQLITE_BUSY while keeping
+		// PTY output fan-out independent of persistence latency.
+		if err := m.stopOutputPersistence(session); err != nil {
+			return Snapshot{}, err
+		}
 		if err := m.persist(ctx, session, Running); err != nil {
 			terminateCtx, cancel := context.WithTimeout(context.Background(), m.config.TerminationTimeout)
 			result, _ := session.process.Terminate(terminateCtx, 0)

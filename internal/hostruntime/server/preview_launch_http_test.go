@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -56,6 +57,10 @@ func TestPreviewLaunchHTTPAuthorizesAndReturnsConfirmedRecord(t *testing.T) {
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusOK || !called || !bytes.Contains(response.Body.Bytes(), []byte("https://docs.preview.test")) {
 		t.Fatalf("status=%d called=%v body=%s", response.Code, called, response.Body.String())
+	}
+	var record preview.ControlRecord
+	if err := json.Unmarshal(response.Body.Bytes(), &record); err != nil || record.OperationID != "preview-op-1" {
+		t.Fatalf("record=%+v error=%v", record, err)
 	}
 }
 

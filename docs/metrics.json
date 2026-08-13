@@ -1,0 +1,307 @@
+{
+  "schema_version": 1,
+  "metrics": [
+    {
+      "name": "paperboat_runtime_active_resources",
+      "kind": "gauge",
+      "labels": {
+        "kind": [
+          "attachments",
+          "connectors",
+          "previews",
+          "processes",
+          "serves_detached",
+          "serves_foreground",
+          "sessions",
+          "uploads"
+        ]
+      }
+    },
+    {
+      "name": "paperboat_runtime_cleanup_total",
+      "kind": "counter",
+      "labels": {
+        "kind": [
+          "session",
+          "update",
+          "upload"
+        ],
+        "result": [
+          "failed",
+          "preserved",
+          "removed"
+        ]
+      }
+    },
+    {
+      "name": "paperboat_runtime_connector_recovery_seconds",
+      "kind": "gauge"
+    },
+    {
+      "name": "paperboat_runtime_connector_retries_total",
+      "kind": "counter",
+      "labels": {
+        "result": [
+          "canceled",
+          "connected",
+          "failed",
+          "replaced"
+        ],
+        "transport": [
+          "none",
+          "quic",
+          "tcp_dedicated",
+          "tcp_mux"
+        ]
+      }
+    },
+    {
+      "name": "paperboat_runtime_delivery_total",
+      "kind": "counter",
+      "labels": {
+        "kind": [
+          "preview",
+          "runtime"
+        ],
+        "result": [
+          "canceled",
+          "delivered",
+          "failed"
+        ]
+      }
+    },
+    {
+      "name": "paperboat_runtime_network_changes_total",
+      "kind": "counter",
+      "labels": {
+        "action": [
+          "observe",
+          "rebind"
+        ],
+        "reason": [
+          "address_family",
+          "default_route",
+          "interface_address",
+          "network_cost",
+          "proxy",
+          "viability",
+          "wake"
+        ]
+      }
+    },
+    {
+      "name": "paperboat_runtime_network_generation",
+      "kind": "gauge"
+    },
+    {
+      "name": "paperboat_runtime_operations_total",
+      "kind": "counter",
+      "labels": {
+        "component": [
+          "auth",
+          "connector",
+          "preview",
+          "protocol",
+          "service",
+          "session",
+          "storage",
+          "update",
+          "upload"
+        ],
+        "result": [
+          "canceled",
+          "conflict",
+          "deadline",
+          "ok",
+          "rejected",
+          "replayed",
+          "unavailable"
+        ]
+      }
+    },
+    {
+      "name": "paperboat_runtime_readiness",
+      "kind": "gauge",
+      "labels": {
+        "capability": [
+          "connector",
+          "health",
+          "preview",
+          "terminal",
+          "update",
+          "upload"
+        ],
+        "state": [
+          "degraded",
+          "ready",
+          "unavailable"
+        ]
+      }
+    },
+    {
+      "name": "paperboat_runtime_renewal_failures_total",
+      "kind": "counter"
+    },
+    {
+      "name": "paperboat_runtime_restart_total",
+      "kind": "counter"
+    },
+    {
+      "name": "paperboat_runtime_serve_events_total",
+      "kind": "counter",
+      "labels": {
+        "event": [
+          "cleanup",
+          "drain",
+          "lease_acquire",
+          "lease_loss",
+          "lease_release",
+          "lease_renew",
+          "listener_start",
+          "listener_stop",
+          "orphan_cleanup",
+          "ownership_transfer",
+          "preview_registration",
+          "readiness",
+          "restart",
+          "revoke",
+          "selection",
+          "source_invalidation",
+          "validation"
+        ],
+        "result": [
+          "canceled",
+          "expired",
+          "failed",
+          "ok",
+          "preserved",
+          "removed",
+          "timeout"
+        ]
+      }
+    },
+    {
+      "name": "paperboat_runtime_serve_latency_seconds",
+      "kind": "histogram",
+      "labels": {
+        "owner": [
+          "detached",
+          "foreground"
+        ],
+        "result": [
+          "canceled",
+          "failed",
+          "ok",
+          "timeout"
+        ],
+        "stage": [
+          "drain",
+          "readiness",
+          "reconciliation",
+          "selection",
+          "validation"
+        ]
+      }
+    },
+    {
+      "name": "paperboat_runtime_terminal_bytes_total",
+      "kind": "counter",
+      "labels": {
+        "direction": [
+          "input",
+          "output"
+        ]
+      }
+    },
+    {
+      "name": "paperboat_runtime_terminal_compression_bytes_total",
+      "kind": "counter",
+      "labels": {
+        "kind": [
+          "encoded",
+          "raw"
+        ]
+      }
+    },
+    {
+      "name": "paperboat_runtime_terminal_compression_failures_total",
+      "kind": "counter",
+      "labels": {
+        "stage": [
+          "decode",
+          "encode"
+        ]
+      }
+    },
+    {
+      "name": "paperboat_runtime_terminal_compression_frames_total",
+      "kind": "counter",
+      "labels": {
+        "decision": [
+          "compressed",
+          "failure",
+          "insufficient",
+          "small"
+        ],
+        "encoding": [
+          "raw",
+          "zstd"
+        ]
+      }
+    },
+    {
+      "name": "paperboat_runtime_terminal_compression_nanoseconds_total",
+      "kind": "counter",
+      "labels": {
+        "stage": [
+          "decode",
+          "encode"
+        ]
+      }
+    },
+    {
+      "name": "paperboat_runtime_terminal_events_total",
+      "kind": "counter",
+      "labels": {
+        "event": [
+          "input_uncertain",
+          "replay_gap",
+          "runtime_restart",
+          "slow_consumer"
+        ]
+      }
+    },
+    {
+      "name": "paperboat_runtime_terminal_frames_total",
+      "kind": "counter",
+      "labels": {
+        "direction": [
+          "input",
+          "output"
+        ]
+      }
+    },
+    {
+      "name": "paperboat_runtime_terminal_persistence_failures_total",
+      "kind": "counter"
+    },
+    {
+      "name": "paperboat_runtime_terminal_persistence_lag_bytes",
+      "kind": "gauge"
+    },
+    {
+      "name": "paperboat_runtime_terminal_stage_nanoseconds_total",
+      "kind": "counter",
+      "labels": {
+        "stage": [
+          "pty_to_socket",
+          "socket_to_pty"
+        ]
+      }
+    },
+    {
+      "name": "paperboat_runtime_update_rollbacks_total",
+      "kind": "counter"
+    }
+  ]
+}

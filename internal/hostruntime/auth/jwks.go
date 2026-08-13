@@ -13,6 +13,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
+
+	"github.com/pinksaucepasta/paperboat/internal/httptransport"
 	"sync"
 	"time"
 )
@@ -54,7 +58,7 @@ func NewHTTPJWKSFetcher(endpoint string, allowedHosts []string, transport http.R
 		return nil, ErrJWKSInvalid
 	}
 	if transport == nil {
-		transport = http.DefaultTransport
+		transport = httptransport.Default()
 	}
 	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return ErrJWKSInvalid }}
 	return &HTTPJWKSFetcher{endpoint: parsed, client: client}, nil
@@ -258,28 +262,7 @@ func (c *JWKSCache) persist(document []byte, validatedAt time.Time) error {
 	if err != nil {
 		return err
 	}
-	temporary, err := os.CreateTemp(directory, ".jwks-*")
-	if err != nil {
-		return err
-	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-	if err := temporary.Chmod(0o600); err != nil {
-		temporary.Close()
-		return err
-	}
-	if _, err := temporary.Write(body); err != nil {
-		temporary.Close()
-		return err
-	}
-	if err := temporary.Sync(); err != nil {
-		temporary.Close()
-		return err
-	}
-	if err := temporary.Close(); err != nil {
-		return err
-	}
-	return os.Rename(temporaryPath, path)
+	return atomicfile.Write(path, body, atomicfile.Options{Mode: 0o600, OwnerUID: os.Geteuid(), OwnerGID: os.Getegid()})
 }
 
 type jwksDocument struct {

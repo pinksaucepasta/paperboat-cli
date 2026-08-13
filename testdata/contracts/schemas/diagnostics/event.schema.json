@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.paperboat.dev/diagnostics/event.schema.json",
+  "title": "Paperboat diagnostic event v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "at", "category", "code", "severity"],
+  "properties": {
+    "schema": { "const": "paperboat.diagnostic-event/v1" },
+    "at": { "type": "string", "format": "date-time" },
+    "category": { "type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,32}$" },
+    "code": { "type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,64}$" },
+    "severity": { "enum": ["info", "warning", "error"] },
+    "fields": {
+      "type": "object",
+      "maxProperties": 12,
+      "propertyNames": { "enum": ["capability", "generation", "operation", "outcome", "path_category", "phase", "reason", "relay_region", "retry_class", "state", "transport"] },
+      "additionalProperties": { "type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$" }
+    }
+  }
+}

@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/bootstrap"
 )
 
@@ -31,11 +32,11 @@ var (
 )
 
 type Request struct {
-	Schema    string                      `json:"schema"`
-	Operation string                      `json:"operation"`
-	Mode      string                      `json:"mode,omitempty"`
-	Version   int64                       `json:"version,omitempty"`
-	Artifact  *bootstrap.ArtifactManifest `json:"artifact,omitempty"`
+	Schema    string                    `json:"schema"`
+	Operation string                    `json:"operation"`
+	Mode      string                    `json:"mode,omitempty"`
+	Version   int64                     `json:"version,omitempty"`
+	Artifact  *bootstrap.ArtifactTarget `json:"artifact,omitempty"`
 }
 
 type Response struct {
@@ -51,6 +52,7 @@ type Response struct {
 	Scope              string    `json:"scope"`
 	UpdateVersion      string    `json:"update_version,omitempty"`
 	UpdateRollbacks    uint64    `json:"update_rollbacks"`
+	UpdateHealth       string    `json:"update_health"`
 }
 
 type State struct {
@@ -70,22 +72,26 @@ type Applier interface {
 }
 
 type UpdateActivator interface {
-	Activate(context.Context, bootstrap.ArtifactManifest) (string, error)
+	Activate(context.Context, bootstrap.ArtifactTarget) (string, error)
 }
 
 type UpdateDiagnostics interface {
 	RollbackCount() uint64
+	UpdateHealth() string
 }
 
 type Config struct {
-	SocketPath string
-	StatePath  string
-	UID        int
-	GID        int
-	Applier    Applier
-	Now        func() time.Time
-	Version    string
-	Updates    UpdateActivator
+	SocketPath        string
+	StatePath         string
+	UID               int
+	GID               int
+	Applier           Applier
+	Now               func() time.Time
+	Version           string
+	Updates           UpdateActivator
+	Ready             func() error
+	Heartbeat         func() error
+	HeartbeatInterval time.Duration
 }
 
 type Server struct {
@@ -95,7 +101,8 @@ type Server struct {
 }
 
 func New(config Config) (*Server, error) {
-	if !filepath.IsAbs(config.SocketPath) || !filepath.IsAbs(config.StatePath) || config.UID < 0 || config.GID < 0 || config.Applier == nil || config.Version == "" {
+	if !filepath.IsAbs(config.SocketPath) || !filepath.IsAbs(config.StatePath) || config.UID < 0 || config.GID < 0 || config.Applier == nil || config.Version == "" ||
+		config.HeartbeatInterval < 0 || config.HeartbeatInterval > 0 && config.Heartbeat == nil {
 		return nil, ErrInvalidConfig
 	}
 	if config.Now == nil {
@@ -128,15 +135,36 @@ func (s *Server) Run(ctx context.Context) error {
 		listener.Close()
 		_ = os.Remove(s.config.SocketPath)
 	}()
+	return s.serveListener(ctx, listener)
+}
+
+func (s *Server) serveListener(ctx context.Context, listener *net.UnixListener) error {
+	if s.config.Ready != nil {
+		if err := s.config.Ready(); err != nil {
+			return err
+		}
+	}
 	go func() {
 		<-ctx.Done()
 		listener.Close()
 	}()
 	for {
+		if s.config.HeartbeatInterval > 0 {
+			if err := listener.SetDeadline(s.config.Now().Add(s.config.HeartbeatInterval)); err != nil {
+				return err
+			}
+		}
 		connection, err := listener.AcceptUnix()
 		if err != nil {
 			if ctx.Err() != nil {
 				return errors.Join(ctx.Err(), s.config.Applier.Close(context.Background()))
+			}
+			var networkErr net.Error
+			if errors.As(err, &networkErr) && networkErr.Timeout() && s.config.HeartbeatInterval > 0 {
+				if err := s.config.Heartbeat(); err != nil {
+					return err
+				}
+				continue
 			}
 			return err
 		}
@@ -254,7 +282,7 @@ func (s *Server) listen() (*net.UnixListener, error) {
 		listener.Close()
 		return nil, err
 	}
-	if err := os.Chmod(s.config.SocketPath, 0o600); err != nil {
+	if err := os.Chmod(s.config.SocketPath, 0o660); err != nil {
 		listener.Close()
 		return nil, err
 	}
@@ -288,28 +316,7 @@ func (s *Server) persistLocked() error {
 	if err := secureDirectory(directory, 0o700); err != nil {
 		return err
 	}
-	temporary, err := os.CreateTemp(directory, ".host-policy-*")
-	if err != nil {
-		return err
-	}
-	path := temporary.Name()
-	defer os.Remove(path)
-	if err := temporary.Chmod(0o600); err != nil {
-		temporary.Close()
-		return err
-	}
-	if _, err := temporary.Write(body); err != nil {
-		temporary.Close()
-		return err
-	}
-	if err := temporary.Sync(); err != nil {
-		temporary.Close()
-		return err
-	}
-	if err := temporary.Close(); err != nil {
-		return err
-	}
-	return os.Rename(path, s.config.StatePath)
+	return atomicfile.Write(s.config.StatePath, body, atomicfile.Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1})
 }
 
 func (s *Server) respond(writer io.Writer, value Response) error {
@@ -327,7 +334,11 @@ func (s *Server) response(state State) Response {
 	if diagnostics, ok := s.config.Updates.(UpdateDiagnostics); ok {
 		rollbacks = diagnostics.RollbackCount()
 	}
-	return Response{Schema: ProtocolV1, Status: state.Status, DesiredMode: state.DesiredMode, DesiredVersion: state.DesiredVersion, ObservedMode: state.ObservedMode, ObservedVersion: state.ObservedVersion, ObservedAt: state.ObservedAt, ErrorCode: state.ErrorCode, HostServiceVersion: s.config.Version, Scope: "system", UpdateRollbacks: rollbacks}
+	updateHealth := "unknown"
+	if diagnostics, ok := s.config.Updates.(UpdateDiagnostics); ok {
+		updateHealth = diagnostics.UpdateHealth()
+	}
+	return Response{Schema: ProtocolV1, Status: state.Status, DesiredMode: state.DesiredMode, DesiredVersion: state.DesiredVersion, ObservedMode: state.ObservedMode, ObservedVersion: state.ObservedVersion, ObservedAt: state.ObservedAt, ErrorCode: state.ErrorCode, HostServiceVersion: s.config.Version, Scope: "system", UpdateRollbacks: rollbacks, UpdateHealth: updateHealth}
 }
 func validMode(mode string) bool { return mode == AllowSleep || mode == KeepAwake }
 func validStatus(status string) bool {

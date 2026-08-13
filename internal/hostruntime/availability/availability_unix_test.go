@@ -59,7 +59,7 @@ func TestResolverUsesExactProofAndStrictResponse(t *testing.T) {
 
 func TestHostClientAppliesVersionZeroAndRejectsMismatchedResponse(t *testing.T) {
 	for name, response := range map[string]hostservice.Response{
-		"valid":    {Schema: hostservice.ProtocolV1, Status: "applied", DesiredMode: "allow_sleep", DesiredVersion: 0, ObservedMode: "allow_sleep", ObservedVersion: 0, ObservedAt: time.Now().UTC(), HostServiceVersion: "test", Scope: "system"},
+		"valid":    {Schema: hostservice.ProtocolV1, Status: "applied", DesiredMode: "allow_sleep", DesiredVersion: 0, ObservedMode: "allow_sleep", ObservedVersion: 0, ObservedAt: time.Now().UTC(), HostServiceVersion: "test", Scope: "system", UpdateHealth: "healthy"},
 		"mismatch": {Schema: hostservice.ProtocolV1, Status: "applied", DesiredMode: "keep_awake", DesiredVersion: 1, ObservedMode: "keep_awake", ObservedVersion: 1, ObservedAt: time.Now().UTC(), HostServiceVersion: "test", Scope: "system"},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -118,7 +118,7 @@ type hostStub struct{ applied chan Resolution }
 
 func (h hostStub) Apply(_ context.Context, resolution Resolution) (Observation, error) {
 	h.applied <- resolution
-	return Observation{Schema: PolicySchemaV1, Mode: resolution.Mode, Version: resolution.Version, Status: "applied", ObservedAt: time.Now().UTC(), HostServiceVersion: "test", HostServiceScope: "system"}, nil
+	return Observation{Schema: PolicySchemaV1, Mode: resolution.Mode, Version: resolution.Version, Status: "applied", ObservedAt: time.Now().UTC(), HostServiceVersion: "test", HostServiceScope: "system", UpdateHealth: "healthy"}, nil
 }
 
 func TestServiceStartsOfflineAndEventuallyPublishesObservation(t *testing.T) {

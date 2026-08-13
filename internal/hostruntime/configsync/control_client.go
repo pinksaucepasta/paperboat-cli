@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/pinksaucepasta/paperboat/internal/httptransport"
 )
 
 var (
@@ -170,7 +172,7 @@ func NewControlClient(config ControlClientConfig) (*ControlClient, error) {
 	}
 	transport := config.Transport
 	if transport == nil {
-		transport = http.DefaultTransport
+		transport = httptransport.Default()
 	}
 	return &ControlClient{
 		base: base, identities: config.Identities, proofs: config.Proofs, operationID: config.OperationID,

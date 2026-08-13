@@ -324,7 +324,7 @@ func TestTempFilePatterns(t *testing.T) {
 	i := New(&dest, fixedUploader{"/vm/allowed.png"}, defaultLimits(),
 		WithWatchDirs([]string{dir}), WithTempFilePatterns([]string{"terminal-paste-*.png"}),
 		WithPartialFlushDelay(time.Hour))
-	writeInChunks(t, i, wrap(allowed)+wrap(rejected), 5)
+	writeInChunks(t, i, wrap(rejected)+wrap(allowed), 5)
 	if got, want := dest.String(), wrap(rejected)+wrap("/vm/allowed.png"); got != want {
 		t.Fatalf("got %q want %q", got, want)
 	}

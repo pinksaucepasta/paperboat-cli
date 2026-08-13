@@ -86,7 +86,7 @@ func websocketTestHandler(t *testing.T, tokenSeen *string) *WebSocketHandler {
 	server, err := New(Config{
 		Negotiator: protocol.Negotiator{Profile: config.BYOD, Available: map[string]bool{"terminal.v1": true, "health.v1": true}},
 		Journal:    journal, Handler: websocketDomainHandler{}, MaxConcurrent: 4,
-		HeartbeatInterval: time.Hour, PeerTimeout: 2 * time.Hour, MutationDeadline: 5 * time.Minute,
+		HeartbeatInterval: time.Hour, MutationDeadline: 5 * time.Minute,
 	})
 	if err != nil {
 		t.Fatal(err)

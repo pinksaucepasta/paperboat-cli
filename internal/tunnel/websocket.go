@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
@@ -14,7 +13,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"github.com/coder/websocket"
+	"github.com/pinksaucepasta/paperboat/internal/httptransport"
 	"github.com/pinksaucepasta/paperboat/internal/resolver"
 )
 
@@ -27,16 +27,17 @@ const (
 // WebSocketTunnel attaches to the helper terminal RPC over the server-assigned
 // WebSocket route.
 type WebSocketTunnel struct {
-	Dialer            *websocket.Dialer
+	transportConfig   httptransport.Config
 	OutputQueueChunks int
 	sessionCache      tls.ClientSessionCache
 	sessionCacheOnce  sync.Once
 }
 
 func NewWebSocketTunnel() *WebSocketTunnel {
-	dialer := *websocket.DefaultDialer
-	dialer.TLSClientConfig = &tls.Config{ClientSessionCache: tls.NewLRUClientSessionCache(64)}
-	return &WebSocketTunnel{Dialer: &dialer, OutputQueueChunks: terminalOutputQueueChunks}
+	config := httptransport.DevelopmentConfig()
+	config.ForceAttemptHTTP2 = false
+	config.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12, ClientSessionCache: tls.NewLRUClientSessionCache(64)}
+	return &WebSocketTunnel{transportConfig: config, OutputQueueChunks: terminalOutputQueueChunks}
 }
 
 func (t *WebSocketTunnel) outputQueueChunks() int {
@@ -47,24 +48,24 @@ func (t *WebSocketTunnel) outputQueueChunks() int {
 }
 
 type preparedWebSocketTerminal struct {
-	connection net.Conn
-	dialer     *websocket.Dialer
-	url        string
-	headers    http.Header
-	target     *resolver.TerminalTarget
-	queue      int
-	tls        bool
-	proxy      bool
-	once       sync.Once
+	connection      net.Conn
+	transportConfig httptransport.Config
+	url             string
+	headers         http.Header
+	target          *resolver.TerminalTarget
+	queue           int
+	tls             bool
+	proxy           bool
+	once            sync.Once
 }
 
 func (p *preparedWebSocketTerminal) Attach(ctx context.Context) (Conn, error) {
 	var result Conn
 	var resultErr error
 	p.once.Do(func() {
-		dialer := *p.dialer
+		config := p.transportConfig
 		if !p.proxy {
-			dialer.Proxy = nil
+			config.ProxySource = httptransport.StaticProxySource{}
 		}
 		used := false
 		preparedDial := func(context.Context, string, string) (net.Conn, error) {
@@ -75,11 +76,11 @@ func (p *preparedWebSocketTerminal) Attach(ctx context.Context) (Conn, error) {
 			return p.connection, nil
 		}
 		if p.tls {
-			dialer.NetDialTLSContext = preparedDial
+			config.DialTLSContext = preparedDial
 		} else {
-			dialer.NetDialContext = preparedDial
+			config.DialContext = preparedDial
 		}
-		ws, response, err := dialer.DialContext(ctx, p.url, p.headers)
+		ws, response, err := dialWebSocket(ctx, config, p.url, p.headers)
 		if err != nil {
 			_ = p.connection.Close()
 			resultErr = classifyWebSocketUpgradeError(ctx, err, response)
@@ -87,13 +88,13 @@ func (p *preparedWebSocketTerminal) Attach(ctx context.Context) (Conn, error) {
 		}
 		message := &helperWebSocketConnection{ws: ws}
 		if _, err := helperHandshake(ctx, message); err != nil {
-			_ = ws.Close()
+			_ = ws.Close(websocket.StatusInternalError, "handshake_failed")
 			resultErr = err
 			return
 		}
 		connection := newHelperTerminalConn(message, p.target, p.queue)
 		if err := connection.initialize(ctx); err != nil {
-			_ = ws.Close()
+			_ = ws.Close(websocket.StatusInternalError, "initialize_failed")
 			resultErr = err
 			return
 		}
@@ -112,12 +113,11 @@ func (t *WebSocketTunnel) Check(ctx context.Context, target *resolver.TerminalTa
 	if err != nil {
 		return err
 	}
-	dialer := helperDialer(t.Dialer)
-	ws, resp, err := dialer.DialContext(ctx, wsURL, headers)
+	ws, resp, err := dialWebSocket(ctx, t.transportConfig, wsURL, headers)
 	if err != nil {
 		return classifyWebSocketUpgradeError(ctx, err, resp)
 	}
-	defer ws.Close()
+	defer ws.Close(websocket.StatusNormalClosure, "")
 	message := &helperWebSocketConnection{ws: ws}
 	if _, err := helperHandshake(ctx, message); err != nil {
 		return err
@@ -141,18 +141,19 @@ func (t *WebSocketTunnel) Establish(ctx context.Context, info resolver.ConnectIn
 	if err != nil {
 		return nil, err
 	}
-	dialer := helperDialer(t.Dialer)
-	connection, secure, proxy, err := t.dialTransport(ctx, dialer, wsURL)
+	connection, secure, proxy, snapshot, err := t.dialTransport(ctx, t.transportConfig, wsURL)
 	if err != nil {
 		return nil, err
 	}
-	return &preparedWebSocketTerminal{connection: connection, dialer: dialer, url: wsURL, headers: headers, target: info.Terminal, queue: t.outputQueueChunks(), tls: secure, proxy: proxy}, nil
+	config := t.transportConfig
+	config.ProxySource = httptransport.StaticProxySource{Value: snapshot}
+	return &preparedWebSocketTerminal{connection: connection, transportConfig: config, url: wsURL, headers: headers, target: info.Terminal, queue: t.outputQueueChunks(), tls: secure, proxy: proxy}, nil
 }
 
-func (t *WebSocketTunnel) dialTransport(ctx context.Context, dialer *websocket.Dialer, target string) (net.Conn, bool, bool, error) {
+func (t *WebSocketTunnel) dialTransport(ctx context.Context, config httptransport.Config, target string) (net.Conn, bool, bool, httptransport.ProxySnapshot, error) {
 	u, err := url.Parse(target)
 	if err != nil {
-		return nil, false, false, err
+		return nil, false, false, httptransport.ProxySnapshot{}, err
 	}
 	secure := u.Scheme == "wss"
 	port := u.Port()
@@ -165,18 +166,14 @@ func (t *WebSocketTunnel) dialTransport(ctx context.Context, dialer *websocket.D
 	}
 	address := net.JoinHostPort(u.Hostname(), port)
 	request := &http.Request{URL: u}
-	var proxyURL *url.URL
-	if dialer.Proxy != nil {
-		proxyURL, err = dialer.Proxy(request)
-		proxyErr := err
-		if proxyErr != nil {
-			return nil, secure, false, proxyErr
-		}
+	snapshot, proxyURL, err := httptransport.ResolveProxy(ctx, config.ProxySource, request.URL)
+	if err != nil {
+		return nil, secure, false, httptransport.ProxySnapshot{}, err
 	}
 	dialAddress := address
 	if proxyURL != nil {
 		if proxyURL.Scheme != "http" || proxyURL.Hostname() == "" {
-			return nil, secure, false, errors.New("terminal transport requires an HTTP proxy")
+			return nil, secure, false, snapshot, errors.New("terminal transport requires an HTTP proxy")
 		}
 		proxyPort := proxyURL.Port()
 		if proxyPort == "" {
@@ -184,36 +181,34 @@ func (t *WebSocketTunnel) dialTransport(ctx context.Context, dialer *websocket.D
 		}
 		dialAddress = net.JoinHostPort(proxyURL.Hostname(), proxyPort)
 	}
-	if secure && proxyURL == nil && dialer.NetDialTLSContext != nil {
-		connection, err := dialer.NetDialTLSContext(ctx, "tcp", dialAddress)
-		return connection, secure, false, classifyWebSocketTransportError(ctx, err)
+	if secure && proxyURL == nil && config.DialTLSContext != nil {
+		connection, err := config.DialTLSContext(ctx, "tcp", dialAddress)
+		return connection, secure, false, snapshot, classifyWebSocketTransportError(ctx, err)
 	}
 	var connection net.Conn
-	if dialer.NetDialContext != nil {
-		connection, err = dialer.NetDialContext(ctx, "tcp", dialAddress)
-	} else if dialer.NetDial != nil {
-		connection, err = dialer.NetDial("tcp", dialAddress)
+	if config.DialContext != nil {
+		connection, err = config.DialContext(ctx, "tcp", dialAddress)
 	} else {
 		connection, err = (&net.Dialer{}).DialContext(ctx, "tcp", dialAddress)
 	}
 	if err != nil {
-		return nil, secure, false, classifyWebSocketTransportError(ctx, err)
+		return nil, secure, false, snapshot, classifyWebSocketTransportError(ctx, err)
 	}
 	if proxyURL != nil && !secure {
-		return connection, false, true, nil
+		return connection, false, true, snapshot, nil
 	}
 	if proxyURL != nil {
 		if err := connectWebSocketProxy(ctx, connection, address, proxyURL); err != nil {
 			_ = connection.Close()
-			return nil, true, false, classifyWebSocketTransportError(ctx, err)
+			return nil, true, false, snapshot, classifyWebSocketTransportError(ctx, err)
 		}
 	}
 	if !secure {
-		return connection, false, false, nil
+		return connection, false, false, snapshot, nil
 	}
 	tlsConfig := &tls.Config{ServerName: u.Hostname(), MinVersion: tls.VersionTLS12, ClientSessionCache: t.clientSessionCache()}
-	if dialer.TLSClientConfig != nil {
-		tlsConfig = dialer.TLSClientConfig.Clone()
+	if config.TLSConfig != nil {
+		tlsConfig = config.TLSConfig.Clone()
 		tlsConfig.ServerName = u.Hostname()
 		if tlsConfig.ClientSessionCache == nil {
 			tlsConfig.ClientSessionCache = t.clientSessionCache()
@@ -222,17 +217,13 @@ func (t *WebSocketTunnel) dialTransport(ctx context.Context, dialer *websocket.D
 	tlsConnection := tls.Client(connection, tlsConfig)
 	if err := tlsConnection.HandshakeContext(ctx); err != nil {
 		_ = connection.Close()
-		return nil, true, false, classifyWebSocketTransportError(ctx, err)
+		return nil, true, false, snapshot, classifyWebSocketTransportError(ctx, err)
 	}
-	return tlsConnection, true, false, nil
+	return tlsConnection, true, false, snapshot, nil
 }
 
 func connectWebSocketProxy(ctx context.Context, connection net.Conn, target string, proxy *url.URL) error {
 	request := &http.Request{Method: http.MethodConnect, URL: &url.URL{Opaque: target}, Host: target, Header: make(http.Header)}
-	if proxy.User != nil {
-		password, _ := proxy.User.Password()
-		request.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(proxy.User.Username()+":"+password)))
-	}
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = connection.SetDeadline(deadline)
 	}
@@ -250,6 +241,9 @@ func connectWebSocketProxy(ctx context.Context, connection net.Conn, target stri
 		return err
 	}
 	defer response.Body.Close()
+	if response.StatusCode == http.StatusProxyAuthRequired {
+		return &httptransport.ProxyError{Failure: httptransport.ProxyAuthenticationRequired}
+	}
 	if response.StatusCode != http.StatusOK {
 		return fmt.Errorf("HTTP proxy CONNECT returned status %d", response.StatusCode)
 	}
@@ -291,13 +285,15 @@ func classifyWebSocketUpgradeError(ctx context.Context, err error, response *htt
 	}
 }
 
-func helperDialer(input *websocket.Dialer) *websocket.Dialer {
-	if input == nil {
-		input = websocket.DefaultDialer
+func dialWebSocket(ctx context.Context, config httptransport.Config, target string, headers http.Header) (*websocket.Conn, *http.Response, error) {
+	transport, err := httptransport.New(config)
+	if err != nil {
+		return nil, nil, err
 	}
-	dialer := *input
-	dialer.Subprotocols = []string{helperWebSocketSubprotocol}
-	return &dialer
+	client := &http.Client{Transport: transport}
+	connection, response, err := websocket.Dial(ctx, target, &websocket.DialOptions{HTTPClient: client, HTTPHeader: headers, Subprotocols: []string{helperWebSocketSubprotocol}, CompressionMode: websocket.CompressionDisabled})
+	transport.CloseIdleConnections()
+	return connection, response, err
 }
 
 func terminalWebSocketRequest(target *resolver.TerminalTarget) (string, http.Header, error) {

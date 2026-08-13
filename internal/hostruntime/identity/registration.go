@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
 )
 
 type Registration struct {
@@ -22,6 +24,8 @@ type Registration struct {
 	InstallationGeneration int64     `json:"installation_generation"`
 	SetupMode              string    `json:"setup_mode"`
 	SetupRoles             []string  `json:"setup_roles"`
+	SSHUser                string    `json:"ssh_user,omitempty"`
+	SSHPort                uint16    `json:"ssh_port,omitempty"`
 	UpdatedAt              time.Time `json:"updated_at"`
 }
 
@@ -32,7 +36,7 @@ func (s *Store) SaveRegistration(value Registration) error {
 	if strings.TrimSpace(value.ServerURL) == "" || strings.TrimSpace(value.MachineID) == "" ||
 		strings.TrimSpace(value.EnvironmentID) == "" || value.PublicKeyID != s.key.ID ||
 		strings.TrimSpace(value.PublicIdentityKey) == "" || !filepath.IsAbs(value.InboxPath) || value.InstallationGeneration < 1 ||
-		!validSetupMode(value.SetupMode) || value.UpdatedAt.IsZero() {
+		!validSetupMode(value.SetupMode) || value.UpdatedAt.IsZero() || value.SSHPort == 0 != (strings.TrimSpace(value.SSHUser) == "") {
 		return ErrInvalidStore
 	}
 	value.Version = 1
@@ -48,31 +52,7 @@ func (s *Store) SaveRegistration(value Registration) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	temporary, err := os.CreateTemp(s.config.StateRoot, ".machine-registration-*")
-	if err != nil {
-		return err
-	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-	if err := temporary.Chmod(0o600); err != nil {
-		temporary.Close()
-		return err
-	}
-	if _, err := temporary.Write(encoded); err != nil {
-		temporary.Close()
-		return err
-	}
-	if err := temporary.Sync(); err != nil {
-		temporary.Close()
-		return err
-	}
-	if err := temporary.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(temporaryPath, path); err != nil {
-		return err
-	}
-	return syncDirectory(s.config.StateRoot)
+	return atomicfile.Write(path, encoded, atomicfile.Options{Mode: 0o600, OwnerUID: os.Geteuid(), OwnerGID: os.Getegid()})
 }
 
 func validSetupMode(mode string) bool {
@@ -116,7 +96,7 @@ func (s *Store) Registration() (Registration, error) {
 	if value.SetupMode == "" {
 		value.SetupMode = setupModeFromRoles(value.SetupRoles)
 	}
-	if !validSetupMode(value.SetupMode) {
+	if !validSetupMode(value.SetupMode) || value.SSHPort == 0 != (strings.TrimSpace(value.SSHUser) == "") {
 		return Registration{}, ErrInvalidStore
 	}
 	return value, nil

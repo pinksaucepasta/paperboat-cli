@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/pinksaucepasta/paperboat/internal/httptransport"
 )
 
 const (
@@ -15,8 +17,12 @@ const (
 )
 
 func defaultHTTPClient() *http.Client {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.TLSHandshakeTimeout = defaultTLSHandshakeTimeout
+	config := httptransport.DevelopmentConfig()
+	config.TLSHandshakeTimeout = defaultTLSHandshakeTimeout
+	transport, err := httptransport.New(config)
+	if err != nil {
+		panic(err)
+	}
 	return &http.Client{
 		Timeout: defaultRequestTimeout,
 		Transport: &tlsHandshakeRetryTransport{

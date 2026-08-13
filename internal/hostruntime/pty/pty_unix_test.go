@@ -55,6 +55,31 @@ func TestRealPTYReportsOutputCWDAndExit(t *testing.T) {
 	}
 }
 
+func TestRealPTYPreservesSymlinkInvocationName(t *testing.T) {
+	root := t.TempDir()
+	command := filepath.Join(root, "sh")
+	if err := os.Symlink(shellPath(t), command); err != nil {
+		t.Fatal(err)
+	}
+	adapter, err := NewAdapter(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	process, err := adapter.Start(Command{Path: command, Args: []string{"-c", `printf %s "$0"`}, Env: []string{"PATH=/usr/bin:/bin", "TERM=xterm"}, CWD: root, Dimensions: Dimensions{80, 24}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, readErr := io.ReadAll(process)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	result, err := process.Wait(context.Background())
+	defer process.CloseIO()
+	if err != nil || result.Code != 0 || !strings.Contains(string(output), command) {
+		t.Fatalf("result=%#v error=%v output=%q, want invocation %q", result, err, output, command)
+	}
+}
+
 func TestRealPTYInitialSizeAndResize(t *testing.T) {
 	process, _ := startShell(t, "stty size; echo resize-ready; read line; stty size")
 	reader := bufio.NewReader(process)

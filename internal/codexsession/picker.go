@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 	"unicode"
 
@@ -111,11 +112,11 @@ func remoteJoin(parent, child string) string {
 	return strings.TrimSuffix(parent, "/") + "/" + child
 }
 
-func loadDirectories(ctx context.Context, o Options, d api.CodexDescriptor, path string) (directoryPage, error) {
+func loadDirectories(ctx context.Context, o Options, d api.CodexDescriptor, client *http.Client, path string) (directoryPage, error) {
 	var result directoryPage
 	cursor := ""
 	for {
-		page, err := directories(ctx, o, d, path, cursor)
+		page, err := directories(ctx, client, d, path, cursor)
 		if err != nil {
 			return directoryPage{}, err
 		}
@@ -130,7 +131,7 @@ func loadDirectories(ctx context.Context, o Options, d api.CodexDescriptor, path
 	}
 }
 
-func pickDirectory(ctx context.Context, o Options, d api.CodexDescriptor) (selected string, err error) {
+func pickDirectory(ctx context.Context, o Options, d api.CodexDescriptor, client *http.Client) (selected string, err error) {
 	fd := int(o.Stdin.Fd())
 	oldState, err := term.MakeRaw(fd)
 	if err != nil {
@@ -152,7 +153,7 @@ func pickDirectory(ctx context.Context, o Options, d api.CodexDescriptor) (selec
 		height = 24
 	}
 	picker := directoryPicker{rows: max(3, height-8)}
-	page, err := loadDirectories(ctx, o, d, "~")
+	page, err := loadDirectories(ctx, o, d, client, "~")
 	if err != nil {
 		return "", err
 	}
@@ -175,7 +176,7 @@ func pickDirectory(ctx context.Context, o Options, d api.CodexDescriptor) (selec
 			return selected, nil
 		}
 		if navigate != "" {
-			page, err = loadDirectories(ctx, o, d, navigate)
+			page, err = loadDirectories(ctx, o, d, client, navigate)
 			if err != nil {
 				return "", err
 			}

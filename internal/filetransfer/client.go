@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/pinksaucepasta/paperboat/internal/httptransport"
 )
 
 const contentType = "application/offset+octet-stream"
@@ -57,6 +59,7 @@ type Manifest struct {
 	Size                 int64     `json:"size"`
 	SHA256               string    `json:"sha256"`
 	CommittedOffset      int64     `json:"committed_offset"`
+	CommittedChunk       uint64    `json:"committed_chunk,omitempty"`
 	State                string    `json:"state"`
 	ResultCode           string    `json:"result_code,omitempty"`
 	ReceiptPath          string    `json:"receipt_path,omitempty"`
@@ -105,12 +108,23 @@ type Client struct {
 
 func NewClient(endpoint string, auth Auth, binding Binding, client *http.Client) *Client {
 	if client == nil {
-		client = &http.Client{Timeout: 5 * time.Minute}
+		client = &http.Client{Transport: httptransport.Default(), Timeout: 5 * time.Minute}
 	}
 	return &Client{Endpoint: strings.TrimRight(endpoint, "/"), HTTPClient: client, MaxConcurrent: 2, DeliveryTimeout: 10 * time.Minute, auth: auth, binding: binding}
 }
 
 func (c *Client) UpdateAuth(auth Auth) { c.setAuth(auth) }
+
+func (c *Client) WithTransport(transport http.RoundTripper) *Client {
+	if c == nil || transport == nil {
+		return nil
+	}
+	clone := NewClient(c.Endpoint, c.currentAuth(), c.binding, &http.Client{Transport: transport, Timeout: c.HTTPClient.Timeout})
+	clone.RefreshAuth = c.RefreshAuth
+	clone.MaxConcurrent = c.MaxConcurrent
+	clone.DeliveryTimeout = c.DeliveryTimeout
+	return clone
+}
 
 func (c *Client) Close() error {
 	if c == nil || c.HTTPClient == nil || c.HTTPClient.Transport == nil {
@@ -149,7 +163,7 @@ func (c *Client) VerifyPolicy(ctx context.Context, expected Policy) error {
 	return nil
 }
 
-func (c *Client) SendBatch(ctx context.Context, batchID, sessionID string, sources []Source) (Batch, error) {
+func (c *Client) sendBatchPlaintext(ctx context.Context, batchID, sessionID string, sources []Source) (Batch, error) {
 	if c.binding.SourceMachineID == "" || c.binding.DestinationMachineID == "" || c.binding.InitiatingUserID == "" || c.binding.SourceMachineID == c.binding.DestinationMachineID || len(sources) < 1 || len(sources) > 10 {
 		return Batch{}, errors.New("file transfer batch must contain one through ten files")
 	}
@@ -286,12 +300,29 @@ func (c *Client) Pending(ctx context.Context, sessionID string, waitSeconds int)
 	}
 	target := c.Endpoint + "/pending?session_id=" + url.QueryEscape(sessionID) + "&wait_seconds=" + strconv.Itoa(waitSeconds)
 	var response struct {
-		Transfers []Manifest `json:"transfers"`
+		Transfers []json.RawMessage `json:"transfers"`
 	}
 	if err := c.jsonRequest(ctx, http.MethodGet, target, operationID("pending", sessionID), "", 0, nil, &response); err != nil {
 		return nil, err
 	}
-	return response.Transfers, nil
+	result := make([]Manifest, 0, len(response.Transfers))
+	for _, raw := range response.Transfers {
+		var kind struct {
+			TransferGeneration uint64 `json:"transfer_generation"`
+		}
+		if err := json.Unmarshal(raw, &kind); err != nil {
+			return nil, errors.New("invalid pending transfer response")
+		}
+		if kind.TransferGeneration != 0 {
+			continue
+		}
+		var manifest Manifest
+		if err := json.Unmarshal(raw, &manifest); err != nil || manifest.TransferID == "" {
+			return nil, errors.New("invalid pending transfer manifest")
+		}
+		result = append(result, manifest)
+	}
+	return result, nil
 }
 
 func (c *Client) Content(ctx context.Context, manifest Manifest, offset int64) (*http.Response, error) {

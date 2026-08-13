@@ -58,6 +58,7 @@ func copyFileToInbox(ctx context.Context, source Source, inboxPath string, verif
 	if err != nil || !os.SameFile(source.info, openedInfo) {
 		return InboxCopy{}, errors.Join(ErrSourceChanged, err)
 	}
+	//paperboat:allow-source-policy atomic-replacement owner=serve-inbox reason=streamed-file-publication
 	temporary, err := os.CreateTemp(directory, ".copy-*")
 	if err != nil {
 		return InboxCopy{}, fmt.Errorf("create serve Inbox temporary file: %w", err)

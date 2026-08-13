@@ -107,6 +107,16 @@ func (r staticPolicyResolver) Policy(frame protocol.Frame) (auth.Policy, error) 
 		base.CredentialClass = "terminal_operation"
 		base.Scopes = []string{"terminal:operate"}
 		base.MaxLifetime = 5 * time.Minute
+	case "exec.v1":
+		base.CredentialClass = "exec_operation"
+		base.Scopes = []string{"exec:operate"}
+		base.OperationID = frame.OperationID
+		base.MaxLifetime = 5 * time.Minute
+	case "ssh.v1":
+		base.CredentialClass = "ssh_operation"
+		base.Scopes = []string{"ssh:operate"}
+		base.OperationID = frame.OperationID
+		base.MaxLifetime = 5 * time.Minute
 	case "preview.launch.v1":
 		base.CredentialClass = "preview_launch"
 		base.Scopes = []string{"preview:launch"}

@@ -11,24 +11,27 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
 	"github.com/pinksaucepasta/paperboat/internal/resolver"
 )
 
 type TerminalTransport string
 
 const (
-	TerminalTransportAuto TerminalTransport = "auto"
-	TerminalTransportQUIC TerminalTransport = "quic"
-	TerminalTransportWSS  TerminalTransport = "wss"
+	TerminalTransportAuto      TerminalTransport = "a"
+	TerminalTransportDirect    TerminalTransport = "d"
+	TerminalTransportRelayQUIC TerminalTransport = "q"
+	TerminalTransportRelayWSS  TerminalTransport = "w"
+	TerminalTransportRelay     TerminalTransport = "r"
 )
 
 func ParseTerminalTransport(value string) (TerminalTransport, error) {
 	mode := TerminalTransport(strings.ToLower(strings.TrimSpace(value)))
 	switch mode {
-	case TerminalTransportAuto, TerminalTransportQUIC, TerminalTransportWSS:
+	case TerminalTransportAuto, TerminalTransportDirect, TerminalTransportRelayQUIC, TerminalTransportRelayWSS, TerminalTransportRelay:
 		return mode, nil
 	default:
-		return "", errors.New("terminal transport must be auto, quic, or wss")
+		return "", errors.New("path must be a, d, q, w, or r")
 	}
 }
 
@@ -42,6 +45,7 @@ type TerminalTransportSelector struct {
 	preferences    map[string]terminalTransportPreference
 	now            func() time.Time
 	preferencePath string
+	preferenceErr  error
 }
 
 type terminalTransportPreference struct {
@@ -68,7 +72,7 @@ func (s *TerminalTransportSelector) SetPreferencePath(path string) error {
 		return nil
 	}
 	for host, preference := range persisted {
-		if host != "" && (preference.Transport == TerminalTransportQUIC || preference.Transport == TerminalTransportWSS) && s.now().Before(preference.ExpiresAt) {
+		if host != "" && (preference.Transport == TerminalTransportDirect || preference.Transport == TerminalTransportRelayWSS) && s.now().Before(preference.ExpiresAt) {
 			s.preferences[host] = preference
 		}
 	}
@@ -103,14 +107,16 @@ func NewTerminalTransportSelector(mode TerminalTransport, quic, wss Tunnel) (*Te
 
 func (s *TerminalTransportSelector) Dial(ctx context.Context, info resolver.ConnectInfo) (Conn, error) {
 	switch s.Mode {
-	case TerminalTransportQUIC:
+	case TerminalTransportDirect, TerminalTransportRelayQUIC:
 		connection, err := s.QUIC.Dial(ctx, info)
 		s.observe(TerminalTransportSelection{Requested: s.Mode, Selected: "quic", Fallback: "none"}, err)
 		return connection, err
-	case TerminalTransportWSS:
+	case TerminalTransportRelayWSS:
 		connection, err := s.WSS.Dial(ctx, info)
 		s.observe(TerminalTransportSelection{Requested: s.Mode, Selected: "wss", Fallback: "none"}, err)
 		return connection, err
+	case TerminalTransportRelay:
+		return s.dialAuto(ctx, info)
 	}
 	if _, quicOK := s.QUIC.(terminalEstablisher); quicOK {
 		if _, wssOK := s.WSS.(terminalEstablisher); wssOK {
@@ -140,7 +146,7 @@ func (s *TerminalTransportSelector) Dial(ctx context.Context, info resolver.Conn
 	}
 	connection, err := s.QUIC.Dial(ctx, info)
 	if err == nil {
-		s.markPreferred(host, TerminalTransportQUIC)
+		s.markPreferred(host, TerminalTransportDirect)
 		s.observe(TerminalTransportSelection{Requested: s.Mode, Selected: "quic", Fallback: "none"}, nil)
 		return connection, nil
 	}
@@ -158,7 +164,7 @@ func (s *TerminalTransportSelector) Dial(ctx context.Context, info resolver.Conn
 		s.observe(TerminalTransportSelection{Requested: s.Mode, Selected: "wss", Fallback: fallback}, combined)
 		return nil, combined
 	}
-	s.markPreferred(host, TerminalTransportWSS)
+	s.markPreferred(host, TerminalTransportRelayWSS)
 	s.observe(TerminalTransportSelection{Requested: s.Mode, Selected: "wss", Fallback: "quic_connect"}, nil)
 	return connection, nil
 }
@@ -171,8 +177,8 @@ type establishResult struct {
 
 func (s *TerminalTransportSelector) dialAuto(ctx context.Context, info resolver.ConnectInfo) (Conn, error) {
 	host := terminalTargetHost(info.Terminal)
-	first, second := TerminalTransportQUIC, TerminalTransportWSS
-	if preferred, ok := s.preferred(host); ok && preferred == TerminalTransportWSS {
+	first, second := TerminalTransportDirect, TerminalTransportRelayWSS
+	if preferred, ok := s.preferred(host); ok && preferred == TerminalTransportRelayWSS {
 		first, second = second, first
 	}
 	raceCtx, cancel := context.WithCancel(ctx)
@@ -180,7 +186,7 @@ func (s *TerminalTransportSelector) dialAuto(ctx context.Context, info resolver.
 	results := make(chan establishResult, 2)
 	start := func(mode TerminalTransport) {
 		tunnel := s.QUIC
-		if mode == TerminalTransportWSS {
+		if mode == TerminalTransportRelayWSS {
 			tunnel = s.WSS
 		}
 		go func() {
@@ -242,8 +248,7 @@ func (s *TerminalTransportSelector) dialAuto(ctx context.Context, info resolver.
 			}
 			firstErr = errors.Join(firstErr, result.err)
 			if !startedSecond {
-				if timer.Stop() {
-				}
+				_ = timer.Stop()
 				start(second)
 				startedSecond = true
 			}
@@ -283,11 +288,11 @@ func (s *TerminalTransportSelector) Check(ctx context.Context, target *resolver.
 	if !quicOK || !wssOK {
 		return selection, errors.New("terminal transport does not support diagnostics")
 	}
-	if s.Mode == TerminalTransportQUIC {
+	if s.Mode == TerminalTransportDirect || s.Mode == TerminalTransportRelayQUIC {
 		selection.Selected = "quic"
 		return selection, quicChecker.Check(ctx, target)
 	}
-	if s.Mode == TerminalTransportWSS {
+	if s.Mode == TerminalTransportRelayWSS {
 		selection.Selected = "wss"
 		return selection, wssChecker.Check(ctx, target)
 	}
@@ -325,13 +330,13 @@ func (s *TerminalTransportSelector) Check(ctx context.Context, target *resolver.
 		}
 		return selection, combined
 	}
-	s.markPreferred(host, TerminalTransportWSS)
+	s.markPreferred(host, TerminalTransportRelayWSS)
 	return selection, nil
 }
 
 func (s *TerminalTransportSelector) isWSSSticky(host string) bool {
 	preferred, ok := s.preferred(host)
-	return ok && preferred == TerminalTransportWSS
+	return ok && preferred == TerminalTransportRelayWSS
 }
 
 func (s *TerminalTransportSelector) preferred(host string) (TerminalTransport, bool) {
@@ -340,14 +345,14 @@ func (s *TerminalTransportSelector) preferred(host string) (TerminalTransport, b
 	preference, ok := s.preferences[host]
 	if ok && !s.now().Before(preference.ExpiresAt) {
 		delete(s.preferences, host)
-		s.persistLocked()
+		s.preferenceErr = s.persistLocked()
 		return "", false
 	}
 	return preference.Transport, ok
 }
 
 func (s *TerminalTransportSelector) markWSSSticky(host string) {
-	s.markPreferred(host, TerminalTransportWSS)
+	s.markPreferred(host, TerminalTransportRelayWSS)
 }
 
 func (s *TerminalTransportSelector) markPreferred(host string, transport TerminalTransport) {
@@ -356,45 +361,33 @@ func (s *TerminalTransportSelector) markPreferred(host string, transport Termina
 	}
 	s.mu.Lock()
 	s.preferences[host] = terminalTransportPreference{Transport: transport, ExpiresAt: s.now().Add(30 * time.Minute)}
-	s.persistLocked()
+	s.preferenceErr = s.persistLocked()
 	s.mu.Unlock()
 }
 
 func (s *TerminalTransportSelector) clearWSSSticky(host string) {
-	s.markPreferred(host, TerminalTransportQUIC)
+	s.markPreferred(host, TerminalTransportDirect)
 }
 
-func (s *TerminalTransportSelector) persistLocked() {
+func (s *TerminalTransportSelector) persistLocked() error {
 	if s.preferencePath == "" {
-		return
+		return nil
 	}
 	data, err := json.Marshal(s.preferences)
 	if err != nil {
-		return
+		return err
 	}
 	dir := filepath.Dir(s.preferencePath)
-	if os.MkdirAll(dir, 0700) != nil {
-		return
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
 	}
-	temporary, err := os.CreateTemp(dir, "transport-preference-*")
-	if err != nil {
-		return
-	}
-	name := temporary.Name()
-	defer os.Remove(name)
-	if temporary.Chmod(0600) != nil {
-		_ = temporary.Close()
-		return
-	}
-	if _, err = temporary.Write(data); err == nil {
-		err = temporary.Sync()
-	}
-	if closeErr := temporary.Close(); err == nil {
-		err = closeErr
-	}
-	if err == nil {
-		_ = os.Rename(name, s.preferencePath)
-	}
+	return atomicfile.Write(s.preferencePath, data, atomicfile.Options{Mode: 0o600, OwnerUID: os.Geteuid(), OwnerGID: os.Getegid()})
+}
+
+func (s *TerminalTransportSelector) PreferenceError() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.preferenceErr
 }
 
 func terminalTargetHost(target *resolver.TerminalTarget) string {

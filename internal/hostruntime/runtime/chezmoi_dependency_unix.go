@@ -15,6 +15,8 @@ import (
 	"os"
 	"path/filepath"
 	goruntime "runtime"
+
+	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
 )
 
 const chezmoiVersion = "2.71.0"
@@ -82,26 +84,7 @@ func ensureChezmoi(ctx context.Context, configured, stateRoot string, client *ht
 }
 
 func writeDependencyAtomic(destination string, value []byte, mode os.FileMode) error {
-	directory := filepath.Dir(destination)
-	temporary, err := os.CreateTemp(directory, ".chezmoi-*")
-	if err != nil {
-		return err
-	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-	if err = temporary.Chmod(mode); err == nil {
-		_, err = temporary.Write(value)
-	}
-	if err == nil {
-		err = temporary.Sync()
-	}
-	if closeErr := temporary.Close(); err == nil {
-		err = closeErr
-	}
-	if err == nil {
-		err = os.Rename(temporaryPath, destination)
-	}
-	return err
+	return atomicfile.Write(destination, value, atomicfile.Options{Mode: mode, OwnerUID: os.Geteuid(), OwnerGID: os.Getegid()})
 }
 
 func extractChezmoi(archive []byte) ([]byte, error) {

@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/pinksaucepasta/paperboat/internal/httptransport"
 )
 
 var ErrCredentialSourceInvalid = errors.New("invalid preview credential source")
@@ -63,7 +65,7 @@ func NewCredentialSource(config CredentialSourceConfig) (*CredentialSource, erro
 	}
 	transport := config.Transport
 	if transport == nil {
-		transport = http.DefaultTransport
+		transport = httptransport.Default()
 	}
 	return &CredentialSource{endpoint: endpoint, identities: config.Identities, proofs: config.Proofs, operationID: config.OperationID, client: &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return ErrCredentialSourceInvalid }}, clock: config.Clock, refreshBefore: config.RefreshBefore}, nil
 }

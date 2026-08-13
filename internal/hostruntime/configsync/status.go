@@ -11,6 +11,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
 )
 
 var (
@@ -118,23 +120,7 @@ func WriteStatus(path string, status Status, summaryLimit int) error {
 	if err != nil {
 		return err
 	}
-	temporary, err := os.CreateTemp(parent, ".config-sync-status-*")
-	if err != nil {
-		return err
-	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-	if err = temporary.Chmod(0o600); err == nil {
-		_, err = temporary.Write(append(data, '\n'))
-	}
-	if err == nil {
-		err = temporary.Sync()
-	}
-	err = errors.Join(err, temporary.Close())
-	if err != nil {
-		return err
-	}
-	return os.Rename(temporaryPath, path)
+	return atomicfile.Write(path, append(data, '\n'), atomicfile.Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1})
 }
 
 func ReadStatus(path string, summaryLimit int) (Status, error) {

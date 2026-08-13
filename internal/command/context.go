@@ -35,14 +35,6 @@ func (c *Context) Bool(name string) bool {
 	result, _ := value.Get().(bool)
 	return result
 }
-func (c *Context) Float64(name string) float64 {
-	value, ok := c.set.Lookup(name).Value.(flag.Getter)
-	if !ok {
-		return 0
-	}
-	result, _ := value.Get().(float64)
-	return result
-}
 func (c *Context) Uint(name string) uint {
 	value, ok := c.set.Lookup(name).Value.(flag.Getter)
 	if !ok {

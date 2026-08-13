@@ -92,6 +92,56 @@ func TestStaticAuthorizerMapsConfigAssignmentOnlyAfterMachineVerification(t *tes
 	}
 }
 
+func TestStaticAuthorizerExecRequiresExactExecCredentialAndOperation(t *testing.T) {
+	public, private, _ := ed25519.GenerateKey(rand.Reader)
+	now := time.Now().UTC()
+	factory, err := NewStaticAuthorizer(StaticAuthConfig{Issuer: "https://control.test", EnvironmentID: "env_test", MachineID: "machine_test", HelperID: "hlp_test", Keys: map[string]ed25519.PublicKey{"key-1": public}, Clock: staticClock{now}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims := auth.Claims{Issuer: "https://control.test", Audience: "paperboat-machine", Subject: "usr_test", JTI: "jti_exec", IssuedAt: now.Add(-time.Minute).Unix(), ExpiresAt: now.Add(time.Minute).Unix(), Scope: []string{"exec:operate"}, CredentialClass: "exec_operation", EnvironmentID: "env_test", MachineID: "machine_test", UserID: "usr_test", CLIClientSessionID: "cli_test", OperationID: "operation_exec_1"}
+	authorizer, _ := factory(signStaticCredential(t, private, "key-1", claims))
+	if _, err := authorizer.Authorize(context.Background(), protocol.Frame{Capability: "exec.v1", OperationID: "operation_exec_1"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := authorizer.Authorize(context.Background(), protocol.Frame{Capability: "exec.v1", OperationID: "operation_exec_2"}); err == nil {
+		t.Fatal("cross-operation credential accepted")
+	}
+	if _, err := authorizer.Authorize(context.Background(), protocol.Frame{Capability: "terminal.v1", OperationID: "operation_exec_1"}); err == nil {
+		t.Fatal("exec credential accepted for terminal")
+	}
+	claims.Scope, claims.CredentialClass, claims.SessionID = []string{"terminal:operate"}, "terminal_operation", "ses_test"
+	authorizer, _ = factory(signStaticCredential(t, private, "key-1", claims))
+	if _, err := authorizer.Authorize(context.Background(), protocol.Frame{Capability: "exec.v1", OperationID: "operation_exec_1"}); err == nil {
+		t.Fatal("terminal credential accepted for exec")
+	}
+}
+
+func TestStaticAuthorizerSSHRequiresExactSSHCredentialAndOperation(t *testing.T) {
+	public, private, _ := ed25519.GenerateKey(rand.Reader)
+	now := time.Now().UTC()
+	factory, err := NewStaticAuthorizer(StaticAuthConfig{Issuer: "https://control.test", EnvironmentID: "env_test", MachineID: "machine_test", HelperID: "hlp_test", Keys: map[string]ed25519.PublicKey{"key-1": public}, Clock: staticClock{now}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims := auth.Claims{Issuer: "https://control.test", Audience: "paperboat-machine", Subject: "usr_test", JTI: "jti_ssh", IssuedAt: now.Add(-time.Minute).Unix(), ExpiresAt: now.Add(time.Minute).Unix(), Scope: []string{"ssh:operate"}, CredentialClass: "ssh_operation", EnvironmentID: "env_test", MachineID: "machine_test", UserID: "usr_test", CLIClientSessionID: "cli_test", OperationID: "operation_ssh_1"}
+	authorizer, _ := factory(signStaticCredential(t, private, "key-1", claims))
+	if _, err := authorizer.Authorize(context.Background(), protocol.Frame{Capability: "ssh.v1", OperationID: "operation_ssh_1"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := authorizer.Authorize(context.Background(), protocol.Frame{Capability: "ssh.v1", OperationID: "operation_ssh_2"}); err == nil {
+		t.Fatal("cross-operation credential accepted")
+	}
+	if _, err := authorizer.Authorize(context.Background(), protocol.Frame{Capability: "exec.v1", OperationID: "operation_ssh_1"}); err == nil {
+		t.Fatal("ssh credential accepted for exec")
+	}
+	claims.Scope, claims.CredentialClass = []string{"exec:operate"}, "exec_operation"
+	authorizer, _ = factory(signStaticCredential(t, private, "key-1", claims))
+	if _, err := authorizer.Authorize(context.Background(), protocol.Frame{Capability: "ssh.v1", OperationID: "operation_ssh_1"}); err == nil {
+		t.Fatal("exec credential accepted for ssh")
+	}
+}
+
 func TestStaticAuthorizerRejectsInvalidConfiguration(t *testing.T) {
 	if _, err := NewStaticAuthorizer(StaticAuthConfig{}); !errors.Is(err, ErrStaticAuthInvalid) {
 		t.Fatalf("err=%v", err)

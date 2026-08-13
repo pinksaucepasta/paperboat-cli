@@ -40,10 +40,11 @@ type userMachineSessionClient interface {
 }
 
 type target struct {
-	kind  string
-	id    string
-	name  string
-	state string
+	kind       string
+	id         string
+	name       string
+	state      string
+	generation uint64
 }
 
 type EnvironmentIdentity struct {
@@ -140,12 +141,13 @@ func (r *APIResolver) Resolve(ctx context.Context, req ConnectRequest) (ConnectI
 	}
 
 	info := ConnectInfo{
-		TargetKind:   target.kind,
-		ProjectID:    target.id,
-		Project:      target.name,
-		ProjectState: targetState(target, resp),
-		TunnelTarget: resp.Terminal.Endpoints.WSS,
-		Local:        false,
+		TargetKind:        target.kind,
+		ProjectID:         target.id,
+		Project:           target.name,
+		ProjectState:      targetState(target, resp),
+		MachineGeneration: target.generation,
+		TunnelTarget:      resp.Terminal.Endpoints.WSS,
+		Local:             false,
 		Terminal: &TerminalTarget{
 			Protocol:      resp.Terminal.Protocol,
 			EnvironmentID: resp.Environment.EnvironmentID,
@@ -330,7 +332,7 @@ func (r *APIResolver) findTarget(ctx context.Context, requested string) (target,
 			if err := terminalCapabilityError(machine); err != nil {
 				return target{}, err
 			}
-			return target{kind: targetUserMachine, id: machine.ID, name: machine.DisplayName, state: machine.State}, nil
+			return target{kind: targetUserMachine, id: machine.ID, name: machine.DisplayName, state: machine.State, generation: uint64(machine.InstallationGeneration)}, nil
 		}
 	}
 	var matches []api.UserMachine
@@ -344,7 +346,7 @@ func (r *APIResolver) findTarget(ctx context.Context, requested string) (target,
 		if err := terminalCapabilityError(machine); err != nil {
 			return target{}, err
 		}
-		return target{kind: targetUserMachine, id: machine.ID, name: machine.DisplayName, state: machine.State}, nil
+		return target{kind: targetUserMachine, id: machine.ID, name: machine.DisplayName, state: machine.State, generation: uint64(machine.InstallationGeneration)}, nil
 	}
 	if len(matches) > 1 {
 		ids := make([]string, 0, len(matches))

@@ -30,7 +30,10 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/health"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostinstall"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/identity"
+	"github.com/pinksaucepasta/paperboat/internal/httptransport"
 )
+
+var fetchBootstrapArtifact = bootstrap.FetchVerifiedArtifact
 
 func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	flags := flag.NewFlagSet("bootstrap", flag.ContinueOnError)
@@ -107,14 +110,6 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	if err != nil {
 		return errors.Join(err, reportInstallationFailureWithEnrollmentCredential(ctx, material, "artifact_verification"))
 	}
-	executable, err := os.Executable()
-	if err != nil {
-		return errors.Join(err, reportInstallationFailureWithEnrollmentCredential(ctx, material, "artifact_verification"))
-	}
-	executable, err = filepath.EvalSymlinks(executable)
-	if err != nil {
-		return errors.Join(err, reportInstallationFailureWithEnrollmentCredential(ctx, material, "artifact_verification"))
-	}
 	artifactHTTP := artifactHTTPClient()
 	artifactPath, err := prepareInstallation(ctx, &material, *stateRoot, artifactHTTP, client)
 	if err != nil {
@@ -123,7 +118,7 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 		}
 		return failBootstrapInstallation(ctx, err, material, *stateRoot, "artifact_verification")
 	}
-	executable = artifactPath
+	executable := artifactPath
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return failBootstrapInstallation(ctx, err, material, *stateRoot, "service_install")
@@ -135,7 +130,7 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	}
 	installRequest := hostinstall.Request{
 		Schema: hostinstall.SchemaV1, Platform: runtime.GOOS, User: account.Username, UID: uid, Group: group.Name, GID: gid,
-		Executable: executable, Artifact: *material.Artifact, ArtifactPublicKey: material.ArtifactPublicKey,
+		Executable: executable, Artifact: *material.Artifact,
 		Home: home, Path: servicePath, StateRoot: *stateRoot, WorkspaceRoot: workspace, ControlURL: material.ControlURL,
 		UserMachineID: material.UserMachineID, Shell: resolvedShell, HelperListenAddress: material.HelperListenAddress,
 		SetupMode: "host",
@@ -300,11 +295,11 @@ func authorizeServiceOperation(ctx context.Context, executable, operation string
 }
 
 func artifactHTTPClient() *http.Client {
-	return &http.Client{Timeout: 2 * time.Minute, CheckRedirect: func(request *http.Request, via []*http.Request) error {
+	return &http.Client{Transport: httptransport.Default(), Timeout: 2 * time.Minute, CheckRedirect: func(request *http.Request, via []*http.Request) error {
 		if len(via) != 1 || request.Method != http.MethodGet || request.URL.Scheme != "https" || request.URL.User != nil ||
 			!strings.EqualFold(via[0].URL.Hostname(), "github.com") ||
 			!strings.EqualFold(request.URL.Hostname(), "release-assets.githubusercontent.com") {
-			return bootstrap.ErrArtifactManifest
+			return bootstrap.ErrArtifactTarget
 		}
 		return nil
 	}}
@@ -413,6 +408,7 @@ func installWorkerCommand(directory, artifact string) (*workerCommandInstallatio
 		if info.Mode()&os.ModeSymlink == 0 && (!info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 || info.Mode().Perm()&0o022 != 0) {
 			return nil, bootstrap.ErrInvalid
 		}
+		//paperboat:allow-source-policy atomic-replacement owner=runtime-bootstrap reason=command-backup-transition
 		if err := os.Rename(commandPath, backupPath); err != nil {
 			return nil, err
 		}
@@ -423,13 +419,16 @@ func installWorkerCommand(directory, artifact string) (*workerCommandInstallatio
 	temporary := filepath.Join(directory, fmt.Sprintf(".pb-%d", time.Now().UnixNano()))
 	if err := os.Symlink(artifact, temporary); err != nil {
 		if previousExists {
+			//paperboat:allow-source-policy atomic-replacement owner=runtime-bootstrap reason=failed-symlink-rollback
 			_ = os.Rename(backupPath, commandPath)
 		}
 		return nil, err
 	}
 	defer os.Remove(temporary)
+	//paperboat:allow-source-policy atomic-replacement owner=runtime-bootstrap reason=command-symlink-activation
 	if err := os.Rename(temporary, commandPath); err != nil {
 		if previousExists {
+			//paperboat:allow-source-policy atomic-replacement owner=runtime-bootstrap reason=activation-failure-rollback
 			_ = os.Rename(backupPath, commandPath)
 		}
 		return nil, err
@@ -455,6 +454,7 @@ func (i *workerCommandInstallation) Rollback() error {
 	if i.backupPath == "" {
 		return removeErr
 	}
+	//paperboat:allow-source-policy atomic-replacement owner=runtime-bootstrap reason=explicit-command-rollback
 	return errors.Join(removeErr, os.Rename(i.backupPath, i.commandPath))
 }
 
@@ -468,7 +468,7 @@ func pathListContains(value, want string) bool {
 }
 
 func reportInstallationFailure(ctx context.Context, material bootstrap.Material, stateRoot, stage string) error {
-	return reportInstallationFailureWithClient(ctx, material, stateRoot, stage, &http.Client{Timeout: 5 * time.Second})
+	return reportInstallationFailureWithClient(ctx, material, stateRoot, stage, &http.Client{Transport: httptransport.Default(), Timeout: 5 * time.Second})
 }
 
 func reportInstallationFailureWithClient(ctx context.Context, material bootstrap.Material, stateRoot, stage string, client *http.Client) error {
@@ -515,7 +515,7 @@ func reportInstallationFailureWithClient(ctx context.Context, material bootstrap
 }
 
 func reportInstallationFailureWithEnrollmentCredential(ctx context.Context, material bootstrap.Material, stage string) error {
-	return reportInstallationFailureWithEnrollmentCredentialClient(ctx, material, stage, &http.Client{Timeout: 5 * time.Second})
+	return reportInstallationFailureWithEnrollmentCredentialClient(ctx, material, stage, &http.Client{Transport: httptransport.Default(), Timeout: 5 * time.Second})
 }
 
 func reportInstallationFailureWithEnrollmentCredentialClient(ctx context.Context, material bootstrap.Material, stage string, client *http.Client) error {
@@ -586,7 +586,7 @@ func prepareInstallation(ctx context.Context, material *bootstrap.Material, stat
 			return "", bootstrap.ErrInvalid
 		}
 	}
-	artifactPath, err := bootstrap.FetchVerifiedArtifact(ctx, *material.Artifact, material.ArtifactPublicKey, filepath.Join(stateRoot, "artifacts"), artifactHTTP)
+	artifactPath, err := fetchBootstrapArtifact(ctx, *material.Artifact, filepath.Join(stateRoot, "tuf"), artifactHTTP)
 	if err != nil {
 		return "", err
 	}

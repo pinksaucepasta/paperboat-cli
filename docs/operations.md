@@ -10,14 +10,17 @@ retry.
 - A rejected access token requires `pb auth login`; there is no local-shell fallback.
 - Upload failures are fail-open only for the affected paste. Image bytes and paths are never logged.
 - For a stolen device, revoke its client session in the dashboard, then run `pb auth logout`.
-- During outages, use `pb doctor`; never bypass `paperboat-tunnel` or attach over SSH.
+- During outages, use `pb doctor`; never bypass the common Paperboat transport or expose a raw
+  machine port. `pb ssh` is allowed only when its stream succeeds through the normal selected
+  direct/relay/WSS carrier and terminates at the machine's system `sshd`.
 - `pb codex` credentials, remote paths, command arguments, and Codex output are never
   written to logs. The remote environment owns its Codex login and configuration.
 
 Production connection metrics are written as validated JSONL to
 `observability.event_log_path`, or `telemetry.jsonl` beside the CLI config by
-default. The file is restricted to mode `0600` and never contains endpoints,
-credentials, terminal bytes, image data, or local/VM paths. Its configured size
+default. The file is restricted to mode `0600` and never contains network endpoints,
+candidate addresses, credentials, private-content bytes, or local/machine paths. Opaque endpoint
+IDs may appear only where the documented diagnostic contract requires them. Its configured size
 limit bounds disk usage; the oldest accumulated events are truncated when the
 next record would exceed that limit.
 
@@ -47,8 +50,9 @@ owning repositories.
 provenance JSON containing the version, protocol, commit, and Go toolchain. The
 release pipeline must sign these files and attach an SBOM before publishing.
 
-Pushing a validated `YYYY.MM.DD.X` tag runs `.github/workflows/release.yml`. It cross-builds the six
-supported OS/architecture combinations, creates checksums and SPDX JSON SBOMs,
+Pushing a validated `YYYY.MM.DD.X` tag runs `.github/workflows/release.yml`. It cross-builds the four
+supported combinations (`darwin/amd64`, `darwin/arm64`, `linux/amd64`, and `linux/arm64`), creates
+checksums and SPDX JSON SBOMs,
 attests each archive with GitHub's OIDC-backed artifact attestation, and uploads
 the assets to the GitHub release. Verify an installed archive with `gh
 attestation verify <archive> --repo <owner>/<repo>` and its adjacent checksum
@@ -57,6 +61,50 @@ before installation.
 Incident procedures are maintained in [runbooks.md](runbooks.md).
 
 ## Machine runtime services
+
+`pb status` and `pb wait` use one per-user local daemon. When its owner-only Unix socket is
+already healthy, commands only read the local API. If the socket is absent or refusing
+connections, the CLI atomically installs and starts `paperboat-local-daemon.service` under
+the Linux user systemd manager or
+`com.pinksaucepasta.paperboat.local-daemon` under the macOS GUI launchd domain, then waits
+up to five seconds for a validated snapshot. Permission, protocol-version, and invalid-state
+failures never trigger service replacement. The service runs the exact installed `pb`
+executable with `__local-daemon`, preserves an explicit config/server selection, uses the
+canonical user state/runtime paths, and holds the process lock that authorizes stale-socket
+cleanup. `pb uninstall` stops and unloads this service before removing its definition or
+user state.
+
+Active peer clients publish metadata-only `paperboat.transport-observation/v1` records to
+the owner-only local API. Records contain a random process source ID, monotonic sequence,
+machine ID, selected path category, the signed descriptor's relay region for relay-backed
+paths, active lease count, and a maximum 30-second expiry; they never contain relay URLs,
+endpoints, candidates, network fingerprints, credentials, or payloads.
+The daemon rejects stale or replayed records, caps publishers and consumer counts,
+aggregates concurrent processes, and expires crashed publishers. Closing a peer connection
+publishes an immediate zero-consumer record. Control-plane inventory refreshes preserve
+this local overlay, while the snapshot store alone assigns monotonic status generations.
+
+For online current installations, the same bounded inventory refresh reads the
+generation-fenced managed SSH target and active host-key set. A missing target reports SSH
+as unavailable, a target without approved current-generation host keys reports degraded,
+and only matching current generations plus healthy local managed-SSH integration report
+ready. Authentication, authorization, and
+malformed authority fail the refresh and preserve the last good snapshot rather than
+guessing readiness.
+
+Machine SSH names use the server-owned `alias` field, not display names. Aliases are
+lowercase ASCII DNS labels and unique within an account while the machine is active.
+Enrollment derives a stable label, avoids reserved Paperboat command and infrastructure
+names, and allocates deterministic `-2`, `-3`, and later suffixes under account-scoped
+transaction serialization. Local inventory rejects absent or malformed aliases.
+
+Machine runtime services may set `PAPERBOAT_HTTP_PROXY`, `PAPERBOAT_HTTPS_PROXY`, and
+`PAPERBOAT_NO_PROXY` as administrator policy. These settings take precedence over the
+standard process environment and native macOS proxy settings for all runtime-owned
+control, WebSocket, update, artifact, and configuration traffic. Proxy URLs must use
+`http` or `https`, contain a host, and contain no credentials, path, query, or fragment;
+invalid policy prevents the runtime from starting. Paperboat never downloads or executes
+PAC/WPAD scripts and never accepts proxy credentials in configuration.
 
 `pb pair` installs the terminal host and its `runtime` connector. Configuration sync is a
 separate per-user `__runtime-config` service and starts only while the local machine has an
@@ -71,19 +119,19 @@ active server record and uses the remaining lifetime. Expiry or server revocatio
 the route, descriptor, and service definition. A crash retains the descriptor so the OS
 service can retry without extending expiry.
 
-`pb serve` uses the same preview service namespace and inventory. Foreground mode first
-acquires a bounded `local_runtime_control/1.0` management lease from the loopback runtime
-using an owner-only local token, renews it while attached, and stops the workload if renewal
-fails. The runtime expires abandoned leases and reconciles the preview route. The CLI owns
-an ephemeral `127.0.0.1` static listener and drains it before canceling the preview runner.
-`--detach` installs `__runtime-serve`; its v1 descriptor contains
-only the canonical source path and filesystem identity, file/directory kind, SPA policy,
-bind address, assigned loopback port, owner mode, preview record, service definition,
-service generation, and original absolute expiry. It contains no credential. The detached
-unit is active only for the current machine runtime and is not enabled for the next boot.
-Server revocation and capacity eviction are observed by the existing
-preview reconciliation loop and stop the listener, descriptor, and service. Successfully
-ingested Inbox files remain user-owned.
+`pb serve` is private and local by default. Foreground mode owns an ephemeral
+`127.0.0.1` HTTP listener directly and has no account, control-plane, machine-runtime, or
+route dependency. `--listen-port` requests an exact loopback port and fails on conflict.
+`--detach` installs `__runtime-serve`; its v1 descriptor contains only the canonical source
+path and filesystem identity, file/directory kind, SPA policy, private visibility, requested
+and assigned loopback port, owner mode, service definition, service generation, and original
+absolute expiry. It contains no credential. `pb preview list` reads this owner-only local
+state, and `pb preview revoke <name>` retires the service without contacting the backend.
+Successfully ingested Inbox files remain user-owned.
+
+`pb serve --public` retains the control-plane preview registration, management lease,
+reconciliation, and public Caddy route lifecycle. Public mode never uses a requested local
+port and remains explicitly outside the private-content E2EE claim.
 
 `pb doctor` verifies the local lease protocol and compares served descriptors with their
 loopback listeners without returning source paths. Session-mode transitions, unpair, and

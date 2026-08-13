@@ -3,10 +3,11 @@ package config
 import (
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"runtime"
 	"time"
+
+	"github.com/pinksaucepasta/paperboat/internal/userpaths"
 )
 
 type Profile string
@@ -21,11 +22,10 @@ type Limits struct {
 	TerminalFrameBytes   uint64
 	PendingOutputBytes   uint64
 	HeartbeatInterval    time.Duration
-	PeerTimeout          time.Duration
 	MutationDeadline     time.Duration
 }
 
-var DefaultLimits = Limits{64 << 10, 256 << 10, 1 << 20, 15 * time.Second, 45 * time.Second, 5 * time.Minute}
+var DefaultLimits = Limits{64 << 10, 256 << 10, 1 << 20, 15 * time.Second, 5 * time.Minute}
 
 type Config struct {
 	Profile   Profile
@@ -61,7 +61,7 @@ func (c Config) Validate() error {
 	if c.Limits.StructuredFrameBytes == 0 || c.Limits.StructuredFrameBytes > DefaultLimits.StructuredFrameBytes ||
 		c.Limits.TerminalFrameBytes == 0 || c.Limits.TerminalFrameBytes > DefaultLimits.TerminalFrameBytes ||
 		c.Limits.PendingOutputBytes == 0 || c.Limits.PendingOutputBytes > DefaultLimits.PendingOutputBytes ||
-		c.Limits.HeartbeatInterval <= 0 || c.Limits.PeerTimeout < c.Limits.HeartbeatInterval ||
+		c.Limits.HeartbeatInterval <= 0 ||
 		c.Limits.MutationDeadline <= 0 || c.Limits.MutationDeadline > DefaultLimits.MutationDeadline {
 		return fmt.Errorf("limits exceed protocol bounds: %w", ErrInvalid)
 	}
@@ -102,17 +102,9 @@ func DefaultStateRoot(environ func(string) string) (string, error) {
 			}
 			return filepath.Join(base, "paperboat", "runtime"), nil
 		}
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", fmt.Errorf("state root: %w", err)
-		}
-		return filepath.Join(home, ".local", "state", "paperboat", "runtime"), nil
+		return userpaths.State("paperboat/runtime")
 	}
-	base, err := os.UserConfigDir()
-	if err != nil {
-		return "", fmt.Errorf("state root: %w", err)
-	}
-	return filepath.Join(base, "Paperboat", "runtime"), nil
+	return userpaths.State("Paperboat/runtime")
 }
 
 var ErrInvalid = errors.New("invalid configuration")

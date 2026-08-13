@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -11,23 +12,43 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/pinksaucepasta/paperboat/internal/config"
+	clienttransfer "github.com/pinksaucepasta/paperboat/internal/filetransfer"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/filetransfer"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/operation"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/protocol"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/store"
+	"github.com/pinksaucepasta/paperboat/internal/peertransport/peercontext"
+	"github.com/pinksaucepasta/paperboat/internal/peertransport/transfercrypto"
 )
 
 type readProbe struct{ reads int }
 
 func (r *readProbe) Read([]byte) (int, error) { r.reads++; return 0, io.EOF }
 func (*readProbe) Close() error               { return nil }
+
+type loseFirstCompleteResponse struct {
+	base http.RoundTripper
+	lost atomic.Bool
+}
+
+func (t *loseFirstCompleteResponse) RoundTrip(request *http.Request) (*http.Response, error) {
+	response, err := t.base.RoundTrip(request)
+	if err != nil || !strings.HasSuffix(request.URL.Path, "/complete") || !t.lost.CompareAndSwap(false, true) {
+		return response, err
+	}
+	_ = response.Body.Close()
+	return nil, io.ErrUnexpectedEOF
+}
 
 type revocableBody struct {
 	started chan struct{}
@@ -155,6 +176,86 @@ func TestFileTransferHTTPResumesCompletesAndRangesOpaqueContent(t *testing.T) {
 	}
 }
 
+func TestEncryptedFileTransferPublishesOnlyAfterAuthenticatedManifestChunksAndReceipt(t *testing.T) {
+	handler, _ := fileTransferTestHandler(t)
+	vault, err := transfercrypto.NewKeyVault(config.FileSecretStore{Dir: filepath.Join(t.TempDir(), "keys")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler.config.TransferKeys = vault
+	now := time.Now().UTC().Truncate(time.Second)
+	peer := peercontext.Context{AccountID: "user_1", UserID: "user_1", DeviceID: "cli_1", MachineID: "machine_host", HostGeneration: 2, AuthorizationGeneration: 3, IntentID: "intent_01", OperationID: "operation_key_01", Consumer: "file_transfer_key", InitiatorRole: "controlling", ResponderRole: "controlled", AttemptGeneration: 1}
+	peer.InitiatorCertificateHash[0], peer.ResponderCertificateHash[0] = 1, 2
+	material, _ := transfercrypto.GenerateKeyMaterial()
+	batchID := "fb_encrypted_01"
+	if err := vault.SaveBound(batchID, 1, material, now.Add(time.Hour), peer); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	lossy := &loseFirstCompleteResponse{base: server.Client().Transport}
+	client := clienttransfer.NewClient(server.URL+"/v1/file-transfers", clienttransfer.Auth{Token: "token"}, clienttransfer.Binding{SourceMachineID: "machine_client", DestinationMachineID: "machine_host", InitiatingUserID: "user_1"}, &http.Client{Transport: lossy})
+	plaintext := []byte("private file payload")
+	digest := sha256.Sum256(plaintext)
+	batch, err := client.SendEncryptedBatch(context.Background(), batchID, "ses_1", []clienttransfer.Source{{Basename: "private.txt", Size: int64(len(plaintext)), SHA256: digest, Reader: bytes.NewReader(plaintext)}}, 1, clienttransfer.PreparedKey{Material: material, Context: peer})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(batch.Transfers) != 1 || batch.Transfers[0].State != "delivered" || batch.Paths[0] != "Paperboat Inbox/fb_encrypted_01.0-private.txt" {
+		t.Fatalf("batch=%+v", batch)
+	}
+	if !lossy.lost.Load() {
+		t.Fatal("completion response loss was not exercised")
+	}
+	published, err := handler.config.Service.PublishedPath(context.Background(), batch.Transfers[0].TransferID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(published)
+	if err != nil || !bytes.Equal(content, plaintext) {
+		t.Fatalf("published=%q err=%v", content, err)
+	}
+	if _, err := vault.Load(batchID, 1); !errors.Is(err, transfercrypto.ErrKeyUnavailable) {
+		t.Fatalf("completed transfer key still available: %v", err)
+	}
+}
+
+func TestEncryptedManifestTamperingFailsAfterVisibleDigestReplacement(t *testing.T) {
+	handler, _ := fileTransferTestHandler(t)
+	vault, err := transfercrypto.NewKeyVault(config.FileSecretStore{Dir: filepath.Join(t.TempDir(), "keys")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler.config.TransferKeys = vault
+	peer := peercontext.Context{AccountID: "user_1", UserID: "user_1", DeviceID: "cli_1", MachineID: "machine_host", HostGeneration: 2, AuthorizationGeneration: 3, IntentID: "intent_01", OperationID: "operation_key_01", Consumer: "file_transfer_key", InitiatorRole: "controlling", ResponderRole: "controlled", AttemptGeneration: 1}
+	peer.InitiatorCertificateHash[0], peer.ResponderCertificateHash[0] = 1, 2
+	material, err := transfercrypto.GenerateKeyMaterial()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer material.Destroy()
+	batchID := "fb_manifest_tamper"
+	if err := vault.SaveBound(batchID, 1, material, time.Now().UTC().Add(time.Hour), peer); err != nil {
+		t.Fatal(err)
+	}
+	plaintextDigest := sha256.Sum256([]byte("private"))
+	manifest := transfercrypto.Manifest{BatchID: batchID, Files: []transfercrypto.ManifestFile{{TransferID: batchID + ".0", Name: "private.txt", RelativeDestination: "Paperboat Inbox/private.txt", Mode: 0o600, Size: 7, PlaintextSHA256: plaintextDigest, ChunkCount: 1}}}
+	ciphertext, err := transfercrypto.EncryptManifest(material, recordContext(peer, batchID, 1), manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ciphertext[len(ciphertext)-1] ^= 1
+	visibleDigest := sha256.Sum256(ciphertext)
+	envelope := &fileTransferE2EE{Version: 1, TransferID: batchID, TransferGeneration: 1, EncryptedManifest: base64.RawURLEncoding.EncodeToString(ciphertext), ManifestDigest: hex.EncodeToString(visibleDigest[:])}
+	input := &CreateFileTransferRequest{BatchID: batchID, SourceMachineID: "machine_client", DestinationMachineID: "machine_host", InitiatingUserID: "user_1"}
+	if err := handler.openEncryptedCreate(envelope, input, Authorization{UserID: "user_1"}); !errors.Is(err, transfercrypto.ErrAuthentication) {
+		t.Fatalf("tampered manifest err=%v", err)
+	}
+	if len(input.Files) != 0 {
+		t.Fatalf("tampered manifest created files: %+v", input.Files)
+	}
+}
+
 func TestFileTransferHTTPCreateIsIdempotentAndOffsetConflictReportsCommittedOffset(t *testing.T) {
 	handler, _ := fileTransferTestHandler(t)
 	data := []byte("x")
@@ -246,6 +347,139 @@ func TestFileTransferHTTPPendingIsRecipientPinnedAndReceiptIsRelative(t *testing
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusOK || bytes.Contains(response.Body.Bytes(), []byte(id)) {
 		t.Fatalf("redelivery=%d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestEncryptedReversePendingManifestAndChunksAreOpaque(t *testing.T) {
+	handler, _ := fileTransferTestHandler(t)
+	vault, err := transfercrypto.NewKeyVault(config.FileSecretStore{Dir: filepath.Join(t.TempDir(), "keys")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler.config.TransferKeys = vault
+	plaintext := []byte("machine to cli private payload")
+	batchID := "fb_reverse_encrypted"
+	resourceID := batchID + ".0"
+	generation := uint64(3)
+	material, _ := transfercrypto.GenerateKeyMaterial()
+	defer material.Destroy()
+	keyBytes, _ := material.MarshalBinary()
+	expiresAt := time.Now().UTC().Truncate(time.Second).Add(time.Hour)
+	local, err := NewLocalFileTransferHandler(LocalFileTransferConfig{Token: strings.Repeat("l", 43), MachineID: "machine_host", Service: handler.config.Service, TransferKeys: vault, ResolveRecipient: func(sessionID, machineID string) (string, error) {
+		if sessionID == "ses_1" && machineID == "machine_client" {
+			return "cli_1", nil
+		}
+		return "", errors.New("missing")
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	createPayload, _ := json.Marshal(localFileTransferCreate{BatchID: batchID, DestinationMachineID: "machine_client", InitiatingUserID: "user_1", SessionID: "ses_1", TransferGeneration: generation, ExpiresAt: expiresAt, KeyMaterial: base64.RawURLEncoding.EncodeToString(keyBytes), Files: []filetransfer.File{{ID: resourceID, Basename: "private-name.txt", Size: int64(len(plaintext)), SHA256: transferDigest(plaintext), Ordinal: 0}}})
+	localRequest := httptest.NewRequest(http.MethodPost, "http://helper.test/v1/local-file-transfers", bytes.NewReader(createPayload))
+	localRequest.Header.Set("Authorization", "Bearer "+strings.Repeat("l", 43))
+	localResponse := httptest.NewRecorder()
+	local.ServeHTTP(localResponse, localRequest)
+	if localResponse.Code != http.StatusCreated {
+		t.Fatalf("local create=%d %s", localResponse.Code, localResponse.Body.String())
+	}
+	localRequest = httptest.NewRequest(http.MethodPatch, "http://helper.test/v1/local-file-transfers/"+resourceID+"/content", bytes.NewReader(plaintext))
+	localRequest.Header.Set("Authorization", "Bearer "+strings.Repeat("l", 43))
+	localRequest.Header.Set("Content-Type", "application/offset+octet-stream")
+	localRequest.Header.Set(HeaderUploadOffset, "0")
+	localResponse = httptest.NewRecorder()
+	local.ServeHTTP(localResponse, localRequest)
+	if localResponse.Code != http.StatusNoContent {
+		t.Fatalf("local content=%d %s", localResponse.Code, localResponse.Body.String())
+	}
+	localRequest = httptest.NewRequest(http.MethodPost, "http://helper.test/v1/local-file-transfers/"+resourceID+"/complete", nil)
+	localRequest.Header.Set("Authorization", "Bearer "+strings.Repeat("l", 43))
+	localResponse = httptest.NewRecorder()
+	local.ServeHTTP(localResponse, localRequest)
+	if localResponse.Code != http.StatusOK {
+		t.Fatalf("local complete=%d %s", localResponse.Code, localResponse.Body.String())
+	}
+	peer := peercontext.Context{AccountID: "user_1", UserID: "user_1", DeviceID: "cli_1", MachineID: "machine_host", HostGeneration: 2, AuthorizationGeneration: 3, IntentID: "intent_reverse", OperationID: clienttransfer.KeyOperationID(batchID), Consumer: "file_transfer_key", InitiatorRole: "controlling", ResponderRole: "controlled", AttemptGeneration: 1}
+	peer.InitiatorCertificateHash[0], peer.ResponderCertificateHash[0] = 1, 2
+	if err := vault.SaveLocalBound(batchID, generation, material, expiresAt, peer); err != nil {
+		t.Fatal(err)
+	}
+
+	request := transferRequest(http.MethodGet, "http://helper.test/v1/file-transfers/pending?session_id=ses_1&wait_seconds=0", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("pending=%d %s", response.Code, response.Body.String())
+	}
+	pending := response.Body.String()
+	for _, forbidden := range []string{"private-name.txt", transferDigest(plaintext), "machine_host", "machine_client", "user_1", "Paperboat Inbox", `\"size\"`, `\"basename\"`, `\"sha256\"`} {
+		if strings.Contains(pending, forbidden) {
+			t.Fatalf("pending exposed %q: %s", forbidden, pending)
+		}
+	}
+	if !strings.Contains(pending, batchID) || !strings.Contains(pending, resourceID) {
+		t.Fatalf("pending omitted opaque identities: %s", pending)
+	}
+
+	request = transferRequest(http.MethodGet, "http://helper.test/v1/file-transfers/"+resourceID+"/e2ee-manifest", nil)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("manifest=%d %s", response.Code, response.Body.String())
+	}
+	var envelope encryptedManifestResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	ciphertext, err := base64.RawURLEncoding.Strict().DecodeString(envelope.EncryptedManifest)
+	visibleDigest := sha256.Sum256(ciphertext)
+	if err != nil || envelope.TransferID != batchID || envelope.TransferGeneration != generation || envelope.ManifestDigest != hex.EncodeToString(visibleDigest[:]) {
+		t.Fatalf("manifest envelope=%+v err=%v", envelope, err)
+	}
+	manifest, err := transfercrypto.DecryptManifest(material, recordContextDirection(peer, batchID, generation, transfercrypto.DirectionFromMachine), ciphertext)
+	if err != nil || len(manifest.Files) != 1 || manifest.Files[0].Name != "private-name.txt" || manifest.Files[0].TransferID != resourceID || manifest.Files[0].Size != uint64(len(plaintext)) {
+		t.Fatalf("manifest=%+v err=%v", manifest, err)
+	}
+
+	request = transferRequest(http.MethodGet, "http://helper.test/v1/file-transfers/"+resourceID+"/chunks/0", nil)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || response.Header().Get("Content-Type") != "application/octet-stream" {
+		t.Fatalf("chunk=%d headers=%v body=%q", response.Code, response.Header(), response.Body.String())
+	}
+	chunkContext := transfercrypto.ChunkContext{AccountID: peer.AccountID, DeviceID: peer.DeviceID, MachineID: peer.MachineID, InitiatorCertificateHash: peer.InitiatorCertificateHash, ResponderCertificateHash: peer.ResponderCertificateHash, OperationID: peer.OperationID, TransferID: batchID, Direction: transfercrypto.DirectionFromMachine, TransferGeneration: generation, FileOrdinal: 0, ChunkOrdinal: 0, Final: true}
+	opened, err := transfercrypto.DecryptChunk(material, chunkContext, response.Body.Bytes())
+	if err != nil || !bytes.Equal(opened, plaintext) {
+		t.Fatalf("opened=%q err=%v", opened, err)
+	}
+	clear(opened)
+	manifestHash, err := manifest.Hash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiptRecord := transfercrypto.FinalReceipt{ManifestHash: manifestHash, Files: []transfercrypto.ReceiptFile{{FileOrdinal: 0, Result: transfercrypto.CollisionOriginal, RelativePath: "Paperboat Inbox/private-name.txt"}}}
+	receiptCiphertext, err := transfercrypto.EncryptFinalReceipt(material, recordContextDirection(peer, batchID, generation, transfercrypto.DirectionFromMachine), receiptRecord)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiptDigest := sha256.Sum256(receiptCiphertext)
+	receiptPayload, _ := json.Marshal(map[string]string{"encrypted_receipt": base64.RawURLEncoding.EncodeToString(receiptCiphertext), "receipt_digest": hex.EncodeToString(receiptDigest[:])})
+	if bytes.Contains(receiptPayload, []byte("private-name.txt")) || bytes.Contains(receiptPayload, []byte("Paperboat Inbox")) {
+		t.Fatalf("receipt exposed plaintext metadata: %s", receiptPayload)
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		request = transferRequest(http.MethodPost, "http://helper.test/v1/file-transfers/"+resourceID+"/receipt", receiptPayload)
+		response = httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusNoContent {
+			t.Fatalf("receipt attempt=%d status=%d body=%s", attempt, response.Code, response.Body.String())
+		}
+	}
+	delivered, err := handler.config.Service.Get(context.Background(), resourceID)
+	if err != nil || delivered.State != "delivered" || delivered.ReceiptPath != "Paperboat Inbox/private-name.txt" {
+		t.Fatalf("delivered=%+v err=%v", delivered, err)
+	}
+	if _, err := vault.Load(batchID, generation); !errors.Is(err, transfercrypto.ErrKeyUnavailable) {
+		t.Fatalf("sender key retained after receipt: %v", err)
 	}
 }
 

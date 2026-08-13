@@ -226,7 +226,7 @@ func (i *Interceptor) Write(p []byte) (int, error) {
 		return 0, io.ErrClosedPipe
 	}
 	if i.directInput && len(p) > 0 && i.queued.Load() == 0 && i.stateMu.TryLock() {
-		if !i.inPaste && len(i.buf) == 0 && bytes.Index(p, startMarker) < 0 && partialSuffix(p, startMarker) == 0 {
+		if !i.inPaste && len(i.buf) == 0 && !bytes.Contains(p, startMarker) && partialSuffix(p, startMarker) == 0 {
 			n, err := i.writeDest(p)
 			i.stateMu.Unlock()
 			if errors.Is(err, tunnel.ErrWriteUncertain) {
@@ -425,12 +425,15 @@ func (i *Interceptor) run() {
 					break coalesce
 				}
 			}
+			// These chunks are no longer queued once this worker owns them. In
+			// particular, ordinary input must be able to take the direct path
+			// while an upload started by this batch is still in flight.
+			i.queued.Add(-processed)
 			err := i.drain()
 			if err == nil && batchInputClosed {
 				err = i.flush()
 			}
 			i.stateMu.Unlock()
-			i.queued.Add(-processed)
 			if err != nil && handleWriteErr(err) {
 				return
 			}

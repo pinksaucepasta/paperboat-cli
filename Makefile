@@ -5,20 +5,32 @@ BINDIR      := $(PREFIX)/bin
 VERSION     ?= $(shell ./tools/release-version.sh current)
 COMMIT      ?= $(shell git rev-parse --verify HEAD 2>/dev/null || echo unknown)
 PROTOCOL_VERSION ?= 1
-ANDROID_API ?= 24
-ANDROID_NDK_HOME ?= $(HOME)/Library/Android/sdk/ndk/27.1.12297006
-ANDROID_CC ?= $(ANDROID_NDK_HOME)/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android$(ANDROID_API)-clang
-GO_VERSION  := 1.25.7
+GO_VERSION  := 1.26.5
 SQLC_VERSION := v1.30.0
 GO          := GOTOOLCHAIN=local go
 GOFMT       := $(shell GOTOOLCHAIN=local go env GOROOT 2>/dev/null)/bin/gofmt
 GO_FILES    := $(shell find . -path ./.git -prune -o -name '*.go' -print)
 LDFLAGS     := -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Version=$(VERSION) -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Commit=$(COMMIT) -X github.com/pinksaucepasta/paperboat/internal/buildinfo.ProtocolVersion=$(PROTOCOL_VERSION)
 
-.PHONY: build check clean complete contracts cross-build fmt fmt-check generate generate-check install lint race release-metadata test tidy uninstall verify-toolchain vet
+.PHONY: binary-size-check build check clean complete contracts cross-build dependencies fmt fmt-check fuzz generate generate-check hosted-image-check install license-check lint metrics-check metrics-generate race release-metadata reproducible-builds source-policy static-analysis test tidy tidy-check uninstall verification verify-toolchain vet vulnerability-check
 
 contracts:
 	@./testdata/contracts/validate.sh
+
+dependencies:
+	@./tools/verify-peer-dependencies.sh
+
+source-policy:
+	@./tools/verify-source-policy.sh
+
+metrics-generate:
+	$(GO) run ./tools/metric-schema -write docs/metrics.json
+
+metrics-check:
+	$(GO) run ./tools/metric-schema docs/metrics.json
+
+hosted-image-check:
+	@./tools/verify-hosted-image.sh
 
 verify-toolchain:
 	@test "$$(GOTOOLCHAIN=local go env GOVERSION)" = "go$(GO_VERSION)" || { echo "required Go $(GO_VERSION), found $$(GOTOOLCHAIN=local go env GOVERSION)" >&2; exit 1; }
@@ -28,14 +40,10 @@ build:
 
 cross-build: verify-toolchain
 	@mkdir -p dist
-	@test -x "$(ANDROID_CC)" || { echo "Android NDK compiler not found: $(ANDROID_CC)" >&2; exit 1; }
-	CGO_ENABLED=1 GOOS=android GOARCH=arm64 CC="$(ANDROID_CC)" $(GO) build -trimpath -buildmode=pie -ldflags "$(LDFLAGS)" -o dist/$(BINARY)-android-arm64 $(PKG)
 	CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o dist/$(BINARY)-darwin-amd64 $(PKG)
 	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o dist/$(BINARY)-darwin-arm64 $(PKG)
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o dist/$(BINARY)-linux-amd64 $(PKG)
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o dist/$(BINARY)-linux-arm64 $(PKG)
-	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o dist/$(BINARY)-windows-amd64.exe $(PKG)
-	CGO_ENABLED=0 GOOS=windows GOARCH=arm64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o dist/$(BINARY)-windows-arm64.exe $(PKG)
 
 # Produce reviewable integrity metadata alongside a release binary. Signing,
 # SBOM generation, and publishing are performed by the release pipeline.
@@ -62,6 +70,24 @@ test:
 race:
 	$(GO) test -race ./...
 
+fuzz: verify-toolchain
+	@./tools/run-fuzz-targets.sh
+
+reproducible-builds: verify-toolchain
+	@VERSION="$(VERSION)" COMMIT="$(COMMIT)" PROTOCOL_VERSION="$(PROTOCOL_VERSION)" ./tools/verify-reproducible-builds.sh
+
+static-analysis: verify-toolchain source-policy
+	@./tools/verify-static-analysis.sh
+
+vulnerability-check: verify-toolchain
+	@./tools/verify-vulnerabilities.sh
+
+license-check: verify-toolchain
+	@./tools/verify-licenses.sh
+
+binary-size-check: verify-toolchain
+	@LDFLAGS='$(LDFLAGS)' ./tools/verify-binary-sizes.sh
+
 vet:
 	$(GO) vet ./...
 
@@ -83,9 +109,14 @@ lint: fmt-check vet
 tidy:
 	$(GO) mod tidy
 
-check: verify-toolchain contracts fmt-check generate-check vet test build
+tidy-check: verify-toolchain
+	@./tools/verify-tidy.sh
+
+check: verify-toolchain contracts dependencies source-policy metrics-check hosted-image-check fmt-check generate-check tidy-check vet test build
 
 complete: check race cross-build
+
+verification: complete fuzz reproducible-builds static-analysis vulnerability-check license-check binary-size-check
 
 clean:
 	rm -rf bin dist coverage.out

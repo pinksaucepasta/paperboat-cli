@@ -40,7 +40,7 @@ type Options struct {
 	Stdout        io.Writer
 	Stderr        io.Writer
 	CodexPath     string
-	HTTPClient    *http.Client
+	PeerDial      func(context.Context, api.CodexDescriptor) (net.Conn, error)
 	Now           func() time.Time
 }
 type runtimeDescriptor struct {
@@ -56,7 +56,7 @@ type directoryPage struct {
 }
 
 func Run(ctx context.Context, o Options) error {
-	if o.Backend == nil || o.EnvironmentID == "" || o.Stdin == nil {
+	if o.Backend == nil || o.EnvironmentID == "" || o.Stdin == nil || o.PeerDial == nil {
 		return errors.New("invalid Codex session configuration")
 	}
 	if o.Stdout == nil {
@@ -67,9 +67,6 @@ func Run(ctx context.Context, o Options) error {
 	}
 	if o.CodexPath == "" {
 		o.CodexPath = "codex"
-	}
-	if o.HTTPClient == nil {
-		o.HTTPClient = &http.Client{Timeout: 20 * time.Second}
 	}
 	if o.Now == nil {
 		o.Now = func() time.Time { return time.Now().UTC() }
@@ -91,12 +88,14 @@ func Run(ctx context.Context, o Options) error {
 	}
 	cleanup := true
 	var descriptor api.CodexDescriptor
+	var client *http.Client
+	var transport *http.Transport
 	defer func() {
 		if cleanup {
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-			if descriptor.ManagementURL != "" {
-				if cleanupErr := stopRemote(cleanupCtx, o, descriptor); cleanupErr != nil {
+			if descriptor.ManagementURL != "" && client != nil {
+				if cleanupErr := stopRemote(cleanupCtx, client, descriptor); cleanupErr != nil {
 					fmt.Fprintf(o.Stderr, "Paperboat could not confirm runtime Codex cleanup: %v\n", cleanupErr)
 				}
 			}
@@ -109,17 +108,20 @@ func Run(ctx context.Context, o Options) error {
 	if err != nil {
 		return err
 	}
+	client, transport = newPeerHTTPClient(func(dialCtx context.Context) (net.Conn, error) { return o.PeerDial(dialCtx, descriptor) })
+	defer transport.CloseIdleConnections()
+	websocketClient := &http.Client{Transport: transport}
 	path := strings.TrimSpace(o.Path)
 	if path == "" {
 		if !term.IsTerminal(int(o.Stdin.Fd())) {
 			return errors.New("pb codex requires --path when stdin is not a terminal")
 		}
-		path, err = pickDirectory(ctx, o, descriptor)
+		path, err = pickDirectory(ctx, o, descriptor, client)
 		if err != nil {
 			return err
 		}
 	}
-	prepared, err := prepare(ctx, o, descriptor, path, session.LeaseExpiresAt)
+	prepared, err := prepare(ctx, client, descriptor, path, session.LeaseExpiresAt)
 	if err != nil {
 		return err
 	}
@@ -135,13 +137,13 @@ func Run(ctx context.Context, o Options) error {
 		return err
 	}
 	defer listener.Close()
-	bridge := newBridge(listener, bridgeToken, descriptor.WebSocketURL, descriptor.ConnectCredential)
+	bridge := newBridge(listener, bridgeToken, descriptor.WebSocketURL, descriptor.ConnectCredential, websocketClient)
 	bridgeCtx, bridgeCancel := context.WithCancel(ctx)
 	defer bridgeCancel()
 	go bridge.serve(bridgeCtx)
 	renewCtx, renewCancel := context.WithCancel(ctx)
 	defer renewCancel()
-	go renewLoop(renewCtx, o, session.ID)
+	go renewLoop(renewCtx, o, client, session.ID)
 	args := []string{"--remote", "ws://" + listener.Addr().String(), "--remote-auth-token-env", "PAPERBOAT_CODEX_BRIDGE_TOKEN", "-C", prepared.Path}
 	args = append(args, o.Args...)
 	command := exec.CommandContext(ctx, o.CodexPath, args...)
@@ -161,13 +163,19 @@ func Run(ctx context.Context, o Options) error {
 	return nil
 }
 
-func stopRemote(ctx context.Context, o Options, d api.CodexDescriptor) error {
+func newPeerHTTPClient(dial func(context.Context) (net.Conn, error)) (*http.Client, *http.Transport) {
+	transport := &http.Transport{Proxy: nil, ForceAttemptHTTP2: false, MaxConnsPerHost: 2, MaxIdleConnsPerHost: 2, IdleConnTimeout: 30 * time.Second, ResponseHeaderTimeout: 10 * time.Second}
+	transport.DialTLSContext = func(ctx context.Context, _, _ string) (net.Conn, error) { return dial(ctx) }
+	return &http.Client{Transport: transport, Timeout: 20 * time.Second}, transport
+}
+
+func stopRemote(ctx context.Context, client *http.Client, d api.CodexDescriptor) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, d.ManagementURL, nil)
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+d.ManageCredential)
-	resp, err := o.HTTPClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -178,7 +186,7 @@ func stopRemote(ctx context.Context, o Options, d api.CodexDescriptor) error {
 	return nil
 }
 
-func prepare(ctx context.Context, o Options, d api.CodexDescriptor, path string, lease time.Time) (runtimeDescriptor, error) {
+func prepare(ctx context.Context, client *http.Client, d api.CodexDescriptor, path string, lease time.Time) (runtimeDescriptor, error) {
 	body, _ := json.Marshal(map[string]any{"path": path, "lease_expires_at": lease})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.ManagementURL, strings.NewReader(string(body)))
 	if err != nil {
@@ -186,7 +194,7 @@ func prepare(ctx context.Context, o Options, d api.CodexDescriptor, path string,
 	}
 	req.Header.Set("Authorization", "Bearer "+d.ManageCredential)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := o.HTTPClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return runtimeDescriptor{}, err
 	}
@@ -198,7 +206,7 @@ func prepare(ctx context.Context, o Options, d api.CodexDescriptor, path string,
 	err = json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&out)
 	return out, err
 }
-func directories(ctx context.Context, o Options, d api.CodexDescriptor, path, cursor string) (directoryPage, error) {
+func directories(ctx context.Context, client *http.Client, d api.CodexDescriptor, path, cursor string) (directoryPage, error) {
 	endpoint, err := url.Parse(d.ManagementURL + "/directories")
 	if err != nil {
 		return directoryPage{}, err
@@ -211,7 +219,7 @@ func directories(ctx context.Context, o Options, d api.CodexDescriptor, path, cu
 	endpoint.RawQuery = q.Encode()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
 	req.Header.Set("Authorization", "Bearer "+d.ManageCredential)
-	resp, err := o.HTTPClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return directoryPage{}, err
 	}
@@ -289,7 +297,7 @@ func childError(err error) error {
 	}
 	return err
 }
-func renewLoop(ctx context.Context, o Options, id string) {
+func renewLoop(ctx context.Context, o Options, client *http.Client, id string) {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 	for {
@@ -303,7 +311,7 @@ func renewLoop(ctx context.Context, o Options, id string) {
 				var descriptor api.CodexDescriptor
 				descriptor, err = o.Backend.CodexSessionDescriptor(renewCtx, id)
 				if err == nil {
-					err = renewRuntime(renewCtx, o, descriptor, renewed.LeaseExpiresAt)
+					err = renewRuntime(renewCtx, client, descriptor, renewed.LeaseExpiresAt)
 				}
 			}
 			cancel()
@@ -314,7 +322,7 @@ func renewLoop(ctx context.Context, o Options, id string) {
 	}
 }
 
-func renewRuntime(ctx context.Context, o Options, d api.CodexDescriptor, lease time.Time) error {
+func renewRuntime(ctx context.Context, client *http.Client, d api.CodexDescriptor, lease time.Time) error {
 	body, _ := json.Marshal(map[string]any{"lease_expires_at": lease})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.ManagementURL+"/renew", strings.NewReader(string(body)))
 	if err != nil {
@@ -322,7 +330,7 @@ func renewRuntime(ctx context.Context, o Options, d api.CodexDescriptor, lease t
 	}
 	req.Header.Set("Authorization", "Bearer "+d.ManageCredential)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := o.HTTPClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -336,13 +344,14 @@ func renewRuntime(ctx context.Context, o Options, d api.CodexDescriptor, lease t
 type bridge struct {
 	listener                      net.Listener
 	token, remoteURL, remoteToken string
+	httpClient                    *http.Client
 	mu                            sync.Mutex
 	serveErr                      error
 	server                        *http.Server
 }
 
-func newBridge(l net.Listener, token, remoteURL, remoteToken string) *bridge {
-	return &bridge{listener: l, token: token, remoteURL: remoteURL, remoteToken: remoteToken}
+func newBridge(l net.Listener, token, remoteURL, remoteToken string, httpClient *http.Client) *bridge {
+	return &bridge{listener: l, token: token, remoteURL: remoteURL, remoteToken: remoteToken, httpClient: httpClient}
 }
 func (b *bridge) serve(ctx context.Context) {
 	mux := http.NewServeMux()
@@ -366,7 +375,7 @@ func (b *bridge) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	local.SetReadLimit(128 << 20)
-	remote, _, err := websocket.Dial(r.Context(), b.remoteURL, &websocket.DialOptions{HTTPHeader: http.Header{"Authorization": []string{"Bearer " + b.remoteToken}}, CompressionMode: websocket.CompressionDisabled})
+	remote, _, err := websocket.Dial(r.Context(), b.remoteURL, &websocket.DialOptions{HTTPClient: b.httpClient, HTTPHeader: http.Header{"Authorization": []string{"Bearer " + b.remoteToken}}, CompressionMode: websocket.CompressionDisabled})
 	if err != nil {
 		b.mu.Lock()
 		b.serveErr = err

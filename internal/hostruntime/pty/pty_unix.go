@@ -73,6 +73,7 @@ func (a *Adapter) Start(command Command) (*Process, error) {
 		return nil, ErrInvalidCommand
 	}
 	cmd := exec.Command(path, command.Args...)
+	cmd.Args[0] = command.Path
 	cmd.Dir = cwd
 	cmd.Env = append([]string(nil), command.Env...)
 	terminal, err := creackpty.StartWithSize(cmd, &creackpty.Winsize{Cols: command.Dimensions.Columns, Rows: command.Dimensions.Rows})

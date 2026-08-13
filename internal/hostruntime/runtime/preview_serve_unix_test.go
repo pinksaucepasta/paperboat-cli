@@ -39,7 +39,7 @@ func TestServeRuntimeDescriptorRoundTrip(t *testing.T) {
 		BindAddress:       "127.0.0.1",
 		ServiceGeneration: 1,
 		ServiceDefinition: filepath.Join(root, "paperboat-preview.service"),
-		Serve:             &ServeRuntimeDescriptor{SourcePath: source.Path, SourceKind: source.Kind, SourceIdentity: identity, SPA: true, OwnerMode: "detached"},
+		Serve:             &ServeRuntimeDescriptor{SourcePath: source.Path, SourceKind: source.Kind, SourceIdentity: identity, SPA: true, OwnerMode: "detached", Visibility: "private"},
 	}
 	path := filepath.Join(root, "descriptor.json")
 	if err := writePreviewRuntimeDescriptor(path, descriptor); err != nil {
@@ -70,8 +70,8 @@ func TestServeRuntimeDescriptorRequiresCurrentSchemaFields(t *testing.T) {
 	}
 	expires := time.Now().UTC().Add(time.Hour)
 	for _, descriptor := range []PreviewRuntimeDescriptor{
-		{Schema: "paperboat.preview-runtime/v1", Name: "docs", ExpiresAt: &expires, ServiceGeneration: 1, Serve: &ServeRuntimeDescriptor{SourcePath: source.Path, SourceKind: source.Kind, SourceIdentity: identityValue, OwnerMode: "detached"}},
-		{Schema: "paperboat.preview-runtime/v1", Name: "docs", ExpiresAt: &expires, BindAddress: "127.0.0.1", Serve: &ServeRuntimeDescriptor{SourcePath: source.Path, SourceKind: source.Kind, SourceIdentity: identityValue, OwnerMode: "detached"}},
+		{Schema: "paperboat.preview-runtime/v1", Name: "docs", ExpiresAt: &expires, ServiceGeneration: 1, Serve: &ServeRuntimeDescriptor{SourcePath: source.Path, SourceKind: source.Kind, SourceIdentity: identityValue, OwnerMode: "detached", Visibility: "private"}},
+		{Schema: "paperboat.preview-runtime/v1", Name: "docs", ExpiresAt: &expires, BindAddress: "127.0.0.1", Serve: &ServeRuntimeDescriptor{SourcePath: source.Path, SourceKind: source.Kind, SourceIdentity: identityValue, OwnerMode: "detached", Visibility: "private"}},
 	} {
 		path := filepath.Join(root, fmt.Sprintf("descriptor-%d.json", descriptor.ServiceGeneration))
 		if err := writePreviewRuntimeDescriptor(path, descriptor); err != nil {
@@ -115,10 +115,59 @@ func TestDetachedServeShutdownStopsListenerAndRemovesDescriptor(t *testing.T) {
 	}
 }
 
+func TestDetachedPrivateServePublishesOnlyLoopbackURL(t *testing.T) {
+	root := t.TempDir()
+	descriptorPath, expires := writeTestServeDescriptor(t, root, "private-docs", time.Now().UTC().Add(time.Hour))
+	readyPath := filepath.Join(root, "previews", "active", previewServiceInstance("private-docs")+".json")
+	if err := os.Rename(descriptorPath, readyPath); err != nil {
+		t.Fatal(err)
+	}
+	descriptorPath = readyPath
+	descriptor, err := readPreviewRuntimeDescriptor(descriptorPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor.Serve.Visibility = "private"
+	descriptor.Serve.ListenPort = 0
+	if err := writePreviewRuntimeDescriptor(descriptorPath, descriptor); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- RunProductionServeWorker(ctx, ProductionServeWorkerConfig{StateRoot: root, Name: "private-docs", ExpiresAt: &expires, DescriptorPath: descriptorPath})
+	}()
+	readyCtx, cancelReady := context.WithTimeout(context.Background(), 5*time.Second)
+	record, err := WaitPreviewServiceReady(readyCtx, root, "private-docs")
+	cancelReady()
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(record.URL, "http://127.0.0.1:") {
+		cancel()
+		t.Fatalf("URL = %q", record.URL)
+	}
+	response, err := http.Get(record.URL)
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(descriptorPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("descriptor remains after shutdown: %v", err)
+	}
+}
+
 func TestDetachedServeRevocationStopsListenerAndRemovesDescriptor(t *testing.T) {
 	root := t.TempDir()
 	descriptorPath, expires := writeTestServeDescriptor(t, root, "docs", time.Now().UTC().Add(time.Hour))
 	revoke := make(chan struct{})
+	ready := make(chan struct{})
 	port := make(chan uint16, 1)
 	done := make(chan error, 1)
 	go func() {
@@ -129,12 +178,14 @@ func TestDetachedServeRevocationStopsListenerAndRemovesDescriptor(t *testing.T) 
 				if err := run.Ready(preview.ControlRecord{ID: "prv_docs", PreviewKey: "p-abcdefghijklmnopqrstuvwxyz", URL: "https://docs.preview.test", State: "ready", ExpiresAt: &expires}); err != nil {
 					return err
 				}
+				close(ready)
 				<-revoke
 				return os.Remove(descriptorPath)
 			},
 		})
 	}()
 	listenerPort := <-port
+	<-ready
 	close(revoke)
 	if err := <-done; err != nil {
 		t.Fatal(err)
@@ -200,7 +251,7 @@ func writeTestServeDescriptor(t *testing.T, root, name string, expires time.Time
 		t.Fatal(err)
 	}
 	path := filepath.Join(root, "previews", "active", name+".json")
-	descriptor := PreviewRuntimeDescriptor{Schema: "paperboat.preview-runtime/v1", Name: name, BindAddress: "127.0.0.1", ServiceGeneration: 1, ExpiresAt: &expires, Serve: &ServeRuntimeDescriptor{SourcePath: source.Path, SourceKind: source.Kind, SourceIdentity: identityValue, OwnerMode: "detached"}}
+	descriptor := PreviewRuntimeDescriptor{Schema: "paperboat.preview-runtime/v1", Name: name, BindAddress: "127.0.0.1", ServiceGeneration: 1, ExpiresAt: &expires, Serve: &ServeRuntimeDescriptor{SourcePath: source.Path, SourceKind: source.Kind, SourceIdentity: identityValue, OwnerMode: "detached", Visibility: "public"}}
 	if err := writePreviewRuntimeDescriptor(path, descriptor); err != nil {
 		t.Fatal(err)
 	}
@@ -272,7 +323,7 @@ func TestServeWorkerRejectsReplacedSourceBeforeListener(t *testing.T) {
 	descriptorPath := filepath.Join(root, "descriptor.json")
 	descriptor := PreviewRuntimeDescriptor{
 		Schema: "paperboat.preview-runtime/v1", Name: "report", BindAddress: "127.0.0.1", ServiceGeneration: 1, ExpiresAt: &expires,
-		Serve: &ServeRuntimeDescriptor{SourcePath: source.Path, SourceKind: source.Kind, SourceIdentity: identity, OwnerMode: "detached"},
+		Serve: &ServeRuntimeDescriptor{SourcePath: source.Path, SourceKind: source.Kind, SourceIdentity: identity, OwnerMode: "detached", Visibility: "private"},
 	}
 	if err := writePreviewRuntimeDescriptor(descriptorPath, descriptor); err != nil {
 		t.Fatal(err)
@@ -286,7 +337,10 @@ func TestServeWorkerRejectsReplacedSourceBeforeListener(t *testing.T) {
 	err := RunProductionServeWorker(context.Background(), ProductionServeWorkerConfig{
 		ControlURL: "https://api.paperboat.test", StateRoot: root, Name: "report", ExpiresAt: &expires, DescriptorPath: descriptorPath,
 	})
-	if !errors.Is(err, servepkg.ErrSourceChanged) {
+	if err != nil {
 		t.Fatalf("error = %v", err)
+	}
+	if _, err := os.Stat(descriptorPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("descriptor remains after invalid source cleanup: %v", err)
 	}
 }

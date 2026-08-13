@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -132,6 +133,18 @@ func TestRacingConnectorIgnoresExpiredPreference(t *testing.T) {
 	}
 	if first := <-selected; first != QUIC {
 		t.Fatalf("expired preference selected %q first", first)
+	}
+}
+
+func TestRacingConnectorPreferenceFailureIsReturned(t *testing.T) {
+	root := t.TempDir()
+	directory := filepath.Join(root, "blocked")
+	if err := os.WriteFile(directory, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r := newRacingConnector(context.Background(), &v1.ClientCommonConfig{}, filepath.Join(directory, "preference.json")).(*racingConnector)
+	if err := r.savePreference(QUIC); err == nil {
+		t.Fatal("preference persistence failure was discarded")
 	}
 }
 

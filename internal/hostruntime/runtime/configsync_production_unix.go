@@ -18,6 +18,7 @@ import (
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/configsync"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/machinecontrol"
+	"github.com/pinksaucepasta/paperboat/internal/httptransport"
 )
 
 type productionConfigSyncConfig struct {
@@ -105,9 +106,13 @@ func newProductionConfigSync(config productionConfigSyncConfig) (*configsync.Sup
 			if err != nil {
 				return nil, err
 			}
+			transport := config.Transport
+			if transport == nil {
+				transport = httptransport.Default()
+			}
 			chezmoiBinary, err := ensureChezmoi(
 				ctx, config.ChezmoiBinary, assignmentRoot,
-				&http.Client{Timeout: 2 * time.Minute},
+				&http.Client{Transport: transport, Timeout: 2 * time.Minute},
 			)
 			if err != nil {
 				return nil, err
@@ -164,45 +169,4 @@ func protectConfigSyncRuntimeState(
 	}
 	descriptor.Policy.RuntimeExclusionRoots = append(descriptor.Policy.RuntimeExclusionRoots, relative)
 	return descriptor, nil
-}
-
-func productionConfigHome(profileHosted bool, hostedRoot string) (string, error) {
-	root := hostedRoot
-	if !profileHosted {
-		var err error
-		root, err = os.UserHomeDir()
-		if err != nil {
-			return "", err
-		}
-	}
-	if !filepath.IsAbs(root) || filepath.Clean(root) != root {
-		return "", ErrProductionInvalid
-	}
-	resolved, err := filepath.EvalSymlinks(root)
-	if err != nil || resolved != root {
-		return "", errors.Join(ErrProductionInvalid, err)
-	}
-	return root, nil
-}
-
-func productionRepositoryHosts(value string) ([]string, error) {
-	if strings.TrimSpace(value) == "" {
-		value = "github.com"
-	}
-	seen := make(map[string]bool)
-	var hosts []string
-	for _, item := range strings.Split(value, ",") {
-		host := strings.ToLower(strings.TrimSpace(item))
-		if host == "" || strings.ContainsAny(host, "/:@") {
-			return nil, ErrProductionInvalid
-		}
-		if !seen[host] {
-			seen[host] = true
-			hosts = append(hosts, host)
-		}
-	}
-	if len(hosts) == 0 {
-		return nil, ErrProductionInvalid
-	}
-	return hosts, nil
 }

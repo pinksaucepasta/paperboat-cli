@@ -17,6 +17,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/pinksaucepasta/paperboat/internal/httptransport"
 )
 
 var (
@@ -40,19 +42,18 @@ type Pairing struct {
 }
 
 type Material struct {
-	Schema                  string            `json:"schema"`
-	UserMachineID           string            `json:"user_machine_id"`
-	UserMachineEnrollmentID string            `json:"user_machine_enrollment_id"`
-	EnvironmentID           string            `json:"environment_id"`
-	ControlURL              string            `json:"control_url"`
-	HelperID                string            `json:"helper_id"`
-	EnrollmentID            string            `json:"enrollment_id"`
-	EnrollmentCredential    string            `json:"enrollment_credential"`
-	ReuseIdentity           bool              `json:"reuse_identity,omitempty"`
-	ExpiresAt               time.Time         `json:"expires_at"`
-	Artifact                *ArtifactManifest `json:"artifact,omitempty"`
-	ArtifactPublicKey       string            `json:"artifact_public_key,omitempty"`
-	HelperListenAddress     string            `json:"helper_listen_address"`
+	Schema                  string          `json:"schema"`
+	UserMachineID           string          `json:"user_machine_id"`
+	UserMachineEnrollmentID string          `json:"user_machine_enrollment_id"`
+	EnvironmentID           string          `json:"environment_id"`
+	ControlURL              string          `json:"control_url"`
+	HelperID                string          `json:"helper_id"`
+	EnrollmentID            string          `json:"enrollment_id"`
+	EnrollmentCredential    string          `json:"enrollment_credential"`
+	ReuseIdentity           bool            `json:"reuse_identity,omitempty"`
+	ExpiresAt               time.Time       `json:"expires_at"`
+	Artifact                *ArtifactTarget `json:"artifact,omitempty"`
+	HelperListenAddress     string          `json:"helper_listen_address"`
 }
 
 func CreatePairing(ctx context.Context, config Config) (Pairing, error) {
@@ -92,7 +93,7 @@ func WaitForMaterial(ctx context.Context, config Config, expiresAt time.Time, in
 		err := request(ctx, client(config), http.MethodPost, base+"/v1/machines/pairings/installation", body, &material)
 		if err == nil {
 			validEnrollment := material.ReuseIdentity && material.EnrollmentID == "" && material.EnrollmentCredential == "" || !material.ReuseIdentity && material.EnrollmentID != "" && len(material.EnrollmentCredential) >= 32
-			if material.Schema != "paperboat.byod-installation/v1" || material.UserMachineID == "" || material.UserMachineEnrollmentID == "" || material.EnvironmentID == "" || material.HelperID == "" || !validEnrollment || !validLoopbackAddress(material.HelperListenAddress) || !time.Now().UTC().Before(material.ExpiresAt) || material.Artifact == nil || VerifyArtifactManifest(*material.Artifact, material.ArtifactPublicKey) != nil || material.Artifact.Schema != ArtifactSchemaV1 || material.Artifact.Kind != ArtifactKindPB {
+			if material.Schema != "paperboat.byod-installation/v1" || material.UserMachineID == "" || material.UserMachineEnrollmentID == "" || material.EnvironmentID == "" || material.HelperID == "" || !validEnrollment || !validLoopbackAddress(material.HelperListenAddress) || !time.Now().UTC().Before(material.ExpiresAt) || material.Artifact == nil || VerifyArtifactTarget(*material.Artifact) != nil {
 				return Material{}, ErrInvalid
 			}
 			return material, nil
@@ -149,7 +150,7 @@ func client(config Config) *http.Client {
 	if config.HTTP != nil {
 		return config.HTTP
 	}
-	return &http.Client{Timeout: 15 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return ErrInvalid }}
+	return &http.Client{Transport: httptransport.Default(), Timeout: 15 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return ErrInvalid }}
 }
 
 func request(ctx context.Context, client *http.Client, method, target string, body []byte, output any) error {

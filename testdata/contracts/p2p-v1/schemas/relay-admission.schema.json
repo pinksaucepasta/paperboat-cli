@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://paperboat.dev/contracts/p2p-v1/relay-admission.schema.json",
+  "title": "Paperboat relay admission v1",
+  "oneOf": [
+    { "$ref": "#/$defs/route" },
+    { "$ref": "#/$defs/stream" },
+    { "$ref": "#/$defs/decision" }
+  ],
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$" },
+    "token": { "type": "string", "pattern": "^[A-Za-z0-9_-]{22,342}$" },
+    "generation": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "time": { "type": "string", "format": "date-time", "pattern": "Z$" },
+    "route": {
+      "type": "object", "additionalProperties": false,
+      "required": ["type", "version", "route_token", "intent_id", "initiator_endpoint_id", "responder_endpoint_id", "carrier", "attempt_generation", "network_generation", "route_generation", "expires_at", "initiator_byte_limit", "responder_byte_limit"],
+      "properties": {
+        "type": { "const": "route_allocation" }, "version": { "const": 1 },
+        "route_token": { "$ref": "#/$defs/token" }, "intent_id": { "$ref": "#/$defs/id" },
+        "initiator_endpoint_id": { "$ref": "#/$defs/id" }, "responder_endpoint_id": { "$ref": "#/$defs/id" },
+        "carrier": { "enum": ["relay_quic", "relay_wss"] },
+        "attempt_generation": { "$ref": "#/$defs/generation" }, "network_generation": { "$ref": "#/$defs/generation" },
+        "route_generation": { "$ref": "#/$defs/generation" }, "expires_at": { "$ref": "#/$defs/time" },
+        "initiator_byte_limit": { "type": "integer", "minimum": 1, "maximum": 1125899906842624 },
+        "responder_byte_limit": { "type": "integer", "minimum": 1, "maximum": 1125899906842624 }
+      }
+    },
+    "stream": {
+      "type": "object", "additionalProperties": false,
+      "required": ["type", "version", "route_token", "stream_handle", "endpoint_id", "role", "carrier", "intent_id", "attempt_generation", "network_generation", "route_generation", "expires_at"],
+      "properties": {
+        "type": { "const": "stream_admission" }, "version": { "const": 1 },
+        "route_token": { "$ref": "#/$defs/token" }, "stream_handle": { "$ref": "#/$defs/token" },
+        "endpoint_id": { "$ref": "#/$defs/id" }, "role": { "enum": ["initiator", "responder"] },
+        "carrier": { "enum": ["relay_quic", "relay_wss"] }, "intent_id": { "$ref": "#/$defs/id" },
+        "attempt_generation": { "$ref": "#/$defs/generation" }, "network_generation": { "$ref": "#/$defs/generation" },
+        "route_generation": { "$ref": "#/$defs/generation" }, "expires_at": { "$ref": "#/$defs/time" }
+      }
+    },
+    "decision": {
+      "type": "object", "additionalProperties": false,
+      "required": ["type", "version", "admitted"],
+      "properties": {
+        "type": { "const": "admission_decision" }, "version": { "const": 1 },
+        "admitted": { "type": "boolean" },
+        "code": { "enum": ["admission_rejected", "byte_limit_exhausted", "route_unavailable"] }
+      },
+      "allOf": [
+        { "if": { "properties": { "admitted": { "const": false } } }, "then": { "required": ["code"] } },
+        { "if": { "properties": { "admitted": { "const": true } } }, "then": { "not": { "required": ["code"] } } }
+      ]
+    }
+  }
+}

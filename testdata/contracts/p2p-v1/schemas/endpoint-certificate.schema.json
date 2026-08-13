@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://paperboat.dev/contracts/p2p-v1/endpoint-certificate.schema.json",
+  "title": "Paperboat endpoint certificate HTTP document v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "account_id", "root_fingerprint", "endpoint_id", "role", "generation", "serial", "issued_at", "expires_at", "certificate", "certificate_fingerprint"],
+  "properties": {
+    "version": { "const": 1 },
+    "account_id": { "$ref": "#/$defs/id" },
+    "root_fingerprint": { "$ref": "#/$defs/fingerprint" },
+    "endpoint_id": { "$ref": "#/$defs/id" },
+    "role": { "enum": ["cli", "machine"] },
+    "generation": { "$ref": "#/$defs/generation" },
+    "serial": { "$ref": "#/$defs/generation" },
+    "issued_at": { "$ref": "#/$defs/time" },
+    "expires_at": { "$ref": "#/$defs/time" },
+    "certificate": { "type": "string", "pattern": "^[A-Za-z0-9_-]{230,568}$" },
+    "certificate_fingerprint": { "$ref": "#/$defs/fingerprint" }
+  },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$" },
+    "fingerprint": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "generation": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "time": { "type": "string", "format": "date-time", "pattern": "Z$" }
+  }
+}

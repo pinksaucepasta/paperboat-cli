@@ -10,12 +10,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/store"
+	"github.com/pinksaucepasta/paperboat/internal/peertransport/transfercrypto"
 )
 
 const (
@@ -37,6 +39,8 @@ type Policy struct {
 }
 
 var DefaultPolicy = Policy{Revision: "file-transfer-v1", MaxFileBytes: MaxFileBytes, MaxBatchFiles: MaxBatchFiles, MaxBatchBytes: MaxBatchBytes, MaxConcurrentTransfers: 2, RetentionSeconds: int64(Retention / time.Second), DeliveryTimeoutSeconds: 600, MaxPendingSpoolBytes: 1 << 30}
+
+var opaqueIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$`)
 
 type PolicyStore struct {
 	mu     sync.RWMutex
@@ -91,9 +95,11 @@ func (e *Error) Error() string {
 func (e *Error) Unwrap() error { return e.Cause }
 
 type File struct {
+	ID       string `json:"transfer_id,omitempty"`
 	Basename string `json:"basename"`
 	Size     int64  `json:"size"`
 	SHA256   string `json:"sha256"`
+	Ordinal  uint64 `json:"file_ordinal,omitempty"`
 }
 type CreateRequest struct {
 	BatchID              string
@@ -103,16 +109,19 @@ type CreateRequest struct {
 	SessionID            string
 	DeliveryClientID     string
 	Files                []File
+	E2EETransferID       string
+	TransferGeneration   uint64
 }
 
 type Config struct {
-	Root           string
-	PublishRoot    string
-	LocalMachineID string
-	Store          *store.Store
-	Now            func() time.Time
-	Random         io.Reader
-	Policy         *PolicyStore
+	Root             string
+	PublishRoot      string
+	LocalMachineID   string
+	Store            *store.Store
+	EraseTransferKey func(string) error
+	Now              func() time.Time
+	Random           io.Reader
+	Policy           *PolicyStore
 }
 
 type Service struct {
@@ -152,7 +161,8 @@ func New(config Config) (*Service, error) {
 
 func (s *Service) Create(ctx context.Context, request CreateRequest) ([]store.FileTransfer, error) {
 	policy := s.config.Policy.Current()
-	if request.BatchID == "" || request.SourceMachineID == "" || request.DestinationMachineID == "" || request.InitiatingUserID == "" || request.SourceMachineID == request.DestinationMachineID || request.DestinationMachineID != s.config.LocalMachineID && (request.SessionID == "" || request.DeliveryClientID == "") {
+	encrypted := request.E2EETransferID != "" || request.TransferGeneration != 0
+	if request.BatchID == "" || request.SourceMachineID == "" || request.DestinationMachineID == "" || request.InitiatingUserID == "" || request.SourceMachineID == request.DestinationMachineID || request.DestinationMachineID != s.config.LocalMachineID && (request.SessionID == "" || request.DeliveryClientID == "") || encrypted != (opaqueIDPattern.MatchString(request.E2EETransferID) && request.TransferGeneration > 0) {
 		return nil, &Error{Code: InvalidPath}
 	}
 	if len(request.Files) < 1 || len(request.Files) > policy.MaxBatchFiles {
@@ -162,6 +172,9 @@ func (s *Service) Create(ctx context.Context, request CreateRequest) ([]store.Fi
 	transfers := make([]store.FileTransfer, len(request.Files))
 	var total int64
 	for i, file := range request.Files {
+		if encrypted && (!opaqueIDPattern.MatchString(file.ID) || file.Ordinal != uint64(i)) || !encrypted && (file.ID != "" || file.Ordinal != 0) {
+			return nil, &Error{Code: InvalidPath}
+		}
 		if !validBasename(file.Basename) {
 			return nil, &Error{Code: InvalidPath}
 		}
@@ -175,15 +188,19 @@ func (s *Service) Create(ctx context.Context, request CreateRequest) ([]store.Fi
 		if total > policy.MaxBatchBytes {
 			return nil, &Error{Code: BatchLimit}
 		}
-		id, err := s.newID("ft_")
-		if err != nil {
-			return nil, &Error{Code: StorageUnavailable, Cause: err}
+		id := file.ID
+		if id == "" {
+			var err error
+			id, err = s.newID("ft_")
+			if err != nil {
+				return nil, &Error{Code: StorageUnavailable, Cause: err}
+			}
 		}
 		expiresAt := now.Add(time.Duration(policy.RetentionSeconds) * time.Second)
 		if request.DestinationMachineID != s.config.LocalMachineID {
 			expiresAt = now.Add(time.Duration(policy.DeliveryTimeoutSeconds) * time.Second)
 		}
-		transfers[i] = store.FileTransfer{ID: id, BatchID: request.BatchID, SourceMachineID: request.SourceMachineID, DestinationMachineID: request.DestinationMachineID, InitiatingUserID: request.InitiatingUserID, SessionID: request.SessionID, DeliveryClientID: request.DeliveryClientID, Basename: file.Basename, Size: file.Size, SHA256: file.SHA256, State: "created", CreatedAt: now, ExpiresAt: expiresAt}
+		transfers[i] = store.FileTransfer{ID: id, BatchID: request.BatchID, SourceMachineID: request.SourceMachineID, DestinationMachineID: request.DestinationMachineID, InitiatingUserID: request.InitiatingUserID, SessionID: request.SessionID, DeliveryClientID: request.DeliveryClientID, Basename: file.Basename, Size: file.Size, SHA256: file.SHA256, State: "created", CreatedAt: now, ExpiresAt: expiresAt, E2EETransferID: request.E2EETransferID, TransferGeneration: request.TransferGeneration, FileOrdinal: file.Ordinal}
 	}
 	if err := s.config.Store.CreateFileTransfersWithinLimits(ctx, transfers, policy.MaxPendingSpoolBytes, policy.MaxConcurrentTransfers); err != nil {
 		if errors.Is(err, store.ErrConflict) {
@@ -215,6 +232,19 @@ func (s *Service) CleanupExpired(ctx context.Context) error {
 	transfers, err := s.config.Store.ExpiredFileTransfers(ctx, s.config.Now())
 	if err != nil {
 		return err
+	}
+	erased := make(map[string]struct{})
+	for _, transfer := range transfers {
+		if transfer.E2EETransferID == "" || s.config.EraseTransferKey == nil {
+			continue
+		}
+		if _, ok := erased[transfer.E2EETransferID]; ok {
+			continue
+		}
+		if err := s.config.EraseTransferKey(transfer.E2EETransferID); err != nil {
+			return &Error{Code: StorageUnavailable, Cause: fmt.Errorf("erase expired transfer key: %w", err)}
+		}
+		erased[transfer.E2EETransferID] = struct{}{}
 	}
 	for _, transfer := range transfers {
 		_ = os.Remove(s.partialPath(transfer.ID))
@@ -325,6 +355,71 @@ func (s *Service) Append(ctx context.Context, id string, offset int64, body io.R
 	return transfer, nil
 }
 
+func (s *Service) AppendEncrypted(ctx context.Context, id string, ordinal uint64, ciphertextDigest [sha256.Size]byte, ciphertextLength int, plaintext []byte) (store.FileTransfer, error) {
+	if err := s.acquire(ctx); err != nil {
+		return store.FileTransfer{}, err
+	}
+	defer s.release()
+	lock := s.lock(id)
+	lock.Lock()
+	defer lock.Unlock()
+	transfer, err := s.config.Store.FileTransfer(ctx, id)
+	if err != nil || transfer.E2EETransferID == "" || transfer.TransferGeneration == 0 {
+		return store.FileTransfer{}, &Error{Code: InvalidPath, Cause: err}
+	}
+	if transfer.State == "canceled" {
+		return store.FileTransfer{}, &Error{Code: Canceled}
+	}
+	if ordinal > uint64(^uint64(0)>>1)/uint64(transfercrypto.ChunkSize) {
+		return transfer, &Error{Code: InvalidSize}
+	}
+	offset := int64(ordinal * uint64(transfercrypto.ChunkSize))
+	want := transfer.Size - offset
+	if want > int64(transfercrypto.ChunkSize) {
+		want = int64(transfercrypto.ChunkSize)
+	}
+	if want < 0 || int64(len(plaintext)) != want {
+		return transfer, &Error{Code: InvalidSize}
+	}
+	if ordinal < transfer.CommittedChunks {
+		replayed, commitErr := s.config.Store.CommitFileTransferChunk(ctx, id, ordinal, offset, offset+int64(len(plaintext)), ciphertextDigest, ciphertextLength, len(plaintext))
+		if commitErr != nil || !replayed {
+			return transfer, &Error{Code: OffsetConflict, Cause: commitErr}
+		}
+		return transfer, nil
+	}
+	if ordinal != transfer.CommittedChunks || offset != transfer.CommittedOffset {
+		return transfer, &Error{Code: OffsetConflict}
+	}
+	file, err := os.OpenFile(s.partialPath(id), os.O_WRONLY, 0)
+	if err != nil {
+		return transfer, &Error{Code: StorageUnavailable, Cause: err}
+	}
+	defer file.Close()
+	if err := file.Truncate(offset); err != nil {
+		return transfer, &Error{Code: StorageUnavailable, Cause: err}
+	}
+	if _, err := file.Seek(offset, io.SeekStart); err != nil {
+		return transfer, &Error{Code: StorageUnavailable, Cause: err}
+	}
+	if written, err := file.Write(plaintext); err != nil || written != len(plaintext) {
+		_ = file.Truncate(offset)
+		return transfer, &Error{Code: StorageUnavailable, Cause: errors.Join(err, io.ErrShortWrite)}
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Truncate(offset)
+		return transfer, &Error{Code: StorageUnavailable, Cause: err}
+	}
+	if _, err := s.config.Store.CommitFileTransferChunk(ctx, id, ordinal, offset, offset+int64(len(plaintext)), ciphertextDigest, ciphertextLength, len(plaintext)); err != nil {
+		_ = file.Truncate(offset)
+		return transfer, &Error{Code: OffsetConflict, Cause: err}
+	}
+	transfer.CommittedOffset += int64(len(plaintext))
+	transfer.CommittedChunks++
+	transfer.State = "uploading"
+	return transfer, nil
+}
+
 func (s *Service) acquire(ctx context.Context) error {
 	for {
 		s.slotMu.Lock()
@@ -395,8 +490,10 @@ func (s *Service) Complete(ctx context.Context, id string) (store.FileTransfer, 
 		if _, statErr := os.Stat(s.contentPath(transfer.ID)); statErr == nil {
 			continue
 		}
+		//paperboat:allow-source-policy atomic-replacement owner=file-transfer reason=verified-content-commit
 		if renameErr := os.Rename(s.partialPath(transfer.ID), s.contentPath(transfer.ID)); renameErr != nil {
 			for index := len(renamed) - 1; index >= 0; index-- {
+				//paperboat:allow-source-policy atomic-replacement owner=file-transfer reason=batch-commit-rollback
 				_ = os.Rename(s.contentPath(renamed[index].ID), s.partialPath(renamed[index].ID))
 			}
 			return requested, &Error{Code: StorageUnavailable, Cause: renameErr}
@@ -437,6 +534,19 @@ func (s *Service) Receipt(ctx context.Context, id, clientID, resultCode, receipt
 		return &Error{Code: StorageUnavailable, Cause: err}
 	}
 	s.cancels.Delete(id)
+	return syncDir(s.config.Root)
+}
+
+func (s *Service) ReceiptBatch(ctx context.Context, receipts []store.FileTransferReceipt) error {
+	if err := s.config.Store.ReceiptFileTransferBatch(ctx, receipts); err != nil {
+		return err
+	}
+	for _, receipt := range receipts {
+		if err := os.Remove(s.contentPath(receipt.ID)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return &Error{Code: StorageUnavailable, Cause: err}
+		}
+		s.cancels.Delete(receipt.ID)
+	}
 	return syncDir(s.config.Root)
 }
 func (s *Service) OpenContent(ctx context.Context, id string) (*os.File, store.FileTransfer, error) {
@@ -542,21 +652,6 @@ func (s *Service) Cancel(ctx context.Context, id string) error {
 	return s.cancelBatchLocked(ctx, transfers)
 }
 
-func (s *Service) cancelLocked(ctx context.Context, id string) error {
-	transfer, err := s.config.Store.FileTransfer(ctx, id)
-	if err != nil {
-		return err
-	}
-	if err := s.config.Store.CancelFileTransfer(ctx, id); err != nil {
-		return err
-	}
-	for _, path := range []string{s.partialPath(id), s.contentPath(id), s.publishedPath(transfer)} {
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return &Error{Code: StorageUnavailable, Cause: err}
-		}
-	}
-	return syncDir(s.config.Root)
-}
 func (s *Service) cancelBatch(ctx context.Context, transfers []store.FileTransfer) error {
 	if len(transfers) == 0 {
 		return nil

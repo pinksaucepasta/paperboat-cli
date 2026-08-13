@@ -49,6 +49,14 @@ func TestTerminalV1FramesRoundTrip(t *testing.T) {
 	if err != nil || resize.StreamID != 10 || resize.Columns != 120 || resize.Rows != 40 || resize.Sequence != 2 {
 		t.Fatalf("resize = %#v, %v", resize, err)
 	}
+	eofWire, err := EncodeTerminalEOF(TerminalEOFFrame{StreamID: 11, Sequence: 3}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eof, err := DecodeTerminalEOF(eofWire)
+	if err != nil || eof.StreamID != 11 || eof.Sequence != 3 {
+		t.Fatalf("eof = %#v, %v", eof, err)
+	}
 }
 
 func TestTerminalOutputAdaptiveCompression(t *testing.T) {

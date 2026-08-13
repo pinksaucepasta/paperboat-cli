@@ -9,12 +9,12 @@ import (
 )
 
 func TestBYODNegotiationFiltersHostedAndUnprovedConfig(t *testing.T) {
-	available := map[string]bool{"terminal.v1": true, "health.v1": true, "config.apply.v1": true, "hosted.lifecycle.v1": true}
-	w, err := (Negotiator{Profile: config.BYOD, Available: available}).Negotiate("1.0", "1.0", []string{"terminal.v1", "health.v1", "config.apply.v1", "hosted.lifecycle.v1", "future.v1"})
+	available := map[string]bool{"terminal.v1": true, "health.v1": true, "exec.v1": true, "ssh.v1": true, "config.apply.v1": true, "hosted.lifecycle.v1": true}
+	w, err := (Negotiator{Profile: config.BYOD, Available: available}).Negotiate("1.0", "1.0", []string{"terminal.v1", "health.v1", "exec.v1", "ssh.v1", "config.apply.v1", "hosted.lifecycle.v1", "future.v1"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(w.Capabilities, []string{"health.v1", "terminal.v1"}) {
+	if !slices.Equal(w.Capabilities, []string{"exec.v1", "health.v1", "ssh.v1", "terminal.v1"}) {
 		t.Fatalf("capabilities=%v", w.Capabilities)
 	}
 }

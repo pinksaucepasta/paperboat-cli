@@ -1,6 +1,7 @@
 package serve
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/http"
@@ -139,7 +140,7 @@ func TestServerBindsLoopbackAndServes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = server.Shutdown(nil) })
+	t.Cleanup(func() { _ = server.Shutdown(context.Background()) })
 	response, err := http.Get("http://" + server.listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)

@@ -13,6 +13,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
+	"github.com/pinksaucepasta/paperboat/internal/userpaths"
 )
 
 const ProfileVersion = 1
@@ -61,6 +64,7 @@ func (l *sharedLock) Lock() error {
 		stale, err := sharedLockIsStale(l.path, hostname)
 		if err == nil && stale {
 			stalePath := l.path + ".stale-" + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+			//paperboat:allow-source-policy atomic-replacement owner=runtime-auth reason=stale-lock-quarantine
 			if os.Rename(l.path, stalePath) == nil {
 				_ = os.RemoveAll(stalePath)
 				continue
@@ -69,6 +73,7 @@ func (l *sharedLock) Lock() error {
 		if time.Now().After(deadline) {
 			return fmt.Errorf("timed out waiting for shared credential lock %s", l.path)
 		}
+		//paperboat:allow-source-policy sleep owner=runtime-auth reason=bounded-cross-process-lock-poll
 		time.Sleep(25 * time.Millisecond)
 	}
 }
@@ -142,6 +147,7 @@ type PendingRevocation struct {
 	Version            int       `json:"version"`
 	Issuer             string    `json:"issuer"`
 	CLIClientSessionID string    `json:"cli_client_session_id"`
+	AccountID          string    `json:"account_id,omitempty"`
 	RefreshSecretRef   string    `json:"refresh_secret_ref"`
 	CreatedAt          time.Time `json:"created_at"`
 	ServerRevoked      bool      `json:"server_revoked,omitempty"`
@@ -161,21 +167,31 @@ func (s FileSecretStore) Set(ref, value string) error {
 	if err := os.MkdirAll(s.Dir, 0o700); err != nil {
 		return err
 	}
+	if err := validateCredentialDirectory(s.Dir); err != nil {
+		return err
+	}
 	return atomicWrite(s.path(ref), []byte(value), 0o600)
 }
 func (s FileSecretStore) Get(ref string) (string, error) {
-	p := s.path(ref)
-	info, err := os.Stat(p)
-	if err != nil {
+	if err := validateCredentialDirectory(s.Dir); err != nil {
+		if os.IsNotExist(err) {
+			return "", ErrSecretNotFound
+		}
 		return "", err
 	}
-	if info.Mode().Perm() != 0o600 {
-		return "", fmt.Errorf("insecure credential file permissions %o; require 0600", info.Mode().Perm())
+	b, err := readCredentialFile(s.path(ref))
+	if os.IsNotExist(err) {
+		return "", ErrSecretNotFound
 	}
-	b, err := os.ReadFile(p)
 	return string(b), err
 }
 func (s FileSecretStore) Delete(ref string) error {
+	if err := validateCredentialDirectory(s.Dir); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
 	err := os.Remove(s.path(ref))
 	if os.IsNotExist(err) {
 		return nil
@@ -279,7 +295,7 @@ func (s ProfileStore) loadNormalized(issuer string) (Profile, error) {
 	return p, nil
 }
 
-func (s ProfileStore) Save(p Profile, cred Credential) error {
+func (s ProfileStore) Save(p Profile, cred Credential) (resultErr error) {
 	issuer, err := NormalizeIssuer(p.Issuer)
 	if err != nil {
 		return err
@@ -296,7 +312,7 @@ func (s ProfileStore) Save(p Profile, cred Credential) error {
 	if err := lock.Lock(); err != nil {
 		return err
 	}
-	defer lock.Unlock()
+	defer func() { resultErr = errors.Join(resultErr, lock.Unlock()) }()
 	if _, err := os.Stat(s.profilePath(issuer)); err == nil {
 		return ErrProfileExists
 	} else if !os.IsNotExist(err) {
@@ -331,7 +347,7 @@ func (s ProfileStore) Save(p Profile, cred Credential) error {
 // Replace preserves the currently active profile if persisting its replacement
 // fails. This is separate from refresh persistence because a rotated refresh
 // token must never be rolled back to its server-invalid predecessor.
-func (s ProfileStore) Replace(p Profile, cred Credential) error {
+func (s ProfileStore) Replace(p Profile, cred Credential) (resultErr error) {
 	issuer, err := NormalizeIssuer(p.Issuer)
 	if err != nil {
 		return err
@@ -349,7 +365,7 @@ func (s ProfileStore) Replace(p Profile, cred Credential) error {
 	if err := lock.Lock(); err != nil {
 		return err
 	}
-	defer lock.Unlock()
+	defer func() { resultErr = errors.Join(resultErr, lock.Unlock()) }()
 	previous, err := s.loadNormalized(issuer)
 	if err != nil {
 		return err
@@ -388,7 +404,7 @@ func (s ProfileStore) Replace(p Profile, cred Credential) error {
 // Switch compares, retains, and replaces the active session under one issuer
 // lock so overlapping account switches cannot associate credentials with a
 // stale client session ID.
-func (s ProfileStore) Switch(expectedSessionID string, p Profile, cred Credential) error {
+func (s ProfileStore) Switch(expectedSessionID string, p Profile, cred Credential) (resultErr error) {
 	issuer, err := NormalizeIssuer(p.Issuer)
 	if err != nil {
 		return err
@@ -406,7 +422,7 @@ func (s ProfileStore) Switch(expectedSessionID string, p Profile, cred Credentia
 	if err := lock.Lock(); err != nil {
 		return err
 	}
-	defer lock.Unlock()
+	defer func() { resultErr = errors.Join(resultErr, lock.Unlock()) }()
 	previous, err := s.loadNormalized(issuer)
 	if err != nil {
 		return err
@@ -418,7 +434,7 @@ func (s ProfileStore) Switch(expectedSessionID string, p Profile, cred Credentia
 	if err != nil {
 		return err
 	}
-	if err := s.QueueRevocation(issuer, previous.CLIClientSessionID, previousCred.RefreshToken); err != nil {
+	if err := s.QueueRevocation(issuer, previous.CLIClientSessionID, previousCred.RefreshToken, previous.Account.ID); err != nil {
 		return err
 	}
 	rollback := func(cause error) error {
@@ -484,10 +500,22 @@ func (s ProfileStore) Remove(issuer string) (Credential, error) {
 		return Credential{}, err
 	}
 	lock := newSharedLock(path + ".lock")
+	return s.removeCredential(issuer, lock)
+}
+
+func (s ProfileStore) removeCredential(issuer string, lock credentialLock) (credential Credential, resultErr error) {
+	if issuer == "" || lock == nil {
+		return Credential{}, ErrCredentialStoreUnavailable
+	}
 	if err := lock.Lock(); err != nil {
 		return Credential{}, err
 	}
-	defer lock.Unlock()
+	defer func() {
+		resultErr = errors.Join(resultErr, lock.Unlock())
+		if resultErr != nil {
+			credential = Credential{}
+		}
+	}()
 	p, err := s.loadNormalized(issuer)
 	if errors.Is(err, ErrNoCredentials) {
 		return Credential{}, ErrNoCredentials
@@ -497,7 +525,7 @@ func (s ProfileStore) Remove(issuer string) (Credential, error) {
 	}
 	cred, credentialErr := s.credentialForProfile(p)
 	var errs []error
-	errs = append(errs, s.Secrets.Delete(p.AccessSecretRef), s.Secrets.Delete(p.RefreshSecretRef))
+	errs = append(errs, s.Secrets.Delete(p.AccessSecretRef), s.Secrets.Delete(p.RefreshSecretRef), s.DeleteManagedSSHIdentity(p.Issuer, p.CLIClientSessionID), s.DeletePeerEndpointIdentity(p.Issuer, p.CLIClientSessionID), s.DeletePeerAccountRoot(p.Issuer, p.Account.ID))
 	if err := os.Remove(s.profilePath(p.Issuer)); err != nil && !os.IsNotExist(err) {
 		errs = append(errs, err)
 	}
@@ -509,13 +537,20 @@ func (s ProfileStore) Remove(issuer string) (Credential, error) {
 
 // QueueRevocation durably retains a refresh token until server revocation is
 // confirmed. Re-queueing the same client session is idempotent.
-func (s ProfileStore) QueueRevocation(issuer, cliClientSessionID, refreshToken string) error {
+func (s ProfileStore) QueueRevocation(issuer, cliClientSessionID, refreshToken string, accountID ...string) (resultErr error) {
 	issuer, err := NormalizeIssuer(issuer)
 	if err != nil {
 		return err
 	}
 	if strings.TrimSpace(cliClientSessionID) == "" || strings.TrimSpace(refreshToken) == "" {
 		return errors.New("pending revocation requires client session id and refresh token")
+	}
+	account := ""
+	if len(accountID) > 0 {
+		account = accountID[0]
+		if account != "" && !validCredentialID(account) {
+			return errors.New("pending revocation account id is invalid")
+		}
 	}
 	path := s.pendingRevocationPath(issuer, cliClientSessionID)
 	lock := newSharedLock(path + ".lock")
@@ -525,12 +560,12 @@ func (s ProfileStore) QueueRevocation(issuer, cliClientSessionID, refreshToken s
 	if err := lock.Lock(); err != nil {
 		return err
 	}
-	defer lock.Unlock()
+	defer func() { resultErr = errors.Join(resultErr, lock.Unlock()) }()
 	ref := pendingRefreshRef(issuer, cliClientSessionID)
 	if err := s.Secrets.Set(ref, refreshToken); err != nil {
 		return fmt.Errorf("store pending revocation token: %w", err)
 	}
-	record := PendingRevocation{Version: ProfileVersion, Issuer: issuer, CLIClientSessionID: cliClientSessionID, RefreshSecretRef: ref, CreatedAt: time.Now().UTC()}
+	record := PendingRevocation{Version: ProfileVersion, Issuer: issuer, CLIClientSessionID: cliClientSessionID, AccountID: account, RefreshSecretRef: ref, CreatedAt: time.Now().UTC()}
 	b, err := json.MarshalIndent(record, "", "  ")
 	if err != nil {
 		return err
@@ -587,15 +622,31 @@ func (s ProfileStore) PendingRevocationCredential(record PendingRevocation) (Cre
 	return Credential{RefreshToken: refresh, TokenType: "Bearer"}, nil
 }
 
-func (s ProfileStore) CompleteRevocation(record PendingRevocation) error {
+func (s ProfileStore) CompleteRevocation(record PendingRevocation) (resultErr error) {
 	path := s.existingPendingRevocationPath(record.Issuer, record.CLIClientSessionID)
 	lock := newSharedLock(path + ".lock")
 	if err := lock.Lock(); err != nil {
 		return err
 	}
-	defer lock.Unlock()
+	defer func() { resultErr = errors.Join(resultErr, lock.Unlock()) }()
 	if err := s.Secrets.Delete(record.RefreshSecretRef); err != nil {
 		return err
+	}
+	if err := s.DeleteManagedSSHIdentity(record.Issuer, record.CLIClientSessionID); err != nil {
+		return err
+	}
+	if err := s.DeletePeerEndpointIdentity(record.Issuer, record.CLIClientSessionID); err != nil {
+		return err
+	}
+	if record.AccountID != "" {
+		active, loadErr := s.Load(record.Issuer)
+		if errors.Is(loadErr, ErrNoCredentials) || loadErr == nil && active.Account.ID != record.AccountID {
+			if err := s.DeletePeerAccountRoot(record.Issuer, record.AccountID); err != nil {
+				return err
+			}
+		} else if loadErr != nil {
+			return loadErr
+		}
 	}
 	err := os.Remove(path)
 	if err != nil && !os.IsNotExist(err) {
@@ -607,7 +658,7 @@ func (s ProfileStore) CompleteRevocation(record PendingRevocation) error {
 // DiscardRevocation removes a queued copy without revoking the server session.
 // It is used to roll back an account switch whose active-profile replacement
 // did not commit.
-func (s ProfileStore) DiscardRevocation(issuer, cliClientSessionID string) error {
+func (s ProfileStore) DiscardRevocation(issuer, cliClientSessionID string) (resultErr error) {
 	issuer, err := NormalizeIssuer(issuer)
 	if err != nil {
 		return err
@@ -617,7 +668,7 @@ func (s ProfileStore) DiscardRevocation(issuer, cliClientSessionID string) error
 	if err := lock.Lock(); err != nil {
 		return err
 	}
-	defer lock.Unlock()
+	defer func() { resultErr = errors.Join(resultErr, lock.Unlock()) }()
 	b, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -650,7 +701,7 @@ func (s ProfileStore) DiscardRevocation(issuer, cliClientSessionID string) error
 // Logout uses this after abandoning best-effort server revocation. It tolerates
 // partially written metadata so corrupt historical entries cannot trap a user
 // in a locally signed-in state.
-func (s ProfileStore) DiscardPendingRevocations(issuer string) error {
+func (s ProfileStore) DiscardPendingRevocations(issuer string) (resultErr error) {
 	issuer, err := NormalizeIssuer(issuer)
 	if err != nil {
 		return err
@@ -676,13 +727,20 @@ func (s ProfileStore) DiscardPendingRevocations(issuer string) error {
 			continue
 		}
 		func() {
-			defer lock.Unlock()
+			defer func() {
+				if unlockErr := lock.Unlock(); unlockErr != nil {
+					errs = append(errs, unlockErr)
+				}
+			}()
 			var record PendingRevocation
 			if data, readErr := os.ReadFile(path); readErr == nil {
 				_ = json.Unmarshal(data, &record)
 			}
 			if strings.HasPrefix(record.RefreshSecretRef, "revocation-") {
 				errs = append(errs, s.Secrets.Delete(record.RefreshSecretRef))
+			}
+			if record.CLIClientSessionID != "" {
+				errs = append(errs, s.DeleteManagedSSHIdentity(issuer, record.CLIClientSessionID))
 			}
 			if removeErr := os.Remove(path); removeErr != nil && !os.IsNotExist(removeErr) {
 				errs = append(errs, removeErr)
@@ -692,13 +750,18 @@ func (s ProfileStore) DiscardPendingRevocations(issuer string) error {
 	return errors.Join(errs...)
 }
 
-func (s ProfileStore) MarkRevocationSucceeded(record PendingRevocation) (PendingRevocation, error) {
+func (s ProfileStore) MarkRevocationSucceeded(record PendingRevocation) (result PendingRevocation, resultErr error) {
 	path := s.existingPendingRevocationPath(record.Issuer, record.CLIClientSessionID)
 	lock := newSharedLock(path + ".lock")
 	if err := lock.Lock(); err != nil {
 		return PendingRevocation{}, err
 	}
-	defer lock.Unlock()
+	defer func() {
+		resultErr = errors.Join(resultErr, lock.Unlock())
+		if resultErr != nil {
+			result = PendingRevocation{}
+		}
+	}()
 	record.ServerRevoked = true
 	b, err := json.MarshalIndent(record, "", "  ")
 	if err != nil {
@@ -712,7 +775,7 @@ func (s ProfileStore) MarkRevocationSucceeded(record PendingRevocation) (Pending
 
 // QueueActiveRevocation moves the active profile into the durable revocation
 // queue before removing its normal credential references.
-func (s ProfileStore) QueueActiveRevocation(issuer string) error {
+func (s ProfileStore) QueueActiveRevocation(issuer string) (resultErr error) {
 	issuer, err := NormalizeIssuer(issuer)
 	if err != nil {
 		return err
@@ -725,7 +788,7 @@ func (s ProfileStore) QueueActiveRevocation(issuer string) error {
 	if err := lock.Lock(); err != nil {
 		return err
 	}
-	defer lock.Unlock()
+	defer func() { resultErr = errors.Join(resultErr, lock.Unlock()) }()
 	p, err := s.loadNormalized(issuer)
 	if err != nil {
 		return err
@@ -736,14 +799,14 @@ func (s ProfileStore) QueueActiveRevocation(issuer string) error {
 		if getErr != nil {
 			return getErr
 		}
-		if err := s.QueueRevocation(p.Issuer, p.CLIClientSessionID, refreshToken); err != nil {
+		if err := s.QueueRevocation(p.Issuer, p.CLIClientSessionID, refreshToken, p.Account.ID); err != nil {
 			return err
 		}
 	} else if err != nil {
 		return err
 	}
 	var deleteErrs []error
-	deleteErrs = append(deleteErrs, s.Secrets.Delete(p.AccessSecretRef), s.Secrets.Delete(p.RefreshSecretRef))
+	deleteErrs = append(deleteErrs, s.Secrets.Delete(p.AccessSecretRef), s.Secrets.Delete(p.RefreshSecretRef), s.DeleteManagedSSHIdentity(p.Issuer, p.CLIClientSessionID))
 	if err := errors.Join(deleteErrs...); err != nil {
 		return err
 	}
@@ -788,10 +851,23 @@ func (s ProfileStore) CredentialWithRefresh(issuer string, refreshBefore time.Du
 		return Credential{}, err
 	}
 	lock := newSharedLock(path + ".lock")
+	return s.credentialWithRefresh(issuer, refreshBefore, refresh, lock)
+}
+
+func (s ProfileStore) credentialWithRefresh(issuer string, refreshBefore time.Duration, refresh RefreshFunc, lock credentialLock) (credential Credential, resultErr error) {
+	if issuer == "" || lock == nil {
+		return Credential{}, ErrCredentialStoreUnavailable
+	}
+	path := s.profilePath(issuer)
 	if err := lock.Lock(); err != nil {
 		return Credential{}, err
 	}
-	defer lock.Unlock()
+	defer func() {
+		resultErr = errors.Join(resultErr, lock.Unlock())
+		if resultErr != nil {
+			credential = Credential{}
+		}
+	}()
 	p, err := s.loadNormalized(issuer)
 	if err != nil {
 		return Credential{}, err
@@ -866,34 +942,12 @@ func publishCredentialLocation(defaultDir, dir string) error {
 	return nil
 }
 func DefaultCredentialDir() (string, error) {
-	d, err := os.UserConfigDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(d, "paperboat", "credentials"), nil
+	return userpaths.Config("paperboat/credentials")
 }
 
 func atomicWrite(path string, data []byte, mode os.FileMode) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	f, err := os.CreateTemp(filepath.Dir(path), ".tmp-")
-	if err != nil {
-		return err
-	}
-	name := f.Name()
-	defer os.Remove(name)
-	if err = f.Chmod(mode); err == nil {
-		_, err = f.Write(data)
-	}
-	if err == nil {
-		err = f.Sync()
-	}
-	if closeErr := f.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return err
-	}
-	return os.Rename(name, path)
+	return atomicfile.Write(path, data, atomicfile.Options{Mode: mode, OwnerUID: -1, OwnerGID: -1})
 }

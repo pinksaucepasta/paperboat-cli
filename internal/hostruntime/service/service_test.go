@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"howett.net/plist"
 )
 
 type controller struct {
@@ -34,9 +36,45 @@ func executable(t *testing.T) string {
 }
 
 func TestSystemdDefinitionSignalsWorkerBeforeForceCleaningCgroup(t *testing.T) {
-	definition := string(renderSystemd(Config{User: "paperboat", Group: "paperboat", Executable: "/usr/local/libexec/paperboat/pb"}))
-	if !strings.Contains(definition, "TimeoutStopSec=60s\nKillMode=mixed\n") {
+	body, err := renderSystemd(Config{Kind: WorkerKind, User: "paperboat", Group: "paperboat", Executable: "/usr/local/libexec/paperboat/pb"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition := string(body)
+	if !strings.Contains(definition, "TimeoutStopSec=60s\nKillMode=mixed\n") ||
+		!strings.Contains(definition, "Type=notify\n") || !strings.Contains(definition, "WatchdogSec=30s\n") ||
+		!strings.Contains(definition, "RuntimeDirectory=paperboat\n") || !strings.Contains(definition, "StateDirectoryMode=0700\n") ||
+		!strings.Contains(definition, "CacheDirectoryMode=0750\n") {
 		t.Fatalf("systemd shutdown policy missing:\n%s", definition)
+	}
+}
+
+func TestSystemdDefinitionEscapesSpecifiersAndEnvironmentExpansion(t *testing.T) {
+	body, err := renderSystemd(Config{Kind: WorkerKind, User: "paperboat", Group: "paperboat", Executable: "/opt/pb%stable", Arguments: []string{"$TOKEN"}, Environment: map[string]string{"VALUE": "$HOME%h"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition := string(body)
+	if !strings.Contains(definition, `ExecStart="/opt/pb%%stable" "$$TOKEN"`) ||
+		!strings.Contains(definition, `Environment="VALUE=$$HOME%%h"`) {
+		t.Fatalf("unsafe systemd escaping:\n%s", definition)
+	}
+}
+
+func TestPreviewSystemdDefinitionKeepsSourceTmpVisible(t *testing.T) {
+	body, err := renderSystemd(Config{Kind: PreviewKind, Instance: "abc123", Executable: "/opt/pb", Arguments: []string{"__runtime-serve"}, Environment: map[string]string{"HOME": "/home/test"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "PrivateTmp=true") {
+		t.Fatalf("preview worker must see user-selected /tmp sources:\n%s", body)
+	}
+	body, err = renderSystemd(Config{Kind: WorkerKind, User: "paperboat", Group: "paperboat", Executable: "/opt/pb", Arguments: []string{"run"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "PrivateTmp=true") {
+		t.Fatalf("non-preview worker lost PrivateTmp:\n%s", body)
 	}
 }
 
@@ -128,6 +166,36 @@ func TestLaunchdDefinitionIsEscapedValidXML(t *testing.T) {
 	}
 }
 
+func TestLaunchdDefinitionUsesTypedStructuredValues(t *testing.T) {
+	config := Config{
+		Kind: PreviewKind, Instance: "docs", Executable: "/Applications/Paperboat & Tools/pb",
+		User: "test", Group: "staff", Arguments: []string{"preview", "<docs>"},
+		Environment: map[string]string{"PAPERBOAT_VALUE": `a&b<"c">`},
+	}
+	body, err := renderLaunchd(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded struct {
+		Label                string
+		ProgramArguments     []string
+		EnvironmentVariables map[string]string
+		RunAtLoad            bool
+		KeepAlive            struct{ SuccessfulExit bool }
+		Umask                uint64
+	}
+	format, err := plist.Unmarshal(body, &decoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if format != plist.XMLFormat || decoded.Label != previewLabel("docs") || !decoded.RunAtLoad ||
+		decoded.KeepAlive.SuccessfulExit || decoded.Umask != 0o77 ||
+		len(decoded.ProgramArguments) != 3 || decoded.ProgramArguments[0] != config.Executable ||
+		decoded.ProgramArguments[2] != "<docs>" || decoded.EnvironmentVariables["PAPERBOAT_VALUE"] != `a&b<"c">` {
+		t.Fatalf("decoded launchd definition=%+v format=%d", decoded, format)
+	}
+}
+
 func TestHostServiceDefinitionsRunAsRootInBootDomain(t *testing.T) {
 	for _, platform := range []string{"linux", "darwin"} {
 		t.Run(platform, func(t *testing.T) {
@@ -174,6 +242,42 @@ func TestConfigServiceDefinitionsUsePerUserDomains(t *testing.T) {
 				t.Fatalf("path=%s body=%s", installer.DefinitionPath(), body)
 			}
 		})
+	}
+}
+
+func TestLocalDaemonDefinitionsUsePerUserDomains(t *testing.T) {
+	for _, platform := range []string{"darwin", "linux"} {
+		t.Run(platform, func(t *testing.T) {
+			installer, err := New(Config{Platform: platform, Kind: DaemonKind, ConfigRoot: t.TempDir(), Executable: executable(t), User: "test", Group: "test", Arguments: []string{"__local-daemon"}, Controller: &controller{}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := installer.Install(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			body, _ := os.ReadFile(installer.DefinitionPath())
+			definition := string(body)
+			if platform == "darwin" {
+				if !strings.HasSuffix(installer.DefinitionPath(), "/Library/LaunchAgents/"+DaemonLabel+".plist") || !strings.Contains(definition, "<string>"+DaemonLabel+"</string>") {
+					t.Fatalf("path=%s body=%s", installer.DefinitionPath(), body)
+				}
+			} else if !strings.HasSuffix(installer.DefinitionPath(), "/.config/systemd/user/paperboat-local-daemon.service") || !strings.Contains(definition, "Description=Paperboat local daemon") || !strings.Contains(definition, "WantedBy=default.target") || strings.Contains(definition, "User=test") {
+				t.Fatalf("path=%s body=%s", installer.DefinitionPath(), body)
+			}
+		})
+	}
+}
+
+func TestAccountNamesAllowSafelyPlacedDots(t *testing.T) {
+	for _, value := range []string{"pujan.pm", "first.last-1", "user_name"} {
+		if !safeAccount(value) {
+			t.Fatalf("safe account %q was rejected", value)
+		}
+	}
+	for _, value := range []string{".user", "user.", "user..name", "user/name"} {
+		if safeAccount(value) {
+			t.Fatalf("unsafe account %q was accepted", value)
+		}
 	}
 }
 

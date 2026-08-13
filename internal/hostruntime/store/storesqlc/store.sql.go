@@ -79,7 +79,7 @@ func (q *Queries) DeleteExpiredOperations(ctx context.Context, expiresAt int64) 
 }
 
 const expiredFileTransfers = `-- name: ExpiredFileTransfers :many
-SELECT id, batch_id, source_machine_id, destination_machine_id, initiating_user_id, session_id, delivery_client_id, basename, size, sha256, committed_offset, state, result_code, receipt_path, created_at, expires_at FROM file_transfers WHERE expires_at<=? AND state IN ('created','uploading','published','pending') ORDER BY expires_at,id LIMIT 100
+SELECT id, batch_id, source_machine_id, destination_machine_id, initiating_user_id, session_id, delivery_client_id, basename, size, sha256, committed_offset, state, result_code, receipt_path, created_at, expires_at, e2ee_transfer_id, transfer_generation, file_ordinal, committed_chunks FROM file_transfers WHERE expires_at<=? AND state IN ('created','uploading','published','pending') ORDER BY expires_at,id LIMIT 100
 `
 
 func (q *Queries) ExpiredFileTransfers(ctx context.Context, expiresAt int64) ([]FileTransfer, error) {
@@ -108,6 +108,10 @@ func (q *Queries) ExpiredFileTransfers(ctx context.Context, expiresAt int64) ([]
 			&i.ReceiptPath,
 			&i.CreatedAt,
 			&i.ExpiresAt,
+			&i.E2eeTransferID,
+			&i.TransferGeneration,
+			&i.FileOrdinal,
+			&i.CommittedChunks,
 		); err != nil {
 			return nil, err
 		}
@@ -123,7 +127,7 @@ func (q *Queries) ExpiredFileTransfers(ctx context.Context, expiresAt int64) ([]
 }
 
 const fileTransfer = `-- name: FileTransfer :one
-SELECT id, batch_id, source_machine_id, destination_machine_id, initiating_user_id, session_id, delivery_client_id, basename, size, sha256, committed_offset, state, result_code, receipt_path, created_at, expires_at FROM file_transfers WHERE id=?
+SELECT id, batch_id, source_machine_id, destination_machine_id, initiating_user_id, session_id, delivery_client_id, basename, size, sha256, committed_offset, state, result_code, receipt_path, created_at, expires_at, e2ee_transfer_id, transfer_generation, file_ordinal, committed_chunks FROM file_transfers WHERE id=?
 `
 
 func (q *Queries) FileTransfer(ctx context.Context, id string) (FileTransfer, error) {
@@ -146,12 +150,16 @@ func (q *Queries) FileTransfer(ctx context.Context, id string) (FileTransfer, er
 		&i.ReceiptPath,
 		&i.CreatedAt,
 		&i.ExpiresAt,
+		&i.E2eeTransferID,
+		&i.TransferGeneration,
+		&i.FileOrdinal,
+		&i.CommittedChunks,
 	)
 	return i, err
 }
 
 const fileTransfersByBatch = `-- name: FileTransfersByBatch :many
-SELECT id, batch_id, source_machine_id, destination_machine_id, initiating_user_id, session_id, delivery_client_id, basename, size, sha256, committed_offset, state, result_code, receipt_path, created_at, expires_at FROM file_transfers WHERE batch_id=? ORDER BY created_at,id
+SELECT id, batch_id, source_machine_id, destination_machine_id, initiating_user_id, session_id, delivery_client_id, basename, size, sha256, committed_offset, state, result_code, receipt_path, created_at, expires_at, e2ee_transfer_id, transfer_generation, file_ordinal, committed_chunks FROM file_transfers WHERE batch_id=? ORDER BY created_at,id
 `
 
 func (q *Queries) FileTransfersByBatch(ctx context.Context, batchID string) ([]FileTransfer, error) {
@@ -180,6 +188,10 @@ func (q *Queries) FileTransfersByBatch(ctx context.Context, batchID string) ([]F
 			&i.ReceiptPath,
 			&i.CreatedAt,
 			&i.ExpiresAt,
+			&i.E2eeTransferID,
+			&i.TransferGeneration,
+			&i.FileOrdinal,
+			&i.CommittedChunks,
 		); err != nil {
 			return nil, err
 		}
@@ -385,7 +397,7 @@ func (q *Queries) ListSessions(ctx context.Context) ([]ListSessionsRow, error) {
 }
 
 const pendingFileTransfers = `-- name: PendingFileTransfers :many
-SELECT id, batch_id, source_machine_id, destination_machine_id, initiating_user_id, session_id, delivery_client_id, basename, size, sha256, committed_offset, state, result_code, receipt_path, created_at, expires_at FROM file_transfers WHERE delivery_client_id=? AND session_id=? AND state='pending' AND expires_at>? ORDER BY created_at,id LIMIT ?
+SELECT id, batch_id, source_machine_id, destination_machine_id, initiating_user_id, session_id, delivery_client_id, basename, size, sha256, committed_offset, state, result_code, receipt_path, created_at, expires_at, e2ee_transfer_id, transfer_generation, file_ordinal, committed_chunks FROM file_transfers WHERE delivery_client_id=? AND session_id=? AND state='pending' AND expires_at>? ORDER BY created_at,id LIMIT ?
 `
 
 type PendingFileTransfersParams struct {
@@ -426,6 +438,10 @@ func (q *Queries) PendingFileTransfers(ctx context.Context, arg PendingFileTrans
 			&i.ReceiptPath,
 			&i.CreatedAt,
 			&i.ExpiresAt,
+			&i.E2eeTransferID,
+			&i.TransferGeneration,
+			&i.FileOrdinal,
+			&i.CommittedChunks,
 		); err != nil {
 			return nil, err
 		}

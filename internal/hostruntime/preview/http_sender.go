@@ -12,6 +12,8 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+
+	"github.com/pinksaucepasta/paperboat/internal/httptransport"
 )
 
 var ErrHTTPSenderInvalid = errors.New("invalid preview HTTPS sender")
@@ -80,7 +82,7 @@ func NewHTTPSender(config HTTPSenderConfig) (*HTTPSender, error) {
 	}
 	transport := config.Transport
 	if transport == nil {
-		transport = http.DefaultTransport
+		transport = httptransport.Default()
 	}
 	return &HTTPSender{endpoint: endpoint, tokens: config.Tokens, identities: config.Identities, proofs: config.Proofs, operationID: config.OperationID, client: &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return ErrHTTPSenderInvalid }}, maxResponseBytes: config.MaxResponseBytes}, nil
 }

@@ -20,10 +20,6 @@ func run(args []string, stdout, stderr io.Writer) int {
 	return execute(context.Background(), args, os.Stdin, stdout, stderr)
 }
 
-func runWithInput(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	return execute(context.Background(), args, stdin, stdout, stderr)
-}
-
 // Execute runs a validated host-runtime mode from the unified pb command.
 func Execute(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if ctx == nil || stdin == nil || stdout == nil || stderr == nil {

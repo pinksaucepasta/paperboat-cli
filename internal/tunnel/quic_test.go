@@ -5,30 +5,37 @@ import (
 	"context"
 	"errors"
 	"io"
+	"slices"
 	"testing"
 
 	"github.com/pinksaucepasta/paperboat/internal/resolver"
 )
 
+func TestNativeAndHelperHandshakesOfferManagedSSH(t *testing.T) {
+	if capabilities := helperCapabilities(); !slices.Equal(capabilities, []string{"terminal.v1", "health.v1", "exec.v1", "ssh.v1"}) {
+		t.Fatalf("capabilities=%v", capabilities)
+	}
+}
+
 func TestNativeHandshakeErrorClassification(t *testing.T) {
 	transient := errors.New("edge route is rebuilding")
-	if err := classifyNativeHandshakeError(context.Background(), transient); !FallbackEligible(err) {
+	if err := classifyNativeHandshakeError(context.Background(), "QUIC", transient); !FallbackEligible(err) {
 		t.Fatalf("transient handshake error is not retryable: %v", err)
 	}
 	retryableRemote := &helperRemoteError{Code: "route_unavailable", Retryable: true}
-	if err := classifyNativeHandshakeError(context.Background(), retryableRemote); !FallbackEligible(err) {
+	if err := classifyNativeHandshakeError(context.Background(), "QUIC", retryableRemote); !FallbackEligible(err) {
 		t.Fatalf("retryable remote error is not retryable: %v", err)
 	}
 	permanent := &helperRemoteError{Code: "not_found_or_forbidden", Retryable: false}
-	if err := classifyNativeHandshakeError(context.Background(), permanent); FallbackEligible(err) || !errors.Is(err, permanent) {
+	if err := classifyNativeHandshakeError(context.Background(), "QUIC", permanent); FallbackEligible(err) || !errors.Is(err, permanent) {
 		t.Fatalf("permanent remote error was reclassified: %v", err)
 	}
-	if err := classifyNativeHandshakeError(context.Background(), errInvalidNativeWelcome); FallbackEligible(err) || !errors.Is(err, errInvalidNativeWelcome) {
+	if err := classifyNativeHandshakeError(context.Background(), "QUIC", errInvalidNativeWelcome); FallbackEligible(err) || !errors.Is(err, errInvalidNativeWelcome) {
 		t.Fatalf("invalid welcome was reclassified: %v", err)
 	}
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := classifyNativeHandshakeError(canceled, transient); !errors.Is(err, context.Canceled) || FallbackEligible(err) {
+	if err := classifyNativeHandshakeError(canceled, "QUIC", transient); !errors.Is(err, context.Canceled) || FallbackEligible(err) {
 		t.Fatalf("cancellation was reclassified: %v", err)
 	}
 }

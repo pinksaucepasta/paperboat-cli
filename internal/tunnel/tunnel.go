@@ -38,10 +38,6 @@ type terminalCompressionReporter interface {
 	TerminalCompressionTelemetry() TerminalCompressionTelemetry
 }
 
-func readBufferedChunks(p []byte, pending *[]byte, out <-chan []byte) (int, error) {
-	return readBufferedChunksWithWait(p, pending, out, 0)
-}
-
 func readBufferedChunksWithWait(p []byte, pending *[]byte, out <-chan []byte, wait time.Duration) (int, error) {
 	if len(p) == 0 {
 		return 0, nil

@@ -11,8 +11,12 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/pinksaucepasta/paperboat/internal/httptransport"
 
 	"github.com/pinksaucepasta/paperboat/internal/buildinfo"
 	"github.com/pinksaucepasta/paperboat/internal/config"
@@ -149,6 +153,63 @@ type ClientConfiguration struct {
 	MachinesURL        string `json:"machines_url"`
 }
 
+type NetworkCheckRegion struct {
+	Region   string `json:"region"`
+	STUNURL  string `json:"stun_url"`
+	HTTPSURL string `json:"https_url"`
+}
+
+type NetworkCheckRegions struct {
+	Regions []NetworkCheckRegion `json:"regions"`
+}
+
+func (c *Client) NetworkCheckRegions(ctx context.Context) (NetworkCheckRegions, error) {
+	var out NetworkCheckRegions
+	if err := c.do(ctx, http.MethodGet, "/network-check/regions/v1", nil, &out); err != nil {
+		return NetworkCheckRegions{}, err
+	}
+	if len(out.Regions) > 32 {
+		return NetworkCheckRegions{}, errors.New("paperboat-server returned too many network-check regions")
+	}
+	seen := make(map[string]bool, len(out.Regions))
+	for _, region := range out.Regions {
+		if !validRegionCode(region.Region) || seen[region.Region] || !validSTUNProbeURL(region.STUNURL) || !validHTTPSProbeURL(region.HTTPSURL) {
+			return NetworkCheckRegions{}, errors.New("paperboat-server returned an invalid network-check region")
+		}
+		seen[region.Region] = true
+	}
+	return out, nil
+}
+
+func validRegionCode(value string) bool {
+	if value == "" || len(value) > 63 {
+		return false
+	}
+	for _, r := range value {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' {
+			return false
+		}
+	}
+	return value[0] != '-' && value[len(value)-1] != '-'
+}
+
+func validSTUNProbeURL(raw string) bool {
+	if !strings.HasPrefix(raw, "stun:") || strings.ContainsAny(raw, "?#") {
+		return false
+	}
+	value, err := url.Parse("//" + strings.TrimPrefix(raw, "stun:"))
+	if err != nil || value.Hostname() == "" || value.Port() == "" || value.User != nil || value.Path != "" {
+		return false
+	}
+	port, err := strconv.ParseUint(value.Port(), 10, 16)
+	return err == nil && port > 0
+}
+
+func validHTTPSProbeURL(raw string) bool {
+	value, err := url.Parse(raw)
+	return err == nil && value.Scheme == "https" && value.Hostname() != "" && value.User == nil && value.Path == "/network-check/v1" && value.RawQuery == "" && value.Fragment == ""
+}
+
 func (c *Client) ClientConfiguration(ctx context.Context) (ClientConfiguration, error) {
 	var out ClientConfiguration
 	if err := c.do(ctx, http.MethodGet, "/v1/client-configuration", nil, &out); err != nil {
@@ -162,6 +223,201 @@ func (c *Client) ClientConfiguration(ctx context.Context) (ClientConfiguration, 
 		return ClientConfiguration{}, errors.New("paperboat-server returned an invalid machines URL")
 	}
 	return out, nil
+}
+
+type PeerAttemptInput struct {
+	OperationID                       string               `json:"operation_id"`
+	EnvironmentID                     string               `json:"environment_id"`
+	Purpose                           string               `json:"purpose"`
+	Consumer                          string               `json:"consumer"`
+	ControllingCertificateFingerprint string               `json:"controlling_certificate_fingerprint"`
+	ControlledCertificateFingerprint  string               `json:"controlled_certificate_fingerprint"`
+	AttemptGeneration                 uint64               `json:"attempt_generation"`
+	NetworkGeneration                 uint64               `json:"network_generation"`
+	AllowedPaths                      []string             `json:"allowed_paths"`
+	Transfer                          *PeerAttemptTransfer `json:"transfer,omitempty"`
+	RelayLatency                      *RelayLatencyVector  `json:"relay_latency,omitempty"`
+}
+
+type RelayLatencySample struct {
+	Region string `json:"region"`
+	RTTMS  int64  `json:"rtt_ms"`
+}
+
+type RelayLatencyVector struct {
+	Generation         uint64               `json:"generation"`
+	ObservedAt         time.Time            `json:"observed_at"`
+	Samples            []RelayLatencySample `json:"samples"`
+	RelaySuccessRegion string               `json:"relay_success_region,omitempty"`
+	RelaySuccessAt     time.Time            `json:"relay_success_at,omitempty"`
+}
+
+type PeerAttemptTransfer struct {
+	TransferID string    `json:"transfer_id"`
+	Generation uint64    `json:"generation"`
+	ExpiresAt  time.Time `json:"expires_at"`
+}
+
+type PeerAttemptCertificate struct {
+	EndpointID  string `json:"endpoint_id"`
+	Certificate string `json:"certificate"`
+}
+
+type PeerAttemptDescriptor struct {
+	Version                 int                      `json:"version"`
+	AccountID               string                   `json:"account_id"`
+	DeviceID                string                   `json:"device_id"`
+	OperationID             string                   `json:"operation_id"`
+	IntentID                string                   `json:"intent_id"`
+	EnvironmentID           string                   `json:"environment_id"`
+	Purpose                 string                   `json:"purpose"`
+	Consumer                string                   `json:"consumer"`
+	InitiatorEndpointID     string                   `json:"initiator_endpoint_id"`
+	ResponderEndpointID     string                   `json:"responder_endpoint_id"`
+	Role                    string                   `json:"role"`
+	AttemptGeneration       uint64                   `json:"attempt_generation"`
+	NetworkGeneration       uint64                   `json:"network_generation"`
+	HostGeneration          uint64                   `json:"host_generation"`
+	AuthorizationGeneration uint64                   `json:"authorization_generation"`
+	IssuedAt                time.Time                `json:"issued_at"`
+	ExpiresAt               time.Time                `json:"expires_at"`
+	EndpointCertificates    []PeerAttemptCertificate `json:"endpoint_certificates"`
+	Direct                  struct {
+		ICEUfrag    string   `json:"ice_ufrag"`
+		ICEPassword string   `json:"ice_password"`
+		STUNURLs    []string `json:"stun_urls"`
+	} `json:"direct"`
+	Signaling struct {
+		URL         string `json:"url"`
+		Credential  string `json:"credential"`
+		Subprotocol string `json:"subprotocol"`
+	} `json:"signaling"`
+	Relays []PeerAttemptRelay `json:"relays"`
+	Policy struct {
+		AllowedPaths     []string `json:"allowed_paths"`
+		RelayDeadlineMS  int      `json:"relay_deadline_ms"`
+		HealthIntervalMS int      `json:"health_interval_ms"`
+		MaxCandidates    int      `json:"max_candidates"`
+	} `json:"policy"`
+	StreamPolicy *PeerAttemptStreamPolicy `json:"stream_policy,omitempty"`
+	Transfer     *PeerAttemptTransfer     `json:"transfer,omitempty"`
+}
+
+type PeerAttemptStreamPolicy struct {
+	Protocol         string   `json:"protocol"`
+	AllowedConsumers []string `json:"allowed_consumers"`
+	MaximumStreams   int      `json:"maximum_streams"`
+}
+
+type PeerAttemptRelay struct {
+	Region          string    `json:"region"`
+	RouteGeneration uint64    `json:"route_generation"`
+	QUICURL         string    `json:"quic_url,omitempty"`
+	WSSURL          string    `json:"wss_url,omitempty"`
+	RouteToken      string    `json:"route_token"`
+	PMTUToken       string    `json:"pmtu_token"`
+	PMTUURL         string    `json:"pmtu_url"`
+	ExpiresAt       time.Time `json:"expires_at"`
+}
+
+type EndpointCertificateDocument struct {
+	Version                int    `json:"version"`
+	AccountID              string `json:"account_id"`
+	RootFingerprint        string `json:"root_fingerprint"`
+	EndpointID             string `json:"endpoint_id"`
+	Role                   string `json:"role"`
+	Generation             uint64 `json:"generation"`
+	Serial                 uint64 `json:"serial"`
+	IssuedAt               string `json:"issued_at"`
+	ExpiresAt              string `json:"expires_at"`
+	Certificate            string `json:"certificate"`
+	CertificateFingerprint string `json:"certificate_fingerprint"`
+}
+
+type E2EEBootstrapInput struct {
+	RootPublicKey string                      `json:"root_public_key"`
+	Certificate   EndpointCertificateDocument `json:"certificate"`
+}
+
+type E2EEBootstrapResult = E2EEBootstrapInput
+
+type E2EERoot struct {
+	Version     int    `json:"version"`
+	PublicKey   string `json:"public_key"`
+	Fingerprint string `json:"fingerprint"`
+	Generation  uint64 `json:"generation"`
+}
+
+type PendingEndpointIdentity struct {
+	RequestID      string    `json:"request_id"`
+	EndpointID     string    `json:"endpoint_id"`
+	Generation     uint64    `json:"generation"`
+	NoisePublicKey string    `json:"noise_public_key"`
+	QUICPublicKey  string    `json:"quic_public_key"`
+	CreatedAt      time.Time `json:"created_at"`
+	ExpiresAt      time.Time `json:"expires_at"`
+	SafetyCode     string    `json:"safety_code"`
+}
+
+func (c *Client) E2EERoot(ctx context.Context) (E2EERoot, error) {
+	var out E2EERoot
+	if err := c.doStrict(ctx, http.MethodGet, "/v1/e2ee/root", nil, &out); err != nil {
+		return E2EERoot{}, err
+	}
+	return out, nil
+}
+
+func (c *Client) PendingE2EEEndpoints(ctx context.Context) ([]PendingEndpointIdentity, error) {
+	var out []PendingEndpointIdentity
+	if err := c.doStrict(ctx, http.MethodGet, "/v1/e2ee/pending-endpoints", nil, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *Client) RegisterEndpointCertificate(ctx context.Context, operationID string, document EndpointCertificateDocument) (EndpointCertificateDocument, error) {
+	var out EndpointCertificateDocument
+	path := "/v1/endpoints/" + url.PathEscape(document.EndpointID) + "/certificates/" + fmt.Sprintf("%d", document.Generation)
+	if err := c.doWithHeaders(ctx, http.MethodPut, path, document, &out, http.Header{"Idempotency-Key": []string{operationID}}); err != nil {
+		return EndpointCertificateDocument{}, err
+	}
+	return out, nil
+}
+
+func (c *Client) EndpointCertificate(ctx context.Context, endpointID string, generation uint64) (EndpointCertificateDocument, error) {
+	if strings.TrimSpace(endpointID) == "" || generation == 0 {
+		return EndpointCertificateDocument{}, errors.New("endpoint certificate identity is invalid")
+	}
+	var out EndpointCertificateDocument
+	path := "/v1/endpoints/" + url.PathEscape(endpointID) + "/certificates/" + fmt.Sprintf("%d", generation)
+	if err := c.doStrict(ctx, http.MethodGet, path, nil, &out); err != nil {
+		return EndpointCertificateDocument{}, err
+	}
+	return out, nil
+}
+
+func (c *Client) BootstrapE2EE(ctx context.Context, operationID string, input E2EEBootstrapInput) (E2EEBootstrapResult, error) {
+	var out E2EEBootstrapResult
+	if err := c.doWithHeaders(ctx, http.MethodPost, "/v1/e2ee/bootstrap", input, &out, http.Header{"Idempotency-Key": []string{operationID}}); err != nil {
+		return E2EEBootstrapResult{}, err
+	}
+	return out, nil
+}
+
+func (c *Client) CreatePeerAttempt(ctx context.Context, input PeerAttemptInput) (PeerAttemptDescriptor, error) {
+	var out PeerAttemptDescriptor
+	if err := c.doStrict(ctx, http.MethodPost, "/v1/peer-attempts", input, &out); err != nil {
+		return PeerAttemptDescriptor{}, err
+	}
+	return out, nil
+}
+
+func (c *Client) RevokePeerAttempt(ctx context.Context, operationID, intentID string, attemptGeneration uint64) error {
+	var out struct {
+		IntentID string `json:"intent_id"`
+	}
+	path := "/v1/peer-attempts/" + url.PathEscape(intentID) + "/" + strconv.FormatUint(attemptGeneration, 10)
+	return c.doWithHeaders(ctx, http.MethodDelete, path, nil, &out, http.Header{"Idempotency-Key": []string{operationID}})
 }
 
 type CatalogMachineType struct {
@@ -230,6 +486,7 @@ type UserMachine struct {
 	ID                     string               `json:"id"`
 	EnvironmentID          string               `json:"environment_id"`
 	DisplayName            string               `json:"display_name"`
+	Alias                  string               `json:"alias"`
 	State                  string               `json:"state"`
 	Online                 bool                 `json:"online"`
 	Platform               string               `json:"platform"`
@@ -243,25 +500,70 @@ type UserMachine struct {
 	Availability           AvailabilityPolicy   `json:"availability"`
 	RuntimeDiagnostics     RuntimeDiagnostics   `json:"runtime_diagnostics"`
 	Installation           *ReceiveInstallation `json:"installation,omitempty"`
+	SSHAuthority           SSHAuthority         `json:"-"`
+	SSHLocalReady          bool                 `json:"-"`
+	SSHLocalCode           string               `json:"-"`
+}
+
+type SSHAuthority struct {
+	TargetGeneration  uint64
+	HostKeyGeneration uint64
+}
+
+type ManagedSSHTarget struct {
+	Type                  string `json:"type"`
+	Version               int    `json:"version"`
+	MachineID             string `json:"machine_id"`
+	MachineGeneration     uint64 `json:"machine_generation"`
+	OSUser                string `json:"os_user"`
+	Port                  uint16 `json:"port"`
+	ReconciliationVersion uint64 `json:"reconciliation_version"`
+}
+
+type ManagedSSHHostKeySet struct {
+	Type                  string   `json:"type"`
+	Version               int      `json:"version"`
+	SetID                 string   `json:"set_id"`
+	MachineID             string   `json:"machine_id"`
+	MachineGeneration     uint64   `json:"machine_generation"`
+	ObservationGeneration uint64   `json:"observation_generation"`
+	Keys                  []string `json:"keys"`
+	Fingerprint           string   `json:"fingerprint"`
+	State                 string   `json:"state"`
+	ReconciliationVersion uint64   `json:"reconciliation_version"`
+}
+
+type ManagedSSHAuthorizedKeys struct {
+	Type              string   `json:"type"`
+	Version           int      `json:"version"`
+	MachineID         string   `json:"machine_id"`
+	MachineGeneration uint64   `json:"machine_generation"`
+	Keys              []string `json:"keys"`
+}
+
+type ManagedSSHClientKey struct {
+	Type                  string `json:"type"`
+	Version               int    `json:"version"`
+	Fingerprint           string `json:"fingerprint"`
+	PublicKey             string `json:"public_key"`
+	State                 string `json:"state"`
+	ReconciliationVersion uint64 `json:"reconciliation_version"`
 }
 
 type MachineArtifact struct {
-	Schema       string `json:"schema"`
-	Kind         string `json:"kind"`
-	Version      string `json:"version"`
-	Platform     string `json:"platform"`
-	Architecture string `json:"architecture"`
-	URL          string `json:"url"`
-	ByteLength   int64  `json:"byte_length"`
-	SHA256       string `json:"sha256"`
-	Signature    string `json:"signature"`
+	Schema        string `json:"schema"`
+	Kind          string `json:"kind"`
+	Version       string `json:"version"`
+	Platform      string `json:"platform"`
+	Architecture  string `json:"architecture"`
+	RepositoryURL string `json:"repository_url"`
+	TargetPath    string `json:"target_path"`
 }
 
 type ReceiveInstallation struct {
 	ControlURL          string          `json:"control_url"`
 	HelperListenAddress string          `json:"helper_listen_address"`
 	Artifact            MachineArtifact `json:"artifact"`
-	ArtifactPublicKey   string          `json:"artifact_public_key"`
 }
 
 type MachineCapability struct {
@@ -341,6 +643,7 @@ type AvailabilityPolicy struct {
 	HostServiceVersion string     `json:"host_service_version,omitempty"`
 	HostServiceScope   string     `json:"host_service_scope,omitempty"`
 	UpdateRollbacks    int64      `json:"update_rollbacks"`
+	UpdateHealth       string     `json:"update_health"`
 }
 
 type ConfigRepository struct {
@@ -576,6 +879,7 @@ type CodexSession struct {
 }
 type CodexDescriptor struct {
 	Session             CodexSession `json:"session"`
+	MachineGeneration   uint64       `json:"machine_generation"`
 	ManagementURL       string       `json:"management_url"`
 	WebSocketURL        string       `json:"websocket_url"`
 	ManageCredential    string       `json:"manage_credential"`
@@ -670,6 +974,7 @@ type PreviewLaunchError struct {
 func (e *PreviewLaunchError) Error() string { return e.Message }
 
 type PreviewRecord struct {
+	OperationID   string     `json:"operation_id,omitempty"`
 	ID            string     `json:"id"`
 	EnvironmentID string     `json:"environment_id"`
 	PreviewKey    string     `json:"preview_key"`
@@ -700,6 +1005,16 @@ type ConnectionDescriptor struct {
 	RetryAfterSeconds int           `json:"retry_after_seconds,omitempty"`
 	Capabilities      []string      `json:"capabilities,omitempty"`
 }
+
+type ExecDescriptor struct {
+	OperationID string            `json:"operation_id"`
+	Environment *Environment      `json:"environment"`
+	Endpoints   TerminalEndpoints `json:"endpoints"`
+	Auth        AuthMaterial      `json:"auth"`
+	ExpiresAt   time.Time         `json:"expires_at"`
+}
+
+type SSHDescriptor = ExecDescriptor
 
 // NormalizeConnectionDescriptor maps the canonical wire contract onto the
 // internal transport fields.
@@ -885,6 +1200,138 @@ func (c *Client) ListUserMachines(ctx context.Context) ([]UserMachine, error) {
 	}
 }
 
+func (c *Client) ManagedSSHTarget(ctx context.Context, machineID string, generation uint64) (ManagedSSHTarget, error) {
+	if strings.TrimSpace(machineID) == "" || generation == 0 {
+		return ManagedSSHTarget{}, errors.New("valid managed SSH target identity is required")
+	}
+	var target ManagedSSHTarget
+	path := fmt.Sprintf("/v1/machines/%s/ssh-target?machine_generation=%d", url.PathEscape(machineID), generation)
+	if err := c.do(ctx, http.MethodGet, path, nil, &target); err != nil {
+		return ManagedSSHTarget{}, err
+	}
+	if target.Type != "machine_target" || target.Version != 1 || target.MachineID != machineID || target.MachineGeneration != generation || target.Port == 0 || target.ReconciliationVersion == 0 || strings.TrimSpace(target.OSUser) == "" {
+		return ManagedSSHTarget{}, errors.New("paperboat-server returned an invalid managed SSH target")
+	}
+	return target, nil
+}
+
+func (c *Client) RegisterManagedSSHTarget(ctx context.Context, machineID string, generation uint64, osUser string, port uint16, operationID string) (ManagedSSHTarget, error) {
+	if strings.TrimSpace(machineID) == "" || generation == 0 || strings.TrimSpace(osUser) == "" || port == 0 || strings.TrimSpace(operationID) == "" {
+		return ManagedSSHTarget{}, errors.New("valid managed SSH target registration is required")
+	}
+	var target ManagedSSHTarget
+	err := c.doWithHeaders(ctx, http.MethodPut, "/v1/machines/"+url.PathEscape(machineID)+"/ssh-target", map[string]any{"machine_generation": generation, "os_user": osUser, "port": port}, &target, http.Header{"Idempotency-Key": []string{operationID}})
+	if err != nil {
+		return ManagedSSHTarget{}, err
+	}
+	if target.Type != "machine_target" || target.Version != 1 || target.MachineID != machineID || target.MachineGeneration != generation || target.OSUser != osUser || target.Port != port || target.ReconciliationVersion == 0 {
+		return ManagedSSHTarget{}, errors.New("paperboat-server returned an invalid managed SSH target")
+	}
+	return target, nil
+}
+
+func (c *Client) UpdateManagedSSHTargetPort(ctx context.Context, machineID string, generation, expectedVersion uint64, port uint16, operationID string) (ManagedSSHTarget, error) {
+	if strings.TrimSpace(machineID) == "" || generation == 0 || expectedVersion == 0 || port == 0 || strings.TrimSpace(operationID) == "" {
+		return ManagedSSHTarget{}, errors.New("valid managed SSH target update is required")
+	}
+	var target ManagedSSHTarget
+	err := c.doWithHeaders(ctx, http.MethodPut, "/v1/machines/"+url.PathEscape(machineID)+"/ssh-target", map[string]any{"machine_generation": generation, "port": port, "expected_reconciliation_version": expectedVersion}, &target, http.Header{"Idempotency-Key": []string{operationID}})
+	if err != nil {
+		return ManagedSSHTarget{}, err
+	}
+	if target.Type != "machine_target" || target.Version != 1 || target.MachineID != machineID || target.MachineGeneration != generation || target.Port != port || target.ReconciliationVersion != expectedVersion+1 {
+		return ManagedSSHTarget{}, errors.New("paperboat-server returned an invalid managed SSH target update")
+	}
+	return target, nil
+}
+
+func (c *Client) ObserveManagedSSHHostKeys(ctx context.Context, machineID, keyID, operationID, setID string, generation, observationGeneration uint64, publicKeys []string, proof []byte) (ManagedSSHHostKeySet, error) {
+	if strings.TrimSpace(machineID) == "" || strings.TrimSpace(keyID) == "" || strings.TrimSpace(operationID) == "" || strings.TrimSpace(setID) == "" || generation == 0 || observationGeneration == 0 || len(publicKeys) == 0 || len(proof) == 0 {
+		return ManagedSSHHostKeySet{}, errors.New("valid managed SSH host-key observation is required")
+	}
+	var set ManagedSSHHostKeySet
+	err := c.doWithHeaders(ctx, http.MethodPut, "/v1/machines/"+url.PathEscape(machineID)+"/ssh-host-keys", map[string]any{"set_id": setID, "observation_generation": observationGeneration, "public_keys": publicKeys}, &set, http.Header{"X-Paperboat-Machine-Identity": []string{keyID}, "X-Paperboat-Machine-Proof": []string{base64.RawURLEncoding.EncodeToString(proof)}})
+	if err != nil {
+		return ManagedSSHHostKeySet{}, err
+	}
+	if set.Type != "host_key_set" || set.Version != 1 || set.SetID != setID || set.MachineID != machineID || set.MachineGeneration != generation || set.ObservationGeneration == 0 || len(set.Keys) == 0 || set.ReconciliationVersion == 0 {
+		return ManagedSSHHostKeySet{}, fmt.Errorf("paperboat-server returned an invalid managed SSH host-key observation: got type=%q version=%d machine=%q generation=%d observation=%d keys=%d revision=%d expected machine=%q generation=%d observation=%d", set.Type, set.Version, set.MachineID, set.MachineGeneration, set.ObservationGeneration, len(set.Keys), set.ReconciliationVersion, machineID, generation, observationGeneration)
+	}
+	return set, nil
+}
+
+func (c *Client) ManagedSSHAuthorizedKeys(ctx context.Context, machineID, keyID string, generation uint64, proof []byte) (ManagedSSHAuthorizedKeys, error) {
+	if strings.TrimSpace(machineID) == "" || strings.TrimSpace(keyID) == "" || generation == 0 || len(proof) == 0 {
+		return ManagedSSHAuthorizedKeys{}, errors.New("valid managed SSH authorized-key request is required")
+	}
+	var set ManagedSSHAuthorizedKeys
+	err := c.doWithHeaders(ctx, http.MethodPost, "/v1/machines/"+url.PathEscape(machineID)+"/ssh-authorized-keys", map[string]any{}, &set, http.Header{"X-Paperboat-Machine-Identity": []string{keyID}, "X-Paperboat-Machine-Proof": []string{base64.RawURLEncoding.EncodeToString(proof)}})
+	if err != nil {
+		return ManagedSSHAuthorizedKeys{}, err
+	}
+	if set.Type != "authorized_key_set" || set.Version != 1 || set.MachineID != machineID || set.MachineGeneration != generation || len(set.Keys) > 64 {
+		return ManagedSSHAuthorizedKeys{}, errors.New("paperboat-server returned an invalid managed SSH authorized-key set")
+	}
+	return set, nil
+}
+
+func (c *Client) ManagedSSHHostKeys(ctx context.Context, machineID string, generation uint64) (ManagedSSHHostKeySet, error) {
+	return c.managedSSHHostKeys(ctx, machineID, generation, "active")
+}
+
+func (c *Client) ManagedSSHPendingHostKeys(ctx context.Context, machineID string, generation uint64) (ManagedSSHHostKeySet, error) {
+	return c.managedSSHHostKeys(ctx, machineID, generation, "pending")
+}
+
+func (c *Client) managedSSHHostKeys(ctx context.Context, machineID string, generation uint64, state string) (ManagedSSHHostKeySet, error) {
+	if strings.TrimSpace(machineID) == "" || generation == 0 {
+		return ManagedSSHHostKeySet{}, errors.New("valid managed SSH host-key identity is required")
+	}
+	var set ManagedSSHHostKeySet
+	path := fmt.Sprintf("/v1/machines/%s/ssh-host-keys?machine_generation=%d&state=%s", url.PathEscape(machineID), generation, state)
+	if err := c.do(ctx, http.MethodGet, path, nil, &set); err != nil {
+		return ManagedSSHHostKeySet{}, err
+	}
+	if set.Type != "host_key_set" || set.Version != 1 || set.SetID == "" || set.MachineID != machineID || set.MachineGeneration != generation || set.ObservationGeneration == 0 || len(set.Keys) == 0 || set.State != state || set.Fingerprint == "" || set.ReconciliationVersion == 0 {
+		return ManagedSSHHostKeySet{}, errors.New("paperboat-server returned an invalid managed SSH host-key set")
+	}
+	return set, nil
+}
+
+func (c *Client) PromoteManagedSSHHostKeys(ctx context.Context, machineID, setID, fingerprint, operationID string, generation uint64) (ManagedSSHHostKeySet, error) {
+	if strings.TrimSpace(machineID) == "" || strings.TrimSpace(setID) == "" || strings.TrimSpace(fingerprint) == "" || strings.TrimSpace(operationID) == "" || generation == 0 {
+		return ManagedSSHHostKeySet{}, errors.New("valid managed SSH host-key promotion is required")
+	}
+	var set ManagedSSHHostKeySet
+	err := c.doWithHeaders(ctx, http.MethodPost, "/v1/machines/"+url.PathEscape(machineID)+"/ssh-host-keys/"+url.PathEscape(setID)+"/promote", map[string]any{"machine_generation": generation, "expected_fingerprint": fingerprint}, &set, http.Header{"Idempotency-Key": []string{operationID}})
+	if err != nil {
+		return ManagedSSHHostKeySet{}, err
+	}
+	if set.Type != "host_key_set" || set.Version != 1 || set.SetID != setID || set.MachineID != machineID || set.MachineGeneration != generation || set.State != "active" || set.Fingerprint != fingerprint || set.ReconciliationVersion == 0 {
+		return ManagedSSHHostKeySet{}, errors.New("paperboat-server returned an invalid managed SSH host-key promotion")
+	}
+	return set, nil
+}
+
+func (c *Client) RegisterManagedSSHClientKey(ctx context.Context, publicKey string, fingerprint [32]byte, operationID string) (ManagedSSHClientKey, error) {
+	publicKey = strings.TrimSpace(publicKey)
+	operationID = strings.TrimSpace(operationID)
+	if publicKey == "" || fingerprint == [32]byte{} || operationID == "" {
+		return ManagedSSHClientKey{}, errors.New("valid managed SSH client-key registration is required")
+	}
+	encodedFingerprint := "SHA256:" + base64.RawStdEncoding.EncodeToString(fingerprint[:])
+	var key ManagedSSHClientKey
+	path := "/v1/ssh/client-keys/" + url.PathEscape(encodedFingerprint)
+	err := c.doWithHeaders(ctx, http.MethodPut, path, map[string]string{"public_key": publicKey}, &key, http.Header{"Idempotency-Key": []string{operationID}})
+	if err != nil {
+		return ManagedSSHClientKey{}, err
+	}
+	if key.Type != "client_key" || key.Version != 1 || key.Fingerprint != encodedFingerprint || key.PublicKey != publicKey || key.State != "active" || key.ReconciliationVersion == 0 {
+		return ManagedSSHClientKey{}, errors.New("paperboat-server returned an invalid managed SSH client key")
+	}
+	return key, nil
+}
+
 func (c *Client) DisconnectUserMachine(ctx context.Context, machineID string) error {
 	if strings.TrimSpace(machineID) == "" {
 		return errors.New("machine ID is required")
@@ -974,6 +1421,42 @@ func (c *Client) UserMachineConnectionDescriptorForSession(ctx context.Context, 
 	return out, err
 }
 
+func (c *Client) MachineExecDescriptor(ctx context.Context, machineID, operationID string) (ExecDescriptor, error) {
+	if strings.TrimSpace(machineID) == "" || len(operationID) < 8 || len(operationID) > 128 || c.sourceMachineID == "" {
+		return ExecDescriptor{}, errors.New("machine, source machine, and operation IDs are required")
+	}
+	var out ExecDescriptor
+	err := c.do(ctx, http.MethodPost, "/v1/machines/"+url.PathEscape(machineID)+"/exec-descriptor", map[string]string{"source_machine_id": c.sourceMachineID, "operation_id": operationID}, &out)
+	if err == nil {
+		err = validateOperationDescriptor(out, machineID, operationID, "exec:operate", "exec")
+	}
+	return out, err
+}
+
+func (c *Client) MachineSSHDescriptor(ctx context.Context, machineID, operationID string) (SSHDescriptor, error) {
+	if strings.TrimSpace(machineID) == "" || len(operationID) < 8 || len(operationID) > 128 || c.sourceMachineID == "" {
+		return SSHDescriptor{}, errors.New("machine, source machine, and operation IDs are required")
+	}
+	var out SSHDescriptor
+	err := c.do(ctx, http.MethodPost, "/v1/machines/"+url.PathEscape(machineID)+"/ssh-descriptor", map[string]string{"source_machine_id": c.sourceMachineID, "operation_id": operationID}, &out)
+	if err == nil {
+		err = validateOperationDescriptor(out, machineID, operationID, "ssh:operate", "ssh")
+	}
+	return out, err
+}
+
+func validateOperationDescriptor(out ExecDescriptor, machineID, operationID, expectedScope, operationKind string) error {
+	quic, quicErr := url.Parse(out.Endpoints.QUIC)
+	wss, wssErr := url.Parse(out.Endpoints.WSS)
+	if out.OperationID != operationID || out.Environment == nil || out.Environment.ID == "" || out.Environment.Kind != "byod" || out.Environment.ResourceID != machineID || out.Environment.State != "ready" || !filepath.IsAbs(out.Environment.Root) ||
+		quicErr != nil || quic.Scheme != "quic" || quic.Hostname() == "" || quic.User != nil || quic.Path != "" || quic.RawQuery != "" || quic.Fragment != "" ||
+		wssErr != nil || wss.Scheme != "wss" || wss.Hostname() == "" || wss.User != nil || wss.Path != "/v1/runtime" || wss.RawQuery != "" || wss.Fragment != "" ||
+		out.Auth.Method != "bearer" || out.Auth.Token == "" || len(out.Auth.Scopes) != 1 || out.Auth.Scopes[0] != expectedScope || out.ExpiresAt.IsZero() || out.Auth.ExpiresAt.IsZero() || !out.ExpiresAt.Equal(out.Auth.ExpiresAt) {
+		return fmt.Errorf("invalid %s descriptor", operationKind)
+	}
+	return nil
+}
+
 func (c *Client) MachineFileTransferDescriptor(ctx context.Context, destinationMachineID, sourceMachineID, sessionID string) (FileTransfer, error) {
 	if strings.TrimSpace(destinationMachineID) == "" || strings.TrimSpace(sourceMachineID) == "" {
 		return FileTransfer{}, errors.New("source and destination machine IDs are required")
@@ -996,7 +1479,7 @@ func (c *Client) MachinePreviewLaunchDescriptor(ctx context.Context, machineID s
 		return PreviewLaunchDescriptor{}, err
 	}
 	u, parseErr := url.Parse(out.Endpoint)
-	if parseErr != nil || u.Scheme != "https" || u.Host == "" || u.Path != "/v1/preview-launches" || out.MachineID != machineID || out.Auth.Method != "bearer" || out.Auth.Token == "" {
+	if parseErr != nil || u.Scheme != "https" || u.Host == "" || u.Path != "/v1/preview-launches" || out.MachineID != machineID || out.Auth.Method != "bearer" || out.Auth.Token == "" || out.ExpiresAt.IsZero() || out.Auth.ExpiresAt.IsZero() || !out.ExpiresAt.Equal(out.Auth.ExpiresAt) || len(out.Auth.Scopes) != 1 || out.Auth.Scopes[0] != "preview:launch" {
 		return PreviewLaunchDescriptor{}, errors.New("paperboat-server returned an invalid preview launch descriptor")
 	}
 	return out, nil
@@ -1004,7 +1487,7 @@ func (c *Client) MachinePreviewLaunchDescriptor(ctx context.Context, machineID s
 
 func LaunchMachinePreview(ctx context.Context, descriptor PreviewLaunchDescriptor, input PreviewLaunchRequest, transport http.RoundTripper) (PreviewRecord, error) {
 	if transport == nil {
-		transport = http.DefaultTransport
+		transport = httptransport.Default()
 	}
 	body, err := json.Marshal(input)
 	if err != nil {
@@ -1036,7 +1519,7 @@ func LaunchMachinePreview(ctx context.Context, descriptor PreviewLaunchDescripto
 	var record PreviewRecord
 	decoder := json.NewDecoder(io.LimitReader(response.Body, 64<<10))
 	decoder.DisallowUnknownFields()
-	if decoder.Decode(&record) != nil || decoder.Decode(&struct{}{}) != io.EOF || record.URL == "" || record.LogicalName == "" {
+	if decoder.Decode(&record) != nil || decoder.Decode(&struct{}{}) != io.EOF || record.OperationID != input.OperationID || record.URL == "" || record.LogicalName == "" {
 		return PreviewRecord{}, errors.New("machine returned an invalid preview launch response")
 	}
 	return record, nil
@@ -1168,10 +1651,18 @@ func (c *Client) ProjectConnectionReadinessForSession(ctx context.Context, proje
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
-	return c.doWithHeaders(ctx, method, path, body, out, nil)
+	return c.doRequest(ctx, method, path, body, out, nil, false)
 }
 
 func (c *Client) doWithHeaders(ctx context.Context, method, path string, body, out any, headers http.Header) error {
+	return c.doRequest(ctx, method, path, body, out, headers, false)
+}
+
+func (c *Client) doStrict(ctx context.Context, method, path string, body, out any) error {
+	return c.doRequest(ctx, method, path, body, out, nil, true)
+}
+
+func (c *Client) doRequest(ctx context.Context, method, path string, body, out any, headers http.Header, strict bool) error {
 	if strings.TrimSpace(c.baseURL) == "" {
 		return errors.New("paperboat-server base URL is not configured")
 	}
@@ -1245,8 +1736,19 @@ func (c *Client) doWithHeaders(ctx context.Context, method, path string, body, o
 	if len(envelope.Data) == 0 {
 		return fmt.Errorf("%s %s returned an empty response", method, path)
 	}
-	if err := json.Unmarshal(envelope.Data, out); err != nil {
+	if !strict {
+		if err := json.Unmarshal(envelope.Data, out); err != nil {
+			return fmt.Errorf("decode %s %s data: %w", method, path, err)
+		}
+		return nil
+	}
+	decoder := json.NewDecoder(bytes.NewReader(envelope.Data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(out); err != nil {
 		return fmt.Errorf("decode %s %s data: %w", method, path, err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("decode %s %s data: trailing JSON", method, path)
 	}
 	return nil
 }

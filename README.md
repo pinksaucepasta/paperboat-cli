@@ -25,36 +25,49 @@ pb auth status               # show the active account for the configured server
 pb auth switch               # replace the active account for this server
 pb auth logout               # revoke and remove this installation's session
 pb doctor                    # check auth + environment connectivity
+pb Studio -- git status      # execute an exact argv vector on a machine
+pb exec Studio --cwd /src -- make test
 pb config path|show          # inspect the local config
-pb serve ./dist --public     # publish a local file or static directory
+pb serve ./dist              # serve privately on this device
+pb serve ./dist --public     # publish through a public preview
 ```
 
 Flags may appear before or after the environment name.
 Hosted projects and machines use the same durable terminal-session workflow:
 `--new`, `--session`, and `pb sessions` apply to either environment type.
 
+## Remote execution
+
+`pb <machine> -- <argv...>` executes an exact argument vector without an implicit shell.
+Use `pb exec` for execution controls such as `--cwd`, `--timeout`, repeated `--env
+name=value`, `--pty`, and `--json`. Non-PTY execution keeps stdout and stderr separate;
+PTY mode merges them and forwards terminal resize events. JSON mode emits the versioned
+`paperboat.exec-event/v1` JSON Lines stream and returns the remote process exit status.
+
 ## Serve a file or directory
 
-`pb serve [path]` publishes a regular file or static directory from the current device
-through a public Paperboat preview. It binds the static server only to loopback, waits for
-the public route to become ready before printing its URL, and stops both the listener and
-preview on cancellation or expiry.
+`pb serve [path]` serves a regular file or static directory privately on an IPv4 loopback
+listener by default. It needs no Paperboat setup, account, machine runtime, or network
+connection. `--listen-port` requests one specific loopback port; otherwise the OS selects
+an available port. `--public` explicitly creates the existing public Paperboat preview and
+does not accept `--listen-port`.
 
 ```sh
-pb serve ./report.html --public
-pb serve ./dist --public --spa --duration 1h
-pb serve ./demo.pdf --public --detach
+pb serve ./report.html
+pb serve ./dist --spa --listen-port 8080
+pb serve ./demo.pdf --detach
+pb serve ./dist --public --duration 1h
 ```
 
 Without a path in an interactive terminal, `pb serve` opens the local file-and-directory
 picker. Pasting or dropping one file stages a verified, collision-safe copy under
-`Paperboat Inbox/serve` after public-access confirmation. The Inbox copy remains after the
-preview stops. `--detach` transfers ownership to the local Paperboat runtime so serving
-survives CLI exit, but local runtime or machine shutdown stops it. Stop either mode through
-`pb preview revoke`.
+`Paperboat Inbox/serve`; public mode asks for confirmation before publishing. The Inbox
+copy remains after serving stops. `--detach` transfers ownership to an isolated local user
+service so serving survives CLI exit. List it with `pb preview list` and stop it by name
+with `pb preview revoke <name>`.
 
-Non-interactive and JSON invocations require both a path and `--public`. Use `--indefinite`
-instead of `--duration` only when the preview should remain until explicitly revoked.
+Non-interactive and JSON invocations require a path. Use `--indefinite` instead of
+`--duration` only when the listener should remain until explicitly stopped.
 
 Interactive attaches forward `TERM`, `COLORTERM`, `TERM_PROGRAM`,
 `TERM_PROGRAM_VERSION`, and locale variables when they are set locally.
@@ -92,14 +105,13 @@ Attach flags override saved behavior for one session:
 ```sh
 pb demo --status-bar=off
 pb demo --status-bar-fullscreen=show --status-bar-theme=mono
-pb demo --transport=quic
+pb demo --path=d
 ```
 
-Terminal attachments use `connect.terminal_transport`, with `auto` (the default), `quic`,
-or `wss`. `auto` tries native QUIC over UDP 443 first and falls back to WSS over TCP 443 only
-when QUIC cannot connect. `--transport` overrides the mode for one command without
-rewriting configuration. Authentication, certificate, route, and protocol failures do not
-fall back.
+Terminal attachments use `connect.terminal_transport`, with `a` (the default), `d`, `q`,
+`w`, or `r`. Auto races direct and relay paths, prefers direct, and keeps a relay standby
+while the application is active. `--path` overrides the mode for one command without
+rewriting configuration. Explicit path modes never select a path outside their contract.
 
 The bar automatically drops storage, credits, config-sync, session, and project widgets
 in that order as width becomes constrained. Connection and active failure state retain
@@ -130,7 +142,7 @@ receipt. Inbox files remain until the user removes them.
 
 Run `pb setup` to register the interactive installation and its Paperboat Inbox. Run
 `pb pair` to add the host role to the same stable machine identity. Pairing verifies the
-server-selected signed `pb` artifact, installs the minimum launchd or systemd services,
+server-selected TUF target, installs the minimum launchd or systemd services,
 and waits for authenticated readiness.
 
 Interactive-only setup does not run a terminal host or connector. After pairing, machines
@@ -157,7 +169,7 @@ Android archives target API 24 and link against Bionic so Termux uses Android's 
 
 ## Stack
 
-Go — distributed as a single static binary (Cobra, Go 1.25.7).
+Go - distributed as a single static binary for Linux and macOS (Cobra, Go 1.26.5).
 
 ## Layout
 

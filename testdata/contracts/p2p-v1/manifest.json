@@ -1,0 +1,16 @@
+{
+  "manifest_version": 1,
+  "contract_version": "1.0.0",
+  "family": "paperboat.p2p",
+  "status": "approved",
+  "artifacts": [
+    { "id": "p2p.contracts", "path": "contracts.md", "type": "specification", "sha256": "02dd91974a7026161a636734aea00cf8059f2dcca3a57c98b36e3e2b37f2494b", "consumers": ["paperboat", "paperboat-server", "paperboat-tunnel"] },
+    { "id": "p2p.endpoint-certificate", "path": "schemas/endpoint-certificate.schema.json", "type": "json-schema", "sha256": "abd8099b44305b8fdcc83b12faa98f9d8df6316f9360e156476d8287153d1fe7", "consumers": ["paperboat", "paperboat-server"] },
+    { "id": "p2p.peer-attempt-descriptor", "path": "schemas/peer-attempt-descriptor.schema.json", "type": "json-schema", "sha256": "7854f6c8d8a800290bceea799f8bb400f54240bc19b95eeec9af80832e8c36e5", "consumers": ["paperboat", "paperboat-server"] },
+    { "id": "p2p.relay-admission", "path": "schemas/relay-admission.schema.json", "type": "json-schema", "sha256": "8b45a58635216974d6691f234dc27d332aa242428be4e881153b7a023794fc62", "consumers": ["paperboat", "paperboat-server", "paperboat-tunnel"] },
+    { "id": "p2p.file-transfer-e2ee", "path": "schemas/file-transfer-e2ee.schema.json", "type": "json-schema", "sha256": "45f3ec8d286f8e10036cbaa1698fb15033a19391eb6d84912d37f7c1e03284d9", "consumers": ["paperboat", "paperboat-server", "paperboat-tunnel"] },
+    { "id": "p2p.managed-ssh", "path": "schemas/managed-ssh.schema.json", "type": "json-schema", "sha256": "7f58fcab3a0582934215e2826310df66c8775813e03f2badd4f6402dffb2337b", "consumers": ["paperboat", "paperboat-server"] },
+    { "id": "p2p.endpoint-certificate.vector", "path": "fixtures/endpoint-certificate.json", "type": "signing-vector", "sha256": "9ed0e4b5283ff905fcc6282d1448112db577e81b2b827c3dbdbf0185ab4a5c96", "consumers": ["paperboat", "paperboat-server"] },
+    { "id": "p2p.vectors", "path": "fixtures/vectors.ndjson", "type": "contract-vectors", "sha256": "f405187d724f2add375c9b6872de3a7b52beccac399953b8bea2e45a712ec423", "consumers": ["paperboat", "paperboat-server", "paperboat-tunnel"] }
+  ]
+}

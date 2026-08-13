@@ -10,6 +10,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
 )
 
 var ErrConfigRepositoryInvalid = errors.New("invalid config repository")
@@ -150,23 +152,7 @@ func writePrivateAtomic(path string, data []byte) error {
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return errors.Join(ErrConfigRepositoryInvalid, err)
 	}
-	temporary, err := os.CreateTemp(parent, ".paperboat-config-*")
-	if err != nil {
-		return err
-	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-	if err = temporary.Chmod(0o600); err == nil {
-		_, err = temporary.Write(data)
-	}
-	if err == nil {
-		err = temporary.Sync()
-	}
-	err = errors.Join(err, temporary.Close())
-	if err != nil {
-		return err
-	}
-	return os.Rename(temporaryPath, path)
+	return atomicfile.Write(path, data, atomicfile.Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1})
 }
 
 func canonicalAbsolutePath(path string) bool {

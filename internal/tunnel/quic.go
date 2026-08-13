@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/protocol"
 	"github.com/pinksaucepasta/paperboat/internal/resolver"
 	"github.com/quic-go/quic-go"
 )
@@ -25,6 +26,7 @@ const (
 	nativeRoleControl byte = 1
 	nativeRoleInput   byte = 2
 	nativeRoleOutput  byte = 3
+	nativeRoleUnified byte = 4
 	nativeBindingSize      = 32
 	nativeMaxRecord        = 1 << 20
 	nativeStructured  byte = 1
@@ -50,6 +52,23 @@ type preparedNativeTerminal struct {
 	queue      int
 	once       sync.Once
 }
+
+type nativeStream interface {
+	io.ReadWriteCloser
+	SetWriteDeadline(time.Time) error
+}
+
+type nativeStreamGroup interface {
+	OpenStream(context.Context) (nativeStream, error)
+	Close() error
+}
+
+type quicNativeStreamGroup struct{ connection *quic.Conn }
+
+func (g quicNativeStreamGroup) OpenStream(ctx context.Context) (nativeStream, error) {
+	return g.connection.OpenStreamSync(ctx)
+}
+func (g quicNativeStreamGroup) Close() error { return g.connection.CloseWithError(0, "closed") }
 
 func (p *preparedNativeTerminal) Attach(ctx context.Context) (Conn, error) {
 	var result Conn
@@ -85,6 +104,7 @@ type terminalTransportError struct {
 }
 
 var errInvalidNativeWelcome = errors.New("helper returned an invalid native protocol welcome")
+var ErrPeerStreamOpen = errors.New("peer application stream open failed")
 
 func (e *terminalTransportError) Error() string {
 	return fmt.Sprintf("%s terminal transport unavailable: %v", e.transport, e.cause)
@@ -176,47 +196,87 @@ func (t *QUICTunnel) dialTransport(ctx context.Context, target *resolver.Termina
 }
 
 func authenticateNativeConnection(ctx context.Context, connection *quic.Conn, target *resolver.TerminalTarget) (*nativeMessageConnection, error) {
+	return authenticateNativeStreamGroup(ctx, quicNativeStreamGroup{connection: connection}, target, "QUIC")
+}
+
+func authenticateNativeStreamGroup(ctx context.Context, connection nativeStreamGroup, target *resolver.TerminalTarget, transport string) (*nativeMessageConnection, error) {
 	var id [16]byte
 	if _, err := io.ReadFull(rand.Reader, id[:]); err != nil {
-		_ = connection.CloseWithError(1, "random_failed")
+		_ = connection.Close()
 		return nil, err
 	}
-	control, err := connection.OpenStreamSync(ctx)
+	control, err := connection.OpenStream(ctx)
 	if err != nil {
-		_ = connection.CloseWithError(1, "control_failed")
-		return nil, &terminalTransportError{transport: "QUIC", cause: err}
+		_ = connection.Close()
+		return nil, errors.Join(ErrPeerStreamOpen, &terminalTransportError{transport: transport, cause: err})
 	}
 	if err := writeNativePreface(control, nativeRoleControl, id, nil, target.Auth.Token); err != nil {
-		_ = connection.CloseWithError(1, "preface_failed")
-		return nil, classifyNativeHandshakeError(ctx, err)
+		_ = connection.Close()
+		return nil, classifyNativeHandshakeError(ctx, transport, err)
 	}
 	message := newNativeMessageConnection(connection, control)
 	binding, err := nativeHandshake(ctx, message)
 	if err != nil {
 		_ = message.Close()
-		return nil, classifyNativeHandshakeError(ctx, err)
+		return nil, classifyNativeHandshakeError(ctx, transport, err)
 	}
-	input, err := connection.OpenStreamSync(ctx)
-	if err == nil {
-		err = writeNativePreface(input, nativeRoleInput, id, binding, "")
-	}
-	if err != nil {
-		_ = message.Close()
-		return nil, &terminalTransportError{transport: "QUIC", cause: err}
-	}
-	output, err := connection.OpenStreamSync(ctx)
-	if err == nil {
-		err = writeNativePreface(output, nativeRoleOutput, id, binding, "")
-	}
-	if err != nil {
-		_ = message.Close()
-		return nil, &terminalTransportError{transport: "QUIC", cause: err}
+	var input, output nativeStream
+	// The host admits auxiliary streams in this order. Opening concurrently
+	// allows relay multiplexing to deliver output before input, causing a
+	// stream-scoped Noise authority mismatch even though the transport is valid.
+	for _, role := range []byte{nativeRoleInput, nativeRoleOutput} {
+		stream, openErr := connection.OpenStream(ctx)
+		if openErr == nil {
+			openErr = writeNativePreface(stream, role, id, binding, "")
+		}
+		if openErr != nil {
+			if stream != nil {
+				_ = stream.Close()
+			}
+			if input != nil {
+				_ = input.Close()
+			}
+			if output != nil {
+				_ = output.Close()
+			}
+			_ = message.Close()
+			return nil, &terminalTransportError{transport: transport, cause: openErr}
+		}
+		if role == nativeRoleInput {
+			input = stream
+		} else {
+			output = stream
+		}
 	}
 	message.attach(input, output)
 	return message, nil
 }
 
-func classifyNativeHandshakeError(ctx context.Context, err error) error {
+func authenticateUnifiedNativeStream(ctx context.Context, connection nativeStreamGroup, target *resolver.TerminalTarget, transport string) (*nativeMessageConnection, error) {
+	var id [16]byte
+	if _, err := io.ReadFull(rand.Reader, id[:]); err != nil {
+		_ = connection.Close()
+		return nil, err
+	}
+	control, err := connection.OpenStream(ctx)
+	if err != nil {
+		_ = connection.Close()
+		return nil, errors.Join(ErrPeerStreamOpen, &terminalTransportError{transport: transport, cause: err})
+	}
+	if err := writeNativePreface(control, nativeRoleUnified, id, nil, target.Auth.Token); err != nil {
+		_ = connection.Close()
+		return nil, classifyNativeHandshakeError(ctx, transport, err)
+	}
+	message := newNativeMessageConnection(connection, control)
+	message.unified = true
+	if _, err := nativeHandshake(ctx, message); err != nil {
+		_ = message.Close()
+		return nil, classifyNativeHandshakeError(ctx, transport, err)
+	}
+	return message, nil
+}
+
+func classifyNativeHandshakeError(ctx context.Context, transport string, err error) error {
 	if err == nil {
 		return nil
 	}
@@ -227,7 +287,7 @@ func classifyNativeHandshakeError(ctx context.Context, err error) error {
 	if errors.As(err, &remote) && !remote.Retryable || errors.Is(err, errInvalidNativeWelcome) {
 		return err
 	}
-	return &terminalTransportError{transport: "QUIC", cause: err}
+	return &terminalTransportError{transport: transport, cause: err}
 }
 
 func nativeEndpoint(target *resolver.TerminalTarget) (string, string, error) {
@@ -253,7 +313,7 @@ func certificateError(err error) bool {
 }
 
 func nativeHandshake(ctx context.Context, message helperMessageConnection) ([]byte, error) {
-	payload, _ := json.Marshal(map[string]any{"min_version": helperProtocolVersion, "max_version": helperProtocolVersion, "capabilities": []string{"terminal.v1", "health.v1"}})
+	payload, _ := json.Marshal(map[string]any{"min_version": helperProtocolVersion, "max_version": helperProtocolVersion, "capabilities": helperCapabilities()})
 	id := helperID("req_")
 	if err := writeHelperFrame(ctx, message, helperFrame{Type: "hello", RequestID: id, Version: helperProtocolVersion, Payload: payload}); err != nil {
 		return nil, err
@@ -277,15 +337,16 @@ func nativeHandshake(ctx context.Context, message helperMessageConnection) ([]by
 }
 
 type nativeMessageConnection struct {
-	connection *quic.Conn
-	control    *quic.Stream
-	input      *quic.Stream
-	output     *quic.Stream
+	connection nativeStreamGroup
+	control    nativeStream
+	input      nativeStream
+	output     nativeStream
 	ctx        context.Context
 	cancel     context.CancelFunc
 	reads      chan nativeMessage
 	writeMu    sync.Mutex
 	closeOnce  sync.Once
+	unified    bool
 }
 type nativeMessage struct {
 	kind helperMessageType
@@ -293,19 +354,25 @@ type nativeMessage struct {
 	err  error
 }
 
-func newNativeMessageConnection(connection *quic.Conn, control *quic.Stream) *nativeMessageConnection {
+func newNativeMessageConnection(connection nativeStreamGroup, control nativeStream) *nativeMessageConnection {
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &nativeMessageConnection{connection: connection, control: control, ctx: ctx, cancel: cancel, reads: make(chan nativeMessage, 2)}
 	go c.read(control, true)
 	return c
 }
-func (c *nativeMessageConnection) attach(input, output *quic.Stream) {
+func (c *nativeMessageConnection) attach(input, output nativeStream) {
 	c.input, c.output = input, output
 	go c.read(output, false)
 }
 func (c *nativeMessageConnection) read(stream io.Reader, typed bool) {
 	for {
 		kind, data, err := readNativeRecord(stream, typed)
+		// Auxiliary output closure is independent of the authenticated control
+		// stream. Do not turn it into a connection-wide EOF before control can
+		// deliver the terminal result.
+		if err != nil && !typed {
+			return
+		}
 		messageKind := helperBinaryMessage
 		if kind == nativeStructured {
 			messageKind = helperStructuredMessage
@@ -338,7 +405,7 @@ func (c *nativeMessageConnection) WriteMessage(ctx context.Context, kind helperM
 	recordKind := nativeStructured
 	if kind == helperBinaryMessage {
 		recordKind = nativeBinary
-		if len(data) > 0 && data[0] == 1 {
+		if !c.unified && len(data) > 0 && (data[0] == protocol.TerminalInputOpcode || data[0] == protocol.TerminalEOFOpcode) {
 			if c.input == nil {
 				return errors.New("native input stream unavailable")
 			}
@@ -367,7 +434,23 @@ func (c *nativeMessageConnection) WriteMessage(ctx context.Context, kind helperM
 	return err
 }
 func (c *nativeMessageConnection) Close() error {
-	c.closeOnce.Do(func() { c.cancel(); _ = c.connection.CloseWithError(0, "closed") })
+	c.closeOnce.Do(func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		for _, stream := range []nativeStream{c.control, c.input, c.output} {
+			if stream == nil {
+				continue
+			}
+			if half, ok := stream.(interface{ CloseWrite() error }); ok {
+				_ = half.CloseWrite()
+			}
+			if graceful, ok := stream.(interface{ WaitWriteClosed(context.Context) error }); ok {
+				_ = graceful.WaitWriteClosed(closeCtx)
+			}
+		}
+		c.cancel()
+		_ = c.connection.Close()
+	})
 	return nil
 }
 
@@ -380,6 +463,9 @@ func writeNativePreface(w io.Writer, role byte, id [16]byte, binding []byte, tok
 	binary.BigEndian.PutUint16(buffer[24:26], uint16(len(token)))
 	copy(buffer[26:], binding)
 	copy(buffer[26+len(binding):], token)
+	if bound, ok := w.(interface{ WriteFirst([]byte) error }); ok {
+		return bound.WriteFirst(buffer)
+	}
 	return writeNativeFull(w, buffer)
 }
 func readNativeRecord(r io.Reader, typed bool) (byte, []byte, error) {

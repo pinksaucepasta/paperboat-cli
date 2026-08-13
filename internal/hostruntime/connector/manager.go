@@ -38,6 +38,7 @@ type Admission struct {
 	Generation         uint64
 	EdgePool           string
 	EdgeNodeID         string
+	RelayHTTPEndpoint  string
 	Endpoint           EdgeEndpoint
 	Routes             []RouteHandoff
 	ProtocolVersion    string

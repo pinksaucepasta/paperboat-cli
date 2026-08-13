@@ -58,7 +58,7 @@ func purgeSystemInstallation(ctx context.Context) error {
 		arguments := append([]string{"reset-failed"}, units...)
 		_ = exec.CommandContext(ctx, "/usr/bin/systemctl", arguments...).Run()
 	}
-	paths := []string{"/usr/local/libexec/paperboat", "/var/lib/paperboat", "/var/run/paperboat", "/usr/local/bin/pb"}
+	paths := []string{"/usr/local/libexec/paperboat", "/var/lib/paperboat-installer", "/var/lib/paperboat", "/var/run/paperboat", "/usr/local/bin/pb"}
 	if runtime.GOOS == "darwin" {
 		paths = []string{"/Library/PrivilegedHelperTools/Paperboat", "/Library/Application Support/Paperboat", "/var/run/paperboat", "/usr/local/bin/pb"}
 	}

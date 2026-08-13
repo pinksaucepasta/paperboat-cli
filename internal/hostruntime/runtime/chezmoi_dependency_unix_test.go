@@ -13,6 +13,37 @@ import (
 	"testing"
 )
 
+func TestChezmoiDependencyWriteIsAtomicAndRejectsSymlinkDestination(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "chezmoi")
+	if err := writeDependencyAtomic(path, []byte("first"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDependencyAtomic(path, []byte("second"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil || string(body) != "second" {
+		t.Fatalf("body=%q error=%v", body, err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Fatalf("mode=%v", info.Mode())
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(root, "elsewhere"), path); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDependencyAtomic(path, []byte("unsafe"), 0o700); err == nil {
+		t.Fatal("symlink destination was replaced")
+	}
+}
+
 func TestVerifiedCachedChezmoiRejectsTampering(t *testing.T) {
 	archive := testChezmoiArchive(t, tar.TypeReg, []byte("binary"))
 	sum := sha256.Sum256(archive)

@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -85,6 +86,15 @@ func TestEnrollBindsKeyAndPersistsPrivateIdentity(t *testing.T) {
 	public, publicErr := base64.RawURLEncoding.DecodeString(publicKey)
 	if payloadErr != nil || signatureErr != nil || publicErr != nil || !ed25519.Verify(ed25519.PublicKey(public), payload, signature) {
 		t.Fatal("helper proof signature is invalid")
+	}
+	proofSource := ProofSource{StateRoot: stateRoot, Clock: func() time.Time { return time.Date(2098, 1, 1, 0, 0, 0, 0, time.UTC) }}
+	if _, err := proofSource.Proof(context.Background(), "op_host_keys_0001", http.MethodPut, "/v1/machines/machine_1/ssh-host-keys", []byte(`{"keys":[]}`)); err != nil {
+		t.Fatalf("PUT machine proof: %v", err)
+	}
+	for _, method := range []string{http.MethodGet, http.MethodPatch, http.MethodDelete} {
+		if _, err := proofSource.Proof(context.Background(), "op_rejected_0001", method, "/v1/resource", nil); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("method %s error=%v", method, err)
+		}
 	}
 }
 

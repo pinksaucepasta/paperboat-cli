@@ -3,7 +3,9 @@ package connector
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"io"
@@ -14,10 +16,31 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pinksaucepasta/paperboat/internal/httptransport"
+
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/auth"
 )
 
 var ErrAdmissionSourceInvalid = errors.New("invalid connector admission source")
+
+func connectorRouteBinding(routes []RouteHandoff) string {
+	hash := sha256.New()
+	var size [8]byte
+	binary.BigEndian.PutUint64(size[:], uint64(len(routes)))
+	_, _ = hash.Write(size[:])
+	for _, route := range routes {
+		for _, value := range []string{route.RouteID, route.Kind, route.PublicHost, route.ProxyName, route.LocalTarget.Host} {
+			binary.BigEndian.PutUint64(size[:], uint64(len(value)))
+			_, _ = hash.Write(size[:])
+			_, _ = io.WriteString(hash, value)
+		}
+		binary.BigEndian.PutUint64(size[:], route.Revision)
+		_, _ = hash.Write(size[:])
+		binary.BigEndian.PutUint64(size[:], uint64(route.LocalTarget.Port))
+		_, _ = hash.Write(size[:])
+	}
+	return base64.RawURLEncoding.EncodeToString(hash.Sum(nil))
+}
 
 type IdentityTokenSource interface {
 	Token(context.Context) (string, error)
@@ -69,6 +92,7 @@ type admissionResponse struct {
 	Generation         uint64                  `json:"connector_generation"`
 	EdgePool           string                  `json:"edge_pool"`
 	EdgeNodeID         string                  `json:"edge_node_id"`
+	RelayHTTPEndpoint  string                  `json:"relay_http_endpoint"`
 	EdgeEndpoint       EdgeEndpoint            `json:"edge_endpoint"`
 	Routes             []RouteHandoff          `json:"routes"`
 	ProtocolVersion    string                  `json:"protocol_version"`
@@ -97,7 +121,7 @@ func NewHTTPSAdmissionSource(config AdmissionSourceConfig) (*HTTPSAdmissionSourc
 	}
 	transport := config.Transport
 	if transport == nil {
-		transport = http.DefaultTransport
+		transport = httptransport.Default()
 	}
 	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return ErrAdmissionSourceInvalid }}
 	return &HTTPSAdmissionSource{config: config, endpoint: endpoint, client: client}, nil
@@ -144,7 +168,7 @@ func (s *HTTPSAdmissionSource) Admission(ctx context.Context) (Admission, error)
 		return Admission{}, ErrAdmissionSourceInvalid
 	}
 	var document admissionResponse
-	if strictJSON(body, &document) != nil || document.OperationID != operationID || document.EnvironmentID != s.config.EnvironmentID || document.MachineID != s.config.MachineID || document.ConnectorID != s.config.ConnectorID || document.EdgePool != s.config.EdgePool || !identifierPattern.MatchString(document.EdgeNodeID) || document.ProtocolVersion != "1.0" || document.Generation == 0 || len(document.Credential) < 32 || len(document.Credential) > 8192 || !validCapabilities(document.Capabilities) || !validEndpoint(document.EdgeEndpoint) || !validRoutes(document.Routes) || !validFileTransferPolicy(document.FileTransferPolicy) {
+	if strictJSON(body, &document) != nil || document.OperationID != operationID || document.EnvironmentID != s.config.EnvironmentID || document.MachineID != s.config.MachineID || document.ConnectorID != s.config.ConnectorID || document.EdgePool != s.config.EdgePool || !identifierPattern.MatchString(document.EdgeNodeID) || document.ProtocolVersion != "1.0" || document.Generation == 0 || len(document.Credential) < 32 || len(document.Credential) > 8192 || !validCapabilities(document.Capabilities) || !validEndpoint(document.EdgeEndpoint) || !validRelayHTTPEndpoint(document.RelayHTTPEndpoint) || !validRoutes(document.Routes) || !validFileTransferPolicy(document.FileTransferPolicy) {
 		return Admission{}, ErrAdmissionSourceInvalid
 	}
 	claims, err := s.config.Verifier.Verify(ctx, document.Credential, auth.Policy{Issuer: s.config.Issuer, Audience: "paperboat-edge", CredentialClass: "connector_admission", Scopes: []string{"connector:admit"}, EnvironmentID: s.config.EnvironmentID, MachineID: s.config.MachineID, ConnectorID: s.config.ConnectorID, ConnectorGeneration: document.Generation, EdgePool: s.config.EdgePool, EdgeNodeID: document.EdgeNodeID, MaxLifetime: 5 * time.Minute, SingleUse: true})
@@ -152,10 +176,15 @@ func (s *HTTPSAdmissionSource) Admission(ctx context.Context) (Admission, error)
 		return Admission{}, err
 	}
 	expires := time.Unix(claims.ExpiresAt, 0).UTC()
-	if claims.JTI == "" || claims.EdgePool != s.config.EdgePool || !expires.After(s.config.Clock.Now()) || claims.FileTransferPolicy == nil || *claims.FileTransferPolicy != document.FileTransferPolicy {
+	if claims.JTI == "" || claims.EdgePool != s.config.EdgePool || claims.RouteBinding != connectorRouteBinding(document.Routes) || !expires.After(s.config.Clock.Now()) || claims.FileTransferPolicy == nil || *claims.FileTransferPolicy != document.FileTransferPolicy {
 		return Admission{}, ErrAdmissionSourceInvalid
 	}
-	return Admission{OperationID: document.OperationID, JTI: claims.JTI, Credential: document.Credential, EnvironmentID: document.EnvironmentID, MachineID: document.MachineID, ConnectorID: document.ConnectorID, Generation: document.Generation, EdgePool: claims.EdgePool, EdgeNodeID: claims.EdgeNodeID, Endpoint: document.EdgeEndpoint, Routes: append([]RouteHandoff(nil), document.Routes...), ProtocolVersion: document.ProtocolVersion, ExpiresAt: expires, FileTransferPolicy: document.FileTransferPolicy}, nil
+	return Admission{OperationID: document.OperationID, JTI: claims.JTI, Credential: document.Credential, EnvironmentID: document.EnvironmentID, MachineID: document.MachineID, ConnectorID: document.ConnectorID, Generation: document.Generation, EdgePool: claims.EdgePool, EdgeNodeID: claims.EdgeNodeID, RelayHTTPEndpoint: document.RelayHTTPEndpoint, Endpoint: document.EdgeEndpoint, Routes: append([]RouteHandoff(nil), document.Routes...), ProtocolVersion: document.ProtocolVersion, ExpiresAt: expires, FileTransferPolicy: document.FileTransferPolicy}, nil
+}
+
+func validRelayHTTPEndpoint(value string) bool {
+	parsed, err := url.Parse(value)
+	return err == nil && parsed.Scheme == "https" && parsed.Hostname() != "" && parsed.User == nil && parsed.Path == "" && parsed.RawQuery == "" && parsed.Fragment == ""
 }
 
 func validFileTransferPolicy(policy auth.FileTransferPolicy) bool {

@@ -4,6 +4,8 @@ package runtime
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
@@ -11,7 +13,85 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	hostservice "github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
 )
+
+func TestPrivatePreviewDescriptorPublishesOnlyLoopbackReadiness(t *testing.T) {
+	root := t.TempDir()
+	name := "remote-docs"
+	digest := sha256.Sum256([]byte(name))
+	path := filepath.Join(root, "previews", "active", hex.EncodeToString(digest[:8])+".json")
+	expires := time.Now().UTC().Add(time.Hour)
+	remote := &PrivatePreviewRuntimeDescriptor{MachineID: "machine_1", MachineName: "Studio", EnvironmentID: "env_1", MachineGeneration: 4, TargetPort: 3000}
+	descriptor := PreviewRuntimeDescriptor{Schema: "paperboat.preview-runtime/v1", Name: name, BindAddress: "127.0.0.1", ServiceGeneration: 5, ExpiresAt: &expires, ServiceDefinition: filepath.Join(root, "service"), PrivateRemote: remote}
+	if err := writePreviewRuntimeDescriptor(path, descriptor); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := ReadPrivatePreviewService(root, name)
+	if err != nil || loaded != *remote {
+		t.Fatalf("loaded=%+v err=%v", loaded, err)
+	}
+	if err := MarkPrivatePreviewServiceReady(root, name, "http://127.0.0.1:4567"); err != nil {
+		t.Fatal(err)
+	}
+	ready, err := readPreviewRuntimeDescriptor(path)
+	if err != nil || ready.Port != 4567 || ready.Record == nil || ready.Record.URL != "http://127.0.0.1:4567" || ready.Record.TargetPort != 3000 || ready.Record.State != "ready" {
+		t.Fatalf("ready=%+v err=%v", ready, err)
+	}
+	for _, invalid := range []string{"http://0.0.0.0:4567", "https://127.0.0.1:4567", "http://127.0.0.1:4567/path"} {
+		if err := MarkPrivatePreviewServiceReady(root, name, invalid); !errors.Is(err, ErrProductionInvalid) {
+			t.Fatalf("url=%q err=%v", invalid, err)
+		}
+	}
+	if err := BeginPrivatePreviewService(root, name); err != nil {
+		t.Fatal(err)
+	}
+	restarting, err := readPreviewRuntimeDescriptor(path)
+	if err != nil || restarting.Port != 0 || restarting.Record != nil {
+		t.Fatalf("restarting=%+v err=%v", restarting, err)
+	}
+}
+
+func TestPrivatePreviewPolicyCapFailsWithListStopRecovery(t *testing.T) {
+	root := t.TempDir()
+	expires := time.Now().UTC().Add(time.Hour)
+	existing := PreviewRuntimeDescriptor{Schema: "paperboat.preview-runtime/v1", Name: "existing", BindAddress: "127.0.0.1", ServiceGeneration: 1, ExpiresAt: &expires, ServiceDefinition: filepath.Join(root, "existing.service"), PrivateRemote: &PrivatePreviewRuntimeDescriptor{MachineID: "machine_1", MachineName: "Studio", EnvironmentID: "env_1", MachineGeneration: 1, TargetPort: 3000}}
+	if err := writePreviewRuntimeDescriptor(filepath.Join(root, "previews", "active", "existing.json"), existing); err != nil {
+		t.Fatal(err)
+	}
+	_, err := InstallPrivatePreviewService(context.Background(), filepath.Join(root, "pb"), root, "second", PrivatePreviewRuntimeDescriptor{MachineID: "machine_2", MachineName: "Office", EnvironmentID: "env_2", MachineGeneration: 1, TargetPort: 4000}, &expires, false, 1)
+	if !errors.Is(err, ErrPreviewAlreadyActive) || !strings.Contains(err.Error(), "pb preview revoke") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestPrivatePreviewInstallLockHonorsCancellation(t *testing.T) {
+	root := t.TempDir()
+	release, err := acquirePreviewInstallLock(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := acquirePreviewInstallLock(ctx, root); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestWaitPreviewServiceReadyReportsMissingWorkerImmediately(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	started := time.Now()
+	_, err := WaitPreviewServiceReady(ctx, t.TempDir(), "missing-preview")
+	if !errors.Is(err, ErrPreviewServiceMissing) {
+		t.Fatalf("err=%v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("missing worker took %s to report", elapsed)
+	}
+}
 
 func TestExpiredPreviewDescriptorCleansWithoutExtendingLifetime(t *testing.T) {
 	root := t.TempDir()
@@ -43,10 +123,10 @@ func TestExpiredPreviewDescriptorCleansWithoutExtendingLifetime(t *testing.T) {
 		}
 	}
 	joined := strings.Join(runner.calls, "\n")
-	if runtime.GOOS == "linux" && (!strings.Contains(joined, "systemctl --user disable --now paperboat-preview-") || !strings.Contains(joined, "systemctl --user daemon-reload")) {
+	if runtime.GOOS == "linux" && (strings.Contains(joined, "disable --now") || !strings.Contains(joined, "systemctl --user daemon-reload") || !strings.Contains(joined, "systemctl --user reset-failed")) {
 		t.Fatalf("retirement calls=%v", runner.calls)
 	}
-	if runtime.GOOS == "darwin" && !strings.Contains(joined, "launchctl bootout gui/") {
+	if runtime.GOOS == "darwin" && strings.Contains(joined, "launchctl bootout gui/") {
 		t.Fatalf("retirement calls=%v", runner.calls)
 	}
 }
@@ -77,6 +157,125 @@ type recordingPreviewRunner struct{ calls []string }
 func (r *recordingPreviewRunner) Run(_ context.Context, name string, args ...string) error {
 	r.calls = append(r.calls, strings.Join(append([]string{name}, args...), " "))
 	return nil
+}
+
+type scriptedPreviewRunner struct {
+	calls []string
+	run   func(string) error
+}
+
+type outputPreviewRunner struct {
+	recordingPreviewRunner
+	output string
+}
+
+func (r *outputPreviewRunner) Output(_ context.Context, name string, args ...string) (string, error) {
+	r.calls = append(r.calls, strings.Join(append([]string{name}, args...), " "))
+	return r.output, nil
+}
+
+func (r *scriptedPreviewRunner) Run(_ context.Context, name string, args ...string) error {
+	call := strings.Join(append([]string{name}, args...), " ")
+	r.calls = append(r.calls, call)
+	if r.run != nil {
+		return r.run(call)
+	}
+	return nil
+}
+
+func TestReconcileExpiredPreviewServiceWithMissingUnitAndDefinition(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	expires := time.Now().UTC().Add(-time.Minute)
+	definition, _, err := previewServiceDefinition(root, "stale", runtime.GOOS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "previews", "active", "stale.json")
+	if err := writePreviewRuntimeDescriptor(path, PreviewRuntimeDescriptor{Schema: "paperboat.preview-runtime/v1", Name: "stale", Port: 3000, ExpiresAt: &expires, ServiceDefinition: definition}); err != nil {
+		t.Fatal(err)
+	}
+	runner := &scriptedPreviewRunner{run: func(call string) error {
+		if runtime.GOOS == "linux" && strings.Contains(call, "disable --now") {
+			return &hostservice.CommandError{Tool: "systemctl", Cause: errors.New("exit status 1"), Output: "Failed to disable unit: Unit paperboat-preview.service does not exist"}
+		}
+		if runtime.GOOS == "linux" && strings.Contains(call, "reset-failed") {
+			return &hostservice.CommandError{Tool: "systemctl", Cause: errors.New("exit status 1"), Output: "Unit paperboat-preview.service not loaded"}
+		}
+		if runtime.GOOS == "darwin" && strings.Contains(call, "bootout") {
+			return errors.New("No such process")
+		}
+		return nil
+	}}
+	if err := reconcileExpiredPreviewServices(context.Background(), root, time.Now().UTC(), runner); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale descriptor remains: %v", err)
+	}
+	joined := strings.Join(runner.calls, "\n")
+	if runtime.GOOS == "linux" && strings.Contains(joined, "reset-failed paperboat-preview-*.service") {
+		t.Fatalf("unexpected retirement calls: %v", runner.calls)
+	}
+}
+
+func TestResetFailedPreviewServicesEnumeratesExactUnits(t *testing.T) {
+	runner := &outputPreviewRunner{output: "● paperboat-preview-0123456789abcdef.service loaded failed failed\n" +
+		"paperboat-preview-fedcba9876543210.service loaded failed failed\n" +
+		"paperboat-preview-bad;touch.service loaded failed failed\n" +
+		"other.service loaded failed failed\n"}
+	if err := resetFailedPreviewServices(context.Background(), runner); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(runner.calls, "\n")
+	for _, unit := range []string{"paperboat-preview-0123456789abcdef.service", "paperboat-preview-fedcba9876543210.service"} {
+		if !strings.Contains(joined, "reset-failed "+unit) {
+			t.Fatalf("unit was not reset: %s calls=%v", unit, runner.calls)
+		}
+	}
+	if strings.Contains(joined, "bad;touch") || strings.Contains(joined, "reset-failed other.service") {
+		t.Fatalf("unsafe or foreign unit was reset: %v", runner.calls)
+	}
+}
+
+func TestWaitPreviewServiceReadyReportsFailedWorkerImmediately(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	expires := time.Now().UTC().Add(time.Hour)
+	definition, _, err := previewServiceDefinition(root, "failed", runtime.GOOS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(definition), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(definition, []byte("service"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "previews", "active", previewServiceInstance("failed")+".json")
+	if err := writePreviewRuntimeDescriptor(path, PreviewRuntimeDescriptor{Schema: "paperboat.preview-runtime/v1", Name: "failed", Port: 3000, ExpiresAt: &expires, ServiceDefinition: definition}); err != nil {
+		t.Fatal(err)
+	}
+	runner := &scriptedPreviewRunner{run: func(call string) error {
+		if strings.Contains(call, "is-active") {
+			return errors.New("inactive")
+		}
+		if strings.Contains(call, "is-failed") {
+			return nil
+		}
+		if runtime.GOOS == "darwin" && strings.Contains(call, "launchctl print") {
+			return errors.New("worker exited")
+		}
+		return nil
+	}}
+	started := time.Now()
+	_, err = waitPreviewServiceReady(context.Background(), root, "failed", runner)
+	if !errors.Is(err, ErrPreviewServiceFailed) {
+		t.Fatalf("err=%v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("failed worker took %s to report", elapsed)
+	}
 }
 
 func TestRemoveAllPreviewServicesRetiresOnlyDurableEntries(t *testing.T) {
@@ -147,9 +346,6 @@ func TestRemoveAllPreviewServicesRetainsDescriptorWhenStopFails(t *testing.T) {
 }
 
 func TestCoordinatorPreviewRecoveryOwnsChildrenAndContinuesPastBadDescriptors(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("requires a Unix process")
-	}
 	root := t.TempDir()
 	executable := filepath.Join(root, "preview-runner")
 	script := "#!/bin/sh\ntrap 'exit 0' INT TERM\nprintf '%s' \"$$\" > \"$PAPERBOAT_TEST_PID_FILE\"\nwhile :; do sleep 1; done\n"

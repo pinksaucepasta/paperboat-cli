@@ -21,8 +21,7 @@ import (
 
 type ReceiveInstallConfig struct {
 	StateRoot, WorkspaceRoot, ControlURL, MachineID, ListenAddress string
-	Artifact                                                       bootstrap.ArtifactManifest
-	ArtifactPublicKey                                              string
+	Artifact                                                       bootstrap.ArtifactTarget
 }
 
 func InstallReceive(ctx context.Context, config ReceiveInstallConfig, stdin io.Reader, stdout, stderr io.Writer) error {
@@ -46,7 +45,7 @@ func InstallReceive(ctx context.Context, config ReceiveInstallConfig, stdin io.R
 	if err != nil {
 		return err
 	}
-	artifactPath, err := bootstrap.FetchVerifiedArtifact(ctx, config.Artifact, config.ArtifactPublicKey, filepath.Join(config.StateRoot, "artifacts"), artifactHTTPClient())
+	artifactPath, err := bootstrap.FetchVerifiedArtifact(ctx, config.Artifact, filepath.Join(config.StateRoot, "tuf"), artifactHTTPClient())
 	if err != nil {
 		return err
 	}
@@ -57,7 +56,7 @@ func InstallReceive(ctx context.Context, config ReceiveInstallConfig, stdin io.R
 	}
 	request := hostinstall.Request{
 		Schema: hostinstall.SchemaV1, Platform: runtime.GOOS, User: account.Username, UID: uid, Group: group.Name, GID: gid,
-		Executable: artifactPath, Artifact: config.Artifact, ArtifactPublicKey: config.ArtifactPublicKey,
+		Executable: artifactPath, Artifact: config.Artifact,
 		Home: account.HomeDir, Path: servicePath, StateRoot: config.StateRoot, WorkspaceRoot: config.WorkspaceRoot,
 		ControlURL: config.ControlURL, UserMachineID: config.MachineID, Shell: shell,
 		HelperListenAddress: config.ListenAddress, SetupMode: "receive",

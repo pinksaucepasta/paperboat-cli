@@ -169,7 +169,7 @@ func TestAutoPersistsQUICWinner(t *testing.T) {
 		t.Fatal(err)
 	}
 	preference := persisted["example.test"]
-	if preference.Transport != TerminalTransportQUIC || !preference.ExpiresAt.After(time.Now()) {
+	if preference.Transport != TerminalTransportDirect || !preference.ExpiresAt.After(time.Now()) {
 		t.Fatalf("preference = %#v", preference)
 	}
 }
@@ -179,8 +179,25 @@ func TestExpiredTransportPreferenceIsDiscarded(t *testing.T) {
 	selector, _ := NewTerminalTransportSelector(TerminalTransportAuto,
 		&selectorEstablisher{started: &qs, attached: &qa, closed: &qc},
 		&selectorEstablisher{started: &ws, attached: &wa, closed: &wc})
-	selector.preferences["example.test"] = terminalTransportPreference{Transport: TerminalTransportWSS, ExpiresAt: time.Now().Add(-time.Second)}
+	selector.preferences["example.test"] = terminalTransportPreference{Transport: TerminalTransportRelayWSS, ExpiresAt: time.Now().Add(-time.Second)}
 	if _, ok := selector.preferred("example.test"); ok {
 		t.Fatal("expired preference was retained")
+	}
+}
+
+func TestTransportPreferencePersistenceFailureIsRetained(t *testing.T) {
+	selector, _ := NewTerminalTransportSelector(TerminalTransportAuto, &selectorEstablisher{}, &selectorEstablisher{})
+	root := t.TempDir()
+	directory := filepath.Join(root, "blocked")
+	path := filepath.Join(directory, "preference.json")
+	if err := selector.SetPreferencePath(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(directory, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	selector.markPreferred("example.test", TerminalTransportDirect)
+	if selector.PreferenceError() == nil {
+		t.Fatal("preference persistence failure was discarded")
 	}
 }

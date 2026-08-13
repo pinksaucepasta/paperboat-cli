@@ -23,11 +23,11 @@ type fakeApplier struct {
 }
 
 type fakeUpdateActivator struct {
-	artifact bootstrap.ArtifactManifest
+	artifact bootstrap.ArtifactTarget
 	err      error
 }
 
-func (a *fakeUpdateActivator) Activate(_ context.Context, artifact bootstrap.ArtifactManifest) (string, error) {
+func (a *fakeUpdateActivator) Activate(_ context.Context, artifact bootstrap.ArtifactTarget) (string, error) {
 	a.artifact = artifact
 	return artifact.Version, a.err
 }
@@ -52,6 +52,85 @@ func TestNewAllowsRootPeerIdentity(t *testing.T) {
 	})
 	if err != nil || server.config.UID != 0 || server.config.GID != 0 {
 		t.Fatalf("server=%v error=%v", server, err)
+	}
+}
+
+func TestNewRejectsHeartbeatIntervalWithoutCallback(t *testing.T) {
+	root := t.TempDir()
+	_, err := New(Config{
+		SocketPath: filepath.Join(root, "host.sock"), StatePath: filepath.Join(root, "policy.json"),
+		UID: os.Getuid(), GID: os.Getgid(), Applier: &fakeApplier{}, Version: "test", HeartbeatInterval: time.Second,
+	})
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestServeListenerReportsReadyAndHeartbeatsFromAcceptLoop(t *testing.T) {
+	root, err := os.MkdirTemp("", "pb-hostservice-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	ready := make(chan struct{}, 1)
+	heartbeat := make(chan struct{}, 1)
+	server, err := New(Config{
+		SocketPath: filepath.Join(root, "host.sock"), StatePath: filepath.Join(root, "policy.json"),
+		UID: os.Getuid(), GID: os.Getgid(), Applier: &fakeApplier{}, Version: "test",
+		Ready:     func() error { ready <- struct{}{}; return nil },
+		Heartbeat: func() error { heartbeat <- struct{}{}; return nil }, HeartbeatInterval: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: server.config.SocketPath, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- server.serveListener(ctx, listener) }()
+	select {
+	case <-ready:
+	case <-time.After(time.Second):
+		t.Fatal("readiness was not reported")
+	}
+	select {
+	case <-heartbeat:
+	case <-time.After(time.Second):
+		t.Fatal("accept loop did not report heartbeat")
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("run error=%v", err)
+	}
+}
+
+func TestHostServiceSocketUsesEnrolledUserAndGroupMode(t *testing.T) {
+	root, err := os.MkdirTemp("", "pb-hostservice-mode-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	server, err := New(Config{
+		SocketPath: filepath.Join(root, "host.sock"), StatePath: filepath.Join(root, "policy.json"),
+		UID: os.Getuid(), GID: os.Getgid(), Applier: &fakeApplier{}, Version: "test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := server.listen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	info, err := os.Lstat(server.config.SocketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o660 || info.Mode()&os.ModeSocket == 0 {
+		t.Fatalf("socket mode=%v", info.Mode())
 	}
 }
 
@@ -121,7 +200,7 @@ func TestProtocolAllowsOnlySingleSignedUpdateManifest(t *testing.T) {
 	activator := &fakeUpdateActivator{}
 	server := testServer(t, os.Getuid(), &fakeApplier{})
 	server.config.Updates = activator
-	artifact := &bootstrap.ArtifactManifest{Schema: bootstrap.ArtifactSchemaV1, Kind: bootstrap.ArtifactKindPB, Version: "2026.07.26"}
+	artifact := &bootstrap.ArtifactTarget{Schema: bootstrap.ArtifactTargetSchemaV1, Kind: bootstrap.ArtifactKindPB, Version: "2026.07.26"}
 	response := requestServer(t, server, Request{Schema: ProtocolV1, Operation: "activate_update", Artifact: artifact})
 	if response.ErrorCode != "" || response.UpdateVersion != artifact.Version || activator.artifact.Kind != bootstrap.ArtifactKindPB {
 		t.Fatalf("response=%+v activator=%+v", response, activator)

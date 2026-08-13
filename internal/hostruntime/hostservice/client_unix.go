@@ -26,7 +26,7 @@ func NewClient(socketPath string, timeout time.Duration) (*Client, error) {
 	return &Client{socketPath: socketPath, timeout: timeout}, nil
 }
 
-func (c *Client) Activate(ctx context.Context, artifact bootstrap.ArtifactManifest) (string, error) {
+func (c *Client) Activate(ctx context.Context, artifact bootstrap.ArtifactTarget) (string, error) {
 	dialer := net.Dialer{Timeout: c.timeout}
 	connection, err := dialer.DialContext(ctx, "unix", c.socketPath)
 	if err != nil {

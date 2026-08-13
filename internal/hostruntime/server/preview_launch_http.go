@@ -95,6 +95,10 @@ func NewPreviewLaunchHandler(config PreviewLaunchHandlerConfig) (http.Handler, e
 			_ = json.NewEncoder(w).Encode(map[string]any{"error": launchError})
 			return
 		}
+		// The initiating CLI binds the response to this exact launch operation.
+		// The control client may use a separate idempotency operation internally,
+		// but the machine response must echo the caller's request identity.
+		record.OperationID = input.OperationID
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-store")
 		_ = json.NewEncoder(w).Encode(record)

@@ -72,7 +72,7 @@ func admissionSourceFor(t *testing.T, responseBody func(admissionRequest) string
 }
 
 func validAdmissionResponse(input admissionRequest) string {
-	encoded, _ := json.Marshal(admissionResponse{OperationID: input.OperationID, EnvironmentID: input.EnvironmentID, MachineID: input.MachineID, ConnectorID: input.ConnectorID, Generation: 3, EdgePool: input.EdgePool, EdgeNodeID: "edge_1", EdgeEndpoint: EdgeEndpoint{Host: "edge.test", Port: 7000}, Routes: []RouteHandoff{{RouteID: "route_1", Revision: 1, Kind: "runtime_https_wss", PublicHost: "helper.test", ProxyName: "helper_1", LocalTarget: RouteTarget{Host: "127.0.0.1", Port: 8080}}}, ProtocolVersion: "1.0", Capabilities: []string{"terminal.v1"}, Credential: "test-only-connector-admission-credential", FileTransferPolicy: testFileTransferPolicy()})
+	encoded, _ := json.Marshal(admissionResponse{OperationID: input.OperationID, EnvironmentID: input.EnvironmentID, MachineID: input.MachineID, ConnectorID: input.ConnectorID, Generation: 3, EdgePool: input.EdgePool, EdgeNodeID: "edge_1", RelayHTTPEndpoint: "https://relay.test", EdgeEndpoint: EdgeEndpoint{Host: "edge.test", Port: 7000}, Routes: []RouteHandoff{{RouteID: "route_1", Revision: 1, Kind: "runtime_https_wss", PublicHost: "helper.test", ProxyName: "helper_1", LocalTarget: RouteTarget{Host: "127.0.0.1", Port: 8080}}}, ProtocolVersion: "1.0", Capabilities: []string{"terminal.v1"}, Credential: "test-only-connector-admission-credential", FileTransferPolicy: testFileTransferPolicy()})
 	return string(encoded)
 }
 
@@ -87,14 +87,28 @@ func TestHTTPSAdmissionSourceVerifiesExactBindingsAndReturnsCredential(t *testin
 			return auth.Claims{}, errors.New("incorrect policy")
 		}
 		transferPolicy := testFileTransferPolicy()
-		return auth.Claims{JTI: "jti_admit_0001", EdgePool: "default", EdgeNodeID: "edge_1", ExpiresAt: now.Add(time.Minute).Unix(), FileTransferPolicy: &transferPolicy}, nil
+		routes := []RouteHandoff{{RouteID: "route_1", Revision: 1, Kind: "runtime_https_wss", PublicHost: "helper.test", ProxyName: "helper_1", LocalTarget: RouteTarget{Host: "127.0.0.1", Port: 8080}}}
+		return auth.Claims{JTI: "jti_admit_0001", EdgePool: "default", EdgeNodeID: "edge_1", RouteBinding: connectorRouteBinding(routes), ExpiresAt: now.Add(time.Minute).Unix(), FileTransferPolicy: &transferPolicy}, nil
 	}))
 	admission, err := source.Admission(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if admission.Credential != "test-only-connector-admission-credential" || admission.Generation != 3 || admission.JTI != "jti_admit_0001" {
+	if admission.Credential != "test-only-connector-admission-credential" || admission.Generation != 3 || admission.JTI != "jti_admit_0001" || admission.RelayHTTPEndpoint != "https://relay.test" {
 		t.Fatalf("admission=%#v", admission)
+	}
+}
+
+func TestRelayHTTPEndpointValidation(t *testing.T) {
+	for _, value := range []string{"https://relay.test", "https://relay.test:443"} {
+		if !validRelayHTTPEndpoint(value) {
+			t.Fatalf("valid endpoint rejected: %q", value)
+		}
+	}
+	for _, value := range []string{"", "http://relay.test", "https://user@relay.test", "https://relay.test/path", "https://relay.test?query=1", "https://relay.test/#fragment"} {
+		if validRelayHTTPEndpoint(value) {
+			t.Fatalf("invalid endpoint accepted: %q", value)
+		}
 	}
 }
 

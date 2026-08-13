@@ -151,24 +151,6 @@ func TestCloseCodeUsesFrozenTransportCategories(t *testing.T) {
 	}
 }
 
-func decodeWire(t *testing.T, chunks []string) []byte {
-	t.Helper()
-	var wire []byte
-	for _, encoded := range chunks {
-		chunk, err := base64.StdEncoding.DecodeString(encoded)
-		if err != nil {
-			t.Fatal(err)
-		}
-		wire = append(wire, chunk...)
-	}
-	return wire
-}
-
-func readBinaryFrameError(wire []byte) error {
-	_, err := ReadBinaryFrame(bytes.NewReader(wire))
-	return err
-}
-
 func assertProtocolCode(t *testing.T, err error, code Code) {
 	t.Helper()
 	var protocolError *Error

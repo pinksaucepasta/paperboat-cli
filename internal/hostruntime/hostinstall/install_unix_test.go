@@ -4,13 +4,7 @@ package hostinstall
 
 import (
 	"bytes"
-	"crypto/ed25519"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/base64"
 	"encoding/binary"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"os"
 	"os/user"
@@ -41,8 +35,12 @@ func TestRemoveInstalledFilesDeletesOnlyAllowlistedHostState(t *testing.T) {
 	if err := os.MkdirAll(state, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	paths := installPaths{root: root, state: state, worker: filepath.Join(root, "pb"), metadata: filepath.Join(state, "install-metadata.json")}
-	removed := []string{paths.worker, paths.metadata, filepath.Join(state, "power-baseline.json"), filepath.Join(state, "availability-policy.json"), filepath.Join(state, "update-current.json"), filepath.Join(state, "update-journal.json"), filepath.Join(state, "update-rollbacks.json")}
+	paths := installPaths{root: root, installerState: state, runtimeState: state, worker: filepath.Join(root, "pb"), metadata: filepath.Join(state, "install-metadata.json")}
+	updateRoot := filepath.Join(state, "privileged-updates")
+	if err := os.Mkdir(updateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	removed := []string{paths.worker, paths.metadata, filepath.Join(state, "power-baseline.json"), filepath.Join(state, "availability-policy.json"), filepath.Join(state, "update-current.json"), filepath.Join(state, "update-journal.json"), filepath.Join(state, "update-rollbacks.json"), filepath.Join(updateRoot, "update-current.json"), filepath.Join(updateRoot, "update-journal.json"), filepath.Join(updateRoot, "update-rollbacks.json")}
 	for _, path := range removed {
 		if err := os.WriteFile(path, []byte("owned"), 0o600); err != nil {
 			t.Fatal(err)
@@ -60,8 +58,31 @@ func TestRemoveInstalledFilesDeletesOnlyAllowlistedHostState(t *testing.T) {
 			t.Fatalf("allowlisted path retained: %s (%v)", path, err)
 		}
 	}
+	if _, err := os.Lstat(updateRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("privileged update directory retained: %v", err)
+	}
 	if body, err := os.ReadFile(unrelated); err != nil || string(body) != "preserve" {
 		t.Fatalf("unrelated file changed: %q, %v", body, err)
+	}
+}
+
+func TestPlatformPathsKeepLinuxInstallerStateOutsideSystemdStateDirectory(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("systemd path contract is Linux-specific")
+	}
+	paths := platformPaths()
+	if paths.installerState == paths.runtimeState || filepath.Dir(paths.journal) != paths.installerState || filepath.Dir(paths.metadata) != paths.installerState {
+		t.Fatalf("installer state overlaps runtime state: %+v", paths)
+	}
+	if paths.legacyMetadata != filepath.Join(paths.runtimeState, "install-metadata.json") {
+		t.Fatalf("legacy metadata path=%q", paths.legacyMetadata)
+	}
+}
+
+func TestLoadInstallMetadataPreservesNotExist(t *testing.T) {
+	_, err := loadInstallMetadata(filepath.Join(t.TempDir(), "missing.json"), os.Getuid())
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("error=%v", err)
 	}
 }
 
@@ -158,26 +179,7 @@ func validRequest(t *testing.T) Request {
 	if err := os.WriteFile(executable, body, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	digest := sha256.Sum256(body)
-	manifest := bootstrap.ArtifactManifest{Schema: bootstrap.ArtifactSchemaV1, Kind: bootstrap.ArtifactKindPB, Version: "test", Platform: runtime.GOOS, Architecture: runtime.GOARCH, URL: "https://example.test/pb", ByteLength: int64(len(body)), SHA256: hex.EncodeToString(digest[:])}
-	public, private, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sign := func(value *bootstrap.ArtifactManifest) {
-		payload, _ := json.Marshal(struct {
-			Architecture string `json:"architecture"`
-			ByteLength   int64  `json:"byte_length"`
-			Kind         string `json:"kind"`
-			Platform     string `json:"platform"`
-			Schema       string `json:"schema"`
-			SHA256       string `json:"sha256"`
-			URL          string `json:"url"`
-			Version      string `json:"version"`
-		}{value.Architecture, value.ByteLength, value.Kind, value.Platform, value.Schema, value.SHA256, value.URL, value.Version})
-		value.Signature = base64.RawURLEncoding.EncodeToString(ed25519.Sign(private, payload))
-	}
-	sign(&manifest)
+	manifest := bootstrap.ArtifactTarget{Schema: bootstrap.ArtifactTargetSchemaV1, Kind: bootstrap.ArtifactKindPB, Version: "test", Platform: runtime.GOOS, Architecture: runtime.GOARCH, RepositoryURL: "https://updates.example.test/paperboat", TargetPath: "pb-" + runtime.GOOS + "-" + runtime.GOARCH}
 	state := t.TempDir()
 	state, err = filepath.EvalSymlinks(state)
 	if err != nil {
@@ -190,7 +192,7 @@ func validRequest(t *testing.T) Request {
 	return Request{
 		SetupMode: "host",
 		Schema:    SchemaV1, Platform: runtime.GOOS, User: account.Username, UID: uid, Group: group.Name, GID: gid,
-		Executable: executable, Artifact: manifest, ArtifactPublicKey: base64.RawURLEncoding.EncodeToString(public),
+		Executable: executable, Artifact: manifest,
 		Home: account.HomeDir, Path: "/usr/bin:/bin", StateRoot: state, WorkspaceRoot: account.HomeDir,
 		ControlURL: "https://control.example.test", UserMachineID: "um_test", Shell: shell,
 		HelperListenAddress: "127.0.0.1:8080",

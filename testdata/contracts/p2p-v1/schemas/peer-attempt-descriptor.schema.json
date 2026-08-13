@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://paperboat.dev/contracts/p2p-v1/peer-attempt-descriptor.schema.json",
+  "title": "Paperboat peer attempt descriptor v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "account_id", "device_id", "operation_id", "intent_id", "environment_id", "purpose", "consumer", "initiator_endpoint_id", "responder_endpoint_id", "role", "attempt_generation", "network_generation", "host_generation", "authorization_generation", "issued_at", "expires_at", "endpoint_certificates", "direct", "signaling", "relays", "policy"],
+  "properties": {
+    "version": { "const": 1 },
+    "account_id": { "$ref": "#/$defs/id" },
+    "device_id": { "$ref": "#/$defs/id" },
+    "operation_id": { "$ref": "#/$defs/id" },
+    "intent_id": { "$ref": "#/$defs/id" },
+    "environment_id": { "$ref": "#/$defs/id" },
+    "purpose": { "enum": ["interactive", "private_preview", "codex", "health_probe", "direct_probe", "file_transfer_key"] },
+    "consumer": { "enum": ["terminal", "exec", "ssh", "private_preview", "codex", "health_probe", "file_transfer_key"] },
+    "initiator_endpoint_id": { "$ref": "#/$defs/id" },
+    "responder_endpoint_id": { "$ref": "#/$defs/id" },
+    "role": { "enum": ["controlling", "controlled"] },
+    "attempt_generation": { "$ref": "#/$defs/generation" },
+    "network_generation": { "$ref": "#/$defs/generation" },
+    "host_generation": { "$ref": "#/$defs/generation" },
+    "authorization_generation": { "$ref": "#/$defs/generation" },
+    "issued_at": { "$ref": "#/$defs/time" },
+    "expires_at": { "$ref": "#/$defs/time" },
+    "endpoint_certificates": {
+      "type": "array", "minItems": 2, "maxItems": 2,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["endpoint_id", "certificate"],
+        "properties": {
+          "endpoint_id": { "$ref": "#/$defs/id" },
+          "certificate": { "type": "string", "pattern": "^[A-Za-z0-9_-]{230,568}$" }
+        }
+      }
+    },
+    "direct": {
+      "type": "object", "additionalProperties": false,
+      "required": ["ice_ufrag", "ice_password", "stun_urls"],
+      "properties": {
+        "ice_ufrag": { "type": "string", "pattern": "^[A-Za-z0-9_-]{16,64}$" },
+        "ice_password": { "type": "string", "pattern": "^[A-Za-z0-9_-]{32,128}$" },
+        "stun_urls": { "type": "array", "minItems": 1, "maxItems": 8, "uniqueItems": true, "items": { "type": "string", "pattern": "^stun:[A-Za-z0-9.-]+:[0-9]{1,5}$" } }
+      }
+    },
+    "signaling": { "$ref": "#/$defs/wss" },
+    "relays": { "type": "array", "maxItems": 8, "items": { "$ref": "#/$defs/relay" } },
+    "policy": {
+      "type": "object", "additionalProperties": false,
+      "required": ["allowed_paths", "relay_deadline_ms", "health_interval_ms", "max_candidates"],
+      "properties": {
+        "allowed_paths": { "type": "array", "minItems": 1, "maxItems": 3, "uniqueItems": true, "items": { "enum": ["direct_quic", "relay_quic", "relay_wss"] } },
+        "relay_deadline_ms": { "type": "integer", "minimum": 100, "maximum": 60000 },
+        "health_interval_ms": { "type": "integer", "minimum": 1000, "maximum": 300000 },
+        "max_candidates": { "type": "integer", "minimum": 1, "maximum": 64 }
+      }
+    },
+    "transfer": {
+      "type": "object", "additionalProperties": false,
+      "required": ["transfer_id", "generation", "expires_at"],
+      "properties": {
+        "transfer_id": { "$ref": "#/$defs/id" },
+        "generation": { "$ref": "#/$defs/generation" },
+        "expires_at": { "$ref": "#/$defs/time" }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "purpose": { "const": "direct_probe" } } },
+      "then": { "properties": { "policy": { "properties": { "allowed_paths": { "const": ["direct_quic"] } } } } },
+      "else": { "properties": { "policy": { "properties": { "allowed_paths": { "const": ["direct_quic", "relay_quic", "relay_wss"] } } } } }
+    },
+    {
+      "if": { "properties": { "purpose": { "const": "file_transfer_key" } }, "required": ["purpose"] },
+      "then": { "required": ["transfer"] },
+      "else": { "not": { "required": ["transfer"] } }
+    },
+    {
+      "oneOf": [
+        { "properties": { "purpose": { "const": "interactive" }, "consumer": { "enum": ["terminal", "exec", "ssh"] } } },
+        { "properties": { "purpose": { "const": "private_preview" }, "consumer": { "const": "private_preview" } } },
+        { "properties": { "purpose": { "const": "codex" }, "consumer": { "const": "codex" } } },
+        { "properties": { "purpose": { "const": "health_probe" }, "consumer": { "const": "health_probe" } } },
+        { "properties": { "purpose": { "const": "direct_probe" }, "consumer": { "const": "terminal" } } },
+        { "properties": { "purpose": { "const": "file_transfer_key" }, "consumer": { "const": "file_transfer_key" } } }
+      ]
+    }
+  ],
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$" },
+    "generation": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "time": { "type": "string", "format": "date-time", "pattern": "Z$" },
+    "token": { "type": "string", "pattern": "^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$", "maxLength": 8192 },
+    "wss": {
+      "type": "object", "additionalProperties": false,
+      "required": ["url", "credential", "subprotocol"],
+      "properties": {
+        "url": { "type": "string", "pattern": "^wss://[^/?#]+/v1/peer-signaling$" },
+        "credential": { "$ref": "#/$defs/token" },
+        "subprotocol": { "const": "paperboat.peer-signaling.v1" }
+      }
+    },
+    "relay": {
+      "type": "object", "additionalProperties": false,
+	  "required": ["region", "route_generation", "route_token", "pmtu_token", "pmtu_url", "expires_at"],
+	  "anyOf": [{ "required": ["quic_url"] }, { "required": ["wss_url"] }],
+      "properties": {
+        "region": { "$ref": "#/$defs/id" },
+        "route_generation": { "$ref": "#/$defs/generation" },
+        "quic_url": { "type": "string", "pattern": "^https://[^/?#]+/v1/peer-relay$" },
+        "wss_url": { "type": "string", "pattern": "^wss://[^/?#]+/v1/peer-relay$" },
+        "route_token": { "$ref": "#/$defs/token" },
+		"pmtu_token": { "$ref": "#/$defs/token" },
+		"pmtu_url": { "type": "string", "pattern": "^udp://[^/?#]+:[0-9]{1,5}$" },
+        "expires_at": { "$ref": "#/$defs/time" }
+      }
+    }
+  }
+}

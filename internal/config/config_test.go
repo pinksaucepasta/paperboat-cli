@@ -130,6 +130,16 @@ func TestLoadAppliesDialRetryDefaultWhenOmitted(t *testing.T) {
 	}
 }
 
+func TestLoadIgnoresRemovedPeerRaceOverrides(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"server_url":"https://api.example","connect":{"peer_relay_delay_milliseconds":5000,"peer_wss_delay_milliseconds":5000,"peer_connect_timeout_milliseconds":15000}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err != nil {
+		t.Fatalf("removed peer race overrides affected config loading: %v", err)
+	}
+}
+
 func TestLoadRejectsInvalidTerminalTransport(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(path, []byte(`{"connect":{"terminal_transport":"tcp"}}`), 0o600); err != nil {

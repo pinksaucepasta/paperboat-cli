@@ -682,6 +682,7 @@ func writeMergedTarget(root, relative string, merged mergedContent) error {
 	if err := ensurePrivateParent(root, filepath.Dir(target)); err != nil {
 		return err
 	}
+	//paperboat:allow-source-policy atomic-replacement owner=config-sync reason=validated-workspace-merge-staging
 	temporary, err := os.CreateTemp(filepath.Dir(target), ".paperboat-merge-*")
 	if err != nil {
 		return err
@@ -703,6 +704,7 @@ func writeMergedTarget(root, relative string, merged mergedContent) error {
 	} else if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
 		return statErr
 	}
+	//paperboat:allow-source-policy atomic-replacement owner=config-sync reason=validated-workspace-merge-publication
 	return os.Rename(temporaryPath, target)
 }
 

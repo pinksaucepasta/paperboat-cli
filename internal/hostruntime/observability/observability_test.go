@@ -93,6 +93,8 @@ func TestDefaultMetricVocabularyHasFixedCardinality(t *testing.T) {
 		{"paperboat_runtime_connector_retries_total", map[string]string{"transport": "quic", "result": "connected"}},
 		{"paperboat_runtime_connector_retries_total", map[string]string{"transport": "tcp_dedicated", "result": "connected"}},
 		{"paperboat_runtime_connector_retries_total", map[string]string{"transport": "tcp_mux", "result": "connected"}},
+		{"paperboat_runtime_network_changes_total", map[string]string{"reason": "default_route", "action": "rebind"}},
+		{"paperboat_runtime_network_generation", nil},
 		{"paperboat_runtime_terminal_events_total", map[string]string{"event": "slow_consumer"}},
 		{"paperboat_runtime_delivery_total", map[string]string{"kind": "preview", "result": "failed"}},
 		{"paperboat_runtime_cleanup_total", map[string]string{"kind": "upload", "result": "preserved"}},
@@ -108,6 +110,9 @@ func TestDefaultMetricVocabularyHasFixedCardinality(t *testing.T) {
 	}
 	if err := registry.Record("paperboat_runtime_delivery_total", 1, map[string]string{"kind": "customer_123", "result": "failed"}); !errors.Is(err, ErrInvalidLabels) {
 		t.Fatalf("unbounded label err=%v", err)
+	}
+	if err := registry.Record("paperboat_runtime_network_changes_total", 1, map[string]string{"reason": "en0", "action": "rebind"}); !errors.Is(err, ErrInvalidLabels) {
+		t.Fatalf("network identity label err=%v", err)
 	}
 }
 

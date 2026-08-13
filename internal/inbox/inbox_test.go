@@ -46,7 +46,7 @@ func TestDeliverResumesPartialAcrossPBRestartAndReturnsDurableRelativePath(t *te
 	downloads := t.TempDir()
 	data := []byte("exact transfer bytes")
 	client := &fakeClient{data: data}
-	receiver, err := New(Config{Client: client, MachineID: "machine_local", SessionID: "session_1", Path: filepath.Join(downloads, "Paperboat Inbox")})
+	_, err := New(Config{Client: client, MachineID: "machine_local", SessionID: "session_1", Path: filepath.Join(downloads, "Paperboat Inbox")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +58,7 @@ func TestDeliverResumesPartialAcrossPBRestartAndReturnsDurableRelativePath(t *te
 		t.Fatal(err)
 	}
 	// A new Inbox has no process-local state from the instance that wrote the partial.
-	receiver, err = New(Config{Client: client, MachineID: "machine_local", SessionID: "session_1", Path: filepath.Join(downloads, "Paperboat Inbox")})
+	receiver, err := New(Config{Client: client, MachineID: "machine_local", SessionID: "session_1", Path: filepath.Join(downloads, "Paperboat Inbox")})
 	if err != nil {
 		t.Fatal(err)
 	}

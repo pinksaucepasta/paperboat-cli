@@ -3,6 +3,7 @@ package serve
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -21,10 +22,14 @@ type Server struct {
 }
 
 func Start(handler http.Handler) (*Server, error) {
+	return StartLoopback(handler, 0)
+}
+
+func StartLoopback(handler http.Handler, port uint16) (*Server, error) {
 	if handler == nil {
 		return nil, ErrInvalidSource
 	}
-	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	listener, err := net.Listen("tcp4", net.JoinHostPort("127.0.0.1", fmt.Sprint(port)))
 	if err != nil {
 		if closer, ok := handler.(io.Closer); ok {
 			_ = closer.Close()
@@ -57,11 +62,15 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		defer cancel()
 	}
 	shutdownErr := s.http.Shutdown(ctx)
+	listenerErr := s.listener.Close()
+	if errors.Is(listenerErr, net.ErrClosed) {
+		listenerErr = nil
+	}
 	var closeErr error
 	s.close.Do(func() {
 		if s.closer != nil {
 			closeErr = s.closer.Close()
 		}
 	})
-	return errors.Join(shutdownErr, closeErr)
+	return errors.Join(shutdownErr, listenerErr, closeErr)
 }

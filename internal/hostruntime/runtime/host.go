@@ -16,10 +16,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/bootstrap"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/codexsession"
 	runtimeconfig "github.com/pinksaucepasta/paperboat/internal/hostruntime/config"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/configapply"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/execprocess"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/filetransfer"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/health"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/observability"
@@ -32,6 +34,8 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/server"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/session"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/store"
+	"github.com/pinksaucepasta/paperboat/internal/managedssh"
+	"github.com/pinksaucepasta/paperboat/internal/peertransport/transfercrypto"
 )
 
 var ErrHostInvalid = errors.New("invalid host runtime composition")
@@ -68,7 +72,7 @@ type HostDependencies struct {
 	ConfigApplyProof          bool
 	ConfigSync                Service
 	Updates                   interface {
-		Activate(context.Context, bootstrap.ArtifactManifest) (string, error)
+		Activate(context.Context, bootstrap.ArtifactTarget) (string, error)
 	}
 	Random                 io.Reader
 	HostedLifecycle        HostedLifecycle
@@ -77,6 +81,17 @@ type HostDependencies struct {
 	CodexSessions          *codexsession.Manager
 	ServeLeases            *servelease.Manager
 	LocalControlToken      string
+	ManagedSSH             *managedssh.Host
+	ManagedSSHService      Service
+	NativePeerFactory      func(func(net.Conn) error, http.Handler, http.Handler) (Service, error)
+	TransferKeys           *transfercrypto.KeyVault
+}
+
+func transferKeyEraser(vault *transfercrypto.KeyVault) func(string) error {
+	if vault == nil {
+		return nil
+	}
+	return vault.Delete
 }
 
 type HostedLifecycle interface {
@@ -118,12 +133,12 @@ func NewReceiveCoordinator(ctx context.Context, config HostConfig, dependencies 
 	if err != nil {
 		return nil, err
 	}
-	transferService, err := filetransfer.New(filetransfer.Config{Root: filepath.Join(config.Runtime.StateRoot, "file-transfers"), LocalMachineID: config.MachineID, Store: durable, PublishRoot: config.InboxPath, Random: rand.Reader, Policy: config.FileTransferPolicy})
+	transferService, err := filetransfer.New(filetransfer.Config{Root: filepath.Join(config.Runtime.StateRoot, "file-transfers"), LocalMachineID: config.MachineID, Store: durable, PublishRoot: config.InboxPath, Random: rand.Reader, Policy: config.FileTransferPolicy, EraseTransferKey: transferKeyEraser(dependencies.TransferKeys)})
 	if err != nil {
 		return nil, err
 	}
 	transferHandler, err := server.NewFileTransferHandler(server.FileTransferHandlerConfig{
-		Service: transferService, Journal: journal, Authorizer: dependencies.Authorizer,
+		Service: transferService, Journal: journal, Authorizer: dependencies.Authorizer, TransferKeys: dependencies.TransferKeys,
 		AuthorizeCreate: func(authorization server.Authorization, request server.CreateFileTransferRequest) bool {
 			return authorization.MachineID == config.MachineID && authorization.UserID != "" && request.SourceMachineID == authorization.SourceMachineID && request.InitiatingUserID == authorization.UserID && request.DestinationMachineID == config.MachineID && request.SessionID == ""
 		},
@@ -230,6 +245,7 @@ func NewHost(ctx context.Context, config HostConfig, dependencies HostDependenci
 	config.AgentEnvironment = append(config.AgentEnvironment,
 		"PAPERBOAT_PREVIEW_REGISTRATION_ENDPOINT=http://"+config.ListenAddress+"/v1/preview-registrations",
 		"PAPERBOAT_FILE_TRANSFER_ENDPOINT=http://"+config.ListenAddress+"/v1/file-transfers",
+		"PAPERBOAT_FILE_TRANSFER_STAGING_ENDPOINT=http://"+config.ListenAddress+"/v1/local-file-transfers",
 		"PAPERBOAT_RUNTIME_AGENT_TOKEN_FILE="+config.AgentTokenFile,
 		"PAPERBOAT_WORKSPACE_ROOT="+config.WorkspaceRoot,
 	)
@@ -302,26 +318,34 @@ func NewHost(ctx context.Context, config HostConfig, dependencies HostDependenci
 
 	healthSource := &runtimeHealthSource{}
 	writers := filetransfer.NewWriterRegistry()
+	executions, err := execprocess.NewPersistent(ctx, execprocess.Config{
+		WorkspaceRoot: config.WorkspaceRoot, BaseEnvironment: config.AgentEnvironment,
+		MaximumActive: resources.MaxConcurrentOps, MaximumOperations: resources.MaxConcurrentOps * 32,
+		ReplayBytes: int(config.Runtime.Limits.PendingOutputBytes), CancelGrace: 2 * time.Second, Store: durable,
+	})
+	if err != nil {
+		return nil, err
+	}
 	dispatcher, err := server.NewDispatcher(server.DispatcherConfig{
 		Sessions: sessions, Health: healthSource, SessionLauncher: sessionLauncher,
 		WorkspaceRoot: config.WorkspaceRoot, Random: random,
 		Previews: dependencies.Previews, PreviewControl: dependencies.PreviewControl,
 		ConfigApply: dependencies.ConfigApply,
 		Updates:     dependencies.Updates,
-		Writers:     writers,
+		Writers:     writers, Exec: executions,
 	})
 	if err != nil {
 		return nil, err
 	}
 	transferService, err := filetransfer.New(filetransfer.Config{
 		Root: filepath.Join(config.Runtime.StateRoot, "file-transfers"), LocalMachineID: config.MachineID, Store: durable,
-		PublishRoot: config.InboxPath, Random: random, Policy: config.FileTransferPolicy,
+		PublishRoot: config.InboxPath, Random: random, Policy: config.FileTransferPolicy, EraseTransferKey: transferKeyEraser(dependencies.TransferKeys),
 	})
 	if err != nil {
 		return nil, err
 	}
 	transferHandler, err := server.NewFileTransferHandler(server.FileTransferHandlerConfig{
-		Service: transferService, Journal: journal, Authorizer: dependencies.Authorizer,
+		Service: transferService, Journal: journal, Authorizer: dependencies.Authorizer, TransferKeys: dependencies.TransferKeys,
 		AuthorizeCreate: func(authorization server.Authorization, request server.CreateFileTransferRequest) bool {
 			return authorization.MachineID == config.MachineID && authorization.UserID != "" &&
 				request.SourceMachineID == authorization.SourceMachineID && request.InitiatingUserID == authorization.UserID &&
@@ -354,7 +378,6 @@ func NewHost(ctx context.Context, config HostConfig, dependencies HostDependenci
 		Journal:    journal, Authorizer: nil, Handler: dispatcher,
 		MaxConcurrent:     resources.MaxConcurrentOps,
 		HeartbeatInterval: config.Runtime.Limits.HeartbeatInterval,
-		PeerTimeout:       config.Runtime.Limits.PeerTimeout,
 		MutationDeadline:  config.Runtime.Limits.MutationDeadline,
 		Metrics:           protocolMetrics,
 	})
@@ -371,6 +394,31 @@ func NewHost(ctx context.Context, config HostConfig, dependencies HostDependenci
 	if err != nil {
 		return nil, err
 	}
+	var codexHTTPHandler http.Handler
+	if dependencies.CodexSessions != nil {
+		codexMux := http.NewServeMux()
+		codexHandler, codexErr := codexsession.NewHandler(codexsession.HandlerConfig{Manager: dependencies.CodexSessions, Authorizer: dependencies.Authorizer})
+		if codexErr != nil {
+			return nil, codexErr
+		}
+		managementHandler, managementErr := codexsession.NewManagementHandler(dependencies.CodexSessions, dependencies.Authorizer)
+		if managementErr != nil {
+			return nil, managementErr
+		}
+		codexMux.Handle("/v1/codex-sessions/{session_id}/ws", codexHandler)
+		codexMux.Handle("POST /v1/codex-sessions/{session_id}", managementHandler)
+		codexMux.Handle("POST /v1/codex-sessions/{session_id}/renew", managementHandler)
+		codexMux.Handle("GET /v1/codex-sessions/{session_id}/directories", managementHandler)
+		codexMux.Handle("DELETE /v1/codex-sessions/{session_id}", managementHandler)
+		codexHTTPHandler = codexMux
+	}
+	var nativePeerService Service
+	if dependencies.NativePeerFactory != nil {
+		nativePeerService, err = dependencies.NativePeerFactory(nativeManager.Serve, transferHandler, codexHTTPHandler)
+		if err != nil || nativePeerService == nil {
+			return nil, errors.Join(ErrHostInvalid, err)
+		}
+	}
 	websocketHandler, err := server.NewWebSocketHandler(server.WebSocketHandlerConfig{
 		Server: protocolServer, Authorizer: dependencies.Authorizer,
 		OriginPatterns: append([]string(nil), config.OriginPatterns...),
@@ -385,23 +433,19 @@ func NewHost(ctx context.Context, config HostConfig, dependencies HostDependenci
 		mux.Handle("/v1/serve-leases", servelease.Handler{Manager: dependencies.ServeLeases, Token: dependencies.LocalControlToken})
 	}
 	mux.Handle("/v1/runtime", websocketHandler)
-	if dependencies.CodexSessions != nil {
-		codexHandler, codexErr := codexsession.NewHandler(codexsession.HandlerConfig{Manager: dependencies.CodexSessions, Authorizer: dependencies.Authorizer})
-		if codexErr != nil {
-			return nil, codexErr
-		}
-		mux.Handle("/v1/codex-sessions/{session_id}/ws", codexHandler)
-		managementHandler, managementErr := codexsession.NewManagementHandler(dependencies.CodexSessions, dependencies.Authorizer)
-		if managementErr != nil {
-			return nil, managementErr
-		}
-		mux.Handle("POST /v1/codex-sessions/{session_id}", managementHandler)
-		mux.Handle("POST /v1/codex-sessions/{session_id}/renew", managementHandler)
-		mux.Handle("GET /v1/codex-sessions/{session_id}/directories", managementHandler)
-		mux.Handle("DELETE /v1/codex-sessions/{session_id}", managementHandler)
+	if codexHTTPHandler != nil {
+		mux.Handle("/v1/codex-sessions/", codexHTTPHandler)
 	}
 	mux.Handle("/v1/file-transfers", transferHandler)
 	mux.Handle("/v1/file-transfers/", transferHandler)
+	if dependencies.TransferKeys != nil {
+		localTransferHandler, localTransferErr := server.NewLocalFileTransferHandler(server.LocalFileTransferConfig{Token: agentToken, MachineID: config.MachineID, Service: transferService, TransferKeys: dependencies.TransferKeys, ResolveRecipient: writers.Recipient})
+		if localTransferErr != nil {
+			return nil, localTransferErr
+		}
+		mux.Handle("/v1/local-file-transfers", localTransferHandler)
+		mux.Handle("/v1/local-file-transfers/", localTransferHandler)
+	}
 	if dependencies.PreviewLauncher != nil {
 		previewLaunchHandler, launchErr := server.NewPreviewLaunchHandler(server.PreviewLaunchHandlerConfig{Authorizer: dependencies.Authorizer, Launcher: dependencies.PreviewLauncher, MachineID: config.MachineID})
 		if launchErr != nil {
@@ -458,6 +502,9 @@ func NewHost(ctx context.Context, config HostConfig, dependencies HostDependenci
 		})
 	}
 	components = append(components, Component{Capability: "protocol", Required: true, Service: protocolServer})
+	if nativePeerService != nil {
+		components = append(components, Component{Capability: "peer_transport", Required: false, Service: nativePeerService})
+	}
 	if dependencies.PreviewService != nil {
 		components = append(components, Component{Capability: "target", Required: false, Service: dependencies.PreviewService})
 	}
@@ -469,6 +516,9 @@ func NewHost(ctx context.Context, config HostConfig, dependencies HostDependenci
 	}
 	if dependencies.RuntimeObservationService != nil {
 		components = append(components, Component{Capability: "runtime_observation", Required: false, Service: dependencies.RuntimeObservationService})
+	}
+	if dependencies.ManagedSSHService != nil {
+		components = append(components, Component{Capability: "managed_ssh_authority", Required: false, Service: dependencies.ManagedSSHService})
 	}
 	if dependencies.Connector != nil {
 		components = append(components, Component{Capability: "edge", Required: true, Service: dependencies.Connector})
@@ -528,28 +578,7 @@ func writeAgentToken(path string, random io.Reader) (string, error) {
 		return "", err
 	}
 	token := base64.RawURLEncoding.EncodeToString(raw)
-	temporary, err := os.CreateTemp(directory, ".agent-token-*")
-	if err != nil {
-		return "", err
-	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-	if err := temporary.Chmod(0o600); err != nil {
-		temporary.Close()
-		return "", err
-	}
-	if _, err := io.WriteString(temporary, token+"\n"); err != nil {
-		temporary.Close()
-		return "", err
-	}
-	if err := temporary.Sync(); err != nil {
-		temporary.Close()
-		return "", err
-	}
-	if err := temporary.Close(); err != nil {
-		return "", err
-	}
-	if err := os.Rename(temporaryPath, path); err != nil {
+	if err := atomicfile.Write(path, []byte(token+"\n"), atomicfile.Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1}); err != nil {
 		return "", err
 	}
 	return token, nil

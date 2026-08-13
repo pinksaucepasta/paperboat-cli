@@ -58,12 +58,14 @@ type Claims struct {
 	InstallationGeneration int64               `json:"installation_generation,omitempty"`
 	SourceMachineID        string              `json:"source_machine_id,omitempty"`
 	SessionID              string              `json:"session_id,omitempty"`
+	OperationID            string              `json:"operation_id,omitempty"`
 	AssignmentID           string              `json:"assignment_id,omitempty"`
 	WarningRevision        string              `json:"warning_revision,omitempty"`
 	ConnectorID            string              `json:"connector_id,omitempty"`
 	ConnectorGeneration    uint64              `json:"connector_generation,omitempty"`
 	EdgePool               string              `json:"edge_pool,omitempty"`
 	EdgeNodeID             string              `json:"edge_node_id,omitempty"`
+	RouteBinding           string              `json:"route_binding,omitempty"`
 	FileTransferPolicy     *FileTransferPolicy `json:"file_transfer_policy,omitempty"`
 	CounterEpoch           string              `json:"counter_epoch,omitempty"`
 	Confirmation           *struct {
@@ -94,6 +96,7 @@ type Policy struct {
 	MachineID           string
 	SourceMachineID     string
 	SessionID           string
+	OperationID         string
 	AssignmentID        string
 	WarningRevision     string
 	ConnectorID         string
@@ -289,7 +292,7 @@ func rejectDuplicateKeys(data []byte) error {
 }
 
 func bindingsMatch(c Claims, p Policy) bool {
-	return match(p.EnvironmentID, c.EnvironmentID) && match(p.MachineID, c.MachineID) && match(p.SourceMachineID, c.SourceMachineID) && match(p.UserID, c.UserID) && match(p.CLIClientSessionID, c.CLIClientSessionID) && match(p.HelperID, c.HelperID) && match(p.SessionID, c.SessionID) && match(p.AssignmentID, c.AssignmentID) && match(p.WarningRevision, c.WarningRevision) && match(p.ConnectorID, c.ConnectorID) && matchUint(p.ConnectorGeneration, c.ConnectorGeneration) && match(p.EdgePool, c.EdgePool) && match(p.EdgeNodeID, c.EdgeNodeID) && match(p.CounterEpoch, c.CounterEpoch)
+	return match(p.EnvironmentID, c.EnvironmentID) && match(p.MachineID, c.MachineID) && match(p.SourceMachineID, c.SourceMachineID) && match(p.UserID, c.UserID) && match(p.CLIClientSessionID, c.CLIClientSessionID) && match(p.HelperID, c.HelperID) && match(p.SessionID, c.SessionID) && match(p.OperationID, c.OperationID) && match(p.AssignmentID, c.AssignmentID) && match(p.WarningRevision, c.WarningRevision) && match(p.ConnectorID, c.ConnectorID) && matchUint(p.ConnectorGeneration, c.ConnectorGeneration) && match(p.EdgePool, c.EdgePool) && match(p.EdgeNodeID, c.EdgeNodeID) && match(p.CounterEpoch, c.CounterEpoch)
 }
 func match(expected, actual string) bool     { return expected == "" || expected == actual }
 func matchUint(expected, actual uint64) bool { return expected == 0 || expected == actual }

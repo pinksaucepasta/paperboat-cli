@@ -40,14 +40,14 @@ var requiredCapabilities = map[string]bool{"terminal.v1": true, "health.v1": tru
 
 var allowedCapabilities = map[config.Profile]map[string]bool{
 	config.Hosted: {
-		"terminal.v1": true, "health.v1": true,
+		"terminal.v1": true, "health.v1": true, "exec.v1": true, "ssh.v1": true,
 		"preview.public.v1": true, "config.apply.v1": true,
-		"hosted.lifecycle.v1": true, "update.signed.v1": true,
+		"hosted.lifecycle.v1": true, "update.tuf.v1": true,
 	},
 	config.BYOD: {
-		"terminal.v1": true, "health.v1": true,
+		"terminal.v1": true, "health.v1": true, "exec.v1": true, "ssh.v1": true,
 		"preview.public.v1": true, "config.apply.v1": true,
-		"update.signed.v1": true,
+		"update.tuf.v1": true,
 	},
 }
 

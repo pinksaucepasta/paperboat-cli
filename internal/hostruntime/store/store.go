@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/store/storesqlc"
@@ -17,7 +18,7 @@ import (
 )
 
 const (
-	CurrentVersion          = 1
+	CurrentVersion          = 2
 	MaxOperationResultBytes = 64 << 10
 )
 
@@ -105,11 +106,22 @@ type FileTransfer struct {
 	Size                 int64     `json:"size"`
 	SHA256               string    `json:"sha256"`
 	CommittedOffset      int64     `json:"committed_offset"`
+	CommittedChunks      uint64    `json:"-"`
 	State                string    `json:"state"`
 	ResultCode           string    `json:"result_code,omitempty"`
 	ReceiptPath          string    `json:"receipt_path,omitempty"`
 	CreatedAt            time.Time `json:"created_at"`
 	ExpiresAt            time.Time `json:"expires_at"`
+	E2EETransferID       string    `json:"-"`
+	TransferGeneration   uint64    `json:"-"`
+	FileOrdinal          uint64    `json:"-"`
+}
+
+type FileTransferReceipt struct {
+	ID         string
+	ClientID   string
+	ResultCode string
+	Path       string
 }
 
 func (s *Store) CreateFileTransfers(ctx context.Context, transfers []FileTransfer) error {
@@ -152,10 +164,11 @@ func (s *Store) CreateFileTransfersWithinLimits(ctx context.Context, transfers [
 		}
 	}
 	for _, transfer := range transfers {
-		if transfer.ID == "" || transfer.BatchID == "" || transfer.SourceMachineID == "" || transfer.DestinationMachineID == "" || transfer.InitiatingUserID == "" || transfer.Basename == "" || transfer.Size < 0 || transfer.CommittedOffset != 0 || transfer.CreatedAt.IsZero() || transfer.ExpiresAt.IsZero() {
+		e2ee := transfer.E2EETransferID != "" || transfer.TransferGeneration != 0
+		if transfer.ID == "" || transfer.BatchID == "" || transfer.SourceMachineID == "" || transfer.DestinationMachineID == "" || transfer.InitiatingUserID == "" || transfer.Basename == "" || transfer.Size < 0 || transfer.CommittedOffset != 0 || transfer.CreatedAt.IsZero() || transfer.ExpiresAt.IsZero() || e2ee != (transfer.E2EETransferID != "" && transfer.TransferGeneration > 0) {
 			return ErrConflict
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO file_transfers(id,batch_id,source_machine_id,destination_machine_id,initiating_user_id,session_id,delivery_client_id,basename,size,sha256,committed_offset,state,result_code,receipt_path,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,0,'created',NULL,NULL,?,?)`, transfer.ID, transfer.BatchID, transfer.SourceMachineID, transfer.DestinationMachineID, transfer.InitiatingUserID, nullableString(transfer.SessionID), nullableString(transfer.DeliveryClientID), transfer.Basename, transfer.Size, transfer.SHA256, transfer.CreatedAt.UnixNano(), transfer.ExpiresAt.UnixNano()); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO file_transfers(id,batch_id,source_machine_id,destination_machine_id,initiating_user_id,session_id,delivery_client_id,basename,size,sha256,committed_offset,state,result_code,receipt_path,created_at,expires_at,e2ee_transfer_id,transfer_generation,file_ordinal) VALUES(?,?,?,?,?,?,?,?,?,?,0,'created',NULL,NULL,?,?,?,?,?)`, transfer.ID, transfer.BatchID, transfer.SourceMachineID, transfer.DestinationMachineID, transfer.InitiatingUserID, nullableString(transfer.SessionID), nullableString(transfer.DeliveryClientID), transfer.Basename, transfer.Size, transfer.SHA256, transfer.CreatedAt.UnixNano(), transfer.ExpiresAt.UnixNano(), nullableString(transfer.E2EETransferID), nullableUint64(transfer.TransferGeneration), nullableUint64IfEncrypted(transfer.FileOrdinal, e2ee)); err != nil {
 			return classify(err)
 		}
 	}
@@ -232,6 +245,41 @@ func (s *Store) CommitFileTransferOffset(ctx context.Context, id string, expecte
 		return ErrConflict
 	}
 	return nil
+}
+
+func (s *Store) CommitFileTransferChunk(ctx context.Context, id string, ordinal uint64, expectedOffset, nextOffset int64, ciphertextDigest [32]byte, ciphertextLength, plaintextLength int) (bool, error) {
+	if id == "" || ordinal > uint64(^uint64(0)>>1) || expectedOffset < 0 || nextOffset < expectedOffset || ciphertextLength < 16 || ciphertextLength > (1<<20)+16 || plaintextLength < 0 || plaintextLength > 1<<20 || nextOffset-expectedOffset != int64(plaintextLength) {
+		return false, ErrConflict
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var existingDigest []byte
+	var existingCiphertextLength, existingPlaintextLength int
+	err = tx.QueryRowContext(ctx, `SELECT ciphertext_sha256,ciphertext_length,plaintext_length FROM file_transfer_chunks WHERE transfer_id=? AND ordinal=?`, id, int64(ordinal)).Scan(&existingDigest, &existingCiphertextLength, &existingPlaintextLength)
+	if err == nil {
+		if !bytes.Equal(existingDigest, ciphertextDigest[:]) || existingCiphertextLength != ciphertextLength || existingPlaintextLength != plaintextLength {
+			return false, ErrConflict
+		}
+		return true, tx.Commit()
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE file_transfers SET committed_offset=?,committed_chunks=?,state='uploading' WHERE id=? AND committed_offset=? AND committed_chunks=? AND state IN ('created','uploading') AND ?<=size`, nextOffset, int64(ordinal+1), id, expectedOffset, int64(ordinal), nextOffset)
+	if err != nil {
+		return false, err
+	}
+	changed, _ := result.RowsAffected()
+	if changed != 1 {
+		return false, ErrConflict
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO file_transfer_chunks(transfer_id,ordinal,ciphertext_sha256,ciphertext_length,plaintext_length) VALUES(?,?,?,?,?)`, id, int64(ordinal), ciphertextDigest[:], ciphertextLength, plaintextLength); err != nil {
+		return false, classify(err)
+	}
+	return false, tx.Commit()
 }
 
 func (s *Store) CompleteFileTransfer(ctx context.Context, id, localMachineID string) error {
@@ -363,6 +411,34 @@ func (s *Store) ReceiptFileTransfer(ctx context.Context, id, clientID, resultCod
 	return nil
 }
 
+func (s *Store) ReceiptFileTransferBatch(ctx context.Context, receipts []FileTransferReceipt) error {
+	if len(receipts) == 0 || len(receipts) > 10 {
+		return ErrConflict
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, receipt := range receipts {
+		state := "failed"
+		if receipt.ResultCode == "stored" {
+			state = "delivered"
+		} else if receipt.ResultCode == "" || receipt.Path != "" {
+			return ErrConflict
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE file_transfers SET state=?,result_code=?,receipt_path=? WHERE id=? AND delivery_client_id=? AND (state='pending' OR (state IN ('delivered','failed') AND COALESCE(result_code,'')=? AND COALESCE(receipt_path,'')=?))`, state, receipt.ResultCode, nullableString(receipt.Path), receipt.ID, receipt.ClientID, receipt.ResultCode, receipt.Path)
+		if err != nil {
+			return err
+		}
+		changed, _ := result.RowsAffected()
+		if changed != 1 {
+			return ErrConflict
+		}
+	}
+	return tx.Commit()
+}
+
 func (s *Store) CancelFileTransfer(ctx context.Context, id string) error {
 	result, err := s.db.ExecContext(ctx, `UPDATE file_transfers SET state='canceled',result_code='canceled' WHERE id=? AND state IN ('created','uploading','pending')`, id)
 	if err != nil {
@@ -400,7 +476,23 @@ func fileTransferFromSQLC(row storesqlc.FileTransfer) FileTransfer {
 		Basename: row.Basename, Size: row.Size, SHA256: row.Sha256, CommittedOffset: row.CommittedOffset,
 		State: row.State, ResultCode: row.ResultCode.String, ReceiptPath: row.ReceiptPath.String,
 		CreatedAt: time.Unix(0, row.CreatedAt).UTC(), ExpiresAt: time.Unix(0, row.ExpiresAt).UTC(),
+		E2EETransferID: row.E2eeTransferID.String, TransferGeneration: uint64(row.TransferGeneration.Int64), FileOrdinal: uint64(row.FileOrdinal.Int64),
+		CommittedChunks: uint64(row.CommittedChunks),
 	}
+}
+
+func nullableUint64(value uint64) any {
+	if value == 0 {
+		return nil
+	}
+	return int64(value)
+}
+
+func nullableUint64IfEncrypted(value uint64, encrypted bool) any {
+	if !encrypted {
+		return nil
+	}
+	return int64(value)
 }
 
 func Open(ctx context.Context, config Config) (*Store, error) {
@@ -416,13 +508,23 @@ func Open(ctx context.Context, config Config) (*Store, error) {
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
-	dsn := (&url.URL{Scheme: "file", Path: path}).String()
+	dsnURL := &url.URL{Scheme: "file", Path: path}
+	query := dsnURL.Query()
+	// These PRAGMAs are connection-local. Put them in the DSN so every
+	// database/sql connection gets the same locking and integrity policy.
+	query.Add("_pragma", "busy_timeout(5000)")
+	query.Add("_pragma", "foreign_keys(ON)")
+	query.Add("_pragma", "synchronous(FULL)")
+	dsnURL.RawQuery = query.Encode()
+	dsn := dsnURL.String()
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
+	// Schema validation can issue nested reads while Goose still owns its
+	// connection. A single-connection pool deadlocks on Linux/arm64.
+	db.SetMaxOpenConns(2)
+	db.SetMaxIdleConns(2)
 	store := &Store{db: db, q: storesqlc.New(db), hook: config.FailureHook}
 	if err := store.configure(ctx); err != nil {
 		db.Close()
@@ -431,6 +533,10 @@ func Open(ctx context.Context, config Config) (*Store, error) {
 	if err := store.migrate(ctx); err != nil {
 		db.Close()
 		return nil, classifyDBError(err)
+	}
+	if err := validateDatabaseSchema(ctx, db); err != nil {
+		db.Close()
+		return nil, err
 	}
 	if err := os.Chmod(path, 0o600); err != nil {
 		db.Close()
@@ -794,23 +900,47 @@ func (s *Store) CompleteOperation(ctx context.Context, operation OperationResult
 	if len(operation.Result) > MaxOperationResultBytes {
 		return ErrResultTooLarge
 	}
-	result, err := s.db.ExecContext(ctx, `UPDATE operation_results SET state='completed',result=?,error_code=?,completed_at=?,expires_at=? WHERE operation_id=? AND request_hash=? AND state='pending'`, operation.Result, nullableString(operation.ErrorCode), operation.CompletedAt.UnixNano(), operation.ExpiresAt.UnixNano(), operation.OperationID, operation.RequestHash)
-	if err != nil {
-		return err
-	}
-	changed, _ := result.RowsAffected()
-	if changed == 1 {
-		return nil
-	}
-	existing, err := s.operation(ctx, operation.OperationID)
-	if err != nil {
-		return err
-	}
-	if !bytes.Equal(existing.RequestHash, operation.RequestHash) {
-		return ErrConflict
-	}
-	if existing.State == "completed" && bytes.Equal(existing.Result, operation.Result) && existing.ErrorCode == operation.ErrorCode {
-		return nil
+	const attempts = 20
+	for attempt := 0; attempt < attempts; attempt++ {
+		result, err := s.db.ExecContext(ctx, `UPDATE operation_results SET state='completed',result=?,error_code=?,completed_at=?,expires_at=? WHERE operation_id=? AND request_hash=? AND state='pending'`, operation.Result, nullableString(operation.ErrorCode), operation.CompletedAt.UnixNano(), operation.ExpiresAt.UnixNano(), operation.OperationID, operation.RequestHash)
+		if err != nil {
+			if !strings.Contains(err.Error(), "SQLITE_BUSY") && !strings.Contains(err.Error(), "database is locked") {
+				return err
+			}
+			if attempt+1 < attempts {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(50 * time.Millisecond):
+				}
+				continue
+			}
+			return err
+		}
+		changed, _ := result.RowsAffected()
+		if changed == 1 {
+			return nil
+		}
+		existing, err := s.operation(ctx, operation.OperationID)
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(existing.RequestHash, operation.RequestHash) {
+			return ErrConflict
+		}
+		if existing.State == "completed" {
+			if bytes.Equal(existing.Result, operation.Result) && existing.ErrorCode == operation.ErrorCode {
+				return nil
+			}
+			return ErrConflict
+		}
+		if attempt+1 < attempts {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
 	}
 	return ErrConflict
 }
@@ -841,6 +971,51 @@ func (s *Store) Operations(ctx context.Context, now time.Time, limit int) ([]Ope
 		operations = append(operations, operationFromSQLC(row.OperationID, row.RequestHash, row.State, row.Result, row.ErrorCode, row.CompletedAt, row.ExpiresAt))
 	}
 	return operations, nil
+}
+
+func (s *Store) OperationsWithPrefix(ctx context.Context, prefix string, now time.Time, limit int) ([]OperationResult, error) {
+	return s.operationsByPrefix(ctx, prefix, false, now, limit)
+}
+
+func (s *Store) OperationsExcludingPrefix(ctx context.Context, prefix string, now time.Time, limit int) ([]OperationResult, error) {
+	return s.operationsByPrefix(ctx, prefix, true, now, limit)
+}
+
+func (s *Store) operationsByPrefix(ctx context.Context, prefix string, exclude bool, now time.Time, limit int) ([]OperationResult, error) {
+	if prefix == "" || limit < 1 || limit > 1<<20 {
+		return nil, ErrConflict
+	}
+	if err := s.DeleteExpiredOperations(ctx, now); err != nil {
+		return nil, err
+	}
+	comparison := "LIKE"
+	if exclude {
+		comparison = "NOT LIKE"
+	}
+	query := `SELECT operation_id,request_hash,state,result,COALESCE(error_code,''),completed_at,expires_at FROM operation_results WHERE operation_id ` + comparison + ` ? ESCAPE '\' ORDER BY CASE state WHEN 'pending' THEN 0 ELSE 1 END,completed_at ASC LIMIT ?`
+	rows, err := s.db.QueryContext(ctx, query, escapeLike(prefix)+"%", limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	operations := make([]OperationResult, 0)
+	for rows.Next() {
+		var operationID, state, errorCode string
+		var requestHash, result []byte
+		var completed sql.NullInt64
+		var expires int64
+		if err := rows.Scan(&operationID, &requestHash, &state, &result, &errorCode, &completed, &expires); err != nil {
+			return nil, err
+		}
+		operations = append(operations, operationFromSQLC(operationID, requestHash, state, result, errorCode, completed, expires))
+	}
+	return operations, rows.Err()
+}
+
+func escapeLike(value string) string {
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	value = strings.ReplaceAll(value, `%`, `\%`)
+	return strings.ReplaceAll(value, `_`, `\_`)
 }
 
 func (s *Store) operation(ctx context.Context, operationID string) (OperationResult, error) {

@@ -42,8 +42,8 @@ func TestDashboardTokenPairingAndMaterialExchange(t *testing.T) {
 				_ = json.NewEncoder(writer).Encode(map[string]any{"error": map[string]string{"code": "user_machine_approval_pending", "message": "Machine approval is pending."}})
 				return
 			}
-			manifest, _, publicKey := signedArtifactPair(t, server.URL)
-			_ = json.NewEncoder(writer).Encode(map[string]any{"data": Material{Schema: "paperboat.byod-installation/v1", UserMachineID: "um_1", UserMachineEnrollmentID: "ume_1", EnvironmentID: "env_1", ControlURL: server.URL, HelperID: "helper_1", EnrollmentID: "enroll_1", EnrollmentCredential: "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOP", ExpiresAt: expires, Artifact: &manifest, ArtifactPublicKey: publicKey, HelperListenAddress: "127.0.0.1:38080"}})
+			manifest := descriptor(server.URL, "0.0.0-development")
+			_ = json.NewEncoder(writer).Encode(map[string]any{"data": Material{Schema: "paperboat.byod-installation/v1", UserMachineID: "um_1", UserMachineEnrollmentID: "ume_1", EnvironmentID: "env_1", ControlURL: server.URL, HelperID: "helper_1", EnrollmentID: "enroll_1", EnrollmentCredential: "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOP", ExpiresAt: expires, Artifact: &manifest, HelperListenAddress: "127.0.0.1:38080"}})
 		default:
 			http.NotFound(writer, request)
 		}

@@ -29,6 +29,7 @@ func NewProxy(config ProxyConfig) (*Proxy, error) {
 		return nil, ErrInvalidTarget
 	}
 	if config.Transport == nil {
+		//paperboat:allow-source-policy default-http owner=runtime-preview reason=clone-standard-transport-before-bounded-customization
 		config.Transport = http.DefaultTransport
 	}
 	if config.RetryAfter == 0 {

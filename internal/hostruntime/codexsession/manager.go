@@ -16,6 +16,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
 )
 
 var (
@@ -406,22 +408,7 @@ func writeDescriptor(dir string, d Descriptor) error {
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, ".descriptor-*")
-	if err != nil {
-		return err
-	}
-	name := tmp.Name()
-	defer os.Remove(name)
-	if err = tmp.Chmod(0o600); err == nil {
-		_, err = tmp.Write(body)
-	}
-	if closeErr := tmp.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return err
-	}
-	return os.Rename(name, filepath.Join(dir, "descriptor.json"))
+	return atomicfile.Write(filepath.Join(dir, "descriptor.json"), body, atomicfile.Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1})
 }
 func waitSocket(ctx context.Context, path string, timeout time.Duration) error {
 	deadline := time.NewTimer(timeout)

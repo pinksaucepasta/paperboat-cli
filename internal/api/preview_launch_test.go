@@ -37,16 +37,16 @@ func TestLaunchMachinePreviewRequiresAuthenticatedSuccess(t *testing.T) {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(PreviewRecord{PreviewKey: "p-docs", LogicalName: "docs", URL: "https://docs.preview.test", State: "active"})
+		_ = json.NewEncoder(w).Encode(PreviewRecord{OperationID: input.OperationID, PreviewKey: "p-docs", LogicalName: "docs", URL: "https://docs.preview.test", State: "active"})
 	}))
 	defer server.Close()
 	descriptor := PreviewLaunchDescriptor{Endpoint: server.URL + "/v1/preview-launches", MachineID: "machine_1", Auth: AuthMaterial{Method: "bearer", Token: "launch-token"}}
-	record, err := LaunchMachinePreview(context.Background(), descriptor, PreviewLaunchRequest{Name: "docs", Port: 3000, DurationSeconds: 60}, server.Client().Transport)
+	record, err := LaunchMachinePreview(context.Background(), descriptor, PreviewLaunchRequest{OperationID: "operation-123", Name: "docs", Port: 3000, DurationSeconds: 60}, server.Client().Transport)
 	if err != nil || record.URL != "https://docs.preview.test" {
 		t.Fatalf("record=%#v err=%v", record, err)
 	}
 	descriptor.Auth.Token = "wrong"
-	if _, err := LaunchMachinePreview(context.Background(), descriptor, PreviewLaunchRequest{Name: "docs", Port: 3000, DurationSeconds: 60}, server.Client().Transport); err == nil || !strings.Contains(err.Error(), "status 403") {
+	if _, err := LaunchMachinePreview(context.Background(), descriptor, PreviewLaunchRequest{OperationID: "operation-456", Name: "docs", Port: 3000, DurationSeconds: 60}, server.Client().Transport); err == nil || !strings.Contains(err.Error(), "status 403") {
 		t.Fatalf("auth err=%v", err)
 	}
 }

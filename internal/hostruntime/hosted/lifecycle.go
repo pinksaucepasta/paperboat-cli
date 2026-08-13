@@ -16,6 +16,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
 )
 
 var (
@@ -232,23 +234,7 @@ func (l *Lifecycle) prepareWorkspace(context.Context) error {
 }
 
 func writePrivateFile(path string, data []byte) error {
-	file, err := os.CreateTemp(filepath.Dir(path), ".hosted-state-*")
-	if err != nil {
-		return err
-	}
-	temporary := file.Name()
-	defer os.Remove(temporary)
-	if err = file.Chmod(0o600); err == nil {
-		_, err = file.Write(data)
-	}
-	if err == nil {
-		err = file.Sync()
-	}
-	err = errors.Join(err, file.Close())
-	if err != nil {
-		return err
-	}
-	return os.Rename(temporary, path)
+	return atomicfile.Write(path, data, atomicfile.Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1})
 }
 
 func (l *Lifecycle) checkout(ctx context.Context) error {

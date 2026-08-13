@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/bootstrap"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/configapply"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/execprocess"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/filetransfer"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/health"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/history"
@@ -22,6 +24,7 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/protocol"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/pty"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/session"
+	"github.com/pinksaucepasta/paperboat/internal/managedssh"
 )
 
 type HealthSource interface{ Snapshot() health.Snapshot }
@@ -35,7 +38,7 @@ type DispatcherConfig struct {
 	PreviewControl preview.PreviewControl
 	ConfigApply    configapply.Handler
 	Updates        interface {
-		Activate(context.Context, bootstrap.ArtifactManifest) (string, error)
+		Activate(context.Context, bootstrap.ArtifactTarget) (string, error)
 	}
 	Health          HealthSource
 	SessionLauncher SessionLauncher
@@ -43,9 +46,14 @@ type DispatcherConfig struct {
 	Random          io.Reader
 	Now             func() time.Time
 	Writers         *filetransfer.WriterRegistry
+	Exec            *execprocess.Manager
+	SSH             *managedssh.Host
 }
 
-type Dispatcher struct{ config DispatcherConfig }
+type Dispatcher struct {
+	config DispatcherConfig
+	ssh    sshStreamRegistry
+}
 
 type terminalOutputStream struct {
 	manager      *session.Manager
@@ -75,7 +83,13 @@ func (d *Dispatcher) Capabilities() []string {
 		capabilities = append(capabilities, "config.apply.v1")
 	}
 	if d.config.Updates != nil {
-		capabilities = append(capabilities, "update.signed.v1")
+		capabilities = append(capabilities, "update.tuf.v1")
+	}
+	if d.config.Exec != nil {
+		capabilities = append(capabilities, "exec.v1")
+	}
+	if d.config.SSH != nil {
+		capabilities = append(capabilities, "ssh.v1")
 	}
 	return capabilities
 }
@@ -90,15 +104,35 @@ func (d *Dispatcher) Handle(ctx context.Context, authorization Authorization, ca
 		return result(d.config.Health.Snapshot())
 	case "config.apply.v1":
 		return d.configApply(ctx, authorization, payload)
-	case "update.signed.v1":
+	case "update.tuf.v1":
 		return d.update(ctx, payload)
+	case "exec.v1":
+		return d.exec(ctx, payload)
+	case "ssh.v1":
+		return d.sshRequest(payload)
 	default:
 		return failure("capability_required")
 	}
 }
 
+func (d *Dispatcher) HandleOperation(ctx context.Context, authorization Authorization, capability, operationID string, payload json.RawMessage) operation.Outcome {
+	if capability == "exec.v1" {
+		var request execRequest
+		if decodeStrict(payload, &request) != nil || request.OperationID != operationID {
+			return failure("invalid_request")
+		}
+	}
+	if capability == "ssh.v1" {
+		var request sshRequest
+		if decodeStrict(payload, &request) != nil || request.OperationID != operationID {
+			return failure("invalid_request")
+		}
+	}
+	return d.Handle(ctx, authorization, capability, payload)
+}
+
 type signedUpdateRequest struct {
-	Artifact bootstrap.ArtifactManifest `json:"artifact"`
+	Artifact bootstrap.ArtifactTarget `json:"artifact"`
 }
 
 func (d *Dispatcher) update(ctx context.Context, payload json.RawMessage) operation.Outcome {
@@ -171,6 +205,29 @@ func (d *Dispatcher) HandleTerminalResize(_ context.Context, authorization Autho
 	return d.config.Sessions.Resize(sessionID, attachmentID, pty.Dimensions{Columns: columns, Rows: rows}, d.config.Now())
 }
 
+func (d *Dispatcher) HandleExecInput(_ context.Context, authorization Authorization, operationID string, data []byte) error {
+	if d.config.Exec == nil || authorization.ClientID == "" || operationID == "" || len(data) == 0 {
+		return execprocess.ErrInvalid
+	}
+	execution, err := d.config.Exec.Get(operationID)
+	if err != nil {
+		return err
+	}
+	_, err = execution.Write(data)
+	return err
+}
+
+func (d *Dispatcher) HandleExecResize(_ context.Context, authorization Authorization, operationID string, columns, rows uint16) error {
+	if d.config.Exec == nil || authorization.ClientID == "" || operationID == "" || columns == 0 || rows == 0 {
+		return execprocess.ErrInvalid
+	}
+	execution, err := d.config.Exec.Get(operationID)
+	if err != nil {
+		return err
+	}
+	return execution.Resize(pty.Dimensions{Columns: columns, Rows: rows})
+}
+
 func (d *Dispatcher) HandleControl(_ context.Context, authorization Authorization, frame protocol.Frame) operation.Outcome {
 	var control attachmentControl
 	if decodeStrict(frame.Payload, &control) != nil || control.SessionID == "" || control.AttachmentID == "" || authorization.ClientID == "" {
@@ -194,7 +251,29 @@ func (d *Dispatcher) HandleControl(_ context.Context, authorization Authorizatio
 	return domainResult(struct{}{}, err)
 }
 
-func (d *Dispatcher) OpenStream(_ context.Context, authorization Authorization, capability string, payload json.RawMessage, outcome operation.Outcome, replay bool) (OutputStream, bool, error) {
+func (d *Dispatcher) OpenStream(ctx context.Context, authorization Authorization, capability string, payload json.RawMessage, outcome operation.Outcome, replay bool) (OutputStream, bool, error) {
+	if capability == "ssh.v1" {
+		return d.openSSHStream(ctx, authorization, payload, outcome)
+	}
+	if capability == "exec.v1" && outcome.ErrorCode == "" {
+		var request execRequest
+		if decodeStrict(payload, &request) != nil || request.OperationID == "" || request.Action != "start" && request.Action != "attach" {
+			return nil, false, nil
+		}
+		execution, err := d.config.Exec.Get(request.OperationID)
+		if err != nil {
+			return nil, false, err
+		}
+		from := request.FromSequence
+		if from == 0 {
+			from = 1
+		}
+		reader, err := execution.OpenReader(from)
+		if err != nil {
+			return nil, false, err
+		}
+		return &execOutputStream{execution: execution, reader: reader}, true, nil
+	}
 	if capability != "terminal.v1" || outcome.ErrorCode != "" {
 		return nil, false, nil
 	}
@@ -223,6 +302,167 @@ func (d *Dispatcher) OpenStream(_ context.Context, authorization Authorization, 
 		d.config.Writers.Attach(request.SessionID, response.AttachmentID, authorization.ClientID, authorization.SourceMachineID)
 	}
 	return &terminalOutputStream{manager: d.config.Sessions, sessionID: request.SessionID, attachmentID: response.AttachmentID, writers: d.config.Writers}, true, nil
+}
+
+type execRequest struct {
+	Action       string            `json:"action"`
+	OperationID  string            `json:"operation_id"`
+	Argv         []string          `json:"argv,omitempty"`
+	CWD          string            `json:"cwd,omitempty"`
+	Environment  map[string]string `json:"environment,omitempty"`
+	TimeoutMS    uint32            `json:"timeout_ms,omitempty"`
+	PTY          bool              `json:"pty,omitempty"`
+	Columns      uint16            `json:"columns,omitempty"`
+	Rows         uint16            `json:"rows,omitempty"`
+	FromSequence uint64            `json:"from_sequence,omitempty"`
+	Data         []byte            `json:"data,omitempty"`
+	Signal       string            `json:"signal,omitempty"`
+}
+
+func (d *Dispatcher) exec(ctx context.Context, payload json.RawMessage) operation.Outcome {
+	if d.config.Exec == nil {
+		return failure("capability_required")
+	}
+	var request execRequest
+	if decodeStrict(payload, &request) != nil || request.OperationID == "" {
+		return failure("invalid_request")
+	}
+	switch request.Action {
+	case "start":
+		execution, replay, err := d.config.Exec.Start(ctx, execprocess.Request{OperationID: request.OperationID, Argv: request.Argv, CWD: request.CWD, Environment: request.Environment, Timeout: time.Duration(request.TimeoutMS) * time.Millisecond, PTY: request.PTY, Dimensions: pty.Dimensions{Columns: request.Columns, Rows: request.Rows}})
+		if err != nil {
+			return execResult(nil, err)
+		}
+		return result(struct {
+			Snapshot execprocess.Snapshot `json:"snapshot"`
+			Replay   bool                 `json:"replay"`
+		}{execution.Snapshot(), replay})
+	case "attach":
+		execution, err := d.config.Exec.Get(request.OperationID)
+		if err != nil {
+			return execResult(nil, err)
+		}
+		return result(struct {
+			Snapshot execprocess.Snapshot `json:"snapshot"`
+			Replay   bool                 `json:"replay"`
+		}{execution.Snapshot(), true})
+	case "status":
+		execution, err := d.config.Exec.Get(request.OperationID)
+		if err != nil {
+			return execResult(nil, err)
+		}
+		return result(execution.Snapshot())
+	case "input":
+		execution, err := d.config.Exec.Get(request.OperationID)
+		if err == nil {
+			_, err = execution.Write(request.Data)
+		}
+		return execResult(struct{}{}, err)
+	case "close-input":
+		execution, err := d.config.Exec.Get(request.OperationID)
+		if err == nil {
+			err = execution.CloseInput()
+		}
+		return execResult(struct{}{}, err)
+	case "signal":
+		execution, err := d.config.Exec.Get(request.OperationID)
+		if err == nil {
+			err = execution.Signal(pty.Signal(request.Signal))
+		}
+		return execResult(struct{}{}, err)
+	case "resize":
+		execution, err := d.config.Exec.Get(request.OperationID)
+		if err == nil {
+			err = execution.Resize(pty.Dimensions{Columns: request.Columns, Rows: request.Rows})
+		}
+		return execResult(struct{}{}, err)
+	case "cancel":
+		execution, err := d.config.Exec.Get(request.OperationID)
+		if err == nil {
+			cancelCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			err = execution.Cancel(cancelCtx)
+			cancel()
+		}
+		return execResult(struct{}{}, err)
+	default:
+		return failure("invalid_request")
+	}
+}
+
+func execResult(value any, err error) operation.Outcome {
+	switch {
+	case err == nil:
+		return result(value)
+	case errors.Is(err, execprocess.ErrNotFound):
+		return failure("not_found_or_forbidden")
+	case errors.Is(err, execprocess.ErrConflict):
+		return failure("exec_already_running")
+	case errors.Is(err, execprocess.ErrCapacity):
+		return failure("resource_limit")
+	case errors.Is(err, execprocess.ErrReplayUnavailable):
+		return failure("exec_result_unavailable")
+	default:
+		return failure("invalid_request")
+	}
+}
+
+type execOutputStream struct {
+	execution          *execprocess.Execution
+	reader             *execprocess.Reader
+	lastOutputSequence uint64
+}
+
+const execOutputEnvelopeVersion = byte(1)
+
+func encodeExecOutput(sequence uint64, data []byte) []byte {
+	encoded := make([]byte, 9+len(data))
+	encoded[0] = execOutputEnvelopeVersion
+	binary.BigEndian.PutUint64(encoded[1:9], sequence)
+	copy(encoded[9:], data)
+	return encoded
+}
+
+func (s *execOutputStream) Next(ctx context.Context) (protocol.BinaryFrame, error) {
+	for {
+		event, release, err := s.reader.Next(ctx)
+		if errors.Is(err, execprocess.ErrReplayUnavailable) {
+			return protocol.BinaryFrame{}, &StreamError{Code: "replay_gap", CloseCode: protocol.CloseReplayGap}
+		}
+		if err != nil {
+			return protocol.BinaryFrame{}, err
+		}
+		if len(event.Data) != 0 {
+			s.lastOutputSequence = event.Sequence
+			channel := protocol.Stdout
+			if event.Stream == "stderr" {
+				channel = protocol.Stderr
+			}
+			return protocol.BinaryFrame{Channel: channel, StartSequence: event.StreamSequence, Data: encodeExecOutput(event.Sequence, event.Data), Release: release}, nil
+		}
+		release()
+		if event.State == execprocess.StateExited || event.State == execprocess.StateSignaled || event.State == execprocess.StateCanceled || event.State == execprocess.StateFailed {
+			payload, marshalErr := json.Marshal(struct {
+				Event              string              `json:"event"`
+				OperationID        string              `json:"operation_id"`
+				State              execprocess.State   `json:"state"`
+				Result             *execprocess.Result `json:"result,omitempty"`
+				ErrorCode          string              `json:"error_code,omitempty"`
+				Sequence           uint64              `json:"sequence"`
+				LastOutputSequence uint64              `json:"last_output_sequence,omitempty"`
+			}{"exec_stream_end", s.execution.Snapshot().OperationID, event.State, event.Result, event.ErrorCode, event.Sequence, s.lastOutputSequence})
+			if marshalErr != nil {
+				return protocol.BinaryFrame{}, marshalErr
+			}
+			return protocol.BinaryFrame{}, &StreamEnd{Payload: payload}
+		}
+	}
+}
+
+func (s *execOutputStream) Close() error {
+	if s == nil || s.reader == nil {
+		return nil
+	}
+	return s.reader.Close()
 }
 
 func (s *terminalOutputStream) Next(ctx context.Context) (protocol.BinaryFrame, error) {

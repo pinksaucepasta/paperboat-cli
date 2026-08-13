@@ -61,7 +61,7 @@ func NewPersistentJournal(ctx context.Context, maxEntries int, durable *store.St
 	}
 	journal.store, journal.retention, journal.now = durable, retention, now
 	currentTime := now()
-	records, err := durable.Operations(ctx, currentTime, maxEntries)
+	records, err := durable.OperationsExcludingPrefix(ctx, "exec:", currentTime, maxEntries)
 	if err != nil {
 		return nil, err
 	}

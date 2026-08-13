@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -61,7 +62,7 @@ func RunProductionServeWorker(ctx context.Context, config ProductionServeWorkerC
 	source, err := servepkg.ResolvePinnedSource(descriptor.Serve.SourcePath, descriptor.Serve.SourceKind, descriptor.Serve.SourceIdentity)
 	if err != nil {
 		logEvent("source_invalidation", "failed", time.Since(restartStarted))
-		cleanupErr := reconcileInvalidServeSource(ctx, config)
+		cleanupErr := reconcileInvalidServeSource(ctx, config, descriptor.Serve.Visibility == "public")
 		if cleanupErr == nil {
 			logEvent("cleanup", "removed", time.Since(restartStarted))
 			return nil
@@ -80,6 +81,22 @@ func RunProductionServeWorker(ctx context.Context, config ProductionServeWorkerC
 	}
 	observe := func(event servepkg.LifecycleEvent) {
 		logEvent(event.Operation, event.Result, event.Duration)
+	}
+	if descriptor.Serve.Visibility == "private" {
+		local, startErr := servepkg.StartLocal(ctx, servepkg.LocalConfig{
+			Source: source, Duration: duration, Indefinite: config.Indefinite, SPA: descriptor.Serve.SPA, ListenPort: descriptor.Serve.ListenPort, Observe: observe,
+			Ready: func(localURL string) error {
+				descriptor.Port = uint16Port(localURL)
+				descriptor.Record = &preview.ControlRecord{URL: localURL, State: "ready", ExpiresAt: config.ExpiresAt}
+				return writePreviewRuntimeDescriptor(config.DescriptorPath, descriptor)
+			},
+		})
+		if startErr != nil {
+			return startErr
+		}
+		waitErr := local.Wait()
+		cleanupErr := retireCompletedServeService(context.Background(), config.Name, config.DescriptorPath, config.ServiceDefinition, config.ServiceRunner)
+		return errors.Join(waitErr, cleanupErr)
 	}
 	previewRunner := config.PreviewRunner
 	if previewRunner == nil {
@@ -105,6 +122,9 @@ func RunProductionServeWorker(ctx context.Context, config ProductionServeWorkerC
 		},
 	})
 	if err != nil {
+		if errors.Is(err, context.Canceled) && ctx.Err() != nil {
+			return retireCompletedServeService(context.Background(), config.Name, config.DescriptorPath, config.ServiceDefinition, config.ServiceRunner)
+		}
 		return err
 	}
 	waitErr := foreground.Wait()
@@ -112,9 +132,11 @@ func RunProductionServeWorker(ctx context.Context, config ProductionServeWorkerC
 	return errors.Join(waitErr, cleanupErr)
 }
 
-func reconcileInvalidServeSource(ctx context.Context, config ProductionServeWorkerConfig) error {
-	if err := revokeProductionPreviewByName(ctx, config.ControlURL, config.StateRoot, config.Name, config.Transport); err != nil {
-		return err
+func reconcileInvalidServeSource(ctx context.Context, config ProductionServeWorkerConfig, public bool) error {
+	if public {
+		if err := revokeProductionPreviewByName(ctx, config.ControlURL, config.StateRoot, config.Name, config.Transport); err != nil {
+			return err
+		}
 	}
 	runner := config.ServiceRunner
 	if runner == nil {
@@ -125,7 +147,23 @@ func reconcileInvalidServeSource(ctx context.Context, config ProductionServeWork
 			return err
 		}
 	}
-	return os.Remove(config.DescriptorPath)
+	err := os.Remove(config.DescriptorPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
+func uint16Port(rawURL string) uint16 {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return 0
+	}
+	port, err := net.LookupPort("tcp", parsed.Port())
+	if err != nil || port < 1 || port > 65535 {
+		return 0
+	}
+	return uint16(port)
 }
 
 func revokeProductionPreviewByName(ctx context.Context, controlAddress, stateRoot, name string, transport http.RoundTripper) error {

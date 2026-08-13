@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
 )
 
 var (
@@ -169,31 +171,7 @@ func (s *Store) write(key Key) error {
 	if err != nil {
 		return err
 	}
-	temporary, err := os.CreateTemp(s.config.StateRoot, ".machine-identity-*")
-	if err != nil {
-		return err
-	}
-	path := temporary.Name()
-	defer os.Remove(path)
-	if err := temporary.Chmod(0o600); err != nil {
-		temporary.Close()
-		return err
-	}
-	if _, err := temporary.Write(encoded); err != nil {
-		temporary.Close()
-		return err
-	}
-	if err := temporary.Sync(); err != nil {
-		temporary.Close()
-		return err
-	}
-	if err := temporary.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(path, s.path); err != nil {
-		return err
-	}
-	return syncDirectory(s.config.StateRoot)
+	return atomicfile.Write(s.path, encoded, atomicfile.Options{Mode: 0o600, OwnerUID: os.Geteuid(), OwnerGID: os.Getegid()})
 }
 
 func privateDirectory(path string) error {

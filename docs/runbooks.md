@@ -1,8 +1,8 @@
 # Paperboat CLI Integration Runbooks
 
-Capture only timestamps and stable request, project, environment, and access-session
+Capture only timestamps and stable request, project, environment, endpoint, intent, and operation
 IDs. Never capture codes, tokens, URLs containing credentials, terminal output,
-image bytes, or local/VM paths.
+file/preview bytes, private keys, candidate addresses, or local/machine paths.
 
 ## WorkOS outage
 
@@ -16,7 +16,7 @@ requests fail while existing client sessions remain otherwise healthy.
 
 ## Signing-key rotation or rollback
 
-Detection: helper credential verification rejects an otherwise authorized environment with
+Detection: runtime or endpoint-certificate verification rejects an otherwise authorized environment with
 an unknown key or signature error.
 
 1. Confirm the active `kid`, issuer, audience, and configured JWKS overlap without recording proofs.
@@ -31,8 +31,27 @@ dialing fails across projects.
 
 1. Use `pb doctor <environment>` to distinguish route readiness from host-runtime health.
 2. Stop reconnect storms and honor configured retry bounds.
-3. Do not expose a Fly port or fall back to SSH.
+3. Do not expose a machine port or bypass Paperboat with raw SSH. `pb ssh` is valid only when
+   its byte stream succeeds through the same direct/relay/WSS transport policy.
 4. After recovery, verify terminal attach, reconnect, resumable file transfer, and revoked-route rejection.
+
+## Local daemon unavailable
+
+Detection: `pb status` or `pb wait` cannot open the owner-only local API after its bounded
+lazy-start attempt.
+
+1. Verify the socket path and parent directory are owned by the current user and are not
+   symlinks or group/world writable. Do not delete an unfamiliar socket or lock file.
+2. Check `systemctl --user status paperboat-local-daemon.service` on Linux or
+   `launchctl print gui/<uid>/com.pinksaucepasta.paperboat.local-daemon` on macOS.
+3. If the service is active, preserve its typed health state and inspect only bounded,
+   redacted service diagnostics. Do not bypass the local API with direct control-plane
+   polling.
+4. Retry `pb status`; it may repair a missing definition only when the socket is absent or
+   refusing connections. Permission, protocol, and invalid-state failures require fixing
+   ownership or upgrading `pb`, not repeated reinstall attempts.
+5. Verify one snapshot read, one watch transition, service restart, stale-socket recovery,
+   and `pb uninstall` unloading the service before state removal.
 
 ## Codex session interruption
 
@@ -46,22 +65,34 @@ Detection: `pb codex` reports a bridge interruption or Codex exits after a remot
 ## Fly start or machine failure
 
 Detection: readiness remains in a machine-starting state, reports machine failure,
-or times out before route/helper checks.
+or times out before route/runtime checks.
 
 1. Correlate the project and machine lifecycle event in the control plane.
 2. Confirm entitlement, credits, volume attachment, image identity, and runtime health.
 3. Avoid repeated replacement while volume ownership is uncertain.
 4. After recovery, run `pb doctor <project>`, attach once, and verify the persistent workspace.
 
-## Helper authorization mismatch
+## Host-runtime authorization mismatch
 
 Detection: route and runtime are healthy but mint, token exchange, WebSocket ticket,
 terminal scope, or `file:transfer` scope is rejected.
 
 1. Compare issuer, environment ID, owner ID, audience, scope, and clock configuration.
 2. Revoke the affected downstream sessions; never broaden a credential scope to diagnose.
-3. Reconcile the VM identity configuration and re-broker a new descriptor.
+3. Reconcile the machine endpoint identity and host generation, then broker a new descriptor.
 4. Verify terminal-only credentials cannot transfer files and file-only credentials cannot attach.
+
+## Endpoint or account-root key compromise
+
+1. Stop new private operations and record only endpoint IDs, certificate fingerprints, generations,
+   and timestamps. Never export private key material for diagnosis.
+2. For one endpoint, revoke its certificate, advance authorization state, remove its local endpoint
+   state through the supported logout/unpair flow, and re-enroll it under the existing account root.
+3. For account-root loss or suspected compromise, revoke every endpoint certificate, advance the
+   account authorization generation, complete the explicit root reset/recovery flow, and re-pair
+   every CLI and machine. The server must not fabricate or escrow a replacement root.
+4. Verify old certificates, descriptors, relay admissions, and encrypted transfer resources fail;
+   then verify one newly paired terminal and file transfer on the new generations.
 
 ## Stuck device grant
 
@@ -76,7 +107,8 @@ grant cannot be consumed exactly once.
 ## Stolen device
 
 1. Revoke the device's client session from the dashboard immediately.
-2. Verify the Paperboat token family, helper sessions, and tunnel access are revoked within the configured bound.
+2. Verify the Paperboat token family, endpoint certificate, runtime sessions, and tunnel access
+   are revoked within the configured bound.
 3. Run `pb auth logout` on the device if recovered so queued local cleanup completes.
 4. Review metadata-only access events; rotate unrelated account credentials only if evidence warrants it.
 
@@ -87,7 +119,7 @@ reports repeated failures.
 
 1. Stop accepting transfers if storage safety limits are threatened; terminal access remains separately scoped.
 2. Inspect counts, sizes, ages, and environment IDs only, never file contents or source paths.
-3. Restore the helper cleanup worker and run its idempotent cleanup operation.
+3. Restore the host-runtime cleanup worker and run its idempotent cleanup operation.
 4. Verify expired files are gone, active files remain readable, traversal is rejected, and new transfers obey retention.
 
 ## Served preview workload drift

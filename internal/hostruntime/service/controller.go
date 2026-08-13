@@ -14,16 +14,26 @@ type Runner interface {
 	Run(context.Context, string, ...string) error
 }
 
+type OutputRunner interface {
+	Runner
+	Output(context.Context, string, ...string) (string, error)
+}
+
 type ExecRunner struct{}
 
 func (ExecRunner) Run(ctx context.Context, name string, arguments ...string) error {
+	_, err := (ExecRunner{}).Output(ctx, name, arguments...)
+	return err
+}
+
+func (ExecRunner) Output(ctx context.Context, name string, arguments ...string) (string, error) {
 	output := &boundedCommandOutput{limit: 8 << 10}
 	command := exec.CommandContext(ctx, name, arguments...)
 	command.Stdout, command.Stderr = output, output
 	if err := command.Run(); err != nil {
-		return &CommandError{Tool: name, Output: output.String(), Cause: err}
+		return output.String(), &CommandError{Tool: name, Output: output.String(), Cause: err}
 	}
-	return nil
+	return output.String(), nil
 }
 
 type CommandError struct {
@@ -105,7 +115,7 @@ func (c SystemdController) Remove(ctx context.Context, definitionPath string) er
 		}
 		return values
 	}
-	if err := c.Runner.Run(ctx, "systemctl", args("disable", "--now", c.unit())...); err != nil {
+	if err := c.Runner.Run(ctx, "systemctl", args("disable", "--now", c.unit())...); err != nil && !systemdUnitAbsent(err) {
 		return err
 	}
 	if err := os.Remove(definitionPath); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -126,7 +136,7 @@ func systemdUnitAbsent(err error) bool {
 		return false
 	}
 	output := strings.ToLower(commandErr.Output)
-	return strings.Contains(output, "unit") && (strings.Contains(output, "not loaded") || strings.Contains(output, "not found"))
+	return strings.Contains(output, "unit") && (strings.Contains(output, "not loaded") || strings.Contains(output, "not found") || strings.Contains(output, "does not exist"))
 }
 
 type LaunchdController struct {

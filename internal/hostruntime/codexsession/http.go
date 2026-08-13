@@ -157,11 +157,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	local.SetReadLimit(MaxMessageBytes)
-	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+	transport := &http.Transport{ResponseHeaderTimeout: 10 * time.Second, DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "unix", socket)
 	}}
 	defer transport.CloseIdleConnections()
-	remote, _, err := websocket.Dial(r.Context(), "ws://localhost", &websocket.DialOptions{HTTPClient: &http.Client{Transport: transport, Timeout: 10 * time.Second}, CompressionMode: websocket.CompressionDisabled})
+	remote, _, err := websocket.Dial(context.WithoutCancel(r.Context()), "ws://localhost", &websocket.DialOptions{HTTPClient: &http.Client{Transport: transport}, CompressionMode: websocket.CompressionDisabled})
 	if err != nil {
 		_ = local.Close(websocket.StatusInternalError, "remote_unavailable")
 		return

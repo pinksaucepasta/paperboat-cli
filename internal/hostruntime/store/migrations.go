@@ -8,10 +8,14 @@ import (
 	"sync"
 
 	"github.com/pressly/goose/v3"
+	"github.com/tailscale/squibble"
 )
 
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
+
+//go:embed schema.sql
+var canonicalSchema string
 
 var migrationMu sync.Mutex
 
@@ -40,6 +44,13 @@ func migrateDatabase(ctx context.Context, database *sql.DB, hook func(string) er
 	}
 	if err := goose.UpContext(ctx, database, "migrations"); err != nil {
 		return fmt.Errorf("migrate runtime store: %w", err)
+	}
+	return nil
+}
+
+func validateDatabaseSchema(ctx context.Context, database *sql.DB) error {
+	if err := squibble.Validate(ctx, database, canonicalSchema, &squibble.DigestOptions{IgnoreTables: []string{"goose_db_version"}}); err != nil {
+		return fmt.Errorf("%w: schema: %v", ErrCorrupt, err)
 	}
 	return nil
 }

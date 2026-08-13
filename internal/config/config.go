@@ -12,6 +12,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
+	"github.com/pinksaucepasta/paperboat/internal/userpaths"
 )
 
 // EnvConfigPath overrides the config file location when set.
@@ -121,8 +124,8 @@ type AuthConfig struct {
 
 // ConnectConfig tunes how the CLI waits for an idle machine and its helper route.
 type ConnectConfig struct {
-	// TerminalTransport selects auto, quic, or wss. Auto prefers native QUIC and
-	// falls back to WSS only when the transport cannot connect.
+	// TerminalTransport selects auto, quic, or wss. Auto uses direct QUIC,
+	// relay QUIC, then WSS; quic excludes WSS.
 	TerminalTransport string `json:"terminal_transport,omitempty"`
 	// ReadyTimeoutSeconds caps how long to poll for the tunnel to become
 	// connectable before giving up. Defaults to DefaultReadyTimeoutSeconds.
@@ -158,7 +161,10 @@ const (
 	DefaultTerminalOutputBatchMilliseconds = 0
 	DefaultTerminalOutputBufferBytes       = 128 * 1024
 	DefaultInputPartialFlushMilliseconds   = 1
-	DefaultTerminalTransport               = "auto"
+	DefaultTerminalTransport               = "a"
+	PeerRelayPreferenceMilliseconds        = 1000
+	PeerWSSStartMilliseconds               = 1000
+	PeerConnectTimeoutMilliseconds         = 20000
 	DefaultStatusBarMode                   = "auto"
 	DefaultStatusBarFullscreen             = "hide"
 	DefaultStatusBarTheme                  = "terminal"
@@ -217,11 +223,11 @@ func DefaultPath() (string, error) {
 	if p := os.Getenv(EnvConfigPath); p != "" {
 		return p, nil
 	}
-	dir, err := os.UserConfigDir()
+	path, err := userpaths.Config("paperboat/config.json")
 	if err != nil {
 		return "", fmt.Errorf("resolve user config dir: %w", err)
 	}
-	return filepath.Join(dir, "paperboat", "config.json"), nil
+	return path, nil
 }
 
 // Load reads the config at path (or DefaultPath when path is empty). A missing
@@ -356,9 +362,9 @@ func (c *Config) Validate() error {
 		seenFavorites[key] = struct{}{}
 	}
 	switch c.Connect.TerminalTransport {
-	case "auto", "quic", "wss":
+	case "a", "d", "q", "w", "r":
 	default:
-		return fmt.Errorf("connect.terminal_transport must be auto, quic, or wss")
+		return fmt.Errorf("connect.terminal_transport must be a, d, q, w, or r")
 	}
 	if c.Connect.TerminalOutputBatchMilliseconds < 0 {
 		return fmt.Errorf("connect.terminal_output_batch_milliseconds cannot be negative")
@@ -484,33 +490,10 @@ func (c *Config) Save() error {
 		return fmt.Errorf("encode config: %w", err)
 	}
 	data = append(data, '\n')
-	// A torn config file can strand the CLI without its server configuration.
-	// Write beside the target then atomically replace it.
-	tmp, err := os.CreateTemp(filepath.Dir(c.path), ".config-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create config temp file: %w", err)
-	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
-	if err := tmp.Chmod(0o600); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("restrict config temp file: %w", err)
-	}
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("write config %s: %w", c.path, err)
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("sync config %s: %w", c.path, err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close config %s: %w", c.path, err)
-	}
-	if err := os.Rename(tmpPath, c.path); err != nil {
+	if err := atomicfile.Write(c.path, data, atomicfile.Options{Mode: 0o600, OwnerUID: os.Geteuid(), OwnerGID: os.Getegid()}); err != nil {
 		return fmt.Errorf("replace config %s: %w", c.path, err)
 	}
-	return os.Chmod(c.path, 0o600)
+	return nil
 }
 
 // NormalizeServerURL accepts the public Paperboat API URL. HTTP is restricted

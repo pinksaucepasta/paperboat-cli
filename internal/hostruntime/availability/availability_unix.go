@@ -48,6 +48,7 @@ type Observation struct {
 	HostServiceVersion string    `json:"host_service_version"`
 	HostServiceScope   string    `json:"host_service_scope"`
 	UpdateRollbacks    uint64    `json:"update_rollbacks"`
+	UpdateHealth       string    `json:"update_health"`
 }
 
 type Resolver struct {
@@ -142,10 +143,10 @@ func (c *HostClient) Apply(ctx context.Context, policy Resolution) (Observation,
 	decoder.DisallowUnknownFields()
 	var response hostservice.Response
 	var extra any
-	if decoder.Decode(&response) != nil || decoder.Decode(&extra) != io.EOF || response.Schema != hostservice.ProtocolV1 || response.DesiredMode != policy.Mode || response.DesiredVersion != policy.Version || response.ObservedMode != policy.Mode || response.ObservedVersion != policy.Version || response.ObservedAt.IsZero() || response.HostServiceVersion == "" || response.Scope != "system" || !validStatus(response.Status, response.ErrorCode) {
+	if decoder.Decode(&response) != nil || decoder.Decode(&extra) != io.EOF || response.Schema != hostservice.ProtocolV1 || response.DesiredMode != policy.Mode || response.DesiredVersion != policy.Version || response.ObservedMode != policy.Mode || response.ObservedVersion != policy.Version || response.ObservedAt.IsZero() || response.HostServiceVersion == "" || response.Scope != "system" || !validStatus(response.Status, response.ErrorCode) || !validUpdateHealth(response.UpdateHealth) {
 		return Observation{}, ErrInvalid
 	}
-	return Observation{Schema: PolicySchemaV1, Mode: response.ObservedMode, Version: response.ObservedVersion, Status: response.Status, ObservedAt: response.ObservedAt.UTC(), ErrorCode: response.ErrorCode, HostServiceVersion: response.HostServiceVersion, HostServiceScope: response.Scope, UpdateRollbacks: response.UpdateRollbacks}, nil
+	return Observation{Schema: PolicySchemaV1, Mode: response.ObservedMode, Version: response.ObservedVersion, Status: response.Status, ObservedAt: response.ObservedAt.UTC(), ErrorCode: response.ErrorCode, HostServiceVersion: response.HostServiceVersion, HostServiceScope: response.Scope, UpdateRollbacks: response.UpdateRollbacks, UpdateHealth: response.UpdateHealth}, nil
 }
 
 type Service struct {
@@ -270,4 +271,7 @@ func validMode(value string) bool {
 }
 func validStatus(status, code string) bool {
 	return status == "applied" && code == "" || (status == "unsupported" || status == "error") && code != ""
+}
+func validUpdateHealth(value string) bool {
+	return value == "healthy" || value == "recovery_required"
 }

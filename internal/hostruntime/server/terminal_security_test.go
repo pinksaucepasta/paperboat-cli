@@ -62,6 +62,27 @@ func TestTerminalStreamIDsCannotCrossConnections(t *testing.T) {
 	}
 }
 
+func TestLateFramesForClosedTerminalStreamDoNotKillCarrier(t *testing.T) {
+	handler := &terminalSecurityHandler{}
+	server := &Server{config: Config{Handler: handler}}
+	state := boundTerminalState(7)
+	state.remove(7)
+
+	input, _ := protocol.EncodeTerminalInput(protocol.TerminalInputFrame{StreamID: 7, Sequence: 1, Data: []byte("late")}, nil)
+	ack, _ := protocol.EncodeTerminalACK(protocol.TerminalACKFrame{StreamID: 7, NextSequence: 1}, nil)
+	resize, _ := protocol.EncodeTerminalResize(protocol.TerminalResizeFrame{StreamID: 7, Columns: 80, Rows: 24, Sequence: 1}, nil)
+	for _, frame := range [][]byte{input, ack, resize} {
+		if err := server.handleTerminalData(context.Background(), frame, state); err != nil {
+			t.Fatalf("late frame error=%v", err)
+		}
+	}
+	unknown, _ := protocol.EncodeTerminalInput(protocol.TerminalInputFrame{StreamID: 8, Sequence: 1, Data: []byte("unknown")}, nil)
+	requireInvalidTerminalFrame(t, server.handleTerminalData(context.Background(), unknown, state))
+	if handler.inputs != 0 || handler.acks != 0 || handler.resizes != 0 {
+		t.Fatalf("handler calls: input=%d ack=%d resize=%d", handler.inputs, handler.acks, handler.resizes)
+	}
+}
+
 func TestTerminalInputAndResizeSequencesMustBeContiguous(t *testing.T) {
 	handler := &terminalSecurityHandler{}
 	server := &Server{config: Config{Handler: handler}}

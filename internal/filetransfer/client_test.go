@@ -78,7 +78,7 @@ func TestUploadBatchResumesAndRefreshesWithoutChangingTransferID(t *testing.T) {
 		refreshes++
 		return Auth{Token: "fresh", ExpiresAt: time.Now().Add(time.Minute)}, nil
 	}
-	batch, err := client.SendBatch(context.Background(), "fb_1", "ses_1", []Source{source(data)})
+	batch, err := client.sendBatchPlaintext(context.Background(), "fb_1", "ses_1", []Source{source(data)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +103,7 @@ func TestUploadBatchCancelsEveryManifestAfterFailure(t *testing.T) {
 	}))
 	defer server.Close()
 	client := NewClient(server.URL, Auth{Token: "token"}, testBinding(), server.Client())
-	_, err := client.SendBatch(context.Background(), "fb", "ses", []Source{source([]byte("a")), source([]byte("b"))})
+	_, err := client.sendBatchPlaintext(context.Background(), "fb", "ses", []Source{source([]byte("a")), source([]byte("b"))})
 	if err == nil {
 		t.Fatal("expected failure")
 	}
@@ -133,7 +133,7 @@ func TestUploadBatchCancelsEveryManifestAfterInvalidCompletion(t *testing.T) {
 	}))
 	defer server.Close()
 	client := NewClient(server.URL+"/v1/file-transfers", Auth{Token: "token"}, testBinding(), server.Client())
-	_, err := client.SendBatch(context.Background(), "fb", "ses", []Source{source(nil), source(nil)})
+	_, err := client.sendBatchPlaintext(context.Background(), "fb", "ses", []Source{source(nil), source(nil)})
 	if err == nil {
 		t.Fatal("expected invalid completion failure")
 	}
@@ -166,7 +166,7 @@ func TestSendBatchWaitsForPendingDeliveryReceipt(t *testing.T) {
 
 	client := NewClient(server.URL+"/v1/file-transfers", Auth{Token: "token"}, testBinding(), server.Client())
 	client.DeliveryTimeout = time.Second
-	batch, err := client.SendBatch(context.Background(), "fb", "ses", []Source{source(nil)})
+	batch, err := client.sendBatchPlaintext(context.Background(), "fb", "ses", []Source{source(nil)})
 	if err != nil {
 		t.Fatal(err)
 	}

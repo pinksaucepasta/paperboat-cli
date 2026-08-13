@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.paperboat.dev/diagnostics/bugreport.schema.json",
+  "title": "pb bugreport JSON result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "bundle_created", "recorded", "uploaded"],
+  "properties": {
+    "schema": { "const": "paperboat.bugreport/v1" },
+    "bundle_created": { "type": "boolean" },
+    "correlation_id": { "type": "string", "pattern": "^pb-[a-f0-9]{32}$" },
+    "bundle_path": { "type": "string", "minLength": 1, "maxLength": 4096 },
+    "bytes": { "type": "integer", "minimum": 1, "maximum": 26214400 },
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "categories": {
+      "type": "array",
+      "prefixItems": [{ "const": "manifest" }, { "const": "recent_events" }, { "const": "redacted_events" }, { "const": "status" }],
+      "minItems": 4,
+      "maxItems": 4
+    },
+    "created_at": { "type": "string", "format": "date-time" },
+    "recorded": { "type": "boolean" },
+    "uploaded": { "type": "boolean" },
+    "server_correlation_id": { "type": "string", "pattern": "^pb-[a-f0-9]{32}$" },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "stage", "message"],
+      "properties": {
+        "code": { "type": "string", "pattern": "^[a-z0-9_]{1,64}$" },
+        "stage": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "message": { "type": "string", "minLength": 1, "maxLength": 512 }
+      }
+    }
+  },
+  "allOf": [
+    { "if": { "properties": { "bundle_created": { "const": true } }, "required": ["bundle_created"] }, "then": { "required": ["correlation_id", "bundle_path", "bytes", "sha256", "categories", "created_at"] } },
+    { "if": { "properties": { "uploaded": { "const": true } }, "required": ["uploaded"] }, "then": { "required": ["server_correlation_id"] } }
+  ]
+}

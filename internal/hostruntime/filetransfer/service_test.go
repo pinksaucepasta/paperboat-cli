@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/store"
+	"github.com/pinksaucepasta/paperboat/internal/peertransport/transfercrypto"
 )
 
 func newService(t *testing.T) (*Service, *store.Store, string) {
@@ -398,6 +399,86 @@ func TestPublishedInboundFileSurvivesUntilSevenDayRetentionBoundary(t *testing.T
 	}
 	if _, err := os.Stat(filepath.Join(root, "transfers", id+".content")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("expired content remains: %v", err)
+	}
+}
+
+func TestEncryptedTransferExpiryErasesKeyBeforeCleanup(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	root := t.TempDir()
+	durable, err := store.Open(context.Background(), store.Config{Root: filepath.Join(root, "state")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer durable.Close()
+	eraseErr := errors.New("vault unavailable")
+	erased := 0
+	service, err := New(Config{
+		Root: filepath.Join(root, "transfers"), LocalMachineID: "machine_local", Store: durable,
+		Now: func() time.Time { return now }, EraseTransferKey: func(id string) error {
+			if id != "fb_encrypted" {
+				t.Fatalf("key id=%q", id)
+			}
+			erased++
+			return eraseErr
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := requestFor([]byte("private"))
+	request.E2EETransferID, request.TransferGeneration = "fb_encrypted", 1
+	request.Files[0].ID, request.Files[0].Ordinal = "fb_encrypted.0", 0
+	created, err := service.Create(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(Retention)
+	if err := service.CleanupExpired(context.Background()); !hasCode(err, StorageUnavailable) {
+		t.Fatalf("cleanup err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "transfers", created[0].ID+".part")); err != nil {
+		t.Fatalf("failed erasure removed retry state: %v", err)
+	}
+	eraseErr = nil
+	if err := service.CleanupExpired(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if erased != 2 {
+		t.Fatalf("erase attempts=%d", erased)
+	}
+	if _, err := os.Stat(filepath.Join(root, "transfers", created[0].ID+".part")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expired content remains: %v", err)
+	}
+}
+
+func TestEncryptedChunkCommitRejectsReorderAndAlteredReplay(t *testing.T) {
+	service, _, _ := newService(t)
+	data := bytes.Repeat([]byte{7}, transfercrypto.ChunkSize+1)
+	request := requestFor(data)
+	request.E2EETransferID, request.TransferGeneration = "fb_encrypted", 1
+	request.Files[0].ID, request.Files[0].Ordinal = "fb_encrypted.0", 0
+	created, err := service.Create(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstDigest := sha256.Sum256([]byte("ciphertext-0"))
+	secondDigest := sha256.Sum256([]byte("ciphertext-1"))
+	if _, err := service.AppendEncrypted(context.Background(), created[0].ID, 1, secondDigest, 17, data[transfercrypto.ChunkSize:]); !hasCode(err, OffsetConflict) {
+		t.Fatalf("reordered chunk err=%v", err)
+	}
+	if _, err := service.AppendEncrypted(context.Background(), created[0].ID, 0, firstDigest, 31, data[:transfercrypto.ChunkSize]); err != nil {
+		t.Fatal(err)
+	}
+	if replayed, err := service.AppendEncrypted(context.Background(), created[0].ID, 0, firstDigest, 31, data[:transfercrypto.ChunkSize]); err != nil || replayed.CommittedChunks != 1 {
+		t.Fatalf("exact replay transfer=%+v err=%v", replayed, err)
+	}
+	alteredDigest := sha256.Sum256([]byte("altered-ciphertext-0"))
+	if _, err := service.AppendEncrypted(context.Background(), created[0].ID, 0, alteredDigest, 31, data[:transfercrypto.ChunkSize]); !hasCode(err, OffsetConflict) {
+		t.Fatalf("altered replay err=%v", err)
+	}
+	current, err := service.Get(context.Background(), created[0].ID)
+	if err != nil || current.CommittedChunks != 1 || current.CommittedOffset != transfercrypto.ChunkSize {
+		t.Fatalf("current=%+v err=%v", current, err)
 	}
 }
 

@@ -13,7 +13,7 @@ credentials remain outside this repository.
 
 ## Stack
 
-Go `1.25.7`; Cobra; standard HTTP; Gorilla WebSocket; `x/term`; OS credential adapters.
+Go `1.26.5`; Cobra; standard HTTP; Coder WebSocket; `x/term`; OS credential adapters.
 
 ## Local Rules
 

@@ -25,10 +25,12 @@ type ConnectInfo struct {
 	// TargetKind identifies the Paperboat environment provider. It is
 	// "project" for a hosted Fly environment and "machine" for an
 	// enrolled customer machine.
-	TargetKind   string
-	ProjectID    string
-	Project      string
-	ProjectState string
+	TargetKind        string
+	ProjectID         string
+	Project           string
+	ProjectState      string
+	MachineGeneration uint64
+	Transport         string
 	// TunnelTarget identifies how the tunnel layer should reach the helper.
 	TunnelTarget string
 	// Local is true when this resolves to a local dev target (no real VM).

@@ -46,6 +46,57 @@ func TestClientConfigurationUsesServerOwnedURLWithoutAuthentication(t *testing.T
 	}
 }
 
+func TestMachineExecDescriptorBindsSourceAndOperation(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/machines/um_1/exec-descriptor" {
+			http.NotFound(w, r)
+			return
+		}
+		var body map[string]string
+		if json.NewDecoder(r.Body).Decode(&body) != nil || body["source_machine_id"] != "um_source" || body["operation_id"] != "operation_exec_1" {
+			t.Fatalf("body=%#v", body)
+		}
+		expiresAt := time.Now().Add(time.Minute)
+		writeData(w, http.StatusOK, ExecDescriptor{OperationID: "operation_exec_1", Environment: &Environment{ID: "env_1", Kind: "byod", ResourceID: "um_1", State: "ready", Root: "/workspace"}, Endpoints: TerminalEndpoints{QUIC: "quic://machine.test:443", WSS: "wss://machine.test/v1/runtime"}, Auth: AuthMaterial{Method: "bearer", Token: "exec-token", ExpiresAt: expiresAt, Scopes: []string{"exec:operate"}}, ExpiresAt: expiresAt})
+	}))
+	defer server.Close()
+	client := New(server.URL, config.Credential{AccessToken: "token"}, nil)
+	client.SetSourceMachineID("um_source")
+	descriptor, err := client.MachineExecDescriptor(context.Background(), "um_1", "operation_exec_1")
+	if err != nil || descriptor.Auth.Token != "exec-token" || descriptor.Environment.Root != "/workspace" {
+		t.Fatalf("descriptor=%#v err=%v", descriptor, err)
+	}
+}
+
+func TestMachineSSHDescriptorRequiresExactScope(t *testing.T) {
+	for _, scope := range []string{"ssh:operate", "exec:operate"} {
+		t.Run(scope, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != "/v1/machines/um_1/ssh-descriptor" {
+					http.NotFound(w, r)
+					return
+				}
+				var body map[string]string
+				if json.NewDecoder(r.Body).Decode(&body) != nil || body["source_machine_id"] != "um_source" || body["operation_id"] != "operation_ssh_1" {
+					t.Fatalf("body=%#v", body)
+				}
+				expiresAt := time.Now().Add(time.Minute)
+				writeData(w, http.StatusOK, SSHDescriptor{OperationID: "operation_ssh_1", Environment: &Environment{ID: "env_1", Kind: "byod", ResourceID: "um_1", State: "ready", Root: "/workspace"}, Endpoints: TerminalEndpoints{QUIC: "quic://machine.test:443", WSS: "wss://machine.test/v1/runtime"}, Auth: AuthMaterial{Method: "bearer", Token: "ssh-token", ExpiresAt: expiresAt, Scopes: []string{scope}}, ExpiresAt: expiresAt})
+			}))
+			defer server.Close()
+			client := New(server.URL, config.Credential{AccessToken: "token"}, nil)
+			client.SetSourceMachineID("um_source")
+			_, err := client.MachineSSHDescriptor(context.Background(), "um_1", "operation_ssh_1")
+			if scope == "ssh:operate" && err != nil {
+				t.Fatal(err)
+			}
+			if scope != "ssh:operate" && err == nil {
+				t.Fatal("exec scope accepted for ssh descriptor")
+			}
+		})
+	}
+}
+
 func TestClientConfigurationRejectsInvalidURL(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		writeData(w, http.StatusOK, ClientConfiguration{Version: "1", MachinesURL: "/dashboard/machines"})
@@ -55,6 +106,99 @@ func TestClientConfigurationRejectsInvalidURL(t *testing.T) {
 	_, err := New(srv.URL, config.Credential{}, nil).ClientConfiguration(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "invalid machines URL") {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestNetworkCheckRegionsUsesBoundedPublicContract(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/network-check/regions/v1" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		writeData(w, http.StatusOK, NetworkCheckRegions{Regions: []NetworkCheckRegion{{Region: "fsn1", STUNURL: "stun:stun.example.test:3478", HTTPSURL: "https://signal.example.test/network-check/v1"}}})
+	}))
+	defer srv.Close()
+	got, err := New(srv.URL, config.Credential{}, srv.Client()).NetworkCheckRegions(context.Background())
+	if err != nil || len(got.Regions) != 1 || got.Regions[0].Region != "fsn1" {
+		t.Fatalf("regions=%#v err=%v", got, err)
+	}
+}
+
+func TestNetworkCheckRegionsRejectsMalformedAuthorityData(t *testing.T) {
+	for _, region := range []NetworkCheckRegion{
+		{Region: "FSN1", STUNURL: "stun:stun.example.test:3478", HTTPSURL: "https://signal.example.test/network-check/v1"},
+		{Region: "fsn1", STUNURL: "stun:stun.example.test", HTTPSURL: "https://signal.example.test/network-check/v1"},
+		{Region: "fsn1", STUNURL: "stun:stun.example.test:3478", HTTPSURL: "https://signal.example.test/other"},
+	} {
+		t.Run(region.Region+region.STUNURL+region.HTTPSURL, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				writeData(w, http.StatusOK, NetworkCheckRegions{Regions: []NetworkCheckRegion{region}})
+			}))
+			defer srv.Close()
+			if _, err := New(srv.URL, config.Credential{}, srv.Client()).NetworkCheckRegions(context.Background()); err == nil {
+				t.Fatal("malformed region accepted")
+			}
+		})
+	}
+}
+
+func TestCreatePeerAttemptUsesStrictSecurityDocument(t *testing.T) {
+	for _, unknown := range []bool{false, true} {
+		t.Run(map[bool]string{false: "valid", true: "unknown field"}[unknown], func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != "/v1/peer-attempts" || r.Header.Get("Authorization") != "Bearer token" {
+					t.Fatalf("request=%s %s auth=%q", r.Method, r.URL.Path, r.Header.Get("Authorization"))
+				}
+				var input PeerAttemptInput
+				if err := json.NewDecoder(r.Body).Decode(&input); err != nil || input.OperationID != "peer-operation-0123456789" || input.Purpose != "direct_probe" || input.Consumer != "terminal" || input.AttemptGeneration != 2 || input.RelayLatency == nil || input.RelayLatency.Generation != 1 {
+					t.Fatalf("input=%+v err=%v", input, err)
+				}
+				data := map[string]any{"version": 1, "intent_id": "psi_0123456789abcdef", "environment_id": "env_1", "purpose": "direct_probe", "consumer": "terminal", "initiator_endpoint_id": "cli_1", "responder_endpoint_id": "machine_1", "role": "controlling", "attempt_generation": 2, "network_generation": 4, "issued_at": "2026-08-03T00:00:00Z", "expires_at": "2026-08-03T00:05:00Z", "endpoint_certificates": []any{}, "direct": map[string]any{"ice_ufrag": "abcdefghijklmnop", "ice_password": "abcdefghijklmnopqrstuvwxyzABCDEF", "stun_urls": []string{"stun:edge.example.test:3478"}}, "signaling": map[string]any{"url": "wss://signal.example.test/v1/peer-signaling", "credential": "header.payload.signature", "subprotocol": "paperboat.peer-signaling.v1"}, "relays": []any{}, "policy": map[string]any{"allowed_paths": []string{"direct_quic"}, "relay_deadline_ms": 5000, "health_interval_ms": 15000, "max_candidates": 32}}
+				if unknown {
+					data["unexpected_authority"] = true
+				}
+				writeData(w, http.StatusCreated, data)
+			}))
+			defer srv.Close()
+			_, err := New(srv.URL, config.Credential{AccessToken: "token"}, nil).CreatePeerAttempt(context.Background(), PeerAttemptInput{OperationID: "peer-operation-0123456789", EnvironmentID: "env_1", Purpose: "direct_probe", Consumer: "terminal", AttemptGeneration: 2, NetworkGeneration: 4, RelayLatency: &RelayLatencyVector{Generation: 1, ObservedAt: time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC), Samples: []RelayLatencySample{{Region: "fsn1", RTTMS: 20}}}})
+			if unknown && err == nil {
+				t.Fatal("unknown descriptor field accepted")
+			}
+			if !unknown && err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestEndpointCertificateUsesExactEscapedIdentity(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.EscapedPath() != "/v1/endpoints/machine_01/certificates/3" || r.Header.Get("Authorization") != "Bearer token" {
+			t.Fatalf("request=%s %s authorization=%q", r.Method, r.URL.EscapedPath(), r.Header.Get("Authorization"))
+		}
+		writeData(w, http.StatusOK, EndpointCertificateDocument{Version: 1, EndpointID: "machine_01", Generation: 3})
+	}))
+	defer server.Close()
+	value, err := New(server.URL, config.Credential{AccessToken: "token"}, server.Client()).EndpointCertificate(context.Background(), "machine_01", 3)
+	if err != nil || value.EndpointID != "machine_01" || value.Generation != 3 {
+		t.Fatalf("value=%+v err=%v", value, err)
+	}
+	if _, err := New(server.URL, config.Credential{}, server.Client()).EndpointCertificate(context.Background(), "", 3); err == nil {
+		t.Fatal("empty endpoint identity was accepted")
+	}
+}
+
+func TestBootstrapE2EEUsesIdempotencyAndStrictResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost || request.URL.Path != "/v1/e2ee/bootstrap" || request.Header.Get("Idempotency-Key") != "bootstrap-operation-0123456789" {
+			t.Fatalf("request=%s %s headers=%v", request.Method, request.URL.Path, request.Header)
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(writer, `{"data":{"root_public_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","certificate":{"version":1,"account_id":"account_1","root_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","endpoint_id":"cli_1","role":"cli","generation":1,"serial":1,"issued_at":"2026-08-03T00:00:00Z","expires_at":"2026-09-02T00:00:00Z","certificate":"certificate","certificate_fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}`)
+	}))
+	defer server.Close()
+	result, err := New(server.URL, config.Credential{AccessToken: "token"}, nil).BootstrapE2EE(context.Background(), "bootstrap-operation-0123456789", E2EEBootstrapInput{})
+	if err != nil || result.Certificate.EndpointID != "cli_1" {
+		t.Fatalf("result=%+v err=%v", result, err)
 	}
 }
 
@@ -322,6 +466,60 @@ func TestUserMachineRevokeRequestsUseBearer(t *testing.T) {
 	}
 	if got := strings.Join(seen, ","); got != "POST /v1/machines/um_1/disconnect Bearer token,DELETE /v1/machines/um_1 Bearer token" {
 		t.Fatalf("requests=%q", got)
+	}
+}
+
+func TestManagedSSHReadinessRecordsAreGenerationBound(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/v1/machines/machine_1/ssh-target":
+			writeData(writer, http.StatusOK, ManagedSSHTarget{Type: "machine_target", Version: 1, MachineID: "machine_1", MachineGeneration: 4, OSUser: "deploy", Port: 22, ReconciliationVersion: 2})
+		case "/v1/machines/machine_1/ssh-host-keys":
+			writeData(writer, http.StatusOK, ManagedSSHHostKeySet{Type: "host_key_set", Version: 1, SetID: "sshks_test", MachineID: "machine_1", MachineGeneration: 4, ObservationGeneration: 3, Keys: []string{"ssh-ed25519 AAAA test"}, Fingerprint: "SHA256:test", State: "active", ReconciliationVersion: 5})
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+	client := New(server.URL, config.Credential{AccessToken: "token"}, server.Client())
+	if target, err := client.ManagedSSHTarget(context.Background(), "machine_1", 4); err != nil || target.Port != 22 {
+		t.Fatalf("target=%+v err=%v", target, err)
+	}
+	if keys, err := client.ManagedSSHHostKeys(context.Background(), "machine_1", 4); err != nil || keys.ObservationGeneration != 3 {
+		t.Fatalf("keys=%+v err=%v", keys, err)
+	}
+}
+
+func TestObserveManagedSSHHostKeysAcceptsReusedActiveSet(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writeData(writer, http.StatusOK, ManagedSSHHostKeySet{Type: "host_key_set", Version: 1, SetID: "sshks_test", MachineID: "machine_1", MachineGeneration: 4, ObservationGeneration: 3, Keys: []string{"ssh-ed25519 AAAA test"}, Fingerprint: "SHA256:test", State: "active", ReconciliationVersion: 5})
+	}))
+	defer server.Close()
+	client := New(server.URL, config.Credential{}, server.Client())
+	set, err := client.ObserveManagedSSHHostKeys(context.Background(), "machine_1", "identity", "managed-ssh-observe-4-47", "sshks_test", 4, 47, []string{"ssh-ed25519 AAAA test"}, []byte("proof"))
+	if err != nil || set.ObservationGeneration != 3 {
+		t.Fatalf("set=%+v err=%v", set, err)
+	}
+}
+
+func TestManagedSSHClientKeyRegistrationBindsFingerprintAndIdempotency(t *testing.T) {
+	var requestPath, operationID, body string
+	fingerprint := [32]byte{1, 2, 3}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requestPath = request.URL.Path
+		operationID = request.Header.Get("Idempotency-Key")
+		value, _ := io.ReadAll(request.Body)
+		body = string(value)
+		writeData(writer, http.StatusCreated, ManagedSSHClientKey{Type: "client_key", Version: 1, Fingerprint: "SHA256:AQIDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", PublicKey: "ssh-ed25519 AAAA test", State: "active", ReconciliationVersion: 1})
+	}))
+	defer server.Close()
+	client := New(server.URL, config.Credential{AccessToken: "token"}, server.Client())
+	key, err := client.RegisterManagedSSHClientKey(context.Background(), "ssh-ed25519 AAAA test", fingerprint, "managed-ssh-operation-1")
+	if err != nil || key.State != "active" {
+		t.Fatalf("key=%+v err=%v", key, err)
+	}
+	if requestPath != "/v1/ssh/client-keys/SHA256:AQIDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" || operationID != "managed-ssh-operation-1" || body != `{"public_key":"ssh-ed25519 AAAA test"}` {
+		t.Fatalf("path=%q operation=%q body=%q", requestPath, operationID, body)
 	}
 }
 
@@ -664,12 +862,12 @@ func TestProjectConnectionDescriptorDecodesCanonicalDescriptor(t *testing.T) {
 func TestLaunchMachinePreviewAcceptsCanonicalRuntimeRecord(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"id": "prv_1", "environment_id": "env_1", "logical_name": "web", "preview_key": "p-test",
+			"operation_id": "operation-123", "id": "prv_1", "environment_id": "env_1", "logical_name": "web", "preview_key": "p-test",
 			"url": "https://web.preview.example.test", "target_port": 3000, "state": "ready",
 		})
 	}))
 	defer server.Close()
-	record, err := LaunchMachinePreview(context.Background(), PreviewLaunchDescriptor{Endpoint: server.URL, Auth: AuthMaterial{Token: "token"}}, PreviewLaunchRequest{Name: "web", Port: 3000}, server.Client().Transport)
+	record, err := LaunchMachinePreview(context.Background(), PreviewLaunchDescriptor{Endpoint: server.URL, Auth: AuthMaterial{Token: "token"}}, PreviewLaunchRequest{OperationID: "operation-123", Name: "web", Port: 3000}, server.Client().Transport)
 	if err != nil || record.ID != "prv_1" || record.EnvironmentID != "env_1" || record.TargetPort != 3000 {
 		t.Fatalf("record=%+v err=%v", record, err)
 	}

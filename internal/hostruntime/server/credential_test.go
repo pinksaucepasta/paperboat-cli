@@ -67,3 +67,21 @@ func TestCredentialAuthorizerFailsClosedWithoutPolicy(t *testing.T) {
 		t.Fatalf("err=%v", err)
 	}
 }
+
+func TestStableClaimsBindingKeepsExecRenewalButSeparatesOperations(t *testing.T) {
+	claims := auth.Claims{Issuer: "https://api.test", Subject: "usr_1", JTI: "jti_1", IssuedAt: 1, ExpiresAt: 100, Scope: []string{"exec:operate"}, CredentialClass: "exec_operation", EnvironmentID: "env_1", MachineID: "machine_1", UserID: "usr_1", CLIClientSessionID: "cli_1", OperationID: "operation_exec_1"}
+	first, err := stableClaimsBinding(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims.JTI, claims.IssuedAt, claims.ExpiresAt = "jti_2", 50, 150
+	renewed, err := stableClaimsBinding(claims)
+	if err != nil || renewed != first {
+		t.Fatalf("renewed=%q first=%q err=%v", renewed, first, err)
+	}
+	claims.OperationID = "operation_exec_2"
+	other, err := stableClaimsBinding(claims)
+	if err != nil || other == first {
+		t.Fatalf("other=%q first=%q err=%v", other, first, err)
+	}
+}

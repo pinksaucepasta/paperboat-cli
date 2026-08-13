@@ -290,6 +290,8 @@ func DefaultDescriptors() []Descriptor {
 		{Name: "paperboat_runtime_restart_total", Kind: Counter},
 		{Name: "paperboat_runtime_renewal_failures_total", Kind: Counter},
 		{Name: "paperboat_runtime_connector_recovery_seconds", Kind: Gauge},
+		{Name: "paperboat_runtime_network_changes_total", Kind: Counter, Labels: map[string]map[string]bool{"reason": set("default_route", "interface_address", "address_family", "proxy", "network_cost", "viability", "wake"), "action": set("observe", "rebind")}},
+		{Name: "paperboat_runtime_network_generation", Kind: Gauge},
 		{Name: "paperboat_runtime_update_rollbacks_total", Kind: Counter},
 		{Name: "paperboat_runtime_terminal_events_total", Kind: Counter, Labels: map[string]map[string]bool{"event": set("replay_gap", "slow_consumer", "input_uncertain", "runtime_restart")}},
 		{Name: "paperboat_runtime_terminal_persistence_failures_total", Kind: Counter},

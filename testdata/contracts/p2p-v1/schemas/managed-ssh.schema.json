@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://paperboat.dev/contracts/p2p-v1/managed-ssh.schema.json",
+  "title": "Paperboat managed SSH resources v1",
+  "oneOf": [
+    { "$ref": "#/$defs/client_key" },
+    { "$ref": "#/$defs/target" },
+    { "$ref": "#/$defs/host_keys" },
+    { "$ref": "#/$defs/readiness" }
+  ],
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$" },
+    "fingerprint": { "type": "string", "pattern": "^SHA256:[A-Za-z0-9+/]{43}$" },
+    "generation": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "time": { "type": "string", "format": "date-time", "pattern": "Z$" },
+    "public_key": { "type": "string", "pattern": "^(ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|ssh-rsa) [A-Za-z0-9+/]+={0,2}$", "maxLength": 8192 },
+    "client_key": {
+      "type": "object", "additionalProperties": false,
+      "required": ["type", "version", "fingerprint", "public_key", "state", "reconciliation_version", "created_at"],
+      "properties": {
+        "type": { "const": "client_key" }, "version": { "const": 1 },
+        "fingerprint": { "$ref": "#/$defs/fingerprint" }, "public_key": { "$ref": "#/$defs/public_key" },
+        "state": { "enum": ["active", "revoked"] },
+        "reconciliation_version": { "$ref": "#/$defs/generation" },
+        "created_at": { "$ref": "#/$defs/time" }, "revoked_at": { "$ref": "#/$defs/time" }
+      }
+    },
+    "target": {
+      "type": "object", "additionalProperties": false,
+      "required": ["type", "version", "machine_id", "machine_generation", "os_user", "port", "reconciliation_version", "created_at", "updated_at"],
+      "properties": {
+        "type": { "const": "machine_target" }, "version": { "const": 1 }, "machine_id": { "$ref": "#/$defs/id" },
+        "machine_generation": { "$ref": "#/$defs/generation" },
+        "os_user": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "reconciliation_version": { "$ref": "#/$defs/generation" },
+        "created_at": { "$ref": "#/$defs/time" }, "updated_at": { "$ref": "#/$defs/time" }
+      }
+    },
+    "host_keys": {
+      "type": "object", "additionalProperties": false,
+      "required": ["type", "version", "set_id", "machine_id", "machine_generation", "observation_generation", "fingerprint", "keys", "state", "reconciliation_version"],
+      "properties": {
+        "type": { "const": "host_key_set" }, "version": { "const": 1 },
+        "set_id": { "type": "string", "pattern": "^sshks_[A-Za-z0-9_-]{16,128}$" },
+        "machine_id": { "$ref": "#/$defs/id" },
+        "machine_generation": { "$ref": "#/$defs/generation" },
+        "observation_generation": { "$ref": "#/$defs/generation" },
+        "fingerprint": { "$ref": "#/$defs/fingerprint" },
+        "keys": { "type": "array", "minItems": 1, "maxItems": 8, "uniqueItems": true, "items": { "$ref": "#/$defs/public_key" } },
+        "state": { "enum": ["active", "pending", "superseded"] },
+        "reconciliation_version": { "$ref": "#/$defs/generation" }
+      }
+    },
+    "readiness": {
+      "type": "object", "additionalProperties": false,
+      "required": ["type", "version", "machine_id", "ready", "target_generation", "host_key_generation"],
+      "properties": {
+        "type": { "const": "ssh_readiness" }, "version": { "const": 1 }, "machine_id": { "$ref": "#/$defs/id" },
+        "ready": { "type": "boolean" }, "target_generation": { "$ref": "#/$defs/generation" },
+        "host_key_generation": { "$ref": "#/$defs/generation" },
+        "code": { "enum": ["ssh_key_rejected", "ssh_target_not_ready", "ssh_host_key_changed"] }
+      },
+      "allOf": [
+        { "if": { "properties": { "ready": { "const": false } } }, "then": { "required": ["code"] } },
+        { "if": { "properties": { "ready": { "const": true } } }, "then": { "not": { "required": ["code"] } } }
+      ]
+    }
+  }
+}

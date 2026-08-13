@@ -1,12 +1,52 @@
 package codexsession
 
 import (
+	"bufio"
 	"bytes"
+	"context"
+	"io"
+	"net"
+	"net/http"
 	"strings"
 	"testing"
 
 	"github.com/charmbracelet/x/ansi"
 )
+
+func TestPeerHTTPClientCarriesRequestOnlyThroughInjectedConnection(t *testing.T) {
+	requests := make(chan *http.Request, 1)
+	client, transport := newPeerHTTPClient(func(context.Context) (net.Conn, error) {
+		initiator, responder := net.Pipe()
+		go func() {
+			defer responder.Close()
+			request, err := http.ReadRequest(bufio.NewReader(responder))
+			if err != nil {
+				requests <- nil
+				return
+			}
+			requests <- request
+			response := &http.Response{StatusCode: http.StatusNoContent, Status: "204 No Content", ProtoMajor: 1, ProtoMinor: 1, Header: make(http.Header), Body: http.NoBody, ContentLength: 0}
+			_ = response.Write(responder)
+		}()
+		return initiator, nil
+	})
+	defer transport.CloseIdleConnections()
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodPost, "https://edge.invalid/v1/codex-sessions/cdx_1", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer session-bound")
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	_ = response.Body.Close()
+	observed := <-requests
+	if observed == nil || observed.Method != http.MethodPost || observed.URL.Path != "/v1/codex-sessions/cdx_1" || observed.Header.Get("Authorization") != "Bearer session-bound" || response.StatusCode != http.StatusNoContent {
+		t.Fatalf("request=%+v response=%v", observed, response.StatusCode)
+	}
+}
 
 func TestValidateArgsRejectsPaperboatOwnedFlags(t *testing.T) {
 	for _, args := range [][]string{{"--remote", "ws://x"}, {"--remote=x"}, {"--remote-auth-token-env=X"}, {"-C"}, {"--cd=/tmp"}} {

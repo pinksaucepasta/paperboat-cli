@@ -4,8 +4,6 @@ package hostinstall
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/binarytarget"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/bootstrap"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostservice"
@@ -40,24 +39,23 @@ var (
 // Request is the complete allowlist accepted by the privileged installer.
 // It deliberately has no generic command, argument, path, or environment fields.
 type Request struct {
-	Schema              string                     `json:"schema"`
-	Platform            string                     `json:"platform"`
-	User                string                     `json:"user"`
-	UID                 int                        `json:"uid"`
-	Group               string                     `json:"group"`
-	GID                 int                        `json:"gid"`
-	Executable          string                     `json:"executable"`
-	Artifact            bootstrap.ArtifactManifest `json:"artifact"`
-	ArtifactPublicKey   string                     `json:"artifact_public_key"`
-	Home                string                     `json:"home"`
-	Path                string                     `json:"path"`
-	StateRoot           string                     `json:"state_root"`
-	WorkspaceRoot       string                     `json:"workspace_root"`
-	ControlURL          string                     `json:"control_url"`
-	UserMachineID       string                     `json:"machine_id"`
-	Shell               string                     `json:"shell"`
-	HelperListenAddress string                     `json:"helper_listen_address"`
-	SetupMode           string                     `json:"setup_mode"`
+	Schema              string                   `json:"schema"`
+	Platform            string                   `json:"platform"`
+	User                string                   `json:"user"`
+	UID                 int                      `json:"uid"`
+	Group               string                   `json:"group"`
+	GID                 int                      `json:"gid"`
+	Executable          string                   `json:"executable"`
+	Artifact            bootstrap.ArtifactTarget `json:"artifact"`
+	Home                string                   `json:"home"`
+	Path                string                   `json:"path"`
+	StateRoot           string                   `json:"state_root"`
+	WorkspaceRoot       string                   `json:"workspace_root"`
+	ControlURL          string                   `json:"control_url"`
+	UserMachineID       string                   `json:"machine_id"`
+	Shell               string                   `json:"shell"`
+	HelperListenAddress string                   `json:"helper_listen_address"`
+	SetupMode           string                   `json:"setup_mode"`
 }
 
 func Decode(reader io.Reader) (Request, error) {
@@ -65,11 +63,14 @@ func Decode(reader io.Reader) (Request, error) {
 	decoder := json.NewDecoder(io.LimitReader(reader, 128<<10))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&request); err != nil {
-		return Request{}, ErrInvalidRequest
+		return Request{}, fmt.Errorf("%w: decode request: %v", ErrInvalidRequest, err)
 	}
 	var extra any
-	if decoder.Decode(&extra) != io.EOF {
-		return Request{}, ErrInvalidRequest
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return Request{}, fmt.Errorf("%w: multiple request values", ErrInvalidRequest)
+		}
+		return Request{}, fmt.Errorf("%w: finish request: %v", ErrInvalidRequest, err)
 	}
 	return request, nil
 }
@@ -173,6 +174,9 @@ func UninstallPersisted(ctx context.Context) error {
 	}
 	paths := platformPaths()
 	request, err := loadInstallMetadata(paths.metadata, invokingUID())
+	if errors.Is(err, os.ErrNotExist) && paths.legacyMetadata != "" {
+		request, err = loadInstallMetadata(paths.legacyMetadata, invokingUID())
+	}
 	if err != nil {
 		return err
 	}
@@ -188,7 +192,7 @@ func uninstallValidated(ctx context.Context, request Request, paths installPaths
 	var restoreErr error
 	if host != nil {
 		serviceErr = errors.Join(serviceErr, host.Uninstall(ctx))
-		restoreErr = hostservice.NewPlatformApplier(filepath.Join(paths.state, "power-baseline.json")).Apply(ctx, hostservice.AllowSleep)
+		restoreErr = hostservice.NewPlatformApplier(filepath.Join(paths.runtimeState, "power-baseline.json")).Apply(ctx, hostservice.AllowSleep)
 	}
 	journal, journalErr := loadJournal(paths.journal)
 	if journalErr == nil {
@@ -234,7 +238,7 @@ func hostInstaller(request Request, paths installPaths) (*service.Installer, err
 		Platform: request.Platform, Kind: service.HostKind, ConfigRoot: string(os.PathSeparator), Executable: paths.worker,
 		User: "root", Group: rootGroup, Arguments: []string{
 			"__runtime-host-service", "--uid", strconv.Itoa(request.UID), "--gid", strconv.Itoa(request.GID),
-			"--artifact-public-key", request.ArtifactPublicKey, "--listen-address", request.HelperListenAddress,
+			"--listen-address", request.HelperListenAddress,
 		}, Controller: hostController,
 	})
 	if err != nil {
@@ -243,7 +247,11 @@ func hostInstaller(request Request, paths installPaths) (*service.Installer, err
 	return host, nil
 }
 
-type installPaths struct{ root, state, worker, workerNext, workerRollback, workerPrevious, journal, metadata string }
+type installPaths struct {
+	root, installerState, runtimeState                 string
+	worker, workerNext, workerRollback, workerPrevious string
+	journal, metadata, legacyMetadata                  string
+}
 type installJournal struct {
 	Schema    string    `json:"schema"`
 	Stage     string    `json:"stage"`
@@ -252,17 +260,22 @@ type installJournal struct {
 }
 
 func platformPaths() installPaths {
-	root, state := "/usr/local/libexec/paperboat", "/var/lib/paperboat"
+	root := "/usr/local/libexec/paperboat"
+	installerState, runtimeState := "/var/lib/paperboat-installer", "/var/lib/paperboat"
+	legacyMetadata := filepath.Join(runtimeState, "install-metadata.json")
 	if runtime.GOOS == "darwin" {
-		root, state = "/Library/PrivilegedHelperTools/Paperboat", "/Library/Application Support/Paperboat"
+		root = "/Library/PrivilegedHelperTools/Paperboat"
+		installerState = "/Library/Application Support/Paperboat"
+		runtimeState = installerState
+		legacyMetadata = ""
 	}
-	p := installPaths{root: root, state: state}
+	p := installPaths{root: root, installerState: installerState, runtimeState: runtimeState, legacyMetadata: legacyMetadata}
 	p.worker = filepath.Join(root, "pb")
 	p.workerNext = p.worker + ".next"
 	p.workerRollback = p.worker + ".rollback"
 	p.workerPrevious = p.worker + ".previous"
-	p.journal = filepath.Join(state, "install-journal.json")
-	p.metadata = filepath.Join(state, "install-metadata.json")
+	p.journal = filepath.Join(installerState, "install-journal.json")
+	p.metadata = filepath.Join(installerState, "install-metadata.json")
 	return p
 }
 
@@ -274,33 +287,15 @@ func writeInstallMetadata(path string, request Request) error {
 	if err != nil {
 		return err
 	}
-	temporary, err := os.CreateTemp(filepath.Dir(path), ".install-metadata-*")
-	if err != nil {
-		return err
-	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-	if err := temporary.Chmod(0o600); err != nil {
-		temporary.Close()
-		return err
-	}
-	if _, err := temporary.Write(body); err != nil {
-		temporary.Close()
-		return err
-	}
-	if err := temporary.Sync(); err != nil {
-		temporary.Close()
-		return err
-	}
-	if err := temporary.Close(); err != nil {
-		return err
-	}
-	return os.Rename(temporaryPath, path)
+	return atomicfile.Write(path, body, atomicfile.Options{Mode: 0o600, OwnerUID: os.Geteuid(), OwnerGID: -1})
 }
 
 func loadInstallMetadata(path string, sudoUID int) (Request, error) {
 	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o600 || ownerUID(info) != 0 || info.Size() < 1 || info.Size() > 128<<10 {
+	if err != nil {
+		return Request{}, err
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o600 || ownerUID(info) != 0 || info.Size() < 1 || info.Size() > 128<<10 {
 		return Request{}, ErrInvalidRequest
 	}
 	body, err := os.ReadFile(path)
@@ -322,7 +317,7 @@ func loadInstallMetadata(path string, sudoUID int) (Request, error) {
 	return request, nil
 }
 
-func stageBinary(source, destination string, manifest bootstrap.ArtifactManifest) error {
+func stageBinary(source, destination string, manifest bootstrap.ArtifactTarget) error {
 	if err := secureRootDirectory(filepath.Dir(destination), 0o755); err != nil {
 		return err
 	}
@@ -331,6 +326,7 @@ func stageBinary(source, destination string, manifest bootstrap.ArtifactManifest
 		return err
 	}
 	defer input.Close()
+	//paperboat:allow-source-policy atomic-replacement owner=host-install reason=streamed-binary-staging
 	temporary, err := os.CreateTemp(filepath.Dir(destination), ".binary-*")
 	if err != nil {
 		return err
@@ -341,9 +337,8 @@ func stageBinary(source, destination string, manifest bootstrap.ArtifactManifest
 		temporary.Close()
 		return err
 	}
-	hash := sha256.New()
-	written, err := io.Copy(io.MultiWriter(temporary, hash), io.LimitReader(input, manifest.ByteLength+1))
-	if err != nil || written != manifest.ByteLength || !strings.EqualFold(hex.EncodeToString(hash.Sum(nil)), manifest.SHA256) {
+	written, err := io.Copy(temporary, io.LimitReader(input, 256<<20+1))
+	if err != nil || written < 1 || written > 256<<20 {
 		temporary.Close()
 		return ErrInvalidRequest
 	}
@@ -354,6 +349,7 @@ func stageBinary(source, destination string, manifest bootstrap.ArtifactManifest
 	if err := temporary.Close(); err != nil {
 		return err
 	}
+	//paperboat:allow-source-policy atomic-replacement owner=host-install reason=verified-stage-publication
 	if err := os.Rename(path, destination); err != nil {
 		return err
 	}
@@ -368,12 +364,14 @@ func activateBinary(current, next, rollback string) error {
 		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || ownerUID(info) != 0 {
 			return ErrInvalidRequest
 		}
+		//paperboat:allow-source-policy atomic-replacement owner=host-install reason=current-binary-rollback-stage
 		if err := os.Rename(current, rollback); err != nil {
 			return err
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
+	//paperboat:allow-source-policy atomic-replacement owner=host-install reason=verified-binary-activation
 	return os.Rename(next, current)
 }
 
@@ -390,6 +388,7 @@ func rollbackFiles(paths installPaths, journal installJournal) error {
 			}
 		}
 		if item.had && rollbackExists {
+			//paperboat:allow-source-policy atomic-replacement owner=host-install reason=journaled-install-rollback
 			if err := os.Rename(item.rollback, item.current); err != nil {
 				result = errors.Join(result, err)
 			}
@@ -429,28 +428,7 @@ func writeJournal(path string, journal installJournal) error {
 	if err != nil {
 		return err
 	}
-	temporary, err := os.CreateTemp(filepath.Dir(path), ".journal-*")
-	if err != nil {
-		return err
-	}
-	name := temporary.Name()
-	defer os.Remove(name)
-	if err := temporary.Chmod(0o600); err != nil {
-		temporary.Close()
-		return err
-	}
-	if _, err := temporary.Write(body); err != nil {
-		temporary.Close()
-		return err
-	}
-	if err := temporary.Sync(); err != nil {
-		temporary.Close()
-		return err
-	}
-	if err := temporary.Close(); err != nil {
-		return err
-	}
-	return os.Rename(name, path)
+	return atomicfile.Write(path, body, atomicfile.Options{Mode: 0o600, OwnerUID: os.Geteuid(), OwnerGID: -1})
 }
 
 func loadJournal(path string) (installJournal, error) {
@@ -483,6 +461,7 @@ func replacePrevious(rollback, previous string) error {
 	if err := os.Remove(previous); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
+	//paperboat:allow-source-policy atomic-replacement owner=host-install reason=verified-previous-retention
 	return os.Rename(rollback, previous)
 }
 func removeJournal(path string) error {
@@ -496,13 +475,20 @@ func removeInstalledFiles(paths installPaths) error {
 	var result error
 	for _, path := range []string{
 		paths.worker, paths.workerNext, paths.workerRollback, paths.workerPrevious,
-		paths.metadata,
-		filepath.Join(paths.state, "power-baseline.json"),
-		filepath.Join(paths.state, "availability-policy.json"),
-		filepath.Join(paths.state, "update-current.json"),
-		filepath.Join(paths.state, "update-journal.json"),
-		filepath.Join(paths.state, "update-rollbacks.json"),
+		paths.metadata, paths.legacyMetadata,
+		filepath.Join(paths.runtimeState, "power-baseline.json"),
+		filepath.Join(paths.runtimeState, "availability-policy.json"),
+		filepath.Join(paths.runtimeState, "update-current.json"),
+		filepath.Join(paths.runtimeState, "update-journal.json"),
+		filepath.Join(paths.runtimeState, "update-rollbacks.json"),
+		filepath.Join(paths.runtimeState, "privileged-updates", "update-current.json"),
+		filepath.Join(paths.runtimeState, "privileged-updates", "update-journal.json"),
+		filepath.Join(paths.runtimeState, "privileged-updates", "update-rollbacks.json"),
+		filepath.Join(paths.runtimeState, "privileged-updates"),
 	} {
+		if path == "" {
+			continue
+		}
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			result = errors.Join(result, err)
 		}
@@ -527,40 +513,43 @@ func secureRootDirectory(path string, mode os.FileMode) error {
 func Validate(request Request, sudoUID int) error {
 	if request.Schema != SchemaV1 || request.Platform != runtime.GOOS || !validRunIdentity(request) || sudoUID != request.UID ||
 		request.UserMachineID == "" || !slices.Contains([]string{"receive", "host"}, request.SetupMode) || strings.ContainsAny(request.UserMachineID, "\x00\r\n") {
-		return ErrInvalidRequest
+		return fmt.Errorf("%w: identity contract", ErrInvalidRequest)
 	}
 	account, err := user.Lookup(request.User)
 	if err != nil || account.Uid != strconv.Itoa(request.UID) || account.Gid != strconv.Itoa(request.GID) || account.HomeDir != request.Home {
-		return ErrInvalidRequest
+		return fmt.Errorf("%w: user account", ErrInvalidRequest)
 	}
 	group, err := user.LookupGroup(request.Group)
 	if err != nil || group.Gid != strconv.Itoa(request.GID) {
-		return ErrInvalidRequest
+		return fmt.Errorf("%w: user group", ErrInvalidRequest)
 	}
-	if err := bootstrap.VerifyArtifactManifest(request.Artifact, request.ArtifactPublicKey); err != nil ||
-		request.Artifact.Platform != request.Platform || request.Artifact.Schema != bootstrap.ArtifactSchemaV1 || request.Artifact.Kind != bootstrap.ArtifactKindPB ||
-		verifyArtifact(request.Executable, request.Artifact, request.UID) != nil ||
-		binarytarget.Validate(request.Executable, request.Platform, request.Artifact.Architecture) != nil {
-		return ErrInvalidRequest
+	if err := bootstrap.VerifyArtifactTarget(request.Artifact); err != nil || request.Artifact.Platform != request.Platform {
+		return fmt.Errorf("%w: TUF target descriptor", ErrInvalidRequest)
+	}
+	if err := verifyArtifact(request.Executable, request.UID); err != nil {
+		return fmt.Errorf("%w: TUF target file", ErrInvalidRequest)
+	}
+	if err := binarytarget.Validate(request.Executable, request.Platform, request.Artifact.Architecture); err != nil {
+		return fmt.Errorf("%w: target architecture", ErrInvalidRequest)
 	}
 	for _, path := range []string{request.Home, request.StateRoot, request.WorkspaceRoot} {
 		if !canonicalOwnedDirectory(path, request.UID) {
-			return ErrInvalidRequest
+			return fmt.Errorf("%w: owned directory %q", ErrInvalidRequest, path)
 		}
 	}
 	if !canonicalExecutable(request.Shell) {
-		return ErrInvalidRequest
+		return fmt.Errorf("%w: login shell", ErrInvalidRequest)
 	}
 	if !pathListValid(request.Path) {
-		return ErrInvalidRequest
+		return fmt.Errorf("%w: service PATH", ErrInvalidRequest)
 	}
 	parsed, err := url.Parse(request.ControlURL)
 	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
-		return ErrInvalidRequest
+		return fmt.Errorf("%w: control URL", ErrInvalidRequest)
 	}
 	host, port, err := net.SplitHostPort(request.HelperListenAddress)
 	if err != nil || port == "" || net.ParseIP(host) == nil || !net.ParseIP(host).IsLoopback() {
-		return ErrInvalidRequest
+		return fmt.Errorf("%w: helper listen address", ErrInvalidRequest)
 	}
 	return nil
 }
@@ -588,7 +577,7 @@ func invokingUID() int {
 	return uid
 }
 
-func verifyArtifact(path string, manifest bootstrap.ArtifactManifest, uid int) error {
+func verifyArtifact(path string, uid int) error {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return ErrInvalidRequest
 	}
@@ -602,11 +591,7 @@ func verifyArtifact(path string, manifest bootstrap.ArtifactManifest, uid int) e
 	}
 	defer file.Close()
 	info, err := file.Stat()
-	if err != nil || !info.Mode().IsRegular() || info.Size() != manifest.ByteLength || ownerUID(info) != uid {
-		return ErrInvalidRequest
-	}
-	hash := sha256.New()
-	if _, err := io.Copy(hash, io.LimitReader(file, manifest.ByteLength+1)); err != nil || !strings.EqualFold(hex.EncodeToString(hash.Sum(nil)), manifest.SHA256) {
+	if err != nil || !info.Mode().IsRegular() || info.Size() < 1 || info.Size() > 256<<20 || ownerUID(info) != uid {
 		return ErrInvalidRequest
 	}
 	return nil

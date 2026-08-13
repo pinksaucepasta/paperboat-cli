@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.paperboat.dev/diagnostics/doctor.schema.json",
+  "title": "pb doctor JSON result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "correlation_id", "checked_at", "overall", "checks"],
+  "properties": {
+    "schema": { "const": "paperboat.doctor/v1" },
+    "correlation_id": { "type": "string", "pattern": "^pb-doctor-[a-f0-9]{16}$" },
+    "checked_at": { "type": "string", "format": "date-time" },
+    "overall": { "enum": ["healthy", "degraded", "unhealthy"] },
+    "machine": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "alias"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_.:-]{0,127}$" },
+        "alias": { "type": "string", "minLength": 1, "maxLength": 256 }
+      }
+    },
+    "checks": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["category", "code", "status", "summary"],
+        "properties": {
+          "category": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_.:-]{0,127}$" },
+          "code": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_.:-]{0,127}$" },
+          "status": { "enum": ["pass", "warning", "fail", "unavailable"] },
+          "summary": { "type": "string", "minLength": 1, "maxLength": 512 },
+          "recovery": { "type": "string", "minLength": 1, "maxLength": 512 },
+          "selected_path": { "enum": ["direct", "relay", "wss"] },
+          "relay_region": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_.:-]{0,127}$" },
+          "rtt_ms": { "type": "number", "exclusiveMinimum": 0, "maximum": 60000 },
+          "ptos": { "type": "integer", "minimum": 0, "maximum": 1000 },
+          "fallback": { "enum": ["none", "direct_not_selected", "quic_not_selected"] }
+        },
+        "allOf": [
+          {
+            "if": { "properties": { "status": { "enum": ["warning", "fail"] } }, "required": ["status"] },
+            "then": { "required": ["recovery"] }
+          },
+          {
+            "if": { "required": ["selected_path"] },
+            "then": { "properties": { "code": { "const": "peer_reachability" } }, "required": ["rtt_ms", "fallback"] }
+          },
+          {
+            "if": { "properties": { "selected_path": { "const": "direct" } }, "required": ["selected_path"] },
+            "then": { "properties": { "fallback": { "const": "none" } }, "not": { "required": ["relay_region"] } }
+          },
+          {
+            "if": { "properties": { "selected_path": { "enum": ["relay", "wss"] } }, "required": ["selected_path"] },
+            "then": { "required": ["relay_region"] }
+          }
+        ]
+      }
+    }
+  }
+}

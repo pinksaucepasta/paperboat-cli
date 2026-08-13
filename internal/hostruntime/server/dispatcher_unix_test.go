@@ -5,14 +5,19 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/config"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/execprocess"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/health"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/operation"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/preview"
@@ -20,6 +25,7 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/protocol"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/pty"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/session"
+	"github.com/pinksaucepasta/paperboat/internal/managedssh"
 )
 
 type healthyProber struct{}
@@ -29,6 +35,287 @@ func (healthyProber) Probe(context.Context, preview.Target) error { return nil }
 type testSessionLauncher struct {
 	sessions *session.Manager
 	args     []string
+}
+
+func execDispatcher(t *testing.T) (*Dispatcher, string) {
+	t.Helper()
+	root := t.TempDir()
+	adapter, err := pty.NewAdapter(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessions, err := session.NewManager(session.ManagerConfig{Launch: func(command pty.Command) (session.PTYProcess, error) { return adapter.Start(command) }, MaxSessions: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	executions, err := execprocess.New(execprocess.Config{WorkspaceRoot: root, BaseEnvironment: []string{"PATH=/usr/bin:/bin", "LANG=C"}, MaximumActive: 4, ReplayBytes: 64 << 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	readiness := health.New("test", []string{"terminal.v1", "health.v1", "exec.v1"}, nil)
+	dispatcher, err := NewDispatcher(DispatcherConfig{Sessions: sessions, Health: readiness, SessionLauncher: testSessionLauncher{sessions: sessions, args: []string{"-c", "exit"}}, WorkspaceRoot: root, Random: bytes.NewReader(bytes.Repeat([]byte{1}, 256)), Exec: executions})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = sessions.Shutdown(ctx)
+	})
+	return dispatcher, root
+}
+
+func TestExecDispatcherStreamsInputStdoutStderrAndExactExit(t *testing.T) {
+	dispatcher, root := execDispatcher(t)
+	authorization := Authorization{ClientID: "cli_1"}
+	payload, _ := json.Marshal(map[string]any{"action": "start", "operation_id": "operation_dispatch", "argv": []string{"/bin/sh", "-c", `read line; printf "out:%s" "$line"; printf "err:%s" "$line" >&2; exit 7`}, "cwd": root})
+	outcome := dispatcher.Handle(context.Background(), authorization, "exec.v1", payload)
+	if outcome.ErrorCode != "" {
+		t.Fatalf("outcome=%#v", outcome)
+	}
+	stream, opened, err := dispatcher.OpenStream(context.Background(), authorization, "exec.v1", payload, outcome, false)
+	if err != nil || !opened {
+		t.Fatalf("opened=%v err=%v", opened, err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		execution, getErr := dispatcher.config.Exec.Get("operation_dispatch")
+		if getErr == nil && execution.Snapshot().State == execprocess.StateRunning {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("exec did not reach running state")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := dispatcher.HandleExecInput(context.Background(), authorization, "operation_dispatch", []byte("value\n")); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr strings.Builder
+	var lastEventSequence uint64
+	for {
+		frame, nextErr := stream.Next(context.Background())
+		if nextErr == nil {
+			if len(frame.Data) < 9 || frame.Data[0] != execOutputEnvelopeVersion {
+				t.Fatalf("invalid exec output envelope: %x", frame.Data)
+			}
+			eventSequence := binary.BigEndian.Uint64(frame.Data[1:9])
+			if eventSequence <= lastEventSequence {
+				t.Fatalf("event sequence = %d after %d", eventSequence, lastEventSequence)
+			}
+			lastEventSequence = eventSequence
+			if frame.Channel == protocol.Stdout {
+				stdout.Write(frame.Data[9:])
+			} else if frame.Channel == protocol.Stderr {
+				stderr.Write(frame.Data[9:])
+			}
+			if frame.Release != nil {
+				frame.Release()
+			}
+			continue
+		}
+		var end *StreamEnd
+		if !errors.As(nextErr, &end) {
+			t.Fatal(nextErr)
+		}
+		var terminal struct {
+			State    string `json:"state"`
+			Sequence uint64 `json:"sequence"`
+			Result   struct {
+				Code int `json:"code"`
+			} `json:"result"`
+		}
+		if json.Unmarshal(end.Payload, &terminal) != nil || terminal.State != "exited" || terminal.Result.Code != 7 || terminal.Sequence <= lastEventSequence {
+			t.Fatalf("end=%s", end.Payload)
+		}
+		break
+	}
+	if stdout.String() != "out:value" || stderr.String() != "err:value" {
+		t.Fatalf("stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+}
+
+func TestExecDispatcherLiveStreamExceedsReplayBudgetWithoutGap(t *testing.T) {
+	dispatcher, root := execDispatcher(t)
+	authorization := Authorization{ClientID: "cli_1"}
+	payload, _ := json.Marshal(map[string]any{"action": "start", "operation_id": "operation_large_live", "argv": []string{"/bin/sh", "-c", `head -c 262144 /dev/zero`}, "cwd": root})
+	outcome := dispatcher.Handle(context.Background(), authorization, "exec.v1", payload)
+	if outcome.ErrorCode != "" {
+		t.Fatalf("outcome=%#v", outcome)
+	}
+	stream, opened, err := dispatcher.OpenStream(context.Background(), authorization, "exec.v1", payload, outcome, false)
+	if err != nil || !opened {
+		t.Fatalf("opened=%v err=%v", opened, err)
+	}
+	defer stream.Close()
+	var received int
+	for {
+		frame, nextErr := stream.Next(context.Background())
+		if nextErr == nil {
+			if len(frame.Data) < 9 {
+				t.Fatalf("short frame: %d", len(frame.Data))
+			}
+			received += len(frame.Data) - 9
+			if frame.Release != nil {
+				frame.Release()
+			}
+			continue
+		}
+		var end *StreamEnd
+		if !errors.As(nextErr, &end) {
+			t.Fatal(nextErr)
+		}
+		break
+	}
+	if received != 262144 {
+		t.Fatalf("received=%d", received)
+	}
+}
+
+func TestSSHDispatcherBridgesOpaqueBytesAndEOF(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		for {
+			connection, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go func() {
+				defer connection.Close()
+				_, _ = io.Copy(connection, connection)
+			}()
+		}
+	}()
+	host, err := managedssh.NewHost(managedssh.HostConfig{MaxStreams: 2, ProbeTimeout: time.Second, DialTimeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := uint16(listener.Addr().(*net.TCPAddr).Port)
+	if _, err := host.ReconcileTarget(context.Background(), 4, port); err != nil {
+		t.Fatal(err)
+	}
+	dispatcher, _ := execDispatcher(t)
+	dispatcher.config.SSH = host
+	authorization := Authorization{ClientID: "cli_1"}
+	payload := json.RawMessage(`{"operation_id":"operation_ssh_0001","generation":4}`)
+	outcome := dispatcher.HandleOperation(context.Background(), authorization, "ssh.v1", "operation_ssh_0001", payload)
+	if outcome.ErrorCode != "" {
+		t.Fatalf("outcome=%#v", outcome)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stream, opened, err := dispatcher.OpenStream(ctx, authorization, "ssh.v1", payload, outcome, false)
+	if err != nil || !opened {
+		t.Fatalf("opened=%v err=%v", opened, err)
+	}
+	defer stream.Close()
+	if err := dispatcher.HandleSSHInput(ctx, authorization, "operation_ssh_0001", []byte("opaque-ssh-bytes")); err != nil {
+		t.Fatal(err)
+	}
+	frame, err := stream.Next(ctx)
+	if err != nil || string(frame.Data) != "opaque-ssh-bytes" || frame.Channel != protocol.Stdout {
+		t.Fatalf("frame=%#v err=%v", frame, err)
+	}
+	if err := dispatcher.HandleSSHEOF(ctx, authorization, "operation_ssh_0001"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExecDispatcherResumesFromJournalSequenceWithoutOutputReplay(t *testing.T) {
+	dispatcher, root := execDispatcher(t)
+	authorization := Authorization{ClientID: "cli_1"}
+	payload, _ := json.Marshal(map[string]any{"action": "start", "operation_id": "operation_resume", "argv": []string{"/bin/sh", "-c", `printf one; sleep 0.1; printf two`}, "cwd": root})
+	outcome := dispatcher.Handle(context.Background(), authorization, "exec.v1", payload)
+	stream, opened, err := dispatcher.OpenStream(context.Background(), authorization, "exec.v1", payload, outcome, false)
+	if err != nil || !opened {
+		t.Fatalf("opened=%v err=%v outcome=%#v", opened, err, outcome)
+	}
+	first, err := stream.Next(context.Background())
+	if err != nil || len(first.Data) < 9 || string(first.Data[9:]) != "one" {
+		t.Fatalf("first=%#v err=%v", first, err)
+	}
+	from := binary.BigEndian.Uint64(first.Data[1:9]) + 1
+	attachPayload, _ := json.Marshal(map[string]any{"action": "start", "operation_id": "operation_resume", "argv": []string{"/bin/sh", "-c", `printf one; sleep 0.1; printf two`}, "cwd": root, "from_sequence": from})
+	replay := dispatcher.Handle(context.Background(), authorization, "exec.v1", attachPayload)
+	resumed, opened, err := dispatcher.OpenStream(context.Background(), authorization, "exec.v1", attachPayload, replay, true)
+	if err != nil || !opened || replay.ErrorCode != "" {
+		t.Fatalf("opened=%v err=%v replay=%#v", opened, err, replay)
+	}
+	second, err := resumed.Next(context.Background())
+	if err != nil || len(second.Data) < 9 || string(second.Data[9:]) != "two" {
+		t.Fatalf("second=%#v err=%v", second, err)
+	}
+	if sequence := binary.BigEndian.Uint64(second.Data[1:9]); sequence < from {
+		t.Fatalf("resumed sequence = %d, want >= %d", sequence, from)
+	}
+}
+
+func TestExecStreamBindingAcceptsBinaryInputAndResizeOnlyForPTY(t *testing.T) {
+	dispatcher, root := execDispatcher(t)
+	authorization := Authorization{ClientID: "cli_1"}
+	payload, _ := json.Marshal(map[string]any{"action": "start", "operation_id": "operation_binding", "argv": []string{"/bin/sh", "-c", "read line; printf %s \"$line\""}, "cwd": root})
+	outcome := dispatcher.Handle(context.Background(), authorization, "exec.v1", payload)
+	state := newTerminalConnectionState()
+	streamID, err := state.bind(authorization, protocol.Frame{Capability: "exec.v1", Payload: payload}, outcome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		execution, getErr := dispatcher.config.Exec.Get("operation_binding")
+		if getErr == nil && execution.Snapshot().State == execprocess.StateRunning {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("exec did not start")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	wire, _ := protocol.EncodeTerminalInput(protocol.TerminalInputFrame{StreamID: streamID, Sequence: 1, Data: []byte("bound\n")}, nil)
+	server := &Server{config: Config{Handler: dispatcher}}
+	if err := server.handleTerminalData(context.Background(), wire, state); err != nil {
+		t.Fatal(err)
+	}
+	resize, _ := protocol.EncodeTerminalResize(protocol.TerminalResizeFrame{StreamID: streamID, Sequence: 1, Columns: 100, Rows: 30}, nil)
+	if err := server.handleTerminalData(context.Background(), resize, state); !errors.Is(err, execprocess.ErrInvalid) {
+		t.Fatalf("non-PTY resize err=%v", err)
+	}
+}
+
+func TestExecProtocolOperationIDMustMatchPayload(t *testing.T) {
+	dispatcher, root := execDispatcher(t)
+	payload, _ := json.Marshal(map[string]any{"action": "start", "operation_id": "operation_payload", "argv": []string{"/bin/true"}, "cwd": root})
+	outcome := dispatcher.HandleOperation(context.Background(), Authorization{ClientID: "cli_1"}, "exec.v1", "operation_frame", payload)
+	if outcome.ErrorCode != "invalid_request" {
+		t.Fatalf("outcome=%#v", outcome)
+	}
+	if _, err := dispatcher.config.Exec.Get("operation_payload"); !errors.Is(err, execprocess.ErrNotFound) {
+		t.Fatalf("mismatched operation started: %v", err)
+	}
+}
+
+func TestExecAttachReusesExistingExecution(t *testing.T) {
+	dispatcher, root := execDispatcher(t)
+	operationID := "operation_attach"
+	startPayload, _ := json.Marshal(map[string]any{"action": "start", "operation_id": operationID, "argv": []string{"/bin/true"}, "cwd": root})
+	if outcome := dispatcher.HandleOperation(context.Background(), Authorization{ClientID: "cli_1"}, "exec.v1", operationID, startPayload); outcome.ErrorCode != "" {
+		t.Fatalf("start outcome=%#v", outcome)
+	}
+	attachPayload, _ := json.Marshal(map[string]any{"action": "attach", "operation_id": operationID, "from_sequence": 1})
+	outcome := dispatcher.HandleOperation(context.Background(), Authorization{ClientID: "cli_1"}, "exec.v1", operationID, attachPayload)
+	if outcome.ErrorCode != "" {
+		t.Fatalf("attach outcome=%#v", outcome)
+	}
+	var response struct {
+		Replay bool `json:"replay"`
+	}
+	if err := json.Unmarshal(outcome.Result, &response); err != nil || !response.Replay {
+		t.Fatalf("attach result=%s err=%v", outcome.Result, err)
+	}
 }
 
 func (l testSessionLauncher) Launch(ctx context.Context, request process.LaunchRequest) (session.Snapshot, error) {
@@ -72,7 +359,7 @@ func verticalServerCommand(t *testing.T, shellArgs []string) *Server {
 		Authorizer: authorizerFunc(func(context.Context, protocol.Frame) (Authorization, error) {
 			return Authorization{JournalBinding: "env:env_test_01:user:usr_1", EnvironmentID: "env_test_01", UserID: "usr_1", ClientID: "cli_1", ResourceID: "p-abcdefghijklmnopqrstuvwxyz"}, nil
 		}),
-		Handler: dispatcher, MaxConcurrent: 4, HeartbeatInterval: time.Hour, PeerTimeout: 2 * time.Hour, MutationDeadline: 5 * time.Minute,
+		Handler: dispatcher, MaxConcurrent: 4, HeartbeatInterval: time.Hour, MutationDeadline: 5 * time.Minute,
 	})
 	if err != nil {
 		t.Fatal(err)

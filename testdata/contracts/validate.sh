@@ -19,7 +19,17 @@ $(jq -r --arg repo "$repo" '.artifacts[] | select(.consumers | index($repo)) | "
 EOF
 for file in $(find "$contracts" -type f | sort); do
   relative=${file#"$contracts/"}
-  case "$relative" in manifest.json|consumer.json|validate.sh) continue ;; esac
+  case "$relative" in manifest.json|consumer.json|validate.sh|p2p-v1/*) continue ;; esac
   jq -e --arg repo "$repo" --arg path "$relative" '.artifacts[] | select(.path == $path and (.consumers | index($repo)))' "$manifest" >/dev/null || { echo "$repo contracts: unknown or inapplicable artifact $relative" >&2; exit 1; }
 done
+p2p="$contracts/p2p-v1"
+jq -e --arg repo "$repo" '.manifest_version == 1 and .family == "paperboat.p2p" and .status == "approved" and ([.artifacts[] | select(.consumers | index($repo))] | length > 0)' "$p2p/manifest.json" >/dev/null || { echo "$repo contracts: invalid P2P manifest" >&2; exit 1; }
+while IFS='|' read -r path digest; do
+  file="$p2p/$path"
+  [ -f "$file" ] || { echo "$repo contracts: missing P2P $path" >&2; exit 1; }
+  actual=$(shasum -a 256 "$file" | awk '{print $1}')
+  [ "$actual" = "$digest" ] || { echo "$repo contracts: stale P2P $path" >&2; exit 1; }
+done <<EOF
+$(jq -r --arg repo "$repo" '.artifacts[] | select(.consumers | index($repo)) | "\(.path)|\(.sha256)"' "$p2p/manifest.json")
+EOF
 echo "$repo contracts: valid"

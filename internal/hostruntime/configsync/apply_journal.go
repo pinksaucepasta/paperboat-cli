@@ -144,6 +144,7 @@ func restoreApplyJournalEntry(homeRoot string, entry applyJournalEntry) error {
 	if !entry.Mode.IsRegular() {
 		return ErrApplyJournalInvalid
 	}
+	//paperboat:allow-source-policy atomic-replacement owner=config-sync reason=journal-restore-staging
 	temporary, err := os.CreateTemp(filepath.Dir(target), ".paperboat-restore-*")
 	if err != nil {
 		return err
@@ -161,6 +162,7 @@ func restoreApplyJournalEntry(homeRoot string, entry applyJournalEntry) error {
 	if err != nil {
 		return err
 	}
+	//paperboat:allow-source-policy atomic-replacement owner=config-sync reason=journaled-workspace-restore
 	return os.Rename(temporaryPath, target)
 }
 

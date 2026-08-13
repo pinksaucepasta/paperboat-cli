@@ -3,7 +3,6 @@ package fileindex
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -11,6 +10,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
+	"github.com/pinksaucepasta/paperboat/internal/userpaths"
 )
 
 const cacheVersion = 1
@@ -36,11 +38,7 @@ type cache struct {
 }
 
 func CachePath() (string, error) {
-	root, err := os.UserCacheDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(root, "paperboat", "file-index.json"), nil
+	return userpaths.Cache("paperboat/file-index.json")
 }
 
 func Load(root, cachePath string) ([]string, bool) {
@@ -204,35 +202,5 @@ func writeCache(path string, value cache) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	temporary, err := os.CreateTemp(filepath.Dir(path), ".file-index-*")
-	if err != nil {
-		return err
-	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-	if chmodErr := temporary.Chmod(0o600); chmodErr != nil {
-		temporary.Close()
-		return chmodErr
-	}
-	if _, err = temporary.Write(data); err == nil {
-		err = temporary.Sync()
-	}
-	if closeErr := temporary.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return err
-	}
-	if err := os.Rename(temporaryPath, path); err != nil {
-		return err
-	}
-	directoryHandle, err := os.Open(filepath.Dir(path))
-	if err != nil {
-		return err
-	}
-	defer directoryHandle.Close()
-	if err := directoryHandle.Sync(); err != nil && !errors.Is(err, os.ErrInvalid) {
-		return err
-	}
-	return nil
+	return atomicfile.Write(path, data, atomicfile.Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1})
 }

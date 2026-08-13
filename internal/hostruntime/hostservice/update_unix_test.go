@@ -4,17 +4,12 @@ package hostservice
 
 import (
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/base64"
 	"encoding/binary"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -23,7 +18,10 @@ import (
 
 type fakeUpdateFetcher struct{ body []byte }
 
-func (f fakeUpdateFetcher) Fetch(_ context.Context, _ bootstrap.ArtifactManifest, _ string, directory string) (string, error) {
+func (f fakeUpdateFetcher) Fetch(_ context.Context, _ bootstrap.ArtifactTarget, directory string) (string, error) {
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return "", err
+	}
 	file, err := os.CreateTemp(directory, ".paperboat-artifact-")
 	if err != nil {
 		return "", err
@@ -67,6 +65,9 @@ func TestRootUpdateActivatesPBArtifactAndPreservesPrevious(t *testing.T) {
 	if replayed, err := manager.activate(context.Background(), artifact); err != nil || replayed != version || services.workerRestarts != 1 || services.hostRestarts != 1 {
 		t.Fatalf("replay version=%q err=%v restarts=%+v", replayed, err, services)
 	}
+	if health := manager.UpdateHealth(); health != "healthy" {
+		t.Fatalf("update health=%q", health)
+	}
 }
 
 func TestRootUpdateHealthFailureRollsBackPB(t *testing.T) {
@@ -81,6 +82,9 @@ func TestRootUpdateHealthFailureRollsBackPB(t *testing.T) {
 	if count := manager.RollbackCount(); count != 1 {
 		t.Fatalf("rollback count=%d", count)
 	}
+	if health := manager.UpdateHealth(); health != "healthy" {
+		t.Fatalf("recovered rollback health=%q", health)
+	}
 }
 
 func TestRootUpdateRejectsSignedBinaryForDifferentTarget(t *testing.T) {
@@ -94,8 +98,8 @@ func TestRootUpdateRejectsSignedBinaryForDifferentTarget(t *testing.T) {
 		foreign[4], foreign[5] = 2, 1
 		binary.LittleEndian.PutUint16(foreign[18:20], 62)
 	}
-	artifact, publicKey := signedUpdate(t, foreign)
-	manager.config.PublicKey, manager.fetcher = publicKey, fakeUpdateFetcher{body: foreign}
+	artifact, _ := signedUpdate(t, foreign)
+	manager.fetcher = fakeUpdateFetcher{body: foreign}
 	if _, err := manager.activate(context.Background(), artifact); !errors.Is(err, ErrUpdateInvalid) {
 		t.Fatalf("foreign binary error=%v", err)
 	}
@@ -121,6 +125,137 @@ func TestRootUpdateRecoveryRollsBackInterruptedActivation(t *testing.T) {
 	if count := manager.RollbackCount(); count != 1 {
 		t.Fatalf("recovery rollback count=%d", count)
 	}
+	if restarts := manager.services.(*fakeUpdateServices).workerRestarts; restarts != 0 {
+		t.Fatalf("constructor recovery restarted worker %d times", restarts)
+	}
+	body, err := os.ReadFile(manager.current)
+	if err != nil || !strings.Contains(string(body), `"version":"2026.07.26"`) {
+		t.Fatalf("rollback current metadata=%q err=%v", body, err)
+	}
+}
+
+func TestRootUpdateRecoveryDiscardsStagedTransactionWithoutRollback(t *testing.T) {
+	manager, _ := testUpdateManager(t, nil)
+	staged, err := os.CreateTemp(filepath.Dir(manager.config.BinaryPath), ".paperboat-artifact-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stagedPath := staged.Name()
+	if err := staged.Close(); err != nil {
+		t.Fatal(err)
+	}
+	entry := updateJournal{Schema: updateJournalSchemaV1, Stage: "staged", Version: "2026.07.27", PreviousVersion: "2026.07.26", Staged: stagedPath, UpdatedAt: time.Now().UTC()}
+	if err := manager.writeJournal(entry); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	assertFileBody(t, manager.config.BinaryPath, string(testBinary("old")))
+	if _, err := os.Stat(stagedPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staged artifact remains: %v", err)
+	}
+	if count := manager.RollbackCount(); count != 0 {
+		t.Fatalf("staged recovery rollback count=%d", count)
+	}
+}
+
+func TestRootUpdateLiveHealthFailureStillRestartsWorkerAfterRollback(t *testing.T) {
+	manager, artifact := testUpdateManager(t, errors.New("new runtime unhealthy"))
+	if _, err := manager.activate(context.Background(), artifact); err == nil {
+		t.Fatal("health failure was accepted")
+	}
+	if restarts := manager.services.(*fakeUpdateServices).workerRestarts; restarts != 2 {
+		t.Fatalf("live activation worker restarts=%d, want activation and rollback", restarts)
+	}
+}
+
+func TestUpdateValidationReportsExactFailedInvariant(t *testing.T) {
+	manager, _ := testUpdateManager(t, nil)
+	manager.config.CurrentVersion = "invalid"
+	err := manager.validate()
+	if !errors.Is(err, ErrUpdateInvalid) || !strings.Contains(err.Error(), `current version "invalid" is invalid`) {
+		t.Fatalf("validation error=%v", err)
+	}
+}
+
+func TestRootUpdateStateCanLiveUnderUserOwnedParent(t *testing.T) {
+	root := t.TempDir()
+	parent := filepath.Join(root, "shared")
+	if err := os.Mkdir(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	updateRoot := filepath.Join(parent, "privileged-updates")
+	if err := os.Mkdir(updateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manager, _ := testUpdateManager(t, nil)
+	manager.config.StateRoot = updateRoot
+	manager.journal = filepath.Join(updateRoot, "update-journal.json")
+	manager.current = filepath.Join(updateRoot, "update-current.json")
+	manager.rollbacks = filepath.Join(updateRoot, "update-rollbacks.json")
+	if err := manager.validate(); err != nil {
+		t.Fatalf("dedicated update root rejected: %v", err)
+	}
+}
+
+func TestRootUpdateRecoveryDoesNotProbeCommittedActivationBeforeListenerStarts(t *testing.T) {
+	manager, _ := testUpdateManager(t, errors.New("listener is not started"))
+	entry := updateJournal{Schema: updateJournalSchemaV1, Stage: "committed", Version: "2026.07.27", PreviousVersion: "2026.07.26", UpdatedAt: time.Now().UTC()}
+	manager.config.CurrentVersion = entry.Version
+	if err := manager.writeJournal(entry); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if count := manager.RollbackCount(); count != 0 {
+		t.Fatalf("committed recovery rollback count=%d", count)
+	}
+}
+
+func TestRootUpdateRecoveryReconcilesCommittedJournalAfterRootReplacement(t *testing.T) {
+	manager, _ := testUpdateManager(t, errors.New("listener is not started"))
+	entry := updateJournal{Schema: updateJournalSchemaV1, Stage: "committed", Version: "2026.07.27", PreviousVersion: "2026.07.26", UpdatedAt: time.Now().UTC()}
+	manager.config.CurrentVersion = "2026.07.28"
+	if err := manager.writeJournal(entry); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(manager.journal); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale committed journal remains: %v", err)
+	}
+	if count := manager.RollbackCount(); count != 0 {
+		t.Fatalf("root replacement rollback count=%d", count)
+	}
+	body, err := os.ReadFile(manager.current)
+	if err != nil || !strings.Contains(string(body), manager.config.CurrentVersion) {
+		t.Fatalf("current version body=%q error=%v", body, err)
+	}
+}
+
+func TestRootUpdateHealthFailsClosedForRepeatedOrInvalidRecoveryState(t *testing.T) {
+	manager, _ := testUpdateManager(t, nil)
+	if err := manager.incrementRollbackCount(); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.incrementRollbackCount(); err != nil {
+		t.Fatal(err)
+	}
+	if health := manager.UpdateHealth(); health != "recovery_required" {
+		t.Fatalf("repeated rollback health=%q", health)
+	}
+	if err := os.Remove(manager.rollbacks); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manager.journal, []byte(`{"schema":"paperboat.host-update/v1","stage":"checking"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if health := manager.UpdateHealth(); health != "recovery_required" {
+		t.Fatalf("invalid journal health=%q", health)
+	}
 }
 
 func TestReleaseVersionComparisonIncludesRevision(t *testing.T) {
@@ -136,7 +271,7 @@ func TestReleaseVersionComparisonIncludesRevision(t *testing.T) {
 	}
 }
 
-func testUpdateManager(t *testing.T, healthErr error) (*UpdateManager, bootstrap.ArtifactManifest) {
+func testUpdateManager(t *testing.T, healthErr error) (*UpdateManager, bootstrap.ArtifactTarget) {
 	t.Helper()
 	root, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
@@ -153,9 +288,9 @@ func testUpdateManager(t *testing.T, healthErr error) (*UpdateManager, bootstrap
 		t.Fatal(err)
 	}
 	newBody := testBinary("new")
-	artifact, publicKey := signedUpdate(t, newBody)
+	artifact, _ := signedUpdate(t, newBody)
 	manager := &UpdateManager{
-		config:   UpdateConfig{StateRoot: state, BinaryPath: binaryPath, PublicKey: publicKey, CurrentVersion: "2026.07.26", ListenAddress: "127.0.0.1:8080"},
+		config:   UpdateConfig{StateRoot: state, BinaryPath: binaryPath, CurrentVersion: "2026.07.26", ListenAddress: "127.0.0.1:8080"},
 		ownerUID: os.Getuid(), fetcher: fakeUpdateFetcher{body: newBody}, services: &fakeUpdateServices{}, health: fakeUpdateHealth{err: healthErr},
 		journal: filepath.Join(state, "update-journal.json"), current: filepath.Join(state, "update-current.json"), rollbacks: filepath.Join(state, "update-rollbacks.json"),
 	}
@@ -186,26 +321,11 @@ func testBinary(label string) []byte {
 	return append(header, label...)
 }
 
-func signedUpdate(t *testing.T, body []byte) (bootstrap.ArtifactManifest, string) {
+func signedUpdate(t *testing.T, body []byte) (bootstrap.ArtifactTarget, string) {
 	t.Helper()
-	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	digest := sha256.Sum256(body)
-	manifest := bootstrap.ArtifactManifest{Schema: bootstrap.ArtifactSchemaV1, Kind: bootstrap.ArtifactKindPB, Version: "2026.07.27", Platform: runtime.GOOS, Architecture: runtime.GOARCH, URL: "https://updates.example.test/pb", ByteLength: int64(len(body)), SHA256: hex.EncodeToString(digest[:])}
-	payload, _ := json.Marshal(struct {
-		Architecture string `json:"architecture"`
-		ByteLength   int64  `json:"byte_length"`
-		Kind         string `json:"kind"`
-		Platform     string `json:"platform"`
-		Schema       string `json:"schema"`
-		SHA256       string `json:"sha256"`
-		URL          string `json:"url"`
-		Version      string `json:"version"`
-	}{manifest.Architecture, manifest.ByteLength, manifest.Kind, manifest.Platform, manifest.Schema, manifest.SHA256, manifest.URL, manifest.Version})
-	manifest.Signature = base64.RawURLEncoding.EncodeToString(ed25519.Sign(privateKey, payload))
-	return manifest, base64.RawURLEncoding.EncodeToString(publicKey)
+	_ = body
+	manifest := bootstrap.ArtifactTarget{Schema: bootstrap.ArtifactTargetSchemaV1, Kind: bootstrap.ArtifactKindPB, Version: "2026.07.27", Platform: runtime.GOOS, Architecture: runtime.GOARCH, RepositoryURL: "https://updates.example.test/paperboat", TargetPath: "pb-" + runtime.GOOS + "-" + runtime.GOARCH}
+	return manifest, ""
 }
 
 func assertFileBody(t *testing.T, path, expected string) {

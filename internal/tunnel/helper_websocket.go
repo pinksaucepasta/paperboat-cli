@@ -15,7 +15,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"github.com/coder/websocket"
+	"github.com/pinksaucepasta/paperboat/internal/diagnosticlog"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/protocol"
 	"github.com/pinksaucepasta/paperboat/internal/resolver"
 )
@@ -86,47 +87,41 @@ type helperMessageConnection interface {
 type helperWebSocketConnection struct{ ws *websocket.Conn }
 
 func (c *helperWebSocketConnection) ReadMessage(ctx context.Context) (helperMessageType, []byte, error) {
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = c.ws.SetReadDeadline(deadline)
-		defer c.ws.SetReadDeadline(time.Time{})
-	}
-	messageType, data, err := c.ws.ReadMessage()
+	c.ws.SetReadLimit(helperMaxFrame)
+	messageType, data, err := c.ws.Read(ctx)
 	if err != nil {
 		return 0, nil, err
 	}
-	if messageType == websocket.TextMessage {
+	if messageType == websocket.MessageText {
 		return helperStructuredMessage, data, nil
 	}
-	if messageType == websocket.BinaryMessage {
+	if messageType == websocket.MessageBinary {
 		return helperBinaryMessage, data, nil
 	}
 	return 0, nil, errors.New("unsupported helper websocket message")
 }
 
 func (c *helperWebSocketConnection) WriteMessage(ctx context.Context, messageType helperMessageType, data []byte) error {
-	deadline := time.Now().Add(websocketWriteTimeout)
-	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
-		deadline = contextDeadline
-	}
-	_ = c.ws.SetWriteDeadline(deadline)
-	defer c.ws.SetWriteDeadline(time.Time{})
-	websocketType := websocket.TextMessage
+	writeCtx, cancel := context.WithTimeout(ctx, websocketWriteTimeout)
+	defer cancel()
+	websocketType := websocket.MessageText
 	if messageType == helperBinaryMessage {
-		websocketType = websocket.BinaryMessage
+		websocketType = websocket.MessageBinary
 	} else if messageType != helperStructuredMessage {
 		return errors.New("invalid helper message type")
 	}
-	return c.ws.WriteMessage(websocketType, data)
+	return c.ws.Write(writeCtx, websocketType, data)
 }
 
-func (c *helperWebSocketConnection) Close() error { return c.ws.Close() }
+func (c *helperWebSocketConnection) Close() error {
+	return c.ws.Close(websocket.StatusNormalClosure, "")
+}
 
 type helperTerminalConn struct {
 	message helperMessageConnection
 	target  *resolver.TerminalTarget
 
 	readMu        sync.Mutex
-	pending       []byte
 	current       *helperOutput
 	out           chan helperOutput
 	done          chan struct{}
@@ -171,7 +166,7 @@ func newHelperTerminalConn(message helperMessageConnection, target *resolver.Ter
 }
 
 func helperHandshake(ctx context.Context, message helperMessageConnection) (bool, error) {
-	payload, _ := json.Marshal(map[string]any{"min_version": helperProtocolVersion, "max_version": helperProtocolVersion, "capabilities": []string{"terminal.v1", "health.v1"}})
+	payload, _ := json.Marshal(map[string]any{"min_version": helperProtocolVersion, "max_version": helperProtocolVersion, "capabilities": helperCapabilities()})
 	requestID := helperID("req_")
 	if err := writeHelperFrame(ctx, message, helperFrame{Type: "hello", RequestID: requestID, Version: helperProtocolVersion, Payload: payload}); err != nil {
 		return false, err
@@ -194,6 +189,10 @@ func helperHandshake(ctx context.Context, message helperMessageConnection) (bool
 		return false, errors.New("helper did not negotiate required capabilities")
 	}
 	return true, nil
+}
+
+func helperCapabilities() []string {
+	return []string{"terminal.v1", "health.v1", "exec.v1", "ssh.v1"}
 }
 
 func helperCheck(ctx context.Context, message helperMessageConnection) error {
@@ -316,6 +315,7 @@ func (c *helperTerminalConn) initialize(ctx context.Context) error {
 	if c.generation == 0 {
 		return errors.New("helper terminal session has no generation")
 	}
+	diagnosticlog.TryInfo("peer terminal attachment initialized", "session_id", c.target.SessionID, "existing", existingSession, "snapshot_latest", snapshotLatest, "from_sequence", fromSequence, "initial_binary_frames", len(c.initialBinary), "initial_binary_bytes", c.initialDecodedBytes)
 	for _, data := range c.initialBinary {
 		output, decodeErr := c.decodeHelperBinary(data)
 		if decodeErr != nil {
@@ -469,40 +469,6 @@ func helperRequestSync(ctx context.Context, message helperMessageConnection, cap
 	}
 }
 
-func (c *helperTerminalConn) request(capability string, payload any) (helperFrame, error) {
-	encoded, err := json.Marshal(payload)
-	if err != nil {
-		return helperFrame{}, err
-	}
-	requestID := helperID("req_")
-	response := make(chan helperFrame, 1)
-	c.pendingMu.Lock()
-	c.responses[requestID] = response
-	c.pendingMu.Unlock()
-	defer func() {
-		c.pendingMu.Lock()
-		delete(c.responses, requestID)
-		c.pendingMu.Unlock()
-	}()
-	frame := helperFrame{Type: "request", RequestID: requestID, Version: helperProtocolVersion, OperationID: helperID("op_"), Capability: capability, DeadlineMS: uint32(helperRequestTimeout / time.Millisecond), Payload: encoded}
-	if err := c.writeFrame(frame); err != nil {
-		return helperFrame{}, err
-	}
-	timer := time.NewTimer(helperRequestTimeout)
-	defer timer.Stop()
-	select {
-	case frame := <-response:
-		if frame.Type == "error" {
-			return helperFrame{}, decodeHelperError(frame)
-		}
-		return frame, nil
-	case <-c.done:
-		return helperFrame{}, c.terminalError()
-	case <-timer.C:
-		return helperFrame{}, errors.New("helper operation outcome is uncertain")
-	}
-}
-
 func (c *helperTerminalConn) writeFrame(frame helperFrame) error {
 	encoded, err := json.Marshal(frame)
 	if err != nil || len(encoded) == 0 || len(encoded) > 64<<10 {
@@ -568,7 +534,12 @@ func (c *helperTerminalConn) nextWrite() (helperWrite, bool) {
 
 func (c *helperTerminalConn) readLoop() {
 	defer close(c.out)
+	firstOutput := true
 	for _, output := range c.initial {
+		if firstOutput {
+			diagnosticlog.TryInfo("peer terminal first output", "session_id", c.target.SessionID, "source", "initial", "bytes", len(output.data))
+			firstOutput = false
+		}
 		select {
 		case c.out <- output:
 		case <-c.done:
@@ -613,6 +584,10 @@ func (c *helperTerminalConn) readLoop() {
 			if err != nil {
 				c.finish(1, errors.Join(ErrTransportLost, err))
 				return
+			}
+			if firstOutput {
+				diagnosticlog.TryInfo("peer terminal first output", "session_id", c.target.SessionID, "source", "live", "bytes", len(output.data))
+				firstOutput = false
 			}
 			select {
 			case c.out <- output:

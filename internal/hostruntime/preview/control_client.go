@@ -13,6 +13,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/pinksaucepasta/paperboat/internal/httptransport"
 )
 
 var ErrControlClientInvalid = errors.New("invalid preview control client")
@@ -70,7 +72,7 @@ func NewControlClient(config ControlClientConfig) (*ControlClient, error) {
 	}
 	transport := config.Transport
 	if transport == nil {
-		transport = http.DefaultTransport
+		transport = httptransport.Default()
 	}
 	return &ControlClient{endpoint: u, config: config, client: &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return ErrControlClientInvalid }}}, nil
 }

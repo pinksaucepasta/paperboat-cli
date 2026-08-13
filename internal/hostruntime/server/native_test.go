@@ -61,7 +61,9 @@ func TestNativeThreeStreamAssociationAuthenticatesOnce(t *testing.T) {
 	}, func(context.Context, Authorization, string, json.RawMessage) operation.Outcome {
 		return operation.Outcome{}
 	}, 2)
-	limiter, _ := NewConnectionLimiter(3)
+	// The limiter counts authenticated logical associations, not their control,
+	// input, and output streams independently.
+	limiter, _ := NewConnectionLimiter(1)
 	manager, _ := NewNativeAssociationManager(NativeAssociationConfig{Server: protocolServer, Authorizer: func(token string) (Authorizer, error) {
 		if token != "signed-token" {
 			return nil, ErrNativeAssociation

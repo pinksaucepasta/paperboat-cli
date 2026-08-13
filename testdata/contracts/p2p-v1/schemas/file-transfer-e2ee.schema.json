@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://paperboat.dev/contracts/p2p-v1/file-transfer-e2ee.schema.json",
+  "title": "Paperboat file transfer E2EE extension v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "transfer_id", "transfer_generation", "encrypted_manifest", "manifest_digest"],
+  "properties": {
+    "version": { "const": 1 },
+    "transfer_id": { "$ref": "#/$defs/id" },
+    "transfer_generation": { "$ref": "#/$defs/generation" },
+    "encrypted_manifest": { "$ref": "#/$defs/ciphertext" },
+    "manifest_digest": { "$ref": "#/$defs/digest" }
+  },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$" },
+    "generation": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "digest": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "ciphertext": { "type": "string", "pattern": "^[A-Za-z0-9_-]{22,11184811}$" }
+  }
+}

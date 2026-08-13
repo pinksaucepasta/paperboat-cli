@@ -25,6 +25,18 @@ type FileTransfer struct {
 	ReceiptPath          sql.NullString
 	CreatedAt            int64
 	ExpiresAt            int64
+	E2eeTransferID       sql.NullString
+	TransferGeneration   sql.NullInt64
+	FileOrdinal          sql.NullInt64
+	CommittedChunks      int64
+}
+
+type FileTransferChunk struct {
+	TransferID       string
+	Ordinal          int64
+	CiphertextSha256 []byte
+	CiphertextLength int64
+	PlaintextLength  int64
 }
 
 type InputDecision struct {

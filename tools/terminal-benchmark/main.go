@@ -244,6 +244,7 @@ func run(parent context.Context, args []string, stdout, stderr io.Writer) error 
 			warmupTimeouts += attempts - 1
 		}
 		if cfg.interval > 0 {
+			//paperboat:allow-source-policy sleep owner=benchmarking reason=operator-configured-probe-pacing
 			time.Sleep(cfg.interval)
 		}
 	}
@@ -390,6 +391,21 @@ func (m *streamMatcher) wait(ctx context.Context, marker string) error {
 			}
 			return err
 		case <-ctx.Done():
+			// Account for output that arrived before the deadline but lost the
+			// select race. Do not wait for any output arriving after the deadline.
+			for queued := len(m.chunks); queued > 0; queued-- {
+				chunk, ok := <-m.chunks
+				if !ok {
+					break
+				}
+				matched, err := m.consume(chunk, marker)
+				if err != nil {
+					return err
+				}
+				if matched {
+					return nil
+				}
+			}
 			return m.timeoutError(ctx.Err(), marker)
 		}
 	}

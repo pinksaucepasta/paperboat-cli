@@ -16,6 +16,37 @@ type faultSecretStore struct {
 	failDeleteRef string
 }
 
+type unlockTamperingSecretStore struct {
+	root   string
+	values map[string]string
+}
+
+func (s *unlockTamperingSecretStore) Set(ref, value string) error {
+	s.values[ref] = value
+	return filepath.WalkDir(s.root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !entry.IsDir() && entry.Name() == "owner.json" && strings.HasSuffix(filepath.Dir(path), ".lock.d") {
+			return os.WriteFile(path, []byte("invalid lock owner"), 0o600)
+		}
+		return nil
+	})
+}
+
+func (s *unlockTamperingSecretStore) Get(ref string) (string, error) {
+	value, ok := s.values[ref]
+	if !ok {
+		return "", ErrSecretNotFound
+	}
+	return value, nil
+}
+
+func (s *unlockTamperingSecretStore) Delete(ref string) error {
+	delete(s.values, ref)
+	return nil
+}
+
 func (s *faultSecretStore) Set(ref, value string) error {
 	if s.failAccess && strings.HasSuffix(ref, "-access") {
 		return errors.New("injected access write failure")
@@ -104,6 +135,16 @@ func TestInitialSaveAccessFailureRemovesStoredRefreshSecret(t *testing.T) {
 	}
 }
 
+func TestProfileMutationReportsSharedLockReleaseFailure(t *testing.T) {
+	dir := t.TempDir()
+	secrets := &unlockTamperingSecretStore{root: dir, values: make(map[string]string)}
+	store := ProfileStore{Path: dir, Secrets: secrets}
+	err := store.Save(Profile{Issuer: "https://api.example.com", CLIClientSessionID: "cls_1"}, Credential{AccessToken: "access", RefreshToken: "refresh"})
+	if err == nil {
+		t.Fatalf("release error=%v", err)
+	}
+}
+
 func TestInitialSaveMetadataFailureRemovesStoredSecrets(t *testing.T) {
 	dir := t.TempDir()
 	secrets := &faultSecretStore{values: map[string]string{}}
@@ -127,6 +168,9 @@ func TestInitialSaveMetadataFailureRemovesStoredSecrets(t *testing.T) {
 
 func TestFileSecretStoreRejectsLoosePermissions(t *testing.T) {
 	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	s := FileSecretStore{Dir: dir}
 	p := s.path("bad")
 	if err := os.WriteFile(p, []byte("secret"), 0o644); err != nil {
@@ -163,6 +207,46 @@ func TestNormalizeIssuerRemovesDefaultPorts(t *testing.T) {
 			t.Errorf("NormalizeIssuer(%q) = %q, want %q", input, got, want)
 		}
 	}
+}
+
+func TestCredentialOperationsWithholdTokensWhenUnlockFails(t *testing.T) {
+	want := errors.New("unlock failed")
+	newStore := func(t *testing.T, expiresAt time.Time) (ProfileStore, string) {
+		t.Helper()
+		dir := t.TempDir()
+		store := ProfileStore{Path: dir, Secrets: FileSecretStore{Dir: filepath.Join(dir, "secrets")}}
+		issuer := "https://api.example.com"
+		if err := store.Save(Profile{Issuer: issuer, CLIClientSessionID: "cls_1", AccessExpiresAt: expiresAt}, Credential{AccessToken: "access-old", RefreshToken: "refresh-old", ExpiresAt: expiresAt}); err != nil {
+			t.Fatal(err)
+		}
+		return store, issuer
+	}
+
+	t.Run("cached", func(t *testing.T) {
+		store, issuer := newStore(t, time.Now().Add(time.Hour))
+		credential, err := store.credentialWithRefresh(issuer, time.Minute, nil, failingCredentialLock{unlock: want})
+		if !errors.Is(err, want) || credential != (Credential{}) {
+			t.Fatalf("credential=%+v error=%v", credential, err)
+		}
+	})
+
+	t.Run("refreshed", func(t *testing.T) {
+		store, issuer := newStore(t, time.Now().Add(-time.Minute))
+		credential, err := store.credentialWithRefresh(issuer, time.Minute, func(Credential) (Credential, string, error) {
+			return Credential{AccessToken: "access-new", RefreshToken: "refresh-new", TokenType: "Bearer", ExpiresAt: time.Now().Add(time.Hour)}, "cls_1", nil
+		}, failingCredentialLock{unlock: want})
+		if !errors.Is(err, want) || credential != (Credential{}) {
+			t.Fatalf("credential=%+v error=%v", credential, err)
+		}
+	})
+
+	t.Run("remove", func(t *testing.T) {
+		store, issuer := newStore(t, time.Now().Add(time.Hour))
+		credential, err := store.removeCredential(issuer, failingCredentialLock{unlock: want})
+		if !errors.Is(err, want) || credential != (Credential{}) {
+			t.Fatalf("credential=%+v error=%v", credential, err)
+		}
+	})
 }
 
 func TestRefreshWriteFailurePreservesRotatedRefreshToken(t *testing.T) {

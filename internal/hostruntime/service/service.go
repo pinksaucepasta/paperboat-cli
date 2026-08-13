@@ -1,23 +1,28 @@
 package service
 
 import (
-	"bytes"
 	"context"
-	"encoding/xml"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/coreos/go-systemd/v22/unit"
+	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
+	"howett.net/plist"
 )
 
 const (
 	Label       = "com.pinksaucepasta.paperboat.runtime-host"
 	HostLabel   = "com.pinksaucepasta.paperboat.runtime-privileged"
 	ConfigLabel = "com.pinksaucepasta.paperboat.runtime-config"
+	DaemonLabel = "com.pinksaucepasta.paperboat.local-daemon"
 	WorkerKind  = "worker"
 	HostKind    = "host"
 	ConfigKind  = "config"
+	DaemonKind  = "daemon"
 	PreviewKind = "preview"
 )
 
@@ -71,13 +76,15 @@ func New(config Config) (*Installer, error) {
 			label = HostLabel
 		} else if config.Kind == ConfigKind {
 			label = ConfigLabel
+		} else if config.Kind == DaemonKind {
+			label = DaemonLabel
 		} else if config.Kind == PreviewKind && safeInstance(config.Instance) {
 			label = previewLabel(config.Instance)
 		} else if config.Kind != WorkerKind {
 			return nil, ErrInvalidDefinition
 		}
 		directory := "LaunchDaemons"
-		if config.Kind == ConfigKind || config.Kind == PreviewKind {
+		if config.Kind == ConfigKind || config.Kind == DaemonKind || config.Kind == PreviewKind {
 			directory = "LaunchAgents"
 		}
 		path = filepath.Join(config.ConfigRoot, "Library", directory, label+".plist")
@@ -87,6 +94,8 @@ func New(config Config) (*Installer, error) {
 			unit = "paperboat-runtime-privileged.service"
 		} else if config.Kind == ConfigKind {
 			path = filepath.Join(config.ConfigRoot, ".config", "systemd", "user", "paperboat-runtime-config.service")
+		} else if config.Kind == DaemonKind {
+			path = filepath.Join(config.ConfigRoot, ".config", "systemd", "user", "paperboat-local-daemon.service")
 		} else if config.Kind == PreviewKind && safeInstance(config.Instance) {
 			path = filepath.Join(config.ConfigRoot, ".config", "systemd", "user", "paperboat-preview-"+config.Instance+".service")
 		} else if config.Kind != WorkerKind {
@@ -167,197 +176,134 @@ func (i *Installer) render() ([]byte, error) {
 	if i.config.Platform == "darwin" {
 		return renderLaunchd(i.config)
 	}
-	return renderSystemd(i.config), nil
+	return renderSystemd(i.config)
 }
 
 func renderLaunchd(config Config) ([]byte, error) {
-	var output bytes.Buffer
-	output.WriteString(xml.Header)
-	output.WriteString(`<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">` + "\n")
-	encoder := xml.NewEncoder(&output)
-	encoder.Indent("", "  ")
-	start := func(name string) error { return encoder.EncodeToken(xml.StartElement{Name: xml.Name{Local: name}}) }
-	end := func(name string) error { return encoder.EncodeToken(xml.EndElement{Name: xml.Name{Local: name}}) }
-	text := func(element, value string) error {
-		if err := start(element); err != nil {
-			return err
-		}
-		if err := encoder.EncodeToken(xml.CharData(value)); err != nil {
-			return err
-		}
-		return end(element)
-	}
-	if err := encoder.EncodeToken(xml.StartElement{Name: xml.Name{Local: "plist"}, Attr: []xml.Attr{{Name: xml.Name{Local: "version"}, Value: "1.0"}}}); err != nil {
-		return nil, err
-	}
-	if err := start("dict"); err != nil {
-		return nil, err
-	}
 	label := Label
 	if config.Kind == HostKind {
 		label = HostLabel
 	} else if config.Kind == ConfigKind {
 		label = ConfigLabel
+	} else if config.Kind == DaemonKind {
+		label = DaemonLabel
 	} else if config.Kind == PreviewKind {
 		label = previewLabel(config.Instance)
 	}
-	pairs := [][2]string{{"Label", label}, {"ProcessType", "Background"}, {"UserName", config.User}, {"GroupName", config.Group}}
-	for _, pair := range pairs {
-		if err := text("key", pair[0]); err != nil {
-			return nil, err
-		}
-		if err := text("string", pair[1]); err != nil {
-			return nil, err
-		}
-	}
-	if err := text("key", "ProgramArguments"); err != nil {
-		return nil, err
-	}
-	if err := start("array"); err != nil {
-		return nil, err
-	}
-	for _, argument := range append([]string{config.Executable}, config.Arguments...) {
-		if err := text("string", argument); err != nil {
-			return nil, err
-		}
-	}
-	if err := end("array"); err != nil {
-		return nil, err
-	}
-	if err := text("key", "EnvironmentVariables"); err != nil {
-		return nil, err
-	}
-	if err := start("dict"); err != nil {
-		return nil, err
-	}
-	keys := sortedKeys(config.Environment)
-	for _, key := range keys {
-		if err := text("key", key); err != nil {
-			return nil, err
-		}
-		if err := text("string", config.Environment[key]); err != nil {
-			return nil, err
-		}
-	}
-	if err := end("dict"); err != nil {
-		return nil, err
-	}
-	for _, key := range []string{"RunAtLoad"} {
-		if err := text("key", key); err != nil {
-			return nil, err
-		}
-		if err := start("true"); err != nil {
-			return nil, err
-		}
-		if err := end("true"); err != nil {
-			return nil, err
-		}
-	}
-	if err := text("key", "KeepAlive"); err != nil {
-		return nil, err
-	}
+	var keepAlive any = true
 	if config.Kind == PreviewKind {
-		if err := start("dict"); err != nil {
-			return nil, err
-		}
-		if err := text("key", "SuccessfulExit"); err != nil {
-			return nil, err
-		}
-		if err := start("false"); err != nil {
-			return nil, err
-		}
-		if err := end("false"); err != nil {
-			return nil, err
-		}
-		if err := end("dict"); err != nil {
-			return nil, err
-		}
-	} else {
-		if err := start("true"); err != nil {
-			return nil, err
-		}
-		if err := end("true"); err != nil {
-			return nil, err
-		}
+		keepAlive = struct {
+			SuccessfulExit bool `plist:"SuccessfulExit"`
+		}{SuccessfulExit: false}
 	}
-	if err := text("key", "Umask"); err != nil {
-		return nil, err
+	definition := struct {
+		Label                string            `plist:"Label"`
+		ProcessType          string            `plist:"ProcessType"`
+		UserName             string            `plist:"UserName"`
+		GroupName            string            `plist:"GroupName"`
+		ProgramArguments     []string          `plist:"ProgramArguments"`
+		EnvironmentVariables map[string]string `plist:"EnvironmentVariables"`
+		RunAtLoad            bool              `plist:"RunAtLoad"`
+		KeepAlive            any               `plist:"KeepAlive"`
+		Umask                uint64            `plist:"Umask"`
+	}{
+		Label: label, ProcessType: "Background", UserName: config.User, GroupName: config.Group,
+		ProgramArguments:     append([]string{config.Executable}, config.Arguments...),
+		EnvironmentVariables: config.Environment, RunAtLoad: true, KeepAlive: keepAlive, Umask: 0o77,
 	}
-	if err := start("integer"); err != nil {
-		return nil, err
-	}
-	if err := encoder.EncodeToken(xml.CharData("63")); err != nil {
-		return nil, err
-	}
-	if err := end("integer"); err != nil {
-		return nil, err
-	}
-	if err := end("dict"); err != nil {
-		return nil, err
-	}
-	if err := end("plist"); err != nil {
-		return nil, err
-	}
-	if err := encoder.Flush(); err != nil {
-		return nil, err
-	}
-	return bytes.ReplaceAll(output.Bytes(), []byte("<true></true>"), []byte("<true/>")), nil
+	return plist.MarshalIndent(definition, plist.XMLFormat, "  ")
 }
 
-func renderSystemd(config Config) []byte {
-	var output strings.Builder
+func renderSystemd(config Config) ([]byte, error) {
 	description := "Paperboat host runtime"
 	if config.Kind == HostKind {
 		description = "Paperboat host service"
 	} else if config.Kind == ConfigKind {
 		description = "Paperboat config sync"
+	} else if config.Kind == DaemonKind {
+		description = "Paperboat local daemon"
 	} else if config.Kind == PreviewKind {
 		description = "Paperboat preview " + config.Instance
 	}
-	output.WriteString("[Unit]\nDescription=")
-	output.WriteString(description)
-	output.WriteString("\nAfter=local-fs.target\nStartLimitIntervalSec=0\n\n[Service]\nType=simple\n")
-	if config.Kind != ConfigKind && config.Kind != PreviewKind {
-		output.WriteString("User=")
-		output.WriteString(config.User)
-		output.WriteString("\nGroup=")
-		output.WriteString(config.Group)
-		output.WriteByte('\n')
+	options := []*unit.UnitOption{
+		unit.NewUnitOption("Unit", "Description", description),
+		unit.NewUnitOption("Unit", "After", "local-fs.target"),
+		unit.NewUnitOption("Unit", "StartLimitIntervalSec", "0"),
 	}
-	output.WriteString("ExecStart=")
-	output.WriteString(systemdEscape(config.Executable))
+	systemService := config.Kind == WorkerKind || config.Kind == HostKind
+	notify := systemService
+	serviceType := "simple"
+	if notify {
+		serviceType = "notify"
+	}
+	options = append(options, unit.NewUnitOption("Service", "Type", serviceType))
+	if config.Kind != ConfigKind && config.Kind != DaemonKind && config.Kind != PreviewKind {
+		options = append(options,
+			unit.NewUnitOption("Service", "User", config.User),
+			unit.NewUnitOption("Service", "Group", config.Group),
+		)
+	}
+	var command strings.Builder
+	command.WriteString(systemdEscape(config.Executable))
 	for _, argument := range config.Arguments {
-		output.WriteByte(' ')
-		output.WriteString(systemdEscape(argument))
+		command.WriteByte(' ')
+		command.WriteString(systemdEscape(argument))
 	}
-	output.WriteByte('\n')
+	options = append(options, unit.NewUnitOption("Service", "ExecStart", command.String()))
 	for _, key := range sortedKeys(config.Environment) {
-		output.WriteString("Environment=")
-		output.WriteString(systemdEscape(key + "=" + config.Environment[key]))
-		output.WriteByte('\n')
+		options = append(options, unit.NewUnitOption("Service", "Environment", systemdEscape(key+"="+config.Environment[key])))
 	}
+	restart := "always"
 	if config.Kind == PreviewKind {
-		output.WriteString("Restart=on-failure\n")
-	} else {
-		output.WriteString("Restart=always\n")
+		restart = "on-failure"
 	}
-	output.WriteString("RestartSec=5s\nTimeoutStopSec=60s\nKillMode=mixed\nUMask=0077\n")
+	options = append(options,
+		unit.NewUnitOption("Service", "Restart", restart),
+		unit.NewUnitOption("Service", "RestartSec", "5s"),
+		unit.NewUnitOption("Service", "TimeoutStopSec", "60s"),
+		unit.NewUnitOption("Service", "KillMode", "mixed"),
+		unit.NewUnitOption("Service", "UMask", "0077"),
+	)
+	if notify {
+		options = append(options,
+			unit.NewUnitOption("Service", "NotifyAccess", "main"),
+			unit.NewUnitOption("Service", "WatchdogSec", "30s"),
+		)
+	}
+	if systemService {
+		options = append(options,
+			unit.NewUnitOption("Service", "RuntimeDirectory", "paperboat"),
+			unit.NewUnitOption("Service", "RuntimeDirectoryMode", "0755"),
+			unit.NewUnitOption("Service", "StateDirectory", "paperboat"),
+			unit.NewUnitOption("Service", "StateDirectoryMode", "0700"),
+			unit.NewUnitOption("Service", "CacheDirectory", "paperboat"),
+			unit.NewUnitOption("Service", "CacheDirectoryMode", "0750"),
+		)
+	}
+	noNewPrivileges := "false"
 	if config.Kind == HostKind {
-		output.WriteString("NoNewPrivileges=true\n")
-	} else {
-		output.WriteString("NoNewPrivileges=false\n")
+		noNewPrivileges = "true"
 	}
-	output.WriteString("PrivateTmp=true\n\n[Install]\nWantedBy=")
-	if config.Kind == ConfigKind || config.Kind == PreviewKind {
-		output.WriteString("default.target\n")
-	} else {
-		output.WriteString("multi-user.target\n")
+	options = append(options, unit.NewUnitOption("Service", "NoNewPrivileges", noNewPrivileges))
+	// Detached serve workers must access the user-selected source path. A private
+	// /tmp namespace hides valid sources such as /tmp/site from the worker.
+	if config.Kind != PreviewKind {
+		options = append(options, unit.NewUnitOption("Service", "PrivateTmp", "true"))
 	}
-	return []byte(output.String())
+	wantedBy := "multi-user.target"
+	if config.Kind == ConfigKind || config.Kind == DaemonKind || config.Kind == PreviewKind {
+		wantedBy = "default.target"
+	}
+	options = append(options, unit.NewUnitOption("Install", "WantedBy", wantedBy))
+	return io.ReadAll(unit.Serialize(options))
 }
 
 func systemdEscape(value string) string {
-	return `"` + strings.ReplaceAll(strings.ReplaceAll(value, `\`, `\\`), `"`, `\"`) + `"`
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	value = strings.ReplaceAll(value, `"`, `\"`)
+	value = strings.ReplaceAll(value, `%`, `%%`)
+	value = strings.ReplaceAll(value, `$`, `$$`)
+	return `"` + value + `"`
 }
 
 func atomicWrite(path string, data []byte, mode os.FileMode) error {
@@ -376,31 +322,7 @@ func atomicWrite(path string, data []byte, mode os.FileMode) error {
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o755 {
 		return ErrInvalidDefinition
 	}
-	temporary, err := os.CreateTemp(directory, ".service-*")
-	if err != nil {
-		return err
-	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-	if err := temporary.Chmod(mode); err != nil {
-		temporary.Close()
-		return err
-	}
-	if _, err := temporary.Write(data); err != nil {
-		temporary.Close()
-		return err
-	}
-	if err := temporary.Sync(); err != nil {
-		temporary.Close()
-		return err
-	}
-	if err := temporary.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(temporaryPath, path); err != nil {
-		return err
-	}
-	return syncDirectory(directory)
+	return atomicfile.Write(path, data, atomicfile.Options{Mode: mode, OwnerUID: -1, OwnerGID: -1})
 }
 func syncDirectory(path string) error {
 	directory, err := os.Open(path)
@@ -450,8 +372,8 @@ func safeAccount(value string) bool {
 	if value == "" || len(value) > 128 {
 		return false
 	}
-	for _, char := range value {
-		if !(char == '_' || char == '-' || char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9') {
+	for index, char := range value {
+		if !(char == '_' || char == '-' || index > 0 && index < len(value)-1 && char == '.' && value[index-1] != '.' || char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9') {
 			return false
 		}
 	}

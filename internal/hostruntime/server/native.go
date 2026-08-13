@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -45,21 +46,22 @@ func NewNativeAssociationManager(config NativeAssociationConfig) (*NativeAssocia
 }
 
 func (m *NativeAssociationManager) Serve(conn net.Conn) error {
-	if conn == nil || !m.config.Limiter.acquire() {
-		if conn != nil {
-			_ = conn.Close()
-		}
+	if conn == nil {
 		return ErrNativeAssociation
 	}
-	defer m.config.Limiter.release()
 	_ = conn.SetReadDeadline(time.Now().Add(m.config.Expiry))
 	preface, err := nativeproto.ReadPreface(conn)
 	if err != nil {
 		_ = conn.Close()
-		return err
+		return fmt.Errorf("native preface: %w", err)
 	}
 	_ = conn.SetReadDeadline(time.Time{})
-	if preface.Role == nativeproto.RoleControl {
+	if preface.Role == nativeproto.RoleControl || preface.Role == nativeproto.RoleUnified {
+		if !m.config.Limiter.acquire() {
+			_ = conn.Close()
+			return ErrNativeAssociation
+		}
+		defer m.config.Limiter.release()
 		return m.serveControl(conn, preface)
 	}
 	return m.serveAuxiliary(conn, preface)
@@ -72,6 +74,7 @@ func (m *NativeAssociationManager) serveControl(conn net.Conn, p nativeproto.Pre
 		return ErrNativeAssociation
 	}
 	native := newNativeConnection(conn, p.ConnectionID, m.config.Expiry)
+	native.unified = p.Role == nativeproto.RoleUnified
 	if _, err := io.ReadFull(m.config.Random, native.binding[:]); err != nil {
 		_ = conn.Close()
 		return err
@@ -130,6 +133,7 @@ type nativeConnection struct {
 	readOnce      sync.Once
 	reads         chan nativeRead
 	revoked       atomic.Bool
+	unified       bool
 }
 
 type nativeRead struct {
@@ -175,7 +179,7 @@ func (c *nativeConnection) markAuthenticated() {
 }
 
 func (c *nativeConnection) signalReadyLocked() {
-	if c.authenticated && c.input != nil && c.output != nil {
+	if c.authenticated && (c.unified || c.input != nil && c.output != nil) {
 		c.readyOnce.Do(func() {
 			if c.timer != nil {
 				c.timer.Stop()
@@ -197,6 +201,9 @@ func (c *nativeConnection) expireIncomplete() {
 func (c *nativeConnection) startReaders() {
 	c.readOnce.Do(func() {
 		go c.readControl()
+		if c.unified {
+			return
+		}
 		go func() {
 			select {
 			case <-c.ready:
@@ -293,8 +300,11 @@ func (c *nativeConnection) writeOutput(data []byte) error {
 	}
 	c.mu.Lock()
 	output := c.output
+	if c.unified {
+		output = c.control
+	}
 	c.mu.Unlock()
-	return nativeproto.WriteRecord(output, nativeproto.RecordBinary, data, false)
+	return nativeproto.WriteRecord(output, nativeproto.RecordBinary, data, c.unified)
 }
 
 func (c *nativeConnection) CloseProtocol(int, string) error { return c.Close() }

@@ -5,6 +5,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -40,6 +41,10 @@ type ProductionPreviewWorkerConfig struct {
 }
 
 func RunProductionPreviewWorker(ctx context.Context, config ProductionPreviewWorkerConfig) (runErr error) {
+	startedAt := time.Now()
+	stage := func(name string) {
+		slog.Info("public preview startup", "stage", name, "duration_ms", time.Since(startedAt).Milliseconds())
+	}
 	controlURL, err := url.Parse(strings.TrimSpace(config.ControlURL))
 	if err != nil || controlURL.Scheme != "https" || controlURL.Hostname() == "" || !filepath.IsAbs(config.StateRoot) || config.Name == "" || config.Port == 0 || config.Indefinite && (config.Duration != 0 || config.ExpiresAt != nil) || !config.Indefinite && config.Duration <= 0 && config.ExpiresAt == nil {
 		return ErrProductionInvalid
@@ -69,7 +74,7 @@ func RunProductionPreviewWorker(ctx context.Context, config ProductionPreviewWor
 			if runErr == nil {
 				cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
-				runErr = errors.Join(runErr, retirePreviewService(cleanupCtx, config.Name, config.ServiceDefinition, runner))
+				runErr = errors.Join(runErr, retireCompletedServeService(cleanupCtx, config.Name, config.DescriptorPath, config.ServiceDefinition, runner))
 			}
 		}()
 	}
@@ -124,6 +129,7 @@ func RunProductionPreviewWorker(ctx context.Context, config ProductionPreviewWor
 			return err
 		}
 	}
+	stage("registered")
 	removeRemote := true
 	defer func() {
 		if removeRemote {
@@ -167,16 +173,17 @@ func RunProductionPreviewWorker(ctx context.Context, config ProductionPreviewWor
 	if err != nil {
 		return err
 	}
+	stage("authority_ready")
 	verifier := auth.Verifier{Keys: keys, Clock: productionClock{}, Replays: auth.NewReplayCache(256, productionClock{}), Revocations: auth.NewRevocationCache(), ClockSkew: 30 * time.Second, RefreshTimeout: 2 * time.Second}
 	admissions, err := connector.NewHTTPSAdmissionSource(connector.AdmissionSourceConfig{Endpoint: controlURL.ResolveReference(&url.URL{Path: "/v1/connectors/admission"}).String(), AllowedHosts: []string{controlURL.Hostname()}, Tokens: machines, Proofs: machines, Verifier: verifier, Clock: productionClock{}, Issuer: strings.TrimRight(controlURL.String(), "/"), EnvironmentID: registration.EnvironmentID, MachineID: registration.MachineID, ConnectorID: remote.PreviewKey, EdgePool: "default", OperationID: operationID, Transport: config.Transport})
 	if err != nil {
 		return err
 	}
-	dialer, err := connector.NewFRPDialer(connector.FRPDialerConfig{ReadyTimeout: 15 * time.Second, RouteKinds: []string{"preview_public_https_wss"}, PreferencePath: filepath.Join(config.StateRoot, "previews", remote.PreviewKey, "transport.json")})
+	dialer, err := connector.NewPublicPreviewDialer(connector.PublicPreviewDialerConfig{})
 	if err != nil {
 		return err
 	}
-	manager, err := connector.New(connector.Config{EnvironmentID: registration.EnvironmentID, MachineID: registration.MachineID, ConnectorID: remote.PreviewKey, EdgePool: "default", Dialer: dialer, DrainTimeout: 10 * time.Second})
+	manager, err := connector.New(connector.Config{EnvironmentID: registration.EnvironmentID, MachineID: registration.MachineID, ConnectorID: remote.PreviewKey, EdgePool: "default", Dialer: dialer, DrainTimeout: 10 * time.Second, Transport: connector.QUIC})
 	if err != nil {
 		return err
 	}
@@ -195,16 +202,21 @@ func RunProductionPreviewWorker(ctx context.Context, config ProductionPreviewWor
 	if err = connectorService.Start(ctx); err != nil {
 		return err
 	}
+	stage("connector_started")
 	defer shutdownPreviewComponent(connectorService.Shutdown)
 	if err = monitor.RunOnce(ctx); err != nil {
 		return err
 	}
+	stage("target_probed")
 	if _, err = reporter.DeliverOnce(ctx); err != nil {
 		return err
 	}
+	stage("observation_delivered")
 	if err = waitForPreviewConnector(ctx, manager); err != nil {
 		return err
 	}
+	status := manager.Status()
+	slog.Info("public preview carrier ready", "transport", status.Transport, "generation", status.Generation, "duration_ms", time.Since(startedAt).Milliseconds())
 	remote.State = "ready"
 	if config.Ready != nil {
 		if err = config.Ready(remote); err != nil {

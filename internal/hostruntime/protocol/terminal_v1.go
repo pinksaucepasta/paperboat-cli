@@ -57,6 +57,7 @@ const (
 	TerminalOutputOpcode byte = 2
 	TerminalACKOpcode    byte = 3
 	TerminalResizeOpcode byte = 4
+	TerminalEOFOpcode    byte = 5
 
 	TerminalStdout byte = 1
 	TerminalStderr byte = 2
@@ -72,6 +73,7 @@ const (
 	MaxTerminalOutputBytes               = MaxBinaryFrame - terminalOutputHeaderLen
 	terminalACKLen                       = 13
 	terminalResizeLen                    = 17
+	terminalEOFLen                       = 13
 )
 
 type TerminalInputFrame struct {
@@ -130,6 +132,11 @@ type TerminalResizeFrame struct {
 	StreamID uint32
 	Columns  uint16
 	Rows     uint16
+	Sequence uint64
+}
+
+type TerminalEOFFrame struct {
+	StreamID uint32
 	Sequence uint64
 }
 
@@ -355,11 +362,33 @@ func DecodeTerminalResize(message []byte) (TerminalResizeFrame, error) {
 	return frame, nil
 }
 
+func EncodeTerminalEOF(frame TerminalEOFFrame, dst []byte) ([]byte, error) {
+	if frame.StreamID == 0 || frame.Sequence == 0 {
+		return nil, &Error{Code: InvalidFrame}
+	}
+	dst = growFrame(dst, terminalEOFLen)
+	dst[0] = TerminalEOFOpcode
+	binary.BigEndian.PutUint32(dst[1:5], frame.StreamID)
+	binary.BigEndian.PutUint64(dst[5:13], frame.Sequence)
+	return dst, nil
+}
+
+func DecodeTerminalEOF(message []byte) (TerminalEOFFrame, error) {
+	if len(message) != terminalEOFLen || message[0] != TerminalEOFOpcode {
+		return TerminalEOFFrame{}, &Error{Code: InvalidFrame}
+	}
+	frame := TerminalEOFFrame{StreamID: binary.BigEndian.Uint32(message[1:5]), Sequence: binary.BigEndian.Uint64(message[5:13])}
+	if frame.StreamID == 0 || frame.Sequence == 0 {
+		return TerminalEOFFrame{}, &Error{Code: InvalidFrame}
+	}
+	return frame, nil
+}
+
 func TerminalOpcode(message []byte) (byte, error) {
 	if len(message) == 0 {
 		return 0, &Error{Code: InvalidFrame, Cause: errors.New("terminal frame is empty")}
 	}
-	if message[0] < TerminalInputOpcode || message[0] > TerminalResizeOpcode {
+	if message[0] < TerminalInputOpcode || message[0] > TerminalEOFOpcode {
 		return 0, &Error{Code: UnsupportedChannel}
 	}
 	return message[0], nil

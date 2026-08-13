@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
 )
 
 type MachineControl struct {
@@ -63,7 +65,8 @@ func (s *Store) MachineControl(now time.Time, expiryGrace time.Duration) (Machin
 
 func (s *Store) MachineProof(operationID, method, path string, body []byte, now time.Time) ([]byte, error) {
 	registration, err := s.Registration()
-	if err != nil || len(operationID) < 8 || len(operationID) > 128 || strings.ToUpper(method) != http.MethodPost || !strings.HasPrefix(path, "/v1/") || len(body) > 1<<20 {
+	method = strings.ToUpper(method)
+	if err != nil || len(operationID) < 8 || len(operationID) > 128 || method != http.MethodPost && method != http.MethodPut && method != http.MethodDelete || !strings.HasPrefix(path, "/v1/") || len(body) > 1<<20 {
 		return nil, ErrInvalidStore
 	}
 	now = now.UTC()
@@ -78,7 +81,7 @@ func (s *Store) MachineProof(operationID, method, path string, body []byte, now 
 		BodySHA256             string    `json:"body_sha256"`
 		IssuedAt               time.Time `json:"issued_at"`
 		ExpiresAt              time.Time `json:"expires_at"`
-	}{registration.MachineID, registration.EnvironmentID, registration.InstallationGeneration, operationID, http.MethodPost, path, base64.RawURLEncoding.EncodeToString(bodyHash[:]), now, now.Add(time.Minute)})
+	}{registration.MachineID, registration.EnvironmentID, registration.InstallationGeneration, operationID, method, path, base64.RawURLEncoding.EncodeToString(bodyHash[:]), now, now.Add(time.Minute)})
 	if err != nil {
 		return nil, err
 	}
@@ -89,7 +92,7 @@ func (s *Store) MachineProof(operationID, method, path string, body []byte, now 
 	}{"EdDSA", base64.RawURLEncoding.EncodeToString(payload), base64.RawURLEncoding.EncodeToString(s.key.Sign(payload))})
 }
 
-func (s *Store) writePrivateDocument(name, pattern string, encoded []byte) error {
+func (s *Store) writePrivateDocument(name, _ string, encoded []byte) error {
 	path := filepath.Join(s.config.StateRoot, name)
 	if info, err := os.Lstat(path); err == nil {
 		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
@@ -98,29 +101,5 @@ func (s *Store) writePrivateDocument(name, pattern string, encoded []byte) error
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	temporary, err := os.CreateTemp(s.config.StateRoot, pattern)
-	if err != nil {
-		return err
-	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-	if err := temporary.Chmod(0o600); err != nil {
-		temporary.Close()
-		return err
-	}
-	if _, err := temporary.Write(encoded); err != nil {
-		temporary.Close()
-		return err
-	}
-	if err := temporary.Sync(); err != nil {
-		temporary.Close()
-		return err
-	}
-	if err := temporary.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(temporaryPath, path); err != nil {
-		return err
-	}
-	return syncDirectory(s.config.StateRoot)
+	return atomicfile.Write(path, encoded, atomicfile.Options{Mode: 0o600, OwnerUID: os.Geteuid(), OwnerGID: os.Getegid()})
 }

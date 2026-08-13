@@ -59,6 +59,9 @@ func (KeyringStore) Get(ref string) (string, error) {
 		return "", err
 	}
 	item, err := linuxSecretItem(service, ref)
+	if errors.Is(err, errKeyringSecretNotFound) {
+		return "", ErrSecretNotFound
+	}
 	if err != nil {
 		return "", err
 	}

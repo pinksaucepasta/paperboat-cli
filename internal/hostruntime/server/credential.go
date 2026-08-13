@@ -117,8 +117,9 @@ func stableClaimsBinding(claims auth.Claims) (string, error) {
 		CLIClientSessionID string   `json:"cli_client_session_id"`
 		HelperID           string   `json:"helper_id"`
 		SessionID          string   `json:"session_id"`
+		OperationID        string   `json:"operation_id"`
 		AssignmentID       string   `json:"assignment_id"`
-	}{claims.Issuer, claims.Subject, claims.CredentialClass, claims.Scope, claims.EnvironmentID, claims.MachineID, claims.SourceMachineID, claims.UserID, claims.CLIClientSessionID, claims.HelperID, claims.SessionID, claims.AssignmentID})
+	}{claims.Issuer, claims.Subject, claims.CredentialClass, claims.Scope, claims.EnvironmentID, claims.MachineID, claims.SourceMachineID, claims.UserID, claims.CLIClientSessionID, claims.HelperID, claims.SessionID, claims.OperationID, claims.AssignmentID})
 	if err != nil {
 		return "", err
 	}
