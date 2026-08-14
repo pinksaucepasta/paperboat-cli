@@ -105,7 +105,6 @@ type PeerTerminalTunnel struct {
 	authorities          *clientauthority.Cache
 	networkMu            sync.Mutex
 	sharedMonitor        *networkmonitor.Monitor
-	socketSubstrate      *directpath.SocketSubstrate
 	sharedFingerprint    networkadaptation.Fingerprint
 	sharedFingerprintOK  bool
 }
@@ -181,9 +180,6 @@ func (t *PeerTerminalTunnel) Start(ctx context.Context) error {
 			return
 		}
 		t.advanceNetwork()
-		if t.socketSubstrate != nil {
-			_ = t.socketSubstrate.NetworkChanged(t.network.Load())
-		}
 		if t.relayPMTU != nil {
 			t.relayPMTU.Invalidate()
 		}
@@ -212,15 +208,6 @@ func (t *PeerTerminalTunnel) Start(ctx context.Context) error {
 		_ = monitor.Close()
 		return err
 	}
-	substrate, err := directpath.NewSocketSubstrate(directpath.SocketSubstrateConfig{
-		Sockets: udpsocket.DevelopmentConfig(true, true), SocketMapping: monitor,
-		MaximumPMTU:      networkadaptation.DevelopmentPMTUPolicy().MaximumPayload,
-		ApplicationQueue: 64, PMTUResponseLimit: time.Second, MaximumAttempts: 256,
-	})
-	if err != nil {
-		_ = monitor.Close()
-		return err
-	}
 	fingerprint, fingerprintErr := monitor.CurrentFingerprint()
 	t.networkMu.Lock()
 	if t.sharedMonitor != nil {
@@ -229,7 +216,6 @@ func (t *PeerTerminalTunnel) Start(ctx context.Context) error {
 		return nil
 	}
 	t.sharedMonitor, t.sharedFingerprint, t.sharedFingerprintOK = monitor, fingerprint, fingerprintErr == nil && fingerprint.Valid()
-	t.socketSubstrate = substrate
 	t.networkMu.Unlock()
 	t.observeNetworkFingerprint(fingerprint, fingerprintErr == nil && fingerprint.Valid())
 	credential, err := t.config.Auth.Credential()
@@ -242,11 +228,6 @@ func (t *PeerTerminalTunnel) Start(ctx context.Context) error {
 	if err != nil || len(regionsDocument.Regions) == 0 {
 		_ = t.Close()
 		return errors.Join(ErrPeerTerminalInvalid, err)
-	}
-	firstRegion := regionsDocument.Regions[0]
-	if err := substrate.Warm(ctx, t.network.Load(), []string{firstRegion.STUNURL}); err != nil {
-		_ = t.Close()
-		return err
 	}
 	var warmWait sync.WaitGroup
 	var warmMu sync.Mutex
@@ -283,8 +264,8 @@ func (t *PeerTerminalTunnel) Start(ctx context.Context) error {
 		_ = t.Close()
 		return err
 	}
-	// Substrate readiness includes control-plane TLS, relay discovery, and
-	// reachability. This scan does not create a machine data carrier.
+	// Readiness includes control-plane TLS, relay discovery, and reachability.
+	// This scan does not create a machine data carrier.
 	_ = regional.Scan(ctx, true)
 	t.regionalMu.Lock()
 	t.sharedRegional = regional
@@ -359,10 +340,8 @@ func (t *PeerTerminalTunnel) Close() error {
 	t.regionalMu.Lock()
 	t.sharedRegional = nil
 	t.regionalMu.Unlock()
-	substrate := t.socketSubstrate
-	t.socketSubstrate = nil
 	if monitor != nil {
-		err := errors.Join(monitor.Close(), substrate.Close(), t.signalingSubstrate.Close())
+		err := errors.Join(monitor.Close(), t.signalingSubstrate.Close())
 		if t.authorities != nil {
 			t.authorities.Close()
 		}
@@ -371,7 +350,7 @@ func (t *PeerTerminalTunnel) Close() error {
 	if t.authorities != nil {
 		t.authorities.Close()
 	}
-	return errors.Join(substrate.Close(), t.signalingSubstrate.Close())
+	return t.signalingSubstrate.Close()
 }
 
 // InvalidateMachine clears only cached authority metadata for one machine.
@@ -1608,10 +1587,11 @@ func (t *PeerTerminalTunnel) dialDirect(ctx, lifetime context.Context, target *r
 			return viable
 		}
 	}
-	substrate := t.socketSubstrate
-	factory, err := directpath.NewSignalingFactory(directpath.SignalingFactoryConfig{Descriptors: source, SocketMapping: nil, Lifetime: lifetime, TLS: t.config.TLS.Clone(), Dial: func(dialCtx context.Context, config signaling.WebSocketConfig) (directpath.SignalingTransport, error) {
+	// Pion dispatches post-ICE packets by remote address. Independent direct
+	// QUIC sessions to one machine therefore require independent UDP ports.
+	factory, err := directpath.NewSignalingFactory(directpath.SignalingFactoryConfig{Descriptors: source, SocketMapping: mapping, Lifetime: lifetime, TLS: t.config.TLS.Clone(), Dial: func(dialCtx context.Context, config signaling.WebSocketConfig) (directpath.SignalingTransport, error) {
 		return t.signalingSubstrate.Open(dialCtx, config)
-	}, Assembly: directpath.Config{Sockets: sockets, PMTUKey: pmtuKey[:], MaximumPMTU: networkadaptation.DevelopmentPMTUPolicy().MaximumPayload, ApplicationQueue: 64, PMTUResponseLimit: time.Second, Substrate: substrate}})
+	}, Assembly: directpath.Config{Sockets: sockets, PMTUKey: pmtuKey[:], MaximumPMTU: networkadaptation.DevelopmentPMTUPolicy().MaximumPayload, ApplicationQueue: 64, PMTUResponseLimit: time.Second}})
 	if err != nil {
 		return nil, err
 	}

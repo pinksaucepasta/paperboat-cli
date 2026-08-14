@@ -50,15 +50,12 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/server"
 	"github.com/pinksaucepasta/paperboat/internal/httptransport"
 	"github.com/pinksaucepasta/paperboat/internal/managedssh"
-	"github.com/pinksaucepasta/paperboat/internal/peertransport/directpath"
-	"github.com/pinksaucepasta/paperboat/internal/peertransport/networkadaptation"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/networkcheck"
 	peerpreview "github.com/pinksaucepasta/paperboat/internal/peertransport/privatepreview"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/relayselection"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/signaling"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/streamauth"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/transfercrypto"
-	"github.com/pinksaucepasta/paperboat/internal/peertransport/udpsocket"
 )
 
 var ErrProductionInvalid = errors.New("invalid production host configuration")
@@ -439,20 +436,10 @@ func NewProductionHost(ctx context.Context, version string, environ func(string)
 	if err := networkChanges.ConfigurePortMapping(networkcheck.MappingVerifier{Resolver: net.DefaultResolver, Timeout: 500 * time.Millisecond}); err != nil {
 		return nil, err
 	}
-	directSubstrate, err := directpath.NewSocketSubstrate(directpath.SocketSubstrateConfig{
-		Sockets: udpsocket.DevelopmentConfig(true, true), SocketMapping: networkChanges,
-		MaximumPMTU:      networkadaptation.DevelopmentPMTUPolicy().MaximumPayload,
-		ApplicationQueue: 64, PMTUResponseLimit: time.Second, MaximumAttempts: 256,
-	})
-	if err != nil {
-		return nil, err
-	}
 	connectorService := &connectorReadinessService{supervisor: supervisor, manager: manager, networkChanges: networkChanges}
 	relayRegion := &currentRelayRegion{}
 	signalingSubstrate := &signaling.SubstrateManager{}
-	regionalMonitor, regionalCache, err := newProductionRegionalMonitor(controlURL, transport, relayRegion.Current, signalingSubstrate, &tls.Config{MinVersion: tls.VersionTLS13}, func(warmCtx context.Context, generation uint64, stunURL string) error {
-		return directSubstrate.Warm(warmCtx, networkChanges.Generation(), []string{stunURL})
-	})
+	regionalMonitor, regionalCache, err := newProductionRegionalMonitor(controlURL, transport, relayRegion.Current, signalingSubstrate, &tls.Config{MinVersion: tls.VersionTLS13}, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -572,7 +559,7 @@ func NewProductionHost(ctx context.Context, version string, environ func(string)
 		}
 		dependencies.NativePeerFactory = func(serve func(net.Conn) error, transferHandler, codexHandler http.Handler) (Service, error) {
 			previewDialer := &net.Dialer{Timeout: 10 * time.Second}
-			service, serviceErr := peerrelay.New(peerrelay.Config{Source: attempts, Fingerprints: networkChanges, SocketMapping: networkChanges, SocketSubstrate: directSubstrate, SignalingSubstrate: signalingSubstrate, StateRoot: runtimeConfig.StateRoot, TLS: &tls.Config{MinVersion: tls.VersionTLS13}, HTTPClient: &http.Client{Transport: transport}, Serve: serve, ServePreview: func(ctx context.Context, stream net.Conn) error {
+			service, serviceErr := peerrelay.New(peerrelay.Config{Source: attempts, Fingerprints: networkChanges, SocketMapping: networkChanges, SignalingSubstrate: signalingSubstrate, StateRoot: runtimeConfig.StateRoot, TLS: &tls.Config{MinVersion: tls.VersionTLS13}, HTTPClient: &http.Client{Transport: transport}, Serve: serve, ServePreview: func(ctx context.Context, stream net.Conn) error {
 				return peerpreview.Serve(ctx, stream, previewDialer.DialContext)
 			}, ServeTransfer: func(ctx context.Context, stream net.Conn) error {
 				return server.ServeHTTPConnection(ctx, stream, transferHandler)

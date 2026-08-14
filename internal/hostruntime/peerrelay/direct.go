@@ -76,10 +76,12 @@ func (s *Service) serveDirect(setupCtx, lifetime context.Context, document api.P
 		return false, err
 	}
 	owner := &directAttempt{cancel: cancelOwner}
+	stopOwnerCancellation := context.AfterFunc(ownerCtx, cancelDeadline)
 	s.directMu.Lock()
 	s.directAttempts[owner] = struct{}{}
 	s.directMu.Unlock()
 	defer func() {
+		stopOwnerCancellation()
 		cancelDeadline()
 		cancelOwner()
 		s.directMu.Lock()
@@ -102,7 +104,7 @@ func (s *Service) serveDirect(setupCtx, lifetime context.Context, document api.P
 		return descriptor, nil
 	}), SocketMapping: mappingSource, Lifetime: ownerCtx, TLS: s.config.TLS.Clone(), Dial: func(dialCtx context.Context, config signaling.WebSocketConfig) (directpath.SignalingTransport, error) {
 		return s.config.SignalingSubstrate.Open(dialCtx, config)
-	}, Assembly: directpath.Config{Sockets: udpsocket.DevelopmentConfig(true, true), PMTUKey: pmtuKey[:], MaximumPMTU: networkadaptation.DevelopmentPMTUPolicy().MaximumPayload, ApplicationQueue: 64, PMTUResponseLimit: time.Second, Substrate: s.config.SocketSubstrate}})
+	}, Assembly: directpath.Config{Sockets: udpsocket.DevelopmentConfig(true, true), PMTUKey: pmtuKey[:], MaximumPMTU: networkadaptation.DevelopmentPMTUPolicy().MaximumPayload, ApplicationQueue: 64, PMTUResponseLimit: time.Second}})
 	if err != nil {
 		return false, err
 	}

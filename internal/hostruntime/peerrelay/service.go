@@ -70,7 +70,6 @@ type Config struct {
 	DialQUIC            func(context.Context, relaycarrier.QUICDialConfig) (*relaycarrier.Connection, error)
 	TransferKeys        *transfercrypto.KeyVault
 	SocketMapping       directpath.SocketMappingSource
-	SocketSubstrate     *directpath.SocketSubstrate
 	SignalingSubstrate  *signaling.SubstrateManager
 	ObserveError        func(error)
 	ObserveRelaySuccess func(string)
@@ -232,9 +231,6 @@ func (s *Service) NetworkChanged(generation uint64) bool {
 		delete(s.directAttempts, attempt)
 	}
 	s.directMu.Unlock()
-	if s.config.SocketSubstrate != nil {
-		_ = s.config.SocketSubstrate.NetworkChanged(generation)
-	}
 	for _, cancel := range cancels {
 		cancel()
 	}
@@ -272,9 +268,6 @@ func (s *Service) run(ctx context.Context) {
 	defer close(s.done)
 	defer s.streams.Close()
 	defer s.config.SignalingSubstrate.Close()
-	if s.config.SocketSubstrate != nil {
-		defer s.config.SocketSubstrate.Close()
-	}
 	permits := make(chan struct{}, s.config.AttemptLimit)
 	var attempts sync.WaitGroup
 	defer attempts.Wait()
