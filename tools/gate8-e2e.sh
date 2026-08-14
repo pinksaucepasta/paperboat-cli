@@ -341,7 +341,19 @@ sudo /usr/local/sbin/paperboat-gate8-network block-udp
 EXPECTED_EXIT=nonzero run_case preview private direct-loss curl --fail --silent --show-error --max-time 5 "http://127.0.0.1:$private_listen/http"
 sudo /usr/local/sbin/paperboat-gate8-network allow-udp
 private_recovered=false
-for _ in $(seq 1 60); do if curl --fail --silent --max-time 2 "http://127.0.0.1:$private_listen/http" | grep -q preview-http-ok; then private_recovered=true; break; fi; sleep 0.5; done
+private_recovery_deadline=$((SECONDS + 60))
+while ((SECONDS < private_recovery_deadline)); do
+  private_recovery_remaining=$((private_recovery_deadline - SECONDS))
+  private_recovery_attempt_timeout=5
+  if ((private_recovery_remaining < private_recovery_attempt_timeout)); then
+    private_recovery_attempt_timeout="$private_recovery_remaining"
+  fi
+  if curl --fail --silent --max-time "$private_recovery_attempt_timeout" "http://127.0.0.1:$private_listen/http" | grep -q preview-http-ok; then
+    private_recovered=true
+    break
+  fi
+  sleep 0.5
+done
 assert_case preview-private-recovery restored "$private_recovered" exact
 run_case preview private revoke pb preview revoke "$machine_private_name" --yes --json
 assert_case preview-private-listener removed "$( ! ss -ltn | grep -q ":$private_listen " && echo true || echo false)" exact
