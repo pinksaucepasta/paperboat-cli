@@ -345,6 +345,21 @@ func (c *blockingConfirmConn) Write(value []byte) (int, error) {
 	return c.Conn.Write(value)
 }
 
+type blockingPayloadConn struct {
+	net.Conn
+	blocked chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (c *blockingPayloadConn) Write(value []byte) (int, error) {
+	if len(value) == maximumFrame {
+		c.once.Do(func() { close(c.blocked) })
+		<-c.release
+	}
+	return c.Conn.Write(value)
+}
+
 func TestPromotionDoesNotWaitForPostCommitConfirm(t *testing.T) {
 	initiator, responder := testPair(t, 64<<10)
 	attachInitial(t, initiator, responder)
@@ -526,6 +541,97 @@ func TestConcurrentFullDuplexAcrossPromotion(t *testing.T) {
 	}
 	if !bytes.Equal(leftGot, b) || !bytes.Equal(rightGot, a) {
 		t.Fatal("full-duplex bytes changed")
+	}
+}
+
+func TestDirectionReversalBeyondWindowAfterPromotion(t *testing.T) {
+	left, right := testPair(t, maximumFrame*2)
+	attachInitial(t, left, right)
+	upload := bytes.Repeat([]byte("upload"), maximumFrame)
+	download := bytes.Repeat([]byte("download"), maximumFrame)
+
+	uploaded := make([]byte, len(upload))
+	uploadDone := make(chan error, 1)
+	go func() { _, err := io.ReadFull(right, uploaded); uploadDone <- err }()
+	if _, err := left.Write(upload); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-uploadDone; err != nil {
+		t.Fatal(err)
+	}
+
+	handle, _, _ := prepare(t, left, right)
+	if err := left.PromoteCarrier(t.Context(), handle); err != nil {
+		t.Fatal(err)
+	}
+
+	downloaded := make([]byte, len(download))
+	downloadDone := make(chan error, 1)
+	go func() { _, err := io.ReadFull(left, downloaded); downloadDone <- err }()
+	if _, err := right.Write(download); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-downloadDone; err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(uploaded, upload) || !bytes.Equal(downloaded, download) {
+		t.Fatal("bytes changed across promoted direction reversal")
+	}
+}
+
+func TestReadDoesNotWaitForBlockedAcknowledgementAfterPromotion(t *testing.T) {
+	left, right := testPair(t, maximumFrame*2)
+	attachInitial(t, left, right)
+	leftCarrier, rightCarrier := net.Pipe()
+	blocked := &blockingPayloadConn{Conn: leftCarrier, blocked: make(chan struct{}), release: make(chan struct{})}
+	accepted := make(chan error, 1)
+	go func() { accepted <- right.AcceptCarrier(t.Context(), rightCarrier) }()
+	handle, err := left.PrepareCarrier(t.Context(), blocked)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-accepted; err != nil {
+		t.Fatal(err)
+	}
+	if err := left.PromoteCarrier(t.Context(), handle); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := left.Write(bytes.Repeat([]byte{1}, maximumFrame)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-blocked.blocked:
+	case <-time.After(time.Second):
+		t.Fatal("outbound payload write did not block")
+	}
+
+	response := []byte("reverse-direction-response")
+	if _, err := right.Write(response); err != nil {
+		t.Fatal(err)
+	}
+	read := make(chan error, 1)
+	go func() {
+		got := make([]byte, len(response))
+		_, err := io.ReadFull(left, got)
+		if err == nil && !bytes.Equal(got, response) {
+			err = errors.New("reverse-direction bytes changed")
+		}
+		read <- err
+	}()
+	select {
+	case err := <-read:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("application read waited for blocked acknowledgement")
+	}
+
+	close(blocked.release)
+	drained := make([]byte, maximumFrame)
+	if _, err := io.ReadFull(right, drained); err != nil {
+		t.Fatal(err)
 	}
 }
 

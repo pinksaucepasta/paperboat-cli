@@ -105,6 +105,8 @@ type Conn struct {
 	recvNext    uint64
 	recvBase    uint64
 	recv        []byte
+	ackCarrier  CarrierID
+	ackOffset   uint64
 	remoteFIN   bool
 	remoteFINAt uint64
 
@@ -131,6 +133,7 @@ func New(parent context.Context, config Config) (*Conn, error) {
 	}
 	connection := &Conn{id: nextDiagnosticID.Add(1), ctx: ctx, cancel: cancel, window: config.WindowBytes, role: config.Role, identity: digest, notify: make(chan struct{}), events: make(chan Event, 16), commitWait: make(map[CarrierID]chan error), discardWait: make(map[CarrierID]chan error), detachedTimeout: detachedTimeout}
 	go connection.watchContext()
+	go connection.writeAcknowledgements()
 	return connection, nil
 }
 
@@ -415,14 +418,8 @@ func (c *Conn) Read(buffer []byte) (int, error) {
 			n := copy(buffer, c.recv)
 			c.recv = c.recv[n:]
 			c.recvBase += uint64(n)
-			ack, carrier := c.recvBase, c.active
 			c.signalLocked()
 			c.mu.Unlock()
-			if carrier != nil {
-				if err := c.writeFrame(carrier, frameAck, ack, nil); err != nil {
-					c.failCarrier(carrier, err)
-				}
-			}
 			return n, nil
 		}
 		if c.remoteFIN && c.recvNext >= c.remoteFINAt {
@@ -442,6 +439,34 @@ func (c *Conn) Read(buffer []byte) (int, error) {
 		if err := wait(c.ctx, notify, deadline); err != nil {
 			return 0, err
 		}
+	}
+}
+
+func (c *Conn) writeAcknowledgements() {
+	for {
+		c.mu.Lock()
+		carrier, offset := c.active, c.recvBase
+		if carrier == nil || c.ackCarrier == carrier.id && c.ackOffset >= offset {
+			notify := c.notify
+			c.mu.Unlock()
+			if err := wait(c.ctx, notify, time.Time{}); err != nil {
+				return
+			}
+			continue
+		}
+		c.mu.Unlock()
+		if err := c.writeFrame(carrier, frameAck, offset, nil); err != nil {
+			c.failCarrier(carrier, err)
+			continue
+		}
+		c.mu.Lock()
+		if c.active == carrier {
+			c.ackCarrier = carrier.id
+			if offset > c.ackOffset {
+				c.ackOffset = offset
+			}
+		}
+		c.mu.Unlock()
 	}
 }
 
