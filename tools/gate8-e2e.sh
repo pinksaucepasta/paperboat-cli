@@ -7,6 +7,14 @@ TARGET="${TARGET:-hn-byod-ready}"
 RESULT_ROOT="${RESULT_ROOT:-$HOME/gate8-results/$(date -u +%Y%m%dT%H%M%SZ)}"
 REPEAT="${REPEAT:-5}"
 TEST_TIMEOUT="${TEST_TIMEOUT:-45}"
+SCRIPT_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+TERMINAL_READY="${GATE8_TERMINAL_READY:-$SCRIPT_ROOT/gate8-terminal-ready.py}"
+PREVIEW_WS="${GATE8_PREVIEW_WS:-$SCRIPT_ROOT/gate8-preview-ws}"
+TRANSITION_RUNNER="${GATE8_TRANSITION_RUNNER:-$SCRIPT_ROOT/gate8-transitions.sh}"
+case "$RESULT_ROOT" in
+  "$HOME"/*) ;;
+  *) printf 'Gate 8 evidence must be stored under %s: %s\n' "$HOME" "$RESULT_ROOT" >&2; exit 2 ;;
+esac
 mkdir -p "$RESULT_ROOT/cases"
 available_kb="$(df -Pk "$RESULT_ROOT" | awk 'NR==2 {print $4}')"
 if test -z "$available_kb" || test "$available_kb" -lt 1048576; then
@@ -190,6 +198,9 @@ trap 'sudo /usr/local/sbin/paperboat-gate8-network allow-udp >/dev/null 2>&1 || 
 for required in pb jq timeout setsid flock script ssh scp sftp curl sudo python3 sha256sum; do
   command -v "$required" >/dev/null || { printf 'missing required command: %s\n' "$required" >&2; exit 2; }
 done
+test -r "$TERMINAL_READY" || { printf 'missing terminal fixture: %s\n' "$TERMINAL_READY" >&2; exit 2; }
+test -x "$PREVIEW_WS" || { printf 'missing WebSocket fixture: %s\n' "$PREVIEW_WS" >&2; exit 2; }
+test -x "$TRANSITION_RUNNER" || { printf 'missing transition runner: %s\n' "$TRANSITION_RUNNER" >&2; exit 2; }
 sudo -n /usr/local/sbin/paperboat-gate8-network allow-udp
 
 # Installed artifact and service preflight. Expected hashes are supplied by
@@ -198,10 +209,10 @@ dadape_hash="$(sha256sum "$(command -v pb)" | cut -d' ' -f1)"
 assert_case preflight installed-hash "$(test -n "${EXPECTED_DADAPE_SHA256:-}" -a "$dadape_hash" = "${EXPECTED_DADAPE_SHA256:-missing}" && echo true || echo false)" "actual=$dadape_hash expected=${EXPECTED_DADAPE_SHA256:-unset}"
 assert_case preflight user-daemon "$(systemctl --user is-active paperboat-local-daemon.service >/dev/null 2>&1 && echo true || echo false)" exact
 assert_case preflight host-services "$(systemctl is-active paperboat-runtime-host.service paperboat-runtime-privileged.service 2>/dev/null | awk 'BEGIN{ok=1} $0!="active"{ok=0} END{print ok ? "true" : "false"}')" exact
-source_evidence="${GATE8_SOURCE_EVIDENCE:-/tmp/gate8-source-evidence.txt}"
+source_evidence="${GATE8_SOURCE_EVIDENCE:-$HOME/gate8-source-evidence.txt}"
 source_evidence_hash="$(sha256sum "$source_evidence" 2>/dev/null | cut -d' ' -f1 || true)"
 assert_case preflight source-evidence "$(test -n "${EXPECTED_SOURCE_EVIDENCE_SHA256:-}" -a "$source_evidence_hash" = "${EXPECTED_SOURCE_EVIDENCE_SHA256:-missing}" && grep -q '^result=PASS$' "$source_evidence" && echo true || echo false)" "actual=$source_evidence_hash expected=${EXPECTED_SOURCE_EVIDENCE_SHA256:-unset}"
-deployment_evidence="${GATE8_DEPLOYMENT_EVIDENCE:-/tmp/gate8-deployment-evidence.txt}"
+deployment_evidence="${GATE8_DEPLOYMENT_EVIDENCE:-$HOME/gate8-deployment-evidence.txt}"
 deployment_evidence_hash="$(sha256sum "$deployment_evidence" 2>/dev/null | cut -d' ' -f1 || true)"
 assert_case preflight deployment-evidence "$(test -n "${EXPECTED_DEPLOYMENT_EVIDENCE_SHA256:-}" -a "$deployment_evidence_hash" = "${EXPECTED_DEPLOYMENT_EVIDENCE_SHA256:-missing}" && grep -q '^result=PASS$' "$deployment_evidence" && echo true || echo false)" "actual=$deployment_evidence_hash expected=${EXPECTED_DEPLOYMENT_EVIDENCE_SHA256:-unset}"
 
@@ -260,11 +271,11 @@ done
 # fixed startup sleep can turn transport latency into a false product failure.
 for transport in a d q w r; do
   terminal_name="g8-${transport}-$(date +%s%N)"
-  run_case terminal "$transport" create python3 /tmp/gate8-terminal-ready.py "$TARGET" "$transport" "$terminal_name" "terminal-$transport" "$RESULT_ROOT/cases/terminal-${transport}-pty.raw"
+  run_case terminal "$transport" create python3 "$TERMINAL_READY" "$TARGET" "$transport" "$terminal_name" "terminal-$transport" "$RESULT_ROOT/cases/terminal-${transport}-pty.raw"
   terminal_stdout="$RESULT_ROOT/cases/terminal-${transport}-pty.raw"
   assert_case "terminal-${transport}-create" canary \
-    "$(grep -q "terminal-$transport" "$terminal_stdout" && echo true || echo false)" \
-    "expected terminal-$transport"
+    "$(grep -Eq 'GATE8_READY:[0-9]+' "$terminal_stdout" && echo true || echo false)" \
+    "computed shell canary"
   run_case sessions "$transport" list pb sessions "$TARGET" --json --wide
   run_case sessions "$transport" rename pb sessions rename "$TARGET" "$terminal_name" "${terminal_name}-renamed"
   run_case sessions "$transport" close pb sessions close "$TARGET" "${terminal_name}-renamed" --yes --json
@@ -319,7 +330,7 @@ run_case preview private http curl --fail --silent --show-error --max-time 30 "h
 assert_case preview-private-http exact-body "$(test "$(cat "$RESULT_ROOT/cases/preview-private-http.stdout")" = preview-http-ok && echo true || echo false)" exact
 run_case preview private sse curl --no-buffer --fail --silent --show-error --max-time 30 "http://127.0.0.1:$private_listen/sse"
 assert_case preview-private-sse events "$(grep -q 'data: one' "$RESULT_ROOT/cases/preview-private-sse.stdout" && grep -q 'data: two' "$RESULT_ROOT/cases/preview-private-sse.stdout" && echo true || echo false)" exact
-run_case preview private websocket /tmp/gate8-preview-ws "ws://127.0.0.1:$private_listen/ws" gate8-ws
+run_case preview private websocket "$PREVIEW_WS" "ws://127.0.0.1:$private_listen/ws" gate8-ws
 assert_case preview-private-websocket exact-echo "$(test "$(cat "$RESULT_ROOT/cases/preview-private-websocket.stdout")" = echo:gate8-ws && echo true || echo false)" exact
 dd if=/dev/urandom of="$RESULT_ROOT/payload/preview-stream.bin" bs=1048576 count=8 status=none
 run_case preview private stream curl --fail --silent --show-error --max-time 45 --data-binary "@$RESULT_ROOT/payload/preview-stream.bin" "http://127.0.0.1:$private_listen/stream"
@@ -375,8 +386,8 @@ run_case preview none final-list pb preview list --json
 assert_case preview-final-list empty "$(jq -e '(.previews // .items // []) | length == 0' "$RESULT_ROOT/cases/preview-none-final-list.stdout" >/dev/null 2>&1 && echo true || echo false)" exact
 
 # Diagnostics and support artifacts.
-run_case diagnostics none bugreport pb bugreport --record --json
-run_case diagnostics none bugreport-upload pb bugreport --record --upload --json
+run_case diagnostics none bugreport pb bugreport --record --json </dev/null
+run_case diagnostics none bugreport-upload pb bugreport --record --upload --json </dev/null
 
 # Seamless live path changes use the standalone authoritative runner. It waits
 # for application bytes and the published standby path, records transition
@@ -384,7 +395,7 @@ run_case diagnostics none bugreport-upload pb bugreport --record --upload --json
 # cleanup before starting the next case.
 transition_result="$RESULT_ROOT/transition-matrix"
 mkdir -p "$transition_result"
-if RESULT_ROOT="$transition_result" TARGET="$TARGET" REPEAT="${TRANSITION_REPEAT:-3}" tools/gate8-transitions.sh >"$RESULT_ROOT/cases/transition-runner.stdout" 2>"$RESULT_ROOT/cases/transition-runner.stderr"; then
+if RESULT_ROOT="$transition_result" TARGET="$TARGET" REPEAT="${TRANSITION_REPEAT:-3}" "$TRANSITION_RUNNER" >"$RESULT_ROOT/cases/transition-runner.stdout" 2>"$RESULT_ROOT/cases/transition-runner.stderr"; then
   transition_runner_pass=true
 else
   transition_runner_pass=false

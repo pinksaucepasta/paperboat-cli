@@ -157,6 +157,13 @@ func (s *SecureStream) Close() error {
 	return s.err
 }
 
+func (s *SecureStream) ChannelBinding() ([32]byte, error) {
+	if s == nil || s.session == nil {
+		return [32]byte{}, ErrInvalid
+	}
+	return s.session.ChannelBinding(), nil
+}
+
 type handshakeStream interface {
 	io.ReadWriteCloser
 	SetReadDeadline(time.Time) error

@@ -169,6 +169,45 @@ func TestRelayQUICUsesOnePersistentAuthenticatedHTTP3Attachment(t *testing.T) {
 	}
 }
 
+func TestRelayQUICSetupCancellationAfterAdmissionDoesNotCloseAttachment(t *testing.T) {
+	handle := [16]byte{8}
+	transport := newPairedRoundTripper()
+	setup, cancelSetup := context.WithCancel(context.Background())
+	lifetime, cancelLifetime := context.WithCancel(context.Background())
+	defer cancelLifetime()
+	type outcome struct {
+		connection *Connection
+		err        error
+	}
+	dial := func(ctx, owner context.Context, role string, result chan<- outcome) {
+		connection, err := DialQUIC(ctx, QUICDialConfig{URL: "https://relay.example.test/v1/peer-relay", Credential: "route.token.signature", EndpointID: "endpoint_" + role, Role: role, StreamHandle: handle, TLS: &tls.Config{MinVersion: tls.VersionTLS13}, HTTPClient: &http.Client{Transport: transport}, Lifetime: owner, MaximumDeadline: time.Minute, Carrier: DevelopmentConfig()})
+		result <- outcome{connection: connection, err: err}
+	}
+	initiatorResult, responderResult := make(chan outcome, 1), make(chan outcome, 1)
+	go dial(setup, lifetime, "initiator", initiatorResult)
+	go dial(context.Background(), context.Background(), "responder", responderResult)
+	initiator, responder := <-initiatorResult, <-responderResult
+	if initiator.err != nil || responder.err != nil {
+		t.Fatalf("initiator=%v responder=%v", initiator.err, responder.err)
+	}
+	defer initiator.connection.Close()
+	defer responder.connection.Close()
+	cancelSetup()
+
+	accepted := make(chan io.ReadWriteCloser, 1)
+	go func() { stream, _ := responder.connection.AcceptStream(context.Background()); accepted <- stream }()
+	stream, err := initiator.connection.OpenStream(context.Background())
+	if err != nil {
+		t.Fatalf("established attachment closed with setup context: %v", err)
+	}
+	peer := <-accepted
+	if peer == nil {
+		t.Fatal("responder did not accept stream after setup cancellation")
+	}
+	_ = stream.Close()
+	_ = peer.Close()
+}
+
 func TestRelayQUICRejectsMissingPersistentHandleAndNonHTTP3(t *testing.T) {
 	base := QUICDialConfig{URL: "https://relay.example.test/v1/peer-relay", Credential: "route.token.signature", EndpointID: "endpoint_cli", Role: "initiator", TLS: &tls.Config{MinVersion: tls.VersionTLS13}, HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: http.StatusOK, ProtoMajor: 2, Body: http.NoBody}, nil
@@ -177,16 +216,28 @@ func TestRelayQUICRejectsMissingPersistentHandleAndNonHTTP3(t *testing.T) {
 		t.Fatalf("missing handle error=%v", err)
 	}
 	base.StreamHandle = [16]byte{1}
-	connection, err := DialQUIC(context.Background(), base)
-	if err != nil {
-		t.Fatal(err)
+	if _, err := DialQUIC(context.Background(), base); err == nil {
+		t.Fatal("non-HTTP/3 relay response was admitted")
 	}
-	defer connection.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	if stream, err := connection.OpenStream(ctx); err == nil {
-		_ = stream.Close()
-		t.Fatal("non-HTTP/3 relay response carried a logical stream")
+}
+
+func TestRelayQUICSetupCancellationBeforeAdmissionAbortsDial(t *testing.T) {
+	started := make(chan struct{})
+	setup, cancelSetup := context.WithCancel(context.Background())
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		close(started)
+		<-request.Context().Done()
+		return nil, request.Context().Err()
+	})
+	result := make(chan error, 1)
+	go func() {
+		_, err := DialQUIC(setup, QUICDialConfig{URL: "https://relay.example.test/v1/peer-relay", Credential: "route.token.signature", EndpointID: "endpoint_initiator", Role: "initiator", StreamHandle: [16]byte{1}, TLS: &tls.Config{MinVersion: tls.VersionTLS13}, HTTPClient: &http.Client{Transport: transport}, Lifetime: context.Background(), MaximumDeadline: time.Minute, Carrier: DevelopmentConfig()})
+		result <- err
+	}()
+	<-started
+	cancelSetup()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("setup cancellation error=%v", err)
 	}
 }
 

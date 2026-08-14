@@ -396,7 +396,7 @@ func runTopologyRelayEndpoint(t *testing.T, role string) {
 	if responder {
 		if initialHealth {
 			prefix, err := connection.AcceptInitialHealth(ctx, relaycarrier.ResponderConfig{LocalStatic: responderKey, InitiatorPublic: topologyRelayPublic(initiatorKey), Prologue: topologyRelayInitialHealthPrologue(carrier), Handle: topologyRelayHealthHandle()})
-			if err != nil || prefix == [8]byte{} {
+			if err != nil || prefix.Prefix == [8]byte{} {
 				t.Fatalf("accept initial relay health prefix=%x error=%v", prefix, err)
 			}
 			fmt.Println("PAPERBOAT_TOPOLOGY_INITIAL_HEALTH_OK")

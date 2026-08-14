@@ -2,9 +2,12 @@ package peerrelay
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/pinksaucepasta/paperboat/internal/peertransport/candidatelease"
 )
 
 func TestTransportActivityKeepsStandbyWhileConsumerIsActive(t *testing.T) {
@@ -66,6 +69,70 @@ func TestCandidateOwnerClosesExactlyOnce(t *testing.T) {
 	owner.Stop()
 	if closed.Load() != 1 {
 		t.Fatalf("candidate close events=%d", closed.Load())
+	}
+}
+
+func TestCandidateOwnerAdoptReleaseIsIdempotentAndFenced(t *testing.T) {
+	owner := newCandidateOwner(context.Background(), nil)
+	id := candidatelease.ID("candidate")
+	if err := owner.Configure(id, 7); err != nil {
+		t.Fatal(err)
+	}
+	adopt := candidatelease.Message{Version: 1, Type: candidatelease.Adopt, Candidate: id, LeaseGeneration: 7}
+	for range 2 {
+		ack, err := owner.Handle(adopt)
+		if err != nil || ack.Type != candidatelease.AdoptAck {
+			t.Fatalf("adopt ack=%+v err=%v", ack, err)
+		}
+	}
+	if err := owner.Retained(); err != nil {
+		t.Fatal(err)
+	}
+	release := candidatelease.Message{Version: 1, Type: candidatelease.Release, Candidate: id, LeaseGeneration: 7}
+	for range 2 {
+		ack, err := owner.Handle(release)
+		if err != nil || ack.Type != candidatelease.ReleaseAck {
+			t.Fatalf("release ack=%+v err=%v", ack, err)
+		}
+	}
+	if _, err := owner.Handle(adopt); !errors.Is(err, candidatelease.ErrFenced) {
+		t.Fatalf("adopt after release error=%v", err)
+	}
+	if _, err := owner.Handle(candidatelease.Message{Version: 1, Type: candidatelease.Release, Candidate: "other", LeaseGeneration: 7}); !errors.Is(err, candidatelease.ErrFenced) {
+		t.Fatalf("wrong candidate error=%v", err)
+	}
+}
+
+func TestDirectCandidateSetupWaitsForAdoptionBeforeCanceling(t *testing.T) {
+	setup, cancelSetup := context.WithCancel(context.Background())
+	owner := newCandidateOwner(context.Background(), nil)
+	id := candidatelease.ID("candidate")
+	if err := owner.Configure(id, 7); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- retainDirectCandidate(setup, cancelSetup, owner) }()
+	select {
+	case err := <-done:
+		t.Fatalf("retention returned before adoption: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	if setup.Err() != nil {
+		t.Fatalf("setup canceled before adoption: %v", setup.Err())
+	}
+	if _, err := owner.Handle(candidatelease.Message{Version: 1, Type: candidatelease.Adopt, Candidate: id, LeaseGeneration: 7}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("retention did not complete after adoption")
+	}
+	if !errors.Is(setup.Err(), context.Canceled) {
+		t.Fatalf("setup remained live after adoption: %v", setup.Err())
 	}
 }
 

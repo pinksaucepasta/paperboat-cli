@@ -16,6 +16,7 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/api"
 	"github.com/pinksaucepasta/paperboat/internal/diagnosticlog"
 	identitystore "github.com/pinksaucepasta/paperboat/internal/hostruntime/identity"
+	"github.com/pinksaucepasta/paperboat/internal/peertransport/candidatelease"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/connectionmanager"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/directpath"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/endpointidentity"
@@ -27,6 +28,7 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/signaling"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/streamauth"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/udpsocket"
+	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 )
 
@@ -98,7 +100,7 @@ func (s *Service) serveDirect(setupCtx, lifetime context.Context, document api.P
 	}
 	factory, err := directpath.NewSignalingFactory(directpath.SignalingFactoryConfig{Descriptors: directpath.DescriptorSourceFunc(func(context.Context, directpath.Generation) (directpath.AttemptDescriptor, error) {
 		return descriptor, nil
-	}), SocketMapping: mappingSource, TLS: s.config.TLS.Clone(), Dial: func(dialCtx context.Context, config signaling.WebSocketConfig) (directpath.SignalingTransport, error) {
+	}), SocketMapping: mappingSource, Lifetime: ownerCtx, TLS: s.config.TLS.Clone(), Dial: func(dialCtx context.Context, config signaling.WebSocketConfig) (directpath.SignalingTransport, error) {
 		return s.config.SignalingSubstrate.Open(dialCtx, config)
 	}, Assembly: directpath.Config{Sockets: udpsocket.DevelopmentConfig(true, true), PMTUKey: pmtuKey[:], MaximumPMTU: networkadaptation.DevelopmentPMTUPolicy().MaximumPayload, ApplicationQueue: 64, PMTUResponseLimit: time.Second, Substrate: s.config.SocketSubstrate}})
 	if err != nil {
@@ -145,6 +147,24 @@ func (s *Service) serveDirect(setupCtx, lifetime context.Context, document api.P
 		return false, errors.Join(err, session.Close(), assembly.Close())
 	}
 	defer health.Close()
+	var candidateOwner *candidateOwner
+	if document.Purpose == "peer_transport" {
+		if activity == nil || activity.owner == nil {
+			return false, ErrInvalid
+		}
+		binding, bindingErr := peerquic.CandidateBinding(session.Connection.ConnectionState().TLS, authority.Transport)
+		if bindingErr != nil {
+			return false, bindingErr
+		}
+		candidateID, candidateErr := candidatelease.NewID(binding[:], document.IntentID, document.AttemptGeneration, "direct_quic")
+		if candidateErr != nil {
+			return false, candidateErr
+		}
+		candidateOwner = activity.owner
+		if err := candidateOwner.Configure(candidateID, document.AttemptGeneration); err != nil {
+			return false, err
+		}
+	}
 	watchDone := make(chan struct{})
 	defer close(watchDone)
 	go func() {
@@ -154,7 +174,29 @@ func (s *Service) serveDirect(setupCtx, lifetime context.Context, document api.P
 		case <-watchDone:
 		}
 	}()
-	router, err := peerquic.NewStreamRouter(session, peerquic.DevelopmentStreamRouterConfig())
+	routerConfig := peerquic.DevelopmentStreamRouterConfig()
+	if document.Purpose == "peer_transport" {
+		routerConfig.CandidateControl = func(controlCtx context.Context, stream *quic.Stream) error {
+			for {
+				message, err := candidatelease.FrameReader(stream)
+				if err != nil {
+					return err
+				}
+				ackMessage, err := candidateOwner.Handle(message)
+				if err != nil {
+					return err
+				}
+				ack, err := candidatelease.Frame(ackMessage)
+				if err == nil {
+					_, err = stream.Write(ack)
+				}
+				if err != nil || message.Type == candidatelease.Release {
+					return err
+				}
+			}
+		}
+	}
+	router, err := peerquic.NewStreamRouter(session, routerConfig)
 	if err != nil {
 		return false, err
 	}
@@ -163,7 +205,6 @@ func (s *Service) serveDirect(setupCtx, lifetime context.Context, document api.P
 		return false, err
 	}
 	mark("initial_health_complete")
-	cancelDeadline()
 	if document.Purpose == "peer_transport" {
 		if s.config.AuthorizeStream == nil || s.config.ServeStream == nil || document.StreamPolicy == nil {
 			return false, ErrInvalid
@@ -171,8 +212,12 @@ func (s *Service) serveDirect(setupCtx, lifetime context.Context, document api.P
 		if !claim() {
 			return false, context.Canceled
 		}
+		if err := retainDirectCandidate(directCtx, cancelDeadline, candidateOwner); err != nil {
+			return false, err
+		}
 		return true, s.serveDirectTransport(ownerCtx, document, authority, session, router, activity)
 	}
+	cancelDeadline()
 	if document.Purpose == "health_probe" {
 		if err := router.WaitHealthExchanges(ownerCtx, 2); err != nil {
 			return false, err
@@ -389,6 +434,17 @@ func directSetupContext(parent context.Context, expiresAt time.Time) (context.Co
 	return ctx, cancel, nil
 }
 
+func retainDirectCandidate(setup context.Context, cancelSetup context.CancelFunc, owner *candidateOwner) error {
+	if setup == nil || cancelSetup == nil || owner == nil {
+		return ErrInvalid
+	}
+	if err := owner.WaitRetained(setup); err != nil {
+		return err
+	}
+	cancelSetup()
+	return nil
+}
+
 func (s *Service) serveDirectTransport(ctx context.Context, document api.PeerAttemptDescriptor, authority peersession.Authority, session *peerquic.Session, router *peerquic.StreamRouter, activity *transportActivity) error {
 	if ctx == nil || session == nil || session.Connection == nil || router == nil {
 		return ErrInvalid
@@ -399,6 +455,16 @@ func (s *Service) serveDirectTransport(ctx context.Context, document api.PeerAtt
 	// a carrier parked until ICE/descriptor expiry.
 	transportCtx, cancel := context.WithCancel(ctx)
 	go func() {
+		if activity != nil && activity.owner != nil {
+			select {
+			case <-session.Connection.Context().Done():
+				cancel()
+			case <-activity.owner.Released():
+				cancel()
+			case <-transportCtx.Done():
+			}
+			return
+		}
 		select {
 		case <-session.Connection.Context().Done():
 			cancel()

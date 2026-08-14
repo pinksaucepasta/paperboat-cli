@@ -71,8 +71,12 @@ type MappingSource interface {
 }
 
 type SignalingFactoryConfig struct {
-	Descriptors   DescriptorSource
-	Assembly      Config
+	Descriptors DescriptorSource
+	Assembly    Config
+	// Lifetime owns an assembly after setup succeeds. Descriptor acquisition,
+	// signaling, negotiation, and the caller-visible Create operation remain
+	// bounded by the Create context.
+	Lifetime      context.Context
 	TLS           *tls.Config
 	Now           func() time.Time
 	Dial          SignalingDialer
@@ -152,8 +156,12 @@ func (f *SignalingFactory) Create(ctx context.Context, generation Generation) (*
 	}
 	assemblyDone := make(chan assemblyResult, 1)
 	transportDone := make(chan transportResult, 1)
+	assemblyCtx := runCtx
+	if f.config.Lifetime != nil {
+		assemblyCtx = f.config.Lifetime
+	}
 	go func() {
-		value, openErr := f.config.Open(runCtx, assemblyConfig)
+		value, openErr := f.config.Open(assemblyCtx, assemblyConfig)
 		assemblyDone <- assemblyResult{value: value, err: openErr}
 	}()
 	go func() {

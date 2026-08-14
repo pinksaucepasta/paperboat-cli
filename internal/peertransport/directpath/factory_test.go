@@ -305,6 +305,56 @@ func TestNewSignalingFactoryRejectsTypedNilDescriptorSource(t *testing.T) {
 	}
 }
 
+func TestSignalingFactoryEstablishedAssemblyOutlivesCreateContext(t *testing.T) {
+	createCtx, cancelCreate := context.WithCancel(context.Background())
+	lifetime, cancelLifetime := context.WithCancel(context.Background())
+	defer cancelLifetime()
+	opened := make(chan context.Context, 1)
+	dialed := make(chan context.Context, 1)
+	want := errors.New("stop after context capture")
+	now := time.Now().UTC()
+	factory, err := NewSignalingFactory(SignalingFactoryConfig{
+		Descriptors: DescriptorSourceFunc(func(context.Context, Generation) (AttemptDescriptor, error) {
+			return AttemptDescriptor{IntentID: "intent_lifetime", AttemptGeneration: 1, NetworkGeneration: 1, Role: signaling.RoleControlling, SignalingURL: "wss://signal.example.test/v1/peer-signaling", SignalingCredential: "header.payload.signature", LocalUfrag: "factoryLocal", LocalPassword: "factoryPassword123456789012345", IssuedAt: now, ExpiresAt: now.Add(time.Minute)}, nil
+		}),
+		Assembly: Config{PMTUKey: []byte("key")},
+		Lifetime: lifetime,
+		Open: func(ctx context.Context, _ Config) (*Assembly, error) {
+			opened <- ctx
+			return nil, want
+		},
+		Dial: func(ctx context.Context, _ signaling.WebSocketConfig) (SignalingTransport, error) {
+			dialed <- ctx
+			return nil, want
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := factory.Create(createCtx, Generation{Attempt: 1, Network: 1}); !errors.Is(err, want) {
+		t.Fatalf("error=%v", err)
+	}
+	assemblyContext := <-opened
+	signalingContext := <-dialed
+	cancelCreate()
+	select {
+	case <-assemblyContext.Done():
+		t.Fatal("established assembly canceled with setup context")
+	default:
+	}
+	select {
+	case <-signalingContext.Done():
+	case <-time.After(time.Second):
+		t.Fatal("signaling did not follow setup context")
+	}
+	cancelLifetime()
+	select {
+	case <-assemblyContext.Done():
+	case <-time.After(time.Second):
+		t.Fatal("established assembly did not follow lifetime context")
+	}
+}
+
 func TestSignalingFactoryRejectsNilOwnedResults(t *testing.T) {
 	now := time.Now().UTC()
 	descriptor := AttemptDescriptor{IntentID: "intent", AttemptGeneration: 1, NetworkGeneration: 1, Role: signaling.RoleControlling, SignalingURL: "wss://signal.example.test/v1/peer-signaling", SignalingCredential: "header.payload.signature", LocalUfrag: "factoryLocal", LocalPassword: "factoryPassword123456789012345", IssuedAt: now, ExpiresAt: now.Add(time.Minute)}

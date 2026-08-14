@@ -1,9 +1,52 @@
 package candidatelease
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"io"
 )
+
+const maxControlMessage = 64 << 10
+
+func Frame(m Message) ([]byte, error) {
+	payload, err := m.Marshal()
+	if err != nil {
+		return nil, err
+	}
+	if len(payload) > maxControlMessage {
+		return nil, ErrProtocol
+	}
+	frame := make([]byte, 4+len(payload))
+	binary.BigEndian.PutUint32(frame[:4], uint32(len(payload)))
+	copy(frame[4:], payload)
+	return frame, nil
+}
+
+func Unframe(raw []byte) (Message, error) {
+	if len(raw) < 4 || binary.BigEndian.Uint32(raw[:4]) != uint32(len(raw)-4) || len(raw)-4 > maxControlMessage {
+		return Message{}, ErrProtocol
+	}
+	return Parse(raw[4:])
+}
+
+func FrameReader(r io.Reader) (Message, error) {
+	var header [4]byte
+	if _, err := io.ReadFull(r, header[:]); err != nil {
+		return Message{}, err
+	}
+	size := binary.BigEndian.Uint32(header[:])
+	if size == 0 || size > maxControlMessage {
+		return Message{}, ErrProtocol
+	}
+	payload := make([]byte, size)
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return Message{}, err
+	}
+	return Parse(payload)
+}
+
+func FrameBytes(m Message) ([]byte, error) { return Frame(m) }
 
 var ErrProtocol = errors.New("invalid candidate lease message")
 

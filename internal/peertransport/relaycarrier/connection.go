@@ -352,6 +352,7 @@ func (m *yamuxMux) dispatchHandledStreams() {
 	for {
 		stream, err := m.session.AcceptStream()
 		if err != nil {
+			slog.Info("relay yamux handled accept stopped", "error", err)
 			m.failHandledAccepts(err)
 			return
 		}
@@ -434,6 +435,7 @@ func (m *yamuxMux) run(ctx context.Context, operation func() (*yamux.Stream, err
 		return value.stream, value.err
 	case <-ctx.Done():
 		if closeOnCancel {
+			slog.Info("relay yamux accept context canceled; closing session", "error", ctx.Err())
 			_ = m.session.Close()
 			<-result
 			return nil, ctx.Err()

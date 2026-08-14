@@ -78,6 +78,14 @@ func DialQUIC(ctx context.Context, config QUICDialConfig) (*Connection, error) {
 	openCtx, cancelOpen := context.WithCancel(ownerCtx)
 	stopSetupCancel := context.AfterFunc(ctx, cancelOpen)
 	base, err := attachment.open(openCtx, config.StreamHandle)
+	if err == nil {
+		stream, ok := base.(*relayQUICStream)
+		if !ok {
+			err = ErrInvalid
+		} else {
+			err = stream.awaitResponse()
+		}
+	}
 	if !stopSetupCancel() && err == nil {
 		err = ctx.Err()
 	}
@@ -195,7 +203,10 @@ type pendingRelayQUICBody struct {
 	err    error
 }
 
-func (b *pendingRelayQUICBody) Read(target []byte) (int, error) {
+func (b *pendingRelayQUICBody) awaitResponse() error {
+	if b == nil {
+		return ErrInvalid
+	}
 	b.once.Do(func() {
 		value := <-b.result
 		if b.stop != nil {
@@ -203,7 +214,11 @@ func (b *pendingRelayQUICBody) Read(target []byte) (int, error) {
 		}
 		b.body, b.err = value.responseBody()
 	})
-	if b.err != nil {
+	return b.err
+}
+
+func (b *pendingRelayQUICBody) Read(target []byte) (int, error) {
+	if err := b.awaitResponse(); err != nil {
 		return 0, b.err
 	}
 	return b.body.Read(target)
@@ -214,13 +229,7 @@ func (b *pendingRelayQUICBody) Close() error {
 		return nil
 	}
 	b.cancel()
-	b.once.Do(func() {
-		value := <-b.result
-		if b.stop != nil {
-			b.stop()
-		}
-		b.body, b.err = value.responseBody()
-	})
+	_ = b.awaitResponse()
 	if b.body != nil {
 		return b.body.Close()
 	}
@@ -277,6 +286,17 @@ type relayQUICStream struct {
 	writeActive   bool
 	readTimedOut  bool
 	writeTimedOut bool
+}
+
+func (s *relayQUICStream) awaitResponse() error {
+	if s == nil {
+		return ErrInvalid
+	}
+	body, ok := s.reader.(*pendingRelayQUICBody)
+	if !ok {
+		return ErrInvalid
+	}
+	return body.awaitResponse()
 }
 
 func (s *relayQUICStream) Read(target []byte) (int, error) {

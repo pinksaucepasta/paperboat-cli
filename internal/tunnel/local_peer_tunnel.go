@@ -82,7 +82,11 @@ func (t LocalPeerTunnel) Dial(ctx context.Context, info resolver.ConnectInfo) (C
 	if err != nil {
 		return nil, err
 	}
-	return &previewStreamConn{ReadWriteCloser: stream}, nil
+	connection, err := NewLocalPeerConn(stream)
+	if err != nil {
+		_ = stream.Close()
+	}
+	return connection, err
 }
 
 func (t LocalPeerTunnel) DialExec(ctx context.Context, info resolver.ConnectInfo, value ExecRequest) (ExecConn, error) {

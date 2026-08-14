@@ -25,15 +25,10 @@ func TestMachineTransportInvalidatorFencesAuthorityTransitions(t *testing.T) {
 		Availability:       api.AvailabilityPolicy{DesiredMode: "keep_awake", DesiredVersion: 2, ObservedMode: "keep_awake", ObservedVersion: 2, Status: "applied"},
 	}
 	tests := map[string]func(*api.UserMachine){
-		"environment":          func(value *api.UserMachine) { value.EnvironmentID = "environment_2" },
-		"lifecycle state":      func(value *api.UserMachine) { value.State = "revoked" },
-		"online state":         func(value *api.UserMachine) { value.Online = false },
-		"identity":             func(value *api.UserMachine) { value.PublicIdentityKey = "identity_2" },
-		"installation":         func(value *api.UserMachine) { value.InstallationGeneration++ },
-		"connector generation": func(value *api.UserMachine) { value.RuntimeDiagnostics.ConnectorGeneration++ },
-		"worker generation":    func(value *api.UserMachine) { value.RuntimeDiagnostics.WorkerGeneration++ },
-		"boot identity":        func(value *api.UserMachine) { value.RuntimeDiagnostics.OSBootID = "boot_2" },
-		"service scope":        func(value *api.UserMachine) { value.RuntimeDiagnostics.WorkerServiceScope = "user" },
+		"environment":              func(value *api.UserMachine) { value.EnvironmentID = "environment_2" },
+		"terminal lifecycle state": func(value *api.UserMachine) { value.State = "revoked" },
+		"identity":                 func(value *api.UserMachine) { value.PublicIdentityKey = "identity_2" },
+		"installation":             func(value *api.UserMachine) { value.InstallationGeneration++ },
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -49,6 +44,37 @@ func TestMachineTransportInvalidatorFencesAuthorityTransitions(t *testing.T) {
 			mutate(&changed)
 			if !observer.Observe([]api.UserMachine{changed}) || len(recorder.prefixes) != 1 || recorder.prefixes[0] != "machine_1:" {
 				t.Fatalf("transition invalidated=%v", recorder.prefixes)
+			}
+		})
+	}
+}
+
+func TestMachineTransportInvalidatorRetiresObservedRouteChanges(t *testing.T) {
+	base := api.UserMachine{
+		ID: "machine_1", EnvironmentID: "environment_1", State: "online", Online: true,
+		PublicIdentityKey: "identity_1", InstallationGeneration: 3,
+		RuntimeDiagnostics: api.RuntimeDiagnostics{ConnectorGeneration: 5, WorkerGeneration: 7, OSBootID: "boot_1", WorkerServiceScope: "system"},
+	}
+	tests := map[string]func(*api.UserMachine){
+		"liveness":             func(value *api.UserMachine) { value.Online = false },
+		"nonterminal state":    func(value *api.UserMachine) { value.State = "offline" },
+		"connector generation": func(value *api.UserMachine) { value.RuntimeDiagnostics.ConnectorGeneration++ },
+		"worker generation":    func(value *api.UserMachine) { value.RuntimeDiagnostics.WorkerGeneration++ },
+		"boot identity":        func(value *api.UserMachine) { value.RuntimeDiagnostics.OSBootID = "boot_2" },
+		"worker service scope": func(value *api.UserMachine) { value.RuntimeDiagnostics.WorkerServiceScope = "user" },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			recorder := &recordingTransportInvalidator{}
+			observer := &MachineTransportInvalidator{manager: recorder, seen: make(map[string]machineTransportState)}
+			observer.Observe([]api.UserMachine{base})
+			changed := base
+			mutate(&changed)
+			if !observer.Observe([]api.UserMachine{changed}) {
+				t.Fatal("route change was not observed")
+			}
+			if len(recorder.prefixes) != 0 || len(recorder.retired) != 1 || recorder.retired[0] != "machine_1:" {
+				t.Fatalf("invalidated=%v retired=%v", recorder.prefixes, recorder.retired)
 			}
 		})
 	}
@@ -75,8 +101,8 @@ func TestMachineTransportInvalidatorDoesNotFenceUnchangedMachine(t *testing.T) {
 	second := api.UserMachine{ID: "machine_2", Online: true}
 	observer.Observe([]api.UserMachine{first, second})
 	second.Online = false
-	if !observer.Observe([]api.UserMachine{first, second}) || len(recorder.prefixes) != 1 || recorder.prefixes[0] != "machine_2:" {
-		t.Fatalf("invalidated=%v", recorder.prefixes)
+	if !observer.Observe([]api.UserMachine{first, second}) || len(recorder.prefixes) != 0 || len(recorder.retired) != 1 || recorder.retired[0] != "machine_2:" {
+		t.Fatalf("invalidated=%v retired=%v", recorder.prefixes, recorder.retired)
 	}
 }
 
@@ -96,8 +122,8 @@ func TestMachineTransportInvalidatorRetainsAuthorityAcrossPolicyReconciliation(t
 		t.Fatalf("policy transition invalidated endpoint authority: %v", authorities)
 	}
 	changed.RuntimeDiagnostics.WorkerGeneration = 4
-	if !observer.Observe([]api.UserMachine{changed}) || len(recorder.prefixes) != 1 || len(authorities) != 1 || authorities[0] != "machine_1" {
-		t.Fatalf("worker transition did not invalidate endpoint authority: %v", authorities)
+	if !observer.Observe([]api.UserMachine{changed}) || len(recorder.prefixes) != 0 || len(recorder.retired) != 1 || len(authorities) != 0 {
+		t.Fatalf("worker transition invalidated endpoint authority: prefixes=%v authorities=%v", recorder.prefixes, authorities)
 	}
 }
 

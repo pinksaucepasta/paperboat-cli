@@ -89,10 +89,14 @@ func (o *MachineTransportInvalidator) Observe(machines []api.UserMachine) bool {
 }
 
 // Authority metadata is independently cacheable from active carrier policy.
-// Availability reconciliation fences carriers, but does not alter endpoint
-// identity, certificates, or the generation used to resolve authority.
+// Liveness and runtime diagnostics describe an observed route, not the
+// authenticated peer identity carried by an established connection.
 func authorityStateChanged(previous, current machineTransportState) bool {
-	return previous.environmentID != current.environmentID || previous.state != current.state || previous.online != current.online || previous.identityKey != current.identityKey || previous.installationGen != current.installationGen || previous.connectorGeneration != current.connectorGeneration || previous.workerGeneration != current.workerGeneration || previous.osBootID != current.osBootID || previous.serviceScope != current.serviceScope
+	return previous.environmentID != current.environmentID || previous.identityKey != current.identityKey || previous.installationGen != current.installationGen || terminalMachineState(previous.state) != terminalMachineState(current.state)
+}
+
+func terminalMachineState(state string) bool {
+	return state == "revoked" || state == "deleted"
 }
 
 func transportState(machine api.UserMachine) machineTransportState {

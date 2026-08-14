@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"os"
 	"reflect"
 	"slices"
 	"sync"
@@ -821,6 +822,92 @@ func TestCoordinatorSerializesNewSnapshotBehindCommit(t *testing.T) {
 	_ = client.Close()
 }
 
+func TestCoordinatorPromotesPreparedWSSAfterDirectAndRelayFailures(t *testing.T) {
+	client, server := coordinatorStreamPair(t)
+	relay, direct, wss := coordinatorTestCandidate(), coordinatorTestCandidate(), coordinatorTestCandidate()
+	type openedCarrier struct {
+		source *terminalPathCandidate
+		peer   net.Conn
+	}
+	opened := make(chan openedCarrier, 3)
+	configure := func(source *terminalPathCandidate) {
+		source.openAuthorized = func(ctx context.Context, _ streamauth.Header) (net.Conn, error) {
+			left, right := net.Pipe()
+			opened <- openedCarrier{source: source, peer: right}
+			go func() { _ = server.AcceptCarrier(ctx, right) }()
+			return left, nil
+		}
+	}
+	configure(relay)
+	configure(direct)
+	configure(wss)
+	inbox := make(chan connectionmanager.AvailabilitySnapshot, 3)
+	coordinator := coordinatorTestStream(client, relay)
+	coordinator.availability = inbox
+	relay.streams[client] = coordinator
+	go coordinator.run()
+
+	inbox <- coordinatorSnapshot(1, direct, direct, relay, wss)
+	waitCoordinatorSettled(t, coordinator, 1, direct, relay)
+	inbox <- coordinatorSnapshot(2, relay, relay, wss)
+	waitCoordinatorSettled(t, coordinator, 2, relay, wss)
+
+	var relayPeer net.Conn
+	for range 3 {
+		carrier := <-opened
+		if carrier.source == relay {
+			relayPeer = carrier.peer
+		}
+	}
+	if relayPeer == nil {
+		t.Fatal("relay carrier was not opened")
+	}
+	if err := relayPeer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitCoordinatorSource(t, coordinator, wss, true)
+
+	payload := []byte("prepared-wss-failover")
+	if _, err := client.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(server, got); err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("payload=%q err=%v", got, err)
+	}
+	_ = client.Close()
+}
+
+func TestCoordinatorSourceReleaseDoesNotWaitForPhysicalCleanup(t *testing.T) {
+	candidate := coordinatorTestCandidate()
+	candidate.health = &candidateHealth{}
+	releaseStarted := make(chan struct{})
+	release := make(chan struct{})
+	candidate.sourceRefs = 1
+	candidate.closePending = true
+	candidate.releaseLease = func(context.Context) error {
+		close(releaseStarted)
+		<-release
+		return nil
+	}
+	done := make(chan struct{})
+	go func() {
+		candidate.releaseSource()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("source release waited for physical cleanup")
+	}
+	select {
+	case <-releaseStarted:
+	case <-time.After(time.Second):
+		t.Fatal("physical cleanup did not start")
+	}
+	close(release)
+}
+
 func TestCoordinatorReconcilesNewSnapshotAfterPreferredOpenFails(t *testing.T) {
 	client, server := coordinatorStreamPair(t)
 	relay, direct, wss := coordinatorTestCandidate(), coordinatorTestCandidate(), coordinatorTestCandidate()
@@ -914,14 +1001,14 @@ func TestCoordinatorClearsFailedPreparedCarrierHandle(t *testing.T) {
 func TestCoordinatorRetriesUnsettledSnapshotAfterPreparedFailureArrives(t *testing.T) {
 	client, server := coordinatorStreamPair(t)
 	relay, staleWSS, freshWSS := coordinatorTestCandidate(), coordinatorTestCandidate(), coordinatorTestCandidate()
-	peers := make(chan net.Conn, 2)
+	peers := make(chan net.Conn, 3)
 	open := func(ctx context.Context, _ streamauth.Header) (net.Conn, error) {
 		left, right := net.Pipe()
 		peers <- right
 		go func() { _ = server.AcceptCarrier(ctx, right) }()
 		return left, nil
 	}
-	staleWSS.openAuthorized, freshWSS.openAuthorized = open, open
+	relay.openAuthorized, staleWSS.openAuthorized, freshWSS.openAuthorized = open, open, open
 	coordinator := coordinatorTestStream(client, relay)
 	coordinator.availability = make(chan connectionmanager.AvailabilitySnapshot)
 
@@ -1240,6 +1327,10 @@ func TestRelayFallbackRequiresExplicitTransientClass(t *testing.T) {
 	t.Parallel()
 	if !relayFallbackEligible(context.Background(), &connectionmanager.Failure{Class: connectionmanager.FailureTransient, Path: connectionmanager.PathRelayQUIC, Cause: errors.New("relay unavailable")}) {
 		t.Fatal("typed relay transient failure was not fallback eligible")
+	}
+	blockedUDP := &net.OpError{Op: "write", Net: "udp", Err: os.ErrPermission}
+	if !relayFallbackEligible(context.Background(), fmt.Errorf("relay QUIC request failed: %w", blockedUDP)) {
+		t.Fatal("UDP policy failure was not fallback eligible")
 	}
 	for _, err := range []error{
 		errors.New("unknown relay failure"),

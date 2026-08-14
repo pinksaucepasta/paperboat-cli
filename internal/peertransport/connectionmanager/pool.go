@@ -103,6 +103,7 @@ type managedConnection struct {
 	secondaryRole     bool
 	closed            bool
 	healthCancel      context.CancelFunc
+	healthRebind      chan struct{}
 	healthToken       *ownershipToken
 }
 
@@ -645,12 +646,12 @@ func (p *Pool) promotePathOwned(class peerquic.Class, path Path, connection Conn
 	p.cancelIdleLocked(state)
 	oldStandby, oldSecondary := state.standby, state.secondary
 	// Relay entries retained behind the promoted primary receive the new pool
-	// generation below. Cancel their old health ownership before rewriting that
-	// identity; otherwise a late result from the previous generation can retire
-	// an authenticated fallback after the direct upgrade has completed.
-	p.stopHealthLocked(previous)
-	p.stopHealthLocked(oldStandby)
-	p.stopHealthLocked(oldSecondary)
+	// generation below. Gracefully rebind their health ownership before
+	// rewriting that identity; an allocated ordered probe must finish, while a
+	// late result from the old generation must not retire the retained fallback.
+	p.rebindHealthLocked(previous)
+	p.rebindHealthLocked(oldStandby)
+	p.rebindHealthLocked(oldSecondary)
 	previous.selection.Generation = generation
 	// A path promotion changes the carrier generation but does not invalidate
 	// the authenticated standby race already owned by this active session.
@@ -1092,13 +1093,15 @@ func (p *Pool) startHealthLocked(class peerquic.Class, entry *managedConnection)
 		return err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	rebind := make(chan struct{})
 	token := &ownershipToken{}
 	entry.healthToken = token
 	entry.healthCancel = cancel
+	entry.healthRebind = rebind
 	binding := ActiveHealthBinding{Path: entry.selection.Path, Generation: entry.selection.Generation, NetworkGeneration: p.networkGeneration}
 	go func() {
-		err := p.health.Run(ctx, binding, transport)
-		if err != nil && !errors.Is(err, context.Canceled) {
+		err := p.health.Run(withActiveHealthRebind(ctx, rebind), binding, transport)
+		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, errActiveHealthRebind) {
 			slog.Warn("peer active health stopped", "class", uint8(class), "path", uint8(binding.Path), "generation", binding.Generation, "network_generation", binding.NetworkGeneration, "error", err)
 		}
 		p.mu.Lock()
@@ -1107,8 +1110,18 @@ func (p *Pool) startHealthLocked(class peerquic.Class, entry *managedConnection)
 			return
 		}
 		entry.healthCancel = nil
+		entry.healthRebind = nil
 		entry.healthToken = nil
 		if ctx.Err() != nil || p.closed || entry.closed {
+			return
+		}
+		if errors.Is(err, errActiveHealthRebind) {
+			if entryOwned(entry) && !entry.closed {
+				if restartErr := p.startHealthLocked(class, entry); restartErr != nil {
+					p.failHealthLocked(class, entry)
+				}
+			}
+			p.signalLocked()
 			return
 		}
 		if err != nil {
@@ -1250,15 +1263,37 @@ func (p *Pool) restartHealthLocked(entry *managedConnection) {
 	}
 }
 
+func (p *Pool) ensureHealthLocked(class peerquic.Class, state *classState, entry *managedConnection) {
+	if entry == nil || entry.healthCancel != nil || p.classLeasesLocked(state) == 0 {
+		return
+	}
+	if err := p.startHealthLocked(class, entry); err != nil {
+		p.failHealthLocked(class, entry)
+		p.signalLocked()
+	}
+}
+
 func (p *Pool) stopHealthLocked(entry *managedConnection) {
 	if entry == nil {
 		return
 	}
 	entry.healthToken = nil
+	entry.healthRebind = nil
 	if entry.healthCancel != nil {
 		entry.healthCancel()
 		entry.healthCancel = nil
 	}
+}
+
+// rebindHealthLocked lets an ordered exchange finish, then restarts the
+// monitor against the entry's current pool generation. It is used only when
+// a retained candidate changes role; closure and health failure remain hard.
+func (p *Pool) rebindHealthLocked(entry *managedConnection) {
+	if entry == nil || entry.healthRebind == nil {
+		return
+	}
+	close(entry.healthRebind)
+	entry.healthRebind = nil
 }
 
 func (p *Pool) failHealthLocked(class peerquic.Class, entry *managedConnection) bool {
@@ -1304,7 +1339,7 @@ func (p *Pool) failHealthLocked(class peerquic.Class, entry *managedConnection) 
 			}
 			syncEntryRoles(state, entry, standby)
 			p.closeIfUnownedLocked(entry)
-			p.restartHealthLocked(standby)
+			p.ensureHealthLocked(class, state, standby)
 			p.publishAvailabilityLocked(class, state, entry)
 			p.ensureStandbyReplenishmentLocked(class, state)
 		} else {

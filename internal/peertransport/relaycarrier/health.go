@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"io"
 	"sync/atomic"
 
 	"github.com/hashicorp/yamux"
@@ -57,6 +58,12 @@ type HealthConnection struct {
 	transport HealthTransport
 	path      connectionmanager.Path
 	state     atomic.Uint32
+	binding   [32]byte
+}
+
+type InitialHealth struct {
+	Prefix  [8]byte
+	Binding [32]byte
 }
 
 func NewHealthConnection(connection *Connection, source HealthConfigSource) (*HealthConnection, error) {
@@ -128,9 +135,12 @@ func (c *HealthConnection) AdmitInitialRelayHealth(ctx context.Context, config I
 	stream, response, err := c.Connection.Initiate(ctx, config)
 	if err == nil {
 		defer stream.Close()
+		c.binding, err = stream.ChannelBinding()
 		var responseNonce [16]byte
 		var responsePrefix [8]byte
-		responseNonce, responsePrefix, err = parseInitialHealthPayload(response, 2)
+		if err == nil {
+			responseNonce, responsePrefix, err = parseInitialHealthPayload(response, 2)
+		}
 		if err == nil && (responseNonce != nonce || responsePrefix != c.transport.handles.prefix) {
 			err = relaynoise.ErrProtocol
 		}
@@ -142,6 +152,13 @@ func (c *HealthConnection) AdmitInitialRelayHealth(ctx context.Context, config I
 	}
 	c.state.Store(uint32(connectionmanager.StateTrusted))
 	return nil
+}
+
+func (c *HealthConnection) CandidateBinding() ([32]byte, error) {
+	if c == nil || c.binding == [32]byte{} || c.State() != connectionmanager.StateTrusted {
+		return [32]byte{}, ErrInvalid
+	}
+	return c.binding, nil
 }
 
 func (t HealthTransport) HealthExchange(ctx context.Context, nonce [16]byte) (uint32, error) {
@@ -224,9 +241,9 @@ func (c *Connection) AcceptHealth(ctx context.Context, config ResponderConfig) e
 
 // AcceptInitialHealth authenticates the bootstrap exchange and returns the
 // encrypted random prefix needed to predict subsequent one-time handles.
-func (c *Connection) AcceptInitialHealth(ctx context.Context, config ResponderConfig) ([8]byte, error) {
+func (c *Connection) AcceptInitialHealth(ctx context.Context, config ResponderConfig) (InitialHealth, error) {
 	if c == nil || ctx == nil || config.Authorize != nil {
-		return [8]byte{}, ErrInvalid
+		return InitialHealth{}, ErrInvalid
 	}
 	var prefix [8]byte
 	config.Authorize = func(_ context.Context, request []byte) ([]byte, error) {
@@ -239,9 +256,10 @@ func (c *Connection) AcceptInitialHealth(ctx context.Context, config ResponderCo
 	}
 	stream, _, err := c.Accept(ctx, config)
 	if err != nil {
-		return [8]byte{}, err
+		return InitialHealth{}, err
 	}
-	return prefix, stream.Close()
+	binding, bindingErr := stream.ChannelBinding()
+	return InitialHealth{Prefix: prefix, Binding: binding}, errors.Join(bindingErr, stream.Close())
 }
 
 // ServeHealth answers periodic probes in the negotiated handle order. It is
@@ -265,6 +283,13 @@ func (c *Connection) ServeHealth(ctx context.Context, prefix [8]byte, source Hea
 		}
 		config.Authorize = nil
 		if err := c.AcceptHealth(ctx, config); err != nil {
+			// Active-health ownership can move between pool roles while a probe
+			// is in flight. The initiator aborts that stream, which appears as
+			// EOF to the responder; the authenticated carrier remains retained
+			// and the next one-time handle is still authoritative.
+			if (errors.Is(err, io.EOF) || errors.Is(err, yamux.ErrStreamClosed)) && ctx.Err() == nil && !c.closed() {
+				continue
+			}
 			return err
 		}
 	}

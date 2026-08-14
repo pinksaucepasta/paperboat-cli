@@ -25,6 +25,7 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/diagnosticlog"
 	"github.com/pinksaucepasta/paperboat/internal/localapi"
 	"github.com/pinksaucepasta/paperboat/internal/localobservation"
+	"github.com/pinksaucepasta/paperboat/internal/peertransport/candidatelease"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/clientauthority"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/connectionmanager"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/directpath"
@@ -1462,15 +1463,20 @@ func (t *PeerTerminalTunnel) dialRelayQUIC(ctx, lifetime context.Context, target
 	initialPacketSize := t.relayPacketSize(lifetime, descriptor, fingerprint)
 	connection, err := relaycarrier.DialQUIC(ctx, relaycarrier.QUICDialConfig{URL: descriptor.RelayQUICURL, Credential: descriptor.RelayCredential, EndpointID: authority.LocalEndpointID(), Role: "initiator", StreamHandle: authority.RouteHandle, TLS: t.config.TLS.Clone(), Lifetime: lifetime, MaximumDeadline: maximumDeadline, Carrier: relaycarrier.DevelopmentConfig(), InitialPacketSize: initialPacketSize})
 	if err != nil {
+		diagnosticlog.TryInfo("peer relay candidate admission stage", "intent_id", descriptor.IntentID, "attempt_generation", descriptor.AttemptGeneration, "stage", "carrier_dialed", "error", err)
 		return nil, err
 	}
+	diagnosticlog.TryInfo("peer relay candidate admission stage", "intent_id", descriptor.IntentID, "attempt_generation", descriptor.AttemptGeneration, "stage", "carrier_dialed", "error", nil)
 	health, initial, err := newPeerRelayHealthConnection(connection, authority)
 	if err != nil {
+		diagnosticlog.TryInfo("peer relay candidate admission stage", "intent_id", descriptor.IntentID, "attempt_generation", descriptor.AttemptGeneration, "stage", "health_created", "error", err)
 		return nil, errors.Join(err, connection.Close())
 	}
 	if err := admitPeerRelayHealth(ctx, health, initial); err != nil {
+		diagnosticlog.TryInfo("peer relay candidate admission stage", "intent_id", descriptor.IntentID, "attempt_generation", descriptor.AttemptGeneration, "stage", "health_admitted", "error", err)
 		return nil, errors.Join(err, connection.Close())
 	}
+	diagnosticlog.TryInfo("peer relay candidate admission stage", "intent_id", descriptor.IntentID, "attempt_generation", descriptor.AttemptGeneration, "stage", "health_admitted", "error", nil)
 	initiator := nativepeer.Initiator{Connection: connection, Authority: authority}
 	var candidate *terminalPathCandidate
 	candidate, candidateErr := newRelayTerminalPathCandidate(descriptor.RelayRegion, health, func(attachCtx context.Context, attachment terminalAttachment) (Conn, error) {
@@ -1533,6 +1539,12 @@ func (t *PeerTerminalTunnel) dialRelayQUIC(ctx, lifetime context.Context, target
 	}
 	if descriptor.Document.Purpose != "peer_transport" {
 		candidate.expiresAt, candidate.now = descriptor.ExpiresAt, t.config.Now
+	} else {
+		if err := adoptRelayCandidate(ctx, candidate, health, initiator, descriptor, "relay_quic"); err != nil {
+			diagnosticlog.TryInfo("peer relay candidate admission stage", "intent_id", descriptor.IntentID, "attempt_generation", descriptor.AttemptGeneration, "stage", "candidate_adopted", "error", err)
+			return nil, errors.Join(err, candidate.health.Close())
+		}
+		diagnosticlog.TryInfo("peer relay candidate admission stage", "intent_id", descriptor.IntentID, "attempt_generation", descriptor.AttemptGeneration, "stage", "candidate_adopted", "error", nil)
 	}
 	return candidate, nil
 }
@@ -1588,7 +1600,7 @@ func (t *PeerTerminalTunnel) dialDirect(ctx, lifetime context.Context, target *r
 		}
 	}
 	substrate := t.socketSubstrate
-	factory, err := directpath.NewSignalingFactory(directpath.SignalingFactoryConfig{Descriptors: source, SocketMapping: nil, TLS: t.config.TLS.Clone(), Dial: func(dialCtx context.Context, config signaling.WebSocketConfig) (directpath.SignalingTransport, error) {
+	factory, err := directpath.NewSignalingFactory(directpath.SignalingFactoryConfig{Descriptors: source, SocketMapping: nil, Lifetime: lifetime, TLS: t.config.TLS.Clone(), Dial: func(dialCtx context.Context, config signaling.WebSocketConfig) (directpath.SignalingTransport, error) {
 		return t.signalingSubstrate.Open(dialCtx, config)
 	}, Assembly: directpath.Config{Sockets: sockets, PMTUKey: pmtuKey[:], MaximumPMTU: networkadaptation.DevelopmentPMTUPolicy().MaximumPayload, ApplicationQueue: 64, PMTUResponseLimit: time.Second, Substrate: substrate}})
 	if err != nil {
@@ -1755,6 +1767,10 @@ func (t *PeerTerminalTunnel) dialDirect(ctx, lifetime context.Context, target *r
 	}
 	if descriptor.Document.Purpose != "private_preview" && descriptor.Document.Purpose != "peer_transport" {
 		candidate.expiresAt, candidate.now = descriptor.ExpiresAt, t.config.Now
+	} else if descriptor.Document.Purpose == "peer_transport" {
+		if err := adoptDirectCandidate(ctx, candidate, session, sessionAuthority, descriptor); err != nil {
+			return nil, errors.Join(err, candidate.health.Close())
+		}
 	}
 	return candidate, nil
 }
@@ -1803,6 +1819,11 @@ type terminalPathCandidate struct {
 	pool            *connectionmanager.Pool
 	sourceRefs      uint64
 	closePending    bool
+	leaseID         candidatelease.ID
+	leaseGeneration uint64
+	releaseLease    func(context.Context) error
+	releaseOnce     sync.Once
+	releaseErr      error
 }
 
 type streamCoordinator struct {
@@ -1994,6 +2015,84 @@ func newTerminalPathCandidate(health connectionmanager.ActiveHealthConnection, a
 	return &terminalPathCandidate{health: health, transport: capability.Transport, attach: attach, streams: make(map[*resumablestream.Conn]*streamCoordinator)}, nil
 }
 
+func adoptRelayCandidate(ctx context.Context, candidate *terminalPathCandidate, health *relaycarrier.HealthConnection, initiator nativepeer.Initiator, descriptor directpath.AttemptDescriptor, path string) error {
+	binding, err := health.CandidateBinding()
+	if err != nil {
+		return err
+	}
+	id, err := candidatelease.NewID(binding[:], descriptor.IntentID, descriptor.AttemptGeneration, path)
+	if err != nil {
+		return err
+	}
+	adopt := candidatelease.Message{Version: 1, Type: candidatelease.Adopt, Candidate: id, LeaseGeneration: descriptor.AttemptGeneration}
+	payload, err := adopt.Marshal()
+	if err != nil {
+		return err
+	}
+	control, response, err := initiator.OpenCandidateControl(ctx, payload)
+	if err != nil {
+		return err
+	}
+	ack, err := candidatelease.Parse(response)
+	if err != nil || ack.Type != candidatelease.AdoptAck || ack.Candidate != id || ack.LeaseGeneration != descriptor.AttemptGeneration {
+		return errors.Join(candidatelease.ErrProtocol, err, control.Close())
+	}
+	candidate.leaseID, candidate.leaseGeneration = id, descriptor.AttemptGeneration
+	candidate.releaseLease = func(releaseCtx context.Context) error {
+		frame, frameErr := candidatelease.Frame(candidatelease.Message{Version: 1, Type: candidatelease.Release, Candidate: id, LeaseGeneration: descriptor.AttemptGeneration})
+		if frameErr == nil {
+			_ = control.SetDeadline(time.Now().Add(2 * time.Second))
+			_, frameErr = control.Write(frame)
+		}
+		if frameErr == nil {
+			var releaseAck candidatelease.Message
+			releaseAck, frameErr = candidatelease.FrameReader(control)
+			if frameErr == nil && (releaseAck.Type != candidatelease.ReleaseAck || releaseAck.Candidate != id || releaseAck.LeaseGeneration != descriptor.AttemptGeneration) {
+				frameErr = candidatelease.ErrProtocol
+			}
+		}
+		return errors.Join(frameErr, control.Close())
+	}
+	return nil
+}
+
+func adoptDirectCandidate(ctx context.Context, candidate *terminalPathCandidate, session *peerquic.Session, authority peersession.Authority, descriptor directpath.AttemptDescriptor) error {
+	binding, err := peerquic.CandidateBinding(session.Connection.ConnectionState().TLS, authority.Transport)
+	if err != nil {
+		return err
+	}
+	id, err := candidatelease.NewID(binding[:], descriptor.IntentID, descriptor.AttemptGeneration, "direct_quic")
+	if err != nil {
+		return err
+	}
+	send := func(controlCtx context.Context, message candidatelease.Message) error {
+		frame, frameErr := candidatelease.Frame(message)
+		if frameErr != nil {
+			return frameErr
+		}
+		stream, openErr := session.OpenCandidateControl(controlCtx, frame)
+		if openErr != nil {
+			return openErr
+		}
+		stopCancel := context.AfterFunc(controlCtx, func() { _ = stream.Close() })
+		ack, readErr := candidatelease.FrameReader(stream)
+		stopCancel()
+		closeErr := stream.Close()
+		if readErr != nil || ack.Candidate != id || ack.LeaseGeneration != descriptor.AttemptGeneration || message.Type == candidatelease.Adopt && ack.Type != candidatelease.AdoptAck || message.Type == candidatelease.Release && ack.Type != candidatelease.ReleaseAck {
+			return errors.Join(candidatelease.ErrProtocol, readErr, closeErr)
+		}
+		return closeErr
+	}
+	if err := send(ctx, candidatelease.Message{Version: 1, Type: candidatelease.Adopt, Candidate: id, LeaseGeneration: descriptor.AttemptGeneration}); err != nil {
+		return err
+	}
+	candidate.leaseID, candidate.leaseGeneration = id, descriptor.AttemptGeneration
+	candidate.releaseLease = func(releaseCtx context.Context) error {
+		return send(releaseCtx, candidatelease.Message{Version: 1, Type: candidatelease.Release, Candidate: id, LeaseGeneration: descriptor.AttemptGeneration})
+	}
+	return nil
+}
+
 func (c *terminalPathCandidate) SetStandby(connection connectionmanager.Connection) {
 	if c == nil {
 		return
@@ -2140,11 +2239,13 @@ func (c *streamCoordinator) prepareDesired() {
 	c.mu.Unlock()
 	carrier, err := source.openAuthorized(c.ctx, c.header)
 	if err != nil {
+		diagnosticlog.TryInfo("peer logical stream prepare desired failed", "consumer", c.header.Consumer, "operation_id", c.header.OperationID, "stream_id", c.header.StreamID, "source", fmt.Sprintf("%p", source), "error", err)
 		diagnosticlog.TryInfo("peer logical stream prepare source failed", "consumer", c.header.Consumer, "operation_id", c.header.OperationID, "stream_id", c.header.StreamID, "error", err)
 		return
 	}
 	handle, err := c.stream.PrepareCarrier(c.ctx, carrier)
 	if err != nil {
+		diagnosticlog.TryInfo("peer logical stream prepare desired carrier failed", "consumer", c.header.Consumer, "operation_id", c.header.OperationID, "stream_id", c.header.StreamID, "source", fmt.Sprintf("%p", source), "error", err)
 		_ = carrier.Close()
 		return
 	}
@@ -2171,6 +2272,9 @@ func (c *streamCoordinator) promotePrepared(source *terminalPathCandidate, handl
 	c.promoting = true
 	c.mu.Unlock()
 	err := c.stream.PromoteCarrier(c.ctx, handle)
+	if err != nil {
+		diagnosticlog.TryInfo("peer logical stream promote desired failed", "consumer", c.header.Consumer, "operation_id", c.header.OperationID, "stream_id", c.header.StreamID, "source", fmt.Sprintf("%p", source), "epoch", handle.Epoch, "error", err)
+	}
 	c.mu.Lock()
 	c.promoting = false
 	committed := err == nil && c.prepared == source && c.handle == handle
@@ -2269,7 +2373,7 @@ func (c *streamCoordinator) reconcileLatestSnapshot() {
 		preferred = firstDifferentCandidate(available, current)
 	}
 	if preferred != nil && preferred.openAuthorized != nil && preferred != current {
-		if err := c.reconcileCarrier(preferred, true); err != nil {
+		if err := c.reconcileCarrier(preferred, true, snapshot.Revision); err != nil {
 			diagnosticlog.TryInfo("peer logical stream reconcile preferred failed", "consumer", c.header.Consumer, "operation_id", c.header.OperationID, "stream_id", c.header.StreamID, "pool_revision", snapshot.Revision, "error", err)
 			return
 		}
@@ -2279,7 +2383,7 @@ func (c *streamCoordinator) reconcileLatestSnapshot() {
 	c.mu.Unlock()
 	fallback := firstDifferentCandidate(available, current)
 	if fallback != nil {
-		if err := c.reconcileCarrier(fallback, false); err != nil {
+		if err := c.reconcileCarrier(fallback, false, snapshot.Revision); err != nil {
 			diagnosticlog.TryInfo("peer logical stream reconcile fallback failed", "consumer", c.header.Consumer, "operation_id", c.header.OperationID, "stream_id", c.header.StreamID, "pool_revision", snapshot.Revision, "error", err)
 			return
 		}
@@ -2311,7 +2415,7 @@ func firstDifferentCandidate(available []*terminalPathCandidate, current *termin
 	return nil
 }
 
-func (c *streamCoordinator) reconcileCarrier(source *terminalPathCandidate, promote bool) error {
+func (c *streamCoordinator) reconcileCarrier(source *terminalPathCandidate, promote bool, revision uint64) error {
 	c.mu.Lock()
 	prepared, handle := c.prepared, c.handle
 	c.mu.Unlock()
@@ -2328,10 +2432,12 @@ func (c *streamCoordinator) reconcileCarrier(source *terminalPathCandidate, prom
 	if prepared == nil {
 		carrier, err := source.openAuthorized(c.ctx, c.header)
 		if err != nil {
+			diagnosticlog.TryInfo("peer logical stream reconcile open failed", "consumer", c.header.Consumer, "operation_id", c.header.OperationID, "stream_id", c.header.StreamID, "pool_revision", revision, "promote", promote, "source", fmt.Sprintf("%p", source), "error", err)
 			return err
 		}
 		handle, err := c.stream.PrepareCarrier(c.ctx, carrier)
 		if err != nil {
+			diagnosticlog.TryInfo("peer logical stream reconcile prepare failed", "consumer", c.header.Consumer, "operation_id", c.header.OperationID, "stream_id", c.header.StreamID, "pool_revision", revision, "promote", promote, "source", fmt.Sprintf("%p", source), "error", err)
 			_ = carrier.Close()
 			return err
 		}
@@ -2347,6 +2453,7 @@ func (c *streamCoordinator) reconcileCarrier(source *terminalPathCandidate, prom
 	handle = c.handle
 	c.mu.Unlock()
 	if err := c.stream.PromoteCarrier(c.ctx, handle); err != nil {
+		diagnosticlog.TryInfo("peer logical stream reconcile promote failed", "consumer", c.header.Consumer, "operation_id", c.header.OperationID, "stream_id", c.header.StreamID, "pool_revision", revision, "source", fmt.Sprintf("%p", source), "epoch", handle.Epoch, "error", err)
 		c.clearPreparedHandle(source, handle)
 		return err
 	}
@@ -2498,8 +2605,23 @@ func (c *terminalPathCandidate) releaseSource() {
 	}
 	c.mu.Unlock()
 	if closeNow {
-		_ = c.health.Close()
+		go func() { _ = c.closePhysical() }()
 	}
+}
+
+func (c *terminalPathCandidate) closePhysical() error {
+	if c == nil {
+		return nil
+	}
+	c.releaseOnce.Do(func() {
+		if c.releaseLease != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			c.releaseErr = c.releaseLease(ctx)
+			cancel()
+		}
+		c.releaseErr = errors.Join(c.releaseErr, c.health.Close())
+	})
+	return c.releaseErr
 }
 
 func (c *terminalPathCandidate) Attach(ctx context.Context, attachment terminalAttachment) (Conn, error) {
@@ -2637,7 +2759,7 @@ func (c *terminalPathCandidate) Close() error {
 	}
 	c.closed = true
 	c.mu.Unlock()
-	return c.health.Close()
+	return c.closePhysical()
 }
 
 type terminalRaceConnector struct {
@@ -3167,15 +3289,21 @@ func (c *terminalRaceConnector) DialProbe(ctx context.Context, attempt connectio
 	if err != nil {
 		return nil, err
 	}
+	logStage := func(stage string, stageErr error) {
+		diagnosticlog.TryInfo("peer recovery candidate stage", "path", uint8(path), "probe_generation", attempt.Generation, "network_generation", attempt.NetworkGeneration, "intent_id", descriptor.IntentID, "attempt_generation", descriptor.AttemptGeneration, "stage", stage, "error", stageErr)
+	}
+	logStage("descriptor_acquired", nil)
 	if descriptor.Document.Purpose != "peer_transport" {
 		c.releaseRecoveryDescriptor(descriptor, "peer recovery descriptor revoke failed")
 		return nil, ErrPeerTerminalInvalid
 	}
 	if err := c.health.observeProbe(attempt, descriptor); err != nil {
+		logStage("quality_bound", err)
 		return nil, err
 	}
 	probeCtx, cancelProbe, err := peerRecoveryAttemptContext(ctx, descriptor, c.owner.config.Now())
 	if err != nil {
+		logStage("attempt_context", err)
 		c.releaseRecoveryDescriptor(descriptor, "peer recovery descriptor revoke failed")
 		return nil, err
 	}
@@ -3195,11 +3323,13 @@ func (c *terminalRaceConnector) DialProbe(ctx context.Context, attempt connectio
 		return nil, ErrPeerTerminalInvalid
 	}
 	if err != nil {
+		logStage("candidate_dialed", err)
 		c.releaseRecoveryDescriptor(descriptor, "peer recovery descriptor revoke failed")
 		return nil, err
 	}
 	candidate.intentID = descriptor.IntentID
 	candidate.attempt = descriptor.AttemptGeneration
+	logStage("candidate_dialed", nil)
 	return candidate, nil
 }
 
@@ -3312,6 +3442,8 @@ func (t *PeerTerminalTunnel) dialWSS(ctx, lifetime context.Context, target *reso
 	}
 	if descriptor.Document.Purpose != "peer_transport" {
 		candidate.expiresAt, candidate.now = descriptor.ExpiresAt, t.config.Now
+	} else if err := adoptRelayCandidate(ctx, candidate, health, initiator, descriptor, "relay_wss"); err != nil {
+		return nil, errors.Join(err, candidate.health.Close())
 	}
 	return candidate, nil
 }
@@ -3368,7 +3500,14 @@ func relayFallbackEligible(ctx context.Context, err error) bool {
 		return true
 	}
 	var networkError net.Error
-	return errors.As(err, &networkError) && networkError.Timeout()
+	if errors.As(err, &networkError) && networkError.Timeout() {
+		return true
+	}
+	// A relay QUIC dial can fail synchronously when local policy blocks UDP.
+	// net.OpError preserves that this was a network operation even when the
+	// underlying syscall (for example EPERM) doesn't implement net.Error.
+	var operationError *net.OpError
+	return errors.As(err, &operationError)
 }
 
 type peerQUICNativeStreamGroup struct {

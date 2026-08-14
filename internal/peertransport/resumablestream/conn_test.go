@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -325,6 +326,57 @@ func TestActiveFailureEmitsDetachedWithoutPromotingPrepared(t *testing.T) {
 	}
 }
 
+type blockingConfirmConn struct {
+	net.Conn
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (c *blockingConfirmConn) Write(value []byte) (int, error) {
+	if len(value) == headerSize && value[0] == frameConfirm {
+		c.once.Do(func() { close(c.started) })
+		select {
+		case <-c.release:
+		case <-time.After(time.Second):
+			return 0, context.DeadlineExceeded
+		}
+	}
+	return c.Conn.Write(value)
+}
+
+func TestPromotionDoesNotWaitForPostCommitConfirm(t *testing.T) {
+	initiator, responder := testPair(t, 64<<10)
+	attachInitial(t, initiator, responder)
+	left, right := net.Pipe()
+	blocked := &blockingConfirmConn{Conn: left, started: make(chan struct{}), release: make(chan struct{})}
+	accepted := make(chan error, 1)
+	go func() { accepted <- responder.AcceptCarrier(t.Context(), right) }()
+	handle, err := initiator.PrepareCarrier(t.Context(), blocked)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-accepted; err != nil {
+		t.Fatal(err)
+	}
+	promoted := make(chan error, 1)
+	go func() { promoted <- initiator.PromoteCarrier(t.Context(), handle) }()
+	select {
+	case <-blocked.started:
+	case <-time.After(time.Second):
+		t.Fatal("post-commit confirm did not start")
+	}
+	select {
+	case err := <-promoted:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("promotion waited for post-commit confirm")
+	}
+	close(blocked.release)
+}
+
 func TestDetachedRecoveryTimeoutAbortsLogicalStream(t *testing.T) {
 	identity := testIdentity()
 	left, err := New(t.Context(), Config{WindowBytes: 64 << 10, Role: RoleInitiator, Identity: identity, DetachedTimeout: 20 * time.Millisecond})
@@ -414,6 +466,21 @@ func TestRetainedApplicationFrameDispositionSurvivesConfirmRetirement(t *testing
 	stream.mu.Unlock()
 	if got := stream.applicationDisposition(carrier); got != applicationIgnoreLate {
 		t.Fatalf("retired disposition=%d want ignore late", got)
+	}
+}
+
+func TestOrphanedActiveApplicationFrameDispositionIgnoresLateData(t *testing.T) {
+	stream, _ := testPair(t, 64<<10)
+	carrier := &physicalCarrier{state: carrierActive, epoch: 2}
+	stream.mu.Lock()
+	stream.committedEpoch = 2
+	stream.mu.Unlock()
+	if got := stream.applicationDisposition(carrier); got != applicationIgnoreLate {
+		t.Fatalf("orphaned active disposition=%d want ignore late", got)
+	}
+	carrier.state = carrierPrepared
+	if got := stream.applicationDisposition(carrier); got != applicationReject {
+		t.Fatalf("orphaned prepared disposition=%d want reject", got)
 	}
 }
 

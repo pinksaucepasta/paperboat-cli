@@ -171,8 +171,8 @@ func TestRelayHealthNegotiatesPeriodicResponderHandles(t *testing.T) {
 					served <- acceptErr
 					return
 				}
-				prefixReady <- prefix
-				served <- server.ServeHealth(ctx, prefix, responderSource)
+				prefixReady <- prefix.Prefix
+				served <- server.ServeHealth(ctx, prefix.Prefix, responderSource)
 			}()
 			var initialNonce [16]byte
 			copy(initialNonce[:], "negotiated-start")
@@ -181,6 +181,9 @@ func TestRelayHealthNegotiatesPeriodicResponderHandles(t *testing.T) {
 			}
 			if prefix := <-prefixReady; prefix == [8]byte{} || prefix != health.transport.handles.prefix {
 				t.Fatalf("negotiated prefix=%x local=%x", prefix, health.transport.handles.prefix)
+			}
+			if binding, err := health.CandidateBinding(); err != nil || binding == [32]byte{} {
+				t.Fatalf("candidate binding=%x error=%v", binding, err)
 			}
 			transport, err := connectionmanager.ConnectionHealthTransport(connectionmanager.Selection{Generation: 1, Path: health.path, Connection: health})
 			if err != nil {
@@ -196,6 +199,60 @@ func TestRelayHealthNegotiatesPeriodicResponderHandles(t *testing.T) {
 			_ = server.Close()
 			if err := <-served; err == nil {
 				t.Fatal("periodic responder returned success without shutdown")
+			}
+		})
+	}
+}
+
+func TestRelayHealthResponderSurvivesAbortedProbe(t *testing.T) {
+	for _, carrier := range []relaynoise.Carrier{relaynoise.CarrierRelayQUIC, relaynoise.CarrierWSS} {
+		t.Run(carrierName(carrier), func(t *testing.T) {
+			var client, server *Connection
+			if carrier == relaynoise.CarrierRelayQUIC {
+				clientSession, serverSession := quicPair(t)
+				client, _ = NewRelayQUIC(clientSession, DevelopmentConfig())
+				server, _ = NewRelayQUIC(serverSession, DevelopmentConfig())
+			} else {
+				client, server, _ = wssPair(t, 4)
+			}
+			t.Cleanup(func() { _ = client.Close(); _ = server.Close() })
+			initiator, responder, _, prologue := testIdentities(t, carrier)
+			var prefix [8]byte
+			copy(prefix[:], "recover1")
+			initiatorSource := HealthConfigSourceFunc(func(_ context.Context, handle [16]byte) (InitiatorConfig, error) {
+				return InitiatorConfig{LocalStatic: initiator, ResponderPublic: public32(responder), Prologue: prologue, Handle: handle}, nil
+			})
+			responderSource := HealthResponderConfigSourceFunc(func(_ context.Context, handle [16]byte) (ResponderConfig, error) {
+				return ResponderConfig{LocalStatic: responder, InitiatorPublic: public32(initiator), Prologue: prologue, Handle: handle}, nil
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			served := make(chan error, 1)
+			go func() { served <- server.ServeHealth(ctx, prefix, responderSource) }()
+
+			handles := &healthHandleSequence{prefix: prefix}
+			abortedHandle, err := handles.nextHandle()
+			if err != nil {
+				t.Fatal(err)
+			}
+			aborted, err := client.openHandle(ctx, abortedHandle, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := aborted.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			transport := HealthTransport{Connection: client, source: initiatorSource, handles: handles}
+			var nonce [16]byte
+			copy(nonce[:], "after-abort-ok")
+			if _, err := transport.HealthExchange(ctx, nonce); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err := <-served:
+				t.Fatalf("responder stopped after aborted probe: %v", err)
+			default:
 			}
 		})
 	}

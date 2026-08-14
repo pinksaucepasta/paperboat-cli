@@ -71,6 +71,62 @@ func TestStreamRouterServesHealthWithoutConsumingApplicationStream(t *testing.T)
 	}
 }
 
+func TestStreamRouterRoutesCandidateControlSeparately(t *testing.T) {
+	client, server, closePair := routerSessionPair(t)
+	defer closePair()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	payload := []byte("candidate-adopt-payload")
+	control := make(chan []byte, 1)
+	config := peerquic.DevelopmentStreamRouterConfig()
+	config.CandidateControl = func(_ context.Context, stream *quic.Stream) error {
+		value, err := io.ReadAll(stream)
+		if err == nil {
+			control <- value
+		}
+		return err
+	}
+	router, err := peerquic.NewStreamRouter(server, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer router.Close()
+	stream, err := client.OpenCandidateControl(ctx, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-control:
+		if !bytes.Equal(got, payload) {
+			t.Fatalf("control payload=%q", got)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	application, err := client.Connection.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer application.Close()
+	if _, err := application.Write([]byte("ordinary")); err != nil {
+		t.Fatal(err)
+	}
+	if err := application.Close(); err != nil {
+		t.Fatal(err)
+	}
+	routed, err := router.Accept(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(routed)
+	if err != nil || !bytes.Equal(got, []byte("ordinary")) {
+		t.Fatalf("application=%q err=%v", got, err)
+	}
+}
+
 func TestStreamRouterReturnsHealthStreamCreditWhileApplicationStreamIsOpen(t *testing.T) {
 	client, server, closePair := routerSessionPair(t)
 	defer closePair()

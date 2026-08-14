@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -153,7 +154,7 @@ func TestDevelopmentActiveHealthPolicyAcceptsObservedDirectWANLatency(t *testing
 
 func TestDevelopmentActiveHealthPolicyMatchesMagicsockTrustWindow(t *testing.T) {
 	policy := DevelopmentActiveHealthPolicy()
-	if policy.HeartbeatInterval != 3*time.Second || policy.PathTrustDuration != 6500*time.Millisecond {
+	if policy.HeartbeatInterval != 500*time.Millisecond || policy.PathTrustDuration != 1500*time.Millisecond {
 		t.Fatalf("policy=%+v", policy)
 	}
 }
@@ -245,6 +246,67 @@ func TestActiveHealthMonitorDoesNotRecordCallerCancellationAsLoss(t *testing.T) 
 	}
 	if len(recorder.samples) != 0 {
 		t.Fatalf("cancellation samples=%+v", recorder.samples)
+	}
+}
+
+func TestActiveHealthMonitorGracefulRebindFinishesInflightExchange(t *testing.T) {
+	recorder := &activeHealthRecorder{}
+	monitor, _ := NewActiveHealthMonitor(DevelopmentActiveHealthPolicy(), recorder)
+	monitor.random = bytes.NewReader(bytes.Repeat([]byte{9}, 32))
+	monitor.wait = func(context.Context, time.Duration) error { return nil }
+	started := make(chan context.Context, 1)
+	finish := make(chan struct{})
+	transport := activeHealthTransportFunc(func(ctx context.Context, _ [16]byte) (uint32, error) {
+		started <- ctx
+		<-finish
+		return 0, ctx.Err()
+	})
+	rebind := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- monitor.Run(withActiveHealthRebind(context.Background(), rebind), ActiveHealthBinding{Path: PathRelayQUIC, Generation: 4, NetworkGeneration: 2}, transport)
+	}()
+	exchangeCtx := <-started
+	close(rebind)
+	select {
+	case <-exchangeCtx.Done():
+		t.Fatalf("graceful rebind canceled in-flight exchange: %v", exchangeCtx.Err())
+	default:
+	}
+	close(finish)
+	if err := <-done; !errors.Is(err, errActiveHealthRebind) {
+		t.Fatalf("Run() error=%v", err)
+	}
+	if len(recorder.samples) != 1 || !recorder.samples[0].Succeeded {
+		t.Fatalf("samples=%+v", recorder.samples)
+	}
+}
+
+func TestActiveHealthMonitorGracefulRebindDoesNotRetireCarrierOnInflightEOF(t *testing.T) {
+	recorder := &activeHealthRecorder{}
+	monitor, _ := NewActiveHealthMonitor(DevelopmentActiveHealthPolicy(), recorder)
+	monitor.random = bytes.NewReader(bytes.Repeat([]byte{9}, 32))
+	monitor.wait = func(context.Context, time.Duration) error { return nil }
+	started := make(chan struct{})
+	finish := make(chan struct{})
+	transport := activeHealthTransportFunc(func(context.Context, [16]byte) (uint32, error) {
+		close(started)
+		<-finish
+		return 0, io.EOF
+	})
+	rebind := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- monitor.Run(withActiveHealthRebind(context.Background(), rebind), ActiveHealthBinding{Path: PathRelayQUIC, Generation: 4, NetworkGeneration: 2}, transport)
+	}()
+	<-started
+	close(rebind)
+	close(finish)
+	if err := <-done; !errors.Is(err, errActiveHealthRebind) {
+		t.Fatalf("Run() error=%v", err)
+	}
+	if len(recorder.samples) != 0 {
+		t.Fatalf("role transition recorded in-flight EOF as path loss: %+v", recorder.samples)
 	}
 }
 

@@ -322,17 +322,28 @@ func (c *Conn) PromoteCarrier(ctx context.Context, handle CarrierHandle) error {
 		return ErrProtocol
 	}
 	c.mu.Unlock()
+	// COMMIT_ACK is the authoritative promotion boundary. CONFIRM only lets the
+	// peer retire the previous carrier, so a failed path must not block the
+	// coordinator from promoting the next prepared carrier.
+	go c.confirmCarrier(carrier)
+	c.emit(Event{Type: EventActive, ActiveCarrier: carrier.id, CommittedEpoch: carrier.epoch})
+	return nil
+}
+
+func (c *Conn) confirmCarrier(carrier *physicalCarrier) {
 	if c.writeControl(carrier, frameConfirm) == nil {
 		c.mu.Lock()
-		old := c.retained
-		c.retained = nil
+		var old *physicalCarrier
+		if c.active == carrier {
+			old = c.retained
+			c.retained = nil
+		}
 		c.mu.Unlock()
 		if old != nil {
 			_ = old.conn.Close()
 		}
 	}
-	c.emit(Event{Type: EventActive, ActiveCarrier: carrier.id, CommittedEpoch: carrier.epoch})
-	return nil
+	c.writeActive(carrier, 0)
 }
 
 func (c *Conn) Events() <-chan Event {
@@ -787,7 +798,6 @@ func (c *Conn) readCarrier(carrier *physicalCarrier) {
 			c.signalLocked()
 			commit := c.commitWait[carrier.id]
 			c.mu.Unlock()
-			go c.writeActive(carrier, 0)
 			if commit != nil {
 				select {
 				case commit <- nil:
@@ -894,7 +904,10 @@ func (c *Conn) applicationDisposition(carrier *physicalCarrier) applicationDispo
 	if c.active == carrier && carrier.state == carrierActive || c.retained == carrier && carrier.state == carrierRetained {
 		return applicationAccept
 	}
-	if carrier.state == carrierRetained || carrier.state == carrierSuperseded || carrier.state == carrierFailed {
+	// A COMMIT can retire the old active carrier while its read loop already
+	// holds a queued frame. That orphaned carrier is no longer authoritative;
+	// discard its late frame just as for an explicitly retained/superseded one.
+	if carrier.state == carrierRetained || carrier.state == carrierSuperseded || carrier.state == carrierFailed || carrier.state == carrierActive && c.active != carrier {
 		return applicationIgnoreLate
 	}
 	return applicationReject

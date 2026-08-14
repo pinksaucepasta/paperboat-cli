@@ -135,6 +135,20 @@ record_path_until_stopped() {
   done
 }
 
+stop_case() {
+  local client_pid="$1" reader_pid="$2" observer_pid="$3" output_fifo="$4" stop_file="$5" deadline
+  sudo /usr/local/sbin/paperboat-gate8-network allow-udp >/dev/null 2>&1 || true
+  kill -TERM -- "-$client_pid" 2>/dev/null || true
+  deadline=$((SECONDS + 3))
+  while ((SECONDS < deadline)) && kill -0 "$client_pid" 2>/dev/null; do sleep 0.1; done
+  kill -KILL -- "-$client_pid" 2>/dev/null || true
+  wait "$client_pid" 2>/dev/null || true
+  wait "$reader_pid" 2>/dev/null || true
+  rm -f "$output_fifo"
+  touch "$stop_file"
+  wait "$observer_pid" 2>/dev/null || true
+}
+
 transition_case() {
   local mode="$1" id="$2" output history stop_file output_fifo
   output="$RESULT_ROOT/cases/transition-$id.output"
@@ -146,7 +160,7 @@ transition_case() {
   sudo /usr/local/sbin/paperboat-gate8-network allow-udp
   awk '{command="date +%s%3N"; command | getline received; close(command); print $1, received; fflush()}' <"$output_fifo" >"$output" &
   local reader_pid=$!
-  pb exec "$TARGET" --transport "$mode" -- sh -c 'i=0; while :; do printf "%s\n" "$i"; i=$((i+1)); sleep 0.2; done' >"$output_fifo" 2>"$RESULT_ROOT/cases/transition-$id.stderr" &
+  setsid pb exec "$TARGET" --transport "$mode" -- sh -c 'i=0; while :; do printf "%s\n" "$i"; i=$((i+1)); sleep 0.2; done' >"$output_fifo" 2>"$RESULT_ROOT/cases/transition-$id.stderr" &
   local client_pid=$!
   record_path_until_stopped "$history" "$stop_file" &
   local observer_pid=$!
@@ -154,23 +168,13 @@ transition_case() {
   initial="$(wait_path direct_quic,relay_quic,wss || true)"
 	if ! wait_output "$output"; then
 	  assert_case "transition-$id" application-started false "no output before fault injection"
-	  kill -KILL "$client_pid" 2>/dev/null || true
-	  wait "$client_pid" 2>/dev/null || true
-	  wait "$reader_pid" 2>/dev/null || true
-	  rm -f "$output_fifo"
-	  touch "$stop_file"
-	  wait "$observer_pid" 2>/dev/null || true
+	  stop_case "$client_pid" "$reader_pid" "$observer_pid" "$output_fifo" "$stop_file"
 	  return
 	fi
 	assert_case "transition-$id" application-started true "first byte observed"
   if test "$mode" = a; then
 	if ! require_standby "$id-before-direct-failure" relay_quic,wss; then
-	  kill -KILL "$client_pid" 2>/dev/null || true
-	  wait "$client_pid" 2>/dev/null || true
-	  wait "$reader_pid" 2>/dev/null || true
-	  rm -f "$output_fifo"
-	  touch "$stop_file"
-	  wait "$observer_pid" 2>/dev/null || true
+	  stop_case "$client_pid" "$reader_pid" "$observer_pid" "$output_fifo" "$stop_file"
 	  return
 	fi
     sudo /usr/local/sbin/paperboat-gate8-network relay-only-udp
@@ -180,12 +184,7 @@ transition_case() {
     relay_only="$initial"
   fi
 	if ! require_standby "$id-before-udp-failure" wss; then
-	  kill -KILL "$client_pid" 2>/dev/null || true
-	  wait "$client_pid" 2>/dev/null || true
-	  wait "$reader_pid" 2>/dev/null || true
-	  rm -f "$output_fifo"
-	  touch "$stop_file"
-	  wait "$observer_pid" 2>/dev/null || true
+	  stop_case "$client_pid" "$reader_pid" "$observer_pid" "$output_fifo" "$stop_file"
 	  return
 	fi
   sudo /usr/local/sbin/paperboat-gate8-network block-udp
@@ -206,12 +205,7 @@ transition_case() {
 	  required_standby=wss
 	fi
 	if ! require_standby "$id-before-second-failure" "$required_standby"; then
-	  kill -KILL "$client_pid" 2>/dev/null || true
-	  wait "$client_pid" 2>/dev/null || true
-	  wait "$reader_pid" 2>/dev/null || true
-	  rm -f "$output_fifo"
-	  touch "$stop_file"
-	  wait "$observer_pid" 2>/dev/null || true
+	  stop_case "$client_pid" "$reader_pid" "$observer_pid" "$output_fifo" "$stop_file"
 	  return
 	fi
   sudo /usr/local/sbin/paperboat-gate8-network block-udp
@@ -226,13 +220,7 @@ transition_case() {
   else
     restored_again="$relay_restored_again"
   fi
-  sudo /usr/local/sbin/paperboat-gate8-network allow-udp
-  kill -KILL "$client_pid" 2>/dev/null || true
-  wait "$client_pid" 2>/dev/null || true
-  wait "$reader_pid" 2>/dev/null || true
-  rm -f "$output_fifo"
-  touch "$stop_file"
-  wait "$observer_pid" 2>/dev/null || true
+  stop_case "$client_pid" "$reader_pid" "$observer_pid" "$output_fifo" "$stop_file"
   local path_sequence=false
   if test "$blocked" = wss && test "$relay_restored" = relay_quic && test "$blocked_again" = wss && test "$relay_restored_again" = relay_quic; then
     if test "$mode" = a && test "$relay_only" = relay_quic && test "$restored" = direct_quic && test "$restored_again" = direct_quic; then

@@ -13,7 +13,34 @@ var (
 	ErrPathSuspect           = errors.New("selected peer path health is suspect")
 	ErrActiveHealthExhausted = errors.New("active path health sequence exhausted")
 	errTwoPTOs               = errors.New("peer QUIC reached two PTOs since the last authenticated health exchange")
+	errActiveHealthRebind    = errors.New("active health monitor rebind requested")
 )
+
+type activeHealthRebindKey struct{}
+
+type activeHealthRebindSignal struct{ done <-chan struct{} }
+
+func withActiveHealthRebind(ctx context.Context, done <-chan struct{}) context.Context {
+	return context.WithValue(ctx, activeHealthRebindKey{}, activeHealthRebindSignal{done: done})
+}
+
+func activeHealthRebindRequested(ctx context.Context) bool {
+	if done := activeHealthRebindDone(ctx); done != nil {
+		select {
+		case <-done:
+			return true
+		default:
+		}
+	}
+	return false
+}
+
+func activeHealthRebindDone(ctx context.Context) <-chan struct{} {
+	if signal, ok := ctx.Value(activeHealthRebindKey{}).(activeHealthRebindSignal); ok {
+		return signal.done
+	}
+	return nil
+}
 
 type ActiveHealthTransport interface {
 	HealthExchange(context.Context, [16]byte) (uint32, error)
@@ -85,9 +112,10 @@ type ActiveHealthPolicy struct {
 
 func DevelopmentActiveHealthPolicy() ActiveHealthPolicy {
 	return ActiveHealthPolicy{
-		// Match magicsock's active UDP confidence window.
-		HeartbeatInterval: 3 * time.Second,
-		PathTrustDuration: 6500 * time.Millisecond,
+		// Keep fault detection below the terminal continuity budget while
+		// allowing one authenticated exchange to establish trust.
+		HeartbeatInterval: 500 * time.Millisecond,
+		PathTrustDuration: 1500 * time.Millisecond,
 	}
 }
 
@@ -125,9 +153,15 @@ func (m *ActiveHealthMonitor) run(ctx context.Context, binding ActiveHealthBindi
 		return ErrActiveHealthExhausted
 	}
 	for {
+		if activeHealthRebindRequested(ctx) {
+			return errActiveHealthRebind
+		}
 		waitStarted := m.now()
 		ptos, err := m.waitForHeartbeat(ctx, transport, m.policy.HeartbeatInterval)
 		if err != nil {
+			if activeHealthRebindRequested(ctx) {
+				return errActiveHealthRebind
+			}
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
@@ -144,10 +178,16 @@ func (m *ActiveHealthMonitor) run(ctx context.Context, binding ActiveHealthBindi
 			}
 			return err
 		}
+		if activeHealthRebindRequested(ctx) {
+			return errActiveHealthRebind
+		}
 		var nonce [16]byte
 		if _, err := io.ReadFull(m.random, nonce[:]); err != nil {
 			return fmt.Errorf("generate active health nonce: %w", err)
 		}
+		// A graceful role rebind is a separate signal, so it cannot abort an
+		// already allocated ordered relay handle. Hard cancellation still flows
+		// through the runner context and interrupts the bounded exchange.
 		exchangeCtx, cancel := context.WithTimeout(ctx, m.policy.PathTrustDuration-m.policy.HeartbeatInterval)
 		started := m.now()
 		ptos, exchangeErr := monitorHealthExchange(exchangeCtx, transport, nonce)
@@ -165,8 +205,14 @@ func (m *ActiveHealthMonitor) run(ctx context.Context, binding ActiveHealthBindi
 			if sequence == ^uint64(0) {
 				return ErrActiveHealthExhausted
 			}
+			if activeHealthRebindRequested(ctx) {
+				return errActiveHealthRebind
+			}
 			sequence++
 			continue
+		}
+		if activeHealthRebindRequested(ctx) {
+			return errActiveHealthRebind
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -220,17 +266,28 @@ func monitorHealthExchange(ctx context.Context, transport ActiveHealthTransport,
 }
 
 func (m *ActiveHealthMonitor) waitForHeartbeat(ctx context.Context, transport ActiveHealthTransport, duration time.Duration) (uint32, error) {
+	waitCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if rebind := activeHealthRebindDone(ctx); rebind != nil {
+		go func() {
+			select {
+			case <-rebind:
+				cancel()
+			case <-waitCtx.Done():
+			}
+		}()
+	}
 	observer, ok := transport.(activeHealthPTOObserver)
 	if !ok || observer.PTOChanged() == nil {
-		return 0, m.wait(ctx, duration)
+		return 0, m.wait(waitCtx, duration)
 	}
 	baseline := observer.PTOCount()
 	timer := time.NewTimer(duration)
 	defer timer.Stop()
 	for {
 		select {
-		case <-ctx.Done():
-			return 0, ctx.Err()
+		case <-waitCtx.Done():
+			return 0, waitCtx.Err()
 		case <-timer.C:
 			current := observer.PTOCount()
 			if current < baseline {

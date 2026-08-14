@@ -875,6 +875,28 @@ func TestSelectedDrainingRelayFailureRetainsApplicationLeaseBehindWSS(t *testing
 	_ = pool.Close()
 }
 
+func TestPoolRestartsSelectedHealthWhenLeaseIsDraining(t *testing.T) {
+	health := newPoolHealthRunner()
+	pool, err := NewPool(testRacer(t, newFakeConnector()), PoolConfig{CloseWhenIdle: true, Health: health, HealthTransport: poolHealthFactory})
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay := &managedConnection{selection: Selection{Generation: 1, Path: PathRelayQUIC, Connection: &fakeConnection{}}, applicationLeases: 1}
+	selected := &managedConnection{selection: Selection{Generation: 1, Path: PathRelayQUIC, Connection: &fakeConnection{}}}
+	state := &classState{generation: 1, selected: selected, draining: relay}
+	syncEntryRoles(state, selected, relay)
+	pool.classes[peerquic.ClassInteractive] = state
+	pool.mu.Lock()
+	pool.ensureHealthLocked(peerquic.ClassInteractive, state, selected)
+	pool.mu.Unlock()
+	run := health.next(t)
+	if run.binding.Path != PathRelayQUIC {
+		t.Fatalf("health path=%v", run.binding.Path)
+	}
+	_ = pool.Close()
+	run.assertCanceled(t)
+}
+
 func TestPoolInvalidationCancelsIdleGrace(t *testing.T) {
 	connector := newFakeConnector()
 	pool, _ := NewPool(testRacer(t, connector), PoolConfig{IdleGrace: 30 * time.Second})
@@ -1484,6 +1506,8 @@ func (r *poolHealthRunner) Run(ctx context.Context, binding ActiveHealthBinding,
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
+	case <-activeHealthRebindDone(ctx):
+		return errActiveHealthRebind
 	case err := <-run.failure:
 		return err
 	}

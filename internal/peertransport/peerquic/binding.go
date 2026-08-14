@@ -18,6 +18,14 @@ const (
 	recordVersion = 1
 )
 
+func CandidateBinding(state tls.ConnectionState, transport peercontext.Transport) ([bindingSize]byte, error) {
+	encoded, err := transport.MarshalBinary()
+	if err != nil {
+		return [bindingSize]byte{}, err
+	}
+	return exporterBinding(state, append([]byte("PBCANDIDATE\x00"), encoded...))
+}
+
 var (
 	ErrBinding = errors.New("peer QUIC exporter binding mismatch")
 	ErrRecord  = errors.New("invalid peer QUIC first record")

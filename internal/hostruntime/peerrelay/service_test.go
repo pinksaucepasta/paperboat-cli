@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/pinksaucepasta/paperboat/internal/api"
+	"github.com/pinksaucepasta/paperboat/internal/peertransport/candidatelease"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/peercontext"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/peersession"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/relaycarrier"
@@ -415,11 +416,46 @@ func TestSetupExpiryDoesNotCancelEstablishedCandidate(t *testing.T) {
 	setup, cancelSetup := context.WithTimeout(parent, 20*time.Millisecond)
 	owner := newCandidateOwner(parent, nil)
 	defer owner.Stop()
+	transport, cancelTransport := relayTransportContext(owner.ctx, owner.activity)
+	defer cancelTransport()
 	<-setup.Done()
 	cancelSetup()
 	select {
 	case <-owner.ctx.Done():
 		t.Fatal("setup expiry canceled established candidate")
+	default:
+	}
+	select {
+	case <-transport.Done():
+		t.Fatal("setup expiry canceled established candidate control")
+	default:
+	}
+}
+
+func TestRelayCandidateReleaseCancelsTransportLifetime(t *testing.T) {
+	parent, cancelParent := context.WithCancel(context.Background())
+	defer cancelParent()
+	owner := newCandidateOwner(parent, nil)
+	id := candidatelease.ID("candidate")
+	if err := owner.Configure(id, 7); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := relayTransportContext(parent, owner.activity)
+	defer cancel()
+	if _, err := owner.Handle(candidatelease.Message{Version: 1, Type: candidatelease.Adopt, Candidate: id, LeaseGeneration: 7}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.Handle(candidatelease.Message{Version: 1, Type: candidatelease.Release, Candidate: id, LeaseGeneration: 7}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("candidate release did not cancel relay transport lifetime")
+	}
+	select {
+	case <-parent.Done():
+		t.Fatal("candidate release canceled descriptor authority")
 	default:
 	}
 }

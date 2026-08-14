@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+if test "${1:-}" = check && test "$#" -eq 1; then
+  test "$(id -u)" -eq 0
+  test "$(uname -m)" = aarch64
+  test "$(systemctl is-active paperboat-runtime-host.service)" = active
+  test "$(systemctl is-active paperboat-runtime-privileged.service)" = active
+  exit
+fi
+
+if test "${1:-}" = commit && test "$#" -eq 2; then
+  version="$2"
+  [[ "$version" =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.(0|[1-9][0-9]*)$ ]] || exit 64
+  test "$(id -u)" -eq 0
+  rm -f "/usr/local/bin/pb.rollback-$version" "/usr/local/libexec/paperboat/pb.rollback-$version"
+  exit
+fi
+
+if test "${1:-}" = rollback && test "$#" -eq 2; then
+  version="$2"
+  [[ "$version" =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.(0|[1-9][0-9]*)$ ]] || exit 64
+  bin=/usr/local/bin/pb
+  runtime=/usr/local/libexec/paperboat/pb
+  bin_backup="$bin.rollback-$version"
+  runtime_backup="$runtime.rollback-$version"
+  test "$(id -u)" -eq 0
+  test -f "$bin_backup" && test -f "$runtime_backup"
+  mv -f "$bin_backup" "$bin"
+  mv -f "$runtime_backup" "$runtime"
+  systemctl start paperboat-runtime-host.service paperboat-runtime-privileged.service
+  test "$(systemctl is-active paperboat-runtime-host.service)" = active
+  test "$(systemctl is-active paperboat-runtime-privileged.service)" = active
+  exit
+fi
+
+test "$#" -eq 4 || { echo "usage: $0 YYYY.MM.DD.X SHA256 SIZE ARTIFACT" >&2; exit 64; }
+version="$1"
+expected="$2"
+expected_size="$3"
+artifact="$4"
+
+[[ "$version" =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.(0|[1-9][0-9]*)$ ]] || exit 64
+[[ "$expected" =~ ^[0-9a-f]{64}$ ]] || exit 64
+[[ "$expected_size" =~ ^[1-9][0-9]*$ ]] || exit 64
+test "$artifact" = "/home/anvit/pb-dev-$version-arm64" || exit 64
+test "$(id -u)" -eq 0
+test "$(uname -m)" = aarch64
+test -f "$artifact" && test ! -L "$artifact"
+test "$(stat -c '%U:%G' "$artifact")" = anvit:anvit
+test "$(stat -c '%s' "$artifact")" = "$expected_size"
+test "$(sha256sum "$artifact" | awk '{print $1}')" = "$expected"
+
+bin=/usr/local/bin/pb
+runtime=/usr/local/libexec/paperboat/pb
+bin_backup="$bin.rollback-$version"
+runtime_backup="$runtime.rollback-$version"
+installed=false
+
+finish() {
+  status=$?
+  trap - EXIT
+  set +e
+  if test "$status" -ne 0 && test "$installed" = true; then
+    mv -f "$bin_backup" "$bin"
+    mv -f "$runtime_backup" "$runtime"
+  fi
+  systemctl start paperboat-runtime-host.service paperboat-runtime-privileged.service
+  start_status=$?
+  rm -f "$bin.installing" "$runtime.installing"
+  if test "$status" -eq 0 && test "$start_status" -ne 0; then
+    status=1
+  fi
+  exit "$status"
+}
+trap finish EXIT
+
+systemctl stop paperboat-runtime-host.service paperboat-runtime-privileged.service
+cp -p "$bin" "$bin_backup"
+cp -p "$runtime" "$runtime_backup"
+installed=true
+install -m 0755 -o root -g root "$artifact" "$bin.installing"
+install -m 0755 -o root -g root "$artifact" "$runtime.installing"
+mv -f "$bin.installing" "$bin"
+mv -f "$runtime.installing" "$runtime"
+test "$(sha256sum "$bin" | awk '{print $1}')" = "$expected"
+test "$(sha256sum "$runtime" | awk '{print $1}')" = "$expected"
+"$bin" --version | grep -F "Version $version" >/dev/null
+systemctl start paperboat-runtime-host.service paperboat-runtime-privileged.service
+test "$(systemctl is-active paperboat-runtime-host.service)" = active
+test "$(systemctl is-active paperboat-runtime-privileged.service)" = active
+installed=false

@@ -16,12 +16,14 @@ import (
 
 	"github.com/pinksaucepasta/paperboat/internal/api"
 	identitystore "github.com/pinksaucepasta/paperboat/internal/hostruntime/identity"
+	"github.com/pinksaucepasta/paperboat/internal/peertransport/candidatelease"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/directpath"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/endpointidentity"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/nativepeer"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/networkadaptation"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/peersession"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/relaycarrier"
+	"github.com/pinksaucepasta/paperboat/internal/peertransport/relaynoise"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/relaypmtu"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/signaling"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/streamauth"
@@ -613,6 +615,21 @@ func establishedCarrierContext(parent context.Context) (context.Context, context
 	return context.WithCancel(parent)
 }
 
+func relayTransportContext(parent context.Context, activity *transportActivity) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(parent)
+	if activity == nil || activity.owner == nil {
+		return ctx, cancel
+	}
+	go func() {
+		select {
+		case <-activity.owner.Released():
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
+}
+
 func allowedPathCount(direct, relay, wss bool) int {
 	count := 0
 	if direct {
@@ -733,6 +750,8 @@ func (s *Service) measureRelayPMTU(ctx context.Context, descriptor api.PeerAttem
 func (s *Service) serveRelay(setupCtx, lifetime context.Context, connection *relaycarrier.Connection, descriptor api.PeerAttemptDescriptor, authority peersession.Authority, claim func() bool, activity *transportActivity) (bool, error) {
 	responder := nativepeer.Responder{Connection: connection, Authority: authority}
 	defer responder.Close()
+	transportCtx, cancelTransport := relayTransportContext(lifetime, activity)
+	defer cancelTransport()
 	healthAuthority, err := authority.Responder("native-health")
 	if err != nil {
 		return false, transportstage.Wrap("noise_started", err)
@@ -743,7 +762,7 @@ func (s *Service) serveRelay(setupCtx, lifetime context.Context, connection *rel
 		return false, err
 	}
 	healthConfig.Authorize = nil
-	prefix, err := connection.AcceptInitialHealth(setupCtx, healthConfig)
+	initial, err := connection.AcceptInitialHealth(setupCtx, healthConfig)
 	if err != nil {
 		s.logWSSStage(setupCtx, descriptor, "health_admission_started", time.Now(), err)
 		return false, transportstage.Wrap("health_admission_started", err)
@@ -768,7 +787,7 @@ func (s *Service) serveRelay(setupCtx, lifetime context.Context, connection *rel
 			periodicAuthority.Handle = handle
 			return relaycarrier.PeerResponderConfig(periodicAuthority, connection.Carrier(), "native-health", func(context.Context, []byte) ([]byte, error) { return nil, nil })
 		})
-		return true, connection.ServeHealthOnce(lifetime, prefix, healthSource)
+		return true, connection.ServeHealthOnce(lifetime, initial.Prefix, healthSource)
 	}
 	if authority.Context.Consumer == "peer_transport" {
 		if s.config.AuthorizeStream == nil || s.config.ServeStream == nil || descriptor.StreamPolicy == nil {
@@ -777,6 +796,58 @@ func (s *Service) serveRelay(setupCtx, lifetime context.Context, connection *rel
 		if !claimRelay() {
 			return false, context.Canceled
 		}
+		if activity == nil || activity.owner == nil {
+			return false, ErrInvalid
+		}
+		candidateID, candidateErr := candidatelease.NewID(initial.Binding[:], descriptor.IntentID, descriptor.AttemptGeneration, relayCandidatePath(connection.Carrier()))
+		if candidateErr != nil || activity.owner.Configure(candidateID, descriptor.AttemptGeneration) != nil {
+			return false, errors.Join(candidateErr, ErrInvalid)
+		}
+		// Candidate adoption belongs to the established physical transport. The
+		// setup deadline only bounds initial health admission; applying it here
+		// tears down an authenticated relay candidate while its client is still
+		// preparing the logical-stream transition.
+		control, _, controlErr := responder.AcceptCandidateControl(transportCtx, func(_ context.Context, payload []byte) ([]byte, error) {
+			message, parseErr := candidatelease.Parse(payload)
+			if parseErr != nil {
+				return nil, parseErr
+			}
+			ack, handleErr := activity.owner.Handle(message)
+			if handleErr != nil {
+				return nil, handleErr
+			}
+			return ack.Marshal()
+		})
+		if controlErr != nil {
+			return false, controlErr
+		}
+		defer control.Close()
+		if retainErr := activity.owner.Retained(); retainErr != nil {
+			return false, retainErr
+		}
+		controlDone := make(chan error, 1)
+		go func() {
+			for {
+				message, readErr := candidatelease.FrameReader(control)
+				if readErr != nil {
+					controlDone <- readErr
+					return
+				}
+				ack, handleErr := activity.owner.Handle(message)
+				if handleErr != nil {
+					controlDone <- handleErr
+					return
+				}
+				frame, frameErr := candidatelease.Frame(ack)
+				if frameErr == nil {
+					_, frameErr = control.Write(frame)
+				}
+				if frameErr != nil || message.Type == candidatelease.Release {
+					controlDone <- frameErr
+					return
+				}
+			}
+		}()
 		healthSource := relaycarrier.HealthResponderConfigSourceFunc(func(_ context.Context, handle [16]byte) (relaycarrier.ResponderConfig, error) {
 			periodicAuthority := healthAuthority
 			periodicAuthority.Handle = handle
@@ -784,15 +855,21 @@ func (s *Service) serveRelay(setupCtx, lifetime context.Context, connection *rel
 		})
 		applicationDone := make(chan error, 1)
 		healthDone := make(chan error, 1)
-		go func() { applicationDone <- s.serveRelayTransport(lifetime, responder, descriptor, activity) }()
-		go func() { healthDone <- connection.ServeHealth(lifetime, prefix, healthSource) }()
+		go func() { applicationDone <- s.serveRelayTransport(transportCtx, responder, descriptor, activity) }()
+		go func() { healthDone <- connection.ServeHealth(transportCtx, initial.Prefix, healthSource) }()
 		select {
 		case applicationErr := <-applicationDone:
+			slog.Info("peer retained relay transport ending", "intent_id", descriptor.IntentID, "attempt_generation", descriptor.AttemptGeneration, "path", relayCandidatePath(connection.Carrier()), "owner", "application", "error", applicationErr)
 			return true, applicationErr
 		case healthErr := <-healthDone:
+			slog.Info("peer retained relay transport ending", "intent_id", descriptor.IntentID, "attempt_generation", descriptor.AttemptGeneration, "path", relayCandidatePath(connection.Carrier()), "owner", "health", "error", healthErr)
 			return true, healthErr
-		case <-lifetime.Done():
-			return true, lifetime.Err()
+		case controlErr := <-controlDone:
+			slog.Info("peer retained relay transport ending", "intent_id", descriptor.IntentID, "attempt_generation", descriptor.AttemptGeneration, "path", relayCandidatePath(connection.Carrier()), "owner", "candidate_control", "error", controlErr)
+			return true, controlErr
+		case <-transportCtx.Done():
+			slog.Info("peer retained relay transport ending", "intent_id", descriptor.IntentID, "attempt_generation", descriptor.AttemptGeneration, "path", relayCandidatePath(connection.Carrier()), "owner", "lifetime", "error", transportCtx.Err())
+			return true, transportCtx.Err()
 		}
 	}
 	if authority.Context.Consumer == "file_transfer_key" {
@@ -823,7 +900,7 @@ func (s *Service) serveRelay(setupCtx, lifetime context.Context, connection *rel
 		previewDone := make(chan error, 1)
 		healthDone := make(chan error, 1)
 		go func() { previewDone <- s.config.ServePreview(lifetime, stream) }()
-		go func() { healthDone <- connection.ServeHealth(lifetime, prefix, healthSource) }()
+		go func() { healthDone <- connection.ServeHealth(lifetime, initial.Prefix, healthSource) }()
 		select {
 		case previewErr := <-previewDone:
 			return true, previewErr
@@ -850,7 +927,7 @@ func (s *Service) serveRelay(setupCtx, lifetime context.Context, connection *rel
 		codexDone := make(chan error, 1)
 		healthDone := make(chan error, 1)
 		go func() { codexDone <- s.config.ServeCodex(lifetime, stream) }()
-		go func() { healthDone <- connection.ServeHealth(lifetime, prefix, healthSource) }()
+		go func() { healthDone <- connection.ServeHealth(lifetime, initial.Prefix, healthSource) }()
 		select {
 		case codexErr := <-codexDone:
 			return true, codexErr
@@ -889,7 +966,7 @@ func (s *Service) serveRelay(setupCtx, lifetime context.Context, connection *rel
 		return relaycarrier.PeerResponderConfig(periodicAuthority, connection.Carrier(), "native-health", func(context.Context, []byte) ([]byte, error) { return nil, nil })
 	})
 	healthDone := make(chan error, 1)
-	go func() { healthDone <- connection.ServeHealth(lifetime, prefix, healthSource) }()
+	go func() { healthDone <- connection.ServeHealth(lifetime, initial.Prefix, healthSource) }()
 	for range 3 {
 		select {
 		case <-served:
@@ -900,6 +977,13 @@ func (s *Service) serveRelay(setupCtx, lifetime context.Context, connection *rel
 		}
 	}
 	return true, nil
+}
+
+func relayCandidatePath(carrier relaynoise.Carrier) string {
+	if carrier == relaynoise.CarrierWSS {
+		return "relay_wss"
+	}
+	return "relay_quic"
 }
 
 func (s *Service) logWSSStage(ctx context.Context, descriptor api.PeerAttemptDescriptor, stage string, started time.Time, err error) {
