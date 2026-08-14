@@ -12,7 +12,6 @@ import (
 var (
 	ErrPathSuspect           = errors.New("selected peer path health is suspect")
 	ErrActiveHealthExhausted = errors.New("active path health sequence exhausted")
-	errTwoPTOs               = errors.New("peer QUIC reached two PTOs since the last authenticated health exchange")
 	errActiveHealthRebind    = errors.New("active health monitor rebind requested")
 )
 
@@ -46,13 +45,7 @@ type ActiveHealthTransport interface {
 	HealthExchange(context.Context, [16]byte) (uint32, error)
 }
 
-type activeHealthPTOObserver interface {
-	PTOCount() uint32
-	PTOChanged() <-chan struct{}
-}
-
 type activeHealthConfidenceObserver interface {
-	PathSuspect()
 	PathTrusted()
 }
 
@@ -156,25 +149,13 @@ func (m *ActiveHealthMonitor) run(ctx context.Context, binding ActiveHealthBindi
 		if activeHealthRebindRequested(ctx) {
 			return errActiveHealthRebind
 		}
-		waitStarted := m.now()
-		ptos, err := m.waitForHeartbeat(ctx, transport, m.policy.HeartbeatInterval)
+		err := m.waitForHeartbeat(ctx, m.policy.HeartbeatInterval)
 		if err != nil {
 			if activeHealthRebindRequested(ctx) {
 				return errActiveHealthRebind
 			}
 			if ctx.Err() != nil {
 				return ctx.Err()
-			}
-			if errors.Is(err, errTwoPTOs) {
-				completed := m.now().Sub(waitStarted)
-				if completed <= 0 {
-					completed = time.Nanosecond
-				}
-				sample := ActiveHealthSample{Binding: binding, Sequence: sequence, At: m.now().UTC(), Completed: completed, PTOs: ptos, Succeeded: false}
-				if recordErr := m.recorder.RecordActiveHealth(sample); recordErr != nil {
-					return fmt.Errorf("record active health: %w", recordErr)
-				}
-				return fmt.Errorf("%w: %v", ErrPathSuspect, err)
 			}
 			return err
 		}
@@ -217,7 +198,7 @@ func (m *ActiveHealthMonitor) run(ctx context.Context, binding ActiveHealthBindi
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if !errors.Is(exchangeErr, errTwoPTOs) && !activeHealthAllowsFallback(exchangeErr) {
+		if !activeHealthAllowsFallback(exchangeErr) {
 			return exchangeErr
 		}
 		if err := m.recorder.RecordActiveHealth(sample); err != nil {
@@ -227,45 +208,14 @@ func (m *ActiveHealthMonitor) run(ctx context.Context, binding ActiveHealthBindi
 	}
 }
 
-type activeHealthExchangeResult struct {
-	ptos uint32
-	err  error
-}
-
 func monitorHealthExchange(ctx context.Context, transport ActiveHealthTransport, nonce [16]byte) (uint32, error) {
-	observer, ok := transport.(activeHealthPTOObserver)
-	if !ok || observer.PTOChanged() == nil {
-		return transport.HealthExchange(ctx, nonce)
-	}
-	baseline := observer.PTOCount()
-	done := make(chan activeHealthExchangeResult, 1)
-	go func() {
-		ptos, err := transport.HealthExchange(ctx, nonce)
-		done <- activeHealthExchangeResult{ptos: ptos, err: err}
-	}()
-	for {
-		select {
-		case result := <-done:
-			return result.ptos, result.err
-		case <-ctx.Done():
-			result := <-done
-			return result.ptos, result.err
-		case <-observer.PTOChanged():
-			current := observer.PTOCount()
-			if current < baseline {
-				return 0, ErrActiveHealthExhausted
-			}
-			if current-baseline >= 1 {
-				markPathSuspect(transport)
-			}
-			if current-baseline >= 2 {
-				return current - baseline, errTwoPTOs
-			}
-		}
-	}
+	// PTO counters belong to the entire QUIC connection, so application data
+	// can advance them while this probe is idle or in flight. Only the bounded,
+	// authenticated exchange can attribute reachability to this health check.
+	return transport.HealthExchange(ctx, nonce)
 }
 
-func (m *ActiveHealthMonitor) waitForHeartbeat(ctx context.Context, transport ActiveHealthTransport, duration time.Duration) (uint32, error) {
+func (m *ActiveHealthMonitor) waitForHeartbeat(ctx context.Context, duration time.Duration) error {
 	waitCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	if rebind := activeHealthRebindDone(ctx); rebind != nil {
@@ -277,42 +227,7 @@ func (m *ActiveHealthMonitor) waitForHeartbeat(ctx context.Context, transport Ac
 			}
 		}()
 	}
-	observer, ok := transport.(activeHealthPTOObserver)
-	if !ok || observer.PTOChanged() == nil {
-		return 0, m.wait(waitCtx, duration)
-	}
-	baseline := observer.PTOCount()
-	timer := time.NewTimer(duration)
-	defer timer.Stop()
-	for {
-		select {
-		case <-waitCtx.Done():
-			return 0, waitCtx.Err()
-		case <-timer.C:
-			current := observer.PTOCount()
-			if current < baseline {
-				return 0, ErrActiveHealthExhausted
-			}
-			return current - baseline, nil
-		case <-observer.PTOChanged():
-			current := observer.PTOCount()
-			if current < baseline {
-				return 0, ErrActiveHealthExhausted
-			}
-			if current-baseline >= 1 {
-				markPathSuspect(transport)
-			}
-			if current-baseline >= 2 {
-				return current - baseline, errTwoPTOs
-			}
-		}
-	}
-}
-
-func markPathSuspect(transport ActiveHealthTransport) {
-	if observer, ok := transport.(activeHealthConfidenceObserver); ok {
-		observer.PathSuspect()
-	}
+	return m.wait(waitCtx, duration)
 }
 
 func markPathTrusted(transport ActiveHealthTransport) {

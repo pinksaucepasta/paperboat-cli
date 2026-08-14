@@ -43,7 +43,10 @@ run_case() {
   printf '%q ' "$@" >"$meta_file"
   printf '\n' >>"$meta_file"
   start_ns="$(date +%s%N)"
-  timeout --foreground --signal=TERM --kill-after=5 "$TEST_TIMEOUT" setsid "$@" >"$stdout_file" 2>"$stderr_file"
+  # GNU timeout owns a process group unless --foreground is used. Keep the
+  # command and descendants in that group so timed-out SSH ProxyCommands do
+  # not retain daemon transport leases after their parent exits.
+  timeout --signal=TERM --kill-after=5 "$TEST_TIMEOUT" "$@" >"$stdout_file" 2>"$stderr_file"
   rc=$?
   end_ns="$(date +%s%N)"
   elapsed_ms=$(((end_ns - start_ns) / 1000000))
@@ -194,8 +197,13 @@ transition_case() {
 }
 
 snapshot before
-trap 'sudo /usr/local/sbin/paperboat-gate8-network allow-udp >/dev/null 2>&1 || true' EXIT INT TERM
-for required in pb jq timeout setsid flock script ssh scp sftp curl sudo python3 sha256sum; do
+cleanup_network() {
+  sudo /usr/local/sbin/paperboat-gate8-network allow-udp >/dev/null 2>&1 || true
+}
+trap cleanup_network EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+for required in pb jq timeout flock script ssh scp sftp curl sudo python3 sha256sum; do
   command -v "$required" >/dev/null || { printf 'missing required command: %s\n' "$required" >&2; exit 2; }
 done
 test -r "$TERMINAL_READY" || { printf 'missing terminal fixture: %s\n' "$TERMINAL_READY" >&2; exit 2; }

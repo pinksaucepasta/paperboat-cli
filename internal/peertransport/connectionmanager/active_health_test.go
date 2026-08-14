@@ -19,19 +19,12 @@ type activeHealthPTOTransport struct {
 	activeHealthTransport
 	total    atomic.Uint32
 	changed  chan struct{}
-	read     chan struct{}
 	exchange activeHealthTransportFunc
 	suspect  atomic.Uint32
 	trusted  atomic.Uint32
 }
 
 func (t *activeHealthPTOTransport) PTOCount() uint32 {
-	if t.read != nil {
-		select {
-		case t.read <- struct{}{}:
-		default:
-		}
-	}
 	return t.total.Load()
 }
 func (t *activeHealthPTOTransport) PTOChanged() <-chan struct{} { return t.changed }
@@ -159,63 +152,76 @@ func TestDevelopmentActiveHealthPolicyMatchesMagicsockTrustWindow(t *testing.T) 
 	}
 }
 
-func TestActiveHealthMonitorFailsBeforeHeartbeatAfterTwoQUICPTOs(t *testing.T) {
+func TestActiveHealthMonitorDoesNotAttributeApplicationPTOsBeforeHeartbeat(t *testing.T) {
 	recorder := &activeHealthRecorder{}
 	monitor, _ := NewActiveHealthMonitor(DevelopmentActiveHealthPolicy(), recorder)
-	transport := &activeHealthPTOTransport{changed: make(chan struct{}, 1), read: make(chan struct{}, 1)}
-	done := make(chan error, 1)
-	go func() {
-		done <- monitor.Run(context.Background(), ActiveHealthBinding{Path: PathDirectQUIC, Generation: 1, NetworkGeneration: 1}, transport)
-	}()
-	<-transport.read
-	transport.total.Store(2)
-	transport.changed <- struct{}{}
-	select {
-	case err := <-done:
-		if !errors.Is(err, ErrPathSuspect) {
-			t.Fatalf("error=%v", err)
+	monitor.random = bytes.NewReader(make([]byte, 16))
+	ctx, cancel := context.WithCancel(context.Background())
+	waits := 0
+	transport := &activeHealthPTOTransport{changed: make(chan struct{}, 1)}
+	monitor.wait = func(context.Context, time.Duration) error {
+		waits++
+		if waits == 1 {
+			transport.total.Store(2)
+			transport.changed <- struct{}{}
+			return nil
 		}
-	case <-time.After(time.Second):
-		t.Fatal("two PTOs waited for the heartbeat deadline")
+		cancel()
+		return context.Canceled
 	}
-	if len(recorder.samples) != 1 || recorder.samples[0].Succeeded || recorder.samples[0].PTOs != 2 {
+	if err := monitor.Run(ctx, ActiveHealthBinding{Path: PathDirectQUIC, Generation: 1, NetworkGeneration: 1}, transport); !errors.Is(err, context.Canceled) {
+		t.Fatalf("error=%v", err)
+	}
+	if len(recorder.samples) != 1 || !recorder.samples[0].Succeeded {
 		t.Fatalf("samples=%+v", recorder.samples)
 	}
-	if transport.suspect.Load() == 0 {
-		t.Fatal("first PTO did not mark the path suspect")
+	if transport.suspect.Load() != 0 || transport.trusted.Load() != 1 {
+		t.Fatalf("suspect=%d trusted=%d", transport.suspect.Load(), transport.trusted.Load())
 	}
 }
 
-func TestActiveHealthMonitorFailsDuringExchangeAfterTwoQUICPTOs(t *testing.T) {
+func TestActiveHealthMonitorDoesNotAttributeApplicationPTOsDuringExchange(t *testing.T) {
 	recorder := &activeHealthRecorder{}
 	monitor, _ := NewActiveHealthMonitor(DevelopmentActiveHealthPolicy(), recorder)
-	monitor.wait = func(context.Context, time.Duration) error { return nil }
+	monitor.random = bytes.NewReader(make([]byte, 16))
+	ctx, cancel := context.WithCancel(context.Background())
+	waits := 0
+	monitor.wait = func(context.Context, time.Duration) error {
+		waits++
+		if waits == 2 {
+			cancel()
+			return context.Canceled
+		}
+		return nil
+	}
 	started := make(chan struct{})
-	transport := &activeHealthPTOTransport{changed: make(chan struct{}, 1), exchange: func(ctx context.Context, _ [16]byte) (uint32, error) {
+	finish := make(chan struct{})
+	transport := &activeHealthPTOTransport{changed: make(chan struct{}, 1), exchange: func(context.Context, [16]byte) (uint32, error) {
 		close(started)
-		<-ctx.Done()
-		return 0, ctx.Err()
+		<-finish
+		return 2, nil
 	}}
 	done := make(chan error, 1)
 	go func() {
-		done <- monitor.Run(context.Background(), ActiveHealthBinding{Path: PathDirectQUIC, Generation: 1, NetworkGeneration: 1}, transport)
+		done <- monitor.Run(ctx, ActiveHealthBinding{Path: PathDirectQUIC, Generation: 1, NetworkGeneration: 1}, transport)
 	}()
 	<-started
 	transport.total.Store(2)
 	transport.changed <- struct{}{}
 	select {
 	case err := <-done:
-		if !errors.Is(err, ErrPathSuspect) {
-			t.Fatalf("error=%v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("two PTOs waited for the exchange deadline")
+		t.Fatalf("application PTOs stopped authenticated exchange: %v", err)
+	case <-time.After(20 * time.Millisecond):
 	}
-	if len(recorder.samples) != 1 || recorder.samples[0].Succeeded || recorder.samples[0].PTOs != 2 {
+	close(finish)
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("error=%v", err)
+	}
+	if len(recorder.samples) != 1 || !recorder.samples[0].Succeeded || recorder.samples[0].PTOs != 2 {
 		t.Fatalf("samples=%+v", recorder.samples)
 	}
-	if transport.suspect.Load() == 0 {
-		t.Fatal("in-flight PTO did not mark the path suspect")
+	if transport.suspect.Load() != 0 || transport.trusted.Load() != 1 {
+		t.Fatalf("suspect=%d trusted=%d", transport.suspect.Load(), transport.trusted.Load())
 	}
 }
 
