@@ -1460,8 +1460,15 @@ func (t *PeerTerminalTunnel) dialRelayQUIC(ctx, lifetime context.Context, target
 	if maximumDeadline <= 0 {
 		return nil, ErrPeerTerminalInvalid
 	}
+	carrierLifetime, cancelCarrier := retainedRelayCarrierLifetime(lifetime, descriptor.Document.Purpose == "peer_transport")
+	carrierLifetimeOwned := false
+	defer func() {
+		if cancelCarrier != nil && !carrierLifetimeOwned {
+			cancelCarrier()
+		}
+	}()
 	initialPacketSize := t.relayPacketSize(lifetime, descriptor, fingerprint)
-	connection, err := relaycarrier.DialQUIC(ctx, relaycarrier.QUICDialConfig{URL: descriptor.RelayQUICURL, Credential: descriptor.RelayCredential, EndpointID: authority.LocalEndpointID(), Role: "initiator", StreamHandle: authority.RouteHandle, TLS: t.config.TLS.Clone(), Lifetime: lifetime, MaximumDeadline: maximumDeadline, Carrier: relaycarrier.DevelopmentConfig(), InitialPacketSize: initialPacketSize})
+	connection, err := relaycarrier.DialQUIC(ctx, relaycarrier.QUICDialConfig{URL: descriptor.RelayQUICURL, Credential: descriptor.RelayCredential, EndpointID: authority.LocalEndpointID(), Role: "initiator", StreamHandle: authority.RouteHandle, TLS: t.config.TLS.Clone(), Lifetime: carrierLifetime, MaximumDeadline: maximumDeadline, Carrier: relaycarrier.DevelopmentConfig(), InitialPacketSize: initialPacketSize})
 	if err != nil {
 		diagnosticlog.TryInfo("peer relay candidate admission stage", "intent_id", descriptor.IntentID, "attempt_generation", descriptor.AttemptGeneration, "stage", "carrier_dialed", "error", err)
 		return nil, err
@@ -1544,6 +1551,8 @@ func (t *PeerTerminalTunnel) dialRelayQUIC(ctx, lifetime context.Context, target
 			diagnosticlog.TryInfo("peer relay candidate admission stage", "intent_id", descriptor.IntentID, "attempt_generation", descriptor.AttemptGeneration, "stage", "candidate_adopted", "error", err)
 			return nil, errors.Join(err, candidate.health.Close())
 		}
+		candidate.bindRetainedCarrierLifetime(lifetime, carrierLifetime, cancelCarrier)
+		carrierLifetimeOwned = true
 		diagnosticlog.TryInfo("peer relay candidate admission stage", "intent_id", descriptor.IntentID, "attempt_generation", descriptor.AttemptGeneration, "stage", "candidate_adopted", "error", nil)
 	}
 	return candidate, nil
@@ -1822,6 +1831,7 @@ type terminalPathCandidate struct {
 	leaseID         candidatelease.ID
 	leaseGeneration uint64
 	releaseLease    func(context.Context) error
+	cancelCarrier   context.CancelFunc
 	releaseOnce     sync.Once
 	releaseErr      error
 }
@@ -2620,8 +2630,35 @@ func (c *terminalPathCandidate) closePhysical() error {
 			cancel()
 		}
 		c.releaseErr = errors.Join(c.releaseErr, c.health.Close())
+		if c.cancelCarrier != nil {
+			c.cancelCarrier()
+		}
 	})
 	return c.releaseErr
+}
+
+func retainedRelayCarrierLifetime(parent context.Context, retained bool) (context.Context, context.CancelFunc) {
+	if !retained {
+		return parent, nil
+	}
+	return context.WithCancel(context.Background())
+}
+
+// Retained relay candidates use an end-to-end lease over a separate relay
+// connection on each peer. Keep the local carrier alive while logical stream
+// references drain so candidate_release can reach and close the host carrier.
+func (c *terminalPathCandidate) bindRetainedCarrierLifetime(parent, carrier context.Context, cancel context.CancelFunc) {
+	if c == nil || parent == nil || carrier == nil || cancel == nil {
+		return
+	}
+	c.cancelCarrier = cancel
+	go func() {
+		select {
+		case <-parent.Done():
+			_ = c.Close()
+		case <-carrier.Done():
+		}
+	}()
 }
 
 func (c *terminalPathCandidate) Attach(ctx context.Context, attachment terminalAttachment) (Conn, error) {
@@ -3362,7 +3399,14 @@ func (t *PeerTerminalTunnel) dialWSS(ctx, lifetime context.Context, target *reso
 	if maximumDeadline <= 0 {
 		return nil, ErrPeerTerminalInvalid
 	}
-	connection, err := relaycarrier.DialWSS(ctx, relaycarrier.WSSDialConfig{URL: descriptor.RelayWSSURL, Credential: descriptor.RelayCredential, StreamHandle: authority.RouteHandle, EndpointID: authority.LocalEndpointID(), Role: "initiator", RelayID: descriptor.RelayRegion, TLS: t.config.TLS.Clone(), HTTPClient: t.config.HTTPClient, Lifetime: lifetime, MaximumDeadline: maximumDeadline, Carrier: relaycarrier.DevelopmentConfig()})
+	carrierLifetime, cancelCarrier := retainedRelayCarrierLifetime(lifetime, descriptor.Document.Purpose == "peer_transport")
+	carrierLifetimeOwned := false
+	defer func() {
+		if cancelCarrier != nil && !carrierLifetimeOwned {
+			cancelCarrier()
+		}
+	}()
+	connection, err := relaycarrier.DialWSS(ctx, relaycarrier.WSSDialConfig{URL: descriptor.RelayWSSURL, Credential: descriptor.RelayCredential, StreamHandle: authority.RouteHandle, EndpointID: authority.LocalEndpointID(), Role: "initiator", RelayID: descriptor.RelayRegion, TLS: t.config.TLS.Clone(), HTTPClient: t.config.HTTPClient, Lifetime: carrierLifetime, MaximumDeadline: maximumDeadline, Carrier: relaycarrier.DevelopmentConfig()})
 	if err != nil {
 		if certificateError(err) {
 			return nil, fmt.Errorf("verify peer WSS relay certificate: %w", err)
@@ -3442,8 +3486,12 @@ func (t *PeerTerminalTunnel) dialWSS(ctx, lifetime context.Context, target *reso
 	}
 	if descriptor.Document.Purpose != "peer_transport" {
 		candidate.expiresAt, candidate.now = descriptor.ExpiresAt, t.config.Now
-	} else if err := adoptRelayCandidate(ctx, candidate, health, initiator, descriptor, "relay_wss"); err != nil {
-		return nil, errors.Join(err, candidate.health.Close())
+	} else {
+		if err := adoptRelayCandidate(ctx, candidate, health, initiator, descriptor, "relay_wss"); err != nil {
+			return nil, errors.Join(err, candidate.health.Close())
+		}
+		candidate.bindRetainedCarrierLifetime(lifetime, carrierLifetime, cancelCarrier)
+		carrierLifetimeOwned = true
 	}
 	return candidate, nil
 }

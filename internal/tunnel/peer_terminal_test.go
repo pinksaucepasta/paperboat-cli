@@ -13,6 +13,7 @@ import (
 	"net/netip"
 	"os"
 	"reflect"
+	"runtime"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -906,6 +907,63 @@ func TestCoordinatorSourceReleaseDoesNotWaitForPhysicalCleanup(t *testing.T) {
 		t.Fatal("physical cleanup did not start")
 	}
 	close(release)
+}
+
+func TestRetainedRelayLifetimeReleasesLeaseBeforeCarrierCancellation(t *testing.T) {
+	parent, cancelParent := context.WithCancel(context.Background())
+	carrier, cancelCarrier := context.WithCancel(context.Background())
+	health := &candidateHealth{}
+	released := make(chan struct{})
+	var releasedAfterCancel atomic.Bool
+	candidate := &terminalPathCandidate{health: health, streams: make(map[*resumablestream.Conn]*streamCoordinator), sourceRefs: 1}
+	candidate.releaseLease = func(context.Context) error {
+		select {
+		case <-carrier.Done():
+			releasedAfterCancel.Store(true)
+		default:
+		}
+		close(released)
+		return nil
+	}
+	candidate.bindRetainedCarrierLifetime(parent, carrier, cancelCarrier)
+
+	cancelParent()
+	deadline := time.Now().Add(time.Second)
+	for {
+		candidate.mu.Lock()
+		pending := candidate.closePending
+		candidate.mu.Unlock()
+		if pending {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("parent cancellation did not begin candidate close")
+		}
+		runtime.Gosched()
+	}
+	select {
+	case <-carrier.Done():
+		t.Fatal("carrier canceled while logical source remained attached")
+	default:
+	}
+
+	candidate.releaseSource()
+	select {
+	case <-released:
+	case <-time.After(time.Second):
+		t.Fatal("lease release did not run after source drained")
+	}
+	if releasedAfterCancel.Load() {
+		t.Fatal("carrier canceled before lease release")
+	}
+	select {
+	case <-carrier.Done():
+	case <-time.After(time.Second):
+		t.Fatal("carrier lifetime was not canceled after lease release")
+	}
+	if !health.closed.Load() {
+		t.Fatal("carrier health was not closed")
+	}
 }
 
 func TestCoordinatorReconcilesNewSnapshotAfterPreferredOpenFails(t *testing.T) {
