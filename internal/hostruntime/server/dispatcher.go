@@ -647,9 +647,16 @@ func (d *Dispatcher) terminal(ctx context.Context, authorization Authorization, 
 		return domainResult(value, err)
 	case "close":
 		value, err := d.config.Sessions.Close(ctx, request.SessionID)
+		if errors.Is(err, session.ErrSessionUnknown) {
+			return result(session.Snapshot{ID: request.SessionID, State: session.Closed})
+		}
 		return domainResult(value, err)
 	case "delete":
-		return domainResult(struct{}{}, d.config.Sessions.Delete(request.SessionID))
+		err := d.config.Sessions.Delete(request.SessionID)
+		if errors.Is(err, session.ErrSessionUnknown) {
+			return result(struct{}{})
+		}
+		return domainResult(struct{}{}, err)
 	default:
 		return failure("invalid_request")
 	}

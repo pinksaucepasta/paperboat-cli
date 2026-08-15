@@ -74,6 +74,7 @@ type Manager struct {
 type managedSession struct {
 	opMu          sync.Mutex
 	inputMu       sync.Mutex
+	persistMu     sync.Mutex
 	liveProcess   atomic.Pointer[liveProcess]
 	id            string
 	name          string
@@ -677,9 +678,7 @@ func (m *Manager) Delete(sessionID string) (resultErr error) {
 			return
 		}
 		result := "removed"
-		if errors.Is(resultErr, ErrSessionRunning) {
-			result = "preserved"
-		} else if resultErr != nil {
+		if resultErr != nil {
 			result = "failed"
 		}
 		_ = m.config.Metrics.Record("paperboat_runtime_cleanup_total", 1, map[string]string{"kind": "session", "result": result})
@@ -689,8 +688,20 @@ func (m *Manager) Delete(sessionID string) (resultErr error) {
 		return err
 	}
 	session.opMu.Lock()
-	defer session.opMu.Unlock()
 	state, _ := session.lifecycle.Snapshot()
+	session.opMu.Unlock()
+	if state != Exited && state != Closed {
+		if _, err := m.Close(context.Background(), sessionID); err != nil {
+			return err
+		}
+	}
+	session, err = m.get(sessionID)
+	if err != nil {
+		return err
+	}
+	session.opMu.Lock()
+	defer session.opMu.Unlock()
+	state, _ = session.lifecycle.Snapshot()
 	if state != Exited && state != Closed {
 		return ErrSessionRunning
 	}
@@ -864,6 +875,8 @@ func (m *Manager) startOutputPersistence(session *managedSession) {
 	if m.config.Store == nil {
 		return
 	}
+	session.persistMu.Lock()
+	defer session.persistMu.Unlock()
 	session.persistNotify = make(chan struct{}, 1)
 	session.persistStop = make(chan struct{})
 	session.persistDone = make(chan error, 1)
@@ -872,6 +885,8 @@ func (m *Manager) startOutputPersistence(session *managedSession) {
 }
 
 func (m *Manager) queueOutputPersistence(session *managedSession, event history.Event) {
+	session.persistMu.Lock()
+	defer session.persistMu.Unlock()
 	if session.persistNotify == nil {
 		return
 	}
@@ -882,6 +897,8 @@ func (m *Manager) queueOutputPersistence(session *managedSession, event history.
 }
 
 func (m *Manager) stopOutputPersistence(session *managedSession) error {
+	session.persistMu.Lock()
+	defer session.persistMu.Unlock()
 	if session.persistStop == nil {
 		return nil
 	}

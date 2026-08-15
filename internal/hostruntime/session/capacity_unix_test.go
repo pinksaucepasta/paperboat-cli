@@ -7,12 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/pty"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/store"
 )
 
 type capacityProcess struct {
@@ -116,5 +118,63 @@ func TestConfiguredSessionCapacityRemainsBoundedAndShutsDownCleanly(t *testing.T
 	}
 	if launched.Load() != maxSessions {
 		t.Fatalf("launched=%d", launched.Load())
+	}
+}
+
+func TestDeleteRunningSessionTerminatesAndReleasesCapacity(t *testing.T) {
+	var exited atomic.Int32
+	manager, err := NewManager(ManagerConfig{
+		Launch: func(pty.Command) (PTYProcess, error) {
+			return &capacityProcess{done: make(chan struct{}), exited: &exited}, nil
+		},
+		MaxSessions: 1, MaxAttachments: 1, MaxInputDecisions: 1,
+		HistoryBytes: 1024, AttachmentBytes: 1024,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := manager.Create(context.Background(), CreateRequest{Name: "running", Command: pty.Command{Path: "/bin/sh", CWD: "/tmp", Dimensions: pty.Dimensions{Columns: 80, Rows: 24}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Delete(created.ID); err != nil {
+		t.Fatal(err)
+	}
+	if exited.Load() != 1 || manager.ResourceCounts()["sessions"] != 0 {
+		t.Fatalf("exited=%d resources=%v", exited.Load(), manager.ResourceCounts())
+	}
+	if _, err := manager.Create(context.Background(), CreateRequest{Name: "replacement", Command: pty.Command{Path: "/bin/sh", CWD: "/tmp", Dimensions: pty.Dimensions{Columns: 80, Rows: 24}}}); err != nil {
+		t.Fatalf("replacement create: %v", err)
+	}
+}
+
+func TestDeleteRunningSessionPurgesPersistentState(t *testing.T) {
+	state, err := store.Open(context.Background(), store.Config{Root: filepath.Join(t.TempDir(), "state")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	var exited atomic.Int32
+	manager, err := NewManager(ManagerConfig{
+		Store: state,
+		Launch: func(pty.Command) (PTYProcess, error) {
+			return &capacityProcess{done: make(chan struct{}), exited: &exited}, nil
+		},
+		MaxSessions: 20, MaxAttachments: 1, MaxInputDecisions: 1,
+		HistoryBytes: 1024, AttachmentBytes: 1024,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := manager.Create(context.Background(), CreateRequest{Name: "persistent", Command: pty.Command{Path: "/bin/sh", CWD: "/tmp", Dimensions: pty.Dimensions{Columns: 80, Rows: 24}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Delete(created.ID); err != nil {
+		t.Fatal(err)
+	}
+	records, err := state.Sessions(context.Background())
+	if err != nil || len(records) != 0 {
+		t.Fatalf("persistent sessions=%v err=%v", records, err)
 	}
 }

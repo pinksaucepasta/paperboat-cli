@@ -135,6 +135,24 @@ func TestExecDispatcherStreamsInputStdoutStderrAndExactExit(t *testing.T) {
 	}
 }
 
+func TestTerminalCleanupIsIdempotentWhenSessionIsAlreadyAbsent(t *testing.T) {
+	dispatcher, _ := execDispatcher(t)
+	authorization := Authorization{ClientID: "cli_1"}
+	for _, action := range []string{"close", "delete"} {
+		payload, _ := json.Marshal(map[string]any{"action": action, "session_id": "ses_absent"})
+		outcome := dispatcher.Handle(context.Background(), authorization, "terminal.v1", payload)
+		if outcome.ErrorCode != "" {
+			t.Fatalf("%s outcome=%#v", action, outcome)
+		}
+		if action == "close" {
+			var snapshot session.Snapshot
+			if err := json.Unmarshal(outcome.Result, &snapshot); err != nil || snapshot.ID != "ses_absent" || snapshot.State != session.Closed {
+				t.Fatalf("close result=%s snapshot=%#v err=%v", outcome.Result, snapshot, err)
+			}
+		}
+	}
+}
+
 func TestExecDispatcherLiveStreamExceedsReplayBudgetWithoutGap(t *testing.T) {
 	dispatcher, root := execDispatcher(t)
 	authorization := Authorization{ClientID: "cli_1"}

@@ -4164,8 +4164,8 @@ func sessionsCobraCommand() *cobra.Command {
 			entry.Flags().Bool("yes", false, "confirm "+child.Name)
 			entry.Flags().Bool("json", false, "print JSON")
 		}
-		if child.Name == "close" {
-			entry.Flags().Bool("all", false, "close all sessions in the environment")
+		if child.Name == "close" || child.Name == "delete" {
+			entry.Flags().Bool("all", false, child.Name+" all sessions in the environment")
 		}
 		command.AddCommand(entry)
 	}
@@ -4252,8 +4252,8 @@ func sessionCobraCommand() *cobra.Command {
 			entry.Flags().Bool("yes", false, "confirm "+child.Name)
 			entry.Flags().Bool("json", false, "print JSON")
 		}
-		if child.Name == "close" {
-			entry.Flags().Bool("all", false, "close all sessions in the environment")
+		if child.Name == "close" || child.Name == "delete" {
+			entry.Flags().Bool("all", false, child.Name+" all sessions in the environment")
 		}
 		command.AddCommand(entry)
 	}
@@ -7035,9 +7035,10 @@ func sessionsCommand() *command.Spec {
 			}
 			return nil
 		}, Flags: []command.Flag{&command.BoolFlag{Name: "yes", Usage: "confirm close"}, &command.BoolFlag{Name: "all", Usage: "close all sessions in the environment"}, &command.BoolFlag{Name: "json", Usage: "emit JSON"}}},
-		{Name: "delete", ArgsUsage: "<environment> [<session>]", Usage: "Delete a closed terminal session and its history", Flags: []command.Flag{&command.BoolFlag{Name: "yes", Usage: "confirm deletion"}, &command.BoolFlag{Name: "json", Usage: "emit JSON"}}, Action: func(c *command.Context) error {
-			if c.Args().Len() < 1 || c.Args().Len() > 2 {
-				return errors.New("usage: pb sessions delete <environment> [<session>] [--yes]")
+		{Name: "delete", ArgsUsage: "<environment> [<session>]", Usage: "Delete a terminal session and its history", Flags: []command.Flag{&command.BoolFlag{Name: "yes", Usage: "confirm deletion"}, &command.BoolFlag{Name: "all", Usage: "delete all non-default sessions in the environment"}, &command.BoolFlag{Name: "json", Usage: "emit JSON"}}, Action: func(c *command.Context) error {
+			all := c.Bool("all")
+			if c.Args().Len() < 1 || c.Args().Len() > 2 || all && c.Args().Len() != 1 {
+				return errors.New("usage: pb session delete <environment> <session> --yes OR pb session delete <environment> --all --yes")
 			}
 			client, err := backendClient(c)
 			if err != nil {
@@ -7047,13 +7048,42 @@ func sessionsCommand() *command.Spec {
 			if err != nil {
 				return err
 			}
+			if all {
+				sessions, err := listTerminalSessionsForTarget(c.Context, client, target)
+				if err != nil {
+					return friendlyCommandError(err)
+				}
+				selected := slices.DeleteFunc(sessions, func(item api.TerminalSession) bool { return item.IsDefault })
+				fmt.Fprintf(c.ErrWriter, "Environment: %s (%s)\n", target.name, target.id)
+				fmt.Fprintf(c.ErrWriter, "Non-default sessions to delete: %d\n", len(selected))
+				if !c.Bool("yes") {
+					return errors.New("session deletion requires --yes")
+				}
+				var deleteErrors []error
+				deleted := 0
+				for _, session := range selected {
+					if err := deleteTerminalSessionForTarget(c.Context, client, target, session.ID); err != nil {
+						deleteErrors = append(deleteErrors, fmt.Errorf("delete session %s: %w", session.Name, err))
+						continue
+					}
+					deleted++
+				}
+				if len(deleteErrors) > 0 {
+					return fmt.Errorf("deleted %d of %d sessions in %s; remote state changed: %w", deleted, len(selected), target.name, errors.Join(deleteErrors...))
+				}
+				if c.Bool("json") {
+					return json.NewEncoder(c.Writer).Encode(map[string]any{"version": "1", "environment": map[string]string{"id": target.id, "kind": target.kind, "display_name": target.name}, "deleted": deleted})
+				}
+				fmt.Fprintf(c.Writer, "Deleted %d sessions and their history in %s.\n", deleted, target.name)
+				return nil
+			}
 			var session api.TerminalSession
 			if c.Args().Len() == 1 {
 				sessions, listErr := listTerminalSessionsForTarget(c.Context, client, target)
 				if listErr != nil {
 					return friendlyCommandError(listErr)
 				}
-				session, err = selectSession(target, slices.DeleteFunc(sessions, func(item api.TerminalSession) bool { return item.State != "closed" || item.IsDefault }), "Choose a session to delete")
+				session, err = selectSession(target, slices.DeleteFunc(sessions, func(item api.TerminalSession) bool { return item.IsDefault }), "Choose a session to delete")
 			} else {
 				session, err = resolveTerminalSession(c.Context, client, target, c.Args().Get(1))
 			}

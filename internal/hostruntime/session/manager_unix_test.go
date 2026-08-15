@@ -265,12 +265,6 @@ func TestManagerClearRestartCloseAndDeleteRemainDistinct(t *testing.T) {
 	if err != nil || restarted.ID != created.ID || restarted.Generation != created.Generation+1 || restarted.State != Running {
 		t.Fatalf("restarted=%#v err=%v", restarted, err)
 	}
-	if err := manager.Delete(created.ID); !errors.Is(err, ErrSessionRunning) {
-		t.Fatalf("delete running err=%v", err)
-	}
-	if _, err := manager.Close(context.Background(), created.ID); err != nil {
-		t.Fatal(err)
-	}
 	if err := manager.Delete(created.ID); err != nil {
 		t.Fatal(err)
 	}

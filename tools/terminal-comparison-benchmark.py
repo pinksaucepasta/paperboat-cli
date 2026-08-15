@@ -45,6 +45,10 @@ def cells() -> list[Cell]:
     return result
 
 
+def session_delete_command(pb: str, target: str, session_name: str) -> list[str]:
+    return [pb, "session", "delete", target, session_name, "--yes"]
+
+
 def percentile(values: list[float], percent: int) -> float:
     if not values:
         return 0.0
@@ -225,15 +229,27 @@ class Runner:
             True,
         )
 
-    def delete_session(self, session_name: str) -> None:
-        subprocess.run(
-            [self.args.pb, "session", "delete", self.args.target, session_name, "--yes"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=15,
-            check=False,
-        )
+    def cleanup_session(self, session_name: str) -> None:
+        command = session_delete_command(self.args.pb, self.args.target, session_name)
+        try:
+            completed = subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=30,
+                check=False,
+                text=True,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError(f"session delete timed out for {session_name}") from error
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout).strip()
+            if len(detail) > 500:
+                detail = detail[:500] + "..."
+            raise RuntimeError(
+                f"session delete failed for {session_name}: exit={completed.returncode} output={detail!r}"
+            )
 
     def open_ready(self, cell: Cell, run: int, workload: str) -> tuple[PTYSession, str, float]:
         session_name = f"bench-{workload}-{cell.name}-{run}-{time.time_ns()}"
@@ -274,17 +290,20 @@ class Runner:
                 raise RuntimeError("readiness probe was not sent")
             terminal.pending.clear()
             return terminal, session_name, (ready_at - started) * 1000
-        except Exception:
+        except BaseException as error:
             terminal.close()
             if native:
-                self.delete_session(session_name)
+                try:
+                    self.cleanup_session(session_name)
+                except Exception as cleanup_error:
+                    raise cleanup_error from error
             raise
 
     def finish(self, terminal: PTYSession, session_name: str) -> None:
         native = terminal.native
         terminal.close()
         if native:
-            self.delete_session(session_name)
+            self.cleanup_session(session_name)
 
     def startup(self, cell: Cell, run: int) -> dict:
         terminal, session_name, startup_ms = self.open_ready(cell, run, "startup")
@@ -477,6 +496,9 @@ def self_test() -> None:
     assert percentile([4, 1, 3, 2], 50) == 2
     assert percentile([4, 1, 3, 2], 95) == 4
     assert len(cells()) == 10
+    assert session_delete_command("/pb", "machine", "bench-1") == [
+        "/pb", "session", "delete", "machine", "bench-1", "--yes",
+    ]
     for kind in ("compressible", "entropy"):
         value = payload(kind, 5, 80)
         assert len(value) == 400
@@ -491,11 +513,16 @@ def emit(value: dict) -> None:
     print(json.dumps(value, separators=(",", ":")), flush=True)
 
 
+def interrupt(_signum: int, _frame: object) -> None:
+    raise KeyboardInterrupt
+
+
 def main() -> int:
     args = parse_args()
     if args.self_test:
         self_test()
         return 0
+    signal.signal(signal.SIGTERM, interrupt)
     if min(args.startup_runs, args.cmatrix_runs, args.input_runs, args.bulk_runs, args.input_samples, args.bulk_records, args.bulk_width) < 1:
         raise SystemExit("run and sample counts must be positive")
     selected = cells()

@@ -1414,6 +1414,91 @@ func TestSessionsCloseAllClosesEveryOpenSessionAndRetainsHistory(t *testing.T) {
 	}
 }
 
+func TestSessionDeleteAllRequiresConfirmationAndRejectsSessionArgument(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	mutated := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/projects":
+			writeAPIData(t, w, map[string]any{"items": []map[string]any{{"id": "prj_1", "name": "demo", "state": "ready"}}, "pagination": map[string]any{"next_offset": nil}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/projects/prj_1/terminal-sessions":
+			writeAPIData(t, w, map[string]any{"items": []map[string]any{{"id": "ses_1", "name": "default", "state": "open", "is_default": true}, {"id": "ses_2", "name": "work", "state": "open"}}, "pagination": map[string]any{"next_offset": nil}})
+		default:
+			mutated = true
+			t.Fatalf("unexpected request before confirmation: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+	writeTestProfile(t, dir, configPath, srv.URL)
+
+	var output bytes.Buffer
+	if code := run(context.Background(), []string{"--config", configPath, "session", "delete", "demo", "--all"}, &output, &output); code != 1 || mutated || !strings.Contains(output.String(), "Non-default sessions to delete: 1") || !strings.Contains(output.String(), "requires --yes") {
+		t.Fatalf("code=%d mutated=%t output=%q", code, mutated, output.String())
+	}
+
+	root := newRootCommand()
+	root.SetArgs([]string{"session", "delete", "um_1", "shell-2", "--all", "--yes"})
+	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), "usage: pb session delete") {
+		t.Fatalf("err=%v, want mutually exclusive usage error", err)
+	}
+}
+
+func TestSessionDeleteAllDeletesOpenAndClosedNonDefaultSessions(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	var deleted []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/projects":
+			writeAPIData(t, w, map[string]any{"items": []map[string]any{{"id": "prj_1", "name": "demo", "state": "ready"}}, "pagination": map[string]any{"next_offset": nil}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/projects/prj_1/terminal-sessions":
+			writeAPIData(t, w, map[string]any{"items": []map[string]any{{"id": "ses_1", "name": "default", "state": "open", "is_default": true}, {"id": "ses_2", "name": "work", "state": "open"}, {"id": "ses_3", "name": "old", "state": "closed"}}, "pagination": map[string]any{"next_offset": nil}})
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/v1/projects/prj_1/terminal-sessions/"):
+			deleted = append(deleted, r.URL.Path)
+			writeAPIData(t, w, map[string]any{})
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer srv.Close()
+	writeTestProfile(t, dir, configPath, srv.URL)
+
+	var output bytes.Buffer
+	if code := run(context.Background(), []string{"--config", configPath, "sessions", "delete", "demo", "--all", "--yes", "--json"}, &output, &output); code != 0 {
+		t.Fatalf("code=%d output=%q", code, output.String())
+	}
+	if len(deleted) != 2 || !strings.HasSuffix(deleted[0], "/ses_2") || !strings.HasSuffix(deleted[1], "/ses_3") || !strings.Contains(output.String(), `"deleted":2`) {
+		t.Fatalf("deleted=%v output=%q", deleted, output.String())
+	}
+}
+
+func TestSessionDeleteOpenSessionSendsDelete(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	deleted := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/projects":
+			writeAPIData(t, w, map[string]any{"items": []map[string]any{{"id": "prj_1", "name": "demo", "state": "ready"}}, "pagination": map[string]any{"next_offset": nil}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/projects/prj_1/terminal-sessions":
+			writeAPIData(t, w, map[string]any{"items": []map[string]any{{"id": "ses_2", "name": "work", "state": "open"}}, "pagination": map[string]any{"next_offset": nil}})
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/projects/prj_1/terminal-sessions/ses_2":
+			deleted = true
+			writeAPIData(t, w, map[string]any{})
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer srv.Close()
+	writeTestProfile(t, dir, configPath, srv.URL)
+
+	var output bytes.Buffer
+	if code := run(context.Background(), []string{"--config", configPath, "session", "delete", "demo", "work", "--yes", "--json"}, &output, &output); code != 0 || !deleted || !strings.Contains(output.String(), `"deleted":true`) {
+		t.Fatalf("code=%d deleted=%t output=%q", code, deleted, output.String())
+	}
+}
+
 func TestPreviewsListsAndPurgesOnlySelectedEnvironment(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.json")

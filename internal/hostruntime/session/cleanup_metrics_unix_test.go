@@ -4,7 +4,6 @@ package session
 
 import (
 	"context"
-	"errors"
 	"testing"
 )
 
@@ -23,13 +22,7 @@ func TestDeleteEmitsCleanupOutcome(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.Delete(created.ID); !errors.Is(err, ErrSessionRunning) || metric.result != "preserved" {
-		t.Fatalf("running delete err=%v metric=%q", err, metric.result)
-	}
-	if _, err := manager.Close(context.Background(), created.ID); err != nil {
-		t.Fatal(err)
-	}
 	if err := manager.Delete(created.ID); err != nil || metric.result != "removed" {
-		t.Fatalf("closed delete err=%v metric=%q", err, metric.result)
+		t.Fatalf("running delete err=%v metric=%q", err, metric.result)
 	}
 }
