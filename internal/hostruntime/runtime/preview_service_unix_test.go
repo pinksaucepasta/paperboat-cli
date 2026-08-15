@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -49,6 +50,42 @@ func TestPrivatePreviewDescriptorPublishesOnlyLoopbackReadiness(t *testing.T) {
 	}
 	restarting, err := readPreviewRuntimeDescriptor(path)
 	if err != nil || restarting.Port != 0 || restarting.Record != nil {
+		t.Fatalf("restarting=%+v err=%v", restarting, err)
+	}
+}
+
+func TestPrivatePreviewStartupFailureIsTypedAndClearedForRestart(t *testing.T) {
+	root := t.TempDir()
+	name := "remote-docs"
+	digest := sha256.Sum256([]byte(name))
+	path := filepath.Join(root, "previews", "active", hex.EncodeToString(digest[:8])+".json")
+	expires := time.Now().UTC().Add(time.Hour)
+	remote := &PrivatePreviewRuntimeDescriptor{MachineID: "machine_1", MachineName: "Studio", EnvironmentID: "env_1", MachineGeneration: 4, TargetPort: 3000}
+	descriptor := PreviewRuntimeDescriptor{Schema: "paperboat.preview-runtime/v1", Name: name, BindAddress: "127.0.0.1", ServiceGeneration: 5, ExpiresAt: &expires, ServiceDefinition: filepath.Join(root, "service"), PrivateRemote: remote}
+	if err := writePreviewRuntimeDescriptor(path, descriptor); err != nil {
+		t.Fatal(err)
+	}
+	listenErr := &net.OpError{Op: "listen", Net: "tcp4", Err: errors.New("address unavailable")}
+	if err := MarkPrivatePreviewServiceFailed(root, name, listenErr); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	_, err := waitPreviewServiceReady(context.Background(), root, name, &recordingPreviewRunner{})
+	var failure *PreviewServiceFailureError
+	if !errors.As(err, &failure) || failure.Code != "preview_listener_unavailable" || !errors.Is(err, ErrPreviewServiceFailed) {
+		t.Fatalf("failure=%+v err=%v", failure, err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("failure took %s to report", elapsed)
+	}
+	if _, err := ReadPrivatePreviewService(root, name); err != nil {
+		t.Fatal(err)
+	}
+	if err := BeginPrivatePreviewService(root, name); err != nil {
+		t.Fatal(err)
+	}
+	restarting, err := readPreviewRuntimeDescriptor(path)
+	if err != nil || restarting.Record != nil || restarting.Failure != nil {
 		t.Fatalf("restarting=%+v err=%v", restarting, err)
 	}
 }
@@ -123,11 +160,47 @@ func TestExpiredPreviewDescriptorCleansWithoutExtendingLifetime(t *testing.T) {
 		}
 	}
 	joined := strings.Join(runner.calls, "\n")
-	if runtime.GOOS == "linux" && (strings.Contains(joined, "disable --now") || !strings.Contains(joined, "systemctl --user daemon-reload") || !strings.Contains(joined, "systemctl --user reset-failed")) {
+	if runtime.GOOS == "linux" && (!strings.Contains(joined, "systemctl --user disable paperboat-preview-") || strings.Contains(joined, "disable --now") || !strings.Contains(joined, "systemctl --user daemon-reload") || !strings.Contains(joined, "systemctl --user reset-failed")) {
 		t.Fatalf("retirement calls=%v", runner.calls)
 	}
 	if runtime.GOOS == "darwin" && strings.Contains(joined, "launchctl bootout gui/") {
 		t.Fatalf("retirement calls=%v", runner.calls)
+	}
+}
+
+func TestCompletedPreviewRetirementPreservesRecoveryFilesWhenDisableFails(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("systemd-only behavior")
+	}
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	name := "docs"
+	definition, _, err := previewServiceDefinition(root, name, runtime.GOOS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor := filepath.Join(root, "previews", "active", "docs.json")
+	for _, path := range []string{definition, descriptor} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("state"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runner := &scriptedPreviewRunner{run: func(call string) error {
+		if strings.Contains(call, " disable ") {
+			return errors.New("disable failed")
+		}
+		return nil
+	}}
+	if err := retireCompletedServeService(context.Background(), name, descriptor, definition, runner); err == nil {
+		t.Fatal("expected disable failure")
+	}
+	for _, path := range []string{definition, descriptor} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("recovery path %s was removed: %v", path, err)
+		}
 	}
 }
 

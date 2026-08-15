@@ -94,6 +94,59 @@ assert_case() {
   flock -u 8
 }
 
+preview_instance() {
+  printf '%s' "$1" | sha256sum | cut -c1-16
+}
+
+preview_cleanup_detail() {
+  local name="$1" listen_port="${2:-}" instance unit definition link descriptor detail=""
+  instance="$(preview_instance "$name")"
+  unit="paperboat-preview-$instance.service"
+  definition="$HOME/.config/systemd/user/$unit"
+  link="$HOME/.config/systemd/user/default.target.wants/$unit"
+  descriptor="$HOME/.local/state/paperboat/runtime/previews/active/$instance.json"
+  for path in "$definition" "$link" "$descriptor"; do
+    if test -e "$path" || test -L "$path"; then
+      detail="$detail path=$path"
+    fi
+  done
+  if systemctl --user list-unit-files "$unit" --no-legend --no-pager 2>/dev/null | grep -Fq "$unit"; then
+    detail="$detail unit_file=$unit"
+  fi
+  if systemctl --user list-units --all "$unit" --no-legend --no-pager 2>/dev/null | grep -Fq "$unit"; then
+    detail="$detail loaded_unit=$unit"
+  fi
+  if test -n "$listen_port" && ss -ltnp | grep -q ":$listen_port "; then
+    detail="$detail listener=$listen_port"
+  fi
+  if pgrep -af "$instance|$name" 2>/dev/null | grep -v -E 'pgrep -af|gate8-e2e' >/dev/null; then
+    detail="$detail process=$instance"
+  fi
+  printf '%s' "$detail"
+}
+
+assert_preview_cleanup() {
+  local id="$1" name="$2" listen_port="${3:-}" deadline=$((SECONDS + 30)) detail
+  while ((SECONDS < deadline)); do
+    detail="$(preview_cleanup_detail "$name" "$listen_port")"
+    test -n "$detail" || break
+    sleep 0.2
+  done
+  assert_case "$id" artifact-cleanup "$(test -z "$detail" && echo true || echo false)" "${detail:-exact}"
+}
+
+wait_preview_absent() {
+  local name="$1" deadline=$((SECONDS + 30))
+  while ((SECONDS < deadline)); do
+    if pb preview list --json 2>/dev/null | jq -e --arg name "$name" \
+      '([.data.previews[], .data.private_serves[]] | map(select(.name == $name)) | length) == 0' >/dev/null; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  return 1
+}
+
 snapshot() {
   local name="$1"
   pb status --json >"$RESULT_ROOT/status-$name.json" 2>"$RESULT_ROOT/status-$name.stderr" || true
@@ -198,12 +251,19 @@ transition_case() {
 
 snapshot before
 cleanup_network() {
+  local pid identity
+  for pid in "${forward_pid:-}" "${occupied_pid:-}"; do
+    test -z "$pid" || kill -TERM "$pid" 2>/dev/null || true
+  done
+  for identity in "${private_preview_name:-}" "${restart_preview_name:-}" "${occupied_name:-}" "${private_name:-}" "${public_id:-}" "${expiry_name:-}" "${source_name:-}"; do
+    test -z "$identity" || pb preview revoke "$identity" --yes --json >/dev/null 2>&1 || true
+  done
   sudo /usr/local/sbin/paperboat-gate8-network allow-udp >/dev/null 2>&1 || true
 }
 trap cleanup_network EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-for required in pb jq timeout flock script ssh scp sftp curl sudo python3 sha256sum; do
+for required in pb jq timeout flock script ssh scp sftp rsync git curl sudo python3 sha256sum ss pgrep cmp; do
   command -v "$required" >/dev/null || { printf 'missing required command: %s\n' "$required" >&2; exit 2; }
 done
 test -r "$TERMINAL_READY" || { printf 'missing terminal fixture: %s\n' "$TERMINAL_READY" >&2; exit 2; }
@@ -227,17 +287,35 @@ assert_case preflight deployment-evidence "$(test -n "${EXPECTED_DEPLOYMENT_EVID
 run_case inventory none environments pb environments --json
 run_case inventory none machine-list pb machine list --json
 run_case inventory none status pb status "$TARGET" --json
+run_case inventory none status-repeat pb status "$TARGET" --json
+offline_target="$(jq -r --arg target "$TARGET" '.machines[] | select(.online == false and .alias != $target) | .alias' "$RESULT_ROOT/cases/inventory-none-machine-list.stdout" | head -1)"
 run_case readiness none wait-runtime pb wait "$TARGET" --for runtime --timeout 30s --json
 run_case readiness none wait-transport pb wait "$TARGET" --for transport --timeout 30s --json
 run_case readiness none wait-ssh pb wait "$TARGET" --for ssh --timeout 30s --json
+test -z "$offline_target" || EXPECTED_EXIT=nonzero run_case readiness none wait-offline pb wait "$offline_target" --for runtime --timeout 1s --json
 run_case diagnostics none doctor-local pb doctor --json
 EXPECTED_EXIT=0or1 run_case diagnostics none doctor-target pb doctor "$TARGET" --json
+run_case diagnostics none doctor-local-repeat pb doctor --json
+EXPECTED_EXIT=0or1 run_case diagnostics none doctor-target-repeat pb doctor "$TARGET" --json
 doctor_target_rc="$(jq -r 'select(.id=="diagnostics-none-doctor-target") | .exit_code' "$RESULTS")"
 doctor_target_overall="$(jq -r '.overall // empty' "$RESULT_ROOT/cases/diagnostics-none-doctor-target.stdout")"
 assert_case diagnostics-none-doctor-target structured-result \
   "$(test "$doctor_target_rc" = 0 -o "$doctor_target_rc" = 1 && test -n "$doctor_target_overall" && echo true || echo false)" \
   "exit=$doctor_target_rc overall=$doctor_target_overall"
 run_case ssh none doctor pb ssh doctor "$TARGET"
+run_case config none show pb config show --json
+run_case config none status pb config status "$TARGET" --json
+isolated_config="$RESULT_ROOT/isolated-config.json"
+active_server="$(jq -r '.server_url' "$RESULT_ROOT/cases/config-none-show.stdout")"
+run_case config none isolated-set pb --config "$isolated_config" config set server "$active_server"
+run_case config none isolated-show pb --config "$isolated_config" config show --json
+assert_case config-isolated-show server \
+  "$(jq -e --arg server "$active_server" '.server_url == $server' "$RESULT_ROOT/cases/config-none-isolated-show.stdout" >/dev/null 2>&1 && echo true || echo false)" exact
+run_case e2ee none pending pb e2ee pending --json
+target_workspace="$(jq -er --arg target "$TARGET" '.machines[] | select(.alias == $target) | .workspace_root | select(type == "string" and startswith("/"))' "$RESULT_ROOT/status-before.json")"
+run_case codex auto version pb codex "$TARGET" --path "$target_workspace" -- --version
+assert_case codex-auto-version recognizable \
+  "$(grep -Eq '^codex-cli [0-9]+\.[0-9]+\.[0-9]+' "$RESULT_ROOT/cases/codex-auto-version.stdout" && echo true || echo false)" exact
 
 for transport in a d q w r; do
   for run in $(seq 1 "$REPEAT"); do
@@ -247,6 +325,10 @@ for transport in a d q w r; do
       "$(jq -e '(.lost // .packet_loss // 0) == 0' "$ping_file" >/dev/null 2>&1 && echo true || echo false)" exact
   done
 done
+
+TEST_TIMEOUT=120 run_case exec auto silent-90 pb exec "$TARGET" --transport a -- sh -c 'sleep 90; printf silent-exec-ok'
+assert_case exec-auto-silent-90 canary \
+  "$(test "$(cat "$RESULT_ROOT/cases/exec-auto-silent-90.stdout")" = silent-exec-ok && echo true || echo false)" exact
 
 for transport in a d q w r; do
   for run in $(seq 1 "$REPEAT"); do
@@ -313,6 +395,14 @@ transfer_batch_id="$(jq -r '..|.batch_id? // empty' "$RESULT_ROOT/cases/transfer
 transfer_id="$(jq -r --arg batch "$transfer_batch_id" '.. | objects | select(.batch_id? == $batch) | .transfer_id? // empty' "$RESULT_ROOT/cases/transfer-none-list.stdout" 2>/dev/null | head -1 || true)"
 assert_case transfer-none-status-id item-present "$(test -n "$transfer_id" && echo true || echo false)" "batch=$transfer_batch_id transfer=$transfer_id"
 test -z "$transfer_id" || run_case transfer none status pb transfer status "$transfer_id" --on "$TARGET" --json
+transfer_receipt="$(jq -r '.. | objects | select(.batch_id? == $batch) | .receipt_path? // empty' --arg batch "$transfer_batch_id" "$RESULT_ROOT/cases/transfer-none-send-binary.stdout" | head -1)"
+transfer_remote_hash=""
+if test -n "$transfer_receipt"; then
+  transfer_remote_hash="$(pb exec "$TARGET" --transport a -- sh -c 'inbox=$(pb inbox path); sha256sum "$(dirname "$inbox")/$1"' sh "$transfer_receipt" 2>/dev/null | awk '{print $1}')"
+fi
+assert_case transfer-none-send-binary receipt-sha256 \
+  "$(test -n "$transfer_receipt" -a "$transfer_remote_hash" = "$(sha256sum "$RESULT_ROOT/payload/random.bin" | cut -d' ' -f1)" && echo true || echo false)" \
+  "receipt=$transfer_receipt remote_sha256=${transfer_remote_hash:-missing}"
 
 # Ordinary OpenSSH tooling exercises the managed opaque SSH stream contract.
 run_case openssh auto command ssh -o BatchMode=yes -o ConnectTimeout=20 "root@$TARGET.pprbt.dev" true
@@ -325,6 +415,35 @@ for run in $(seq 1 "$REPEAT"); do
   run_case sftp auto "put-get-$run" sh -c "printf 'put $RESULT_ROOT/payload/random.bin /tmp/g8-sftp-upload-$run.bin\\nget /tmp/g8-sftp-upload-$run.bin $RESULT_ROOT/payload/sftp-download-$run.bin\\nquit\\n' | sftp -q -oBatchMode=yes -oConnectTimeout=20 root@$TARGET.pprbt.dev"
   assert_case "sftp-roundtrip-$run" sha256 "$(test "$payload_hash" = "$(sha256sum "$RESULT_ROOT/payload/sftp-download-$run.bin" 2>/dev/null | cut -d' ' -f1)" && echo true || echo false)" exact
 done
+
+
+# The managed OpenSSH configuration must remain compatible with common tools.
+printf 'gate8-rsync\n' >"$RESULT_ROOT/payload/rsync.txt"
+run_case rsync auto upload rsync -a -e "ssh -o BatchMode=yes -o ConnectTimeout=20" "$RESULT_ROOT/payload/rsync.txt" "root@$TARGET.pprbt.dev:/tmp/g8-rsync.txt"
+run_case rsync auto download rsync -a -e "ssh -o BatchMode=yes -o ConnectTimeout=20" "root@$TARGET.pprbt.dev:/tmp/g8-rsync.txt" "$RESULT_ROOT/payload/rsync-download.txt"
+assert_case rsync-auto-roundtrip exact \
+  "$(cmp -s "$RESULT_ROOT/payload/rsync.txt" "$RESULT_ROOT/payload/rsync-download.txt" && echo true || echo false)" exact
+run_case git auto prepare ssh -o BatchMode=yes -o ConnectTimeout=20 "root@$TARGET.pprbt.dev" \
+  'set -eu; rm -rf /tmp/g8.git /tmp/g8-work; git init -q /tmp/g8-work; cd /tmp/g8-work; git config user.name Gate8; git config user.email gate8@paperboat.test; printf gate8-git >canary.txt; git add canary.txt; git commit -qm gate8; git clone -q --bare . /tmp/g8.git'
+GIT_SSH_COMMAND='ssh -o BatchMode=yes -o ConnectTimeout=20' run_case git auto clone git clone -q "root@$TARGET.pprbt.dev:/tmp/g8.git" "$RESULT_ROOT/payload/git-clone"
+assert_case git-auto-clone canary \
+  "$(test "$(cat "$RESULT_ROOT/payload/git-clone/canary.txt" 2>/dev/null)" = gate8-git && echo true || echo false)" exact
+
+forward_port=39218
+ssh -o BatchMode=yes -o ConnectTimeout=20 -o ExitOnForwardFailure=yes -N -L "127.0.0.1:$forward_port:127.0.0.1:38142" "root@$TARGET.pprbt.dev" >"$RESULT_ROOT/cases/forward-auto-local.stdout" 2>"$RESULT_ROOT/cases/forward-auto-local.stderr" &
+forward_pid=$!
+forward_ready=false
+forward_deadline=$((SECONDS + 20))
+while ((SECONDS < forward_deadline)); do
+  if test "$(curl --fail --silent --max-time 1 "http://127.0.0.1:$forward_port/http" 2>/dev/null || true)" = preview-http-ok; then
+    forward_ready=true
+    break
+  fi
+  sleep 0.2
+done
+kill -TERM "$forward_pid" 2>/dev/null || true
+wait "$forward_pid" 2>/dev/null || true
+assert_case forward-auto-local reachable "$forward_ready" exact
 
 # Private machine preview: browser-to-loopback HTTP/1.1, direct-only remote
 # HTTP/3. The target fixture runs on Hetzner at 127.0.0.1:38142.
@@ -365,6 +484,47 @@ done
 assert_case preview-private-recovery restored "$private_recovered" exact
 run_case preview private revoke pb preview revoke "$machine_private_name" --yes --json
 assert_case preview-private-listener removed "$( ! ss -ltn | grep -q ":$private_listen " && echo true || echo false)" exact
+assert_preview_cleanup preview-private-revoke "$private_preview_name" "$private_listen"
+
+# Detached machine previews survive daemon restart and report worker failures
+# without waiting for the command timeout.
+restart_preview_name="g8-machine-restart-$(date +%s%N)"
+restart_listen=39196
+run_case preview_restart private create pb preview create --machine "$TARGET" --port 38142 --listen-port "$restart_listen" --detach --duration 5m --name "$restart_preview_name" --json
+systemctl --user restart paperboat-local-daemon.service
+restart_ready=false
+restart_deadline=$((SECONDS + 30))
+restart_run=0
+while ((SECONDS < restart_deadline)); do
+  restart_run=$((restart_run + 1))
+  restart_code="$(curl --silent --output "$RESULT_ROOT/cases/preview-restart-body-$restart_run" --write-out '%{http_code}' --max-time 3 "http://127.0.0.1:$restart_listen/http" 2>"$RESULT_ROOT/cases/preview-restart-error-$restart_run" || true)"
+  restart_body="$(cat "$RESULT_ROOT/cases/preview-restart-body-$restart_run" 2>/dev/null || true)"
+  printf '%s run=%d code=%s body=%s error=%s\n' "$(date -u +%FT%T.%3NZ)" "$restart_run" "$restart_code" "$restart_body" "$(tr '\n' ' ' <"$RESULT_ROOT/cases/preview-restart-error-$restart_run")" >>"$RESULT_ROOT/cases/preview-restart.timeline"
+  if test "$restart_code" = 200 && test "$restart_body" = preview-http-ok; then
+    restart_ready=true
+    break
+  fi
+  sleep 0.5
+done
+assert_case preview-restart-private-fetch exact-body "$restart_ready" "$(tail -1 "$RESULT_ROOT/cases/preview-restart.timeline")"
+run_case preview_restart private revoke pb preview revoke "$restart_preview_name" --yes --json
+assert_preview_cleanup preview-restart-private-revoke "$restart_preview_name" "$restart_listen"
+
+occupied_listen=39197
+python3 -m http.server "$occupied_listen" --bind 127.0.0.1 >"$RESULT_ROOT/cases/preview-occupied-server.stdout" 2>"$RESULT_ROOT/cases/preview-occupied-server.stderr" &
+occupied_pid=$!
+sleep 0.2
+occupied_ready="$(kill -0 "$occupied_pid" 2>/dev/null && ss -ltn | grep -q ":$occupied_listen " && echo true || echo false)"
+assert_case preview-failure-fixture occupied "$occupied_ready" "port=$occupied_listen"
+occupied_name="g8-machine-occupied-$(date +%s%N)"
+EXPECTED_EXIT=nonzero run_case preview_failure private occupied-port pb preview create --machine "$TARGET" --port 38142 --listen-port "$occupied_listen" --detach --duration 5m --name "$occupied_name" --json
+kill -TERM "$occupied_pid" 2>/dev/null || true
+wait "$occupied_pid" 2>/dev/null || true
+assert_case preview-failure-private-occupied-port immediate \
+  "$(jq -e 'select(.id=="preview_failure-private-occupied-port") | .elapsed_ms < 10000' "$RESULTS" >/dev/null && echo true || echo false)" exact
+assert_case preview-failure-private-occupied-port diagnostic \
+  "$(grep -Eqi 'address already in use|bind|listen' "$RESULT_ROOT/cases/preview_failure-private-occupied-port.stderr" && echo true || echo false)" exact
+assert_preview_cleanup preview-failure-private-occupied "$occupied_name" "$occupied_listen"
 
 # Local private serve and public serve lifecycle. Public is verified over H3,
 # then with UDP blocked so the typed relay HTTP/2 fallback is mandatory.
@@ -402,12 +562,40 @@ test -z "$public_url" || run_case preview public h2 curl --http2 --fail --silent
 sudo /usr/local/sbin/paperboat-gate8-network allow-udp
 test -z "$private_identity" || run_case preview private revoke pb preview revoke "$private_identity" --yes --json
 test -z "$public_id" || run_case preview public revoke pb preview revoke "$public_id" --yes --json
+test -z "$private_identity" || assert_preview_cleanup serve-private-revoke "$private_identity"
+test -z "$public_name" || assert_preview_cleanup serve-public-revoke "$public_name"
+
+# Expiry and source replacement must retire detached services without an
+# explicit revoke and without leaving local runtime artifacts.
+printf 'gate8-expiry\n' >"$RESULT_ROOT/site-expiry.txt"
+expiry_name="g8-expiry-$(date +%s%N)"
+run_case serve_expiry private create pb serve "$RESULT_ROOT/site-expiry.txt" --detach --duration 3s --name "$expiry_name" --json
+expiry_url="$(jq -r '.data.url // empty' "$RESULT_ROOT/cases/serve_expiry-private-create.stdout")"
+test -z "$expiry_url" || run_case serve_expiry private fetch curl --fail --silent --show-error --max-time 10 "$expiry_url"
+sleep 4
+run_case serve_expiry none reconcile pb preview list --json
+assert_case serve-expiry absent "$(wait_preview_absent "$expiry_name" && echo true || echo false)" exact
+assert_preview_cleanup serve-expiry-cleanup "$expiry_name"
+
+printf 'gate8-source-a\n' >"$RESULT_ROOT/site-source.txt"
+source_name="g8-source-$(date +%s%N)"
+run_case serve_source private create pb serve "$RESULT_ROOT/site-source.txt" --detach --duration 5m --name "$source_name" --json
+printf 'gate8-source-b\n' >"$RESULT_ROOT/site-source.replacement"
+mv "$RESULT_ROOT/site-source.replacement" "$RESULT_ROOT/site-source.txt"
+systemctl --user restart "paperboat-preview-$(preview_instance "$source_name").service" >/dev/null 2>&1 || true
+run_case serve_source none reconcile pb preview list --json
+assert_case serve-source absent "$(wait_preview_absent "$source_name" && echo true || echo false)" exact
+sleep 1
+assert_preview_cleanup serve-source-cleanup "$source_name"
 run_case preview none final-list pb preview list --json
-assert_case preview-final-list empty "$(jq -e '(.previews // .items // []) | length == 0' "$RESULT_ROOT/cases/preview-none-final-list.stdout" >/dev/null 2>&1 && echo true || echo false)" exact
+assert_case preview-final-list empty "$(jq -e '(.data.previews | length) == 0 and (.data.private_serves | length) == 0' "$RESULT_ROOT/cases/preview-none-final-list.stdout" >/dev/null 2>&1 && echo true || echo false)" exact
+preview_artifact_count="$({ find "$HOME/.config/systemd/user" -maxdepth 1 -type f -name 'paperboat-preview-*.service' -print 2>/dev/null; find "$HOME/.config/systemd/user/default.target.wants" -maxdepth 1 -type l -name 'paperboat-preview-*.service' -print 2>/dev/null; find "$HOME/.local/state/paperboat/runtime/previews/active" -maxdepth 1 -type f -name '*.json' -print 2>/dev/null; } | wc -l | awk '{print $1}')"
+assert_case preview-final-artifacts empty "$(test "$preview_artifact_count" = 0 && echo true || echo false)" "count=$preview_artifact_count"
 
 # Diagnostics and support artifacts.
 run_case diagnostics none bugreport pb bugreport --record --json </dev/null
 run_case diagnostics none bugreport-upload pb bugreport --record --upload --json </dev/null
+TEST_TIMEOUT=10 EXPECTED_EXIT=nonzero run_case diagnostics none bugreport-upload-failure pb --server https://api.pprbt.dev:1 bugreport --record --upload --json </dev/null
 
 # Seamless live path changes use the standalone authoritative runner. It waits
 # for application bytes and the published standby path, records transition

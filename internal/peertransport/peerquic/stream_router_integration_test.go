@@ -6,11 +6,15 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/http"
+	"net/url"
 	"testing"
 	"time"
 
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/peerquic"
+	peerpreview "github.com/pinksaucepasta/paperboat/internal/peertransport/privatepreview"
 	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 )
 
 func TestStreamRouterServesHealthWithoutConsumingApplicationStream(t *testing.T) {
@@ -68,6 +72,87 @@ func TestStreamRouterServesHealthWithoutConsumingApplicationStream(t *testing.T)
 	}
 	if err := router.WaitHealthExchanges(ctx, 2); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestPrivatePreviewExtendedConnectWaitsForHTTP3Handoff(t *testing.T) {
+	client, server, closePair := routerSessionPairForClass(t, peerquic.ClassPreview)
+	defer closePair()
+	router, err := peerquic.NewStreamRouter(server, peerquic.DevelopmentStreamRouterConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	var nonce [16]byte
+	copy(nonce[:], "preview-handoff")
+	healthDone := make(chan error, 1)
+	go func() { _, healthErr := client.HealthExchange(ctx, nonce); healthDone <- healthErr }()
+	if err := router.WaitInitialHealth(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-healthDone; err != nil {
+		t.Fatal(err)
+	}
+
+	previewClient := (&http3.Transport{}).NewClientConn(client.Connection)
+	requestCtx, cancelRequest := context.WithCancel(ctx)
+	defer cancelRequest()
+	request := (&http.Request{
+		Method: http.MethodConnect,
+		URL:    &url.URL{Scheme: "https", Host: "private-preview.paperboat", Path: "/"},
+		Proto:  peerpreview.HTTP3ConnectProtocol,
+		Host:   "private-preview.paperboat",
+		Header: make(http.Header),
+	}).WithContext(requestCtx)
+	responseDone := make(chan *http.Response, 1)
+	requestErrors := make(chan error, 1)
+	go func() {
+		response, requestErr := previewClient.RoundTrip(request)
+		if requestErr != nil {
+			requestErrors <- requestErr
+			return
+		}
+		responseDone <- response
+	}()
+
+	beforeHandoff, cancelBeforeHandoff := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancelBeforeHandoff()
+	if stream, acceptErr := router.Accept(beforeHandoff); !errors.Is(acceptErr, context.DeadlineExceeded) {
+		if stream != nil {
+			_ = stream.Close()
+		}
+		t.Fatalf("HTTP/3 request reached Paperboat router before handoff: %v", acceptErr)
+	}
+	if err := router.Handoff(); err != nil {
+		t.Fatal(err)
+	}
+	previewServer := &http3.Server{Handler: http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodConnect || request.Proto != peerpreview.HTTP3ConnectProtocol || request.URL.Path != "/" {
+			http.Error(writer, "invalid preview request", http.StatusBadRequest)
+			return
+		}
+		writer.WriteHeader(http.StatusOK)
+	})}
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- previewServer.ServeQUICConn(server.Connection) }()
+	select {
+	case response := <-responseDone:
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("status=%s", response.Status)
+		}
+	case err := <-requestErrors:
+		t.Fatal(err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	cancelRequest()
+	_ = client.Connection.CloseWithError(0, "complete")
+	select {
+	case <-serveDone:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
 	}
 }
 
@@ -292,10 +377,14 @@ func TestStreamRouterClassifierLimitFailsConnection(t *testing.T) {
 }
 
 func routerSessionPair(t *testing.T) (*peerquic.Session, *peerquic.Session, func()) {
+	return routerSessionPairForClass(t, peerquic.ClassInteractive)
+}
+
+func routerSessionPairForClass(t *testing.T, class peerquic.Class) (*peerquic.Session, *peerquic.Session, func()) {
 	t.Helper()
 	clientTLS, serverTLS := probeTLSConfigs(t)
 	clientConn, serverConn := net.Pipe()
-	listener, err := peerquic.Listen(serverConn, serverTLS, peerquic.ClassInteractive)
+	listener, err := peerquic.Listen(serverConn, serverTLS, class)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,7 +399,7 @@ func routerSessionPair(t *testing.T) (*peerquic.Session, *peerquic.Session, func
 		}
 		accepted <- session
 	}()
-	client, err := peerquic.Dial(ctx, clientConn, clientTLS, peerquic.ClassInteractive)
+	client, err := peerquic.Dial(ctx, clientConn, clientTLS, class)
 	if err != nil {
 		cancel()
 		_ = listener.Close()

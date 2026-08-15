@@ -6,7 +6,7 @@
   "artifacts": [
     { "id": "p2p.contracts", "path": "contracts.md", "type": "specification", "sha256": "02dd91974a7026161a636734aea00cf8059f2dcca3a57c98b36e3e2b37f2494b", "consumers": ["paperboat", "paperboat-server", "paperboat-tunnel"] },
     { "id": "p2p.endpoint-certificate", "path": "schemas/endpoint-certificate.schema.json", "type": "json-schema", "sha256": "abd8099b44305b8fdcc83b12faa98f9d8df6316f9360e156476d8287153d1fe7", "consumers": ["paperboat", "paperboat-server"] },
-    { "id": "p2p.peer-attempt-descriptor", "path": "schemas/peer-attempt-descriptor.schema.json", "type": "json-schema", "sha256": "7854f6c8d8a800290bceea799f8bb400f54240bc19b95eeec9af80832e8c36e5", "consumers": ["paperboat", "paperboat-server"] },
+    { "id": "p2p.peer-attempt-descriptor", "path": "schemas/peer-attempt-descriptor.schema.json", "type": "json-schema", "sha256": "43dcca6f8e724beef0588b452a6b199196f38e932d3200fdb913f5058fc91825", "consumers": ["paperboat", "paperboat-server"] },
     { "id": "p2p.relay-admission", "path": "schemas/relay-admission.schema.json", "type": "json-schema", "sha256": "8b45a58635216974d6691f234dc27d332aa242428be4e881153b7a023794fc62", "consumers": ["paperboat", "paperboat-server", "paperboat-tunnel"] },
     { "id": "p2p.file-transfer-e2ee", "path": "schemas/file-transfer-e2ee.schema.json", "type": "json-schema", "sha256": "45f3ec8d286f8e10036cbaa1698fb15033a19391eb6d84912d37f7c1e03284d9", "consumers": ["paperboat", "paperboat-server", "paperboat-tunnel"] },
     { "id": "p2p.managed-ssh", "path": "schemas/managed-ssh.schema.json", "type": "json-schema", "sha256": "7f58fcab3a0582934215e2826310df66c8775813e03f2badd4f6402dffb2337b", "consumers": ["paperboat", "paperboat-server"] },

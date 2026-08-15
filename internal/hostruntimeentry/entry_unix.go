@@ -49,6 +49,10 @@ func MarkPrivatePreviewServiceReady(stateRoot, name, rawURL string) error {
 	return hostruntime.MarkPrivatePreviewServiceReady(stateRoot, name, rawURL)
 }
 
+func MarkPrivatePreviewServiceFailed(stateRoot, name string, cause error) error {
+	return hostruntime.MarkPrivatePreviewServiceFailed(stateRoot, name, cause)
+}
+
 func BeginPrivatePreviewService(stateRoot, name string) error {
 	return hostruntime.BeginPrivatePreviewService(stateRoot, name)
 }

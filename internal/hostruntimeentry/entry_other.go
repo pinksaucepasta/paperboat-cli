@@ -60,6 +60,7 @@ func ReadPrivatePreviewService(string, string) (PrivatePreviewRuntimeDescriptor,
 	return PrivatePreviewRuntimeDescriptor{}, ErrUnsupported
 }
 func MarkPrivatePreviewServiceReady(string, string, string) error         { return ErrUnsupported }
+func MarkPrivatePreviewServiceFailed(string, string, error) error         { return ErrUnsupported }
 func BeginPrivatePreviewService(string, string) error                     { return ErrUnsupported }
 func CompletePrivatePreviewService(context.Context, string, string) error { return ErrUnsupported }
 func InstallServeService(context.Context, string, string, string, servepkg.Source, bool, *time.Time, bool, bool, uint16) error {

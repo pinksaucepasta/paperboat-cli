@@ -625,6 +625,7 @@ func verifyRoot(root *metadata.Metadata[metadata.RootType]) error {
 }
 
 func atomicWrite(path string, body []byte, mode os.FileMode) error {
+	//paperboat:allow-source-policy atomic-replacement owner=tuf-repository reason=same-directory-fsynced-staging
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".paperboat-tuf-")
 	if err != nil {
 		return err
@@ -649,6 +650,7 @@ func atomicWrite(path string, body []byte, mode os.FileMode) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
+	//paperboat:allow-source-policy atomic-replacement owner=tuf-repository reason=verified-metadata-publication
 	if err := os.Rename(name, path); err != nil {
 		return err
 	}

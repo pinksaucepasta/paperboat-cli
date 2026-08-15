@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	peerpreview "github.com/pinksaucepasta/paperboat/internal/peertransport/privatepreview"
 	"github.com/pinksaucepasta/paperboat/internal/resolver"
 	"github.com/quic-go/quic-go/http3"
 )
@@ -31,7 +32,7 @@ func (t *PeerTerminalTunnel) DialPrivatePreview(ctx context.Context, info resolv
 		// and deadline, and this explicit cancel owns the CONNECT stream lifetime.
 		streamCtx, cancelStream := context.WithCancel(context.WithoutCancel(openCtx))
 		reader, writer := io.Pipe()
-		request := &http.Request{Method: http.MethodConnect, URL: &url.URL{Scheme: "https", Host: "private-preview.paperboat", Path: "/"}, Host: "private-preview.paperboat", Header: make(http.Header), Body: reader}
+		request := &http.Request{Method: http.MethodConnect, URL: &url.URL{Scheme: "https", Host: "private-preview.paperboat", Path: "/"}, Proto: peerpreview.HTTP3ConnectProtocol, Host: "private-preview.paperboat", Header: make(http.Header), Body: reader}
 		request.Header.Set("X-Paperboat-Preview-Port", strconv.Itoa(int(port)))
 		request = request.WithContext(streamCtx)
 		type result struct {

@@ -65,6 +65,7 @@ func Negotiate(ctx context.Context, config NegotiationConfig) (*ice.Conn, error)
 		return nil, errors.Join(ErrNegotiationInvalid, closeNegotiation(config))
 	}
 	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	var closeOnce sync.Once
 	var transportCloseErr error
 	closeTransport := func() error {

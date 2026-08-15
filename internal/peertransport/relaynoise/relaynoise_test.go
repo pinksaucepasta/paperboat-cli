@@ -114,7 +114,7 @@ func TestTransportOnlyPrologueBindsReusableTransport(t *testing.T) {
 		DeviceID: legacy.Context.DeviceID, MachineID: legacy.Context.MachineID,
 		InitiatorCertificateHash: legacy.Context.InitiatorCertificateHash,
 		ResponderCertificateHash: legacy.Context.ResponderCertificateHash,
-		HostGeneration: legacy.Context.HostGeneration, AuthorizationGeneration: legacy.Context.AuthorizationGeneration,
+		HostGeneration:           legacy.Context.HostGeneration, AuthorizationGeneration: legacy.Context.AuthorizationGeneration,
 		TransportID: legacy.Context.IntentID, InitiatorRole: legacy.Context.InitiatorRole,
 		ResponderRole: legacy.Context.ResponderRole, AttemptGeneration: legacy.Context.AttemptGeneration,
 	}

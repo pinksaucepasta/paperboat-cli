@@ -662,6 +662,7 @@ func (c *Conn) readCarrier(carrier *physicalCarrier) {
 			c.mu.Lock()
 			if !c.firstRecvSeen {
 				c.firstRecvSeen = true
+				//paperboat:allow-source-policy sensitive-log owner=transport-observability reason=bounded-stream-counters-only
 				slog.Info("resumable first data received", "stream_instance", c.id, "epoch", carrier.epoch, "sequence", sequence, "bytes", len(payload))
 			}
 			if sequence > c.recvNext {

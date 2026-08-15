@@ -21,9 +21,10 @@ var (
 )
 
 const (
-	requestSize  = 7
-	statusReady  = 0
-	statusFailed = 1
+	requestSize          = 7
+	statusReady          = 0
+	statusFailed         = 1
+	HTTP3ConnectProtocol = "paperboat-preview"
 )
 
 type DialContext func(context.Context, string, string) (net.Conn, error)

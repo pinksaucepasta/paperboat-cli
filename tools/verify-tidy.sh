@@ -6,8 +6,12 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/paperboat-tidy.XXXXXX")
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 
 mkdir "$work/repository"
-cp -R "$root/." "$work/repository"
-rm -rf "$work/repository/.git" "$work/repository/bin" "$work/repository/dist"
+(
+	cd "$root"
+	git ls-files -z --cached --others --exclude-standard >"$work/files"
+	tar --null -T "$work/files" -cf "$work/repository.tar"
+)
+tar -xf "$work/repository.tar" -C "$work/repository"
 
 cd "$work/repository"
 GOTOOLCHAIN=local go mod tidy

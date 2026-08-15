@@ -18,6 +18,7 @@ func main() {
 		for _, value := range []string{"one", "two"} {
 			fmt.Fprintf(writer, "data: %s\n\n", value)
 			flusher.Flush()
+			//paperboat:allow-source-policy sleep owner=gate8-fixture reason=separate-sse-event-flushes
 			time.Sleep(100 * time.Millisecond)
 		}
 	})

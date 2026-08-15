@@ -858,6 +858,7 @@ func (s *Service) serveRelay(setupCtx, lifetime context.Context, connection *rel
 			slog.Info("peer retained relay transport ending", "intent_id", descriptor.IntentID, "attempt_generation", descriptor.AttemptGeneration, "path", relayCandidatePath(connection.Carrier()), "owner", "health", "error", healthErr)
 			return true, healthErr
 		case controlErr := <-controlDone:
+			//paperboat:allow-source-policy sensitive-log owner=transport-observability reason=bounded-intent-generation-path-error
 			slog.Info("peer retained relay transport ending", "intent_id", descriptor.IntentID, "attempt_generation", descriptor.AttemptGeneration, "path", relayCandidatePath(connection.Carrier()), "owner", "candidate_control", "error", controlErr)
 			return true, controlErr
 		case <-transportCtx.Done():
@@ -991,6 +992,7 @@ func (s *Service) logWSSStage(ctx context.Context, descriptor api.PeerAttemptDes
 
 func (s *Service) logCandidateStage(ctx context.Context, descriptor api.PeerAttemptDescriptor, path, stage string, started time.Time, err error) {
 	deadline, _ := ctx.Deadline()
+	//paperboat:allow-source-policy sensitive-log owner=transport-observability reason=bounded-intent-generation-stage-error
 	slog.Info("peer candidate lifecycle", "intent_id", descriptor.IntentID, "attempt_generation", descriptor.AttemptGeneration,
 		"network_generation", descriptor.NetworkGeneration, "path", path, "stage", stage,
 		"elapsed_ms", time.Since(started).Milliseconds(), "context_deadline", deadline.UTC().Format(time.RFC3339Nano), "error", err)

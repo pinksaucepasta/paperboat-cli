@@ -308,8 +308,8 @@ func (s *Service) serveDirect(setupCtx, lifetime context.Context, document api.P
 		}
 		server := &http3.Server{Handler: http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 			port, parseErr := strconv.ParseUint(request.Header.Get("X-Paperboat-Preview-Port"), 10, 16)
-			if request.Method != http.MethodConnect || request.Host != "private-preview.paperboat" || request.URL.Path != "" || parseErr != nil || port == 0 {
-				diagnosticlog.TryInfo("private preview HTTP/3 CONNECT rejected", "method", request.Method, "host", request.Host, "path", request.URL.Path, "port", request.Header.Get("X-Paperboat-Preview-Port"), "port_error", parseErr)
+			if request.Method != http.MethodConnect || request.Proto != peerpreview.HTTP3ConnectProtocol || request.Host != "private-preview.paperboat" || request.URL.Path != "/" || parseErr != nil || port == 0 {
+				diagnosticlog.TryInfo("private preview HTTP/3 CONNECT rejected", "method", request.Method, "protocol", request.Proto, "host", request.Host, "path", request.URL.Path, "port", request.Header.Get("X-Paperboat-Preview-Port"), "port_error", parseErr)
 				http.Error(writer, "invalid private preview request", http.StatusBadRequest)
 				return
 			}

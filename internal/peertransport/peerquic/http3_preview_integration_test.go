@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/peerquic"
+	peerpreview "github.com/pinksaucepasta/paperboat/internal/peertransport/privatepreview"
 	"github.com/quic-go/quic-go/http3"
 )
 
@@ -46,7 +47,7 @@ func TestPreviewHTTP3StreamOutlivesSetupContext(t *testing.T) {
 	setupCtx, cancelSetup := context.WithCancel(context.Background())
 	streamCtx, cancelStream := context.WithCancel(context.WithoutCancel(setupCtx))
 	reader, writer := io.Pipe()
-	request := (&http.Request{Method: http.MethodConnect, URL: &url.URL{Scheme: "https", Host: "private-preview.paperboat"}, Host: "private-preview.paperboat", Header: make(http.Header), Body: reader}).WithContext(streamCtx)
+	request := (&http.Request{Method: http.MethodConnect, URL: &url.URL{Scheme: "https", Host: "private-preview.paperboat", Path: "/"}, Proto: peerpreview.HTTP3ConnectProtocol, Host: "private-preview.paperboat", Header: make(http.Header), Body: reader}).WithContext(streamCtx)
 	response, err := client.RoundTrip(request)
 	if err != nil {
 		t.Fatal(err)

@@ -1339,6 +1339,9 @@ func privatePreviewRuntimeCommand() *cobra.Command {
 			if err := hostruntimeentry.BeginPrivatePreviewService(stateRoot, name); err != nil {
 				return err
 			}
+			failStartup := func(cause error) error {
+				return errors.Join(cause, hostruntimeentry.MarkPrivatePreviewServiceFailed(stateRoot, name, cause))
+			}
 			ctx := command.Context()
 			var cancel context.CancelFunc
 			if expiresAt != nil {
@@ -1348,11 +1351,11 @@ func privatePreviewRuntimeCommand() *cobra.Command {
 			action := actionContext(command, nil)
 			dependencies, err := buildDeps(action)
 			if err != nil || dependencies.peerApplications == nil {
-				return errors.Join(errors.New("private peer transport is unavailable"), err)
+				return failStartup(errors.Join(errors.New("private peer transport is unavailable"), err))
 			}
 			client, err := backendForCommand(command)
 			if err != nil {
-				return err
+				return failStartup(err)
 			}
 			proxy, err := privatepreviewproxy.Start(ctx, privatepreviewproxy.Config{ListenPort: remote.ListenPort, Dial: func(dialCtx context.Context) (io.ReadWriteCloser, error) {
 				target, targetErr := privatePreviewPeerTarget(dialCtx, client, remote.MachineID, remote.MachineName, remote.EnvironmentID, remote.MachineGeneration)
@@ -1362,11 +1365,11 @@ func privatePreviewRuntimeCommand() *cobra.Command {
 				return dependencies.peerApplications.DialPrivatePreview(dialCtx, target, remote.TargetPort)
 			}})
 			if err != nil {
-				return err
+				return failStartup(err)
 			}
 			defer proxy.Close()
 			if err := hostruntimeentry.MarkPrivatePreviewServiceReady(stateRoot, name, proxy.URL); err != nil {
-				return err
+				return failStartup(err)
 			}
 			waitErr := proxy.Wait()
 			if errors.Is(context.Cause(ctx), context.Canceled) {
@@ -5810,7 +5813,9 @@ func runServeCommand(command *cobra.Command, args []string) error {
 		if err := hostruntimeentry.InstallServeService(command.Context(), executable, stateRoot, name, source, spa, expiresAt, indefinite, true, 0); err != nil {
 			return err
 		}
-		readyCtx, cancelReady := context.WithTimeout(command.Context(), 30*time.Second)
+		// A connector acceptance attempt is bounded at 25 seconds. Leave enough
+		// startup budget for one complete retry after the supervisor backoff.
+		readyCtx, cancelReady := context.WithTimeout(command.Context(), 60*time.Second)
 		defer cancelReady()
 		record, err = hostruntimeentry.WaitPreviewServiceReady(readyCtx, stateRoot, name)
 		if err != nil {

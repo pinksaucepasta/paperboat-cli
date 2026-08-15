@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"os"
 	"os/user"
@@ -47,8 +48,13 @@ type PreviewRuntimeDescriptor struct {
 	ExpiresAt         *time.Time                       `json:"expires_at,omitempty"`
 	ServiceDefinition string                           `json:"service_definition"`
 	Record            *preview.ControlRecord           `json:"record,omitempty"`
+	Failure           *PreviewRuntimeFailure           `json:"failure,omitempty"`
 	Serve             *ServeRuntimeDescriptor          `json:"serve,omitempty"`
 	PrivateRemote     *PrivatePreviewRuntimeDescriptor `json:"private_remote,omitempty"`
+}
+
+type PreviewRuntimeFailure struct {
+	Code string `json:"code"`
 }
 
 type PrivatePreviewRuntimeDescriptor struct {
@@ -63,6 +69,19 @@ type PrivatePreviewRuntimeDescriptor struct {
 var ErrPreviewAlreadyActive = errors.New("preview name is already active")
 var ErrPreviewServiceMissing = errors.New("preview service is missing")
 var ErrPreviewServiceFailed = errors.New("preview service failed")
+
+type PreviewServiceFailureError struct {
+	Code string
+}
+
+func (e *PreviewServiceFailureError) Error() string {
+	if e == nil || e.Code == "" {
+		return ErrPreviewServiceFailed.Error()
+	}
+	return ErrPreviewServiceFailed.Error() + ": " + e.Code
+}
+
+func (e *PreviewServiceFailureError) Unwrap() error { return ErrPreviewServiceFailed }
 
 func InstallPreviewService(ctx context.Context, executable, stateRoot, name string, port uint16, expiresAt *time.Time, indefinite bool) (PreviewRuntimeDescriptor, error) {
 	return installPreviewService(ctx, executable, stateRoot, name, port, expiresAt, indefinite, nil, nil, 0)
@@ -331,6 +350,13 @@ func retireCompletedServeService(ctx context.Context, name, descriptorPath, defi
 	if err != nil || definition != expected {
 		return errors.Join(ErrProductionInvalid, err)
 	}
+	if runtime.GOOS == "linux" {
+		unit := "paperboat-preview-" + previewServiceInstance(name) + ".service"
+		disableErr := runner.Run(ctx, "systemctl", "--user", "disable", unit)
+		if disableErr != nil && !previewSystemdUnitAbsent(disableErr) {
+			return disableErr
+		}
+	}
 	removeDescriptorErr := os.Remove(descriptorPath)
 	if errors.Is(removeDescriptorErr, os.ErrNotExist) {
 		removeDescriptorErr = nil
@@ -512,7 +538,11 @@ func waitPreviewServiceReady(ctx context.Context, stateRoot, name string, runner
 			return preview.ControlRecord{}, errors.Join(ErrPreviewServiceMissing, err)
 		}
 		if err == nil && descriptor.Record != nil && descriptor.Record.State == "failed" {
-			return preview.ControlRecord{}, ErrPreviewServiceFailed
+			failure := &PreviewServiceFailureError{}
+			if descriptor.Failure != nil {
+				failure.Code = descriptor.Failure.Code
+			}
+			return preview.ControlRecord{}, failure
 		}
 		if err == nil && descriptor.ServiceDefinition != "" {
 			if _, statErr := os.Stat(descriptor.ServiceDefinition); errors.Is(statErr, os.ErrNotExist) {
@@ -576,7 +606,7 @@ func ReadPrivatePreviewService(stateRoot, name string) (PrivatePreviewRuntimeDes
 	}
 	digest := sha256.Sum256([]byte(name))
 	descriptor, err := readPreviewRuntimeDescriptor(filepath.Join(stateRoot, "previews", "active", hex.EncodeToString(digest[:8])+".json"))
-	if err != nil || descriptor.Schema != "paperboat.preview-runtime/v1" || descriptor.Name != name || descriptor.BindAddress != "127.0.0.1" || descriptor.PrivateRemote == nil || descriptor.Serve != nil || descriptor.Record != nil && descriptor.Record.State != "ready" {
+	if err != nil || descriptor.Schema != "paperboat.preview-runtime/v1" || descriptor.Name != name || descriptor.BindAddress != "127.0.0.1" || descriptor.PrivateRemote == nil || descriptor.Serve != nil || descriptor.Record != nil && descriptor.Record.State != "ready" && descriptor.Record.State != "failed" {
 		return PrivatePreviewRuntimeDescriptor{}, errors.Join(ErrProductionInvalid, err)
 	}
 	return *descriptor.PrivateRemote, nil
@@ -602,6 +632,7 @@ func MarkPrivatePreviewServiceReady(stateRoot, name, rawURL string) error {
 	}
 	descriptor.Port = uint16(port)
 	descriptor.Record = &preview.ControlRecord{LogicalName: name, URL: rawURL, TargetPort: int32(descriptor.PrivateRemote.TargetPort), State: "ready", ExpiresAt: descriptor.ExpiresAt}
+	descriptor.Failure = nil
 	return writePreviewRuntimeDescriptor(path, descriptor)
 }
 
@@ -617,6 +648,28 @@ func BeginPrivatePreviewService(stateRoot, name string) error {
 	}
 	descriptor.Port = 0
 	descriptor.Record = nil
+	descriptor.Failure = nil
+	return writePreviewRuntimeDescriptor(path, descriptor)
+}
+
+func MarkPrivatePreviewServiceFailed(stateRoot, name string, cause error) error {
+	if !filepath.IsAbs(stateRoot) || name == "" || cause == nil {
+		return ErrProductionInvalid
+	}
+	digest := sha256.Sum256([]byte(name))
+	path := filepath.Join(stateRoot, "previews", "active", hex.EncodeToString(digest[:8])+".json")
+	descriptor, err := readPreviewRuntimeDescriptor(path)
+	if err != nil || descriptor.PrivateRemote == nil || descriptor.Name != name {
+		return errors.Join(ErrProductionInvalid, err)
+	}
+	code := "preview_worker_start_failed"
+	var networkErr *net.OpError
+	if errors.As(cause, &networkErr) && networkErr.Op == "listen" {
+		code = "preview_listener_unavailable"
+	}
+	descriptor.Port = 0
+	descriptor.Record = &preview.ControlRecord{LogicalName: name, TargetPort: int32(descriptor.PrivateRemote.TargetPort), State: "failed", ExpiresAt: descriptor.ExpiresAt}
+	descriptor.Failure = &PreviewRuntimeFailure{Code: code}
 	return writePreviewRuntimeDescriptor(path, descriptor)
 }
 
@@ -630,15 +683,7 @@ func CompletePrivatePreviewService(ctx context.Context, stateRoot, name string) 
 	if err != nil || descriptor.PrivateRemote == nil || descriptor.Name != name {
 		return errors.Join(ErrProductionInvalid, err)
 	}
-	runner := hostservice.ExecRunner{}
-	var disableErr error
-	if runtime.GOOS == "linux" {
-		disableErr = runner.Run(ctx, "systemctl", "--user", "disable", "paperboat-preview-"+previewServiceInstance(name)+".service")
-		if previewSystemdUnitAbsent(disableErr) {
-			disableErr = nil
-		}
-	}
-	return errors.Join(disableErr, retireCompletedServeService(ctx, name, path, descriptor.ServiceDefinition, runner))
+	return retireCompletedServeService(ctx, name, path, descriptor.ServiceDefinition, hostservice.ExecRunner{})
 }
 
 func previewSystemdUnitAbsent(err error) bool {
@@ -675,7 +720,8 @@ func readPreviewRuntimeDescriptor(path string) (PreviewRuntimeDescriptor, error)
 	validPreview := descriptor.Serve == nil && descriptor.PrivateRemote == nil && descriptor.Port != 0
 	validServe := descriptor.PrivateRemote == nil && validServeRuntimeDescriptor(descriptor.Serve) && descriptor.BindAddress == "127.0.0.1" && descriptor.ServiceGeneration > 0
 	validRemote := descriptor.Serve == nil && validPrivatePreviewRuntimeDescriptor(descriptor.PrivateRemote) && descriptor.BindAddress == "127.0.0.1" && descriptor.ServiceGeneration > 0
-	if descriptor.Schema != "paperboat.preview-runtime/v1" || !validPreview && !validServe && !validRemote || descriptor.Name == "" || descriptor.ServiceDefinition != "" && !filepath.IsAbs(descriptor.ServiceDefinition) || descriptor.Indefinite == (descriptor.ExpiresAt != nil) {
+	validFailure := descriptor.Failure == nil || descriptor.Record != nil && descriptor.Record.State == "failed" && (descriptor.Failure.Code == "preview_listener_unavailable" || descriptor.Failure.Code == "preview_worker_start_failed")
+	if descriptor.Schema != "paperboat.preview-runtime/v1" || !validPreview && !validServe && !validRemote || descriptor.Name == "" || descriptor.ServiceDefinition != "" && !filepath.IsAbs(descriptor.ServiceDefinition) || descriptor.Indefinite == (descriptor.ExpiresAt != nil) || !validFailure {
 		return PreviewRuntimeDescriptor{}, ErrProductionInvalid
 	}
 	return descriptor, nil

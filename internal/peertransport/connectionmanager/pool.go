@@ -1210,6 +1210,7 @@ func (p *Pool) ensureStandbyReplenishmentLocked(class peerquic.Class, state *cla
 		current.replenishment = nil
 		selection := Selection{Generation: generation, Path: PathWSS, Connection: connection}
 		p.adoptStandbyLocked(class, current, &selection)
+		//paperboat:allow-source-policy sensitive-log owner=transport-observability reason=bounded-path-generation-stage
 		slog.Info("peer WSS setup stage", "attempt_generation", generation, "path", "relay_wss", "stage", "candidate_adopted")
 		p.signalLocked()
 	}()
@@ -1302,6 +1303,7 @@ func (p *Pool) failHealthLocked(class peerquic.Class, entry *managedConnection) 
 	selected := state.selected == entry
 	wasDraining := state.draining == entry
 	if !selected && state.standby == entry {
+		//paperboat:allow-source-policy sensitive-log owner=transport-observability reason=bounded-carrier-ownership-state
 		slog.Warn("peer pool candidate health failed", "class", uint8(class), "generation", state.generation, "role", "standby", "path", entryPath(entry), "connection", connectionIdentity(entry))
 		state.standby = nil
 		if secondary := state.secondary; secondary != nil && !secondary.closed && secondary.selection.Generation == entry.selection.Generation && secondary.selection.Connection.State() == StateTrusted {
@@ -1317,6 +1319,7 @@ func (p *Pool) failHealthLocked(class peerquic.Class, entry *managedConnection) 
 		return false
 	}
 	if !selected && state.secondary == entry {
+		//paperboat:allow-source-policy sensitive-log owner=transport-observability reason=bounded-carrier-ownership-state
 		slog.Warn("peer pool candidate health failed", "class", uint8(class), "generation", state.generation, "role", "secondary", "path", entryPath(entry), "connection", connectionIdentity(entry))
 		state.secondary = nil
 		syncEntryRoles(state, entry)
@@ -1325,6 +1328,7 @@ func (p *Pool) failHealthLocked(class peerquic.Class, entry *managedConnection) 
 		return false
 	}
 	if state.selected == entry {
+		//paperboat:allow-source-policy sensitive-log owner=transport-observability reason=bounded-carrier-ownership-state
 		slog.Warn("peer pool candidate health failed", "class", uint8(class), "generation", state.generation, "role", "selected", "path", entryPath(entry), "connection", connectionIdentity(entry))
 		state.selected = nil
 		if standby := state.standby; standby != nil && !standby.closed && standby.selection.Generation == entry.selection.Generation && standby.selection.Connection.State() == StateTrusted {

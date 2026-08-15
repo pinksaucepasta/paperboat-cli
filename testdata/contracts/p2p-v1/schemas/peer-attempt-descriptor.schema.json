@@ -69,7 +69,14 @@
     {
       "if": { "properties": { "purpose": { "const": "direct_probe" } } },
       "then": { "properties": { "policy": { "properties": { "allowed_paths": { "const": ["direct_quic"] } } } } },
-      "else": { "properties": { "policy": { "properties": { "allowed_paths": { "const": ["direct_quic", "relay_quic", "relay_wss"] } } } } }
+      "else": { "properties": { "policy": { "properties": { "allowed_paths": { "oneOf": [
+        { "const": ["direct_quic", "relay_quic", "relay_wss"] },
+        { "const": ["direct_quic", "relay_quic"] },
+        { "const": ["direct_quic"] },
+        { "const": ["relay_quic", "relay_wss"] },
+        { "const": ["relay_quic"] },
+        { "const": ["relay_wss"] }
+      ] } } } } }
     },
     {
       "if": { "properties": { "purpose": { "const": "file_transfer_key" } }, "required": ["purpose"] },

@@ -2,11 +2,11 @@
   "contract_family": "paperboat.p2p",
   "contract_version": "1.0.0",
   "status": "approved",
-  "manifest_sha256": "461658a111c28a59f78f44211a63ddaa776ca1f53512ac4dc5364ee22d5f6081",
+  "manifest_sha256": "a28b483854289eb86b877b77dc554bf079eaa2131b0c7641eaac89295248b0e2",
   "approval": {
     "owner": "pujan-modha",
     "authority": "workspace owner",
-    "reviewed_at": "2026-08-05T22:44:54Z",
+    "reviewed_at": "2026-08-14T20:48:42Z",
     "decision": "approved",
     "scope": ["product", "server", "tunnel", "security", "operations", "release"]
   },
