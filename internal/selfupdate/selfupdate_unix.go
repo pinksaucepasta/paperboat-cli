@@ -77,6 +77,7 @@ func InstallCLI(currentExecutable, verifiedArtifact string) error {
 		return err
 	}
 	defer input.Close()
+	//paperboat:allow-source-policy atomic-replacement owner=self-update reason=verified-cli-staging
 	temporary, err := os.CreateTemp(filepath.Dir(currentExecutable), ".pb-update-*")
 	if err != nil {
 		return err
@@ -102,10 +103,13 @@ func InstallCLI(currentExecutable, verifiedArtifact string) error {
 	if err := os.Remove(rollback); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
+	//paperboat:allow-source-policy atomic-replacement owner=self-update reason=current-cli-backup
 	if err := os.Rename(currentExecutable, rollback); err != nil {
 		return err
 	}
+	//paperboat:allow-source-policy atomic-replacement owner=self-update reason=verified-cli-activation
 	if err := os.Rename(temporaryPath, currentExecutable); err != nil {
+		//paperboat:allow-source-policy atomic-replacement owner=self-update reason=activation-failure-rollback
 		_ = os.Rename(rollback, currentExecutable)
 		return err
 	}
@@ -116,6 +120,7 @@ func InstallCLI(currentExecutable, verifiedArtifact string) error {
 	}
 	if err != nil {
 		_ = os.Remove(currentExecutable)
+		//paperboat:allow-source-policy atomic-replacement owner=self-update reason=directory-sync-failure-rollback
 		_ = os.Rename(rollback, currentExecutable)
 		return err
 	}
