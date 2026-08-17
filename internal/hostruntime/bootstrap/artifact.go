@@ -63,6 +63,7 @@ type tufReleaseIndexCustom struct {
 type tufReleaseComponentCustom struct {
 	Schema       string `json:"schema"`
 	Kind         string `json:"kind"`
+	Component    string `json:"component"`
 	Version      string `json:"version"`
 	Platform     string `json:"platform"`
 	Architecture string `json:"architecture"`
@@ -178,7 +179,7 @@ func FetchVerifiedReleaseComponent(ctx context.Context, repositoryURL, stateDire
 	decoder := json.NewDecoder(strings.NewReader(string(*info.Custom)))
 	decoder.DisallowUnknownFields()
 	var extra any
-	if decoder.Decode(&custom) != nil || decoder.Decode(&extra) != io.EOF || custom.Schema != ArtifactTargetSchemaV1 || custom.Kind != component || custom.Version != index.Version || custom.Platform != target.Platform || custom.Architecture != target.Architecture {
+	if decoder.Decode(&custom) != nil || decoder.Decode(&extra) != io.EOF || custom.Schema != "paperboat.tuf-component/v1" || custom.Kind != "component" || custom.Component != component || custom.Version != index.Version || custom.Platform != target.Platform || custom.Architecture != target.Architecture {
 		return "", ErrArtifactMismatch
 	}
 	path, _, err := client.DownloadTarget(info, "", "")

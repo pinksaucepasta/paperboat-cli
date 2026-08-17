@@ -14,6 +14,7 @@ const usage = `pb internal host runtime.
 Usage:
   pb __runtime-hostd
   pb __runtime-worker
+  pb __runtime-updated
 
 This entry point is managed by Paperboat services and is not a user command.`
 
@@ -98,6 +99,13 @@ func execute(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 	}
 	if args[0] == "worker" {
 		if err := runWorker(ctx, args[1:], stdin, stdout, stderr); err != nil {
+			writeError(stderr, err)
+			return 1
+		}
+		return 0
+	}
+	if args[0] == "updated" {
+		if err := runUpdated(ctx, args[1:], stdout, stderr); err != nil {
 			writeError(stderr, err)
 			return 1
 		}

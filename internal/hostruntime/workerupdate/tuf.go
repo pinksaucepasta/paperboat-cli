@@ -58,6 +58,22 @@ func (s TUFSource) ResolveManual(ctx context.Context) (Release, bool, error) {
 	return release, true, nil
 }
 
+// Active resolves the signed metadata for the runtime already selected by the
+// stable launcher. Startup fails closed if that executable is not the exact
+// signed active version; an updater never invents a hash for a local file.
+func (s TUFSource) Active(ctx context.Context, version string) (Release, error) {
+	now := s.now()
+	index, err := bootstrap.FetchVerifiedReleaseIndex(ctx, s.RepositoryURL, filepath.Join(s.StateRoot, "index"), s.HTTP, now)
+	if err != nil {
+		return Release{}, err
+	}
+	release, ok := releaseFromIndex(index)
+	if !ok || release.Version != version {
+		return Release{}, ErrInvalidRelease
+	}
+	return release, nil
+}
+
 func (s TUFSource) Fetch(ctx context.Context, release Release) (io.ReadCloser, error) {
 	now := s.now()
 	index, err := bootstrap.FetchVerifiedReleaseIndex(ctx, s.RepositoryURL, filepath.Join(s.StateRoot, "index"), s.HTTP, now)

@@ -302,6 +302,16 @@ func runtimeWorkerCommand() *cobra.Command {
 	}
 }
 
+func updatedRuntimeCommand() *cobra.Command {
+	return &cobra.Command{Use: "__runtime-updated", Hidden: true, DisableFlagParsing: true, RunE: func(command *cobra.Command, args []string) error {
+		code := hostruntimecmd.Execute(command.Context(), append([]string{"updated"}, args...), command.InOrStdin(), command.OutOrStdout(), command.ErrOrStderr())
+		if code != 0 {
+			return exitCodeError{code: code}
+		}
+		return nil
+	}, SilenceUsage: true, SilenceErrors: true}
+}
+
 func localDaemonCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:    "__local-daemon",
@@ -2280,6 +2290,7 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(hostRuntimeCommand())
 	root.AddCommand(hostdRuntimeCommand())
 	root.AddCommand(runtimeWorkerCommand())
+	root.AddCommand(updatedRuntimeCommand())
 	root.AddCommand(localDaemonCommand())
 	root.AddCommand(statusCommand())
 	root.AddCommand(waitCommand())
