@@ -6,6 +6,8 @@ import (
 	"strings"
 )
 
+const AliasSuffix = "pprbt"
+
 var (
 	ErrSSHAliasInvalid     = errors.New("managed SSH alias is invalid")
 	ErrSSHUsernameInvalid  = errors.New("managed SSH username is invalid")
@@ -13,6 +15,32 @@ var (
 	ErrSSHPortConflict     = errors.New("OpenSSH destination port differs from the registered SSH target")
 	ErrSSHUsernameMissing  = errors.New("managed SSH username is unavailable")
 )
+
+// ParseMachineTarget separates an optional OpenSSH username while preserving
+// the full Paperboat machine selector, including stable machine IDs.
+func ParseMachineTarget(value string) (target, username string, err error) {
+	value = strings.TrimSpace(value)
+	if strings.Count(value, "@") > 1 {
+		return "", "", ErrSSHAliasInvalid
+	}
+	if before, after, found := strings.Cut(value, "@"); found {
+		username, value = before, after
+		if !validSSHUsername(username) {
+			return "", "", ErrSSHUsernameInvalid
+		}
+	}
+	if value == "" || strings.ContainsAny(value, "\x00\r\n") {
+		return "", "", ErrSSHAliasInvalid
+	}
+	return value, username, nil
+}
+
+func ValidateUsername(value string) error {
+	if !validSSHUsername(strings.TrimSpace(value)) {
+		return ErrSSHUsernameInvalid
+	}
+	return nil
+}
 
 type Destination struct {
 	Alias string

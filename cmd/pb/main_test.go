@@ -48,11 +48,30 @@ import (
 )
 
 func TestOpenSSHArgumentsPlacesRemoteCommandAfterDestination(t *testing.T) {
-	destination := managedssh.Destination{User: "root", Host: "machine.pprbt.dev", Port: 2222}
+	destination := managedssh.Destination{User: "root", Host: "machine.pprbt", Port: 2222}
 	got := openSSHArguments(destination, []string{"printf ssh-ok"}, true)
-	want := []string{"-p", "2222", "root@machine.pprbt.dev", "printf ssh-ok"}
+	want := []string{"-p", "2222", "root@machine.pprbt", "printf ssh-ok"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("openSSHArguments() = %q, want %q", got, want)
+	}
+}
+
+func TestResolveSSHRequestedUser(t *testing.T) {
+	for _, test := range []struct{ target, flag, want string }{
+		{target: "root", want: "root"},
+		{flag: "deploy", want: "deploy"},
+		{target: "root", flag: "root", want: "root"},
+	} {
+		got, err := resolveSSHRequestedUser(test.target, test.flag)
+		if err != nil || got != test.want {
+			t.Fatalf("resolveSSHRequestedUser(%q, %q) = %q, %v", test.target, test.flag, got, err)
+		}
+	}
+	if _, err := resolveSSHRequestedUser("root", "deploy"); !errors.Is(err, managedssh.ErrSSHUsernameConflict) {
+		t.Fatalf("conflict error = %v", err)
+	}
+	if _, err := resolveSSHRequestedUser("", "bad user"); !errors.Is(err, managedssh.ErrSSHUsernameInvalid) {
+		t.Fatalf("invalid username error = %v", err)
 	}
 }
 

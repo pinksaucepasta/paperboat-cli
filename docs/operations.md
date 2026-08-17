@@ -98,6 +98,16 @@ Enrollment derives a stable label, avoids reserved Paperboat command and infrast
 names, and allocates deterministic `-2`, `-3`, and later suffixes under account-scoped
 transaction serialization. Local inventory rejects absent or malformed aliases.
 
+Managed SSH uses the canonical OpenSSH host `<machine>.pprbt`; the former `.pprbt.dev`
+form is not accepted. `pb ssh <machine>` delegates to the system OpenSSH client as
+`<setup-user>@<machine>.pprbt`, where the setup user is the operating-system account that
+ran `pb setup`. Callers can override it with either `pb ssh user@<machine>` or
+`pb ssh <machine> --user user`; conflicting explicit users fail before OpenSSH starts.
+The installed `Host *.pprbt` configuration uses the same ProxyCommand, managed identity,
+and strict host-key source for native `ssh`, `scp`, `sftp`, `rsync`, Git-over-SSH, and
+OpenSSH forwarding. Native ecosystem commands should spell the user explicitly, for
+example `scp file root@hn.pprbt:/tmp/file`.
+
 Machine runtime services may set `PAPERBOAT_HTTP_PROXY`, `PAPERBOAT_HTTPS_PROXY`, and
 `PAPERBOAT_NO_PROXY` as administrator policy. These settings take precedence over the
 standard process environment and native macOS proxy settings for all runtime-owned

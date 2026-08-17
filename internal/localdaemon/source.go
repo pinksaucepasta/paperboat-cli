@@ -199,7 +199,7 @@ func (s AuthenticatedMachineSource) ListUserMachines(ctx context.Context) ([]api
 		return nil, err
 	}
 	for index := range machines {
-		if _, err := managedssh.AliasHost(machines[index].Alias, managedSSHAliasSuffix); err != nil {
+		if _, err := managedssh.AliasHost(machines[index].Alias, managedssh.AliasSuffix); err != nil {
 			return nil, errors.New("paperboat-server returned an invalid machine alias")
 		}
 		machines[index].SSHLocalReady = s.SSHLocalReady

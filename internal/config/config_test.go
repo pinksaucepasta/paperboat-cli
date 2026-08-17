@@ -7,7 +7,23 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/pinksaucepasta/paperboat/internal/buildinfo"
 )
+
+func TestLoadUsesReleaseServerDefaultWithoutPersistingIt(t *testing.T) {
+	previous := buildinfo.DefaultServerURL
+	buildinfo.DefaultServerURL = "https://api.release.example"
+	t.Cleanup(func() { buildinfo.DefaultServerURL = previous })
+
+	cfg, err := Load(filepath.Join(t.TempDir(), "missing.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ServerURL != buildinfo.DefaultServerURL {
+		t.Fatalf("server URL = %q, want release default %q", cfg.ServerURL, buildinfo.DefaultServerURL)
+	}
+}
 
 func TestFavoritesEnforceSharedLimitAndPersist(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")

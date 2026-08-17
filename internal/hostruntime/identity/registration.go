@@ -36,7 +36,8 @@ func (s *Store) SaveRegistration(value Registration) error {
 	if strings.TrimSpace(value.ServerURL) == "" || strings.TrimSpace(value.MachineID) == "" ||
 		strings.TrimSpace(value.EnvironmentID) == "" || value.PublicKeyID != s.key.ID ||
 		strings.TrimSpace(value.PublicIdentityKey) == "" || !filepath.IsAbs(value.InboxPath) || value.InstallationGeneration < 1 ||
-		!validSetupMode(value.SetupMode) || value.UpdatedAt.IsZero() || value.SSHPort == 0 != (strings.TrimSpace(value.SSHUser) == "") {
+		!validSetupMode(value.SetupMode) || value.UpdatedAt.IsZero() || value.SSHPort == 0 != (strings.TrimSpace(value.SSHUser) == "") ||
+		value.SetupMode != "host" && (value.SSHPort != 0 || strings.TrimSpace(value.SSHUser) != "") {
 		return ErrInvalidStore
 	}
 	value.Version = 1
@@ -96,7 +97,8 @@ func (s *Store) Registration() (Registration, error) {
 	if value.SetupMode == "" {
 		value.SetupMode = setupModeFromRoles(value.SetupRoles)
 	}
-	if !validSetupMode(value.SetupMode) || value.SSHPort == 0 != (strings.TrimSpace(value.SSHUser) == "") {
+	if !validSetupMode(value.SetupMode) || value.SSHPort == 0 != (strings.TrimSpace(value.SSHUser) == "") ||
+		value.SetupMode != "host" && (value.SSHPort != 0 || strings.TrimSpace(value.SSHUser) != "") {
 		return Registration{}, ErrInvalidStore
 	}
 	return value, nil

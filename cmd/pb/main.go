@@ -1555,9 +1555,14 @@ func setupCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			sshPortValue, err := command.Flags().GetUint("ssh-port")
-			if err != nil || sshPortValue == 0 || sshPortValue > 65535 {
-				return invocationError(errors.New("--ssh-port must be between 1 and 65535"))
+			sshPortValue := uint(0)
+			if mode == "host" {
+				sshPortValue, err = command.Flags().GetUint("ssh-port")
+				if err != nil || sshPortValue == 0 || sshPortValue > 65535 {
+					return invocationError(errors.New("--ssh-port must be between 1 and 65535"))
+				}
+			} else if command.Flags().Changed("ssh-port") {
+				return invocationError(errors.New("--ssh-port is available only with --mode host"))
 			}
 			account, err := user.Current()
 			if err != nil || strings.TrimSpace(account.Username) == "" {
@@ -1636,15 +1641,18 @@ func setupCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if err := identityStore.SaveRegistration(identity.Registration{
+			registration := identity.Registration{
 				ServerURL: d.cfg.ServerURL, MachineID: machine.ID, EnvironmentID: machine.EnvironmentID,
 				PublicKeyID: key.ID, PublicIdentityKey: publicIdentityKey,
 				InboxPath:              inboxPath,
 				InstallationGeneration: machine.InstallationGeneration, SetupRoles: machine.SetupRoles,
 				SetupMode: setupAPIMode,
-				SSHUser:   account.Username, SSHPort: uint16(sshPortValue),
 				UpdatedAt: time.Now().UTC(),
-			}); err != nil {
+			}
+			if mode == "host" {
+				registration.SSHUser, registration.SSHPort = account.Username, uint16(sshPortValue)
+			}
+			if err := identityStore.SaveRegistration(registration); err != nil {
 				return fmt.Errorf("save machine registration: %w", err)
 			}
 			if mode == "session" {
@@ -2067,7 +2075,7 @@ func newRootCommand() *cobra.Command {
 	execCommand.Flags().Bool("json", false, "emit paperboat.exec-event/v1 JSON Lines")
 	execCommand.Flags().String("transport", "", "peer transport: a, d, q, w, or r")
 	root.AddCommand(execCommand)
-	sshCommand := &cobra.Command{Use: "ssh <machine> [-- <OpenSSH arguments...>]", Short: "Connect to a machine with OpenSSH", Args: commandArgs(cobra.ArbitraryArgs), RunE: actionSSH}
+	sshCommand := &cobra.Command{Use: "ssh [user@]<machine> [-- <OpenSSH arguments...>]", Short: "Connect to a machine with OpenSSH", Args: commandArgs(cobra.ArbitraryArgs), RunE: actionSSH}
 	sshCommand.Flags().String("user", "", "remote operating-system user")
 	sshCommand.Flags().String("transport", "", "peer transport: a, d, q, w, or r")
 	sshTrustHost := &cobra.Command{Use: "trust-host <machine>", Short: "Approve a changed SSH host identity", Args: commandArgs(cobra.ExactArgs(1)), RunE: actionSSHTrustHost}
@@ -7372,29 +7380,24 @@ func actionExecCobra(cobraCommand *cobra.Command, args []string, shorthand bool)
 func actionSSH(command *cobra.Command, args []string) error {
 	dash := command.ArgsLenAtDash()
 	if len(args) == 0 || dash > 1 || dash < 0 && len(args) != 1 {
-		return invocationError(errors.New("SSH requires <machine> [-- <OpenSSH arguments...>]"))
+		return invocationError(errors.New("SSH requires [user@]<machine> [-- <OpenSSH arguments...>]"))
+	}
+	targetName, targetUser, err := managedssh.ParseMachineTarget(args[0])
+	if err != nil {
+		return invocationError(err)
+	}
+	flagUser, _ := command.Flags().GetString("user")
+	requestedUser, err := resolveSSHRequestedUser(targetUser, flagUser)
+	if err != nil {
+		return invocationError(err)
 	}
 	ctx := actionContext(command, args)
-	client, machine, target, err := resolveSSHCommandTargetFast(ctx, args[0])
+	client, machine, target, err := resolveSSHCommandTargetFast(ctx, targetName)
 	if err != nil {
 		return friendlyCommandError(err)
 	}
 	_ = client
-	requestedUser, _ := command.Flags().GetString("user")
-	host, err := managedssh.AliasHost(machine.Alias, "pprbt.dev")
-	if err != nil {
-		return err
-	}
-	openSSHUser, err := configuredOpenSSHUser(command.Context(), host)
-	if err != nil {
-		return err
-	}
-	account, _ := user.Current()
-	localUser := ""
-	if account != nil {
-		localUser = account.Username
-	}
-	destination, err := managedssh.ResolveDestination(managedssh.DestinationInput{Alias: machine.Alias, AliasSuffix: "pprbt.dev", RegisteredPort: target.Port, RequestedUser: requestedUser, OpenSSHUser: openSSHUser, RegisteredUser: target.OSUser, LocalUser: localUser, HasRegisteredUser: true})
+	destination, err := managedssh.ResolveDestination(managedssh.DestinationInput{Alias: machine.Alias, AliasSuffix: managedssh.AliasSuffix, RegisteredPort: target.Port, RequestedUser: requestedUser, RegisteredUser: target.OSUser, HasRegisteredUser: true})
 	if err != nil {
 		return err
 	}
@@ -7404,6 +7407,21 @@ func actionSSH(command *cobra.Command, args []string) error {
 		environment = append(environment, "PAPERBOAT_TRANSPORT="+transport)
 	}
 	return (managedssh.OpenSSHExecutor{}).Execute("ssh", arguments, environment)
+}
+
+func resolveSSHRequestedUser(targetUser, flagUser string) (string, error) {
+	if flagUser != "" {
+		if err := managedssh.ValidateUsername(flagUser); err != nil {
+			return "", err
+		}
+	}
+	if flagUser != "" && targetUser != "" && flagUser != targetUser {
+		return "", managedssh.ErrSSHUsernameConflict
+	}
+	if flagUser != "" {
+		return flagUser, nil
+	}
+	return targetUser, nil
 }
 
 func openSSHArguments(destination managedssh.Destination, passthrough []string, includePassthrough bool) []string {
@@ -7430,7 +7448,7 @@ func actionSSHProxy(command *cobra.Command, _ []string) error {
 	}
 	host, _ := command.Flags().GetString("host")
 	portText, _ := command.Flags().GetString("port")
-	alias, err := managedssh.ParseAliasHost(host, "pprbt.dev")
+	alias, err := managedssh.ParseAliasHost(host, managedssh.AliasSuffix)
 	if err != nil {
 		return err
 	}
@@ -7506,7 +7524,7 @@ func copySSHProxy(connection io.ReadWriteCloser, halfCloser interface{ CloseWrit
 func actionSSHKnownHosts(command *cobra.Command, _ []string) error {
 	host, _ := command.Flags().GetString("host")
 	portText, _ := command.Flags().GetString("port")
-	alias, err := managedssh.ParseAliasHost(host, "pprbt.dev")
+	alias, err := managedssh.ParseAliasHost(host, managedssh.AliasSuffix)
 	if err != nil {
 		return err
 	}
@@ -7609,7 +7627,7 @@ func actionSSHDoctor(command *cobra.Command, args []string) error {
 		return err
 	}
 	agentSocket := filepath.Join(paths.RuntimeRoot, "paperboat-ssh-agent.sock")
-	if err := managedssh.ValidateInstalledOpenSSHConfig(home, uint32(os.Geteuid()), "pprbt.dev", agentSocket); err != nil {
+	if err := managedssh.ValidateInstalledOpenSSHConfig(home, uint32(os.Geteuid()), managedssh.AliasSuffix, agentSocket); err != nil {
 		return fmt.Errorf("managed OpenSSH configuration is not ready; rerun `pb auth login`: %w", err)
 	}
 	if err := managedssh.ProbeAgentIdentity(command.Context(), agentSocket, identity.Fingerprint, 5*time.Second); err != nil {
@@ -7630,7 +7648,7 @@ func actionSSHDoctor(command *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("managed SSH transport or loopback target is not ready: %w", err)
 	}
-	host, err := managedssh.AliasHost(machine.Alias, "pprbt.dev")
+	host, err := managedssh.AliasHost(machine.Alias, managedssh.AliasSuffix)
 	if err != nil {
 		_ = connection.Close()
 		return err
@@ -7759,47 +7777,6 @@ func resolveSSHMachine(ctx context.Context, client *api.Client, requested string
 		}
 	}
 	return resolveUserMachine(ctx, client, requested)
-}
-
-func configuredOpenSSHUser(ctx context.Context, host string) (string, error) {
-	type probeResult struct {
-		user string
-		err  error
-	}
-	probe := func(arguments []string) probeResult {
-		user, err := openSSHResolvedUser(ctx, "ssh", arguments)
-		return probeResult{user: user, err: err}
-	}
-	configuredCh := make(chan probeResult, 1)
-	baselineCh := make(chan probeResult, 1)
-	go func() { configuredCh <- probe([]string{"-G", host}) }()
-	go func() { baselineCh <- probe([]string{"-G", "-F", "/dev/null", host}) }()
-	configured, baseline := <-configuredCh, <-baselineCh
-	if configured.err != nil {
-		return "", configured.err
-	}
-	if baseline.err != nil {
-		return "", baseline.err
-	}
-	if configured.user != baseline.user {
-		return configured.user, nil
-	}
-	return "", nil
-}
-
-func openSSHResolvedUser(ctx context.Context, executable string, arguments []string) (string, error) {
-	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	output, err := exec.CommandContext(probeCtx, executable, arguments...).Output()
-	if err != nil || len(output) > 1<<20 {
-		return "", errors.Join(managedssh.ErrOpenSSHUnavailable, err)
-	}
-	for _, line := range strings.Split(string(output), "\n") {
-		if value, ok := strings.CutPrefix(line, "user "); ok {
-			return strings.TrimSpace(value), nil
-		}
-	}
-	return "", managedssh.ErrOpenSSHUnavailable
 }
 
 func newSSHOperationID() string {

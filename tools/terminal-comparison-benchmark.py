@@ -222,7 +222,7 @@ class Runner:
             return ([self.args.pb, "ssh", self.args.target, "--transport", cell.transport], environment, False)
         if cell.entrypoint == "openssh_alias":
             environment["PAPERBOAT_TRANSPORT"] = cell.transport or ""
-            return (["ssh", *ssh_options, f"{self.args.ssh_user}@{self.args.target}.pprbt.dev"], environment, False)
+            return (["ssh", *ssh_options, f"{self.args.ssh_user}@{self.args.target}.pprbt"], environment, False)
         return (
             [self.args.pb, self.args.target, "new", "--transport", cell.transport or "", "--name", session_name, "--status-bar", "off"],
             environment,

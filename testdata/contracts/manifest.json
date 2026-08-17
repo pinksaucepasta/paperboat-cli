@@ -17,7 +17,7 @@
       "id": "cli.command-tree",
       "path": "cli/command-tree.json",
       "type": "command-tree",
-      "sha256": "c6c16ece447e77f9fb9b6c240d8362b19187e41c9544514e7093724d32bd58ea",
+      "sha256": "b3b826e8cb6007e45b1b80a2bae3c6acbb3a333e30fb48f33a2e0fd153a666e9",
       "owner": "cli",
       "review": "preview-ownership-review",
       "consumers": [
@@ -561,7 +561,7 @@
       "id": "cli.command.transcripts",
       "path": "transcripts/cli/commands.json",
       "type": "transcripts",
-      "sha256": "b853bfcc7a2005d88b62f49c0574755edb337c79ada3cb373dc1381a2cb76cf7",
+      "sha256": "b5d98bdacd41838cb585d09a5a2010ce21db9590ab84826275982257829afbed",
       "owner": "cli",
       "review": "preview-ownership-review",
       "consumers": [

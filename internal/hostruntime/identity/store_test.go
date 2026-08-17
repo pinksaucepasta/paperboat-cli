@@ -115,6 +115,24 @@ func TestMachineControlIsBoundToRegistrationAndSignsExactRequest(t *testing.T) {
 	}
 }
 
+func TestNonHostRegistrationRejectsSSHConfiguration(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "identity")
+	store, err := Open(Config{StateRoot: root, Random: bytes.NewReader(bytes.Repeat([]byte{8}, 32))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := store.Current()
+	registration := Registration{
+		ServerURL: "https://api.example.test", MachineID: "mch_1", EnvironmentID: "env_1",
+		PublicKeyID: key.ID, PublicIdentityKey: base64.RawURLEncoding.EncodeToString(key.Public()),
+		InboxPath: filepath.Join(root, "inbox"), InstallationGeneration: 1, SetupMode: "receive",
+		SetupRoles: []string{"interactive"}, SSHUser: "developer", SSHPort: 22, UpdatedAt: time.Now().UTC(),
+	}
+	if err := store.SaveRegistration(registration); !errors.Is(err, ErrInvalidStore) {
+		t.Fatalf("non-host SSH registration error = %v", err)
+	}
+}
+
 type failingReader struct{}
 
 func (failingReader) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }

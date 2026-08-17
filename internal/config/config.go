@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
+	"github.com/pinksaucepasta/paperboat/internal/buildinfo"
 	"github.com/pinksaucepasta/paperboat/internal/userpaths"
 )
 
@@ -269,6 +270,9 @@ func Load(path string) (*Config, error) {
 }
 
 func (c *Config) applyDefaults() {
+	if strings.TrimSpace(c.ServerURL) == "" {
+		c.ServerURL = strings.TrimSpace(buildinfo.DefaultServerURL)
+	}
 	if strings.TrimSpace(c.Connect.TerminalTransport) == "" {
 		c.Connect.TerminalTransport = DefaultTerminalTransport
 	}

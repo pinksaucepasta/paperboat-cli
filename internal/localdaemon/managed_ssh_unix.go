@@ -16,8 +16,6 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/managedssh"
 )
 
-const managedSSHAliasSuffix = "pprbt.dev"
-
 type ManagedSSHConfig struct {
 	ServerURL            string
 	Auth                 config.AuthSource
@@ -62,7 +60,7 @@ func StartManagedSSH(ctx context.Context, cfg ManagedSSHConfig) (*ManagedSSHRunt
 	}
 	command := strconv.Quote(cfg.Executable)
 	_, err = managedssh.InstallOpenSSHConfig(managedssh.OpenSSHConfig{
-		Home: cfg.Home, OwnerUID: cfg.OwnerUID, AliasSuffix: managedSSHAliasSuffix,
+		Home: cfg.Home, OwnerUID: cfg.OwnerUID, AliasSuffix: managedssh.AliasSuffix,
 		ProxyCommand:      command + " __ssh-proxy --host %h --port %p",
 		KnownHostsCommand: command + " __ssh-known-hosts --host %H --port %p",
 		AgentSocket:       agent.Socket(),

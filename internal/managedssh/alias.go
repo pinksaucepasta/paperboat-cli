@@ -11,5 +11,5 @@ func validAliasSuffix(value string) bool {
 			return false
 		}
 	}
-	return strings.Contains(value, ".")
+	return true
 }

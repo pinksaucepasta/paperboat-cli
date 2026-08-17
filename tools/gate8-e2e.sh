@@ -303,6 +303,8 @@ assert_case diagnostics-none-doctor-target structured-result \
   "$(test "$doctor_target_rc" = 0 -o "$doctor_target_rc" = 1 && test -n "$doctor_target_overall" && echo true || echo false)" \
   "exit=$doctor_target_rc overall=$doctor_target_overall"
 run_case ssh none doctor pb ssh doctor "$TARGET"
+run_case ssh auto default-setup-user pb ssh "$TARGET" -- true
+run_case ssh auto user-at-machine pb ssh "root@$TARGET" -- true
 run_case config none show pb config show --json
 run_case config none status pb config status "$TARGET" --json
 isolated_config="$RESULT_ROOT/isolated-config.json"
@@ -405,32 +407,32 @@ assert_case transfer-none-send-binary receipt-sha256 \
   "receipt=$transfer_receipt remote_sha256=${transfer_remote_hash:-missing}"
 
 # Ordinary OpenSSH tooling exercises the managed opaque SSH stream contract.
-run_case openssh auto command ssh -o BatchMode=yes -o ConnectTimeout=20 "root@$TARGET.pprbt.dev" true
+run_case openssh auto command ssh -o BatchMode=yes -o ConnectTimeout=20 "root@$TARGET.pprbt" true
 pb exec "$TARGET" --transport a -- rm -f /tmp/g8-scp-upload.bin /tmp/g8-sftp-upload.bin >/dev/null 2>&1 || true
 payload_hash="$(sha256sum "$RESULT_ROOT/payload/random.bin" | cut -d' ' -f1)"
 for run in $(seq 1 "$REPEAT"); do
-  run_case scp auto "upload-$run" scp -q -o BatchMode=yes -o ConnectTimeout=20 "$RESULT_ROOT/payload/random.bin" "root@$TARGET.pprbt.dev:/tmp/g8-scp-upload-$run.bin"
-  run_case scp auto "download-$run" scp -q -o BatchMode=yes -o ConnectTimeout=20 "root@$TARGET.pprbt.dev:/tmp/g8-scp-upload-$run.bin" "$RESULT_ROOT/payload/scp-download-$run.bin"
+  run_case scp auto "upload-$run" scp -q -o BatchMode=yes -o ConnectTimeout=20 "$RESULT_ROOT/payload/random.bin" "root@$TARGET.pprbt:/tmp/g8-scp-upload-$run.bin"
+  run_case scp auto "download-$run" scp -q -o BatchMode=yes -o ConnectTimeout=20 "root@$TARGET.pprbt:/tmp/g8-scp-upload-$run.bin" "$RESULT_ROOT/payload/scp-download-$run.bin"
   assert_case "scp-roundtrip-$run" sha256 "$(test "$payload_hash" = "$(sha256sum "$RESULT_ROOT/payload/scp-download-$run.bin" 2>/dev/null | cut -d' ' -f1)" && echo true || echo false)" exact
-  run_case sftp auto "put-get-$run" sh -c "printf 'put $RESULT_ROOT/payload/random.bin /tmp/g8-sftp-upload-$run.bin\\nget /tmp/g8-sftp-upload-$run.bin $RESULT_ROOT/payload/sftp-download-$run.bin\\nquit\\n' | sftp -q -oBatchMode=yes -oConnectTimeout=20 root@$TARGET.pprbt.dev"
+  run_case sftp auto "put-get-$run" sh -c "printf 'put $RESULT_ROOT/payload/random.bin /tmp/g8-sftp-upload-$run.bin\\nget /tmp/g8-sftp-upload-$run.bin $RESULT_ROOT/payload/sftp-download-$run.bin\\nquit\\n' | sftp -q -oBatchMode=yes -oConnectTimeout=20 root@$TARGET.pprbt"
   assert_case "sftp-roundtrip-$run" sha256 "$(test "$payload_hash" = "$(sha256sum "$RESULT_ROOT/payload/sftp-download-$run.bin" 2>/dev/null | cut -d' ' -f1)" && echo true || echo false)" exact
 done
 
 
 # The managed OpenSSH configuration must remain compatible with common tools.
 printf 'gate8-rsync\n' >"$RESULT_ROOT/payload/rsync.txt"
-run_case rsync auto upload rsync -a -e "ssh -o BatchMode=yes -o ConnectTimeout=20" "$RESULT_ROOT/payload/rsync.txt" "root@$TARGET.pprbt.dev:/tmp/g8-rsync.txt"
-run_case rsync auto download rsync -a -e "ssh -o BatchMode=yes -o ConnectTimeout=20" "root@$TARGET.pprbt.dev:/tmp/g8-rsync.txt" "$RESULT_ROOT/payload/rsync-download.txt"
+run_case rsync auto upload rsync -a -e "ssh -o BatchMode=yes -o ConnectTimeout=20" "$RESULT_ROOT/payload/rsync.txt" "root@$TARGET.pprbt:/tmp/g8-rsync.txt"
+run_case rsync auto download rsync -a -e "ssh -o BatchMode=yes -o ConnectTimeout=20" "root@$TARGET.pprbt:/tmp/g8-rsync.txt" "$RESULT_ROOT/payload/rsync-download.txt"
 assert_case rsync-auto-roundtrip exact \
   "$(cmp -s "$RESULT_ROOT/payload/rsync.txt" "$RESULT_ROOT/payload/rsync-download.txt" && echo true || echo false)" exact
-run_case git auto prepare ssh -o BatchMode=yes -o ConnectTimeout=20 "root@$TARGET.pprbt.dev" \
+run_case git auto prepare ssh -o BatchMode=yes -o ConnectTimeout=20 "root@$TARGET.pprbt" \
   'set -eu; rm -rf /tmp/g8.git /tmp/g8-work; git init -q /tmp/g8-work; cd /tmp/g8-work; git config user.name Gate8; git config user.email gate8@paperboat.test; printf gate8-git >canary.txt; git add canary.txt; git commit -qm gate8; git clone -q --bare . /tmp/g8.git'
-GIT_SSH_COMMAND='ssh -o BatchMode=yes -o ConnectTimeout=20' run_case git auto clone git clone -q "root@$TARGET.pprbt.dev:/tmp/g8.git" "$RESULT_ROOT/payload/git-clone"
+GIT_SSH_COMMAND='ssh -o BatchMode=yes -o ConnectTimeout=20' run_case git auto clone git clone -q "root@$TARGET.pprbt:/tmp/g8.git" "$RESULT_ROOT/payload/git-clone"
 assert_case git-auto-clone canary \
   "$(test "$(cat "$RESULT_ROOT/payload/git-clone/canary.txt" 2>/dev/null)" = gate8-git && echo true || echo false)" exact
 
 forward_port=39218
-ssh -o BatchMode=yes -o ConnectTimeout=20 -o ExitOnForwardFailure=yes -N -L "127.0.0.1:$forward_port:127.0.0.1:38142" "root@$TARGET.pprbt.dev" >"$RESULT_ROOT/cases/forward-auto-local.stdout" 2>"$RESULT_ROOT/cases/forward-auto-local.stderr" &
+ssh -o BatchMode=yes -o ConnectTimeout=20 -o ExitOnForwardFailure=yes -N -L "127.0.0.1:$forward_port:127.0.0.1:38142" "root@$TARGET.pprbt" >"$RESULT_ROOT/cases/forward-auto-local.stdout" 2>"$RESULT_ROOT/cases/forward-auto-local.stderr" &
 forward_pid=$!
 forward_ready=false
 forward_deadline=$((SECONDS + 20))

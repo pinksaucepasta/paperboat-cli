@@ -22,7 +22,7 @@ func TestOpenSSHExecutorPreservesArgumentsAndEnvironment(t *testing.T) {
 		gotPath, gotArguments, gotEnvironment = path, append([]string(nil), arguments...), append([]string(nil), environment...)
 		return sentinel
 	}}
-	arguments := []string{"-vv", "deploy@build.pprbt.dev", "printf", "%s", "hello world"}
+	arguments := []string{"-vv", "deploy@build.pprbt", "printf", "%s", "hello world"}
 	environment := []string{"PATH=/usr/bin:/bin", "SSH_AUTH_SOCK=/tmp/agent.sock"}
 	if err := executor.Execute(executable, arguments, environment); !errors.Is(err, sentinel) {
 		t.Fatalf("Execute() error=%v", err)

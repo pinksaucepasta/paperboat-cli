@@ -51,7 +51,7 @@ func TestProbeSSHAuthenticationProvesManagedKeyAndHostPinWithoutChannel(t *testi
 		t.Fatal(err)
 	}
 	public := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(hostSigner.PublicKey())))
-	if err := ProbeSSHAuthentication(t.Context(), client, "studio.pprbt.dev:22", "deploy", clientSigner, []string{public}); err != nil {
+	if err := ProbeSSHAuthentication(t.Context(), client, "studio.pprbt:22", "deploy", clientSigner, []string{public}); err != nil {
 		t.Fatal(err)
 	}
 	if err := <-serverDone; err != nil {
@@ -65,7 +65,7 @@ func TestProbeSSHAuthenticationHonorsCancellation(t *testing.T) {
 	defer server.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err := ProbeSSHAuthentication(ctx, client, "studio.pprbt.dev:22", "deploy", clientSigner, []string{strings.TrimSpace(string(ssh.MarshalAuthorizedKey(clientSigner.PublicKey())))})
+	err := ProbeSSHAuthentication(ctx, client, "studio.pprbt:22", "deploy", clientSigner, []string{strings.TrimSpace(string(ssh.MarshalAuthorizedKey(clientSigner.PublicKey())))})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancellation error=%v", err)
 	}

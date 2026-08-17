@@ -49,7 +49,7 @@
     {"name":"wait","aliases":[],"args":["<machine>"],"flags":["--for <runtime|transport|ssh>","--timeout <duration>","--json"],"json":true},
     {"name":"ping","aliases":[],"args":["<machine>"],"flags":["--count <n>","--timeout <duration>","--json"],"json":true},
     {"name":"bugreport","aliases":[],"args":[],"flags":["--record","--upload","--json"],"json":true},
-    {"name":"ssh","aliases":[],"args":["<machine>","[-- <OpenSSH arguments...>]"],"flags":["--user <os-user>"]},
+    {"name":"ssh","aliases":[],"args":["[user@]<machine>","[-- <OpenSSH arguments...>]"],"flags":["--user <os-user>"]},
     {"name":"ssh trust-host","aliases":[],"args":["<machine>"],"flags":["--fingerprint <SHA256:fingerprint>"],"interactive":true},
     {"name":"ssh doctor","aliases":[],"args":["<machine>"]},
     {"name":"doctor","aliases":[],"args":["[machine]"],"flags":["--json"],"json":true}
