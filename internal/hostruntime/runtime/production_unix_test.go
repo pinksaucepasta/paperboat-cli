@@ -97,7 +97,7 @@ type managedSSHTestClient struct {
 }
 
 func (c *managedSSHTestClient) ObserveManagedSSHHostKeys(_ context.Context, machineID, identity, operationID, setID string, generation, observation uint64, keys []string, proof []byte) (clientapi.ManagedSSHHostKeySet, error) {
-	if machineID != "machine_1" || operationID != "managed-ssh-observe-4-7" || setID != "set_1" || generation != 4 || observation != 7 || len(keys) != 1 {
+	if machineID != "machine_1" || operationID != "managed-ssh-observe-machine_1-4-7" || setID != "set_1" || generation != 4 || observation != 7 || len(keys) != 1 {
 		return clientapi.ManagedSSHHostKeySet{}, errors.New("wrong host-key observation")
 	}
 	c.observedIdentity, c.observedProof = identity, append([]byte(nil), proof...)
@@ -134,7 +134,7 @@ func TestManagedSSHAuthorityUsesCurrentCredentialAndExactProofBodies(t *testing.
 	if string(identity.proofs[1].body) != "{}" || identity.proofs[1].method != http.MethodPost || identity.proofs[1].path != "/v1/machines/machine_1/ssh-authorized-keys" {
 		t.Fatalf("authorized-key proof = %#v", identity.proofs[1])
 	}
-	if string(client.observedProof) != "proof-managed-ssh-observe-4-7" || string(client.keysProof) != "proof-managed-ssh-keys-4-7" {
+	if string(client.observedProof) != "proof-managed-ssh-observe-machine_1-4-7" || string(client.keysProof) != "proof-managed-ssh-keys-machine_1-4-7" {
 		t.Fatalf("proofs=%q,%q", client.observedProof, client.keysProof)
 	}
 }
@@ -230,7 +230,7 @@ func TestManagedSSHKeyReconcilerConvergesAddAndRevocation(t *testing.T) {
 	identity.mu.Lock()
 	operations := append([]string(nil), identity.operations...)
 	identity.mu.Unlock()
-	if len(operations) < 4 || operations[0] == operations[2] || !strings.Contains(operations[0], "-4-9-refresh-") {
+	if len(operations) < 4 || operations[0] == operations[2] || !strings.Contains(operations[0], "-machine_1-4-9-refresh-") {
 		t.Fatalf("proof operations=%v", operations)
 	}
 }

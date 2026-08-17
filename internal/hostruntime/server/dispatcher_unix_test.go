@@ -611,3 +611,55 @@ func TestDispatcherRejectsEscapedCWDAndOverriddenPreviewIdentity(t *testing.T) {
 		t.Fatalf("escaped cwd=%#v", response)
 	}
 }
+
+func TestDispatcherCreateOrGetReturnsExistingSnapshot(t *testing.T) {
+	server := verticalServer(t)
+	client, peer := net.Pipe()
+	go server.Serve(peer)
+	hello := json.RawMessage(`{"min_version":"1.0","max_version":"1.0","capabilities":["terminal.v1","health.v1"]}`)
+	_ = sendRequest(t, client, protocol.Frame{Type: "hello", RequestID: "req_hello", Version: "1.0", Payload: hello})
+
+	createFirst, _ := json.Marshal(map[string]any{"action": "create", "session_id": "ses_cog_1", "name": "ses-cog-1", "cwd": ".", "columns": 80, "rows": 24, "existing_snapshot": true})
+	response := sendRequest(t, client, request("req_create_1", "op_create_cog_1", createFirst))
+	if response.Type != "response" {
+		t.Fatalf("first create=%s", response.Payload)
+	}
+	var created struct {
+		Result struct {
+			ID       string `json:"id"`
+			State    string `json:"state"`
+			Existing bool   `json:"existing"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(response.Payload, &created); err != nil || created.Result.ID != "ses_cog_1" || created.Result.Existing {
+		t.Fatalf("first create payload=%s err=%v", response.Payload, err)
+	}
+
+	createAgain, _ := json.Marshal(map[string]any{"action": "create", "session_id": "ses_cog_1", "name": "ses-cog-1", "cwd": ".", "columns": 80, "rows": 24, "existing_snapshot": true})
+	response = sendRequest(t, client, request("req_create_2", "op_create_cog_2", createAgain))
+	if response.Type != "response" {
+		t.Fatalf("second create=%s", response.Payload)
+	}
+	var existing struct {
+		Result struct {
+			ID       string `json:"id"`
+			State    string `json:"state"`
+			Existing bool   `json:"existing"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(response.Payload, &existing); err != nil || existing.Result.ID != "ses_cog_1" || !existing.Result.Existing || existing.Result.State != "running" {
+		t.Fatalf("second create payload=%s err=%v", response.Payload, err)
+	}
+
+	createPlain, _ := json.Marshal(map[string]any{"action": "create", "session_id": "ses_cog_1", "name": "ses-cog-1", "cwd": ".", "columns": 80, "rows": 24})
+	response = sendRequest(t, client, request("req_create_3", "op_create_cog_3", createPlain))
+	if response.Type != "error" || !strings.Contains(string(response.Payload), "session_exists") {
+		t.Fatalf("plain create on existing session=%s", response.Payload)
+	}
+
+	attach, _ := json.Marshal(map[string]any{"action": "attach", "session_id": "ses_cog_1", "from_sequence": 0})
+	response = sendRequest(t, client, request("req_attach", "op_attach_cog_1", attach))
+	if response.Type != "response" {
+		t.Fatalf("attach=%s", response.Payload)
+	}
+}

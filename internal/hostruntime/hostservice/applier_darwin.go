@@ -34,7 +34,13 @@ func (a *platformApplier) Apply(ctx context.Context, mode string) error {
 			return err
 		}
 		values, err := readPMSet(ctx)
-		if err != nil || !allValues(values, 1) {
+		if err == nil && allValues(values, 1) {
+			return nil
+		}
+		// macOS 26 and later apply `disablesleep` but no longer report it in
+		// `pmset -g custom`. Verify against the live power state instead.
+		live, liveErr := readPMSetLive(ctx)
+		if liveErr != nil || live != 1 {
 			return errors.New("pmset did not apply keep_awake")
 		}
 		return nil
@@ -167,6 +173,37 @@ func allValues(values map[string]int, want int) bool {
 		}
 	}
 	return true
+}
+
+// readPMSetLive reports the applied `SleepDisabled` value from the live
+// `pmset -g` state. macOS 26 and later apply the `disablesleep` setting but
+// hide it from `pmset -g custom`, so keep-awake verification falls back here.
+func readPMSetLive(ctx context.Context) (int, error) {
+	command := exec.CommandContext(ctx, "/usr/bin/pmset", "-g")
+	var output bytes.Buffer
+	command.Stdout, command.Stderr = &output, &output
+	if err := command.Run(); err != nil {
+		return 0, err
+	}
+	value, ok := parseLiveSleepDisabled(output.String())
+	if !ok {
+		return 0, ErrInvalidConfig
+	}
+	return value, nil
+}
+
+func parseLiveSleepDisabled(output string) (int, bool) {
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) == 2 && fields[0] == "SleepDisabled" {
+			value, err := strconv.Atoi(fields[1])
+			if err != nil || value != 0 && value != 1 {
+				return 0, false
+			}
+			return value, true
+		}
+	}
+	return 0, false
 }
 func fixedCommand(ctx context.Context, path string, args ...string) error {
 	command := exec.CommandContext(ctx, path, args...)

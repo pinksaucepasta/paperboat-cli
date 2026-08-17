@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/pinksaucepasta/paperboat/internal/httptransport"
@@ -98,7 +99,7 @@ func WaitForMaterial(ctx context.Context, config Config, expiresAt time.Time, in
 			}
 			return material, nil
 		}
-		if !errors.Is(err, ErrApprovalPending) {
+		if !errors.Is(err, ErrApprovalPending) && !transientBootstrapError(err) {
 			return Material{}, err
 		}
 		timer := time.NewTimer(interval)
@@ -110,6 +111,19 @@ func WaitForMaterial(ctx context.Context, config Config, expiresAt time.Time, in
 		}
 	}
 	return Material{}, ErrPairingExpired
+}
+
+// transientBootstrapError reports errors that do not carry pairing-terminal
+// meaning: stalled or reset connections and timeouts. Approval polling must
+// survive them instead of abandoning a pairing that is still redeemable.
+func transientBootstrapError(err error) bool {
+	var networkErr net.Error
+	if errors.As(err, &networkErr) && networkErr.Timeout() {
+		return true
+	}
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.ECONNABORTED) || errors.Is(err, syscall.EPIPE)
 }
 
 func validLoopbackAddress(address string) bool {

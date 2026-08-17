@@ -92,6 +92,28 @@ func TestPublisherRejectsInvalidConfiguration(t *testing.T) {
 	}
 }
 
+func TestPublisherReportsEveryLeasedPath(t *testing.T) {
+	now := time.Date(2026, 8, 17, 18, 0, 0, 0, time.UTC)
+	client := &observationClient{observations: make(chan localapi.TransportObservation, 1)}
+	pool := &observationPool{changes: make(chan struct{}, 1), state: connectionmanager.ClassSnapshot{Leases: 2, PathConsumers: []connectionmanager.PathConsumer{{Path: connectionmanager.PathDirectQUIC, ActiveConsumers: 1}, {Path: connectionmanager.PathRelayQUIC, ActiveConsumers: 1, RelayRegion: "bom"}}}}
+	publisher, err := New(Config{Client: client, Pool: pool, MachineID: "machine_1", Classes: []peerquic.Class{peerquic.ClassInteractive}, Clock: func() time.Time { return now }, Heartbeat: time.Second, Lifetime: 15 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- publisher.Run(ctx) }()
+	observation := receiveObservation(t, client.observations)
+	if observation.SelectedPath != "mixed" || observation.ActiveConsumers != 2 || len(observation.TransportConsumers) != 2 || observation.TransportConsumers[0] != (localapi.TransportConsumer{Path: "direct", ActiveConsumers: 1}) || observation.TransportConsumers[1] != (localapi.TransportConsumer{Path: "relay", ActiveConsumers: 1, RelayRegion: "bom"}) {
+		t.Fatalf("observation=%#v", observation)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("run err=%v", err)
+	}
+}
+
 func receiveObservation(t *testing.T, observations <-chan localapi.TransportObservation) localapi.TransportObservation {
 	t.Helper()
 	select {

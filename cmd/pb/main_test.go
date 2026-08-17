@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -17,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -25,6 +27,7 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/api"
 	bugreportpkg "github.com/pinksaucepasta/paperboat/internal/bugreport"
 	"github.com/pinksaucepasta/paperboat/internal/buildinfo"
+	"github.com/pinksaucepasta/paperboat/internal/command"
 	"github.com/pinksaucepasta/paperboat/internal/config"
 	"github.com/pinksaucepasta/paperboat/internal/diagnostics"
 	doctorpkg "github.com/pinksaucepasta/paperboat/internal/doctor"
@@ -827,7 +830,7 @@ func TestSelectTerminalSessionDoesNotHideAmbiguousProjectWithUserMachine(t *test
 	}))
 	defer server.Close()
 
-	_, err := selectTerminalSession(context.Background(), api.New(server.URL, config.Credential{AccessToken: "token"}, server.Client()), "studio", "", "named")
+	_, _, _, err := selectTerminalSession(context.Background(), api.New(server.URL, config.Credential{AccessToken: "token"}, server.Client()), "studio", "", "named")
 	if !errors.Is(err, resolver.ErrProjectAmbiguous) {
 		t.Fatalf("err = %v, want project ambiguity", err)
 	}
@@ -848,7 +851,7 @@ func TestSelectTerminalSessionCreatesFreshSessionByDefault(t *testing.T) {
 	}))
 	defer server.Close()
 
-	got, err := selectTerminalSession(context.Background(), api.New(server.URL, config.Credential{AccessToken: "token"}, server.Client()), "studio", "", "")
+	got, _, _, err := selectTerminalSession(context.Background(), api.New(server.URL, config.Credential{AccessToken: "token"}, server.Client()), "studio", "", "")
 	if err != nil || got.ID != "pts_1" || got.Name != "quiet-harbor" || !created {
 		t.Fatalf("fresh session = %+v, %v; created=%t", got, err, created)
 	}
@@ -1171,16 +1174,36 @@ func TestUpdateSelectedTransportUsesSelectorOutcome(t *testing.T) {
 	bar.SetConnection("connected")
 
 	updateSelectedTransport(bar, tunnel.TerminalTransportSelection{Selected: "quic"}, "selected")
-	if line := bar.Render(40); !strings.HasSuffix(line, "connected  Q") {
+	if line := bar.Render(40); !strings.Contains(line, "connected  q") {
 		t.Fatalf("selected QUIC transport missing from status bar: %q", line)
 	}
 	updateSelectedTransport(bar, tunnel.TerminalTransportSelection{Selected: "wss"}, "selected")
-	if line := bar.Render(40); !strings.HasSuffix(line, "connected  W") {
+	if line := bar.Render(40); !strings.Contains(line, "connected  w") {
 		t.Fatalf("selected WSS transport missing from status bar: %q", line)
 	}
 	updateSelectedTransport(bar, tunnel.TerminalTransportSelection{Selected: "quic"}, "failure")
-	if line := bar.Render(40); !strings.HasSuffix(line, "connected  W") {
+	if line := bar.Render(40); !strings.Contains(line, "connected  w") {
 		t.Fatalf("failed selection changed status bar transport: %q", line)
+	}
+}
+
+func TestMachineTransportSnapshotCannotOverwriteForcedStatusBarMarker(t *testing.T) {
+	bar := statusbar.New(statusbar.Options{Mode: statusbar.ModeOff, Layout: statusbar.Layout{Right: []string{"connection"}}})
+	bar.SetConnection("connected")
+	snapshot := localapi.Snapshot{Machines: []localapi.MachineStatus{{ID: "machine_1", SelectedPath: "mixed", ActiveConsumers: 2, TransportConsumers: []localapi.TransportConsumer{{Path: "direct", ActiveConsumers: 1}, {Path: "relay", ActiveConsumers: 1, RelayRegion: "bom"}}}}}
+	applyMachineTransportPath(snapshot, "machine_1", tunnel.TerminalTransportDirect, bar)
+	if line := bar.Render(40); !strings.Contains(line, "connected  d") {
+		t.Fatalf("forced direct marker overwritten: %q", line)
+	}
+}
+
+func TestMachineTransportSnapshotRetainsAutoMarkerForMixedPaths(t *testing.T) {
+	bar := statusbar.New(statusbar.Options{Mode: statusbar.ModeOff, Layout: statusbar.Layout{Right: []string{"connection"}}})
+	bar.SetConnection("connected")
+	applyMachineTransportPath(localapi.Snapshot{Machines: []localapi.MachineStatus{{ID: "machine_1", SelectedPath: "relay"}}}, "machine_1", tunnel.TerminalTransportAuto, bar)
+	applyMachineTransportPath(localapi.Snapshot{Machines: []localapi.MachineStatus{{ID: "machine_1", SelectedPath: "mixed", ActiveConsumers: 2, TransportConsumers: []localapi.TransportConsumer{{Path: "direct", ActiveConsumers: 1}, {Path: "relay", ActiveConsumers: 1, RelayRegion: "bom"}}}}}, "machine_1", tunnel.TerminalTransportAuto, bar)
+	if line := bar.Render(40); !strings.Contains(line, "connected  q") {
+		t.Fatalf("mixed aggregate erased automatic marker: %q", line)
 	}
 }
 
@@ -2896,5 +2919,268 @@ func TestLocalDaemonSnapshotInstallsOnlyForUnavailableSocket(t *testing.T) {
 	cancel()
 	if err := <-done; !errors.Is(err, context.Canceled) {
 		t.Fatalf("server err=%v", err)
+	}
+}
+
+func TestResolveSSHCommandTargetFastUsesWarmSnapshotAndCache(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	runtimeRoot := filepath.Join(root, "runtime")
+	for _, directory := range []string{home, runtimeRoot} {
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "xdg-state"))
+	t.Setenv("XDG_RUNTIME_DIR", runtimeRoot)
+	t.Setenv("TMPDIR", runtimeRoot)
+	t.Setenv("PAPERBOAT_RUNTIME_STATE_ROOT", filepath.Join(root, "identity"))
+
+	var machineListCalls, sshTargetCalls int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines":
+			atomic.AddInt32(&machineListCalls, 1)
+			writeAPIData(t, w, map[string]any{"items": []map[string]any{}, "pagination": map[string]any{"next_offset": nil}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines/mch_1/ssh-target":
+			atomic.AddInt32(&sshTargetCalls, 1)
+			if r.URL.Query().Get("machine_generation") != "4" {
+				t.Errorf("machine_generation = %q", r.URL.Query().Get("machine_generation"))
+			}
+			writeAPIData(t, w, map[string]any{"type": "machine_target", "version": 1, "machine_id": "mch_1", "machine_generation": 4, "os_user": "root", "port": 22, "reconciliation_version": 1})
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer backend.Close()
+
+	configPath := filepath.Join(root, "config.json")
+	writeTestProfile(t, root, configPath, backend.URL)
+
+	identityRoot := filepath.Join(root, "identity")
+	identityStore, err := identity.Open(identity.Config{StateRoot: identityRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := identityStore.SaveRegistration(identity.Registration{
+		ServerURL:              backend.URL,
+		MachineID:              "mch_source",
+		EnvironmentID:          "env_source",
+		PublicKeyID:            identityStore.Current().ID,
+		PublicIdentityKey:      "test-public-key",
+		InboxPath:              filepath.Join(home, "inbox"),
+		InstallationGeneration: 1,
+		UpdatedAt:              time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	paths, err := localdaemon.CurrentUserPaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC)
+	snapshot := localapi.Snapshot{
+		Schema: localapi.SnapshotSchemaV1, Generation: 1, ObservedAt: now, DaemonState: "ready",
+		Machines: []localapi.MachineStatus{{ID: "mch_1", EnvironmentID: "env_1", WorkspaceRoot: "/root", Alias: "hn-byod-ready", Eligible: true, RuntimeState: "ready", Generation: 4, SelectedPath: "none", TransferReadiness: "unavailable", PreviewReadiness: "unavailable", SSHReadiness: "ready", NATMappingIPv4: "unknown", NATMappingIPv6: "unknown", CaptivePortal: "unknown", PMTU: "unknown", RouterProtocol: "unknown", RouterMapping: "unknown", MappingLifetime: "unknown", UpdateHealth: "unknown"}},
+	}
+	store, err := localapi.NewSnapshotStore(&snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := localapi.NewServer(localapi.ServerConfig{SocketPath: paths.SocketPath, OwnerUID: os.Geteuid(), OwnerGID: os.Getegid(), Source: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- server.Run(ctx) }()
+	waitForCommandSocket(t, paths.SocketPath)
+
+	set := flag.NewFlagSet("test", flag.ContinueOnError)
+	set.String("config", configPath, "")
+	set.String("server", "", "")
+	set.String("transport", "", "")
+	commandContext := command.NewContext(set)
+
+	client, machine, target, err := resolveSSHCommandTargetFast(commandContext, "hn-byod-ready")
+	if err != nil {
+		t.Fatalf("fast resolve: %v", err)
+	}
+	if client == nil || machine.ID != "mch_1" || machine.Alias != "hn-byod-ready" || target.Port != 22 || target.OSUser != "root" {
+		t.Fatalf("client=%v machine=%+v target=%+v", client != nil, machine, target)
+	}
+	if got := atomic.LoadInt32(&machineListCalls); got != 0 {
+		t.Fatalf("warm fast path listed machines %d times", got)
+	}
+	if got := atomic.LoadInt32(&sshTargetCalls); got != 1 {
+		t.Fatalf("warm fast path fetched SSH target %d times, want 1", got)
+	}
+
+	if _, _, cached, err := resolveSSHCommandTargetFast(commandContext, "hn-byod-ready"); err != nil || cached.Port != 22 || cached.OSUser != "root" {
+		t.Fatalf("cached resolve: %+v %v", cached, err)
+	}
+	if got := atomic.LoadInt32(&machineListCalls); got != 0 {
+		t.Fatalf("cached fast path listed machines %d times", got)
+	}
+	if got := atomic.LoadInt32(&sshTargetCalls); got != 1 {
+		t.Fatalf("cached fast path fetched SSH target %d times, want 1", got)
+	}
+
+	if _, _, live, err := resolveSSHCommandTargetLive(commandContext, "hn-byod-ready"); err != nil || live.Port != 22 {
+		t.Fatalf("live resolve: %+v %v", live, err)
+	}
+	if got := atomic.LoadInt32(&machineListCalls); got != 0 {
+		t.Fatalf("live path listed machines %d times", got)
+	}
+	if got := atomic.LoadInt32(&sshTargetCalls); got != 2 {
+		t.Fatalf("live path fetched SSH target %d times, want 2", got)
+	}
+
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("server err=%v", err)
+	}
+}
+
+func TestSelectTerminalSessionPrefersWarmMachineSnapshot(t *testing.T) {
+	root := t.TempDir()
+	runtimeRoot := filepath.Join(root, "runtime")
+	if err := os.MkdirAll(runtimeRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	if err := os.MkdirAll(filepath.Join(root, "home"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_RUNTIME_DIR", runtimeRoot)
+	t.Setenv("TMPDIR", runtimeRoot)
+
+	var catalogCalls int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/projects" || r.URL.Path == "/v1/machines":
+			atomic.AddInt32(&catalogCalls, 1)
+			http.NotFound(w, r)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/machines/mch_1/terminal-sessions":
+			writeAPIData(t, w, map[string]any{"id": "umts_1", "name": "quiet-harbor", "state": "open", "created_at": time.Now(), "updated_at": time.Now()})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer backend.Close()
+
+	paths, err := localdaemon.CurrentUserPaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC)
+	snapshot := localapi.Snapshot{
+		Schema: localapi.SnapshotSchemaV1, Generation: 1, ObservedAt: now, DaemonState: "ready",
+		Machines: []localapi.MachineStatus{{ID: "mch_1", EnvironmentID: "env_1", WorkspaceRoot: "/root", Alias: "hn-byod-ready", Eligible: true, RuntimeState: "ready", Generation: 4, SelectedPath: "none", TransferReadiness: "unavailable", PreviewReadiness: "unavailable", SSHReadiness: "unavailable", NATMappingIPv4: "unknown", NATMappingIPv6: "unknown", CaptivePortal: "unknown", PMTU: "unknown", RouterProtocol: "unknown", RouterMapping: "unknown", MappingLifetime: "unknown", UpdateHealth: "unknown"}},
+	}
+	store, err := localapi.NewSnapshotStore(&snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := localapi.NewServer(localapi.ServerConfig{SocketPath: paths.SocketPath, OwnerUID: os.Geteuid(), OwnerGID: os.Getegid(), Source: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- server.Run(ctx) }()
+	waitForCommandSocket(t, paths.SocketPath)
+
+	session, target, machine, err := selectTerminalSession(context.Background(), api.New(backend.URL, config.Credential{AccessToken: "token"}, backend.Client()), "hn-byod-ready", "", "")
+	if err != nil {
+		t.Fatalf("selectTerminalSession: %v", err)
+	}
+	if session.ID != "umts_1" || target.kind != environmentUserMachine || target.id != "mch_1" || machine.ID != "mch_1" {
+		t.Fatalf("session=%+v target=%+v machine=%+v", session, target, machine)
+	}
+	if got := atomic.LoadInt32(&catalogCalls); got != 0 {
+		t.Fatalf("warm machine resolution consulted the catalog %d times", got)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("server err=%v", err)
+	}
+}
+
+func TestResolveSSHCommandTargetFastFallsBackWithoutWarmSnapshot(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	runtimeRoot := filepath.Join(root, "runtime")
+	for _, directory := range []string{home, runtimeRoot} {
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "xdg-state"))
+	t.Setenv("XDG_RUNTIME_DIR", runtimeRoot)
+	t.Setenv("TMPDIR", runtimeRoot)
+	t.Setenv("PAPERBOAT_RUNTIME_STATE_ROOT", filepath.Join(root, "identity"))
+
+	var machineListCalls, sshTargetCalls int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines":
+			atomic.AddInt32(&machineListCalls, 1)
+			writeAPIData(t, w, map[string]any{"items": []map[string]any{{"id": "mch_1", "display_name": "hn-byod-ready", "alias": "hn-byod-ready", "state": "online", "online": true, "installation_generation": 4, "environment_id": "env_1", "workspace_root": "/root", "capabilities": map[string]any{"terminal_host": map[string]any{"configured": true, "observed": true}}}}, "pagination": map[string]any{"next_offset": nil}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines/mch_1/ssh-target":
+			atomic.AddInt32(&sshTargetCalls, 1)
+			writeAPIData(t, w, map[string]any{"type": "machine_target", "version": 1, "machine_id": "mch_1", "machine_generation": 4, "os_user": "root", "port": 2222, "reconciliation_version": 1})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer backend.Close()
+
+	configPath := filepath.Join(root, "config.json")
+	writeTestProfile(t, root, configPath, backend.URL)
+	identityRoot := filepath.Join(root, "identity")
+	identityStore, err := identity.Open(identity.Config{StateRoot: identityRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := identityStore.SaveRegistration(identity.Registration{
+		ServerURL:              backend.URL,
+		MachineID:              "mch_source",
+		EnvironmentID:          "env_source",
+		PublicKeyID:            identityStore.Current().ID,
+		PublicIdentityKey:      "test-public-key",
+		InboxPath:              filepath.Join(home, "inbox"),
+		InstallationGeneration: 1,
+		UpdatedAt:              time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	set := flag.NewFlagSet("test", flag.ContinueOnError)
+	set.String("config", configPath, "")
+	set.String("server", "", "")
+	set.String("transport", "", "")
+	commandContext := command.NewContext(set)
+
+	// No daemon socket exists: the fast path must fall back to the canonical
+	// live resolution instead of failing.
+	client, machine, target, err := resolveSSHCommandTargetFast(commandContext, "hn-byod-ready")
+	if err != nil {
+		t.Fatalf("fallback resolve: %v", err)
+	}
+	if client == nil || machine.ID != "mch_1" || target.Port != 2222 || target.OSUser != "root" {
+		t.Fatalf("client=%v machine=%+v target=%+v", client != nil, machine, target)
+	}
+	if got := atomic.LoadInt32(&machineListCalls); got == 0 {
+		t.Fatal("fallback path did not list machines")
+	}
+	if got := atomic.LoadInt32(&sshTargetCalls); got != 1 {
+		t.Fatalf("fallback path fetched SSH target %d times, want 1", got)
 	}
 }

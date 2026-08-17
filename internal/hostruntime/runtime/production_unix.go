@@ -712,8 +712,8 @@ func productionManagedSSH(ctx context.Context, controlURL string, transport http
 
 func reconcileManagedSSHAuthority(ctx context.Context, client managedSSHControlClient, identitySource managedSSHIdentitySource, registration runtimeidentity.Registration, observationGeneration uint64, setID string, publicKeys []string) (clientapi.ManagedSSHAuthorizedKeys, bool, error) {
 	return reconcileManagedSSHAuthorityWithOperations(ctx, client, identitySource, registration, observationGeneration, setID, publicKeys,
-		"managed-ssh-observe-"+strconv.FormatUint(uint64(registration.InstallationGeneration), 10)+"-"+strconv.FormatUint(observationGeneration, 10),
-		"managed-ssh-keys-"+strconv.FormatUint(uint64(registration.InstallationGeneration), 10)+"-"+strconv.FormatUint(observationGeneration, 10))
+		"managed-ssh-observe-"+registration.MachineID+"-"+strconv.FormatUint(uint64(registration.InstallationGeneration), 10)+"-"+strconv.FormatUint(observationGeneration, 10),
+		"managed-ssh-keys-"+registration.MachineID+"-"+strconv.FormatUint(uint64(registration.InstallationGeneration), 10)+"-"+strconv.FormatUint(observationGeneration, 10))
 }
 
 func reconcileManagedSSHAuthorityWithOperations(ctx context.Context, client managedSSHControlClient, identitySource managedSSHIdentitySource, registration runtimeidentity.Registration, observationGeneration uint64, setID string, publicKeys []string, observeOperationID, keyOperationID string) (clientapi.ManagedSSHAuthorizedKeys, bool, error) {

@@ -178,30 +178,44 @@ type HealthItem struct {
 }
 
 type MachineStatus struct {
-	ID                string       `json:"id"`
-	EnvironmentID     string       `json:"environment_id,omitempty"`
-	WorkspaceRoot     string       `json:"workspace_root,omitempty"`
-	Alias             string       `json:"alias"`
-	Eligible          bool         `json:"eligible"`
-	RuntimeState      string       `json:"runtime_state"`
-	Generation        uint64       `json:"generation"`
-	LastObservedAt    *time.Time   `json:"last_observed_at,omitempty"`
-	ActiveConsumers   uint64       `json:"active_consumers"`
-	SelectedPath      string       `json:"selected_path"`
-	StandbyPath       string       `json:"standby_path,omitempty"`
-	RelayRegion       string       `json:"relay_region,omitempty"`
-	TransferReadiness string       `json:"transfer_readiness"`
-	PreviewReadiness  string       `json:"preview_readiness"`
-	SSHReadiness      string       `json:"ssh_readiness"`
-	NATMappingIPv4    string       `json:"nat_mapping_ipv4"`
-	NATMappingIPv6    string       `json:"nat_mapping_ipv6"`
-	CaptivePortal     string       `json:"captive_portal"`
-	PMTU              string       `json:"pmtu"`
-	RouterProtocol    string       `json:"router_protocol"`
-	RouterMapping     string       `json:"router_mapping"`
-	MappingLifetime   string       `json:"mapping_lifetime"`
-	UpdateHealth      string       `json:"update_health"`
-	Health            []HealthItem `json:"health"`
+	ID              string     `json:"id"`
+	EnvironmentID   string     `json:"environment_id,omitempty"`
+	WorkspaceRoot   string     `json:"workspace_root,omitempty"`
+	Alias           string     `json:"alias"`
+	Eligible        bool       `json:"eligible"`
+	RuntimeState    string     `json:"runtime_state"`
+	Generation      uint64     `json:"generation"`
+	LastObservedAt  *time.Time `json:"last_observed_at,omitempty"`
+	ActiveConsumers uint64     `json:"active_consumers"`
+	SelectedPath    string     `json:"selected_path"`
+	// TransportConsumers reports every active path for this machine. The
+	// selected_path scalar remains for single-path callers and is "mixed" when
+	// more than one path has consumers.
+	TransportConsumers []TransportConsumer `json:"transport_consumers,omitempty"`
+	StandbyPath        string              `json:"standby_path,omitempty"`
+	RelayRegion        string              `json:"relay_region,omitempty"`
+	TransferReadiness  string              `json:"transfer_readiness"`
+	PreviewReadiness   string              `json:"preview_readiness"`
+	SSHReadiness       string              `json:"ssh_readiness"`
+	NATMappingIPv4     string              `json:"nat_mapping_ipv4"`
+	NATMappingIPv6     string              `json:"nat_mapping_ipv6"`
+	CaptivePortal      string              `json:"captive_portal"`
+	PMTU               string              `json:"pmtu"`
+	RouterProtocol     string              `json:"router_protocol"`
+	RouterMapping      string              `json:"router_mapping"`
+	MappingLifetime    string              `json:"mapping_lifetime"`
+	UpdateHealth       string              `json:"update_health"`
+	Health             []HealthItem        `json:"health"`
+}
+
+// TransportConsumer is one active path and the number of local consumers
+// currently using it. It intentionally does not identify terminal sessions.
+// The local status endpoint is machine-scoped and must not expose session
+// metadata from other clients.
+type TransportConsumer struct {
+	Path            string `json:"path"`
+	ActiveConsumers uint64 `json:"active_consumers"`
+	RelayRegion     string `json:"relay_region,omitempty"`
 }
 
 type Snapshot struct {
@@ -219,27 +233,28 @@ type StatusEvent struct {
 }
 
 type TransportObservation struct {
-	Schema          string    `json:"schema"`
-	SourceID        string    `json:"source_id"`
-	Sequence        uint64    `json:"sequence"`
-	ObservedAt      time.Time `json:"observed_at"`
-	ExpiresAt       time.Time `json:"expires_at"`
-	MachineID       string    `json:"machine_id"`
-	ActiveConsumers uint64    `json:"active_consumers"`
-	SelectedPath    string    `json:"selected_path"`
-	StandbyPath     string    `json:"standby_path,omitempty"`
-	RelayRegion     string    `json:"relay_region,omitempty"`
-	NATMappingIPv4  string    `json:"nat_mapping_ipv4"`
-	NATMappingIPv6  string    `json:"nat_mapping_ipv6"`
-	CaptivePortal   string    `json:"captive_portal"`
-	PMTU            string    `json:"pmtu"`
-	RouterProtocol  string    `json:"router_protocol"`
-	RouterMapping   string    `json:"router_mapping"`
-	MappingLifetime string    `json:"mapping_lifetime"`
+	Schema             string              `json:"schema"`
+	SourceID           string              `json:"source_id"`
+	Sequence           uint64              `json:"sequence"`
+	ObservedAt         time.Time           `json:"observed_at"`
+	ExpiresAt          time.Time           `json:"expires_at"`
+	MachineID          string              `json:"machine_id"`
+	ActiveConsumers    uint64              `json:"active_consumers"`
+	SelectedPath       string              `json:"selected_path"`
+	TransportConsumers []TransportConsumer `json:"transport_consumers,omitempty"`
+	StandbyPath        string              `json:"standby_path,omitempty"`
+	RelayRegion        string              `json:"relay_region,omitempty"`
+	NATMappingIPv4     string              `json:"nat_mapping_ipv4"`
+	NATMappingIPv6     string              `json:"nat_mapping_ipv6"`
+	CaptivePortal      string              `json:"captive_portal"`
+	PMTU               string              `json:"pmtu"`
+	RouterProtocol     string              `json:"router_protocol"`
+	RouterMapping      string              `json:"router_mapping"`
+	MappingLifetime    string              `json:"mapping_lifetime"`
 }
 
 func (o TransportObservation) Validate() error {
-	if o.Schema != ObservationSchemaV1 || !safeValue(o.SourceID) || o.Sequence == 0 || o.ObservedAt.IsZero() || o.ExpiresAt.IsZero() || !o.ExpiresAt.After(o.ObservedAt) || o.ExpiresAt.Sub(o.ObservedAt) > 30*time.Second || !safeValue(o.MachineID) || o.ActiveConsumers > 1024 || !oneOf(o.SelectedPath, "none", "direct", "relay", "wss") || !optionalTransportPath(o.StandbyPath) || o.ActiveConsumers > 0 && o.SelectedPath == "none" || o.ActiveConsumers == 0 && o.StandbyPath != "" && o.StandbyPath != "none" || o.StandbyPath != "" && o.StandbyPath != "none" && o.StandbyPath == o.SelectedPath || o.SelectedPath != "relay" && o.SelectedPath != "wss" && o.RelayRegion != "" || o.RelayRegion != "" && !safeValue(o.RelayRegion) || !natMapping(o.NATMappingIPv4) || !natMapping(o.NATMappingIPv6) || !captivePortal(o.CaptivePortal) || !pmtu(o.PMTU) || !routerProtocol(o.RouterProtocol) || !routerMapping(o.RouterMapping) || !mappingLifetime(o.MappingLifetime) {
+	if o.Schema != ObservationSchemaV1 || !safeValue(o.SourceID) || o.Sequence == 0 || o.ObservedAt.IsZero() || o.ExpiresAt.IsZero() || !o.ExpiresAt.After(o.ObservedAt) || o.ExpiresAt.Sub(o.ObservedAt) > 30*time.Second || !safeValue(o.MachineID) || o.ActiveConsumers > 1024 || !transportSummary(o.SelectedPath, o.ActiveConsumers, o.TransportConsumers, o.StandbyPath, o.RelayRegion) || !natMapping(o.NATMappingIPv4) || !natMapping(o.NATMappingIPv6) || !captivePortal(o.CaptivePortal) || !pmtu(o.PMTU) || !routerProtocol(o.RouterProtocol) || !routerMapping(o.RouterMapping) || !mappingLifetime(o.MappingLifetime) {
 		return ErrInvalidResponse
 	}
 	return nil
@@ -256,7 +271,7 @@ func (s Snapshot) Validate() error {
 	}
 	seen := make(map[string]bool, len(s.Machines))
 	for _, machine := range s.Machines {
-		if !safeValue(machine.ID) || !safeText(machine.Alias) || seen[machine.ID] || !oneOf(machine.RuntimeState, "starting", "ready", "degraded", "offline", "stopped", "failed") || !oneOf(machine.SelectedPath, "none", "direct", "relay", "wss") || !optionalTransportPath(machine.StandbyPath) || machine.ActiveConsumers == 0 && machine.StandbyPath != "" && machine.StandbyPath != "none" || machine.StandbyPath != "" && machine.StandbyPath != "none" && machine.StandbyPath == machine.SelectedPath || !readiness(machine.TransferReadiness) || !readiness(machine.PreviewReadiness) || !readiness(machine.SSHReadiness) || machine.SelectedPath != "relay" && machine.SelectedPath != "wss" && machine.RelayRegion != "" || machine.RelayRegion != "" && !safeValue(machine.RelayRegion) || !natMapping(machine.NATMappingIPv4) || !natMapping(machine.NATMappingIPv6) || !captivePortal(machine.CaptivePortal) || !pmtu(machine.PMTU) || !routerProtocol(machine.RouterProtocol) || !routerMapping(machine.RouterMapping) || !mappingLifetime(machine.MappingLifetime) || !oneOf(machine.UpdateHealth, "unknown", "healthy", "recovery_required") {
+		if !safeValue(machine.ID) || !safeText(machine.Alias) || seen[machine.ID] || !oneOf(machine.RuntimeState, "starting", "ready", "degraded", "offline", "stopped", "failed") || !transportSummary(machine.SelectedPath, machine.ActiveConsumers, machine.TransportConsumers, machine.StandbyPath, machine.RelayRegion) || !readiness(machine.TransferReadiness) || !readiness(machine.PreviewReadiness) || !readiness(machine.SSHReadiness) || !natMapping(machine.NATMappingIPv4) || !natMapping(machine.NATMappingIPv6) || !captivePortal(machine.CaptivePortal) || !pmtu(machine.PMTU) || !routerProtocol(machine.RouterProtocol) || !routerMapping(machine.RouterMapping) || !mappingLifetime(machine.MappingLifetime) || !oneOf(machine.UpdateHealth, "unknown", "healthy", "recovery_required") {
 			return ErrInvalidResponse
 		}
 		seen[machine.ID] = true
@@ -271,6 +286,37 @@ func (s Snapshot) Validate() error {
 
 func optionalTransportPath(value string) bool {
 	return value == "" || oneOf(value, "none", "direct", "relay", "wss")
+}
+
+func transportSummary(selected string, total uint64, consumers []TransportConsumer, standby, relayRegion string) bool {
+	if !oneOf(selected, "none", "direct", "relay", "wss", "mixed") || !optionalTransportPath(standby) || total == 0 && standby != "" && standby != "none" || standby != "" && standby != "none" && standby == selected || selected != "relay" && selected != "wss" && relayRegion != "" || relayRegion != "" && !safeValue(relayRegion) {
+		return false
+	}
+	if len(consumers) == 0 {
+		return selected != "mixed" && !(total > 0 && selected == "none")
+	}
+	if len(consumers) > 3 || standby != "" && standby != "none" {
+		return false
+	}
+	seen := make(map[string]struct{}, len(consumers))
+	var counted uint64
+	for _, consumer := range consumers {
+		if !oneOf(consumer.Path, "direct", "relay", "wss") || consumer.ActiveConsumers == 0 || ^uint64(0)-counted < consumer.ActiveConsumers || consumer.RelayRegion != "" && (!oneOf(consumer.Path, "relay", "wss") || !safeValue(consumer.RelayRegion)) {
+			return false
+		}
+		if _, exists := seen[consumer.Path]; exists {
+			return false
+		}
+		seen[consumer.Path] = struct{}{}
+		counted += consumer.ActiveConsumers
+	}
+	if counted != total {
+		return false
+	}
+	if len(consumers) == 1 {
+		return selected == consumers[0].Path && relayRegion == consumers[0].RelayRegion
+	}
+	return selected == "mixed" && relayRegion == ""
 }
 
 func validHealth(item HealthItem) bool {

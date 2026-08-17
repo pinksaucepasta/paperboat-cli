@@ -69,7 +69,7 @@ func (s *managedSSHKeyReconciler) run(ctx context.Context, done chan<- struct{})
 
 func (s *managedSSHKeyReconciler) reconcile(ctx context.Context) error {
 	sequence := s.sequence.Add(1)
-	suffix := strconv.FormatUint(uint64(s.registration.InstallationGeneration), 10) + "-" + strconv.FormatUint(s.workerGeneration, 10) + "-refresh-" + strconv.FormatUint(sequence, 10)
+	suffix := s.registration.MachineID + "-" + strconv.FormatUint(uint64(s.registration.InstallationGeneration), 10) + "-" + strconv.FormatUint(s.workerGeneration, 10) + "-refresh-" + strconv.FormatUint(sequence, 10)
 	keys, active, err := reconcileManagedSSHAuthorityWithOperations(ctx, s.client, s.identity, s.registration, s.workerGeneration, s.setID, s.publicKeys, "managed-ssh-observe-"+suffix, "managed-ssh-keys-"+suffix)
 	if err != nil {
 		return err

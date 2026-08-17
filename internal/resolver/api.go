@@ -39,6 +39,10 @@ type userMachineSessionClient interface {
 	UserMachineConnectionReadinessForSession(context.Context, string, string) (api.ConnectionDescriptor, error)
 }
 
+type userMachineCreateSessionClient interface {
+	UserMachineConnectionDescriptorWithSessionCreate(context.Context, string, string, string) (api.ConnectionDescriptor, api.TerminalSession, error)
+}
+
 type target struct {
 	kind       string
 	id         string
@@ -117,20 +121,49 @@ func (r *APIResolver) Resolve(ctx context.Context, req ConnectRequest) (ConnectI
 	if err := r.validatePolicy(); err != nil {
 		return ConnectInfo{}, err
 	}
-	target, err := r.findTarget(ctx, req.Project)
-	if err != nil {
-		return ConnectInfo{}, err
+	var resolved target
+	if req.ResolvedMachine != nil {
+		if strings.TrimSpace(req.ResolvedMachine.ID) == "" || req.ResolvedMachine.Generation == 0 {
+			return ConnectInfo{}, errors.New("resolved machine is incomplete")
+		}
+		resolved = target{kind: targetUserMachine, id: req.ResolvedMachine.ID, name: req.ResolvedMachine.Name, state: req.ResolvedMachine.State, generation: req.ResolvedMachine.Generation}
+	} else {
+		found, resolveErr := r.findTarget(ctx, req.Project)
+		if resolveErr != nil {
+			return ConnectInfo{}, resolveErr
+		}
+		resolved = found
 	}
+	target := resolved
 	projectID = target.id
 
-	resp, err := r.connect(ctx, target, req.TerminalSessionID)
-	if err != nil {
-		return ConnectInfo{}, fmt.Errorf("connect to environment %q: %w", req.Project, err)
+	var createdSession *TerminalSessionInfo
+	var resp api.ConnectionDescriptor
+	if req.CreateTerminalSession != nil {
+		if target.kind != targetUserMachine {
+			return ConnectInfo{}, errors.New("session creation is only available for machine targets")
+		}
+		var createErr error
+		resp, createdSession, createErr = r.connectWithSessionCreate(ctx, target, req.CreateTerminalSession)
+		if createErr != nil {
+			return ConnectInfo{}, fmt.Errorf("connect to environment %q: %w", req.Project, createErr)
+		}
+	} else {
+		var connectErr error
+		resp, connectErr = r.connect(ctx, target, req.TerminalSessionID)
+		if connectErr != nil {
+			return ConnectInfo{}, fmt.Errorf("connect to environment %q: %w", req.Project, connectErr)
+		}
 	}
 
-	resp, err = r.waitConnectable(ctx, target, req.TerminalSessionID, resp)
-	if err != nil {
-		return ConnectInfo{}, err
+	sessionID := req.TerminalSessionID
+	if createdSession != nil {
+		sessionID = createdSession.ID
+	}
+	waitErr := error(nil)
+	resp, waitErr = r.waitConnectable(ctx, target, sessionID, resp)
+	if waitErr != nil {
+		return ConnectInfo{}, waitErr
 	}
 	if resp.Environment != nil {
 		environmentID = resp.Environment.EnvironmentID
@@ -164,6 +197,7 @@ func (r *APIResolver) Resolve(ctx context.Context, req ConnectRequest) (ConnectI
 	if resp.FileTransfer != nil {
 		info.FileTransfer = &FileTransferTarget{Endpoint: resp.FileTransfer.Endpoint, SourceMachineID: resp.FileTransfer.SourceMachineID, DestinationMachineID: resp.FileTransfer.DestinationMachineID, InitiatingUserID: resp.FileTransfer.InitiatingUserID, Auth: mapAuth(resp.FileTransfer.Auth), Policy: resp.FileTransfer.Policy}
 	}
+	info.TerminalSession = createdSession
 	outcome = "success"
 	return info, nil
 }
@@ -203,6 +237,21 @@ func (r *APIResolver) connect(ctx context.Context, target target, terminalSessio
 	default:
 		return api.ConnectionDescriptor{}, errors.New("unknown environment target")
 	}
+}
+
+func (r *APIResolver) connectWithSessionCreate(ctx context.Context, target target, create *TerminalSessionCreate) (api.ConnectionDescriptor, *TerminalSessionInfo, error) {
+	if create == nil || strings.TrimSpace(create.IdempotencyKey) == "" {
+		return api.ConnectionDescriptor{}, nil, errors.New("terminal session creation requires an idempotency key")
+	}
+	client, ok := r.client.(userMachineCreateSessionClient)
+	if !ok {
+		return api.ConnectionDescriptor{}, nil, errors.New("this server client does not support create-and-connect for machines")
+	}
+	descriptor, session, err := client.UserMachineConnectionDescriptorWithSessionCreate(ctx, target.id, create.Name, create.IdempotencyKey)
+	if err != nil {
+		return api.ConnectionDescriptor{}, nil, err
+	}
+	return descriptor, &TerminalSessionInfo{ID: session.ID, Name: session.Name, EvictedSession: session.EvictedSession}, nil
 }
 
 func (r *APIResolver) connectionStatus(ctx context.Context, target target, terminalSessionID string) (api.ConnectionDescriptor, error) {

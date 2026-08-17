@@ -126,6 +126,55 @@ func TestWaitForMaterialStopsOnTerminalServerErrors(t *testing.T) {
 	}
 }
 
+func TestWaitForMaterialToleratesTransientNetworkErrors(t *testing.T) {
+	workspace, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	expires := time.Now().UTC().Add(time.Minute)
+	calls := 0
+	var server *httptest.Server
+	server = httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		calls++
+		writer.Header().Set("Content-Type", "application/json")
+		switch calls {
+		case 1:
+			writer.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(writer).Encode(map[string]any{"error": map[string]string{"code": "user_machine_approval_pending", "message": "Machine approval is pending."}})
+		case 2:
+			panic(http.ErrAbortHandler)
+		default:
+			manifest := descriptor(server.URL, "0.0.0-development")
+			_ = json.NewEncoder(writer).Encode(map[string]any{"data": Material{Schema: "paperboat.byod-installation/v1", UserMachineID: "um_1", UserMachineEnrollmentID: "ume_1", EnvironmentID: "env_1", ControlURL: server.URL, HelperID: "helper_1", EnrollmentID: "enroll_1", EnrollmentCredential: "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOP", ExpiresAt: expires, Artifact: &manifest, HelperListenAddress: "127.0.0.1:38080"}})
+		}
+	}))
+	defer server.Close()
+	config := Config{ServerURL: server.URL, EnrollmentToken: "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOP", DisplayName: "Studio", WorkspaceRoot: workspace, Verifier: "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOP", PublicIdentityKey: testPublicIdentityKey, HTTP: server.Client()}
+	material, err := WaitForMaterial(context.Background(), config, expires, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 3 || material.EnvironmentID != "env_1" {
+		t.Fatalf("requests=%d material=%+v", calls, material)
+	}
+}
+
+func TestWaitForMaterialExpiresAfterTransientErrors(t *testing.T) {
+	workspace, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		panic(http.ErrAbortHandler)
+	}))
+	defer server.Close()
+	config := Config{ServerURL: server.URL, EnrollmentToken: "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOP", DisplayName: "Studio", WorkspaceRoot: workspace, Verifier: "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOP", PublicIdentityKey: testPublicIdentityKey, HTTP: server.Client()}
+	_, err = WaitForMaterial(context.Background(), config, time.Now().UTC().Add(40*time.Millisecond), time.Millisecond)
+	if !errors.Is(err, ErrPairingExpired) {
+		t.Fatalf("error = %v, want %v", err, ErrPairingExpired)
+	}
+}
+
 func TestValidateWorkspaceRejectsSymlink(t *testing.T) {
 	root, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {

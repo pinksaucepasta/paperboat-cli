@@ -95,6 +95,15 @@ func (f *fakeClient) UserMachineConnectionReadinessForSession(_ context.Context,
 	return f.nextStatus()
 }
 
+func (f *fakeClient) UserMachineConnectionDescriptorWithSessionCreate(_ context.Context, machineID, name, idempotencyKey string) (api.ConnectionDescriptor, api.TerminalSession, error) {
+	f.connectSessionIDs = append(f.connectSessionIDs, idempotencyKey)
+	descriptor, err := f.nextConnect()
+	if err != nil {
+		return api.ConnectionDescriptor{}, api.TerminalSession{}, err
+	}
+	return descriptor, api.TerminalSession{ID: "umts_1", Name: name}, nil
+}
+
 func newTestResolver(fc *fakeClient) *APIResolver {
 	cfg := &config.Config{}
 	cfg.ServerURL = "https://api.paperboat.test"
@@ -615,5 +624,104 @@ func TestResolveCapsRetryHintAtReadyDeadline(t *testing.T) {
 	_, err := r.Resolve(context.Background(), ConnectRequest{Project: "app"})
 	if err == nil || waited <= 0 || waited > 30*time.Second {
 		t.Fatalf("err=%v waited=%s", err, waited)
+	}
+}
+
+func TestResolveSkipsTargetLookupForResolvedMachine(t *testing.T) {
+	term := readyTerminal()
+	term.Endpoints = api.TerminalEndpoints{QUIC: "quic://edge.paperboat.test:443", WSS: "wss://edge.paperboat.test/v1/runtime"}
+	// The listing clients must never be consulted when the caller already
+	// resolved the machine: any listing result would contradict the request.
+	fc := &fakeClient{
+		projectsErr: errors.New("listing must not be called"),
+		machines:    []api.UserMachine{{ID: "um_other", DisplayName: "Other"}},
+		connectSeq:  []api.ConnectionDescriptor{readyUserMachineResponse(term)},
+	}
+	info, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{
+		Project:           "hn-byod-ready",
+		TerminalSessionID: "umts_1",
+		ResolvedMachine:   &ResolvedMachine{ID: "um_1", Name: "hn-byod-ready", State: "online", Generation: 3},
+	})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if info.TargetKind != targetUserMachine || info.ProjectID != "um_1" || info.Project != "hn-byod-ready" || info.MachineGeneration != 3 {
+		t.Fatalf("info = %+v", info)
+	}
+	if fc.connectN != 1 || len(fc.connectSessionIDs) != 1 || fc.connectSessionIDs[0] != "umts_1" {
+		t.Fatalf("connect calls = %d session ids = %v", fc.connectN, fc.connectSessionIDs)
+	}
+}
+
+func TestResolveRejectsIncompleteResolvedMachine(t *testing.T) {
+	fc := &fakeClient{projectsErr: errors.New("listing must not be called")}
+	_, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "hn-byod-ready", ResolvedMachine: &ResolvedMachine{ID: "um_1"}})
+	if err == nil || !strings.Contains(err.Error(), "incomplete") {
+		t.Fatalf("err = %v", err)
+	}
+	_, err = newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "hn-byod-ready", ResolvedMachine: &ResolvedMachine{Generation: 3}})
+	if err == nil || !strings.Contains(err.Error(), "incomplete") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestResolveRejectsResolvedMachineDescriptorForDifferentMachine(t *testing.T) {
+	term := readyTerminal()
+	term.Endpoints = api.TerminalEndpoints{QUIC: "quic://edge.paperboat.test:443", WSS: "wss://edge.paperboat.test/v1/runtime"}
+	response := readyUserMachineResponse(term)
+	response.UserMachineID = "um_other"
+	fc := &fakeClient{
+		projectsErr: errors.New("listing must not be called"),
+		connectSeq:  []api.ConnectionDescriptor{response},
+	}
+	_, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "hn-byod-ready", ResolvedMachine: &ResolvedMachine{ID: "um_1", Name: "hn-byod-ready", State: "online", Generation: 3}})
+	if err == nil || !strings.Contains(err.Error(), "wrong machine") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestResolveCreatesSessionAndDescriptorInOneRoundTrip(t *testing.T) {
+	term := readyTerminal()
+	term.Endpoints = api.TerminalEndpoints{QUIC: "quic://edge.paperboat.test:443", WSS: "wss://edge.paperboat.test/v1/runtime"}
+	term.SessionID = "umts_1"
+	fc := &fakeClient{
+		projectsErr: errors.New("listing must not be called"),
+		connectSeq:  []api.ConnectionDescriptor{readyUserMachineResponse(term)},
+	}
+	info, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{
+		Project:               "hn-byod-ready",
+		ResolvedMachine:       &ResolvedMachine{ID: "um_1", Name: "hn-byod-ready", State: "online", Generation: 3},
+		CreateTerminalSession: &TerminalSessionCreate{Name: "bench-1", IdempotencyKey: "pb-key-1"},
+	})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if info.TerminalSession == nil || info.TerminalSession.ID != "umts_1" || info.TerminalSession.Name != "bench-1" {
+		t.Fatalf("terminal session = %+v", info.TerminalSession)
+	}
+	if info.Terminal == nil || info.Terminal.SessionID != "umts_1" {
+		t.Fatalf("terminal = %+v", info.Terminal)
+	}
+	if len(fc.connectSessionIDs) != 1 || fc.connectSessionIDs[0] != "pb-key-1" {
+		t.Fatalf("create calls = %v", fc.connectSessionIDs)
+	}
+	if fc.statusN != 0 {
+		t.Fatalf("connectable create-and-connect polled status %d times", fc.statusN)
+	}
+}
+
+func TestResolveRejectsSessionCreationForProjects(t *testing.T) {
+	fc := &fakeClient{projects: []api.Project{{ID: "prj_1", Name: "app"}}, connectSeq: []api.ConnectionDescriptor{readyResponse(readyTerminal())}}
+	_, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "app", CreateTerminalSession: &TerminalSessionCreate{Name: "named", IdempotencyKey: "pb-key-1"}})
+	if err == nil || !strings.Contains(err.Error(), "machine targets") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestResolveRejectsSessionCreationWithoutIdempotencyKey(t *testing.T) {
+	fc := &fakeClient{projectsErr: errors.New("listing must not be called")}
+	_, err := newTestResolver(fc).Resolve(context.Background(), ConnectRequest{Project: "hn-byod-ready", ResolvedMachine: &ResolvedMachine{ID: "um_1", Name: "hn", State: "online", Generation: 3}, CreateTerminalSession: &TerminalSessionCreate{Name: "named"}})
+	if err == nil || !strings.Contains(err.Error(), "idempotency") {
+		t.Fatalf("err = %v", err)
 	}
 }

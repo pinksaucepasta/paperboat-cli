@@ -254,6 +254,16 @@ type ClassSnapshot struct {
 	Connecting        bool
 	UpgradePending    bool
 	Closed            bool
+	PathConsumers     []PathConsumer
+}
+
+// PathConsumer reports application leases held by one physical transport
+// path. It is intentionally path-scoped because a pool can retain a leased
+// draining carrier while a different carrier is selected for new streams.
+type PathConsumer struct {
+	Path            Path
+	ActiveConsumers uint64
+	RelayRegion     string
 }
 
 // Changes is a coalesced wakeup channel. Consumers must read Snapshot after
@@ -340,6 +350,7 @@ func (p *Pool) Snapshot(class peerquic.Class) (ClassSnapshot, error) {
 	syncEntryRoles(state)
 	syncEntryRoles(state)
 	snapshot := ClassSnapshot{Class: class, Generation: state.generation, Leases: p.applicationLeasesLocked(state), Warm: state.warmHolds > 0, Connecting: state.connecting, UpgradePending: state.upgradePending, Closed: p.closed}
+	snapshot.PathConsumers = pathConsumers(state)
 	if state.selected != nil && !state.selected.closed && state.selected.selectedRole {
 		snapshot.Path = state.selected.selection.Path
 		snapshot.RelayRegion = state.selected.selection.RelayRegion
@@ -358,7 +369,11 @@ func (p *Pool) Snapshot(class peerquic.Class) (ClassSnapshot, error) {
 			break
 		}
 	}
-	if !committedObserved {
+	// A connection may implement CommittedApplicationObserver while its
+	// logical stream has not committed on that carrier yet. Leases still prove
+	// that an application is attached, so do not report "none" merely because
+	// the observer is present but currently returns zero.
+	if !committedObserved || snapshot.ActivePath == 0 {
 		if state.selected != nil && !state.selected.closed && state.selected.applicationLeases > 0 {
 			snapshot.ActivePath = state.selected.selection.Path
 			snapshot.ActiveRelayRegion = state.selected.selection.RelayRegion
@@ -376,6 +391,38 @@ func (p *Pool) Snapshot(class peerquic.Class) (ClassSnapshot, error) {
 		}
 	}
 	return snapshot, nil
+}
+
+// pathConsumers returns deterministic per-path lease counts for every unique
+// managed carrier retained by the class. A leased draining carrier remains
+// observable after a selected-path failure until its lease is released.
+func pathConsumers(state *classState) []PathConsumer {
+	if state == nil {
+		return nil
+	}
+	counts := make(map[Path]PathConsumer)
+	for _, entry := range uniqueEntries(state.selected, state.standby, state.secondary, state.draining) {
+		if entry == nil || entry.closed || entry.applicationLeases == 0 || !validPath(entry.selection.Path) {
+			continue
+		}
+		consumer := counts[entry.selection.Path]
+		consumer.Path = entry.selection.Path
+		consumer.RelayRegion = entry.selection.RelayRegion
+		if math.MaxUint64-consumer.ActiveConsumers < entry.applicationLeases {
+			consumer.ActiveConsumers = math.MaxUint64
+		} else {
+			consumer.ActiveConsumers += entry.applicationLeases
+		}
+		counts[entry.selection.Path] = consumer
+	}
+	result := make([]PathConsumer, 0, len(counts))
+	for _, consumer := range counts {
+		result = append(result, consumer)
+	}
+	slices.SortStableFunc(result, func(left, right PathConsumer) int {
+		return cmp.Compare(uint8(left.Path), uint8(right.Path))
+	})
+	return result
 }
 
 type Lease struct {
@@ -1350,6 +1397,13 @@ func (p *Pool) failHealthLocked(class peerquic.Class, entry *managedConnection) 
 			oldStandby, oldSecondary := state.standby, state.secondary
 			state.standby = nil
 			state.secondary = nil
+			// Keep the failed carrier reachable while its application leases
+			// drain. Without this ownership record Snapshot loses both the
+			// active path and consumer count even though the terminal is still
+			// attached to the carrier.
+			if entry.applicationLeases > 0 && state.draining == nil {
+				state.draining = entry
+			}
 			syncEntryRoles(state, entry, oldStandby, oldSecondary)
 			p.closeIfUnownedLocked(entry)
 			p.closeIfUnownedLocked(oldStandby)

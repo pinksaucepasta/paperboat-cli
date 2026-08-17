@@ -418,8 +418,8 @@ func TestCanonicalHelperExistingSessionDoesNotInjectTerminalInput(t *testing.T) 
 				var payload map[string]any
 				_ = json.Unmarshal(frame.Payload, &payload)
 				switch payload["action"] {
-				case "snapshot":
-					writeHelperTestFrame(t, ws, helperFrame{Type: "response", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"result":{"state":"running","generation":1,"earliest_sequence":100,"latest_sequence":200},"replay":false}`)})
+				case "create":
+					writeHelperTestFrame(t, ws, helperFrame{Type: "response", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"result":{"state":"running","generation":1,"earliest_sequence":100,"latest_sequence":200,"existing":true},"replay":false}`)})
 				case "attach":
 					writeHelperTestFrame(t, ws, helperFrame{Type: "response", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"result":{"stream_id":8,"attachment_id":"att_live","session":{"snapshot":{"generation":1}}},"replay":false}`)})
 				}
@@ -509,8 +509,8 @@ func TestCanonicalHelperRestartIsLimitedToInitialAttach(t *testing.T) {
 					action, _ := payload["action"].(string)
 					actions <- action
 					switch action {
-					case "snapshot":
-						writeHelperTestFrame(t, ws, helperFrame{Type: "response", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"result":{"state":"exited","generation":3},"replay":false}`)})
+					case "create":
+						writeHelperTestFrame(t, ws, helperFrame{Type: "response", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"result":{"state":"exited","generation":3,"existing":true},"replay":false}`)})
 					case "restart":
 						writeHelperTestFrame(t, ws, helperFrame{Type: "response", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"result":{"state":"running","generation":4},"replay":false}`)})
 					case "attach":
@@ -541,7 +541,7 @@ func TestCanonicalHelperRestartIsLimitedToInitialAttach(t *testing.T) {
 			for action := range actions {
 				got = append(got, action)
 			}
-			want := []string{"snapshot"}
+			want := []string{"create"}
 			if test.wantRestart {
 				want = append(want, "restart")
 			}
@@ -590,8 +590,8 @@ func TestCanonicalHelperStaleReconnectCursorReportsReplayGap(t *testing.T) {
 			}
 			_ = json.Unmarshal(frame.Payload, &payload)
 			switch payload.Action {
-			case "snapshot":
-				writeHelperTestFrame(t, ws, helperFrame{Type: "response", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"result":{"state":"running","generation":1,"earliest_sequence":10,"latest_sequence":18},"replay":false}`)})
+			case "create":
+				writeHelperTestFrame(t, ws, helperFrame{Type: "response", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"result":{"state":"running","generation":1,"earliest_sequence":10,"latest_sequence":18,"existing":true},"replay":false}`)})
 			case "attach":
 				attachFrom <- payload.FromSequence
 				attachLive <- payload.AtLive
@@ -635,6 +635,82 @@ func TestCanonicalHelperStaleReconnectCursorReportsReplayGap(t *testing.T) {
 	}
 	if got := cursor.Load(); got != 24 {
 		t.Fatalf("cursor=%d want 24", got)
+	}
+}
+
+func TestCanonicalHelperFallsBackToLegacyWhenCreateOrGetUnavailable(t *testing.T) {
+	actions := make(chan string, 4)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{helperWebSocketSubprotocol}, CompressionMode: websocket.CompressionDisabled})
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer ws.Close(websocket.StatusNormalClosure, "")
+		for {
+			messageType, data, err := ws.Read(context.Background())
+			if err != nil {
+				return
+			}
+			if messageType != websocket.MessageText {
+				return
+			}
+			frame, err := decodeHelperFrame(data)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			if frame.Type == "hello" {
+				writeHelperTestFrame(t, ws, helperFrame{Type: "welcome", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"version":"1.0","capabilities":["health.v1","terminal.v1"]}`)})
+				continue
+			}
+			if frame.Type != "request" {
+				continue
+			}
+			var payload struct {
+				Action           string `json:"action"`
+				ExistingSnapshot bool   `json:"existing_snapshot"`
+			}
+			_ = json.Unmarshal(frame.Payload, &payload)
+			actions <- payload.Action
+			switch payload.Action {
+			case "create":
+				if payload.ExistingSnapshot {
+					// Old host runtimes reject the unknown create-or-get field.
+					writeHelperTestFrame(t, ws, helperFrame{Type: "error", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"code":"invalid_request","message":"operation failed","retryable":false}`)})
+					continue
+				}
+				writeHelperTestFrame(t, ws, helperFrame{Type: "response", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"result":{"state":"running","generation":1},"replay":false}`)})
+			case "snapshot":
+				writeHelperTestFrame(t, ws, helperFrame{Type: "error", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"code":"not_found_or_forbidden","message":"operation failed","retryable":false}`)})
+			case "attach":
+				writeHelperTestFrame(t, ws, helperFrame{Type: "response", RequestID: frame.RequestID, Version: helperProtocolVersion, Payload: json.RawMessage(`{"result":{"stream_id":11,"attachment_id":"att_legacy","session":{"snapshot":{"generation":1}}},"replay":false}`)})
+				writeHelperTestFrame(t, ws, helperFrame{Type: "event", RequestID: "stream", Version: helperProtocolVersion, Capability: "terminal.v1", Payload: json.RawMessage(`{"event":"terminal_stream_end","session_id":"ses_legacy","state":"exited","final_sequence":3,"exit":{"code":0}}`)})
+			}
+		}
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	u.Scheme = strings.Replace(u.Scheme, "http", "ws", 1)
+	u.Path = "/v1/runtime"
+	target := &resolver.TerminalTarget{Protocol: "paperboat.terminal.v1", WSSEndpoint: u.String(), Auth: resolver.AuthTarget{Method: "bearer", Token: "helper-token"}, SessionID: "ses_legacy", TerminalID: "default", CWD: "/workspace"}
+	conn, err := NewWebSocketTunnel().Dial(context.Background(), resolver.ConnectInfo{Terminal: target})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if code, err := conn.Wait(); err != nil || code != 0 {
+		t.Fatalf("Wait()=%d,%v", code, err)
+	}
+	close(actions)
+	var got []string
+	for action := range actions {
+		got = append(got, action)
+	}
+	want := []string{"create", "snapshot", "create", "attach"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("actions=%v want=%v", got, want)
 	}
 }
 

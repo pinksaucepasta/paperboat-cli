@@ -18,6 +18,30 @@ type ConnectRequest struct {
 	// TerminalSessionID is the immutable server catalog ID. It is required for
 	// terminal connections; pb creates a fresh session before resolving.
 	TerminalSessionID string
+	// ResolvedMachine carries a machine catalog entry the caller has already
+	// resolved. When set, the resolver skips its own target lookup round trips
+	// and proceeds directly to the connection descriptor.
+	ResolvedMachine *ResolvedMachine
+	// CreateTerminalSession asks the resolver to create a durable terminal
+	// session and issue its connection descriptor in one round trip. It is
+	// mutually exclusive with TerminalSessionID.
+	CreateTerminalSession *TerminalSessionCreate
+}
+
+// ResolvedMachine is a machine catalog entry the caller resolved before
+// requesting a connection descriptor.
+type ResolvedMachine struct {
+	ID         string
+	Name       string
+	State      string
+	Generation uint64
+}
+
+// TerminalSessionCreate describes the durable terminal session the resolver
+// should create while issuing the connection descriptor.
+type TerminalSessionCreate struct {
+	Name           string
+	IdempotencyKey string
 }
 
 // ConnectInfo is what the resolver hands back to the tunnel + session layers.
@@ -39,6 +63,18 @@ type ConnectInfo struct {
 	// pre-connect broker.
 	Terminal     *TerminalTarget
 	FileTransfer *FileTransferTarget
+	// TerminalSession describes the durable session the resolver created or
+	// selected. It is populated when the resolver created the session as part
+	// of a create-and-connect round trip.
+	TerminalSession *TerminalSessionInfo
+}
+
+// TerminalSessionInfo carries the durable terminal session the resolver
+// created or selected.
+type TerminalSessionInfo struct {
+	ID             string
+	Name           string
+	EvictedSession *api.TerminalSession
 }
 
 // AuthTarget is short-lived, scoped auth material returned by the broker.

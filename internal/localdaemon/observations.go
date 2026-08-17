@@ -141,6 +141,7 @@ func (s *ObservationStore) applyLocked(now time.Time) error {
 			indices[desired.Machines[index].ID] = index
 			desired.Machines[index].ActiveConsumers = 0
 			desired.Machines[index].SelectedPath = "none"
+			desired.Machines[index].TransportConsumers = nil
 			desired.Machines[index].StandbyPath = "none"
 			desired.Machines[index].RelayRegion = ""
 			desired.Machines[index].NATMappingIPv4 = "unknown"
@@ -151,29 +152,84 @@ func (s *ObservationStore) applyLocked(now time.Time) error {
 			desired.Machines[index].RouterProtocol = "unknown"
 			desired.Machines[index].MappingLifetime = "unknown"
 		}
+		type aggregate struct {
+			consumers uint64
+			region    string
+		}
+		paths := make(map[string]map[string]aggregate, len(desired.Machines))
+		latest := make(map[string]localapi.TransportObservation, len(desired.Machines))
 		for _, observation := range active {
 			index, ok := indices[observation.MachineID]
 			if !ok {
 				continue
 			}
 			desired.Machines[index].ActiveConsumers += observation.ActiveConsumers
-			desired.Machines[index].SelectedPath = observation.SelectedPath
-			desired.Machines[index].StandbyPath = observation.StandbyPath
-			if desired.Machines[index].StandbyPath == "" {
-				desired.Machines[index].StandbyPath = "none"
+			latest[observation.MachineID] = observation
+			for _, consumer := range observationConsumers(observation) {
+				byPath := paths[observation.MachineID]
+				if byPath == nil {
+					byPath = make(map[string]aggregate, 3)
+					paths[observation.MachineID] = byPath
+				}
+				value := byPath[consumer.Path]
+				value.consumers += consumer.ActiveConsumers
+				if consumer.RelayRegion != "" {
+					value.region = consumer.RelayRegion
+				}
+				byPath[consumer.Path] = value
 			}
-			desired.Machines[index].RelayRegion = observation.RelayRegion
-			desired.Machines[index].NATMappingIPv4 = observation.NATMappingIPv4
-			desired.Machines[index].NATMappingIPv6 = observation.NATMappingIPv6
-			desired.Machines[index].CaptivePortal = observation.CaptivePortal
-			desired.Machines[index].PMTU = observation.PMTU
-			desired.Machines[index].RouterMapping = observation.RouterMapping
-			desired.Machines[index].RouterProtocol = observation.RouterProtocol
-			desired.Machines[index].MappingLifetime = observation.MappingLifetime
+		}
+		for machineID, index := range indices {
+			machine := &desired.Machines[index]
+			if observation, ok := latest[machineID]; ok {
+				machine.StandbyPath = observation.StandbyPath
+				if machine.StandbyPath == "" {
+					machine.StandbyPath = "none"
+				}
+				machine.RelayRegion = observation.RelayRegion
+				machine.NATMappingIPv4 = observation.NATMappingIPv4
+				machine.NATMappingIPv6 = observation.NATMappingIPv6
+				machine.CaptivePortal = observation.CaptivePortal
+				machine.PMTU = observation.PMTU
+				machine.RouterMapping = observation.RouterMapping
+				machine.RouterProtocol = observation.RouterProtocol
+				machine.MappingLifetime = observation.MappingLifetime
+				// A legacy warm observation has no active consumers but still
+				// describes a ready path. Keep its scalar projection.
+				if machine.ActiveConsumers == 0 {
+					machine.SelectedPath = observation.SelectedPath
+				}
+			}
+			for path, value := range paths[machineID] {
+				machine.TransportConsumers = append(machine.TransportConsumers, localapi.TransportConsumer{Path: path, ActiveConsumers: value.consumers, RelayRegion: value.region})
+			}
+			sort.Slice(machine.TransportConsumers, func(left, right int) bool {
+				return machine.TransportConsumers[left].Path < machine.TransportConsumers[right].Path
+			})
+			switch len(machine.TransportConsumers) {
+			case 0:
+			case 1:
+				machine.SelectedPath = machine.TransportConsumers[0].Path
+				machine.RelayRegion = machine.TransportConsumers[0].RelayRegion
+			case 2, 3:
+				machine.SelectedPath = "mixed"
+				machine.StandbyPath = "none"
+				machine.RelayRegion = ""
+			}
 		}
 		return desired, nil
 	})
 	return err
+}
+
+func observationConsumers(observation localapi.TransportObservation) []localapi.TransportConsumer {
+	if len(observation.TransportConsumers) > 0 {
+		return observation.TransportConsumers
+	}
+	if observation.ActiveConsumers == 0 || observation.SelectedPath == "none" || observation.SelectedPath == "mixed" {
+		return nil
+	}
+	return []localapi.TransportConsumer{{Path: observation.SelectedPath, ActiveConsumers: observation.ActiveConsumers, RelayRegion: observation.RelayRegion}}
 }
 
 func observationKey(peer localapi.Peer, sourceID string) string {

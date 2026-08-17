@@ -1579,12 +1579,28 @@ func (t *PeerTerminalTunnel) dialDirect(ctx, lifetime context.Context, target *r
 	if viable, known := t.cachedIPv6Viability(fingerprint); known {
 		sockets.IPv6Viable = func(context.Context) bool { return viable }
 	} else {
-		sockets.IPv6Viable = func(probeCtx context.Context) bool {
-			probeCtx, cancelProbe := context.WithTimeout(probeCtx, 500*time.Millisecond)
+		// Start the reachability probe before the signaling/ICE assembly so
+		// the probe latency overlaps the signaling dial instead of blocking
+		// socket creation serially. The result is recorded for future dials
+		// on the same network fingerprint.
+		probeResult := make(chan bool, 1)
+		go func() {
+			probeCtx, cancelProbe := context.WithTimeout(context.Background(), 500*time.Millisecond)
 			defer cancelProbe()
 			viable := networkcheck.ProbeSTUNReachability(probeCtx, "ip6", descriptor.STUNURLs, net.DefaultResolver, 250*time.Millisecond)
 			t.recordIPv6Viability(fingerprint, viable)
-			return viable
+			probeResult <- viable
+		}()
+		var probeOnce sync.Once
+		var probedViable bool
+		sockets.IPv6Viable = func(probeCtx context.Context) bool {
+			probeOnce.Do(func() {
+				select {
+				case probedViable = <-probeResult:
+				case <-probeCtx.Done():
+				}
+			})
+			return probedViable
 		}
 	}
 	// Pion dispatches post-ICE packets by remote address. Independent direct

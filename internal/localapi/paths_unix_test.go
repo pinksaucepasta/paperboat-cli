@@ -64,6 +64,22 @@ func TestResolvePathsUsesSafeRuntimeAndRejectsRelativeOverrides(t *testing.T) {
 	}
 }
 
+func TestResolvePathsAcceptsTrailingSlashRuntimeOverride(t *testing.T) {
+	if runtime.GOOS == "linux" {
+		t.Skip("TMPDIR override is darwin-only")
+	}
+	home := localAPITestDir(t)
+	runtimeRoot := filepath.Join(home, "runtime")
+	if err := os.Mkdir(runtimeRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	environment := map[string]string{"TMPDIR": runtimeRoot + string(os.PathSeparator)}
+	paths, err := ResolvePaths(func(key string) string { return environment[key] }, home, os.Geteuid())
+	if err != nil || paths.RuntimeRoot != filepath.Join(runtimeRoot, "paperboat") {
+		t.Fatalf("paths=%#v err=%v", paths, err)
+	}
+}
+
 func TestResolvePathsRejectsPermissiveOwnedRuntimeDirectory(t *testing.T) {
 	home := localAPITestDir(t)
 	runtimeRoot := filepath.Join(home, "runtime")

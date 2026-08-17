@@ -6,6 +6,8 @@
 /bin/
 /dist/
 /.codex-build/
+/cmd/pb-peerprobe/
+/tools/deploy-mac.sh
 
 # Test & coverage
 *.out

@@ -180,6 +180,29 @@ func TestTransportObservationValidatesStandbyState(t *testing.T) {
 	}
 }
 
+func TestTransportObservationValidatesPerPathConsumers(t *testing.T) {
+	now := time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC)
+	base := TransportObservation{Schema: ObservationSchemaV1, SourceID: "source_1", Sequence: 1, ObservedAt: now, ExpiresAt: now.Add(15 * time.Second), MachineID: "machine_1", ActiveConsumers: 2, SelectedPath: "mixed", TransportConsumers: []TransportConsumer{{Path: "direct", ActiveConsumers: 1}, {Path: "relay", ActiveConsumers: 1, RelayRegion: "bom"}}, NATMappingIPv4: "unknown", NATMappingIPv6: "unknown", CaptivePortal: "unknown", PMTU: "unknown", RouterProtocol: "unknown", RouterMapping: "unknown", MappingLifetime: "unknown"}
+	if err := base.Validate(); err != nil {
+		t.Fatalf("valid mixed consumers: %v", err)
+	}
+	for name, mutate := range map[string]func(*TransportObservation){
+		"wrong total":       func(value *TransportObservation) { value.ActiveConsumers = 3 },
+		"wrong summary":     func(value *TransportObservation) { value.SelectedPath = "direct" },
+		"duplicate path":    func(value *TransportObservation) { value.TransportConsumers[1].Path = "direct" },
+		"direct with relay": func(value *TransportObservation) { value.TransportConsumers[0].RelayRegion = "bom" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			value := base
+			value.TransportConsumers = append([]TransportConsumer(nil), base.TransportConsumers...)
+			mutate(&value)
+			if err := value.Validate(); !errors.Is(err, ErrInvalidResponse) {
+				t.Fatalf("err=%v", err)
+			}
+		})
+	}
+}
+
 func TestNATMappingValidationRejectsAddressesAndMissingCategories(t *testing.T) {
 	now := time.Date(2026, 8, 4, 20, 0, 0, 0, time.UTC)
 	base := TransportObservation{Schema: ObservationSchemaV1, SourceID: "source_1", Sequence: 1, ObservedAt: now, ExpiresAt: now.Add(15 * time.Second), MachineID: "machine_1", ActiveConsumers: 1, SelectedPath: "direct", NATMappingIPv4: "unknown", NATMappingIPv6: "unknown", CaptivePortal: "unknown", PMTU: "unknown", RouterProtocol: "unknown", RouterMapping: "unknown", MappingLifetime: "unknown"}

@@ -398,6 +398,9 @@ func writeStatus(output io.Writer, snapshot localapi.Snapshot) {
 		if machine.RelayRegion != "" {
 			path += "/" + machine.RelayRegion
 		}
+		if len(machine.TransportConsumers) > 0 {
+			path = transportConsumerSummary(machine.TransportConsumers)
+		}
 		observed := "never"
 		if machine.LastObservedAt != nil {
 			observed = machine.LastObservedAt.Format(time.RFC3339)
@@ -409,6 +412,18 @@ func writeStatus(output io.Writer, snapshot localapi.Snapshot) {
 			fmt.Fprintf(output, "  Health: %s: %s  Recovery: %s\n", health.Severity, health.Title, health.Recovery)
 		}
 	}
+}
+
+func transportConsumerSummary(consumers []localapi.TransportConsumer) string {
+	parts := make([]string, 0, len(consumers))
+	for _, consumer := range consumers {
+		path := consumer.Path
+		if consumer.RelayRegion != "" {
+			path += "/" + consumer.RelayRegion
+		}
+		parts = append(parts, fmt.Sprintf("%s=%d", path, consumer.ActiveConsumers))
+	}
+	return strings.Join(parts, ", ")
 }
 
 func doctorCommandV1() *cobra.Command {
@@ -4476,7 +4491,7 @@ func actionRun(action command.Action) func(*cobra.Command, []string) error {
 func actionContext(cobraCommand *cobra.Command, args []string) *command.Context {
 	set := flag.NewFlagSet("pb", flag.ContinueOnError)
 	values := map[string]string{}
-	for _, name := range []string{"config", "server", "name", "machine", "session", "status-bar", "status-bar-fullscreen", "status-bar-theme", "mode", "path", "transport", "code"} {
+	for _, name := range []string{"config", "server", "name", "machine", "session", "status-bar", "status-bar-fullscreen", "status-bar-theme", "mode", "path", "transport", "code", "input", "output", "keep"} {
 		value, _ := cobraCommand.Flags().GetString(name)
 		values[name] = value
 		set.String(name, value, "")
@@ -5241,6 +5256,7 @@ func deleteTerminalSessionForTarget(ctx context.Context, client *api.Client, tar
 // deps bundles production dependencies for a command.
 type deps struct {
 	cfg              *config.Config
+	transportMode    tunnel.TerminalTransport
 	auth             config.AuthSource
 	resolver         resolver.ProjectResolver
 	tunnel           tunnel.Tunnel
@@ -5339,6 +5355,7 @@ func buildDeps(c *command.Context) (*deps, error) {
 	}
 	return &deps{
 		cfg:              cfg,
+		transportMode:    mode,
 		auth:             authSource,
 		resolver:         nil,
 		tunnel:           selectedTunnel,
@@ -7116,29 +7133,58 @@ func sessionsCommand() *command.Spec {
 	}}
 }
 
-func selectTerminalSession(ctx context.Context, client *api.Client, projectRef, name, ref string) (api.TerminalSession, error) {
-	target, err := resolveEnvironmentTarget(ctx, client, projectRef)
+func selectTerminalSession(ctx context.Context, client *api.Client, projectRef, name, ref string) (api.TerminalSession, environmentTarget, api.UserMachine, error) {
+	target, machine, err := resolveEnvironmentTargetWithMachine(ctx, client, projectRef)
 	if err != nil {
-		return api.TerminalSession{}, err
+		return api.TerminalSession{}, environmentTarget{}, api.UserMachine{}, err
 	}
 	if strings.TrimSpace(ref) == "" {
 		if err := validateSessionNameOptional(name); err != nil {
-			return api.TerminalSession{}, err
+			return api.TerminalSession{}, environmentTarget{}, api.UserMachine{}, err
 		}
 		session, err := createTerminalSessionForTarget(ctx, client, target, name, newIdempotencyKey())
 		if err != nil {
-			return api.TerminalSession{}, friendlyCommandError(err)
+			return api.TerminalSession{}, environmentTarget{}, api.UserMachine{}, friendlyCommandError(err)
 		}
 		if session.EvictedSession != nil {
 			fmt.Fprintf(os.Stderr, "Session limit reached; removed least-recent session %q (%s).\n", session.EvictedSession.Name, session.EvictedSession.State)
 		}
-		return session, nil
+		return session, target, machine, nil
 	}
 	session, err := resolveTerminalSession(ctx, client, target, ref)
 	if err != nil {
-		return api.TerminalSession{}, err
+		return api.TerminalSession{}, environmentTarget{}, api.UserMachine{}, friendlyCommandError(err)
 	}
-	return session, nil
+	return session, target, machine, nil
+}
+
+// resolveEnvironmentTargetWithMachine resolves like resolveEnvironmentTarget but
+// also returns the machine catalog entry for machine targets so callers can
+// reuse it without a second listing round trip. The daemon's warm inventory
+// snapshot is consulted first: a machine it already tracks needs no catalog
+// listing at all, and the server revalidates the machine on every session
+// create and connection descriptor anyway.
+func resolveEnvironmentTargetWithMachine(ctx context.Context, client *api.Client, requested string) (environmentTarget, api.UserMachine, error) {
+	if machine, ok := resolveWarmUserMachine(ctx, requested); ok && machine.InstallationGeneration > 0 {
+		return environmentTarget{kind: environmentUserMachine, id: machine.ID, name: machine.DisplayName}, machine, nil
+	}
+	project, err := resolveProjectID(ctx, client, requested)
+	if err == nil {
+		return environmentTarget{kind: environmentProject, id: project.ID, name: project.Name}, api.UserMachine{}, nil
+	}
+	// Accounts without hosted projects receive a 404 from the project API. That
+	// is still a valid machine-targeting path, so preserve the machine fallback.
+	if !errors.Is(err, resolver.ErrProjectNotFound) && !api.IsNotFound(err) && !api.IsHostedEntitlementRequired(err) {
+		return environmentTarget{}, api.UserMachine{}, err
+	}
+	machine, machineErr := resolveUserMachine(ctx, client, requested)
+	if machineErr != nil {
+		if api.IsNotFound(machineErr) {
+			return environmentTarget{}, api.UserMachine{}, err
+		}
+		return environmentTarget{}, api.UserMachine{}, machineErr
+	}
+	return environmentTarget{kind: environmentUserMachine, id: machine.ID, name: machine.DisplayName}, machine, nil
 }
 
 func resolveUserMachine(ctx context.Context, client *api.Client, requested string) (api.UserMachine, error) {
@@ -7329,7 +7375,7 @@ func actionSSH(command *cobra.Command, args []string) error {
 		return invocationError(errors.New("SSH requires <machine> [-- <OpenSSH arguments...>]"))
 	}
 	ctx := actionContext(command, args)
-	client, machine, target, err := resolveSSHCommandTarget(ctx, args[0])
+	client, machine, target, err := resolveSSHCommandTargetFast(ctx, args[0])
 	if err != nil {
 		return friendlyCommandError(err)
 	}
@@ -7389,7 +7435,7 @@ func actionSSHProxy(command *cobra.Command, _ []string) error {
 		return err
 	}
 	ctx := actionContext(command, nil)
-	_, machine, target, err := resolveSSHCommandTarget(ctx, alias)
+	_, machine, target, err := resolveSSHCommandTargetLive(ctx, alias)
 	if err != nil {
 		return friendlyCommandError(err)
 	}
@@ -7464,7 +7510,7 @@ func actionSSHKnownHosts(command *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
-	client, machine, target, err := resolveSSHCommandTarget(actionContext(command, nil), alias)
+	client, machine, target, err := resolveSSHCommandTargetFast(actionContext(command, nil), alias)
 	if err != nil {
 		return friendlyCommandError(err)
 	}
@@ -7609,16 +7655,10 @@ func resolveSSHCommandTarget(ctx *command.Context, requested string) (*api.Clien
 	if d.cfg.ServerURL == "" {
 		return nil, api.UserMachine{}, api.ManagedSSHTarget{}, errors.New("Paperboat server is required for SSH")
 	}
-	credential, err := d.auth.Credential()
+	client, err := sshAPIClient(d)
 	if err != nil {
 		return nil, api.UserMachine{}, api.ManagedSSHTarget{}, err
 	}
-	client := api.New(d.cfg.ServerURL, credential, nil)
-	sourceMachineID, err := configuredMachineID()
-	if err != nil {
-		return nil, api.UserMachine{}, api.ManagedSSHTarget{}, err
-	}
-	client.SetSourceMachineID(sourceMachineID)
 	machine, err := resolveSSHMachine(ctx.Context, client, requested)
 	if err != nil {
 		return nil, api.UserMachine{}, api.ManagedSSHTarget{}, err
@@ -7630,7 +7670,82 @@ func resolveSSHCommandTarget(ctx *command.Context, requested string) (*api.Clien
 	if err != nil {
 		return nil, api.UserMachine{}, api.ManagedSSHTarget{}, err
 	}
+	_ = sshTargetCacheStore(d.cfg, machine, target, time.Now())
 	return client, machine, target, nil
+}
+
+// resolveSSHCommandTargetFast resolves the machine from the daemon's warm
+// inventory snapshot and the SSH target from a short-lived local cache when
+// fresh, avoiding catalog listing round trips on the interactive SSH path.
+// Any unavailable shortcut falls back to the canonical live resolution so
+// error behavior is unchanged.
+func resolveSSHCommandTargetFast(ctx *command.Context, requested string) (*api.Client, api.UserMachine, api.ManagedSSHTarget, error) {
+	d, err := buildDeps(ctx)
+	if err != nil {
+		return nil, api.UserMachine{}, api.ManagedSSHTarget{}, err
+	}
+	if d.cfg.ServerURL == "" {
+		return nil, api.UserMachine{}, api.ManagedSSHTarget{}, errors.New("Paperboat server is required for SSH")
+	}
+	machine, ok := resolveWarmUserMachine(ctx.Context, requested)
+	if !ok || machine.InstallationGeneration < 1 {
+		return resolveSSHCommandTarget(ctx, requested)
+	}
+	client, err := sshAPIClient(d)
+	if err != nil {
+		return resolveSSHCommandTarget(ctx, requested)
+	}
+	if target, fresh := sshTargetCacheLookup(d.cfg, machine, time.Now()); fresh {
+		return client, machine, target, nil
+	}
+	target, err := client.ManagedSSHTarget(ctx.Context, machine.ID, uint64(machine.InstallationGeneration))
+	if err != nil {
+		return resolveSSHCommandTarget(ctx, requested)
+	}
+	_ = sshTargetCacheStore(d.cfg, machine, target, time.Now())
+	return client, machine, target, nil
+}
+
+// resolveSSHCommandTargetLive skips the machine catalog listing through the
+// daemon's warm snapshot but always validates the SSH target against fresh
+// server data. The managed SSH proxy uses this so destination port validation
+// can never trust a stale local cache.
+func resolveSSHCommandTargetLive(ctx *command.Context, requested string) (*api.Client, api.UserMachine, api.ManagedSSHTarget, error) {
+	d, err := buildDeps(ctx)
+	if err != nil {
+		return nil, api.UserMachine{}, api.ManagedSSHTarget{}, err
+	}
+	if d.cfg.ServerURL == "" {
+		return nil, api.UserMachine{}, api.ManagedSSHTarget{}, errors.New("Paperboat server is required for SSH")
+	}
+	machine, ok := resolveWarmUserMachine(ctx.Context, requested)
+	if !ok || machine.InstallationGeneration < 1 {
+		return resolveSSHCommandTarget(ctx, requested)
+	}
+	client, err := sshAPIClient(d)
+	if err != nil {
+		return resolveSSHCommandTarget(ctx, requested)
+	}
+	target, err := client.ManagedSSHTarget(ctx.Context, machine.ID, uint64(machine.InstallationGeneration))
+	if err != nil {
+		return resolveSSHCommandTarget(ctx, requested)
+	}
+	_ = sshTargetCacheStore(d.cfg, machine, target, time.Now())
+	return client, machine, target, nil
+}
+
+func sshAPIClient(d *deps) (*api.Client, error) {
+	credential, err := d.auth.Credential()
+	if err != nil {
+		return nil, err
+	}
+	client := api.New(d.cfg.ServerURL, credential, nil)
+	sourceMachineID, err := configuredMachineID()
+	if err != nil {
+		return nil, err
+	}
+	client.SetSourceMachineID(sourceMachineID)
+	return client, nil
 }
 
 func resolveSSHMachine(ctx context.Context, client *api.Client, requested string) (api.UserMachine, error) {
@@ -7647,16 +7762,27 @@ func resolveSSHMachine(ctx context.Context, client *api.Client, requested string
 }
 
 func configuredOpenSSHUser(ctx context.Context, host string) (string, error) {
-	configured, err := openSSHResolvedUser(ctx, "ssh", []string{"-G", host})
-	if err != nil {
-		return "", err
+	type probeResult struct {
+		user string
+		err  error
 	}
-	baseline, err := openSSHResolvedUser(ctx, "ssh", []string{"-G", "-F", "/dev/null", host})
-	if err != nil {
-		return "", err
+	probe := func(arguments []string) probeResult {
+		user, err := openSSHResolvedUser(ctx, "ssh", arguments)
+		return probeResult{user: user, err: err}
 	}
-	if configured != baseline {
-		return configured, nil
+	configuredCh := make(chan probeResult, 1)
+	baselineCh := make(chan probeResult, 1)
+	go func() { configuredCh <- probe([]string{"-G", host}) }()
+	go func() { baselineCh <- probe([]string{"-G", "-F", "/dev/null", host}) }()
+	configured, baseline := <-configuredCh, <-baselineCh
+	if configured.err != nil {
+		return "", configured.err
+	}
+	if baseline.err != nil {
+		return "", baseline.err
+	}
+	if configured.user != baseline.user {
+		return configured.user, nil
 	}
 	return "", nil
 }
@@ -8449,12 +8575,42 @@ func actionConnectTarget(c *command.Context, requested string) error {
 		updateSelectedTransport(bar, selection, outcome)
 	}
 
-	terminalSession, err := selectTerminalSession(c.Context, backend, project, c.String("name"), c.String("session"))
+	sessionName := c.String("name")
+	sessionRef := c.String("session")
+	target, resolvedMachine, err := resolveEnvironmentTargetWithMachine(c.Context, backend, project)
 	if err != nil {
 		return err
 	}
-	terminalSessionID := terminalSession.ID
-	bar.SetIdentity(project, terminalSession.Name)
+	var createSession *resolver.TerminalSessionCreate
+	terminalSessionID := ""
+	terminalSessionName := ""
+	if strings.TrimSpace(sessionRef) != "" {
+		session, err := resolveTerminalSession(c.Context, backend, target, sessionRef)
+		if err != nil {
+			return friendlyCommandError(err)
+		}
+		terminalSessionID = session.ID
+		terminalSessionName = session.Name
+	} else if err := validateSessionNameOptional(sessionName); err != nil {
+		return err
+	} else if target.kind == environmentUserMachine {
+		// Machine targets create the durable session and fetch its connection
+		// descriptor in one round trip; the idempotency key makes descriptor
+		// retries resolve the same session.
+		createSession = &resolver.TerminalSessionCreate{Name: sessionName, IdempotencyKey: newIdempotencyKey()}
+		terminalSessionName = sessionName
+	} else {
+		session, err := createTerminalSessionForTarget(c.Context, backend, target, sessionName, newIdempotencyKey())
+		if err != nil {
+			return friendlyCommandError(err)
+		}
+		if session.EvictedSession != nil {
+			fmt.Fprintf(os.Stderr, "Session limit reached; removed least-recent session %q (%s).\n", session.EvictedSession.Name, session.EvictedSession.State)
+		}
+		terminalSessionID = session.ID
+		terminalSessionName = session.Name
+	}
+	bar.SetIdentity(project, terminalSessionName)
 	newResolver := func(credential config.Credential) *resolver.APIResolver {
 		client := api.New(d.cfg.ServerURL, credential, nil)
 		client.SetSourceMachineID(sourceMachineID)
@@ -8541,8 +8697,25 @@ func actionConnectTarget(c *command.Context, requested string) error {
 	}
 	var transferClient *filetransfer.Client
 	for attempt := 0; attempt <= d.cfg.Connect.DialRetries; attempt++ {
-		info, err = d.resolver.Resolve(ctx, resolver.ConnectRequest{Project: project, Credential: cred, TerminalSessionID: terminalSessionID})
+		resolveRequest := resolver.ConnectRequest{Project: project, Credential: cred, TerminalSessionID: terminalSessionID, CreateTerminalSession: createSession}
+		if target.kind == environmentUserMachine && resolvedMachine.ID != "" && resolvedMachine.InstallationGeneration > 0 {
+			resolveRequest.ResolvedMachine = &resolver.ResolvedMachine{ID: resolvedMachine.ID, Name: resolvedMachine.DisplayName, State: resolvedMachine.State, Generation: uint64(resolvedMachine.InstallationGeneration)}
+		}
+		info, err = d.resolver.Resolve(ctx, resolveRequest)
 		if err == nil {
+			if createSession != nil && info.TerminalSession != nil {
+				created := info.TerminalSession
+				if terminalSessionID == "" {
+					terminalSessionID = created.ID
+				}
+				if created.Name != "" && created.Name != terminalSessionName {
+					terminalSessionName = created.Name
+					bar.SetIdentity(project, terminalSessionName)
+				}
+				if created.EvictedSession != nil {
+					fmt.Fprintf(os.Stderr, "Session limit reached; removed least-recent session %q (%s).\n", created.EvictedSession.Name, created.EvictedSession.State)
+				}
+			}
 			if info.Terminal != nil {
 				info.Terminal.RestartIfNotRunning = true
 				info.Terminal.ReplayHistory = true
@@ -8556,17 +8729,28 @@ func actionConnectTarget(c *command.Context, requested string) error {
 			}
 			transferClient = fileTransferClientForTarget(info.FileTransfer)
 			configureFileTransferRefresh(transferClient)
+			// The file-transfer policy check runs concurrently with the
+			// transport dial. Paste availability is decided before any input
+			// is accepted, but the health check round trip never delays the
+			// shell becoming interactive.
+			verifyDone := make(chan struct{})
 			if transferClient != nil {
-				if policyErr := transferClient.VerifyPolicy(ctx, descriptorFileTransferPolicy(info.FileTransfer)); policyErr != nil {
-					transferClient = nil
-					if useStatusBar {
-						bar.FailureFor("file_transfer", "File transfer unavailable")
-					} else {
-						fmt.Fprintln(os.Stderr, "File transfer is unavailable for this connection. Terminal access will continue.")
+				go func() {
+					defer close(verifyDone)
+					if policyErr := transferClient.VerifyPolicy(ctx, descriptorFileTransferPolicy(info.FileTransfer)); policyErr != nil {
+						transferClient = nil
+						if useStatusBar {
+							bar.FailureFor("file_transfer", "File transfer unavailable")
+						} else {
+							fmt.Fprintln(os.Stderr, "File transfer is unavailable for this connection. Terminal access will continue.")
+						}
 					}
-				}
+				}()
+			} else {
+				close(verifyDone)
 			}
 			conn, err = d.tunnel.Dial(ctx, info)
+			<-verifyDone
 		}
 		if err == nil {
 			break
@@ -8617,6 +8801,9 @@ func actionConnectTarget(c *command.Context, requested string) error {
 		bar.ClearRemoteViewport()
 	} else if term.IsTerminal(int(os.Stdout.Fd())) {
 		_, _ = fmt.Fprint(os.Stdout, "\x1b[2J\x1b[H")
+	}
+	if useStatusBar && d.peerLocal != nil && info.TargetKind == "machine" {
+		go watchMachineTransportPath(ctx, d.peerLocal, info.ProjectID, d.transportMode, bar)
 	}
 	var inboxMu sync.Mutex
 	var cancelInbox context.CancelFunc
@@ -8675,7 +8862,11 @@ func actionConnectTarget(c *command.Context, requested string) error {
 			return nil, credErr
 		}
 		freshResolver := newResolver(freshCred)
-		freshInfo, resolveErr := freshResolver.Resolve(reconnectCtx, resolver.ConnectRequest{Project: info.ProjectID, Credential: freshCred, TerminalSessionID: terminalSessionID})
+		reconnectRequest := resolver.ConnectRequest{Project: info.ProjectID, Credential: freshCred, TerminalSessionID: terminalSessionID}
+		if target.kind == environmentUserMachine && info.MachineGeneration > 0 {
+			reconnectRequest.ResolvedMachine = &resolver.ResolvedMachine{ID: info.ProjectID, Name: info.Project, State: info.ProjectState, Generation: info.MachineGeneration}
+		}
+		freshInfo, resolveErr := freshResolver.Resolve(reconnectCtx, reconnectRequest)
 		if resolveErr != nil {
 			var apiErr *api.APIError
 			if errors.As(resolveErr, &apiErr) && apiErr.Code == "machine_revoked" {
@@ -8808,6 +8999,64 @@ func actionConnectTarget(c *command.Context, requested string) error {
 func updateSelectedTransport(bar *statusbar.Bar, selection tunnel.TerminalTransportSelection, outcome string) {
 	if outcome == "selected" {
 		bar.SetTransport(selection.Selected)
+	}
+}
+
+// watchMachineTransportPath keeps an automatic session marker in sync with a
+// uniform machine path. A daemon snapshot is machine-scoped, so it must never
+// overwrite a forced session's requested path or resolve a mixed snapshot to
+// an arbitrary peer's transport.
+func watchMachineTransportPath(ctx context.Context, client *localapi.Client, machineID string, requested tunnel.TerminalTransport, bar *statusbar.Bar) {
+	if client == nil || bar == nil || machineID == "" {
+		return
+	}
+	if forcedTransportMarker(requested, bar) {
+		return
+	}
+	snapshot, err := client.Snapshot(ctx)
+	if err != nil {
+		return
+	}
+	applyMachineTransportPath(snapshot, machineID, requested, bar)
+	updates, watchErr := client.Watch(ctx, snapshot.Generation)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case snapshot, ok := <-updates:
+			if !ok {
+				return
+			}
+			applyMachineTransportPath(snapshot, machineID, requested, bar)
+		case <-watchErr:
+			return
+		}
+	}
+}
+
+func forcedTransportMarker(requested tunnel.TerminalTransport, bar *statusbar.Bar) bool {
+	switch requested {
+	case tunnel.TerminalTransportDirect:
+		bar.SetTransport("direct")
+	case tunnel.TerminalTransportRelayQUIC:
+		bar.SetTransport("relay")
+	case tunnel.TerminalTransportRelayWSS:
+		bar.SetTransport("wss")
+	default:
+		return false
+	}
+	return true
+}
+
+func applyMachineTransportPath(snapshot localapi.Snapshot, machineID string, requested tunnel.TerminalTransport, bar *statusbar.Bar) {
+	if forcedTransportMarker(requested, bar) {
+		return
+	}
+	for _, machine := range snapshot.Machines {
+		if machine.ID == machineID && (machine.SelectedPath == "direct" || machine.SelectedPath == "relay" || machine.SelectedPath == "wss") {
+			bar.SetTransport(machine.SelectedPath)
+			return
+		}
 	}
 }
 

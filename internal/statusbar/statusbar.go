@@ -451,14 +451,18 @@ func (b *Bar) SetConnection(state string) {
 }
 
 // SetTransport records the transport used by the active terminal connection.
-// It is rendered as the final Q/W marker independently of configurable widgets.
+// It is rendered as the final d/q/w marker independently of configurable
+// widgets: direct, relay QUIC, and relay WSS respectively. Unknown or empty
+// values hide the marker until the next selection is observed.
 func (b *Bar) SetTransport(transport string) {
 	b.mu.Lock()
 	switch strings.ToLower(strings.TrimSpace(transport)) {
-	case "quic", "q":
-		b.transport = "Q"
+	case "direct", "d":
+		b.transport = "d"
+	case "relay", "quic", "q":
+		b.transport = "q"
 	case "wss", "w":
-		b.transport = "W"
+		b.transport = "w"
 	default:
 		b.transport = ""
 	}

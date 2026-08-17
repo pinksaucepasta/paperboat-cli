@@ -116,13 +116,21 @@ func TestTransportIndicatorIsAlwaysLast(t *testing.T) {
 	bar.SetIdentity("demo", "default")
 	bar.SetConnection("connected")
 
+	bar.SetTransport("direct")
+	if line := bar.Render(80); !strings.HasSuffix(line, "connected  d") {
+		t.Fatalf("direct indicator is not last: %q", line)
+	}
 	bar.SetTransport("quic")
-	if line := bar.Render(80); !strings.HasSuffix(line, "connected  Q") {
+	if line := bar.Render(80); !strings.HasSuffix(line, "connected  q") {
 		t.Fatalf("QUIC indicator is not last: %q", line)
 	}
 	bar.SetTransport("wss")
-	if line := bar.Render(80); !strings.HasSuffix(line, "connected  W") {
+	if line := bar.Render(80); !strings.HasSuffix(line, "connected  w") {
 		t.Fatalf("WSS indicator is not last: %q", line)
+	}
+	bar.SetTransport("relay")
+	if line := bar.Render(80); !strings.HasSuffix(line, "connected  q") {
+		t.Fatalf("relay indicator is not last: %q", line)
 	}
 	bar.SetTransport("unknown")
 	if line := bar.Render(80); !strings.HasSuffix(line, "connected") {

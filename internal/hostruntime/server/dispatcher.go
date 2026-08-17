@@ -529,6 +529,10 @@ type terminalRequest struct {
 	Rows           uint16            `json:"rows,omitempty"`
 	Environment    map[string]string `json:"environment,omitempty"`
 	Signal         string            `json:"signal,omitempty"`
+	// ExistingSnapshot asks create to return the current snapshot instead of
+	// failing when the session already exists. Responses to such creates carry
+	// an "existing" flag so the client can pick the right attach boundary.
+	ExistingSnapshot bool `json:"existing_snapshot,omitempty"`
 }
 
 type terminalAttachResponse struct {
@@ -602,6 +606,26 @@ func (d *Dispatcher) terminal(ctx context.Context, authorization Authorization, 
 			return failure("invalid_request")
 		}
 		value, err := d.config.SessionLauncher.Launch(ctx, process.LaunchRequest{ID: request.SessionID, Name: request.Name, CWD: cwd, Dimensions: pty.Dimensions{Columns: request.Columns, Rows: request.Rows}, Environment: request.Environment})
+		if request.ExistingSnapshot {
+			// create-or-get lets one round trip both create a fresh session
+			// and resolve an already-running one. A name collision without a
+			// matching session ID keeps the original failure so clients
+			// cannot claim another session's name.
+			if errors.Is(err, session.ErrSessionExists) {
+				if snapshot, snapshotErr := d.config.Sessions.Snapshot(request.SessionID); snapshotErr == nil {
+					return result(struct {
+						session.Snapshot
+						Existing bool `json:"existing"`
+					}{Snapshot: snapshot, Existing: true})
+				}
+			}
+			if err == nil {
+				return result(struct {
+					session.Snapshot
+					Existing bool `json:"existing"`
+				}{Snapshot: value, Existing: false})
+			}
+		}
 		return domainResult(value, err)
 	case "attach", "replay":
 		attachmentID := request.AttachmentID
@@ -808,6 +832,8 @@ func domainResult(value any, err error) operation.Outcome {
 		return failure("deadline_exceeded")
 	case errors.Is(err, session.ErrSessionUnknown), errors.Is(err, preview.ErrNotFound):
 		return failure("not_found_or_forbidden")
+	case errors.Is(err, session.ErrSessionExists):
+		return failure("session_exists")
 	case errors.Is(err, session.ErrSessionRunning):
 		return failure("session_running")
 	case errors.Is(err, session.ErrStaleGeneration):

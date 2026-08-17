@@ -977,6 +977,101 @@ func TestPoolSnapshotReportsOnlyReadyActiveStandby(t *testing.T) {
 	_ = pool.Close()
 }
 
+func TestPoolSnapshotRetainsLeasedPathAfterSelectedHealthFailure(t *testing.T) {
+	pool, err := NewPool(testRacer(t, newFakeConnector()), DevelopmentPoolConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	direct := &fakeConnection{}
+	state := &classState{generation: 4, selected: &managedConnection{
+		selection:         Selection{Generation: 4, Path: PathDirectQUIC, Connection: direct},
+		applicationLeases: 2,
+	}}
+	pool.classes[peerquic.ClassInteractive] = state
+
+	pool.mu.Lock()
+	if !pool.failHealthLocked(peerquic.ClassInteractive, state.selected) {
+		pool.mu.Unlock()
+		t.Fatal("selected health failure was not reported")
+	}
+	pool.mu.Unlock()
+
+	snapshot, err := pool.Snapshot(peerquic.ClassInteractive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Selected || snapshot.Path != 0 || snapshot.ActivePath != PathDirectQUIC || snapshot.Leases != 2 {
+		t.Fatalf("snapshot lost leased path: %+v", snapshot)
+	}
+	if len(snapshot.PathConsumers) != 1 || snapshot.PathConsumers[0].Path != PathDirectQUIC || snapshot.PathConsumers[0].ActiveConsumers != 2 {
+		t.Fatalf("path consumers=%+v", snapshot.PathConsumers)
+	}
+	if state.draining == nil || state.draining.selection.Connection != direct {
+		t.Fatalf("failed leased carrier was not retained: %+v", state)
+	}
+	_ = pool.Close()
+}
+
+func TestPoolSnapshotReportsDeterministicPerPathLeaseCounts(t *testing.T) {
+	pool, err := NewPool(testRacer(t, newFakeConnector()), DevelopmentPoolConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	direct := &fakeConnection{}
+	relay := &relayMetadataConnection{fakeConnection: &fakeConnection{}, region: "bom"}
+	wss := &relayMetadataConnection{fakeConnection: &fakeConnection{}, region: "sin"}
+	state := &classState{generation: 5,
+		selected:  &managedConnection{selection: Selection{Generation: 5, Path: PathDirectQUIC, Connection: direct}, applicationLeases: 2},
+		standby:   &managedConnection{selection: Selection{Generation: 5, Path: PathRelayQUIC, RelayRegion: "bom", Connection: relay}, applicationLeases: 3},
+		secondary: &managedConnection{selection: Selection{Generation: 5, Path: PathWSS, RelayRegion: "sin", Connection: wss}, applicationLeases: 1},
+	}
+	// Keep one path in two pool roles to prove entries are deduplicated before
+	// aggregation, as happens while a selected carrier is being promoted.
+	state.draining = state.standby
+	pool.classes[peerquic.ClassInteractive] = state
+
+	snapshot, err := pool.Snapshot(peerquic.ClassInteractive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.PathConsumers) != 3 {
+		t.Fatalf("path consumers=%+v", snapshot.PathConsumers)
+	}
+	want := []PathConsumer{
+		{Path: PathDirectQUIC, ActiveConsumers: 2},
+		{Path: PathRelayQUIC, ActiveConsumers: 3, RelayRegion: "bom"},
+		{Path: PathWSS, ActiveConsumers: 1, RelayRegion: "sin"},
+	}
+	for index := range want {
+		if snapshot.PathConsumers[index] != want[index] {
+			t.Fatalf("path consumers[%d]=%+v want=%+v", index, snapshot.PathConsumers[index], want[index])
+		}
+	}
+	_ = pool.Close()
+}
+
+func TestPoolSnapshotFallsBackToLeasedPathWhenCommittedObserverIsEmpty(t *testing.T) {
+	pool, err := NewPool(testRacer(t, newFakeConnector()), DevelopmentPoolConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	direct := &committedFakeConnection{fakeConnection: &fakeConnection{}}
+	state := &classState{generation: 6, selected: &managedConnection{
+		selection:         Selection{Generation: 6, Path: PathDirectQUIC, Connection: direct},
+		applicationLeases: 1,
+	}}
+	pool.classes[peerquic.ClassInteractive] = state
+
+	snapshot, err := pool.Snapshot(peerquic.ClassInteractive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.ActivePath != PathDirectQUIC || snapshot.Leases != 1 {
+		t.Fatalf("snapshot=%+v", snapshot)
+	}
+	_ = pool.Close()
+}
+
 type committedFakeConnection struct {
 	*fakeConnection
 	committed uint64

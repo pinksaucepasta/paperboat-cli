@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"sort"
 	"sync"
 	"time"
 
@@ -131,6 +132,7 @@ func (p *Publisher) publish(ctx context.Context, clear bool) error {
 	p.mu.Unlock()
 
 	consumers := uint64(0)
+	consumerPaths := make(map[string]localapi.TransportConsumer, 3)
 	path := connectionmanager.Path(0)
 	standbyPath := connectionmanager.Path(0)
 	relayRegion := ""
@@ -141,6 +143,22 @@ func (p *Publisher) publish(ctx context.Context, clear bool) error {
 				return err
 			}
 			consumers += snapshot.Leases
+			for _, consumer := range snapshot.PathConsumers {
+				if consumer.ActiveConsumers == 0 {
+					continue
+				}
+				pathName := observationPath(consumer.Path)
+				if pathName == "none" {
+					continue
+				}
+				value := consumerPaths[pathName]
+				value.Path = pathName
+				value.ActiveConsumers += consumer.ActiveConsumers
+				if consumer.RelayRegion != "" {
+					value.RelayRegion = consumer.RelayRegion
+				}
+				consumerPaths[pathName] = value
+			}
 			if snapshot.ActivePath != 0 {
 				path = snapshot.ActivePath
 				standbyPath = snapshot.StandbyPath
@@ -151,8 +169,28 @@ func (p *Publisher) publish(ctx context.Context, clear bool) error {
 			}
 		}
 	}
+	transportConsumers := make([]localapi.TransportConsumer, 0, len(consumerPaths))
+	for _, consumer := range consumerPaths {
+		transportConsumers = append(transportConsumers, consumer)
+	}
+	sort.Slice(transportConsumers, func(left, right int) bool { return transportConsumers[left].Path < transportConsumers[right].Path })
+	if len(transportConsumers) > 0 {
+		consumers = 0
+		for _, consumer := range transportConsumers {
+			consumers += consumer.ActiveConsumers
+		}
+		path = pathFromObservation(transportConsumers[0].Path)
+		relayRegion = transportConsumers[0].RelayRegion
+		if len(transportConsumers) > 1 {
+			path = 0
+			relayRegion = ""
+			standbyPath = 0
+		}
+	}
 	selected := observationPath(path)
-	if path == 0 {
+	if len(transportConsumers) > 1 {
+		selected = "mixed"
+	} else if path == 0 {
 		selected = "none"
 		relayRegion = ""
 	}
@@ -165,7 +203,7 @@ func (p *Publisher) publish(ctx context.Context, clear bool) error {
 		}
 	}
 	now := p.clock().UTC()
-	observation := localapi.TransportObservation{Schema: localapi.ObservationSchemaV1, SourceID: p.sourceID, Sequence: sequence, ObservedAt: now, ExpiresAt: now.Add(p.lifetime), MachineID: p.machineID, ActiveConsumers: consumers, SelectedPath: selected, StandbyPath: standby, RelayRegion: relayRegion, NATMappingIPv4: natIPv4, NATMappingIPv6: natIPv6, CaptivePortal: captivePortal, PMTU: pmtu, RouterProtocol: routerProtocol, RouterMapping: routerMapping, MappingLifetime: mappingLifetime}
+	observation := localapi.TransportObservation{Schema: localapi.ObservationSchemaV1, SourceID: p.sourceID, Sequence: sequence, ObservedAt: now, ExpiresAt: now.Add(p.lifetime), MachineID: p.machineID, ActiveConsumers: consumers, SelectedPath: selected, TransportConsumers: transportConsumers, StandbyPath: standby, RelayRegion: relayRegion, NATMappingIPv4: natIPv4, NATMappingIPv6: natIPv6, CaptivePortal: captivePortal, PMTU: pmtu, RouterProtocol: routerProtocol, RouterMapping: routerMapping, MappingLifetime: mappingLifetime}
 	return p.client.PublishTransportObservation(ctx, observation)
 }
 
@@ -179,5 +217,18 @@ func observationPath(path connectionmanager.Path) string {
 		return "wss"
 	default:
 		return "none"
+	}
+}
+
+func pathFromObservation(path string) connectionmanager.Path {
+	switch path {
+	case "direct":
+		return connectionmanager.PathDirectQUIC
+	case "relay":
+		return connectionmanager.PathRelayQUIC
+	case "wss":
+		return connectionmanager.PathWSS
+	default:
+		return 0
 	}
 }

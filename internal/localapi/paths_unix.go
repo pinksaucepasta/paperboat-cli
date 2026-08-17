@@ -65,8 +65,11 @@ func ResolvePaths(environ func(string) string, home string, uid int) (Paths, err
 		if candidate != "" && !filepath.IsAbs(candidate) {
 			return Paths{}, ErrInvalidConfig
 		}
-		if candidate != "" && safeOwnerDirectory(candidate, uid) {
-			runtimeBase = candidate
+		if candidate != "" {
+			candidate = filepath.Clean(candidate)
+			if safeOwnerDirectory(candidate, uid) {
+				runtimeBase = candidate
+			}
 		}
 	}
 	var runtimeRoot string

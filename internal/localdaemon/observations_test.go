@@ -50,8 +50,11 @@ func TestObservationStoreAggregatesSourcesAndSelectsFreshestPath(t *testing.T) {
 	}
 	snapshot, _ := store.Snapshot(context.Background())
 	machine := snapshot.Machines[0]
-	if snapshot.Generation != 3 || machine.ActiveConsumers != 3 || machine.SelectedPath != "relay" || machine.StandbyPath != "wss" || machine.RelayRegion != "bom" || machine.NATMappingIPv4 != "destination_dependent" || machine.NATMappingIPv6 != "endpoint_independent" || machine.CaptivePortal != "suspected" || machine.PMTU != "standard" {
+	if snapshot.Generation != 3 || machine.ActiveConsumers != 3 || machine.SelectedPath != "mixed" || machine.StandbyPath != "none" || machine.RelayRegion != "" || machine.NATMappingIPv4 != "destination_dependent" || machine.NATMappingIPv6 != "endpoint_independent" || machine.CaptivePortal != "suspected" || machine.PMTU != "standard" {
 		t.Fatalf("snapshot=%#v", snapshot)
+	}
+	if len(machine.TransportConsumers) != 2 || machine.TransportConsumers[0] != (localapi.TransportConsumer{Path: "direct", ActiveConsumers: 1}) || machine.TransportConsumers[1] != (localapi.TransportConsumer{Path: "relay", ActiveConsumers: 2, RelayRegion: "bom"}) {
+		t.Fatalf("transport consumers=%#v", machine.TransportConsumers)
 	}
 	if err := observations.PublishObservation(context.Background(), peerB, newest); err != nil {
 		t.Fatal(err)
@@ -69,7 +72,7 @@ func TestObservationStoreAggregatesSourcesAndSelectsFreshestPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	snapshot, _ = store.Snapshot(context.Background())
-	if snapshot.Machines[0].ActiveConsumers != 1 || snapshot.Machines[0].SelectedPath != "direct" || snapshot.Machines[0].StandbyPath != "none" || snapshot.Machines[0].RelayRegion != "" || snapshot.Machines[0].NATMappingIPv4 != "unknown" || snapshot.Machines[0].NATMappingIPv6 != "unknown" || snapshot.Machines[0].CaptivePortal != "unknown" || snapshot.Machines[0].PMTU != "unknown" {
+	if snapshot.Machines[0].ActiveConsumers != 1 || snapshot.Machines[0].SelectedPath != "direct" || len(snapshot.Machines[0].TransportConsumers) != 1 || snapshot.Machines[0].TransportConsumers[0] != (localapi.TransportConsumer{Path: "direct", ActiveConsumers: 1}) || snapshot.Machines[0].StandbyPath != "none" || snapshot.Machines[0].RelayRegion != "" || snapshot.Machines[0].NATMappingIPv4 != "unknown" || snapshot.Machines[0].NATMappingIPv6 != "unknown" || snapshot.Machines[0].CaptivePortal != "unknown" || snapshot.Machines[0].PMTU != "unknown" {
 		t.Fatalf("cleared snapshot=%#v", snapshot)
 	}
 }

@@ -1396,6 +1396,30 @@ func (c *Client) UserMachineConnectionDescriptor(ctx context.Context, machineID 
 	return c.UserMachineConnectionDescriptorForSession(ctx, machineID, "")
 }
 
+// UserMachineConnectionDescriptorWithSessionCreate creates a durable terminal
+// session and issues the connection descriptor in one round trip. The
+// idempotency key makes retried requests resolve the same durable session.
+func (c *Client) UserMachineConnectionDescriptorWithSessionCreate(ctx context.Context, machineID, name, idempotencyKey string) (ConnectionDescriptor, TerminalSession, error) {
+	if strings.TrimSpace(machineID) == "" || strings.TrimSpace(idempotencyKey) == "" || c.sourceMachineID == "" {
+		return ConnectionDescriptor{}, TerminalSession{}, errors.New("machine identity and idempotency key are required")
+	}
+	var out struct {
+		Descriptor      ConnectionDescriptor `json:"descriptor"`
+		TerminalSession TerminalSession      `json:"terminal_session"`
+	}
+	err := c.do(ctx, http.MethodPost, "/v1/machines/"+url.PathEscape(machineID)+"/connection-descriptor", map[string]any{
+		"source_machine_id": c.sourceMachineID,
+		"create_session":    map[string]string{"name": name, "idempotency_key": idempotencyKey},
+	}, &out)
+	if err == nil {
+		err = out.Descriptor.NormalizeConnectionDescriptor()
+	}
+	if err == nil && out.TerminalSession.ID == "" {
+		err = errors.New("server did not return the created terminal session")
+	}
+	return out.Descriptor, out.TerminalSession, err
+}
+
 // UserMachineConnectionDescriptorForSession connects a durable terminal session belonging
 // to an enrolled machine.
 func (c *Client) UserMachineConnectionDescriptorForSession(ctx context.Context, machineID, terminalSessionID string) (ConnectionDescriptor, error) {

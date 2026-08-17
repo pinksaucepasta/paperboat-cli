@@ -206,7 +206,148 @@ func helperCheck(ctx context.Context, message helperMessageConnection) error {
 	return nil
 }
 
+// initialize attaches the canonical terminal session with a create-or-get
+// fast path: one create round trip both creates a fresh session and resolves
+// an already-running one, so the common fresh-session startup needs two round
+// trips (create, attach) instead of three (snapshot, create, attach).
 func (c *helperTerminalConn) initialize(ctx context.Context) error {
+	if c.target.SessionID == "" {
+		return errors.New("canonical terminal descriptor is missing session ID")
+	}
+	cols, rows := c.target.Cols, c.target.Rows
+	if cols == 0 {
+		cols = 80
+	}
+	if rows == 0 {
+		rows = 24
+	}
+	// The server-bound session ID remains unique across machine re-enrollment.
+	// Terminal IDs such as "term-1" can be reused and collide with durable
+	// helper history left by the previous machine identity.
+	name := canonicalSessionName(c.target.SessionID)
+	createPayload, _ := json.Marshal(map[string]any{"action": "create", "session_id": c.target.SessionID, "name": name, "cwd": c.target.CWD, "columns": cols, "rows": rows, "environment": c.target.Env, "existing_snapshot": true})
+	frame, err := c.requestSync(ctx, "terminal.v1", createPayload)
+	if err != nil {
+		var remote *helperRemoteError
+		if !errors.As(err, &remote) || remote.Code != "invalid_request" && remote.Code != "session_exists" {
+			return err
+		}
+		// Host runtimes without create-or-get reject the extra field, and name
+		// collisions surface as session_exists. The legacy sequence preserves
+		// the historical behavior for both cases.
+		return c.initializeLegacy(ctx)
+	}
+	existingSession := helperResponseSessionExisting(frame)
+	snapshotLatest := uint64(0)
+	if existingSession {
+		var state string
+		state, _, snapshotLatest = helperResponseSessionState(frame)
+		if c.target.RestartIfNotRunning && (state == "exited" || state == "closed") {
+			restartPayload, _ := json.Marshal(map[string]any{"action": "restart", "session_id": c.target.SessionID})
+			frame, err = c.requestSync(ctx, "terminal.v1", restartPayload)
+			if err != nil {
+				return fmt.Errorf("restart helper terminal session: %w", err)
+			}
+		}
+	}
+	c.generation = helperResponseGeneration(frame)
+	fromSequence := uint64(max(0, c.target.AfterSequence))
+	if existingSession && c.target.AfterSequence <= 0 && snapshotLatest > fromSequence {
+		// A bounded raw byte tail is not a terminal snapshot: it can begin inside
+		// an ANSI sequence or alternate-screen update and render as a blank pane.
+		// An initial attach joins at the live boundary and requests a coherent
+		// application redraw. Reconnects carry a committed sequence and replay all
+		// retained output after that cursor.
+		fromSequence = snapshotLatest
+		if c.target.SequenceSink != nil {
+			c.target.SequenceSink(int(snapshotLatest))
+		}
+	}
+	attach := func(sequence uint64, liveBoundary bool) (helperFrame, error) {
+		payload, _ := json.Marshal(map[string]any{"action": "attach", "session_id": c.target.SessionID, "from_sequence": sequence, "at_live_boundary": liveBoundary})
+		return c.requestSync(ctx, "terminal.v1", payload)
+	}
+	frame, err = attach(fromSequence, existingSession && c.target.AfterSequence <= 0)
+	for attempt := 0; err != nil; attempt++ {
+		var remote *helperRemoteError
+		if !errors.As(err, &remote) || remote.Code != "replay_gap" || remote.Details == nil || remote.Details.EarliestSequence > remote.Details.LatestSequence || attempt >= 3 {
+			if attempt > 0 {
+				return fmt.Errorf("recover helper terminal replay gap: %w", err)
+			}
+			return fmt.Errorf("attach helper terminal session: %w", err)
+		}
+		// Once compaction has passed the committed cursor, a numeric retry can
+		// race a high-output terminal and become stale again before it arrives.
+		// Join at the helper's atomic live boundary, make the loss explicit once,
+		// and request a coherent redraw.
+		if c.target.SequenceSink != nil {
+			c.target.SequenceSink(int(remote.Details.LatestSequence))
+		}
+		if attempt == 0 {
+			if c.target.ReplayGapSink != nil {
+				c.target.ReplayGapSink(remote.Details.RequestedSequence, remote.Details.EarliestSequence, remote.Details.LatestSequence)
+			}
+			c.initial = append(c.initial, helperOutput{data: []byte(helperReplayGapMarker), endSequence: remote.Details.LatestSequence})
+		}
+		frame, err = attach(remote.Details.LatestSequence, true)
+	}
+	var response struct {
+		Result struct {
+			StreamID     uint32 `json:"stream_id"`
+			AttachmentID string `json:"attachment_id"`
+			Session      struct {
+				Snapshot struct {
+					Generation uint64 `json:"generation"`
+				} `json:"snapshot"`
+			} `json:"session"`
+		} `json:"result"`
+	}
+	if json.Unmarshal(frame.Payload, &response) != nil || response.Result.StreamID == 0 || response.Result.AttachmentID == "" {
+		return errors.New("helper returned an invalid terminal attachment")
+	}
+	if existingSession && c.target.AfterSequence <= 0 {
+		if modes := helperResponseTerminalModes(frame); modes != "" {
+			c.initial = append([]helperOutput{{data: []byte(modes), endSequence: snapshotLatest}}, c.initial...)
+		}
+	}
+	c.attachmentID = response.Result.AttachmentID
+	c.streamID = response.Result.StreamID
+	if response.Result.Session.Snapshot.Generation != 0 {
+		c.generation = response.Result.Session.Snapshot.Generation
+	}
+	if c.generation == 0 {
+		return errors.New("helper terminal session has no generation")
+	}
+	diagnosticlog.TryInfo("peer terminal attachment initialized", "session_id", c.target.SessionID, "existing", existingSession, "snapshot_latest", snapshotLatest, "from_sequence", fromSequence, "initial_binary_frames", len(c.initialBinary), "initial_binary_bytes", c.initialDecodedBytes)
+	for _, data := range c.initialBinary {
+		output, decodeErr := c.decodeHelperBinary(data)
+		if decodeErr != nil {
+			return decodeErr
+		}
+		c.initial = append(c.initial, output)
+	}
+	c.initialBinary = nil
+	c.initialEncodedBytes = 0
+	c.initialDecodedBytes = 0
+	go c.writeLoop()
+	go c.readLoop()
+	go c.ackLoop()
+	return nil
+}
+
+func helperResponseSessionExisting(frame helperFrame) bool {
+	var response struct {
+		Result struct {
+			Existing bool `json:"existing"`
+		} `json:"result"`
+	}
+	_ = json.Unmarshal(frame.Payload, &response)
+	return response.Result.Existing
+}
+
+// initializeLegacy reproduces the historical snapshot/create/attach sequence
+// for host runtimes that predate create-or-get.
+func (c *helperTerminalConn) initializeLegacy(ctx context.Context) error {
 	if c.target.SessionID == "" {
 		return errors.New("canonical terminal descriptor is missing session ID")
 	}
@@ -315,7 +456,7 @@ func (c *helperTerminalConn) initialize(ctx context.Context) error {
 	if c.generation == 0 {
 		return errors.New("helper terminal session has no generation")
 	}
-	diagnosticlog.TryInfo("peer terminal attachment initialized", "session_id", c.target.SessionID, "existing", existingSession, "snapshot_latest", snapshotLatest, "from_sequence", fromSequence, "initial_binary_frames", len(c.initialBinary), "initial_binary_bytes", c.initialDecodedBytes)
+	diagnosticlog.TryInfo("peer terminal attachment initialized (legacy)", "session_id", c.target.SessionID, "existing", existingSession, "snapshot_latest", snapshotLatest, "from_sequence", fromSequence, "initial_binary_frames", len(c.initialBinary), "initial_binary_bytes", c.initialDecodedBytes)
 	for _, data := range c.initialBinary {
 		output, decodeErr := c.decodeHelperBinary(data)
 		if decodeErr != nil {
