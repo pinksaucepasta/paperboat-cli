@@ -29,9 +29,8 @@ type Layout struct {
 	HostdSocket     string
 }
 
-// DefaultLayout returns only supported native host layouts. Windows has no
-// implementation here because a service definition without its required pipe
-// ACL and service-token enforcement would be a misleading, unsafe stub.
+// DefaultLayout returns the fixed, supported native host layout. Windows uses
+// a named pipe rather than pretending a filesystem socket is secure there.
 func DefaultLayout(platform string) (Layout, error) {
 	var installRoot, updateStateRoot, socketRoot string
 	switch platform {
@@ -43,27 +42,46 @@ func DefaultLayout(platform string) (Layout, error) {
 		installRoot = "/Library/PrivilegedHelperTools/Paperboat"
 		updateStateRoot = "/Library/Application Support/Paperboat/updated"
 		socketRoot = "/var/run/paperboat-hostd"
+	case "windows":
+		installRoot = `C:\Program Files\Paperboat`
+		updateStateRoot = `C:\ProgramData\Paperboat\updated`
+		socketRoot = `\\.\pipe\Paperboat`
 	default:
 		return Layout{}, ErrUnsupportedPlatform
 	}
-	releasesRoot := filepath.Join(installRoot, "releases")
+	join := filepath.Join
+	if platform == "windows" {
+		join = windowsPathJoin
+	}
+	releasesRoot := join(installRoot, "releases")
 	layout := Layout{
 		Platform: platform,
 
 		InstallRoot:   installRoot,
 		ReleasesRoot:  releasesRoot,
-		HostdBinary:   filepath.Join(installRoot, "components", "paperboat-hostd"),
-		UpdaterBinary: filepath.Join(installRoot, "components", "paperboat-updated"),
-		Launcher:      filepath.Join(installRoot, "launcher", "pb"),
+		HostdBinary:   join(installRoot, "components", "paperboat-hostd"),
+		UpdaterBinary: join(installRoot, "components", "paperboat-updated"),
+		Launcher:      join(installRoot, "launcher", "pb"),
 
-		RuntimeCurrent:  filepath.Join(releasesRoot, "runtime-current", "paperboat-runtime"),
-		RuntimeRollback: filepath.Join(releasesRoot, "runtime-rollback", "paperboat-runtime"),
-		RuntimeStaged:   filepath.Join(releasesRoot, "runtime-staged", "paperboat-runtime"),
-		CLICurrent:      filepath.Join(releasesRoot, "cli-current", "pb"),
-		CLIRollback:     filepath.Join(releasesRoot, "cli-rollback", "pb"),
+		RuntimeCurrent:  join(releasesRoot, "runtime-current", "paperboat-runtime"),
+		RuntimeRollback: join(releasesRoot, "runtime-rollback", "paperboat-runtime"),
+		RuntimeStaged:   join(releasesRoot, "runtime-staged", "paperboat-runtime"),
+		CLICurrent:      join(releasesRoot, "cli-current", "pb"),
+		CLIRollback:     join(releasesRoot, "cli-rollback", "pb"),
 
 		UpdateStateRoot: updateStateRoot,
-		HostdSocket:     filepath.Join(socketRoot, "hostd.sock"),
+		HostdSocket:     join(socketRoot, "hostd.sock"),
+	}
+	if platform == "windows" {
+		layout.HostdBinary += ".exe"
+		layout.UpdaterBinary += ".exe"
+		layout.Launcher += ".exe"
+		layout.RuntimeCurrent += ".exe"
+		layout.RuntimeRollback += ".exe"
+		layout.RuntimeStaged += ".exe"
+		layout.CLICurrent += ".exe"
+		layout.CLIRollback += ".exe"
+		layout.HostdSocket = `\\.\pipe\PaperboatHostd`
 	}
 	if err := layout.Validate(); err != nil {
 		return Layout{}, err
@@ -72,7 +90,7 @@ func DefaultLayout(platform string) (Layout, error) {
 }
 
 func (l Layout) Validate() error {
-	if l.Platform != "linux" && l.Platform != "darwin" {
+	if l.Platform != "linux" && l.Platform != "darwin" && l.Platform != "windows" {
 		return ErrUnsupportedPlatform
 	}
 	for _, path := range []string{
@@ -80,25 +98,52 @@ func (l Layout) Validate() error {
 		l.RuntimeCurrent, l.RuntimeRollback, l.RuntimeStaged, l.CLICurrent, l.CLIRollback,
 		l.UpdateStateRoot, l.HostdSocket,
 	} {
-		if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		if !absoluteForPlatform(l.Platform, path) {
 			return ErrInvalidDefinition
 		}
 	}
-	if filepath.Dir(l.HostdSocket) == l.UpdateStateRoot || filepath.Dir(l.HostdSocket) == l.ReleasesRoot {
+	if l.Platform != "windows" && (filepath.Dir(l.HostdSocket) == l.UpdateStateRoot || filepath.Dir(l.HostdSocket) == l.ReleasesRoot) {
 		return ErrInvalidDefinition
 	}
 	for _, path := range []string{l.RuntimeCurrent, l.RuntimeRollback, l.RuntimeStaged, l.CLICurrent, l.CLIRollback} {
-		if !within(l.ReleasesRoot, path) {
+		if !withinForPlatform(l.Platform, l.ReleasesRoot, path) {
 			return ErrInvalidDefinition
 		}
 	}
-	if !within(l.InstallRoot, l.ReleasesRoot) || !within(l.InstallRoot, l.HostdBinary) || !within(l.InstallRoot, l.UpdaterBinary) || !within(l.InstallRoot, l.Launcher) {
+	if !withinForPlatform(l.Platform, l.InstallRoot, l.ReleasesRoot) || !withinForPlatform(l.Platform, l.InstallRoot, l.HostdBinary) || !withinForPlatform(l.Platform, l.InstallRoot, l.UpdaterBinary) || !withinForPlatform(l.Platform, l.InstallRoot, l.Launcher) {
 		return ErrInvalidDefinition
 	}
 	if l.RuntimeCurrent == l.RuntimeRollback || l.RuntimeCurrent == l.RuntimeStaged || l.RuntimeRollback == l.RuntimeStaged || l.CLICurrent == l.CLIRollback {
 		return ErrInvalidDefinition
 	}
 	return nil
+}
+
+func absoluteForPlatform(platform, path string) bool {
+	if platform != "windows" {
+		return filepath.IsAbs(path) && filepath.Clean(path) == path
+	}
+	return len(path) >= 3 && ((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) && path[1] == ':' && path[2] == '\\' || strings.HasPrefix(path, `\\.\pipe\`)
+}
+
+func windowsPathJoin(elements ...string) string {
+	result := ""
+	for _, element := range elements {
+		if result == "" {
+			result = strings.TrimRight(element, `\\`)
+			continue
+		}
+		result += `\\` + strings.Trim(element, `\\`)
+	}
+	return result
+}
+
+func withinForPlatform(platform, root, path string) bool {
+	if platform != "windows" {
+		return within(root, path)
+	}
+	root = strings.TrimRight(strings.ToLower(root), `\\`) + `\\`
+	return strings.HasPrefix(strings.ToLower(path), root)
 }
 
 func within(root, path string) bool {

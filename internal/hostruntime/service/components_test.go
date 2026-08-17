@@ -41,22 +41,19 @@ func splitLayout(t *testing.T, platform string) Layout {
 }
 
 func TestDefaultSplitLayoutsAreFixedAndBounded(t *testing.T) {
-	for _, platform := range []string{"linux", "darwin"} {
+	for _, platform := range []string{"linux", "darwin", "windows"} {
 		t.Run(platform, func(t *testing.T) {
 			layout, err := DefaultLayout(platform)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := layout.Validate(); err != nil || !within(layout.InstallRoot, layout.HostdBinary) || !within(layout.ReleasesRoot, layout.RuntimeCurrent) {
+			if err := layout.Validate(); err != nil || !withinForPlatform(platform, layout.InstallRoot, layout.HostdBinary) || !withinForPlatform(platform, layout.ReleasesRoot, layout.RuntimeCurrent) {
 				t.Fatalf("layout=%+v err=%v", layout, err)
 			}
 			if layout.RuntimeCurrent == layout.RuntimeRollback || layout.RuntimeCurrent == layout.RuntimeStaged || layout.CLICurrent == layout.CLIRollback {
 				t.Fatalf("release retention paths overlap: %+v", layout)
 			}
 		})
-	}
-	if _, err := DefaultLayout("windows"); !errors.Is(err, ErrUnsupportedPlatform) {
-		t.Fatalf("windows layout err=%v", err)
 	}
 }
 
