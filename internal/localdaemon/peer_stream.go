@@ -30,7 +30,7 @@ func TunnelPeerStreamOpener(peerTunnel *tunnel.PeerTerminalTunnel) func(context.
 				return nil, err
 			}
 		}
-		target := &resolver.TerminalTarget{Protocol: terminalPayload.Protocol, EnvironmentID: request.EnvironmentID, Auth: resolver.AuthTarget{Token: request.Credential, ExpiresAt: request.Deadline.UTC().Format("2006-01-02T15:04:05Z07:00")}, ThreadID: terminalPayload.ThreadID, TerminalID: terminalPayload.TerminalID, SessionID: terminalPayload.SessionID, CWD: terminalPayload.CWD, Env: terminalPayload.Environment, Cols: terminalPayload.Columns, Rows: terminalPayload.Rows, RestartIfNotRunning: terminalPayload.RestartIfNotRunning, ReplayHistory: terminalPayload.ReplayHistory, AfterSequence: terminalPayload.AfterSequence}
+		target := &resolver.TerminalTarget{Protocol: terminalPayload.Protocol, EnvironmentID: request.EnvironmentID, Auth: resolver.AuthTarget{Token: request.Credential, ExpiresAt: request.Deadline.UTC().Format("2006-01-02T15:04:05Z07:00")}, ThreadID: terminalPayload.ThreadID, TerminalID: terminalPayload.TerminalID, SessionID: terminalPayload.SessionID, CWD: terminalPayload.CWD, Env: terminalPayload.Environment, Cols: terminalPayload.Columns, Rows: terminalPayload.Rows, RestartIfNotRunning: terminalPayload.RestartIfNotRunning, ReplayHistory: terminalPayload.ReplayHistory, AfterSequence: terminalPayload.AfterSequence, InputAttachmentID: terminalPayload.InputAttachmentID}
 		target.QUICEndpoint, target.WSSEndpoint = request.QUICEndpoint, request.WSSEndpoint
 		info := resolver.ConnectInfo{TargetKind: "machine", ProjectID: request.MachineID, MachineGeneration: request.MachineGeneration, Transport: request.Transport, Terminal: target}
 		// Setup is part of the local API request and must stop when the caller

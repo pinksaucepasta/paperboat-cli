@@ -65,6 +65,14 @@ type helperOutput struct {
 	endSequence uint64
 }
 
+type TerminalInputResult struct {
+	StreamID     uint32
+	Sequence     uint64
+	Status       string
+	BytesWritten int
+	ErrorCode    string
+}
+
 type helperWrite struct {
 	messageType helperMessageType
 	data        []byte
@@ -142,6 +150,9 @@ type helperTerminalConn struct {
 	ackSent                   atomic.Uint64
 	ackNotify                 chan struct{}
 	ackMu                     sync.Mutex
+	inputResultMu             sync.Mutex
+	inputResults              chan TerminalInputResult
+	inputQueue                *resolver.TerminalInputQueue
 	closing                   atomic.Bool
 	finishOnce                sync.Once
 	exitCode                  int
@@ -162,7 +173,14 @@ func newHelperTerminalConn(message helperMessageConnection, target *resolver.Ter
 	if queue < 1 {
 		queue = terminalOutputQueueChunks
 	}
-	return &helperTerminalConn{message: message, target: target, out: make(chan helperOutput, queue), done: make(chan struct{}), inputWrites: make(chan helperWrite, 64), controlWrites: make(chan helperWrite, 16), detachWrites: make(chan helperWrite, 1), ackWrites: make(chan helperWrite, 1), ackNotify: make(chan struct{}, 1), responses: make(map[string]chan helperFrame)}
+	if target != nil && target.InputQueue == nil {
+		target.InputQueue = resolver.NewTerminalInputQueue(256)
+	}
+	var inputQueue *resolver.TerminalInputQueue
+	if target != nil {
+		inputQueue = target.InputQueue
+	}
+	return &helperTerminalConn{message: message, target: target, out: make(chan helperOutput, queue), done: make(chan struct{}), inputWrites: make(chan helperWrite, 64), controlWrites: make(chan helperWrite, 16), detachWrites: make(chan helperWrite, 1), ackWrites: make(chan helperWrite, 1), ackNotify: make(chan struct{}, 1), responses: make(map[string]chan helperFrame), inputResults: make(chan TerminalInputResult, 256), inputQueue: inputQueue}
 }
 
 func helperHandshake(ctx context.Context, message helperMessageConnection) (bool, error) {
@@ -264,7 +282,7 @@ func (c *helperTerminalConn) initialize(ctx context.Context) error {
 		}
 	}
 	attach := func(sequence uint64, liveBoundary bool) (helperFrame, error) {
-		payload, _ := json.Marshal(map[string]any{"action": "attach", "session_id": c.target.SessionID, "from_sequence": sequence, "at_live_boundary": liveBoundary})
+		payload, _ := json.Marshal(map[string]any{"action": "attach", "session_id": c.target.SessionID, "attachment_id": c.target.InputAttachmentID, "from_sequence": sequence, "at_live_boundary": liveBoundary})
 		return c.requestSync(ctx, "terminal.v1", payload)
 	}
 	frame, err = attach(fromSequence, existingSession && c.target.AfterSequence <= 0)
@@ -293,9 +311,10 @@ func (c *helperTerminalConn) initialize(ctx context.Context) error {
 	}
 	var response struct {
 		Result struct {
-			StreamID     uint32 `json:"stream_id"`
-			AttachmentID string `json:"attachment_id"`
-			Session      struct {
+			StreamID      uint32 `json:"stream_id"`
+			AttachmentID  string `json:"attachment_id"`
+			InputSequence uint64 `json:"input_sequence"`
+			Session       struct {
 				Snapshot struct {
 					Generation uint64 `json:"generation"`
 				} `json:"snapshot"`
@@ -311,7 +330,12 @@ func (c *helperTerminalConn) initialize(ctx context.Context) error {
 		}
 	}
 	c.attachmentID = response.Result.AttachmentID
+	c.target.InputAttachmentID = response.Result.AttachmentID
 	c.streamID = response.Result.StreamID
+	c.inputSeq.Store(response.Result.InputSequence)
+	for _, pending := range c.inputQueue.Reconcile(response.Result.InputSequence) {
+		c.publishInputResult(TerminalInputResult{StreamID: c.streamID, Sequence: pending.Sequence, Status: "uncertain", BytesWritten: 0, ErrorCode: "delivery_reconciled_without_result"})
+	}
 	if response.Result.Session.Snapshot.Generation != 0 {
 		c.generation = response.Result.Session.Snapshot.Generation
 	}
@@ -402,7 +426,7 @@ func (c *helperTerminalConn) initializeLegacy(ctx context.Context) error {
 		}
 	}
 	attach := func(sequence uint64, liveBoundary bool) (helperFrame, error) {
-		payload, _ := json.Marshal(map[string]any{"action": "attach", "session_id": c.target.SessionID, "from_sequence": sequence, "at_live_boundary": liveBoundary})
+		payload, _ := json.Marshal(map[string]any{"action": "attach", "session_id": c.target.SessionID, "attachment_id": c.target.InputAttachmentID, "from_sequence": sequence, "at_live_boundary": liveBoundary})
 		return c.requestSync(ctx, "terminal.v1", payload)
 	}
 	frame, err = attach(fromSequence, existingSession && c.target.AfterSequence <= 0)
@@ -431,9 +455,10 @@ func (c *helperTerminalConn) initializeLegacy(ctx context.Context) error {
 	}
 	var response struct {
 		Result struct {
-			StreamID     uint32 `json:"stream_id"`
-			AttachmentID string `json:"attachment_id"`
-			Session      struct {
+			StreamID      uint32 `json:"stream_id"`
+			AttachmentID  string `json:"attachment_id"`
+			InputSequence uint64 `json:"input_sequence"`
+			Session       struct {
 				Snapshot struct {
 					Generation uint64 `json:"generation"`
 				} `json:"snapshot"`
@@ -449,7 +474,12 @@ func (c *helperTerminalConn) initializeLegacy(ctx context.Context) error {
 		}
 	}
 	c.attachmentID = response.Result.AttachmentID
+	c.target.InputAttachmentID = response.Result.AttachmentID
 	c.streamID = response.Result.StreamID
+	c.inputSeq.Store(response.Result.InputSequence)
+	for _, pending := range c.inputQueue.Reconcile(response.Result.InputSequence) {
+		c.publishInputResult(TerminalInputResult{StreamID: c.streamID, Sequence: pending.Sequence, Status: "uncertain", BytesWritten: 0, ErrorCode: "delivery_reconciled_without_result"})
+	}
 	if response.Result.Session.Snapshot.Generation != 0 {
 		c.generation = response.Result.Session.Snapshot.Generation
 	}
@@ -746,6 +776,11 @@ func (c *helperTerminalConn) handleEvent(frame helperFrame) bool {
 	var event struct {
 		Event         string `json:"event"`
 		SessionID     string `json:"session_id"`
+		StreamID      uint32 `json:"stream_id"`
+		Sequence      uint64 `json:"sequence"`
+		Status        string `json:"status"`
+		BytesWritten  int    `json:"bytes_written"`
+		ErrorCode     string `json:"error_code,omitempty"`
 		State         string `json:"state"`
 		FinalSequence uint64 `json:"final_sequence"`
 		Exit          *struct {
@@ -753,7 +788,20 @@ func (c *helperTerminalConn) handleEvent(frame helperFrame) bool {
 			Signal string `json:"signal"`
 		} `json:"exit"`
 	}
-	if json.Unmarshal(frame.Payload, &event) != nil || event.Event != "terminal_stream_end" || event.SessionID != c.target.SessionID {
+	if json.Unmarshal(frame.Payload, &event) != nil {
+		c.finish(1, errors.Join(ErrTransportLost, errors.New("invalid helper terminal event")))
+		return true
+	}
+	if event.Event == "terminal_input_result" {
+		if event.StreamID == 0 || event.StreamID != c.streamID || event.Sequence == 0 || event.Status == "" {
+			c.finish(1, errors.Join(ErrTransportLost, errors.New("invalid helper terminal input result")))
+			return true
+		}
+		c.inputQueue.Complete(event.Sequence, event.Status)
+		c.publishInputResult(TerminalInputResult{StreamID: event.StreamID, Sequence: event.Sequence, Status: event.Status, BytesWritten: event.BytesWritten, ErrorCode: event.ErrorCode})
+		return false
+	}
+	if event.Event != "terminal_stream_end" || c.target == nil || event.SessionID != c.target.SessionID {
 		c.finish(1, errors.Join(ErrTransportLost, errors.New("invalid helper terminal event")))
 		return true
 	}
@@ -770,6 +818,25 @@ func (c *helperTerminalConn) handleEvent(frame helperFrame) bool {
 	}
 	c.finish(code, nil)
 	return true
+}
+
+func (c *helperTerminalConn) publishInputResult(result TerminalInputResult) {
+	if c.inputResults == nil {
+		return
+	}
+	select {
+	case c.inputResults <- result:
+	case <-c.done:
+	default:
+		// A full decision queue is a local safety fault. Do not discard the
+		// durable status silently; close the connection so the caller observes
+		// a bounded failure and can reconcile through a fresh attachment.
+		c.finish(1, errors.Join(ErrTransportLost, errors.New("terminal input result queue is full")))
+	}
+}
+
+func (c *helperTerminalConn) InputResults() <-chan TerminalInputResult {
+	return c.inputResults
 }
 
 func (c *helperTerminalConn) Read(p []byte) (int, error) {
@@ -867,16 +934,25 @@ func (c *helperTerminalConn) Write(p []byte) (int, error) {
 	if c.streamID == 0 {
 		return 0, errors.New("terminal input frame is invalid")
 	}
+	if c.inputQueue == nil {
+		c.inputQueue = resolver.NewTerminalInputQueue(256)
+	}
 	written := 0
 	for len(p) > 0 {
 		size := min(len(p), helperInputChunkBytes)
-		sequence := c.inputSeq.Add(1)
+		sequence, queueErr := c.inputQueue.Enqueue(p[:size])
+		if queueErr != nil {
+			return written, queueErr
+		}
+		c.inputSeq.Store(sequence)
 		message := make([]byte, 13+size)
 		message[0] = 1
 		binary.BigEndian.PutUint32(message[1:5], c.streamID)
 		binary.BigEndian.PutUint64(message[5:13], sequence)
 		copy(message[13:], p[:size])
 		if err := c.queueWrite(c.inputWrites, helperWrite{messageType: helperBinaryMessage, data: message, result: make(chan error, 1)}); err != nil {
+			c.inputQueue.Complete(sequence, "uncertain")
+			c.publishInputResult(TerminalInputResult{StreamID: c.streamID, Sequence: sequence, Status: "uncertain", ErrorCode: "transport_write_uncertain"})
 			return written, err
 		}
 		written += size

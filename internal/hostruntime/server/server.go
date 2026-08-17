@@ -16,6 +16,7 @@ import (
 	pberrors "github.com/pinksaucepasta/paperboat/internal/hostruntime/errors"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/operation"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/protocol"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/session"
 )
 
 var (
@@ -122,9 +123,23 @@ type ControlHandler interface {
 }
 
 type TerminalDataHandler interface {
-	HandleTerminalInput(context.Context, Authorization, string, string, uint64, []byte) error
 	HandleTerminalACK(context.Context, Authorization, string, string, uint64) error
 	HandleTerminalResize(context.Context, Authorization, string, string, uint16, uint16) error
+}
+
+// TerminalInputHandler receives one durable, idempotent input operation. The
+// input sequence is part of the identity and must never be treated as a raw
+// stream offset. Implementations return the recorded decision so the server
+// can acknowledge accepted, rejected, uncertain, and conflicting deliveries.
+type TerminalInputHandler interface {
+	HandleTerminalInput(context.Context, Authorization, string, string, uint64, uint64, []byte) (session.InputDecision, error)
+}
+
+// legacyTerminalInputHandler is test-only compatibility for non-session data
+// handlers. The production dispatcher implements TerminalInputHandler and
+// never uses this path.
+type legacyTerminalInputHandler interface {
+	HandleTerminalInput(context.Context, Authorization, string, string, uint64, []byte) error
 }
 
 type ExecDataHandler interface {
@@ -333,7 +348,7 @@ func (s *Server) ServeAuthenticated(conn Connection, authorizer Authorizer) (ser
 				return result.err
 			}
 			if len(result.binary) != 0 {
-				if err := s.handleTerminalData(connectionCtx, result.binary, terminalState); err != nil {
+				if err := s.handleTerminalDataWithWriter(connectionCtx, result.binary, terminalState, writer); err != nil {
 					return err
 				}
 				continue
@@ -367,6 +382,10 @@ func (s *Server) ServeAuthenticated(conn Connection, authorizer Authorizer) (ser
 }
 
 func (s *Server) handleTerminalData(ctx context.Context, message []byte, state *terminalConnectionState) error {
+	return s.handleTerminalDataWithWriter(ctx, message, state, nil)
+}
+
+func (s *Server) handleTerminalDataWithWriter(ctx context.Context, message []byte, state *terminalConnectionState, writer *lockedWriter) error {
 	opcode, err := protocol.TerminalOpcode(message)
 	if err != nil {
 		return err
@@ -387,12 +406,19 @@ func (s *Server) handleTerminalData(ctx context.Context, message []byte, state *
 			}
 			return bindErr
 		}
-		if frame.Sequence != binding.inputSequence+1 {
+		duplicateInput := frame.Sequence == binding.inputSequence
+		if duplicateInput {
+			if _, rich := s.config.Handler.(TerminalInputHandler); !rich {
+				return &protocol.Error{Code: protocol.InvalidFrame, Cause: errors.New("terminal input sequence is not contiguous")}
+			}
+		}
+		if frame.Sequence != binding.inputSequence+1 && !duplicateInput {
 			return &protocol.Error{Code: protocol.InvalidFrame, Cause: errors.New("terminal input sequence is not contiguous")}
 		}
 		if err := validateTerminalBinding(binding); err != nil {
 			return err
 		}
+		advanceInput := false
 		if binding.kind == "exec" {
 			handler, ok := s.config.Handler.(ExecDataHandler)
 			if !ok {
@@ -410,22 +436,49 @@ func (s *Server) handleTerminalData(ctx context.Context, message []byte, state *
 				return err
 			}
 		} else {
-			handler, ok := s.config.Handler.(TerminalDataHandler)
-			if !ok {
+			var decision session.InputDecision
+			var inputErr error
+			if handler, ok := s.config.Handler.(TerminalInputHandler); ok {
+				decision, inputErr = handler.HandleTerminalInput(ctx, binding.authorization, binding.sessionID, binding.attachmentID, binding.generation, frame.Sequence, frame.Data)
+			} else if handler, ok := s.config.Handler.(legacyTerminalInputHandler); ok {
+				inputErr = handler.HandleTerminalInput(ctx, binding.authorization, binding.sessionID, binding.attachmentID, binding.generation, frame.Data)
+				decision = session.InputDecision{Status: session.InputAccepted, InputSequence: frame.Sequence, BytesWritten: len(frame.Data)}
+			} else {
 				return ErrCapabilityUnavailable
 			}
-			if err := handler.HandleTerminalInput(ctx, binding.authorization, binding.sessionID, binding.attachmentID, binding.generation, frame.Data); err != nil {
-				return err
+			if inputErr != nil {
+				if decision.Status == "" || decision.Status != session.InputUncertain {
+					decision = inputDecisionForError(inputErr, frame.Sequence)
+				} else {
+					decision.InputSequence = frame.Sequence
+					if decision.WriteError == "" {
+						decision.WriteError = "input_uncertain"
+					}
+				}
 			}
+			if decision.Status == "" {
+				decision = inputDecisionForError(errors.New("empty input decision"), frame.Sequence)
+			}
+			if writer != nil {
+				if err := writeTerminalInputResult(writer, frame.StreamID, decision, inputErr); err != nil {
+					return err
+				}
+			}
+			if inputErr != nil && !errors.Is(inputErr, session.ErrInputConflict) && !errors.Is(inputErr, session.ErrInputSequence) && !errors.Is(inputErr, session.ErrInputUncertain) && !errors.Is(inputErr, session.ErrStaleGeneration) && !errors.Is(inputErr, session.ErrInvalidInput) {
+				return inputErr
+			}
+			advanceInput = inputErr == nil
 		}
 		if metrics, ok := s.config.Metrics.(terminalMetricRecorder); ok {
 			metrics.RecordTerminalStage("socket_to_pty", time.Since(started), len(frame.Data))
 		}
-		state.mu.Lock()
-		if current := state.streams[streamID]; current == binding {
-			current.inputSequence = frame.Sequence
+		if advanceInput {
+			state.mu.Lock()
+			if current := state.streams[streamID]; current == binding && frame.Sequence > current.inputSequence {
+				current.inputSequence = frame.Sequence
+			}
+			state.mu.Unlock()
 		}
-		state.mu.Unlock()
 		return nil
 	case protocol.TerminalEOFOpcode:
 		frame, decodeErr := protocol.DecodeTerminalEOF(message)
@@ -527,6 +580,48 @@ func (s *Server) handleTerminalData(ctx context.Context, message []byte, state *
 	default:
 		return &protocol.Error{Code: protocol.InvalidFrame}
 	}
+}
+
+type terminalInputResult struct {
+	Event        string              `json:"event"`
+	StreamID     uint32              `json:"stream_id"`
+	Sequence     uint64              `json:"sequence"`
+	Status       session.InputStatus `json:"status"`
+	BytesWritten int                 `json:"bytes_written"`
+	ErrorCode    string              `json:"error_code,omitempty"`
+}
+
+func inputDecisionForError(err error, sequence uint64) session.InputDecision {
+	status := session.InputRejected
+	code := "input_rejected"
+	switch {
+	case errors.Is(err, session.ErrInputConflict):
+		status, code = session.InputStatus("conflict"), "input_conflict"
+	case errors.Is(err, session.ErrInputUncertain):
+		status, code = session.InputUncertain, "input_uncertain"
+	case errors.Is(err, session.ErrInputSequence):
+		status, code = session.InputRejected, "input_sequence"
+	case errors.Is(err, session.ErrStaleGeneration):
+		status, code = session.InputRejected, "stale_generation"
+	case errors.Is(err, session.ErrInvalidInput):
+		status, code = session.InputRejected, "invalid_input"
+	}
+	return session.InputDecision{Status: status, InputSequence: sequence, WriteError: code}
+}
+
+func writeTerminalInputResult(writer *lockedWriter, streamID uint32, decision session.InputDecision, inputErr error) error {
+	if writer == nil || streamID == 0 {
+		return nil
+	}
+	errorCode := decision.WriteError
+	if errorCode == "" && inputErr != nil {
+		errorCode = "input_rejected"
+	}
+	payload, err := json.Marshal(terminalInputResult{Event: "terminal_input_result", StreamID: streamID, Sequence: decision.InputSequence, Status: decision.Status, BytesWritten: decision.BytesWritten, ErrorCode: errorCode})
+	if err != nil {
+		return err
+	}
+	return writer.write(protocol.Frame{Type: "event", RequestID: fmt.Sprintf("input_%d_%d", streamID, decision.InputSequence), Version: protocol.ProtocolVersion, Payload: payload})
 }
 
 func validateTerminalBinding(binding *terminalStreamBinding) error {
@@ -723,7 +818,7 @@ func (s *terminalConnectionState) bind(authorization Authorization, frame protoc
 	var response terminalAttachResponse
 	binding := &terminalStreamBinding{authorization: authorization}
 	if frame.Capability == "terminal.v1" && decodeStrict(frame.Payload, &request) == nil && request.Action == "attach" && json.Unmarshal(outcome.Result, &response) == nil && request.SessionID != "" && response.AttachmentID != "" && response.Session.Snapshot.Generation != 0 {
-		binding.kind, binding.sessionID, binding.attachmentID, binding.generation = "terminal", request.SessionID, response.AttachmentID, response.Session.Snapshot.Generation
+		binding.kind, binding.sessionID, binding.attachmentID, binding.generation, binding.inputSequence = "terminal", request.SessionID, response.AttachmentID, response.Session.Snapshot.Generation, response.InputSequence
 	} else if frame.Capability == "exec.v1" {
 		var execRequest execRequest
 		if decodeStrict(frame.Payload, &execRequest) != nil || execRequest.OperationID == "" || execRequest.Action != "start" && execRequest.Action != "attach" {

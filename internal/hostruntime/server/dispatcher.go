@@ -180,15 +180,18 @@ type attachmentControl struct {
 	NextSequence uint64 `json:"next_sequence,omitempty"`
 }
 
-func (d *Dispatcher) HandleTerminalInput(_ context.Context, authorization Authorization, sessionID, attachmentID string, generation uint64, data []byte) error {
+func (d *Dispatcher) HandleTerminalInput(_ context.Context, authorization Authorization, sessionID, attachmentID string, generation, inputSequence uint64, data []byte) (session.InputDecision, error) {
 	if authorization.ClientID == "" || sessionID == "" || attachmentID == "" || generation == 0 || (authorization.SessionID != "" && authorization.SessionID != sessionID) {
-		return session.ErrInvalidInput
+		return session.InputDecision{InputSequence: inputSequence}, session.ErrInvalidInput
 	}
-	err := d.config.Sessions.WriteStream(sessionID, attachmentID, generation, data)
-	if err == nil && d.config.Writers != nil {
+	decision, err := d.config.Sessions.Write(sessionID, session.InputKey{ClientID: authorization.ClientID, AttachmentID: attachmentID, Generation: generation, InputSequence: inputSequence}, data)
+	if err == nil && d.config.Writers != nil && decision.Status != session.InputUncertain {
 		d.config.Writers.Input(sessionID, attachmentID, authorization.ClientID, d.config.Now())
 	}
-	return err
+	if decision.InputSequence == 0 {
+		decision.InputSequence = inputSequence
+	}
+	return decision, err
 }
 
 func (d *Dispatcher) HandleTerminalACK(_ context.Context, authorization Authorization, sessionID, attachmentID string, nextSequence uint64) error {
@@ -282,7 +285,8 @@ func (d *Dispatcher) OpenStream(ctx context.Context, authorization Authorization
 		return nil, false, nil
 	}
 	var response struct {
-		AttachmentID string `json:"attachment_id"`
+		AttachmentID  string `json:"attachment_id"`
+		InputSequence uint64 `json:"input_sequence"`
 	}
 	if json.Unmarshal(outcome.Result, &response) != nil || response.AttachmentID == "" {
 		return nil, false, ErrInvalidConfiguration
@@ -536,9 +540,10 @@ type terminalRequest struct {
 }
 
 type terminalAttachResponse struct {
-	StreamID     uint32 `json:"stream_id,omitempty"`
-	AttachmentID string `json:"attachment_id"`
-	Session      struct {
+	StreamID      uint32 `json:"stream_id,omitempty"`
+	AttachmentID  string `json:"attachment_id"`
+	InputSequence uint64 `json:"input_sequence,omitempty"`
+	Session       struct {
 		Snapshot session.Snapshot `json:"snapshot"`
 		Replay   struct {
 			FromSequence     uint64 `json:"from_sequence"`
@@ -645,10 +650,14 @@ func (d *Dispatcher) terminal(ctx context.Context, authorization Authorization, 
 		if err != nil {
 			return domainResult(nil, err)
 		}
+		attachResponse := newTerminalAttachResponse(attachmentID, value)
+		if attachResponse.InputSequence, err = d.config.Sessions.InputSequence(request.SessionID, authorization.ClientID, attachmentID, value.Snapshot.Generation); err != nil {
+			return domainResult(nil, err)
+		}
 		// Replay bytes travel as binary frames after this control response. Keeping
 		// them out of JSON prevents a terminal-sized replay from overflowing the
 		// structured-frame limit and avoids delivering the same output twice.
-		return result(newTerminalAttachResponse(attachmentID, value))
+		return result(attachResponse)
 	case "detach":
 		err := d.config.Sessions.Detach(request.SessionID, request.AttachmentID)
 		if err == nil && d.config.Writers != nil {

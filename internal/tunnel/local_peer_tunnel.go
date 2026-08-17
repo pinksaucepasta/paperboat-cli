@@ -66,7 +66,7 @@ func (t LocalPeerTunnel) request(info resolver.ConnectInfo, consumer, operationI
 }
 
 func terminalLocalPayload(target *resolver.TerminalTarget) localapi.PeerTerminalPayload {
-	return localapi.PeerTerminalPayload{Protocol: target.Protocol, ThreadID: target.ThreadID, TerminalID: target.TerminalID, SessionID: target.SessionID, CWD: target.CWD, Environment: target.Env, Columns: target.Cols, Rows: target.Rows, RestartIfNotRunning: target.RestartIfNotRunning, ReplayHistory: target.ReplayHistory, AfterSequence: target.AfterSequence}
+	return localapi.PeerTerminalPayload{Protocol: target.Protocol, ThreadID: target.ThreadID, TerminalID: target.TerminalID, SessionID: target.SessionID, CWD: target.CWD, Environment: target.Env, Columns: target.Cols, Rows: target.Rows, RestartIfNotRunning: target.RestartIfNotRunning, ReplayHistory: target.ReplayHistory, AfterSequence: target.AfterSequence, InputAttachmentID: target.InputAttachmentID}
 }
 
 func (t LocalPeerTunnel) Dial(ctx context.Context, info resolver.ConnectInfo) (Conn, error) {

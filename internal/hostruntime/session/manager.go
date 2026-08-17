@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -409,6 +410,7 @@ func (m *Manager) Write(sessionID string, key InputKey, data []byte) (InputDecis
 	if attachmentState, _, err := session.fanout.Status(key.AttachmentID); err != nil || attachmentState != Attached {
 		return InputDecision{}, ErrInvalidInput
 	}
+	key, _ = normalizeInputKey(key)
 	if _, queryErr := session.inputs.Query(key); queryErr == nil {
 		return session.inputs.Write(key, data, session.process)
 	} else if !errors.Is(queryErr, ErrInputUnknown) {
@@ -418,8 +420,9 @@ func (m *Manager) Write(sessionID string, key InputKey, data []byte) (InputDecis
 		return InputDecision{}, err
 	}
 	hash := sha256.Sum256(data)
+	storageID := inputStorageID(key)
 	if m.config.Store != nil {
-		inserted, err := m.config.Store.PutInputDecision(context.Background(), store.InputDecision{SessionID: sessionID, ClientID: key.ClientID, AttachmentID: key.AttachmentID, Generation: key.Generation, InputID: key.InputID, Hash: hash[:], Status: string(InputUncertain), CreatedAt: time.Now().UTC()})
+		inserted, err := m.config.Store.PutInputDecision(context.Background(), store.InputDecision{SessionID: sessionID, ClientID: key.ClientID, AttachmentID: key.AttachmentID, Generation: key.Generation, InputID: storageID, Hash: hash[:], Status: string(InputUncertain), CreatedAt: time.Now().UTC()})
 		if err != nil {
 			return InputDecision{}, err
 		}
@@ -432,7 +435,7 @@ func (m *Manager) Write(sessionID string, key InputKey, data []byte) (InputDecis
 		return decision, err
 	}
 	if m.config.Store != nil {
-		persisted := store.InputDecision{SessionID: sessionID, ClientID: key.ClientID, AttachmentID: key.AttachmentID, Generation: key.Generation, InputID: key.InputID, Hash: hash[:], Status: string(decision.Status), BytesWritten: decision.BytesWritten, ErrorCode: decision.WriteError}
+		persisted := store.InputDecision{SessionID: sessionID, ClientID: key.ClientID, AttachmentID: key.AttachmentID, Generation: key.Generation, InputID: storageID, Hash: hash[:], Status: string(decision.Status), BytesWritten: decision.BytesWritten, ErrorCode: decision.WriteError}
 		if persistErr := m.config.Store.UpdateInputDecision(context.Background(), persisted); persistErr != nil {
 			decision.Status = InputUncertain
 			decision.WriteError = "decision_persist_failed"
@@ -440,6 +443,24 @@ func (m *Manager) Write(sessionID string, key InputKey, data []byte) (InputDecis
 		}
 	}
 	return decision, nil
+}
+
+// InputSequence returns the highest sequence recorded for an attachment. The
+// stream server uses it when rebinding a persistent attachment after a
+// transport reconnect so a duplicate delivery is answered from the journal.
+func (m *Manager) InputSequence(sessionID, clientID, attachmentID string, generation uint64) (uint64, error) {
+	session, err := m.get(sessionID)
+	if err != nil {
+		return 0, err
+	}
+	return session.inputs.LastSequence(clientID, attachmentID, generation), nil
+}
+
+func inputStorageID(key InputKey) string {
+	if key.InputSequence != 0 {
+		return strconv.FormatUint(key.InputSequence, 10)
+	}
+	return key.InputID
 }
 
 // WriteStream writes ordered live terminal input without creating an
@@ -1088,6 +1109,10 @@ func (m *Manager) recover(ctx context.Context) error {
 		}
 		for _, decision := range decisions {
 			key := InputKey{ClientID: decision.ClientID, AttachmentID: decision.AttachmentID, Generation: decision.Generation, InputID: decision.InputID}
+			if sequence, parseErr := strconv.ParseUint(decision.InputID, 10, 64); parseErr == nil && sequence > 0 {
+				key.InputSequence = sequence
+				key.InputID = ""
+			}
 			if err := inputJournal.Restore(key, decision.Hash, InputStatus(decision.Status), decision.BytesWritten, decision.ErrorCode); err != nil {
 				return err
 			}

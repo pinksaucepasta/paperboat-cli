@@ -72,6 +72,7 @@ type PeerTerminalPayload struct {
 	RestartIfNotRunning bool              `json:"restart_if_not_running,omitempty"`
 	ReplayHistory       bool              `json:"replay_history,omitempty"`
 	AfterSequence       int               `json:"after_sequence,omitempty"`
+	InputAttachmentID   string            `json:"input_attachment_id,omitempty"`
 }
 
 type PeerProbeResult struct {

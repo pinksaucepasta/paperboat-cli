@@ -14,6 +14,17 @@ type countingWriter struct {
 	err   error
 }
 
+type blockingWriter struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (w *blockingWriter) Write(p []byte) (int, error) {
+	close(w.started)
+	<-w.release
+	return len(p), nil
+}
+
 func (w *countingWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -94,5 +105,45 @@ func TestBoundedInputJournalRejectsNewIdentityButPreservesDuplicate(t *testing.T
 	}
 	if writer.calls != 1 {
 		t.Fatalf("writer calls=%d", writer.calls)
+	}
+}
+
+func TestInputSequenceReservesBeforePTYWriteAndRejectsUncertainSuccessor(t *testing.T) {
+	journal := NewInputJournal(1)
+	writer := &blockingWriter{started: make(chan struct{}), release: make(chan struct{})}
+	key := InputKey{ClientID: "cli", AttachmentID: "att", Generation: 1, InputSequence: 1}
+	decision := make(chan InputDecision, 1)
+	go func() {
+		value, err := journal.Write(key, []byte("x"), writer)
+		if err != nil {
+			t.Errorf("write err=%v", err)
+		}
+		decision <- value
+	}()
+	<-writer.started
+	queried, err := journal.Query(key)
+	if err != nil || queried.Status != InputUncertain || queried.InputSequence != 1 {
+		t.Fatalf("reserved decision=%#v err=%v", queried, err)
+	}
+	if _, err := journal.Write(InputKey{ClientID: "cli", AttachmentID: "att", Generation: 1, InputSequence: 2}, []byte("y"), &countingWriter{n: -1}); !errors.Is(err, ErrInputUncertain) {
+		t.Fatalf("successor err=%v, want uncertain", err)
+	}
+	close(writer.release)
+	if got := <-decision; got.Status != InputAccepted {
+		t.Fatalf("final decision=%#v", got)
+	}
+}
+
+func TestInputSequenceDuplicateReturnsOriginalDecision(t *testing.T) {
+	journal := NewInputJournal(1)
+	writer := &countingWriter{n: -1}
+	key := InputKey{ClientID: "cli", AttachmentID: "att", Generation: 1, InputSequence: 1}
+	first, err := journal.Write(key, []byte("x"), writer)
+	if err != nil || first.Status != InputAccepted {
+		t.Fatalf("first=%#v err=%v", first, err)
+	}
+	second, err := journal.Write(key, []byte("x"), writer)
+	if err != nil || second.Status != InputAccepted || second.InputSequence != 1 || writer.calls != 1 {
+		t.Fatalf("duplicate=%#v calls=%d err=%v", second, writer.calls, err)
 	}
 }

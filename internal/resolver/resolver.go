@@ -5,10 +5,113 @@ package resolver
 
 import (
 	"context"
+	"errors"
+	"sync"
 
 	"github.com/pinksaucepasta/paperboat/internal/api"
 	"github.com/pinksaucepasta/paperboat/internal/config"
 )
+
+var ErrTerminalInputQueueFull = errors.New("terminal input queue is full")
+var ErrTerminalInputUncertain = errors.New("terminal input delivery is uncertain")
+
+type TerminalInput struct {
+	Sequence uint64
+	Data     []byte
+}
+
+// TerminalInputQueue is shared by all transport attempts for one terminal.
+// It retains only bounded, unacknowledged input and never retransmits bytes on
+// its own. A reconnect reconciles entries against the host's durable cursor;
+// entries whose result cannot be recovered become uncertain and stop the
+// queue until the caller explicitly handles them.
+type TerminalInputQueue struct {
+	mu        sync.Mutex
+	next      uint64
+	limit     int
+	pending   map[uint64]TerminalInput
+	uncertain bool
+}
+
+func NewTerminalInputQueue(limit int) *TerminalInputQueue {
+	if limit < 1 {
+		limit = 256
+	}
+	return &TerminalInputQueue{limit: limit, pending: make(map[uint64]TerminalInput)}
+}
+
+func (q *TerminalInputQueue) Enqueue(data []byte) (uint64, error) {
+	if q == nil || len(data) == 0 {
+		return 0, ErrTerminalInputQueueFull
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.uncertain {
+		return 0, ErrTerminalInputUncertain
+	}
+	if len(q.pending) >= q.limit {
+		return 0, ErrTerminalInputQueueFull
+	}
+	q.next++
+	if q.next == 0 {
+		return 0, ErrTerminalInputQueueFull
+	}
+	q.pending[q.next] = TerminalInput{Sequence: q.next, Data: append([]byte(nil), data...)}
+	return q.next, nil
+}
+
+func (q *TerminalInputQueue) Complete(sequence uint64, status string) {
+	if q == nil {
+		return
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	delete(q.pending, sequence)
+	if status == "uncertain" {
+		q.uncertain = true
+	}
+	if sequence > q.next {
+		q.next = sequence
+	}
+}
+
+// Reconcile marks pending operations at or before the host cursor as
+// uncertain. The host proves that those sequence numbers have a durable
+// decision, but a lost response must never be interpreted as accepted.
+func (q *TerminalInputQueue) Reconcile(hostSequence uint64) []TerminalInput {
+	if q == nil {
+		return nil
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	var uncertain []TerminalInput
+	for sequence, item := range q.pending {
+		if sequence <= hostSequence {
+			uncertain = append(uncertain, item)
+			delete(q.pending, sequence)
+		}
+	}
+	if len(uncertain) != 0 {
+		q.uncertain = true
+	}
+	if hostSequence > q.next {
+		q.next = hostSequence
+	}
+	return uncertain
+}
+
+func (q *TerminalInputQueue) Pending() []TerminalInput {
+	if q == nil {
+		return nil
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	result := make([]TerminalInput, 0, len(q.pending))
+	for _, item := range q.pending {
+		result = append(result, TerminalInput{Sequence: item.Sequence, Data: append([]byte(nil), item.Data...)})
+	}
+	return result
+}
 
 // ConnectRequest describes what the user asked to connect to.
 type ConnectRequest struct {
@@ -117,6 +220,11 @@ type TerminalTarget struct {
 	AfterSequence int
 	SequenceSink  func(int)
 	ReplayGapSink func(requested, earliest, latest uint64)
+	// InputAttachmentID is stable across transport reconnects. The host uses it
+	// as part of the durable input idempotency key; it is never a transport
+	// stream identifier and is safe to reuse after a detached stream is closed.
+	InputAttachmentID string
+	InputQueue        *TerminalInputQueue
 }
 
 type FileTransferTarget struct {
