@@ -2310,7 +2310,12 @@ func actionUpdate(command *cobra.Command, _ []string) error {
 				return clientErr
 			}
 			if _, clientErr = client.Activate(ctx, artifact); clientErr != nil {
-				return fmt.Errorf("activate managed runtime update: %w", clientErr)
+				// Activating replaces and restarts the process serving this socket, so
+				// the successful request can lose its response. The runtime health
+				// version is the authoritative activation result in that case.
+				if healthErr = waitForUpdateHealth(ctx, artifact.Version, 30*time.Second); healthErr != nil {
+					return fmt.Errorf("activate managed runtime update: %w", clientErr)
+				}
 			}
 			result.RuntimeUpdated = true
 		}
@@ -2361,6 +2366,26 @@ func localUpdateHealth(ctx context.Context) (updateHealthDocument, error) {
 		return updateHealthDocument{}, errors.New("managed runtime health is unavailable")
 	}
 	return document, nil
+}
+
+func waitForUpdateHealth(ctx context.Context, version string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		health, err := localUpdateHealth(ctx)
+		if err == nil && health.Version == version {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return errors.New("managed runtime did not report the updated version")
+		}
+		timer := time.NewTimer(250 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 const shellCompletionDeadline = 200 * time.Millisecond
