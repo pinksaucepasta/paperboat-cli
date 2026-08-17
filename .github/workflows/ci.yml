@@ -21,4 +21,6 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Install repository check dependencies
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
       - run: make check race static-analysis vulnerability-check license-check
