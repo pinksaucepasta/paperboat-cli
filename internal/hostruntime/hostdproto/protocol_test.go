@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"testing"
+	"time"
 )
 
 func TestEncodeDecodeRoundTripStrictMessages(t *testing.T) {
@@ -202,6 +203,33 @@ func TestControllerReturnsActiveFenceForEmptyStatusQuery(t *testing.T) {
 	status, ok := response.(Status)
 	if !ok || status.State != StateActive || status.Epoch != welcome.Epoch {
 		t.Fatalf("response=%+v", response)
+	}
+}
+
+func TestActiveStatusRecordsOnlyAcceptedHeartbeat(t *testing.T) {
+	now := time.Date(2026, 8, 18, 2, 3, 4, 0, time.UTC)
+	controller, err := NewController(ControllerConfig{APIMin: 1, APIMax: 1, Random: bytes.NewReader(bytes.Repeat([]byte{6}, 32)), Clock: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	welcome, err := controller.Negotiate(Hello{WorkerID: "runtime", Version: "1", APIMin: 1, APIMax: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.MarkReady(readyFor(welcome)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.Activate(activateFor(welcome)); err != nil {
+		t.Fatal(err)
+	}
+	if status := controller.Status(); status.LastHeartbeatUnixMilli != 0 {
+		t.Fatalf("activation heartbeat=%d", status.LastHeartbeatUnixMilli)
+	}
+	if err := controller.AcceptHeartbeat(heartbeatFor(welcome)); err != nil {
+		t.Fatal(err)
+	}
+	if status := controller.Status(); status.LastHeartbeatUnixMilli != now.UnixMilli() {
+		t.Fatalf("heartbeat=%d", status.LastHeartbeatUnixMilli)
 	}
 }
 

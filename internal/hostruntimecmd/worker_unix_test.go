@@ -61,7 +61,7 @@ func TestRuntimeWorkerEntryActivatesFencedHostdLease(t *testing.T) {
 		}, bytes.NewReader(nil), &output, &bytes.Buffer{})
 	}()
 	deadline = time.Now().Add(time.Second)
-	for server.Status().State != hostdproto.StateActive {
+	for server.Status().State != hostdproto.StateActive || output.String() != "ready 1 1\nactive 1 1\n" {
 		if time.Now().After(deadline) {
 			t.Fatalf("worker did not activate: status=%+v output=%q", server.Status(), output.String())
 		}

@@ -18,6 +18,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -140,21 +141,22 @@ const (
 
 // Status confirms the active fence. It intentionally does not reveal a lease.
 type Status struct {
-	State      State  `json:"state"`
-	WorkerID   string `json:"worker_id,omitempty"`
-	APIVersion uint16 `json:"api_version,omitempty"`
-	Epoch      uint64 `json:"epoch,omitempty"`
+	State                  State  `json:"state"`
+	WorkerID               string `json:"worker_id,omitempty"`
+	APIVersion             uint16 `json:"api_version,omitempty"`
+	Epoch                  uint64 `json:"epoch,omitempty"`
+	LastHeartbeatUnixMilli int64  `json:"last_heartbeat_unix_milli,omitempty"`
 }
 
 func (Status) messageType() Type { return TypeStatus }
 func (m Status) validate() error {
 	switch m.State {
 	case StateEmpty:
-		if m.WorkerID != "" || m.APIVersion != 0 || m.Epoch != 0 {
+		if m.WorkerID != "" || m.APIVersion != 0 || m.Epoch != 0 || m.LastHeartbeatUnixMilli != 0 {
 			return ErrInvalidFrame
 		}
 	case StateCandidate, StateActive:
-		if !validWorkerID(m.WorkerID) || !validAPIVersion(m.APIVersion) || m.Epoch == 0 {
+		if !validWorkerID(m.WorkerID) || !validAPIVersion(m.APIVersion) || m.Epoch == 0 || m.LastHeartbeatUnixMilli < 0 {
 			return ErrInvalidFrame
 		}
 	default:
@@ -328,14 +330,16 @@ type Controller struct {
 	candidate worker
 	lastEpoch uint64
 	persist   func(Status) error
+	now       func() time.Time
 }
 
 type worker struct {
-	workerID   string
-	apiVersion uint16
-	epoch      uint64
-	lease      string
-	ready      bool
+	workerID      string
+	apiVersion    uint16
+	epoch         uint64
+	lease         string
+	ready         bool
+	lastHeartbeat time.Time
 }
 
 type ControllerConfig struct {
@@ -346,6 +350,7 @@ type ControllerConfig struct {
 	// PersistActivation must crash-consistently record the new active fence.
 	// Activate does not expose or accept the new epoch until this succeeds.
 	PersistActivation func(Status) error
+	Clock             func() time.Time
 }
 
 func NewController(config ControllerConfig) (*Controller, error) {
@@ -355,9 +360,12 @@ func NewController(config ControllerConfig) (*Controller, error) {
 	if config.Random == nil {
 		config.Random = rand.Reader
 	}
+	if config.Clock == nil {
+		config.Clock = time.Now
+	}
 	return &Controller{
 		apiMin: config.APIMin, apiMax: config.APIMax, random: config.Random,
-		lastEpoch: config.InitialEpoch, persist: config.PersistActivation,
+		lastEpoch: config.InitialEpoch, persist: config.PersistActivation, now: config.Clock,
 	}, nil
 }
 
@@ -439,6 +447,7 @@ func (c *Controller) AcceptHeartbeat(message Heartbeat) error {
 	if !matches(c.active, message.WorkerID, message.APIVersion, message.Epoch, message.Lease) {
 		return ErrFenced
 	}
+	c.active.lastHeartbeat = c.now().UTC()
 	return nil
 }
 
@@ -517,7 +526,11 @@ func (c *Controller) Handle(message Message) (Message, error) {
 }
 
 func statusFor(value worker, state State) Status {
-	return Status{State: state, WorkerID: value.workerID, APIVersion: value.apiVersion, Epoch: value.epoch}
+	status := Status{State: state, WorkerID: value.workerID, APIVersion: value.apiVersion, Epoch: value.epoch}
+	if state == StateActive && !value.lastHeartbeat.IsZero() {
+		status.LastHeartbeatUnixMilli = value.lastHeartbeat.UnixMilli()
+	}
+	return status
 }
 
 func matches(value worker, workerID string, apiVersion uint16, epoch uint64, lease string) bool {

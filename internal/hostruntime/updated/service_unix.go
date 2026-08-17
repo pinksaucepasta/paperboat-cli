@@ -111,7 +111,7 @@ type HTTPHealth struct {
 }
 
 func (h HTTPHealth) Check(ctx context.Context, status hostdproto.Status, _ workerupdate.Release) error {
-	if status.State != hostdproto.StateActive || status.WorkerID == "" || status.Epoch == 0 {
+	if status.State != hostdproto.StateActive || status.WorkerID == "" || status.Epoch == 0 || status.LastHeartbeatUnixMilli == 0 || time.Since(time.UnixMilli(status.LastHeartbeatUnixMilli)) > 15*time.Second {
 		return ErrInvalidConfig
 	}
 	parsed, err := url.Parse(h.Endpoint)

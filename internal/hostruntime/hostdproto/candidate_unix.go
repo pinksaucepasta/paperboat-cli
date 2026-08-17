@@ -57,6 +57,13 @@ func (c *Candidate) Activate(ctx context.Context) (Status, error) {
 	if err != nil {
 		return Status{}, err
 	}
+	if _, err := candidateStatus(response, StateActive, c.lease); err != nil {
+		return Status{}, err
+	}
+	response, err = c.client.Request(ctx, heartbeatForCandidate(c.lease))
+	if err != nil {
+		return Status{}, err
+	}
 	return candidateStatus(response, StateActive, c.lease)
 }
 
