@@ -14,9 +14,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/releaseindex"
 	"github.com/theupdateframework/go-tuf/v2/metadata/config"
 	"github.com/theupdateframework/go-tuf/v2/metadata/updater"
 )
+
+const ReleaseIndexTargetSchemaV1 = "paperboat.tuf-release-index/v1"
 
 const (
 	ArtifactTargetSchemaV1 = "paperboat.tuf-target/v1"
@@ -47,6 +50,75 @@ type tufTargetCustom struct {
 	Version      string `json:"version"`
 	Platform     string `json:"platform"`
 	Architecture string `json:"architecture"`
+}
+
+type tufReleaseIndexCustom struct {
+	Schema       string `json:"schema"`
+	Kind         string `json:"kind"`
+	Channel      string `json:"channel"`
+	Platform     string `json:"platform"`
+	Architecture string `json:"architecture"`
+}
+
+// FetchVerifiedReleaseIndex fetches the fixed stable selector through TUF.
+// Unsigned discovery data cannot influence the selected target name.
+func FetchVerifiedReleaseIndex(ctx context.Context, repositoryURL, stateDirectory string, httpClient *http.Client, now time.Time) (releaseindex.Index, error) {
+	parsed, err := url.Parse(repositoryURL)
+	if err != nil || parsed.Scheme != "https" || parsed.User != nil || parsed.Hostname() == "" || parsed.RawQuery != "" || parsed.Fragment != "" || !filepath.IsAbs(stateDirectory) || filepath.Clean(stateDirectory) != stateDirectory {
+		return releaseindex.Index{}, ErrArtifactTarget
+	}
+	if err := secureDirectory(stateDirectory); err != nil {
+		return releaseindex.Index{}, err
+	}
+	configuration, err := config.New(strings.TrimRight(repositoryURL, "/")+"/metadata/", trustedRoot)
+	if err != nil {
+		return releaseindex.Index{}, err
+	}
+	configuration.LocalMetadataDir = filepath.Join(stateDirectory, "metadata")
+	configuration.LocalTargetsDir = filepath.Join(stateDirectory, "targets")
+	configuration.RemoteTargetsURL = strings.TrimRight(repositoryURL, "/") + "/targets/"
+	configuration.PrefixTargetsWithHash = true
+	configuration.MaxRootRotations, configuration.RootMaxLength, configuration.TimestampMaxLength, configuration.SnapshotMaxLength, configuration.TargetsMaxLength = 32, 128<<10, 64<<10, 256<<10, 512<<10
+	httpClient = secureArtifactHTTPClient(httpClient, parsedOrigin(repositoryURL))
+	if err := configuration.SetDefaultFetcherHTTPClient(httpClient); err != nil {
+		return releaseindex.Index{}, err
+	}
+	client, err := updater.New(configuration)
+	if err != nil {
+		return releaseindex.Index{}, err
+	}
+	if err := client.Refresh(); err != nil {
+		return releaseindex.Index{}, err
+	}
+	name := "release-index-stable-" + runtime.GOOS + "-" + runtime.GOARCH + ".json"
+	info, err := client.GetTargetInfo(name)
+	if err != nil {
+		return releaseindex.Index{}, err
+	}
+	if info.Length < 1 || info.Length > 64<<10 || info.Custom == nil {
+		return releaseindex.Index{}, ErrArtifactMismatch
+	}
+	var custom tufReleaseIndexCustom
+	decoder := json.NewDecoder(strings.NewReader(string(*info.Custom)))
+	decoder.DisallowUnknownFields()
+	var extra any
+	if decoder.Decode(&custom) != nil || decoder.Decode(&extra) != io.EOF || custom.Schema != ReleaseIndexTargetSchemaV1 || custom.Kind != "release-index" || custom.Channel != "stable" || custom.Platform != runtime.GOOS || custom.Architecture != runtime.GOARCH {
+		return releaseindex.Index{}, ErrArtifactMismatch
+	}
+	path, _, err := client.DownloadTarget(info, "", "")
+	if err != nil {
+		return releaseindex.Index{}, err
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return releaseindex.Index{}, err
+	}
+	defer file.Close()
+	index, err := releaseindex.Decode(file, now)
+	if err != nil || index.Platform != runtime.GOOS || index.Architecture != runtime.GOARCH {
+		return releaseindex.Index{}, ErrArtifactMismatch
+	}
+	return index, nil
 }
 
 func VerifyArtifactTarget(target ArtifactTarget) error {

@@ -163,3 +163,15 @@ func TestVerifyArtifactTargetRejectsWrongPlatformAndOrigin(t *testing.T) {
 		t.Fatalf("origin err=%v", err)
 	}
 }
+
+func TestReleaseIndexDiscoveryRejectsUnsignedTargetSelectionInputs(t *testing.T) {
+	state := filepath.Join(t.TempDir(), "tuf")
+	for _, repository := range []string{
+		"http://releases.example.test", "https://user@releases.example.test",
+		"https://releases.example.test?target=attacker", "https://releases.example.test/#fragment",
+	} {
+		if _, err := FetchVerifiedReleaseIndex(context.Background(), repository, state, nil, time.Now().UTC()); !errors.Is(err, ErrArtifactTarget) {
+			t.Fatalf("repository=%q error=%v", repository, err)
+		}
+	}
+}
