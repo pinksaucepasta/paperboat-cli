@@ -31,9 +31,9 @@ Options:
   -h, --help                 Show this help
 
 Examples:
-  curl -fsSL https://pprbt.dev/install | bash
-  curl -fsSL https://pprbt.dev/install | bash -s -- --pair --enrollment-token TOKEN
-  curl -fsSL https://pprbt.dev/install | bash -s -- --setup receive
+  curl -fsSL https://get.pprbt.dev/install | bash
+  curl -fsSL https://get.pprbt.dev/install | bash -s -- --pair --enrollment-token TOKEN
+  curl -fsSL https://get.pprbt.dev/install | bash -s -- --setup receive
 EOF
 }
 
