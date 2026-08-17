@@ -105,12 +105,19 @@ func TestPingCommandAndOutputContract(t *testing.T) {
 }
 
 func TestUpdateCommandContract(t *testing.T) {
-	command, _, err := newRootCommand().Find([]string{"update"})
+	root := newRootCommand()
+	command, _, err := root.Find([]string{"update"})
 	if err != nil || command == nil {
 		t.Fatalf("find update: %v", err)
 	}
 	if command.Use != "update" || command.Flags().Lookup("json") == nil {
 		t.Fatalf("unexpected update command contract: %q", command.Use)
+	}
+	for _, path := range [][]string{{"update", "check"}, {"update", "status"}} {
+		child, _, childErr := root.Find(path)
+		if childErr != nil || child == nil || child.Flags().Lookup("json") == nil {
+			t.Fatalf("find %v: command=%v error=%v", path, child, childErr)
+		}
 	}
 }
 

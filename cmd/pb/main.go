@@ -2270,19 +2270,81 @@ type updateResult struct {
 func updateCommand() *cobra.Command {
 	command := &cobra.Command{Use: "update", Short: "Update pb from the signed Paperboat release", Args: commandArgs(cobra.NoArgs), RunE: actionUpdate}
 	command.Flags().Bool("json", false, "print JSON")
+	check := &cobra.Command{Use: "check", Short: "Check the signed Paperboat release without installing it", Args: commandArgs(cobra.NoArgs), RunE: actionUpdateCheck}
+	check.Flags().Bool("json", false, "print JSON")
+	status := &cobra.Command{Use: "status", Short: "Show installed Paperboat update state", Args: commandArgs(cobra.NoArgs), RunE: actionUpdateStatus}
+	status.Flags().Bool("json", false, "print JSON")
+	command.AddCommand(check, status)
 	return command
 }
 
-func actionUpdate(command *cobra.Command, _ []string) error {
-	releaseURL := strings.TrimSpace(buildinfo.DefaultReleaseURL)
-	if releaseURL == "" {
-		return errors.New("this pb build does not define a signed release origin")
-	}
+type updateCheckResult struct {
+	InstalledVersion string `json:"installed_version"`
+	LatestVersion    string `json:"latest_version"`
+	UpdateAvailable  bool   `json:"update_available"`
+	Verified         bool   `json:"verified"`
+}
+
+func actionUpdateCheck(command *cobra.Command, _ []string) error {
 	ctx, cancel := context.WithTimeout(command.Context(), 3*time.Minute)
 	defer cancel()
-	artifact, err := selfupdate.Resolve(ctx, releaseURL, &http.Client{Transport: httptransport.Default(), Timeout: 30 * time.Second})
+	artifact, _, err := resolveVerifiedUpdate(ctx)
 	if err != nil {
-		return fmt.Errorf("resolve latest signed release: %w", err)
+		return err
+	}
+	available := buildinfo.Version == "dev"
+	if !available {
+		comparison, compareErr := selfupdate.CompareVersions(artifact.Version, buildinfo.Version)
+		if compareErr != nil {
+			return compareErr
+		}
+		available = comparison > 0
+	}
+	result := updateCheckResult{InstalledVersion: buildinfo.Version, LatestVersion: artifact.Version, UpdateAvailable: available, Verified: true}
+	jsonOutput, _ := command.Flags().GetBool("json")
+	if jsonOutput {
+		return json.NewEncoder(command.OutOrStdout()).Encode(result)
+	}
+	if available {
+		fmt.Fprintf(command.OutOrStdout(), "Paperboat %s is available; installed version is %s.\n", artifact.Version, buildinfo.Version)
+	} else {
+		fmt.Fprintf(command.OutOrStdout(), "pb %s is up to date.\n", buildinfo.Version)
+	}
+	return nil
+}
+
+type updateStatusResult struct {
+	CLIVersion       string `json:"cli_version"`
+	RuntimeVersion   string `json:"runtime_version,omitempty"`
+	RuntimeAvailable bool   `json:"runtime_available"`
+	ActiveSessions   uint64 `json:"active_sessions"`
+}
+
+func actionUpdateStatus(command *cobra.Command, _ []string) error {
+	health, err := localUpdateHealth(command.Context())
+	result := updateStatusResult{CLIVersion: buildinfo.Version}
+	if err == nil {
+		result.RuntimeVersion, result.RuntimeAvailable, result.ActiveSessions = health.Version, true, health.Workloads.Sessions
+	}
+	jsonOutput, _ := command.Flags().GetBool("json")
+	if jsonOutput {
+		return json.NewEncoder(command.OutOrStdout()).Encode(result)
+	}
+	fmt.Fprintf(command.OutOrStdout(), "CLI: %s\n", result.CLIVersion)
+	if result.RuntimeAvailable {
+		fmt.Fprintf(command.OutOrStdout(), "Runtime: %s\nActive sessions: %d\n", result.RuntimeVersion, result.ActiveSessions)
+	} else {
+		fmt.Fprintln(command.OutOrStdout(), "Runtime: unavailable")
+	}
+	return nil
+}
+
+func actionUpdate(command *cobra.Command, _ []string) error {
+	ctx, cancel := context.WithTimeout(command.Context(), 3*time.Minute)
+	defer cancel()
+	artifact, verified, err := resolveVerifiedUpdate(ctx)
+	if err != nil {
+		return err
 	}
 	result := updateResult{PreviousVersion: buildinfo.Version, Version: artifact.Version}
 	if buildinfo.Version != "dev" {
@@ -2290,14 +2352,6 @@ func actionUpdate(command *cobra.Command, _ []string) error {
 		if compareErr != nil || comparison < 0 {
 			return errors.New("the signed release origin returned an older version; refusing to downgrade pb")
 		}
-	}
-	stateRoot, stateErr := helperconfig.DefaultStateRoot(os.Getenv)
-	if stateErr != nil {
-		return stateErr
-	}
-	verified, fetchErr := bootstrap.FetchVerifiedArtifact(ctx, artifact, filepath.Join(stateRoot, "self-update", "tuf"), &http.Client{Transport: httptransport.Default(), Timeout: 2 * time.Minute})
-	if fetchErr != nil {
-		return fmt.Errorf("verify latest signed pb release: %w", fetchErr)
 	}
 	health, healthErr := localUpdateHealth(ctx)
 	runtimeInstalled := healthErr == nil
@@ -2344,6 +2398,26 @@ func actionUpdate(command *cobra.Command, _ []string) error {
 	}
 	fmt.Fprintf(command.OutOrStdout(), "Updated pb to %s.\n", artifact.Version)
 	return nil
+}
+
+func resolveVerifiedUpdate(ctx context.Context) (bootstrap.ArtifactTarget, string, error) {
+	releaseURL := strings.TrimSpace(buildinfo.DefaultReleaseURL)
+	if releaseURL == "" {
+		return bootstrap.ArtifactTarget{}, "", errors.New("this pb build does not define a signed release origin")
+	}
+	artifact, err := selfupdate.Resolve(ctx, releaseURL, &http.Client{Transport: httptransport.Default(), Timeout: 30 * time.Second})
+	if err != nil {
+		return bootstrap.ArtifactTarget{}, "", fmt.Errorf("resolve latest signed release: %w", err)
+	}
+	stateRoot, err := helperconfig.DefaultStateRoot(os.Getenv)
+	if err != nil {
+		return bootstrap.ArtifactTarget{}, "", err
+	}
+	verified, err := bootstrap.FetchVerifiedArtifact(ctx, artifact, filepath.Join(stateRoot, "self-update", "tuf"), &http.Client{Transport: httptransport.Default(), Timeout: 2 * time.Minute})
+	if err != nil {
+		return bootstrap.ArtifactTarget{}, "", fmt.Errorf("verify latest signed pb release: %w", err)
+	}
+	return artifact, verified, nil
 }
 
 type updateHealthDocument struct {
