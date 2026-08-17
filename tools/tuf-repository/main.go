@@ -28,12 +28,38 @@ const keychainService = "com.pinksaucepasta.paperboat.tuf.production"
 
 var roles = []string{"root-1", "root-2", "root-3", "targets-1", "targets-2", "snapshot-1", "timestamp-1"}
 
-type targetCustom struct {
-	Schema       string `json:"schema"`
-	Kind         string `json:"kind"`
-	Version      string `json:"version"`
+type componentTarget struct {
+	Component    string `json:"component"`
+	TargetPath   string `json:"target_path"`
+	SHA256       string `json:"sha256"`
+	Length       int64  `json:"length"`
 	Platform     string `json:"platform"`
 	Architecture string `json:"architecture"`
+	BinaryFormat string `json:"binary_format"`
+}
+type rolloutPolicy struct {
+	Schema     string `json:"schema"`
+	CohortSeed string `json:"cohort_seed"`
+	Percentage uint8  `json:"percentage"`
+}
+type releaseIndex struct {
+	Schema                string            `json:"schema"`
+	ReleaseID             string            `json:"release_id"`
+	Version               string            `json:"version"`
+	Channel               string            `json:"channel"`
+	Severity              string            `json:"severity"`
+	CreatedAt             time.Time         `json:"created_at"`
+	Platform              string            `json:"platform"`
+	Architecture          string            `json:"architecture"`
+	BinaryFormat          string            `json:"binary_format"`
+	Targets               []componentTarget `json:"targets"`
+	HostdAPIMin           uint16            `json:"hostd_api_min"`
+	HostdAPIMax           uint16            `json:"hostd_api_max"`
+	RuntimeAPIMin         uint16            `json:"runtime_api_min"`
+	RuntimeAPIMax         uint16            `json:"runtime_api_max"`
+	RolloutPolicyRevision uint64            `json:"rollout_policy_revision"`
+	SupervisorMaintenance bool              `json:"supervisor_maintenance_required"`
+	Rollout               rolloutPolicy     `json:"rollout"`
 }
 
 type signingState struct {
@@ -68,10 +94,17 @@ func run(args []string) error {
 		repo := fs.String("repository", "", "repository directory")
 		version := fs.String("version", "", "release version")
 		artifacts := fs.String("artifacts", "", "release artifact directory")
+		rolloutRevision := fs.Uint64("rollout-revision", 0, "monotonic signed rollout policy revision")
+		percentage := fs.Uint("percentage", 0, "initial eligible cohort percentage")
+		severity := fs.String("severity", "routine", "routine, security, or critical")
+		supervisorMaintenance := fs.Bool("supervisor-maintenance", false, "release updates stable supervisor components")
 		if err := fs.Parse(args[1:]); err != nil || fs.NArg() != 0 {
-			return errors.New("usage: paperboat-tuf publish -repository DIR -version VERSION -artifacts DIR")
+			return errors.New("usage: paperboat-tuf publish -repository DIR -version VERSION -artifacts DIR -rollout-revision N -percentage 0..100")
 		}
-		return publish(*repo, *version, *artifacts)
+		if *rolloutRevision == 0 || *percentage > 100 || (*severity != "routine" && *severity != "security" && *severity != "critical") {
+			return errors.New("valid rollout revision, percentage, and severity are required")
+		}
+		return publish(*repo, *version, *artifacts, *rolloutRevision, uint8(*percentage), *severity, *supervisorMaintenance)
 	case "refresh":
 		fs := flag.NewFlagSet("refresh", flag.ContinueOnError)
 		repo := fs.String("repository", "", "repository directory")
@@ -175,7 +208,7 @@ func initialize(repo string) error {
 	return writeSigningState(repo, initialSigningState())
 }
 
-func publish(repo, version, artifacts string) error {
+func publish(repo, version, artifacts string, rolloutRevision uint64, percentage uint8, severity string, supervisorMaintenance bool) error {
 	repo, err := validateRepository(repo, true)
 	if err != nil {
 		return err
@@ -192,20 +225,53 @@ func publish(repo, version, artifacts string) error {
 		return err
 	}
 	targets.Signed.Targets = map[string]*metadata.TargetFiles{}
-	for _, platform := range []string{"darwin", "linux"} {
+	createdAt := time.Now().UTC()
+	for _, platform := range []string{"darwin", "linux", "windows"} {
 		for _, architecture := range []string{"amd64", "arm64"} {
-			name := "pb-" + platform + "-" + architecture
-			local := filepath.Join(artifacts, name)
-			info, err := metadata.TargetFile().FromFile(local, "sha256")
-			if err != nil {
-				return fmt.Errorf("target %s: %w", name, err)
+			format := map[string]string{"darwin": "mach-o", "linux": "elf", "windows": "pe"}[platform]
+			components := make([]componentTarget, 0, 5)
+			for _, component := range []string{"cli", "runtime", "hostd", "updater", "launcher"} {
+				name := component + "-" + platform + "-" + architecture
+				local := filepath.Join(artifacts, name)
+				info, err := metadata.TargetFile().FromFile(local, "sha256")
+				if err != nil {
+					return fmt.Errorf("target %s: %w", name, err)
+				}
+				custom, _ := json.Marshal(map[string]any{"schema": "paperboat.tuf-component/v1", "kind": "component", "component": component, "version": version, "platform": platform, "architecture": architecture, "binary_format": format})
+				raw := json.RawMessage(custom)
+				info.Custom, info.Path = &raw, name
+				targets.Signed.Targets[name] = info
+				if err := copyConsistentTarget(repo, local, name, info); err != nil {
+					return err
+				}
+				components = append(components, componentTarget{Component: component, TargetPath: name, SHA256: hex.EncodeToString(info.Hashes["sha256"]), Length: info.Length, Platform: platform, Architecture: architecture, BinaryFormat: format})
 			}
-			custom, _ := json.Marshal(targetCustom{"paperboat.tuf-target/v1", "pb", version, platform, architecture})
-			raw := json.RawMessage(custom)
-			info.Custom = &raw
-			info.Path = name
-			targets.Signed.Targets[name] = info
-			if err := copyConsistentTarget(repo, local, name, info); err != nil {
+			indexName := "release-index-stable-" + platform + "-" + architecture + ".json"
+			indexBody, err := json.Marshal(releaseIndex{Schema: "paperboat.release-index/v1", ReleaseID: "rel_" + version, Version: version, Channel: "stable", Severity: severity, CreatedAt: createdAt, Platform: platform, Architecture: architecture, BinaryFormat: format, Targets: components, HostdAPIMin: 1, HostdAPIMax: 2, RuntimeAPIMin: 1, RuntimeAPIMax: 2, RolloutPolicyRevision: rolloutRevision, SupervisorMaintenance: supervisorMaintenance, Rollout: rolloutPolicy{Schema: "paperboat.release-rollout/v1", CohortSeed: "release-" + version, Percentage: percentage}})
+			if err != nil {
+				return err
+			}
+			indexInfo, err := metadata.TargetFile().FromBytes(indexName, indexBody, "sha256")
+			if err != nil {
+				return err
+			}
+			indexCustom, _ := json.Marshal(map[string]string{"schema": "paperboat.tuf-release-index/v1", "kind": "release-index", "channel": "stable", "platform": platform, "architecture": architecture})
+			indexRaw := json.RawMessage(indexCustom)
+			indexInfo.Custom, indexInfo.Path = &indexRaw, indexName
+			targets.Signed.Targets[indexName] = indexInfo
+			indexLocal := filepath.Join(artifacts, indexName)
+			indexFile, err := os.OpenFile(indexLocal, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+			if err != nil {
+				return fmt.Errorf("create release index %s: %w", indexName, err)
+			}
+			if _, err = indexFile.Write(indexBody); err == nil {
+				err = indexFile.Sync()
+			}
+			err = errors.Join(err, indexFile.Close())
+			if err != nil {
+				return err
+			}
+			if err := copyConsistentTarget(repo, indexLocal, indexName, indexInfo); err != nil {
 				return err
 			}
 		}
