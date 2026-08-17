@@ -30,6 +30,9 @@ type Current struct {
 }
 
 func Resolve(ctx context.Context, releaseURL string, client *http.Client) (bootstrap.ArtifactTarget, error) {
+	if client == nil {
+		return bootstrap.ArtifactTarget{}, ErrInvalidRelease
+	}
 	base, err := url.Parse(strings.TrimRight(strings.TrimSpace(releaseURL), "/"))
 	if err != nil || base.Scheme != "https" || base.Hostname() == "" || base.User != nil || base.RawQuery != "" || base.Fragment != "" {
 		return bootstrap.ArtifactTarget{}, ErrInvalidRelease
@@ -37,9 +40,6 @@ func Resolve(ctx context.Context, releaseURL string, client *http.Client) (boots
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, base.String()+"/current.json", nil)
 	if err != nil {
 		return bootstrap.ArtifactTarget{}, err
-	}
-	if client == nil {
-		client = http.DefaultClient
 	}
 	response, err := client.Do(request)
 	if err != nil {
