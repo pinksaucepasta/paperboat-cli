@@ -69,6 +69,8 @@ jobs:
             dist/*.tar.gz
             dist/pb-*
             dist/pb_*
+            dist/install.sh
+            dist/SHA256SUMS
       - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:

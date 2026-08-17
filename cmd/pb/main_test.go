@@ -384,7 +384,7 @@ func TestUserFacingErrorSanitizesInfrastructureFailures(t *testing.T) {
 		{
 			name: "pairing required",
 			err:  identitybootstrap.ErrPairingRequired,
-			want: "awaiting approval",
+			want: "needs the account recovery key",
 		},
 	}
 	for _, test := range tests {
@@ -1775,6 +1775,11 @@ func TestConfigCommandsAreDiscoverableAndUnassignRequiresConfirmation(t *testing
 
 func TestCompatibilityOnlyCommandsAreAbsent(t *testing.T) {
 	root := newRootCommand()
+	for _, child := range root.Commands() {
+		if child.Name() == "e2ee" {
+			t.Fatal("internal transport encryption is still exposed as a public command")
+		}
+	}
 	for parentName, removed := range map[string][]string{
 		"config":   {"enable", "disable"},
 		"preview":  {"remove", "purge"},
@@ -1793,6 +1798,24 @@ func TestCompatibilityOnlyCommandsAreAbsent(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+func TestPrivateTransportLifecycleIsIntegratedIntoPublicWorkflows(t *testing.T) {
+	root := newRootCommand()
+	for _, path := range []string{"auth login", "machine pending", "machine approve", "setup"} {
+		entry, _, err := root.Find(strings.Fields(path))
+		if err != nil || entry.CommandPath() != "pb "+path {
+			t.Fatalf("find %q command=%v err=%v", path, entry, err)
+		}
+	}
+	login, _, _ := root.Find([]string{"auth", "login"})
+	if login.Flags().Lookup("recovery-key") == nil {
+		t.Fatal("auth login does not own recovery continuation")
+	}
+	setup, _, _ := root.Find([]string{"setup"})
+	if setup.Flags().Lookup("recovery-output") == nil {
+		t.Fatal("setup does not own recovery backup")
 	}
 }
 

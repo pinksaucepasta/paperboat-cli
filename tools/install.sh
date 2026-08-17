@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-repository=${PAPERBOAT_GITHUB_REPOSITORY:-pinksaucepasta/paperboat}
+repository=${PAPERBOAT_GITHUB_REPOSITORY:-pinksaucepasta/paperboat-cli}
 version=${PAPERBOAT_VERSION:-latest}
 install_dir=${PAPERBOAT_INSTALL_DIR:-"${HOME}/.local/bin"}
 setup_mode=
@@ -9,6 +9,7 @@ pair=false
 enrollment_token=
 machine_name=
 ssh_port=
+recovery_output=
 
 usage() {
   cat <<'EOF'
@@ -25,19 +26,20 @@ Options:
   --enrollment-token TOKEN   Use a dashboard-issued single-use pairing token
   --name NAME                Set the machine name
   --ssh-port PORT            Existing SSH port; valid only with --setup host
+  --recovery-output FILE     Save the account recovery key during setup
   --no-setup                 Install only (the default)
   -h, --help                 Show this help
 
 Examples:
-  curl -fsSL https://github.com/pinksaucepasta/paperboat/releases/latest/download/install.sh | sh
-  curl -fsSL https://github.com/pinksaucepasta/paperboat/releases/latest/download/install.sh | sh -s -- --pair --enrollment-token TOKEN
-  curl -fsSL https://github.com/pinksaucepasta/paperboat/releases/latest/download/install.sh | sh -s -- --setup receive
+  curl -fsSL https://pprbt.dev/install | bash
+  curl -fsSL https://pprbt.dev/install | bash -s -- --pair --enrollment-token TOKEN
+  curl -fsSL https://pprbt.dev/install | bash -s -- --setup receive
 EOF
 }
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --version|--install-dir|--setup|--enrollment-token|--name|--ssh-port)
+    --version|--install-dir|--setup|--enrollment-token|--name|--ssh-port|--recovery-output)
       [ "$#" -ge 2 ] || { echo "pb installer: $1 requires a value" >&2; exit 2; }
       case "$1" in
         --version) version=$2 ;;
@@ -46,6 +48,7 @@ while [ "$#" -gt 0 ]; do
         --enrollment-token) enrollment_token=$2 ;;
         --name) machine_name=$2 ;;
         --ssh-port) ssh_port=$2 ;;
+        --recovery-output) recovery_output=$2 ;;
       esac
       shift 2
       ;;
@@ -62,6 +65,10 @@ case "$setup_mode" in
 esac
 if [ -n "$ssh_port" ] && [ "$setup_mode" != host ]; then
   echo "pb installer: --ssh-port is valid only with --setup host" >&2
+  exit 2
+fi
+if [ -n "$recovery_output" ] && [ -z "$setup_mode" ]; then
+  echo "pb installer: --recovery-output requires --setup" >&2
   exit 2
 fi
 if [ -n "$enrollment_token" ] && [ "$pair" != true ]; then
@@ -91,10 +98,14 @@ fi
 
 asset="pb-${os}-${arch}"
 if [ "$version" = latest ]; then
-  release_base="https://github.com/${repository}/releases/latest/download"
-else
-  release_base="https://github.com/${repository}/releases/download/${version}"
+  latest_url="https://github.com/${repository}/releases/latest"
+  tag_url=$(curl -fLsS --proto '=https' --tlsv1.2 -o /dev/null -w '%{url_effective}' "$latest_url")
+  version=${tag_url##*/}
 fi
+case "$version" in
+  ""|*/*|*[!0-9A-Za-z._-]*) echo "pb installer: invalid release version" >&2; exit 1 ;;
+esac
+release_base="https://github.com/${repository}/releases/download/${version}"
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/paperboat-install.XXXXXX")
 trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
 
@@ -135,7 +146,8 @@ fi
 if [ -n "$setup_mode" ]; then
   set -- "$@" --mode "$setup_mode"
   if [ -n "$ssh_port" ]; then set -- "$@" --ssh-port "$ssh_port"; fi
+  if [ -n "$recovery_output" ]; then set -- "$@" --recovery-output "$recovery_output"; fi
   exec "$target" setup "$@"
 fi
 
-"$target" version
+"$target" --version

@@ -178,10 +178,10 @@ func userFacingError(err error) string {
 		return "Your Paperboat session is no longer valid. Run `pb auth login`, then retry."
 	}
 	if errors.Is(err, config.ErrSecretNotFound) {
-		return "This CLI is authenticated but is not paired for private transport. Run `pb e2ee recovery-import --input /absolute/recovery-key-file` or approve this CLI from an existing paired CLI."
+		return "This CLI is signed in but not paired for private transport. Run `pb auth login --recovery-key /absolute/recovery-key-file`."
 	}
 	if errors.Is(err, identitybootstrap.ErrPairingRequired) {
-		return "This CLI is awaiting approval from an existing paired CLI. Compare the pairing code on both devices, or use `pb e2ee recovery-import` with the account recovery key."
+		return "This CLI needs the account recovery key before private transport can be enabled. Rerun `pb auth login --recovery-key /absolute/recovery-key-file`."
 	}
 	if message := friendlyAPIError(err); message != "" {
 		return sentence(message)
@@ -1665,7 +1665,7 @@ func setupCommand() *cobra.Command {
 					}
 				}
 				fmt.Fprintf(command.OutOrStdout(), "Set up %s (%s) in session mode\n", machine.DisplayName, machine.ID)
-				return nil
+				return exportSetupRecoveryKey(command)
 			}
 			operationID := "machine-control-" + strings.TrimPrefix(newIdempotencyKey(), "pb-")
 			controlBody, err := json.Marshal(struct {
@@ -1765,7 +1765,7 @@ func setupCommand() *cobra.Command {
 				}
 			}
 			fmt.Fprintf(command.OutOrStdout(), "Set up %s (%s) in %s mode\n", machine.DisplayName, machine.ID, mode)
-			return nil
+			return exportSetupRecoveryKey(command)
 		},
 		SilenceUsage: true, SilenceErrors: true,
 	}
@@ -1773,6 +1773,7 @@ func setupCommand() *cobra.Command {
 	command.Flags().String("mode", "", "installation mode: receive, session, or host")
 	command.Flags().String("state-root", "", "runtime state directory")
 	command.Flags().Uint("ssh-port", 22, "existing loopback sshd port")
+	command.Flags().String("recovery-output", "", "new absolute file for the account recovery key")
 	return command
 }
 
@@ -2134,8 +2135,9 @@ func newRootCommand() *cobra.Command {
 		return actionHomeAccount(command)
 	}
 	root.AddCommand(authTree)
-	root.AddCommand(e2eeCobraCommand())
-	root.AddCommand(&cobra.Command{Use: "login", Short: "Sign in through the Paperboat dashboard", Args: commandArgs(cobra.NoArgs), RunE: actionRun(authLogin)})
+	login := &cobra.Command{Use: "login", Short: "Sign in through the Paperboat dashboard", Args: commandArgs(cobra.NoArgs), RunE: actionRun(authLogin)}
+	login.Flags().String("recovery-key", "", "absolute recovery-key file for restoring private transport")
+	root.AddCommand(login)
 	root.AddCommand(&cobra.Command{Use: "logout", Short: "Revoke and remove the active client session", Args: commandArgs(cobra.NoArgs), RunE: actionRun(authLogout)})
 	configTree := specTree(configCommand(), "config")
 	configTree.RunE = func(command *cobra.Command, _ []string) error {
@@ -2335,22 +2337,6 @@ func sessionCompletionValues(items []api.TerminalSession, prefix string) []strin
 	}
 	sort.Strings(values)
 	return values
-}
-
-func e2eeCobraCommand() *cobra.Command {
-	root := &cobra.Command{Use: "e2ee", Short: "Manage end-to-end encrypted endpoint identities", Args: commandArgs(cobra.NoArgs), RunE: func(command *cobra.Command, _ []string) error { return command.Help() }}
-	pending := &cobra.Command{Use: "pending", Short: "List machine endpoint identities awaiting approval", Args: commandArgs(cobra.NoArgs), RunE: actionRun(e2eePending)}
-	pending.Flags().Bool("json", false, "print JSON")
-	approve := &cobra.Command{Use: "approve-machine <request-id>", Short: "Approve a verified machine endpoint identity", Args: commandArgs(cobra.ExactArgs(1)), RunE: actionRun(e2eeApproveMachine)}
-	approve.Flags().String("code", "", "safety code shown by the machine")
-	approve.Flags().Bool("json", false, "print JSON")
-	export := &cobra.Command{Use: "recovery-export", Short: "Write the account recovery key to a new owner-only file", Args: commandArgs(cobra.NoArgs), RunE: actionRun(e2eeRecoveryExport)}
-	export.Flags().String("output", "", "new absolute output file")
-	recover := &cobra.Command{Use: "recovery-import", Short: "Import an account recovery key from an owner-only file", Args: commandArgs(cobra.NoArgs), RunE: actionRun(e2eeRecoveryImport)}
-	recover.Flags().String("input", "", "absolute recovery-key file")
-	recover.Flags().Bool("json", false, "print JSON")
-	root.AddCommand(pending, approve, export, recover)
-	return root
 }
 
 func actionHome(command *cobra.Command) error {
@@ -4074,11 +4060,11 @@ func validateConnectInvocation(command *cobra.Command) error {
 }
 
 func specTree(source *command.Spec, use string) *cobra.Command {
-	command := &cobra.Command{Use: use, Short: source.Usage, Args: commandArgs(cobra.NoArgs)}
+	root := &cobra.Command{Use: use, Short: source.Usage, Args: commandArgs(cobra.NoArgs)}
 	if source.Action != nil {
-		command.RunE = actionRun(source.Action)
+		root.RunE = actionRun(source.Action)
 	} else {
-		command.RunE = func(command *cobra.Command, _ []string) error { return command.Help() }
+		root.RunE = func(command *cobra.Command, _ []string) error { return command.Help() }
 	}
 	for _, child := range source.Subcommands {
 		child := child
@@ -4087,6 +4073,11 @@ func specTree(source *command.Spec, use string) *cobra.Command {
 			childUse += " " + child.ArgsUsage
 		}
 		entry := &cobra.Command{Use: childUse, Short: child.Usage, Args: commandArgs(specCommandArgs(use, child.Name)), RunE: actionRun(child.Action)}
+		for _, configuredFlag := range child.Flags {
+			if stringFlag, ok := configuredFlag.(*command.StringFlag); ok {
+				entry.Flags().String(stringFlag.Name, "", stringFlag.Usage)
+			}
+		}
 		if (use == "auth" && child.Name == "status") || (use == "config" && child.Name == "show") {
 			entry.Flags().Bool("json", false, "print JSON")
 		}
@@ -4123,9 +4114,9 @@ func specTree(source *command.Spec, use string) *cobra.Command {
 				entry.Flags().Bool("json", false, "print JSON")
 			}
 		}
-		command.AddCommand(entry)
+		root.AddCommand(entry)
 	}
-	return command
+	return root
 }
 
 func specCommandArgs(parent, name string) cobra.PositionalArgs {
@@ -4433,7 +4424,12 @@ func userMachineCobraCommand() *cobra.Command {
 	availability.Flags().String("mode", "", "availability mode: allow-sleep or keep-awake")
 	availability.Flags().Bool("yes", false, "confirm keep-awake power behavior")
 	availability.Flags().Bool("json", false, "print JSON")
-	machine.AddCommand(add, list, revoke, availability)
+	pendingTrust := &cobra.Command{Use: "pending", Short: "List machines awaiting trust approval", Args: commandArgs(cobra.NoArgs), RunE: actionRun(e2eePending)}
+	pendingTrust.Flags().Bool("json", false, "print JSON")
+	approveTrust := &cobra.Command{Use: "approve <request-id>", Short: "Approve a machine after comparing its trust code", Args: commandArgs(cobra.ExactArgs(1)), RunE: actionRun(e2eeApproveMachine)}
+	approveTrust.Flags().String("code", "", "trust code shown by the machine")
+	approveTrust.Flags().Bool("json", false, "print JSON")
+	machine.AddCommand(add, list, revoke, availability, pendingTrust, approveTrust)
 	return machine
 }
 
@@ -4499,7 +4495,7 @@ func actionRun(action command.Action) func(*cobra.Command, []string) error {
 func actionContext(cobraCommand *cobra.Command, args []string) *command.Context {
 	set := flag.NewFlagSet("pb", flag.ContinueOnError)
 	values := map[string]string{}
-	for _, name := range []string{"config", "server", "name", "machine", "session", "status-bar", "status-bar-fullscreen", "status-bar-theme", "mode", "path", "transport", "code", "input", "output", "keep"} {
+	for _, name := range []string{"config", "server", "name", "machine", "session", "status-bar", "status-bar-fullscreen", "status-bar-theme", "mode", "path", "transport", "code", "input", "output", "keep", "recovery-key"} {
 		value, _ := cobraCommand.Flags().GetString(name)
 		values[name] = value
 		set.String(name, value, "")
@@ -4556,8 +4552,8 @@ func newApp() *command.App {
 
 func authCommand() *command.Spec {
 	return &command.Spec{Name: "auth", Usage: "Manage Paperboat sign-in", Subcommands: []*command.Spec{
-		{Name: "login", Usage: "Sign in through the Paperboat dashboard", Action: authLogin},
-		{Name: "switch", Usage: "Replace the active account for this server", Action: func(c *command.Context) error { return authLoginMode(c, true) }},
+		{Name: "login", Usage: "Sign in through the Paperboat dashboard", Flags: []command.Flag{&command.StringFlag{Name: "recovery-key", Usage: "absolute recovery-key file for restoring private transport"}}, Action: authLogin},
+		{Name: "switch", Usage: "Replace the active account for this server", Flags: []command.Flag{&command.StringFlag{Name: "recovery-key", Usage: "absolute recovery-key file for restoring private transport"}}, Action: func(c *command.Context) error { return authLoginMode(c, true) }},
 		{Name: "status", Usage: "Show the active Paperboat account", Flags: []command.Flag{&command.BoolFlag{Name: "json"}}, Action: authStatus},
 		{Name: "logout", Usage: "Revoke and remove the active client session", Action: authLogout},
 	}}
@@ -4597,7 +4593,7 @@ func authLoginMode(c *command.Context, replace bool) error {
 			if credentialErr != nil {
 				return credentialErr
 			}
-			if err := ensureCLIIdentity(c.Context, store, existingProfile, credential); err != nil {
+			if err := ensureCLIIdentityForLogin(c, store, existingProfile, credential); err != nil {
 				return err
 			}
 			if err := ensureLocalDaemonService(c.Context, cfg); err != nil {
@@ -4693,8 +4689,8 @@ func authLoginMode(c *command.Context, replace bool) error {
 		if saveErr != nil {
 			return errors.Join(saveErr, cleanupIssuedSession(cfg.ServerURL, tokens.CLIClientSessionID, tokens.RefreshToken, store))
 		}
-		if err := ensureCLIIdentity(c.Context, store, p, cred); err != nil {
-			return fmt.Errorf("signed in, but E2EE identity setup is incomplete; rerun `pb auth login`: %w", err)
+		if err := ensureCLIIdentityForLogin(c, store, p, cred); err != nil {
+			return fmt.Errorf("signed in, but private transport setup is incomplete; rerun `pb auth login`: %w", err)
 		}
 		if err := ensureLocalDaemonService(c.Context, cfg); err != nil {
 			return fmt.Errorf("signed in, but local SSH integration is incomplete; rerun `pb auth login`: %w", err)
@@ -4732,6 +4728,77 @@ func ensureCLIIdentity(ctx context.Context, store config.ProfileStore, profile c
 	return err
 }
 
+func ensureCLIIdentityForLogin(c *command.Context, store config.ProfileStore, profile config.Profile, credential config.Credential) error {
+	if input := strings.TrimSpace(c.String("recovery-key")); input != "" {
+		if err := importRecoveryKey(store, profile, input); err != nil {
+			return err
+		}
+	}
+	return ensureCLIIdentity(c.Context, store, profile, credential)
+}
+
+func importRecoveryKey(store config.ProfileStore, profile config.Profile, input string) error {
+	if !filepath.IsAbs(input) {
+		return invocationError(errors.New("--recovery-key must be an absolute path"))
+	}
+	info, err := os.Lstat(input)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 {
+		return errors.New("recovery-key file must be a regular owner-only file")
+	}
+	encoded, err := os.ReadFile(input)
+	if err != nil {
+		return err
+	}
+	seed, err := recoverykey.Decode(strings.TrimSpace(string(encoded)))
+	clear(encoded)
+	if err != nil {
+		return err
+	}
+	defer clear(seed)
+	return store.ImportPeerAccountRootSeed(profile.Issuer, profile.Account.ID, seed)
+}
+
+func exportSetupRecoveryKey(command *cobra.Command) error {
+	output, err := command.Flags().GetString("recovery-output")
+	if err != nil || strings.TrimSpace(output) == "" {
+		return err
+	}
+	output = strings.TrimSpace(output)
+	if !filepath.IsAbs(output) {
+		return invocationError(errors.New("--recovery-output must be an absolute path"))
+	}
+	ctx := actionContext(command, nil)
+	_, store, profile, err := e2eeClient(ctx)
+	if err != nil {
+		return fmt.Errorf("machine setup completed, but recovery-key export failed: %w", err)
+	}
+	seed, err := store.ExportPeerAccountRootSeed(profile.Issuer, profile.Account.ID)
+	if err != nil {
+		return fmt.Errorf("machine setup completed, but recovery-key export failed: %w", err)
+	}
+	defer clear(seed)
+	encoded, err := recoverykey.Encode(seed)
+	if err != nil {
+		return err
+	}
+	file, err := os.OpenFile(output, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return fmt.Errorf("machine setup completed, but create recovery-key file: %w", err)
+	}
+	if _, err = io.WriteString(file, encoded+"\n"); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("machine setup completed, but write recovery-key file: %w", err)
+	}
+	if err = file.Close(); err != nil {
+		return fmt.Errorf("machine setup completed, but close recovery-key file: %w", err)
+	}
+	fmt.Fprintf(command.OutOrStdout(), "Recovery key written to %s\n", output)
+	return nil
+}
+
 func e2eePending(c *command.Context) error {
 	client, _, _, err := e2eeClient(c)
 	if err != nil {
@@ -4745,11 +4812,11 @@ func e2eePending(c *command.Context) error {
 		return json.NewEncoder(c.Writer).Encode(pending)
 	}
 	if len(pending) == 0 {
-		fmt.Fprintln(c.Writer, "No machine endpoint identities are awaiting approval.")
+		fmt.Fprintln(c.Writer, "No machines are awaiting trust approval.")
 		return nil
 	}
 	w := tabwriter.NewWriter(c.Writer, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "REQUEST ID\tMACHINE ID\tGENERATION\tSAFETY CODE\tEXPIRES")
+	fmt.Fprintln(w, "REQUEST ID\tMACHINE ID\tGENERATION\tTRUST CODE\tEXPIRES")
 	for _, item := range pending {
 		fmt.Fprintf(w, "%s\t%s\t%d\t%s\t%s\n", item.RequestID, item.EndpointID, item.Generation, item.SafetyCode, item.ExpiresAt.UTC().Format(time.RFC3339))
 	}
@@ -4763,7 +4830,7 @@ func e2eeApproveMachine(c *command.Context) error {
 	}
 	code := strings.TrimSpace(c.String("code"))
 	if code == "" {
-		return invocationError(errors.New("--code is required after comparing the safety code shown by the machine"))
+		return invocationError(errors.New("--code is required after comparing the trust code shown by the machine"))
 	}
 	result, err := identitybootstrap.ApproveMachine(c.Context, identitybootstrap.ApprovalRequest{Store: store, Client: client, Issuer: profile.Issuer, AccountID: profile.Account.ID, CLIClientSessionID: profile.CLIClientSessionID, RequestID: c.Args().First(), SafetyCode: code})
 	if err != nil {
@@ -4772,7 +4839,7 @@ func e2eeApproveMachine(c *command.Context) error {
 	if c.Bool("json") {
 		return json.NewEncoder(c.Writer).Encode(map[string]any{"approved": true, "request_id": c.Args().First(), "certificate_fingerprint": result.CertificateFingerprint, "root_fingerprint": result.RootFingerprint})
 	}
-	fmt.Fprintf(c.Writer, "Approved machine endpoint %s\nCertificate fingerprint: %s\n", c.Args().First(), result.CertificateFingerprint)
+	fmt.Fprintf(c.Writer, "Trusted machine %s\nIdentity fingerprint: %s\n", c.Args().First(), result.CertificateFingerprint)
 	return nil
 }
 
