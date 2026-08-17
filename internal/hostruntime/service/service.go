@@ -15,15 +15,22 @@ import (
 )
 
 const (
-	Label       = "com.pinksaucepasta.paperboat.runtime-host"
-	HostLabel   = "com.pinksaucepasta.paperboat.runtime-privileged"
-	ConfigLabel = "com.pinksaucepasta.paperboat.runtime-config"
-	DaemonLabel = "com.pinksaucepasta.paperboat.local-daemon"
-	WorkerKind  = "worker"
-	HostKind    = "host"
-	ConfigKind  = "config"
-	DaemonKind  = "daemon"
-	PreviewKind = "preview"
+	// Legacy labels remain for existing monolithic installations. New automatic
+	// update installations use HostdKind and UpdaterKind below.
+	Label         = "com.pinksaucepasta.paperboat.runtime-host"
+	HostLabel     = "com.pinksaucepasta.paperboat.runtime-privileged"
+	ConfigLabel   = "com.pinksaucepasta.paperboat.runtime-config"
+	DaemonLabel   = "com.pinksaucepasta.paperboat.local-daemon"
+	HostdLabel    = "com.pinksaucepasta.paperboat.hostd"
+	UpdaterLabel  = "com.pinksaucepasta.paperboat.updated"
+	WorkerKind    = "worker"
+	HostKind      = "host"
+	ConfigKind    = "config"
+	DaemonKind    = "daemon"
+	PreviewKind   = "preview"
+	HostdKind     = "hostd"
+	UpdaterKind   = "updater"
+	UpgradeReload = "reload_only"
 )
 
 var (
@@ -45,6 +52,11 @@ type Config struct {
 	Group       string
 	Arguments   []string
 	Environment map[string]string
+	// UpgradeMode controls only service-definition activation. The stable hostd
+	// service must not be restarted merely because its definition is rewritten:
+	// ordinary releases replace a child runtime under hostd ownership instead.
+	// The empty value preserves the legacy restart-on-upgrade behavior.
+	UpgradeMode string
 	Controller  Controller
 }
 type Installer struct {
@@ -65,7 +77,7 @@ func New(config Config) (*Installer, error) {
 	if !safeValues([]string{config.Executable}) {
 		return nil, ErrInvalidDefinition
 	}
-	if !safeValues(config.Arguments) || !safeEnvironment(config.Environment) {
+	if !safeValues(config.Arguments) || !safeEnvironment(config.Environment) || config.UpgradeMode != "" && config.UpgradeMode != UpgradeReload {
 		return nil, ErrInvalidDefinition
 	}
 	var path string
@@ -74,6 +86,10 @@ func New(config Config) (*Installer, error) {
 		label := Label
 		if config.Kind == HostKind {
 			label = HostLabel
+		} else if config.Kind == HostdKind {
+			label = HostdLabel
+		} else if config.Kind == UpdaterKind {
+			label = UpdaterLabel
 		} else if config.Kind == ConfigKind {
 			label = ConfigLabel
 		} else if config.Kind == DaemonKind {
@@ -92,13 +108,17 @@ func New(config Config) (*Installer, error) {
 		unit := "paperboat-runtime-host.service"
 		if config.Kind == HostKind {
 			unit = "paperboat-runtime-privileged.service"
+		} else if config.Kind == HostdKind {
+			unit = "paperboat-hostd.service"
+		} else if config.Kind == UpdaterKind {
+			unit = "paperboat-updated.service"
 		} else if config.Kind == ConfigKind {
 			path = filepath.Join(config.ConfigRoot, ".config", "systemd", "user", "paperboat-runtime-config.service")
 		} else if config.Kind == DaemonKind {
 			path = filepath.Join(config.ConfigRoot, ".config", "systemd", "user", "paperboat-local-daemon.service")
 		} else if config.Kind == PreviewKind && safeInstance(config.Instance) {
 			path = filepath.Join(config.ConfigRoot, ".config", "systemd", "user", "paperboat-preview-"+config.Instance+".service")
-		} else if config.Kind != WorkerKind {
+		} else if config.Kind != WorkerKind && config.Kind != HostdKind && config.Kind != UpdaterKind {
 			return nil, ErrInvalidDefinition
 		}
 		if path == "" {
@@ -136,7 +156,15 @@ func (i *Installer) Install(ctx context.Context) error {
 	if err := atomicWrite(i.definitionPath, definition, 0o600); err != nil {
 		return err
 	}
-	if err := i.config.Controller.Apply(ctx, i.definitionPath, upgrading); err != nil {
+	// A stable hostd cannot be reloaded through launchd without restarting it,
+	// and a systemd daemon-reload is unnecessary until the next boot for this
+	// deliberately static definition. Keep the process and every workload it
+	// owns untouched. Initial installation still starts it below.
+	if upgrading && i.config.UpgradeMode == UpgradeReload {
+		return nil
+	}
+	activateUpgrade := upgrading && i.config.UpgradeMode != UpgradeReload
+	if err := i.config.Controller.Apply(ctx, i.definitionPath, activateUpgrade); err != nil {
 		rollbackErr := i.rollback(ctx, previous, upgrading)
 		return errors.Join(err, rollbackErr)
 	}
@@ -155,7 +183,7 @@ func (i *Installer) rollback(ctx context.Context, previous []byte, upgrading boo
 	if err := atomicWrite(i.definitionPath, previous, 0o600); err != nil {
 		return err
 	}
-	return i.config.Controller.Apply(ctx, i.definitionPath, true)
+	return i.config.Controller.Apply(ctx, i.definitionPath, i.config.UpgradeMode != UpgradeReload)
 }
 func (i *Installer) Uninstall(ctx context.Context) error {
 	if err := i.config.Controller.Remove(ctx, i.definitionPath); err != nil {
@@ -183,6 +211,10 @@ func renderLaunchd(config Config) ([]byte, error) {
 	label := Label
 	if config.Kind == HostKind {
 		label = HostLabel
+	} else if config.Kind == HostdKind {
+		label = HostdLabel
+	} else if config.Kind == UpdaterKind {
+		label = UpdaterLabel
 	} else if config.Kind == ConfigKind {
 		label = ConfigLabel
 	} else if config.Kind == DaemonKind {
@@ -218,6 +250,10 @@ func renderSystemd(config Config) ([]byte, error) {
 	description := "Paperboat host runtime"
 	if config.Kind == HostKind {
 		description = "Paperboat host service"
+	} else if config.Kind == HostdKind {
+		description = "Paperboat stable host supervisor"
+	} else if config.Kind == UpdaterKind {
+		description = "Paperboat signed update service"
 	} else if config.Kind == ConfigKind {
 		description = "Paperboat config sync"
 	} else if config.Kind == DaemonKind {
@@ -225,12 +261,19 @@ func renderSystemd(config Config) ([]byte, error) {
 	} else if config.Kind == PreviewKind {
 		description = "Paperboat preview " + config.Instance
 	}
+	after := "local-fs.target"
+	if config.Kind == UpdaterKind {
+		after = "local-fs.target network-online.target"
+	}
 	options := []*unit.UnitOption{
 		unit.NewUnitOption("Unit", "Description", description),
-		unit.NewUnitOption("Unit", "After", "local-fs.target"),
+		unit.NewUnitOption("Unit", "After", after),
 		unit.NewUnitOption("Unit", "StartLimitIntervalSec", "0"),
 	}
-	systemService := config.Kind == WorkerKind || config.Kind == HostKind
+	if config.Kind == UpdaterKind {
+		options = append(options, unit.NewUnitOption("Unit", "Wants", "network-online.target"))
+	}
+	systemService := config.Kind == WorkerKind || config.Kind == HostKind || config.Kind == HostdKind || config.Kind == UpdaterKind
 	notify := systemService
 	serviceType := "simple"
 	if notify {
@@ -271,17 +314,18 @@ func renderSystemd(config Config) ([]byte, error) {
 		)
 	}
 	if systemService {
+		directory := systemDirectoryName(config.Kind)
 		options = append(options,
-			unit.NewUnitOption("Service", "RuntimeDirectory", "paperboat"),
+			unit.NewUnitOption("Service", "RuntimeDirectory", directory),
 			unit.NewUnitOption("Service", "RuntimeDirectoryMode", "0755"),
-			unit.NewUnitOption("Service", "StateDirectory", "paperboat"),
+			unit.NewUnitOption("Service", "StateDirectory", directory),
 			unit.NewUnitOption("Service", "StateDirectoryMode", "0700"),
-			unit.NewUnitOption("Service", "CacheDirectory", "paperboat"),
+			unit.NewUnitOption("Service", "CacheDirectory", directory),
 			unit.NewUnitOption("Service", "CacheDirectoryMode", "0750"),
 		)
 	}
 	noNewPrivileges := "false"
-	if config.Kind == HostKind {
+	if config.Kind == HostKind || config.Kind == HostdKind || config.Kind == UpdaterKind {
 		noNewPrivileges = "true"
 	}
 	options = append(options, unit.NewUnitOption("Service", "NoNewPrivileges", noNewPrivileges))
@@ -296,6 +340,17 @@ func renderSystemd(config Config) ([]byte, error) {
 	}
 	options = append(options, unit.NewUnitOption("Install", "WantedBy", wantedBy))
 	return io.ReadAll(unit.Serialize(options))
+}
+
+func systemDirectoryName(kind string) string {
+	switch kind {
+	case HostdKind:
+		return "paperboat-hostd"
+	case UpdaterKind:
+		return "paperboat-updated"
+	default:
+		return "paperboat"
+	}
 }
 
 func systemdEscape(value string) string {
