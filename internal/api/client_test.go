@@ -114,7 +114,7 @@ func TestNetworkCheckRegionsUsesBoundedPublicContract(t *testing.T) {
 		if r.Method != http.MethodGet || r.URL.Path != "/network-check/regions/v1" {
 			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
 		}
-		writeData(w, http.StatusOK, NetworkCheckRegions{Regions: []NetworkCheckRegion{{Region: "fsn1", STUNURL: "stun:stun.example.test:3478", HTTPSURL: "https://signal.example.test/network-check/v1"}}})
+		writeData(w, http.StatusOK, NetworkCheckRegions{Regions: []NetworkCheckRegion{{RelayID: "pprbt-fsn1", Region: "fsn1", Name: "Falkenstein", STUNURL: "stun:stun.example.test:3478", HTTPSURL: "https://signal.example.test/network-check/v1"}}})
 	}))
 	defer srv.Close()
 	got, err := New(srv.URL, config.Credential{}, srv.Client()).NetworkCheckRegions(context.Background())
@@ -125,8 +125,8 @@ func TestNetworkCheckRegionsUsesBoundedPublicContract(t *testing.T) {
 
 func TestNetworkCheckRegionsRejectsMalformedAuthorityData(t *testing.T) {
 	for _, region := range []NetworkCheckRegion{
-		{Region: "FSN1", STUNURL: "stun:stun.example.test:3478", HTTPSURL: "https://signal.example.test/network-check/v1"},
-		{Region: "fsn1", STUNURL: "stun:stun.example.test", HTTPSURL: "https://signal.example.test/network-check/v1"},
+		{RelayID: "pprbt-fsn1", Region: "FSN1", Name: "Falkenstein", STUNURL: "stun:stun.example.test:3478", HTTPSURL: "https://signal.example.test/network-check/v1"},
+		{RelayID: "pprbt-fsn1", Region: "fsn1", Name: "Falkenstein", STUNURL: "stun:stun.example.test", HTTPSURL: "https://signal.example.test/network-check/v1"},
 		{Region: "fsn1", STUNURL: "stun:stun.example.test:3478", HTTPSURL: "https://signal.example.test/other"},
 	} {
 		t.Run(region.Region+region.STUNURL+region.HTTPSURL, func(t *testing.T) {

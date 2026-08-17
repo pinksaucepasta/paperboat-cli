@@ -154,7 +154,9 @@ type ClientConfiguration struct {
 }
 
 type NetworkCheckRegion struct {
+	RelayID  string `json:"relay_id"`
 	Region   string `json:"region"`
+	Name     string `json:"name"`
 	STUNURL  string `json:"stun_url"`
 	HTTPSURL string `json:"https_url"`
 }
@@ -173,7 +175,7 @@ func (c *Client) NetworkCheckRegions(ctx context.Context) (NetworkCheckRegions, 
 	}
 	seen := make(map[string]bool, len(out.Regions))
 	for _, region := range out.Regions {
-		if !validRegionCode(region.Region) || seen[region.Region] || !validSTUNProbeURL(region.STUNURL) || !validHTTPSProbeURL(region.HTTPSURL) {
+		if !validRegionCode(region.RelayID) || !validRegionCode(region.Region) || strings.TrimSpace(region.Name) == "" || len(region.Name) > 80 || seen[region.Region] || !validSTUNProbeURL(region.STUNURL) || !validHTTPSProbeURL(region.HTTPSURL) {
 			return NetworkCheckRegions{}, errors.New("paperboat-server returned an invalid network-check region")
 		}
 		seen[region.Region] = true
