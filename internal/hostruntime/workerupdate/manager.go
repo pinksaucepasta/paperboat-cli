@@ -670,13 +670,16 @@ func validateConfig(config Config) error {
 }
 
 func validateRelease(release Release) error {
-	if !validVersion(release.Version) || len(release.SHA256) != 64 || release.Length < 1 || release.Length > maxRuntimeBytes || release.Platform != runtime.GOOS || release.Architecture != runtime.GOARCH || !hexDigest(release.SHA256) || invalidAPIRange(release.HostdAPIMin, release.HostdAPIMax) || invalidAPIRange(release.RuntimeAPIMin, release.RuntimeAPIMax) {
+	if !validVersion(release.Version) || len(release.SHA256) != 64 || release.Length < 1 || release.Length > maxRuntimeBytes || release.Platform != runtime.GOOS || release.Architecture != runtime.GOARCH || !hexDigest(release.SHA256) || invalidRequiredAPIRange(release.HostdAPIMin, release.HostdAPIMax) || invalidRequiredAPIRange(release.RuntimeAPIMin, release.RuntimeAPIMax) {
 		return ErrInvalidRelease
 	}
 	return nil
 }
 func invalidAPIRange(minimum, maximum uint16) bool { return minimum > maximum || maximum > 1024 }
-func hexDigest(value string) bool                  { _, err := hex.DecodeString(value); return err == nil }
+func invalidRequiredAPIRange(minimum, maximum uint16) bool {
+	return minimum == 0 || invalidAPIRange(minimum, maximum)
+}
+func hexDigest(value string) bool { _, err := hex.DecodeString(value); return err == nil }
 func validVersion(value string) bool {
 	parts := strings.Split(value, ".")
 	if len(parts) != 4 {

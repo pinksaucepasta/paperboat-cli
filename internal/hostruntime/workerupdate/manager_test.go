@@ -104,6 +104,19 @@ func TestWorkerUpdateRejectsTamperedArtifactBeforeCandidateStart(t *testing.T) {
 	}
 }
 
+func TestWorkerUpdateRejectsUnsignedCompatibilityRange(t *testing.T) {
+	fixture := newFixture(t)
+	invalid := fixture.candidate
+	invalid.HostdAPIMin, invalid.HostdAPIMax = 0, 0
+	_, err := fixture.manager.Activate(context.Background(), invalid)
+	if !errors.Is(err, ErrInvalidRelease) {
+		t.Fatalf("error=%v", err)
+	}
+	if fixture.starter.starts != 0 {
+		t.Fatalf("candidate started with an invalid API range")
+	}
+}
+
 func TestSchedulerAdapterOnlyRunsSafeManagerTransaction(t *testing.T) {
 	fixture := newFixture(t)
 	scheduler, err := fixture.manager.MandatoryScheduler(func(context.Context) (Release, bool, error) {
