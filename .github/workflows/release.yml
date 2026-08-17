@@ -33,9 +33,11 @@ jobs:
         env:
           VERSION: ${{ github.ref_name }}
           DEFAULT_SERVER_URL: ${{ vars.PAPERBOAT_DEFAULT_SERVER_URL }}
+          DEFAULT_RELEASE_URL: ${{ vars.PAPERBOAT_DEFAULT_RELEASE_URL }}
         run: |
           set -euo pipefail
           test -n "${DEFAULT_SERVER_URL}" || { echo "PAPERBOAT_DEFAULT_SERVER_URL repository variable is required" >&2; exit 1; }
+          test -n "${DEFAULT_RELEASE_URL}" || { echo "PAPERBOAT_DEFAULT_RELEASE_URL repository variable is required" >&2; exit 1; }
           case "${DEFAULT_SERVER_URL}" in https://*) ;; *) echo "PAPERBOAT_DEFAULT_SERVER_URL must use https" >&2; exit 1 ;; esac
           mkdir -p dist stage
           version="${VERSION}"
@@ -44,7 +46,7 @@ jobs:
             os="${target%/*}"
             arch="${target#*/}"
             CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath \
-              -ldflags="-s -w -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Version=$version -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Commit=$commit -X github.com/pinksaucepasta/paperboat/internal/buildinfo.ProtocolVersion=1 -X github.com/pinksaucepasta/paperboat/internal/buildinfo.DefaultServerURL=${DEFAULT_SERVER_URL}" \
+              -ldflags="-s -w -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Version=$version -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Commit=$commit -X github.com/pinksaucepasta/paperboat/internal/buildinfo.ProtocolVersion=1 -X github.com/pinksaucepasta/paperboat/internal/buildinfo.DefaultServerURL=${DEFAULT_SERVER_URL} -X github.com/pinksaucepasta/paperboat/internal/buildinfo.DefaultReleaseURL=${DEFAULT_RELEASE_URL}" \
               -o "stage/pb" ./cmd/pb
             cp "stage/pb" "dist/pb_${VERSION}_${os}_${arch}"
             cp "stage/pb" "dist/pb-${os}-${arch}"

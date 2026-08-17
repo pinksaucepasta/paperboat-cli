@@ -104,6 +104,16 @@ func TestPingCommandAndOutputContract(t *testing.T) {
 	}
 }
 
+func TestUpdateCommandContract(t *testing.T) {
+	command, _, err := newRootCommand().Find([]string{"update"})
+	if err != nil || command == nil {
+		t.Fatalf("find update: %v", err)
+	}
+	if command.Use != "update" || command.Flags().Lookup("json") == nil {
+		t.Fatalf("unexpected update command contract: %q", command.Use)
+	}
+}
+
 func TestPeerRacePolicyUsesOneSecondDirectPreference(t *testing.T) {
 	policy := peerRacePolicy()
 	if policy.RelayDelay != time.Second || policy.WSSDelay != time.Second || policy.ConnectTimeout != 20*time.Second {

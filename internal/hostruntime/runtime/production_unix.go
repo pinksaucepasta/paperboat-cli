@@ -369,7 +369,7 @@ func NewProductionHost(ctx context.Context, version string, environ func(string)
 	if err != nil {
 		return nil, err
 	}
-	if err := waitForPeerEnrollment(ctx, peerEnrollment, 2*time.Second); err != nil {
+	if err := allowPendingPeerEnrollment(ctx, peerEnrollment); err != nil {
 		return nil, err
 	}
 	fetcher, err := auth.NewHTTPJWKSFetcher(controlURL.ResolveReference(&url.URL{Path: "/.well-known/jwks.json"}).String(), []string{controlURL.Hostname()}, transport)
@@ -802,7 +802,7 @@ func newProductionReceiveCoordinator(ctx context.Context, version string, enviro
 	if err != nil {
 		return nil, err
 	}
-	if err := waitForPeerEnrollment(ctx, peerEnrollment, 2*time.Second); err != nil {
+	if err := allowPendingPeerEnrollment(ctx, peerEnrollment); err != nil {
 		return nil, err
 	}
 	fetcher, err := auth.NewHTTPJWKSFetcher(controlURL.ResolveReference(&url.URL{Path: "/.well-known/jwks.json"}).String(), []string{controlURL.Hostname()}, transport)
@@ -894,6 +894,18 @@ func newProductionReceiveCoordinator(ctx context.Context, version string, enviro
 
 type peerEnrollmentEnsurer interface {
 	Ensure(context.Context) error
+}
+
+func allowPendingPeerEnrollment(ctx context.Context, enrollment peerEnrollmentEnsurer) error {
+	err := enrollment.Ensure(ctx)
+	if !errors.Is(err, peeridentityenrollment.ErrPending) {
+		return err
+	}
+	var pending *peeridentityenrollment.PendingError
+	if errors.As(err, &pending) {
+		slog.Warn("machine endpoint approval pending; relay connectivity remains available", "request_id", pending.RequestID, "safety_code", pending.SafetyCode, "expires_at", pending.ExpiresAt)
+	}
+	return nil
 }
 
 func waitForPeerEnrollment(ctx context.Context, enrollment peerEnrollmentEnsurer, interval time.Duration) error {

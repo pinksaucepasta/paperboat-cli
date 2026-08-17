@@ -54,6 +54,7 @@ import (
 	filetransfer "github.com/pinksaucepasta/paperboat/internal/filetransfer"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/bootstrap"
 	helperconfig "github.com/pinksaucepasta/paperboat/internal/hostruntime/config"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostservice"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/identity"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/preview"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/servelease"
@@ -78,6 +79,7 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/prompt"
 	"github.com/pinksaucepasta/paperboat/internal/resolver"
 	"github.com/pinksaucepasta/paperboat/internal/selector"
+	"github.com/pinksaucepasta/paperboat/internal/selfupdate"
 	servepkg "github.com/pinksaucepasta/paperboat/internal/serve"
 	"github.com/pinksaucepasta/paperboat/internal/session"
 	"github.com/pinksaucepasta/paperboat/internal/statusbar"
@@ -2236,6 +2238,7 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(userMachineCobraCommand())
 	root.AddCommand(pairCommand())
 	root.AddCommand(setupCommand())
+	root.AddCommand(updateCommand())
 	root.AddCommand(unpairCommand())
 	root.AddCommand(uninstallCommand())
 	root.AddCommand(sendCommand())
@@ -2253,6 +2256,111 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(configRuntimeCommand())
 	configureShellCompletion(root)
 	return root
+}
+
+type updateResult struct {
+	PreviousVersion string `json:"previous_version"`
+	Version         string `json:"version"`
+	CLIUpdated      bool   `json:"cli_updated"`
+	RuntimeUpdated  bool   `json:"runtime_updated"`
+	RuntimeDeferred bool   `json:"runtime_deferred"`
+	ActiveSessions  uint64 `json:"active_sessions,omitempty"`
+}
+
+func updateCommand() *cobra.Command {
+	command := &cobra.Command{Use: "update", Short: "Update pb from the signed Paperboat release", Args: commandArgs(cobra.NoArgs), RunE: actionUpdate}
+	command.Flags().Bool("json", false, "print JSON")
+	return command
+}
+
+func actionUpdate(command *cobra.Command, _ []string) error {
+	releaseURL := strings.TrimSpace(buildinfo.DefaultReleaseURL)
+	if releaseURL == "" {
+		return errors.New("this pb build does not define a signed release origin")
+	}
+	ctx, cancel := context.WithTimeout(command.Context(), 3*time.Minute)
+	defer cancel()
+	artifact, err := selfupdate.Resolve(ctx, releaseURL, &http.Client{Transport: httptransport.Default(), Timeout: 30 * time.Second})
+	if err != nil {
+		return fmt.Errorf("resolve latest signed release: %w", err)
+	}
+	result := updateResult{PreviousVersion: buildinfo.Version, Version: artifact.Version}
+	if buildinfo.Version != "dev" {
+		comparison, compareErr := selfupdate.CompareVersions(artifact.Version, buildinfo.Version)
+		if compareErr != nil || comparison < 0 {
+			return errors.New("the signed release origin returned an older version; refusing to downgrade pb")
+		}
+	}
+	stateRoot, stateErr := helperconfig.DefaultStateRoot(os.Getenv)
+	if stateErr != nil {
+		return stateErr
+	}
+	verified, fetchErr := bootstrap.FetchVerifiedArtifact(ctx, artifact, filepath.Join(stateRoot, "self-update", "tuf"), &http.Client{Transport: httptransport.Default(), Timeout: 2 * time.Minute})
+	if fetchErr != nil {
+		return fmt.Errorf("verify latest signed pb release: %w", fetchErr)
+	}
+	health, healthErr := localUpdateHealth(ctx)
+	runtimeInstalled := healthErr == nil
+	if runtimeInstalled && health.Version != artifact.Version {
+		if health.Workloads.Sessions > 0 {
+			result.RuntimeDeferred, result.ActiveSessions = true, health.Workloads.Sessions
+		} else {
+			client, clientErr := hostservice.NewClient("/var/run/paperboat/host-service.sock", 2*time.Minute)
+			if clientErr != nil {
+				return clientErr
+			}
+			if _, clientErr = client.Activate(ctx, artifact); clientErr != nil {
+				return fmt.Errorf("activate managed runtime update: %w", clientErr)
+			}
+			result.RuntimeUpdated = true
+		}
+	}
+	if buildinfo.Version != artifact.Version {
+		executable, executableErr := os.Executable()
+		if executableErr != nil {
+			return executableErr
+		}
+		if executableErr = selfupdate.InstallCLI(executable, verified); executableErr != nil {
+			return fmt.Errorf("install pb update: %w", executableErr)
+		}
+		result.CLIUpdated = true
+	}
+	jsonOutput, _ := command.Flags().GetBool("json")
+	if jsonOutput {
+		return json.NewEncoder(command.OutOrStdout()).Encode(result)
+	}
+	if !result.CLIUpdated && !result.RuntimeUpdated && !result.RuntimeDeferred {
+		fmt.Fprintf(command.OutOrStdout(), "pb %s is already up to date.\n", artifact.Version)
+		return nil
+	}
+	if result.RuntimeDeferred {
+		fmt.Fprintf(command.OutOrStdout(), "Updated pb to %s. The managed runtime update was deferred to preserve %d active session(s); run `pb update` again after they finish.\n", artifact.Version, result.ActiveSessions)
+		return nil
+	}
+	fmt.Fprintf(command.OutOrStdout(), "Updated pb to %s.\n", artifact.Version)
+	return nil
+}
+
+type updateHealthDocument struct {
+	Version   string `json:"version"`
+	Workloads struct {
+		Sessions uint64 `json:"sessions"`
+	} `json:"workloads"`
+}
+
+func localUpdateHealth(ctx context.Context) (updateHealthDocument, error) {
+	request, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://127.0.0.1:38080/healthz", nil)
+	client := &http.Client{Timeout: 2 * time.Second}
+	response, err := client.Do(request)
+	if err != nil {
+		return updateHealthDocument{}, err
+	}
+	defer response.Body.Close()
+	var document updateHealthDocument
+	if response.StatusCode != http.StatusOK || json.NewDecoder(io.LimitReader(response.Body, 64<<10)).Decode(&document) != nil || document.Version == "" {
+		return updateHealthDocument{}, errors.New("managed runtime health is unavailable")
+	}
+	return document, nil
 }
 
 const shellCompletionDeadline = 200 * time.Millisecond

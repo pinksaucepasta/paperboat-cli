@@ -14,3 +14,7 @@ var ProtocolVersion = "1"
 // DefaultServerURL is the default paperboat-server base URL. Replaced by
 // release builds; empty requires server_url or --server at runtime.
 var DefaultServerURL = ""
+
+// DefaultReleaseURL is the HTTPS origin serving the signed TUF repository.
+// Release builds replace it with the production release origin.
+var DefaultReleaseURL = ""

@@ -30,6 +30,7 @@
     {"name":"config show","aliases":[],"args":[],"json":true},
     {"name":"config path","aliases":[],"args":[]},
     {"name":"setup","aliases":[],"args":[],"flags":["--mode <receive|session|host>","--ssh-port <1-65535>","--recovery-output <absolute-path>"],"interactive":true},
+    {"name":"update","aliases":[],"args":[],"flags":["--json"],"json":true},
     {"name":"pair","aliases":[],"args":[],"interactive":true},
     {"name":"unpair","aliases":[],"args":[],"destructive":true},
     {"name":"uninstall","aliases":[],"args":[],"interactive":true,"destructive":true},
