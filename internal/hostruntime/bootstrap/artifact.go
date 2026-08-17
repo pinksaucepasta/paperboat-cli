@@ -3,6 +3,7 @@ package bootstrap
 import (
 	"context"
 	_ "embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -56,6 +57,13 @@ type tufReleaseIndexCustom struct {
 	Schema       string `json:"schema"`
 	Kind         string `json:"kind"`
 	Channel      string `json:"channel"`
+	Platform     string `json:"platform"`
+	Architecture string `json:"architecture"`
+}
+type tufReleaseComponentCustom struct {
+	Schema       string `json:"schema"`
+	Kind         string `json:"kind"`
+	Version      string `json:"version"`
 	Platform     string `json:"platform"`
 	Architecture string `json:"architecture"`
 }
@@ -119,6 +127,65 @@ func FetchVerifiedReleaseIndex(ctx context.Context, repositoryURL, stateDirector
 		return releaseindex.Index{}, ErrArtifactMismatch
 	}
 	return index, nil
+}
+
+// FetchVerifiedReleaseComponent obtains one component named by an already
+// verified release index. Both the index and the TUF target metadata must agree
+// on the fixed component name, platform, architecture, length, and digest.
+// The caller receives only a local verified artifact path; it must still stage
+// the bytes into its own privileged release directory.
+func FetchVerifiedReleaseComponent(ctx context.Context, repositoryURL, stateDirectory string, index releaseindex.Index, component string, httpClient *http.Client, now time.Time) (string, error) {
+	if index.Validate(now) != nil || index.Platform != runtime.GOOS || index.Architecture != runtime.GOARCH || !filepath.IsAbs(stateDirectory) || filepath.Clean(stateDirectory) != stateDirectory {
+		return "", ErrArtifactTarget
+	}
+	target, ok := index.Component(component)
+	if !ok || component != "runtime" && component != "cli" && component != "hostd" && component != "updater" && component != "launcher" {
+		return "", ErrArtifactTarget
+	}
+	if err := secureDirectory(stateDirectory); err != nil {
+		return "", err
+	}
+	parsed, err := url.Parse(repositoryURL)
+	if err != nil || parsed.Scheme != "https" || parsed.User != nil || parsed.Hostname() == "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", ErrArtifactTarget
+	}
+	configuration, err := config.New(strings.TrimRight(repositoryURL, "/")+"/metadata/", trustedRoot)
+	if err != nil {
+		return "", err
+	}
+	configuration.LocalMetadataDir = filepath.Join(stateDirectory, "metadata")
+	configuration.LocalTargetsDir = filepath.Join(stateDirectory, "targets")
+	configuration.RemoteTargetsURL = strings.TrimRight(repositoryURL, "/") + "/targets/"
+	configuration.PrefixTargetsWithHash = true
+	configuration.MaxRootRotations, configuration.RootMaxLength, configuration.TimestampMaxLength, configuration.SnapshotMaxLength, configuration.TargetsMaxLength = 32, 128<<10, 64<<10, 256<<10, 512<<10
+	httpClient = secureArtifactHTTPClient(httpClient, parsedOrigin(repositoryURL))
+	if err := configuration.SetDefaultFetcherHTTPClient(httpClient); err != nil {
+		return "", err
+	}
+	client, err := updater.New(configuration)
+	if err != nil {
+		return "", err
+	}
+	if err := client.Refresh(); err != nil {
+		return "", err
+	}
+	info, err := client.GetTargetInfo(target.TargetPath)
+	digest, hasDigest := info.Hashes["sha256"]
+	if err != nil || !hasDigest || info.Length != target.Length || hex.EncodeToString(digest) != target.SHA256 || info.Custom == nil {
+		return "", ErrArtifactMismatch
+	}
+	var custom tufReleaseComponentCustom
+	decoder := json.NewDecoder(strings.NewReader(string(*info.Custom)))
+	decoder.DisallowUnknownFields()
+	var extra any
+	if decoder.Decode(&custom) != nil || decoder.Decode(&extra) != io.EOF || custom.Schema != ArtifactTargetSchemaV1 || custom.Kind != component || custom.Version != index.Version || custom.Platform != target.Platform || custom.Architecture != target.Architecture {
+		return "", ErrArtifactMismatch
+	}
+	path, _, err := client.DownloadTarget(info, "", "")
+	if err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 func VerifyArtifactTarget(target ArtifactTarget) error {

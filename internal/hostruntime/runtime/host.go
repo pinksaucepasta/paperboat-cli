@@ -623,6 +623,16 @@ func (h *Host) Start(ctx context.Context) error {
 	return nil
 }
 
+// StartStable starts only hostd-owned workloads and ingress. It deliberately
+// does not start the in-process Runtime worker: production hostd uses this
+// entry point and launches the active runtime as a separately fenced process.
+func (h *Host) StartStable(ctx context.Context) error {
+	if h.hostd == nil {
+		return ErrHostInvalid
+	}
+	return h.hostd.Start(ctx)
+}
+
 // ReplaceWorker swaps coordination only. Hostd-owned workload managers,
 // accepted ingress, PTYs and streams continue running throughout the change.
 func (h *Host) ReplaceWorker(ctx context.Context, candidate *Runtime) error {
@@ -652,6 +662,15 @@ func (h *Host) Shutdown(ctx context.Context) error {
 		return worker.Shutdown(ctx)
 	}
 	return errors.Join(h.workers.Shutdown(ctx), h.hostd.Shutdown(ctx))
+}
+
+// ShutdownStable is used by the stable hostd process after its external worker
+// has been stopped. It is reserved for actual supervisor shutdown.
+func (h *Host) ShutdownStable(ctx context.Context) error {
+	if h.hostd == nil {
+		return ErrHostInvalid
+	}
+	return h.hostd.Shutdown(ctx)
 }
 func (h *Host) State() State {
 	h.workerMu.RLock()

@@ -139,7 +139,11 @@ func (s *Server) serveOne(connection *net.UnixConn) {
 	defer connection.Close()
 	_ = connection.SetDeadline(time.Now().Add(s.config.RequestTimeout))
 	uid, err := s.config.peerUID(connection)
-	if err != nil || uid != s.config.UID {
+	// The enrolled worker UID may use the lifecycle API. The local root updater
+	// may also connect, but it still needs the per-installation capability and
+	// cannot create a valid lease for an existing worker. Root access is needed
+	// only to query a persisted cutover after power loss.
+	if err != nil || uid != s.config.UID && uid != 0 {
 		return
 	}
 	token := make([]byte, installationTokenBytes)

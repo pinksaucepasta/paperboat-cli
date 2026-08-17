@@ -58,7 +58,7 @@ func TestRuntimeWorkerEntryActivatesFencedHostdLease(t *testing.T) {
 		done <- runWorker(workerCtx, []string{
 			"--socket", filepath.Join(root, "socket", "hostd.sock"), "--token-file", tokenPath,
 			"--worker-id", "runtime-test", "--version", "test", "--heartbeat", "1s",
-		}, &output, &bytes.Buffer{})
+		}, bytes.NewReader(nil), &output, &bytes.Buffer{})
 	}()
 	deadline = time.Now().Add(time.Second)
 	for server.Status().State != hostdproto.StateActive {
@@ -71,7 +71,7 @@ func TestRuntimeWorkerEntryActivatesFencedHostdLease(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	if output.String() != "pb runtime worker ready\n" {
+	if output.String() != "ready 1 1\nactive 1 1\n" {
 		t.Fatalf("output=%q", output.String())
 	}
 }

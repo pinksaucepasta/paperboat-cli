@@ -92,6 +92,17 @@ func TestSocketRejectsUnauthorizedUIDAndCapability(t *testing.T) {
 	}
 }
 
+func TestSocketAllowsRootUpdaterOnlyWithCapability(t *testing.T) {
+	config := testSocketConfig(t)
+	config.peerUID = func(*net.UnixConn) (int, error) { return 0, nil }
+	_, cancel, done := startSocketServer(t, config)
+	defer stopSocketServer(t, cancel, done)
+	client := testSocketClient(t, config)
+	if _, err := client.Request(context.Background(), Hello{WorkerID: "runtime", Version: "1", APIMin: 1, APIMax: 1}); err != nil {
+		t.Fatalf("root updater request: %v", err)
+	}
+}
+
 func TestSocketRepliesWithTypedErrorsAndBoundsRequests(t *testing.T) {
 	config := testSocketConfig(t)
 	config.RequestTimeout = 100 * time.Millisecond

@@ -97,7 +97,7 @@ func execute(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 		return 0
 	}
 	if args[0] == "worker" {
-		if err := runWorker(ctx, args[1:], stdout, stderr); err != nil {
+		if err := runWorker(ctx, args[1:], stdin, stdout, stderr); err != nil {
 			writeError(stderr, err)
 			return 1
 		}
