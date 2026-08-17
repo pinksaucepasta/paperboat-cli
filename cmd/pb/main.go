@@ -69,6 +69,7 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/paste"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/connectionmanager"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/identitybootstrap"
+	"github.com/pinksaucepasta/paperboat/internal/peertransport/networkcheck"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/recoverykey"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/transfercrypto"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/transportmanager"
@@ -2021,6 +2022,72 @@ func purgeUserPaperboatState(command *cobra.Command) error {
 	return result
 }
 
+type relayListResult struct {
+	RelayID string  `json:"relay_id"`
+	Name    string  `json:"name"`
+	Region  string  `json:"region"`
+	Status  string  `json:"status"`
+	RTTMS   float64 `json:"rtt_ms,omitempty"`
+}
+
+func actionRelayList(command *cobra.Command, _ []string) error {
+	cfg, err := config.Load(configPathFlag(command))
+	if err != nil {
+		return err
+	}
+	if server, _ := command.Flags().GetString("server"); strings.TrimSpace(server) != "" {
+		cfg.ServerURL, err = config.NormalizeServerURL(server)
+		if err != nil {
+			return err
+		}
+	}
+	regions, err := api.New(cfg.ServerURL, config.Credential{}, nil).NetworkCheckRegions(command.Context())
+	if err != nil {
+		return err
+	}
+	probe, err := networkcheck.NewRegionalProbe(networkcheck.RegionalProbeConfig{
+		Timeout: 3 * time.Second,
+		STUN:    networkcheck.STUNRegionalLatency(net.DefaultResolver, 2*time.Second),
+		HTTPS:   networkcheck.HTTPSRegionalLatency(time.Now, &http.Client{Timeout: 3 * time.Second}),
+	})
+	if err != nil {
+		return err
+	}
+	results := make([]relayListResult, len(regions.Regions))
+	var wait sync.WaitGroup
+	for index, region := range regions.Regions {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			result := relayListResult{RelayID: region.RelayID, Name: region.Name, Region: region.Region, Status: "unreachable"}
+			rtt, probeErr := probe.Probe(command.Context(), networkcheck.ProbeRegion{Region: region.Region, STUNURL: region.STUNURL, HTTPSURL: region.HTTPSURL})
+			if probeErr == nil {
+				result.Status = "healthy"
+				result.RTTMS = float64(rtt) / float64(time.Millisecond)
+			}
+			results[index] = result
+		}()
+	}
+	wait.Wait()
+	jsonOutput, _ := command.Flags().GetBool("json")
+	if jsonOutput {
+		return json.NewEncoder(command.OutOrStdout()).Encode(struct {
+			Schema string            `json:"schema"`
+			Relays []relayListResult `json:"relays"`
+		}{Schema: "paperboat.relay-list/v1", Relays: results})
+	}
+	writer := tabwriter.NewWriter(command.OutOrStdout(), 0, 4, 2, ' ', 0)
+	_, _ = fmt.Fprintln(writer, "RELAY\tNAME\tREGION\tSTATUS\tRTT")
+	for _, result := range results {
+		rtt := "-"
+		if result.RTTMS > 0 {
+			rtt = fmt.Sprintf("%.1fms", result.RTTMS)
+		}
+		_, _ = fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\n", result.RelayID, result.Name, result.Region, result.Status, rtt)
+	}
+	return writer.Flush()
+}
+
 func newRootCommand() *cobra.Command {
 	root := &cobra.Command{
 		Use:   "pb [environment] [new]",
@@ -2126,6 +2193,11 @@ func newRootCommand() *cobra.Command {
 	ping.Flags().String("transport", "a", "peer transport: a, d, q, w, or r")
 	ping.Flags().Bool("json", false, "print JSON")
 	root.AddCommand(ping)
+	relay := &cobra.Command{Use: "relay", Short: "Inspect Paperboat relays"}
+	relayList := &cobra.Command{Use: "list", Short: "List relays and measure current latency", Args: commandArgs(cobra.NoArgs), RunE: actionRelayList}
+	relayList.Flags().Bool("json", false, "print JSON")
+	relay.AddCommand(relayList)
+	root.AddCommand(relay)
 
 	authTree := specTree(authCommand(), "auth")
 	authTree.RunE = func(command *cobra.Command, _ []string) error {
