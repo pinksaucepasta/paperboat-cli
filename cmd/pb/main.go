@@ -256,8 +256,42 @@ func hostRuntimeCommand() *cobra.Command {
 		Args:   commandArgs(cobra.NoArgs),
 		RunE: func(command *cobra.Command, _ []string) error {
 			code := hostruntimecmd.Execute(
-				command.Context(), []string{"run"}, command.InOrStdin(), command.OutOrStdout(), command.ErrOrStderr(),
+				command.Context(), []string{"hostd"}, command.InOrStdin(), command.OutOrStdout(), command.ErrOrStderr(),
 			)
+			if code != 0 {
+				return exitCodeError{code: code}
+			}
+			return nil
+		},
+		SilenceUsage:  true,
+		SilenceErrors: true,
+	}
+}
+
+func hostdRuntimeCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:    "__runtime-hostd",
+		Hidden: true,
+		Args:   commandArgs(cobra.NoArgs),
+		RunE: func(command *cobra.Command, _ []string) error {
+			code := hostruntimecmd.Execute(command.Context(), []string{"hostd"}, command.InOrStdin(), command.OutOrStdout(), command.ErrOrStderr())
+			if code != 0 {
+				return exitCodeError{code: code}
+			}
+			return nil
+		},
+		SilenceUsage:  true,
+		SilenceErrors: true,
+	}
+}
+
+func runtimeWorkerCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:                "__runtime-worker",
+		Hidden:             true,
+		DisableFlagParsing: true,
+		RunE: func(command *cobra.Command, args []string) error {
+			code := hostruntimecmd.Execute(command.Context(), append([]string{"worker"}, args...), command.InOrStdin(), command.OutOrStdout(), command.ErrOrStderr())
 			if code != 0 {
 				return exitCodeError{code: code}
 			}
@@ -2244,6 +2278,8 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(sendCommand())
 	root.AddCommand(transferCommand())
 	root.AddCommand(hostRuntimeCommand())
+	root.AddCommand(hostdRuntimeCommand())
+	root.AddCommand(runtimeWorkerCommand())
 	root.AddCommand(localDaemonCommand())
 	root.AddCommand(statusCommand())
 	root.AddCommand(waitCommand())

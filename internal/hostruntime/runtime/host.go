@@ -24,6 +24,7 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/execprocess"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/filetransfer"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/health"
+	stablehostd "github.com/pinksaucepasta/paperboat/internal/hostruntime/hostd"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/observability"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/operation"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/preview"
@@ -100,10 +101,14 @@ type HostedLifecycle interface {
 }
 
 type Host struct {
+	workerMu sync.RWMutex
 	runtime  *Runtime
+	hostd    *stablehostd.Daemon
+	workers  *stablehostd.WorkerController
 	http     *HTTPService
 	handler  http.Handler
 	sessions *session.Manager
+	health   *runtimeHealthSource
 }
 
 func NewReceiveCoordinator(ctx context.Context, config HostConfig, dependencies HostDependencies) (_ *Host, resultErr error) {
@@ -482,59 +487,75 @@ func NewHost(ctx context.Context, config HostConfig, dependencies HostDependenci
 	if err != nil {
 		return nil, err
 	}
-	components := make([]Component, 0, 8)
+	// The stable daemon owns every component which terminates or routes a live
+	// workload. A replaceable worker only coordinates policy and the control
+	// plane. This is the update boundary: stopping a worker must never call
+	// ShutdownForRecovery or close a connection accepted by hostd.
+	stableComponents := make([]stablehostd.Component, 0, 12)
 	transferCleanup := &filetransfer.CleanupWorker{Service: transferService}
-	components = append(components,
-		Component{Capability: "storage", Required: true, Service: shutdownService{shutdown: func(context.Context) error { return durable.Close() }}},
-		Component{Capability: "sessions", Required: true, Service: shutdownService{shutdown: sessions.ShutdownForRecovery}},
-		Component{Capability: "file_transfer_cleanup", Required: true, Service: transferCleanup},
+	stableComponents = append(stableComponents,
+		stablehostd.Component{Name: "storage", Required: true, Service: shutdownService{shutdown: func(context.Context) error { return durable.Close() }}},
+		stablehostd.Component{Name: "sessions", Required: true, Service: shutdownService{shutdown: sessions.Shutdown}},
+		stablehostd.Component{Name: "file_transfer_cleanup", Required: true, Service: transferCleanup},
 	)
 	if dependencies.CodexSessions != nil {
-		components = append(components, Component{Capability: "codex.v1", Required: false, Service: &codexSessionService{manager: dependencies.CodexSessions}})
+		stableComponents = append(stableComponents, stablehostd.Component{Name: "codex.v1", Required: false, Service: &codexSessionService{manager: dependencies.CodexSessions}})
 	}
+	workerComponents := []Component{{Capability: "worker_lifecycle", Required: true, Service: workerLifecycleService{}}}
 	if dependencies.AuthorizationService != nil {
-		components = append(components, Component{Capability: "authorization", Required: false, Service: dependencies.AuthorizationService})
+		workerComponents = append(workerComponents, Component{Capability: "authorization", Required: false, Service: dependencies.AuthorizationService})
 	}
 	if dependencies.ConfigSync != nil {
-		components = append(components, Component{
+		workerComponents = append(workerComponents, Component{
 			Capability: "config_sync", Required: config.Runtime.Profile == runtimeconfig.BYOD,
 			Service: dependencies.ConfigSync,
 		})
 	}
-	components = append(components, Component{Capability: "protocol", Required: true, Service: protocolServer})
+	stableComponents = append(stableComponents, stablehostd.Component{Name: "protocol", Required: true, Service: protocolServer})
 	if nativePeerService != nil {
-		components = append(components, Component{Capability: "peer_transport", Required: false, Service: nativePeerService})
+		stableComponents = append(stableComponents, stablehostd.Component{Name: "peer_transport", Required: false, Service: nativePeerService})
 	}
 	if dependencies.PreviewService != nil {
-		components = append(components, Component{Capability: "target", Required: false, Service: dependencies.PreviewService})
+		stableComponents = append(stableComponents, stablehostd.Component{Name: "target", Required: false, Service: dependencies.PreviewService})
 	}
 	if dependencies.PreviewRecovery != nil {
-		components = append(components, Component{Capability: "preview_recovery", Required: false, Service: dependencies.PreviewRecovery})
+		stableComponents = append(stableComponents, stablehostd.Component{Name: "preview_recovery", Required: false, Service: dependencies.PreviewRecovery})
 	}
 	if dependencies.ServeLeases != nil {
-		components = append(components, Component{Capability: "serve_lease", Required: false, Service: dependencies.ServeLeases})
+		stableComponents = append(stableComponents, stablehostd.Component{Name: "serve_lease", Required: false, Service: dependencies.ServeLeases})
 	}
 	if dependencies.RuntimeObservationService != nil {
-		components = append(components, Component{Capability: "runtime_observation", Required: false, Service: dependencies.RuntimeObservationService})
+		workerComponents = append(workerComponents, Component{Capability: "runtime_observation", Required: false, Service: dependencies.RuntimeObservationService})
 	}
 	if dependencies.ManagedSSHService != nil {
-		components = append(components, Component{Capability: "managed_ssh_authority", Required: false, Service: dependencies.ManagedSSHService})
+		stableComponents = append(stableComponents, stablehostd.Component{Name: "managed_ssh_authority", Required: false, Service: dependencies.ManagedSSHService})
 	}
 	if dependencies.Connector != nil {
-		components = append(components, Component{Capability: "edge", Required: true, Service: dependencies.Connector})
+		stableComponents = append(stableComponents, stablehostd.Component{Name: "edge", Required: true, Service: dependencies.Connector})
 	}
 	// Start hosted preparation after transport dependencies. Reverse shutdown then
 	// flushes hosted state before connector drain and the final runtime observation.
 	if dependencies.HostedLifecycle != nil {
-		components = append(components, Component{Capability: "hosted_lifecycle", Required: true, Service: dependencies.HostedLifecycle})
+		workerComponents = append(workerComponents, Component{Capability: "hosted_lifecycle", Required: true, Service: dependencies.HostedLifecycle})
 	}
-	components = append(components, Component{Capability: "control_plane", Required: true, Service: httpService})
-	runtime, err := NewRuntime(Config{Version: config.Runtime.Version, Components: components, ShutdownTimeout: config.ShutdownTimeout})
+	stableComponents = append(stableComponents, stablehostd.Component{Name: "control_plane", Required: true, Service: httpService})
+	daemon, err := stablehostd.New(stablehostd.Config{
+		Workloads:  stablehostd.Workloads{Sessions: sessions, Executions: executions, Transfers: transferService, Previews: dependencies.Previews, Codex: dependencies.CodexSessions, ServeLeases: dependencies.ServeLeases, ManagedSSH: dependencies.ManagedSSH},
+		Components: stableComponents, ShutdownTimeout: config.ShutdownTimeout,
+	})
+	if err != nil {
+		return nil, errors.Join(ErrHostInvalid, err)
+	}
+	runtime, err := NewRuntime(Config{Version: config.Runtime.Version, Components: workerComponents, ShutdownTimeout: config.ShutdownTimeout})
 	if err != nil {
 		return nil, err
 	}
-	healthSource.set(runtime, components)
-	return &Host{runtime: runtime, http: httpService, handler: mux, sessions: sessions}, nil
+	workers, err := stablehostd.NewWorkerController(daemon)
+	if err != nil {
+		return nil, errors.Join(ErrHostInvalid, err)
+	}
+	healthSource.set(runtime, workerComponents)
+	return &Host{runtime: runtime, hostd: daemon, workers: workers, http: httpService, handler: mux, sessions: sessions, health: healthSource}, nil
 }
 
 func hostWorkloadCounts(sessions *session.Manager, transferRoot string) map[string]uint64 {
@@ -584,14 +605,72 @@ func writeAgentToken(path string, random io.Reader) (string, error) {
 	return token, nil
 }
 
-func (h *Host) Start(ctx context.Context) error    { return h.runtime.Start(ctx) }
-func (h *Host) Shutdown(ctx context.Context) error { return h.runtime.Shutdown(ctx) }
-func (h *Host) State() State                       { return h.runtime.State() }
+func (h *Host) Start(ctx context.Context) error {
+	h.workerMu.RLock()
+	worker := h.runtime
+	h.workerMu.RUnlock()
+	if h.hostd == nil || h.workers == nil {
+		return worker.Start(ctx)
+	}
+	if err := h.hostd.Start(ctx); err != nil {
+		return err
+	}
+	if err := h.workers.Start(ctx, worker); err != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		return errors.Join(err, h.hostd.Shutdown(shutdownCtx))
+	}
+	return nil
+}
+
+// ReplaceWorker swaps coordination only. Hostd-owned workload managers,
+// accepted ingress, PTYs and streams continue running throughout the change.
+func (h *Host) ReplaceWorker(ctx context.Context, candidate *Runtime) error {
+	if h.workers == nil {
+		return ErrHostInvalid
+	}
+	if candidate == nil {
+		return ErrHostInvalid
+	}
+	if err := h.workers.Replace(ctx, candidate); err != nil {
+		return err
+	}
+	h.workerMu.Lock()
+	h.runtime = candidate
+	h.workerMu.Unlock()
+	if h.health != nil {
+		h.health.set(candidate, candidate.config.Components)
+	}
+	return nil
+}
+
+func (h *Host) Shutdown(ctx context.Context) error {
+	h.workerMu.RLock()
+	worker := h.runtime
+	h.workerMu.RUnlock()
+	if h.hostd == nil || h.workers == nil {
+		return worker.Shutdown(ctx)
+	}
+	return errors.Join(h.workers.Shutdown(ctx), h.hostd.Shutdown(ctx))
+}
+func (h *Host) State() State {
+	h.workerMu.RLock()
+	defer h.workerMu.RUnlock()
+	return h.runtime.State()
+}
 
 type shutdownService struct{ shutdown func(context.Context) error }
 
 func (shutdownService) Start(context.Context) error          { return nil }
 func (s shutdownService) Shutdown(ctx context.Context) error { return s.shutdown(ctx) }
+
+// workerLifecycleService represents the replaceable runtime process itself.
+// It has no workload ownership; hostd owns all state which survives a worker
+// update.
+type workerLifecycleService struct{}
+
+func (workerLifecycleService) Start(context.Context) error    { return nil }
+func (workerLifecycleService) Shutdown(context.Context) error { return nil }
 
 type serviceGroup []Service
 

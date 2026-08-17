@@ -12,7 +12,8 @@ import (
 const usage = `pb internal host runtime.
 
 Usage:
-  pb __runtime-host
+  pb __runtime-hostd
+  pb __runtime-worker
 
 This entry point is managed by Paperboat services and is not a user command.`
 
@@ -79,6 +80,24 @@ func execute(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 			return 2
 		}
 		if err := runProduction(ctx, stdout); err != nil {
+			writeError(stderr, err)
+			return 1
+		}
+		return 0
+	}
+	if args[0] == "hostd" {
+		if len(args) != 1 {
+			writeError(stderr, fmt.Errorf("hostd does not accept arguments"))
+			return 2
+		}
+		if err := runHostd(ctx, stdout); err != nil {
+			writeError(stderr, err)
+			return 1
+		}
+		return 0
+	}
+	if args[0] == "worker" {
+		if err := runWorker(ctx, args[1:], stdout, stderr); err != nil {
 			writeError(stderr, err)
 			return 1
 		}
