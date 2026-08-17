@@ -14,6 +14,11 @@ import (
 
 var ErrEngineInvalid = errors.New("invalid config sync engine")
 
+const (
+	initialSyncRetryDelay = 100 * time.Millisecond
+	maximumSyncRetryDelay = 2 * time.Second
+)
+
 type Syncer interface {
 	Sync(context.Context, string) (PublishResult, error)
 }
@@ -258,7 +263,7 @@ func (e *Engine) syncNow(ctx context.Context) error {
 	e.mu.Unlock()
 	e.report(ctx)
 
-	result, err := e.syncer.Sync(ctx, remoteRevision)
+	result, err := e.syncWithRetry(ctx, remoteRevision)
 	e.mu.Lock()
 	watcher := e.watcher
 	e.mu.Unlock()
@@ -322,6 +327,18 @@ func (e *Engine) syncNow(ctx context.Context) error {
 		e.status.State = "warning"
 		e.status.ErrorCode = "writes_disabled"
 		e.status.RecoveryActions = []string{"wait_for_rollout"}
+	case errors.Is(err, ErrLeaseBusy):
+		e.status.State = "pending"
+		e.status.ErrorCode = "lease_busy"
+		e.status.RecoveryActions = []string{"wait_for_lease"}
+	case errors.Is(err, ErrLeaseLost):
+		e.status.State = "pending"
+		e.status.ErrorCode = "lease_lost"
+		e.status.RecoveryActions = []string{"retry"}
+	case errors.Is(err, ErrRemoteRevisionChanged):
+		e.status.State = "pending"
+		e.status.ErrorCode = "remote_revision_changed"
+		e.status.RecoveryActions = []string{"retry"}
 	case errors.Is(err, ErrManifestMissing):
 		e.status.State = "error"
 		e.status.ErrorCode = "manifest_missing"
@@ -330,7 +347,7 @@ func (e *Engine) syncNow(ctx context.Context) error {
 		e.status.State = "error"
 		e.status.ErrorCode = "manifest_invalid"
 		e.status.RecoveryActions = []string{"fix_manifest"}
-	case errors.Is(err, ErrAuthorization), errors.Is(err, ErrLeaseLost):
+	case errors.Is(err, ErrAuthorization):
 		e.status.State = "revoked"
 		e.status.ErrorCode = "credential_expired"
 	default:
@@ -340,6 +357,51 @@ func (e *Engine) syncNow(ctx context.Context) error {
 	e.mu.Unlock()
 	e.report(ctx)
 	return err
+}
+
+func (e *Engine) syncWithRetry(ctx context.Context, remoteRevision string) (PublishResult, error) {
+	for attempt := 0; attempt < e.descriptor.Policy.RetryLimit; attempt++ {
+		result, err := e.syncer.Sync(ctx, remoteRevision)
+		if err == nil || !retryableSyncError(err) || attempt+1 == e.descriptor.Policy.RetryLimit {
+			return result, err
+		}
+		delay := syncRetryDelay(attempt)
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return PublishResult{}, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return PublishResult{}, ErrEngineInvalid
+}
+
+func retryableSyncError(err error) bool {
+	return err != nil &&
+		!errors.Is(err, context.Canceled) &&
+		!errors.Is(err, context.DeadlineExceeded) &&
+		!errors.Is(err, ErrConfigConflict) &&
+		!errors.Is(err, ErrSyncUncertain) &&
+		!errors.Is(err, ErrAuthorization) &&
+		!errors.Is(err, ErrWritesDisabled) &&
+		!errors.Is(err, ErrManifestMissing) &&
+		!errors.Is(err, ErrManifestInvalid) &&
+		!errors.Is(err, ErrManifestUnsafePath) &&
+		!errors.Is(err, ErrBaselineInvalid)
+}
+
+func syncRetryDelay(attempt int) time.Duration {
+	delay := initialSyncRetryDelay
+	for index := 0; index < attempt && delay < maximumSyncRetryDelay; index++ {
+		delay *= 2
+	}
+	if delay > maximumSyncRetryDelay {
+		return maximumSyncRetryDelay
+	}
+	return delay
 }
 
 func (e *Engine) report(ctx context.Context) {

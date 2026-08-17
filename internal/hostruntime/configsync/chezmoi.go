@@ -128,13 +128,8 @@ func ValidateConfigRepository(root string) error {
 		if strings.HasSuffix(name, ".tmpl") {
 			return fmt.Errorf("%w: template at %q", ErrConfigRepositoryInvalid, relative)
 		}
-		for _, unsafe := range []string{
-			"run_", "run_once_", "run_onchange_", "modify_", "external_", "remove_",
-			"create_", "exact_", "executable_",
-		} {
-			if strings.HasPrefix(name, unsafe) || strings.Contains(name, "_"+unsafe) {
-				return fmt.Errorf("%w: executable attribute at %q", ErrConfigRepositoryInvalid, relative)
-			}
+		if unsafeChezmoiSourceName(name) {
+			return fmt.Errorf("%w: unsafe chezmoi attribute at %q", ErrConfigRepositoryInvalid, relative)
 		}
 		if !entry.IsDir() {
 			info, infoErr := entry.Info()
@@ -144,6 +139,27 @@ func ValidateConfigRepository(root string) error {
 		}
 		return nil
 	})
+}
+
+func unsafeChezmoiSourceName(name string) bool {
+	// chezmoi's literal attribute stops subsequent filename attributes from
+	// taking effect. Preserve ordinary target files whose names happen to use a
+	// reserved word while still rejecting attributes that occur before literal.
+	if strings.HasSuffix(name, ".literal") {
+		return false
+	}
+	if index := strings.Index(name, "literal_"); index >= 0 {
+		name = name[:index]
+	}
+	for _, unsafe := range []string{
+		"run_", "run_once_", "run_onchange_", "modify_", "external_", "remove_",
+		"create_", "exact_", "encrypted_",
+	} {
+		if strings.HasPrefix(name, unsafe) || strings.Contains(name, "_"+unsafe) {
+			return true
+		}
+	}
+	return false
 }
 
 func writePrivateAtomic(path string, data []byte) error {

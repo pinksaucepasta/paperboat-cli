@@ -94,3 +94,48 @@ func TestApplyJournalRejectsWrongAssignmentWithoutMutation(t *testing.T) {
 		t.Fatalf("target mutated = %q, %v", content, err)
 	}
 }
+
+func TestApplyJournalRecoversValidBase64ExpandedBatch(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := filepath.Join(root, "home")
+	state := filepath.Join(root, "state")
+	if err := os.Mkdir(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(state, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const maxBatchBytes = 4 << 20
+	target := filepath.Join(home, "value")
+	original := make([]byte, maxBatchBytes)
+	for index := range original {
+		original[index] = byte(index)
+	}
+	if err := os.WriteFile(target, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	journal := filepath.Join(state, "apply-journal.json")
+	if err := beginApplyJournal(journal, home, "repo", "assignment", "revision", []string{"value"}, maxBatchBytes); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() <= maxBatchBytes+(1<<20) {
+		t.Fatalf("journal size = %d, expected base64 expansion beyond former recovery limit", info.Size())
+	}
+	if err := os.WriteFile(target, []byte("changed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := recoverApplyJournal(journal, home, "repo", "assignment", maxBatchBytes); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := os.ReadFile(target)
+	if err != nil || string(restored) != string(original) {
+		t.Fatalf("restored content mismatch: %d bytes, %v", len(restored), err)
+	}
+}

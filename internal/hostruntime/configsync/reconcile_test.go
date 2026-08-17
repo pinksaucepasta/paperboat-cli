@@ -45,12 +45,22 @@ func TestPlanReconciliationModes(t *testing.T) {
 	}
 	push := PlanReconciliationMode(base, local, remote, ModePushOnly)
 	if len(push.PublishUpdates) != 1 || push.PublishUpdates[0] != "local" || len(push.ApplyRemote) != 0 ||
-		len(push.Conflicts) != 1 || push.Conflicts[0].Path != "remote" {
+		len(push.Conflicts) != 0 {
 		t.Fatalf("push-only plan = %#v", push)
 	}
 	bidirectional := PlanReconciliationMode(base, local, remote, ModeBidirectional)
 	if len(bidirectional.PublishUpdates) != 1 || len(bidirectional.ApplyRemote) != 1 || len(bidirectional.Conflicts) != 0 {
 		t.Fatalf("bidirectional plan = %#v", bidirectional)
+	}
+}
+
+func TestPushOnlyConflictsOnlyOnConcurrentPathChanges(t *testing.T) {
+	base := map[string]FileState{"path": {Hash: "base"}}
+	local := map[string]FileState{"path": {Hash: "local"}}
+	remote := map[string]FileState{"path": {Hash: "remote"}}
+	plan := PlanReconciliationMode(base, local, remote, ModePushOnly)
+	if len(plan.Conflicts) != 1 || plan.Conflicts[0].Path != "path" {
+		t.Fatalf("push-only concurrent conflict plan = %#v", plan)
 	}
 }
 

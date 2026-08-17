@@ -21,6 +21,23 @@ func (s failingSyncer) Sync(context.Context, string) (PublishResult, error) {
 	return PublishResult{}, s.err
 }
 
+type retryingSyncer struct {
+	mu       sync.Mutex
+	failures int
+	calls    int
+	err      error
+}
+
+func (s *retryingSyncer) Sync(context.Context, string) (PublishResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	if s.calls <= s.failures {
+		return PublishResult{}, s.err
+	}
+	return PublishResult{RemoteRevision: "head", Landed: true}, nil
+}
+
 func (s *recordingSyncer) Sync(context.Context, string) (PublishResult, error) {
 	s.mu.Lock()
 	s.calls++
@@ -167,7 +184,79 @@ func TestEngineRecordsFailedSyncRevisionWithoutSuccess(t *testing.T) {
 	if err := engine.Apply(context.Background()); !errors.Is(err, ErrRemoteRevisionChanged) {
 		t.Fatalf("error = %v", err)
 	}
-	if engine.status.SyncRevision != 1 || engine.status.State != "error" || engine.status.LastSuccessfulAt != nil {
+	if engine.status.SyncRevision != 1 || engine.status.State != "pending" || engine.status.ErrorCode != "remote_revision_changed" || engine.status.LastSuccessfulAt != nil {
 		t.Fatalf("failed sync status = %#v", engine.status)
+	}
+}
+
+func TestEngineRetriesSafeFailuresAndReportsLeaseContention(t *testing.T) {
+	home, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor := RuntimeDescriptor{
+		WriteMode: "leased_writes", Mode: ModeBidirectional, RepositoryID: "repository", AssignmentID: "assignment",
+		EnvironmentID: "environment", MachineID: "helper", WarningRevision: "warning", InstallationGeneration: 1,
+		Policy: RuntimePolicy{
+			Format: "paperboat-config-plaintext-v1", Revision: "policy", ManifestContract: ManifestContractVersion,
+			ManifestMaxBytes: DefaultManifestMaxBytes, ManifestMaxLines: DefaultManifestMaxLines, ManifestMaxPatternBytes: DefaultManifestMaxPatternBytes,
+			MaxFileBytes: 1 << 20, MaxBatchBytes: 2 << 20, Debounce: time.Second, MinimumPushInterval: time.Minute,
+			MaximumDirtyDelay: time.Minute, RemotePollInterval: time.Hour, RetryLimit: 3, ShutdownFlushTimeout: time.Second, SummaryLimit: 10,
+		},
+	}
+	syncer := &retryingSyncer{failures: 2, err: ErrLeaseBusy}
+	engine, err := NewEngine(EngineConfig{HomeRoot: home, Descriptor: descriptor, Syncer: syncer})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.Apply(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if syncer.calls != 3 || engine.status.State != "healthy" {
+		t.Fatalf("calls = %d, status = %#v", syncer.calls, engine.status)
+	}
+
+	engine, err = NewEngine(EngineConfig{HomeRoot: home, Descriptor: descriptor, Syncer: failingSyncer{err: ErrLeaseBusy}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.Apply(context.Background()); !errors.Is(err, ErrLeaseBusy) {
+		t.Fatalf("error = %v", err)
+	}
+	if engine.status.State != "pending" || engine.status.ErrorCode != "lease_busy" ||
+		len(engine.status.RecoveryActions) != 1 || engine.status.RecoveryActions[0] != "wait_for_lease" {
+		t.Fatalf("lease contention status = %#v", engine.status)
+	}
+}
+
+func TestEngineDoesNotRetryUncertainPublication(t *testing.T) {
+	home, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor := testEngineDescriptor(3)
+	syncer := &retryingSyncer{failures: 3, err: ErrSyncUncertain}
+	engine, err := NewEngine(EngineConfig{HomeRoot: home, Descriptor: descriptor, Syncer: syncer})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.Apply(context.Background()); !errors.Is(err, ErrSyncUncertain) {
+		t.Fatalf("error = %v", err)
+	}
+	if syncer.calls != 1 || engine.status.State != "sync_uncertain" {
+		t.Fatalf("calls = %d, status = %#v", syncer.calls, engine.status)
+	}
+}
+
+func testEngineDescriptor(retryLimit int) RuntimeDescriptor {
+	return RuntimeDescriptor{
+		WriteMode: "leased_writes", Mode: ModeBidirectional, RepositoryID: "repository", AssignmentID: "assignment",
+		EnvironmentID: "environment", MachineID: "helper", WarningRevision: "warning", InstallationGeneration: 1,
+		Policy: RuntimePolicy{
+			Format: "paperboat-config-plaintext-v1", Revision: "policy", ManifestContract: ManifestContractVersion,
+			ManifestMaxBytes: DefaultManifestMaxBytes, ManifestMaxLines: DefaultManifestMaxLines, ManifestMaxPatternBytes: DefaultManifestMaxPatternBytes,
+			MaxFileBytes: 1 << 20, MaxBatchBytes: 2 << 20, Debounce: time.Second, MinimumPushInterval: time.Minute,
+			MaximumDirtyDelay: time.Minute, RemotePollInterval: time.Hour, RetryLimit: retryLimit, ShutdownFlushTimeout: time.Second, SummaryLimit: 10,
+		},
 	}
 }

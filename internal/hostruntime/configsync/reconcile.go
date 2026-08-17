@@ -63,12 +63,6 @@ func PlanReconciliationMode(baseline, local, remote map[string]FileState, mode A
 		switch {
 		case !statesDiffer:
 			continue
-		case mode == ModePushOnly && remoteChanged:
-			bytes := int64(0)
-			if remoteOK {
-				bytes = remoteState.Bytes
-			}
-			plan.Conflicts = append(plan.Conflicts, PathSummary{Path: path, Bytes: bytes, Reason: "remote_update"})
 		case localChanged && remoteChanged:
 			bytes := int64(0)
 			if remoteOK {

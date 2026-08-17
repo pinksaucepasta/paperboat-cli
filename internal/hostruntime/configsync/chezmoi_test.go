@@ -8,15 +8,45 @@ import (
 )
 
 func TestPlaintextRepositoryRejectsUnsafeChezmoiSource(t *testing.T) {
+	for _, name := range []string{"run_once_bad", "encrypted_dot_config", "encrypted_literal_dot_config"} {
+		t.Run(name, func(t *testing.T) {
+			root, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(root, name), []byte("unsafe"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := ValidateConfigRepository(root); err == nil {
+				t.Fatal("unsafe chezmoi source accepted")
+			}
+		})
+	}
+}
+
+func TestPlaintextRepositoryAllowsExecutableChezmoiSource(t *testing.T) {
 	root, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(root, "run_once_bad"), []byte("unsafe"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "executable_dot_script"), []byte("#!/bin/sh\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := ValidateConfigRepository(root); err == nil {
-		t.Fatal("executable chezmoi source accepted")
+	if err := ValidateConfigRepository(root); err != nil {
+		t.Fatalf("executable source rejected: %v", err)
+	}
+}
+
+func TestPlaintextRepositoryAllowsLiteralEncryptedFilename(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "literal_encrypted_dot_config"), []byte("plain"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateConfigRepository(root); err != nil {
+		t.Fatalf("literal filename rejected: %v", err)
 	}
 }
 

@@ -81,6 +81,9 @@ func beginApplyJournal(path, homeRoot, repositoryID, assignmentID, remoteRevisio
 	if err != nil {
 		return err
 	}
+	if int64(len(plaintext)) > encodedApplyJournalLimit(maxBytes) {
+		return ErrApplyJournalInvalid
+	}
 	return writePrivateAtomic(path, append(plaintext, '\n'))
 }
 
@@ -89,8 +92,9 @@ func recoverApplyJournal(path, homeRoot, repositoryID, assignmentID string, maxB
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
+	maxJournalBytes := encodedApplyJournalLimit(maxBytes)
 	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 ||
-		info.Mode().Perm()&0o077 != 0 || info.Size() > maxBytes+(1<<20) {
+		info.Mode().Perm()&0o077 != 0 || info.Size() > maxJournalBytes {
 		return errors.Join(ErrApplyJournalInvalid, err)
 	}
 	file, err := os.Open(path)
@@ -99,11 +103,14 @@ func recoverApplyJournal(path, homeRoot, repositoryID, assignmentID string, maxB
 	}
 	defer file.Close()
 	var journal applyJournal
-	decoder := json.NewDecoder(io.LimitReader(file, maxBytes+(1<<20)))
+	decoder := json.NewDecoder(io.LimitReader(file, maxJournalBytes))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&journal) != nil || !errors.Is(decoder.Decode(&struct{}{}), io.EOF) ||
 		journal.Format != "paperboat-config-apply-journal-v1" ||
 		journal.RepositoryID != repositoryID || journal.AssignmentID != assignmentID {
+		return ErrApplyJournalInvalid
+	}
+	if !validApplyJournalEntries(journal.Entries, maxBytes) {
 		return ErrApplyJournalInvalid
 	}
 	for index := len(journal.Entries) - 1; index >= 0; index-- {
@@ -112,6 +119,46 @@ func recoverApplyJournal(path, homeRoot, repositoryID, assignmentID string, maxB
 		}
 	}
 	return os.Remove(path)
+}
+
+// encodedApplyJournalLimit accounts for JSON's base64 encoding of each
+// applyJournalEntry.Content value. The raw rollback content is limited to
+// maxBytes by beginApplyJournal; recovery must accept the corresponding valid
+// encoded journal while retaining a bounded parser input.
+func encodedApplyJournalLimit(maxBytes int64) int64 {
+	if maxBytes <= 0 {
+		return 0
+	}
+	return maxBytes + (maxBytes+2)/3 + (1 << 20)
+}
+
+func validApplyJournalEntries(entries []applyJournalEntry, maxBytes int64) bool {
+	if maxBytes <= 0 {
+		return false
+	}
+	var total int64
+	for _, entry := range entries {
+		if !safeRelativeStatusPath(entry.Path) {
+			return false
+		}
+		if entry.Mode&os.ModeSymlink != 0 {
+			if !entry.Existed || entry.Target == "" || filepath.IsAbs(entry.Target) || len(entry.Content) != 0 {
+				return false
+			}
+			continue
+		}
+		if !entry.Existed {
+			if entry.Mode != 0 || entry.Target != "" || len(entry.Content) != 0 {
+				return false
+			}
+			continue
+		}
+		if !entry.Mode.IsRegular() || entry.Target != "" || int64(len(entry.Content)) > maxBytes-total {
+			return false
+		}
+		total += int64(len(entry.Content))
+	}
+	return true
 }
 
 func restoreApplyJournalEntry(homeRoot string, entry applyJournalEntry) error {
