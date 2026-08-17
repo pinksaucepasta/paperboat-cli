@@ -288,6 +288,21 @@ func (c *Client) Request(ctx context.Context, request Message) (Message, error) 
 	return response, nil
 }
 
+// Active reads hostd's persisted worker fence through the authenticated local
+// socket. It is deliberately read-only, so a root updater can resolve an
+// interrupted cutover without receiving any workload-control capability.
+func (c *Client) Active(ctx context.Context) (Status, error) {
+	response, err := c.Request(ctx, Status{State: StateEmpty})
+	if err != nil {
+		return Status{}, err
+	}
+	status, ok := response.(*Status)
+	if !ok || status.validate() != nil {
+		return Status{}, ErrInvalidFrame
+	}
+	return *status, nil
+}
+
 func errorForCode(code string) error {
 	switch code {
 	case "incompatible":

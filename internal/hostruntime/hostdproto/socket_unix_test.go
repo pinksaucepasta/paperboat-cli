@@ -43,6 +43,10 @@ func TestSocketLifecyclePersistsFenceAndRejectsSupersededWorker(t *testing.T) {
 	if err := clientHeartbeat(client, second); err != nil {
 		t.Fatalf("new heartbeat: %v", err)
 	}
+	status, err := client.Active(context.Background())
+	if err != nil || status.State != StateActive || status.WorkerID != "runtime-new" || status.Epoch != second.Epoch {
+		t.Fatalf("status=%+v err=%v", status, err)
+	}
 	if info, err := os.Stat(config.SocketPath); err != nil || info.Mode().Perm() != 0o600 {
 		t.Fatalf("socket permissions info=%v err=%v", info, err)
 	}
@@ -154,6 +158,39 @@ func TestSocketClientMapsRemoteFencingError(t *testing.T) {
 	}
 	if _, err := client.Request(context.Background(), heartbeatFor(first)); !errors.Is(err, ErrFenced) {
 		t.Fatalf("fenced response error=%v, want ErrFenced", err)
+	}
+}
+
+func TestCandidatePerformsReadyActivateAndFencesPriorWorker(t *testing.T) {
+	config := testSocketConfig(t)
+	_, cancel, done := startSocketServer(t, config)
+	defer stopSocketServer(t, cancel, done)
+	client := testSocketClient(t, config)
+	first, err := NewCandidate(client, "runtime-old", "2026.08.18.1", 1, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Ready(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Activate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewCandidate(client, "runtime-new", "2026.08.18.2", 1, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.Ready(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.Activate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Heartbeat(context.Background()); !errors.Is(err, ErrFenced) {
+		t.Fatalf("old worker heartbeat=%v", err)
+	}
+	if err := second.Heartbeat(context.Background()); err != nil {
+		t.Fatalf("active worker heartbeat=%v", err)
 	}
 }
 

@@ -63,6 +63,9 @@ type Journal struct {
 	StagedPath       string    `json:"staged_path,omitempty"`
 	HostdAPIMin      uint16    `json:"hostd_api_min,omitempty"`
 	HostdAPIMax      uint16    `json:"hostd_api_max,omitempty"`
+	RuntimeAPIMin    uint16    `json:"runtime_api_min,omitempty"`
+	RuntimeAPIMax    uint16    `json:"runtime_api_max,omitempty"`
+	WorkerID         string    `json:"worker_id,omitempty"`
 	WorkerEpoch      uint64    `json:"worker_epoch,omitempty"`
 	BootID           string    `json:"boot_id"`
 	StageUpdatedAt   time.Time `json:"stage_updated_at"`
@@ -77,7 +80,7 @@ func (j Journal) Validate() error {
 	if j.Schema != SchemaV1 || !validID(j.TransactionID) || !validVersion(j.ActiveVersion) || !validID(j.BootID) || j.StageUpdatedAt.IsZero() {
 		return ErrInvalidJournal
 	}
-	if !knownStage(j.Stage) || !knownFailure(j.LastFailure) || j.HostdAPIMin > j.HostdAPIMax {
+	if !knownStage(j.Stage) || !knownFailure(j.LastFailure) || invalidRange(j.HostdAPIMin, j.HostdAPIMax) || invalidRange(j.RuntimeAPIMin, j.RuntimeAPIMax) {
 		return ErrInvalidJournal
 	}
 	if j.RollbackVersion != "" && !validVersion(j.RollbackVersion) || j.CandidateVersion != "" && !validVersion(j.CandidateVersion) {
@@ -92,10 +95,14 @@ func (j Journal) Validate() error {
 	if requiresCandidate(j.Stage) && (j.CandidateVersion == "" || j.CandidateDigest == "" || j.CandidateLength <= 0 || j.StagedPath == "") {
 		return ErrInvalidJournal
 	}
-	if (j.Stage == StageCutover || j.Stage == StageMonitoring || j.Stage == StageCommitted) && j.WorkerEpoch == 0 {
+	if (j.Stage == StageCutover || j.Stage == StageMonitoring || j.Stage == StageCommitted) && (j.WorkerEpoch == 0 || !validID(j.WorkerID)) {
 		return ErrInvalidJournal
 	}
 	return nil
+}
+
+func invalidRange(minimum, maximum uint16) bool {
+	return minimum > maximum || maximum > 1024
 }
 
 func (j Journal) Transition(next Stage, now time.Time) (Journal, error) {

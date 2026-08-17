@@ -16,7 +16,7 @@ func validJournal(root string, stage Stage) Journal {
 		ActiveVersion: "2026.08.18.3", RollbackVersion: "2026.08.17.1",
 		CandidateVersion: "2026.08.19.1", CandidateDigest: strings.Repeat("a", 64),
 		CandidateLength: 1024, StagedPath: filepath.Join(root, "runtime.staged"),
-		HostdAPIMin: 1, HostdAPIMax: 2, WorkerEpoch: 4, BootID: "boot_1",
+		HostdAPIMin: 1, HostdAPIMax: 2, WorkerID: "runtime_4", WorkerEpoch: 4, BootID: "boot_1",
 		StageUpdatedAt: time.Date(2026, 8, 18, 1, 0, 0, 0, time.UTC)}
 }
 

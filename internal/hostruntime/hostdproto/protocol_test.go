@@ -142,8 +142,10 @@ func TestControllerHandleAcceptsOnlyLifecycleMessages(t *testing.T) {
 	} else if status, ok := response.(Status); !ok || status.State != StateActive {
 		t.Fatalf("heartbeat response=%+v", response)
 	}
-	if _, err := controller.Handle(Status{State: StateEmpty}); !errors.Is(err, ErrInvalidFrame) {
-		t.Fatalf("status request error=%v, want ErrInvalidFrame", err)
+	if response, err = controller.Handle(Status{State: StateEmpty}); err != nil {
+		t.Fatalf("status request error=%v", err)
+	} else if status, ok := response.(Status); !ok || status.State != StateActive {
+		t.Fatalf("status response=%+v", response)
 	}
 }
 
@@ -175,6 +177,31 @@ func TestControllerRejectsUnreadyStaleAndIncompatibleCandidates(t *testing.T) {
 	}
 	if _, err := controller.Activate(Activate{WorkerID: second.WorkerID, APIVersion: second.APIVersion, Epoch: second.Epoch, Lease: testLease(9)}); !errors.Is(err, ErrFenced) {
 		t.Fatalf("forged activate error=%v, want ErrFenced", err)
+	}
+}
+
+func TestControllerReturnsActiveFenceForEmptyStatusQuery(t *testing.T) {
+	controller, err := NewController(ControllerConfig{APIMin: 1, APIMax: 1, Random: bytes.NewReader(bytes.Repeat([]byte{7}, 32))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	welcome, err := controller.Negotiate(Hello{WorkerID: "runtime", Version: "1", APIMin: 1, APIMax: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.MarkReady(readyFor(welcome)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.Activate(activateFor(welcome)); err != nil {
+		t.Fatal(err)
+	}
+	response, err := controller.Handle(Status{State: StateEmpty})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, ok := response.(Status)
+	if !ok || status.State != StateActive || status.Epoch != welcome.Epoch {
+		t.Fatalf("response=%+v", response)
 	}
 }
 

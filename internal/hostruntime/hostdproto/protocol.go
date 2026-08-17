@@ -454,6 +454,17 @@ func (c *Controller) Status() Status {
 	return Status{State: StateEmpty}
 }
 
+// CandidateStatus is intentionally distinct from Status: while an old worker
+// is active, a ready candidate must still receive proof of its own epoch.
+func (c *Controller) CandidateStatus() Status {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.candidate.epoch != 0 {
+		return statusFor(c.candidate, StateCandidate)
+	}
+	return Status{State: StateEmpty}
+}
+
 // Handle is the only lifecycle dispatch needed by a future local socket
 // server. It deliberately accepts no opaque application operation: callers
 // must add a separately reviewed, typed hostd API for new worker privileges.
@@ -470,12 +481,12 @@ func (c *Controller) Handle(message Message) (Message, error) {
 		if err := c.MarkReady(value); err != nil {
 			return nil, err
 		}
-		return c.Status(), nil
+		return c.CandidateStatus(), nil
 	case *Ready:
 		if err := c.MarkReady(*value); err != nil {
 			return nil, err
 		}
-		return c.Status(), nil
+		return c.CandidateStatus(), nil
 	case Activate:
 		return c.Activate(value)
 	case *Activate:
@@ -488,6 +499,16 @@ func (c *Controller) Handle(message Message) (Message, error) {
 	case *Heartbeat:
 		if err := c.AcceptHeartbeat(*value); err != nil {
 			return nil, err
+		}
+		return c.Status(), nil
+	case Status:
+		if value.State != StateEmpty {
+			return nil, ErrInvalidFrame
+		}
+		return c.Status(), nil
+	case *Status:
+		if value.State != StateEmpty {
+			return nil, ErrInvalidFrame
 		}
 		return c.Status(), nil
 	default:
