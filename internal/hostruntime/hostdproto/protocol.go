@@ -326,6 +326,8 @@ type Controller struct {
 	random    io.Reader
 	active    worker
 	candidate worker
+	lastEpoch uint64
+	persist   func(Status) error
 }
 
 type worker struct {
@@ -337,9 +339,13 @@ type worker struct {
 }
 
 type ControllerConfig struct {
-	APIMin uint16
-	APIMax uint16
-	Random io.Reader
+	APIMin       uint16
+	APIMax       uint16
+	Random       io.Reader
+	InitialEpoch uint64
+	// PersistActivation must crash-consistently record the new active fence.
+	// Activate does not expose or accept the new epoch until this succeeds.
+	PersistActivation func(Status) error
 }
 
 func NewController(config ControllerConfig) (*Controller, error) {
@@ -349,7 +355,10 @@ func NewController(config ControllerConfig) (*Controller, error) {
 	if config.Random == nil {
 		config.Random = rand.Reader
 	}
-	return &Controller{apiMin: config.APIMin, apiMax: config.APIMax, random: config.Random}, nil
+	return &Controller{
+		apiMin: config.APIMin, apiMax: config.APIMax, random: config.Random,
+		lastEpoch: config.InitialEpoch, persist: config.PersistActivation,
+	}, nil
 }
 
 // Negotiate replaces any unready candidate with a freshly fenced candidate.
@@ -364,14 +373,18 @@ func (c *Controller) Negotiate(hello Hello) (Welcome, error) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.active.epoch == ^uint64(0) {
+	if c.active.epoch > c.lastEpoch {
+		c.lastEpoch = c.active.epoch
+	}
+	if c.lastEpoch == ^uint64(0) {
 		return Welcome{}, ErrEpochExhausted
 	}
 	lease, err := c.newUniqueLeaseLocked()
 	if err != nil {
 		return Welcome{}, err
 	}
-	epoch := c.active.epoch + 1
+	epoch := c.lastEpoch + 1
+	c.lastEpoch = epoch
 	c.candidate = worker{workerID: hello.WorkerID, apiVersion: apiVersion, epoch: epoch, lease: lease}
 	return Welcome{WorkerID: hello.WorkerID, APIVersion: apiVersion, Epoch: epoch, Lease: lease}, nil
 }
@@ -404,8 +417,14 @@ func (c *Controller) Activate(message Activate) (Status, error) {
 	if !c.candidate.ready {
 		return Status{}, ErrNotReady
 	}
+	status := statusFor(c.candidate, StateActive)
+	if c.persist != nil {
+		if err := c.persist(status); err != nil {
+			return Status{}, fmt.Errorf("persist hostd worker activation: %w", err)
+		}
+	}
 	c.active, c.candidate = c.candidate, worker{}
-	return statusFor(c.active, StateActive), nil
+	return status, nil
 }
 
 // AcceptHeartbeat is the gate that future worker operations must use before
