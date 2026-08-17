@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 contracts=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-repo=$(basename "$(CDPATH= cd -- "$contracts/../.." && pwd)")
+repo=paperboat
 manifest="$contracts/manifest.json"
 consumer="$contracts/consumer.json"
 command -v jq >/dev/null 2>&1 || { echo "$repo contracts: jq is required" >&2; exit 2; }
