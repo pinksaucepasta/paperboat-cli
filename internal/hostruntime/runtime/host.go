@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
-	"github.com/pinksaucepasta/paperboat/internal/hostruntime/bootstrap"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/codexsession"
 	runtimeconfig "github.com/pinksaucepasta/paperboat/internal/hostruntime/config"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/configapply"
@@ -72,20 +71,17 @@ type HostDependencies struct {
 	ConfigApply               configapply.Handler
 	ConfigApplyProof          bool
 	ConfigSync                Service
-	Updates                   interface {
-		Activate(context.Context, bootstrap.ArtifactTarget) (string, error)
-	}
-	Random                 io.Reader
-	HostedLifecycle        HostedLifecycle
-	SessionLauncherFactory func(*session.Manager) (server.SessionLauncher, error)
-	Metrics                *observability.Registry
-	CodexSessions          *codexsession.Manager
-	ServeLeases            *servelease.Manager
-	LocalControlToken      string
-	ManagedSSH             *managedssh.Host
-	ManagedSSHService      Service
-	NativePeerFactory      func(func(net.Conn) error, http.Handler, http.Handler) (Service, error)
-	TransferKeys           *transfercrypto.KeyVault
+	Random                    io.Reader
+	HostedLifecycle           HostedLifecycle
+	SessionLauncherFactory    func(*session.Manager) (server.SessionLauncher, error)
+	Metrics                   *observability.Registry
+	CodexSessions             *codexsession.Manager
+	ServeLeases               *servelease.Manager
+	LocalControlToken         string
+	ManagedSSH                *managedssh.Host
+	ManagedSSHService         Service
+	NativePeerFactory         func(func(net.Conn) error, http.Handler, http.Handler) (Service, error)
+	TransferKeys              *transfercrypto.KeyVault
 }
 
 func transferKeyEraser(vault *transfercrypto.KeyVault) func(string) error {
@@ -336,7 +332,6 @@ func NewHost(ctx context.Context, config HostConfig, dependencies HostDependenci
 		WorkspaceRoot: config.WorkspaceRoot, Random: random,
 		Previews: dependencies.Previews, PreviewControl: dependencies.PreviewControl,
 		ConfigApply: dependencies.ConfigApply,
-		Updates:     dependencies.Updates,
 		Writers:     writers, Exec: executions,
 	})
 	if err != nil {

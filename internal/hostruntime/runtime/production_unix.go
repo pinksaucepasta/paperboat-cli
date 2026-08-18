@@ -39,7 +39,6 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/filetransfer"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/health"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hosted"
-	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostservice"
 	runtimeidentity "github.com/pinksaucepasta/paperboat/internal/hostruntime/identity"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/machinecontrol"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/observability"
@@ -446,7 +445,6 @@ func NewProductionHost(ctx context.Context, version string, environ func(string)
 	networkHandler.SetObserver(regionalMonitor.NetworkChanged)
 	var runtimeObservation *runtimeObservationService
 	var availabilityService *availability.Service
-	var updateClient *hostservice.Client
 	if runtimeConfig.Profile == runtimeconfig.BYOD {
 		resolver, resolverErr := availability.NewResolver(controlURL.ResolveReference(&url.URL{Path: "/v1/helper-runtime-policies/resolve"}).String(), renewingTokens, enrollment.ProofSource{StateRoot: runtimeConfig.StateRoot}, operationID, &http.Client{Transport: transport, Timeout: 10 * time.Second})
 		if resolverErr != nil {
@@ -457,10 +455,6 @@ func NewProductionHost(ctx context.Context, version string, environ func(string)
 			return nil, hostErr
 		}
 		availabilityService, err = availability.NewService(resolver, hostClient, runtimeConfig.Limits.HeartbeatInterval, metrics)
-		if err != nil {
-			return nil, err
-		}
-		updateClient, err = hostservice.NewClient("/var/run/paperboat/host-service.sock", 2*time.Minute)
 		if err != nil {
 			return nil, err
 		}
@@ -551,7 +545,7 @@ func NewProductionHost(ctx context.Context, version string, environ func(string)
 	if err != nil {
 		return nil, err
 	}
-	dependencies := HostDependencies{Authorizer: authorizer, AuthorizationService: authorizationRefresh, Connector: connectorService, PreviewLauncher: previewManager, PreviewRecovery: previewManager, RuntimeObservationService: runtimeService, Updates: updateClient, Metrics: metrics, CodexSessions: codexManager, ServeLeases: serveLeases, LocalControlToken: localControlToken, ManagedSSH: managedSSHHost, ManagedSSHService: managedSSHService, TransferKeys: transferKeys}
+	dependencies := HostDependencies{Authorizer: authorizer, AuthorizationService: authorizationRefresh, Connector: connectorService, PreviewLauncher: previewManager, PreviewRecovery: previewManager, RuntimeObservationService: runtimeService, Metrics: metrics, CodexSessions: codexManager, ServeLeases: serveLeases, LocalControlToken: localControlToken, ManagedSSH: managedSSHHost, ManagedSSHService: managedSSHService, TransferKeys: transferKeys}
 	if managedSSHIdentity != nil {
 		attempts, attemptErr := peerattempt.New(peerattempt.Config{ControlURL: controlURL.String(), StateRoot: runtimeConfig.StateRoot, Transport: transport, Timeout: 15 * time.Second}, managedSSHIdentity)
 		if attemptErr != nil {

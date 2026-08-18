@@ -12,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pinksaucepasta/paperboat/internal/hostruntime/bootstrap"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/configapply"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/execprocess"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/filetransfer"
@@ -33,13 +32,10 @@ type SessionLauncher interface {
 }
 
 type DispatcherConfig struct {
-	Sessions       *session.Manager
-	Previews       *preview.Registry
-	PreviewControl preview.PreviewControl
-	ConfigApply    configapply.Handler
-	Updates        interface {
-		Activate(context.Context, bootstrap.ArtifactTarget) (string, error)
-	}
+	Sessions        *session.Manager
+	Previews        *preview.Registry
+	PreviewControl  preview.PreviewControl
+	ConfigApply     configapply.Handler
 	Health          HealthSource
 	SessionLauncher SessionLauncher
 	WorkspaceRoot   string
@@ -82,9 +78,6 @@ func (d *Dispatcher) Capabilities() []string {
 	if d.config.ConfigApply != nil {
 		capabilities = append(capabilities, "config.apply.v1")
 	}
-	if d.config.Updates != nil {
-		capabilities = append(capabilities, "update.tuf.v1")
-	}
 	if d.config.Exec != nil {
 		capabilities = append(capabilities, "exec.v1")
 	}
@@ -104,8 +97,6 @@ func (d *Dispatcher) Handle(ctx context.Context, authorization Authorization, ca
 		return result(d.config.Health.Snapshot())
 	case "config.apply.v1":
 		return d.configApply(ctx, authorization, payload)
-	case "update.tuf.v1":
-		return d.update(ctx, payload)
 	case "exec.v1":
 		return d.exec(ctx, payload)
 	case "ssh.v1":
@@ -129,27 +120,6 @@ func (d *Dispatcher) HandleOperation(ctx context.Context, authorization Authoriz
 		}
 	}
 	return d.Handle(ctx, authorization, capability, payload)
-}
-
-type signedUpdateRequest struct {
-	Artifact bootstrap.ArtifactTarget `json:"artifact"`
-}
-
-func (d *Dispatcher) update(ctx context.Context, payload json.RawMessage) operation.Outcome {
-	if d.config.Updates == nil {
-		return failure("capability_required")
-	}
-	var request signedUpdateRequest
-	if decodeStrict(payload, &request) != nil {
-		return failure("invalid_request")
-	}
-	version, err := d.config.Updates.Activate(ctx, request.Artifact)
-	if err != nil {
-		return failure("update_activation_failed")
-	}
-	return result(struct {
-		Version string `json:"version"`
-	}{version})
 }
 
 type configApplyRequest struct {
