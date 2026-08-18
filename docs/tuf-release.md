@@ -15,6 +15,20 @@ Build `cli`, `runtime`, `hostd`, `updater`, and `launcher` for every supported O
 architecture. Name each file `<component>-<os>-<arch>`. Publishing fails if any component is
 missing and creates one signed release index per platform and architecture:
 
+- Every macOS component must be signed with the production Developer ID, submitted to Apple
+  notarization, and stapled before it enters the signed TUF repository. The updater runs both
+  `codesign --verify --deep --strict` and a Gatekeeper `spctl --assess` check before activation.
+- Every Windows component must carry a valid production Authenticode signature before it enters
+  the signed TUF repository. The updater checks `Get-AuthenticodeSignature` and accepts only a
+  `Valid` chain status before activation.
+- Linux components have no native publisher-signature requirement in this release. Their exact
+  TUF target digest, length, ELF header, architecture, protected staging directory, and owner
+  checks remain mandatory.
+
+The GitHub release workflow builds artifacts only. It must not be used as evidence that macOS or
+Windows artifacts are eligible for TUF publication: the platform signing and verification ceremony
+is a required release-authority step, using keys outside GitHub Actions and CI.
+
 ```sh
 paperboat-tuf publish \
   -repository /Users/pujan.pm/.local/share/paperboat-release/tuf-production \

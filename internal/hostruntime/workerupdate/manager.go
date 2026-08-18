@@ -21,6 +21,7 @@ import (
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/binarytarget"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostdproto"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/nativesignature"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/updateflow"
 )
 
@@ -111,6 +112,13 @@ type HealthChecker interface {
 	Check(context.Context, hostdproto.Status, Release) error
 }
 
+// NativeVerifier is the platform-native release gate. It runs only after TUF
+// digest, length, and binary-format validation has completed in a private
+// staging path and before the candidate is made executable by hostd.
+type NativeVerifier interface {
+	Verify(context.Context, string, string, string) error
+}
+
 type Config struct {
 	StatePath       string
 	RuntimeCurrent  string
@@ -129,6 +137,7 @@ type Config struct {
 	Starter         Starter
 	Hostd           Hostd
 	Health          HealthChecker
+	NativeVerifier  NativeVerifier
 	MonitorWindow   time.Duration
 	HealthInterval  time.Duration
 	Now             func() time.Time
@@ -158,6 +167,9 @@ func New(config Config) (*Manager, error) {
 	}
 	if config.Now == nil {
 		config.Now = time.Now
+	}
+	if config.NativeVerifier == nil {
+		config.NativeVerifier = nativesignature.New(nil)
 	}
 	if err := validateConfig(config); err != nil {
 		return nil, err
@@ -547,6 +559,9 @@ func (m *Manager) stage(ctx context.Context, release Release) error {
 	if err := binarytarget.Validate(pendingPath, release.Platform, release.Architecture); err != nil {
 		return ErrInvalidRelease
 	}
+	if err := m.config.NativeVerifier.Verify(ctx, pendingPath, release.Platform, release.Architecture); err != nil {
+		return ErrInvalidRelease
+	}
 	if err := os.Rename(pendingPath, m.config.RuntimeStaged); err != nil {
 		return err
 	}
@@ -604,6 +619,9 @@ func (m *Manager) installCLI(ctx context.Context, release Release) error {
 			return err
 		}
 		if err := binarytarget.Validate(pendingPath, release.CLIPlatform, release.CLIArchitecture); err != nil {
+			return ErrInvalidRelease
+		}
+		if err := m.config.NativeVerifier.Verify(ctx, pendingPath, release.CLIPlatform, release.CLIArchitecture); err != nil {
 			return ErrInvalidRelease
 		}
 		if err := os.Rename(pendingPath, staged); err != nil {

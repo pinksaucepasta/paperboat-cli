@@ -76,6 +76,13 @@ jobs:
           (cd dist && sha256sum paperboat_* > SHA256SUMS)
           (cd dist && sha256sum pb-* pb_* cli-* runtime-* hostd-* updater-* launcher-* >> SHA256SUMS)
           (cd dist && sha256sum install.sh >> SHA256SUMS)
+      - name: Record native signing prerequisite
+        run: |
+          {
+            echo '## Native signing boundary'
+            echo 'This workflow builds and attests artifacts. It does not authorize macOS or Windows artifacts for the signed TUF repository.'
+            echo 'The release authority must Developer-ID sign, notarize and staple each macOS component, and Authenticode-sign each Windows component before TUF publication.'
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Generate SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:

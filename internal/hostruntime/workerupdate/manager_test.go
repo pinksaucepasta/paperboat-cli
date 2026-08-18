@@ -147,6 +147,25 @@ func TestWorkerUpdateRejectsTamperedArtifactBeforeCandidateStart(t *testing.T) {
 	}
 }
 
+func TestWorkerUpdateRejectsNativeSignatureBeforeCandidateStart(t *testing.T) {
+	fixture := newFixture(t)
+	calls := 0
+	fixture.manager.config.NativeVerifier = nativeVerifierFunc(func(_ context.Context, path, platform, architecture string) error {
+		calls++
+		if filepath.Dir(path) != filepath.Dir(fixture.paths.staged) || filepath.Base(path) == filepath.Base(fixture.paths.staged) || platform != runtime.GOOS || architecture != runtime.GOARCH {
+			t.Fatalf("native verification input path=%q platform=%q architecture=%q", path, platform, architecture)
+		}
+		return errors.New("native signature rejected")
+	})
+	_, err := fixture.manager.Activate(context.Background(), fixture.candidate)
+	if !errors.Is(err, ErrInvalidRelease) {
+		t.Fatalf("error=%v", err)
+	}
+	if calls != 1 || fixture.starter.starts != 0 || fixture.hostd.activations != 0 {
+		t.Fatalf("calls=%d starts=%d activations=%d", calls, fixture.starter.starts, fixture.hostd.activations)
+	}
+}
+
 func TestWorkerUpdateRejectsUnsignedCompatibilityRange(t *testing.T) {
 	fixture := newFixture(t)
 	invalid := fixture.candidate
@@ -222,7 +241,7 @@ func newFixture(t *testing.T) fixture {
 	if workerUID == 0 {
 		workerUID = 1
 	}
-	manager, err := New(Config{StatePath: paths.journal, RuntimeCurrent: paths.current, RuntimeRollback: paths.rollback, RuntimeStaged: paths.staged, CLICurrent: paths.cliCurrent, CLIRollback: paths.cliRollback, Active: active, OwnerUID: os.Geteuid(), OwnerGID: os.Getegid(), WorkerUID: workerUID, WorkerGID: os.Getegid(), HostdEndpoint: "private-hostd", Capability: bytes.Repeat([]byte{1}, 32), Fetcher: fetcher, Starter: starter, Hostd: hostd, Health: health, MonitorWindow: time.Millisecond, HealthInterval: time.Millisecond})
+	manager, err := New(Config{StatePath: paths.journal, RuntimeCurrent: paths.current, RuntimeRollback: paths.rollback, RuntimeStaged: paths.staged, CLICurrent: paths.cliCurrent, CLIRollback: paths.cliRollback, Active: active, OwnerUID: os.Geteuid(), OwnerGID: os.Getegid(), WorkerUID: workerUID, WorkerGID: os.Getegid(), HostdEndpoint: "private-hostd", Capability: bytes.Repeat([]byte{1}, 32), Fetcher: fetcher, Starter: starter, Hostd: hostd, Health: health, NativeVerifier: nativeVerifierFunc(func(context.Context, string, string, string) error { return nil }), MonitorWindow: time.Millisecond, HealthInterval: time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -289,3 +308,9 @@ func (*fakeWorker) Stop(context.Context) error { return nil }
 type fakeHealth struct{ err error }
 
 func (h *fakeHealth) Check(context.Context, hostdproto.Status, Release) error { return h.err }
+
+type nativeVerifierFunc func(context.Context, string, string, string) error
+
+func (f nativeVerifierFunc) Verify(ctx context.Context, path, platform, architecture string) error {
+	return f(ctx, path, platform, architecture)
+}
