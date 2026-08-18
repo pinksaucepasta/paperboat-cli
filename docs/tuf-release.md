@@ -58,6 +58,20 @@ paperboat-tuf refresh \
   -repository /Users/pujan.pm/.local/share/paperboat-release/tuf-production
 ```
 
+Rollout changes are release-authority operations. The dashboard or control plane may request
+them, but it cannot authorize them. Run the selected command on the signing workstation, review
+the resulting metadata diff, and publish `metadata/` and the new consistent index targets:
+
+```sh
+paperboat-tuf promote -repository /Users/pujan.pm/.local/share/paperboat-release/tuf-production -rollout-revision 2 -percentage 25
+paperboat-tuf pause -repository /Users/pujan.pm/.local/share/paperboat-release/tuf-production -rollout-revision 3
+paperboat-tuf quarantine -repository /Users/pujan.pm/.local/share/paperboat-release/tuf-production -rollout-revision 4
+```
+
+Revisions must increase. `pause` signs a zero-percent cohort. `quarantine` additionally marks
+the indexed release revoked. Clients accept these decisions only after normal TUF timestamp,
+snapshot, targets, threshold-signature, expiry, and rollback verification.
+
 Rotate one role at a time with `paperboat-tuf rotate -role <role>`. A root rotation is signed
 by both the previous and new root key sets. Publish every numbered root metadata file; clients
 must receive consecutive root versions. Retain revoked keys for incident recovery and audit.
