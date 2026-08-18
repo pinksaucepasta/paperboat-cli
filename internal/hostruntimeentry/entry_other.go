@@ -14,6 +14,8 @@ import (
 )
 
 var ErrUnsupported = errors.New("machine runtime services are supported only on macOS and Linux")
+var ErrPreviewServiceMissing = errors.New("preview service is unavailable on this platform")
+var ErrPreviewServiceFailed = errors.New("preview service failed on this platform")
 
 type ConfigWorkerConfig struct {
 	ControlURL, StateRoot, HomeRoot, ChezmoiBinary string

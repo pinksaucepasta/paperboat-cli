@@ -8322,7 +8322,7 @@ func actionRemoteExec(c *command.Context, requested string, request tunnel.ExecR
 		}
 		defer term.Restore(int(os.Stdin.Fd()), state)
 		resizeSignals := make(chan os.Signal, 1)
-		signal.Notify(resizeSignals, syscall.SIGWINCH)
+		notifyResizeSignals(resizeSignals)
 		defer signal.Stop(resizeSignals)
 		go func() {
 			for {

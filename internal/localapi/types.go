@@ -153,14 +153,15 @@ func safeCompletionValue(value string) bool {
 }
 
 var (
-	ErrInvalidConfig    = errors.New("invalid local API configuration")
-	ErrAlreadyRunning   = errors.New("local API is already running")
-	ErrUnsafeSocket     = errors.New("local API socket is unsafe")
-	ErrPermission       = errors.New("local API peer is not authorized")
-	ErrVersionMismatch  = errors.New("local API version mismatch")
-	ErrInvalidResponse  = errors.New("invalid local API response")
-	ErrStaleObservation = errors.New("local transport observation is stale")
-	ErrObservationLimit = errors.New("local transport observation limit reached")
+	ErrInvalidConfig      = errors.New("invalid local API configuration")
+	ErrAlreadyRunning     = errors.New("local API is already running")
+	ErrUnsafeSocket       = errors.New("local API socket is unsafe")
+	ErrPermission         = errors.New("local API peer is not authorized")
+	ErrVersionMismatch    = errors.New("local API version mismatch")
+	ErrInvalidResponse    = errors.New("invalid local API response")
+	ErrStaleObservation   = errors.New("local transport observation is stale")
+	ErrObservationLimit   = errors.New("local transport observation limit reached")
+	ErrExecStartUncertain = errors.New("remote execution start outcome is uncertain")
 )
 
 type Peer struct {

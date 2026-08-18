@@ -535,8 +535,6 @@ type RemoteError struct {
 	cause      error
 }
 
-var ErrExecStartUncertain = errors.New("remote execution start outcome is uncertain")
-
 func (e *RemoteError) Error() string {
 	if e == nil {
 		return "<nil>"

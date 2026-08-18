@@ -18,6 +18,9 @@ func InstallOpenSSHConfig(OpenSSHConfig) (OpenSSHConfigResult, error) {
 func ValidateOpenSSHConfig(OpenSSHConfig) error {
 	return errors.New("OpenSSH configuration is unsupported on this platform")
 }
+func ValidateInstalledOpenSSHConfig(string, uint32, string, string) error {
+	return errors.New("OpenSSH configuration is unsupported on this platform")
+}
 func UninstallOpenSSHConfig(string, uint32) (OpenSSHConfigResult, error) {
 	return OpenSSHConfigResult{}, errors.New("OpenSSH configuration is unsupported on this platform")
 }

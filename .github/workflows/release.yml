@@ -31,6 +31,17 @@ jobs:
         run: ./tools/release-version.sh validate "${GITHUB_REF_NAME}"
       - name: Test
         run: make check
+      - name: Required Windows cross-build gate
+        run: |
+          set -euo pipefail
+          check_dir="$(mktemp -d)"
+          trap 'rm -rf "$check_dir"' EXIT
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=windows GOARCH="$arch" go build -trimpath -o "$check_dir/pb-$arch.exe" ./cmd/pb
+            CGO_ENABLED=0 GOOS=windows GOARCH="$arch" go build -trimpath -o "$check_dir/pb-launcher-$arch.exe" ./cmd/pb-launcher
+            test -s "$check_dir/pb-$arch.exe"
+            test -s "$check_dir/pb-launcher-$arch.exe"
+          done
       - name: Build archives
         env:
           VERSION: ${{ github.ref_name }}
