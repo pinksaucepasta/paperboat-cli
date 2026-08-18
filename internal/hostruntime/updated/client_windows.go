@@ -7,13 +7,16 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"regexp"
 	"time"
 
 	"github.com/Microsoft/go-winio"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/autoupdate"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/supervisorupdate"
 )
 
 const ControlProtocolV1 = "paperboat.updated/v1"
+const maxUpdateControlTimeout = 15 * time.Minute
 
 var (
 	ErrInvalidControl = errors.New("invalid paperboat-updated control request")
@@ -23,14 +26,16 @@ var (
 type ControlRequest struct {
 	Schema    string `json:"schema"`
 	Operation string `json:"operation"`
+	Release   string `json:"release,omitempty"`
 }
 type ControlResponse struct {
-	Schema      string                 `json:"schema"`
-	Status      string                 `json:"status"`
-	Version     string                 `json:"version,omitempty"`
-	Updated     bool                   `json:"updated"`
-	Observation autoupdate.Observation `json:"observation"`
-	ErrorCode   string                 `json:"error_code,omitempty"`
+	Schema      string                  `json:"schema"`
+	Status      string                  `json:"status"`
+	Version     string                  `json:"version,omitempty"`
+	Updated     bool                    `json:"updated"`
+	Observation autoupdate.Observation  `json:"observation"`
+	ErrorCode   string                  `json:"error_code,omitempty"`
+	Supervisor  supervisorupdate.Result `json:"supervisor,omitempty"`
 }
 
 type Client struct {
@@ -39,7 +44,7 @@ type Client struct {
 }
 
 func NewClient(socketPath string, timeout time.Duration) (*Client, error) {
-	if !validPipePath(socketPath) || timeout <= 0 || timeout > 3*time.Minute {
+	if !validPipePath(socketPath) || timeout <= 0 || timeout > maxUpdateControlTimeout {
 		return nil, ErrInvalidControl
 	}
 	return &Client{socketPath: socketPath, timeout: timeout}, nil
@@ -47,8 +52,14 @@ func NewClient(socketPath string, timeout time.Duration) (*Client, error) {
 func (c *Client) Status(ctx context.Context) (ControlResponse, error) { return c.call(ctx, "status") }
 func (c *Client) Check(ctx context.Context) (ControlResponse, error)  { return c.call(ctx, "check") }
 func (c *Client) Update(ctx context.Context) (ControlResponse, error) { return c.call(ctx, "update") }
+func (c *Client) ApproveMaintenance(ctx context.Context, release string) (ControlResponse, error) {
+	return c.callRequest(ctx, ControlRequest{Schema: ControlProtocolV1, Operation: "approve-maintenance", Release: release})
+}
 func (c *Client) call(ctx context.Context, operation string) (ControlResponse, error) {
-	if c == nil || (operation != "status" && operation != "check" && operation != "update") {
+	return c.callRequest(ctx, ControlRequest{Schema: ControlProtocolV1, Operation: operation})
+}
+func (c *Client) callRequest(ctx context.Context, request ControlRequest) (ControlResponse, error) {
+	if c == nil || !validControlRequest(request) {
 		return ControlResponse{}, ErrInvalidControl
 	}
 	if ctx == nil {
@@ -66,7 +77,7 @@ func (c *Client) call(ctx context.Context, operation string) (ControlResponse, e
 		deadline = limit
 	}
 	_ = connection.SetDeadline(deadline)
-	if err := json.NewEncoder(connection).Encode(ControlRequest{Schema: ControlProtocolV1, Operation: operation}); err != nil {
+	if err := json.NewEncoder(connection).Encode(request); err != nil {
 		return ControlResponse{}, err
 	}
 	decoder := json.NewDecoder(io.LimitReader(connection, 16<<10))
@@ -80,6 +91,22 @@ func (c *Client) call(ctx context.Context, operation string) (ControlResponse, e
 		return ControlResponse{}, errors.New(response.ErrorCode)
 	}
 	return response, nil
+}
+
+var exactReleasePattern = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$`)
+
+func validControlRequest(request ControlRequest) bool {
+	if request.Schema != "" && request.Schema != ControlProtocolV1 {
+		return false
+	}
+	switch request.Operation {
+	case "status", "check", "update":
+		return request.Release == ""
+	case "approve-maintenance":
+		return exactReleasePattern.MatchString(request.Release)
+	default:
+		return false
+	}
 }
 
 func validPipePath(path string) bool {

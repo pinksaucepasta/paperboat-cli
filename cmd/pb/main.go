@@ -2305,10 +2305,11 @@ func newRootCommand() *cobra.Command {
 }
 
 type updateResult struct {
-	PreviousVersion string `json:"previous_version"`
-	Version         string `json:"version"`
-	CLIUpdated      bool   `json:"cli_updated"`
-	RuntimeUpdated  bool   `json:"runtime_updated"`
+	PreviousVersion   string `json:"previous_version"`
+	Version           string `json:"version"`
+	CLIUpdated        bool   `json:"cli_updated"`
+	RuntimeUpdated    bool   `json:"runtime_updated"`
+	SupervisorUpdated bool   `json:"supervisor_updated"`
 }
 
 func updateCommand() *cobra.Command {
@@ -2318,7 +2319,11 @@ func updateCommand() *cobra.Command {
 	check.Flags().Bool("json", false, "print JSON")
 	status := &cobra.Command{Use: "status", Short: "Show installed Paperboat update state", Args: commandArgs(cobra.NoArgs), RunE: actionUpdateStatus}
 	status.Flags().Bool("json", false, "print JSON")
-	command.AddCommand(check, status)
+	approve := &cobra.Command{Use: "approve-maintenance", Short: "Approve one exact supervisor release for a protected-workload interruption", Args: commandArgs(cobra.NoArgs), RunE: actionApproveMaintenance}
+	approve.Flags().String("release", "", "exact signed release version to approve")
+	approve.Flags().Bool("json", false, "print JSON")
+	_ = approve.MarkFlagRequired("release")
+	command.AddCommand(check, status, approve)
 	return command
 }
 
@@ -2360,6 +2365,7 @@ type updateStatusResult struct {
 	LastCheck        time.Time `json:"last_check,omitempty"`
 	NextCheck        time.Time `json:"next_check,omitempty"`
 	LastFailure      string    `json:"last_failure,omitempty"`
+	Supervisor       any       `json:"supervisor,omitempty"`
 }
 
 func actionUpdateStatus(command *cobra.Command, _ []string) error {
@@ -2373,7 +2379,7 @@ func actionUpdateStatus(command *cobra.Command, _ []string) error {
 	if err != nil {
 		return fmt.Errorf("read paperboat-updated status: %w", err)
 	}
-	result := updateStatusResult{CLIVersion: buildinfo.Version, RuntimeVersion: response.Version, RuntimeAvailable: response.Version != "", LastCheck: response.Observation.CheckedAt, NextCheck: response.Observation.NextCheckAt, LastFailure: response.Observation.Failure}
+	result := updateStatusResult{CLIVersion: buildinfo.Version, RuntimeVersion: response.Version, RuntimeAvailable: response.Version != "", LastCheck: response.Observation.CheckedAt, NextCheck: response.Observation.NextCheckAt, LastFailure: response.Observation.Failure, Supervisor: response.Supervisor}
 	jsonOutput, _ := command.Flags().GetBool("json")
 	if jsonOutput {
 		return json.NewEncoder(command.OutOrStdout()).Encode(map[string]any{"schema_version": "1.0", "ok": true, "data": result})
@@ -2390,6 +2396,9 @@ func actionUpdateStatus(command *cobra.Command, _ []string) error {
 	if result.LastFailure != "" {
 		fmt.Fprintf(command.OutOrStdout(), "Last update failure: %s\n", result.LastFailure)
 	}
+	if response.Supervisor.MaintenanceRequired {
+		fmt.Fprintf(command.OutOrStdout(), "Supervisor %s requires maintenance approval.\n", response.Supervisor.StagedVersion)
+	}
 	return nil
 }
 
@@ -2404,7 +2413,7 @@ func actionUpdate(command *cobra.Command, _ []string) error {
 	if err != nil {
 		return fmt.Errorf("update with paperboat-updated: %w", err)
 	}
-	result := updateResult{PreviousVersion: buildinfo.Version, Version: response.Version, CLIUpdated: response.Updated, RuntimeUpdated: response.Updated}
+	result := updateResult{PreviousVersion: buildinfo.Version, Version: response.Version, CLIUpdated: response.Updated, RuntimeUpdated: response.Updated, SupervisorUpdated: response.Supervisor.Applied}
 	jsonOutput, _ := command.Flags().GetBool("json")
 	if jsonOutput {
 		return json.NewEncoder(command.OutOrStdout()).Encode(map[string]any{"schema_version": "1.0", "ok": true, "data": result})
@@ -2414,6 +2423,33 @@ func actionUpdate(command *cobra.Command, _ []string) error {
 		return nil
 	}
 	fmt.Fprintf(command.OutOrStdout(), "Updated Paperboat runtime to %s.\n", result.Version)
+	return nil
+}
+
+func actionApproveMaintenance(command *cobra.Command, _ []string) error {
+	release, err := command.Flags().GetString("release")
+	if err != nil || release == "" {
+		return errors.New("--release is required")
+	}
+	ctx, cancel := context.WithTimeout(command.Context(), 15*time.Minute)
+	defer cancel()
+	client, err := updated.NewClient(updatedControlSocket(), 15*time.Minute)
+	if err != nil {
+		return err
+	}
+	response, err := client.ApproveMaintenance(ctx, release)
+	if err != nil {
+		return fmt.Errorf("approve supervisor maintenance: %w", err)
+	}
+	jsonOutput, _ := command.Flags().GetBool("json")
+	if jsonOutput {
+		return json.NewEncoder(command.OutOrStdout()).Encode(map[string]any{"schema_version": "1.0", "ok": true, "data": response.Supervisor})
+	}
+	if response.Supervisor.Applied {
+		fmt.Fprintf(command.OutOrStdout(), "Approved and applied supervisor release %s.\n", response.Supervisor.Version)
+	} else {
+		fmt.Fprintf(command.OutOrStdout(), "Supervisor release %s was staged; activation is pending.\n", response.Supervisor.StagedVersion)
+	}
 	return nil
 }
 

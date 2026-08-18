@@ -29,9 +29,16 @@ func NewClient(socketPath string, timeout time.Duration) (*Client, error) {
 func (c *Client) Status(ctx context.Context) (ControlResponse, error) { return c.call(ctx, "status") }
 func (c *Client) Check(ctx context.Context) (ControlResponse, error)  { return c.call(ctx, "check") }
 func (c *Client) Update(ctx context.Context) (ControlResponse, error) { return c.call(ctx, "update") }
+func (c *Client) ApproveMaintenance(ctx context.Context, release string) (ControlResponse, error) {
+	return c.callRequest(ctx, ControlRequest{Schema: ControlProtocolV1, Operation: "approve-maintenance", Release: release})
+}
 
 func (c *Client) call(ctx context.Context, operation string) (ControlResponse, error) {
-	if c == nil || (operation != "status" && operation != "check" && operation != "update") {
+	return c.callRequest(ctx, ControlRequest{Schema: ControlProtocolV1, Operation: operation})
+}
+
+func (c *Client) callRequest(ctx context.Context, request ControlRequest) (ControlResponse, error) {
+	if c == nil || !validControlRequest(request) {
 		return ControlResponse{}, ErrInvalidControl
 	}
 	connection, err := (&net.Dialer{Timeout: c.timeout}).DialContext(ctx, "unix", c.socketPath)
@@ -44,7 +51,7 @@ func (c *Client) call(ctx context.Context, operation string) (ControlResponse, e
 		deadline = limit
 	}
 	_ = connection.SetDeadline(deadline)
-	if err := json.NewEncoder(connection).Encode(ControlRequest{Schema: ControlProtocolV1, Operation: operation}); err != nil {
+	if err := json.NewEncoder(connection).Encode(request); err != nil {
 		return ControlResponse{}, err
 	}
 	closer, ok := connection.(interface{ CloseWrite() error })

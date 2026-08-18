@@ -53,6 +53,22 @@ type Release struct {
 	HostdAPIMax     uint16
 	RuntimeAPIMin   uint16
 	RuntimeAPIMax   uint16
+	// Supervisor targets are present in every signed release index. They are
+	// kept separate from the worker/CLI targets because replacing them is a
+	// supervisor-class maintenance operation.
+	Hostd                 ComponentTarget
+	Updater               ComponentTarget
+	Launcher              ComponentTarget
+	SupervisorMaintenance bool
+}
+
+// ComponentTarget is the immutable target identity copied from the verified
+// release index. It is never populated from a local path or a caller.
+type ComponentTarget struct {
+	SHA256       string
+	Length       int64
+	Platform     string
+	Architecture string
 }
 
 // Resolver returns the newest signed and cohort-eligible release. found=false

@@ -10,10 +10,12 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"syscall"
 	"time"
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/autoupdate"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/supervisorupdate"
 	"github.com/pinksaucepasta/paperboat/internal/ospeer"
 )
 
@@ -27,30 +29,35 @@ var (
 )
 
 // ControlRequest intentionally has no artifact, path, command, environment,
-// or release selector. The updater alone resolves a fixed signed index.
+// or arbitrary target selector. The only accepted release value is an exact
+// version for the one-use maintenance approval operation; the updater still
+// resolves and verifies the signed index itself.
 type ControlRequest struct {
 	Schema    string `json:"schema"`
 	Operation string `json:"operation"`
+	Release   string `json:"release,omitempty"`
 }
 
 type ControlResponse struct {
-	Schema      string                 `json:"schema"`
-	Status      string                 `json:"status"`
-	Version     string                 `json:"version,omitempty"`
-	Updated     bool                   `json:"updated"`
-	Observation autoupdate.Observation `json:"observation"`
-	ErrorCode   string                 `json:"error_code,omitempty"`
+	Schema      string                  `json:"schema"`
+	Status      string                  `json:"status"`
+	Version     string                  `json:"version,omitempty"`
+	Updated     bool                    `json:"updated"`
+	Observation autoupdate.Observation  `json:"observation"`
+	ErrorCode   string                  `json:"error_code,omitempty"`
+	Supervisor  supervisorupdate.Result `json:"supervisor,omitempty"`
 }
 
 type controlServer struct {
-	socketPath string
-	uid        int
-	gid        int
-	invoke     func(context.Context, string) (ControlResponse, error)
+	socketPath    string
+	uid           int
+	gid           int
+	invoke        func(context.Context, string) (ControlResponse, error) // legacy test seam
+	invokeRequest func(context.Context, ControlRequest) (ControlResponse, error)
 }
 
 func (s *controlServer) listen() (*net.UnixListener, error) {
-	if !filepath.IsAbs(s.socketPath) || s.uid <= 0 || s.gid < 0 || s.invoke == nil {
+	if !filepath.IsAbs(s.socketPath) || s.uid <= 0 || s.gid < 0 || s.invoke == nil && s.invokeRequest == nil {
 		return nil, ErrInvalidConfig
 	}
 	directory := filepath.Dir(s.socketPath)
@@ -116,14 +123,52 @@ func (s *controlServer) handle(connection *net.UnixConn) error {
 		return s.respond(connection, ControlResponse{Schema: ControlProtocolV1, Status: "error", ErrorCode: "invalid_request"})
 	}
 	var extra any
-	if decoder.Decode(&extra) != io.EOF || request.Schema != ControlProtocolV1 || (request.Operation != "status" && request.Operation != "check" && request.Operation != "update") {
+	if decoder.Decode(&extra) != io.EOF || request.Schema != ControlProtocolV1 || !validControlRequest(request) {
 		return s.respond(connection, ControlResponse{Schema: ControlProtocolV1, Status: "error", ErrorCode: "invalid_request"})
 	}
-	response, invokeErr := s.invoke(context.Background(), request.Operation)
+	var response ControlResponse
+	var invokeErr error
+	if s.invokeRequest != nil {
+		response, invokeErr = s.invokeRequest(context.Background(), request)
+	} else {
+		response, invokeErr = s.invoke(context.Background(), request.Operation)
+	}
 	if invokeErr != nil {
-		response = ControlResponse{Schema: ControlProtocolV1, Status: "error", ErrorCode: "update_failed"}
+		response.Schema = ControlProtocolV1
+		response.Status = "error"
+		response.ErrorCode = controlErrorCode(invokeErr)
 	}
 	return s.respond(connection, response)
+}
+
+var exactReleasePattern = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$`)
+
+func validControlRequest(request ControlRequest) bool {
+	switch request.Operation {
+	case "status", "check", "update":
+		return request.Release == ""
+	case "approve-maintenance":
+		return exactReleasePattern.MatchString(request.Release)
+	default:
+		return false
+	}
+}
+
+func controlErrorCode(err error) string {
+	switch {
+	case errors.Is(err, supervisorupdate.ErrMaintenanceRequired):
+		return "maintenance_required"
+	case errors.Is(err, supervisorupdate.ErrApprovalExpired):
+		return "approval_expired"
+	case errors.Is(err, supervisorupdate.ErrStaleWorkloads):
+		return "stale_workloads"
+	case errors.Is(err, supervisorupdate.ErrBlocked):
+		return "recovery_required"
+	case errors.Is(err, supervisorupdate.ErrInvalidRelease):
+		return "release_not_found"
+	default:
+		return "update_failed"
+	}
 }
 
 func (s *controlServer) respond(writer io.Writer, response ControlResponse) error {
@@ -139,19 +184,33 @@ func (s *controlServer) respond(writer io.Writer, response ControlResponse) erro
 func (s *Service) controlRequest(ctx context.Context, operation string) (ControlResponse, error) {
 	s.controlMu.Lock()
 	defer s.controlMu.Unlock()
-	response := ControlResponse{Schema: ControlProtocolV1, Status: "ok", Observation: s.Snapshot()}
-	switch operation {
+	return s.controlRequestWithRequest(ctx, ControlRequest{Operation: operation})
+}
+
+func (s *Service) controlRequestWithRequest(ctx context.Context, request ControlRequest) (ControlResponse, error) {
+	switch request.Operation {
 	case "status":
+		response := ControlResponse{Schema: ControlProtocolV1, Status: "ok", Observation: s.Snapshot()}
 		response.Version = s.manager.ActiveVersion()
+		response.Supervisor = s.supervisor.Status()
 		return response, nil
 	case "check":
+		response := ControlResponse{Schema: ControlProtocolV1, Status: "ok", Observation: s.Snapshot()}
 		result, err := s.Check(ctx)
 		response.Version, response.Updated = result.Version, result.Updated
+		response.Supervisor = s.supervisor.Status()
 		return response, err
 	case "update":
+		response := ControlResponse{Schema: ControlProtocolV1, Status: "ok", Observation: s.Snapshot()}
 		result, err := s.UpdateNow(ctx)
 		response.Version, response.Updated = result.Version, result.Updated
 		response.Observation = s.Snapshot()
+		response.Supervisor = s.supervisor.Status()
+		return response, err
+	case "approve-maintenance":
+		response := ControlResponse{Schema: ControlProtocolV1, Status: "ok", Observation: s.Snapshot()}
+		result, err := s.ApproveMaintenance(ctx, request.Release)
+		response.Version, response.Updated, response.Supervisor = result.Version, result.Applied, result
 		return response, err
 	default:
 		return ControlResponse{}, ErrInvalidControl

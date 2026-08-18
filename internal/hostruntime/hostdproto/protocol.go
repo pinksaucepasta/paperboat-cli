@@ -146,17 +146,30 @@ type Status struct {
 	APIVersion             uint16 `json:"api_version,omitempty"`
 	Epoch                  uint64 `json:"epoch,omitempty"`
 	LastHeartbeatUnixMilli int64  `json:"last_heartbeat_unix_milli,omitempty"`
+	// Workload fields are populated by the stable hostd socket, never by a
+	// worker. The updater uses the generation as a fencing value before a
+	// supervisor-class activation.
+	WorkloadGeneration uint64 `json:"workload_generation,omitempty"`
+	ProtectedWorkloads uint64 `json:"protected_workloads,omitempty"`
+}
+
+type WorkloadStatus struct {
+	Generation uint64
+	Protected  uint64
 }
 
 func (Status) messageType() Type { return TypeStatus }
 func (m Status) validate() error {
 	switch m.State {
 	case StateEmpty:
-		if m.WorkerID != "" || m.APIVersion != 0 || m.Epoch != 0 || m.LastHeartbeatUnixMilli != 0 {
+		if m.WorkerID != "" || m.APIVersion != 0 || m.Epoch != 0 || m.LastHeartbeatUnixMilli != 0 || m.WorkloadGeneration != 0 || m.ProtectedWorkloads != 0 {
 			return ErrInvalidFrame
 		}
 	case StateCandidate, StateActive:
 		if !validWorkerID(m.WorkerID) || !validAPIVersion(m.APIVersion) || m.Epoch == 0 || m.LastHeartbeatUnixMilli < 0 {
+			return ErrInvalidFrame
+		}
+		if m.ProtectedWorkloads > 0 && m.WorkloadGeneration == 0 {
 			return ErrInvalidFrame
 		}
 	default:

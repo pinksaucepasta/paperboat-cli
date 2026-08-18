@@ -50,7 +50,7 @@ func runHostd(ctx context.Context, output io.Writer) error {
 		_ = notifier.Degraded("hostd startup failed")
 		return err
 	}
-	server, err := hostdproto.NewServer(hostdproto.SocketConfig{SocketPath: socket, StatePath: filepath.Join(filepath.Dir(socket), "fence.json"), UID: os.Geteuid(), GID: os.Getegid(), Token: token, APIMin: 1, APIMax: 1})
+	server, err := hostdproto.NewServer(hostdproto.SocketConfig{SocketPath: socket, StatePath: filepath.Join(filepath.Dir(socket), "fence.json"), UID: os.Geteuid(), GID: os.Getegid(), Token: token, APIMin: 1, APIMax: 1, Workloads: host.WorkloadStatus})
 	if err != nil {
 		shutdownStableHost(host)
 		return err

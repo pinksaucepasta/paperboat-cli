@@ -8,11 +8,13 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -24,6 +26,7 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/filetransfer"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/health"
 	stablehostd "github.com/pinksaucepasta/paperboat/internal/hostruntime/hostd"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostdproto"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/observability"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/operation"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/preview"
@@ -97,14 +100,18 @@ type HostedLifecycle interface {
 }
 
 type Host struct {
-	workerMu sync.RWMutex
-	runtime  *Runtime
-	hostd    *stablehostd.Daemon
-	workers  *stablehostd.WorkerController
-	http     *HTTPService
-	handler  http.Handler
-	sessions *session.Manager
-	health   *runtimeHealthSource
+	workerMu            sync.RWMutex
+	runtime             *Runtime
+	hostd               *stablehostd.Daemon
+	workers             *stablehostd.WorkerController
+	http                *HTTPService
+	handler             http.Handler
+	sessions            *session.Manager
+	health              *runtimeHealthSource
+	transferRoot        string
+	workloadMu          sync.Mutex
+	workloadGeneration  uint64
+	workloadFingerprint string
 }
 
 func NewReceiveCoordinator(ctx context.Context, config HostConfig, dependencies HostDependencies) (_ *Host, resultErr error) {
@@ -550,7 +557,57 @@ func NewHost(ctx context.Context, config HostConfig, dependencies HostDependenci
 		return nil, errors.Join(ErrHostInvalid, err)
 	}
 	healthSource.set(runtime, workerComponents)
-	return &Host{runtime: runtime, hostd: daemon, workers: workers, http: httpService, handler: mux, sessions: sessions, health: healthSource}, nil
+	return &Host{runtime: runtime, hostd: daemon, workers: workers, http: httpService, handler: mux, sessions: sessions, health: healthSource, transferRoot: filepath.Join(config.Runtime.StateRoot, "file-transfers")}, nil
+}
+
+// WorkloadStatus is the stable host's monotonic snapshot used to fence a
+// supervisor maintenance activation. It counts ownership-bearing workloads,
+// not merely network clients, and advances whenever that set changes.
+func (h *Host) WorkloadStatus() hostdproto.WorkloadStatus {
+	if h == nil {
+		return hostdproto.WorkloadStatus{Generation: 1}
+	}
+	counts := map[string]uint64{}
+	if h.sessions != nil {
+		for key, value := range h.sessions.ResourceCounts() {
+			counts[key] = value
+		}
+	}
+	if h.transferRoot != "" {
+		counts["transfers"] = transferWorkloadCount(h.transferRoot)
+	}
+	if h.hostd != nil {
+		workloads := h.hostd.Workloads()
+		if workloads.Previews != nil {
+			for key, value := range workloads.Previews.ResourceCounts() {
+				counts[key] += value
+			}
+		}
+		if workloads.ServeLeases != nil {
+			counts["serves"] = uint64(workloads.ServeLeases.Count())
+		}
+	}
+	keys := make([]string, 0, len(counts))
+	var protected uint64
+	for key, value := range counts {
+		keys = append(keys, key)
+		protected += value
+	}
+	sort.Strings(keys)
+	var fingerprint string
+	for _, key := range keys {
+		fingerprint += fmt.Sprintf("%s=%d;", key, counts[key])
+	}
+	h.workloadMu.Lock()
+	defer h.workloadMu.Unlock()
+	if h.workloadGeneration == 0 {
+		h.workloadGeneration = 1
+		h.workloadFingerprint = fingerprint
+	} else if fingerprint != h.workloadFingerprint {
+		h.workloadGeneration++
+		h.workloadFingerprint = fingerprint
+	}
+	return hostdproto.WorkloadStatus{Generation: h.workloadGeneration, Protected: protected}
 }
 
 func hostWorkloadCounts(sessions *session.Manager, transferRoot string) map[string]uint64 {

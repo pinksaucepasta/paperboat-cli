@@ -42,6 +42,9 @@ type SocketConfig struct {
 
 	RequestTimeout time.Duration
 	MaxConcurrent  int
+	// Workloads is read-only stable-host state. It is evaluated only when a
+	// status request is returned to the updater.
+	Workloads func() WorkloadStatus
 
 	// peerUID is test-only injection for platform credential checks. Production
 	// callers always use the OS-specific implementation.
@@ -159,6 +162,13 @@ func (s *Server) serveOne(connection *net.UnixConn) {
 	if err != nil {
 		s.writeError(connection, err)
 		return
+	}
+	if _, ok := request.(*Status); ok && s.config.Workloads != nil {
+		if status, ok := response.(*Status); ok {
+			workload := s.config.Workloads()
+			status.WorkloadGeneration = workload.Generation
+			status.ProtectedWorkloads = workload.Protected
+		}
 	}
 	_ = WriteFrame(connection, response)
 }

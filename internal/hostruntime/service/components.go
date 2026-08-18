@@ -91,6 +91,9 @@ func NewUpdaterInstaller(config ComponentConfig) (*Installer, error) {
 	environment := copyEnvironment(config.Environment)
 	environment["PAPERBOAT_UPDATE_STATE_ROOT"] = config.Layout.UpdateStateRoot
 	environment["PAPERBOAT_RELEASE_ROOT"] = config.Layout.ReleasesRoot
+	environment["PAPERBOAT_HOSTD_BINARY"] = config.Layout.HostdBinary
+	environment["PAPERBOAT_UPDATER_BINARY"] = config.Layout.UpdaterBinary
+	environment["PAPERBOAT_LAUNCHER_BINARY"] = config.Layout.Launcher
 	environment["PAPERBOAT_RUNTIME_CURRENT"] = config.Layout.RuntimeCurrent
 	environment["PAPERBOAT_RUNTIME_ROLLBACK"] = config.Layout.RuntimeRollback
 	environment["PAPERBOAT_RUNTIME_STAGED"] = config.Layout.RuntimeStaged

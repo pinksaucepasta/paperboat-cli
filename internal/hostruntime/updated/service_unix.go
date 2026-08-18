@@ -15,43 +15,49 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/autoupdate"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostdproto"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/supervisorupdate"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/workerupdate"
 )
 
 var ErrInvalidConfig = errors.New("invalid paperboat-updated configuration")
 
 type Config struct {
-	StateRoot       string
-	RuntimeCurrent  string
-	RuntimeRollback string
-	RuntimeStaged   string
-	CLICurrent      string
-	CLIRollback     string
-	Active          workerupdate.Release
-	WorkerUID       int
-	WorkerGID       int
-	SocketPath      string
-	Token           []byte
-	RepositoryURL   string
-	MachineID       string
-	Health          workerupdate.HealthChecker
+	StateRoot           string
+	RuntimeCurrent      string
+	RuntimeRollback     string
+	RuntimeStaged       string
+	CLICurrent          string
+	CLIRollback         string
+	Active              workerupdate.Release
+	WorkerUID           int
+	WorkerGID           int
+	SocketPath          string
+	Token               []byte
+	RepositoryURL       string
+	MachineID           string
+	Health              workerupdate.HealthChecker
+	SupervisorPaths     supervisorupdate.Paths
+	SupervisorActivator supervisorupdate.Activator
 	// ControlSocket is the fixed local socket exposed to the enrolled user for
 	// pb update, check, and status. It is not an updater command channel.
 	ControlSocket string
 }
 
 type Service struct {
-	manager   *workerupdate.Manager
-	source    workerupdate.TUFSource
-	scheduler *autoupdate.Scheduler
-	control   controlServer
-	controlMu sync.Mutex
+	manager    *workerupdate.Manager
+	supervisor *supervisorupdate.Manager
+	source     workerupdate.TUFSource
+	scheduler  *autoupdate.Scheduler
+	control    controlServer
+	controlMu  sync.Mutex
 }
 
 func New(config Config) (*Service, error) {
@@ -79,20 +85,29 @@ func New(config Config) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
-	scheduler, err := manager.MandatoryScheduler(source.Resolve, nil)
+	supervisor, err := supervisorupdate.New(supervisorupdate.Config{Paths: config.SupervisorPaths, Active: config.Active, Fetcher: source, Workloads: hostdWorkloads{client: client}, Activator: config.SupervisorActivator, OwnerUID: 0, OwnerGID: 0})
 	if err != nil {
 		return nil, err
 	}
-	service := &Service{manager: manager, source: source, scheduler: scheduler}
-	service.control = controlServer{socketPath: config.ControlSocket, uid: config.WorkerUID, gid: config.WorkerGID, invoke: service.controlRequest}
+	scheduler, err := autoupdate.New(autoupdate.Config{Check: func(ctx context.Context) (autoupdate.Result, error) {
+		return serviceCheck(ctx, manager, supervisor, source.Resolve, source.ResolveSupervisor)
+	}})
+	if err != nil {
+		return nil, err
+	}
+	service := &Service{manager: manager, supervisor: supervisor, source: source, scheduler: scheduler}
+	service.control = controlServer{socketPath: config.ControlSocket, uid: config.WorkerUID, gid: config.WorkerGID, invokeRequest: service.controlRequestWithRequest}
 	return service, nil
 }
 
 func (s *Service) Run(ctx context.Context) error {
-	if s == nil || s.manager == nil || s.scheduler == nil {
+	if s == nil || s.manager == nil || s.supervisor == nil || s.scheduler == nil {
 		return ErrInvalidConfig
 	}
 	if err := s.manager.Recover(ctx); err != nil {
+		return err
+	}
+	if err := s.supervisor.Recover(ctx); err != nil {
 		return err
 	}
 	listener, err := s.control.listen()
@@ -111,10 +126,29 @@ func (s *Service) Run(ctx context.Context) error {
 // delay only; TUF verification, revocation, compatibility, and continuity
 // checks remain exactly the same as background activation.
 func (s *Service) UpdateNow(ctx context.Context) (workerupdate.Result, error) {
-	if s == nil || s.manager == nil {
+	if s == nil || s.manager == nil || s.supervisor == nil {
 		return workerupdate.Result{}, ErrInvalidConfig
 	}
-	return s.manager.Check(ctx, s.source.ResolveManual)
+	supervisorResult, supervisorErr := s.supervisor.Check(ctx, s.source.ResolveSupervisorManual)
+	workerResult, workerErr := s.manager.Check(ctx, s.source.ResolveManual)
+	if supervisorErr != nil && !errors.Is(supervisorErr, supervisorupdate.ErrMaintenanceRequired) {
+		return workerResult, supervisorErr
+	}
+	if workerErr != nil {
+		return workerResult, workerErr
+	}
+	if supervisorResult.Version != "" && compareVersions(supervisorResult.Version, workerResult.Version) > 0 {
+		workerResult.Version = supervisorResult.Version
+		workerResult.Updated = supervisorResult.Applied
+	}
+	return workerResult, nil
+}
+
+func (s *Service) ApproveMaintenance(ctx context.Context, version string) (supervisorupdate.Result, error) {
+	if s == nil || s.supervisor == nil {
+		return supervisorupdate.Result{}, ErrInvalidConfig
+	}
+	return s.supervisor.Approve(ctx, version, s.source.ResolveSupervisorManual)
 }
 
 func (s *Service) Snapshot() autoupdate.Observation {
@@ -127,14 +161,74 @@ func (s *Service) Snapshot() autoupdate.Observation {
 // Check resolves the signed cohort-eligible release but does not stage or
 // activate it. Manual installation is deliberately a distinct control action.
 func (s *Service) Check(ctx context.Context) (workerupdate.Result, error) {
-	if s == nil || s.manager == nil {
+	if s == nil || s.manager == nil || s.supervisor == nil {
 		return workerupdate.Result{}, ErrInvalidConfig
 	}
-	release, found, err := s.source.Resolve(ctx)
-	if err != nil || !found {
-		return workerupdate.Result{Version: s.manager.ActiveVersion()}, err
+	result, err := serviceCheck(ctx, s.manager, s.supervisor, s.source.Resolve, s.source.ResolveSupervisor)
+	return workerupdate.Result{Version: result.Version, Updated: result.Updated}, err
+}
+
+type hostdWorkloads struct{ client *hostdproto.Client }
+
+func (w hostdWorkloads) Snapshot(ctx context.Context) (supervisorupdate.WorkloadSnapshot, error) {
+	status, err := w.client.Active(ctx)
+	if err != nil {
+		return supervisorupdate.WorkloadSnapshot{}, err
 	}
-	return workerupdate.Result{Version: release.Version}, nil
+	return supervisorupdate.WorkloadSnapshot{Generation: status.WorkloadGeneration, Protected: status.ProtectedWorkloads}, nil
+}
+
+func serviceCheck(ctx context.Context, manager *workerupdate.Manager, supervisor *supervisorupdate.Manager, workerResolve, supervisorResolve workerupdate.Resolver) (autoupdate.Result, error) {
+	supervisorResult, supervisorErr := supervisor.Check(ctx, supervisorResolve)
+	workerResult, workerErr := manager.Check(ctx, workerResolve)
+	if supervisorErr != nil && !errors.Is(supervisorErr, supervisorupdate.ErrMaintenanceRequired) {
+		return autoupdate.Result{Version: supervisorResult.Version}, supervisorErr
+	}
+	if workerErr != nil {
+		return autoupdate.Result{Version: workerResult.Version}, workerErr
+	}
+	version := workerResult.Version
+	updated := workerResult.Updated
+	if compareVersions(supervisorResult.Version, version) > 0 {
+		version, updated = supervisorResult.Version, supervisorResult.Applied
+	}
+	return autoupdate.Result{Version: version, Updated: updated}, nil
+}
+
+func compareVersions(left, right string) int {
+	if left == right {
+		return 0
+	}
+	if left == "" {
+		return -1
+	}
+	if right == "" {
+		return 1
+	}
+	leftParts, rightParts := strings.Split(left, "."), strings.Split(right, ".")
+	if len(leftParts) != 4 || len(rightParts) != 4 {
+		if left < right {
+			return -1
+		}
+		return 1
+	}
+	for index := range leftParts {
+		lv, lerr := strconv.ParseUint(leftParts[index], 10, 32)
+		rv, rerr := strconv.ParseUint(rightParts[index], 10, 32)
+		if lerr != nil || rerr != nil {
+			if left < right {
+				return -1
+			}
+			return 1
+		}
+		if lv < rv {
+			return -1
+		}
+		if lv > rv {
+			return 1
+		}
+	}
+	return 0
 }
 
 // HTTPHealth is a bounded local hostd readiness check. The endpoint must be a

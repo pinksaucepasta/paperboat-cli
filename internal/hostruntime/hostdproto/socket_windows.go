@@ -46,6 +46,7 @@ type SocketConfig struct {
 
 	RequestTimeout time.Duration
 	MaxConcurrent  int
+	Workloads      func() WorkloadStatus
 }
 
 type Server struct {
@@ -156,6 +157,13 @@ func (s *Server) serveOne(connection net.Conn) {
 	if err != nil {
 		s.writeError(connection, err)
 		return
+	}
+	if _, ok := request.(*Status); ok && s.config.Workloads != nil {
+		if status, ok := response.(*Status); ok {
+			workload := s.config.Workloads()
+			status.WorkloadGeneration = workload.Generation
+			status.ProtectedWorkloads = workload.Protected
+		}
 	}
 	_ = WriteFrame(connection, response)
 }
