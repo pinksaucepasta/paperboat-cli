@@ -150,3 +150,17 @@ uninstall retire all durable preview services before authority or state is remov
 Machine-control credentials renew in memory and are bound to the enrolled Ed25519 key and
 installation generation. Reinstall, unpair, or machine revocation invalidates them. Never
 copy a runtime state directory to another machine or edit preview service descriptors.
+
+## Container hostd and updates
+
+Hosted and self-hosted container deployments use the same split update boundary as native
+hosts. `paperboat-hostd` stays alive and owns live workloads; the root-only
+`paperboat-updated` process verifies TUF metadata, rotates root-owned artifacts in the
+persistent release volume, and replaces only the runtime worker. Routine runtime and CLI
+updates do not replace the container or close a hostd-owned stream.
+
+Use the supplied [container deployment guide](../deploy/container/README.md) and Compose
+definitions. Keep `/var/lib/paperboat` and `/workspace` persistent, distinct, and attached
+only to the Paperboat container. The supplied definitions make the root filesystem read-only
+and do not publish any host port. A pod eviction, image replacement, node failure, or an
+administrator container restart is supervisor-class maintenance, not an invisible update.

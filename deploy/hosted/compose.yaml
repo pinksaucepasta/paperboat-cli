@@ -1,0 +1,25 @@
+services:
+  paperboat-hosted:
+    image: ${PAPERBOAT_IMAGE:?set PAPERBOAT_IMAGE to a signed Paperboat release image}
+    restart: unless-stopped
+    read_only: true
+    environment:
+      PAPERBOAT_CONTAINER_MODE: hosted
+      PAPERBOAT_RELEASE_REPOSITORY: ${PAPERBOAT_RELEASE_REPOSITORY:?set the fixed HTTPS TUF repository}
+      PAPERBOAT_MACHINE_ID: ${PAPERBOAT_MACHINE_ID:?set the enrolled machine ID}
+      PAPERBOAT_CONTROL_URL: ${PAPERBOAT_CONTROL_URL:?set the HTTPS control-plane URL}
+      PAPERBOAT_SSH_USER: paperboat
+      PAPERBOAT_SSH_PORT: ${PAPERBOAT_SSH_PORT:?set the managed SSH port}
+      PAPERBOAT_PROJECT_ID: ${PAPERBOAT_PROJECT_ID:?set the hosted project ID}
+      PAPERBOAT_REPOSITORY_URL: ${PAPERBOAT_REPOSITORY_URL:?set the project repository URL}
+      PAPERBOAT_MACHINE_GENERATION: ${PAPERBOAT_MACHINE_GENERATION:?set the machine generation}
+    volumes:
+      - paperboat-state:/var/lib/paperboat
+      - paperboat-workspace:/workspace
+    tmpfs:
+      - /run:mode=755,nosuid,nodev
+      - /tmp:mode=1777,nosuid,nodev
+
+volumes:
+  paperboat-state:
+  paperboat-workspace:
