@@ -41,39 +41,14 @@ func ExecuteHostService(ctx context.Context, args []string, stderr io.Writer) in
 		fmt.Fprintln(stderr, "pb:", err)
 		return 1
 	}
-	stateRoot, installRoot := "/var/lib/paperboat", "/usr/local/libexec/paperboat"
+	stateRoot := "/var/lib/paperboat"
 	if runtime.GOOS == "darwin" {
-		stateRoot, installRoot = "/Library/Application Support/Paperboat", "/Library/PrivilegedHelperTools/Paperboat"
-	}
-	// Host runtime state is owned by the enrolled user. Keep privileged update
-	// journals and rollback metadata in a root-owned child directory instead of
-	// widening the updater's trust to the shared user-owned state root.
-	updateStateRoot := filepath.Join(stateRoot, "privileged-updates")
-	if err := os.MkdirAll(updateStateRoot, 0o700); err != nil {
-		fmt.Fprintln(stderr, "pb:", err)
-		return 1
-	}
-	if err := os.Chmod(updateStateRoot, 0o700); err != nil {
-		fmt.Fprintln(stderr, "pb:", err)
-		return 1
-	}
-	if err := os.Chown(updateStateRoot, 0, 0); err != nil {
-		fmt.Fprintln(stderr, "pb:", err)
-		return 1
+		stateRoot = "/Library/Application Support/Paperboat"
 	}
 	applier := hostservice.NewPlatformApplier(filepath.Join(stateRoot, "power-baseline.json"))
-	updates, err := hostservice.NewUpdateManager(hostservice.UpdateConfig{
-		StateRoot: updateStateRoot, BinaryPath: filepath.Join(installRoot, "pb"),
-		CurrentVersion: buildinfo.Version, ListenAddress: *listenAddress,
-	})
-	if err != nil {
-		_ = notifier.Degraded("update manager initialization failed")
-		fmt.Fprintln(stderr, "pb:", err)
-		return 1
-	}
 	server, err := hostservice.New(hostservice.Config{
 		SocketPath: "/var/run/paperboat/host-service.sock", StatePath: filepath.Join(stateRoot, "availability-policy.json"),
-		UID: *uid, GID: *gid, Applier: applier, Version: buildinfo.Version, Updates: updates,
+		UID: *uid, GID: *gid, Applier: applier, Version: buildinfo.Version,
 		Ready: notifier.Ready, Heartbeat: notifier.Watchdog, HeartbeatInterval: notifier.WatchdogInterval(),
 	})
 	if err != nil {

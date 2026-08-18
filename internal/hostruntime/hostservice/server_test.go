@@ -12,24 +12,12 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/pinksaucepasta/paperboat/internal/hostruntime/bootstrap"
 )
 
 type fakeApplier struct {
 	mu    sync.Mutex
 	modes []string
 	err   error
-}
-
-type fakeUpdateActivator struct {
-	artifact bootstrap.ArtifactTarget
-	err      error
-}
-
-func (a *fakeUpdateActivator) Activate(_ context.Context, artifact bootstrap.ArtifactTarget) (string, error) {
-	a.artifact = artifact
-	return artifact.Version, a.err
 }
 
 func (a *fakeApplier) Apply(_ context.Context, mode string) error {
@@ -193,30 +181,13 @@ func TestDesiredPolicyPersistsBeforeApplicationFailure(t *testing.T) {
 	}
 }
 
-func TestProtocolAllowsOnlySingleSignedUpdateManifest(t *testing.T) {
+func TestProtocolRejectsRemovedRestartUpdateOperation(t *testing.T) {
 	if os.Getuid() == 0 {
 		t.Skip("peer test requires a non-root enrolled user")
 	}
-	activator := &fakeUpdateActivator{}
 	server := testServer(t, os.Getuid(), &fakeApplier{})
-	server.config.Updates = activator
-	artifact := &bootstrap.ArtifactTarget{Schema: bootstrap.ArtifactTargetSchemaV1, Kind: bootstrap.ArtifactKindPB, Version: "2026.07.26"}
-	response := requestServer(t, server, Request{Schema: ProtocolV1, Operation: "activate_update", Artifact: artifact})
-	if response.ErrorCode != "" || response.UpdateVersion != artifact.Version || activator.artifact.Kind != bootstrap.ArtifactKindPB {
-		t.Fatalf("response=%+v activator=%+v", response, activator)
-	}
-	for name, request := range map[string]Request{
-		"missing artifact": {Schema: ProtocolV1, Operation: "activate_update"},
-		"mode smuggle":     {Schema: ProtocolV1, Operation: "activate_update", Mode: KeepAwake, Artifact: artifact},
-	} {
-		t.Run(name, func(t *testing.T) {
-			if result := requestServer(t, server, request); result.ErrorCode != "invalid_request" {
-				t.Fatalf("response=%+v", result)
-			}
-		})
-	}
-	if result := rawRequestServer(t, server, []byte(`{"schema":"paperboat.host-service/v1","operation":"activate_update","artifact":{},"path":"/tmp/pb"}`)); result.ErrorCode != "invalid_request" {
-		t.Fatalf("path smuggling response=%+v", result)
+	if result := rawRequestServer(t, server, []byte(`{"schema":"paperboat.host-service/v1","operation":"activate_update","artifact":{}}`)); result.ErrorCode != "invalid_request" {
+		t.Fatalf("removed update response=%+v", result)
 	}
 }
 

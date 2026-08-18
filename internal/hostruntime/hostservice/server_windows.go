@@ -1,4 +1,4 @@
-//go:build darwin || linux
+//go:build windows
 
 package hostservice
 
@@ -11,11 +11,14 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/Microsoft/go-winio"
 	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/bootstrap"
+	"golang.org/x/sys/windows"
 )
 
 const (
@@ -27,7 +30,7 @@ const (
 var (
 	ErrInvalidConfig  = errors.New("invalid host-service configuration")
 	ErrInvalidRequest = errors.New("invalid host-service request")
-	ErrPeerDenied     = errors.New("host-service peer is not the enrolled user")
+	ErrPeerDenied     = errors.New("host-service named-pipe peer is not enrolled")
 	ErrStalePolicy    = errors.New("availability policy version is stale")
 )
 
@@ -38,7 +41,6 @@ type Request struct {
 	Version   int64                     `json:"version,omitempty"`
 	Artifact  *bootstrap.ArtifactTarget `json:"artifact,omitempty"`
 }
-
 type Response struct {
 	Schema             string    `json:"schema"`
 	Status             string    `json:"status"`
@@ -50,10 +52,10 @@ type Response struct {
 	ErrorCode          string    `json:"error_code,omitempty"`
 	HostServiceVersion string    `json:"host_service_version"`
 	Scope              string    `json:"scope"`
+	UpdateVersion      string    `json:"update_version,omitempty"`
 	UpdateRollbacks    uint64    `json:"update_rollbacks"`
 	UpdateHealth       string    `json:"update_health"`
 }
-
 type State struct {
 	Schema          string    `json:"schema"`
 	DesiredMode     string    `json:"desired_mode"`
@@ -64,25 +66,31 @@ type State struct {
 	Status          string    `json:"status"`
 	ErrorCode       string    `json:"error_code,omitempty"`
 }
-
 type Applier interface {
 	Apply(context.Context, string) error
 	Close(context.Context) error
 }
-
+type UpdateActivator interface {
+	Activate(context.Context, bootstrap.ArtifactTarget) (string, error)
+}
+type UpdateDiagnostics interface {
+	RollbackCount() uint64
+	UpdateHealth() string
+}
 type Config struct {
 	SocketPath        string
 	StatePath         string
 	UID               int
 	GID               int
+	SID               string
 	Applier           Applier
 	Now               func() time.Time
 	Version           string
+	Updates           UpdateActivator
 	Ready             func() error
 	Heartbeat         func() error
 	HeartbeatInterval time.Duration
 }
-
 type Server struct {
 	config Config
 	mu     sync.Mutex
@@ -90,8 +98,7 @@ type Server struct {
 }
 
 func New(config Config) (*Server, error) {
-	if !filepath.IsAbs(config.SocketPath) || !filepath.IsAbs(config.StatePath) || config.UID < 0 || config.GID < 0 || config.Applier == nil || config.Version == "" ||
-		config.HeartbeatInterval < 0 || config.HeartbeatInterval > 0 && config.Heartbeat == nil {
+	if !validPipePath(config.SocketPath) || !filepath.IsAbs(config.StatePath) || config.Applier == nil || config.Version == "" || config.HeartbeatInterval < 0 || config.HeartbeatInterval > 0 && config.Heartbeat == nil || config.SID != "" && !validSID(config.SID) {
 		return nil, ErrInvalidConfig
 	}
 	if config.Now == nil {
@@ -105,68 +112,39 @@ func New(config Config) (*Server, error) {
 }
 
 func (s *Server) Run(ctx context.Context) error {
-	if os.Geteuid() != 0 {
-		return ErrInvalidConfig
-	}
 	s.mu.Lock()
-	mode := s.state.DesiredMode
+	mode, version := s.state.DesiredMode, s.state.DesiredVersion
 	s.mu.Unlock()
 	if mode == KeepAwake {
-		if err := s.apply(ctx, mode, s.state.DesiredVersion); err != nil {
+		if err := s.apply(ctx, mode, version); err != nil {
 			return err
 		}
 	}
-	listener, err := s.listen()
+	listener, err := winio.ListenPipe(s.config.SocketPath, &winio.PipeConfig{SecurityDescriptor: hostServiceSecurityDescriptor(s.config.SID), InputBufferSize: 16 << 10, OutputBufferSize: 16 << 10})
 	if err != nil {
 		return err
 	}
-	defer func() {
-		listener.Close()
-		_ = os.Remove(s.config.SocketPath)
-	}()
-	return s.serveListener(ctx, listener)
-}
-
-func (s *Server) serveListener(ctx context.Context, listener *net.UnixListener) error {
+	defer listener.Close()
 	if s.config.Ready != nil {
 		if err := s.config.Ready(); err != nil {
 			return err
 		}
 	}
-	go func() {
-		<-ctx.Done()
-		listener.Close()
-	}()
+	go func() { <-ctx.Done(); _ = listener.Close() }()
 	for {
-		if s.config.HeartbeatInterval > 0 {
-			if err := listener.SetDeadline(s.config.Now().Add(s.config.HeartbeatInterval)); err != nil {
-				return err
-			}
-		}
-		connection, err := listener.AcceptUnix()
-		if err != nil {
-			if ctx.Err() != nil {
+		connection, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			if ctx.Err() != nil || errors.Is(acceptErr, net.ErrClosed) || errors.Is(acceptErr, winio.ErrPipeListenerClosed) {
 				return errors.Join(ctx.Err(), s.config.Applier.Close(context.Background()))
 			}
-			var networkErr net.Error
-			if errors.As(err, &networkErr) && networkErr.Timeout() && s.config.HeartbeatInterval > 0 {
-				if err := s.config.Heartbeat(); err != nil {
-					return err
-				}
-				continue
-			}
-			return err
+			return acceptErr
 		}
 		_ = s.serve(connection)
-		connection.Close()
+		_ = connection.Close()
 	}
 }
 
-func (s *Server) serve(connection *net.UnixConn) error {
-	uid, err := peerUID(connection)
-	if err != nil || uid != s.config.UID {
-		return ErrPeerDenied
-	}
+func (s *Server) serve(connection net.Conn) error {
 	_ = connection.SetDeadline(time.Now().Add(5 * time.Second))
 	decoder := json.NewDecoder(io.LimitReader(connection, 16<<10))
 	decoder.DisallowUnknownFields()
@@ -187,6 +165,18 @@ func (s *Server) serve(connection *net.UnixConn) error {
 		s.mu.Unlock()
 		return s.respond(connection, s.response(current))
 	}
+	if request.Operation == "activate_update" {
+		if request.Mode != "" || request.Version != 0 || request.Artifact == nil || s.config.Updates == nil {
+			return s.respond(connection, s.errorResponse("invalid_request"))
+		}
+		version, activateErr := s.config.Updates.Activate(context.Background(), *request.Artifact)
+		if activateErr != nil {
+			return s.respond(connection, s.errorResponse("update_activation_failed"))
+		}
+		response := s.errorResponse("")
+		response.UpdateVersion = version
+		return s.respond(connection, response)
+	}
 	if request.Operation != "apply_availability" || request.Artifact != nil || !validMode(request.Mode) || request.Version < 0 {
 		return s.respond(connection, s.errorResponse("invalid_request"))
 	}
@@ -199,13 +189,15 @@ func (s *Server) serve(connection *net.UnixConn) error {
 	if request.Version == current.DesiredVersion && current.Status == "applied" {
 		return s.respond(connection, s.response(current))
 	}
-	err = s.apply(context.Background(), request.Mode, request.Version)
+	if err := s.apply(context.Background(), request.Mode, request.Version); err != nil {
+		s.mu.Lock()
+		result := s.state
+		s.mu.Unlock()
+		return s.respond(connection, s.response(result))
+	}
 	s.mu.Lock()
 	result := s.state
 	s.mu.Unlock()
-	if err != nil {
-		return s.respond(connection, s.response(result))
-	}
 	return s.respond(connection, s.response(result))
 }
 
@@ -229,43 +221,7 @@ func (s *Server) apply(ctx context.Context, mode string, version int64) error {
 	s.state.ObservedAt, s.state.Status, s.state.ErrorCode = s.config.Now().UTC(), "applied", ""
 	return s.persistLocked()
 }
-
-func (s *Server) State() State {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.state
-}
-
-func (s *Server) listen() (*net.UnixListener, error) {
-	directory := filepath.Dir(s.config.SocketPath)
-	if err := secureDirectory(directory, 0o755); err != nil {
-		return nil, err
-	}
-	if info, err := os.Lstat(s.config.SocketPath); err == nil {
-		if info.Mode()&os.ModeSocket == 0 || info.Mode()&os.ModeSymlink != 0 {
-			return nil, ErrInvalidConfig
-		}
-		if err := os.Remove(s.config.SocketPath); err != nil {
-			return nil, err
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil, err
-	}
-	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: s.config.SocketPath, Net: "unix"})
-	if err != nil {
-		return nil, err
-	}
-	if err := os.Chown(s.config.SocketPath, s.config.UID, s.config.GID); err != nil {
-		listener.Close()
-		return nil, err
-	}
-	if err := os.Chmod(s.config.SocketPath, 0o660); err != nil {
-		listener.Close()
-		return nil, err
-	}
-	return listener, nil
-}
-
+func (s *Server) State() State { s.mu.Lock(); defer s.mu.Unlock(); return s.state }
 func (s *Server) load() error {
 	body, err := os.ReadFile(s.config.StatePath)
 	if err != nil {
@@ -277,25 +233,23 @@ func (s *Server) load() error {
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
 	var state State
-	if decoder.Decode(&state) != nil || state.Schema != ProtocolV1 || !validMode(state.DesiredMode) || state.DesiredVersion < 0 || !validStatus(state.Status) {
+	var extra any
+	if decoder.Decode(&state) != nil || decoder.Decode(&extra) != io.EOF || state.Schema != ProtocolV1 || !validMode(state.DesiredMode) || state.DesiredVersion < 0 || !validStatus(state.Status) {
 		return ErrInvalidConfig
 	}
 	s.state = state
 	return nil
 }
-
 func (s *Server) persistLocked() error {
 	body, err := json.Marshal(s.state)
 	if err != nil {
 		return err
 	}
-	directory := filepath.Dir(s.config.StatePath)
-	if err := secureDirectory(directory, 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(s.config.StatePath), 0o700); err != nil {
 		return err
 	}
 	return atomicfile.Write(s.config.StatePath, body, atomicfile.Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1})
 }
-
 func (s *Server) respond(writer io.Writer, value Response) error {
 	return json.NewEncoder(writer).Encode(value)
 }
@@ -307,19 +261,31 @@ func (s *Server) errorResponse(code string) Response {
 	return value
 }
 func (s *Server) response(state State) Response {
-	return Response{Schema: ProtocolV1, Status: state.Status, DesiredMode: state.DesiredMode, DesiredVersion: state.DesiredVersion, ObservedMode: state.ObservedMode, ObservedVersion: state.ObservedVersion, ObservedAt: state.ObservedAt, ErrorCode: state.ErrorCode, HostServiceVersion: s.config.Version, Scope: "system", UpdateHealth: "unknown"}
+	var rollbacks uint64
+	if diagnostics, ok := s.config.Updates.(UpdateDiagnostics); ok {
+		rollbacks = diagnostics.RollbackCount()
+	}
+	health := "unknown"
+	if diagnostics, ok := s.config.Updates.(UpdateDiagnostics); ok {
+		health = diagnostics.UpdateHealth()
+	}
+	return Response{Schema: ProtocolV1, Status: state.Status, DesiredMode: state.DesiredMode, DesiredVersion: state.DesiredVersion, ObservedMode: state.ObservedMode, ObservedVersion: state.ObservedVersion, ObservedAt: state.ObservedAt, ErrorCode: state.ErrorCode, HostServiceVersion: s.config.Version, Scope: "system", UpdateRollbacks: rollbacks, UpdateHealth: health}
 }
 func validMode(mode string) bool { return mode == AllowSleep || mode == KeepAwake }
 func validStatus(status string) bool {
 	return status == "applied" || status == "pending" || status == "error"
 }
-func secureDirectory(path string, mode os.FileMode) error {
-	if err := os.MkdirAll(path, mode); err != nil {
-		return err
+func validPipePath(path string) bool {
+	const prefix = `\\.\pipe\`
+	return strings.HasPrefix(strings.ToLower(path), prefix) && len(path) > len(prefix) && len(path) <= 256 && !strings.ContainsAny(path[len(prefix):], `/\:*?"<>|`)
+}
+func validSID(value string) bool {
+	sid, err := windows.StringToSid(value)
+	return err == nil && sid != nil && sid.String() == value
+}
+func hostServiceSecurityDescriptor(sid string) string {
+	if validSID(sid) {
+		return "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;" + sid + ")"
 	}
-	info, err := os.Lstat(path)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return ErrInvalidConfig
-	}
-	return os.Chmod(path, mode)
+	return "D:P(A;;GA;;;SY)(A;;GA;;;BA)"
 }

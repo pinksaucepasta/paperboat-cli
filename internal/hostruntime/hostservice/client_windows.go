@@ -1,4 +1,4 @@
-//go:build darwin || linux
+//go:build windows
 
 package hostservice
 
@@ -7,12 +7,13 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"net"
-	"path/filepath"
 	"time"
 
+	"github.com/Microsoft/go-winio"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/bootstrap"
 )
+
+const defaultSocketPath = `\\.\pipe\PaperboatHostService`
 
 type Client struct {
 	socketPath string
@@ -20,15 +21,19 @@ type Client struct {
 }
 
 func NewClient(socketPath string, timeout time.Duration) (*Client, error) {
-	if !filepath.IsAbs(socketPath) || timeout <= 0 || timeout > 2*time.Minute {
+	if !validPipePath(socketPath) || timeout <= 0 || timeout > 2*time.Minute {
 		return nil, ErrInvalidConfig
 	}
 	return &Client{socketPath: socketPath, timeout: timeout}, nil
 }
-
+func DefaultSocketPath() string { return defaultSocketPath }
 func (c *Client) Activate(ctx context.Context, artifact bootstrap.ArtifactTarget) (string, error) {
-	dialer := net.Dialer{Timeout: c.timeout}
-	connection, err := dialer.DialContext(ctx, "unix", c.socketPath)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	dialCtx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	connection, err := winio.DialPipeContext(dialCtx, c.socketPath)
 	if err != nil {
 		return "", err
 	}
@@ -38,12 +43,8 @@ func (c *Client) Activate(ctx context.Context, artifact bootstrap.ArtifactTarget
 		deadline = limit
 	}
 	_ = connection.SetDeadline(deadline)
-	request := Request{Schema: ProtocolV1, Operation: "activate_update", Artifact: &artifact}
-	if err := json.NewEncoder(connection).Encode(request); err != nil {
+	if err := json.NewEncoder(connection).Encode(Request{Schema: ProtocolV1, Operation: "activate_update", Artifact: &artifact}); err != nil {
 		return "", err
-	}
-	if closer, ok := connection.(interface{ CloseWrite() error }); !ok || closer.CloseWrite() != nil {
-		return "", ErrInvalidRequest
 	}
 	decoder := json.NewDecoder(io.LimitReader(connection, 16<<10))
 	decoder.DisallowUnknownFields()
