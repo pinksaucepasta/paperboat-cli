@@ -61,8 +61,12 @@ func New(config Config) (*Service, error) {
 	if err := secureRoot(config.StateRoot); err != nil {
 		return nil, err
 	}
-	for _, path := range []string{filepath.Join(config.StateRoot, "tuf", "index"), filepath.Join(config.StateRoot, "tuf", "targets")} {
-		if err := secureRoot(path); err != nil {
+	tufRoot, err := secureChild(config.StateRoot, "tuf")
+	if err != nil {
+		return nil, err
+	}
+	for _, name := range []string{"index", "targets"} {
+		if _, err := secureChild(tufRoot, name); err != nil {
 			return nil, err
 		}
 	}
@@ -181,4 +185,21 @@ func secureRoot(path string) error {
 		return ErrInvalidConfig
 	}
 	return nil
+}
+
+// secureChild provisions only a fixed component below an already validated
+// root-owned directory. It never follows caller-selected paths or repairs an
+// unsafe existing entry.
+func secureChild(parent, name string) (string, error) {
+	if name == "" || filepath.Base(name) != name {
+		return "", ErrInvalidConfig
+	}
+	path := filepath.Join(parent, name)
+	if err := os.Mkdir(path, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+		return "", err
+	}
+	if err := secureRoot(path); err != nil {
+		return "", err
+	}
+	return path, nil
 }
