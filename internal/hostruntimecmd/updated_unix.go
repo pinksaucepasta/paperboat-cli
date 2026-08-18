@@ -25,10 +25,11 @@ func runUpdated(ctx context.Context, args []string, _ io.Writer, stderr io.Write
 	}
 	stateRoot, current, rollback, staged := os.Getenv("PAPERBOAT_UPDATE_STATE_ROOT"), os.Getenv("PAPERBOAT_RUNTIME_CURRENT"), os.Getenv("PAPERBOAT_RUNTIME_ROLLBACK"), os.Getenv("PAPERBOAT_RUNTIME_STAGED")
 	socket, tokenPath, repository, machineID := os.Getenv("PAPERBOAT_HOSTD_SOCKET"), os.Getenv("PAPERBOAT_HOSTD_TOKEN_FILE"), os.Getenv("PAPERBOAT_RELEASE_REPOSITORY"), os.Getenv("PAPERBOAT_MACHINE_ID")
+	controlSocket := os.Getenv("PAPERBOAT_UPDATED_SOCKET")
 	healthURL := os.Getenv("PAPERBOAT_UPDATE_HEALTH_URL")
 	uid, uidErr := strconv.Atoi(os.Getenv("PAPERBOAT_ENROLLED_UID"))
 	gid, gidErr := strconv.Atoi(os.Getenv("PAPERBOAT_ENROLLED_GID"))
-	for _, path := range []string{stateRoot, current, rollback, staged, socket, tokenPath} {
+	for _, path := range []string{stateRoot, current, rollback, staged, socket, tokenPath, controlSocket} {
 		if !filepath.IsAbs(path) {
 			return errors.New("invalid paperboat-updated environment")
 		}
@@ -45,7 +46,7 @@ func runUpdated(ctx context.Context, args []string, _ io.Writer, stderr io.Write
 	if err != nil {
 		return err
 	}
-	service, err := updated.New(updated.Config{StateRoot: stateRoot, RuntimeCurrent: current, RuntimeRollback: rollback, RuntimeStaged: staged, Active: active, WorkerUID: uid, WorkerGID: gid, SocketPath: socket, Token: token, RepositoryURL: repository, MachineID: machineID, Health: updated.HTTPHealth{Endpoint: healthURL}})
+	service, err := updated.New(updated.Config{StateRoot: stateRoot, RuntimeCurrent: current, RuntimeRollback: rollback, RuntimeStaged: staged, Active: active, WorkerUID: uid, WorkerGID: gid, SocketPath: socket, Token: token, RepositoryURL: repository, MachineID: machineID, Health: updated.HTTPHealth{Endpoint: healthURL}, ControlSocket: controlSocket})
 	if err != nil {
 		return err
 	}

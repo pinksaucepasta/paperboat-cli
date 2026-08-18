@@ -54,11 +54,11 @@ import (
 	filetransfer "github.com/pinksaucepasta/paperboat/internal/filetransfer"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/bootstrap"
 	helperconfig "github.com/pinksaucepasta/paperboat/internal/hostruntime/config"
-	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostservice"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/identity"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/preview"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/servelease"
 	service "github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/updated"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntimecmd"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntimeentry"
 	"github.com/pinksaucepasta/paperboat/internal/httptransport"
@@ -79,7 +79,6 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/prompt"
 	"github.com/pinksaucepasta/paperboat/internal/resolver"
 	"github.com/pinksaucepasta/paperboat/internal/selector"
-	"github.com/pinksaucepasta/paperboat/internal/selfupdate"
 	servepkg "github.com/pinksaucepasta/paperboat/internal/serve"
 	"github.com/pinksaucepasta/paperboat/internal/session"
 	"github.com/pinksaucepasta/paperboat/internal/statusbar"
@@ -2308,10 +2307,7 @@ func newRootCommand() *cobra.Command {
 type updateResult struct {
 	PreviousVersion string `json:"previous_version"`
 	Version         string `json:"version"`
-	CLIUpdated      bool   `json:"cli_updated"`
 	RuntimeUpdated  bool   `json:"runtime_updated"`
-	RuntimeDeferred bool   `json:"runtime_deferred"`
-	ActiveSessions  uint64 `json:"active_sessions,omitempty"`
 }
 
 func updateCommand() *cobra.Command {
@@ -2333,27 +2329,23 @@ type updateCheckResult struct {
 }
 
 func actionUpdateCheck(command *cobra.Command, _ []string) error {
-	ctx, cancel := context.WithTimeout(command.Context(), 3*time.Minute)
+	ctx, cancel := context.WithTimeout(command.Context(), 30*time.Second)
 	defer cancel()
-	artifact, _, err := resolveVerifiedUpdate(ctx)
+	client, err := updated.NewClient(updatedControlSocket(), 30*time.Second)
 	if err != nil {
 		return err
 	}
-	available := buildinfo.Version == "dev"
-	if !available {
-		comparison, compareErr := selfupdate.CompareVersions(artifact.Version, buildinfo.Version)
-		if compareErr != nil {
-			return compareErr
-		}
-		available = comparison > 0
+	response, err := client.Check(ctx)
+	if err != nil {
+		return fmt.Errorf("check with paperboat-updated: %w", err)
 	}
-	result := updateCheckResult{InstalledVersion: buildinfo.Version, LatestVersion: artifact.Version, UpdateAvailable: available, Verified: true}
+	result := updateCheckResult{InstalledVersion: buildinfo.Version, LatestVersion: response.Version, UpdateAvailable: response.Version != "" && response.Version != buildinfo.Version, Verified: true}
 	jsonOutput, _ := command.Flags().GetBool("json")
 	if jsonOutput {
 		return json.NewEncoder(command.OutOrStdout()).Encode(result)
 	}
-	if available {
-		fmt.Fprintf(command.OutOrStdout(), "Paperboat %s is available; installed version is %s.\n", artifact.Version, buildinfo.Version)
+	if result.UpdateAvailable {
+		fmt.Fprintf(command.OutOrStdout(), "Paperboat %s is available; installed version is %s.\n", result.LatestVersion, buildinfo.Version)
 	} else {
 		fmt.Fprintf(command.OutOrStdout(), "pb %s is up to date.\n", buildinfo.Version)
 	}
@@ -2361,27 +2353,41 @@ func actionUpdateCheck(command *cobra.Command, _ []string) error {
 }
 
 type updateStatusResult struct {
-	CLIVersion       string `json:"cli_version"`
-	RuntimeVersion   string `json:"runtime_version,omitempty"`
-	RuntimeAvailable bool   `json:"runtime_available"`
-	ActiveSessions   uint64 `json:"active_sessions"`
+	CLIVersion       string    `json:"cli_version"`
+	RuntimeVersion   string    `json:"runtime_version"`
+	RuntimeAvailable bool      `json:"runtime_available"`
+	LastCheck        time.Time `json:"last_check,omitempty"`
+	NextCheck        time.Time `json:"next_check,omitempty"`
+	LastFailure      string    `json:"last_failure,omitempty"`
 }
 
 func actionUpdateStatus(command *cobra.Command, _ []string) error {
-	health, err := localUpdateHealth(command.Context())
-	result := updateStatusResult{CLIVersion: buildinfo.Version}
-	if err == nil {
-		result.RuntimeVersion, result.RuntimeAvailable, result.ActiveSessions = health.Version, true, health.Workloads.Sessions
+	ctx, cancel := context.WithTimeout(command.Context(), 10*time.Second)
+	defer cancel()
+	client, err := updated.NewClient(updatedControlSocket(), 10*time.Second)
+	if err != nil {
+		return err
 	}
+	response, err := client.Status(ctx)
+	if err != nil {
+		return fmt.Errorf("read paperboat-updated status: %w", err)
+	}
+	result := updateStatusResult{CLIVersion: buildinfo.Version, RuntimeVersion: response.Version, RuntimeAvailable: response.Version != "", LastCheck: response.Observation.CheckedAt, NextCheck: response.Observation.NextCheckAt, LastFailure: response.Observation.Failure}
 	jsonOutput, _ := command.Flags().GetBool("json")
 	if jsonOutput {
 		return json.NewEncoder(command.OutOrStdout()).Encode(result)
 	}
 	fmt.Fprintf(command.OutOrStdout(), "CLI: %s\n", result.CLIVersion)
 	if result.RuntimeAvailable {
-		fmt.Fprintf(command.OutOrStdout(), "Runtime: %s\nActive sessions: %d\n", result.RuntimeVersion, result.ActiveSessions)
+		fmt.Fprintf(command.OutOrStdout(), "Runtime: %s\n", result.RuntimeVersion)
 	} else {
 		fmt.Fprintln(command.OutOrStdout(), "Runtime: unavailable")
+	}
+	if !result.NextCheck.IsZero() {
+		fmt.Fprintf(command.OutOrStdout(), "Next automatic check: %s\n", result.NextCheck.Local().Format(time.RFC3339))
+	}
+	if result.LastFailure != "" {
+		fmt.Fprintf(command.OutOrStdout(), "Last update failure: %s\n", result.LastFailure)
 	}
 	return nil
 }
@@ -2389,124 +2395,32 @@ func actionUpdateStatus(command *cobra.Command, _ []string) error {
 func actionUpdate(command *cobra.Command, _ []string) error {
 	ctx, cancel := context.WithTimeout(command.Context(), 3*time.Minute)
 	defer cancel()
-	artifact, verified, err := resolveVerifiedUpdate(ctx)
+	client, err := updated.NewClient(updatedControlSocket(), 3*time.Minute)
 	if err != nil {
 		return err
 	}
-	result := updateResult{PreviousVersion: buildinfo.Version, Version: artifact.Version}
-	if buildinfo.Version != "dev" {
-		comparison, compareErr := selfupdate.CompareVersions(artifact.Version, buildinfo.Version)
-		if compareErr != nil || comparison < 0 {
-			return errors.New("the signed release origin returned an older version; refusing to downgrade pb")
-		}
+	response, err := client.Update(ctx)
+	if err != nil {
+		return fmt.Errorf("update with paperboat-updated: %w", err)
 	}
-	health, healthErr := localUpdateHealth(ctx)
-	runtimeInstalled := healthErr == nil
-	if runtimeInstalled && health.Version != artifact.Version {
-		if health.Workloads.Sessions > 0 {
-			result.RuntimeDeferred, result.ActiveSessions = true, health.Workloads.Sessions
-		} else {
-			client, clientErr := hostservice.NewClient("/var/run/paperboat/host-service.sock", 2*time.Minute)
-			if clientErr != nil {
-				return clientErr
-			}
-			if _, clientErr = client.Activate(ctx, artifact); clientErr != nil {
-				// Activating replaces and restarts the process serving this socket, so
-				// the successful request can lose its response. The runtime health
-				// version is the authoritative activation result in that case.
-				if healthErr = waitForUpdateHealth(ctx, artifact.Version, 30*time.Second); healthErr != nil {
-					return fmt.Errorf("activate managed runtime update: %w", clientErr)
-				}
-			}
-			result.RuntimeUpdated = true
-		}
-	}
-	if buildinfo.Version != artifact.Version {
-		executable, executableErr := os.Executable()
-		if executableErr != nil {
-			return executableErr
-		}
-		if executableErr = selfupdate.InstallCLI(executable, verified); executableErr != nil {
-			return fmt.Errorf("install pb update: %w", executableErr)
-		}
-		result.CLIUpdated = true
-	}
+	result := updateResult{PreviousVersion: buildinfo.Version, Version: response.Version, RuntimeUpdated: response.Updated}
 	jsonOutput, _ := command.Flags().GetBool("json")
 	if jsonOutput {
 		return json.NewEncoder(command.OutOrStdout()).Encode(result)
 	}
-	if !result.CLIUpdated && !result.RuntimeUpdated && !result.RuntimeDeferred {
-		fmt.Fprintf(command.OutOrStdout(), "pb %s is already up to date.\n", artifact.Version)
+	if !result.RuntimeUpdated {
+		fmt.Fprintf(command.OutOrStdout(), "pb runtime %s is already up to date.\n", result.Version)
 		return nil
 	}
-	if result.RuntimeDeferred {
-		fmt.Fprintf(command.OutOrStdout(), "Updated pb to %s. The managed runtime update was deferred to preserve %d active session(s); run `pb update` again after they finish.\n", artifact.Version, result.ActiveSessions)
-		return nil
-	}
-	fmt.Fprintf(command.OutOrStdout(), "Updated pb to %s.\n", artifact.Version)
+	fmt.Fprintf(command.OutOrStdout(), "Updated Paperboat runtime to %s.\n", result.Version)
 	return nil
 }
 
-func resolveVerifiedUpdate(ctx context.Context) (bootstrap.ArtifactTarget, string, error) {
-	releaseURL := strings.TrimSpace(buildinfo.DefaultReleaseURL)
-	if releaseURL == "" {
-		return bootstrap.ArtifactTarget{}, "", errors.New("this pb build does not define a signed release origin")
+func updatedControlSocket() string {
+	if runtime.GOOS == "darwin" {
+		return "/var/run/paperboat-updated/control.sock"
 	}
-	artifact, err := selfupdate.Resolve(ctx, releaseURL, &http.Client{Transport: httptransport.Default(), Timeout: 30 * time.Second})
-	if err != nil {
-		return bootstrap.ArtifactTarget{}, "", fmt.Errorf("resolve latest signed release: %w", err)
-	}
-	stateRoot, err := helperconfig.DefaultStateRoot(os.Getenv)
-	if err != nil {
-		return bootstrap.ArtifactTarget{}, "", err
-	}
-	verified, err := bootstrap.FetchVerifiedArtifact(ctx, artifact, filepath.Join(stateRoot, "self-update", "tuf"), &http.Client{Transport: httptransport.Default(), Timeout: 2 * time.Minute})
-	if err != nil {
-		return bootstrap.ArtifactTarget{}, "", fmt.Errorf("verify latest signed pb release: %w", err)
-	}
-	return artifact, verified, nil
-}
-
-type updateHealthDocument struct {
-	Version   string `json:"version"`
-	Workloads struct {
-		Sessions uint64 `json:"sessions"`
-	} `json:"workloads"`
-}
-
-func localUpdateHealth(ctx context.Context) (updateHealthDocument, error) {
-	request, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://127.0.0.1:38080/healthz", nil)
-	client := &http.Client{Timeout: 2 * time.Second}
-	response, err := client.Do(request)
-	if err != nil {
-		return updateHealthDocument{}, err
-	}
-	defer response.Body.Close()
-	var document updateHealthDocument
-	if response.StatusCode != http.StatusOK || json.NewDecoder(io.LimitReader(response.Body, 64<<10)).Decode(&document) != nil || document.Version == "" {
-		return updateHealthDocument{}, errors.New("managed runtime health is unavailable")
-	}
-	return document, nil
-}
-
-func waitForUpdateHealth(ctx context.Context, version string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for {
-		health, err := localUpdateHealth(ctx)
-		if err == nil && health.Version == version {
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return errors.New("managed runtime did not report the updated version")
-		}
-		timer := time.NewTimer(250 * time.Millisecond)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
-		}
-	}
+	return "/run/paperboat-updated/control.sock"
 }
 
 const shellCompletionDeadline = 200 * time.Millisecond

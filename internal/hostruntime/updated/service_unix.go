@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -38,16 +39,21 @@ type Config struct {
 	RepositoryURL   string
 	MachineID       string
 	Health          workerupdate.HealthChecker
+	// ControlSocket is the fixed local socket exposed to the enrolled user for
+	// pb update, check, and status. It is not an updater command channel.
+	ControlSocket string
 }
 
 type Service struct {
 	manager   *workerupdate.Manager
 	source    workerupdate.TUFSource
 	scheduler *autoupdate.Scheduler
+	control   controlServer
+	controlMu sync.Mutex
 }
 
 func New(config Config) (*Service, error) {
-	if !filepath.IsAbs(config.StateRoot) || config.WorkerUID <= 0 || config.WorkerGID < 0 || len(config.Token) != 32 || config.SocketPath == "" || config.RepositoryURL == "" || config.MachineID == "" || config.Health == nil {
+	if !filepath.IsAbs(config.StateRoot) || !filepath.IsAbs(config.ControlSocket) || config.WorkerUID <= 0 || config.WorkerGID < 0 || len(config.Token) != 32 || config.SocketPath == "" || config.RepositoryURL == "" || config.MachineID == "" || config.Health == nil {
 		return nil, ErrInvalidConfig
 	}
 	if err := secureRoot(config.StateRoot); err != nil {
@@ -71,7 +77,9 @@ func New(config Config) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Service{manager: manager, source: source, scheduler: scheduler}, nil
+	service := &Service{manager: manager, source: source, scheduler: scheduler}
+	service.control = controlServer{socketPath: config.ControlSocket, uid: config.WorkerUID, gid: config.WorkerGID, invoke: service.controlRequest}
+	return service, nil
 }
 
 func (s *Service) Run(ctx context.Context) error {
@@ -81,6 +89,15 @@ func (s *Service) Run(ctx context.Context) error {
 	if err := s.manager.Recover(ctx); err != nil {
 		return err
 	}
+	listener, err := s.control.listen()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = listener.Close()
+		_ = os.Remove(s.control.socketPath)
+	}()
+	go s.control.serve(ctx, listener)
 	return s.scheduler.Run(ctx)
 }
 
@@ -99,6 +116,19 @@ func (s *Service) Snapshot() autoupdate.Observation {
 		return autoupdate.Observation{}
 	}
 	return s.scheduler.Snapshot()
+}
+
+// Check resolves the signed cohort-eligible release but does not stage or
+// activate it. Manual installation is deliberately a distinct control action.
+func (s *Service) Check(ctx context.Context) (workerupdate.Result, error) {
+	if s == nil || s.manager == nil {
+		return workerupdate.Result{}, ErrInvalidConfig
+	}
+	release, found, err := s.source.Resolve(ctx)
+	if err != nil || !found {
+		return workerupdate.Result{Version: s.manager.ActiveVersion()}, err
+	}
+	return workerupdate.Result{Version: release.Version}, nil
 }
 
 // HTTPHealth is a bounded local hostd readiness check. The endpoint must be a

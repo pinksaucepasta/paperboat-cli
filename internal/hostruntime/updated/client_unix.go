@@ -1,0 +1,65 @@
+//go:build darwin || linux
+
+package updated
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net"
+	"path/filepath"
+	"time"
+)
+
+// Client exposes only the fixed local updater operations. It cannot submit a
+// binary, a release URL, or an activation command.
+type Client struct {
+	socketPath string
+	timeout    time.Duration
+}
+
+func NewClient(socketPath string, timeout time.Duration) (*Client, error) {
+	if !filepath.IsAbs(socketPath) || timeout <= 0 || timeout > 3*time.Minute {
+		return nil, ErrInvalidConfig
+	}
+	return &Client{socketPath: socketPath, timeout: timeout}, nil
+}
+
+func (c *Client) Status(ctx context.Context) (ControlResponse, error) { return c.call(ctx, "status") }
+func (c *Client) Check(ctx context.Context) (ControlResponse, error)  { return c.call(ctx, "check") }
+func (c *Client) Update(ctx context.Context) (ControlResponse, error) { return c.call(ctx, "update") }
+
+func (c *Client) call(ctx context.Context, operation string) (ControlResponse, error) {
+	if c == nil || (operation != "status" && operation != "check" && operation != "update") {
+		return ControlResponse{}, ErrInvalidControl
+	}
+	connection, err := (&net.Dialer{Timeout: c.timeout}).DialContext(ctx, "unix", c.socketPath)
+	if err != nil {
+		return ControlResponse{}, err
+	}
+	defer connection.Close()
+	deadline := time.Now().Add(c.timeout)
+	if limit, ok := ctx.Deadline(); ok && limit.Before(deadline) {
+		deadline = limit
+	}
+	_ = connection.SetDeadline(deadline)
+	if err := json.NewEncoder(connection).Encode(ControlRequest{Schema: ControlProtocolV1, Operation: operation}); err != nil {
+		return ControlResponse{}, err
+	}
+	closer, ok := connection.(interface{ CloseWrite() error })
+	if !ok || closer.CloseWrite() != nil {
+		return ControlResponse{}, ErrInvalidControl
+	}
+	decoder := json.NewDecoder(io.LimitReader(connection, 16<<10))
+	decoder.DisallowUnknownFields()
+	var response ControlResponse
+	var extra any
+	if decoder.Decode(&response) != nil || decoder.Decode(&extra) != io.EOF || response.Schema != ControlProtocolV1 || (response.Status != "ok" && response.Status != "error") {
+		return ControlResponse{}, ErrInvalidControl
+	}
+	if response.ErrorCode != "" {
+		return ControlResponse{}, errors.New(response.ErrorCode)
+	}
+	return response, nil
+}
