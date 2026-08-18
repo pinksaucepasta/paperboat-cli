@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -47,6 +48,45 @@ func TestWorkerUpdateCutsOverWithoutRestartingHostd(t *testing.T) {
 	if err != nil || journal.Stage != updateflow.StageIdle || journal.ActiveVersion != fixture.candidate.Version {
 		t.Fatalf("journal=%+v err=%v", journal, err)
 	}
+}
+
+func TestOneHundredWorkerUpdatesKeepOneHostdAndBoundedRetention(t *testing.T) {
+	fixture := newFixture(t)
+	hostd := fixture.hostd
+	for generation := 2; generation <= 101; generation++ {
+		candidate := release(fmt.Sprintf("2026.08.18.%d", generation), fixture.fetcher.body)
+		candidate.CLISHA256 = fixture.candidate.CLISHA256
+		candidate.CLILength = fixture.candidate.CLILength
+		result, err := fixture.manager.Activate(context.Background(), candidate)
+		if err != nil || !result.Updated || result.Version != candidate.Version {
+			t.Fatalf("generation %d: result=%+v err=%v", generation, result, err)
+		}
+		if fixture.hostd != hostd {
+			t.Fatalf("generation %d replaced the stable hostd", generation)
+		}
+		entries, err := retainedFiles(fixture.paths)
+		if err != nil {
+			t.Fatalf("generation %d: %v", generation, err)
+		}
+		if entries != 4 {
+			t.Fatalf("generation %d retained %d artifacts, want runtime and CLI current+rollback", generation, entries)
+		}
+	}
+	if fixture.hostd.activations != 100 || fixture.starter.starts != 100 {
+		t.Fatalf("activations=%d starts=%d", fixture.hostd.activations, fixture.starter.starts)
+	}
+}
+
+func retainedFiles(paths fixturePaths) (int, error) {
+	count := 0
+	for _, directory := range []string{filepath.Dir(paths.current), filepath.Dir(paths.rollback), filepath.Dir(paths.staged), filepath.Dir(paths.cliCurrent), filepath.Dir(paths.cliRollback)} {
+		entries, err := os.ReadDir(directory)
+		if err != nil {
+			return 0, err
+		}
+		count += len(entries)
+	}
+	return count, nil
 }
 
 func TestWorkerUpdateRollsBackWithoutRestartingHostd(t *testing.T) {
