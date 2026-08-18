@@ -52,28 +52,30 @@ const (
 )
 
 type Journal struct {
-	Schema           string    `json:"schema"`
-	TransactionID    string    `json:"transaction_id"`
-	Stage            Stage     `json:"stage"`
-	ActiveVersion    string    `json:"active_version"`
-	RollbackVersion  string    `json:"rollback_version,omitempty"`
-	CandidateVersion string    `json:"candidate_version,omitempty"`
-	CandidateDigest  string    `json:"candidate_digest,omitempty"`
-	CandidateLength  int64     `json:"candidate_length,omitempty"`
-	StagedPath       string    `json:"staged_path,omitempty"`
-	HostdAPIMin      uint16    `json:"hostd_api_min,omitempty"`
-	HostdAPIMax      uint16    `json:"hostd_api_max,omitempty"`
-	RuntimeAPIMin    uint16    `json:"runtime_api_min,omitempty"`
-	RuntimeAPIMax    uint16    `json:"runtime_api_max,omitempty"`
-	WorkerID         string    `json:"worker_id,omitempty"`
-	WorkerEpoch      uint64    `json:"worker_epoch,omitempty"`
-	BootID           string    `json:"boot_id"`
-	StageUpdatedAt   time.Time `json:"stage_updated_at"`
-	HealthDeadline   time.Time `json:"health_deadline,omitempty"`
-	AttemptCount     uint32    `json:"attempt_count"`
-	RollbackCount    uint32    `json:"rollback_count"`
-	LastFailure      Failure   `json:"last_failure,omitempty"`
-	CleanupComplete  bool      `json:"cleanup_complete"`
+	Schema             string    `json:"schema"`
+	TransactionID      string    `json:"transaction_id"`
+	Stage              Stage     `json:"stage"`
+	ActiveVersion      string    `json:"active_version"`
+	RollbackVersion    string    `json:"rollback_version,omitempty"`
+	CandidateVersion   string    `json:"candidate_version,omitempty"`
+	CandidateDigest    string    `json:"candidate_digest,omitempty"`
+	CandidateLength    int64     `json:"candidate_length,omitempty"`
+	CandidateCLIDigest string    `json:"candidate_cli_digest,omitempty"`
+	CandidateCLILength int64     `json:"candidate_cli_length,omitempty"`
+	StagedPath         string    `json:"staged_path,omitempty"`
+	HostdAPIMin        uint16    `json:"hostd_api_min,omitempty"`
+	HostdAPIMax        uint16    `json:"hostd_api_max,omitempty"`
+	RuntimeAPIMin      uint16    `json:"runtime_api_min,omitempty"`
+	RuntimeAPIMax      uint16    `json:"runtime_api_max,omitempty"`
+	WorkerID           string    `json:"worker_id,omitempty"`
+	WorkerEpoch        uint64    `json:"worker_epoch,omitempty"`
+	BootID             string    `json:"boot_id"`
+	StageUpdatedAt     time.Time `json:"stage_updated_at"`
+	HealthDeadline     time.Time `json:"health_deadline,omitempty"`
+	AttemptCount       uint32    `json:"attempt_count"`
+	RollbackCount      uint32    `json:"rollback_count"`
+	LastFailure        Failure   `json:"last_failure,omitempty"`
+	CleanupComplete    bool      `json:"cleanup_complete"`
 }
 
 func (j Journal) Validate() error {
@@ -86,13 +88,13 @@ func (j Journal) Validate() error {
 	if j.RollbackVersion != "" && !validVersion(j.RollbackVersion) || j.CandidateVersion != "" && !validVersion(j.CandidateVersion) {
 		return ErrInvalidJournal
 	}
-	if j.CandidateDigest != "" && !digestPattern.MatchString(j.CandidateDigest) || j.CandidateLength < 0 {
+	if j.CandidateDigest != "" && !digestPattern.MatchString(j.CandidateDigest) || j.CandidateLength < 0 || j.CandidateCLIDigest != "" && !digestPattern.MatchString(j.CandidateCLIDigest) || j.CandidateCLILength < 0 {
 		return ErrInvalidJournal
 	}
 	if j.StagedPath != "" && (!filepath.IsAbs(j.StagedPath) || filepath.Clean(j.StagedPath) != j.StagedPath) {
 		return ErrInvalidJournal
 	}
-	if requiresCandidate(j.Stage) && (j.CandidateVersion == "" || j.CandidateDigest == "" || j.CandidateLength <= 0 || j.StagedPath == "") {
+	if requiresCandidate(j.Stage) && (j.CandidateVersion == "" || j.CandidateDigest == "" || j.CandidateLength <= 0 || j.CandidateCLIDigest == "" || j.CandidateCLILength <= 0 || j.StagedPath == "") {
 		return ErrInvalidJournal
 	}
 	if (j.Stage == StageCutover || j.Stage == StageMonitoring || j.Stage == StageCommitted) && (j.WorkerEpoch == 0 || !validID(j.WorkerID)) {

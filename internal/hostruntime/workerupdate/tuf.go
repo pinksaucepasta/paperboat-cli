@@ -75,16 +75,23 @@ func (s TUFSource) Active(ctx context.Context, version string) (Release, error) 
 }
 
 func (s TUFSource) Fetch(ctx context.Context, release Release) (io.ReadCloser, error) {
+	return s.FetchComponent(ctx, release, "runtime")
+}
+
+func (s TUFSource) FetchComponent(ctx context.Context, release Release, component string) (io.ReadCloser, error) {
+	if component != "runtime" && component != "cli" {
+		return nil, ErrInvalidRelease
+	}
 	now := s.now()
 	index, err := bootstrap.FetchVerifiedReleaseIndex(ctx, s.RepositoryURL, filepath.Join(s.StateRoot, "index"), s.HTTP, now)
 	if err != nil {
 		return nil, err
 	}
 	selected, ok := releaseFromIndex(index)
-	if !ok || selected.Version != release.Version || selected.SHA256 != release.SHA256 || selected.Length != release.Length {
+	if !ok || selected.Version != release.Version || selected.SHA256 != release.SHA256 || selected.Length != release.Length || selected.CLISHA256 != release.CLISHA256 || selected.CLILength != release.CLILength {
 		return nil, ErrInvalidRelease
 	}
-	path, err := bootstrap.FetchVerifiedReleaseComponent(ctx, s.RepositoryURL, filepath.Join(s.StateRoot, "targets"), index, "runtime", s.HTTP, now)
+	path, err := bootstrap.FetchVerifiedReleaseComponent(ctx, s.RepositoryURL, filepath.Join(s.StateRoot, "targets"), index, component, s.HTTP, now)
 	if err != nil {
 		return nil, err
 	}
@@ -99,11 +106,12 @@ func (s TUFSource) now() time.Time {
 }
 
 func releaseFromIndex(index releaseindex.Index) (Release, bool) {
-	target, ok := index.Component("runtime")
-	if !ok {
+	runtimeTarget, runtimeOK := index.Component("runtime")
+	cliTarget, cliOK := index.Component("cli")
+	if !runtimeOK || !cliOK {
 		return Release{}, false
 	}
-	return Release{Version: index.Version, SHA256: target.SHA256, Length: target.Length, Platform: target.Platform, Architecture: target.Architecture, HostdAPIMin: index.HostdAPIMin, HostdAPIMax: index.HostdAPIMax, RuntimeAPIMin: index.RuntimeAPIMin, RuntimeAPIMax: index.RuntimeAPIMax}, true
+	return Release{Version: index.Version, SHA256: runtimeTarget.SHA256, Length: runtimeTarget.Length, Platform: runtimeTarget.Platform, Architecture: runtimeTarget.Architecture, CLISHA256: cliTarget.SHA256, CLILength: cliTarget.Length, CLIPlatform: cliTarget.Platform, CLIArchitecture: cliTarget.Architecture, HostdAPIMin: index.HostdAPIMin, HostdAPIMax: index.HostdAPIMax, RuntimeAPIMin: index.RuntimeAPIMin, RuntimeAPIMax: index.RuntimeAPIMax}, true
 }
 
 func openReadOnly(path string) (io.ReadCloser, error) { return os.Open(path) }

@@ -20,7 +20,7 @@ type Client struct {
 }
 
 func NewClient(socketPath string, timeout time.Duration) (*Client, error) {
-	if !filepath.IsAbs(socketPath) || timeout <= 0 || timeout > 3*time.Minute {
+	if !filepath.IsAbs(socketPath) || timeout <= 0 || timeout > maxUpdateControlTimeout {
 		return nil, ErrInvalidConfig
 	}
 	return &Client{socketPath: socketPath, timeout: timeout}, nil

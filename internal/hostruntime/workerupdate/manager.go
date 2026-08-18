@@ -39,15 +39,19 @@ var (
 // checks this exact version, hash, length, platform, and architecture before
 // making it executable.
 type Release struct {
-	Version       string
-	SHA256        string
-	Length        int64
-	Platform      string
-	Architecture  string
-	HostdAPIMin   uint16
-	HostdAPIMax   uint16
-	RuntimeAPIMin uint16
-	RuntimeAPIMax uint16
+	Version         string
+	SHA256          string
+	Length          int64
+	Platform        string
+	Architecture    string
+	CLISHA256       string
+	CLILength       int64
+	CLIPlatform     string
+	CLIArchitecture string
+	HostdAPIMin     uint16
+	HostdAPIMax     uint16
+	RuntimeAPIMin   uint16
+	RuntimeAPIMax   uint16
 }
 
 // Resolver returns the newest signed and cohort-eligible release. found=false
@@ -59,6 +63,12 @@ type Resolver func(context.Context) (release Release, found bool, err error)
 // and native-format-checked it in its root-owned staging path.
 type Fetcher interface {
 	Fetch(context.Context, Release) (io.ReadCloser, error)
+}
+
+// ComponentFetcher is implemented by the TUF source. The CLI target is
+// resolved from the same already verified release index as the runtime.
+type ComponentFetcher interface {
+	FetchComponent(context.Context, Release, string) (io.ReadCloser, error)
 }
 
 // StartRequest is fixed update data passed to the private worker launcher. It
@@ -106,6 +116,8 @@ type Config struct {
 	RuntimeCurrent  string
 	RuntimeRollback string
 	RuntimeStaged   string
+	CLICurrent      string
+	CLIRollback     string
 	Active          Release
 	OwnerUID        int
 	OwnerGID        int
@@ -285,6 +297,9 @@ func (m *Manager) Activate(ctx context.Context, release Release) (Result, error)
 		return Result{Version: m.active.Version}, err
 	}
 	m.active = release
+	if err := m.installCLI(ctx, release); err != nil {
+		return Result{Version: release.Version, Updated: true}, err
+	}
 	return Result{Version: release.Version, Updated: true}, m.finishCommitted(journal)
 }
 
@@ -346,6 +361,9 @@ func (m *Manager) recoverLocked(ctx context.Context) error {
 		return m.monitorAndCommitRecovered(ctx, journal)
 	case updateflow.RecoveryFinalizeCleanup:
 		m.active = releaseFromJournal(journal)
+		if err := m.installCLI(ctx, m.active); err != nil {
+			return err
+		}
 		return m.finishCommitted(journal)
 	case updateflow.RecoveryPerformRollback:
 		return ErrBlocked
@@ -369,6 +387,9 @@ func (m *Manager) monitorAndCommitRecovered(ctx context.Context, journal updatef
 		return err
 	}
 	m.active = release
+	if err := m.installCLI(ctx, release); err != nil {
+		return err
+	}
 	return m.finishCommitted(next)
 }
 
@@ -532,6 +553,92 @@ func (m *Manager) stage(ctx context.Context, release Release) error {
 	return syncDirectories(directory)
 }
 
+// installCLI runs only after the runtime worker has survived its monitoring
+// hold and the runtime transaction committed. The stable launcher continues
+// to use the old CLI for this invocation; later invocations select current.
+// A private temporary file is the only transient third CLI artifact.
+func (m *Manager) installCLI(ctx context.Context, release Release) error {
+	fetcher, ok := m.config.Fetcher.(ComponentFetcher)
+	if !ok {
+		return ErrInvalidConfig
+	}
+	directory := filepath.Dir(m.config.CLICurrent)
+	staged := m.config.CLICurrent + ".staged"
+	if regularMatches(m.config.CLICurrent, release.CLILength, release.CLISHA256) {
+		return removeRuntimeFile(staged, m.config.OwnerUID)
+	}
+	if !regularMatches(staged, release.CLILength, release.CLISHA256) {
+		if err := removeRuntimeFile(staged, m.config.OwnerUID); err != nil {
+			return err
+		}
+		stream, err := fetcher.FetchComponent(ctx, release, "cli")
+		if err != nil {
+			return err
+		}
+		defer stream.Close()
+		pending, err := os.CreateTemp(directory, ".paperboat-cli-")
+		if err != nil {
+			return err
+		}
+		pendingPath := pending.Name()
+		defer os.Remove(pendingPath)
+		if err := pending.Chmod(0o700); err != nil {
+			_ = pending.Close()
+			return err
+		}
+		if err := pending.Chown(m.config.OwnerUID, m.config.OwnerGID); err != nil {
+			_ = pending.Close()
+			return err
+		}
+		hash := sha256.New()
+		written, copyErr := io.Copy(io.MultiWriter(pending, hash), io.LimitReader(stream, release.CLILength+1))
+		if copyErr != nil || written != release.CLILength || !strings.EqualFold(hex.EncodeToString(hash.Sum(nil)), release.CLISHA256) {
+			_ = pending.Close()
+			return ErrInvalidRelease
+		}
+		if err := pending.Sync(); err != nil {
+			_ = pending.Close()
+			return err
+		}
+		if err := pending.Close(); err != nil {
+			return err
+		}
+		if err := binarytarget.Validate(pendingPath, release.CLIPlatform, release.CLIArchitecture); err != nil {
+			return ErrInvalidRelease
+		}
+		if err := os.Rename(pendingPath, staged); err != nil {
+			return err
+		}
+		if err := syncDirectories(directory); err != nil {
+			return err
+		}
+	}
+	if _, err := os.Lstat(m.config.CLICurrent); errors.Is(err, os.ErrNotExist) {
+		if err := safeRuntimeFile(m.config.CLIRollback, m.config.OwnerUID, true); err != nil {
+			return err
+		}
+		if err := os.Rename(staged, m.config.CLICurrent); err != nil {
+			return err
+		}
+		return syncDirectories(directory, filepath.Dir(m.config.CLIRollback))
+	} else if err != nil {
+		return err
+	}
+	if err := safeRuntimeFile(m.config.CLICurrent, m.config.OwnerUID, true); err != nil {
+		return err
+	}
+	if err := removeRuntimeFile(m.config.CLIRollback, m.config.OwnerUID); err != nil {
+		return err
+	}
+	if err := os.Rename(m.config.CLICurrent, m.config.CLIRollback); err != nil {
+		return err
+	}
+	if err := os.Rename(staged, m.config.CLICurrent); err != nil {
+		return err
+	}
+	return syncDirectories(directory, filepath.Dir(m.config.CLIRollback))
+}
+
 func (m *Manager) promoteStorage() error {
 	if err := safeRuntimeFile(m.config.RuntimeCurrent, m.config.OwnerUID, true); err != nil {
 		return err
@@ -597,7 +704,7 @@ func (m *Manager) idleJournal(from updateflow.Journal, failure updateflow.Failur
 	journal := updateflow.Journal{Schema: updateflow.SchemaV1, TransactionID: from.TransactionID, Stage: updateflow.StageIdle,
 		ActiveVersion: m.active.Version, BootID: from.BootID, StageUpdatedAt: m.now(), RollbackCount: from.RollbackCount, LastFailure: failure}
 	if quarantine != "" {
-		journal = withRelease(journal, Release{Version: quarantine, SHA256: from.CandidateDigest, Length: from.CandidateLength, Platform: runtime.GOOS, Architecture: runtime.GOARCH, HostdAPIMin: from.HostdAPIMin, HostdAPIMax: from.HostdAPIMax, RuntimeAPIMin: from.RuntimeAPIMin, RuntimeAPIMax: from.RuntimeAPIMax}, m.config.RuntimeStaged)
+		journal = withRelease(journal, Release{Version: quarantine, SHA256: from.CandidateDigest, Length: from.CandidateLength, Platform: runtime.GOOS, Architecture: runtime.GOARCH, CLISHA256: from.CandidateCLIDigest, CLILength: from.CandidateCLILength, CLIPlatform: runtime.GOOS, CLIArchitecture: runtime.GOARCH, HostdAPIMin: from.HostdAPIMin, HostdAPIMax: from.HostdAPIMax, RuntimeAPIMin: from.RuntimeAPIMin, RuntimeAPIMax: from.RuntimeAPIMax}, m.config.RuntimeStaged)
 	}
 	return journal
 }
@@ -633,12 +740,12 @@ func (m *Manager) startRequest(release Release, executable string) StartRequest 
 }
 
 func withRelease(journal updateflow.Journal, release Release, path string) updateflow.Journal {
-	journal.CandidateVersion, journal.CandidateDigest, journal.CandidateLength, journal.StagedPath = release.Version, release.SHA256, release.Length, path
+	journal.CandidateVersion, journal.CandidateDigest, journal.CandidateLength, journal.CandidateCLIDigest, journal.CandidateCLILength, journal.StagedPath = release.Version, release.SHA256, release.Length, release.CLISHA256, release.CLILength, path
 	journal.HostdAPIMin, journal.HostdAPIMax, journal.RuntimeAPIMin, journal.RuntimeAPIMax = release.HostdAPIMin, release.HostdAPIMax, release.RuntimeAPIMin, release.RuntimeAPIMax
 	return journal
 }
 func releaseFromJournal(j updateflow.Journal) Release {
-	return Release{Version: j.CandidateVersion, SHA256: j.CandidateDigest, Length: j.CandidateLength, Platform: runtime.GOOS, Architecture: runtime.GOARCH, HostdAPIMin: j.HostdAPIMin, HostdAPIMax: j.HostdAPIMax, RuntimeAPIMin: j.RuntimeAPIMin, RuntimeAPIMax: j.RuntimeAPIMax}
+	return Release{Version: j.CandidateVersion, SHA256: j.CandidateDigest, Length: j.CandidateLength, Platform: runtime.GOOS, Architecture: runtime.GOARCH, CLISHA256: j.CandidateCLIDigest, CLILength: j.CandidateCLILength, CLIPlatform: runtime.GOOS, CLIArchitecture: runtime.GOARCH, HostdAPIMin: j.HostdAPIMin, HostdAPIMax: j.HostdAPIMax, RuntimeAPIMin: j.RuntimeAPIMin, RuntimeAPIMax: j.RuntimeAPIMax}
 }
 func workerID(version string) string { return "runtime-" + version }
 func matches(status hostdproto.Status, state hostdproto.State, id string, epoch uint64) bool {
@@ -649,7 +756,7 @@ func validateConfig(config Config) error {
 	if config.Fetcher == nil || config.Starter == nil || config.Hostd == nil || config.Health == nil || config.OwnerUID < 0 || config.OwnerGID < 0 || config.WorkerUID <= 0 || config.WorkerGID < 0 || len(config.Capability) != 32 || config.HostdEndpoint == "" || config.MonitorWindow <= 0 || config.HealthInterval <= 0 || config.HealthInterval > config.MonitorWindow || validateRelease(config.Active) != nil {
 		return ErrInvalidConfig
 	}
-	for _, path := range []string{config.StatePath, config.RuntimeCurrent, config.RuntimeRollback, config.RuntimeStaged} {
+	for _, path := range []string{config.StatePath, config.RuntimeCurrent, config.RuntimeRollback, config.RuntimeStaged, config.CLICurrent, config.CLIRollback} {
 		if !filepath.IsAbs(path) || filepath.Clean(path) != path || filepath.Base(path) == "." || filepath.Base(path) == string(filepath.Separator) {
 			return ErrInvalidConfig
 		}
@@ -657,7 +764,7 @@ func validateConfig(config Config) error {
 			return err
 		}
 	}
-	if config.RuntimeCurrent == config.RuntimeRollback || config.RuntimeCurrent == config.RuntimeStaged || config.RuntimeRollback == config.RuntimeStaged {
+	if config.RuntimeCurrent == config.RuntimeRollback || config.RuntimeCurrent == config.RuntimeStaged || config.RuntimeRollback == config.RuntimeStaged || config.CLICurrent == config.CLIRollback {
 		return ErrInvalidConfig
 	}
 	if err := safeRuntimeFile(config.RuntimeCurrent, config.OwnerUID, true); err != nil {
@@ -666,11 +773,14 @@ func validateConfig(config Config) error {
 	if !regularMatches(config.RuntimeCurrent, config.Active.Length, config.Active.SHA256) || binarytarget.Validate(config.RuntimeCurrent, config.Active.Platform, config.Active.Architecture) != nil {
 		return ErrUnsafeStorage
 	}
+	if _, ok := config.Fetcher.(ComponentFetcher); !ok || safeRuntimeFile(config.CLICurrent, config.OwnerUID, true) != nil || binarytarget.Validate(config.CLICurrent, config.Active.CLIPlatform, config.Active.CLIArchitecture) != nil {
+		return ErrUnsafeStorage
+	}
 	return nil
 }
 
 func validateRelease(release Release) error {
-	if !validVersion(release.Version) || len(release.SHA256) != 64 || release.Length < 1 || release.Length > maxRuntimeBytes || release.Platform != runtime.GOOS || release.Architecture != runtime.GOARCH || !hexDigest(release.SHA256) || invalidRequiredAPIRange(release.HostdAPIMin, release.HostdAPIMax) || invalidRequiredAPIRange(release.RuntimeAPIMin, release.RuntimeAPIMax) {
+	if !validVersion(release.Version) || len(release.SHA256) != 64 || release.Length < 1 || release.Length > maxRuntimeBytes || release.Platform != runtime.GOOS || release.Architecture != runtime.GOARCH || !hexDigest(release.SHA256) || len(release.CLISHA256) != 64 || release.CLILength < 1 || release.CLILength > maxRuntimeBytes || release.CLIPlatform != runtime.GOOS || release.CLIArchitecture != runtime.GOARCH || !hexDigest(release.CLISHA256) || invalidRequiredAPIRange(release.HostdAPIMin, release.HostdAPIMax) || invalidRequiredAPIRange(release.RuntimeAPIMin, release.RuntimeAPIMax) {
 		return ErrInvalidRelease
 	}
 	return nil

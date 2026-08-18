@@ -19,6 +19,8 @@ import (
 
 const ControlProtocolV1 = "paperboat.updated/v1"
 
+const maxUpdateControlTimeout = 15 * time.Minute
+
 var (
 	ErrInvalidControl = errors.New("invalid paperboat-updated control request")
 	ErrControlDenied  = errors.New("paperboat-updated control peer is not the enrolled user")
@@ -106,7 +108,7 @@ func (s *controlServer) handle(connection *net.UnixConn) error {
 	if err != nil || identity.UID != s.uid {
 		return ErrControlDenied
 	}
-	_ = connection.SetDeadline(time.Now().Add(3 * time.Minute))
+	_ = connection.SetDeadline(time.Now().Add(maxUpdateControlTimeout))
 	decoder := json.NewDecoder(io.LimitReader(connection, 4<<10))
 	decoder.DisallowUnknownFields()
 	var request ControlRequest

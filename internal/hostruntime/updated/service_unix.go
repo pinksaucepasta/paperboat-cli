@@ -31,6 +31,8 @@ type Config struct {
 	RuntimeCurrent  string
 	RuntimeRollback string
 	RuntimeStaged   string
+	CLICurrent      string
+	CLIRollback     string
 	Active          workerupdate.Release
 	WorkerUID       int
 	WorkerGID       int
@@ -69,7 +71,7 @@ func New(config Config) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
-	manager, err := workerupdate.New(workerupdate.Config{StatePath: filepath.Join(config.StateRoot, "transaction.json"), RuntimeCurrent: config.RuntimeCurrent, RuntimeRollback: config.RuntimeRollback, RuntimeStaged: config.RuntimeStaged, Active: config.Active, OwnerUID: 0, OwnerGID: 0, WorkerUID: config.WorkerUID, WorkerGID: config.WorkerGID, HostdEndpoint: config.SocketPath, Capability: config.Token, Fetcher: source, Starter: workerupdate.ExecStarter{}, Hostd: client, Health: config.Health, MonitorWindow: 10 * time.Minute, HealthInterval: time.Second})
+	manager, err := workerupdate.New(workerupdate.Config{StatePath: filepath.Join(config.StateRoot, "transaction.json"), RuntimeCurrent: config.RuntimeCurrent, RuntimeRollback: config.RuntimeRollback, RuntimeStaged: config.RuntimeStaged, CLICurrent: config.CLICurrent, CLIRollback: config.CLIRollback, Active: config.Active, OwnerUID: 0, OwnerGID: 0, WorkerUID: config.WorkerUID, WorkerGID: config.WorkerGID, HostdEndpoint: config.SocketPath, Capability: config.Token, Fetcher: source, Starter: workerupdate.ExecStarter{}, Hostd: client, Health: config.Health, MonitorWindow: 10 * time.Minute, HealthInterval: time.Second})
 	if err != nil {
 		return nil, err
 	}
