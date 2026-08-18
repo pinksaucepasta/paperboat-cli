@@ -70,11 +70,12 @@ func TestHostdAndUpdaterInstallersUseSeparateStableServices(t *testing.T) {
 		t.Run(platform, func(t *testing.T) {
 			layout := splitLayout(t, platform)
 			control := &controller{}
-			hostd, err := NewHostdInstaller(ComponentConfig{Layout: layout, User: "alice", Group: "staff", UID: 501, Controller: control})
+			config := ComponentConfig{Layout: layout, User: "alice", Group: "staff", UID: 501, GID: 20, HostdTokenFile: filepath.Join(t.TempDir(), "hostd.token"), ReleaseRepository: "https://releases.paperboat.test", MachineID: "machine_1", HealthURL: "http://127.0.0.1:38080/healthz", Controller: control}
+			hostd, err := NewHostdInstaller(config)
 			if err != nil {
 				t.Fatal(err)
 			}
-			updater, err := NewUpdaterInstaller(ComponentConfig{Layout: layout, UID: 501, Controller: control})
+			updater, err := NewUpdaterInstaller(config)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -98,7 +99,7 @@ func TestHostdAndUpdaterInstallersUseSeparateStableServices(t *testing.T) {
 						t.Fatalf("hostd missing %q:\n%s", expected, hostdDefinition)
 					}
 				}
-				for _, expected := range []string{"User=root", "Group=root", "RuntimeDirectory=paperboat-updated", "After=local-fs.target network-online.target", "Wants=network-online.target", "PAPERBOAT_RELEASE_ROOT=" + layout.ReleasesRoot} {
+				for _, expected := range []string{"User=root", "Group=root", "RuntimeDirectory=paperboat-updated", "After=local-fs.target network-online.target", "Wants=network-online.target", "PAPERBOAT_RELEASE_ROOT=" + layout.ReleasesRoot, "PAPERBOAT_RUNTIME_CURRENT=" + layout.RuntimeCurrent, "PAPERBOAT_CLI_CURRENT=" + layout.CLICurrent, "PAPERBOAT_UPDATED_SOCKET=" + updaterControlSocket(platform)} {
 					if !strings.Contains(string(updaterDefinition), expected) {
 						t.Fatalf("updater missing %q:\n%s", expected, updaterDefinition)
 					}
@@ -142,7 +143,7 @@ func TestSplitServiceDefinitionUpgradeDoesNotRestartStableSupervisor(t *testing.
 }
 
 func TestHostdInstallerRejectsRootOwnership(t *testing.T) {
-	_, err := NewHostdInstaller(ComponentConfig{Layout: splitLayout(t, "linux"), User: "root", Group: "root", UID: 0, Controller: &controller{}})
+	_, err := NewHostdInstaller(ComponentConfig{Layout: splitLayout(t, "linux"), User: "root", Group: "root", UID: 0, HostdTokenFile: "/tmp/token", Controller: &controller{}})
 	if !errors.Is(err, ErrInvalidDefinition) {
 		t.Fatalf("root hostd err=%v", err)
 	}
