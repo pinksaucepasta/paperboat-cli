@@ -314,6 +314,7 @@ func TestShellCompletionIsBoundedSilentAndResourceSpecific(t *testing.T) {
 	t.Setenv("HOME", rootPath)
 	t.Setenv("XDG_STATE_HOME", filepath.Join(rootPath, "state"))
 	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(rootPath, "runtime"))
+	t.Setenv("TMPDIR", filepath.Join(rootPath, "runtime"))
 	if err := os.MkdirAll(filepath.Join(rootPath, "runtime"), 0o700); err != nil {
 		t.Fatal(err)
 	}
