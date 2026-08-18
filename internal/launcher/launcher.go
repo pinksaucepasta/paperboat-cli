@@ -26,10 +26,14 @@ func Resolve(args []string, environment []string) (Target, error) {
 	if err != nil {
 		return Target{}, err
 	}
-	if err := validateTarget(layout.CLICurrent); err != nil {
+	path, err := resolveTargetPath(layout.CLICurrent)
+	if err != nil {
 		return Target{}, err
 	}
-	return Target{Path: layout.CLICurrent, Args: append([]string{"pb"}, args...), Env: append([]string(nil), environment...)}, nil
+	if err := validateTarget(path); err != nil {
+		return Target{}, err
+	}
+	return Target{Path: path, Args: append([]string{"pb"}, args...), Env: append([]string(nil), environment...)}, nil
 }
 
 func validateTarget(path string) error {

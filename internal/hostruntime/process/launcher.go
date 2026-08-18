@@ -128,7 +128,7 @@ func validateExecutable(path string) (string, error) {
 		return "", ErrLaunchRejected
 	}
 	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o111 == 0 || info.Mode().Perm()&0o022 != 0 {
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || !platformExecutable(path, info) {
 		return "", ErrLaunchRejected
 	}
 	resolved, err := filepath.EvalSymlinks(path)

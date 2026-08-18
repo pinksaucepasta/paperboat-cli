@@ -46,6 +46,11 @@ func ComponentController(platform, kind string, enrolledUID int, runner Runner) 
 		case UpdaterKind:
 			return LaunchdController{Runner: runner, UID: enrolledUID, Label: UpdaterLabel}, nil
 		}
+	case "windows":
+		switch kind {
+		case HostdKind, UpdaterKind:
+			return WindowsController{}, nil
+		}
 	default:
 		return nil, ErrUnsupportedPlatform
 	}
@@ -104,6 +109,13 @@ func NewUpdaterInstaller(config ComponentConfig) (*Installer, error) {
 		User: "root", Group: group, Arguments: []string{"serve"}, Environment: environment,
 		UpgradeMode: UpgradeReload, Controller: config.Controller,
 	})
+}
+
+func updaterControlSocket(platform string) string {
+	if platform == "darwin" {
+		return "/var/run/paperboat-updated/control.sock"
+	}
+	return "/run/paperboat-updated/control.sock"
 }
 
 func copyEnvironment(values map[string]string) map[string]string {

@@ -179,7 +179,9 @@ func TestComponentControllerUsesOnlySplitServiceNames(t *testing.T) {
 			}
 		})
 	}
-	if _, err := ComponentController("windows", HostdKind, 501, ExecRunner{}); !errors.Is(err, ErrUnsupportedPlatform) {
+	if controller, err := ComponentController("windows", HostdKind, 501, ExecRunner{}); err != nil {
 		t.Fatalf("windows controller err=%v", err)
+	} else if _, ok := controller.(WindowsController); !ok {
+		t.Fatalf("windows controller=%T", controller)
 	}
 }

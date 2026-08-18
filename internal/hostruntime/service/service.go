@@ -71,7 +71,11 @@ func New(config Config) (*Installer, error) {
 	if config.Controller == nil || !filepath.IsAbs(config.ConfigRoot) || !filepath.IsAbs(config.Executable) || len(config.Arguments) == 0 || !safeAccount(config.User) || !safeAccount(config.Group) {
 		return nil, ErrInvalidDefinition
 	}
-	if err := safeExecutable(config.Executable); err != nil {
+	if config.Platform == "windows" {
+		if err := safeExecutableWindows(config.Executable); err != nil {
+			return nil, err
+		}
+	} else if err := safeExecutable(config.Executable); err != nil {
 		return nil, err
 	}
 	if !safeValues([]string{config.Executable}) {
@@ -124,6 +128,14 @@ func New(config Config) (*Installer, error) {
 		if path == "" {
 			path = filepath.Join(config.ConfigRoot, "etc", "systemd", "system", unit)
 		}
+	case "windows":
+		if !safeWindowsServiceKind(config.Kind, config.Instance) {
+			return nil, ErrInvalidDefinition
+		}
+		// The SCM owns the executable registration. This file is a durable,
+		// root-owned declaration used to recover and audit the exact service
+		// arguments without asking the SCM to accept arbitrary input later.
+		path = filepath.Join(`C:\ProgramData\Paperboat\services`, windowsServiceName(config.Kind, config.Instance)+`.json`)
 	default:
 		return nil, ErrUnsupportedPlatform
 	}
@@ -203,6 +215,9 @@ func previewLabel(instance string) string {
 func (i *Installer) render() ([]byte, error) {
 	if i.config.Platform == "darwin" {
 		return renderLaunchd(i.config)
+	}
+	if i.config.Platform == "windows" {
+		return renderWindowsService(i.config)
 	}
 	return renderSystemd(i.config)
 }

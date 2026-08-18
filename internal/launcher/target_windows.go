@@ -3,7 +3,10 @@
 package launcher
 
 import (
+	"bufio"
+	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -12,6 +15,31 @@ import (
 
 	"golang.org/x/sys/windows"
 )
+
+func resolveTargetPath(path string) (string, error) {
+	activePath := filepath.Join(filepath.Dir(path), strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))+".active")
+	file, err := os.Open(activePath)
+	if errors.Is(err, os.ErrNotExist) {
+		return path, nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("%w: read active slot: %v", ErrUnsafeTarget, err)
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(io.LimitReader(file, 256))
+	if !scanner.Scan() || scanner.Scan() || scanner.Err() != nil {
+		return "", ErrUnsafeTarget
+	}
+	slot := scanner.Text()
+	if len(slot) < 5 || len(slot) > 128 || !strings.HasPrefix(slot, strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))+".slot-") || !strings.HasSuffix(strings.ToLower(slot), ".exe") || strings.ContainsAny(slot, `/\:*?"<>|`) {
+		return "", ErrUnsafeTarget
+	}
+	resolved := filepath.Join(filepath.Dir(path), slot)
+	if filepath.Dir(resolved) != filepath.Dir(path) {
+		return "", ErrUnsafeTarget
+	}
+	return resolved, nil
+}
 
 func validatePlatformTarget(path string, info fs.FileInfo) error {
 	// The updater creates this fixed slot with a protected SYSTEM and
