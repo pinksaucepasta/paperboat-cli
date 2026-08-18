@@ -2307,6 +2307,7 @@ func newRootCommand() *cobra.Command {
 type updateResult struct {
 	PreviousVersion string `json:"previous_version"`
 	Version         string `json:"version"`
+	CLIUpdated      bool   `json:"cli_updated"`
 	RuntimeUpdated  bool   `json:"runtime_updated"`
 }
 
@@ -2342,7 +2343,7 @@ func actionUpdateCheck(command *cobra.Command, _ []string) error {
 	result := updateCheckResult{InstalledVersion: buildinfo.Version, LatestVersion: response.Version, UpdateAvailable: response.Version != "" && response.Version != buildinfo.Version, Verified: true}
 	jsonOutput, _ := command.Flags().GetBool("json")
 	if jsonOutput {
-		return json.NewEncoder(command.OutOrStdout()).Encode(result)
+		return json.NewEncoder(command.OutOrStdout()).Encode(map[string]any{"schema_version": "1.0", "ok": true, "data": result})
 	}
 	if result.UpdateAvailable {
 		fmt.Fprintf(command.OutOrStdout(), "Paperboat %s is available; installed version is %s.\n", result.LatestVersion, buildinfo.Version)
@@ -2375,7 +2376,7 @@ func actionUpdateStatus(command *cobra.Command, _ []string) error {
 	result := updateStatusResult{CLIVersion: buildinfo.Version, RuntimeVersion: response.Version, RuntimeAvailable: response.Version != "", LastCheck: response.Observation.CheckedAt, NextCheck: response.Observation.NextCheckAt, LastFailure: response.Observation.Failure}
 	jsonOutput, _ := command.Flags().GetBool("json")
 	if jsonOutput {
-		return json.NewEncoder(command.OutOrStdout()).Encode(result)
+		return json.NewEncoder(command.OutOrStdout()).Encode(map[string]any{"schema_version": "1.0", "ok": true, "data": result})
 	}
 	fmt.Fprintf(command.OutOrStdout(), "CLI: %s\n", result.CLIVersion)
 	if result.RuntimeAvailable {
@@ -2403,10 +2404,10 @@ func actionUpdate(command *cobra.Command, _ []string) error {
 	if err != nil {
 		return fmt.Errorf("update with paperboat-updated: %w", err)
 	}
-	result := updateResult{PreviousVersion: buildinfo.Version, Version: response.Version, RuntimeUpdated: response.Updated}
+	result := updateResult{PreviousVersion: buildinfo.Version, Version: response.Version, CLIUpdated: response.Updated, RuntimeUpdated: response.Updated}
 	jsonOutput, _ := command.Flags().GetBool("json")
 	if jsonOutput {
-		return json.NewEncoder(command.OutOrStdout()).Encode(result)
+		return json.NewEncoder(command.OutOrStdout()).Encode(map[string]any{"schema_version": "1.0", "ok": true, "data": result})
 	}
 	if !result.RuntimeUpdated {
 		fmt.Fprintf(command.OutOrStdout(), "pb runtime %s is already up to date.\n", result.Version)
@@ -2417,6 +2418,9 @@ func actionUpdate(command *cobra.Command, _ []string) error {
 }
 
 func updatedControlSocket() string {
+	if runtime.GOOS == "windows" {
+		return `\\.\pipe\PaperboatUpdatedControl`
+	}
 	if runtime.GOOS == "darwin" {
 		return "/var/run/paperboat-updated/control.sock"
 	}
