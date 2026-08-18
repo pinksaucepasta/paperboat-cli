@@ -57,9 +57,12 @@ type releaseIndex struct {
 	HostdAPIMax           uint16            `json:"hostd_api_max"`
 	RuntimeAPIMin         uint16            `json:"runtime_api_min"`
 	RuntimeAPIMax         uint16            `json:"runtime_api_max"`
+	MinimumVersion        string            `json:"minimum_permitted_version,omitempty"`
+	RevokedVersions       []string          `json:"revoked_versions,omitempty"`
 	RolloutPolicyRevision uint64            `json:"rollout_policy_revision"`
 	SupervisorMaintenance bool              `json:"supervisor_maintenance_required"`
 	Rollout               rolloutPolicy     `json:"rollout"`
+	Revoked               bool              `json:"revoked,omitempty"`
 }
 
 type signingState struct {
@@ -79,7 +82,7 @@ func run(args []string) error {
 		return errors.New("production signing is restricted to the macOS release workstation")
 	}
 	if len(args) == 0 {
-		return errors.New("usage: paperboat-tuf <init|publish|refresh|rotate|status>")
+		return errors.New("usage: paperboat-tuf <init|publish|promote|pause|quarantine|refresh|rotate|status>")
 	}
 	switch args[0] {
 	case "init":
@@ -112,6 +115,15 @@ func run(args []string) error {
 			return errors.New("usage: paperboat-tuf refresh -repository DIR")
 		}
 		return refresh(*repo)
+	case "promote", "pause", "quarantine":
+		fs := flag.NewFlagSet(args[0], flag.ContinueOnError)
+		repo := fs.String("repository", "", "repository directory")
+		revision := fs.Uint64("rollout-revision", 0, "new monotonic signed rollout policy revision")
+		percentage := fs.Uint("percentage", 0, "eligible cohort percentage (promote only)")
+		if err := fs.Parse(args[1:]); err != nil || fs.NArg() != 0 || *revision == 0 || *percentage > 100 || args[0] != "promote" && *percentage != 0 {
+			return fmt.Errorf("usage: paperboat-tuf %s -repository DIR -rollout-revision N%s", args[0], map[bool]string{true: " -percentage 0..100"}[args[0] == "promote"])
+		}
+		return mutateRollout(*repo, args[0], *revision, uint8(*percentage))
 	case "rotate":
 		fs := flag.NewFlagSet("rotate", flag.ContinueOnError)
 		repo := fs.String("repository", "", "repository directory")
@@ -321,6 +333,124 @@ func refresh(repo string) error {
 	}
 	timestamp.Signed.Version++
 	timestamp.Signed.Expires = time.Now().UTC().Add(24 * time.Hour)
+	timestamp.Signed.Meta["snapshot.json"] = metadata.MetaFile(snapshot.Signed.Version)
+	timestamp.ClearSignatures()
+	if err := sign(timestamp, state.Roles["timestamp"]...); err != nil {
+		return err
+	}
+	return writeSet(repo, root, targets, snapshot, timestamp)
+}
+
+// mutateRollout changes only policy carried by the already signed fixed
+// release-index targets. It never accepts artifact paths or target names from
+// the caller. The resulting targets, snapshot, and timestamp metadata are
+// signed with their configured production roles before publication.
+func mutateRollout(repo, operation string, revision uint64, percentage uint8) error {
+	repo, err := validateRepository(repo, true)
+	if err != nil {
+		return err
+	}
+	root, targets, snapshot, timestamp, err := loadSet(repo)
+	if err != nil {
+		return err
+	}
+	state, err := loadSigningState(repo, root)
+	if err != nil {
+		return err
+	}
+	for _, platform := range []string{"darwin", "linux", "windows"} {
+		for _, architecture := range []string{"amd64", "arm64"} {
+			name := "release-index-stable-" + platform + "-" + architecture + ".json"
+			info := targets.Signed.Targets[name]
+			if info == nil || len(info.Hashes["sha256"]) != sha256.Size {
+				return fmt.Errorf("signed release index %s is unavailable", name)
+			}
+			digest := hex.EncodeToString(info.Hashes["sha256"])
+			body, err := os.ReadFile(filepath.Join(repo, "targets", digest+"."+name))
+			if err != nil || int64(len(body)) != info.Length {
+				return fmt.Errorf("read signed release index %s: %w", name, err)
+			}
+			var index releaseIndex
+			decoder := json.NewDecoder(strings.NewReader(string(body)))
+			decoder.DisallowUnknownFields()
+			var extra any
+			if decoder.Decode(&index) != nil || decoder.Decode(&extra) != io.EOF || index.Schema != "paperboat.release-index/v1" || index.Platform != platform || index.Architecture != architecture || revision <= index.RolloutPolicyRevision {
+				return fmt.Errorf("signed release index %s cannot accept revision %d", name, revision)
+			}
+			if err := applyRolloutMutation(&index, operation, revision, percentage); err != nil {
+				return err
+			}
+			updated, err := json.Marshal(index)
+			if err != nil {
+				return err
+			}
+			updatedInfo, err := metadata.TargetFile().FromBytes(name, updated, "sha256")
+			if err != nil {
+				return err
+			}
+			custom, _ := json.Marshal(map[string]string{"schema": "paperboat.tuf-release-index/v1", "kind": "release-index", "channel": "stable", "platform": platform, "architecture": architecture})
+			raw := json.RawMessage(custom)
+			updatedInfo.Custom, updatedInfo.Path = &raw, name
+			temporary, err := os.CreateTemp(repo, ".release-index-*")
+			if err != nil {
+				return err
+			}
+			temporaryPath := temporary.Name()
+			if _, err = temporary.Write(updated); err == nil {
+				err = temporary.Sync()
+			}
+			err = errors.Join(err, temporary.Close())
+			if err == nil {
+				err = copyConsistentTarget(repo, temporaryPath, name, updatedInfo)
+			}
+			removeErr := os.Remove(temporaryPath)
+			if err != nil {
+				return errors.Join(err, removeErr)
+			}
+			targets.Signed.Targets[name] = updatedInfo
+		}
+	}
+	return signTargetsSet(repo, root, targets, snapshot, timestamp, state)
+}
+
+func applyRolloutMutation(index *releaseIndex, operation string, revision uint64, percentage uint8) error {
+	if index == nil || revision == 0 || revision <= index.RolloutPolicyRevision || percentage > 100 {
+		return errors.New("rollout mutation is not monotonic")
+	}
+	if operation != "promote" && operation != "pause" && operation != "quarantine" || operation != "promote" && percentage != 0 {
+		return errors.New("invalid signed rollout operation")
+	}
+	index.RolloutPolicyRevision = revision
+	switch operation {
+	case "promote":
+		index.Rollout.Percentage = percentage
+		index.Revoked = false
+	case "pause":
+		index.Rollout.Percentage = 0
+	case "quarantine":
+		index.Rollout.Percentage = 0
+		index.Revoked = true
+	}
+	return nil
+}
+
+func signTargetsSet(repo string, root *metadata.Metadata[metadata.RootType], targets *metadata.Metadata[metadata.TargetsType], snapshot *metadata.Metadata[metadata.SnapshotType], timestamp *metadata.Metadata[metadata.TimestampType], state signingState) error {
+	now := time.Now().UTC()
+	targets.Signed.Version++
+	targets.Signed.Expires = now.Add(90 * 24 * time.Hour)
+	targets.ClearSignatures()
+	if err := sign(targets, state.Roles["targets"]...); err != nil {
+		return err
+	}
+	snapshot.Signed.Version++
+	snapshot.Signed.Expires = now.Add(7 * 24 * time.Hour)
+	snapshot.Signed.Meta["targets.json"] = metadata.MetaFile(targets.Signed.Version)
+	snapshot.ClearSignatures()
+	if err := sign(snapshot, state.Roles["snapshot"]...); err != nil {
+		return err
+	}
+	timestamp.Signed.Version++
+	timestamp.Signed.Expires = now.Add(24 * time.Hour)
 	timestamp.Signed.Meta["snapshot.json"] = metadata.MetaFile(snapshot.Signed.Version)
 	timestamp.ClearSignatures()
 	if err := sign(timestamp, state.Roles["timestamp"]...); err != nil {

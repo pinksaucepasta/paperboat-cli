@@ -24,3 +24,26 @@ func TestPublishedReleaseIndexMatchesRuntimeContract(t *testing.T) {
 		t.Fatalf("decoded=%+v err=%v", decoded, err)
 	}
 }
+
+func TestRolloutMutationsAreMonotonicAndSignedIndexCompatible(t *testing.T) {
+	index := releaseIndex{RolloutPolicyRevision: 4, Rollout: rolloutPolicy{Percentage: 5}}
+	if err := applyRolloutMutation(&index, "promote", 5, 25); err != nil || index.Rollout.Percentage != 25 || index.Revoked {
+		t.Fatalf("promote index=%+v err=%v", index, err)
+	}
+	if err := applyRolloutMutation(&index, "pause", 6, 0); err != nil || index.Rollout.Percentage != 0 || index.Revoked {
+		t.Fatalf("pause index=%+v err=%v", index, err)
+	}
+	if err := applyRolloutMutation(&index, "quarantine", 7, 0); err != nil || !index.Revoked {
+		t.Fatalf("quarantine index=%+v err=%v", index, err)
+	}
+	for _, test := range []struct {
+		op         string
+		revision   uint64
+		percentage uint8
+	}{{"promote", 7, 50}, {"pause", 8, 1}, {"unknown", 8, 0}} {
+		copy := index
+		if err := applyRolloutMutation(&copy, test.op, test.revision, test.percentage); err == nil {
+			t.Fatalf("mutation %+v unexpectedly succeeded", test)
+		}
+	}
+}
