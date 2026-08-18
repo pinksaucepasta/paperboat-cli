@@ -2393,9 +2393,9 @@ func actionUpdateStatus(command *cobra.Command, _ []string) error {
 }
 
 func actionUpdate(command *cobra.Command, _ []string) error {
-	ctx, cancel := context.WithTimeout(command.Context(), 3*time.Minute)
+	ctx, cancel := context.WithTimeout(command.Context(), 15*time.Minute)
 	defer cancel()
-	client, err := updated.NewClient(updatedControlSocket(), 3*time.Minute)
+	client, err := updated.NewClient(updatedControlSocket(), 15*time.Minute)
 	if err != nil {
 		return err
 	}
