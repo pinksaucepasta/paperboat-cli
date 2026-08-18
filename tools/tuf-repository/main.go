@@ -367,8 +367,11 @@ func mutateRollout(repo, operation string, revision uint64, percentage uint8) er
 			}
 			digest := hex.EncodeToString(info.Hashes["sha256"])
 			body, err := os.ReadFile(filepath.Join(repo, "targets", digest+"."+name))
-			if err != nil || int64(len(body)) != info.Length {
+			if err != nil {
 				return fmt.Errorf("read signed release index %s: %w", name, err)
+			}
+			if int64(len(body)) != info.Length {
+				return fmt.Errorf("signed release index %s has the wrong length", name)
 			}
 			var index releaseIndex
 			decoder := json.NewDecoder(strings.NewReader(string(body)))
