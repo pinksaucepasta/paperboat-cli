@@ -236,11 +236,11 @@ jobs:
           # the owned OpenSSH service through the same elevated repair path a
           # user gets from `pb doctor --repair`; Hostd depends on this loopback
           # target and must not be started before it exists.
-          $repairOutput = & $runtime __runtime-service repair 2>&1
-          $repairExit = $LASTEXITCODE
-          $repairOutput | Out-Host
+          $repairLog = Join-Path $env:RUNNER_TEMP 'paperboat-runtime-repair.log'
+          $repairProcess = Start-Process -FilePath $runtime -ArgumentList @('__runtime-service', 'repair') -Wait -PassThru -RedirectStandardOutput $repairLog -RedirectStandardError ($repairLog + '.err')
+          $repairExit = $repairProcess.ExitCode
+          Get-Content -LiteralPath $repairLog,($repairLog + '.err') -ErrorAction SilentlyContinue | Out-Host
           if ($repairExit -ne 0) { Write-Output "Paperboat aggregate repair returned exit code $repairExit; verifying owned SSH repair independently." }
-          if ($repairOutput -match 'OpenSSH|PaperboatSshd') { $repairOutput | Out-Host }
           try { Start-Service PaperboatHostd -ErrorAction Stop } catch {
             Write-Output 'HOSTD_START_FAILED'
             Get-CimInstance Win32_Service -Filter "Name='PaperboatHostd'" | Format-List Name,State,StartName,PathName
