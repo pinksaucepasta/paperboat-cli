@@ -129,8 +129,8 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Validate Windows release pipeline contract
-        shell: 'C:\\Program Files\\Git\\bin\\bash.exe --noprofile --norc -e -o pipefail {0}'
-        run: ./packaging/windows/scripts/validate-release-pipeline.sh
+        shell: cmd
+        run: '"C:\\Program Files\\Git\\bin\\bash.exe" --noprofile --norc -e -o pipefail -c "./packaging/windows/scripts/validate-release-pipeline.sh"'
       - name: Validate first-party Windows packaging contract
         shell: pwsh
         run: |
