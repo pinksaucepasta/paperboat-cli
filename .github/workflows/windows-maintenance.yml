@@ -39,6 +39,14 @@ jobs:
           if (Test-Path -LiteralPath $stateBackup) {
             Move-Item -LiteralPath $stateBackup -Destination 'C:\ProgramData\Paperboat'
           }
+          # A previous interrupted move can leave the state backup nested one
+          # level below ProgramData. Flatten only this known qualification
+          # backup before starting the restored runtime.
+          $nestedStateBackup = 'C:\ProgramData\Paperboat\PaperboatQualificationStateBackup2'
+          if (Test-Path -LiteralPath $nestedStateBackup) {
+            Get-ChildItem -LiteralPath $nestedStateBackup -Force | Move-Item -Destination 'C:\ProgramData\Paperboat' -Force
+            Remove-Item -LiteralPath $nestedStateBackup -Recurse -Force
+          }
           $registryBackup = 'C:\PaperboatQualificationRegistryBackup.reg'
           if (Test-Path -LiteralPath $registryBackup) {
             reg.exe import $registryBackup | Out-Host
