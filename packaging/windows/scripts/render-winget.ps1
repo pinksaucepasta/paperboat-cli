@@ -83,7 +83,8 @@ foreach ($channel in @('stable', 'beta')) {
         foreach ($replacement in $replacements.GetEnumerator()) {
             $content = $content.Replace($replacement.Key, $replacement.Value)
         }
-        if ($content -match '\{\{[^}]+\}\}') {
+        $manifestContent = ($content -split "`r?`n" | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
+        if ($manifestContent -match '\{\{[^}]+\}\}') {
             throw "Unrendered WinGet placeholder remains in $($template.Name)."
         }
         $content | Set-Content -LiteralPath (Join-Path $destinationDirectory $template.Name) -Encoding utf8
