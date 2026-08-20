@@ -69,7 +69,13 @@ jobs:
         run: ver
       - name: Run the complete native amd64 test suite
         shell: pwsh
-        run: go test -count=1 ./...
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'paperboat-windows-amd64-go-test.jsonl'
+          go test -json -count=1 -timeout 5m ./... 2>&1 | Tee-Object -FilePath $log
+          $exitCode = $LASTEXITCODE
+          Write-Output "Windows test log: $log"
+          Get-Content -LiteralPath $log -Tail 80
+          if ($exitCode -ne 0) { throw "Windows amd64 test suite failed or timed out with exit code $exitCode." }
       - name: Build and validate an amd64 PE
         shell: pwsh
         env:
