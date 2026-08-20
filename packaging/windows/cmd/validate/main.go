@@ -212,6 +212,12 @@ func validateWix(root string, policy metadata) error {
 	}
 	for _, required := range []string{
 		`Value="$(var.WixPlatform)"`,
+		`<Environment`,
+		`Name="PATH"`,
+		`Value="[BINDIR]"`,
+		`Part="last"`,
+		`System="yes"`,
+		`Permanent="no"`,
 		`Name="PaperboatHostd"`,
 		`Name="PaperboatUpdated"`,
 		`Value="PaperboatSshd"`,
@@ -223,6 +229,15 @@ func validateWix(root string, policy metadata) error {
 		if !strings.Contains(string(source), required) {
 			return fmt.Errorf("wix/Paperboat.wxs is missing %q", required)
 		}
+	}
+	componentGUID := regexp.MustCompile(`Guid="([^"]+)"`)
+	seenGUIDs := make(map[string]struct{})
+	for _, match := range componentGUID.FindAllStringSubmatch(string(source), -1) {
+		guid := strings.ToUpper(match[1])
+		if _, exists := seenGUIDs[guid]; exists {
+			return fmt.Errorf("wix/Paperboat.wxs contains duplicate component GUID %s", match[1])
+		}
+		seenGUIDs[guid] = struct{}{}
 	}
 	forbiddenCapability := "Add-" + "WindowsCapability"
 	forbiddenDisplayName := "winget install \"openssh " + "preview\""

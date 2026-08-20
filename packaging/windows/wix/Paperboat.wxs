@@ -107,7 +107,7 @@
       <Component Id="RuntimeComponent" Guid="{F3E5F8E2-BD39-4CC4-BD4C-6FD34E5C8F03}">
         <File Id="RuntimeBinary" Source="$(var.StagingDir)\paperboat-runtime.exe" KeyPath="yes" Vital="yes" />
       </Component>
-      <Component Id="CliPathComponent" Guid="{F3E5F8E2-BD39-4CC4-BD4C-6FD34E5C8F07}">
+      <Component Id="CliPathComponent" Guid="{F3E5F8E2-BD39-4CC4-BD4C-6FD34E5C8F0B}">
         <Environment
             Id="PaperboatBinPath"
             Name="PATH"
