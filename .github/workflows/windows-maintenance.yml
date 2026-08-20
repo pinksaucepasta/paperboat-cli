@@ -105,6 +105,9 @@ jobs:
           if ($sshKeyscan) { & $sshKeyscan.Source -T 5 -p 38222 127.0.0.1 2>&1 | Select-Object -First 12 }
           Get-Content -LiteralPath 'C:\ProgramData\Paperboat\runtime-install.json' -ErrorAction SilentlyContinue
           Get-Content -LiteralPath 'C:\ProgramData\Paperboat\runtime.json' -ErrorAction SilentlyContinue
+          Get-ChildItem -LiteralPath 'C:\Users\Pujan\AppData\Local\Paperboat\runtime' -Recurse -File -ErrorAction SilentlyContinue |
+            Select-Object FullName,Length,LastWriteTime
+          Get-Content -LiteralPath 'C:\Users\Pujan\AppData\Local\Paperboat\runtime\machine-registration.json' -ErrorAction SilentlyContinue
           if ((Get-Service PaperboatHostd).Status -ne 'Running') {
             Write-Output 'STARTING_PAPERBOAT_HOSTD=TRUE'
             Start-Service PaperboatHostd -ErrorAction Stop
