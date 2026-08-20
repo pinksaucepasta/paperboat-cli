@@ -9,11 +9,35 @@ on:
         type: choice
         options:
           - restore-victus-qualification-state
+          - inspect-victus-health
 
 permissions:
   contents: read
 
 jobs:
+  inspect-victus:
+    if: inputs.action == 'inspect-victus-health'
+    runs-on: [self-hosted, Windows, X64, paperboat-windows-11-iot-ltsc]
+    timeout-minutes: 5
+    steps:
+      - name: Inspect live Paperboat services and logs
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Get-Service PaperboatHostd,PaperboatUpdated,PaperboatSshd | Format-Table Name,Status,StartType
+          Get-CimInstance Win32_Service -Filter "Name='PaperboatHostd' OR Name='PaperboatUpdated' OR Name='PaperboatSshd'" | Format-List Name,State,StartName,PathName
+          $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+          Write-Output "MACHINE_PATH_HAS_PAPERBOAT=$($machinePath -split ';' -contains 'C:\Program Files\Paperboat\bin')"
+          Get-ChildItem -LiteralPath 'C:\ProgramData\Paperboat' -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match 'log|error|startup|observation|health' } |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 30 FullName,Length,LastWriteTime
+          Get-Content -LiteralPath 'C:\ProgramData\Paperboat\PaperboatHostd-worker-startup-error.log' -Tail 80 -ErrorAction SilentlyContinue
+          Get-Content -LiteralPath 'C:\ProgramData\Paperboat\manual-out.log' -Tail 80 -ErrorAction SilentlyContinue
+          Get-WinEvent -LogName Application -MaxEvents 100 -ErrorAction SilentlyContinue |
+            Where-Object { $_.Message -match 'Paperboat' } |
+            Select-Object -First 20 TimeCreated,ProviderName,LevelDisplayName,Message | Format-List
+
   restore-victus:
     if: inputs.action == 'restore-victus-qualification-state'
     runs-on: [self-hosted, Windows, X64, paperboat-windows-11-iot-ltsc]
