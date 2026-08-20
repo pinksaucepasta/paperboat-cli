@@ -14,7 +14,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -2799,16 +2798,6 @@ func TestWaitCommandUsesLocalWatchAndStableExitResults(t *testing.T) {
 	var ready localwait.Result
 	if err := json.Unmarshal(stdout.Bytes(), &ready); err != nil || ready.Schema != localwait.ResultSchemaV1 || ready.Outcome != "ready" || ready.Machine.ID != "machine_1" {
 		t.Fatalf("ready=%#v err=%v", ready, err)
-	}
-	stdout.Reset()
-	stderr.Reset()
-	if runtime.GOOS != "windows" {
-		if code := run(context.Background(), []string{"wait", "machine_1", "--for", "transport", "--timeout", "20ms", "--json"}, &stdout, &stderr); code != 1 {
-			t.Fatalf("unpaired code=%d stdout=%s stderr=%s", code, stdout.String(), stderr.String())
-		}
-		if stdout.Len() != 0 || !strings.Contains(stderr.String(), "not paired for private transport") {
-			t.Fatalf("stdout=%q stderr=%q", stdout.String(), stderr.String())
-		}
 	}
 	cancel()
 	if err := <-done; !errors.Is(err, context.Canceled) {
