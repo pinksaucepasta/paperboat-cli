@@ -260,6 +260,16 @@ jobs:
           if ($repairExit -ne 0) { Write-Output "Paperboat aggregate repair returned exit code $repairExit; verifying owned SSH repair independently." }
           icacls.exe $sshState /inheritance:r /remove:g "*$ownerSid" '*S-1-5-32-545' '*S-1-5-11' /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /C | Out-Host
           icacls.exe $hostKeys /inheritance:r /remove:g "*$ownerSid" '*S-1-5-32-545' '*S-1-5-11' /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /T /C | Out-Host
+          foreach ($directory in @($paperboatRoot, $sshState, $hostKeys)) {
+            $acl = New-Object System.Security.AccessControl.DirectorySecurity
+            $acl.SetAccessRuleProtection($true, $false)
+            $inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+            $propagate = [System.Security.AccessControl.PropagationFlags]::None
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($systemSid, 'FullControl', $inherit, $propagate, 'Allow')))
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($adminsSid, 'FullControl', $inherit, $propagate, 'Allow')))
+            Set-Acl -LiteralPath $directory -AclObject $acl
+            icacls.exe $directory | Out-Host
+          }
           Get-ChildItem -LiteralPath $hostKeys -File -Recurse | ForEach-Object {
             $acl = New-Object System.Security.AccessControl.FileSecurity
             $acl.SetAccessRuleProtection($true, $false)
