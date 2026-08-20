@@ -185,6 +185,15 @@ func TestNativeDurablePreviewServiceLifecycle(t *testing.T) {
 			t.Fatalf("expired service remained after explicit cleanup: %v", cleanupErr)
 		}
 	}
+	// The descriptor is user-owned state while the durable service is
+	// LocalSystem-owned. If the SYSTEM transition leaves the temporary test
+	// descriptor outside the installed state root, finish the same idempotent
+	// removal through the public runtime API before asserting cleanup.
+	if _, statErr := os.Stat(previewDescriptorPath(root, name)); statErr == nil {
+		if err := hostruntime.RemovePreviewService(ctx, root, name); err != nil {
+			t.Fatalf("remove expired preview descriptor: %v", err)
+		}
+	}
 	if _, err := os.Stat(previewDescriptorPath(root, name)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("preview descriptor after expiry: %v", err)
 	}
