@@ -209,7 +209,7 @@ jobs:
   windows-amd64-iot-ltsc:
     name: Windows 11 IoT Enterprise LTSC amd64 qualification (manual)
     if: github.event_name == 'workflow_dispatch' && inputs.run_amd64_ltsc
-    runs-on: [self-hosted, windows, amd64, paperboat-windows-11-iot-ltsc]
+    runs-on: [self-hosted, Windows, X64, paperboat-windows-11-iot-ltsc]
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

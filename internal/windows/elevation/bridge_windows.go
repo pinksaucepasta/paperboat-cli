@@ -34,12 +34,13 @@ const (
 )
 
 var (
-	shell32              = windows.NewLazySystemDLL("shell32.dll")
-	procShellExecuteExW  = shell32.NewProc("ShellExecuteExW")
-	shellExecuteExForRun = shellExecuteEx
-	waitForProcess       = waitForProcessExit
-	terminateProcess     = windows.TerminateProcess
-	closeProcessHandle   = windows.CloseHandle
+	shell32                        = windows.NewLazySystemDLL("shell32.dll")
+	procShellExecuteExW            = shell32.NewProc("ShellExecuteExW")
+	shellExecuteExForRun           = shellExecuteEx
+	isCurrentProcessElevatedForRun = IsCurrentProcessElevated
+	waitForProcess                 = waitForProcessExit
+	terminateProcess               = windows.TerminateProcess
+	closeProcessHandle             = windows.CloseHandle
 )
 
 type shellExecuteInfo struct {
@@ -213,7 +214,7 @@ func runOperation(ctx context.Context, executable, operation, action string, pay
 	launchCh := make(chan launchResult, 1)
 	go func() {
 		launcher := shellExecuteExForRun
-		if IsCurrentProcessElevated() {
+		if isCurrentProcessElevatedForRun() {
 			launcher = createProcessForRun
 		}
 		handle, launchErr := launcher(validatedExecutable, parameters, filepath.Dir(validatedExecutable))

@@ -215,10 +215,15 @@ func TestRunOpenSSHMapsUACCancellationToTypedError(t *testing.T) {
 	bridgeTestMutex.Lock()
 	defer bridgeTestMutex.Unlock()
 	previous := shellExecuteExForRun
+	previousElevated := isCurrentProcessElevatedForRun
 	shellExecuteExForRun = func(string, string, string) (windows.Handle, error) {
 		return 0, windows.ERROR_CANCELLED
 	}
-	defer func() { shellExecuteExForRun = previous }()
+	isCurrentProcessElevatedForRun = func() bool { return false }
+	defer func() {
+		shellExecuteExForRun = previous
+		isCurrentProcessElevatedForRun = previousElevated
+	}()
 	err = RunOpenSSH(context.Background(), executable, ActionOpenSSHSetup)
 	if !errors.Is(err, ErrElevationDenied) {
 		t.Fatalf("error = %v, want ErrElevationDenied", err)
