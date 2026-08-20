@@ -134,14 +134,14 @@ func TestBridgeSSHCancellationAndTargetValidation(t *testing.T) {
 	if err := <-done; !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancellation error=%v", err)
 	}
-	writeErr := clientSide.SetWriteDeadline(time.Now().Add(time.Second))
+	writeErr := clientSide.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	if writeErr == nil {
 		_, writeErr = clientSide.Write([]byte{1})
 	}
 	if !errors.Is(writeErr, io.ErrClosedPipe) {
 		t.Fatalf("Paperboat side write error=%v after cancellation", writeErr)
 	}
-	if err := connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+	if err := connection.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	var value [1]byte

@@ -175,9 +175,9 @@ jobs:
           $env:GOOS = 'windows'
           $env:GOARCH = $env:PAPERBOAT_ARCH
           $ldflags = "-s -w -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Version=$version -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Commit=$env:GITHUB_SHA -X github.com/pinksaucepasta/paperboat/internal/buildinfo.ProtocolVersion=1 -X github.com/pinksaucepasta/paperboat/internal/buildinfo.DefaultServerURL=$env:PAPERBOAT_DEFAULT_SERVER_URL -X github.com/pinksaucepasta/paperboat/internal/buildinfo.DefaultReleaseURL=$env:PAPERBOAT_DEFAULT_RELEASE_URL"
-          & go build -trimpath -ldflags $ldflags -o (Join-Path $stage 'pb.exe') ./cmd/pb
+          & go build -buildvcs=false -trimpath -ldflags $ldflags -o (Join-Path $stage 'pb.exe') ./cmd/pb
           if ($LASTEXITCODE -ne 0) { throw 'Windows amd64/arm64 CLI build failed.' }
-          & go build -trimpath -ldflags $ldflags -o (Join-Path $stage 'pb-launcher.exe') ./cmd/pb-launcher
+          & go build -buildvcs=false -trimpath -ldflags $ldflags -o (Join-Path $stage 'pb-launcher.exe') ./cmd/pb-launcher
           if ($LASTEXITCODE -ne 0) { throw 'Windows launcher build failed.' }
           foreach ($role in @('paperboat-runtime.exe', 'paperboat-hostd.exe', 'paperboat-updater.exe')) {
             Copy-Item -LiteralPath (Join-Path $stage 'pb.exe') -Destination (Join-Path $stage $role)

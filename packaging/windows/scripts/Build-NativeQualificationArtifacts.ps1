@@ -46,7 +46,7 @@ function Invoke-GoBuild {
         [Parameter(Mandatory = $true)][string] $Package,
         [string] $LdFlags = ''
     )
-    $arguments = @('build', '-trimpath')
+    $arguments = @('build', '-buildvcs=false', '-trimpath')
     if ($LdFlags -ne '') {
         $arguments += @('-ldflags', $LdFlags)
     }
