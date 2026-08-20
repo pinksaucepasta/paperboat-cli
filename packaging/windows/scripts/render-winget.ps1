@@ -86,7 +86,7 @@ foreach ($channel in @('stable', 'beta')) {
         if ($content -match '\{\{[^}]+\}\}') {
             throw "Unrendered WinGet placeholder remains in $($template.Name)."
         }
-        $content | Set-Content -LiteralPath (Join-Path $destinationDirectory $template.Name) -Encoding utf8NoBOM
+        $content | Set-Content -LiteralPath (Join-Path $destinationDirectory $template.Name) -Encoding utf8
     }
 }
 

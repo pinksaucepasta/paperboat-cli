@@ -184,7 +184,7 @@ $manifest = [ordered]@{
     artifacts = $artifacts
 }
 $manifestPath = Join-Path $output "windows-signing-manifest-${Architecture}.json"
-$manifest | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $manifestPath -Encoding utf8NoBOM
+$manifest | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $manifestPath -Encoding utf8
 
 $checksumPath = Join-Path $output "windows-checksums-${Architecture}.sha256"
 $checksumLines = $artifacts |
@@ -214,7 +214,7 @@ $spdx = [ordered]@{
     files = @($spdxFiles)
 }
 $spdxPath = Join-Path $output "windows-sbom-${Architecture}.spdx.json"
-$spdx | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $spdxPath -Encoding utf8NoBOM
+$spdx | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $spdxPath -Encoding utf8
 
 $provenance = [ordered]@{
     schema = 'paperboat.windows-provenance/v1'
@@ -239,6 +239,6 @@ $provenance = [ordered]@{
     artifacts = $artifacts | ForEach-Object { [ordered]@{ path = $_.path; sha256 = $_.sha256; kind = $_.kind } }
 }
 $provenancePath = Join-Path $output "windows-provenance-${Architecture}.json"
-$provenance | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $provenancePath -Encoding utf8NoBOM
+$provenance | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $provenancePath -Encoding utf8
 
 Write-Output ("Generated Windows signing, checksum, SBOM, and provenance handoff for {0}." -f $Architecture)
