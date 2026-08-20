@@ -23,8 +23,8 @@ func TestJSONFileSinkWritesValidatedMetadataWithPrivateMode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o600 {
-		t.Fatalf("mode = %o", info.Mode().Perm())
+	if !telemetryFilePrivate(path, info) {
+		t.Fatalf("telemetry event log is not private: mode=%o", info.Mode().Perm())
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {

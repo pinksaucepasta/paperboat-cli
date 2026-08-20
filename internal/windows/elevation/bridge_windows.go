@@ -468,7 +468,19 @@ func expectedBridgePath(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return normalizeBridgePath(abs), nil
+	input, err := windows.UTF16PtrFromString(abs)
+	if err != nil {
+		return "", err
+	}
+	buffer := make([]uint16, 32768)
+	n, err := windows.GetLongPathName(input, &buffer[0], uint32(len(buffer)))
+	if err != nil {
+		return "", err
+	}
+	if n == 0 || n >= uint32(len(buffer)) {
+		return "", errors.New("elevation canonical path is too long")
+	}
+	return normalizeBridgePath(windows.UTF16ToString(buffer[:n])), nil
 }
 
 func verifyHandleFinalPath(handle windows.Handle, expected string) error {
@@ -855,7 +867,11 @@ func verifyProtectedACLHandle(handle windows.Handle, ownerSID string, directory 
 	if err != nil {
 		return err
 	}
-	want := protectedSDDL(ownerSID, directory)
+	wantDescriptor, err := windows.SecurityDescriptorFromString(protectedSDDL(ownerSID, directory))
+	if err != nil {
+		return err
+	}
+	want := wantDescriptor.String()
 	got := descriptor.String()
 	// Windows can mark a DACL as auto-inherited when it is applied. That flag
 	// does not grant any access; normalize it before comparing the protected

@@ -784,7 +784,7 @@ func parseCandidate(line string) (pathCandidate, bool) {
 	if start == end {
 		return pathCandidate{}, false
 	}
-	localPath, hasUnquotedGlob, ok := decodePOSIXWord(trimmed)
+	localPath, hasUnquotedGlob, ok := decodeCandidateWord(trimmed)
 	if !ok || localPath == "" {
 		return pathCandidate{}, false
 	}
@@ -807,6 +807,19 @@ func parseCandidate(line string) (pathCandidate, bool) {
 		return pathCandidate{}, false
 	}
 	return pathCandidate{path: localPath, start: start, end: end}, true
+}
+
+func decodeCandidateWord(word string) (string, bool, bool) {
+	if runtime.GOOS == "windows" {
+		candidate := word
+		if len(candidate) >= 2 && (candidate[0] == '"' && candidate[len(candidate)-1] == '"' || candidate[0] == '\'' && candidate[len(candidate)-1] == '\'') {
+			candidate = candidate[1 : len(candidate)-1]
+		}
+		if !strings.ContainsAny(candidate, "\x00\r\n") && filepath.IsAbs(filepath.FromSlash(candidate)) {
+			return candidate, false, true
+		}
+	}
+	return decodePOSIXWord(word)
 }
 
 // decodePOSIXWord decodes one shell word without invoking a shell. The return

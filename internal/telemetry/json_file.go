@@ -34,6 +34,10 @@ func NewJSONFileSinkWithLimit(path string, maxBytes int64) (*JSONFileSink, error
 		_ = file.Close()
 		return nil, fmt.Errorf("secure telemetry event log: %w", err)
 	}
+	if err := secureTelemetryFile(path); err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("secure telemetry event log: %w", err)
+	}
 	if maxBytes <= 0 {
 		_ = file.Close()
 		return nil, fmt.Errorf("telemetry event log limit must be positive")
