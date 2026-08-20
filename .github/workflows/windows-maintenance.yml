@@ -10,11 +10,43 @@ on:
         options:
           - restore-victus-qualification-state
           - inspect-victus-health
+          - prepare-victus-clean-qualification
 
 permissions:
   contents: read
 
 jobs:
+  prepare-victus:
+    if: inputs.action == 'prepare-victus-clean-qualification'
+    runs-on: [self-hosted, Windows, X64, paperboat-windows-11-iot-ltsc]
+    timeout-minutes: 10
+    steps:
+      - name: Snapshot live state and prepare clean qualification host
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $programBackup = 'C:\PaperboatQualificationProgramBackup3'
+          $stateBackup = 'C:\PaperboatQualificationStateBackup3'
+          $registryBackup = 'C:\PaperboatQualificationRegistryBackup3.reg'
+          foreach ($path in @($programBackup, $stateBackup, $registryBackup)) {
+            if (Test-Path -LiteralPath $path) { throw "Refusing to overwrite existing qualification snapshot: $path" }
+          }
+          Stop-Service PaperboatHostd,PaperboatUpdated,PaperboatSshd -Force -ErrorAction SilentlyContinue
+          Get-Service 'PaperboatPreview-*' -ErrorAction SilentlyContinue | ForEach-Object {
+            Stop-Service $_.Name -Force -ErrorAction SilentlyContinue
+            sc.exe delete $_.Name | Out-Host
+          }
+          Get-Process paperboat*,sshd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 2
+          reg.exe export 'HKLM\Software\Paperboat' $registryBackup /y | Out-Host
+          if (Test-Path -LiteralPath 'C:\Program Files\Paperboat') { Move-Item 'C:\Program Files\Paperboat' $programBackup }
+          if (Test-Path -LiteralPath 'C:\ProgramData\Paperboat') { Move-Item 'C:\ProgramData\Paperboat' $stateBackup }
+          foreach ($service in @('PaperboatHostd','PaperboatUpdated','PaperboatSshd')) {
+            sc.exe delete $service | Out-Host
+          }
+          Remove-Item 'HKLM:\Software\Paperboat' -Recurse -Force -ErrorAction SilentlyContinue
+          Write-Output 'Victus is prepared for clean MSI qualification; snapshots are preserved at the explicit qualification backup paths.'
+
   inspect-victus:
     if: inputs.action == 'inspect-victus-health'
     runs-on: [self-hosted, Windows, X64, paperboat-windows-11-iot-ltsc]
