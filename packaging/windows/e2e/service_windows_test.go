@@ -129,6 +129,7 @@ func assertServiceArguments(t *testing.T, name string, want ...string) {
 }
 
 func TestNativeDurablePreviewServiceLifecycle(t *testing.T) {
+	t.Setenv("PAPERBOAT_WINDOWS_PREVIEW_OWNER_WORKLOAD", "")
 	fixture := requiredFixture(t)
 	root := t.TempDir()
 	// Include the process identity and timestamp so a terminated qualification

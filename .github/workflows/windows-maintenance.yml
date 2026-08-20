@@ -60,6 +60,9 @@ jobs:
           Get-CimInstance Win32_Service -Filter "Name='PaperboatHostd' OR Name='PaperboatUpdated' OR Name='PaperboatSshd'" | Format-List Name,State,StartName,PathName
           $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
           Write-Output "MACHINE_PATH_HAS_PAPERBOAT=$($machinePath -split ';' -contains 'C:\Program Files\Paperboat\bin')"
+          Get-Command pwsh.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
+          Get-ChildItem -Path 'C:\Program Files\PowerShell','C:\Users' -Filter pwsh.exe -File -Recurse -ErrorAction SilentlyContinue |
+            Select-Object -First 20 FullName,Length,LastWriteTime
           Get-ChildItem -LiteralPath 'C:\ProgramData\Paperboat' -Recurse -File -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -match 'log|error|startup|observation|health' } |
             Sort-Object LastWriteTime -Descending |
