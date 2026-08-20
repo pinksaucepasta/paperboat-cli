@@ -219,7 +219,6 @@ jobs:
           if (($machinePath -split ';') -notcontains $bin) {
             [Environment]::SetEnvironmentVariable('Path', ($machinePath.TrimEnd(';') + ';' + $bin), 'Machine')
           }
-          Start-Service PaperboatSshd -ErrorAction SilentlyContinue
           try { Start-Service PaperboatHostd -ErrorAction Stop } catch {
             Write-Output 'HOSTD_START_FAILED'
             Get-CimInstance Win32_Service -Filter "Name='PaperboatHostd'" | Format-List Name,State,StartName,PathName
