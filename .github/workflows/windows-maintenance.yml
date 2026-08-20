@@ -183,14 +183,16 @@ jobs:
           $sshState = 'C:\ProgramData\Paperboat\ssh'
           if (Test-Path -LiteralPath $sshState) {
             $paperboatRoot = 'C:\ProgramData\Paperboat'
-            $ownerSid = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+            $runtimeConfigPath = Join-Path $paperboatRoot 'runtime-install.json'
+            $runtimeConfig = if (Test-Path -LiteralPath $runtimeConfigPath) { Get-Content -LiteralPath $runtimeConfigPath -Raw | ConvertFrom-Json } else { $null }
+            $ownerAccount = if ($null -ne $runtimeConfig -and $runtimeConfig.user) { $runtimeConfig.user } else { ([System.Security.Principal.WindowsIdentity]::GetCurrent()).Name }
+            $ownerSid = (New-Object System.Security.Principal.NTAccount($ownerAccount)).Translate([System.Security.Principal.SecurityIdentifier]).Value
             icacls.exe $paperboatRoot /setowner "*$ownerSid" /T /C | Out-Host
             icacls.exe $paperboatRoot /inheritance:r /remove:g '*S-1-5-32-545' '*S-1-5-11' /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /C | Out-Host
-            $runtimeConfigPath = Join-Path $paperboatRoot 'runtime-install.json'
-            if (Test-Path -LiteralPath $runtimeConfigPath) {
-              $runtimeConfig = Get-Content -LiteralPath $runtimeConfigPath -Raw | ConvertFrom-Json
+            if ($null -ne $runtimeConfig) {
               $runtimeConfig.owner_sid = $ownerSid
-              $runtimeConfig | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath $runtimeConfigPath -Encoding UTF8
+              $json = $runtimeConfig | ConvertTo-Json -Depth 16
+              [IO.File]::WriteAllText($runtimeConfigPath, $json, (New-Object Text.UTF8Encoding($false)))
             }
             icacls.exe $sshState /reset /T /C | Out-Host
             icacls.exe $sshState /grant:r 'SYSTEM:(OI)(CI)F' 'Administrators:(OI)(CI)F' /T /C | Out-Host
