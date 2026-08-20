@@ -222,7 +222,7 @@ func retirePreviewService(ctx context.Context, name, definition string, _ hostse
 	if err != nil || expected != definition {
 		return ErrProductionInvalid
 	}
-	if os.Getenv("PAPERBOAT_WINDOWS_PREVIEW_OWNER_WORKLOAD") == "1" {
+	if os.Getenv("PAPERBOAT_WINDOWS_PREVIEW_OWNER_WORKLOAD") == "1" && os.Getenv("PAPERBOAT_RUNTIME_SERVICE_SCOPE") == "user" {
 		// The LocalSystem service parent owns SCM deletion after this enrolled
 		// owner child exits. The child may remove only its user-state descriptor.
 		return nil
