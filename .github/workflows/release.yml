@@ -111,8 +111,10 @@ jobs:
         include:
           - architecture: amd64
             channel: stable
+            runner: [self-hosted, Windows, X64, paperboat-windows-11-iot-ltsc]
           - architecture: arm64
             channel: beta
+            runner: windows-2025
     env:
       PAPERBOAT_ARCH: ${{ matrix.architecture }}
       PAPERBOAT_CHANNEL: ${{ matrix.channel }}
@@ -305,7 +307,7 @@ jobs:
     name: Render final-hash WinGet manifests
     needs: windows-package
     if: needs.windows-package.result == 'success'
-    runs-on: windows-2025
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
     steps:
