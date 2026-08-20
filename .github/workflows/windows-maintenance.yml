@@ -58,6 +58,12 @@ jobs:
             [Environment]::SetEnvironmentVariable('Path', ($machinePath.TrimEnd(';') + ';' + $bin), 'Machine')
           }
           Start-Service PaperboatSshd -ErrorAction SilentlyContinue
-          Start-Service PaperboatHostd
+          try { Start-Service PaperboatHostd -ErrorAction Stop } catch {
+            Write-Output 'HOSTD_START_FAILED'
+            Get-CimInstance Win32_Service -Filter "Name='PaperboatHostd'" | Format-List Name,State,StartName,PathName
+            Get-ChildItem -LiteralPath 'C:\ProgramData\Paperboat' -Recurse -File -ErrorAction SilentlyContinue | Select-Object -Last 20 FullName
+            Get-WinEvent -LogName System -MaxEvents 80 -ErrorAction SilentlyContinue | Where-Object { $_.ProviderName -eq 'Service Control Manager' -and $_.Message -match 'Paperboat' } | Select-Object -First 12 TimeCreated,Message | Format-List
+            throw
+          }
           Start-Service PaperboatUpdated
           Get-Service PaperboatHostd,PaperboatUpdated,PaperboatSshd | Format-Table Name,Status,StartType
