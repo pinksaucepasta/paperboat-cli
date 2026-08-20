@@ -186,7 +186,7 @@ jobs:
             icacls.exe $sshState /grant:r 'SYSTEM:(OI)(CI)F' 'Administrators:(OI)(CI)F' /T /C | Out-Host
             $hostKeys = Join-Path $sshState 'hostkeys'
             if (Test-Path -LiteralPath $hostKeys) {
-              icacls.exe $hostKeys /inheritance:r /remove:g 'Users' 'Authenticated Users' /grant:r 'SYSTEM:F' 'Administrators:F' /T /C | Out-Host
+              icacls.exe $hostKeys /inheritance:r /remove:g '*S-1-5-32-545' '*S-1-5-11' /grant:r '*S-1-5-18:F' '*S-1-5-32-544:F' /T /C | Out-Host
             }
           }
 
