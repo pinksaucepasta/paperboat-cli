@@ -72,8 +72,8 @@ for forbidden in ("windows/amd64", "windows/arm64", "package-zip", "paperboat_.*
         raise SystemExit(f"release-unix still owns Windows assets: {forbidden}")
 
 windows = job("windows-package")
-if "runs-on: windows-2025" not in windows:
-    raise SystemExit("windows-package must run natively on windows-2025")
+if "runs-on: ${{ matrix.runner }}" not in windows or "runner: windows-2025" not in windows or "runner: [self-hosted, Windows, X64, paperboat-windows-11-iot-ltsc]" not in windows:
+    raise SystemExit("windows-package must run natively on windows-2025 for arm64 and the registered native amd64 runner for amd64")
 if "stable" not in windows or "beta" not in windows:
     raise SystemExit("windows-package must declare stable and beta channels")
 
