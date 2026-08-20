@@ -141,6 +141,9 @@ func (s *Server) serveListener(ctx context.Context, listener *net.UnixListener) 
 	for {
 		if s.config.HeartbeatInterval > 0 {
 			if err := listener.SetDeadline(s.config.Now().Add(s.config.HeartbeatInterval)); err != nil {
+				if ctx.Err() != nil {
+					return errors.Join(ctx.Err(), s.config.Applier.Close(context.Background()))
+				}
 				return err
 			}
 		}
