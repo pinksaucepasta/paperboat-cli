@@ -31,8 +31,10 @@ jobs:
             sc.exe delete $_.Name | Out-Host
           }
           foreach ($service in @('PaperboatHostd','PaperboatUpdated','PaperboatSshd')) {
-            Stop-Service $service -Force -ErrorAction SilentlyContinue
-            sc.exe delete $service | Out-Host
+            if (Get-Service $service -ErrorAction SilentlyContinue) {
+              Stop-Service $service -Force -ErrorAction SilentlyContinue
+              sc.exe delete $service | Out-Host
+            }
           }
           Remove-Item 'HKLM:\Software\Paperboat' -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item 'C:\Program Files\Paperboat' -Recurse -Force -ErrorAction SilentlyContinue
