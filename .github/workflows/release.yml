@@ -102,7 +102,7 @@ jobs:
 
   windows-package:
     name: Windows ${{ matrix.architecture }} (${{ matrix.channel }}) package
-    runs-on: windows-2025
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
     strategy:
@@ -307,7 +307,7 @@ jobs:
     name: Render final-hash WinGet manifests
     needs: windows-package
     if: needs.windows-package.result == 'success'
-    runs-on: ${{ matrix.runner }}
+    runs-on: windows-2025
     permissions:
       contents: read
     steps:
