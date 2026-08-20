@@ -90,6 +90,10 @@ jobs:
           if (Test-Path -LiteralPath $sshState) {
             icacls.exe $sshState /reset /T /C | Out-Host
             icacls.exe $sshState /grant:r 'SYSTEM:(OI)(CI)F' 'Administrators:(OI)(CI)F' /T /C | Out-Host
+            $hostKeys = Join-Path $sshState 'hostkeys'
+            if (Test-Path -LiteralPath $hostKeys) {
+              icacls.exe $hostKeys /inheritance:r /remove:g 'Users' 'Authenticated Users' /grant:r 'SYSTEM:F' 'Administrators:F' /T /C | Out-Host
+            }
           }
 
           $runtime = 'C:\Program Files\Paperboat\releases\runtime-current\paperboat-runtime.exe'
