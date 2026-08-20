@@ -87,6 +87,9 @@ jobs:
           $ErrorActionPreference = 'Continue'
           Get-Service PaperboatHostd,PaperboatUpdated,PaperboatSshd | Format-Table Name,Status,StartType
           Get-CimInstance Win32_Service -Filter "Name='PaperboatHostd' OR Name='PaperboatUpdated' OR Name='PaperboatSshd'" | Format-List Name,State,StartName,PathName
+          sc.exe qc PaperboatSshd | Out-Host
+          icacls.exe 'C:\Program Files\Paperboat\releases\runtime-current\paperboat-runtime.exe' | Out-Host
+          icacls.exe 'C:\ProgramData\Paperboat\ssh\sshd_config' | Out-Host
           $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
           Write-Output "MACHINE_PATH_HAS_PAPERBOAT=$($machinePath -split ';' -contains 'C:\Program Files\Paperboat\bin')"
           Get-Command pwsh.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
@@ -102,6 +105,9 @@ jobs:
           Get-WinEvent -LogName Application -MaxEvents 100 -ErrorAction SilentlyContinue |
             Where-Object { $_.Message -match 'Paperboat' } |
             Select-Object -First 20 TimeCreated,ProviderName,LevelDisplayName,Message | Format-List
+          Get-WinEvent -LogName System -MaxEvents 160 -ErrorAction SilentlyContinue |
+            Where-Object { $_.ProviderName -eq 'Service Control Manager' -and $_.Message -match 'PaperboatSshd|PaperboatHostd' } |
+            Select-Object -First 30 TimeCreated,Id,LevelDisplayName,Message | Format-List
 
   restore-victus:
     if: inputs.action == 'restore-victus-qualification-state'
