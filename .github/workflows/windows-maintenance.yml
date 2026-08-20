@@ -87,6 +87,19 @@ jobs:
           $ErrorActionPreference = 'Continue'
           Get-Service PaperboatHostd,PaperboatUpdated,PaperboatSshd | Format-Table Name,Status,StartType
           Get-CimInstance Win32_Service -Filter "Name='PaperboatHostd' OR Name='PaperboatUpdated' OR Name='PaperboatSshd'" | Format-List Name,State,StartName,PathName
+          $hostKey = 'C:\ProgramData\Paperboat\ssh\hostkeys\ssh_host_ed25519_key'
+          if (Test-Path -LiteralPath $hostKey) {
+            $hostKeyAcl = Get-Acl -LiteralPath $hostKey
+            Write-Output "HOSTKEY_OWNER=$($hostKeyAcl.Owner)"
+            Write-Output "HOSTKEY_SDDL=$($hostKeyAcl.Sddl)"
+          }
+          if ((Get-Service PaperboatSshd).Status -ne 'Running') { Start-Service PaperboatSshd -ErrorAction Stop }
+          if ((Get-Service PaperboatHostd).Status -ne 'Running') {
+            Write-Output 'STARTING_PAPERBOAT_HOSTD=TRUE'
+            Start-Service PaperboatHostd -ErrorAction Stop
+          }
+          Start-Sleep -Seconds 35
+          Get-Service PaperboatHostd,PaperboatUpdated,PaperboatSshd | Format-Table Name,Status,StartType
           sc.exe qc PaperboatSshd | Out-Host
           icacls.exe 'C:\Program Files\Paperboat\releases\runtime-current\paperboat-runtime.exe' | Out-Host
           icacls.exe 'C:\ProgramData\Paperboat\ssh\sshd_config' | Out-Host
