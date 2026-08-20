@@ -39,6 +39,10 @@ jobs:
           if (Test-Path -LiteralPath $stateBackup) {
             Move-Item -LiteralPath $stateBackup -Destination 'C:\ProgramData\Paperboat'
           }
+          $registryBackup = 'C:\PaperboatQualificationRegistryBackup.reg'
+          if (Test-Path -LiteralPath $registryBackup) {
+            reg.exe import $registryBackup | Out-Host
+          }
 
           $runtime = 'C:\Program Files\Paperboat\releases\runtime-current\paperboat-runtime.exe'
           if (-not (Test-Path -LiteralPath $runtime -PathType Leaf)) { throw "Restored runtime is missing: $runtime" }
