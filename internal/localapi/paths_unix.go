@@ -7,8 +7,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
-
-	"github.com/adrg/xdg"
 )
 
 type Paths struct {
@@ -19,19 +17,14 @@ type Paths struct {
 }
 
 func CurrentPaths(uid int) (Paths, error) {
-	environ := func(name string) string {
-		switch name {
-		case "XDG_STATE_HOME":
-			return xdg.StateHome
-		case "XDG_RUNTIME_DIR":
-			return xdg.RuntimeDir
-		case "TMPDIR":
-			return os.Getenv("TMPDIR")
-		default:
-			return ""
-		}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return Paths{}, err
 	}
-	return ResolvePaths(environ, xdg.Home, uid)
+	environ := func(name string) string {
+		return os.Getenv(name)
+	}
+	return ResolvePaths(environ, home, uid)
 }
 
 func ResolvePaths(environ func(string) string, home string, uid int) (Paths, error) {

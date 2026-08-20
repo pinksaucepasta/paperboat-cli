@@ -111,8 +111,8 @@ done
 if command -v pwsh >/dev/null 2>&1; then
     for script in "$script_directory"/*.ps1; do
         pwsh -NoLogo -NoProfile -NonInteractive -Command \
-            '$path = $args[0]; [void][System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$null, [ref]$null)' \
-            -- "$script"
+            '& { param([string]$path) [void][System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$null, [ref]$null) }' \
+            "$script"
     done
 fi
 

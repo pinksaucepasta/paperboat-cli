@@ -3192,7 +3192,7 @@ func TestSelectTerminalSessionPrefersWarmMachineSnapshot(t *testing.T) {
 }
 
 func TestResolveSSHCommandTargetFastFallsBackWithoutWarmSnapshot(t *testing.T) {
-	root := t.TempDir()
+	root := commandRuntimeTestRoot(t)
 	home := filepath.Join(root, "home")
 	runtimeRoot := filepath.Join(root, "runtime")
 	for _, directory := range []string{home, runtimeRoot} {

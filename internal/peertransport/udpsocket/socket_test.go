@@ -44,6 +44,9 @@ func TestOpenBindsAvailableFamiliesToSamePort(t *testing.T) {
 		t.Skipf("dual-stack loopback unavailable: %v", err)
 	}
 	defer set.Close()
+	if set.IPv6() == nil {
+		t.Skip("host has no usable non-loopback IPv6 interface")
+	}
 	v4Port := set.IPv4().LocalAddr().(*net.UDPAddr).Port
 	v6Port := set.IPv6().LocalAddr().(*net.UDPAddr).Port
 	if v4Port != v6Port || v4Port != int(set.Port()) {

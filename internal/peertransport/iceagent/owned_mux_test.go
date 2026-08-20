@@ -154,6 +154,9 @@ func TestOwnedUDPMuxAgentsNominateAndExchange(t *testing.T) {
 }
 
 func TestOwnedUDP6MuxAgentsNominateAndCarryNativeQUIC(t *testing.T) {
+	if !testUsableIPv6() {
+		t.Skip("host has no usable non-loopback IPv6 interface")
+	}
 	leftSocket, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6unspecified})
 	if err != nil {
 		t.Skipf("IPv6 unavailable: %v", err)
@@ -213,6 +216,35 @@ func TestOwnedUDP6MuxAgentsNominateAndCarryNativeQUIC(t *testing.T) {
 	defer rightConnected.connection.Close()
 	defer leftConn.Close()
 	assertVNetNativeQUIC(t, leftConn, rightConnected.connection, []byte("owned-ipv6-native-quic"))
+}
+
+func testUsableIPv6() bool {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return false
+	}
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addresses, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, address := range addresses {
+			var ip net.IP
+			switch value := address.(type) {
+			case *net.IPNet:
+				ip = value.IP
+			case *net.IPAddr:
+				ip = value.IP
+			}
+			if ip != nil && ip.To4() == nil && !ip.IsUnspecified() && !ip.IsLinkLocalUnicast() {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func TestNewWithUDPMuxRejectsMismatchedPortsAndClosesSockets(t *testing.T) {
