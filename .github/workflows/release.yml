@@ -464,7 +464,18 @@ jobs:
           PAPERBOAT_WINDOWS_OPENSSH_NATIVE: "1"
         run: |
           $ErrorActionPreference = 'Stop'
+          # The preceding native MSI qualification intentionally verifies a
+          # complete uninstall. Reinstall the same qualified MSI so the
+          # PaperboatSshd lifecycle tests can launch the real installed host
+          # executable rather than a missing post-uninstall path.
+          $msi = $env:PAPERBOAT_FINAL_AMD64_MSI
+          $log = Join-Path $env:RUNNER_TEMP 'paperboat-openssh-msi-reinstall.log'
+          & msiexec.exe /i $msi /qn /norestart "/l*v$log"
+          if ($LASTEXITCODE -ne 0) { throw "Paperboat MSI reinstall failed with exit code $LASTEXITCODE. See $log" }
           $env:PAPERBOAT_SERVICE_EXECUTABLE = 'C:\Program Files\Paperboat\bin\pb.exe'
+          if (-not (Test-Path -LiteralPath $env:PAPERBOAT_SERVICE_EXECUTABLE -PathType Leaf)) {
+            throw "Installed Paperboat service executable is missing: $env:PAPERBOAT_SERVICE_EXECUTABLE"
+          }
           $nativeTests = @(
             'TestNativeProvisionAndService',
             'TestNativeRepairStoppedService',
