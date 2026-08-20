@@ -90,7 +90,7 @@ if "paperboat-tuf-published" not in publication or "TestProductionTUFRepository"
     raise SystemExit("publication is not blocked on public offline-signed TUF metadata")
 
 qualification = job("windows-amd64-native-qualification")
-if "needs: windows-package" not in qualification or "runner: windows-2025" not in qualification or "runner: [self-hosted, windows, amd64, paperboat-windows-11-iot-ltsc]" not in qualification or "runs-on: ${{ matrix.runner }}" not in qualification:
+if "needs: windows-package" not in qualification or "runner: windows-2025" not in qualification or "runner: [self-hosted, Windows, X64, paperboat-windows-11-iot-ltsc]" not in qualification or "runs-on: ${{ matrix.runner }}" not in qualification:
     raise SystemExit("native Windows amd64 qualification must consume the signed package on standard Windows 11 and the registered IoT LTSC runner")
 for required in (
     "Invoke-NativeWindowsQualification.ps1",

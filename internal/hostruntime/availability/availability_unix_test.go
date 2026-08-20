@@ -142,8 +142,18 @@ func TestServiceStartsOfflineAndEventuallyPublishesObservation(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("policy was not retried")
 	}
-	if observation := service.Observation(); observation == nil || observation.Version != 2 {
-		t.Fatalf("observation=%+v", observation)
+	deadline := time.Now().Add(time.Second)
+	for {
+		if observation := service.Observation(); observation != nil {
+			if observation.Version != 2 {
+				t.Fatalf("observation=%+v", observation)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("observation=%+v", service.Observation())
+		}
+		time.Sleep(time.Millisecond)
 	}
 	cancel()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), time.Second)
