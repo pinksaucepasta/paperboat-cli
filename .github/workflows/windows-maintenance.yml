@@ -260,6 +260,14 @@ jobs:
           if ($repairExit -ne 0) { Write-Output "Paperboat aggregate repair returned exit code $repairExit; verifying owned SSH repair independently." }
           icacls.exe $sshState /inheritance:r /remove:g "*$ownerSid" '*S-1-5-32-545' '*S-1-5-11' /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /C | Out-Host
           icacls.exe $hostKeys /inheritance:r /remove:g "*$ownerSid" '*S-1-5-32-545' '*S-1-5-11' /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /T /C | Out-Host
+          Get-ChildItem -LiteralPath $hostKeys -File -Recurse | ForEach-Object {
+            $acl = New-Object System.Security.AccessControl.FileSecurity
+            $acl.SetAccessRuleProtection($true, $false)
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($systemSid, 'FullControl', 'Allow')))
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($adminsSid, 'FullControl', 'Allow')))
+            Set-Acl -LiteralPath $_.FullName -AclObject $acl
+            icacls.exe $_.FullName | Out-Host
+          }
           if (-not (Get-Service PaperboatSshd -ErrorAction SilentlyContinue)) {
             $sshd = 'C:\Program Files\OpenSSH\sshd.exe'
             $sshdConfig = 'C:\ProgramData\Paperboat\ssh\sshd_config'
