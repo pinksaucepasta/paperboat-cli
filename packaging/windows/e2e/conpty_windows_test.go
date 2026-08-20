@@ -50,13 +50,17 @@ func findPowerShell7() (string, error) {
 	}
 	// Qualification runs as LocalSystem, while developers commonly install
 	// PowerShell 7 per-user. Locate those standard per-user installations too.
-	if matches, _ := filepath.Glob(filepath.Join(os.Getenv("SystemDrive"), "Users", "*", "AppData", "Local", "Microsoft", "PowerShell", "7", "pwsh.exe")); len(matches) > 0 {
+	systemDrive := os.Getenv("SystemDrive")
+	if systemDrive == "" {
+		systemDrive = `C:`
+	}
+	if matches, _ := filepath.Glob(filepath.Join(systemDrive, "Users", "*", "AppData", "Local", "Microsoft", "PowerShell", "7", "pwsh.exe")); len(matches) > 0 {
 		candidates = append(candidates, matches...)
 	}
 	// Codex ships a native PowerShell runtime on Windows. It is a supported
 	// PowerShell 7 executable even when the interactive user's package is not
 	// registered in LocalSystem's PATH.
-	if matches, _ := filepath.Glob(filepath.Join(os.Getenv("SystemDrive"), "Users", "*", ".cache", "codex-runtimes", "*", "dependencies", "native", "powershell", "pwsh.exe")); len(matches) > 0 {
+	if matches, _ := filepath.Glob(filepath.Join(systemDrive, "Users", "*", ".cache", "codex-runtimes", "*", "dependencies", "native", "powershell", "pwsh.exe")); len(matches) > 0 {
 		candidates = append(candidates, matches...)
 	}
 	for _, candidate := range candidates {

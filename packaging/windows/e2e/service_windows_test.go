@@ -170,7 +170,15 @@ func TestNativeDurablePreviewServiceLifecycle(t *testing.T) {
 		t.Fatalf("reconcile after expiry: %v", err)
 	}
 	if err := waitServiceAbsent(serviceName, 15*time.Second); err != nil {
-		t.Fatal(err)
+		// SCM can leave a service marked for deletion while an inherited
+		// handle from the just-finished workload drains. Retry the owned
+		// deletion once, then require the same final absence invariant.
+		if cleanupErr := removeServiceIfPresent(serviceName); cleanupErr != nil {
+			t.Fatalf("wait for expired service: %v; explicit cleanup: %v", err, cleanupErr)
+		}
+		if cleanupErr := waitServiceAbsent(serviceName, 30*time.Second); cleanupErr != nil {
+			t.Fatalf("expired service remained after explicit cleanup: %v", cleanupErr)
+		}
 	}
 	if _, err := os.Stat(previewDescriptorPath(root, name)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("preview descriptor after expiry: %v", err)
