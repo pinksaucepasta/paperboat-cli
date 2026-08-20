@@ -373,7 +373,7 @@ jobs:
             runner: windows-2025
             publish_evidence: false
           - target: windows-11-iot-enterprise-ltsc
-            runner: [self-hosted, windows, amd64, paperboat-windows-11-iot-ltsc]
+            runner: [self-hosted, Windows, X64, paperboat-windows-11-iot-ltsc]
             publish_evidence: true
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
