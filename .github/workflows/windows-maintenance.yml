@@ -186,6 +186,12 @@ jobs:
             $ownerSid = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
             icacls.exe $paperboatRoot /setowner "*$ownerSid" /T /C | Out-Host
             icacls.exe $paperboatRoot /inheritance:r /remove:g '*S-1-5-32-545' '*S-1-5-11' /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /C | Out-Host
+            $runtimeConfigPath = Join-Path $paperboatRoot 'runtime-install.json'
+            if (Test-Path -LiteralPath $runtimeConfigPath) {
+              $runtimeConfig = Get-Content -LiteralPath $runtimeConfigPath -Raw | ConvertFrom-Json
+              $runtimeConfig.owner_sid = $ownerSid
+              $runtimeConfig | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath $runtimeConfigPath -Encoding UTF8
+            }
             icacls.exe $sshState /reset /T /C | Out-Host
             icacls.exe $sshState /grant:r 'SYSTEM:(OI)(CI)F' 'Administrators:(OI)(CI)F' /T /C | Out-Host
             icacls.exe $sshState /inheritance:r /remove:g '*S-1-5-32-545' '*S-1-5-11' /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /C | Out-Host
