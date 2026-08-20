@@ -120,8 +120,10 @@ jobs:
           Get-Process paperboat*,sshd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           Start-Sleep -Seconds 2
 
-          $programBackup = 'C:\PaperboatQualificationProgramBackup2'
-          $stateBackup = 'C:\PaperboatQualificationStateBackup2'
+          $programBackup = 'C:\PaperboatQualificationProgramBackup3'
+          $stateBackup = 'C:\PaperboatQualificationStateBackup3'
+          if (-not (Test-Path $programBackup)) { $programBackup = 'C:\PaperboatQualificationProgramBackup2' }
+          if (-not (Test-Path $stateBackup)) { $stateBackup = 'C:\PaperboatQualificationStateBackup2' }
           if (Test-Path -LiteralPath $programBackup) {
             Move-Item -LiteralPath $programBackup -Destination 'C:\Program Files\Paperboat'
           }
@@ -142,7 +144,8 @@ jobs:
             Remove-Item -LiteralPath 'C:\ProgramData\Paperboat' -Recurse -Force
             Move-Item -LiteralPath $restoredState -Destination 'C:\ProgramData\Paperboat'
           }
-          $registryBackup = 'C:\PaperboatQualificationRegistryBackup.reg'
+          $registryBackup = 'C:\PaperboatQualificationRegistryBackup3.reg'
+          if (-not (Test-Path $registryBackup)) { $registryBackup = 'C:\PaperboatQualificationRegistryBackup.reg' }
           if (Test-Path -LiteralPath $registryBackup) {
             reg.exe import $registryBackup | Out-Host
           }
