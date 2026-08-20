@@ -175,6 +175,8 @@ function Assert-InstalledPayload {
         $path = Join-Path $script:binaryRoot $file
         Assert-Qualification (Test-Path -LiteralPath $path -PathType Leaf) "Installed payload is missing $path."
     }
+    $machinePathEntries = @([Environment]::GetEnvironmentVariable('Path', 'Machine').Split(';') | ForEach-Object { $_.Trim().TrimEnd('\') })
+    Assert-Qualification (@($machinePathEntries | Where-Object { $_ -ieq $script:binaryRoot.TrimEnd('\') }).Count -eq 1) 'The MSI did not register exactly one Paperboat bin entry in the machine PATH.'
     foreach ($directory in @(
         (Join-Path $script:stateRoot 'ssh'),
         (Join-Path $script:stateRoot 'updates\current'),
@@ -280,7 +282,9 @@ function Assert-Uninstalled {
         Assert-Qualification ($paperboatSshd.Count -eq 0) 'PaperboatSshd was left behind by MSI uninstall without a pre-existing service.'
     }
     Assert-Qualification (@(Get-InstalledPaperboatProducts).Count -eq 0) 'An ARP Paperboat product entry remains after uninstall.'
-    Add-QualificationEvent -Name 'msi_uninstall_assertions' -Status 'passed' -Detail 'fixed services, dynamic preview services, PaperboatSshd ownership preservation, binaries, product registry, ARP entry, and provisioning metadata were verified.'
+    $machinePathEntries = @([Environment]::GetEnvironmentVariable('Path', 'Machine').Split(';') | ForEach-Object { $_.Trim().TrimEnd('\') })
+    Assert-Qualification (@($machinePathEntries | Where-Object { $_ -ieq $script:binaryRoot.TrimEnd('\') }).Count -eq 0) 'Paperboat bin remains in the machine PATH after uninstall.'
+    Add-QualificationEvent -Name 'msi_uninstall_assertions' -Status 'passed' -Detail 'fixed services, dynamic preview services, PATH ownership, PaperboatSshd ownership preservation, binaries, product registry, ARP entry, and provisioning metadata were verified.'
 }
 
 function Invoke-GoQualification {

@@ -11,11 +11,38 @@ on:
           - restore-victus-qualification-state
           - inspect-victus-health
           - prepare-victus-clean-qualification
+          - clean-victus-qualification-residue
 
 permissions:
   contents: read
 
 jobs:
+  clean-victus:
+    if: inputs.action == 'clean-victus-qualification-residue'
+    runs-on: [self-hosted, Windows, X64, paperboat-windows-11-iot-ltsc]
+    timeout-minutes: 5
+    steps:
+      - name: Remove only failed qualification residue
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Get-Service 'PaperboatPreview-*' -ErrorAction SilentlyContinue | ForEach-Object {
+            Stop-Service $_.Name -Force -ErrorAction SilentlyContinue
+            sc.exe delete $_.Name | Out-Host
+          }
+          foreach ($service in @('PaperboatHostd','PaperboatUpdated','PaperboatSshd')) {
+            Stop-Service $service -Force -ErrorAction SilentlyContinue
+            sc.exe delete $service | Out-Host
+          }
+          Remove-Item 'HKLM:\Software\Paperboat' -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item 'C:\Program Files\Paperboat' -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item 'C:\ProgramData\Paperboat' -Recurse -Force -ErrorAction SilentlyContinue
+          $bin = 'C:\Program Files\Paperboat\bin'
+          $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+          $cleanPath = (($machinePath -split ';' | Where-Object { $_.Trim().TrimEnd('\') -ine $bin }) -join ';').Trim(';')
+          [Environment]::SetEnvironmentVariable('Path', $cleanPath, 'Machine')
+          Write-Output 'Failed qualification residue removed; preserved Backup3 snapshots were not modified.'
+
   prepare-victus:
     if: inputs.action == 'prepare-victus-clean-qualification'
     runs-on: [self-hosted, Windows, X64, paperboat-windows-11-iot-ltsc]
