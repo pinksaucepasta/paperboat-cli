@@ -155,8 +155,8 @@ jobs:
           if ($wixVersion -notmatch '(^|[^0-9])5\.0\.2([^0-9]|$)') {
             throw "Expected WiX 5.0.2, got $wixVersion."
           }
-          "PAPERBOAT_WIX_PATH=$wix" >> $env:GITHUB_ENV
-          "PAPERBOAT_WIX_VERSION=5.0.2" >> $env:GITHUB_ENV
+          "PAPERBOAT_WIX_PATH=$wix" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding UTF8
+          "PAPERBOAT_WIX_VERSION=5.0.2" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding UTF8
       - name: Build native Windows PE inputs
         shell: powershell
         run: |
@@ -182,8 +182,8 @@ jobs:
           foreach ($role in @('paperboat-runtime.exe', 'paperboat-hostd.exe', 'paperboat-updater.exe')) {
             Copy-Item -LiteralPath (Join-Path $stage 'pb.exe') -Destination (Join-Path $stage $role)
           }
-          "PAPERBOAT_WINDOWS_STAGE=$stage" >> $env:GITHUB_ENV
-          "PAPERBOAT_WINDOWS_DIST=$dist" >> $env:GITHUB_ENV
+          "PAPERBOAT_WINDOWS_STAGE=$stage" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding UTF8
+          "PAPERBOAT_WINDOWS_DIST=$dist" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding UTF8
       - name: Apply optional Authenticode and verify every Windows PE
         shell: powershell
         env:
@@ -351,7 +351,7 @@ jobs:
             -Repository $env:GITHUB_REPOSITORY `
             -Amd64Msi $amd64Msi `
             -Arm64Msi $arm64Msi `
-            -OutputDirectory (Join-Path $env:GITHUB_WORKSPACE 'dist') `
+            -OutputDirectory (Join-Path $env:GITHUB_WORKSPACE 'dist')
           if (-not $?) { throw 'Final-hash WinGet manifest rendering failed.' }
       - name: Upload final WinGet manifests
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -406,7 +406,7 @@ jobs:
           }
           $msi = Join-Path $env:GITHUB_WORKSPACE ("input\paperboat_{0}_windows_amd64.msi" -f $env:GITHUB_REF_NAME)
           if (-not (Test-Path -LiteralPath $msi -PathType Leaf)) { throw "Final amd64 MSI is missing: $msi" }
-          "PAPERBOAT_FINAL_AMD64_MSI=$msi" >> $env:GITHUB_ENV
+          "PAPERBOAT_FINAL_AMD64_MSI=$msi" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding UTF8
       - name: Install pinned WiX for qualification upgrade fixture
         shell: powershell
         run: |
@@ -417,7 +417,7 @@ jobs:
           if (-not (Test-Path -LiteralPath $wix -PathType Leaf)) { throw "WiX was not installed at $wix." }
           $version = (& $wix --version | Out-String).Trim()
           if ($version -notmatch '(^|[^0-9])5\.0\.2([^0-9]|$)') { throw "Expected WiX 5.0.2, got $version." }
-          "PAPERBOAT_WINDOWS_E2E_WIX=$wix" >> $env:GITHUB_ENV
+          "PAPERBOAT_WINDOWS_E2E_WIX=$wix" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding UTF8
       - name: Build native upgrade fixture
         shell: powershell
         run: |
@@ -425,7 +425,7 @@ jobs:
           $parts = $env:GITHUB_REF_NAME.Split('.')
           if ($parts.Count -ne 4) { throw "Invalid release version: $env:GITHUB_REF_NAME" }
           $upgradeVersion = '{0}.{1}.{2}.{3}' -f $parts[0], $parts[1], $parts[2], (([uint64]$parts[3]) + 1)
-          "PAPERBOAT_NATIVE_UPGRADE_VERSION=$upgradeVersion" >> $env:GITHUB_ENV
+          "PAPERBOAT_NATIVE_UPGRADE_VERSION=$upgradeVersion" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding UTF8
           & ./packaging/windows/scripts/Build-NativeQualificationArtifacts.ps1 `
             -Version $env:GITHUB_REF_NAME `
             -UpgradeVersion $upgradeVersion `

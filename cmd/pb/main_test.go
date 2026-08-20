@@ -2793,7 +2793,7 @@ func TestWaitCommandUsesLocalWatchAndStableExitResults(t *testing.T) {
 	waitForCommandSocket(t, paths.SocketPath)
 
 	var stdout, stderr bytes.Buffer
-	if code := run(context.Background(), []string{"wait", "Studio Mac", "--for", "runtime", "--json"}, &stdout, &stderr); code != 0 {
+	if code := run(context.Background(), []string{"--config", filepath.Join(root, "config", "paperboat.json"), "wait", "Studio Mac", "--for", "runtime", "--json"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("ready code=%d stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
 	var ready localwait.Result
