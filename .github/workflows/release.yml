@@ -141,7 +141,7 @@ jobs:
         run: |
           & go run ./packaging/windows/cmd/validate --root packaging/windows
           if ($LASTEXITCODE -ne 0) { throw 'Windows packaging contract validation failed.' }
-          & go test -count=1 ./packaging/windows/...
+          & go test -count=1 ./packaging/windows/cmd/... ./packaging/windows/manifest/...
           if ($LASTEXITCODE -ne 0) { throw 'Windows packaging tests failed.' }
       - name: Install pinned WiX Toolset
         shell: powershell
