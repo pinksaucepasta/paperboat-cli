@@ -270,6 +270,7 @@ jobs:
             Set-Acl -LiteralPath $directory -AclObject $acl
             icacls.exe $directory | Out-Host
           }
+          icacls.exe $hostKeys /setowner '*S-1-5-18' /T /C | Out-Host
           Get-ChildItem -LiteralPath $hostKeys -File -Recurse | ForEach-Object {
             $acl = New-Object System.Security.AccessControl.FileSecurity
             $acl.SetAccessRuleProtection($true, $false)
