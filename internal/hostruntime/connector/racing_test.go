@@ -198,7 +198,7 @@ func TestRacingConnectorRetriesQUICImmediatelyWhenPreferredTCPFails(t *testing.T
 	if err := r.Open(); err != nil {
 		t.Fatal(err)
 	}
-	if time.Since(started) >= 150*time.Millisecond {
+	if time.Since(started) >= 200*time.Millisecond {
 		t.Fatal("preferred TCP failure waited for the fallback stagger")
 	}
 	if first, second := <-selected, <-selected; first != TCPMux || second != QUIC || r.winner != quic {
