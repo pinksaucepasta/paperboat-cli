@@ -197,6 +197,10 @@ jobs:
                 $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($systemSid, 'FullControl', 'Allow')))
                 $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($adminsSid, 'FullControl', 'Allow')))
                 Set-Acl -LiteralPath $_.FullName -AclObject $acl
+                # Enforce the same result at the native ACL layer and print it
+                # so a localized account name cannot hide a broad ACE.
+                icacls.exe $_.FullName /inheritance:r /remove:g '*S-1-5-32-545' '*S-1-5-11' /grant:r '*S-1-5-18:F' '*S-1-5-32-544:F' /C | Out-Host
+                icacls.exe $_.FullName | Out-Host
               }
             }
           }
