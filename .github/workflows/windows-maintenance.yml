@@ -184,6 +184,7 @@ jobs:
           if (Test-Path -LiteralPath $sshState) {
             icacls.exe $sshState /reset /T /C | Out-Host
             icacls.exe $sshState /grant:r 'SYSTEM:(OI)(CI)F' 'Administrators:(OI)(CI)F' /T /C | Out-Host
+            icacls.exe $sshState /inheritance:r /remove:g '*S-1-5-32-545' '*S-1-5-11' /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /C | Out-Host
             $hostKeys = Join-Path $sshState 'hostkeys'
             if (Test-Path -LiteralPath $hostKeys) {
               # OpenSSH rejects private keys if any broad/localized Users ACE
