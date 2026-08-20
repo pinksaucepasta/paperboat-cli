@@ -82,6 +82,14 @@ jobs:
             reg.exe import $registryBackup | Out-Host
           }
 
+          # Qualification temporarily tightened these files for a test
+          # identity. Restore the production service ACL before LocalSystem
+          # Hostd starts. Limit this repair to Paperboat-owned SSH state.
+          $sshState = 'C:\ProgramData\Paperboat\ssh'
+          if (Test-Path -LiteralPath $sshState) {
+            icacls.exe $sshState /grant:r 'SYSTEM:(OI)(CI)F' 'Administrators:(OI)(CI)F' /T /C | Out-Host
+          }
+
           $runtime = 'C:\Program Files\Paperboat\releases\runtime-current\paperboat-runtime.exe'
           if (-not (Test-Path -LiteralPath $runtime -PathType Leaf)) { throw "Restored runtime is missing: $runtime" }
           if (-not (Get-Service PaperboatHostd -ErrorAction SilentlyContinue)) {
