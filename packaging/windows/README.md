@@ -50,6 +50,11 @@ staging directory; this repository does not fabricate service binaries. The
 OpenSSH integration file is installed under the Paperboat-owned SSH state root
 and contains no credentials or private material.
 
+The MSI appends `C:\Program Files\Paperboat\bin` to the machine PATH. New
+PowerShell, cmd.exe, Windows Terminal, and other processes can therefore run
+`pb` immediately after installation without a manual PATH command. Uninstall
+removes only Paperboat's PATH entry.
+
 ## Build inputs
 
 The MSI source expects a real, release-built staging directory containing:

@@ -1,0 +1,59 @@
+name: Windows maintenance
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Maintenance operation'
+        required: true
+        type: choice
+        options:
+          - restore-victus-qualification-state
+
+permissions:
+  contents: read
+
+jobs:
+  restore-victus:
+    if: inputs.action == 'restore-victus-qualification-state'
+    runs-on: [self-hosted, Windows, X64, paperboat-windows-11-iot-ltsc]
+    timeout-minutes: 10
+    steps:
+      - name: Restore live Paperboat state
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Stop-Service PaperboatHostd,PaperboatUpdated,PaperboatSshd -Force -ErrorAction SilentlyContinue
+          Get-Service 'PaperboatPreview-*' -ErrorAction SilentlyContinue | ForEach-Object {
+            Stop-Service $_.Name -Force -ErrorAction SilentlyContinue
+            sc.exe delete $_.Name | Out-Host
+          }
+          Get-Process paperboat*,sshd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 2
+
+          $programBackup = 'C:\PaperboatQualificationProgramBackup2'
+          $stateBackup = 'C:\PaperboatQualificationStateBackup2'
+          if (Test-Path -LiteralPath $programBackup) {
+            Move-Item -LiteralPath $programBackup -Destination 'C:\Program Files\Paperboat'
+          }
+          if (Test-Path -LiteralPath $stateBackup) {
+            Move-Item -LiteralPath $stateBackup -Destination 'C:\ProgramData\Paperboat'
+          }
+
+          $runtime = 'C:\Program Files\Paperboat\releases\runtime-current\paperboat-runtime.exe'
+          if (-not (Test-Path -LiteralPath $runtime -PathType Leaf)) { throw "Restored runtime is missing: $runtime" }
+          if (-not (Get-Service PaperboatHostd -ErrorAction SilentlyContinue)) {
+            New-Service -Name PaperboatHostd -BinaryPathName ('"' + $runtime + '" __runtime-hostd') -DisplayName 'PaperboatHostd' -Description 'Paperboat stable host supervisor' -StartupType Automatic | Out-Null
+          }
+          if (-not (Get-Service PaperboatUpdated -ErrorAction SilentlyContinue)) {
+            New-Service -Name PaperboatUpdated -BinaryPathName ('"' + $runtime + '" __runtime-updated') -DisplayName 'PaperboatUpdated' -Description 'Paperboat signed update service' -StartupType Manual | Out-Null
+          }
+          $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+          $bin = 'C:\Program Files\Paperboat\bin'
+          if (($machinePath -split ';') -notcontains $bin) {
+            [Environment]::SetEnvironmentVariable('Path', ($machinePath.TrimEnd(';') + ';' + $bin), 'Machine')
+          }
+          Start-Service PaperboatSshd -ErrorAction SilentlyContinue
+          Start-Service PaperboatHostd
+          Start-Service PaperboatUpdated
+          Get-Service PaperboatHostd,PaperboatUpdated,PaperboatSshd | Format-Table Name,Status,StartType

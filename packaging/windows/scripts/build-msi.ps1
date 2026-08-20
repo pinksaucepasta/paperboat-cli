@@ -96,7 +96,8 @@ $arguments = @(
     '-d', "WixPlatform=$wixPlatform",
     '-d', "StagingDir=$staging",
     '-d', "PackagingRoot=$packagingRoot",
-    '-d', "QualificationRollbackHook=$rollbackHook"
+    '-d', "QualificationRollbackHook=$rollbackHook",
+    '-ext', 'WixToolset.Util.wixext'
 )
 $arguments += @('-o', $outputPath, $source)
 

@@ -131,7 +131,9 @@ func assertServiceArguments(t *testing.T, name string, want ...string) {
 func TestNativeDurablePreviewServiceLifecycle(t *testing.T) {
 	fixture := requiredFixture(t)
 	root := t.TempDir()
-	name := "e2e-preview"
+	// Include the process identity and timestamp so a terminated qualification
+	// process can never collide with a stale service from an earlier run.
+	name := fmt.Sprintf("e2e-preview-%d-%d", os.Getpid(), time.Now().UnixNano())
 	serviceName := previewServiceName(name)
 	assertServiceAbsent(t, serviceName)
 

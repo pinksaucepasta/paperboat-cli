@@ -4,7 +4,8 @@
   architecture/channel constants. All payloads must come from a release-built
   staging directory; this source never invents binaries or signing evidence.
 -->
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
   <Package
       Name="Paperboat"
       Manufacturer="Paperboat"
@@ -106,6 +107,16 @@
       </Component>
       <Component Id="RuntimeComponent" Guid="{F3E5F8E2-BD39-4CC4-BD4C-6FD34E5C8F03}">
         <File Id="RuntimeBinary" Source="$(var.StagingDir)\paperboat-runtime.exe" KeyPath="yes" Vital="yes" />
+      </Component>
+      <Component Id="CliPathComponent" Guid="{F3E5F8E2-BD39-4CC4-BD4C-6FD34E5C8F07}">
+        <util:Environment
+            Id="PaperboatBinPath"
+            Name="PATH"
+            Value="[BINDIR]"
+            Action="set"
+            Part="last"
+            System="yes"
+            Permanent="no" />
       </Component>
     </ComponentGroup>
   </Fragment>

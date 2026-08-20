@@ -29,7 +29,7 @@ func TestNativeConPTYPowerShell51(t *testing.T) {
 }
 
 func TestNativeConPTYPowerShell7(t *testing.T) {
-	powershell, err := exec.LookPath("pwsh.exe")
+	powershell, err := findPowerShell7()
 	if err != nil {
 		t.Fatalf("PowerShell 7 (pwsh.exe) is required: %v", err)
 	}
@@ -37,6 +37,31 @@ func TestNativeConPTYPowerShell7(t *testing.T) {
 		"-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
 		"[Console]::OutputEncoding = [Text.UTF8Encoding]::new(); Write-Output 'paperboat-conpty-powershell7'; exit 0",
 	}, "paperboat-conpty-powershell7")
+}
+
+func findPowerShell7() (string, error) {
+	candidates := []string{
+		os.Getenv("PAPERBOAT_PWSH_PATH"),
+		filepath.Join(os.Getenv("ProgramFiles"), "PowerShell", "7", "pwsh.exe"),
+		filepath.Join(os.Getenv("ProgramFiles"), "PowerShell", "7-preview", "pwsh.exe"),
+	}
+	if localAppData := os.Getenv("LOCALAPPDATA"); localAppData != "" {
+		candidates = append(candidates, filepath.Join(localAppData, "Microsoft", "PowerShell", "7", "pwsh.exe"))
+	}
+	// Qualification runs as LocalSystem, while developers commonly install
+	// PowerShell 7 per-user. Locate those standard per-user installations too.
+	if matches, _ := filepath.Glob(filepath.Join(os.Getenv("SystemDrive"), "Users", "*", "AppData", "Local", "Microsoft", "PowerShell", "7", "pwsh.exe")); len(matches) > 0 {
+		candidates = append(candidates, matches...)
+	}
+	for _, candidate := range candidates {
+		if candidate == "" {
+			continue
+		}
+		if info, statErr := os.Stat(candidate); statErr == nil && !info.IsDir() {
+			return candidate, nil
+		}
+	}
+	return exec.LookPath("pwsh.exe")
 }
 
 func TestNativeConPTYCmd(t *testing.T) {
