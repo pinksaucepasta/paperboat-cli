@@ -47,7 +47,7 @@ func TestGoBuildEmbedsLongPathManifestForBothArchitectures(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			output := filepath.Join(t.TempDir(), test.name+".exe")
-			command := exec.Command("go", "build", "-trimpath", "-o", output, test.pkg)
+			command := exec.Command("go", "build", "-buildvcs=false", "-trimpath", "-o", output, test.pkg)
 			command.Dir = root
 			command.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS="+test.goos, "GOARCH="+test.goarch)
 			if output, err := command.CombinedOutput(); err != nil {
