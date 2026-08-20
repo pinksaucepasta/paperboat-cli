@@ -137,14 +137,14 @@ jobs:
         shell: cmd
         run: '"C:\\Program Files\\Git\\bin\\bash.exe" --noprofile --norc -e -o pipefail -c "./packaging/windows/scripts/validate-release-pipeline.sh"'
       - name: Validate first-party Windows packaging contract
-        shell: pwsh
+        shell: powershell
         run: |
           & go run ./packaging/windows/cmd/validate --root packaging/windows
           if ($LASTEXITCODE -ne 0) { throw 'Windows packaging contract validation failed.' }
           & go test -count=1 ./packaging/windows/...
           if ($LASTEXITCODE -ne 0) { throw 'Windows packaging tests failed.' }
       - name: Install pinned WiX Toolset
-        shell: pwsh
+        shell: powershell
         run: |
           dotnet tool install --global wix --version 5.0.2 --no-cache
           if ($LASTEXITCODE -ne 0) { throw 'Pinned WiX 5.0.2 installation failed.' }
@@ -158,7 +158,7 @@ jobs:
           "PAPERBOAT_WIX_PATH=$wix" >> $env:GITHUB_ENV
           "PAPERBOAT_WIX_VERSION=5.0.2" >> $env:GITHUB_ENV
       - name: Build native Windows PE inputs
-        shell: pwsh
+        shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
           $version = $env:GITHUB_REF_NAME
@@ -185,7 +185,7 @@ jobs:
           "PAPERBOAT_WINDOWS_STAGE=$stage" >> $env:GITHUB_ENV
           "PAPERBOAT_WINDOWS_DIST=$dist" >> $env:GITHUB_ENV
       - name: Apply optional Authenticode and verify every Windows PE
-        shell: pwsh
+        shell: powershell
         env:
           PAPERBOAT_WINDOWS_SIGNING_PFX_B64: ${{ secrets.PAPERBOAT_WINDOWS_SIGNING_PFX_B64 }}
           PAPERBOAT_WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.PAPERBOAT_WINDOWS_SIGNING_PFX_PASSWORD }}
@@ -202,7 +202,7 @@ jobs:
             -Architecture $env:PAPERBOAT_ARCH `
           if (-not $?) { throw 'Windows PE signing or verification failed.' }
       - name: Build MSI with WiX 5.0.2
-        shell: pwsh
+        shell: powershell
         run: |
           & ./packaging/windows/scripts/build-msi.ps1 `
             -Version $env:GITHUB_REF_NAME `
@@ -214,7 +214,7 @@ jobs:
             -ExpectedWixVersion $env:PAPERBOAT_WIX_VERSION
           if (-not $?) { throw 'Windows MSI build failed.' }
       - name: Apply optional Authenticode and verify the MSI
-        shell: pwsh
+        shell: powershell
         env:
           PAPERBOAT_WINDOWS_SIGNING_PFX_B64: ${{ secrets.PAPERBOAT_WINDOWS_SIGNING_PFX_B64 }}
           PAPERBOAT_WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.PAPERBOAT_WINDOWS_SIGNING_PFX_PASSWORD }}
@@ -225,7 +225,7 @@ jobs:
             -Architecture $env:PAPERBOAT_ARCH `
           if (-not $?) { throw 'Windows MSI signing or verification failed.' }
       - name: Package verified Windows ZIP
-        shell: pwsh
+        shell: powershell
         run: |
           $env:SOURCE_DATE_EPOCH = '0'
           $zip = Join-Path $env:PAPERBOAT_WINDOWS_DIST ("paperboat_{0}_windows_{1}.zip" -f $env:GITHUB_REF_NAME, $env:PAPERBOAT_ARCH)
@@ -237,7 +237,7 @@ jobs:
             --output $zip
           if (-not $?) { throw 'Windows ZIP packaging failed.' }
       - name: Verify Windows cross-architecture artifacts
-        shell: pwsh
+        shell: powershell
         run: |
           $msi = Join-Path $env:PAPERBOAT_WINDOWS_DIST ("paperboat_{0}_windows_{1}.msi" -f $env:GITHUB_REF_NAME, $env:PAPERBOAT_ARCH)
           $zip = Join-Path $env:PAPERBOAT_WINDOWS_DIST ("paperboat_{0}_windows_{1}.zip" -f $env:GITHUB_REF_NAME, $env:PAPERBOAT_ARCH)
@@ -248,7 +248,7 @@ jobs:
             -ZipPath $zip
           if (-not $?) { throw 'Windows cross-architecture artifact verification failed.' }
       - name: Copy verified PE release assets
-        shell: pwsh
+        shell: powershell
         run: |
           $files = @{
             'pb.exe' = "paperboat_{0}_windows_{1}_pb.exe" -f $env:GITHUB_REF_NAME, $env:PAPERBOAT_ARCH
@@ -275,7 +275,7 @@ jobs:
             Copy-Item -LiteralPath (Join-Path $env:PAPERBOAT_WINDOWS_STAGE $sourceName) -Destination (Join-Path $env:PAPERBOAT_WINDOWS_DIST $tufFiles[$sourceName])
           }
       - name: Generate signing manifest, checksums, SBOM, and provenance handoff
-        shell: pwsh
+        shell: powershell
         run: |
           & ./packaging/windows/scripts/generate-signing-handoff.ps1 `
             -Version $env:GITHUB_REF_NAME `
@@ -285,7 +285,7 @@ jobs:
             -WixVersion $env:PAPERBOAT_WIX_VERSION
           if (-not $?) { throw 'Windows integrity handoff generation failed.' }
       - name: Require Microsoft Defender malware scan of signed artifacts
-        shell: pwsh
+        shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
           $status = Get-MpComputerStatus -ErrorAction Stop
@@ -330,7 +330,7 @@ jobs:
           name: windows-arm64
           path: input/arm64
       - name: Render and validate WinGet manifests from final MSI bytes
-        shell: pwsh
+        shell: powershell
         run: |
           $amd64Msi = Join-Path $env:GITHUB_WORKSPACE ("input\amd64\paperboat_{0}_windows_amd64.msi" -f $env:GITHUB_REF_NAME)
           $arm64Msi = Join-Path $env:GITHUB_WORKSPACE ("input\arm64\paperboat_{0}_windows_arm64.msi" -f $env:GITHUB_REF_NAME)
@@ -386,7 +386,7 @@ jobs:
           name: windows-amd64
           path: input
       - name: Verify native amd64 runner and release MSI
-        shell: pwsh
+        shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
           if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() -ne 'X64') {
@@ -396,7 +396,7 @@ jobs:
           if (-not (Test-Path -LiteralPath $msi -PathType Leaf)) { throw "Final amd64 MSI is missing: $msi" }
           "PAPERBOAT_FINAL_AMD64_MSI=$msi" >> $env:GITHUB_ENV
       - name: Install pinned WiX for qualification upgrade fixture
-        shell: pwsh
+        shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
           dotnet tool install --global wix --version 5.0.2 --no-cache
@@ -407,7 +407,7 @@ jobs:
           if ($version -notmatch '(^|[^0-9])5\.0\.2([^0-9]|$)') { throw "Expected WiX 5.0.2, got $version." }
           "PAPERBOAT_WINDOWS_E2E_WIX=$wix" >> $env:GITHUB_ENV
       - name: Build native upgrade fixture
-        shell: pwsh
+        shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
           $parts = $env:GITHUB_REF_NAME.Split('.')
@@ -422,7 +422,7 @@ jobs:
             -OutputDirectory (Join-Path $env:RUNNER_TEMP 'paperboat-final-amd64-qualification')
           if (-not $?) { throw 'Native amd64 qualification upgrade fixture build failed.' }
       - name: Run native qualification against final amd64 MSI
-        shell: pwsh
+        shell: powershell
         run: |
           & ./packaging/windows/scripts/Invoke-NativeWindowsQualification.ps1 `
             -MsiPath $env:PAPERBOAT_FINAL_AMD64_MSI `
@@ -435,7 +435,7 @@ jobs:
           if (-not $?) { throw 'Final Windows amd64 qualification failed.' }
       - name: Qualify pinned WinGet OpenSSH and PaperboatSshd lifecycle
         if: matrix.publish_evidence
-        shell: pwsh
+        shell: powershell
         env:
           PAPERBOAT_WINDOWS_OPENSSH_NATIVE: "1"
         run: |
@@ -454,7 +454,7 @@ jobs:
           }
       - name: Convert native report into final-artifact TUF evidence
         if: matrix.publish_evidence
-        shell: pwsh
+        shell: powershell
         run: |
           $report = Join-Path $env:PAPERBOAT_WINDOWS_E2E_OUTPUT 'native-windows-qualification.json'
           $evidence = Join-Path $env:PAPERBOAT_WINDOWS_E2E_OUTPUT 'windows-amd64-native-qualification.json'
