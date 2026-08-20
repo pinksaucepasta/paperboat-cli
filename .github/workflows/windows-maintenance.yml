@@ -92,7 +92,10 @@ jobs:
             $hostKeyAcl = Get-Acl -LiteralPath $hostKey
             Write-Output "HOSTKEY_OWNER=$($hostKeyAcl.Owner)"
             Write-Output "HOSTKEY_SDDL=$($hostKeyAcl.Sddl)"
+            icacls.exe $hostKey | Out-Host
           }
+          $sshLog = 'C:\ProgramData\Paperboat\ssh\logs\service.log'
+          if (Test-Path -LiteralPath $sshLog) { Set-Content -LiteralPath $sshLog -Value '' -Encoding ascii }
           Restart-Service PaperboatSshd -Force -ErrorAction Stop
           Start-Sleep -Seconds 3
           if ((Get-Service PaperboatSshd).Status -ne 'Running') { throw 'PaperboatSshd did not remain running after clean restart' }
