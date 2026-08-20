@@ -124,22 +124,49 @@ jobs:
           $stateBackup = 'C:\PaperboatQualificationStateBackup3'
           if (-not (Test-Path $programBackup)) { $programBackup = 'C:\PaperboatQualificationProgramBackup2' }
           if (-not (Test-Path $stateBackup)) { $stateBackup = 'C:\PaperboatQualificationStateBackup2' }
+          foreach ($nested in @('C:\Program Files\Paperboat\PaperboatQualificationProgramBackup3', 'C:\Program Files\Paperboat\PaperboatQualificationProgramBackup2')) {
+            if (Test-Path -LiteralPath $nested) {
+              $restoredProgram = 'C:\PaperboatQualificationProgramRestored'
+              if (Test-Path -LiteralPath $restoredProgram) { throw "Refusing to overwrite existing program staging path: $restoredProgram" }
+              Move-Item -LiteralPath $nested -Destination $restoredProgram
+              Remove-Item -LiteralPath 'C:\Program Files\Paperboat' -Recurse -Force
+              Move-Item -LiteralPath $restoredProgram -Destination 'C:\Program Files\Paperboat'
+              break
+            }
+          }
+          foreach ($nested in @('C:\ProgramData\Paperboat\PaperboatQualificationStateBackup3', 'C:\ProgramData\Paperboat\PaperboatQualificationStateBackup2')) {
+            if (Test-Path -LiteralPath $nested) {
+              $restoredState = 'C:\PaperboatQualificationStateRestored'
+              if (Test-Path -LiteralPath $restoredState) { throw "Refusing to overwrite existing state staging path: $restoredState" }
+              Move-Item -LiteralPath $nested -Destination $restoredState
+              Remove-Item -LiteralPath 'C:\ProgramData\Paperboat' -Recurse -Force
+              Move-Item -LiteralPath $restoredState -Destination 'C:\ProgramData\Paperboat'
+              break
+            }
+          }
+          $programBackupLeaf = Split-Path -Leaf $programBackup
+          $stateBackupLeaf = Split-Path -Leaf $stateBackup
           if (Test-Path -LiteralPath $programBackup) {
             Move-Item -LiteralPath $programBackup -Destination 'C:\Program Files\Paperboat'
           }
           if (Test-Path -LiteralPath $stateBackup) {
             Move-Item -LiteralPath $stateBackup -Destination 'C:\ProgramData\Paperboat'
           }
-          # A previous interrupted move can leave the state backup nested one
-          # level below ProgramData. Replace the interrupted destination with
-          # that exact known backup. This preserves the backup as a unit and
-          # avoids merging stale qualification residue into live state.
-          $nestedStateBackup = 'C:\ProgramData\Paperboat\PaperboatQualificationStateBackup2'
+          # Move-Item nests a source directory when its destination already
+          # exists. Recover that exact interrupted shape for either snapshot
+          # generation, replacing only the known Paperboat destinations.
+          $nestedProgramBackup = Join-Path 'C:\Program Files\Paperboat' $programBackupLeaf
+          if (Test-Path -LiteralPath $nestedProgramBackup) {
+            $restoredProgram = 'C:\PaperboatQualificationProgramRestored'
+            if (Test-Path -LiteralPath $restoredProgram) { throw "Refusing to overwrite existing program staging path: $restoredProgram" }
+            Move-Item -LiteralPath $nestedProgramBackup -Destination $restoredProgram
+            Remove-Item -LiteralPath 'C:\Program Files\Paperboat' -Recurse -Force
+            Move-Item -LiteralPath $restoredProgram -Destination 'C:\Program Files\Paperboat'
+          }
+          $nestedStateBackup = Join-Path 'C:\ProgramData\Paperboat' $stateBackupLeaf
           if (Test-Path -LiteralPath $nestedStateBackup) {
             $restoredState = 'C:\PaperboatQualificationStateRestored'
-            if (Test-Path -LiteralPath $restoredState) {
-              throw "Refusing to overwrite existing state staging path: $restoredState"
-            }
+            if (Test-Path -LiteralPath $restoredState) { throw "Refusing to overwrite existing state staging path: $restoredState" }
             Move-Item -LiteralPath $nestedStateBackup -Destination $restoredState
             Remove-Item -LiteralPath 'C:\ProgramData\Paperboat' -Recurse -Force
             Move-Item -LiteralPath $restoredState -Destination 'C:\ProgramData\Paperboat'
