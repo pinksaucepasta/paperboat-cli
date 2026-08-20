@@ -138,7 +138,7 @@ func TestNativeDurablePreviewServiceLifecycle(t *testing.T) {
 	serviceName := previewServiceName(name)
 	assertServiceAbsent(t, serviceName)
 
-	expires := time.Now().UTC().Add(30 * time.Second)
+	expires := time.Now().UTC().Add(5 * time.Second)
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	descriptor, err := hostruntime.InstallPreviewService(ctx, fixture, root, name, 32123, &expires, false)
@@ -166,7 +166,12 @@ func TestNativeDurablePreviewServiceLifecycle(t *testing.T) {
 	// restart boundary used by recovery and reconnect flows.
 	restartService(t, serviceName)
 
-	if err := hostruntime.ReconcileExpiredPreviewServices(ctx, root, expires.Add(time.Second)); err != nil {
+	if wait := time.Until(expires); wait > 0 {
+		time.Sleep(wait + 100*time.Millisecond)
+	}
+	// Reconcile against the real clock after the descriptor has actually
+	// expired. This proves the same path used by the production reaper.
+	if err := hostruntime.ReconcileExpiredPreviewServices(ctx, root, time.Now().UTC()); err != nil {
 		t.Fatalf("reconcile after expiry: %v", err)
 	}
 	if err := waitServiceAbsent(serviceName, 15*time.Second); err != nil {
