@@ -198,7 +198,7 @@ jobs:
           & ./packaging/windows/scripts/sign-and-verify.ps1 `
             -Path $pePaths `
             -Architecture $env:PAPERBOAT_ARCH `
-          if ($LASTEXITCODE -ne 0) { throw 'Windows PE signing or verification failed.' }
+          if (-not $?) { throw 'Windows PE signing or verification failed.' }
       - name: Build MSI with WiX 5.0.2
         shell: pwsh
         run: |
@@ -210,7 +210,7 @@ jobs:
             -OutputDirectory $env:PAPERBOAT_WINDOWS_DIST `
             -WixCommand $env:PAPERBOAT_WIX_PATH `
             -ExpectedWixVersion $env:PAPERBOAT_WIX_VERSION
-          if ($LASTEXITCODE -ne 0) { throw 'Windows MSI build failed.' }
+          if (-not $?) { throw 'Windows MSI build failed.' }
       - name: Apply optional Authenticode and verify the MSI
         shell: pwsh
         env:
@@ -221,7 +221,7 @@ jobs:
           & ./packaging/windows/scripts/sign-and-verify.ps1 `
             -Path @($msi) `
             -Architecture $env:PAPERBOAT_ARCH `
-          if ($LASTEXITCODE -ne 0) { throw 'Windows MSI signing or verification failed.' }
+          if (-not $?) { throw 'Windows MSI signing or verification failed.' }
       - name: Package verified Windows ZIP
         shell: pwsh
         run: |
@@ -233,7 +233,7 @@ jobs:
             --channel $env:PAPERBOAT_CHANNEL `
             --staging $env:PAPERBOAT_WINDOWS_STAGE `
             --output $zip
-          if ($LASTEXITCODE -ne 0) { throw 'Signed Windows ZIP packaging failed.' }
+          if (-not $?) { throw 'Windows ZIP packaging failed.' }
       - name: Verify Windows cross-architecture artifacts
         shell: pwsh
         run: |
@@ -244,7 +244,7 @@ jobs:
             -StagingDirectory $env:PAPERBOAT_WINDOWS_STAGE `
             -MsiPath $msi `
             -ZipPath $zip
-          if ($LASTEXITCODE -ne 0) { throw 'Windows cross-architecture artifact verification failed.' }
+          if (-not $?) { throw 'Windows cross-architecture artifact verification failed.' }
       - name: Copy verified PE release assets
         shell: pwsh
         run: |
@@ -281,7 +281,7 @@ jobs:
             -Channel $env:PAPERBOAT_CHANNEL `
             -OutputDirectory $env:PAPERBOAT_WINDOWS_DIST `
             -WixVersion $env:PAPERBOAT_WIX_VERSION
-          if ($LASTEXITCODE -ne 0) { throw 'Windows signing handoff generation failed.' }
+          if (-not $?) { throw 'Windows integrity handoff generation failed.' }
       - name: Require Microsoft Defender malware scan of signed artifacts
         shell: pwsh
         run: |
@@ -338,7 +338,7 @@ jobs:
             -Amd64Msi $amd64Msi `
             -Arm64Msi $arm64Msi `
             -OutputDirectory (Join-Path $env:GITHUB_WORKSPACE 'dist') `
-          if ($LASTEXITCODE -ne 0) { throw 'Final-hash WinGet manifest rendering failed.' }
+          if (-not $?) { throw 'Final-hash WinGet manifest rendering failed.' }
       - name: Upload final WinGet manifests
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -416,7 +416,7 @@ jobs:
             -Architecture amd64 `
             -WixCommand $env:PAPERBOAT_WINDOWS_E2E_WIX `
             -OutputDirectory (Join-Path $env:RUNNER_TEMP 'paperboat-final-amd64-qualification')
-          if ($LASTEXITCODE -ne 0) { throw 'Native amd64 qualification upgrade fixture build failed.' }
+          if (-not $?) { throw 'Native amd64 qualification upgrade fixture build failed.' }
       - name: Run native qualification against final amd64 MSI
         shell: pwsh
         run: |
@@ -428,7 +428,7 @@ jobs:
             -Architecture amd64 `
             -ServiceFixturePath $env:PAPERBOAT_WINDOWS_E2E_SERVICE_FIXTURE `
             -OutputDirectory $env:PAPERBOAT_WINDOWS_E2E_OUTPUT
-          if ($LASTEXITCODE -ne 0) { throw 'Final signed Windows amd64 qualification failed.' }
+          if (-not $?) { throw 'Final Windows amd64 qualification failed.' }
       - name: Qualify pinned WinGet OpenSSH and PaperboatSshd lifecycle
         if: matrix.publish_evidence
         shell: pwsh
