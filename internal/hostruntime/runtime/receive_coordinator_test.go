@@ -37,6 +37,7 @@ func TestReceiveCoordinatorExposesOnlyReceiveRoutes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = host.Shutdown(context.Background()) })
 	for _, tc := range []struct {
 		method string
 		path   string

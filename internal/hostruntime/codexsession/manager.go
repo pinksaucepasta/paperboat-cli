@@ -1,5 +1,3 @@
-//go:build darwin || linux
-
 package codexsession
 
 import (
@@ -14,7 +12,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
@@ -162,11 +159,11 @@ func (m *Manager) Prepare(ctx context.Context, id, requestedPath string, leaseEx
 		m.mu.Unlock()
 		return Descriptor{}, err
 	}
-	socket := filepath.Join(directory, "app.sock")
-	if len(socket) >= 104 {
+	endpoint, listen, err := codexAppServerEndpoint(directory)
+	if err != nil {
 		m.mu.Unlock()
 		_ = os.RemoveAll(directory)
-		return Descriptor{}, errors.Join(ErrInvalid, errors.New("Codex runtime state path is too long for a Unix socket"))
+		return Descriptor{}, errors.Join(ErrInvalid, err)
 	}
 	logPath := filepath.Join(directory, "app-server.log")
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
@@ -176,7 +173,7 @@ func (m *Manager) Prepare(ctx context.Context, id, requestedPath string, leaseEx
 		return Descriptor{}, err
 	}
 	processCtx, cancel := context.WithCancel(context.Background())
-	command := m.config.Command(processCtx, m.config.CodexPath, "app-server", "--listen", "unix://"+socket)
+	command := m.config.Command(processCtx, m.config.CodexPath, "app-server", "--listen", listen)
 	if cmd, ok := command.(*execCommand); ok {
 		cmd.Dir = path
 		cmd.Stdout = &limitedWriter{writer: logFile, remaining: 1 << 20}
@@ -189,7 +186,7 @@ func (m *Manager) Prepare(ctx context.Context, id, requestedPath string, leaseEx
 		_ = os.RemoveAll(directory)
 		return Descriptor{}, errors.Join(ErrCodexUnavailable, err)
 	}
-	d := Descriptor{Schema: descriptorSchema, ID: id, Path: path, SocketPath: socket, CodexVersion: remoteVersion, LeaseExpiresAt: leaseExpiresAt.UTC()}
+	d := Descriptor{Schema: descriptorSchema, ID: id, Path: path, SocketPath: endpoint, CodexVersion: remoteVersion, LeaseExpiresAt: leaseExpiresAt.UTC()}
 	if cmd, ok := command.(*execCommand); ok && cmd.Process != nil {
 		d.PID = cmd.Process.Pid
 	}
@@ -197,7 +194,7 @@ func (m *Manager) Prepare(ctx context.Context, id, requestedPath string, leaseEx
 	m.sessions[id] = s
 	m.mu.Unlock()
 	go func() { s.waitErr = command.Wait(); cancel(); _ = logFile.Close(); close(s.done) }()
-	if err := waitSocket(ctx, socket, m.config.ReadinessTimeout); err != nil {
+	if err := waitCodexAppServer(ctx, endpoint, m.config.ReadinessTimeout); err != nil {
 		_ = m.Stop(context.Background(), id)
 		return Descriptor{}, errors.Join(ErrCodexUnavailable, err)
 	}
@@ -236,7 +233,7 @@ func (m *Manager) Stop(ctx context.Context, id string) error {
 	}
 	delete(m.sessions, id)
 	m.mu.Unlock()
-	_ = s.command.Signal(syscall.SIGTERM)
+	_ = stopCodexCommand(s.command)
 	timer := time.NewTimer(m.config.StopGrace)
 	defer timer.Stop()
 	select {
@@ -372,24 +369,14 @@ func (m *Manager) recover() error {
 		body, readErr := os.ReadFile(filepath.Join(directory, "descriptor.json"))
 		var d Descriptor
 		if readErr != nil || json.Unmarshal(body, &d) != nil || d.Schema != descriptorSchema || !d.LeaseExpiresAt.After(now) {
-			_ = terminatePID(d.PID)
+			_ = terminateCodexPID(d.PID)
 			_ = os.RemoveAll(directory)
 			continue
 		}
-		_ = terminatePID(d.PID)
+		_ = terminateCodexPID(d.PID)
 		_ = os.RemoveAll(directory)
 	}
 	return nil
-}
-func terminatePID(pid int) error {
-	if pid <= 0 {
-		return nil
-	}
-	p, err := os.FindProcess(pid)
-	if err != nil {
-		return err
-	}
-	return p.Signal(syscall.SIGTERM)
 }
 func validID(s string) bool {
 	if len(s) < 8 || len(s) > 128 {
@@ -409,24 +396,6 @@ func writeDescriptor(dir string, d Descriptor) error {
 		return err
 	}
 	return atomicfile.Write(filepath.Join(dir, "descriptor.json"), body, atomicfile.Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1})
-}
-func waitSocket(ctx context.Context, path string, timeout time.Duration) error {
-	deadline := time.NewTimer(timeout)
-	defer deadline.Stop()
-	ticker := time.NewTicker(25 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		if info, err := os.Stat(path); err == nil && info.Mode()&os.ModeSocket != 0 {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-deadline.C:
-			return errors.New("codex app-server readiness timed out")
-		case <-ticker.C:
-		}
-	}
 }
 func codexVersion(ctx context.Context, path string, env []string) (string, error) {
 	cmd := exec.CommandContext(ctx, path, "--version")

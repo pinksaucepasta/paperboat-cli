@@ -11,6 +11,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func writeCredentialFile(path string, value []byte) error { return atomicWrite(path, value, 0o600) }
+
 func validateCredentialDirectory(path string) error {
 	info, err := os.Lstat(path)
 	if err != nil {

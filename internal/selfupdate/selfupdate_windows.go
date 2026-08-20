@@ -21,6 +21,8 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/binarytarget"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/bootstrap"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/nativesignature"
+	"time"
 )
 
 const currentSchemaV1 = "paperboat.release-current/v1"
@@ -75,6 +77,11 @@ func InstallCLI(currentExecutable, verifiedArtifact string) error {
 		return err
 	}
 	if err := binarytarget.Validate(verifiedArtifact, runtime.GOOS, runtime.GOARCH); err != nil {
+		return ErrInvalidRelease
+	}
+	verifyCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := nativesignature.New(nil).Verify(verifyCtx, verifiedArtifact, runtime.GOOS, runtime.GOARCH); err != nil {
 		return ErrInvalidRelease
 	}
 	input, err := os.Open(verifiedArtifact)

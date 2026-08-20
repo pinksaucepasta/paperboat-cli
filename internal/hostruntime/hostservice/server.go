@@ -3,6 +3,7 @@
 package hostservice
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -168,7 +169,12 @@ func (s *Server) serve(connection *net.UnixConn) error {
 		return ErrPeerDenied
 	}
 	_ = connection.SetDeadline(time.Now().Add(5 * time.Second))
-	decoder := json.NewDecoder(io.LimitReader(connection, 16<<10))
+	reader := bufio.NewReaderSize(io.LimitReader(connection, (16<<10)+1), (16<<10)+1)
+	body, err := reader.ReadBytes('\n')
+	if err != nil || len(body) == 0 || len(body) > 16<<10 {
+		return s.respond(connection, s.errorResponse("invalid_request"))
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
 	var request Request
 	if err := decoder.Decode(&request); err != nil {

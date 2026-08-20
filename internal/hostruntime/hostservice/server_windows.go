@@ -3,6 +3,7 @@
 package hostservice
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -87,6 +88,7 @@ type Config struct {
 	Now               func() time.Time
 	Version           string
 	Updates           UpdateActivator
+	UpdateDiagnostics UpdateDiagnostics
 	Ready             func() error
 	Heartbeat         func() error
 	HeartbeatInterval time.Duration
@@ -146,7 +148,12 @@ func (s *Server) Run(ctx context.Context) error {
 
 func (s *Server) serve(connection net.Conn) error {
 	_ = connection.SetDeadline(time.Now().Add(5 * time.Second))
-	decoder := json.NewDecoder(io.LimitReader(connection, 16<<10))
+	reader := bufio.NewReaderSize(io.LimitReader(connection, (16<<10)+1), (16<<10)+1)
+	body, err := reader.ReadBytes('\n')
+	if err != nil || len(body) == 0 || len(body) > 16<<10 {
+		return s.respond(connection, s.errorResponse("invalid_request"))
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
 	var request Request
 	if err := decoder.Decode(&request); err != nil {
@@ -262,14 +269,21 @@ func (s *Server) errorResponse(code string) Response {
 }
 func (s *Server) response(state State) Response {
 	var rollbacks uint64
-	if diagnostics, ok := s.config.Updates.(UpdateDiagnostics); ok {
+	if diagnostics := s.updateDiagnostics(); diagnostics != nil {
 		rollbacks = diagnostics.RollbackCount()
 	}
 	health := "unknown"
-	if diagnostics, ok := s.config.Updates.(UpdateDiagnostics); ok {
+	if diagnostics := s.updateDiagnostics(); diagnostics != nil {
 		health = diagnostics.UpdateHealth()
 	}
 	return Response{Schema: ProtocolV1, Status: state.Status, DesiredMode: state.DesiredMode, DesiredVersion: state.DesiredVersion, ObservedMode: state.ObservedMode, ObservedVersion: state.ObservedVersion, ObservedAt: state.ObservedAt, ErrorCode: state.ErrorCode, HostServiceVersion: s.config.Version, Scope: "system", UpdateRollbacks: rollbacks, UpdateHealth: health}
+}
+func (s *Server) updateDiagnostics() UpdateDiagnostics {
+	if s.config.UpdateDiagnostics != nil {
+		return s.config.UpdateDiagnostics
+	}
+	diagnostics, _ := s.config.Updates.(UpdateDiagnostics)
+	return diagnostics
 }
 func validMode(mode string) bool { return mode == AllowSleep || mode == KeepAwake }
 func validStatus(status string) bool {

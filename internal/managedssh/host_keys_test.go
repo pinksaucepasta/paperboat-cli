@@ -44,6 +44,9 @@ func TestReadHostPublicKeysRejectsDuplicateSymlinkAndWritableFile(t *testing.T) 
 	if _, err := ReadHostPublicKeys([]string{alias}, uint32(os.Getuid())); err == nil {
 		t.Fatal("symlinked host key was accepted")
 	}
+	if os.PathSeparator != '/' {
+		return
+	}
 	if err := os.Chmod(path, 0o666); err != nil {
 		t.Fatal(err)
 	}

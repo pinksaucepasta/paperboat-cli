@@ -162,14 +162,24 @@ make install    # install pb
 make test       # unit tests (paste parser + file-transfer pipeline)
 ```
 
-`YYYY.MM.DD.X` tags publish signed-provenance archives for supported Android, Darwin,
-Linux, and Windows architectures, plus checksums, an SPDX SBOM, and Homebrew/Scoop manifests. Use
-`tools/release-version.sh next` to generate the next tag; tags have no `v` prefix.
+`YYYY.MM.DD.X` tags prepare provenance-attested archives for the supported Darwin, Linux,
+and Windows architectures, plus checksums and an SPDX SBOM. Windows artifacts are not
+described or published as signed unless the protected release signing gate has verified
+Authenticode signatures, publisher identity, RFC 3161 timestamps, and post-signing checksums.
+Use `tools/release-version.sh next` to generate the next tag; tags have no `v` prefix.
 Android archives target API 24 and link against Bionic so Termux uses Android's native DNS resolver.
+
+Native Windows MSI, portable ZIP, and WinGet packaging sources live in
+[`packaging/windows`](packaging/windows). The MSI builder runs only with an installed WiX
+Toolset on Windows and emits unsigned output; external Authenticode signing and RFC 3161
+timestamping remain release-authority requirements. Windows amd64 is the stable target and
+Windows arm64 is the explicit beta target until native ARM64 qualification exists.
 
 ## Stack
 
-Go - distributed as a single static binary for Linux and macOS (Cobra, Go 1.26.5).
+Go - distributed as native static binaries for Windows, macOS, and Linux (Cobra, Go 1.26.6).
+Windows amd64 is stable after native release qualification. Windows arm64 ships the same
+feature set as an explicit beta until native ARM64 hardware qualification is available.
 
 ## Layout
 

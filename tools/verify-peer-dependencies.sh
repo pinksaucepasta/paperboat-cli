@@ -82,13 +82,20 @@ fi
 
 for import in $(rg -o --no-filename --glob '*.go' 'tailscale\.com/[^"[:space:]]+' . | sort -u); do
   case "$import" in
-    tailscale.com/net/netmon|tailscale.com/net/portmapper|tailscale.com/net/portmapper/portmappertype|tailscale.com/net/wsconn|tailscale.com/util/eventbus) ;;
+    tailscale.com/net/netmon|tailscale.com/net/portmapper|tailscale.com/net/portmapper/portmappertype|tailscale.com/net/wsconn|tailscale.com/util/eventbus|tailscale.com/util/winutil|tailscale.com/util/winutil/conpty) ;;
     *)
       echo "owned source imports forbidden Tailscale package: $import" >&2
       exit 1
       ;;
   esac
 done
+
+unexpected_winutil=$(rg -n --glob '*.go' 'tailscale\.com/util/winutil' . | grep -Ev '^\./packaging/windows/e2e/conpty_windows_test\.go:[0-9]+:' || true)
+if [ -n "$unexpected_winutil" ]; then
+  echo "owned source imports Tailscale winutil outside the Windows ConPTY parity test:" >&2
+  printf '%s\n' "$unexpected_winutil" >&2
+  exit 1
+fi
 
 unexpected_eventbus=$(rg -n --glob '*.go' 'tailscale\.com/util/eventbus' . | grep -Ev '^\./internal/peertransport/networkmonitor/(monitor|renewal)(_test)?\.go:[0-9]+:' || true)
 if [ -n "$unexpected_eventbus" ]; then

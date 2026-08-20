@@ -508,7 +508,7 @@ func Open(ctx context.Context, config Config) (*Store, error) {
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
-	dsnURL := &url.URL{Scheme: "file", Path: path}
+	dsnURL := &url.URL{Scheme: "file", Path: sqliteURIPath(path)}
 	query := dsnURL.Query()
 	// These PRAGMAs are connection-local. Put them in the DSN so every
 	// database/sql connection gets the same locking and integrity policy.
@@ -538,7 +538,7 @@ func Open(ctx context.Context, config Config) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	if err := os.Chmod(path, 0o600); err != nil {
+	if err := secureStoreFile(path); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -547,6 +547,16 @@ func Open(ctx context.Context, config Config) (*Store, error) {
 		return nil, classifyDBError(err)
 	}
 	return store, nil
+}
+
+// sqliteURIPath keeps a Windows volume path in the URI path component. Without
+// the leading slash, net/url serializes C: as a URI authority and modernc
+// SQLite rejects the resulting file://C:... DSN before it can open state.db.
+func sqliteURIPath(path string) string {
+	if volume := filepath.VolumeName(path); volume != "" {
+		return "/" + strings.ReplaceAll(path, `\`, "/")
+	}
+	return path
 }
 
 func (s *Store) Close() error {
@@ -1144,5 +1154,5 @@ func ensureDirectory(path string) error {
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return ErrCorrupt
 	}
-	return os.Chmod(path, 0o700)
+	return secureStoreDirectory(path)
 }

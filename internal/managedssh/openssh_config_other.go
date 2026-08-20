@@ -1,4 +1,4 @@
-//go:build !darwin && !linux
+//go:build !darwin && !linux && !windows
 
 package managedssh
 
@@ -7,8 +7,8 @@ import "errors"
 var ErrOpenSSHConfigConflict = errors.New("Paperboat OpenSSH configuration conflicts with existing state")
 
 type OpenSSHConfig struct {
-	Home, AliasSuffix, ProxyCommand, KnownHostsCommand, AgentSocket string
-	OwnerUID                                                        uint32
+	Home, AliasSuffix, ProxyCommand, KnownHostsCommand, AgentSocket, IdentityFile string
+	OwnerUID                                                                      uint32
 }
 type OpenSSHConfigResult struct{ Changed bool }
 

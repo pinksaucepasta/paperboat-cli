@@ -181,6 +181,9 @@ func (b *FileTransferBroker) Close() error {
 }
 
 func samePeer(left, right localapi.Peer) bool {
+	if left.SID != "" || right.SID != "" {
+		return left.SID != "" && left.SID == right.SID && left.PID == right.PID
+	}
 	return left.UID == right.UID && left.GID == right.GID && left.PID == right.PID
 }
 

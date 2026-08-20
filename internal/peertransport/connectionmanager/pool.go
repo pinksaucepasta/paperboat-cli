@@ -503,7 +503,10 @@ func (p *Pool) Acquire(ctx context.Context, class peerquic.Class, mode Mode, net
 		state.wait = make(chan struct{})
 		token := &ownershipToken{}
 		state.connectToken = token
-		attemptCtx, cancelAttempt := context.WithCancel(ctx)
+		// A connection attempt is shared by every waiter for this class. Its
+		// lifetime is owned by the pool, not by whichever caller happened to
+		// arrive first (often a short-lived health probe).
+		attemptCtx, cancelAttempt := context.WithCancel(context.WithoutCancel(ctx))
 		state.connectCancel = cancelAttempt
 		p.mu.Unlock()
 

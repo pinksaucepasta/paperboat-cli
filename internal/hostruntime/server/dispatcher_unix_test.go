@@ -533,18 +533,6 @@ func TestAttachLargeReplayUsesBinaryStreamNotStructuredResponse(t *testing.T) {
 	_ = client.Close()
 }
 
-func sendRequest(t *testing.T, conn net.Conn, frame protocol.Frame) protocol.Frame {
-	t.Helper()
-	if err := protocol.WriteFrame(conn, frame); err != nil {
-		t.Fatal(err)
-	}
-	response, err := protocol.ReadFrame(conn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return response
-}
-
 func TestVerticalFramedTerminalPreviewAndReadiness(t *testing.T) {
 	if _, err := os.Stat("/bin/sh"); err != nil {
 		t.Skip("requires /bin/sh")

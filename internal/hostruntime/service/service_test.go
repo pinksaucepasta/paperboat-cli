@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -28,7 +29,11 @@ func (c *controller) Remove(context.Context, string) error { c.removed++; return
 
 func executable(t *testing.T) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "pb")
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX service installation filesystem semantics are not applicable on Windows")
+	}
+	name := "pb"
+	path := filepath.Join(t.TempDir(), name)
 	if err := os.WriteFile(path, []byte("binary"), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -355,6 +360,9 @@ func TestControllerFailureIsNotReportedAsSuccess(t *testing.T) {
 }
 
 func TestDefinitionQuotesExecutablePathWithSpaces(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX executable permission semantics are not applicable on Windows")
+	}
 	directory := filepath.Join(t.TempDir(), "with space")
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		t.Fatal(err)
@@ -529,9 +537,15 @@ func (r *launchdTransitionRunner) Run(_ context.Context, name string, args ...st
 }
 
 func TestExecRunnerReturnsBoundedNativeDiagnostics(t *testing.T) {
-	err := (ExecRunner{}).Run(context.Background(), "/bin/sh", "-c", "printf native-diagnostic >&2; exit 7")
+	tool := "/bin/sh"
+	arguments := []string{"-c", "printf native-diagnostic >&2; exit 7"}
+	if runtime.GOOS == "windows" {
+		tool = filepath.Join(os.Getenv("SystemRoot"), "System32", "cmd.exe")
+		arguments = []string{"/d", "/s", "/c", "echo native-diagnostic 1>&2 & exit /b 7"}
+	}
+	err := (ExecRunner{}).Run(context.Background(), tool, arguments...)
 	var commandErr *CommandError
-	if !errors.As(err, &commandErr) || commandErr.Tool != "/bin/sh" || !strings.Contains(commandErr.Output, "native-diagnostic") {
+	if !errors.As(err, &commandErr) || commandErr.Tool != tool || !strings.Contains(commandErr.Output, "native-diagnostic") {
 		t.Fatalf("err=%v", err)
 	}
 	output := &boundedCommandOutput{limit: 8}

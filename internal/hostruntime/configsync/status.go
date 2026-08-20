@@ -128,8 +128,7 @@ func ReadStatus(path string, summaryLimit int) (Status, error) {
 		return Status{}, ErrStatusInvalid
 	}
 	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 ||
-		info.Mode().Perm()&0o077 != 0 || info.Size() > maxControlResponseBytes {
+	if err != nil || !privateControlFile(path, info) || info.Size() > maxControlResponseBytes {
 		return Status{}, errors.Join(ErrStatusInvalid, err)
 	}
 	data, err := os.ReadFile(path)

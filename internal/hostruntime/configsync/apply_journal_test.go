@@ -3,6 +3,7 @@ package configsync
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -48,7 +49,7 @@ func TestApplyJournalRestoresOriginalsAndRemovesCreatedPaths(t *testing.T) {
 		t.Fatalf("original = %q, %v", content, err)
 	}
 	info, err := os.Stat(original)
-	if err != nil || info.Mode().Perm() != 0o640 {
+	if err != nil || runtime.GOOS != "windows" && info.Mode().Perm() != 0o640 || runtime.GOOS == "windows" && !privateControlFile(original, info) {
 		t.Fatalf("original mode = %v, %v", info.Mode().Perm(), err)
 	}
 	if _, err := os.Lstat(created); !os.IsNotExist(err) {

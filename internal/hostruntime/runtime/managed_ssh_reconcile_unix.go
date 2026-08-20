@@ -1,17 +1,17 @@
-//go:build darwin || linux
+//go:build darwin || linux || windows
 
 package runtime
 
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	runtimeidentity "github.com/pinksaucepasta/paperboat/internal/hostruntime/identity"
-	"github.com/pinksaucepasta/paperboat/internal/managedssh"
 )
 
 type managedSSHKeyReconciler struct {
@@ -37,7 +37,7 @@ func (s *managedSSHKeyReconciler) Start(ctx context.Context) error {
 		return ErrProductionInvalid
 	}
 	if err := s.reconcile(ctx); err != nil {
-		return err
+		return errors.Join(ErrManagedSSHUnavailable, err)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -61,7 +61,13 @@ func (s *managedSSHKeyReconciler) run(ctx context.Context, done chan<- struct{})
 			return
 		case <-ticker.C:
 			reconcileCtx, cancel := context.WithTimeout(ctx, s.timeout)
-			_ = s.reconcile(reconcileCtx)
+			if err := s.reconcile(reconcileCtx); err != nil {
+				// A managed key is only authoritative while the host can obtain a
+				// current authority response. Retaining it after a failed refresh
+				// would turn a temporary control-plane failure into unbounded
+				// revocation latency.
+				slog.Warn("managed SSH authority refresh failed; removed managed authorized keys", "error", err)
+			}
 			cancel()
 		}
 	}
@@ -72,12 +78,13 @@ func (s *managedSSHKeyReconciler) reconcile(ctx context.Context) error {
 	suffix := s.registration.MachineID + "-" + strconv.FormatUint(uint64(s.registration.InstallationGeneration), 10) + "-" + strconv.FormatUint(s.workerGeneration, 10) + "-refresh-" + strconv.FormatUint(sequence, 10)
 	keys, active, err := reconcileManagedSSHAuthorityWithOperations(ctx, s.client, s.identity, s.registration, s.workerGeneration, s.setID, s.publicKeys, "managed-ssh-observe-"+suffix, "managed-ssh-keys-"+suffix)
 	if err != nil {
-		return err
+		_, cleanupErr := reconcilePlatformAuthorizedKeys(s.home, s.ownerUID, nil)
+		return errors.Join(err, cleanupErr)
 	}
 	if !active {
 		keys.Keys = nil
 	}
-	_, err = managedssh.ReconcileAuthorizedKeys(s.home, s.ownerUID, keys.Keys)
+	_, err = reconcilePlatformAuthorizedKeys(s.home, s.ownerUID, keys.Keys)
 	return err
 }
 
@@ -92,7 +99,8 @@ func (s *managedSSHKeyReconciler) Shutdown(ctx context.Context) error {
 	cancel()
 	select {
 	case <-done:
-		return nil
+		_, err := reconcilePlatformAuthorizedKeys(s.home, s.ownerUID, nil)
+		return err
 	case <-ctx.Done():
 		return ctx.Err()
 	}

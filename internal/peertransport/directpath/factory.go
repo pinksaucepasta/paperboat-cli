@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"time"
@@ -246,20 +247,32 @@ func validateAttemptDescriptor(value AttemptDescriptor, generation Generation, n
 	local := signaling.Binding{IntentID: value.IntentID, AttemptGeneration: value.AttemptGeneration, NetworkGeneration: value.NetworkGeneration, Role: value.Role}
 	remote := local
 	remote.Role = oppositeSignalingRole(local.Role)
-	if value.AttemptGeneration != generation.Attempt || value.NetworkGeneration != generation.Network || value.SignalingURL == "" || value.SignalingCredential == "" || value.LocalUfrag == "" || value.LocalPassword == "" || value.IssuedAt.IsZero() || !value.ExpiresAt.After(now) || !value.ExpiresAt.After(value.IssuedAt) || value.IssuedAt.After(now.Add(30*time.Second)) || value.ExpiresAt.Sub(value.IssuedAt) > 5*time.Minute {
-		return ErrDescriptorInvalid
+	if value.AttemptGeneration != generation.Attempt {
+		return fmt.Errorf("%w: attempt generation", ErrDescriptorInvalid)
+	}
+	if value.NetworkGeneration != generation.Network {
+		return fmt.Errorf("%w: network generation", ErrDescriptorInvalid)
+	}
+	if value.SignalingURL == "" || value.SignalingCredential == "" {
+		return fmt.Errorf("%w: signaling credentials", ErrDescriptorInvalid)
+	}
+	if value.LocalUfrag == "" || value.LocalPassword == "" {
+		return fmt.Errorf("%w: ICE credentials", ErrDescriptorInvalid)
+	}
+	if value.IssuedAt.IsZero() || !value.ExpiresAt.After(now) || !value.ExpiresAt.After(value.IssuedAt) || value.IssuedAt.After(now.Add(30*time.Second)) || value.ExpiresAt.Sub(value.IssuedAt) > 5*time.Minute {
+		return fmt.Errorf("%w: descriptor lifetime", ErrDescriptorInvalid)
 	}
 	if _, err := signaling.NewValidator(local); err != nil {
-		return ErrDescriptorInvalid
+		return fmt.Errorf("%w: local signaling binding: %v", ErrDescriptorInvalid, err)
 	}
 	if _, err := signaling.NewValidator(remote); err != nil {
-		return ErrDescriptorInvalid
+		return fmt.Errorf("%w: remote signaling binding: %v", ErrDescriptorInvalid, err)
 	}
 	if _, err := signaling.Encode(signaling.Message{Schema: signaling.Schema, IntentID: value.IntentID, AttemptGeneration: value.AttemptGeneration, NetworkGeneration: value.NetworkGeneration, Role: value.Role, Sequence: 1, Kind: signaling.KindCredentials, Ufrag: value.LocalUfrag, Password: value.LocalPassword}, local); err != nil {
-		return errors.Join(ErrDescriptorInvalid, err)
+		return fmt.Errorf("%w: signaling encoding: %v", ErrDescriptorInvalid, err)
 	}
 	if _, err := iceagent.ValidateSTUNURLs(value.STUNURLs); err != nil {
-		return errors.Join(ErrDescriptorInvalid, err)
+		return fmt.Errorf("%w: STUN URLs: %v", ErrDescriptorInvalid, err)
 	}
 	return nil
 }

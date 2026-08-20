@@ -9,14 +9,17 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
   packages: write
   id-token: write
   attestations: write
 
 jobs:
-  release:
+  release-unix:
+    name: Build Unix release assets
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -29,83 +32,541 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ripgrep
       - name: Validate release version
         run: ./tools/release-version.sh validate "${GITHUB_REF_NAME}"
-      - name: Test
+      - name: Run release checks
         run: make check
       - name: Required Windows cross-build gate
+        shell: bash
         run: |
           set -euo pipefail
           check_dir="$(mktemp -d)"
           trap 'rm -rf "$check_dir"' EXIT
           for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=windows GOARCH="$arch" go build -trimpath ./...
+            while IFS= read -r package; do
+              name="$(printf '%s' "$package" | sha256sum | cut -d' ' -f1)"
+              CGO_ENABLED=0 GOOS=windows GOARCH="$arch" go test -c -o "$check_dir/$arch-$name.test.exe" "$package"
+            done < <(CGO_ENABLED=0 GOOS=windows GOARCH="$arch" go list -e -f '{{if or .GoFiles .CgoFiles}}{{.ImportPath}}{{end}}' ./... | sed '/^$/d')
             CGO_ENABLED=0 GOOS=windows GOARCH="$arch" go build -trimpath -o "$check_dir/pb-$arch.exe" ./cmd/pb
             CGO_ENABLED=0 GOOS=windows GOARCH="$arch" go build -trimpath -o "$check_dir/pb-launcher-$arch.exe" ./cmd/pb-launcher
             test -s "$check_dir/pb-$arch.exe"
             test -s "$check_dir/pb-launcher-$arch.exe"
           done
-      - name: Build archives
+      - name: Validate Windows packaging and release pipeline contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./packaging/windows/scripts/validate.sh
+          ./packaging/windows/scripts/validate-release-pipeline.sh
+          go test -count=1 ./packaging/windows/...
+      - name: Build Unix archives only
         env:
           VERSION: ${{ github.ref_name }}
           DEFAULT_SERVER_URL: ${{ vars.PAPERBOAT_DEFAULT_SERVER_URL }}
           DEFAULT_RELEASE_URL: ${{ vars.PAPERBOAT_DEFAULT_RELEASE_URL }}
+        shell: bash
         run: |
           set -euo pipefail
           test -n "${DEFAULT_SERVER_URL}" || { echo "PAPERBOAT_DEFAULT_SERVER_URL repository variable is required" >&2; exit 1; }
           test -n "${DEFAULT_RELEASE_URL}" || { echo "PAPERBOAT_DEFAULT_RELEASE_URL repository variable is required" >&2; exit 1; }
           case "${DEFAULT_SERVER_URL}" in https://*) ;; *) echo "PAPERBOAT_DEFAULT_SERVER_URL must use https" >&2; exit 1 ;; esac
           mkdir -p dist stage
-          version="${VERSION}"
-          commit="${GITHUB_SHA}"
-          for target in darwin/amd64 darwin/arm64 linux/amd64 linux/arm64 windows/amd64 windows/arm64; do
+          for target in darwin/amd64 darwin/arm64 linux/amd64 linux/arm64; do
             os="${target%/*}"
             arch="${target#*/}"
-            format="elf"
-            test "$os" != darwin || format="macho"
-            test "$os" != windows || format="pe"
             suffix=""
-            test "$os" != windows || suffix=".exe"
             CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath \
-              -ldflags="-s -w -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Version=$version -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Commit=$commit -X github.com/pinksaucepasta/paperboat/internal/buildinfo.ProtocolVersion=1 -X github.com/pinksaucepasta/paperboat/internal/buildinfo.DefaultServerURL=${DEFAULT_SERVER_URL} -X github.com/pinksaucepasta/paperboat/internal/buildinfo.DefaultReleaseURL=${DEFAULT_RELEASE_URL}" \
+              -ldflags="-s -w -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Version=${VERSION} -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Commit=${GITHUB_SHA} -X github.com/pinksaucepasta/paperboat/internal/buildinfo.ProtocolVersion=1 -X github.com/pinksaucepasta/paperboat/internal/buildinfo.DefaultServerURL=${DEFAULT_SERVER_URL} -X github.com/pinksaucepasta/paperboat/internal/buildinfo.DefaultReleaseURL=${DEFAULT_RELEASE_URL}" \
               -o "stage/pb${suffix}" ./cmd/pb
             CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath \
-              -ldflags="-s -w -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Version=$version -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Commit=$commit -X github.com/pinksaucepasta/paperboat/internal/buildinfo.ProtocolVersion=1 -X github.com/pinksaucepasta/paperboat/internal/buildinfo.DefaultServerURL=${DEFAULT_SERVER_URL} -X github.com/pinksaucepasta/paperboat/internal/buildinfo.DefaultReleaseURL=${DEFAULT_RELEASE_URL}" \
+              -ldflags="-s -w -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Version=${VERSION} -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Commit=${GITHUB_SHA} -X github.com/pinksaucepasta/paperboat/internal/buildinfo.ProtocolVersion=1 -X github.com/pinksaucepasta/paperboat/internal/buildinfo.DefaultServerURL=${DEFAULT_SERVER_URL} -X github.com/pinksaucepasta/paperboat/internal/buildinfo.DefaultReleaseURL=${DEFAULT_RELEASE_URL}" \
               -o "stage/pb-launcher${suffix}" ./cmd/pb-launcher
-            cp "stage/pb${suffix}" "dist/pb_${VERSION}_${os}_${arch}${suffix}"
+            cp "stage/pb${suffix}" "dist/pb_${VERSION}_${os}_${arch}"
             cp "stage/pb${suffix}" "dist/pb-${os}-${arch}"
-            for component in cli runtime hostd updater; do
-              cp "stage/pb${suffix}" "dist/${component}-${os}-${arch}"
-            done
+            cp "stage/pb${suffix}" "dist/cli-${os}-${arch}"
+            cp "stage/pb${suffix}" "dist/runtime-${os}-${arch}"
+            cp "stage/pb${suffix}" "dist/hostd-${os}-${arch}"
+            cp "stage/pb${suffix}" "dist/updater-${os}-${arch}"
             cp "stage/pb-launcher${suffix}" "dist/launcher-${os}-${arch}"
-            if test "$os" = windows; then
-              (cd stage && zip -q "../dist/paperboat_${VERSION}_${os}_${arch}.zip" "pb${suffix}" "pb-launcher${suffix}")
-            else
-              tar -C stage -czf "dist/paperboat_${VERSION}_${os}_${arch}.tar.gz" pb pb-launcher
-            fi
+            tar -C stage -czf "dist/paperboat_${VERSION}_${os}_${arch}.tar.gz" pb pb-launcher
             rm "stage/pb${suffix}" "stage/pb-launcher${suffix}"
           done
-          bash tools/package-manifests.sh dist "${GITHUB_REPOSITORY}" "$VERSION"
+          bash tools/package-manifests.sh dist "${GITHUB_REPOSITORY}" "${VERSION}"
           cp tools/install.sh dist/install.sh
-          (cd dist && sha256sum paperboat_* > SHA256SUMS)
-          (cd dist && sha256sum pb-* pb_* cli-* runtime-* hostd-* updater-* launcher-* >> SHA256SUMS)
-          (cd dist && sha256sum install.sh >> SHA256SUMS)
-      - name: Record native signing prerequisite
+      - name: Upload Unix release handoff
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-unix
+          path: dist
+          if-no-files-found: error
+          retention-days: 14
+
+  windows-package:
+    name: Windows ${{ matrix.architecture }} (${{ matrix.channel }}) package
+    runs-on: windows-2025
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            channel: stable
+          - architecture: arm64
+            channel: beta
+    env:
+      PAPERBOAT_ARCH: ${{ matrix.architecture }}
+      PAPERBOAT_CHANNEL: ${{ matrix.channel }}
+      PAPERBOAT_DEFAULT_SERVER_URL: ${{ vars.PAPERBOAT_DEFAULT_SERVER_URL }}
+      PAPERBOAT_DEFAULT_RELEASE_URL: ${{ vars.PAPERBOAT_DEFAULT_RELEASE_URL }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Validate Windows release pipeline contract
+        shell: bash
+        run: ./packaging/windows/scripts/validate-release-pipeline.sh
+      - name: Validate first-party Windows packaging contract
+        shell: pwsh
         run: |
-          {
-            echo '## Native signing boundary'
-            echo 'This workflow builds and attests artifacts. It does not authorize macOS or Windows artifacts for the signed TUF repository.'
-            echo 'The release authority must Developer-ID sign, notarize and staple each macOS component, and Authenticode-sign each Windows component before TUF publication.'
-          } >> "$GITHUB_STEP_SUMMARY"
-      - name: Generate SBOM
+          & go run ./packaging/windows/cmd/validate --root packaging/windows
+          if ($LASTEXITCODE -ne 0) { throw 'Windows packaging contract validation failed.' }
+          & go test -count=1 ./packaging/windows/...
+          if ($LASTEXITCODE -ne 0) { throw 'Windows packaging tests failed.' }
+      - name: Install pinned WiX Toolset
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2 --no-cache
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned WiX 5.0.2 installation failed.' }
+          $toolDirectory = Join-Path $env:USERPROFILE '.dotnet\tools'
+          $env:PATH = "$toolDirectory;$env:PATH"
+          $wix = (Get-Command wix.exe -ErrorAction Stop).Path
+          $wixVersion = (& $wix --version | Out-String).Trim()
+          if ($wixVersion -notmatch '(^|[^0-9])5\.0\.2([^0-9]|$)') {
+            throw "Expected WiX 5.0.2, got $wixVersion."
+          }
+          "PAPERBOAT_WIX_PATH=$wix" >> $env:GITHUB_ENV
+          "PAPERBOAT_WIX_VERSION=5.0.2" >> $env:GITHUB_ENV
+      - name: Build native Windows PE inputs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:GITHUB_REF_NAME
+          $stage = Join-Path $env:GITHUB_WORKSPACE "stage\windows-$env:PAPERBOAT_ARCH"
+          $dist = Join-Path $env:GITHUB_WORKSPACE 'dist'
+          New-Item -ItemType Directory -Force -Path $stage, $dist | Out-Null
+          if ([string]::IsNullOrWhiteSpace($env:PAPERBOAT_DEFAULT_SERVER_URL) -or [string]::IsNullOrWhiteSpace($env:PAPERBOAT_DEFAULT_RELEASE_URL)) {
+            throw 'PAPERBOAT_DEFAULT_SERVER_URL and PAPERBOAT_DEFAULT_RELEASE_URL repository variables are required.'
+          }
+          if ($env:PAPERBOAT_DEFAULT_SERVER_URL -notmatch '^https://') {
+            throw 'PAPERBOAT_DEFAULT_SERVER_URL must use https.'
+          }
+          $env:CGO_ENABLED = '0'
+          $env:GOOS = 'windows'
+          $env:GOARCH = $env:PAPERBOAT_ARCH
+          $ldflags = "-s -w -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Version=$version -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Commit=$env:GITHUB_SHA -X github.com/pinksaucepasta/paperboat/internal/buildinfo.ProtocolVersion=1 -X github.com/pinksaucepasta/paperboat/internal/buildinfo.DefaultServerURL=$env:PAPERBOAT_DEFAULT_SERVER_URL -X github.com/pinksaucepasta/paperboat/internal/buildinfo.DefaultReleaseURL=$env:PAPERBOAT_DEFAULT_RELEASE_URL"
+          & go build -trimpath -ldflags $ldflags -o (Join-Path $stage 'pb.exe') ./cmd/pb
+          if ($LASTEXITCODE -ne 0) { throw 'Windows amd64/arm64 CLI build failed.' }
+          & go build -trimpath -ldflags $ldflags -o (Join-Path $stage 'pb-launcher.exe') ./cmd/pb-launcher
+          if ($LASTEXITCODE -ne 0) { throw 'Windows launcher build failed.' }
+          foreach ($role in @('paperboat-runtime.exe', 'paperboat-hostd.exe', 'paperboat-updater.exe')) {
+            Copy-Item -LiteralPath (Join-Path $stage 'pb.exe') -Destination (Join-Path $stage $role)
+          }
+          "PAPERBOAT_WINDOWS_STAGE=$stage" >> $env:GITHUB_ENV
+          "PAPERBOAT_WINDOWS_DIST=$dist" >> $env:GITHUB_ENV
+      - name: Apply optional Authenticode and verify every Windows PE
+        shell: pwsh
+        env:
+          PAPERBOAT_WINDOWS_SIGNING_PFX_B64: ${{ secrets.PAPERBOAT_WINDOWS_SIGNING_PFX_B64 }}
+          PAPERBOAT_WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.PAPERBOAT_WINDOWS_SIGNING_PFX_PASSWORD }}
+        run: |
+          $pePaths = @(
+            (Join-Path $env:PAPERBOAT_WINDOWS_STAGE 'pb.exe'),
+            (Join-Path $env:PAPERBOAT_WINDOWS_STAGE 'pb-launcher.exe'),
+            (Join-Path $env:PAPERBOAT_WINDOWS_STAGE 'paperboat-runtime.exe'),
+            (Join-Path $env:PAPERBOAT_WINDOWS_STAGE 'paperboat-hostd.exe'),
+            (Join-Path $env:PAPERBOAT_WINDOWS_STAGE 'paperboat-updater.exe')
+          )
+          & ./packaging/windows/scripts/sign-and-verify.ps1 `
+            -Path $pePaths `
+            -Architecture $env:PAPERBOAT_ARCH `
+          if ($LASTEXITCODE -ne 0) { throw 'Windows PE signing or verification failed.' }
+      - name: Build MSI with WiX 5.0.2
+        shell: pwsh
+        run: |
+          & ./packaging/windows/scripts/build-msi.ps1 `
+            -Version $env:GITHUB_REF_NAME `
+            -Architecture $env:PAPERBOAT_ARCH `
+            -Channel $env:PAPERBOAT_CHANNEL `
+            -StagingDirectory $env:PAPERBOAT_WINDOWS_STAGE `
+            -OutputDirectory $env:PAPERBOAT_WINDOWS_DIST `
+            -WixCommand $env:PAPERBOAT_WIX_PATH `
+            -ExpectedWixVersion $env:PAPERBOAT_WIX_VERSION
+          if ($LASTEXITCODE -ne 0) { throw 'Windows MSI build failed.' }
+      - name: Apply optional Authenticode and verify the MSI
+        shell: pwsh
+        env:
+          PAPERBOAT_WINDOWS_SIGNING_PFX_B64: ${{ secrets.PAPERBOAT_WINDOWS_SIGNING_PFX_B64 }}
+          PAPERBOAT_WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.PAPERBOAT_WINDOWS_SIGNING_PFX_PASSWORD }}
+        run: |
+          $msi = Join-Path $env:PAPERBOAT_WINDOWS_DIST ("paperboat_{0}_windows_{1}.msi" -f $env:GITHUB_REF_NAME, $env:PAPERBOAT_ARCH)
+          & ./packaging/windows/scripts/sign-and-verify.ps1 `
+            -Path @($msi) `
+            -Architecture $env:PAPERBOAT_ARCH `
+          if ($LASTEXITCODE -ne 0) { throw 'Windows MSI signing or verification failed.' }
+      - name: Package verified Windows ZIP
+        shell: pwsh
+        run: |
+          $env:SOURCE_DATE_EPOCH = '0'
+          $zip = Join-Path $env:PAPERBOAT_WINDOWS_DIST ("paperboat_{0}_windows_{1}.zip" -f $env:GITHUB_REF_NAME, $env:PAPERBOAT_ARCH)
+          & ./packaging/windows/scripts/package-zip.ps1 `
+            --version $env:GITHUB_REF_NAME `
+            --architecture $env:PAPERBOAT_ARCH `
+            --channel $env:PAPERBOAT_CHANNEL `
+            --staging $env:PAPERBOAT_WINDOWS_STAGE `
+            --output $zip
+          if ($LASTEXITCODE -ne 0) { throw 'Signed Windows ZIP packaging failed.' }
+      - name: Verify Windows cross-architecture artifacts
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:PAPERBOAT_WINDOWS_DIST ("paperboat_{0}_windows_{1}.msi" -f $env:GITHUB_REF_NAME, $env:PAPERBOAT_ARCH)
+          $zip = Join-Path $env:PAPERBOAT_WINDOWS_DIST ("paperboat_{0}_windows_{1}.zip" -f $env:GITHUB_REF_NAME, $env:PAPERBOAT_ARCH)
+          & ./packaging/windows/scripts/verify-cross-artifacts.ps1 `
+            -Architecture $env:PAPERBOAT_ARCH `
+            -StagingDirectory $env:PAPERBOAT_WINDOWS_STAGE `
+            -MsiPath $msi `
+            -ZipPath $zip
+          if ($LASTEXITCODE -ne 0) { throw 'Windows cross-architecture artifact verification failed.' }
+      - name: Copy verified PE release assets
+        shell: pwsh
+        run: |
+          $files = @{
+            'pb.exe' = "paperboat_{0}_windows_{1}_pb.exe" -f $env:GITHUB_REF_NAME, $env:PAPERBOAT_ARCH
+            'pb-launcher.exe' = "paperboat_{0}_windows_{1}_pb-launcher.exe" -f $env:GITHUB_REF_NAME, $env:PAPERBOAT_ARCH
+            'paperboat-runtime.exe' = "paperboat_{0}_windows_{1}_paperboat-runtime.exe" -f $env:GITHUB_REF_NAME, $env:PAPERBOAT_ARCH
+            'paperboat-hostd.exe' = "paperboat_{0}_windows_{1}_paperboat-hostd.exe" -f $env:GITHUB_REF_NAME, $env:PAPERBOAT_ARCH
+            'paperboat-updater.exe' = "paperboat_{0}_windows_{1}_paperboat-updater.exe" -f $env:GITHUB_REF_NAME, $env:PAPERBOAT_ARCH
+          }
+          foreach ($sourceName in $files.Keys) {
+            Copy-Item -LiteralPath (Join-Path $env:PAPERBOAT_WINDOWS_STAGE $sourceName) -Destination (Join-Path $env:PAPERBOAT_WINDOWS_DIST $files[$sourceName])
+          }
+          # The one-shot https://get.pprbt.dev/install bootstrap downloads a
+          # stable, architecture-specific name. Keep this as a byte-for-byte
+          # copy of the already verified CLI so its TUF digest is authoritative.
+          Copy-Item -LiteralPath (Join-Path $env:PAPERBOAT_WINDOWS_STAGE 'pb.exe') -Destination (Join-Path $env:PAPERBOAT_WINDOWS_DIST ("pb-windows-{0}.exe" -f $env:PAPERBOAT_ARCH))
+          $tufFiles = @{
+            'pb.exe' = "cli-windows-$env:PAPERBOAT_ARCH"
+            'pb-launcher.exe' = "launcher-windows-$env:PAPERBOAT_ARCH"
+            'paperboat-runtime.exe' = "runtime-windows-$env:PAPERBOAT_ARCH"
+            'paperboat-hostd.exe' = "hostd-windows-$env:PAPERBOAT_ARCH"
+            'paperboat-updater.exe' = "updater-windows-$env:PAPERBOAT_ARCH"
+          }
+          foreach ($sourceName in $tufFiles.Keys) {
+            Copy-Item -LiteralPath (Join-Path $env:PAPERBOAT_WINDOWS_STAGE $sourceName) -Destination (Join-Path $env:PAPERBOAT_WINDOWS_DIST $tufFiles[$sourceName])
+          }
+      - name: Generate signing manifest, checksums, SBOM, and provenance handoff
+        shell: pwsh
+        run: |
+          & ./packaging/windows/scripts/generate-signing-handoff.ps1 `
+            -Version $env:GITHUB_REF_NAME `
+            -Architecture $env:PAPERBOAT_ARCH `
+            -Channel $env:PAPERBOAT_CHANNEL `
+            -OutputDirectory $env:PAPERBOAT_WINDOWS_DIST `
+            -WixVersion $env:PAPERBOAT_WIX_VERSION
+          if ($LASTEXITCODE -ne 0) { throw 'Windows signing handoff generation failed.' }
+      - name: Require Microsoft Defender malware scan of signed artifacts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $status = Get-MpComputerStatus -ErrorAction Stop
+          if (-not $status.AntivirusEnabled -or -not $status.RealTimeProtectionEnabled) {
+            throw 'Microsoft Defender antivirus and real-time protection are required for Windows release artifacts.'
+          }
+          Update-MpSignature -ErrorAction Stop
+          $before = @(Get-MpThreatDetection -ErrorAction SilentlyContinue | ForEach-Object ThreatID)
+          Start-MpScan -ScanType CustomScan -ScanPath $env:PAPERBOAT_WINDOWS_DIST -ErrorAction Stop
+          $after = @(Get-MpThreatDetection -ErrorAction SilentlyContinue | Where-Object { $_.Resources -match [regex]::Escape($env:PAPERBOAT_WINDOWS_DIST) })
+          if ($after.Count -ne 0) {
+            $after | Format-List | Out-String | Write-Error
+            throw 'Microsoft Defender detected a threat in signed Windows release artifacts.'
+          }
+      - name: Upload signed Windows handoff
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-${{ matrix.architecture }}
+          path: dist
+          if-no-files-found: error
+          retention-days: 14
+
+  windows-winget:
+    name: Render final-hash WinGet manifests
+    needs: windows-package
+    if: needs.windows-package.result == 'success'
+    runs-on: windows-2025
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 1
+      - name: Download final signed MSI handoffs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: windows-amd64
+          path: input/amd64
+      - name: Download final signed ARM64 MSI handoff
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: windows-arm64
+          path: input/arm64
+      - name: Render and validate WinGet manifests from final MSI bytes
+        shell: pwsh
+        run: |
+          $amd64Msi = Join-Path $env:GITHUB_WORKSPACE ("input\amd64\paperboat_{0}_windows_amd64.msi" -f $env:GITHUB_REF_NAME)
+          $arm64Msi = Join-Path $env:GITHUB_WORKSPACE ("input\arm64\paperboat_{0}_windows_arm64.msi" -f $env:GITHUB_REF_NAME)
+          & ./packaging/windows/scripts/render-winget.ps1 `
+            -Version $env:GITHUB_REF_NAME `
+            -Repository $env:GITHUB_REPOSITORY `
+            -Amd64Msi $amd64Msi `
+            -Arm64Msi $arm64Msi `
+            -OutputDirectory (Join-Path $env:GITHUB_WORKSPACE 'dist') `
+          if ($LASTEXITCODE -ne 0) { throw 'Final-hash WinGet manifest rendering failed.' }
+      - name: Upload final WinGet manifests
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-winget
+          path: dist
+          if-no-files-found: error
+          retention-days: 14
+
+  windows-amd64-native-qualification:
+    name: Qualify final Windows amd64 release assets (${{ matrix.target }})
+    needs: windows-package
+    if: needs.windows-package.result == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: standard-windows-11
+            runner: windows-2025
+            publish_evidence: false
+          - target: windows-11-iot-enterprise-ltsc
+            runner: [self-hosted, windows, amd64, paperboat-windows-11-iot-ltsc]
+            publish_evidence: true
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Download final Windows amd64 assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: windows-amd64
+          path: input
+      - name: Verify native amd64 runner and release MSI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() -ne 'X64') {
+            throw 'Final Windows amd64 qualification requires a native amd64 runner.'
+          }
+          $msi = Join-Path $env:GITHUB_WORKSPACE ("input\paperboat_{0}_windows_amd64.msi" -f $env:GITHUB_REF_NAME)
+          if (-not (Test-Path -LiteralPath $msi -PathType Leaf)) { throw "Final amd64 MSI is missing: $msi" }
+          "PAPERBOAT_FINAL_AMD64_MSI=$msi" >> $env:GITHUB_ENV
+      - name: Install pinned WiX for qualification upgrade fixture
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          dotnet tool install --global wix --version 5.0.2 --no-cache
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned WiX 5.0.2 installation failed.' }
+          $wix = Join-Path $env:USERPROFILE '.dotnet\tools\wix.exe'
+          if (-not (Test-Path -LiteralPath $wix -PathType Leaf)) { throw "WiX was not installed at $wix." }
+          $version = (& $wix --version | Out-String).Trim()
+          if ($version -notmatch '(^|[^0-9])5\.0\.2([^0-9]|$)') { throw "Expected WiX 5.0.2, got $version." }
+          "PAPERBOAT_WINDOWS_E2E_WIX=$wix" >> $env:GITHUB_ENV
+      - name: Build native upgrade fixture
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $parts = $env:GITHUB_REF_NAME.Split('.')
+          if ($parts.Count -ne 4) { throw "Invalid release version: $env:GITHUB_REF_NAME" }
+          $upgradeVersion = '{0}.{1}.{2}.{3}' -f $parts[0], $parts[1], $parts[2], (([uint64]$parts[3]) + 1)
+          "PAPERBOAT_NATIVE_UPGRADE_VERSION=$upgradeVersion" >> $env:GITHUB_ENV
+          & ./packaging/windows/scripts/Build-NativeQualificationArtifacts.ps1 `
+            -Version $env:GITHUB_REF_NAME `
+            -UpgradeVersion $upgradeVersion `
+            -Architecture amd64 `
+            -WixCommand $env:PAPERBOAT_WINDOWS_E2E_WIX `
+            -OutputDirectory (Join-Path $env:RUNNER_TEMP 'paperboat-final-amd64-qualification')
+          if ($LASTEXITCODE -ne 0) { throw 'Native amd64 qualification upgrade fixture build failed.' }
+      - name: Run native qualification against final amd64 MSI
+        shell: pwsh
+        run: |
+          & ./packaging/windows/scripts/Invoke-NativeWindowsQualification.ps1 `
+            -MsiPath $env:PAPERBOAT_FINAL_AMD64_MSI `
+            -UpgradeMsiPath $env:PAPERBOAT_WINDOWS_E2E_UPGRADE_MSI `
+            -Version $env:GITHUB_REF_NAME `
+            -UpgradeVersion $env:PAPERBOAT_NATIVE_UPGRADE_VERSION `
+            -Architecture amd64 `
+            -ServiceFixturePath $env:PAPERBOAT_WINDOWS_E2E_SERVICE_FIXTURE `
+            -OutputDirectory $env:PAPERBOAT_WINDOWS_E2E_OUTPUT
+          if ($LASTEXITCODE -ne 0) { throw 'Final signed Windows amd64 qualification failed.' }
+      - name: Qualify pinned WinGet OpenSSH and PaperboatSshd lifecycle
+        if: matrix.publish_evidence
+        shell: pwsh
+        env:
+          PAPERBOAT_WINDOWS_OPENSSH_NATIVE: "1"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PAPERBOAT_SERVICE_EXECUTABLE = 'C:\Program Files\Paperboat\bin\pb.exe'
+          $nativeTests = @(
+            'TestNativeProvisionAndService',
+            'TestNativeRepairStoppedService',
+            'TestNativeUninstallOwnership',
+            'TestNativeFirewallProfiles',
+            'TestNativeSCMCrashRecovery'
+          )
+          foreach ($testName in $nativeTests) {
+            go test -count=1 -v -run ("^$testName`$") ./internal/windowsopenssh
+            if ($LASTEXITCODE -ne 0) { throw "Final Windows OpenSSH qualification failed: $testName" }
+          }
+      - name: Convert native report into final-artifact TUF evidence
+        if: matrix.publish_evidence
+        shell: pwsh
+        run: |
+          $report = Join-Path $env:PAPERBOAT_WINDOWS_E2E_OUTPUT 'native-windows-qualification.json'
+          $evidence = Join-Path $env:PAPERBOAT_WINDOWS_E2E_OUTPUT 'windows-amd64-native-qualification.json'
+          & python ./packaging/windows/scripts/convert-native-qualification-evidence.py `
+            --report $report `
+            --artifacts-dir (Join-Path $env:GITHUB_WORKSPACE 'input') `
+            --version $env:GITHUB_REF_NAME `
+            --output $evidence
+          if ($LASTEXITCODE -ne 0) { throw 'Final Windows amd64 TUF evidence conversion failed.' }
+      - name: Upload final Windows amd64 native qualification evidence
+        if: matrix.publish_evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-amd64-native-release-qualification
+          path: |
+            ${{ runner.temp }}/paperboat-final-amd64-qualification/native-windows-qualification.json
+            ${{ runner.temp }}/paperboat-final-amd64-qualification/windows-amd64-native-qualification.json
+          if-no-files-found: error
+          retention-days: 14
+
+  publication:
+    name: Publish verified release
+    if: always()
+    needs: [release-unix, windows-package, windows-winget, windows-amd64-native-qualification]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+    environment:
+      name: paperboat-tuf-published
+    steps:
+      - name: Block publication unless all verified handoffs succeeded
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ needs.release-unix.result }}" != "success" || "${{ needs.windows-package.result }}" != "success" || "${{ needs.windows-winget.result }}" != "success" || "${{ needs.windows-amd64-native-qualification.result }}" != "success" ]]; then
+            echo 'Release publication is blocked because a required build, packaging, WinGet, or native Windows amd64 qualification handoff did not succeed.' >&2
+            exit 1
+          fi
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 1
+      - name: Download Unix release handoff
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-unix
+          path: dist
+      - name: Download Windows amd64 handoff
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: windows-amd64
+          path: dist
+      - name: Download Windows arm64 handoff
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: windows-arm64
+          path: dist
+      - name: Download rendered WinGet manifests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: windows-winget
+          path: dist/winget
+      - name: Download final Windows amd64 native qualification evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: windows-amd64-native-release-qualification
+          path: native-qualification
+      - name: Verify and merge Windows release handoffs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 packaging/windows/scripts/merge-signing-manifests.py \
+            --dist dist \
+            --release "${GITHUB_REF_NAME}"
+      - name: Verify native Windows amd64 evidence against final signed assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 packaging/windows/scripts/convert-native-qualification-evidence.py \
+            --report native-qualification/native-windows-qualification.json \
+            --artifacts-dir dist \
+            --version "${GITHUB_REF_NAME}" \
+            --verify-evidence native-qualification/windows-amd64-native-qualification.json
+          cp native-qualification/windows-amd64-native-qualification.json dist/
+      - name: Add certified OpenSSH compatibility metadata to release
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp internal/windowsopenssh/compatibility.json dist/windows-openssh-compatibility.json
+      - name: Verify WinGet manifests still match downloaded MSI bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp dist/winget/stable/*.yaml dist/
+          cp dist/winget/beta/*.yaml dist/
+          python3 packaging/windows/scripts/verify-winget-manifests.py --dist dist --release "${GITHUB_REF_NAME}"
+          rm -rf dist/winget
+      - name: Generate final release checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd dist && find . -maxdepth 1 -type f ! -name SHA256SUMS -print | LC_ALL=C sort | while IFS= read -r file; do sha256sum "$file"; done) > dist/SHA256SUMS
+      - name: Generate final SPDX SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
           path: dist
           format: spdx-json
           output-file: dist/paperboat.spdx.json
-      - name: Attest release assets
+      - name: Refresh checksums after SBOM generation
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd dist && find . -maxdepth 1 -type f ! -name SHA256SUMS -print | LC_ALL=C sort | while IFS= read -r file; do sha256sum "$file"; done) > dist/SHA256SUMS
+      - name: Attest final release assets and preserve provenance handoff
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: |
             dist/*.tar.gz
             dist/*.zip
+            dist/*.msi
+            dist/*.exe
+            dist/*.sha256
             dist/pb-*
             dist/pb_*
             dist/cli-*
@@ -115,6 +576,22 @@ jobs:
             dist/launcher-*
             dist/install.sh
             dist/SHA256SUMS
+            dist/*.spdx.json
+            dist/windows-signing-manifest*.json
+            dist/windows-provenance-*.json
+            dist/windows-amd64-native-qualification.json
+            dist/Pinksaucepasta.Paperboat*.yaml
+            dist/windows-openssh-compatibility.json
+      - name: Verify the offline-signed TUF release is public
+        env:
+          PAPERBOAT_TEST_TUF_REPOSITORY_URL: ${{ vars.PAPERBOAT_PRODUCTION_TUF_REPOSITORY_URL }}
+          PAPERBOAT_TEST_TUF_VERSION: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${PAPERBOAT_TEST_TUF_REPOSITORY_URL}" || { echo 'PAPERBOAT_PRODUCTION_TUF_REPOSITORY_URL is required.' >&2; exit 1; }
+          case "${PAPERBOAT_TEST_TUF_REPOSITORY_URL}" in https://*) ;; *) echo 'Production TUF repository URL must use HTTPS.' >&2; exit 1 ;; esac
+          go test ./internal/hostruntime/bootstrap -run '^TestProductionTUFRepository$' -count=1
       - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
@@ -132,7 +609,11 @@ jobs:
           tags: |
             ghcr.io/pinksaucepasta/paperboat-hosted:${{ github.ref_name }}
             ghcr.io/pinksaucepasta/paperboat-hosted:latest
-      - name: Publish GitHub release
+      - name: Publish GitHub release assets
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${GITHUB_REF_NAME}" dist/* --verify-tag --generate-notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" --verify-tag --generate-notes
+          find dist -maxdepth 1 -type f -print0 | xargs -0 gh release upload "${GITHUB_REF_NAME}" --clobber

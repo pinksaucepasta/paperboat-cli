@@ -3,9 +3,11 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 
@@ -71,7 +73,11 @@ func New(config Config) (*Installer, error) {
 	if config.Controller == nil || !filepath.IsAbs(config.ConfigRoot) || !filepath.IsAbs(config.Executable) || len(config.Arguments) == 0 || !safeAccount(config.User) || !safeAccount(config.Group) {
 		return nil, ErrInvalidDefinition
 	}
-	if config.Platform == "windows" {
+	// Executable validation concerns the filesystem on which this process is
+	// running. Target-platform render tests may deliberately produce another
+	// platform's declaration, but must still validate their local fixture using
+	// the host filesystem's security model.
+	if runtime.GOOS == "windows" {
 		if err := safeExecutableWindows(config.Executable); err != nil {
 			return nil, err
 		}
@@ -144,11 +150,19 @@ func New(config Config) (*Installer, error) {
 
 func (i *Installer) Install(ctx context.Context) error {
 	if err := ensureRoot(i.config.ConfigRoot); err != nil {
-		return err
+		return fmt.Errorf("prepare service config root: %w", err)
+	}
+	if i.config.Platform == "windows" {
+		// Windows declarations live in the fixed machine state directory, not
+		// under caller ConfigRoot. Fresh MSI and portable-host setup must be able
+		// to create that protected declaration directory themselves.
+		if err := ensureRoot(filepath.Dir(i.definitionPath)); err != nil {
+			return fmt.Errorf("prepare Windows service declaration root: %w", err)
+		}
 	}
 	definition, err := i.render()
 	if err != nil {
-		return err
+		return fmt.Errorf("render service declaration: %w", err)
 	}
 	info, statErr := os.Lstat(i.definitionPath)
 	upgrading := statErr == nil
@@ -166,7 +180,7 @@ func (i *Installer) Install(ctx context.Context) error {
 		}
 	}
 	if err := atomicWrite(i.definitionPath, definition, 0o600); err != nil {
-		return err
+		return fmt.Errorf("write service declaration: %w", err)
 	}
 	// A stable hostd cannot be reloaded through launchd without restarting it,
 	// and a systemd daemon-reload is unnecessary until the next boot for this
@@ -178,7 +192,7 @@ func (i *Installer) Install(ctx context.Context) error {
 	activateUpgrade := upgrading && i.config.UpgradeMode != UpgradeReload
 	if err := i.config.Controller.Apply(ctx, i.definitionPath, activateUpgrade); err != nil {
 		rollbackErr := i.rollback(ctx, previous, upgrading)
-		return errors.Join(err, rollbackErr)
+		return errors.Join(fmt.Errorf("apply service declaration: %w", err), rollbackErr)
 	}
 	return nil
 }
@@ -190,7 +204,7 @@ func (i *Installer) rollback(ctx context.Context, previous []byte, upgrading boo
 		if errors.Is(removeErr, os.ErrNotExist) {
 			removeErr = nil
 		}
-		return errors.Join(managerErr, removeErr, syncDirectory(filepath.Dir(i.definitionPath)))
+		return errors.Join(managerErr, removeErr, syncServiceDirectory(filepath.Dir(i.definitionPath)))
 	}
 	if err := atomicWrite(i.definitionPath, previous, 0o600); err != nil {
 		return err
@@ -204,7 +218,7 @@ func (i *Installer) Uninstall(ctx context.Context) error {
 	if err := os.Remove(i.definitionPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	return syncDirectory(filepath.Dir(i.definitionPath))
+	return syncServiceDirectory(filepath.Dir(i.definitionPath))
 }
 func (i *Installer) DefinitionPath() string { return i.definitionPath }
 
@@ -246,17 +260,22 @@ func renderLaunchd(config Config) ([]byte, error) {
 	definition := struct {
 		Label                string            `plist:"Label"`
 		ProcessType          string            `plist:"ProcessType"`
-		UserName             string            `plist:"UserName"`
-		GroupName            string            `plist:"GroupName"`
+		UserName             string            `plist:"UserName,omitempty"`
+		GroupName            string            `plist:"GroupName,omitempty"`
 		ProgramArguments     []string          `plist:"ProgramArguments"`
 		EnvironmentVariables map[string]string `plist:"EnvironmentVariables"`
 		RunAtLoad            bool              `plist:"RunAtLoad"`
 		KeepAlive            any               `plist:"KeepAlive"`
 		Umask                uint64            `plist:"Umask"`
 	}{
-		Label: label, ProcessType: "Background", UserName: config.User, GroupName: config.Group,
+		Label: label, ProcessType: "Background",
 		ProgramArguments:     append([]string{config.Executable}, config.Arguments...),
 		EnvironmentVariables: config.Environment, RunAtLoad: true, KeepAlive: keepAlive, Umask: 0o77,
+	}
+	// launchd user agents inherit the logged-in user and reject UserName and
+	// GroupName keys. System services retain explicit identity fields.
+	if config.Kind == WorkerKind || config.Kind == HostKind || config.Kind == HostdKind || config.Kind == UpdaterKind {
+		definition.UserName, definition.GroupName = config.User, config.Group
 	}
 	return plist.MarshalIndent(definition, plist.XMLFormat, "  ")
 }
@@ -378,29 +397,10 @@ func systemdEscape(value string) string {
 
 func atomicWrite(path string, data []byte, mode os.FileMode) error {
 	directory := filepath.Dir(path)
-	if err := os.MkdirAll(directory, 0o755); err != nil {
+	if err := prepareAtomicDirectory(directory); err != nil {
 		return err
-	}
-	info, err := os.Lstat(directory)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return ErrInvalidDefinition
-	}
-	if err := os.Chmod(directory, 0o755); err != nil {
-		return err
-	}
-	info, err = os.Lstat(directory)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o755 {
-		return ErrInvalidDefinition
 	}
 	return atomicfile.Write(path, data, atomicfile.Options{Mode: mode, OwnerUID: -1, OwnerGID: -1})
-}
-func syncDirectory(path string) error {
-	directory, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer directory.Close()
-	return directory.Sync()
 }
 func safeExecutable(path string) error {
 	info, err := os.Lstat(path)

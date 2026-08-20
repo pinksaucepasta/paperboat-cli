@@ -5,6 +5,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
@@ -35,7 +37,11 @@ func environmentValue(environment []string, key string) string {
 }
 
 func TestShellLauncherStartsValidatedLoginShell(t *testing.T) {
-	shellPath := filepath.Join(t.TempDir(), "shell")
+	shellName := "shell"
+	if runtime.GOOS == "windows" {
+		shellName = "pwsh.exe"
+	}
+	shellPath := filepath.Join(t.TempDir(), shellName)
 	if err := os.WriteFile(shellPath, []byte("#!/bin/sh\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +63,8 @@ func TestShellLauncherStartsValidatedLoginShell(t *testing.T) {
 		t.Fatalf("shell creates=%d", len(runtime.created))
 	}
 	command := runtime.created[0].Command
-	if command.Path != resolvedShellPath || len(command.Args) != 1 || command.Args[0] != "-l" || command.CWD != "/tmp" || command.Dimensions != dimensions {
+	wantArgs := platformShellArguments(resolvedShellPath)
+	if command.Path != resolvedShellPath || !slices.Equal(command.Args, wantArgs) || command.CWD != "/tmp" || command.Dimensions != dimensions {
 		t.Fatalf("command = %#v", command)
 	}
 	if environmentValue(command.Env, "TERM") != "xterm-ghostty" || environmentValue(command.Env, "COLORTERM") != "truecolor" {

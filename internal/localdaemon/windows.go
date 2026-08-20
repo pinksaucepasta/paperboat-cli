@@ -4,9 +4,7 @@ package localdaemon
 
 import (
 	"context"
-	"errors"
 	"net"
-	"os"
 	"time"
 
 	"github.com/pinksaucepasta/paperboat/internal/api"
@@ -14,11 +12,6 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/localapi"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/transportmanager"
 )
-
-// ErrWindowsHostModeUnavailable is deliberately explicit. Windows release
-// artifacts are buildable now, but host-mode local API and ConPTY brokering
-// are not enabled until the Windows service implementation is complete.
-var ErrWindowsHostModeUnavailable = errors.New("Windows host mode is not available yet")
 
 type ManagedSSHConfig struct {
 	ServerURL            string
@@ -37,6 +30,7 @@ type DaemonConfig struct {
 	Source                  MachineSource
 	OwnerUID                int
 	OwnerGID                int
+	OwnerSID                string
 	RefreshInterval         time.Duration
 	RequestTimeout          time.Duration
 	Clock                   func() time.Time
@@ -50,16 +44,22 @@ type DaemonConfig struct {
 	FileTransfers           localapi.FileTransferBroker
 }
 
-func Run(context.Context, DaemonConfig) error { return ErrWindowsHostModeUnavailable }
+func Run(ctx context.Context, config DaemonConfig) error { return runWindowsDaemon(ctx, config) }
 
-func CurrentUserPaths() (localapi.Paths, error) {
-	return localapi.CurrentPaths(os.Getuid())
+// CurrentUserPaths returns the stable per-user state layout. Windows has no
+// numeric UID, so the path resolver receives a validated non-negative marker;
+// authorization is carried by the current user's SID through DaemonConfig and
+// the named-pipe server.
+func CurrentUserPaths() (localapi.Paths, error) { return localapi.CurrentPaths(0) }
+
+// CurrentUserSID is exported for callers that construct a daemon explicitly
+// or need to display the enrolled Windows owner in diagnostics.
+func CurrentUserSID() (string, error) { return currentWindowsUserSID() }
+
+func InstallCurrentUserService(ctx context.Context, executable, configPath, serverURL string) error {
+	return installWindowsCurrentUserService(ctx, executable, configPath, serverURL)
 }
 
-func InstallCurrentUserService(context.Context, string, string, string) error {
-	return ErrWindowsHostModeUnavailable
-}
-
-func RemoveCurrentUserService(context.Context, string) error {
-	return ErrWindowsHostModeUnavailable
+func RemoveCurrentUserService(ctx context.Context, executable string) error {
+	return removeWindowsCurrentUserService(ctx, executable)
 }

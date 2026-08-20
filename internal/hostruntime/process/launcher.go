@@ -53,7 +53,7 @@ func (l *ShellLauncher) Launch(ctx context.Context, request LaunchRequest) (sess
 		return session.Snapshot{}, ErrLaunchRejected
 	}
 	environment = replaceEnvironment(environment, "PAPERBOAT_TERMINAL_SESSION_ID", request.ID)
-	command := pty.Command{Path: l.path, Args: []string{"-l"}, Env: environment, CWD: request.CWD, Dimensions: request.Dimensions}
+	command := pty.Command{Path: l.path, Args: platformShellArguments(l.path), Env: environment, CWD: request.CWD, Dimensions: request.Dimensions}
 	return l.sessions.Create(ctx, session.CreateRequest{ID: request.ID, Name: request.Name, Command: command})
 }
 

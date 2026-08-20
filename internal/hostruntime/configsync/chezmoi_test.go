@@ -3,6 +3,7 @@ package configsync
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -51,6 +52,9 @@ func TestPlaintextRepositoryAllowsLiteralEncryptedFilename(t *testing.T) {
 }
 
 func TestChezmoiSourceConfiguresPlaintextAndAddWithoutEncryption(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell recorder fixture; native Windows chezmoi execution is qualified by runtime tests")
+	}
 	root, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)

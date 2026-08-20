@@ -65,7 +65,7 @@ func TestResolutionCommitRoundTripIsPrivatePlaintextAndBindingChecked(t *testing
 		t.Fatalf("journal is not readable plaintext: %v", err)
 	}
 	info, err := os.Lstat(path)
-	if err != nil || info.Mode().Perm()&0o077 != 0 {
+	if err != nil || !privateControlFile(path, info) {
 		t.Fatalf("journal permissions = %v, %v", info.Mode(), err)
 	}
 	decoded, err := readResolutionCommit(path)

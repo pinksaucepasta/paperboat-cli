@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -53,6 +54,9 @@ func (p *pipeProcess) Start(context.Context) error {
 	}
 	cmd := osExec.Command(path, p.config.Request.Argv[1:]...)
 	cmd.Args[0], cmd.Dir, cmd.Env = p.config.Request.Argv[0], p.config.Request.CWD, environment
+	// Start suspended so the process cannot exit or create descendants before
+	// Paperboat assigns it to the kill-on-close Job Object.
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: windows.CREATE_SUSPENDED}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err
@@ -89,6 +93,15 @@ func (p *pipeProcess) Start(context.Context) error {
 		return err
 	}
 	windows.Close(processHandle)
+	if err := resumeProcessThreads(uint32(cmd.Process.Pid)); err != nil {
+		windows.Close(job)
+		_ = cmd.Process.Kill()
+		_ = stdin.Close()
+		_ = stdout.Close()
+		_ = stderr.Close()
+		_ = cmd.Wait()
+		return err
+	}
 	p.cmd, p.stdin, p.job = cmd, stdin, job
 	var readers sync.WaitGroup
 	readers.Add(2)
@@ -108,6 +121,46 @@ func (p *pipeProcess) Start(context.Context) error {
 		p.job = 0
 		close(p.done)
 	}()
+	return nil
+}
+
+func resumeProcessThreads(processID uint32) error {
+	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPTHREAD, 0)
+	if err != nil {
+		return err
+	}
+	defer windows.Close(snapshot)
+	entry := windows.ThreadEntry32{Size: uint32(unsafe.Sizeof(windows.ThreadEntry32{}))}
+	if err := windows.Thread32First(snapshot, &entry); err != nil {
+		return err
+	}
+	resumed := false
+	for {
+		if entry.OwnerProcessID == processID {
+			thread, openErr := windows.OpenThread(windows.THREAD_SUSPEND_RESUME, false, entry.ThreadID)
+			if openErr != nil {
+				return openErr
+			}
+			previous, resumeErr := windows.ResumeThread(thread)
+			windows.Close(thread)
+			if resumeErr != nil || previous == ^uint32(0) {
+				if resumeErr != nil {
+					return resumeErr
+				}
+				return errors.New("resume suspended exec thread")
+			}
+			resumed = true
+		}
+		if err := windows.Thread32Next(snapshot, &entry); err != nil {
+			if errors.Is(err, syscall.ERROR_NO_MORE_FILES) {
+				break
+			}
+			return err
+		}
+	}
+	if !resumed {
+		return errors.New("suspended exec thread not found")
+	}
 	return nil
 }
 func (p *pipeProcess) copyOutput(stream string, reader io.Reader) {

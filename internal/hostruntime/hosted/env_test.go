@@ -4,12 +4,13 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
 func TestFromEnvLoadsCatalogPresetsWithoutSecrets(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "codex.sh"), []byte("echo codex\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "codex"+hostedPresetExtension()), []byte("echo codex\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	values := map[string]string{
@@ -36,10 +37,10 @@ func TestFromEnvRejectsPresetSymlinkAndWritableFile(t *testing.T) {
 			if err := os.WriteFile(target, []byte("echo x"), 0o644); err != nil {
 				return err
 			}
-			return os.Symlink(target, filepath.Join(dir, "codex.sh"))
+			return os.Symlink(target, filepath.Join(dir, "codex"+hostedPresetExtension()))
 		}},
 		{name: "writable", prepare: func(dir string) error {
-			path := filepath.Join(dir, "codex.sh")
+			path := filepath.Join(dir, "codex"+hostedPresetExtension())
 			if err := os.WriteFile(path, []byte("echo x"), 0o644); err != nil {
 				return err
 			}
@@ -47,6 +48,9 @@ func TestFromEnvRejectsPresetSymlinkAndWritableFile(t *testing.T) {
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if runtime.GOOS == "windows" && tc.name == "writable" {
+				t.Skip("Windows permission checks are ACL-based; os.Chmod does not change the DACL")
+			}
 			dir := t.TempDir()
 			if err := tc.prepare(dir); err != nil {
 				t.Fatal(err)

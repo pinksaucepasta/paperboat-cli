@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -36,9 +38,12 @@ func TestPreviewCreatePrintsPublicURLAndAcknowledgement(t *testing.T) {
 		_, _ = writer.Write([]byte(`{"data":{"id":"prv_1","environment_id":"env_1","logical_name":"web","preview_key":"p-abcdefghijklmnopqrstuvwxyz","url":"https://p-abcdefghijklmnopqrstuvwxyz.preview.test","target_port":3000,"state":"registering"}}`))
 	}))
 	defer server.Close()
-	tokenFile := t.TempDir() + "/token"
+	tokenFile := filepath.Join(t.TempDir(), "token")
 	if err := os.WriteFile(tokenFile, []byte("local-agent-token-01234567890123456789\n"), 0o600); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := readPreviewAuthorizationToken(tokenFile); err != nil {
+		t.Fatalf("read preview authorization token: %v", err)
 	}
 	t.Setenv("PAPERBOAT_PREVIEW_REGISTRATION_ENDPOINT", server.URL+"/v1/preview-registrations")
 	t.Setenv("PAPERBOAT_RUNTIME_AGENT_TOKEN_FILE", tokenFile)
@@ -52,7 +57,10 @@ func TestPreviewCreatePrintsPublicURLAndAcknowledgement(t *testing.T) {
 }
 
 func TestPreviewRejectsInsecureTokenFile(t *testing.T) {
-	tokenFile := t.TempDir() + "/token"
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX mode bits are not a Windows authorization boundary")
+	}
+	tokenFile := filepath.Join(t.TempDir(), "token")
 	if err := os.WriteFile(tokenFile, []byte("local-agent-token-01234567890123456789\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}

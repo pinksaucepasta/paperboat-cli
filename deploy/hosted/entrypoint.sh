@@ -158,6 +158,16 @@ start_sshd() {
     trap - EXIT HUP INT TERM
   fi
   [ -f "$ssh_state/ssh_host_ed25519_key" ] && [ "$(stat -c '%u:%g:%a' "$ssh_state/ssh_host_ed25519_key")" = "0:0:600" ] || fail "unsafe hosted SSH private host key"
+  ssh_host_public=/etc/ssh/ssh_host_ed25519_key.pub
+  [ ! -L "$ssh_host_public" ] || fail "unsafe hosted SSH host-key path"
+  temporary_public="$ssh_state/.ssh_host_ed25519_key.pub.$$"
+  trap 'rm -f "$temporary_public"' EXIT HUP INT TERM
+  ssh-keygen -q -y -f "$ssh_state/ssh_host_ed25519_key" >"$temporary_public"
+  chmod 0644 "$temporary_public"
+  install -m 0644 -o root -g root "$temporary_public" "$ssh_host_public"
+  rm -f "$temporary_public"
+  trap - EXIT HUP INT TERM
+  [ -f "$ssh_host_public" ] && [ "$(stat -c '%u:%g:%a' "$ssh_host_public")" = "0:0:644" ] || fail "unsafe hosted SSH public host key"
   install -d -m 0755 /run/sshd
   ssh_config=/run/paperboat-sshd_config
   cat >"$ssh_config" <<EOF

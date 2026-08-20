@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -25,6 +26,7 @@ import (
 
 	"github.com/charmbracelet/x/ansi"
 	"github.com/pinksaucepasta/paperboat/internal/api"
+	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
 	bugreportpkg "github.com/pinksaucepasta/paperboat/internal/bugreport"
 	"github.com/pinksaucepasta/paperboat/internal/buildinfo"
 	"github.com/pinksaucepasta/paperboat/internal/command"
@@ -33,6 +35,7 @@ import (
 	doctorpkg "github.com/pinksaucepasta/paperboat/internal/doctor"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/identity"
 	"github.com/pinksaucepasta/paperboat/internal/httptransport"
+	"github.com/pinksaucepasta/paperboat/internal/inbox"
 	"github.com/pinksaucepasta/paperboat/internal/localapi"
 	"github.com/pinksaucepasta/paperboat/internal/localdaemon"
 	"github.com/pinksaucepasta/paperboat/internal/localwait"
@@ -50,7 +53,14 @@ import (
 func TestOpenSSHArgumentsPlacesRemoteCommandAfterDestination(t *testing.T) {
 	destination := managedssh.Destination{User: "root", Host: "machine.pprbt", Port: 2222}
 	got := openSSHArguments(destination, []string{"printf ssh-ok"}, true)
-	want := []string{"-p", "2222", "root@machine.pprbt", "printf ssh-ok"}
+	want := []string{
+		"-o", "BatchMode=yes",
+		"-o", "IdentitiesOnly=yes",
+		"-o", "PreferredAuthentications=publickey",
+		"-o", "PasswordAuthentication=no",
+		"-o", "KbdInteractiveAuthentication=no",
+		"-p", "2222", "root@machine.pprbt", "printf ssh-ok",
+	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("openSSHArguments() = %q, want %q", got, want)
 	}
@@ -404,6 +414,18 @@ func TestUserFacingErrorSanitizesInfrastructureFailures(t *testing.T) {
 			err:  identitybootstrap.ErrPairingRequired,
 			want: "needs the account recovery key",
 		},
+		{
+			name:   "peer transport details",
+			err:    fmt.Errorf("open machine: %w", &connectionmanager.Failure{Path: connectionmanager.PathRelayQUIC, Class: connectionmanager.FailureTransient, Cause: errors.New("read Noise response (prologue=secret fingerprint=private handle=private): E2EE authentication failed")}),
+			want:   "secure connection could not be established",
+			forbid: []string{"e2ee", "noise", "fingerprint", "handle", "secret", "connectionmanager", "peer path", "class"},
+		},
+		{
+			name:   "peer deadline details",
+			err:    fmt.Errorf("open machine: %w", &connectionmanager.Failure{Path: connectionmanager.PathRelayQUIC, Class: connectionmanager.FailureTransient, Cause: context.DeadlineExceeded}),
+			want:   "secure connection could not be established",
+			forbid: []string{"peer path", "class", "deadline exceeded"},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -715,7 +737,7 @@ func TestCollectLocalDoctorReportsMachineInboxCredentialAndPreviews(t *testing.T
 		t.Fatal(err)
 	}
 	inboxPath := filepath.Join(root, "Paperboat Inbox")
-	if err := os.Mkdir(inboxPath, 0o700); err != nil {
+	if err := inbox.EnsurePath(inboxPath); err != nil {
 		t.Fatal(err)
 	}
 	key := store.Current()
@@ -1246,7 +1268,7 @@ func TestMachineTransportSnapshotRetainsAutoMarkerForMixedPaths(t *testing.T) {
 
 func TestCanonicalCommandsAreDiscoverable(t *testing.T) {
 	root := newRootCommand()
-	for _, path := range [][]string{{"login"}, {"logout"}, {"pair"}, {"session", "attach"}, {"session", "list"}, {"machine", "add"}, {"machine", "list"}, {"machine", "revoke"}, {"machine", "availability"}, {"preview", "list"}, {"preview", "revoke"}} {
+	for _, path := range [][]string{{"login"}, {"logout"}, {"pair"}, {"session", "attach"}, {"session", "list"}, {"machine", "add"}, {"machine", "list"}, {"machine", "rename"}, {"machine", "revoke"}, {"machine", "availability"}, {"preview", "list"}, {"preview", "revoke"}} {
 		command, remaining, err := root.Find(path)
 		if err != nil || len(remaining) != 0 || command == root {
 			t.Fatalf("command %q not discoverable: command=%v remaining=%q err=%v", path, command, remaining, err)
@@ -1647,7 +1669,7 @@ func TestMachineHomeActionsFollowConfiguredCapabilities(t *testing.T) {
 	for index, action := range actions {
 		ids[index] = action.ID
 	}
-	if !slices.Equal(ids, []string{"send", "preview", "previews"}) {
+	if !slices.Equal(ids, []string{"rename", "send", "preview", "previews"}) {
 		t.Fatalf("receive actions=%v", ids)
 	}
 	machine.SetupMode = "host"
@@ -1657,7 +1679,7 @@ func TestMachineHomeActionsFollowConfiguredCapabilities(t *testing.T) {
 	for _, action := range actions {
 		ids = append(ids, action.ID)
 	}
-	if !slices.Equal(ids, []string{"terminal", "codex", "send", "preview", "sessions", "previews", "allow-sleep", "keep-awake"}) {
+	if !slices.Equal(ids, []string{"rename", "terminal", "codex", "send", "preview", "sessions", "previews", "allow-sleep", "keep-awake"}) {
 		t.Fatalf("host actions=%v", ids)
 	}
 }
@@ -1793,6 +1815,17 @@ func TestConfigCommandsAreDiscoverableAndUnassignRequiresConfirmation(t *testing
 
 func TestCompatibilityOnlyCommandsAreAbsent(t *testing.T) {
 	root := newRootCommand()
+	var help bytes.Buffer
+	root.SetOut(&help)
+	root.SetErr(&help)
+	root.SetArgs([]string{"--help"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("help err=%v", err)
+	}
+	if strings.Contains(strings.ToLower(help.String()), "e2ee") || strings.Contains(strings.ToLower(help.String()), "noise") {
+		t.Fatalf("public help exposes private transport internals: %q", help.String())
+	}
+	root = newRootCommand()
 	for _, child := range root.Commands() {
 		if child.Name() == "e2ee" {
 			t.Fatal("internal transport encryption is still exposed as a public command")
@@ -1821,7 +1854,7 @@ func TestCompatibilityOnlyCommandsAreAbsent(t *testing.T) {
 
 func TestPrivateTransportLifecycleIsIntegratedIntoPublicWorkflows(t *testing.T) {
 	root := newRootCommand()
-	for _, path := range []string{"auth login", "machine pending", "machine approve", "setup"} {
+	for _, path := range []string{"auth login", "setup"} {
 		entry, _, err := root.Find(strings.Fields(path))
 		if err != nil || entry.CommandPath() != "pb "+path {
 			t.Fatalf("find %q command=%v err=%v", path, entry, err)
@@ -2033,41 +2066,25 @@ func TestMachineRevokeJSONOutputContract(t *testing.T) {
 	}
 }
 
-func TestMachineAddUsesServerOwnedMachinesURL(t *testing.T) {
+func TestMachineAddPrintsOneShotEnrollmentCommands(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.json")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.URL.Path != "/v1/client-configuration" {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/machine-enrollments" {
 			http.NotFound(w, r)
 			return
 		}
-		if authorization := r.Header.Get("Authorization"); authorization != "" {
-			t.Fatalf("authorization=%q", authorization)
-		}
-		writeAPIData(t, w, api.ClientConfiguration{
-			Version:            "1",
-			CLIVerificationURL: "https://dashboard.paperboat.test/cli/authorize",
-			MachinesURL:        "https://dashboard.paperboat.test/dashboard/machines",
-		})
+		writeAPIData(t, w, api.MachineEnrollmentStart{ID: "ume_1", BootstrapToken: "one-shot-token", ServerURL: "https://api.paperboat.test"})
 	}))
 	defer srv.Close()
 	writeTestProfile(t, dir, configPath, srv.URL)
 
-	originalOpenBrowser := openBrowser
-	t.Cleanup(func() { openBrowser = originalOpenBrowser })
-	var opened string
-	openBrowser = func(target string) error {
-		opened = target
-		return nil
-	}
-
 	var output bytes.Buffer
-	if code := run(context.Background(), []string{"--config", configPath, "machine", "add"}, &output, &output); code != 0 {
+	if code := run(context.Background(), []string{"--config", configPath, "machine", "add", "--role", "client", "--name", "Victus"}, &output, &output); code != 0 {
 		t.Fatalf("exit=%d output=%q", code, output.String())
 	}
-	want := "https://dashboard.paperboat.test/dashboard/machines"
-	if opened != want || !strings.Contains(output.String(), "Continue machine enrollment at "+want) {
-		t.Fatalf("opened=%q output=%q", opened, output.String())
+	if !strings.Contains(output.String(), "Victus-one-shot-token") || !strings.Contains(output.String(), "get.pprbt.dev/install?p=") || strings.Contains(output.String(), "--setup-mode") || strings.Contains(output.String(), "PAPERBOAT_SERVER") {
+		t.Fatalf("output=%q", output.String())
 	}
 }
 
@@ -2136,6 +2153,9 @@ func TestConnectDoesNotExposeSessionOverrides(t *testing.T) {
 }
 
 func TestConnectWithoutServerDoesNotRunLocalShell(t *testing.T) {
+	previousDefault := buildinfo.DefaultServerURL
+	buildinfo.DefaultServerURL = ""
+	t.Cleanup(func() { buildinfo.DefaultServerURL = previousDefault })
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.json")
 	if err := os.WriteFile(configPath, []byte(`{}`), 0o600); err != nil {
@@ -2148,6 +2168,9 @@ func TestConnectWithoutServerDoesNotRunLocalShell(t *testing.T) {
 }
 
 func TestDoctorReturnsFailureWhenBackendIsUnconfigured(t *testing.T) {
+	previousDefault := buildinfo.DefaultServerURL
+	buildinfo.DefaultServerURL = ""
+	t.Cleanup(func() { buildinfo.DefaultServerURL = previousDefault })
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
 	if err := os.WriteFile(path, []byte(`{"connect":{"ready_timeout_seconds":30,"poll_interval_seconds":1}}`), 0o600); err != nil {
@@ -2543,7 +2566,7 @@ func TestListLocalPrivateServesReadsOwnerOnlyDescriptor(t *testing.T) {
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(directory, "docs.json"), data, 0o600); err != nil {
+	if err := atomicfile.Write(filepath.Join(directory, "docs.json"), data, atomicfile.Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1}); err != nil {
 		t.Fatal(err)
 	}
 	items := listLocalPrivateServes()
@@ -2600,14 +2623,14 @@ func TestEnrichLocalServeSources(t *testing.T) {
 	descriptor := func(id, path string) []byte {
 		return []byte(fmt.Sprintf(`{"schema":"paperboat.preview-runtime/v1","record":{"id":%q},"serve":{"source_path":%q}}`, id, path))
 	}
-	if err := os.WriteFile(filepath.Join(directory, "valid.json"), descriptor("served", source), 0o600); err != nil {
+	if err := atomicfile.Write(filepath.Join(directory, "valid.json"), descriptor("served", source), atomicfile.Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1}); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(directory, "permissive.json"), descriptor("unsafe", "/private/unsafe"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	target := filepath.Join(directory, "target")
-	if err := os.WriteFile(target, descriptor("linked", "/private/linked"), 0o600); err != nil {
+	if err := atomicfile.Write(target, descriptor("linked", "/private/linked"), atomicfile.Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1}); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Symlink(target, filepath.Join(directory, "linked.json")); err != nil {
@@ -2660,11 +2683,7 @@ func TestWriteStatusIncludesOperationalFieldsAndSafeHealth(t *testing.T) {
 }
 
 func TestDoctorCommandUsesOwnerSocketAndStableJSON(t *testing.T) {
-	root, err := os.MkdirTemp("/tmp", "pb-doctor-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	root := commandRuntimeTestRoot(t)
 	home, runtimeRoot := filepath.Join(root, "home"), filepath.Join(root, "runtime")
 	for _, directory := range []string{home, runtimeRoot} {
 		if err := os.Mkdir(directory, 0o700); err != nil {
@@ -2696,7 +2715,11 @@ func TestDoctorCommandUsesOwnerSocketAndStableJSON(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server, err := localapi.NewServer(localapi.ServerConfig{SocketPath: paths.SocketPath, OwnerUID: os.Geteuid(), OwnerGID: os.Getegid(), Source: store})
+	serverConfig, err := commandLocalAPIServerConfig(paths.SocketPath, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := localapi.NewServer(serverConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2729,11 +2752,7 @@ func TestDoctorCommandUsesOwnerSocketAndStableJSON(t *testing.T) {
 }
 
 func TestWaitCommandUsesLocalWatchAndStableExitResults(t *testing.T) {
-	root, err := os.MkdirTemp("/tmp", "pb-wait-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	root := commandRuntimeTestRoot(t)
 	home := filepath.Join(root, "home")
 	runtimeRoot := filepath.Join(root, "runtime")
 	for _, directory := range []string{home, runtimeRoot} {
@@ -2758,7 +2777,11 @@ func TestWaitCommandUsesLocalWatchAndStableExitResults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server, err := localapi.NewServer(localapi.ServerConfig{SocketPath: paths.SocketPath, OwnerUID: os.Geteuid(), OwnerGID: os.Getegid(), Source: store})
+	serverConfig, err := commandLocalAPIServerConfig(paths.SocketPath, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := localapi.NewServer(serverConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2777,11 +2800,13 @@ func TestWaitCommandUsesLocalWatchAndStableExitResults(t *testing.T) {
 	}
 	stdout.Reset()
 	stderr.Reset()
-	if code := run(context.Background(), []string{"wait", "machine_1", "--for", "transport", "--timeout", "20ms", "--json"}, &stdout, &stderr); code != 1 {
-		t.Fatalf("unpaired code=%d stdout=%s stderr=%s", code, stdout.String(), stderr.String())
-	}
-	if stdout.Len() != 0 || !strings.Contains(stderr.String(), "not paired for private transport") {
-		t.Fatalf("stdout=%q stderr=%q", stdout.String(), stderr.String())
+	if runtime.GOOS != "windows" {
+		if code := run(context.Background(), []string{"wait", "machine_1", "--for", "transport", "--timeout", "20ms", "--json"}, &stdout, &stderr); code != 1 {
+			t.Fatalf("unpaired code=%d stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+		}
+		if stdout.Len() != 0 || !strings.Contains(stderr.String(), "not paired for private transport") {
+			t.Fatalf("stdout=%q stderr=%q", stdout.String(), stderr.String())
+		}
 	}
 	cancel()
 	if err := <-done; !errors.Is(err, context.Canceled) {
@@ -2806,11 +2831,7 @@ func (s *commandDiagnosticService) CreateBugreport(context.Context) (diagnostics
 }
 
 func TestBugreportCommandUsesDaemonBundleAndStableJSON(t *testing.T) {
-	root, err := os.MkdirTemp("/tmp", "pb-bugreport-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	root := commandRuntimeTestRoot(t)
 	home, runtimeRoot := filepath.Join(root, "home"), filepath.Join(root, "runtime")
 	for _, directory := range []string{home, runtimeRoot} {
 		if err := os.Mkdir(directory, 0o700); err != nil {
@@ -2830,11 +2851,16 @@ func TestBugreportCommandUsesDaemonBundleAndStableJSON(t *testing.T) {
 	store, _ := localapi.NewSnapshotStore(&snapshot)
 	bundlePath := filepath.Join(root, "bugreport-pb-0123456789abcdef0123456789abcdef.zip")
 	content := []byte("PK command bundle")
-	if err := os.WriteFile(bundlePath, content, 0o600); err != nil {
+	if err := atomicfile.Write(bundlePath, content, atomicfile.Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1}); err != nil {
 		t.Fatal(err)
 	}
 	diagnosticService := &commandDiagnosticService{bundle: diagnostics.Bundle{Schema: diagnostics.BundleSchemaV1, Correlation: "pb-0123456789abcdef0123456789abcdef", CreatedAt: now, Path: bundlePath, Bytes: int64(len(content)), Categories: []string{"manifest", "recent_events", "redacted_events", "status"}}}
-	server, err := localapi.NewServer(localapi.ServerConfig{SocketPath: paths.SocketPath, OwnerUID: os.Geteuid(), OwnerGID: os.Getegid(), Source: store, Diagnostics: diagnosticService})
+	serverConfig, err := commandLocalAPIServerConfig(paths.SocketPath, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverConfig.Diagnostics = diagnosticService
+	server, err := localapi.NewServer(serverConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2849,7 +2875,7 @@ func TestBugreportCommandUsesDaemonBundleAndStableJSON(t *testing.T) {
 	command.SetErr(&stderr)
 	command.SetArgs([]string{"bugreport", "--record", "--json"})
 	if err := command.ExecuteContext(ctx); err != nil {
-		t.Fatal(err)
+		t.Fatalf("execute error=%T %v stdout=%q stderr=%q", err, err, stdout.String(), stderr.String())
 	}
 	var result bugreportpkg.Result
 	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil || result.Validate() != nil || !result.BundleCreated || !result.Recorded || result.Uploaded || !slices.Equal(diagnosticService.markers, []string{"start", "end"}) {
@@ -2898,26 +2924,8 @@ func TestRefreshingBugreportServerRetriesAuthorizationWithSameKey(t *testing.T) 
 	}
 }
 
-func waitForCommandSocket(t *testing.T, path string) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		connection, err := net.DialTimeout("unix", path, 20*time.Millisecond)
-		if err == nil {
-			_ = connection.Close()
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	t.Fatalf("local command socket %s was not ready", path)
-}
-
 func TestLocalDaemonSnapshotInstallsOnlyForUnavailableSocket(t *testing.T) {
-	root, err := os.MkdirTemp("/tmp", "pb-daemon-start-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	root := commandRuntimeTestRoot(t)
 	home := filepath.Join(root, "home")
 	runtimeRoot := filepath.Join(root, "runtime")
 	for _, directory := range []string{home, runtimeRoot} {
@@ -2950,7 +2958,11 @@ func TestLocalDaemonSnapshotInstallsOnlyForUnavailableSocket(t *testing.T) {
 		if !filepath.IsAbs(executable) || configPath != filepath.Join(root, "config.json") || server != "https://api.paperboat.test" {
 			t.Fatalf("executable=%q config=%q server=%q", executable, configPath, server)
 		}
-		localServer, err := localapi.NewServer(localapi.ServerConfig{SocketPath: paths.SocketPath, OwnerUID: os.Geteuid(), OwnerGID: os.Getegid(), Source: store})
+		serverConfig, err := commandLocalAPIServerConfig(paths.SocketPath, store)
+		if err != nil {
+			return err
+		}
+		localServer, err := localapi.NewServer(serverConfig)
 		if err != nil {
 			return err
 		}
@@ -2983,7 +2995,7 @@ func TestLocalDaemonSnapshotInstallsOnlyForUnavailableSocket(t *testing.T) {
 }
 
 func TestResolveSSHCommandTargetFastUsesWarmSnapshotAndCache(t *testing.T) {
-	root := t.TempDir()
+	root := commandRuntimeTestRoot(t)
 	home := filepath.Join(root, "home")
 	runtimeRoot := filepath.Join(root, "runtime")
 	for _, directory := range []string{home, runtimeRoot} {
@@ -3051,7 +3063,11 @@ func TestResolveSSHCommandTargetFastUsesWarmSnapshotAndCache(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server, err := localapi.NewServer(localapi.ServerConfig{SocketPath: paths.SocketPath, OwnerUID: os.Geteuid(), OwnerGID: os.Getegid(), Source: store})
+	serverConfig, err := commandLocalAPIServerConfig(paths.SocketPath, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := localapi.NewServer(serverConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3107,7 +3123,7 @@ func TestResolveSSHCommandTargetFastUsesWarmSnapshotAndCache(t *testing.T) {
 }
 
 func TestSelectTerminalSessionPrefersWarmMachineSnapshot(t *testing.T) {
-	root := t.TempDir()
+	root := commandRuntimeTestRoot(t)
 	runtimeRoot := filepath.Join(root, "runtime")
 	if err := os.MkdirAll(runtimeRoot, 0o700); err != nil {
 		t.Fatal(err)
@@ -3146,7 +3162,11 @@ func TestSelectTerminalSessionPrefersWarmMachineSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server, err := localapi.NewServer(localapi.ServerConfig{SocketPath: paths.SocketPath, OwnerUID: os.Geteuid(), OwnerGID: os.Getegid(), Source: store})
+	serverConfig, err := commandLocalAPIServerConfig(paths.SocketPath, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := localapi.NewServer(serverConfig)
 	if err != nil {
 		t.Fatal(err)
 	}

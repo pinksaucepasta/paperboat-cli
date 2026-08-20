@@ -1,4 +1,4 @@
-//go:build darwin || linux
+//go:build darwin || linux || windows
 
 package runtime
 
@@ -109,6 +109,7 @@ type Host struct {
 	sessions            *session.Manager
 	health              *runtimeHealthSource
 	transferRoot        string
+	cleanupUnstarted    func() error
 	workloadMu          sync.Mutex
 	workloadGeneration  uint64
 	workloadFingerprint string
@@ -211,7 +212,7 @@ func NewReceiveCoordinator(ctx context.Context, config HostConfig, dependencies 
 		return nil, err
 	}
 	healthSource.set(runtime, components)
-	return &Host{runtime: runtime, http: httpService, handler: mux}, nil
+	return &Host{runtime: runtime, http: httpService, handler: mux, cleanupUnstarted: durable.Close}, nil
 }
 
 func transferWorkloadCount(root string) uint64 {
@@ -401,23 +402,9 @@ func NewHost(ctx context.Context, config HostConfig, dependencies HostDependenci
 	if err != nil {
 		return nil, err
 	}
-	var codexHTTPHandler http.Handler
-	if dependencies.CodexSessions != nil {
-		codexMux := http.NewServeMux()
-		codexHandler, codexErr := codexsession.NewHandler(codexsession.HandlerConfig{Manager: dependencies.CodexSessions, Authorizer: dependencies.Authorizer})
-		if codexErr != nil {
-			return nil, codexErr
-		}
-		managementHandler, managementErr := codexsession.NewManagementHandler(dependencies.CodexSessions, dependencies.Authorizer)
-		if managementErr != nil {
-			return nil, managementErr
-		}
-		codexMux.Handle("/v1/codex-sessions/{session_id}/ws", codexHandler)
-		codexMux.Handle("POST /v1/codex-sessions/{session_id}", managementHandler)
-		codexMux.Handle("POST /v1/codex-sessions/{session_id}/renew", managementHandler)
-		codexMux.Handle("GET /v1/codex-sessions/{session_id}/directories", managementHandler)
-		codexMux.Handle("DELETE /v1/codex-sessions/{session_id}", managementHandler)
-		codexHTTPHandler = codexMux
+	codexHTTPHandler, err := hostCodexHTTPHandler(dependencies.CodexSessions, dependencies.Authorizer)
+	if err != nil {
+		return nil, err
 	}
 	var nativePeerService Service
 	if dependencies.NativePeerFactory != nil {
@@ -508,10 +495,11 @@ func NewHost(ctx context.Context, config HostConfig, dependencies HostDependenci
 		workerComponents = append(workerComponents, Component{Capability: "authorization", Required: false, Service: dependencies.AuthorizationService})
 	}
 	if dependencies.ConfigSync != nil {
-		workerComponents = append(workerComponents, Component{
-			Capability: "config_sync", Required: config.Runtime.Profile == runtimeconfig.BYOD,
-			Service: dependencies.ConfigSync,
-		})
+		if stableHostOwnsCoordination() {
+			stableComponents = append(stableComponents, stablehostd.Component{Name: "config_sync", Required: config.Runtime.Profile == runtimeconfig.BYOD, Service: dependencies.ConfigSync})
+		} else {
+			workerComponents = append(workerComponents, Component{Capability: "config_sync", Required: config.Runtime.Profile == runtimeconfig.BYOD, Service: dependencies.ConfigSync})
+		}
 	}
 	stableComponents = append(stableComponents, stablehostd.Component{Name: "protocol", Required: true, Service: protocolServer})
 	if nativePeerService != nil {
@@ -527,10 +515,14 @@ func NewHost(ctx context.Context, config HostConfig, dependencies HostDependenci
 		stableComponents = append(stableComponents, stablehostd.Component{Name: "serve_lease", Required: false, Service: dependencies.ServeLeases})
 	}
 	if dependencies.RuntimeObservationService != nil {
-		workerComponents = append(workerComponents, Component{Capability: "runtime_observation", Required: false, Service: dependencies.RuntimeObservationService})
+		if stableHostOwnsCoordination() {
+			stableComponents = append(stableComponents, stablehostd.Component{Name: "runtime_observation", Required: false, Service: dependencies.RuntimeObservationService})
+		} else {
+			workerComponents = append(workerComponents, Component{Capability: "runtime_observation", Required: false, Service: dependencies.RuntimeObservationService})
+		}
 	}
 	if dependencies.ManagedSSHService != nil {
-		stableComponents = append(stableComponents, stablehostd.Component{Name: "managed_ssh_authority", Required: false, Service: dependencies.ManagedSSHService})
+		stableComponents = append(stableComponents, stablehostd.Component{Name: "managed_ssh_authority", Required: true, Service: dependencies.ManagedSSHService})
 	}
 	if dependencies.Connector != nil {
 		stableComponents = append(stableComponents, stablehostd.Component{Name: "edge", Required: true, Service: dependencies.Connector})
@@ -538,7 +530,11 @@ func NewHost(ctx context.Context, config HostConfig, dependencies HostDependenci
 	// Start hosted preparation after transport dependencies. Reverse shutdown then
 	// flushes hosted state before connector drain and the final runtime observation.
 	if dependencies.HostedLifecycle != nil {
-		workerComponents = append(workerComponents, Component{Capability: "hosted_lifecycle", Required: true, Service: dependencies.HostedLifecycle})
+		if stableHostOwnsCoordination() {
+			stableComponents = append(stableComponents, stablehostd.Component{Name: "hosted_lifecycle", Required: true, Service: dependencies.HostedLifecycle})
+		} else {
+			workerComponents = append(workerComponents, Component{Capability: "hosted_lifecycle", Required: true, Service: dependencies.HostedLifecycle})
+		}
 	}
 	stableComponents = append(stableComponents, stablehostd.Component{Name: "control_plane", Required: true, Service: httpService})
 	daemon, err := stablehostd.New(stablehostd.Config{
@@ -557,7 +553,7 @@ func NewHost(ctx context.Context, config HostConfig, dependencies HostDependenci
 		return nil, errors.Join(ErrHostInvalid, err)
 	}
 	healthSource.set(runtime, workerComponents)
-	return &Host{runtime: runtime, hostd: daemon, workers: workers, http: httpService, handler: mux, sessions: sessions, health: healthSource, transferRoot: filepath.Join(config.Runtime.StateRoot, "file-transfers")}, nil
+	return &Host{runtime: runtime, hostd: daemon, workers: workers, http: httpService, handler: mux, sessions: sessions, health: healthSource, transferRoot: filepath.Join(config.Runtime.StateRoot, "file-transfers"), cleanupUnstarted: durable.Close}, nil
 }
 
 // WorkloadStatus is the stable host's monotonic snapshot used to fence a
@@ -710,6 +706,11 @@ func (h *Host) Shutdown(ctx context.Context) error {
 	h.workerMu.RLock()
 	worker := h.runtime
 	h.workerMu.RUnlock()
+	if worker != nil && worker.State() == New && h.cleanupUnstarted != nil {
+		cleanup := h.cleanupUnstarted
+		h.cleanupUnstarted = nil
+		return cleanup()
+	}
 	if h.hostd == nil || h.workers == nil {
 		return worker.Shutdown(ctx)
 	}

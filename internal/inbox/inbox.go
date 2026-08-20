@@ -297,6 +297,9 @@ func EnsurePath(path string) error {
 	if err := os.Chmod(path, 0o700); err != nil {
 		return err
 	}
+	if err := secureInboxPath(path); err != nil {
+		return err
+	}
 	return ValidatePath(path)
 }
 
@@ -308,11 +311,8 @@ func ValidatePath(path string) error {
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return errors.New("inbox path must be an existing non-symlink directory")
 	}
-	if !ownedByCurrentUser(info) {
-		return errors.New("inbox path must be owned by the current user")
-	}
-	if info.Mode().Perm()&0o022 != 0 {
-		return errors.New("inbox path must not be writable by group or other users")
+	if err := validateInboxPath(path, info); err != nil {
+		return err
 	}
 	//paperboat:allow-source-policy atomic-replacement owner=inbox reason=destination-writability-probe
 	probe, err := os.CreateTemp(path, ".paperboat-inbox-probe-*")
@@ -434,15 +434,6 @@ func boundJournal(value *journal) {
 		}
 		delete(value.Entries, oldestID)
 	}
-}
-
-func syncDir(path string) error {
-	directory, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer directory.Close()
-	return directory.Sync()
 }
 
 func storageError(err error) error { return fmt.Errorf("storage_unavailable: %w", err) }

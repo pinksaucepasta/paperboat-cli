@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -25,6 +26,8 @@ import (
 )
 
 const keychainService = "com.pinksaucepasta.paperboat.tuf.production"
+const windowsAMD64QualificationTarget = "windows-amd64-native-qualification.json"
+const windowsAMD64QualificationSchema = "paperboat.windows-native-qualification/v1"
 
 var roles = []string{"root-1", "root-2", "root-3", "targets-1", "targets-2", "snapshot-1", "timestamp-1"}
 
@@ -37,32 +40,81 @@ type componentTarget struct {
 	Architecture string `json:"architecture"`
 	BinaryFormat string `json:"binary_format"`
 }
+type windowsAMD64Qualification struct {
+	Schema         string                          `json:"schema"`
+	ReleaseVersion string                          `json:"release_version"`
+	Platform       string                          `json:"platform"`
+	Architecture   string                          `json:"architecture"`
+	Status         string                          `json:"status"`
+	NativeTested   bool                            `json:"native_tested"`
+	WindowsBuild   string                          `json:"windows_build"`
+	Runner         string                          `json:"runner"`
+	Artifacts      []windowsAMD64QualifiedArtifact `json:"artifacts"`
+}
+type windowsAMD64QualifiedArtifact struct {
+	Component    string `json:"component"`
+	TargetPath   string `json:"target_path"`
+	SHA256       string `json:"sha256"`
+	Length       int64  `json:"length"`
+	Platform     string `json:"platform"`
+	Architecture string `json:"architecture"`
+	Status       string `json:"status"`
+}
+type windowsAMD64QualificationBinding struct {
+	Schema         string `json:"schema"`
+	EvidenceTarget string `json:"evidence_target"`
+	EvidenceSHA256 string `json:"evidence_sha256"`
+	ReleaseVersion string `json:"release_version"`
+	Platform       string `json:"platform"`
+	Architecture   string `json:"architecture"`
+	Status         string `json:"status"`
+	NativeTested   bool   `json:"native_tested"`
+	WindowsBuild   string `json:"windows_build"`
+	Runner         string `json:"runner"`
+	ArtifactSHA256 string `json:"artifact_sha256"`
+	ArtifactLength int64  `json:"artifact_length"`
+}
+type componentTargetCustom struct {
+	Schema              string                            `json:"schema"`
+	Kind                string                            `json:"kind"`
+	Component           string                            `json:"component"`
+	Version             string                            `json:"version"`
+	Platform            string                            `json:"platform"`
+	Architecture        string                            `json:"architecture"`
+	BinaryFormat        string                            `json:"binary_format"`
+	NativeQualification *windowsAMD64QualificationBinding `json:"native_qualification,omitempty"`
+}
 type rolloutPolicy struct {
 	Schema     string `json:"schema"`
 	CohortSeed string `json:"cohort_seed"`
 	Percentage uint8  `json:"percentage"`
 }
 type releaseIndex struct {
-	Schema                string            `json:"schema"`
-	ReleaseID             string            `json:"release_id"`
-	Version               string            `json:"version"`
-	Channel               string            `json:"channel"`
-	Severity              string            `json:"severity"`
-	CreatedAt             time.Time         `json:"created_at"`
-	Platform              string            `json:"platform"`
-	Architecture          string            `json:"architecture"`
-	BinaryFormat          string            `json:"binary_format"`
-	Targets               []componentTarget `json:"targets"`
-	HostdAPIMin           uint16            `json:"hostd_api_min"`
-	HostdAPIMax           uint16            `json:"hostd_api_max"`
-	RuntimeAPIMin         uint16            `json:"runtime_api_min"`
-	RuntimeAPIMax         uint16            `json:"runtime_api_max"`
-	MinimumVersion        string            `json:"minimum_permitted_version,omitempty"`
-	RevokedVersions       []string          `json:"revoked_versions,omitempty"`
-	RolloutPolicyRevision uint64            `json:"rollout_policy_revision"`
-	SupervisorMaintenance bool              `json:"supervisor_maintenance_required"`
-	Rollout               rolloutPolicy     `json:"rollout"`
-	Revoked               bool              `json:"revoked,omitempty"`
+	Schema                 string            `json:"schema"`
+	ReleaseID              string            `json:"release_id"`
+	Version                string            `json:"version"`
+	Channel                string            `json:"channel"`
+	Severity               string            `json:"severity"`
+	CreatedAt              time.Time         `json:"created_at"`
+	Platform               string            `json:"platform"`
+	Architecture           string            `json:"architecture"`
+	BinaryFormat           string            `json:"binary_format"`
+	Targets                []componentTarget `json:"targets"`
+	HostdAPIMin            uint16            `json:"hostd_api_min"`
+	HostdAPIMax            uint16            `json:"hostd_api_max"`
+	RuntimeAPIMin          uint16            `json:"runtime_api_min"`
+	RuntimeAPIMax          uint16            `json:"runtime_api_max"`
+	MinimumVersion         string            `json:"minimum_permitted_version,omitempty"`
+	RevokedVersions        []string          `json:"revoked_versions,omitempty"`
+	RolloutPolicyRevision  uint64            `json:"rollout_policy_revision"`
+	SupervisorMaintenance  bool              `json:"supervisor_maintenance_required"`
+	Rollout                rolloutPolicy     `json:"rollout"`
+	Revoked                bool              `json:"revoked,omitempty"`
+	Stability              string            `json:"stability,omitempty"`
+	NativeTested           bool              `json:"native_tested,omitempty"`
+	TestedWindowsBuilds    []string          `json:"tested_windows_builds,omitempty"`
+	OpenSSHPackageID       string            `json:"openssh_package_id,omitempty"`
+	OpenSSHApprovedVersion string            `json:"openssh_approved_version,omitempty"`
 }
 
 type signingState struct {
@@ -82,7 +134,7 @@ func run(args []string) error {
 		return errors.New("production signing is restricted to the macOS release workstation")
 	}
 	if len(args) == 0 {
-		return errors.New("usage: paperboat-tuf <init|publish|promote|pause|quarantine|refresh|rotate|status>")
+		return errors.New("usage: paperboat-tuf <init|publish|publish-bootstrap|promote|pause|quarantine|refresh|rotate|status>")
 	}
 	switch args[0] {
 	case "init":
@@ -101,13 +153,14 @@ func run(args []string) error {
 		percentage := fs.Uint("percentage", 0, "initial eligible cohort percentage")
 		severity := fs.String("severity", "routine", "routine, security, or critical")
 		supervisorMaintenance := fs.Bool("supervisor-maintenance", false, "release updates stable supervisor components")
+		qualificationEvidence := fs.String("windows-amd64-native-evidence", "", "absolute JSON evidence for Windows amd64 native qualification")
 		if err := fs.Parse(args[1:]); err != nil || fs.NArg() != 0 {
-			return errors.New("usage: paperboat-tuf publish -repository DIR -version VERSION -artifacts DIR -rollout-revision N -percentage 0..100")
+			return errors.New("usage: paperboat-tuf publish -repository DIR -version VERSION -artifacts DIR -windows-amd64-native-evidence FILE -rollout-revision N -percentage 0..100")
 		}
 		if *rolloutRevision == 0 || *percentage > 100 || (*severity != "routine" && *severity != "security" && *severity != "critical") {
 			return errors.New("valid rollout revision, percentage, and severity are required")
 		}
-		return publish(*repo, *version, *artifacts, *rolloutRevision, uint8(*percentage), *severity, *supervisorMaintenance)
+		return publish(*repo, *version, *artifacts, *qualificationEvidence, *rolloutRevision, uint8(*percentage), *severity, *supervisorMaintenance)
 	case "refresh":
 		fs := flag.NewFlagSet("refresh", flag.ContinueOnError)
 		repo := fs.String("repository", "", "repository directory")
@@ -115,6 +168,18 @@ func run(args []string) error {
 			return errors.New("usage: paperboat-tuf refresh -repository DIR")
 		}
 		return refresh(*repo)
+	case "publish-bootstrap":
+		fs := flag.NewFlagSet("publish-bootstrap", flag.ContinueOnError)
+		repo := fs.String("repository", "", "repository directory")
+		artifact := fs.String("artifact", "", "absolute unified pb artifact")
+		version := fs.String("version", "", "artifact version")
+		platform := fs.String("platform", "", "darwin, linux, or windows")
+		architecture := fs.String("architecture", "", "amd64 or arm64")
+		qualificationOnly := fs.Bool("qualification-only", false, "acknowledge that this target is for qualification and carries no release claim")
+		if err := fs.Parse(args[1:]); err != nil || fs.NArg() != 0 || !*qualificationOnly {
+			return errors.New("usage: paperboat-tuf publish-bootstrap -repository DIR -artifact FILE -version VERSION -platform PLATFORM -architecture ARCH -qualification-only")
+		}
+		return publishBootstrap(*repo, *artifact, *version, *platform, *architecture)
 	case "promote", "pause", "quarantine":
 		fs := flag.NewFlagSet(args[0], flag.ContinueOnError)
 		repo := fs.String("repository", "", "repository directory")
@@ -142,6 +207,63 @@ func run(args []string) error {
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+// publishBootstrap adds only the unified bootstrap binary. It does not create
+// release indexes, rollout metadata, stability claims, or installer targets.
+// This keeps native qualification bootstrapping separate from a GA release.
+func publishBootstrap(repo, artifact, version, platform, architecture string) error {
+	repo, err := validateRepository(repo, true)
+	if err != nil {
+		return err
+	}
+	if !filepath.IsAbs(artifact) || filepath.Clean(artifact) != artifact || strings.TrimSpace(version) == "" || strings.ContainsAny(version, "\x00\r\n/\\") || !slices.Contains([]string{"darwin", "linux", "windows"}, platform) || !slices.Contains([]string{"amd64", "arm64"}, architecture) {
+		return errors.New("bootstrap target parameters are invalid")
+	}
+	root, targets, snapshot, timestamp, err := loadSet(repo)
+	if err != nil {
+		return err
+	}
+	state, err := loadSigningState(repo, root)
+	if err != nil {
+		return err
+	}
+	name := "pb-" + platform + "-" + architecture
+	info, err := metadata.TargetFile().FromFile(artifact, "sha256")
+	if err != nil {
+		return err
+	}
+	custom, err := json.Marshal(map[string]string{"schema": "paperboat.tuf-target/v1", "kind": "pb", "version": version, "platform": platform, "architecture": architecture})
+	if err != nil {
+		return err
+	}
+	raw := json.RawMessage(custom)
+	info.Custom, info.Path = &raw, name
+	targets.Signed.Targets[name] = info
+	if err := copyConsistentTarget(repo, artifact, name, info); err != nil {
+		return err
+	}
+	targets.Signed.Version++
+	targets.Signed.Expires = time.Now().UTC().Add(90 * 24 * time.Hour)
+	targets.ClearSignatures()
+	if err := sign(targets, state.Roles["targets"]...); err != nil {
+		return err
+	}
+	snapshot.Signed.Version++
+	snapshot.Signed.Expires = time.Now().UTC().Add(7 * 24 * time.Hour)
+	snapshot.Signed.Meta["targets.json"] = metadata.MetaFile(targets.Signed.Version)
+	snapshot.ClearSignatures()
+	if err := sign(snapshot, state.Roles["snapshot"]...); err != nil {
+		return err
+	}
+	timestamp.Signed.Version++
+	timestamp.Signed.Expires = time.Now().UTC().Add(24 * time.Hour)
+	timestamp.Signed.Meta["snapshot.json"] = metadata.MetaFile(snapshot.Signed.Version)
+	timestamp.ClearSignatures()
+	if err := sign(timestamp, state.Roles["timestamp"]...); err != nil {
+		return err
+	}
+	return writeSet(repo, root, targets, snapshot, timestamp)
 }
 
 func initialize(repo string) error {
@@ -220,13 +342,17 @@ func initialize(repo string) error {
 	return writeSigningState(repo, initialSigningState())
 }
 
-func publish(repo, version, artifacts string, rolloutRevision uint64, percentage uint8, severity string, supervisorMaintenance bool) error {
+func publish(repo, version, artifacts, qualificationEvidencePath string, rolloutRevision uint64, percentage uint8, severity string, supervisorMaintenance bool) error {
 	repo, err := validateRepository(repo, true)
 	if err != nil {
 		return err
 	}
 	if strings.TrimSpace(version) == "" || !filepath.IsAbs(artifacts) {
 		return errors.New("version and absolute artifacts directory are required")
+	}
+	qualification, qualificationBody, qualificationDigest, err := loadWindowsAMD64Qualification(qualificationEvidencePath)
+	if err != nil {
+		return err
 	}
 	root, targets, snapshot, timestamp, err := loadSet(repo)
 	if err != nil {
@@ -237,11 +363,21 @@ func publish(repo, version, artifacts string, rolloutRevision uint64, percentage
 		return err
 	}
 	targets.Signed.Targets = map[string]*metadata.TargetFiles{}
+	qualificationInfo, err := metadata.TargetFile().FromBytes(windowsAMD64QualificationTarget, qualificationBody, "sha256")
+	if err != nil {
+		return err
+	}
+	qualificationCustom, _ := json.Marshal(map[string]string{"schema": windowsAMD64QualificationSchema, "kind": "windows-amd64-native-qualification", "platform": "windows", "architecture": "amd64", "status": "passed"})
+	qualificationRaw := json.RawMessage(qualificationCustom)
+	qualificationInfo.Custom, qualificationInfo.Path = &qualificationRaw, windowsAMD64QualificationTarget
+	targets.Signed.Targets[windowsAMD64QualificationTarget] = qualificationInfo
 	createdAt := time.Now().UTC()
 	for _, platform := range []string{"darwin", "linux", "windows"} {
 		for _, architecture := range []string{"amd64", "arm64"} {
 			format := map[string]string{"darwin": "mach-o", "linux": "elf", "windows": "pe"}[platform]
 			components := make([]componentTarget, 0, 5)
+			componentFiles := make(map[string]*metadata.TargetFiles, 5)
+			componentPaths := make(map[string]string, 5)
 			for _, component := range []string{"cli", "runtime", "hostd", "updater", "launcher"} {
 				name := component + "-" + platform + "-" + architecture
 				local := filepath.Join(artifacts, name)
@@ -249,17 +385,44 @@ func publish(repo, version, artifacts string, rolloutRevision uint64, percentage
 				if err != nil {
 					return fmt.Errorf("target %s: %w", name, err)
 				}
-				custom, _ := json.Marshal(map[string]any{"schema": "paperboat.tuf-component/v1", "kind": "component", "component": component, "version": version, "platform": platform, "architecture": architecture, "binary_format": format})
-				raw := json.RawMessage(custom)
-				info.Custom, info.Path = &raw, name
-				targets.Signed.Targets[name] = info
-				if err := copyConsistentTarget(repo, local, name, info); err != nil {
+				components = append(components, componentTarget{Component: component, TargetPath: name, SHA256: hex.EncodeToString(info.Hashes["sha256"]), Length: info.Length, Platform: platform, Architecture: architecture, BinaryFormat: format})
+				componentFiles[name], componentPaths[name] = info, local
+			}
+			channel, stability, nativeTested := "stable", "", false
+			var testedBuilds []string
+			openSSHID, openSSHVersion := "", ""
+			if platform == "windows" {
+				stability = "stable"
+				testedBuilds, openSSHID, openSSHVersion = []string{"26100"}, "Microsoft.OpenSSH.Preview", "10.0.0.0"
+				if architecture == "amd64" {
+					if err := validateWindowsAMD64Qualification(qualification, version, components); err != nil {
+						return err
+					}
+					nativeTested, testedBuilds = true, []string{qualification.WindowsBuild}
+				}
+				if architecture == "arm64" {
+					channel, stability = "beta", "beta"
+				}
+			}
+			for _, component := range components {
+				custom := componentTargetCustom{Schema: "paperboat.tuf-component/v1", Kind: "component", Component: component.Component, Version: version, Platform: platform, Architecture: architecture, BinaryFormat: format}
+				if platform == "windows" && architecture == "amd64" {
+					custom.NativeQualification = qualificationBinding(qualification, qualificationDigest, component)
+				}
+				customBody, err := json.Marshal(custom)
+				if err != nil {
 					return err
 				}
-				components = append(components, componentTarget{Component: component, TargetPath: name, SHA256: hex.EncodeToString(info.Hashes["sha256"]), Length: info.Length, Platform: platform, Architecture: architecture, BinaryFormat: format})
+				raw := json.RawMessage(customBody)
+				info := componentFiles[component.TargetPath]
+				info.Custom, info.Path = &raw, component.TargetPath
+				targets.Signed.Targets[component.TargetPath] = info
+				if err := copyConsistentTarget(repo, componentPaths[component.TargetPath], component.TargetPath, info); err != nil {
+					return err
+				}
 			}
-			indexName := "release-index-stable-" + platform + "-" + architecture + ".json"
-			indexBody, err := json.Marshal(releaseIndex{Schema: "paperboat.release-index/v1", ReleaseID: "rel_" + version, Version: version, Channel: "stable", Severity: severity, CreatedAt: createdAt, Platform: platform, Architecture: architecture, BinaryFormat: format, Targets: components, HostdAPIMin: 1, HostdAPIMax: 2, RuntimeAPIMin: 1, RuntimeAPIMax: 2, RolloutPolicyRevision: rolloutRevision, SupervisorMaintenance: supervisorMaintenance, Rollout: rolloutPolicy{Schema: "paperboat.release-rollout/v1", CohortSeed: "release-" + version, Percentage: percentage}})
+			indexName := "release-index-" + channel + "-" + platform + "-" + architecture + ".json"
+			indexBody, err := json.Marshal(releaseIndex{Schema: "paperboat.release-index/v1", ReleaseID: "rel_" + version, Version: version, Channel: channel, Severity: severity, CreatedAt: createdAt, Platform: platform, Architecture: architecture, BinaryFormat: format, Targets: components, HostdAPIMin: 1, HostdAPIMax: 2, RuntimeAPIMin: 1, RuntimeAPIMax: 2, RolloutPolicyRevision: rolloutRevision, SupervisorMaintenance: supervisorMaintenance, Rollout: rolloutPolicy{Schema: "paperboat.release-rollout/v1", CohortSeed: "release-" + version, Percentage: percentage}, Stability: stability, NativeTested: nativeTested, TestedWindowsBuilds: testedBuilds, OpenSSHPackageID: openSSHID, OpenSSHApprovedVersion: openSSHVersion})
 			if err != nil {
 				return err
 			}
@@ -267,7 +430,7 @@ func publish(repo, version, artifacts string, rolloutRevision uint64, percentage
 			if err != nil {
 				return err
 			}
-			indexCustom, _ := json.Marshal(map[string]string{"schema": "paperboat.tuf-release-index/v1", "kind": "release-index", "channel": "stable", "platform": platform, "architecture": architecture})
+			indexCustom, _ := json.Marshal(map[string]string{"schema": "paperboat.tuf-release-index/v1", "kind": "release-index", "channel": channel, "platform": platform, "architecture": architecture})
 			indexRaw := json.RawMessage(indexCustom)
 			indexInfo.Custom, indexInfo.Path = &indexRaw, indexName
 			targets.Signed.Targets[indexName] = indexInfo
@@ -287,6 +450,9 @@ func publish(repo, version, artifacts string, rolloutRevision uint64, percentage
 				return err
 			}
 		}
+	}
+	if err := copyConsistentTarget(repo, qualificationEvidencePath, windowsAMD64QualificationTarget, qualificationInfo); err != nil {
+		return err
 	}
 	targets.Signed.Version++
 	targets.Signed.Expires = time.Now().UTC().Add(90 * 24 * time.Hour)
@@ -309,6 +475,139 @@ func publish(repo, version, artifacts string, rolloutRevision uint64, percentage
 		return err
 	}
 	return writeSet(repo, root, targets, snapshot, timestamp)
+}
+
+func loadWindowsAMD64Qualification(path string) (windowsAMD64Qualification, []byte, string, error) {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return windowsAMD64Qualification{}, nil, "", errors.New("absolute Windows amd64 native qualification evidence is required")
+	}
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() < 1 || info.Size() > 1<<20 {
+		return windowsAMD64Qualification{}, nil, "", errors.New("Windows amd64 native qualification evidence file is invalid")
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return windowsAMD64Qualification{}, nil, "", fmt.Errorf("read Windows amd64 native qualification evidence: %w", err)
+	}
+	var qualification windowsAMD64Qualification
+	decoder := json.NewDecoder(strings.NewReader(string(body)))
+	decoder.DisallowUnknownFields()
+	var extra any
+	if decoder.Decode(&qualification) != nil || decoder.Decode(&extra) != io.EOF {
+		return windowsAMD64Qualification{}, nil, "", errors.New("Windows amd64 native qualification evidence is malformed")
+	}
+	digest := sha256.Sum256(body)
+	return qualification, body, hex.EncodeToString(digest[:]), nil
+}
+
+func validateWindowsAMD64Qualification(qualification windowsAMD64Qualification, version string, components []componentTarget) error {
+	if qualification.Schema != windowsAMD64QualificationSchema || qualification.ReleaseVersion != version || qualification.Platform != "windows" || qualification.Architecture != "amd64" || qualification.Status != "passed" || !qualification.NativeTested || !safeEvidenceValue(qualification.WindowsBuild) || !safeEvidenceValue(qualification.Runner) {
+		return errors.New("Windows amd64 native qualification evidence is incomplete or not passed")
+	}
+	if len(components) != 5 || len(qualification.Artifacts) != len(components) {
+		return errors.New("Windows amd64 native qualification evidence does not cover every component")
+	}
+	expected := make(map[string]componentTarget, len(components))
+	for _, component := range components {
+		if component.Component == "" || expected[component.Component].Component != "" {
+			return errors.New("Windows amd64 component set is invalid")
+		}
+		expected[component.Component] = component
+	}
+	for _, artifact := range qualification.Artifacts {
+		component, ok := expected[artifact.Component]
+		if !ok || artifact.TargetPath != component.TargetPath || artifact.SHA256 != component.SHA256 || artifact.Length != component.Length || artifact.Platform != "windows" || artifact.Architecture != "amd64" || artifact.Status != "passed" {
+			return fmt.Errorf("Windows amd64 native qualification evidence does not match component %q", artifact.Component)
+		}
+		delete(expected, artifact.Component)
+	}
+	if len(expected) != 0 {
+		return errors.New("Windows amd64 native qualification evidence is missing a component")
+	}
+	return nil
+}
+
+func qualificationBinding(qualification windowsAMD64Qualification, evidenceDigest string, component componentTarget) *windowsAMD64QualificationBinding {
+	return &windowsAMD64QualificationBinding{
+		Schema:         windowsAMD64QualificationSchema,
+		EvidenceTarget: windowsAMD64QualificationTarget,
+		EvidenceSHA256: evidenceDigest,
+		ReleaseVersion: qualification.ReleaseVersion,
+		Platform:       qualification.Platform,
+		Architecture:   qualification.Architecture,
+		Status:         qualification.Status,
+		NativeTested:   qualification.NativeTested,
+		WindowsBuild:   qualification.WindowsBuild,
+		Runner:         qualification.Runner,
+		ArtifactSHA256: component.SHA256,
+		ArtifactLength: component.Length,
+	}
+}
+
+func safeEvidenceValue(value string) bool {
+	return len(value) >= 1 && len(value) <= 128 && !strings.ContainsAny(value, "\x00\r\n")
+}
+
+func validateWindowsAMD64SignedQualification(repo string, targetFiles map[string]*metadata.TargetFiles, index releaseIndex) error {
+	if index.Platform != "windows" || index.Architecture != "amd64" || index.Stability != "stable" || !index.NativeTested || len(index.TestedWindowsBuilds) != 1 {
+		return errors.New("release index does not declare a stable native Windows amd64 release")
+	}
+	evidenceInfo := targetFiles[windowsAMD64QualificationTarget]
+	if evidenceInfo == nil {
+		return errors.New("native qualification evidence target is absent")
+	}
+	evidenceBody, err := readConsistentTarget(repo, windowsAMD64QualificationTarget, evidenceInfo)
+	if err != nil {
+		return fmt.Errorf("read native qualification evidence: %w", err)
+	}
+	var qualification windowsAMD64Qualification
+	decoder := json.NewDecoder(strings.NewReader(string(evidenceBody)))
+	decoder.DisallowUnknownFields()
+	var extra any
+	if decoder.Decode(&qualification) != nil || decoder.Decode(&extra) != io.EOF {
+		return errors.New("native qualification evidence target is malformed")
+	}
+	if err := validateWindowsAMD64Qualification(qualification, index.Version, index.Targets); err != nil || qualification.WindowsBuild != index.TestedWindowsBuilds[0] {
+		return errors.New("native qualification evidence does not match release index")
+	}
+	evidenceDigest := hex.EncodeToString(evidenceInfo.Hashes["sha256"])
+	for _, component := range index.Targets {
+		info := targetFiles[component.TargetPath]
+		if info == nil || info.Length != component.Length || hex.EncodeToString(info.Hashes["sha256"]) != component.SHA256 || info.Custom == nil {
+			return fmt.Errorf("component target %q does not match release index", component.TargetPath)
+		}
+		var custom componentTargetCustom
+		decoder := json.NewDecoder(strings.NewReader(string(*info.Custom)))
+		decoder.DisallowUnknownFields()
+		extra = nil
+		if decoder.Decode(&custom) != nil || decoder.Decode(&extra) != io.EOF || custom.NativeQualification == nil {
+			return fmt.Errorf("component target %q has no qualification binding", component.TargetPath)
+		}
+		binding := custom.NativeQualification
+		if binding.Schema != windowsAMD64QualificationSchema || binding.EvidenceTarget != windowsAMD64QualificationTarget || binding.EvidenceSHA256 != evidenceDigest || binding.ReleaseVersion != index.Version || binding.Platform != "windows" || binding.Architecture != "amd64" || binding.Status != "passed" || !binding.NativeTested || binding.WindowsBuild != qualification.WindowsBuild || binding.Runner != qualification.Runner || binding.ArtifactSHA256 != component.SHA256 || binding.ArtifactLength != component.Length {
+			return fmt.Errorf("component target %q has an invalid qualification binding", component.TargetPath)
+		}
+	}
+	return nil
+}
+
+func readConsistentTarget(repo, name string, info *metadata.TargetFiles) ([]byte, error) {
+	if info == nil || len(info.Hashes["sha256"]) != sha256.Size || info.Length < 1 {
+		return nil, errors.New("target metadata is invalid")
+	}
+	digest := hex.EncodeToString(info.Hashes["sha256"])
+	body, err := os.ReadFile(filepath.Join(repo, "targets", digest+"."+name))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) != info.Length {
+		return nil, errors.New("target length does not match metadata")
+	}
+	actual := sha256.Sum256(body)
+	if hex.EncodeToString(actual[:]) != digest {
+		return nil, errors.New("target hash does not match metadata")
+	}
+	return body, nil
 }
 
 func refresh(repo string) error {
@@ -360,7 +659,11 @@ func mutateRollout(repo, operation string, revision uint64, percentage uint8) er
 	}
 	for _, platform := range []string{"darwin", "linux", "windows"} {
 		for _, architecture := range []string{"amd64", "arm64"} {
-			name := "release-index-stable-" + platform + "-" + architecture + ".json"
+			channel := "stable"
+			if platform == "windows" && architecture == "arm64" {
+				channel = "beta"
+			}
+			name := "release-index-" + channel + "-" + platform + "-" + architecture + ".json"
 			info := targets.Signed.Targets[name]
 			if info == nil || len(info.Hashes["sha256"]) != sha256.Size {
 				return fmt.Errorf("signed release index %s is unavailable", name)
@@ -380,6 +683,11 @@ func mutateRollout(repo, operation string, revision uint64, percentage uint8) er
 			if decoder.Decode(&index) != nil || decoder.Decode(&extra) != io.EOF || index.Schema != "paperboat.release-index/v1" || index.Platform != platform || index.Architecture != architecture || revision <= index.RolloutPolicyRevision {
 				return fmt.Errorf("signed release index %s cannot accept revision %d", name, revision)
 			}
+			if platform == "windows" && architecture == "amd64" {
+				if err := validateWindowsAMD64SignedQualification(repo, targets.Signed.Targets, index); err != nil {
+					return fmt.Errorf("signed release index %s has no valid native qualification: %w", name, err)
+				}
+			}
 			if err := applyRolloutMutation(&index, operation, revision, percentage); err != nil {
 				return err
 			}
@@ -391,9 +699,10 @@ func mutateRollout(repo, operation string, revision uint64, percentage uint8) er
 			if err != nil {
 				return err
 			}
-			custom, _ := json.Marshal(map[string]string{"schema": "paperboat.tuf-release-index/v1", "kind": "release-index", "channel": "stable", "platform": platform, "architecture": architecture})
+			custom, _ := json.Marshal(map[string]string{"schema": "paperboat.tuf-release-index/v1", "kind": "release-index", "channel": channel, "platform": platform, "architecture": architecture})
 			raw := json.RawMessage(custom)
 			updatedInfo.Custom, updatedInfo.Path = &raw, name
+			//paperboat:allow-source-policy atomic-replacement owner=tuf-repository reason=same-directory-release-index-staging
 			temporary, err := os.CreateTemp(repo, ".release-index-*")
 			if err != nil {
 				return err

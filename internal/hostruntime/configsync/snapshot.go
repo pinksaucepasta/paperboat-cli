@@ -108,7 +108,7 @@ func takeSelectedSnapshot(
 			result.Skipped = append(result.Skipped, PathSummary{Path: rel, Reason: "special_file"})
 			return nil
 		}
-		if info.Mode().Perm()&0o002 != 0 {
+		if !safeSnapshotPermissions(full, info) {
 			result.Skipped = append(result.Skipped, PathSummary{Path: rel, Bytes: info.Size(), Reason: "unsafe_permissions"})
 			return nil
 		}
@@ -184,7 +184,7 @@ func readStableFile(path string, before fs.FileInfo) (FileState, bool, error) {
 	stable := after.Mode().IsRegular() && before.Size() == after.Size() &&
 		before.ModTime().Equal(after.ModTime()) && before.Mode() == after.Mode()
 	return FileState{
-		Hash: hex.EncodeToString(hash.Sum(nil)), Bytes: bytesRead, Mode: after.Mode().Perm(),
+		Hash: hex.EncodeToString(hash.Sum(nil)), Bytes: bytesRead, Mode: snapshotFileMode(after),
 	}, stable, nil
 }
 

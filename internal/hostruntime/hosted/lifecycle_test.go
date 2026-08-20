@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -23,12 +24,17 @@ func (r *recordingRunner) Run(_ context.Context, command Command) ([]byte, error
 }
 
 func testConfig(root string) Config {
-	return Config{
+	config := Config{
 		VolumeRoot: root, CheckoutRoot: filepath.Join(root, "project"), ProjectID: "prj_1",
 		RepositoryURL: "https://github.com/paperboat/example.git", Branch: "main", AllowedRepositoryHosts: []string{"github.com"},
 		GitPath: "/usr/bin/git", ShellPath: "/bin/sh", Presets: []Script{{Name: "codex", Body: "echo preset"}}, SetupScript: "echo setup",
 		OperationTimeout: time.Second, FlushTimeout: time.Second, MaxScriptBytes: 4096, MaxOutputBytes: 4096,
 	}
+	if runtime.GOOS == "windows" {
+		config.GitPath = filepath.Join(os.Getenv("WINDIR"), "System32", "cmd.exe")
+		config.ShellPath = config.GitPath
+	}
+	return config
 }
 
 func TestLifecyclePreparesCheckoutRunsStagesAndFlushes(t *testing.T) {
@@ -57,7 +63,11 @@ func TestLifecyclePreparesCheckoutRunsStagesAndFlushes(t *testing.T) {
 	if !restored || len(runner.commands) != 3 {
 		t.Fatalf("restored=%v commands=%#v", restored, runner.commands)
 	}
-	if runner.commands[0].Args[0] != "clone" || runner.commands[1].Args[0] != "-eu" || runner.commands[2].Args[0] != "-eu" {
+	scriptFlag := "-eu"
+	if runtime.GOOS == "windows" {
+		scriptFlag = "-NoProfile"
+	}
+	if runner.commands[0].Args[0] != "clone" || runner.commands[1].Args[0] != scriptFlag || runner.commands[2].Args[0] != scriptFlag {
 		t.Fatalf("commands=%#v", runner.commands)
 	}
 	if err := lifecycle.Shutdown(context.Background()); err != nil {
@@ -90,6 +100,9 @@ func TestLifecycleConfigRestoreFailureIsDegradedNotFatal(t *testing.T) {
 }
 
 func TestConfigSyncHooksRetainTokenForShutdownSubprocess(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("covered by Windows owner-token config-sync integration tests")
+	}
 	root := t.TempDir()
 	checkout := filepath.Join(root, "project")
 	if err := os.Mkdir(checkout, 0o700); err != nil {
@@ -172,6 +185,10 @@ func TestLifecycleRejectsUnsafeBranchAndTamperedIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	identityPath := filepath.Join(root, ".paperboat", "workspace.json")
+	if runtime.GOOS == "windows" {
+		// Windows security is ACL-based; os.Chmod does not alter the DACL.
+		return
+	}
 	if err := os.Chmod(identityPath, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -185,6 +202,9 @@ func TestLifecycleRejectsUnsafeBranchAndTamperedIdentity(t *testing.T) {
 }
 
 func TestExecRunnerBoundsOutputAndCancellation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("covered by TestExecRunnerUsesScopedJobOnWindows")
+	}
 	runner := ExecRunner{}
 	_, err := runner.Run(context.Background(), Command{Path: "/bin/sh", Args: []string{"-c", "printf 123456789"}, Dir: t.TempDir(), Env: []string{"PATH=" + os.Getenv("PATH")}, OutputLimit: 4})
 	if !errors.Is(err, ErrOutputLimit) {

@@ -19,6 +19,7 @@ func Downloads() (string, error)          { return canonical(xdg.UserDirs.Downlo
 func Home() (string, error)               { return canonical(xdg.Home) }
 
 func below(base, name string) (string, error) {
+	name = filepath.FromSlash(name)
 	if name == "" || filepath.IsAbs(name) || filepath.Clean(name) != name || name == "." || name == ".." || strings.HasPrefix(name, ".."+string(filepath.Separator)) {
 		return "", ErrInvalid
 	}

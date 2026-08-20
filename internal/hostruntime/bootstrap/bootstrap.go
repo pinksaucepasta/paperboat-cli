@@ -32,8 +32,11 @@ var (
 
 type Config struct {
 	ServerURL, EnrollmentToken, DisplayName, WorkspaceRoot, Verifier, PublicIdentityKey string
+	SSHUser                                                                             string
+	SSHPort                                                                             uint16
 	RuntimeVersions                                                                     map[string]string
 	HTTP                                                                                *http.Client
+	AcceptBetaPlatform                                                                  bool
 }
 
 type Pairing struct {
@@ -55,6 +58,9 @@ type Material struct {
 	ExpiresAt               time.Time       `json:"expires_at"`
 	Artifact                *ArtifactTarget `json:"artifact,omitempty"`
 	HelperListenAddress     string          `json:"helper_listen_address"`
+	InstallationGeneration  int64           `json:"installation_generation"`
+	SetupRoles              []string        `json:"setup_roles"`
+	SetupMode               string          `json:"setup_mode"`
 }
 
 func CreatePairing(ctx context.Context, config Config) (Pairing, error) {
@@ -66,6 +72,8 @@ func CreatePairing(ctx context.Context, config Config) (Pairing, error) {
 		"enrollment_token": config.EnrollmentToken, "verifier": config.Verifier,
 		"display_name": config.DisplayName, "platform": runtime.GOOS, "architecture": runtime.GOARCH,
 		"workspace_root": config.WorkspaceRoot, "runtime_versions": config.RuntimeVersions, "public_identity_key": config.PublicIdentityKey,
+		"accept_beta_platform": config.AcceptBetaPlatform,
+		"ssh_user":             strings.TrimSpace(config.SSHUser), "ssh_port": config.SSHPort,
 	})
 	if err != nil {
 		return Pairing{}, err
@@ -94,7 +102,7 @@ func WaitForMaterial(ctx context.Context, config Config, expiresAt time.Time, in
 		err := request(ctx, client(config), http.MethodPost, base+"/v1/machines/pairings/installation", body, &material)
 		if err == nil {
 			validEnrollment := material.ReuseIdentity && material.EnrollmentID == "" && material.EnrollmentCredential == "" || !material.ReuseIdentity && material.EnrollmentID != "" && len(material.EnrollmentCredential) >= 32
-			if material.Schema != "paperboat.byod-installation/v1" || material.UserMachineID == "" || material.UserMachineEnrollmentID == "" || material.EnvironmentID == "" || material.HelperID == "" || !validEnrollment || !validLoopbackAddress(material.HelperListenAddress) || !time.Now().UTC().Before(material.ExpiresAt) || material.Artifact == nil || VerifyArtifactTarget(*material.Artifact) != nil {
+			if material.Schema != "paperboat.byod-installation/v1" || material.UserMachineID == "" || material.UserMachineEnrollmentID == "" || material.EnvironmentID == "" || material.HelperID == "" || !validEnrollment || !validLoopbackAddress(material.HelperListenAddress) || material.InstallationGeneration < 1 || material.SetupMode != "host" || !hasRole(material.SetupRoles, "host") || !time.Now().UTC().Before(material.ExpiresAt) || material.Artifact == nil || VerifyArtifactTarget(*material.Artifact) != nil {
 				return Material{}, ErrInvalid
 			}
 			return material, nil
@@ -111,6 +119,15 @@ func WaitForMaterial(ctx context.Context, config Config, expiresAt time.Time, in
 		}
 	}
 	return Material{}, ErrPairingExpired
+}
+
+func hasRole(roles []string, wanted string) bool {
+	for _, role := range roles {
+		if role == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 // transientBootstrapError reports errors that do not carry pairing-terminal
@@ -154,7 +171,7 @@ func validate(config Config) (string, error) {
 	parsed, err := url.Parse(strings.TrimSpace(config.ServerURL))
 	publicKey, keyErr := base64.RawURLEncoding.DecodeString(strings.TrimSpace(config.PublicIdentityKey))
 	token := strings.TrimSpace(config.EnrollmentToken)
-	if err != nil || parsed.Scheme != "https" || parsed.User != nil || parsed.Hostname() == "" || parsed.RawQuery != "" || parsed.Fragment != "" || token != "" && (len(token) < 32 || len(token) > 256) || len(config.Verifier) < 32 || strings.TrimSpace(config.DisplayName) == "" || ValidateWorkspace(config.WorkspaceRoot) != nil || keyErr != nil || len(publicKey) != ed25519.PublicKeySize {
+	if err != nil || parsed.Scheme != "https" || parsed.User != nil || parsed.Hostname() == "" || parsed.RawQuery != "" || parsed.Fragment != "" || token != "" && (len(token) < 26 || len(token) > 256) || len(config.Verifier) < 32 || strings.TrimSpace(config.DisplayName) == "" || ValidateWorkspace(config.WorkspaceRoot) != nil || keyErr != nil || len(publicKey) != ed25519.PublicKeySize {
 		return "", ErrInvalid
 	}
 	return strings.TrimRight(parsed.String(), "/"), nil

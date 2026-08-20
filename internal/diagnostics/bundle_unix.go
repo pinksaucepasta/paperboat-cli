@@ -1,5 +1,3 @@
-//go:build darwin || linux
-
 package diagnostics
 
 import (
@@ -9,9 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"time"
 )
@@ -25,6 +21,7 @@ const (
 
 type BundleConfig struct {
 	Directory string
+	OwnerSID  string
 	OwnerUID  int
 	Recorder  *Recorder
 	Status    json.RawMessage
@@ -63,13 +60,17 @@ type bundleManifest struct {
 }
 
 func CreateBundle(ctx context.Context, config BundleConfig) (Bundle, error) {
-	if ctx == nil || config.Recorder == nil || !filepath.IsAbs(config.Directory) || filepath.Clean(config.Directory) != config.Directory || config.OwnerUID < 0 || len(config.Status) == 0 || len(config.Status) > maximumStatusBytes || !json.Valid(config.Status) {
+	if ctx == nil || config.Recorder == nil || !filepath.IsAbs(config.Directory) || filepath.Clean(config.Directory) != config.Directory || len(config.Status) == 0 || len(config.Status) > maximumStatusBytes || !json.Valid(config.Status) {
 		return Bundle{}, ErrInvalid
+	}
+	owner, err := resolveDiagnosticOwner(DiskConfig{OwnerUID: config.OwnerUID, OwnerSID: config.OwnerSID})
+	if err != nil {
+		return Bundle{}, err
 	}
 	if config.Clock == nil {
 		config.Clock = time.Now
 	}
-	if err := ensureDiagnosticDirectory(config.Directory, config.OwnerUID); err != nil {
+	if err := ensureDiagnosticDirectory(config.Directory, owner); err != nil {
 		return Bundle{}, err
 	}
 	correlation, err := newCorrelation()
@@ -94,19 +95,8 @@ func CreateBundle(ctx context.Context, config BundleConfig) (Bundle, error) {
 	if err != nil {
 		return Bundle{}, err
 	}
-	temporary, err := os.OpenFile(filepath.Join(config.Directory, ".bugreport-"+correlation+".tmp"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		return Bundle{}, err
-	}
-	temporaryPath := temporary.Name()
-	keep := false
-	defer func() {
-		_ = temporary.Close()
-		if !keep {
-			_ = os.Remove(temporaryPath)
-		}
-	}()
-	archive := zip.NewWriter(temporary)
+	var output boundedBundleBuffer
+	archive := zip.NewWriter(&output)
 	for _, entry := range []struct {
 		name string
 		data []byte
@@ -122,30 +112,35 @@ func CreateBundle(ctx context.Context, config BundleConfig) (Bundle, error) {
 	if err := archive.Close(); err != nil {
 		return Bundle{}, err
 	}
-	if err := temporary.Sync(); err != nil {
-		return Bundle{}, err
-	}
-	if err := temporary.Close(); err != nil {
-		return Bundle{}, err
-	}
-	info, err := os.Stat(temporaryPath)
-	if err != nil || !validDiagnosticFile(info, config.OwnerUID) || info.Size() <= 0 || info.Size() > MaximumBundleBytes {
-		return Bundle{}, errors.Join(ErrInvalid, err)
-	}
-	finalPath := filepath.Join(config.Directory, "bugreport-"+correlation+".zip")
-	if _, err := os.Lstat(finalPath); !errors.Is(err, os.ErrNotExist) {
+	if output.err != nil || output.Len() == 0 || output.Len() > MaximumBundleBytes {
 		return Bundle{}, ErrInvalid
 	}
-	//paperboat:allow-source-policy atomic-replacement owner=diagnostics reason=verified-bundle-publication
-	if err := os.Rename(temporaryPath, finalPath); err != nil {
+	finalPath := filepath.Join(config.Directory, "bugreport-"+correlation+".zip")
+	if err := writeDiagnosticAtomic(finalPath, output.Bytes(), owner); err != nil {
 		return Bundle{}, err
 	}
-	if err := syncDirectory(config.Directory); err != nil {
-		_ = removeDiagnosticFile(finalPath, config.OwnerUID)
-		return Bundle{}, err
+	info, err := verifiedDiagnosticFile(finalPath, owner)
+	if err != nil || info.Size() != int64(output.Len()) || info.Size() > MaximumBundleBytes {
+		_ = removeDiagnosticFile(finalPath, owner)
+		return Bundle{}, ErrInvalid
 	}
-	keep = true
 	return Bundle{Schema: BundleSchemaV1, Correlation: correlation, CreatedAt: createdAt, Path: finalPath, Bytes: info.Size(), Categories: categories}, nil
+}
+
+type boundedBundleBuffer struct {
+	bytes.Buffer
+	err error
+}
+
+func (b *boundedBundleBuffer) Write(value []byte) (int, error) {
+	if b.err != nil {
+		return 0, b.err
+	}
+	if len(value) > MaximumBundleBytes-b.Len() {
+		b.err = ErrInvalid
+		return 0, b.err
+	}
+	return b.Buffer.Write(value)
 }
 
 func safeHex(value string) bool {

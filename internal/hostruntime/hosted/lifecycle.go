@@ -14,7 +14,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
@@ -43,7 +42,10 @@ const (
 type Script struct{ Name, Body string }
 
 type Config struct {
-	VolumeRoot, CheckoutRoot         string
+	VolumeRoot, CheckoutRoot string
+	// OwnerSID is required on Windows so hosted subprocesses can reject a
+	// LocalSystem service context rather than silently inheriting it.
+	OwnerSID                         string
 	GitToken                         string
 	ProjectID, RepositoryURL, Branch string
 	AllowedRepositoryHosts           []string
@@ -93,7 +95,7 @@ func New(config Config, hooks Hooks, runner Runner) (*Lifecycle, error) {
 		return nil, err
 	}
 	if runner == nil {
-		runner = ExecRunner{}
+		runner = defaultRunner(config)
 	}
 	return &Lifecycle{config: config, hooks: hooks, runner: runner, snapshot: Snapshot{Stage: StageWorkspace}}, nil
 }
@@ -196,8 +198,7 @@ func (l *Lifecycle) prepareWorkspace(context.Context) error {
 	want := workspaceIdentity{Version: 1, ProjectID: l.config.ProjectID, RepositoryURL: l.config.RepositoryURL}
 	info, err := os.Lstat(path)
 	if err == nil {
-		stat, statOK := info.Sys().(*syscall.Stat_t)
-		if !statOK || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o600 || stat.Nlink != 1 || info.Size() > 16<<10 {
+		if !secureIdentityFile(path, info, 16<<10) {
 			return ErrIdentity
 		}
 		data, readErr := os.ReadFile(path)
@@ -280,13 +281,16 @@ func (l *Lifecycle) applySetup(ctx context.Context) error {
 	return l.runScript(ctx, l.config.SetupScript)
 }
 func (l *Lifecycle) runScript(ctx context.Context, body string) error {
-	_, err := l.runner.Run(ctx, Command{Path: l.config.ShellPath, Args: []string{"-eu", "-c", body}, Dir: l.config.CheckoutRoot, Env: []string{"HOME=" + l.config.VolumeRoot, "PATH=" + os.Getenv("PATH")}, OutputLimit: l.config.MaxOutputBytes})
+	_, err := l.runner.Run(ctx, Command{Path: l.config.ShellPath, Args: hostedScriptArguments(body), Dir: l.config.CheckoutRoot, Env: []string{"HOME=" + l.config.VolumeRoot, "PATH=" + os.Getenv("PATH")}, OutputLimit: l.config.MaxOutputBytes})
 	return err
 }
 
 func validate(c Config) error {
 	if !filepath.IsAbs(c.VolumeRoot) || !filepath.IsAbs(c.CheckoutRoot) || c.CheckoutRoot == c.VolumeRoot || !pathWithin(c.VolumeRoot, c.CheckoutRoot) || !safeIdentifier(c.ProjectID) || !safeBranch(c.Branch) || c.OperationTimeout <= 0 || c.FlushTimeout <= 0 || c.MaxScriptBytes <= 0 || c.MaxOutputBytes <= 0 || !filepath.IsAbs(c.GitPath) || !filepath.IsAbs(c.ShellPath) {
 		return ErrInvalid
+	}
+	if err := validatePlatformConfig(c); err != nil {
+		return err
 	}
 	u, err := url.Parse(c.RepositoryURL)
 	if err != nil || u.Scheme != "https" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Hostname() == "" || !slices.Contains(c.AllowedRepositoryHosts, strings.ToLower(u.Hostname())) {

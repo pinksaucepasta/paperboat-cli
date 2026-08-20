@@ -1,0 +1,2016 @@
+{
+  "schema": "paperboat.windows-parity/v1",
+  "ledger_version": 1,
+  "seeded_on": "2026-08-18",
+  "authority": {
+    "title": "Native Windows amd64 Stable and arm64 Beta parity ledger",
+    "source_plan": "Approved Native Windows amd64 Stable and arm64 Beta Plan",
+    "canonical_data": "docs/windows-parity.json",
+    "human_companion": "docs/windows-parity.md",
+    "scope": "Native Windows 11 support without WSL for the complete Paperboat product surface",
+    "authority_status": "user_approved_windows_plan_is_authoritative",
+    "authority_blockers": [],
+    "intentional_feature_omissions": [],
+    "truth_rule": "A state is never promoted from implemented without evidence for the exact dimension. A compile result never counts as native execution evidence. A skipped test is not a pass."
+  },
+  "allowed_feature_states": [
+    "not_started",
+    "implemented",
+    "amd64_native_verified",
+    "arm64_cross_verified",
+    "arm64_native_verified",
+    "stable_ready"
+  ],
+  "allowed_gate_statuses": [
+    "not_started",
+    "in_progress",
+    "blocked",
+    "blocked_no_hardware",
+    "pass",
+    "fail",
+    "not_applicable"
+  ],
+  "evidence_dimensions": [
+    {
+      "id": "windows_amd64_client",
+      "kind": "native_execution",
+      "description": "Paperboat client workflows executed by a native Windows 11 amd64 process."
+    },
+    {
+      "id": "windows_amd64_host",
+      "kind": "native_execution",
+      "description": "Paperboat host and unattended runtime workflows executed natively on Windows 11 amd64."
+    },
+    {
+      "id": "windows_arm64_compile",
+      "kind": "cross_compile",
+      "description": "Windows arm64 packages and test packages compile, pass static checks, and pass applicable contract checks."
+    },
+    {
+      "id": "windows_arm64_native",
+      "kind": "native_execution",
+      "description": "The same Windows arm64 runtime matrix executed on native ARM64 hardware."
+    },
+    {
+      "id": "windows_to_windows",
+      "kind": "interoperability",
+      "description": "Windows amd64 and Windows arm64 clients and hosts interoperate in both directions."
+    },
+    {
+      "id": "windows_to_macos",
+      "kind": "interoperability",
+      "description": "A Windows client reaches a macOS host and exercises the feature under test."
+    },
+    {
+      "id": "macos_to_windows",
+      "kind": "interoperability",
+      "description": "A macOS client reaches a Windows host and exercises the feature under test."
+    },
+    {
+      "id": "windows_to_linux",
+      "kind": "interoperability",
+      "description": "A Windows client reaches a Linux host and exercises the feature under test."
+    },
+    {
+      "id": "linux_to_windows",
+      "kind": "interoperability",
+      "description": "A Linux client reaches a Windows host and exercises the feature under test."
+    },
+    {
+      "id": "human_ux",
+      "kind": "interface",
+      "description": "Human-readable CLI, installer, dashboard, recovery, and support UX is equivalent to the other platforms."
+    },
+    {
+      "id": "json_ux",
+      "kind": "interface",
+      "description": "JSON output, error codes, progress, cancellation, and machine-readable contracts are equivalent to the other platforms."
+    },
+    {
+      "id": "server_control_plane",
+      "kind": "control_plane",
+      "description": "Server enrollment, admission, release policy, telemetry, persistence, and API behavior support Windows."
+    },
+    {
+      "id": "dashboard",
+      "kind": "product_surface",
+      "description": "Dashboard display, channel controls, feature state, and recovery UX support Windows."
+    },
+    {
+      "id": "release_authority",
+      "kind": "release",
+      "description": "Release, signing, SBOM, provenance, TUF, updater, rollback, and rollout authority support Windows."
+    },
+    {
+      "id": "documentation_support",
+      "kind": "operations",
+      "description": "Documentation, support output, diagnostics, runbooks, and beta disclosures are complete for Windows."
+    }
+  ],
+  "applicability_profiles": {
+    "runtime": [
+      "windows_amd64_client",
+      "windows_amd64_host",
+      "windows_arm64_compile",
+      "windows_arm64_native",
+      "windows_to_windows",
+      "windows_to_macos",
+      "macos_to_windows",
+      "windows_to_linux",
+      "linux_to_windows",
+      "human_ux",
+      "json_ux"
+    ],
+    "os_adapter": [
+      "windows_amd64_client",
+      "windows_amd64_host",
+      "windows_arm64_compile",
+      "windows_arm64_native"
+    ],
+    "server": [
+      "server_control_plane",
+      "documentation_support"
+    ],
+    "dashboard": [
+      "dashboard",
+      "documentation_support"
+    ],
+    "release": [
+      "windows_arm64_compile",
+      "windows_arm64_native",
+      "release_authority",
+      "documentation_support"
+    ],
+    "ci": [
+      "windows_arm64_compile",
+      "windows_arm64_native",
+      "release_authority",
+      "documentation_support"
+    ],
+    "docs": [
+      "documentation_support"
+    ]
+  },
+  "state_profiles": {
+    "runtime_partial": {
+      "windows_amd64_client": "implemented",
+      "windows_amd64_host": "not_started",
+      "windows_arm64_compile": "arm64_cross_verified",
+      "windows_arm64_native": "not_started",
+      "windows_to_windows": "not_started",
+      "windows_to_macos": "not_started",
+      "macos_to_windows": "not_started",
+      "windows_to_linux": "not_started",
+      "linux_to_windows": "not_started",
+      "human_ux": "implemented",
+      "json_ux": "implemented",
+      "server_control_plane": "not_started",
+      "dashboard": "not_started",
+      "release_authority": "not_started",
+      "documentation_support": "not_started"
+    },
+    "runtime_host_partial": {
+      "windows_amd64_client": "implemented",
+      "windows_amd64_host": "implemented",
+      "windows_arm64_compile": "arm64_cross_verified",
+      "windows_arm64_native": "not_started",
+      "windows_to_windows": "not_started",
+      "windows_to_macos": "not_started",
+      "macos_to_windows": "not_started",
+      "windows_to_linux": "not_started",
+      "linux_to_windows": "not_started",
+      "human_ux": "implemented",
+      "json_ux": "implemented",
+      "server_control_plane": "not_started",
+      "dashboard": "not_started",
+      "release_authority": "not_started",
+      "documentation_support": "not_started"
+    },
+    "windows_adapter": {
+      "windows_amd64_client": "implemented",
+      "windows_amd64_host": "implemented",
+      "windows_arm64_compile": "arm64_cross_verified",
+      "windows_arm64_native": "not_started",
+      "windows_to_windows": "not_started",
+      "windows_to_macos": "not_started",
+      "macos_to_windows": "not_started",
+      "windows_to_linux": "not_started",
+      "linux_to_windows": "not_started",
+      "human_ux": "not_started",
+      "json_ux": "not_started",
+      "server_control_plane": "not_started",
+      "dashboard": "not_started",
+      "release_authority": "not_started",
+      "documentation_support": "not_started"
+    },
+    "known_folder_native_amd64": {
+      "windows_amd64_client": "amd64_native_verified",
+      "windows_amd64_host": "implemented",
+      "windows_arm64_compile": "arm64_cross_verified",
+      "windows_arm64_native": "not_started",
+      "windows_to_windows": "not_started",
+      "windows_to_macos": "not_started",
+      "macos_to_windows": "not_started",
+      "windows_to_linux": "not_started",
+      "linux_to_windows": "not_started",
+      "human_ux": "not_started",
+      "json_ux": "not_started",
+      "server_control_plane": "not_started",
+      "dashboard": "not_started",
+      "release_authority": "not_started",
+      "documentation_support": "implemented"
+    },
+    "credentials_native_amd64_client": {
+      "windows_amd64_client": "amd64_native_verified",
+      "windows_amd64_host": "implemented",
+      "windows_arm64_compile": "arm64_cross_verified",
+      "windows_arm64_native": "not_started",
+      "windows_to_windows": "not_started",
+      "windows_to_macos": "not_started",
+      "macos_to_windows": "not_started",
+      "windows_to_linux": "not_started",
+      "linux_to_windows": "not_started",
+      "human_ux": "not_started",
+      "json_ux": "not_started",
+      "server_control_plane": "not_started",
+      "dashboard": "not_started",
+      "release_authority": "not_started",
+      "documentation_support": "not_started"
+    },
+    "named_pipe_native_amd64": {
+      "windows_amd64_client": "amd64_native_verified",
+      "windows_amd64_host": "amd64_native_verified",
+      "windows_arm64_compile": "arm64_cross_verified",
+      "windows_arm64_native": "not_started",
+      "windows_to_windows": "not_started",
+      "windows_to_macos": "not_started",
+      "macos_to_windows": "not_started",
+      "windows_to_linux": "not_started",
+      "linux_to_windows": "not_started",
+      "human_ux": "not_started",
+      "json_ux": "not_started",
+      "server_control_plane": "not_started",
+      "dashboard": "not_started",
+      "release_authority": "not_started",
+      "documentation_support": "not_started"
+    },
+    "unattended_core_native_amd64": {
+      "windows_amd64_client": "implemented",
+      "windows_amd64_host": "amd64_native_verified",
+      "windows_arm64_compile": "arm64_cross_verified",
+      "windows_arm64_native": "not_started",
+      "windows_to_windows": "not_started",
+      "windows_to_macos": "not_started",
+      "macos_to_windows": "not_started",
+      "windows_to_linux": "not_started",
+      "linux_to_windows": "not_started",
+      "human_ux": "implemented",
+      "json_ux": "implemented",
+      "server_control_plane": "not_started",
+      "dashboard": "not_started",
+      "release_authority": "implemented",
+      "documentation_support": "implemented"
+    },
+    "control_plane_partial": {
+      "windows_amd64_client": "not_started",
+      "windows_amd64_host": "not_started",
+      "windows_arm64_compile": "not_started",
+      "windows_arm64_native": "not_started",
+      "windows_to_windows": "not_started",
+      "windows_to_macos": "not_started",
+      "macos_to_windows": "not_started",
+      "windows_to_linux": "not_started",
+      "linux_to_windows": "not_started",
+      "human_ux": "not_started",
+      "json_ux": "not_started",
+      "server_control_plane": "implemented",
+      "dashboard": "not_started",
+      "release_authority": "not_started",
+      "documentation_support": "implemented"
+    },
+    "release_partial": {
+      "windows_amd64_client": "not_started",
+      "windows_amd64_host": "not_started",
+      "windows_arm64_compile": "arm64_cross_verified",
+      "windows_arm64_native": "not_started",
+      "windows_to_windows": "not_started",
+      "windows_to_macos": "not_started",
+      "macos_to_windows": "not_started",
+      "windows_to_linux": "not_started",
+      "linux_to_windows": "not_started",
+      "human_ux": "not_started",
+      "json_ux": "implemented",
+      "server_control_plane": "implemented",
+      "dashboard": "not_started",
+      "release_authority": "implemented",
+      "documentation_support": "implemented"
+    },
+    "installer_native_amd64": {
+      "windows_amd64_client": "amd64_native_verified",
+      "windows_amd64_host": "amd64_native_verified",
+      "windows_arm64_compile": "arm64_cross_verified",
+      "windows_arm64_native": "not_started",
+      "windows_to_windows": "not_started",
+      "windows_to_macos": "not_started",
+      "macos_to_windows": "not_started",
+      "windows_to_linux": "not_started",
+      "linux_to_windows": "not_started",
+      "human_ux": "implemented",
+      "json_ux": "implemented",
+      "server_control_plane": "not_started",
+      "dashboard": "not_started",
+      "release_authority": "implemented",
+      "documentation_support": "implemented"
+    },
+    "ssh_crossplatform_interop_native_amd64": {
+      "windows_amd64_client": "amd64_native_verified",
+      "windows_amd64_host": "amd64_native_verified",
+      "windows_arm64_compile": "arm64_cross_verified",
+      "windows_arm64_native": "not_started",
+      "windows_to_windows": "not_started",
+      "windows_to_macos": "amd64_native_verified",
+      "macos_to_windows": "amd64_native_verified",
+      "windows_to_linux": "amd64_native_verified",
+      "linux_to_windows": "amd64_native_verified",
+      "human_ux": "implemented",
+      "json_ux": "implemented",
+      "server_control_plane": "not_started",
+      "dashboard": "not_started",
+      "release_authority": "not_started",
+      "documentation_support": "implemented"
+    },
+    "portable_zip_native_amd64": {
+      "windows_amd64_client": "amd64_native_verified",
+      "windows_amd64_host": "implemented",
+      "windows_arm64_compile": "arm64_cross_verified",
+      "windows_arm64_native": "not_started",
+      "windows_to_windows": "not_started",
+      "windows_to_macos": "not_started",
+      "macos_to_windows": "not_started",
+      "windows_to_linux": "not_started",
+      "linux_to_windows": "not_started",
+      "human_ux": "implemented",
+      "json_ux": "implemented",
+      "server_control_plane": "not_started",
+      "dashboard": "not_started",
+      "release_authority": "implemented",
+      "documentation_support": "implemented"
+    },
+    "conpty_native_amd64": {
+      "windows_amd64_client": "implemented",
+      "windows_amd64_host": "amd64_native_verified",
+      "windows_arm64_compile": "arm64_cross_verified",
+      "windows_arm64_native": "not_started",
+      "windows_to_windows": "not_started",
+      "windows_to_macos": "not_started",
+      "macos_to_windows": "not_started",
+      "windows_to_linux": "not_started",
+      "linux_to_windows": "not_started",
+      "human_ux": "implemented",
+      "json_ux": "implemented",
+      "server_control_plane": "not_started",
+      "dashboard": "not_started",
+      "release_authority": "not_started",
+      "documentation_support": "implemented"
+    },
+    "transport_native_amd64": {
+      "windows_amd64_client": "amd64_native_verified",
+      "windows_amd64_host": "amd64_native_verified",
+      "windows_arm64_compile": "arm64_cross_verified",
+      "windows_arm64_native": "not_started",
+      "windows_to_windows": "amd64_native_verified",
+      "windows_to_macos": "not_started",
+      "macos_to_windows": "not_started",
+      "windows_to_linux": "not_started",
+      "linux_to_windows": "not_started",
+      "human_ux": "not_started",
+      "json_ux": "not_started",
+      "server_control_plane": "not_started",
+      "dashboard": "not_started",
+      "release_authority": "not_started",
+      "documentation_support": "implemented"
+    },
+    "network_observer_native_amd64": {
+      "windows_amd64_client": "implemented",
+      "windows_amd64_host": "amd64_native_verified",
+      "windows_arm64_compile": "arm64_cross_verified",
+      "windows_arm64_native": "not_started",
+      "windows_to_windows": "not_started",
+      "windows_to_macos": "not_started",
+      "macos_to_windows": "not_started",
+      "windows_to_linux": "not_started",
+      "linux_to_windows": "not_started",
+      "human_ux": "not_started",
+      "json_ux": "not_started",
+      "server_control_plane": "not_started",
+      "dashboard": "not_started",
+      "release_authority": "not_started",
+      "documentation_support": "implemented"
+    },
+    "transfer_native_amd64": {
+      "windows_amd64_client": "amd64_native_verified",
+      "windows_amd64_host": "amd64_native_verified",
+      "windows_arm64_compile": "arm64_cross_verified",
+      "windows_arm64_native": "not_started",
+      "windows_to_windows": "not_started",
+      "windows_to_macos": "not_started",
+      "macos_to_windows": "not_started",
+      "windows_to_linux": "not_started",
+      "linux_to_windows": "not_started",
+      "human_ux": "implemented",
+      "json_ux": "implemented",
+      "server_control_plane": "not_started",
+      "dashboard": "not_started",
+      "release_authority": "not_started",
+      "documentation_support": "implemented"
+    },
+    "config_native_amd64": {
+      "windows_amd64_client": "implemented",
+      "windows_amd64_host": "amd64_native_verified",
+      "windows_arm64_compile": "arm64_cross_verified",
+      "windows_arm64_native": "not_started",
+      "windows_to_windows": "not_started",
+      "windows_to_macos": "not_started",
+      "macos_to_windows": "not_started",
+      "windows_to_linux": "not_started",
+      "linux_to_windows": "not_started",
+      "human_ux": "implemented",
+      "json_ux": "implemented",
+      "server_control_plane": "not_started",
+      "dashboard": "not_started",
+      "release_authority": "not_started",
+      "documentation_support": "implemented"
+    },
+    "docs_complete": {
+      "windows_amd64_client": "not_started",
+      "windows_amd64_host": "not_started",
+      "windows_arm64_compile": "not_started",
+      "windows_arm64_native": "not_started",
+      "windows_to_windows": "not_started",
+      "windows_to_macos": "not_started",
+      "macos_to_windows": "not_started",
+      "windows_to_linux": "not_started",
+      "linux_to_windows": "not_started",
+      "human_ux": "not_started",
+      "json_ux": "not_started",
+      "server_control_plane": "not_started",
+      "dashboard": "not_started",
+      "release_authority": "not_started",
+      "documentation_support": "implemented"
+    },
+    "ci_configured": {
+      "windows_amd64_client": "not_started",
+      "windows_amd64_host": "not_started",
+      "windows_arm64_compile": "arm64_cross_verified",
+      "windows_arm64_native": "not_started",
+      "windows_to_windows": "not_started",
+      "windows_to_macos": "not_started",
+      "macos_to_windows": "not_started",
+      "windows_to_linux": "not_started",
+      "linux_to_windows": "not_started",
+      "human_ux": "not_started",
+      "json_ux": "not_started",
+      "server_control_plane": "not_started",
+      "dashboard": "not_started",
+      "release_authority": "implemented",
+      "documentation_support": "implemented"
+    },
+    "not_started": {
+      "windows_amd64_client": "not_started",
+      "windows_amd64_host": "not_started",
+      "windows_arm64_compile": "arm64_cross_verified",
+      "windows_arm64_native": "not_started",
+      "windows_to_windows": "not_started",
+      "windows_to_macos": "not_started",
+      "macos_to_windows": "not_started",
+      "windows_to_linux": "not_started",
+      "linux_to_windows": "not_started",
+      "human_ux": "not_started",
+      "json_ux": "not_started",
+      "server_control_plane": "not_started",
+      "dashboard": "not_started",
+      "release_authority": "not_started",
+      "documentation_support": "not_started"
+    }
+  },
+  "release_targets": {
+    "windows/amd64": {
+      "target_stability": "stable",
+      "channel": "stable",
+      "current_readiness": "blocked",
+      "required_feature_state": "stable_ready",
+      "native_test_required": true,
+      "native_tested": false,
+      "blockers": [
+        "windows_amd64_native_full_matrix_pending",
+        "windows_logged_out_profile_dependency_matrix_pending",
+        "windows_interoperability_matrix_pending",
+        "tuf_release_publication_pending"
+      ]
+    },
+    "windows/arm64": {
+      "target_stability": "beta",
+      "channel": "beta",
+      "current_readiness": "beta_blocked",
+      "required_feature_state": "arm64_cross_verified",
+      "native_test_required": false,
+      "native_tested": false,
+      "native_qualification_gate": "blocked_no_hardware",
+      "promotion_blocked_until": "arm64_native_verified",
+    "blockers": [
+      "native_windows_arm64_e2e: blocked_no_hardware",
+      "windows_artifact_signing: TUF, checksum, SBOM, provenance, malware-scan, and publication evidence pending"
+    ]
+    }
+  },
+  "gates": [
+    {
+      "id": "windows_scope_authority",
+      "status": "pass",
+      "required_for": ["windows/amd64 stable", "windows/arm64 beta"],
+      "counts_as_native_execution": false,
+      "evidence_refs": ["authority-conflict"],
+      "blockers": []
+    },
+    {
+      "id": "windows_amd64_cross_build",
+      "status": "pass",
+      "required_for": ["windows/amd64", "windows/arm64"],
+      "command": "CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build ./...",
+      "counts_as_native_execution": false,
+      "evidence_refs": ["cross-build"]
+    },
+    {
+      "id": "windows_arm64_cross_build",
+      "status": "pass",
+      "required_for": ["windows/arm64"],
+      "command": "CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build ./...",
+      "counts_as_native_execution": false,
+      "evidence_refs": ["arm64-full-package-and-test-package-cross-compile"]
+    },
+    {
+      "id": "windows_amd64_native_full_matrix",
+      "status": "in_progress",
+      "required_for": ["windows/amd64"],
+      "counts_as_native_execution": true,
+      "evidence_refs": [],
+      "blockers": ["full native Windows 11 standard and IoT Enterprise LTSC matrix has not passed"]
+    },
+    {
+      "id": "native_windows_arm64_e2e",
+      "status": "blocked_no_hardware",
+      "required_for": ["windows/arm64 stable promotion"],
+      "counts_as_native_execution": false,
+      "skip_reason": "blocked_no_hardware",
+      "evidence_refs": [],
+      "blockers": ["no native Windows arm64 test machine is available"]
+    },
+    {
+      "id": "windows_arm64_beta_cross_gate",
+      "status": "pass",
+      "required_for": ["windows/arm64 beta"],
+      "counts_as_native_execution": false,
+      "evidence_refs": ["arm64-full-package-and-test-package-cross-compile", "arm64-msi-zip-cross-verification"],
+      "blockers": []
+    },
+    {
+      "id": "windows_amd64_stable_release",
+      "status": "blocked",
+      "required_for": ["windows/amd64 stable"],
+      "counts_as_native_execution": false,
+      "evidence_refs": [],
+      "blockers": ["windows_amd64_native_full_matrix", "logged-out EFS fails and credentialed SMB remains unqualified under passwordless S4U", "authenticated full Codex and Git credential-helper matrices", "remaining directional macOS and Linux interoperability", "final artifact qualification and TUF publication"]
+    },
+    {
+      "id": "windows_artifact_signing",
+      "status": "blocked",
+      "required_for": ["windows/amd64 stable", "windows/arm64 beta"],
+      "counts_as_native_execution": false,
+      "evidence_refs": ["release-signing-gate"],
+      "blockers": ["TUF, checksum, SBOM, provenance, malware-scan, and publication evidence are not present in this checkout"]
+    }
+  ],
+  "evidence_catalog": [
+    {
+      "id": "cross-build",
+      "kind": "command",
+      "status": "pass",
+      "scope": ["windows_amd64_client", "windows_amd64_host", "windows_arm64_compile"],
+      "command": "CGO_ENABLED=0 GOOS=windows GOARCH=<amd64|arm64> go build ./...",
+      "note": "The full repository builds for Windows amd64 and arm64. This remains compile evidence, not native execution evidence."
+    },
+    {
+      "id": "arm64-full-package-and-test-package-cross-compile",
+      "kind": "cross_compile",
+      "status": "pass",
+      "scope": ["windows_arm64_compile"],
+      "architecture": "arm64",
+      "command": "CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build -trimpath ./...; mapfile -t packages < <(go list ./...); for package in \"${packages[@]}\"; do CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go test -c -vet=off -trimpath -tags paperboat_native_e2e,paperboat_native_network_e2e \"$package\"; done; validate every produced PE as ARM64",
+      "tests": ["every Go test package returned by go list ./..., including paperboat_native_e2e and paperboat_native_network_e2e build-tag paths"],
+      "note": "The Windows cross-test-packages CI lane compiles the complete ARM64 source graph and every discovered test package, then validates every generated PE has ARM64 machine type. This is the minimum cross-verification proof for a Windows-specific Go path; it is never native execution evidence."
+    },
+    {
+      "id": "arm64-msi-zip-cross-verification",
+      "kind": "cross_compile",
+      "status": "pass",
+      "scope": ["windows_arm64_compile", "release_authority"],
+      "architecture": "arm64",
+      "runner": "victus",
+      "windows_edition": "Windows 11 IoT Enterprise LTSC",
+      "windows_build": "26100.9168",
+      "command": "packaging/windows/scripts/verify-cross-artifacts.ps1 -Architecture arm64 -StagingDirectory <stage> -MsiPath <msi> -ZipPath <zip>",
+      "tests": ["five release PE payloads have ARM64 machine type", "MSI SummaryInformation template is Arm64", "portable ZIP has exact entries and ARM64 PE payloads", "portable ZIP metadata declares Windows arm64 beta and requires native E2E before stable promotion"],
+      "note": "Victus cross-built the ARM64 release payload, MSI, and ZIP. The verifier reported five ARM64 PE payloads, MSI template Arm64;0, exact ZIP entries, beta metadata, and native-execution=false. Qualification SHA-256 values were 8188b789f51ad96495577ef0b9032f8984bbf6a505d4d823d931d04c2f94f69d for the 51,912,704-byte MSI and 9f53cdd043ba38ed00cb56ac68f29fb4cb36ed1a517e021aff556313a5670287 for the 30,089,273-byte ZIP. Release CI now runs the same verifier for both architectures after MSI and ZIP creation. This is artifact-structure evidence only; native ARM64 execution remains a separate blocked stable-promotion gate."
+    },
+    {
+      "id": "native-windows-udp-dontfragment",
+      "kind": "native_test",
+      "status": "pass",
+      "scope": ["windows_amd64_client", "windows_amd64_host", "windows_arm64_compile"],
+      "runner": "victus",
+      "windows_edition": "Windows 11 IoT Enterprise LTSC",
+      "windows_build": "26100.9168",
+      "architecture": "amd64",
+      "command": "go test -count=1 -run TestOpen -v ./internal/peertransport/udpsocket",
+      "tests": ["IPv4 IP_DONTFRAGMENT enabled", "IPv6 IPV6_DONTFRAG and IPV6_V6ONLY enabled", "dual-stack sockets share one port", "IPv4 remains available without an IPv6 route", "UDP datagrams pass natively"],
+      "note": "Windows now configures non-fragmenting Winsock UDP sockets before bind, so authenticated PMTU probes cannot report false success through IP fragmentation. The native amd64 socket-option suite passes and the full ARM64 test package compiles. Live path-reduction and Defender interaction remain separate evidence."
+    },
+    {
+      "id": "source-windows-setup",
+      "kind": "source",
+      "status": "present",
+      "scope": ["windows_amd64_client", "windows_amd64_host", "human_ux", "json_ux"],
+      "paths": ["cmd/pb/main.go", "cmd/pb/setup_windows.go"],
+      "note": "Windows host setup invokes the OpenSSH setup path, but the complete host setup flow is not qualified."
+    },
+    {
+      "id": "source-windows-openssh",
+      "kind": "source_unit_and_native_e2e",
+      "status": "native_amd64_verified",
+      "scope": ["windows_amd64_client", "windows_amd64_host", "windows_arm64_compile", "human_ux", "json_ux"],
+      "paths": ["internal/windowsopenssh/provision.go", "internal/windowsopenssh/inventory_windows.go", "internal/windowsopenssh/config.go", "internal/windowsopenssh/setup.go", "internal/windowsopenssh/service_windows.go", "internal/windowsopenssh/qualification_windows.go", "internal/windowsopenssh/native_integration_windows_test.go"],
+      "note": "Native LTSC amd64 qualification passed against exact registered Microsoft.OpenSSH.Preview 10.0.0.0: Microsoft signature/version checks, dedicated PaperboatSshd, IPv4/IPv6 loopback ownership, public-key auth, PTY, exec, exit status, SCP and SFTP upload/download, restoration, and temporary-state cleanup. Repair and uninstall ownership passed. A real forced reboot restored automatic PaperboatSshd and post-boot protocol tests. Native crash qualification then exposed and fixed an orphaned-sshd defect by placing the child in a kill-on-close Job Object; terminating the wrapper now kills the old child, SCM restarts under a new PID after 5 seconds, exactly one IPv4/IPv6 listener pair remains, and the complete protocol suite passes. Fresh install and interrupted-install matrices remain."
+    },
+    {
+      "id": "native-ltsc-amd64-msi-lifecycle",
+      "kind": "native_test",
+      "status": "pass",
+      "scope": ["windows_amd64_client", "windows_amd64_host", "release_authority"],
+      "runner": "victus",
+      "windows_edition": "Windows 11 IoT Enterprise LTSC",
+      "windows_build": "26100.9168",
+      "architecture": "amd64",
+      "command": "packaging/windows/scripts/Invoke-NativeWindowsQualification.ps1 -Architecture amd64",
+      "tests": ["native ConPTY PowerShell 5.1/7 and cmd", "native 313-character filesystem lifecycle", "SCM hostd/updater lifecycle", "durable preview lifecycle", "silent fresh install", "repair", "major upgrade", "uninstall", "reinstall", "spaces and Unicode MSI source paths", "forced reboot during active MSI transaction", "fixed-service ownership conflict rejection"],
+      "paths": ["packaging/windows/wix/Paperboat.wxs", "packaging/windows/scripts/Invoke-NativeWindowsQualification.ps1", "packaging/windows/scripts/Invoke-InterruptedMsiQualification.ps1", "packaging/windows/scripts/Invoke-MsiRollbackQualification.ps1", "packaging/windows/e2e/longpath_windows_test.go", "packaging/windows/e2e/service_windows_test.go"],
+      "note": "Unsigned qualification MSIs passed natively on Victus from a 211-character source path containing spaces and Unicode while LongPathsEnabled=0: machine-wide silent install, repair, major upgrade, clean uninstall, reinstall, and a second clean uninstall. After enabling LongPathsEnabled and a real reboot, Paperboat natively completed a 313-character filesystem lifecycle and repeated the complete MSI lifecycle. A forced reboot after observable product state while msiexec remained active recovered to one coherent installation; the startup verifier then uninstalled it cleanly and preserved PaperboatSshd. A service-collision test exposed that the MSI overwrote an administrator-owned PaperboatHostd; registry AppSearch and a launch condition now fail closed before product changes, preserve the service exactly, and leave no files, registry, ARP, or updater service. A build-time-gated qualification-only failure scheduled after files and registry writes forced Windows Installer rollback with exit 1603; rollback removed every product file, service, registry value, and ARP entry. The same 2026.08.18.5/6 qualification MSIs then passed the complete normal lifecycle with the hook dormant. Release builds set the hook definition to zero and omit the custom action. Windows Installer itself rejected an MSI source path over 260 characters even in extended-path form, so that unsupported Windows Installer input is not claimed. Production signing remains separate."
+    },
+    {
+      "id": "source-windows-winget-and-zip",
+      "kind": "source_and_contract_tests",
+      "status": "present",
+      "scope": ["windows_amd64_client", "windows_arm64_compile", "release_authority", "documentation_support"],
+      "paths": ["packaging/windows/winget/stable", "packaging/windows/winget/beta", "packaging/windows/scripts/render-winget.ps1", "packaging/windows/scripts/verify-winget-manifests.py", "packaging/windows/cmd/package-zip", "packaging/windows/scripts/package-zip.ps1", ".github/workflows/release.yml"],
+      "note": "Stable amd64 and explicit beta amd64/arm64 WinGet templates, final-hash renderer, winget.exe validation, release workflow wiring, deterministic portable ZIP tool, metadata contract, and package tests are present. WinGet rendering intentionally refuses unsigned MSIs, so final native rendering remains blocked on the production signing ceremony rather than missing implementation."
+    },
+    {
+      "id": "native-ltsc-amd64-portable-zip",
+      "kind": "native_test",
+      "status": "pass",
+      "scope": ["windows_amd64_client", "release_authority"],
+      "runner": "victus",
+      "windows_edition": "Windows 11 IoT Enterprise LTSC",
+      "windows_build": "26100.9168",
+      "architecture": "amd64",
+      "command": "package-zip.ps1 --version 2026.08.18.7 --architecture amd64; Expand-Archive; pb.exe --version; pb.exe help",
+      "tests": ["deterministic ZIP creation", "Expand-Archive", "portable metadata validation", "pb --version", "pb help"],
+      "paths": ["packaging/windows/cmd/package-zip/main.go", "packaging/windows/cmd/package-zip/main_test.go", "internal/userpaths/paths.go"],
+      "note": "Victus created and extracted a three-file amd64 stable portable ZIP, validated paperboat.windows-portable/v1 metadata, and executed pb --version and pb help. The first execution exposed portable slash rejection in nested Windows user config paths; filepath.FromSlash normalization fixed it and the native userpaths suite plus portable commands passed. Qualification ZIP SHA-256 was 2c9ce95832f2f8b5c05cca61caea99e124353292871b2f4b7c2af38341a6b381. Final TUF-bound ZIP publication remains separate."
+    },
+    {
+      "id": "native-windows-linux-ssh-interoperability",
+      "kind": "native_interoperability_test",
+      "status": "pass",
+      "scope": ["windows_amd64_client", "windows_amd64_host", "windows_to_linux", "linux_to_windows"],
+      "runner": "victus and coolify",
+      "windows_edition": "Windows 11 IoT Enterprise LTSC",
+      "windows_build": "26100.9168",
+      "architecture": "amd64",
+      "tests": ["Windows OpenSSH exec to Linux", "Windows SCP upload/download to Linux", "Windows SFTP upload/download/cleanup to Linux", "Linux OpenSSH exec to PaperboatSshd", "Linux SCP upload/download through PaperboatSshd", "Linux SFTP upload/download/cleanup through PaperboatSshd"],
+      "note": "Victus and the Linux amd64 Hetzner host passed public-key exec, SCP, and SFTP in both directions. Linux reached the loopback-only PaperboatSshd through a temporary authenticated reverse tunnel, preserving the no-public-listener invariant. Payload hashes/content matched. Temporary keys, authorized-key changes, tunnel listener, and transfer files were removed; the original empty Paperboat authorized-keys file was restored and PaperboatSshd was restarted healthy. This proves SSH protocol interoperability only, not the full Paperboat control-plane/session matrix."
+    },
+    {
+      "id": "native-windows-macos-ssh-interoperability",
+      "kind": "native_interoperability_test",
+      "status": "pass",
+      "scope": ["windows_amd64_client", "windows_amd64_host", "windows_to_macos", "macos_to_windows"],
+      "runner": "victus and local macOS amd64 host",
+      "windows_edition": "Windows 11 IoT Enterprise LTSC",
+      "windows_build": "26100.9168",
+      "architecture": "amd64",
+      "tests": ["Windows OpenSSH exec to macOS", "Windows SCP upload/download to macOS", "Windows SFTP upload/download/cleanup to macOS", "macOS OpenSSH exec to PaperboatSshd", "macOS SCP upload/download through PaperboatSshd", "macOS SFTP upload/download/cleanup through PaperboatSshd"],
+      "note": "Victus and the local macOS host passed public-key exec, SCP, and SFTP in both directions through chained authenticated loopback forwards on the Linux test host. No Windows or macOS SSH endpoint was exposed publicly. SCP and SFTP round-trip SHA-256 hashes matched. Temporary authorized keys, forwarding processes, tunnel listeners, and Windows transfer files were removed; the original empty Paperboat authorized-keys file was restored and PaperboatSshd was restarted healthy. This proves SSH protocol interoperability only, not the full Paperboat control-plane/session matrix."
+    },
+    {
+      "id": "source-windows-credentials",
+      "kind": "source_and_tests",
+      "status": "present",
+      "scope": ["windows_amd64_client", "windows_arm64_compile"],
+      "paths": ["internal/config/keyring_windows.go", "internal/config/keyring_dpapi_windows.go", "internal/config/credential_file_windows.go", "internal/config/keyring_windows_test.go"],
+      "note": "Credential Manager and encrypted DPAPI fallback code exists; native account-isolation and service-profile qualification remains pending."
+    },
+    {
+      "id": "native-ltso-amd64-credentials",
+      "kind": "native_test",
+      "status": "pass",
+      "scope": ["windows_amd64_client"],
+      "runner": "victus",
+      "windows_edition": "Windows 11 IoT Enterprise LTSC",
+      "windows_build": "26100",
+      "architecture": "amd64",
+      "command": "go test ./internal/config -run 'TestWindowsCredentialManagerRoundTrip|TestWindowsFileFallbackIsDPAPIProtected|TestWindowsCredentialErrorClassification'",
+      "tests": [
+        "TestWindowsCredentialManagerRoundTrip",
+        "TestWindowsFileFallbackIsDPAPIProtected",
+        "TestWindowsCredentialErrorClassification"
+      ],
+      "note": "Native LTSC amd64 evidence covers Credential Manager round-trip, DPAPI-protected fallback, deletion, missing-credential classification, and access-denied classification. User-scoped DPAPI decryption under logged-out S4U passed again after a real forced reboot. Multi-account and Credential Manager service-profile evidence remain open."
+    },
+    {
+      "id": "native-ltso-amd64-localapi-named-pipe",
+      "kind": "native_test",
+      "status": "pass",
+      "scope": ["windows_amd64_client", "windows_amd64_host"],
+      "runner": "victus",
+      "windows_edition": "Windows 11 IoT Enterprise LTSC",
+      "windows_build": "26100",
+      "architecture": "amd64",
+      "command": "go test ./internal/localapi -run 'TestWindowsLocalAPIPipeParitySnapshotWatchAndPeerStream|TestWindowsPipeContractRejectsInvalidNamesAndUsesExactProtectedDACL|TestWindowsNamedPipePreservesFileTransferUpgradeAndLeaseCleanup'",
+      "tests": [
+        "TestWindowsLocalAPIPipeParitySnapshotWatchAndPeerStream",
+        "TestWindowsPipeContractRejectsInvalidNamesAndUsesExactProtectedDACL",
+        "TestWindowsNamedPipePreservesFileTransferUpgradeAndLeaseCleanup"
+      ],
+      "note": "The focused native tests and the complete internal/localapi suite pass on LTSC amd64. Evidence covers protected named-pipe server/client transport, caller identity, snapshot/watch, completions, diagnostics, bug reports, peer probes and streams, transport observations, transfer-key leases and streams, upgrade framing, deadlines, cancellation, and cleanup. Cross-machine workflows and complete human/JSON CLI UX remain separate gates."
+    },
+    {
+      "id": "known-folder-arm64-cross",
+      "kind": "cross_compile",
+      "status": "pass",
+      "scope": ["windows_arm64_compile"],
+      "architecture": "arm64",
+      "command": "CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go test -c ./internal/inbox",
+      "tests": ["TestDownloadsDirUsesWindowsKnownFolder"],
+      "note": "Known Folder implementation is cross-verified only. No native ARM64 execution claim is permitted until hardware is available."
+    },
+    {
+      "id": "known-folder-amd64-native",
+      "kind": "native_test",
+      "status": "pass",
+      "scope": ["windows_amd64_client"],
+      "runner": "victus",
+      "windows_edition": "Windows 11 IoT Enterprise LTSC",
+      "windows_build": "26100",
+      "architecture": "amd64",
+      "command": "go test ./internal/inbox -run TestDownloadsDirUsesWindowsKnownFolder",
+      "tests": ["TestDownloadsDirUsesWindowsKnownFolder"],
+      "note": "FOLDERID_Downloads resolved to a canonical absolute path under the native SSH logon."
+    },
+    {
+      "id": "source-windows-known-folders",
+      "kind": "source_and_test",
+      "status": "present",
+      "scope": ["windows_amd64_client", "windows_arm64_compile"],
+      "paths": ["internal/inbox/downloads_windows.go", "internal/inbox/downloads_windows_test.go"],
+      "note": "DownloadsDir uses Windows FOLDERID_Downloads and validates an absolute clean non-reparse path; native ARM64 execution remains unverified."
+    },
+    {
+      "id": "source-windows-pe",
+      "kind": "source_and_tests",
+      "status": "present",
+      "scope": ["windows_amd64_client", "windows_amd64_host", "windows_arm64_compile", "release_authority"],
+      "paths": ["internal/hostruntime/binarytarget/validate.go", "internal/hostruntime/binarytarget/validate_test.go", "internal/hostruntime/nativesignature/verify.go", "internal/hostruntime/nativesignature/verify_test.go", "internal/hostruntime/updated/service_windows.go", "internal/hostruntime/hostinstall/install_windows.go", "internal/selfupdate/selfupdate_windows.go"],
+      "note": "PE machine checks and exact TUF target verification are mandatory at initial host installation, CLI self-update, normal updater activation, and reboot rollback recovery. Authenticode publisher verification is enforced when a signature is present. Native amd64 updater recovery tests prove valid current-slot retention, atomic runtime/CLI rollback restoration, staged-file removal, and fail-closed behavior for untrusted current or rollback content without partial activation; ARM64 test packages compile. Final TUF-bound Paperboat artifacts are not present."
+    },
+    {
+      "id": "source-windows-pty",
+      "kind": "source",
+      "status": "present",
+      "scope": ["windows_amd64_host", "windows_arm64_compile"],
+      "paths": ["internal/hostruntime/pty/pty_windows.go", "internal/session/input_windows.go", "internal/session/winch_windows.go"],
+      "note": "ConPTY production adapters and native terminal tests cover process startup, input/output, resize, Ctrl+C, UTF-8/VT, exit status, and Job Object cleanup. Replay and reconnect remain separate session-layer gates."
+    },
+    {
+      "id": "native-ltsc-amd64-conpty-runtime",
+      "kind": "native_test",
+      "status": "pass",
+      "scope": ["windows_amd64_host"],
+      "runner": "victus",
+      "windows_edition": "Windows 11 IoT Enterprise LTSC",
+      "windows_build": "26100.9168",
+      "architecture": "amd64",
+      "command": "pty-native-amd64.test.exe -test.v -test.timeout 2m",
+      "tests": ["TestNativeConPTYCtrlCInterruptsForegroundAndPreservesShell", "TestNativeConPTYResizeAndUTF8VT", "TestNativeConPTYJobCloseKillsDescendant", "TestNativeConPTYPowerShell51", "TestNativeConPTYPowerShell7", "TestNativeConPTYCmd"],
+      "paths": ["internal/hostruntime/pty/pty_windows.go", "internal/hostruntime/pty/pty_windows_native_test.go", "packaging/windows/e2e/conpty_windows_test.go"],
+      "note": "Native production-adapter qualification covers interactive cmd.exe continuity after Ctrl+C, foreground interruption, 101x37 resize, UTF-8 text, VT escape preservation, exit code 7, PowerShell 5.1, PowerShell 7, cmd.exe, and kill-on-close descendant cleanup. Testing exposed and fixed an invalid PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE value, explicit null standard-handle requirements, process-before-Job assignment race, CREATE_NEW_PROCESS_GROUP Ctrl+C suppression, and the need for a bounded descendant fallback when an inbox foreground command ignores ConPTY ETX. ARM64 builds and native test binaries compile but remain non-native evidence."
+    },
+    {
+      "id": "native-ltsc-amd64-session-manager",
+      "kind": "native_test",
+      "status": "pass",
+      "scope": ["windows_amd64_host", "windows_arm64_compile"],
+      "runner": "victus",
+      "windows_edition": "Windows 11 IoT Enterprise LTSC",
+      "windows_build": "26100.9168",
+      "architecture": "amd64",
+      "command": "session-windows-amd64.test.exe -test.v -test.run TestNativeWindowsManagerReplayReconnectResizeCancelAndCleanup",
+      "tests": ["TestNativeWindowsManagerReplayReconnectResizeCancelAndCleanup"],
+      "paths": ["internal/hostruntime/session/manager.go", "internal/hostruntime/session/manager_windows_native_test.go", "internal/hostruntime/pty/pty_windows.go"],
+      "note": "The production session manager and ConPTY adapter passed native session creation, ordered output, resize state, detach and bounded replay reconnect from a cursor, foreground Ctrl+C with shell survival, close, and delete cleanup in 0.49 seconds. The same native test package cross-compiles as ARM64, which is compile evidence only. Authenticated remote protocol and client restart matrices remain separate gates."
+    },
+    {
+      "id": "native-ltsc-amd64-terminal-protocol",
+      "kind": "native_test",
+      "status": "pass",
+      "scope": ["windows_amd64_client", "windows_amd64_host", "windows_arm64_compile"],
+      "runner": "victus",
+      "windows_edition": "Windows 11 IoT Enterprise LTSC",
+      "windows_build": "26100.9168",
+      "architecture": "amd64",
+      "command": "server-windows-amd64.test.exe -test.v -test.timeout 30s -test.run TestNativeWindowsAuthenticatedTerminalProtocolOutputAndExit",
+      "tests": ["TestNativeWindowsAuthenticatedTerminalProtocolOutputAndExit"],
+      "paths": ["internal/hostruntime/server/dispatcher_windows_native_test.go", "internal/hostruntime/server/server.go", "internal/hostruntime/server/dispatcher.go", "internal/hostruntime/pty/pty_windows.go"],
+      "note": "The production framed server, capability negotiation, request authorization, dispatcher, session manager, and ConPTY adapter passed native Windows create, attach, binary VT/output streaming, natural process exit, exact exit code 7, and terminal_stream_end delivery. Qualification exposed and fixed a ConPTY lifecycle cycle where capture waited for output EOF while the pseudoconsole remained open until capture called Wait; the process waiter now closes ConPTY after process exit while capture drains the final output. Existing native Ctrl+C, resize, and Job cleanup tests still pass. ARM64 server test packages cross-compile only. Production credential establishment and real network-carrier interoperability remain separate evidence."
+    },
+    {
+      "id": "native-ltsc-amd64-exec-runtime",
+      "kind": "native_test",
+      "status": "pass",
+      "scope": ["windows_amd64_host", "windows_arm64_compile"],
+      "runner": "victus",
+      "windows_edition": "Windows 11 IoT Enterprise LTSC",
+      "windows_build": "26100.9168",
+      "architecture": "amd64",
+      "command": "execprocess-windows-amd64.test.exe -test.v -test.timeout 2m",
+      "tests": ["TestNativeWindowsExecRaceFreeStartStreamsEnvironmentCWDAndExit"],
+      "paths": ["internal/hostruntime/execprocess/process_windows.go", "internal/hostruntime/execprocess/manager_windows_native_test.go"],
+      "note": "Twenty-five native noninteractive executions passed exact argv, normalized environment overlay, working directory, separate stdout/stderr, complete output drain, and exit code 7. Qualification removed the child-before-Job race by creating every pipe process suspended, assigning it to the kill-on-close Job Object, and resuming its primary thread only after ownership succeeds. The ARM64 package and native test executable cross-compile only."
+    },
+    {
+      "id": "native-ltsc-amd64-peer-transports",
+      "kind": "native_test",
+      "status": "pass",
+      "scope": ["windows_amd64_client", "windows_amd64_host", "windows_to_windows", "windows_arm64_compile"],
+      "runner": "victus",
+      "windows_edition": "Windows 11 IoT Enterprise LTSC",
+      "windows_build": "26100.9168",
+      "architecture": "amd64",
+      "command": "peerquic-windows-amd64.test.exe -test.v -test.timeout 5m; iceagent-windows-amd64.test.exe -test.v -test.timeout 5m; wsscarrier-windows-amd64.test.exe -test.v -test.timeout 2m; relaynoise-windows-amd64.test.exe -test.v -test.timeout 3m; relaycarrier-windows-amd64.test.exe -test.v -test.timeout 5m",
+      "tests": ["TestOwnedUDPMuxAgentsNominateAndExchange", "TestOwnedUDP6MuxAgentsNominateAndCarryNativeQUIC", "TestProbeOnlyQUICCarriesAuthenticatedLifetimeExchange", "TestPreviewHTTP3StreamOutlivesSetupContext", "TestStreamRouterServesHealthWithoutConsumingApplicationStream", "TestBinaryCarrierPartialReadsAndRemoteIdentity", "TestCarrierParentCancellationStopsRead", "TestRelayQUICNoiseInteroperability", "TestWSSNoiseInteroperabilityAndWirePrivacy", "TestRelayHealthExchangeAcrossQUICAndWSS", "TestRelayQUICCarriesFullDuplexBytesOverRealHTTP3", "TestDialWSSAuthenticatesAttachmentAndBuildsBoundedMux", "TestRekeyDriversCompleteInBandTransition"],
+      "paths": ["internal/peertransport/iceagent/owned_universal_mux.go", "internal/peertransport/iceagent/owned_mux_test.go", "internal/peertransport/iceagent/owned_universal_mux_windows_test.go", "internal/peertransport/peerquic", "internal/peertransport/wsscarrier", "internal/peertransport/relaycarrier", "internal/peertransport/relaynoise"],
+      "note": "Victus passed real Winsock-owned IPv4 and IPv6 ICE nomination followed by pinned mutual endpoint identity, TLS 1.3 QUIC, exporter-bound first records, and application payload exchange. The first run exposed that Linux veth filtering also rejected Windows Hyper-V vEthernet external switches, leaving zero candidates; interface filtering is now OS-aware. Native QUIC also passed authenticated lifetime probes, HTTP/3 preview handoff, stream routing, malformed-frame fail-closed behavior, cancellation, and shutdown. Relay QUIC and WSS passed Noise IK identity/prologue binding, wire privacy, full-duplex HTTP/3, persistent authenticated attachment, bounded multiplexing, concurrent streams, health exchange, cancellation, rekey, replay/gap/tamper rejection, and clean shutdown. The loopback WebSocket carrier passed identity, framing, concurrent writes, limits, deadlines, cancellation, and close behavior. ARM64 packages cross-compile only. Live relay-service interoperability, WSS TLS/proxy policy, Defender profile changes, and network migration remain separate gates."
+    },
+    {
+      "id": "native-ltsc-amd64-network-observer",
+      "kind": "native_disruptive_test",
+      "status": "pass",
+      "scope": ["windows_amd64_host", "windows_arm64_compile"],
+      "runner": "victus",
+      "windows_edition": "Windows 11 IoT Enterprise LTSC",
+      "windows_build": "26100.9168",
+      "architecture": "amd64",
+      "command": "networkmonitor-windows-amd64.test.exe -test.v -test.timeout 1m -test.run TestNativeWindowsObserverReceivesExternalInterfaceChange; SYSTEM toggles vEthernet (Default Switch) for 15 seconds with finally restoration",
+      "tests": ["TestNativeWindowsObserverReceivesExternalInterfaceChange"],
+      "paths": ["internal/peertransport/networkmonitor/monitor.go", "internal/peertransport/networkmonitor/monitor_windows_native_test.go", "internal/hostruntime/runtime/network_change_unix.go", ".github/workflows/windows-ci.yml"],
+      "note": "The production Tailscale-backed Windows observer started natively, produced a stable opaque fingerprint, and detected a controlled Hyper-V Default Switch disable/enable as generation 1, interface-address reason, rebind required, dual-stack viable. The adapter was restored by a SYSTEM task finally block, the task was removed, SSH stayed available through the untouched path, and PaperboatSshd remained running. A 3-second toggle coalesced without an event; holding the change for 15 seconds passed, documenting the backend debounce requirement. The qualification-only test is separately tagged paperboat_native_network_e2e and compiled for amd64 and ARM64 by CI; it requires external controlled mutation and is not run by ordinary unit CI. Active session/path replacement, VPN, NAT rebinding, and sleep/wake remain separate evidence."
+    },
+    {
+      "id": "source-windows-process",
+      "kind": "source_and_tests",
+      "status": "native_amd64_verified",
+      "scope": ["windows_amd64_host", "windows_arm64_compile"],
+      "paths": ["internal/hostruntime/execprocess/process_windows.go", "internal/hostruntime/process/platform_windows.go", "internal/hostruntime/service/service_entry_windows.go", "internal/hostruntime/service/s4u_windows.go", "internal/hostruntime/hosted/runner_windows.go"],
+      "note": "Windows process adapters, suspended process creation before race-free Job assignment, LSA S4U token acquisition, profile loading, privilege stripping, and CreateProcessAsUser passed focused native amd64 tests. After a real forced reboot with no interactive owner session, logged-out S4U again passed DPAPI, Git, Codex, outbound TCP, owner profile, and process-tree execution; EFS remained ERROR_ACCESS_DENIED. Fast-user-switch remains open."
+    },
+    {
+      "id": "native-windows-s4u-logged-out",
+      "kind": "native_test",
+      "status": "pass",
+      "scope": ["windows_amd64_host"],
+      "runner": "victus",
+      "windows_edition": "Windows 11 IoT Enterprise LTSC",
+      "windows_build": "26100.9168",
+      "architecture": "amd64",
+      "command": "PAPERBOAT_WINDOWS_E2E_S4U_FIXTURE=paperboat-s4u-fixture.exe PAPERBOAT_WINDOWS_E2E_S4U_OWNER_SID=S-1-5-21-196874002-3579808280-620482841-1001 paperboat-service-s4u.test.exe -test.v -test.run ^TestNativeLoggedOutS4UQualification$",
+      "tests": ["TestNativeLoggedOutS4UQualification", "TestExecRunnerUsesScopedJobOnWindows", "TestOwnerEnvironmentIsCreateProcessCompatible", "logged-out owner-created user-scoped DPAPI decrypt"],
+      "paths": ["internal/hostruntime/service/s4u_qualification_windows_test.go", "internal/hostruntime/service/testdata/s4u-fixture/main_windows.go", "internal/hostruntime/service/service_entry_windows_test.go", "internal/hostruntime/hosted/runner_windows_test.go"],
+      "note": "Windows 11 IoT Enterprise LTSC build 26100 native amd64 qualification passed with the enrolled owner logged out: S4U owner SID, service session 0, loaded profile and environment, CreateProcessAsUser, owner-created user-scoped DPAPI decryption, suspended Job assignment, descendant termination, and service cleanup. Credentialed SMB remains explicitly not qualified by this evidence. ARM64 test packages cross-compile only."
+    },
+    {
+      "id": "native-windows-elevation-path-security",
+      "kind": "native_test",
+      "status": "pass",
+      "scope": ["windows_amd64_client"],
+      "runner": "victus",
+      "windows_edition": "Windows 11 IoT Enterprise LTSC",
+      "windows_build": "26100.9168",
+      "architecture": "amd64",
+      "command": "elevation-final.exe -test.v",
+      "tests": ["TestProtectedBridgeFilesUseCurrentUserACL", "TestOpenBridgeFileRejectsHardLink", "TestOpenBridgeFilePreventsRenameSwap", "TestOpenBridgeHandlesPreventDirectoryRenameSwap", "TestOpenBridgeDirectoryChainRejectsReparseSwap", "TestPinnedExecutableRejectsReplacementAndHardLinks", "TestBridgeRejectsHardLinkedResultPlaceholder", "TestExecuteHonorsProtectedCancellationMarker"],
+      "paths": ["internal/windows/elevation/bridge_windows.go", "internal/windows/elevation/bridge_windows_test.go"],
+      "note": "Pinned handles, final-path identity, protected ACLs, single-link checks, held ancestor directories, cancellation, and executable pinning passed native adversarial tests. ARM64 test binaries cross-compile but have no native evidence."
+    },
+    {
+      "id": "source-windows-service",
+      "kind": "source",
+      "status": "present",
+      "scope": ["windows_amd64_host", "windows_arm64_compile"],
+      "paths": ["internal/hostruntime/service/service_entry_windows.go", "internal/hostruntime/service/service_windows.go", "internal/windowsopenssh/service_windows.go"],
+      "note": "Service adapters and PaperboatSshd registration code exist; complete unattended host qualification is pending."
+    },
+    {
+      "id": "source-windows-managedssh",
+      "kind": "source",
+      "status": "present",
+      "scope": ["windows_amd64_client", "windows_arm64_compile"],
+      "paths": ["internal/managedssh/execute_windows.go", "internal/managedssh/openssh_config_windows.go", "internal/managedssh/authorized_keys_windows.go", "internal/managedssh/agent_socket_windows.go", "internal/managedssh/listener_windows.go"],
+      "note": "Native Windows managed SSH, authorized keys, agent endpoint, listener, ProxyCommand, SCP, and SFTP paths exist and cross-compile; remaining directional interoperability is tracked separately."
+    },
+    {
+      "id": "source-windows-localapi",
+      "kind": "source",
+      "status": "native_amd64_verified",
+      "scope": ["windows_amd64_client", "windows_amd64_host", "windows_arm64_compile"],
+      "paths": ["internal/localapi/client_windows.go", "internal/localapi/server_transport_windows.go", "internal/localapi/peer_windows.go", "internal/localapi/localapi_windows_test.go", "internal/localdaemon/daemon_windows.go", "internal/localdaemon/service_windows.go"],
+      "note": "ACL-protected named-pipe client/server transport, peer token checks, snapshot/watch, peer streams, transfer leases, and daemon integration passed focused native amd64 tests."
+    },
+    {
+      "id": "source-windows-hostruntime",
+      "kind": "source",
+      "status": "present",
+      "scope": ["windows_amd64_host", "windows_arm64_compile"],
+      "paths": ["internal/hostruntimecmd/runtime_windows.go", "internal/hostruntimecmd/worker_windows.go", "internal/hostruntimecmd/service_windows.go", "internal/hostruntimecmd/doctor_windows.go", "internal/hostruntimecmd/purge_windows.go", "internal/hostruntimeentry/entry_windows.go"],
+      "note": "Native Windows runtime, worker, service, doctor, purge, and entry paths exist. Core service and unattended S4U behavior passed focused native amd64 tests."
+    },
+    {
+      "id": "source-windows-config-preview",
+      "kind": "source",
+      "status": "present",
+      "scope": ["windows_amd64_client", "windows_amd64_host", "windows_arm64_compile"],
+      "paths": ["internal/hostruntime/runtime/preview_service_windows.go", "internal/hostruntime/runtime/production_platform_windows.go", "internal/hostruntime/hosted/hooks_windows.go", "internal/hostruntimeentry/entry_windows.go"],
+      "note": "Native Windows config, preview, serve, hosted hooks, and runtime entry paths exist and cross-compile; broader end-to-end config and protocol qualification remains tracked per feature."
+    },
+    {
+      "id": "source-release-index",
+      "kind": "source_and_tests",
+      "status": "present",
+      "scope": ["server_control_plane", "release_authority", "windows_arm64_compile"],
+      "paths": ["internal/hostruntime/releaseindex/index.go", "internal/hostruntime/bootstrap/artifact.go", "tools/tuf-repository/main.go", "../paperboat-server/internal/releases/index.go", "../paperboat-server/internal/usermachines/service.go", "../paperboat-web/dashboard/src/app/dashboard/machines/page.tsx", "../paperboat-web/dashboard/src/app/dashboard/release-authority/page.tsx", "packaging/windows/metadata.json", "packaging/windows/winget"],
+      "note": "Windows stable/beta metadata and admission validation exist; TUF publication and native qualification evidence remain pending."
+    },
+    {
+      "id": "source-server-platform",
+      "kind": "source_and_tests",
+      "status": "present",
+      "scope": ["server_control_plane"],
+      "paths": ["../paperboat-server/internal/config/config.go", "../paperboat-server/internal/usermachines/service.go", "../paperboat-server/internal/releases/current.go"],
+      "note": "Server platform allow-list and Windows artifact admission support exist and are covered by focused tests."
+    },
+    {
+      "id": "native-windows-logged-out-workloads",
+      "kind": "native_e2e",
+      "status": "partial_native_amd64_verified",
+      "scope": ["windows_amd64_client", "windows_amd64_host", "windows_arm64_compile"],
+      "paths": ["internal/hostruntime/service/s4u_qualification_windows_test.go", "internal/hostruntime/service/testdata/s4u-fixture/main_windows.go", "internal/codexsession/native_windows_e2e_test.go"],
+      "note": "Windows 11 IoT Enterprise LTSC amd64 build 26100.9168, with no selectable owner WTS token: SCM/LocalSystem/S4U passed owner SID, profile, DPAPI, native Git, outbound TCP, signed native Codex 0.147.0, descendants, and Job cleanup. EFS encryption failed with ERROR_ACCESS_DENIED and remains a stable blocker. Credentialed SMB remains unqualified because S4U has no reusable network credentials."
+    },
+    {
+      "id": "native-windows-transfer-runtime",
+      "kind": "native_e2e_and_cross_compile",
+      "status": "partial_native_amd64_verified_arm64_cross_verified",
+      "scope": ["windows_amd64_client", "windows_amd64_host", "windows_arm64_compile", "human_ux", "json_ux"],
+      "paths": ["internal/filetransfer", "internal/inbox", "internal/hostruntime/filetransfer", "internal/peertransport/resumablestream", "internal/peertransport/transfercrypto"],
+      "note": "The package-level Windows amd64 and arm64-cross suites pass, including encrypted send/receive, authenticated chunk resume, restart recovery, atomic publication, collisions, exact bytes, digest and replay rejection, cancellation, backpressure, key erasure, and durable receipts. Live control-plane transfer is not qualified: Victus fails during transfer-key acknowledgement with EOF after transport health succeeds, while a Linux host currently fails a later direct-path descriptor attempt. This evidence is therefore partial until the transfer-key protocol and path fallback are repaired and Windows, Linux, and macOS interoperability pass end to end."
+    },
+    {
+      "id": "native-windows-config-runtime",
+      "kind": "native_package_integration_and_cross_compile",
+      "status": "native_amd64_verified_arm64_cross_verified",
+      "scope": ["windows_amd64_host", "windows_arm64_compile", "human_ux", "json_ux"],
+      "paths": ["internal/hostruntime/config", "internal/hostruntime/configapply", "internal/hostruntime/configsync"],
+      "note": "The complete config, config-apply, and 62-test config-sync package suites passed natively on Windows 11 IoT Enterprise LTSC amd64 build 26100.9168 and compile for Windows arm64. Coverage includes manifests, native Git repositories, snapshots, watches, bounded shutdown flush, atomic apply journals, restart recovery, three-way merge, conflict preservation/resolution, restore, status, leases, and resource limits. Qualification fixed POSIX-mode misuse, native protected-ACL validation, stable Windows metadata normalization, open-journal deletion, rollback ACL restoration, and Windows fsnotify shutdown. External native Chezmoi execution, credential-helper interoperability, CLI UX, and cross-platform sync remain separate gates."
+    },
+    {
+      "id": "native-windows-preview-foundation",
+      "kind": "native_package_and_cli_integration",
+      "status": "partial_native_amd64_verified_arm64_cross_verified",
+      "scope": ["windows_amd64_client", "windows_amd64_host", "windows_arm64_compile", "human_ux", "json_ux"],
+      "paths": ["cmd/pb/preview_service_entry_windows.go", "internal/hostruntime/runtime/preview_service_windows.go", "internal/hostruntime/service/service_entry_windows.go", "internal/hostruntimeentry/entry_windows.go", "internal/windows/previewbroker", "internal/windows/elevation"],
+      "note": "The complete native Windows cmd/pb, hostruntime/service, and hostruntime/runtime suites pass on Windows 11 IoT Enterprise LTSC amd64 build 26100.9168 and cross-compile for arm64. Dynamic preview, private-preview, and detached-serve SCM entries launch only through the enrolled owner WTS/S4U token and a kill-on-close Job, never as the LocalSystem workload. A disposable logged-out standard owner qualification proves the installed LocalSystem PaperboatHostd launches both its broker client and dynamic preview workers under the exact owner SID, non-elevated, in session 0; install, single removal, bulk removal, expiry reconciliation, clean service stop, and a second SCM start all pass. It then deletes the enrolled owner while Hostd is running; the LocalSystem parent detects the now-unmapped SID, closes the owner Job Object, and fails the service closed. Recreating the same account name produces a new SID and PaperboatHostd rejects it instead of transferring machine ownership. A separate forced-reboot qualification proved a newer Windows boot, automatic SCM startup without Start-Service, the same complete session-0 broker lifecycle, exact cleanup, unchanged shared ProgramData ACL, and unchanged PaperboatSshd service, managed SSH files, ACLs, and firewall inventory. Those qualifications exposed and fixed remove-all validation, a premature test-worker exit race, and missing active owner-deletion monitoring. Standard-user lifecycle operations use the persistent PaperboatHostd LocalSystem parent through a protected local-only named pipe with exact owner-SID verification, a domain-separated installation capability, bounded framing, concurrency, deadlines, explicit readiness, and service-fatal failure propagation. Normal commands never launch UAC; elevation is limited to setup, repair, and uninstall. The parent self-removes one-shot services after owner-workload expiry; descriptors use protected owner/SYSTEM/Administrators ACLs. Public registration E2E remains unverified."
+    },
+    {
+      "id": "native-windows-preview-traffic",
+      "kind": "native_package_integration_and_cross_compile",
+      "status": "partial_native_amd64_verified_arm64_cross_verified",
+      "scope": ["windows_amd64_client", "windows_amd64_host", "windows_arm64_compile"],
+      "paths": ["internal/privatepreviewproxy", "internal/peertransport/privatepreview", "internal/serve"],
+      "note": "Native Victus suites pass loopback HTTP health preflight, fresh per-request streams, two separately flushed SSE chunks, WebSocket upgrade and binary echo over the private-preview host protocol, cancellation of listeners and active streams, loopback-only serve binding, requested-port conflict handling, source pinning, traversal and reparse protection, expiry, lease loss, and cleanup. Full public control-plane registration, cross-machine reconnect, and SCM reboot recovery remain separate gates."
+    },
+    {
+      "id": "release-signing-gate",
+      "kind": "release_gate",
+      "status": "configured",
+      "scope": ["release_authority"],
+      "paths": [".github/workflows/release.yml", "docs/tuf-release.md"],
+      "note": "The existing release workflow requires signing evidence, but this ledger does not claim that evidence exists."
+    },
+    {
+      "id": "authority-conflict",
+      "kind": "authority_review",
+      "status": "blocked",
+      "scope": ["release_authority", "server_control_plane", "documentation_support"],
+      "paths": ["../plans/p2p-primary-transport.md"],
+      "note": "The user-approved Windows plan and this ledger are the authoritative platform scope."
+    },
+    {
+      "id": "ci-configuration",
+      "kind": "ci_configuration",
+      "status": "present",
+      "scope": ["windows_arm64_compile", "windows_arm64_native", "release_authority"],
+      "paths": [".github/workflows/windows-ci.yml"],
+      "note": "Configuration is not execution evidence. Native ARM64 remains blocked_no_hardware."
+    },
+    {
+      "id": "docs-operations",
+      "kind": "documentation",
+      "status": "present",
+      "scope": ["documentation_support"],
+      "paths": ["README.md", "docs/operations.md", "docs/tuf-release.md"],
+      "note": "Existing operational documentation covers parts of Windows distribution and signing; this ledger records the remaining gaps."
+    }
+  ],
+  "features": [
+    {
+      "id": "auth.login",
+      "group": "authentication and machine lifecycle",
+      "requirement": "Login, token refresh, logout, credential recovery, and account switching work natively on Windows.",
+      "evidence_profile": "conpty_native_amd64",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-credentials"],
+      "blockers": ["native Windows login and credential lifecycle matrix pending"]
+    },
+    {
+      "id": "setup.host",
+      "group": "authentication and machine lifecycle",
+      "requirement": "Client, receive, session, and host setup complete without manual SSH enablement.",
+      "evidence_profile": "runtime_host_partial",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-setup", "source-windows-openssh", "source-windows-hostruntime"],
+      "blockers": ["full elevated setup and unattended host flow pending"]
+    },
+    {
+      "id": "setup.pair",
+      "group": "authentication and machine lifecycle",
+      "requirement": "Pairing enrolls one Windows machine owner and installs the requested host role.",
+      "evidence_profile": "config_native_amd64",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-setup"],
+      "blockers": ["Windows host service and owner-token qualification pending"]
+    },
+    {
+      "id": "setup.unpair",
+      "group": "authentication and machine lifecycle",
+      "requirement": "Unpairing revokes machine ownership, removes Paperboat-owned host state, and preserves administrator-owned SSH state.",
+      "evidence_profile": "runtime_partial",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": [],
+      "blockers": ["Windows uninstall and ownership cleanup matrix pending"]
+    },
+    {
+      "id": "machine.ownership",
+      "group": "authentication and machine lifecycle",
+      "requirement": "One enrolled owner SID is enforced with account deletion, SID change, logout, reboot, lock, unlock, and fast-user-switch handling.",
+      "evidence_profile": "unattended_core_native_amd64",
+      "applicability_profile": "os_adapter",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-process", "source-windows-hostruntime"],
+      "blockers": ["real native lock/unlock and fast-user-switch notification delivery remains; exact event policy is natively unit-verified"]
+    },
+    {
+      "id": "terminal.interactive",
+      "group": "terminal and sessions",
+      "requirement": "Interactive terminal sessions provide the same input, output, environment, and exit behavior as macOS and Linux.",
+      "evidence_profile": "conpty_native_amd64",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-pty", "source-windows-hostruntime", "native-ltsc-amd64-conpty-runtime", "native-ltsc-amd64-terminal-protocol"],
+      "blockers": ["production credential establishment and real QUIC/WSS client-to-host terminal interoperability remain pending"]
+    },
+    {
+      "id": "terminal.exec",
+      "group": "terminal and sessions",
+      "requirement": "Noninteractive exec supports command arguments, environment, working directory, stdout/stderr, and exit status.",
+      "evidence_profile": "conpty_native_amd64",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-process", "source-windows-hostruntime", "native-ltsc-amd64-conpty-runtime", "native-ltsc-amd64-exec-runtime"],
+      "blockers": ["full authenticated Paperboat remote exec interoperability remains pending"]
+    },
+    {
+      "id": "terminal.sessions",
+      "group": "terminal and sessions",
+      "requirement": "Named sessions persist, reconnect, clean up, and preserve exit state across client restarts.",
+      "evidence_profile": "conpty_native_amd64",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-hostruntime", "native-ltsc-amd64-session-manager"],
+      "blockers": ["durable session recovery across actual client and host process restarts remains pending"]
+    },
+    {
+      "id": "terminal.replay",
+      "group": "terminal and sessions",
+      "requirement": "Replay is bounded, ordered, gap-aware, and equivalent after reconnect.",
+      "evidence_profile": "conpty_native_amd64",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-hostruntime", "native-ltsc-amd64-session-manager"],
+      "blockers": ["authenticated remote reconnect replay and replay-gap interoperability remain pending"]
+    },
+    {
+      "id": "terminal.resize",
+      "group": "terminal and sessions",
+      "requirement": "Resize propagates through ConPTY and remains correct across Windows Terminal and ConHost.",
+      "evidence_profile": "conpty_native_amd64",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-pty", "native-ltsc-amd64-conpty-runtime", "native-ltsc-amd64-session-manager"],
+      "blockers": ["authenticated client-to-host resize propagation and Windows Terminal/ConHost front-end matrix remain pending"]
+    },
+    {
+      "id": "terminal.cancellation",
+      "group": "terminal and sessions",
+      "requirement": "Cancellation is deadline-aware, visible, idempotent, and cleans up descendants.",
+      "evidence_profile": "conpty_native_amd64",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-process", "native-ltsc-amd64-conpty-runtime", "native-ltsc-amd64-session-manager"],
+      "blockers": ["authenticated remote cancellation, deadline, and retry matrix remains pending"]
+    },
+    {
+      "id": "terminal.reconnect",
+      "group": "terminal and sessions",
+      "requirement": "Terminal reconnect preserves safe state and never replays uncertain input.",
+      "evidence_profile": "conpty_native_amd64",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-hostruntime", "native-ltsc-amd64-session-manager"],
+      "blockers": ["actual client restart, transport loss, uncertain-input, and authenticated remote reconnect matrix remains pending"]
+    },
+    {
+      "id": "terminal.shells",
+      "group": "terminal and sessions",
+      "requirement": "PowerShell 5.1, PowerShell 7, and cmd.exe are first-class supported shells.",
+      "evidence_profile": "conpty_native_amd64",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-pty", "native-ltsc-amd64-conpty-runtime"],
+      "blockers": ["Windows Terminal and ConHost front-end attachment matrix remains pending"]
+    },
+    {
+      "id": "terminal.utf8-vt",
+      "group": "terminal and sessions",
+      "requirement": "UTF-8, VT sequences, Unicode paths, and rendering remain correct in supported consoles.",
+      "evidence_profile": "conpty_native_amd64",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-pty", "native-ltsc-amd64-conpty-runtime"],
+      "blockers": ["end-to-end client rendering across Windows Terminal and ConHost remains pending"]
+    },
+    {
+      "id": "terminal.ctrl-c",
+      "group": "terminal and sessions",
+      "requirement": "Ctrl+C cancels the foreground operation with Windows console semantics and preserves terminal state.",
+      "evidence_profile": "conpty_native_amd64",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-pty", "native-ltsc-amd64-conpty-runtime"],
+      "blockers": ["remote client-to-host Ctrl+C protocol propagation remains pending"]
+    },
+    {
+      "id": "terminal.descendant-cleanup",
+      "group": "terminal and sessions",
+      "requirement": "Descendant processes are owned by a Job Object and are cleaned up on cancellation, disconnect, logout, and reboot recovery.",
+      "evidence_profile": "conpty_native_amd64",
+      "applicability_profile": "os_adapter",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-process", "native-ltsc-amd64-conpty-runtime"],
+      "blockers": ["remote cancellation and disconnect cleanup remain pending"]
+    },
+    {
+      "id": "codex.sessions",
+      "group": "terminal and sessions",
+      "requirement": "Native Windows Codex sessions support the complete Paperboat Codex suite.",
+      "evidence_profile": "runtime_partial",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-pty", "native-windows-logged-out-workloads"],
+      "blockers": ["authenticated full Paperboat Codex session interoperability remains pending"]
+    },
+    {
+      "id": "ssh.provisioning",
+      "group": "managed SSH",
+      "requirement": "Host setup installs the exact pinned Microsoft.OpenSSH.Preview package through WinGet, with no Add-WindowsCapability fallback.",
+      "evidence_profile": "runtime_host_partial",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-openssh"],
+      "blockers": ["approved installed-package reuse passed; fresh and interrupted WinGet install plus unavailable-version repair matrix remain"]
+    },
+    {
+      "id": "ssh.client-server",
+      "group": "managed SSH",
+      "requirement": "Both OpenSSH Client and Server are installed and independently verified by binary, version, publisher, and architecture.",
+      "evidence_profile": "ssh_crossplatform_interop_native_amd64",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-openssh", "source-windows-pe", "native-windows-linux-ssh-interoperability", "native-windows-macos-ssh-interoperability"],
+      "blockers": ["native amd64 package inventory, signature, version, and binary verification passed; clean-install and ARM64 native evidence remain"]
+    },
+    {
+      "id": "ssh.paperboat-service",
+      "group": "managed SSH",
+      "requirement": "PaperboatSshd is a dedicated automatic loopback-only service with validated configuration and bounded recovery.",
+      "evidence_profile": "runtime_host_partial",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-openssh", "source-windows-service"],
+      "blockers": ["native service start, loopback ownership, unrestricted stable service SID, real reboot auto-start, and actual wrapper-crash SCM recovery with Job cleanup plus post-recovery protocol qualification passed; repeated-failure 30-second/no-action escalation remains"]
+    },
+    {
+      "id": "ssh.authorized-keys",
+      "group": "managed SSH",
+      "requirement": "Paperboat authorized keys are isolated, atomically rotated, revoked immediately, and never written into user SSH files.",
+      "evidence_profile": "runtime_host_partial",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-openssh"],
+      "blockers": ["native atomic enrollment, idempotent restoration, missing-file restoration, and concurrent administrator-mutation fail-closed probes pass on Victus; service-state ACL and live revoked-key rotation probes remain"]
+    },
+    {
+      "id": "ssh.host-keys",
+      "group": "managed SSH",
+      "requirement": "Dedicated Paperboat host keys are generated, ACL-protected, fingerprint-published, and replacement-detected.",
+      "evidence_profile": "runtime_host_partial",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-openssh"],
+      "blockers": ["native key protection and replacement event evidence pending"]
+    },
+    {
+      "id": "ssh.agent",
+      "group": "managed SSH",
+      "requirement": "Windows Credential Manager/DPAPI and the OpenSSH agent provide user-scoped key handling without argv, environment, or log exposure.",
+      "evidence_profile": "runtime_host_partial",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-credentials", "source-windows-openssh"],
+      "blockers": ["native user isolation and agent lifecycle matrix pending"]
+    },
+    {
+      "id": "ssh.key-rotation",
+      "group": "managed SSH",
+      "requirement": "Client and host key rotation is atomic, auditable, reconnect-safe, and removes revoked material immediately.",
+      "evidence_profile": "runtime_partial",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": [],
+      "blockers": ["native rotation and reconnect evidence pending"]
+    },
+    {
+      "id": "ssh.proxy-command",
+      "group": "managed SSH",
+      "requirement": "ProxyCommand integration works with Windows path, quoting, environment, cancellation, and exit semantics.",
+      "evidence_profile": "runtime_partial",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-managedssh"],
+      "blockers": ["native ProxyCommand matrix pending"]
+    },
+    {
+      "id": "ssh.scp",
+      "group": "managed SSH",
+      "requirement": "Managed scp upload and download support spaces, Unicode, cancellation, resume policy, and exit status.",
+      "evidence_profile": "ssh_crossplatform_interop_native_amd64",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-managedssh", "native-windows-linux-ssh-interoperability", "native-windows-macos-ssh-interoperability"],
+      "blockers": ["native upload/download and exit behavior passed; spaces, Unicode, and cancellation matrix remains"]
+    },
+    {
+      "id": "ssh.sftp",
+      "group": "managed SSH",
+      "requirement": "Managed sftp uses an absolute validated subsystem path and supports upload, download, cancellation, and cleanup.",
+      "evidence_profile": "ssh_crossplatform_interop_native_amd64",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-openssh", "native-windows-linux-ssh-interoperability", "native-windows-macos-ssh-interoperability"],
+      "blockers": ["native absolute subsystem plus upload/download and cleanup passed; cancellation matrix remains"]
+    },
+    {
+      "id": "ssh.firewall",
+      "group": "managed SSH",
+      "requirement": "Firewall changes are inventoried, loopback-only, profile-tested, reversible, and never overwrite administrator-owned rules.",
+      "evidence_profile": "known_folder_native_amd64",
+      "applicability_profile": "os_adapter",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-openssh"],
+      "blockers": ["native Domain, Private, and Public profile inventory passed with every profile enabled, no enabled inbound rule targeting PaperboatSshd or port 38222, and healthy IPv4/IPv6 loopback listeners; profile-transition and administrator-rule conflict matrices remain"]
+    },
+    {
+      "id": "ssh.repair",
+      "group": "managed SSH",
+      "requirement": "pb doctor --repair repairs WinGet registration, signatures, ACLs, configuration, service state, keys, and loopback probes; uninstall removes only Paperboat-owned state.",
+      "evidence_profile": "runtime_host_partial",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-openssh", "source-windows-hostruntime"],
+      "blockers": ["native repair, host-key ACL restoration, service-SID restoration, and uninstall ownership matrices passed; corrupt-package reinstall, key-regeneration policy, and complete doctor UX remain"]
+    },
+    {
+      "id": "transfer.send",
+      "group": "transfers and inbox",
+      "requirement": "Send transfers are encrypted, bounded, resumable where supported, observable, and correct with Windows files.",
+      "evidence_profile": "transfer_native_amd64",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["native-windows-transfer-runtime"],
+      "blockers": ["live Victus transfer-key acknowledgement fails with EOF; Linux currently fails a direct-path descriptor fallback; cross-machine Windows and cross-platform transfer interoperability remains"]
+    },
+    {
+      "id": "transfer.receive",
+      "group": "transfers and inbox",
+      "requirement": "Receive transfers preserve atomicity, ownership, path safety, cancellation, and correct Windows metadata policy.",
+      "evidence_profile": "transfer_native_amd64",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-process", "native-windows-transfer-runtime"],
+      "blockers": ["live Victus transfer-key acknowledgement fails with EOF; Linux currently fails a direct-path descriptor fallback; cross-machine Windows and cross-platform transfer interoperability remains"]
+    },
+    {
+      "id": "transfer.inbox",
+      "group": "transfers and inbox",
+      "requirement": "Inbox state, notifications, retention, downloads, and recovery use Windows Known Folders and ACLs.",
+      "evidence_profile": "transfer_native_amd64",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-known-folders", "known-folder-arm64-cross", "native-windows-transfer-runtime"],
+      "blockers": ["Windows notification UX and retention policy qualification remain"]
+    },
+    {
+      "id": "transfer.encryption",
+      "group": "transfers and inbox",
+      "requirement": "Transfer encryption and key handling have the same protocol, failure, and redaction behavior on Windows.",
+      "evidence_profile": "transfer_native_amd64",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-credentials", "native-windows-transfer-runtime"],
+      "blockers": ["cross-platform encrypted transfer evidence remains"]
+    },
+    {
+      "id": "transfer.resume",
+      "group": "transfers and inbox",
+      "requirement": "Interrupted transfers resume from verified leases and never corrupt or duplicate files.",
+      "evidence_profile": "transfer_native_amd64",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["native-windows-transfer-runtime"],
+      "blockers": ["native sleep/wake interruption and network reconnect resume remain"]
+    },
+    {
+      "id": "transfer.cancellation",
+      "group": "transfers and inbox",
+      "requirement": "Transfer cancellation is idempotent, bounded, cleans streams, and reports a stable result in human and JSON UX.",
+      "evidence_profile": "transfer_native_amd64",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["native-windows-transfer-runtime"],
+      "blockers": ["end-user CLI cancellation UX over a cross-machine transfer remains"]
+    },
+    {
+      "id": "preview.private",
+      "group": "previews and serve",
+      "requirement": "Private previews preserve authentication, routing, lifetime, cleanup, and local process ownership on Windows.",
+      "evidence_profile": "runtime_partial",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-config-preview", "native-windows-preview-foundation"],
+      "blockers": ["native private peer traffic, standard-user lifecycle, logout, and reconnect E2E remain"]
+    },
+    {
+      "id": "preview.public",
+      "group": "previews and serve",
+      "requirement": "Public previews require explicit acknowledgement, enforce expiry, and clean up detached processes on Windows.",
+      "evidence_profile": "runtime_partial",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-config-preview", "native-windows-preview-foundation"],
+      "blockers": ["native public registration, traffic, expiry, and standard-user lifecycle E2E remain"]
+    },
+    {
+      "id": "preview.http",
+      "group": "previews and serve",
+      "requirement": "HTTP preview traffic and health checks work through the Windows process and transport layers.",
+      "evidence_profile": "runtime_partial",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["native-windows-preview-foundation", "native-windows-preview-traffic"],
+      "blockers": ["public control-plane and cross-machine HTTP preview evidence pending"]
+    },
+    {
+      "id": "preview.websocket",
+      "group": "previews and serve",
+      "requirement": "WebSocket previews preserve upgrade, streaming, cancellation, and reconnect behavior on Windows.",
+      "evidence_profile": "runtime_partial",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["native-windows-preview-foundation", "native-windows-preview-traffic"],
+      "blockers": ["cross-machine reconnect evidence pending"]
+    },
+    {
+      "id": "preview.sse",
+      "group": "previews and serve",
+      "requirement": "SSE previews preserve streaming, flushing, reconnect, and cancellation behavior on Windows.",
+      "evidence_profile": "runtime_partial",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["native-windows-preview-foundation", "native-windows-preview-traffic"],
+      "blockers": ["cross-machine reconnect evidence pending"]
+    },
+    {
+      "id": "preview.detached-serve",
+      "group": "previews and serve",
+      "requirement": "Detached serve survives client exit, logout, reboot recovery, and repair without orphaned processes.",
+      "evidence_profile": "named_pipe_native_amd64",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-hostruntime", "source-windows-process", "native-windows-preview-foundation"],
+      "blockers": ["native detached SCM traffic plus logout/reboot recovery remain"]
+    },
+    {
+      "id": "config.sync",
+      "group": "configuration and repositories",
+      "requirement": "Configuration sync, leases, watch, apply, and recovery have Windows path and ownership parity.",
+      "evidence_profile": "runtime_partial",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-config-preview", "native-windows-config-runtime"],
+      "blockers": ["end-user CLI sync and cross-machine interoperability remain"]
+    },
+    {
+      "id": "config.git",
+      "group": "configuration and repositories",
+      "requirement": "Git-backed configuration works with Windows Git, credentials, line endings, hooks, and path rules.",
+      "evidence_profile": "config_native_amd64",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-credentials", "native-windows-logged-out-workloads", "native-windows-config-runtime"],
+      "blockers": ["native Git repository execution passed logged-out; credential-helper, hooks, line-ending, and path matrix remains pending"]
+    },
+    {
+      "id": "config.chezmoi",
+      "group": "configuration and repositories",
+      "requirement": "Chezmoi integration preserves Windows templates, secrets, paths, and apply semantics.",
+      "evidence_profile": "config_native_amd64",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["native-windows-config-runtime"],
+      "blockers": ["native external Chezmoi executable and Windows template/secret matrix remain"]
+    },
+    {
+      "id": "config.restore",
+      "group": "configuration and repositories",
+      "requirement": "Restore is atomic, path-safe, ACL-aware, and recoverable on Windows.",
+      "evidence_profile": "config_native_amd64",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-process", "native-windows-config-runtime"],
+      "blockers": ["cross-platform restore interoperability remains"]
+    },
+    {
+      "id": "config.flush",
+      "group": "configuration and repositories",
+      "requirement": "Flush publishes intended state with bounded conflict handling and no partial Windows writes.",
+      "evidence_profile": "config_native_amd64",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["native-windows-config-runtime"],
+      "blockers": ["end-user shutdown and CLI-triggered flush UX remain"]
+    },
+    {
+      "id": "config.conflicts",
+      "group": "configuration and repositories",
+      "requirement": "Conflicts are detected, represented, recoverable, and identical in human and JSON UX.",
+      "evidence_profile": "config_native_amd64",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["native-windows-config-runtime"],
+      "blockers": ["human and JSON conflict-resolution CLI parity remains"]
+    },
+    {
+      "id": "transport.direct-quic",
+      "group": "transport and network adaptation",
+      "requirement": "Direct QUIC works over IPv4 and IPv6 with Windows socket and firewall behavior.",
+      "evidence_profile": "transport_native_amd64",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["native-ltsc-amd64-peer-transports"],
+      "blockers": ["Defender Public/Private/Domain profile qualification and cross-platform direct QUIC remain pending"]
+    },
+    {
+      "id": "transport.relayed-quic",
+      "group": "transport and network adaptation",
+      "requirement": "Relayed QUIC preserves authentication, flow control, cancellation, and reconnect semantics on Windows.",
+      "evidence_profile": "transport_native_amd64",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["native-ltsc-amd64-peer-transports"],
+      "blockers": ["live relay-service and cross-platform relayed QUIC interoperability remain pending"]
+    },
+    {
+      "id": "transport.wss",
+      "group": "transport and network adaptation",
+      "requirement": "WSS fallback preserves protocol, proxy, certificate, cancellation, and reconnect behavior on Windows.",
+      "evidence_profile": "transport_native_amd64",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["native-ltsc-amd64-peer-transports"],
+      "blockers": ["WSS TLS certificate, explicit proxy, relay service, and reconnect matrix remain pending"]
+    },
+    {
+      "id": "transport.network-migration",
+      "group": "transport and network adaptation",
+      "requirement": "Interface changes, NAT rebinding, VPN changes, and path migration preserve sessions safely.",
+      "evidence_profile": "network_observer_native_amd64",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["native-ltsc-amd64-network-observer"],
+      "blockers": ["active QUIC/WSS session replacement, NAT rebinding, VPN transition, and transfer continuity matrix remain pending"]
+    },
+    {
+      "id": "transport.sleep-wake",
+      "group": "transport and network adaptation",
+      "requirement": "Sleep and wake recover transports, sessions, transfers, and previews without unsafe replay.",
+      "evidence_profile": "runtime_partial",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": [],
+      "blockers": ["native Windows sleep/wake matrix pending"]
+    },
+    {
+      "id": "transport.ipv4-ipv6",
+      "group": "transport and network adaptation",
+      "requirement": "IPv4 and IPv6 address selection, binding, discovery, and fallback are equivalent to other platforms.",
+      "evidence_profile": "transport_native_amd64",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["native-ltsc-amd64-peer-transports"],
+      "blockers": ["address selection across interface changes and cross-platform fallback matrix remain pending"]
+    },
+    {
+      "id": "transport.pmtu",
+      "group": "transport and network adaptation",
+      "requirement": "Path MTU discovery and bounded fallback work through Winsock and Defender Firewall.",
+      "evidence_profile": "runtime_partial",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["native-windows-udp-dontfragment"],
+      "blockers": ["live Windows PMTU path-reduction and Defender interaction evidence pending"]
+    },
+    {
+      "id": "transport.vpn-nat-firewall-proxy",
+      "group": "transport and network adaptation",
+      "requirement": "VPN, NAT rebinding, Defender Firewall profiles, and explicit proxying are covered by deterministic Windows tests.",
+      "evidence_profile": "runtime_partial",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": [],
+      "blockers": ["native Windows network matrix pending"]
+    },
+    {
+      "id": "local-api.named-pipe",
+      "group": "Windows integration and local API",
+      "requirement": "The complete local API runs through ACL-protected Windows named pipes under the documented pipe namespace.",
+      "evidence_profile": "named_pipe_native_amd64",
+      "applicability_profile": "os_adapter",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-localapi", "native-ltso-amd64-localapi-named-pipe"],
+      "blockers": ["full Windows local daemon integration and complete local API operation matrix remain incomplete"]
+    },
+    {
+      "id": "local-api.acl-token",
+      "group": "Windows integration and local API",
+      "requirement": "Named-pipe SDDL, client-token identity, deadlines, frame limits, cancellation, and network-client denial are enforced.",
+      "evidence_profile": "runtime_host_partial",
+      "applicability_profile": "os_adapter",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-localapi", "native-ltso-amd64-localapi-named-pipe"],
+      "blockers": ["ACL-protected named-pipe implementation and adversarial tests pending"]
+    },
+    {
+      "id": "local-api.operations",
+      "group": "Windows integration and local API",
+      "requirement": "Snapshot/watch, completions, diagnostics, bug reports, peer probes, transport observations, streams, leases, and transfer APIs are complete on Windows.",
+      "evidence_profile": "named_pipe_native_amd64",
+      "applicability_profile": "os_adapter",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-localapi", "native-ltso-amd64-localapi-named-pipe"],
+      "blockers": ["cross-machine workflow and complete human/JSON CLI qualification remain"]
+    },
+    {
+      "id": "os.known-folders",
+      "group": "Windows integration and local API",
+      "requirement": "Known Folder resolution is used for Downloads, application state, configuration, and user profile paths.",
+      "evidence_profile": "windows_adapter",
+      "applicability_profile": "os_adapter",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-known-folders", "known-folder-amd64-native", "known-folder-arm64-cross"],
+      "blockers": ["native Windows ARM64 path testing remains blocked until hardware is available"]
+    },
+    {
+      "id": "os.acl-reparse",
+      "group": "Windows integration and local API",
+      "requirement": "ACL validation, reparse-point rejection, final-path authorization, reserved names, and long-path security are enforced.",
+      "evidence_profile": "credentials_native_amd64_client",
+      "applicability_profile": "os_adapter",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-process", "native-windows-elevation-path-security"],
+      "blockers": ["reserved-name and long-path adversarial coverage remains pending outside the elevation IPC boundary"]
+    },
+    {
+      "id": "os.long-paths",
+      "group": "Windows integration and local API",
+      "requirement": "Long-path-aware manifests and APIs work with long paths enabled and disabled, including spaces and Unicode.",
+      "evidence_profile": "windows_adapter",
+      "applicability_profile": "os_adapter",
+      "release_blocker": true,
+      "evidence_refs": [],
+      "blockers": ["long-path native matrix pending"]
+    },
+    {
+      "id": "os.atomic-replacement",
+      "group": "Windows integration and local API",
+      "requirement": "Atomic replacement and rollback preserve data, ACLs, cancellation, and crash recovery on Windows.",
+      "evidence_profile": "windows_adapter",
+      "applicability_profile": "os_adapter",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-process"],
+      "blockers": ["native atomic replacement matrix pending"]
+    },
+    {
+      "id": "os.credentials",
+      "group": "Windows integration and local API",
+      "requirement": "Credential Manager and user-scoped DPAPI store secrets with correct ACL, isolation, persistence, redaction, and fallback behavior.",
+      "evidence_profile": "windows_adapter",
+      "applicability_profile": "os_adapter",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-credentials", "native-ltso-amd64-credentials"],
+      "blockers": ["native multi-account, reboot, service-profile, and access-denial matrix pending"]
+    },
+    {
+      "id": "os.pe-authenticode",
+      "group": "Windows integration and local API",
+      "requirement": "PE machine type, exact TUF target digest and length, protected staging ownership, and optional Authenticode evidence are verified before execution.",
+      "evidence_profile": "windows_adapter",
+      "applicability_profile": "os_adapter",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-pe"],
+      "blockers": ["final TUF-bound Windows artifact evidence pending"]
+    },
+    {
+      "id": "os.winsock-observer",
+      "group": "Windows integration and local API",
+      "requirement": "Winsock and network-change observation handles interfaces, sleep/wake, VPN, and address changes without leaks or races.",
+      "evidence_profile": "windows_adapter",
+      "applicability_profile": "os_adapter",
+      "release_blocker": true,
+      "evidence_refs": [],
+      "blockers": ["native Winsock observer implementation and tests pending"]
+    },
+    {
+      "id": "os.services",
+      "group": "Windows integration and local API",
+      "requirement": "Windows services install, start, stop, recover, log, upgrade, and uninstall with correct ACLs and service SIDs.",
+      "evidence_profile": "windows_adapter",
+      "applicability_profile": "os_adapter",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-service"],
+      "blockers": ["native service lifecycle and upgrade matrix pending"]
+    },
+    {
+      "id": "os.owner-token",
+      "group": "Windows integration and local API",
+      "requirement": "The service acquires the enrolled user token without retaining a password, strips privileges, loads the profile, and uses CreateProcessAsUser correctly.",
+      "evidence_profile": "unattended_core_native_amd64",
+      "applicability_profile": "os_adapter",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-process", "source-windows-hostruntime", "native-windows-s4u-logged-out"],
+      "blockers": ["native ARM64 and broader cancellation and reboot matrix pending"]
+    },
+    {
+      "id": "os.user-profile",
+      "group": "Windows integration and local API",
+      "requirement": "User profile, environment, Git credentials, DPAPI, EFS, SMB, Codex, and outbound networking work from unattended sessions.",
+      "evidence_profile": "runtime_host_partial",
+      "applicability_profile": "os_adapter",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-process", "source-windows-credentials"],
+      "blockers": ["credentialed SMB, EFS, Git credentials, Codex, and outbound networking still require separate logged-out native qualification"]
+    },
+    {
+      "id": "os.process-tree",
+      "group": "Windows integration and local API",
+      "requirement": "Process trees are owned, bounded, cancellable, and cleaned on all lifecycle transitions.",
+      "evidence_profile": "unattended_core_native_amd64",
+      "applicability_profile": "os_adapter",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-process", "native-windows-s4u-logged-out"],
+      "blockers": ["native ARM64 and broader cancellation and reboot matrix pending"]
+    },
+    {
+      "id": "os.conpty",
+      "group": "Windows integration and local API",
+      "requirement": "ConPTY supports PowerShell 5.1, PowerShell 7, cmd.exe, Windows Terminal, ConHost, VT, resize, Ctrl+C, replay, and cleanup.",
+      "evidence_profile": "conpty_native_amd64",
+      "applicability_profile": "os_adapter",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-pty", "native-ltsc-amd64-conpty-runtime"],
+      "blockers": ["Windows Terminal and ConHost front-end, replay, and authenticated remote-session matrices remain pending"]
+    },
+    {
+      "id": "os.workspace-smb-efs",
+      "group": "Windows integration and local API",
+      "requirement": "Local workspaces, SMB, EFS, Git credentials, and file metadata have an explicit supported policy and pass native probes.",
+      "evidence_profile": "not_started",
+      "applicability_profile": "os_adapter",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-process", "source-windows-credentials", "native-windows-logged-out-workloads"],
+      "blockers": ["logged-out EFS encryption fails with ERROR_ACCESS_DENIED on the LTSC qualification host", "credentialed SMB cannot be qualified through passwordless S4U because no reusable user network credentials are present", "Git credential and complete workspace metadata matrix remain pending"]
+    },
+    {
+      "id": "ops.diagnostics",
+      "group": "operations, distribution, and release",
+      "requirement": "Diagnostics collect bounded, redacted, Windows-native service, transport, package, and capability evidence.",
+      "evidence_profile": "runtime_partial",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": [],
+      "blockers": ["Windows local API and native diagnostics persistence pending"]
+    },
+    {
+      "id": "ops.bug-reports",
+      "group": "operations, distribution, and release",
+      "requirement": "Bug reports include Windows build, architecture, channel, package, service, and redacted recovery context.",
+      "evidence_profile": "runtime_partial",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": [],
+      "blockers": ["Windows diagnostics and local API evidence pending"]
+    },
+    {
+      "id": "ops.completions",
+      "group": "operations, distribution, and release",
+      "requirement": "Completions work identically in PowerShell 5.1, PowerShell 7, cmd.exe, and supported shells with human and JSON contracts.",
+      "evidence_profile": "runtime_partial",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-setup"],
+      "blockers": ["native shell and local API completion matrix pending"]
+    },
+    {
+      "id": "ops.telemetry",
+      "group": "operations, distribution, and release",
+      "requirement": "Telemetry records OS, architecture, stability, beta channel, package, and recovery outcomes without secrets.",
+      "evidence_profile": "release_partial",
+      "applicability_profile": "server",
+      "release_blocker": true,
+      "evidence_refs": ["source-release-index", "source-server-platform"],
+      "blockers": ["native telemetry emission and dashboard presentation pending"]
+    },
+    {
+      "id": "ops.update",
+      "group": "operations, distribution, and release",
+      "requirement": "Updates select the correct Windows architecture/channel, verify PE signatures, stage safely, and recover across reboot.",
+      "evidence_profile": "release_partial",
+      "applicability_profile": "release",
+      "release_blocker": true,
+      "evidence_refs": ["source-release-index", "source-windows-pe"],
+      "blockers": ["final TUF-bound Windows artifact update and real reboot activation lifecycle pending"]
+    },
+    {
+      "id": "ops.rollback",
+      "group": "operations, distribution, and release",
+      "requirement": "Updates roll back independently per architecture/channel with verified artifacts and bounded recovery.",
+      "evidence_profile": "release_partial",
+      "applicability_profile": "release",
+      "release_blocker": true,
+      "evidence_refs": ["source-release-index"],
+      "blockers": ["final TUF-bound rollback and real updater-service reboot matrix pending"]
+    },
+    {
+      "id": "ops.repair",
+      "group": "operations, distribution, and release",
+      "requirement": "Repair restores binaries, services, ACLs, OpenSSH, keys, configuration, and local APIs without overwriting administrator-owned state.",
+      "evidence_profile": "runtime_host_partial",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-openssh", "source-windows-hostruntime"],
+      "blockers": ["final TUF-bound host-runtime binary restoration and complete installed-host repair matrix pending; combined elevated repair and stopped PaperboatSshd recovery pass natively"]
+    },
+    {
+      "id": "ops.uninstall",
+      "group": "operations, distribution, and release",
+      "requirement": "Uninstall removes only Paperboat services, state, keys, and firewall changes and preserves shared OpenSSH installations.",
+      "evidence_profile": "installer_native_amd64",
+      "applicability_profile": "runtime",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-openssh", "source-windows-hostruntime", "native-ltsc-amd64-msi-lifecycle", "native-windows-preview-foundation"],
+      "blockers": ["signed release-artifact uninstall and enterprise policy matrix remain"]
+    },
+    {
+      "id": "distribution.msi",
+      "group": "operations, distribution, and release",
+      "requirement": "A TUF-bound machine-wide MSI installs every required component, services, ACLs, event source, current slot, and rollback slot.",
+      "evidence_profile": "installer_native_amd64",
+      "applicability_profile": "release",
+      "release_blocker": true,
+      "evidence_refs": ["native-ltsc-amd64-msi-lifecycle"],
+      "blockers": ["final TUF, checksum, SBOM, provenance, and malware-scan evidence remains unavailable", "native arm64 execution remains blocked on hardware"]
+    },
+    {
+      "id": "distribution.winget",
+      "group": "operations, distribution, and release",
+      "requirement": "Paperboat has a final-hash WinGet manifest for its MSI with architecture and channel metadata.",
+      "evidence_profile": "release_partial",
+      "applicability_profile": "release",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-winget-and-zip"],
+      "blockers": ["final manifests require amd64 and arm64 MSI identities, hashes, channel metadata, and native winget.exe validation"]
+    },
+    {
+      "id": "distribution.zip",
+      "group": "operations, distribution, and release",
+      "requirement": "A TUF-bound portable ZIP supports client workflows and routes host mode through the elevated setup engine.",
+      "evidence_profile": "portable_zip_native_amd64",
+      "applicability_profile": "release",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-winget-and-zip", "native-ltsc-amd64-portable-zip"],
+      "blockers": ["final TUF-bound binaries, ZIP release metadata, and publication evidence remain unavailable"]
+    },
+    {
+      "id": "distribution.lifecycle",
+      "group": "operations, distribution, and release",
+      "requirement": "Fresh install, upgrade, repair, interrupted rollback, reboot continuation, uninstall, reinstall, silent install, spaces, Unicode, and long paths pass natively.",
+      "evidence_profile": "installer_native_amd64",
+      "applicability_profile": "release",
+      "release_blocker": true,
+      "evidence_refs": ["native-ltsc-amd64-msi-lifecycle"],
+      "blockers": ["the complete lifecycle must be replayed against final TUF-bound release candidates before stable publication"]
+    },
+    {
+      "id": "distribution.arch-mismatch",
+      "group": "operations, distribution, and release",
+      "requirement": "Installers and updaters fail closed on architecture mismatch and report a stable recovery code.",
+      "evidence_profile": "release_partial",
+      "applicability_profile": "release",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-pe"],
+      "blockers": ["native installer and updater mismatch probes pending"]
+    },
+    {
+      "id": "release.sbom-provenance-signing",
+      "group": "operations, distribution, and release",
+      "requirement": "Stable artifacts carry TUF metadata, SHA-256 checksums, PE architecture validation, SBOM, provenance, and malware scan evidence; Authenticode and RFC 3161 timestamping are optional.",
+      "evidence_profile": "release_partial",
+      "applicability_profile": "release",
+      "release_blocker": true,
+      "evidence_refs": ["source-windows-pe", "release-signing-gate"],
+      "blockers": ["final TUF publication, SBOM, provenance, checksum, and malware-scan evidence are absent"]
+    },
+    {
+      "id": "release.tuf",
+      "group": "operations, distribution, and release",
+      "requirement": "TUF release metadata carries Windows platform, architecture, stability, native_tested, tested builds, and pinned OpenSSH metadata.",
+      "evidence_profile": "release_partial",
+      "applicability_profile": "release",
+      "release_blocker": true,
+      "evidence_refs": ["source-release-index"],
+      "blockers": ["TUF publication and native qualification evidence pending"]
+    },
+    {
+      "id": "release.channels-rollout",
+      "group": "operations, distribution, and release",
+      "requirement": "Windows amd64 stable and Windows arm64 beta have explicit independent channels, gated enrollment, canary rollout, and rollback.",
+      "evidence_profile": "release_partial",
+      "applicability_profile": "release",
+      "release_blocker": true,
+      "evidence_refs": ["source-release-index", "source-server-platform"],
+      "blockers": ["dashboard, TUF rollout, and native release evidence pending"]
+    },
+    {
+      "id": "server.platform-admission",
+      "group": "operations, distribution, and release",
+      "requirement": "Server enrollment and admission allow Windows, enforce stable amd64 versus beta arm64 policy, and record architecture/channel telemetry.",
+      "evidence_profile": "control_plane_partial",
+      "applicability_profile": "server",
+      "release_blocker": true,
+      "evidence_refs": ["source-server-platform"],
+      "blockers": ["end-to-end server admission and beta-account behavior pending"]
+    },
+    {
+      "id": "server.release-index",
+      "group": "operations, distribution, and release",
+      "requirement": "Server release policy validates Windows package ID, approved OpenSSH version, tested builds, stability, and native qualification.",
+      "evidence_profile": "control_plane_partial",
+      "applicability_profile": "server",
+      "release_blocker": true,
+      "evidence_refs": ["source-release-index", "source-server-platform"],
+      "blockers": ["signed release index and server integration qualification pending"]
+    },
+    {
+      "id": "dashboard.beta-status",
+      "group": "operations, distribution, and release",
+      "requirement": "CLI, installer, dashboard, downloads, docs, release notes, and support output visibly label Windows arm64 beta and never silently promote it.",
+      "evidence_profile": "release_partial",
+      "applicability_profile": "dashboard",
+      "release_blocker": true,
+      "evidence_refs": ["source-release-index"],
+      "blockers": ["TUF-bound production download and release-note publication evidence remains"]
+    },
+    {
+      "id": "docs.support",
+      "group": "operations, distribution, and release",
+      "requirement": "Documentation and support runbooks cover native Windows setup, exact WinGet OpenSSH behavior, repair, diagnostics, beta disclosure, and blocked ARM64 native evidence.",
+      "evidence_profile": "docs_complete",
+      "applicability_profile": "docs",
+      "release_blocker": true,
+      "evidence_refs": ["docs-operations"],
+      "blockers": ["full Windows support and troubleshooting documentation remains to be completed"]
+    },
+    {
+      "id": "ci.windows-amd64",
+      "group": "operations, distribution, and release",
+      "requirement": "Native Windows 11 standard and IoT Enterprise LTSC amd64 runners execute the full install, host, transport, interop, update, rollback, and uninstall matrix.",
+      "evidence_profile": "ci_configured",
+      "applicability_profile": "ci",
+      "release_blocker": true,
+      "evidence_refs": ["ci-configuration"],
+      "blockers": ["native runner execution and complete matrix evidence are pending"]
+    },
+    {
+      "id": "ci.windows-arm64",
+      "group": "operations, distribution, and release",
+      "requirement": "Windows arm64 compiles every package and test package, runs static and contract checks, and retains a native runner lane that is blocked explicitly until hardware exists.",
+      "evidence_profile": "ci_configured",
+      "applicability_profile": "ci",
+      "release_blocker": true,
+      "evidence_refs": ["ci-configuration", "cross-build"],
+      "blockers": ["native_windows_arm64_e2e: blocked_no_hardware"]
+    }
+  ],
+  "verification_commands": [
+    {
+      "id": "cross-build-amd64",
+      "command": "CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build ./...",
+      "required_result": "exit 0",
+      "evidence_limit": "Compile only; never upgrades native execution state."
+    },
+    {
+      "id": "cross-build-arm64",
+      "command": "CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build ./...",
+      "required_result": "exit 0",
+      "evidence_limit": "Compile only; never upgrades native execution state."
+    },
+    {
+      "id": "compile-test-packages-amd64",
+      "command": "CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go test -c <each applicable package>",
+      "required_result": "every applicable test package compiles",
+      "evidence_limit": "Compile only; execution must run on native Windows amd64."
+    },
+    {
+      "id": "compile-test-packages-arm64",
+      "command": "CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go test -c <each applicable package>",
+      "required_result": "every applicable test package compiles",
+      "evidence_limit": "Compile only; native ARM64 remains blocked_no_hardware until a real runner exists."
+    },
+    {
+      "id": "validate-ledger",
+      "command": "go run ./tools/validate-windows-parity.go",
+      "required_result": "exit 0",
+      "evidence_limit": "Validates ledger structure and gates; does not create runtime evidence."
+    }
+  ]
+}

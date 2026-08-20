@@ -15,7 +15,7 @@ func FromEnv(environ func(string) string) (Config, error) {
 	if environ == nil {
 		return Config{}, ErrInvalid
 	}
-	volume := valueOr(environ("PAPERBOAT_WORKSPACE"), "/workspace")
+	volume := valueOr(environ("PAPERBOAT_WORKSPACE"), hostedDefaultVolume())
 	repositoryURL := environ("PAPERBOAT_REPOSITORY_URL")
 	projectDir, err := repositoryDirectory(repositoryURL, environ("PAPERBOAT_PROJECT_DIR"))
 	if err != nil {
@@ -37,15 +37,16 @@ func FromEnv(environ func(string) string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	presets, err := loadPresets(valueOr(environ("PAPERBOAT_PRESET_DIR"), "/etc/paperboat/presets.d"), splitValues(environ("PAPERBOAT_PRESET_CODES")), maxScriptBytes)
+	presets, err := loadPresets(valueOr(environ("PAPERBOAT_PRESET_DIR"), hostedDefaultPresetDirectory()), splitValues(environ("PAPERBOAT_PRESET_CODES")), maxScriptBytes)
 	if err != nil {
 		return Config{}, err
 	}
 	config := Config{
 		VolumeRoot: volume, CheckoutRoot: filepath.Join(volume, projectDir), ProjectID: environ("PAPERBOAT_PROJECT_ID"),
+		OwnerSID:      environ("PAPERBOAT_WINDOWS_OWNER_SID"),
 		RepositoryURL: repositoryURL, Branch: valueOr(environ("PAPERBOAT_DEFAULT_BRANCH"), "main"),
 		AllowedRepositoryHosts: splitValues(valueOr(environ("PAPERBOAT_REPOSITORY_HOSTS"), "github.com")),
-		GitPath:                valueOr(environ("PAPERBOAT_GIT_PATH"), "/usr/bin/git"), ShellPath: valueOr(environ("PAPERBOAT_SHELL_PATH"), "/bin/sh"),
+		GitPath:                valueOr(environ("PAPERBOAT_GIT_PATH"), hostedDefaultGitPath()), ShellPath: valueOr(environ("PAPERBOAT_SHELL_PATH"), hostedDefaultShellPath()),
 		Presets: presets, OperationTimeout: operationTimeout, FlushTimeout: flushTimeout,
 		MaxScriptBytes: maxScriptBytes, MaxOutputBytes: maxOutputBytes,
 	}
@@ -65,9 +66,9 @@ func loadPresets(directory string, codes []string, maxBytes int) ([]Script, erro
 		if !safePresetName(code) {
 			return nil, ErrInvalid
 		}
-		path := filepath.Join(directory, code+".sh")
+		path := filepath.Join(directory, code+hostedPresetExtension())
 		info, err := os.Lstat(path)
-		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o022 != 0 || info.Size() < 1 || info.Size() > int64(maxBytes-total) {
+		if err != nil || !securePresetFile(path, info, int64(maxBytes-total)) || info.Size() < 1 {
 			return nil, ErrInvalid
 		}
 		body, err := os.ReadFile(path)

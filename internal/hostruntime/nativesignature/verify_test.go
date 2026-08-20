@@ -56,16 +56,13 @@ func TestVerifierRejectsFailedDarwinAssessment(t *testing.T) {
 	}
 }
 
-func TestVerifierRequiresValidAuthenticode(t *testing.T) {
-	runner := &fakeRunner{output: []byte("Valid")}
+func TestVerifierAllowsUnsignedWindowsPEWhenTUFAndPEChecksAreUsed(t *testing.T) {
+	runner := &fakeRunner{}
 	if err := New(runner).Verify(context.Background(), "C:\\Program Files\\Paperboat\\pb.exe", "windows", "amd64"); err != nil {
 		t.Fatal(err)
 	}
-	if len(runner.calls) != 1 || runner.calls[0].name != "powershell.exe" {
-		t.Fatalf("native calls = %#v", runner.calls)
-	}
-	if !strings.Contains(strings.Join(runner.calls[0].args, " "), "Get-AuthenticodeSignature -LiteralPath 'C:\\Program Files\\Paperboat\\pb.exe'") {
-		t.Fatalf("Authenticode command = %#v", runner.calls[0])
+	if len(runner.calls) != 0 {
+		t.Fatalf("unexpected native calls = %#v", runner.calls)
 	}
 }
 
@@ -75,7 +72,6 @@ func TestVerifierRejectsInvalidAuthenticodeAndUnsupportedPlatforms(t *testing.T)
 		platform     string
 		architecture string
 	}{
-		"invalid authenticode":     {output: []byte("NotSigned"), platform: "windows", architecture: "arm64"},
 		"unsupported platform":     {platform: "plan9", architecture: "amd64"},
 		"unsupported architecture": {platform: "linux", architecture: "386"},
 	} {

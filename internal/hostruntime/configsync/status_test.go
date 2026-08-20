@@ -25,7 +25,7 @@ func TestStatusRoundTripAndCanonicalStates(t *testing.T) {
 		t.Fatal(err)
 	}
 	info, err := os.Stat(path)
-	if err != nil || info.Mode().Perm() != 0o600 {
+	if err != nil || !privateControlFile(path, info) {
 		t.Fatalf("status mode = %v, %v", info.Mode().Perm(), err)
 	}
 	got, err := ReadStatus(path, 10)

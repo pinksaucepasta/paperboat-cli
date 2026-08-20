@@ -3,14 +3,20 @@
 package inbox
 
 import (
-	"os"
+	"errors"
 	"path/filepath"
+	"strings"
+
+	"golang.org/x/sys/windows"
 )
 
 func DownloadsDir() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
+	path, err := windows.KnownFolderPath(windows.FOLDERID_Downloads, windows.KF_FLAG_DEFAULT)
+	if err != nil || !filepath.IsAbs(path) || filepath.Clean(path) != path || strings.ContainsRune(path, 0) {
+		if err == nil {
+			err = errors.New("Windows Downloads known folder is invalid")
+		}
 		return "", err
 	}
-	return filepath.Join(home, "Downloads"), nil
+	return path, nil
 }

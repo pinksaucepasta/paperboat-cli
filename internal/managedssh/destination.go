@@ -9,11 +9,12 @@ import (
 const AliasSuffix = "pprbt"
 
 var (
-	ErrSSHAliasInvalid     = errors.New("managed SSH alias is invalid")
-	ErrSSHUsernameInvalid  = errors.New("managed SSH username is invalid")
-	ErrSSHUsernameConflict = errors.New("OpenSSH username conflicts with the requested user")
-	ErrSSHPortConflict     = errors.New("OpenSSH destination port differs from the registered SSH target")
-	ErrSSHUsernameMissing  = errors.New("managed SSH username is unavailable")
+	ErrSSHAliasInvalid       = errors.New("managed SSH alias is invalid")
+	ErrSSHUsernameInvalid    = errors.New("managed SSH username is invalid")
+	ErrSSHUsernameConflict   = errors.New("OpenSSH username conflicts with the requested user")
+	ErrSSHUsernameNotAllowed = errors.New("OpenSSH username is not the registered Paperboat target user")
+	ErrSSHPortConflict       = errors.New("OpenSSH destination port differs from the registered SSH target")
+	ErrSSHUsernameMissing    = errors.New("managed SSH username is unavailable")
 )
 
 // ParseMachineTarget separates an optional OpenSSH username while preserving
@@ -59,6 +60,7 @@ type DestinationInput struct {
 	RegisteredUser    string
 	LocalUser         string
 	HasRegisteredUser bool
+	Platform          string
 }
 
 // ResolveDestination applies the account alias, registered target, and username
@@ -74,7 +76,7 @@ func ResolveDestination(input DestinationInput) (Destination, error) {
 	if input.RequestedPort != 0 && input.RequestedPort != input.RegisteredPort {
 		return Destination{}, ErrSSHPortConflict
 	}
-	user, err := ResolveUsername(input.RequestedUser, input.OpenSSHUser, input.RegisteredUser, input.LocalUser, input.HasRegisteredUser)
+	user, err := ResolveUsernameForPlatform(input.RequestedUser, input.OpenSSHUser, input.RegisteredUser, input.LocalUser, input.HasRegisteredUser, input.Platform)
 	if err != nil {
 		return Destination{}, err
 	}
@@ -105,11 +107,19 @@ func ParseAliasHost(host, suffix string) (string, error) {
 }
 
 func ResolveUsername(requested, openSSH, registered, local string, hasRegistered bool) (string, error) {
+	return ResolveUsernameForPlatform(requested, openSSH, registered, local, hasRegistered, "")
+}
+
+func ResolveUsernameForPlatform(requested, openSSH, registered, local string, hasRegistered bool, platform string) (string, error) {
 	requested = strings.TrimSpace(requested)
 	openSSH = strings.TrimSpace(openSSH)
 	registered = strings.TrimSpace(registered)
 	local = strings.TrimSpace(local)
-	if requested != "" && openSSH != "" && requested != openSSH {
+	equal := func(left, right string) bool { return left == right }
+	if strings.EqualFold(strings.TrimSpace(platform), "windows") {
+		equal = strings.EqualFold
+	}
+	if requested != "" && openSSH != "" && !equal(requested, openSSH) {
 		return "", ErrSSHUsernameConflict
 	}
 	selected := requested
@@ -127,6 +137,12 @@ func ResolveUsername(requested, openSSH, registered, local string, hasRegistered
 	}
 	if !validSSHUsername(selected) {
 		return "", ErrSSHUsernameInvalid
+	}
+	if hasRegistered && !equal(selected, registered) {
+		return "", ErrSSHUsernameNotAllowed
+	}
+	if hasRegistered {
+		return registered, nil
 	}
 	return selected, nil
 }
@@ -159,7 +175,7 @@ func validSSHUsername(value string) bool {
 		return false
 	}
 	for _, character := range value {
-		if character < 0x21 || character > 0x7e {
+		if character != '.' && character != '_' && character != '-' && (character < 'A' || character > 'Z') && (character < 'a' || character > 'z') && (character < '0' || character > '9') {
 			return false
 		}
 	}

@@ -1,4 +1,4 @@
-//go:build darwin || linux
+//go:build darwin || linux || windows
 
 package availability
 
@@ -10,10 +10,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
-	"strings"
 	"sync"
 	"time"
 
@@ -114,19 +112,11 @@ type HostClient struct {
 	timeout    time.Duration
 }
 
-func NewHostClient(socketPath string, timeout time.Duration) (*HostClient, error) {
-	if !strings.HasPrefix(socketPath, "/") || timeout <= 0 {
-		return nil, ErrInvalid
-	}
-	return &HostClient{socketPath: socketPath, timeout: timeout}, nil
-}
-
 func (c *HostClient) Apply(ctx context.Context, policy Resolution) (Observation, error) {
 	if policy.Schema != PolicySchemaV1 || !validMode(policy.Mode) || policy.Version < 0 {
 		return Observation{}, ErrInvalid
 	}
-	dialer := net.Dialer{Timeout: c.timeout}
-	connection, err := dialer.DialContext(ctx, "unix", c.socketPath)
+	connection, err := dialAvailabilityHostService(ctx, c.socketPath, c.timeout)
 	if err != nil {
 		return Observation{}, err
 	}
@@ -136,7 +126,7 @@ func (c *HostClient) Apply(ctx context.Context, policy Resolution) (Observation,
 	if err := json.NewEncoder(connection).Encode(request); err != nil {
 		return Observation{}, err
 	}
-	if closer, ok := connection.(interface{ CloseWrite() error }); !ok || closer.CloseWrite() != nil {
+	if err := closeAvailabilityHostServiceWrite(connection); err != nil {
 		return Observation{}, ErrInvalid
 	}
 	decoder := json.NewDecoder(io.LimitReader(connection, 16<<10))
@@ -273,5 +263,8 @@ func validStatus(status, code string) bool {
 	return status == "applied" && code == "" || (status == "unsupported" || status == "error") && code != ""
 }
 func validUpdateHealth(value string) bool {
-	return value == "healthy" || value == "recovery_required"
+	// Update reporting is independent from availability application. A host
+	// service without updater diagnostics must still be able to acknowledge a
+	// successfully applied power policy instead of leaving it pending forever.
+	return value == "unknown" || value == "healthy" || value == "recovery_required"
 }

@@ -45,7 +45,8 @@ func StartManagedSSH(ctx context.Context, cfg ManagedSSHConfig) (*ManagedSSHRunt
 		return nil, err
 	}
 	registerCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	_, err = api.New(cfg.ServerURL, credential, nil).RegisterManagedSSHClientKey(registerCtx, identity.PublicKey, identity.Fingerprint, "managed-ssh-register-"+hex.EncodeToString(identity.Fingerprint[:16]))
+	client := api.New(cfg.ServerURL, credential, nil)
+	_, err = client.RegisterManagedSSHClientKey(registerCtx, identity.PublicKey, identity.Fingerprint, "managed-ssh-register-"+hex.EncodeToString(identity.Fingerprint[:16]))
 	cancel()
 	if err != nil {
 		return nil, err
@@ -58,12 +59,23 @@ func StartManagedSSH(ctx context.Context, cfg ManagedSSHConfig) (*ManagedSSHRunt
 	if err != nil {
 		return nil, err
 	}
+	if err := managedssh.InstallManagedIdentityPublicKey(cfg.Home, cfg.OwnerUID, identity.PublicKey); err != nil {
+		_ = agent.Close()
+		return nil, err
+	}
 	command := strconv.Quote(cfg.Executable)
+	targets, err := managedSSHAliasTargets(ctx, client)
+	if err != nil {
+		_ = agent.Close()
+		return nil, err
+	}
 	_, err = managedssh.InstallOpenSSHConfig(managedssh.OpenSSHConfig{
 		Home: cfg.Home, OwnerUID: cfg.OwnerUID, AliasSuffix: managedssh.AliasSuffix,
-		ProxyCommand:      command + " __ssh-proxy --host %h --port %p",
-		KnownHostsCommand: command + " __ssh-known-hosts --host %H --port %p",
+		ProxyCommand:      command + " __ssh-proxy --host %h --port %p --user %r",
+		KnownHostsCommand: command + " __ssh-known-hosts --host %h --port %p",
 		AgentSocket:       agent.Socket(),
+		IdentityFile:      managedssh.ManagedIdentityPublicKeyPath(cfg.Home),
+		Targets:           targets,
 	})
 	if err != nil {
 		_ = agent.Close()
@@ -83,7 +95,7 @@ func ManagedSSHHealthCode(err error) string {
 	switch {
 	case err == nil:
 		return ""
-	case errors.Is(err, managedssh.ErrOpenSSHUnavailable), errors.Is(err, managedssh.ErrOpenSSHConfigConflict), errors.Is(err, managedssh.ErrAgentDenied):
+	case errors.Is(err, managedssh.ErrOpenSSHUnavailable), errors.Is(err, managedssh.ErrOpenSSHConfigConflict), errors.Is(err, managedssh.ErrManagedIdentityFileConflict), errors.Is(err, managedssh.ErrAgentDenied):
 		return "ssh_target_not_ready"
 	default:
 		return "ssh_key_rejected"

@@ -545,6 +545,7 @@ func (m *Manager) stage(ctx context.Context, release Release) error {
 	}
 	defer stream.Close()
 	directory := filepath.Dir(m.config.RuntimeStaged)
+	//paperboat:allow-source-policy atomic-replacement owner=worker-update reason=same-directory-verified-runtime-download-staging
 	pending, err := os.CreateTemp(directory, ".paperboat-runtime-")
 	if err != nil {
 		return err
@@ -578,6 +579,7 @@ func (m *Manager) stage(ctx context.Context, release Release) error {
 	if err := m.config.NativeVerifier.Verify(ctx, pendingPath, release.Platform, release.Architecture); err != nil {
 		return ErrInvalidRelease
 	}
+	//paperboat:allow-source-policy atomic-replacement owner=worker-update reason=verified-runtime-download-publication
 	if err := os.Rename(pendingPath, m.config.RuntimeStaged); err != nil {
 		return err
 	}
@@ -607,6 +609,7 @@ func (m *Manager) installCLI(ctx context.Context, release Release) error {
 			return err
 		}
 		defer stream.Close()
+		//paperboat:allow-source-policy atomic-replacement owner=worker-update reason=same-directory-verified-cli-download-staging
 		pending, err := os.CreateTemp(directory, ".paperboat-cli-")
 		if err != nil {
 			return err
@@ -640,6 +643,7 @@ func (m *Manager) installCLI(ctx context.Context, release Release) error {
 		if err := m.config.NativeVerifier.Verify(ctx, pendingPath, release.CLIPlatform, release.CLIArchitecture); err != nil {
 			return ErrInvalidRelease
 		}
+		//paperboat:allow-source-policy atomic-replacement owner=worker-update reason=verified-cli-download-publication
 		if err := os.Rename(pendingPath, staged); err != nil {
 			return err
 		}
@@ -651,6 +655,7 @@ func (m *Manager) installCLI(ctx context.Context, release Release) error {
 		if err := safeRuntimeFile(m.config.CLIRollback, m.config.OwnerUID, true); err != nil {
 			return err
 		}
+		//paperboat:allow-source-policy atomic-replacement owner=worker-update reason=initial-verified-cli-slot-activation
 		if err := os.Rename(staged, m.config.CLICurrent); err != nil {
 			return err
 		}
@@ -664,9 +669,11 @@ func (m *Manager) installCLI(ctx context.Context, release Release) error {
 	if err := removeRuntimeFile(m.config.CLIRollback, m.config.OwnerUID); err != nil {
 		return err
 	}
+	//paperboat:allow-source-policy atomic-replacement owner=worker-update reason=current-cli-to-rollback-slot-transition
 	if err := os.Rename(m.config.CLICurrent, m.config.CLIRollback); err != nil {
 		return err
 	}
+	//paperboat:allow-source-policy atomic-replacement owner=worker-update reason=verified-staged-cli-slot-activation
 	if err := os.Rename(staged, m.config.CLICurrent); err != nil {
 		return err
 	}
@@ -683,10 +690,13 @@ func (m *Manager) promoteStorage() error {
 	if err := removeRuntimeFile(m.config.RuntimeRollback, m.config.OwnerUID); err != nil {
 		return err
 	}
+	//paperboat:allow-source-policy atomic-replacement owner=worker-update reason=current-runtime-to-rollback-slot-transition
 	if err := os.Rename(m.config.RuntimeCurrent, m.config.RuntimeRollback); err != nil {
 		return err
 	}
+	//paperboat:allow-source-policy atomic-replacement owner=worker-update reason=verified-staged-runtime-slot-activation
 	if err := os.Rename(m.config.RuntimeStaged, m.config.RuntimeCurrent); err != nil {
+		//paperboat:allow-source-policy atomic-replacement owner=worker-update reason=restore-runtime-rollback-after-activation-failure
 		_ = os.Rename(m.config.RuntimeRollback, m.config.RuntimeCurrent)
 		return err
 	}
@@ -715,10 +725,13 @@ func (m *Manager) restoreStorage() error {
 	if err := safeRuntimeFile(m.config.RuntimeRollback, m.config.OwnerUID, true); err != nil {
 		return err
 	}
+	//paperboat:allow-source-policy atomic-replacement owner=worker-update reason=quarantine-current-runtime-before-rollback
 	if err := os.Rename(m.config.RuntimeCurrent, m.config.RuntimeStaged); err != nil {
 		return err
 	}
+	//paperboat:allow-source-policy atomic-replacement owner=worker-update reason=verified-runtime-rollback-slot-activation
 	if err := os.Rename(m.config.RuntimeRollback, m.config.RuntimeCurrent); err != nil {
+		//paperboat:allow-source-policy atomic-replacement owner=worker-update reason=restore-current-runtime-after-rollback-failure
 		_ = os.Rename(m.config.RuntimeStaged, m.config.RuntimeCurrent)
 		return err
 	}

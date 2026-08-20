@@ -185,12 +185,3 @@ func hashFile(name string) (int64, [sha256.Size]byte, error) {
 	copy(digest[:], hash.Sum(nil))
 	return size, digest, err
 }
-
-func syncDirectory(path string) error {
-	directory, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer directory.Close()
-	return directory.Sync()
-}

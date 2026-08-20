@@ -1,4 +1,4 @@
-//go:build !darwin && !linux
+//go:build !darwin && !linux && !windows
 
 package config
 
@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 )
+
+func writeCredentialFile(path string, value []byte) error { return atomicWrite(path, value, 0o600) }
 
 func validateCredentialDirectory(path string) error {
 	info, err := os.Lstat(path)

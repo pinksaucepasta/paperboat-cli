@@ -65,8 +65,7 @@ func writeResolutionCommit(path string, value resolutionCommit) error {
 
 func readResolutionCommit(path string) (resolutionCommit, error) {
 	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 ||
-		info.Mode().Perm()&0o077 != 0 || info.Size() > 64<<20 {
+	if err != nil || !privateControlFile(path, info) || info.Size() > 64<<20 {
 		return resolutionCommit{}, errors.Join(ErrBaselineInvalid, err)
 	}
 	file, err := os.Open(path)

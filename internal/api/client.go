@@ -11,7 +11,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -505,6 +504,8 @@ type UserMachine struct {
 	SSHAuthority           SSHAuthority         `json:"-"`
 	SSHLocalReady          bool                 `json:"-"`
 	SSHLocalCode           string               `json:"-"`
+	SSHUser                string               `json:"-"`
+	SSHPort                uint16               `json:"-"`
 }
 
 type SSHAuthority struct {
@@ -583,13 +584,39 @@ type MachineCapabilities struct {
 }
 
 type MachineSetupInput struct {
-	SetupMode         string            `json:"setup_mode"`
-	DisplayName       string            `json:"display_name"`
-	Platform          string            `json:"platform"`
-	Architecture      string            `json:"architecture"`
-	WorkspaceRoot     string            `json:"workspace_root"`
-	PublicIdentityKey string            `json:"public_identity_key"`
-	RuntimeVersions   map[string]string `json:"runtime_versions"`
+	SetupMode          string            `json:"setup_mode"`
+	DisplayName        string            `json:"display_name"`
+	Platform           string            `json:"platform"`
+	Architecture       string            `json:"architecture"`
+	WorkspaceRoot      string            `json:"workspace_root"`
+	PublicIdentityKey  string            `json:"public_identity_key"`
+	RuntimeVersions    map[string]string `json:"runtime_versions"`
+	AcceptBetaPlatform bool              `json:"accept_beta_platform,omitempty"`
+}
+
+type MachineEnrollmentStart struct {
+	ID             string    `json:"id"`
+	BootstrapToken string    `json:"bootstrap_token"`
+	ServerURL      string    `json:"server_url"`
+	ExpiresAt      time.Time `json:"expires_at"`
+}
+
+// StartMachineEnrollment creates the single-use credential used by the
+// dashboard, CLI, and TUI one-shot installers.
+func (c *Client) StartMachineEnrollment(ctx context.Context, idempotencyKey string, options ...string) (MachineEnrollmentStart, error) {
+	var out MachineEnrollmentStart
+	if strings.TrimSpace(idempotencyKey) == "" {
+		return out, errors.New("machine enrollment idempotency key is required")
+	}
+	role, shell := "host", "posix"
+	if len(options) > 0 && options[0] != "" {
+		role = options[0]
+	}
+	if len(options) > 1 && options[1] != "" {
+		shell = options[1]
+	}
+	err := c.doWithHeaders(ctx, http.MethodPost, "/v1/machine-enrollments", map[string]string{"role": role, "shell": shell}, &out, http.Header{"Idempotency-Key": []string{idempotencyKey}})
+	return out, err
 }
 
 func (c *Client) SetupMachine(ctx context.Context, input MachineSetupInput) (UserMachine, error) {
@@ -1341,6 +1368,17 @@ func (c *Client) DisconnectUserMachine(ctx context.Context, machineID string) er
 	return c.do(ctx, http.MethodPost, "/v1/machines/"+url.PathEscape(machineID)+"/disconnect", nil, nil)
 }
 
+func (c *Client) RenameUserMachine(ctx context.Context, machineID, displayName string) (UserMachine, error) {
+	machineID = strings.TrimSpace(machineID)
+	displayName = strings.TrimSpace(displayName)
+	if machineID == "" || displayName == "" {
+		return UserMachine{}, errors.New("machine ID and display name are required")
+	}
+	var out UserMachine
+	err := c.do(ctx, http.MethodPatch, "/v1/machines/"+url.PathEscape(machineID), map[string]string{"display_name": displayName}, &out)
+	return out, err
+}
+
 func (c *Client) SetUserMachineAvailability(ctx context.Context, machineID, mode, idempotencyKey string, expectedVersion int64) (AvailabilityPolicy, error) {
 	if strings.TrimSpace(machineID) == "" || (mode != "allow_sleep" && mode != "keep_awake") || strings.TrimSpace(idempotencyKey) == "" || expectedVersion < 0 {
 		return AvailabilityPolicy{}, errors.New("valid machine availability input is required")
@@ -1474,13 +1512,33 @@ func (c *Client) MachineSSHDescriptor(ctx context.Context, machineID, operationI
 func validateOperationDescriptor(out ExecDescriptor, machineID, operationID, expectedScope, operationKind string) error {
 	quic, quicErr := url.Parse(out.Endpoints.QUIC)
 	wss, wssErr := url.Parse(out.Endpoints.WSS)
-	if out.OperationID != operationID || out.Environment == nil || out.Environment.ID == "" || out.Environment.Kind != "byod" || out.Environment.ResourceID != machineID || out.Environment.State != "ready" || !filepath.IsAbs(out.Environment.Root) ||
+	if out.OperationID != operationID || out.Environment == nil || out.Environment.ID == "" || out.Environment.Kind != "byod" || out.Environment.ResourceID != machineID || out.Environment.State != "ready" || !remoteAbsolutePath(out.Environment.Root) ||
 		quicErr != nil || quic.Scheme != "quic" || quic.Hostname() == "" || quic.User != nil || quic.Path != "" || quic.RawQuery != "" || quic.Fragment != "" ||
 		wssErr != nil || wss.Scheme != "wss" || wss.Hostname() == "" || wss.User != nil || wss.Path != "/v1/runtime" || wss.RawQuery != "" || wss.Fragment != "" ||
 		out.Auth.Method != "bearer" || out.Auth.Token == "" || len(out.Auth.Scopes) != 1 || out.Auth.Scopes[0] != expectedScope || out.ExpiresAt.IsZero() || out.Auth.ExpiresAt.IsZero() || !out.ExpiresAt.Equal(out.Auth.ExpiresAt) {
 		return fmt.Errorf("invalid %s descriptor", operationKind)
 	}
 	return nil
+}
+
+// remoteAbsolutePath validates a path described by a remote host. filepath.IsAbs
+// cannot be used here because its result depends on the client's operating
+// system, while a Windows client can consume a Linux descriptor and vice versa.
+func remoteAbsolutePath(value string) bool {
+	if value == "" || strings.ContainsRune(value, 0) {
+		return false
+	}
+	if strings.HasPrefix(value, "/") {
+		return true
+	}
+	if len(value) >= 3 && ((value[0] >= 'A' && value[0] <= 'Z') || (value[0] >= 'a' && value[0] <= 'z')) && value[1] == ':' && (value[2] == '\\' || value[2] == '/') {
+		return true
+	}
+	if strings.HasPrefix(value, `\\`) {
+		parts := strings.Split(strings.TrimPrefix(value, `\\`), `\`)
+		return len(parts) >= 2 && parts[0] != "" && parts[1] != ""
+	}
+	return false
 }
 
 func (c *Client) MachineFileTransferDescriptor(ctx context.Context, destinationMachineID, sourceMachineID, sessionID string) (FileTransfer, error) {

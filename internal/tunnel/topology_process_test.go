@@ -73,7 +73,7 @@ type topologyCodexCredential struct {
 
 func TestTopologyPeerTerminalPingProcess(t *testing.T) {
 	role := os.Getenv("PAPERBOAT_TOPOLOGY_TERMINAL_ROLE")
-	if role != "terminal-ping-wss-initiator" && role != "terminal-wss-initiator" && role != "terminal-cancel-wss-initiator" && role != "terminal-relay-quic-initiator" && role != "terminal-cancel-relay-quic-initiator" && role != "terminal-direct-quic-initiator" && role != "terminal-cancel-direct-quic-initiator" && role != "exec-wss-initiator" && role != "exec-relay-quic-initiator" && role != "exec-direct-quic-initiator" && role != "ssh-wss-initiator" && role != "ssh-relay-quic-initiator" && role != "ssh-direct-quic-initiator" && role != "codex-wss-initiator" && role != "codex-relay-quic-initiator" && role != "codex-direct-quic-initiator" && role != "preview-wss-initiator" && role != "preview-relay-quic-initiator" && role != "preview-direct-quic-initiator" && role != "file-direct-quic-initiator" && role != "file-reverse-relay-h3-initiator" && role != "file-reverse-direct-quic-initiator" && role != "file-reverse-relay-h2-initiator" && role != "file-relay-h3-initiator" && role != "file-relay-h2-initiator" {
+	if role != "terminal-ping-wss-initiator" && role != "terminal-ping-auto-initiator" && role != "terminal-ping-auto-fenced-initiator" && role != "terminal-wss-initiator" && role != "terminal-cancel-wss-initiator" && role != "terminal-relay-quic-initiator" && role != "terminal-cancel-relay-quic-initiator" && role != "terminal-direct-quic-initiator" && role != "terminal-cancel-direct-quic-initiator" && role != "exec-wss-initiator" && role != "exec-relay-quic-initiator" && role != "exec-direct-quic-initiator" && role != "ssh-wss-initiator" && role != "ssh-relay-quic-initiator" && role != "ssh-direct-quic-initiator" && role != "codex-wss-initiator" && role != "codex-relay-quic-initiator" && role != "codex-direct-quic-initiator" && role != "preview-wss-initiator" && role != "preview-relay-quic-initiator" && role != "preview-direct-quic-initiator" && role != "file-direct-quic-initiator" && role != "file-reverse-relay-h3-initiator" && role != "file-reverse-direct-quic-initiator" && role != "file-reverse-relay-h2-initiator" && role != "file-relay-h3-initiator" && role != "file-relay-h2-initiator" {
 		t.Skip("topology peer terminal process mode is not configured")
 	}
 	processTimeout := 30 * time.Second
@@ -166,7 +166,7 @@ func TestTopologyPeerTerminalPingProcess(t *testing.T) {
 		waitTopologyExitGate(t, ctx)
 		return
 	}
-	if role != "terminal-ping-wss-initiator" {
+	if role != "terminal-ping-wss-initiator" && role != "terminal-ping-auto-initiator" && role != "terminal-ping-auto-fenced-initiator" {
 		var terminalCredential topologyTerminalCredential
 		readTopologyJSON(t, ctx, topologyTerminalCredentialPath(), &terminalCredential)
 		if terminalCredential.Token == "" {
@@ -283,8 +283,17 @@ func TestTopologyPeerTerminalPingProcess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Path != connectionmanager.PathWSS || result.RelayRegion != "relay-topology" || result.RTT <= 0 {
+	if result.RTT <= 0 {
 		t.Fatalf("ping result=%+v", result)
+	}
+	if role == "terminal-ping-wss-initiator" && (result.Path != connectionmanager.PathWSS || result.RelayRegion != "relay-topology") {
+		t.Fatalf("ping result=%+v", result)
+	}
+	if (role == "terminal-ping-auto-initiator" || role == "terminal-ping-auto-fenced-initiator") && result.Path != connectionmanager.PathDirectQUIC && result.Path != connectionmanager.PathRelayQUIC && result.Path != connectionmanager.PathWSS {
+		t.Fatalf("ping result=%+v", result)
+	}
+	if role == "terminal-ping-auto-fenced-initiator" && result.Path != connectionmanager.PathWSS {
+		t.Fatalf("fenced auto ping did not fall back to WSS: %+v", result)
 	}
 	writeTopologyJSON(t, topologyPingOKPath(), true)
 	fmt.Println("PAPERBOAT_TOPOLOGY_PEER_TERMINAL_PING_OK")
@@ -350,7 +359,9 @@ func newTopologyPeerTunnel(t *testing.T, role string, store config.ProfileStore,
 	transport := &http.Transport{TLSClientConfig: topologyControlTLS(t), Proxy: nil}
 	t.Cleanup(transport.CloseIdleConnections)
 	mode := connectionmanager.ModeWSS
-	if strings.Contains(role, "relay-quic") {
+	if strings.Contains(role, "ping-auto") {
+		mode = connectionmanager.ModeAuto
+	} else if strings.Contains(role, "relay-quic") {
 		mode = connectionmanager.ModeRelayQUIC
 	} else if strings.Contains(role, "direct-quic") {
 		mode = connectionmanager.ModeDirectQUIC

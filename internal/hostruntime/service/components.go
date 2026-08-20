@@ -115,6 +115,9 @@ func NewUpdaterInstaller(config ComponentConfig) (*Installer, error) {
 }
 
 func updaterControlSocket(platform string) string {
+	if platform == "windows" {
+		return `\\.\pipe\PaperboatUpdated`
+	}
 	if platform == "darwin" {
 		return "/var/run/paperboat-updated/control.sock"
 	}

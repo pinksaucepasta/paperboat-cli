@@ -23,6 +23,18 @@ type AuthenticatedMachineSource struct {
 	SSHLocalCode    string
 	HTTPClient      *http.Client
 	SourceMachineID string
+	// AutoApprovePeerEnrollments is invoked after the authenticated machine
+	// list is loaded. Production wires this to the account-root signer so a
+	// one-shot enrollment never requires a separate trust-approval command.
+	AutoApprovePeerEnrollments func(context.Context, *api.Client, []api.UserMachine) error
+}
+
+func (s *AuthenticatedMachineSource) SetManagedSSHReadiness(ready bool, code string) {
+	if s == nil {
+		return
+	}
+	s.SSHLocalReady = ready
+	s.SSHLocalCode = code
 }
 
 // IssuePeerStream obtains a fresh, operation-scoped authorization just before
@@ -198,6 +210,11 @@ func (s AuthenticatedMachineSource) ListUserMachines(ctx context.Context) ([]api
 	if err != nil {
 		return nil, err
 	}
+	if s.AutoApprovePeerEnrollments != nil {
+		if err := s.AutoApprovePeerEnrollments(ctx, client, machines); err != nil {
+			return nil, err
+		}
+	}
 	for index := range machines {
 		if _, err := managedssh.AliasHost(machines[index].Alias, managedssh.AliasSuffix); err != nil {
 			return nil, errors.New("paperboat-server returned an invalid machine alias")
@@ -239,6 +256,7 @@ func reconcileSSHAuthorities(ctx context.Context, client *api.Client, machines [
 				recordSSHLookupError(&errMu, &firstErr, cancel, targetErr)
 				return
 			}
+			machine.SSHUser, machine.SSHPort = target.OSUser, target.Port
 			keys, keysErr := client.ManagedSSHHostKeys(lookupCtx, machine.ID, generation)
 			if api.IsNotFound(keysErr) {
 				machine.SSHAuthority.TargetGeneration = target.MachineGeneration

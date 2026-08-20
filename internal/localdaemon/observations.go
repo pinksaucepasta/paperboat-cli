@@ -16,6 +16,7 @@ const maxObservationSources = 128
 type ObservationConfig struct {
 	Store    *localapi.SnapshotStore
 	OwnerUID int
+	OwnerSID string
 	Clock    func() time.Time
 	Interval time.Duration
 }
@@ -23,6 +24,7 @@ type ObservationConfig struct {
 type ObservationStore struct {
 	store    *localapi.SnapshotStore
 	ownerUID int
+	ownerSID string
 	clock    func() time.Time
 	interval time.Duration
 
@@ -31,7 +33,10 @@ type ObservationStore struct {
 }
 
 func NewObservationStore(config ObservationConfig) (*ObservationStore, error) {
-	if config.Store == nil || config.OwnerUID < 0 || config.Interval < 0 {
+	if config.Store == nil || config.OwnerUID < -1 || config.OwnerSID != "" && config.OwnerUID >= 0 || config.Interval < 0 {
+		return nil, ErrInvalidInventoryConfig
+	}
+	if config.OwnerSID == "" && config.OwnerUID < 0 {
 		return nil, ErrInvalidInventoryConfig
 	}
 	if config.Clock == nil {
@@ -43,11 +48,11 @@ func NewObservationStore(config ObservationConfig) (*ObservationStore, error) {
 	if config.Interval < 10*time.Millisecond || config.Interval > 10*time.Second {
 		return nil, ErrInvalidInventoryConfig
 	}
-	return &ObservationStore{store: config.Store, ownerUID: config.OwnerUID, clock: config.Clock, interval: config.Interval, sources: make(map[string]localapi.TransportObservation)}, nil
+	return &ObservationStore{store: config.Store, ownerUID: config.OwnerUID, ownerSID: config.OwnerSID, clock: config.Clock, interval: config.Interval, sources: make(map[string]localapi.TransportObservation)}, nil
 }
 
 func (s *ObservationStore) PublishObservation(ctx context.Context, peer localapi.Peer, observation localapi.TransportObservation) error {
-	if ctx == nil || peer.UID != s.ownerUID || peer.PID <= 0 {
+	if ctx == nil || !s.authorizes(peer) || peer.PID <= 0 {
 		return localapi.ErrPermission
 	}
 	if observation.Validate() != nil {
@@ -81,6 +86,16 @@ func (s *ObservationStore) PublishObservation(ctx context.Context, peer localapi
 		return err
 	}
 	return nil
+}
+
+func (s *ObservationStore) authorizes(peer localapi.Peer) bool {
+	if s == nil {
+		return false
+	}
+	if s.ownerSID != "" {
+		return peer.SID == s.ownerSID
+	}
+	return peer.UID == s.ownerUID
 }
 
 func (s *ObservationStore) Run(ctx context.Context) error {
@@ -233,7 +248,10 @@ func observationConsumers(observation localapi.TransportObservation) []localapi.
 }
 
 func observationKey(peer localapi.Peer, sourceID string) string {
-	return fmt.Sprintf("%d:%d:%s", peer.UID, peer.PID, sourceID)
+	if peer.SID != "" {
+		return fmt.Sprintf("sid:%s:%d:%s", peer.SID, peer.PID, sourceID)
+	}
+	return fmt.Sprintf("uid:%d:%d:%s", peer.UID, peer.PID, sourceID)
 }
 
 var _ localapi.ObservationSink = (*ObservationStore)(nil)

@@ -50,13 +50,12 @@ owning repositories.
 provenance JSON containing the version, protocol, commit, and Go toolchain. The
 release pipeline must sign these files and attach an SBOM before publishing.
 
-Pushing a validated `YYYY.MM.DD.X` tag runs `.github/workflows/release.yml`. It cross-builds the four
-supported combinations (`darwin/amd64`, `darwin/arm64`, `linux/amd64`, and `linux/arm64`), creates
-checksums and SPDX JSON SBOMs,
-attests each archive with GitHub's OIDC-backed artifact attestation, and uploads
-the assets to the GitHub release. Verify an installed archive with `gh
-attestation verify <archive> --repo <owner>/<repo>` and its adjacent checksum
-before installation.
+Pushing a validated `YYYY.MM.DD.X` tag runs `.github/workflows/release.yml`. It cross-builds
+Darwin, Linux, and Windows amd64/arm64 candidates, creates checksums and an SPDX JSON SBOM,
+and stops before any attestation, container publication, or GitHub release publication unless
+the protected TUF publication handoff verifies every Windows artifact. Verify an installed
+published archive with `gh attestation verify <archive> --repo <owner>/<repo>` and its adjacent
+checksum before installation. Authenticode is optional and is not a release gate.
 
 Incident procedures are maintained in [runbooks.md](runbooks.md).
 
@@ -101,11 +100,12 @@ transaction serialization. Local inventory rejects absent or malformed aliases.
 Managed SSH uses the canonical OpenSSH host `<machine>.pprbt`; the former `.pprbt.dev`
 form is not accepted. `pb ssh <machine>` delegates to the system OpenSSH client as
 `<setup-user>@<machine>.pprbt`, where the setup user is the operating-system account that
-ran `pb setup`. Callers can override it with either `pb ssh user@<machine>` or
-`pb ssh <machine> --user user`; conflicting explicit users fail before OpenSSH starts.
-The installed `Host *.pprbt` configuration uses the same ProxyCommand, managed identity,
-and strict host-key source for native `ssh`, `scp`, `sftp`, `rsync`, Git-over-SSH, and
-OpenSSH forwarding. Native ecosystem commands should spell the user explicitly, for
+ran `pb setup`. That registered user is an authorization boundary: an explicit username
+is accepted only when it exactly matches the registered target, and any other username
+fails before the SSH stream opens. The installed `Host *.pprbt` configuration uses the
+same ProxyCommand, public selector for the credential-store-backed managed identity, and
+strict host-key source for native `ssh`, `scp`, `sftp`, `rsync`, Git-over-SSH, and OpenSSH
+forwarding. Native ecosystem commands should spell the registered user explicitly, for
 example `scp file root@hn.pprbt:/tmp/file`.
 
 Machine runtime services may set `PAPERBOAT_HTTP_PROXY`, `PAPERBOAT_HTTPS_PROXY`, and

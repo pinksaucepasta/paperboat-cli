@@ -120,12 +120,11 @@ func (WindowsController) Apply(ctx context.Context, definitionPath string, upgra
 	} else if err != nil {
 		return err
 	} else {
-		defer service.Close()
 		current, configErr := service.Config()
 		if configErr != nil {
 			return configErr
 		}
-		current.BinaryPathName = definition.Executable
+		current.BinaryPathName = windows.ComposeCommandLine(append([]string{definition.Executable}, definition.Arguments...))
 		current.DisplayName = definition.DisplayName
 		current.Description = definition.Description
 		current.StartType = mgr.StartAutomatic
@@ -136,9 +135,29 @@ func (WindowsController) Apply(ctx context.Context, definitionPath string, upgra
 			_ = stopWindowsService(ctx, service)
 		}
 	}
-	if err := service.Start(); err != nil && !errors.Is(err, windows.ERROR_SERVICE_ALREADY_RUNNING) {
+	defer service.Close()
+	if definition.Name == "PaperboatHostd" {
+		// The hostd service is only a privileged token bridge. If the enrolled
+		// owner has logged off or the child fails, SCM retries the bridge with
+		// bounded backoff instead of leaving a LocalSystem workload behind.
+		if err := service.SetRecoveryActions([]mgr.RecoveryAction{
+			{Type: mgr.ServiceRestart, Delay: 5 * time.Second},
+			{Type: mgr.ServiceRestart, Delay: 15 * time.Second},
+			{Type: mgr.ServiceRestart, Delay: time.Minute},
+		}, 24*60*60); err != nil {
+			return err
+		}
+		if err := service.SetRecoveryActionsOnNonCrashFailures(true); err != nil {
+			return err
+		}
+	}
+	if err := service.Start(); err != nil && !errors.Is(err, windows.ERROR_SERVICE_ALREADY_RUNNING) && !errors.Is(err, windows.ERROR_SERVICE_REQUEST_TIMEOUT) {
 		return err
 	}
+	// SCM can return ERROR_SERVICE_REQUEST_TIMEOUT while the service process is
+	// already registered and still completing its bounded startup. Querying the
+	// authoritative state avoids reporting a failed install when SCM transitions
+	// the same process to Running moments later.
 	return waitWindowsService(ctx, service, svc.Running)
 }
 
@@ -154,22 +173,64 @@ func (WindowsController) Remove(ctx context.Context, definitionPath string) erro
 	if err != nil {
 		return err
 	}
-	defer manager.Disconnect()
 	service, err := manager.OpenService(definition.Name)
 	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+		manager.Disconnect()
 		return nil
 	}
 	if err != nil {
+		manager.Disconnect()
 		return err
 	}
-	defer service.Close()
 	if err := stopWindowsService(ctx, service); err != nil && !errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE) {
+		service.Close()
+		manager.Disconnect()
 		return err
 	}
 	if err := service.Delete(); err != nil && !errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
+		service.Close()
+		manager.Disconnect()
 		return err
 	}
-	return nil
+	if err := service.Close(); err != nil {
+		manager.Disconnect()
+		return err
+	}
+	manager.Disconnect()
+	// Closing the last service handle is what lets SCM finalize a pending
+	// deletion. Give SCM that window before polling so the poll itself does not
+	// continuously reopen and pin the marked-for-delete service.
+	timer := time.NewTimer(500 * time.Millisecond)
+	select {
+	case <-ctx.Done():
+		timer.Stop()
+		return ctx.Err()
+	case <-timer.C:
+	}
+	for {
+		probeManager, connectErr := mgr.Connect()
+		if connectErr != nil {
+			return connectErr
+		}
+		probe, openErr := probeManager.OpenService(definition.Name)
+		if errors.Is(openErr, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+			probeManager.Disconnect()
+			return nil
+		}
+		if openErr != nil {
+			probeManager.Disconnect()
+			return openErr
+		}
+		_ = probe.Close()
+		probeManager.Disconnect()
+		timer = time.NewTimer(500 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 func readWindowsServiceDefinition(path string) (windowsServiceDefinition, error) {

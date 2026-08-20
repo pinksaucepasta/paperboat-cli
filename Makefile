@@ -6,7 +6,7 @@ VERSION     ?= $(shell ./tools/release-version.sh current)
 COMMIT      ?= $(shell git rev-parse --verify HEAD 2>/dev/null || echo unknown)
 PROTOCOL_VERSION ?= 1
 DEFAULT_RELEASE_URL ?=
-GO_VERSION  := 1.26.5
+GO_VERSION  := 1.26.6
 SQLC_VERSION := v1.30.0
 GO          := GOTOOLCHAIN=local go
 GOFMT       := $(shell GOTOOLCHAIN=local go env GOROOT 2>/dev/null)/bin/gofmt

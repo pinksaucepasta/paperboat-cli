@@ -1,5 +1,3 @@
-//go:build darwin || linux
-
 package localapi
 
 import (
@@ -12,14 +10,9 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
-
-	"golang.org/x/sys/unix"
 )
 
 const (
@@ -64,9 +57,13 @@ type StaleSocketAuthority interface {
 type ReadAuthorizer func(Peer) bool
 
 type ServerConfig struct {
-	SocketPath           string
-	OwnerUID             int
-	OwnerGID             int
+	SocketPath string
+	OwnerUID   int
+	OwnerGID   int
+	// OwnerSID is the enrolled Windows owner. Windows uses it in the named-pipe
+	// DACL and verifies every accepted client process token against it.
+	// Unix callers leave it empty and use OwnerUID/OwnerGID.
+	OwnerSID             string
 	Source               SnapshotSource
 	Completions          CompletionSource
 	Observations         ObservationSink
@@ -82,12 +79,15 @@ type ServerConfig struct {
 	MaxWatchEvents       int
 }
 
-type Server struct{ config ServerConfig }
+type Server struct {
+	config  ServerConfig
+	cleanup func()
+}
 
 type peerContextKey struct{}
 
 func NewServer(config ServerConfig) (*Server, error) {
-	if !filepath.IsAbs(config.SocketPath) || len(config.SocketPath) > maxUnixSocketPath || config.OwnerUID < 0 || config.OwnerGID < 0 || config.Source == nil {
+	if config.Source == nil {
 		return nil, ErrInvalidConfig
 	}
 	if config.Timeout == 0 {
@@ -105,13 +105,16 @@ func NewServer(config ServerConfig) (*Server, error) {
 	if config.WatchDuration <= 0 || config.WatchDuration > time.Hour || config.MaxWatchEvents < 1 || config.MaxWatchEvents > 65_536 {
 		return nil, ErrInvalidConfig
 	}
+	if err := validateServerConfig(config); err != nil {
+		return nil, err
+	}
 	if config.Authorize == nil {
-		config.Authorize = func(peer Peer) bool { return peer.UID == config.OwnerUID }
+		config.Authorize = defaultReadAuthorizer(config)
 	}
 	if config.AuthorizeDiagnostics == nil {
-		config.AuthorizeDiagnostics = func(peer Peer) bool { return peer.UID == config.OwnerUID }
+		config.AuthorizeDiagnostics = defaultReadAuthorizer(config)
 	}
-	return &Server{config: config}, nil
+	return &Server{config: config, cleanup: func() {}}, nil
 }
 
 func (s *Server) Run(ctx context.Context) error {
@@ -119,14 +122,9 @@ func (s *Server) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	socketInfo, err := os.Lstat(s.config.SocketPath)
-	if err != nil {
-		_ = listener.Close()
-		return err
-	}
 	defer func() {
 		_ = listener.Close()
-		_ = removeVerifiedSocket(s.config.SocketPath, socketInfo, s.config.OwnerUID)
+		s.cleanup()
 	}()
 	httpServer := &http.Server{
 		Handler:           s.handler(),
@@ -307,7 +305,7 @@ func (s *Server) fileTransferKey(writer http.ResponseWriter, request *http.Reque
 		defer s.config.FileTransfers.ReleaseFileTransfer(peer, result.Handle)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		watchPeerHangup(ctx, local, peer, cancel)
+		watchControlHangup(ctx, local, peer, cancel)
 	}()
 }
 
@@ -464,43 +462,6 @@ func (s *Server) peerStream(writer http.ResponseWriter, request *http.Request, r
 	go func() { defer cancel(); bridgePeerStream(streamCtx, local, stream) }()
 }
 
-func watchPeerHangup(ctx context.Context, connection net.Conn, peer Peer, cancel context.CancelFunc) {
-	systemConnection, ok := connection.(syscall.Conn)
-	if !ok {
-		return
-	}
-	raw, err := systemConnection.SyscallConn()
-	if err != nil {
-		return
-	}
-	fileDescriptor := -1
-	if err := raw.Control(func(value uintptr) { fileDescriptor = int(value) }); err != nil || fileDescriptor < 0 {
-		return
-	}
-	processExit, closeProcessExit := watchProcessExit(peer.PID)
-	defer closeProcessExit()
-	for ctx.Err() == nil {
-		select {
-		case <-processExit:
-			cancel()
-			return
-		default:
-		}
-		poll := []unix.PollFd{{Fd: int32(fileDescriptor), Events: unix.POLLHUP | unix.POLLERR}}
-		count, pollErr := unix.Poll(poll, 250)
-		if errors.Is(pollErr, unix.EINTR) {
-			continue
-		}
-		if pollErr != nil {
-			return
-		}
-		if count > 0 && poll[0].Revents&(unix.POLLHUP|unix.POLLERR|unix.POLLNVAL) != 0 {
-			cancel()
-			return
-		}
-	}
-}
-
 func safeErrorMessage(err error) string {
 	if err == nil {
 		return "unknown error"
@@ -508,6 +469,13 @@ func safeErrorMessage(err error) string {
 	message := strings.Join(strings.FieldsFunc(err.Error(), func(value rune) bool {
 		return value < 0x20 || value == 0x7f
 	}), "; ")
+	// Transport errors append a parenthesized diagnostic record containing
+	// internal identity fingerprints, connection handles, and certificate
+	// hashes. Those fields belong in protected diagnostics, not local API error
+	// envelopes that are rendered by the normal CLI.
+	if index := strings.Index(message, " ("); index >= 0 && strings.Contains(message[index:], "=") {
+		message = message[:index]
+	}
 	if len(message) > 512 {
 		message = message[:512]
 	}
@@ -659,63 +627,6 @@ func (s *Server) watch(writer http.ResponseWriter, request *http.Request, reques
 	}
 }
 
-func (s *Server) listen(ctx context.Context) (*net.UnixListener, error) {
-	directory := filepath.Dir(s.config.SocketPath)
-	info, err := os.Stat(directory)
-	if err != nil || !info.IsDir() || info.Mode().Perm()&0o077 != 0 || fileOwner(info) != s.config.OwnerUID {
-		return nil, ErrUnsafeSocket
-	}
-	if info, err := os.Lstat(s.config.SocketPath); err == nil {
-		if info.Mode()&os.ModeSocket == 0 || info.Mode()&os.ModeSymlink != 0 || fileOwner(info) != s.config.OwnerUID {
-			return nil, ErrUnsafeSocket
-		}
-		connection, dialErr := net.DialTimeout("unix", s.config.SocketPath, 100*time.Millisecond)
-		if dialErr == nil {
-			_ = connection.Close()
-			return nil, ErrAlreadyRunning
-		}
-		if s.config.Stale == nil || !s.config.Stale.CanRemoveStaleSocket(ctx, s.config.SocketPath) {
-			return nil, ErrUnsafeSocket
-		}
-		if err := removeVerifiedSocket(s.config.SocketPath, info, s.config.OwnerUID); err != nil {
-			return nil, err
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil, err
-	}
-	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: s.config.SocketPath, Net: "unix"})
-	if err != nil {
-		return nil, err
-	}
-	listener.SetUnlinkOnClose(false)
-	if os.Geteuid() == 0 {
-		err = os.Chown(s.config.SocketPath, s.config.OwnerUID, s.config.OwnerGID)
-	}
-	if err == nil {
-		err = os.Chmod(s.config.SocketPath, 0o600)
-	}
-	if err != nil {
-		_ = listener.Close()
-		_ = os.Remove(s.config.SocketPath)
-		return nil, err
-	}
-	return listener, nil
-}
-
-func removeVerifiedSocket(path string, expected os.FileInfo, ownerUID int) error {
-	current, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if current.Mode()&os.ModeSocket == 0 || current.Mode()&os.ModeSymlink != 0 || fileOwner(current) != ownerUID || !os.SameFile(expected, current) {
-		return ErrUnsafeSocket
-	}
-	return os.Remove(path)
-}
-
 func writeError(writer http.ResponseWriter, status int, requestID, code, message string) {
 	if len(message) > 512 {
 		message = message[:512]
@@ -737,14 +648,6 @@ func localRequestID() string {
 		return "req_" + hex.EncodeToString(value[:])
 	}
 	return "req_" + strconv.FormatInt(time.Now().UnixNano(), 10)
-}
-
-func fileOwner(info os.FileInfo) int {
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return -1
-	}
-	return int(stat.Uid)
 }
 
 func validRequestID(value string) bool {

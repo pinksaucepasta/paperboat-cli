@@ -19,6 +19,29 @@ type fakeConnector struct {
 	results map[Path]chan connectResult
 }
 
+type oneShotConnector struct {
+	started  chan Attempt
+	release  chan struct{}
+	canceled chan Path
+	direct   Connection
+}
+
+func (c *oneShotConnector) Connect(ctx context.Context, attempt Attempt) (Connection, error) {
+	c.started <- attempt
+	select {
+	case <-c.release:
+	case <-ctx.Done():
+		c.canceled <- attempt.Path
+		return nil, ctx.Err()
+	}
+	if attempt.Path == PathDirectQUIC {
+		return c.direct, nil
+	}
+	<-ctx.Done()
+	c.canceled <- attempt.Path
+	return nil, ctx.Err()
+}
+
 type pairedSuccessConnector struct {
 	mu          sync.Mutex
 	started     chan Attempt
@@ -347,6 +370,158 @@ func TestRaceInitialHealthTypedReachabilityFailureAllowsFallback(t *testing.T) {
 	result := <-done
 	if result.err != nil || result.selection.Path != PathRelayQUIC || result.selection.Connection != relay || direct.closed != 1 {
 		t.Fatalf("selection=%+v error=%v direct closes=%d", result.selection, result.err, direct.closed)
+	}
+}
+
+func TestOneShotRacePreventsConcurrentHealthAdmissions(t *testing.T) {
+	direct := &fakeConnection{}
+	connector := &oneShotConnector{started: make(chan Attempt, 3), release: make(chan struct{}), canceled: make(chan Path, 2), direct: direct}
+	racer := testRacer(t, connector)
+	racer.config.OneShot = true
+	done := make(chan struct {
+		selection Selection
+		err       error
+	}, 1)
+	go func() {
+		selection, err := racer.Connect(context.Background(), 2, ModeAuto, NetworkUnknown)
+		done <- struct {
+			selection Selection
+			err       error
+		}{selection: selection, err: err}
+	}()
+	started := map[Path]bool{}
+	for range 3 {
+		started[receiveAttempt(t, connector.started).Path] = true
+	}
+	if !started[PathDirectQUIC] || !started[PathRelayQUIC] || !started[PathWSS] {
+		t.Fatalf("started=%v", started)
+	}
+	close(connector.release)
+	result := <-done
+	if result.err != nil || result.selection.Path != PathDirectQUIC || result.selection.Connection != direct {
+		t.Fatalf("selection=%+v err=%v", result.selection, result.err)
+	}
+	canceled := map[Path]bool{}
+	for range 2 {
+		select {
+		case path := <-connector.canceled:
+			canceled[path] = true
+		case <-time.After(time.Second):
+			t.Fatal("one-shot race left a loser health admission running")
+		}
+	}
+	if !canceled[PathRelayQUIC] || !canceled[PathWSS] {
+		t.Fatalf("canceled=%v", canceled)
+	}
+}
+
+func TestSequentialFallbackDefersDescriptorAdmissionUntilPriorFailure(t *testing.T) {
+	connector := newFakeConnector()
+	racer := testRacer(t, connector)
+	racer.config.SequentialFallback = true
+	racer.config.OneShot = true
+	done := make(chan struct {
+		selection Selection
+		err       error
+	}, 1)
+	go func() {
+		selection, err := racer.Connect(context.Background(), 9, ModeAuto, NetworkUnknown)
+		done <- struct {
+			selection Selection
+			err       error
+		}{selection: selection, err: err}
+	}()
+	if attempt := receiveAttempt(t, connector.started); attempt.Path != PathDirectQUIC {
+		t.Fatalf("first attempt=%+v", attempt)
+	}
+	connector.results[PathDirectQUIC] <- connectResult{err: &Failure{Class: FailureReachability, Path: PathDirectQUIC, Cause: errors.New("direct attempt fenced")}}
+	if attempt := receiveAttempt(t, connector.started); attempt.Path != PathRelayQUIC {
+		t.Fatalf("second attempt=%+v", attempt)
+	}
+	connector.results[PathRelayQUIC] <- connectResult{err: &Failure{Class: FailureTransient, Path: PathRelayQUIC, Cause: errors.New("relay attempt fenced")}}
+	if attempt := receiveAttempt(t, connector.started); attempt.Path != PathWSS {
+		t.Fatalf("third attempt=%+v", attempt)
+	}
+	wss := &fakeConnection{}
+	connector.results[PathWSS] <- connectResult{connection: wss}
+	result := <-done
+	if result.err != nil || result.selection.Path != PathWSS || result.selection.Connection != wss {
+		t.Fatalf("selection=%+v err=%v", result.selection, result.err)
+	}
+}
+
+func TestSequentialFallbackTimesOutDirectAndPromotesRelayWithinOverallDeadline(t *testing.T) {
+	connector := newFakeConnector()
+	racer := testRacer(t, connector)
+	racer.config.SequentialFallback = true
+	racer.config.OneShot = true
+	racer.config.RelayDelay = 50 * time.Millisecond
+	// Production uses equal relay and WSS delays. Relay must retain its full
+	// per-candidate budget rather than receiving a zero-duration difference.
+	racer.config.WSSDelay = racer.config.RelayDelay
+	racer.config.ConnectTimeout = time.Second
+	started := time.Now()
+	done := make(chan struct {
+		selection Selection
+		err       error
+	}, 1)
+	go func() {
+		selection, err := racer.Connect(context.Background(), 10, ModeAuto, NetworkUnknown)
+		done <- struct {
+			selection Selection
+			err       error
+		}{selection: selection, err: err}
+	}()
+	if attempt := receiveAttempt(t, connector.started); attempt.Path != PathDirectQUIC {
+		t.Fatalf("first attempt=%+v", attempt)
+	}
+	if attempt := receiveAttempt(t, connector.started); attempt.Path != PathRelayQUIC {
+		t.Fatalf("relay did not start after direct preference budget: %+v", attempt)
+	}
+	// Let a viable relay use part of its budget. A zero-duration relay context
+	// would advance to WSS before this result can be delivered.
+	time.Sleep(10 * time.Millisecond)
+	relay := &fakeConnection{}
+	connector.results[PathRelayQUIC] <- connectResult{connection: relay}
+	result := <-done
+	if result.err != nil || result.selection.Path != PathRelayQUIC || result.selection.Connection != relay {
+		t.Fatalf("selection=%+v err=%v", result.selection, result.err)
+	}
+	if elapsed := time.Since(started); elapsed >= racer.config.ConnectTimeout {
+		t.Fatalf("sequential fallback exhausted overall deadline: elapsed=%s", elapsed)
+	}
+}
+
+func TestRelayFirstSequentialFallbackAvoidsDirectBeforeReachableRelay(t *testing.T) {
+	connector := newFakeConnector()
+	racer := testRacer(t, connector)
+	racer.config.SequentialFallback = true
+	racer.config.RelayFirst = true
+	racer.config.OneShot = true
+	done := make(chan struct {
+		selection Selection
+		err       error
+	}, 1)
+	go func() {
+		selection, err := racer.Connect(context.Background(), 11, ModeAuto, NetworkUnknown)
+		done <- struct {
+			selection Selection
+			err       error
+		}{selection: selection, err: err}
+	}()
+	if attempt := receiveAttempt(t, connector.started); attempt.Path != PathRelayQUIC {
+		t.Fatalf("first attempt=%+v", attempt)
+	}
+	relay := &fakeConnection{}
+	connector.results[PathRelayQUIC] <- connectResult{connection: relay}
+	result := <-done
+	if result.err != nil || result.selection.Path != PathRelayQUIC || result.selection.Connection != relay {
+		t.Fatalf("selection=%+v err=%v", result.selection, result.err)
+	}
+	select {
+	case attempt := <-connector.started:
+		t.Fatalf("reachable relay incorrectly started another path: %+v", attempt)
+	case <-time.After(20 * time.Millisecond):
 	}
 }
 

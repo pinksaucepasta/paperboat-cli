@@ -1,5 +1,3 @@
-//go:build darwin || linux
-
 package codexsession
 
 import (
@@ -158,10 +156,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	local.SetReadLimit(MaxMessageBytes)
 	transport := &http.Transport{ResponseHeaderTimeout: 10 * time.Second, DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-		return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "unix", socket)
+		return dialCodexAppServer(ctx, socket)
 	}}
 	defer transport.CloseIdleConnections()
-	remote, _, err := websocket.Dial(context.WithoutCancel(r.Context()), "ws://localhost", &websocket.DialOptions{HTTPClient: &http.Client{Transport: transport}, CompressionMode: websocket.CompressionDisabled})
+	remoteURL := "ws://localhost"
+	if strings.HasPrefix(socket, "ws://127.0.0.1:") {
+		remoteURL = socket
+	}
+	remote, _, err := websocket.Dial(context.WithoutCancel(r.Context()), remoteURL, &websocket.DialOptions{HTTPClient: &http.Client{Transport: transport}, CompressionMode: websocket.CompressionDisabled})
 	if err != nil {
 		_ = local.Close(websocket.StatusInternalError, "remote_unavailable")
 		return

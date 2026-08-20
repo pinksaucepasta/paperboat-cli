@@ -130,6 +130,63 @@ func TestDaemonOwnsStaleSocketCleanupAfterLockAcquisition(t *testing.T) {
 	}
 }
 
+type managedSSHReadinessTestSource struct {
+	ready bool
+	code  string
+}
+
+func (s *managedSSHReadinessTestSource) SetManagedSSHReadiness(ready bool, code string) {
+	s.ready = ready
+	s.code = code
+}
+
+func (s *managedSSHReadinessTestSource) ListUserMachines(context.Context) ([]api.UserMachine, error) {
+	return []api.UserMachine{{
+		ID: "machine_1", DisplayName: "Studio Mac", Online: true, InstallationGeneration: 4,
+		SSHLocalReady: s.ready, SSHLocalCode: s.code,
+		SSHAuthority: api.SSHAuthority{TargetGeneration: 4, HostKeyGeneration: 4},
+	}}, nil
+}
+
+func TestDaemonSurfacesManagedSSHStartupFailureWithoutStopping(t *testing.T) {
+	paths := daemonTestPaths(t)
+	source := &managedSSHReadinessTestSource{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, DaemonConfig{
+			Paths: paths, Source: source, OwnerUID: os.Geteuid(), OwnerGID: os.Getegid(),
+			RefreshInterval: time.Second, RequestTimeout: time.Second, ManagedSSH: &ManagedSSHConfig{},
+		})
+	}()
+	waitForDaemonSocket(t, paths.SocketPath)
+	client, err := localapi.NewClient(paths.SocketPath, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := client.Snapshot(context.Background())
+	if err != nil || snapshot.DaemonState != "ready" || len(snapshot.Machines) != 1 {
+		t.Fatalf("snapshot=%#v err=%v", snapshot, err)
+	}
+	machine := snapshot.Machines[0]
+	if machine.SSHReadiness != "degraded" || len(machine.Health) != 1 || machine.Health[0].Code != "ssh_key_rejected" || machine.Health[0].Recovery != managedSSHDoctorRecovery {
+		t.Fatalf("managed SSH failure was not surfaced: %#v", machine)
+	}
+	diagnostics, err := client.Diagnostics(context.Background())
+	if err != nil || len(diagnostics.Recent) < 2 {
+		t.Fatalf("diagnostics=%#v err=%v", diagnostics, err)
+	}
+	startup := diagnostics.Recent[1]
+	if startup.Category != "ssh" || startup.Code != "managed_startup" || startup.Severity != "warning" || startup.Fields["outcome"] != "degraded" || startup.Fields["reason"] != "ssh_key_rejected" {
+		t.Fatalf("managed SSH startup diagnostic=%#v", startup)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("run err=%v", err)
+	}
+}
+
 func waitForDaemonSocket(t *testing.T, path string) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)

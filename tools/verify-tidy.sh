@@ -8,7 +8,8 @@ trap 'rm -rf "$work"' EXIT HUP INT TERM
 mkdir "$work/repository"
 (
 	cd "$root"
-	git ls-files -z --cached --others --exclude-standard >"$work/files"
+	git ls-files -z --cached --others --exclude-standard |
+		xargs -0 -n 1 sh -c 'test ! -e "$1" || printf "%s\0" "$1"' sh >"$work/files"
 	tar --null -T "$work/files" -cf "$work/repository.tar"
 )
 tar -xf "$work/repository.tar" -C "$work/repository"

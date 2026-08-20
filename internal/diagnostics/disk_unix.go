@@ -1,5 +1,3 @@
-//go:build darwin || linux
-
 package diagnostics
 
 import (
@@ -15,7 +13,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 )
 
@@ -28,13 +25,27 @@ const (
 )
 
 type DiskConfig struct {
-	Directory     string
+	Directory string
+	// OwnerSID selects the Windows user allowed to read and write diagnostic
+	// state. It is optional on Windows, where the current user SID is used.
+	// A supplied SID must identify the current user. Unix ignores this field.
+	OwnerSID string
+	// OwnerUID selects the Unix owner. It is ignored on Windows and must be
+	// non-negative on Unix.
 	OwnerUID      int
 	MaximumBytes  int64
 	Retention     time.Duration
 	SegmentBytes  int64
 	QueueCapacity int
 	Clock         func() time.Time
+}
+
+// diagnosticOwner is deliberately opaque to the recorder. Platform helpers
+// enforce the native ownership contract: UID and mode bits on Unix, protected
+// SID ACLs on Windows.
+type diagnosticOwner struct {
+	uid int
+	sid string
 }
 
 type DiskStats struct {
@@ -50,6 +61,7 @@ type diskRecord struct {
 
 type DiskRing struct {
 	config DiskConfig
+	owner  diagnosticOwner
 	queue  chan diskRecord
 	done   chan struct{}
 
@@ -63,8 +75,12 @@ type DiskRing struct {
 }
 
 func NewDiskRing(config DiskConfig) (*DiskRing, error) {
-	if !filepath.IsAbs(config.Directory) || filepath.Clean(config.Directory) != config.Directory || config.OwnerUID < 0 {
+	if !filepath.IsAbs(config.Directory) || filepath.Clean(config.Directory) != config.Directory {
 		return nil, ErrInvalid
+	}
+	owner, err := resolveDiagnosticOwner(config)
+	if err != nil {
+		return nil, err
 	}
 	if config.MaximumBytes == 0 {
 		config.MaximumBytes = DefaultMaximumBytes
@@ -84,10 +100,10 @@ func NewDiskRing(config DiskConfig) (*DiskRing, error) {
 	if config.MaximumBytes < MaximumRecordBytes || config.MaximumBytes > DefaultMaximumBytes || config.Retention <= 0 || config.Retention > DefaultRetention || config.SegmentBytes < MaximumRecordBytes || config.SegmentBytes > config.MaximumBytes || config.QueueCapacity < 1 || config.QueueCapacity > 4096 {
 		return nil, ErrInvalid
 	}
-	if err := ensureDiagnosticDirectory(config.Directory, config.OwnerUID); err != nil {
+	if err := ensureDiagnosticDirectory(config.Directory, owner); err != nil {
 		return nil, err
 	}
-	ring := &DiskRing{config: config, queue: make(chan diskRecord, config.QueueCapacity), done: make(chan struct{})}
+	ring := &DiskRing{config: config, owner: owner, queue: make(chan diskRecord, config.QueueCapacity), done: make(chan struct{})}
 	if err := ring.recover(); err != nil {
 		return nil, err
 	}
@@ -191,7 +207,7 @@ func (r *DiskRing) persist(encoded []byte) error {
 		return err
 	}
 	for total+int64(len(encoded)) > r.config.MaximumBytes && len(segments) > 0 {
-		if err := removeDiagnosticFile(segments[0].path, r.config.OwnerUID); err != nil {
+		if err := removeDiagnosticFile(segments[0].path, r.owner); err != nil {
 			return err
 		}
 		total -= segments[0].size
@@ -210,7 +226,7 @@ func (r *DiskRing) persist(encoded []byte) error {
 			return err
 		}
 	}
-	file, err := openDiagnosticAppend(path, r.config.OwnerUID)
+	file, err := openDiagnosticAppend(path, r.owner)
 	if err != nil {
 		return err
 	}
@@ -242,7 +258,7 @@ func (r *DiskRing) segments() ([]segmentInfo, int64, error) {
 			continue
 		}
 		path := filepath.Join(r.config.Directory, entry.Name())
-		info, err := verifiedDiagnosticFile(path, r.config.OwnerUID)
+		info, err := verifiedDiagnosticFile(path, r.owner)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -257,18 +273,11 @@ func (r *DiskRing) createSegment() (string, error) {
 	for attempt := 0; attempt < 16; attempt++ {
 		name := fmt.Sprintf("events-%020d-%02d.ndjson", r.config.Clock().UTC().UnixNano(), attempt)
 		path := filepath.Join(r.config.Directory, name)
-		file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		err := createDiagnosticSegment(path, r.owner)
 		if errors.Is(err, os.ErrExist) {
 			continue
 		}
 		if err != nil {
-			return "", err
-		}
-		if err := file.Sync(); err != nil {
-			_ = file.Close()
-			return "", err
-		}
-		if err := file.Close(); err != nil {
 			return "", err
 		}
 		return path, syncDirectory(r.config.Directory)
@@ -284,13 +293,13 @@ func (r *DiskRing) recover() error {
 	cutoff := r.config.Clock().UTC().Add(-r.config.Retention)
 	for _, segment := range segments {
 		if segment.modTime.Before(cutoff) {
-			if err := removeDiagnosticFile(segment.path, r.config.OwnerUID); err != nil {
+			if err := removeDiagnosticFile(segment.path, r.owner); err != nil {
 				return err
 			}
 			total -= segment.size
 			continue
 		}
-		if err := recoverSegment(segment.path, r.config.OwnerUID); err != nil {
+		if err := recoverSegment(segment.path, r.owner); err != nil {
 			return err
 		}
 	}
@@ -299,7 +308,7 @@ func (r *DiskRing) recover() error {
 		return err
 	}
 	for total > r.config.MaximumBytes && len(segments) > 0 {
-		if err := removeDiagnosticFile(segments[0].path, r.config.OwnerUID); err != nil {
+		if err := removeDiagnosticFile(segments[0].path, r.owner); err != nil {
 			return err
 		}
 		total -= segments[0].size
@@ -324,7 +333,7 @@ func (r *DiskRing) ReadAll(ctx context.Context, maximum int64) ([]byte, error) {
 		if int64(output.Len())+segment.size > maximum {
 			return nil, errors.New("diagnostic export exceeds limit")
 		}
-		file, err := openDiagnosticRead(segment.path, r.config.OwnerUID)
+		file, err := openDiagnosticRead(segment.path, r.owner)
 		if err != nil {
 			return nil, err
 		}
@@ -356,7 +365,7 @@ func (r *DiskRing) ReadTail(ctx context.Context, maximum int64) ([]byte, error) 
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		file, err := openDiagnosticRead(segment.path, r.config.OwnerUID)
+		file, err := openDiagnosticRead(segment.path, r.owner)
 		if err != nil {
 			return nil, err
 		}
@@ -369,13 +378,13 @@ func (r *DiskRing) ReadTail(ctx context.Context, maximum int64) ([]byte, error) 
 	return output.Bytes(), nil
 }
 
-func recoverSegment(path string, ownerUID int) error {
+func recoverSegment(path string, owner diagnosticOwner) error {
 	file, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		return err
 	}
 	info, err := file.Stat()
-	if err != nil || !validDiagnosticFile(info, ownerUID) {
+	if err != nil || !validDiagnosticFile(path, info, owner) {
 		_ = file.Close()
 		return ErrInvalid
 	}
@@ -408,88 +417,4 @@ func recoverSegment(path string, ownerUID int) error {
 		}
 	}
 	return file.Close()
-}
-
-func ensureDiagnosticDirectory(path string, ownerUID int) error {
-	if err := os.MkdirAll(path, 0o700); err != nil {
-		return err
-	}
-	info, err := os.Lstat(path)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 || fileUID(info) != ownerUID {
-		return ErrInvalid
-	}
-	return nil
-}
-
-func verifiedDiagnosticFile(path string, ownerUID int) (os.FileInfo, error) {
-	info, err := os.Lstat(path)
-	if err != nil || !validDiagnosticFile(info, ownerUID) {
-		return nil, ErrInvalid
-	}
-	return info, nil
-}
-
-func validDiagnosticFile(info os.FileInfo, ownerUID int) bool {
-	return info != nil && info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 && info.Mode().Perm() == 0o600 && fileUID(info) == ownerUID
-}
-
-func openDiagnosticAppend(path string, ownerUID int) (*os.File, error) {
-	before, err := verifiedDiagnosticFile(path, ownerUID)
-	if err != nil {
-		return nil, err
-	}
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
-	if err != nil {
-		return nil, err
-	}
-	info, err := file.Stat()
-	if err != nil || !validDiagnosticFile(info, ownerUID) || !os.SameFile(before, info) {
-		_ = file.Close()
-		return nil, ErrInvalid
-	}
-	return file, nil
-}
-
-func openDiagnosticRead(path string, ownerUID int) (*os.File, error) {
-	before, err := verifiedDiagnosticFile(path, ownerUID)
-	if err != nil {
-		return nil, err
-	}
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	info, err := file.Stat()
-	if err != nil || !validDiagnosticFile(info, ownerUID) || !os.SameFile(before, info) {
-		_ = file.Close()
-		return nil, ErrInvalid
-	}
-	return file, nil
-}
-
-func removeDiagnosticFile(path string, ownerUID int) error {
-	if _, err := verifiedDiagnosticFile(path, ownerUID); err != nil {
-		return err
-	}
-	if err := os.Remove(path); err != nil {
-		return err
-	}
-	return syncDirectory(filepath.Dir(path))
-}
-
-func syncDirectory(path string) error {
-	directory, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	err = directory.Sync()
-	return errors.Join(err, directory.Close())
-}
-
-func fileUID(info os.FileInfo) int {
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return -1
-	}
-	return int(stat.Uid)
 }

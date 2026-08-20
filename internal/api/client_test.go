@@ -97,6 +97,19 @@ func TestMachineSSHDescriptorRequiresExactScope(t *testing.T) {
 	}
 }
 
+func TestRemoteAbsolutePathIsIndependentOfClientPlatform(t *testing.T) {
+	for _, value := range []string{"/srv/workspace", `C:\Users\paperboat\workspace`, "D:/workspace", `\\server\share\workspace`} {
+		if !remoteAbsolutePath(value) {
+			t.Errorf("remoteAbsolutePath(%q) = false", value)
+		}
+	}
+	for _, value := range []string{"", "relative/path", `C:relative`, `\\server`, "bad\x00path"} {
+		if remoteAbsolutePath(value) {
+			t.Errorf("remoteAbsolutePath(%q) = true", value)
+		}
+	}
+}
+
 func TestClientConfigurationRejectsInvalidURL(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		writeData(w, http.StatusOK, ClientConfiguration{Version: "1", MachinesURL: "/dashboard/machines"})
@@ -537,6 +550,24 @@ func TestSetUserMachineAvailabilityUsesIdempotencyAndVersion(t *testing.T) {
 	defer server.Close()
 	result, err := New(server.URL, config.Credential{AccessToken: "token"}, server.Client()).SetUserMachineAvailability(context.Background(), "um_1", "keep_awake", "availability-1", 4)
 	if err != nil || result.DesiredVersion != 5 || result.Status != "pending" {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+}
+
+func TestRenameUserMachine(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPatch || r.URL.Path != "/v1/machines/um_1" || r.Header.Get("Authorization") != "Bearer token" {
+			t.Fatalf("request=%s %s auth=%q", r.Method, r.URL.Path, r.Header.Get("Authorization"))
+		}
+		var body map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body["display_name"] != "New Studio" {
+			t.Fatalf("body=%v err=%v", body, err)
+		}
+		writeData(w, http.StatusOK, UserMachine{ID: "um_1", DisplayName: "New Studio"})
+	}))
+	defer server.Close()
+	result, err := New(server.URL, config.Credential{AccessToken: "token"}, server.Client()).RenameUserMachine(context.Background(), "um_1", " New Studio ")
+	if err != nil || result.ID != "um_1" || result.DisplayName != "New Studio" {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
 }

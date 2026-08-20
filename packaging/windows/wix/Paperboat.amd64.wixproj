@@ -1,0 +1,13 @@
+<Project Sdk="WixToolset.Sdk/5.0.2">
+  <PropertyGroup>
+    <OutputType>Package</OutputType>
+    <Platform>x64</Platform>
+    <PaperboatArchitecture>amd64</PaperboatArchitecture>
+    <PaperboatChannel>stable</PaperboatChannel>
+    <OutputName>paperboat-$(PaperboatVersion)-windows-amd64</OutputName>
+    <DefineConstants>WixPlatform=x64;PaperboatChannel=stable;PaperboatVersion=$(PaperboatVersion);PaperboatMSIVersion=$(PaperboatMSIVersion);StagingDir=$(StagingDir);PackagingRoot=$(MSBuildProjectDirectory)\..</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Paperboat.wxs" />
+  </ItemGroup>
+</Project>

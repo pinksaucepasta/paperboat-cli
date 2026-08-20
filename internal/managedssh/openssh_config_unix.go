@@ -14,6 +14,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -35,6 +36,8 @@ type OpenSSHConfig struct {
 	ProxyCommand      string
 	KnownHostsCommand string
 	AgentSocket       string
+	IdentityFile      string
+	Targets           []OpenSSHAliasTarget
 }
 
 type OpenSSHConfigResult struct{ Changed bool }
@@ -89,16 +92,18 @@ func ValidateInstalledOpenSSHConfig(home string, ownerUID uint32, aliasSuffix, a
 	record, recordSet, err := readOpenSSHRecord(directoryFD, ownerUID)
 	includeLine := "Include ~/.ssh/paperboat_config # " + openSSHIncludeMarker + "\n"
 	lines := strings.Split(strings.TrimSuffix(string(owned), "\n"), "\n")
+	wildcard := ownedWildcardLine(lines, aliasSuffix)
 	if err != nil || !mainSet || !ownedSet || !recordSet || record.Version != 1 || record.AliasSuffix != aliasSuffix ||
 		!validRecordedInclude(record.IncludeChunk, includeLine) || bytes.Count(main, []byte(record.IncludeChunk)) != 1 ||
-		!validOwnedOpenSSHContent(owned, aliasSuffix) || record.OwnedHash != hashOpenSSHBytes(owned) || len(lines) != 10 ||
-		lines[4] != "    IdentityAgent \""+strings.ReplaceAll(agentSocket, "\\", "\\\\")+"\"" {
+		!validOwnedOpenSSHContent(owned, aliasSuffix) || record.OwnedHash != hashOpenSSHBytes(owned) || wildcard < 1 ||
+		lines[wildcard+3] != "    IdentityAgent \""+strings.ReplaceAll(agentSocket, "\\", "\\\\")+"\"" ||
+		lines[wildcard+4] != "    IdentityFile \""+strings.ReplaceAll(ManagedIdentityPublicKeyPath(home), "\\", "\\\\")+"\"" {
 		return errors.Join(ErrOpenSSHConfigConflict, err)
 	}
 	installed := OpenSSHConfig{
 		AliasSuffix:       aliasSuffix,
-		ProxyCommand:      strings.TrimPrefix(lines[2], "    ProxyCommand "),
-		KnownHostsCommand: strings.TrimPrefix(lines[3], "    KnownHostsCommand "),
+		ProxyCommand:      strings.TrimPrefix(lines[wildcard+1], "    ProxyCommand "),
+		KnownHostsCommand: strings.TrimPrefix(lines[wildcard+2], "    KnownHostsCommand "),
 	}
 	return findOpenSSHOptionConflict(main, installed)
 }
@@ -191,10 +196,14 @@ func InstallOpenSSHConfig(config OpenSSHConfig) (OpenSSHConfigResult, error) {
 		return OpenSSHConfigResult{}, conflict
 	}
 	includeLine := "Include ~/.ssh/paperboat_config # " + openSSHIncludeMarker + "\n"
+	previousKnownHostsOwned := bytes.Replace(owned, []byte("--host %h --port %p"), []byte("--host %H --port %p"), 1)
+	previousCanonicalOwned := bytes.Replace(owned, []byte("    CanonicalizeHostname yes\n"), nil, 1)
 	var nextMain []byte
 	var includeChunk string
 	if recordSet {
-		if !ownedSet || record.Version != 1 || !validRecordedInclude(record.IncludeChunk, includeLine) || !validAliasSuffix(record.AliasSuffix) || !validOwnedOpenSSHContent(existingOwned, record.AliasSuffix) || record.OwnedHash != hashOpenSSHBytes(existingOwned) || bytes.Count(main, []byte(record.IncludeChunk)) != 1 {
+		if !ownedSet || record.Version != 1 || !validRecordedInclude(record.IncludeChunk, includeLine) || !validAliasSuffix(record.AliasSuffix) ||
+			(!validOwnedOpenSSHContent(existingOwned, record.AliasSuffix) && !validOwnedOpenSSHContentWithoutCanonical(existingOwned, record.AliasSuffix) && !validLegacyOwnedOpenSSHContent(existingOwned, record.AliasSuffix) && !bytes.Equal(existingOwned, previousKnownHostsOwned) && !bytes.Equal(existingOwned, previousCanonicalOwned)) ||
+			record.OwnedHash != hashOpenSSHBytes(existingOwned) || bytes.Count(main, []byte(record.IncludeChunk)) != 1 {
 			return OpenSSHConfigResult{}, ErrOpenSSHConfigConflict
 		}
 		nextMain, includeChunk = main, record.IncludeChunk
@@ -269,7 +278,9 @@ func UninstallOpenSSHConfig(home string, ownerUID uint32) (OpenSSHConfigResult, 
 	}
 	owned, ownedSet, err := readOpenSSHFileAt(directoryFD, "paperboat_config", ownerUID)
 	includeLine := "Include ~/.ssh/paperboat_config # " + openSSHIncludeMarker + "\n"
-	if err != nil || !mainSet || !ownedSet || !validRecordedInclude(record.IncludeChunk, includeLine) || !validOwnedOpenSSHContent(owned, record.AliasSuffix) || record.OwnedHash != hashOpenSSHBytes(owned) || bytes.Count(main, []byte(record.IncludeChunk)) != 1 {
+	if err != nil || !mainSet || !ownedSet || !validRecordedInclude(record.IncludeChunk, includeLine) ||
+		(!validOwnedOpenSSHContent(owned, record.AliasSuffix) && !validLegacyOwnedOpenSSHContent(owned, record.AliasSuffix)) ||
+		record.OwnedHash != hashOpenSSHBytes(owned) || bytes.Count(main, []byte(record.IncludeChunk)) != 1 {
 		return OpenSSHConfigResult{}, ErrOpenSSHConfigConflict
 	}
 	nextMain := bytes.Replace(main, []byte(record.IncludeChunk), nil, 1)
@@ -288,18 +299,37 @@ func UninstallOpenSSHConfig(home string, ownerUID uint32) (OpenSSHConfigResult, 
 }
 
 func renderOwnedOpenSSHConfig(config OpenSSHConfig) ([]byte, error) {
-	if !validAliasSuffix(config.AliasSuffix) || !validOpenSSHCommand(config.ProxyCommand) || !validOpenSSHCommand(config.KnownHostsCommand) || !filepath.IsAbs(config.AgentSocket) || strings.ContainsAny(config.AgentSocket, "\r\n\x00\"") {
+	if !validAliasSuffix(config.AliasSuffix) || !validOpenSSHCommand(config.ProxyCommand) || !validOpenSSHCommand(config.KnownHostsCommand) || !filepath.IsAbs(config.AgentSocket) || strings.ContainsAny(config.AgentSocket, "\r\n\x00\"") || !filepath.IsAbs(config.IdentityFile) || strings.ContainsAny(config.IdentityFile, "\r\n\x00\"") {
 		return nil, ErrOpenSSHConfigConflict
 	}
-	content := openSSHBeginMarker + "\n" +
+	var targets strings.Builder
+	seen := make(map[string]struct{}, len(config.Targets))
+	for _, target := range config.Targets {
+		host, hostErr := AliasHost(target.Alias, config.AliasSuffix)
+		if hostErr != nil || target.Port == 0 || strings.TrimSpace(target.User) != target.User || target.User == "" || strings.ContainsAny(target.User, " \t\r\n\x00\"") {
+			return nil, ErrOpenSSHConfigConflict
+		}
+		if _, exists := seen[host]; exists {
+			return nil, ErrOpenSSHConfigConflict
+		}
+		seen[host] = struct{}{}
+		fmt.Fprintf(&targets, "Host %s\n    User %s\n    Port %d\n", openSSHHostPatterns(host, target.DisplayName, config.AliasSuffix), target.User, target.Port)
+	}
+	content := openSSHBeginMarker + "\n" + targets.String() +
 		"Host *." + config.AliasSuffix + "\n" +
 		"    ProxyCommand " + config.ProxyCommand + "\n" +
 		"    KnownHostsCommand " + config.KnownHostsCommand + "\n" +
 		"    IdentityAgent \"" + strings.ReplaceAll(config.AgentSocket, "\\", "\\\\") + "\"\n" +
+		"    IdentityFile \"" + strings.ReplaceAll(config.IdentityFile, "\\", "\\\\") + "\"\n" +
+		"    IdentitiesOnly yes\n" +
+		"    BatchMode yes\n" +
+		"    PasswordAuthentication no\n" +
+		"    KbdInteractiveAuthentication no\n" +
 		"    StrictHostKeyChecking yes\n" +
 		"    CheckHostIP no\n" +
 		"    UserKnownHostsFile none\n" +
-		"    GlobalKnownHostsFile none\n" + openSSHEndMarker + "\n"
+		"    GlobalKnownHostsFile none\n" +
+		"    CanonicalizeHostname yes\n" + openSSHEndMarker + "\n"
 	return []byte(content), nil
 }
 
@@ -309,7 +339,58 @@ func validRecordedInclude(chunk, line string) bool {
 
 func validOwnedOpenSSHContent(value []byte, suffix string) bool {
 	lines := strings.Split(strings.TrimSuffix(string(value), "\n"), "\n")
-	if len(lines) != 10 || lines[0] != openSSHBeginMarker || lines[1] != "Host *."+suffix || lines[9] != openSSHEndMarker {
+	wildcard := ownedWildcardLine(lines, suffix)
+	if wildcard < 1 || len(lines) != wildcard+15 || lines[0] != openSSHBeginMarker || lines[len(lines)-1] != openSSHEndMarker {
+		return false
+	}
+	for index := 1; index < wildcard; index += 3 {
+		if index+2 >= wildcard || !strings.HasPrefix(lines[index], "Host ") || strings.ContainsAny(strings.TrimPrefix(lines[index], "Host "), "\t\r\n") || !strings.HasPrefix(lines[index+1], "    User ") || strings.TrimSpace(strings.TrimPrefix(lines[index+1], "    User ")) == "" || !strings.HasPrefix(lines[index+2], "    Port ") {
+			return false
+		}
+		port, err := strconv.ParseUint(strings.TrimPrefix(lines[index+2], "    Port "), 10, 16)
+		if err != nil || port == 0 {
+			return false
+		}
+	}
+	requiredPrefixes := []string{"    ProxyCommand ", "    KnownHostsCommand ", "    IdentityAgent \"", "    IdentityFile \""}
+	for index, prefix := range requiredPrefixes {
+		if !strings.HasPrefix(lines[wildcard+index+1], prefix) || len(lines[wildcard+index+1]) == len(prefix) {
+			return false
+		}
+	}
+	return strings.HasSuffix(lines[wildcard+3], "\"") && strings.HasSuffix(lines[wildcard+4], "\"") &&
+		lines[wildcard+5] == "    IdentitiesOnly yes" && lines[wildcard+6] == "    BatchMode yes" &&
+		lines[wildcard+7] == "    PasswordAuthentication no" && lines[wildcard+8] == "    KbdInteractiveAuthentication no" &&
+		lines[wildcard+9] == "    StrictHostKeyChecking yes" && lines[wildcard+10] == "    CheckHostIP no" &&
+		lines[wildcard+11] == "    UserKnownHostsFile none" && lines[wildcard+12] == "    GlobalKnownHostsFile none" && lines[wildcard+13] == "    CanonicalizeHostname yes"
+}
+
+func ownedWildcardLine(lines []string, suffix string) int {
+	for index, line := range lines {
+		if line == "Host *."+suffix && (index-1)%3 == 0 {
+			return index
+		}
+	}
+	return -1
+}
+
+func validOwnedOpenSSHContentWithoutCanonical(value []byte, suffix string) bool {
+	needle := []byte(openSSHEndMarker + "\n")
+	if bytes.Count(value, needle) != 1 {
+		return false
+	}
+	upgraded := bytes.Replace(value, needle, []byte("    CanonicalizeHostname yes\n"+openSSHEndMarker+"\n"), 1)
+	return validOwnedOpenSSHContent(upgraded, suffix)
+}
+
+// validLegacyOwnedOpenSSHContent recognizes the immediately previous
+// Paperboat-owned fragment solely so InstallOpenSSHConfig can atomically
+// upgrade it with the public IdentityFile selector. It is never accepted by
+// readiness validation, so a daemon cannot report ready until the upgrade is
+// fully published.
+func validLegacyOwnedOpenSSHContent(value []byte, suffix string) bool {
+	lines := strings.Split(strings.TrimSuffix(string(value), "\n"), "\n")
+	if len(lines) != 14 || lines[0] != openSSHBeginMarker || lines[1] != "Host *."+suffix || lines[13] != openSSHEndMarker {
 		return false
 	}
 	requiredPrefixes := []string{"    ProxyCommand ", "    KnownHostsCommand ", "    IdentityAgent \""}
@@ -318,7 +399,15 @@ func validOwnedOpenSSHContent(value []byte, suffix string) bool {
 			return false
 		}
 	}
-	return strings.HasSuffix(lines[4], "\"") && lines[5] == "    StrictHostKeyChecking yes" && lines[6] == "    CheckHostIP no" && lines[7] == "    UserKnownHostsFile none" && lines[8] == "    GlobalKnownHostsFile none"
+	return strings.HasSuffix(lines[4], "\"") &&
+		lines[5] == "    IdentitiesOnly yes" &&
+		lines[6] == "    BatchMode yes" &&
+		lines[7] == "    PasswordAuthentication no" &&
+		lines[8] == "    KbdInteractiveAuthentication no" &&
+		lines[9] == "    StrictHostKeyChecking yes" &&
+		lines[10] == "    CheckHostIP no" &&
+		lines[11] == "    UserKnownHostsFile none" &&
+		lines[12] == "    GlobalKnownHostsFile none"
 }
 
 func validOpenSSHCommand(value string) bool {

@@ -170,7 +170,7 @@ func (s FileSecretStore) Set(ref, value string) error {
 	if err := validateCredentialDirectory(s.Dir); err != nil {
 		return err
 	}
-	return atomicWrite(s.path(ref), []byte(value), 0o600)
+	return writeCredentialFile(s.path(ref), []byte(value))
 }
 func (s FileSecretStore) Get(ref string) (string, error) {
 	if err := validateCredentialDirectory(s.Dir); err != nil {

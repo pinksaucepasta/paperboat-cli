@@ -1,4 +1,4 @@
-//go:build darwin || linux
+//go:build darwin || linux || windows
 
 package runtime
 
@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	gort "runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -57,7 +58,10 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/transfercrypto"
 )
 
-var ErrProductionInvalid = errors.New("invalid production host configuration")
+var (
+	ErrProductionInvalid     = errors.New("invalid production host configuration")
+	ErrManagedSSHUnavailable = errors.New("managed SSH host authority is unavailable")
+)
 
 type productionClock struct{}
 
@@ -325,11 +329,11 @@ func NewProductionHost(ctx context.Context, version string, environ func(string)
 		}
 		inboxPath = registration.InboxPath
 		machineRegistration = registration
-		control, controlErr := machinecontrol.NewSource(machinecontrol.Config{ControlURL: controlURL.String(), StateRoot: runtimeConfig.StateRoot, Transport: transport, Timeout: 15 * time.Second, RenewBefore: 10 * time.Minute, OperationID: operationID})
-		if controlErr != nil {
-			return nil, controlErr
-		}
-		managedSSHIdentity = control
+		// BYOD host enrollment creates the same helper runtime identity used by
+		// hosted runtimes. A separate machine-control credential is not part of
+		// the host bootstrap contract, so managed SSH must use the renewable
+		// helper token and proof instead of requiring a nonexistent file.
+		managedSSHIdentity = hostedManagedSSHIdentity{tokens: renewingTokens, proofs: enrollment.ProofSource{StateRoot: runtimeConfig.StateRoot}}
 		networkFingerprintSecret, err = identityStore.NetworkFingerprintSecret()
 		if err != nil {
 			return nil, err
@@ -387,7 +391,7 @@ func NewProductionHost(ctx context.Context, version string, environ func(string)
 	if err != nil {
 		return nil, err
 	}
-	authorizationRefresh := serviceGroup{&jwksRefreshService{cache: cache, interval: time.Minute}, revocationRefresh}
+	authorizationRefresh := serviceGroup{&jwksRefreshService{cache: cache, interval: time.Minute}, revocationRefresh, newPeerEnrollmentRuntimeService(peerEnrollment, 2*time.Second)}
 	verifier := auth.Verifier{Keys: cache, Clock: productionClock{}, Replays: auth.NewReplayCache(4096, productionClock{}), Revocations: revocations, ClockSkew: 30 * time.Second, RefreshTimeout: 2 * time.Second}
 	authorizer, err := NewCredentialAuthorizer(CredentialAuthConfig{Issuer: issuer, EnvironmentID: identity.EnvironmentID, MachineID: machineID, HelperID: identity.HelperID, Verifier: verifier, Revocations: revocations})
 	if err != nil {
@@ -450,7 +454,7 @@ func NewProductionHost(ctx context.Context, version string, environ func(string)
 		if resolverErr != nil {
 			return nil, resolverErr
 		}
-		hostClient, hostErr := availability.NewHostClient("/var/run/paperboat/host-service.sock", 5*time.Second)
+		hostClient, hostErr := newProductionAvailabilityHostClient(5 * time.Second)
 		if hostErr != nil {
 			return nil, hostErr
 		}
@@ -465,7 +469,7 @@ func NewProductionHost(ctx context.Context, version string, environ func(string)
 		if scope != "system" && scope != "user" {
 			scope = "unknown"
 		}
-		sender := &runtimeObservationSender{endpoint: runtimeEndpoint, tokens: renewingTokens, proofs: enrollment.ProofSource{StateRoot: runtimeConfig.StateRoot}, operationID: operationID, environmentID: identity.EnvironmentID, machineID: machineID, reporterVersion: version, client: &http.Client{Transport: transport, Timeout: 10 * time.Second}, availability: availabilityService, receiptPath: filepath.Join(runtimeConfig.StateRoot, "runtime", "server-heartbeat.json"), workerGeneration: bootState.Generation, osBootID: bootState.OSBootID, serviceScope: scope, connector: manager, relayLatency: regionalCache, relaySuccess: relayRegion}
+		sender := &runtimeObservationSender{endpoint: runtimeEndpoint, tokens: renewingTokens, proofs: enrollment.ProofSource{StateRoot: runtimeConfig.StateRoot}, operationID: operationID, environmentID: identity.EnvironmentID, machineID: machineID, reporterVersion: version, client: &http.Client{Transport: transport, Timeout: 10 * time.Second}, availability: availabilityService, receiptPath: filepath.Join(runtimeConfig.StateRoot, "runtime", "server-heartbeat.json"), installationGeneration: uint64(machineRegistration.InstallationGeneration), workerGeneration: bootState.Generation, osBootID: bootState.OSBootID, serviceScope: scope, connector: manager, relayLatency: regionalCache, relaySuccess: relayRegion}
 		runtimeObservation = &runtimeObservationService{sender: sender, interval: runtimeConfig.Limits.HeartbeatInterval, timeout: 10 * time.Second}
 	}
 	var hostedLifecycle *hosted.Lifecycle
@@ -489,7 +493,7 @@ func NewProductionHost(ctx context.Context, version string, environ func(string)
 	}
 	shutdownTimeout := 30 * time.Second
 	if runtimeConfig.Profile == runtimeconfig.Hosted {
-		hostedLifecycle, err = hosted.New(hostedConfig, hosted.Hooks{}, nil)
+		hostedLifecycle, err = hosted.New(hostedConfig, hosted.ConfigSyncHooks(hostedConfig, environ), nil)
 		if err != nil {
 			return nil, err
 		}
@@ -644,7 +648,7 @@ type managedSSHControlClient interface {
 	ManagedSSHAuthorizedKeys(context.Context, string, string, uint64, []byte) (clientapi.ManagedSSHAuthorizedKeys, error)
 }
 
-func productionManagedSSH(ctx context.Context, controlURL string, transport http.RoundTripper, registration runtimeidentity.Registration, identitySource managedSSHIdentitySource, observationGeneration uint64) (*managedssh.Host, Service, error) {
+func productionManagedSSHUnix(ctx context.Context, controlURL string, transport http.RoundTripper, registration runtimeidentity.Registration, identitySource managedSSHIdentitySource, observationGeneration uint64) (*managedssh.Host, Service, error) {
 	if registration.MachineID == "" || registration.InstallationGeneration < 1 || registration.SSHPort == 0 || registration.SSHUser == "" || identitySource == nil {
 		return nil, nil, nil
 	}
@@ -655,19 +659,16 @@ func productionManagedSSH(ctx context.Context, controlURL string, transport http
 	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	_, err = host.ReconcileTarget(probeCtx, uint64(registration.InstallationGeneration), registration.SSHPort)
 	cancel()
-	if errors.Is(err, managedssh.ErrSSHTargetUnavailable) {
-		return nil, nil, nil
-	}
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, errors.Join(ErrManagedSSHUnavailable, err)
 	}
-	paths := existingSSHHostPublicKeyPaths()
+	paths := existingSSHHostPublicKeyPathsUnix()
 	if len(paths) == 0 {
-		return nil, nil, nil
+		return nil, nil, errors.Join(ErrManagedSSHUnavailable, errors.New("no SSH host public key is published"))
 	}
 	inventory, err := managedssh.ReadHostPublicKeys(paths, 0)
 	if err != nil {
-		return nil, nil, nil
+		return nil, nil, errors.Join(ErrManagedSSHUnavailable, err)
 	}
 	if observationGeneration == 0 {
 		return nil, nil, errors.New("managed SSH observation generation is unavailable")
@@ -678,23 +679,13 @@ func productionManagedSSH(ctx context.Context, controlURL string, transport http
 	}
 	setID := "sshks_" + hex.EncodeToString(inventory.Fingerprint[:16])
 	client := clientapi.New(controlURL, clientconfig.Credential{}, &http.Client{Transport: transport, Timeout: 15 * time.Second})
-	keySet, active, err := reconcileManagedSSHAuthority(ctx, client, identitySource, registration, observationGeneration, setID, publicKeys)
-	if err != nil {
-		return nil, nil, err
-	}
 	account, err := user.Lookup(registration.SSHUser)
 	if err != nil || !filepath.IsAbs(account.HomeDir) {
-		return nil, nil, nil
+		return nil, nil, errors.Join(ErrManagedSSHUnavailable, errors.New("managed SSH operating-system user is unavailable"), err)
 	}
 	uid, err := strconv.ParseUint(account.Uid, 10, 32)
 	if err != nil {
-		return nil, nil, nil
-	}
-	if !active {
-		keySet.Keys = nil
-	}
-	if _, err := managedssh.ReconcileAuthorizedKeys(account.HomeDir, uint32(uid), keySet.Keys); err != nil {
-		return nil, nil, nil
+		return nil, nil, errors.Join(ErrManagedSSHUnavailable, errors.New("managed SSH operating-system user identifier is invalid"), err)
 	}
 	reconciler := &managedSSHKeyReconciler{
 		client: client, identity: identitySource, registration: registration,
@@ -751,7 +742,7 @@ func reconcileManagedSSHAuthorityWithOperations(ctx context.Context, client mana
 	return keySet, true, nil
 }
 
-func existingSSHHostPublicKeyPaths() []string {
+func existingSSHHostPublicKeyPathsUnix() []string {
 	candidates := []string{
 		"/etc/ssh/ssh_host_ed25519_key.pub",
 		"/etc/ssh/ssh_host_ecdsa_key.pub",
@@ -815,7 +806,7 @@ func newProductionReceiveCoordinator(ctx context.Context, version string, enviro
 	if err != nil {
 		return nil, err
 	}
-	authorizationRefresh := serviceGroup{&jwksRefreshService{cache: cache, interval: time.Minute}, revocationRefresh}
+	authorizationRefresh := serviceGroup{&jwksRefreshService{cache: cache, interval: time.Minute}, revocationRefresh, newPeerEnrollmentRuntimeService(peerEnrollment, 2*time.Second)}
 	verifier := auth.Verifier{Keys: cache, Clock: productionClock{}, Replays: auth.NewReplayCache(4096, productionClock{}), Revocations: revocations, ClockSkew: 30 * time.Second, RefreshTimeout: 2 * time.Second}
 	authorizer, err := NewCredentialAuthorizer(CredentialAuthConfig{Issuer: issuer, EnvironmentID: registration.EnvironmentID, MachineID: registration.MachineID, HelperID: "machine-control", Verifier: verifier, Revocations: revocations})
 	if err != nil {
@@ -888,6 +879,43 @@ func newProductionReceiveCoordinator(ctx context.Context, version string, enviro
 
 type peerEnrollmentEnsurer interface {
 	Ensure(context.Context) error
+}
+
+type peerEnrollmentRuntimeService struct {
+	enrollment peerEnrollmentEnsurer
+	interval   time.Duration
+	cancel     context.CancelFunc
+	done       chan struct{}
+}
+
+func newPeerEnrollmentRuntimeService(enrollment peerEnrollmentEnsurer, interval time.Duration) *peerEnrollmentRuntimeService {
+	return &peerEnrollmentRuntimeService{enrollment: enrollment, interval: interval, done: make(chan struct{})}
+}
+
+func (s *peerEnrollmentRuntimeService) Start(ctx context.Context) error {
+	if s == nil || s.enrollment == nil || s.interval <= 0 || ctx == nil || s.cancel != nil {
+		return ErrProductionInvalid
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	s.cancel = cancel
+	go func() {
+		defer close(s.done)
+		_ = waitForPeerEnrollment(runCtx, s.enrollment, s.interval)
+	}()
+	return nil
+}
+
+func (s *peerEnrollmentRuntimeService) Shutdown(ctx context.Context) error {
+	if s == nil || ctx == nil || s.cancel == nil {
+		return ErrProductionInvalid
+	}
+	s.cancel()
+	select {
+	case <-s.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func allowPendingPeerEnrollment(ctx context.Context, enrollment peerEnrollmentEnsurer) error {
@@ -1039,7 +1067,7 @@ func retryHostedControl[T any](ctx context.Context, operation func(context.Conte
 	}
 }
 
-func validatedBYODShell(path string) (string, error) {
+func validatedBYODShellUnix(path string) (string, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		path = "/bin/sh"
@@ -1065,7 +1093,7 @@ func validatedBYODShell(path string) (string, error) {
 	return resolved, nil
 }
 
-func validateBYODWorkspace(root string) error {
+func validateBYODWorkspaceUnix(root string) error {
 	if strings.TrimSpace(root) == "" || !filepath.IsAbs(root) || filepath.Clean(root) != root {
 		return errors.Join(ErrProductionInvalid, errors.New("BYOD workspace must be an absolute canonical path"))
 	}
@@ -1159,13 +1187,14 @@ type runtimeObservationSender struct {
 	availability interface {
 		Observation() *availability.Observation
 	}
-	receiptPath      string
-	workerGeneration uint64
-	osBootID         string
-	serviceScope     string
-	connector        interface{ Status() connector.Status }
-	capabilities     []string
-	relayLatency     interface {
+	receiptPath            string
+	installationGeneration uint64
+	workerGeneration       uint64
+	osBootID               string
+	serviceScope           string
+	connector              interface{ Status() connector.Status }
+	capabilities           []string
+	relayLatency           interface {
 		Vector(time.Time) relayselection.Vector
 	}
 	relaySuccess    interface{ Success() (string, time.Time) }
@@ -1176,6 +1205,7 @@ type runtimeObservationSender struct {
 func (s *runtimeObservationSender) Send(ctx context.Context) error {
 	now := time.Now().UTC()
 	relayLatency := s.nextRelayLatency(now)
+	availabilityState := availabilityObservation(s.availability)
 	body, err := json.Marshal(struct {
 		EnvironmentID      string                          `json:"environment_id"`
 		ResourceID         string                          `json:"resource_id"`
@@ -1184,7 +1214,17 @@ func (s *runtimeObservationSender) Send(ctx context.Context) error {
 		Availability       *availability.Observation       `json:"availability,omitempty"`
 		RuntimeDiagnostics *runtimeDiagnosticsObservation  `json:"runtime_diagnostics,omitempty"`
 		RelayLatency       *runtimeRelayLatencyObservation `json:"relay_latency,omitempty"`
-	}{s.environmentID, s.machineID, s.reporterVersion, now, availabilityObservation(s.availability), s.runtimeDiagnostics(now), relayLatency})
+		Update             *runtimeUpdateObservation       `json:"update,omitempty"`
+	}{
+		EnvironmentID:      s.environmentID,
+		ResourceID:         s.machineID,
+		ReporterVersion:    s.reporterVersion,
+		SampledAt:          now,
+		Availability:       availabilityState,
+		RuntimeDiagnostics: s.runtimeDiagnostics(now),
+		RelayLatency:       relayLatency,
+		Update:             s.updateObservation(now, availabilityState),
+	})
 	if err != nil {
 		return err
 	}
@@ -1220,6 +1260,49 @@ func (s *runtimeObservationSender) Send(ctx context.Context) error {
 		return nil
 	}
 	return writeServerHeartbeatReceipt(s.receiptPath, serverHeartbeatReceipt{Schema: "paperboat.server-heartbeat/v1", WorkerGeneration: s.workerGeneration, ReporterVersion: s.reporterVersion, AcceptedAt: time.Now().UTC()})
+}
+
+type runtimeUpdateObservation struct {
+	Schema                 string    `json:"schema"`
+	State                  string    `json:"state"`
+	CurrentVersion         string    `json:"current_version"`
+	TargetVersion          string    `json:"target_version,omitempty"`
+	Channel                string    `json:"channel"`
+	OperationID            string    `json:"operation_id"`
+	InstallationGeneration uint64    `json:"installation_generation"`
+	WorkerGeneration       uint64    `json:"worker_generation"`
+	OSBootID               string    `json:"os_boot_id"`
+	RollbackCount          uint64    `json:"rollback_count"`
+	ErrorCode              string    `json:"error_code,omitempty"`
+	ObservedAt             time.Time `json:"observed_at"`
+}
+
+func (s *runtimeObservationSender) updateObservation(now time.Time, availabilityState *availability.Observation) *runtimeUpdateObservation {
+	if availabilityState == nil || availabilityState.UpdateHealth == "unknown" || s.reporterVersion == "" || s.installationGeneration == 0 || s.workerGeneration == 0 || s.osBootID == "" {
+		return nil
+	}
+	state, target, errorCode := "healthy", "", ""
+	if availabilityState.UpdateHealth == "recovery_required" {
+		state, target, errorCode = "failed", s.reporterVersion, "recovery_required"
+	}
+	channel := "stable"
+	if gort.GOOS == "windows" && gort.GOARCH == "arm64" {
+		channel = "beta"
+	}
+	return &runtimeUpdateObservation{
+		Schema:                 "paperboat.update-observation/v1",
+		State:                  state,
+		CurrentVersion:         s.reporterVersion,
+		TargetVersion:          target,
+		Channel:                channel,
+		OperationID:            "update-" + strconv.FormatUint(s.workerGeneration, 10) + "-" + strconv.FormatInt(now.UnixNano(), 10),
+		InstallationGeneration: s.installationGeneration,
+		WorkerGeneration:       s.workerGeneration,
+		OSBootID:               s.osBootID,
+		RollbackCount:          availabilityState.UpdateRollbacks,
+		ErrorCode:              errorCode,
+		ObservedAt:             now,
+	}
 }
 
 type runtimeRelayLatencySample struct {

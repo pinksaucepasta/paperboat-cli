@@ -43,7 +43,7 @@ func TestDashboardTokenPairingAndMaterialExchange(t *testing.T) {
 				return
 			}
 			manifest := descriptor(server.URL, "0.0.0-development")
-			_ = json.NewEncoder(writer).Encode(map[string]any{"data": Material{Schema: "paperboat.byod-installation/v1", UserMachineID: "um_1", UserMachineEnrollmentID: "ume_1", EnvironmentID: "env_1", ControlURL: server.URL, HelperID: "helper_1", EnrollmentID: "enroll_1", EnrollmentCredential: "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOP", ExpiresAt: expires, Artifact: &manifest, HelperListenAddress: "127.0.0.1:38080"}})
+			_ = json.NewEncoder(writer).Encode(map[string]any{"data": Material{Schema: "paperboat.byod-installation/v1", UserMachineID: "um_1", UserMachineEnrollmentID: "ume_1", EnvironmentID: "env_1", ControlURL: server.URL, HelperID: "helper_1", EnrollmentID: "enroll_1", EnrollmentCredential: "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOP", ExpiresAt: expires, Artifact: &manifest, HelperListenAddress: "127.0.0.1:38080", InstallationGeneration: 1, SetupRoles: []string{"host"}, SetupMode: "host"}})
 		default:
 			http.NotFound(writer, request)
 		}
@@ -80,6 +80,28 @@ func TestIdentityPairingDoesNotRequireEnrollmentToken(t *testing.T) {
 	defer server.Close()
 
 	config := Config{ServerURL: server.URL, DisplayName: "Studio", WorkspaceRoot: workspace, Verifier: "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOP", PublicIdentityKey: testPublicIdentityKey, HTTP: server.Client()}
+	if _, err := CreatePairing(context.Background(), config); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDashboardEnrollmentTokenLengthContract(t *testing.T) {
+	workspace, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	expires := time.Now().UTC().Add(time.Minute)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		var body map[string]any
+		if json.NewDecoder(request.Body).Decode(&body) != nil || body["enrollment_token"] != "8GXDIGUWR4E6YIGL0D6X0H3FNA" {
+			t.Fatalf("pairing body=%v", body)
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(writer).Encode(map[string]any{"data": Pairing{ID: "cmp_dashboard", UserCode: "ABCD1234", ExpiresAt: expires}})
+	}))
+	defer server.Close()
+
+	config := Config{ServerURL: server.URL, EnrollmentToken: "8GXDIGUWR4E6YIGL0D6X0H3FNA", DisplayName: "Studio", WorkspaceRoot: workspace, Verifier: "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOP", PublicIdentityKey: testPublicIdentityKey, HTTP: server.Client()}
 	if _, err := CreatePairing(context.Background(), config); err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +167,7 @@ func TestWaitForMaterialToleratesTransientNetworkErrors(t *testing.T) {
 			panic(http.ErrAbortHandler)
 		default:
 			manifest := descriptor(server.URL, "0.0.0-development")
-			_ = json.NewEncoder(writer).Encode(map[string]any{"data": Material{Schema: "paperboat.byod-installation/v1", UserMachineID: "um_1", UserMachineEnrollmentID: "ume_1", EnvironmentID: "env_1", ControlURL: server.URL, HelperID: "helper_1", EnrollmentID: "enroll_1", EnrollmentCredential: "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOP", ExpiresAt: expires, Artifact: &manifest, HelperListenAddress: "127.0.0.1:38080"}})
+			_ = json.NewEncoder(writer).Encode(map[string]any{"data": Material{Schema: "paperboat.byod-installation/v1", UserMachineID: "um_1", UserMachineEnrollmentID: "ume_1", EnvironmentID: "env_1", ControlURL: server.URL, HelperID: "helper_1", EnrollmentID: "enroll_1", EnrollmentCredential: "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOP", ExpiresAt: expires, Artifact: &manifest, HelperListenAddress: "127.0.0.1:38080", InstallationGeneration: 1, SetupRoles: []string{"host"}, SetupMode: "host"}})
 		}
 	}))
 	defer server.Close()

@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -108,7 +109,7 @@ func TestStorePersistsSessionAndOutputAcrossReopen(t *testing.T) {
 		t.Fatalf("events=%#v bounds=(%d,%d) err=%v", events, earliest, latest, err)
 	}
 	info, err := os.Stat(filepath.Join(root, "state.db"))
-	if err != nil || info.Mode().Perm() != 0o600 {
+	if err != nil || runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("mode=%v err=%v", info.Mode().Perm(), err)
 	}
 }

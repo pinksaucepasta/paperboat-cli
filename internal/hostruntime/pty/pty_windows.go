@@ -114,7 +114,11 @@ func (a *Adapter) Start(command Command) (*Process, error) {
 		return nil, fmt.Errorf("create process attributes: %w", err)
 	}
 	defer attributes.Delete()
-	if err := attributes.Update(windows.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, unsafe.Pointer(&console), unsafe.Sizeof(console)); err != nil {
+	// PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE takes the HPCON handle value,
+	// represented as a pointer-sized value. Passing &console attaches a pointer
+	// to the local variable instead and creates a child that never exchanges
+	// input or output with the pseudoconsole.
+	if err := attributes.Update(windows.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, unsafe.Pointer(console), unsafe.Sizeof(console)); err != nil {
 		windows.Close(job)
 		windows.ClosePseudoConsole(console)
 		closeHandles(inputWrite, outputRead)
@@ -143,44 +147,66 @@ func (a *Adapter) Start(command Command) (*Process, error) {
 	}
 	startup := windows.StartupInfoEx{}
 	startup.Cb = uint32(unsafe.Sizeof(startup))
+	// Explicit null standard handles prevent the parent's console handles from
+	// interfering with ConPTY input/output. Windows Terminal and Tailscale use
+	// the same STARTF_USESTDHANDLES contract for pseudoconsole children.
+	startup.Flags = windows.STARTF_USESTDHANDLES
+	startup.StdInput = 0
+	startup.StdOutput = 0
+	startup.StdErr = 0
 	startup.ProcThreadAttributeList = attributes.List()
 	var processInfo windows.ProcessInformation
-	flags := uint32(windows.CREATE_UNICODE_ENVIRONMENT | windows.CREATE_NEW_PROCESS_GROUP | windows.EXTENDED_STARTUPINFO_PRESENT)
+	// CREATE_NEW_PROCESS_GROUP disables Ctrl+C handling for the new process.
+	// ConPTY sessions need terminal ETX input to reach the foreground command,
+	// so process-tree ownership comes from the Job Object instead.
+	flags := uint32(windows.CREATE_UNICODE_ENVIRONMENT | windows.CREATE_SUSPENDED | windows.EXTENDED_STARTUPINFO_PRESENT)
 	if err := windows.CreateProcess(nil, &commandLine[0], nil, nil, false, flags, environment, workingDirectory, &startup.StartupInfo, &processInfo); err != nil {
 		windows.Close(job)
 		windows.ClosePseudoConsole(console)
 		closeHandles(inputWrite, outputRead)
 		return nil, fmt.Errorf("start ConPTY process: %w", err)
 	}
-	windows.Close(processInfo.Thread)
 	if err := windows.AssignProcessToJobObject(job, processInfo.Process); err != nil {
 		_ = windows.TerminateProcess(processInfo.Process, 1)
 		windows.Close(processInfo.Process)
+		windows.Close(processInfo.Thread)
 		windows.Close(job)
 		windows.ClosePseudoConsole(console)
 		closeHandles(inputWrite, outputRead)
 		return nil, fmt.Errorf("assign process to PTY job: %w", err)
 	}
+	if _, err := windows.ResumeThread(processInfo.Thread); err != nil {
+		_ = windows.TerminateProcess(processInfo.Process, 1)
+		windows.Close(processInfo.Process)
+		windows.Close(processInfo.Thread)
+		windows.Close(job)
+		windows.ClosePseudoConsole(console)
+		closeHandles(inputWrite, outputRead)
+		return nil, fmt.Errorf("resume ConPTY process: %w", err)
+	}
+	windows.Close(processInfo.Thread)
 	process := &Process{
 		input:   os.NewFile(uintptr(inputWrite), "paperboat-conpty-input"),
 		output:  os.NewFile(uintptr(outputRead), "paperboat-conpty-output"),
-		console: console, process: processInfo.Process, job: job, done: make(chan struct{}),
+		console: console, process: processInfo.Process, processID: processInfo.ProcessId, job: job, done: make(chan struct{}),
 	}
 	go process.wait()
 	return process, nil
 }
 
 type Process struct {
-	input     *os.File
-	output    *os.File
-	console   windows.Handle
-	process   windows.Handle
-	job       windows.Handle
-	done      chan struct{}
-	mu        sync.RWMutex
-	result    ExitResult
-	waitErr   error
-	closeOnce sync.Once
+	input       *os.File
+	output      *os.File
+	console     windows.Handle
+	process     windows.Handle
+	processID   uint32
+	job         windows.Handle
+	done        chan struct{}
+	mu          sync.RWMutex
+	result      ExitResult
+	waitErr     error
+	consoleOnce sync.Once
+	closeOnce   sync.Once
 }
 
 func (p *Process) Read(buffer []byte) (int, error) { return p.output.Read(buffer) }
@@ -201,6 +227,34 @@ func (p *Process) Signal(signal Signal) error {
 	if process == 0 {
 		return os.ErrProcessDone
 	}
+	if signal == Interrupt {
+		// ConPTY translates the terminal ETX byte into the same Ctrl+C input
+		// event an interactive console receives. Do not terminate the shell:
+		// the foreground command must be interrupted while the session remains
+		// usable for subsequent commands.
+		if _, err := p.input.Write([]byte{0x03}); err != nil {
+			return err
+		}
+		// Some inbox console applications on Windows 11 do not translate ETX
+		// into a control event when hosted below cmd.exe in ConPTY. Give native
+		// handling a short opportunity, then terminate only foreground
+		// descendants. The shell remains alive and all processes stay bounded by
+		// the same Job Object.
+		//paperboat:allow-source-policy sleep owner=windows-conpty reason=bounded-native-ctrl-c-grace-before-descendant-fallback
+		time.Sleep(100 * time.Millisecond)
+		for _, pid := range jobProcessIDs(p.job) {
+			if pid == p.processID {
+				continue
+			}
+			handle, err := windows.OpenProcess(windows.PROCESS_TERMINATE, false, pid)
+			if err != nil {
+				continue
+			}
+			_ = windows.TerminateProcess(handle, 130)
+			windows.CloseHandle(handle)
+		}
+		return nil
+	}
 	code := uint32(1)
 	if signal == Kill {
 		code = 137
@@ -212,6 +266,33 @@ func (p *Process) Signal(signal Signal) error {
 		return err
 	}
 	return nil
+}
+
+func jobProcessIDs(job windows.Handle) []uint32 {
+	// JOBOBJECT_BASIC_PROCESS_ID_LIST has two DWORD counters followed by a
+	// pointer-width process ID array. Cap collection to 256 processes so signal
+	// handling remains bounded even under a hostile workload.
+	const maximumProcesses = 256
+	buffer := make([]byte, 8+maximumProcesses*int(unsafe.Sizeof(uintptr(0))))
+	var returned uint32
+	if err := windows.QueryInformationJobObject(job, windows.JobObjectBasicProcessIdList, uintptr(unsafe.Pointer(&buffer[0])), uint32(len(buffer)), &returned); err != nil {
+		return nil
+	}
+	assigned := *(*uint32)(unsafe.Pointer(&buffer[4]))
+	if assigned > maximumProcesses {
+		assigned = maximumProcesses
+	}
+	result := make([]uint32, 0, assigned)
+	offset := 8
+	stride := int(unsafe.Sizeof(uintptr(0)))
+	for index := uint32(0); index < assigned && offset+stride <= len(buffer); index++ {
+		pid := *(*uintptr)(unsafe.Pointer(&buffer[offset]))
+		if pid != 0 && pid <= uintptr(^uint32(0)) {
+			result = append(result, uint32(pid))
+		}
+		offset += stride
+	}
+	return result
 }
 func (p *Process) Wait(ctx context.Context) (ExitResult, error) {
 	select {
@@ -227,11 +308,14 @@ func (p *Process) CloseIO() error {
 	var err error
 	p.closeOnce.Do(func() {
 		err = errors.Join(p.input.Close(), p.output.Close())
-		windows.ClosePseudoConsole(p.console)
+		p.closeConsole()
 		windows.Close(p.process)
 		windows.Close(p.job)
 	})
 	return err
+}
+func (p *Process) closeConsole() {
+	p.consoleOnce.Do(func() { windows.ClosePseudoConsole(p.console) })
 }
 func (p *Process) Terminate(ctx context.Context, grace time.Duration) (ExitResult, error) {
 	if grace < 0 {
@@ -275,6 +359,12 @@ func (p *Process) wait() {
 	p.result, p.waitErr = result, waitErr
 	p.mu.Unlock()
 	close(p.done)
+	// ConPTY does not close its output pipe merely because the attached process
+	// exited. Closing the pseudoconsole releases the final VT output and lets the
+	// session capture loop observe EOF, after which it can publish exact exit
+	// state. Keep this on the waiter goroutine while capture drains output: the
+	// Windows API may wait for pending pseudoconsole output to be consumed.
+	p.closeConsole()
 }
 
 func anonymousPipe() (windows.Handle, windows.Handle, error) {

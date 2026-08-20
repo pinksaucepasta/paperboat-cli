@@ -103,6 +103,9 @@ func TestListenOwnerSocketEnforcesPathOwnership(t *testing.T) {
 }
 
 func TestListenOwnerSocketReclaimsVerifiedStaleSocket(t *testing.T) {
+	if os.PathSeparator != '/' {
+		t.Skip("Unix-domain stale socket test")
+	}
 	directory, err := os.MkdirTemp("/tmp", "pb-ssh-agent-stale-")
 	if err != nil {
 		t.Fatal(err)

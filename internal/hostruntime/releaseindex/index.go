@@ -18,29 +18,35 @@ const RolloutSchemaV1 = "paperboat.release-rollout/v1"
 
 var ErrInvalid = errors.New("signed release index is invalid")
 var versionPattern = regexp.MustCompile(`^[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]+$`)
+var dependencyVersionPattern = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$`)
 var valuePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:+/-]{0,127}$`)
 
 type Index struct {
-	Schema                string    `json:"schema"`
-	ReleaseID             string    `json:"release_id"`
-	Version               string    `json:"version"`
-	Channel               string    `json:"channel"`
-	Severity              string    `json:"severity"`
-	CreatedAt             time.Time `json:"created_at"`
-	Platform              string    `json:"platform"`
-	Architecture          string    `json:"architecture"`
-	BinaryFormat          string    `json:"binary_format"`
-	Targets               []Target  `json:"targets"`
-	HostdAPIMin           uint16    `json:"hostd_api_min"`
-	HostdAPIMax           uint16    `json:"hostd_api_max"`
-	RuntimeAPIMin         uint16    `json:"runtime_api_min"`
-	RuntimeAPIMax         uint16    `json:"runtime_api_max"`
-	MinimumVersion        string    `json:"minimum_permitted_version,omitempty"`
-	RevokedVersions       []string  `json:"revoked_versions,omitempty"`
-	RolloutPolicyRevision uint64    `json:"rollout_policy_revision"`
-	SupervisorMaintenance bool      `json:"supervisor_maintenance_required"`
-	Rollout               Rollout   `json:"rollout"`
-	Revoked               bool      `json:"revoked,omitempty"`
+	Schema                 string    `json:"schema"`
+	ReleaseID              string    `json:"release_id"`
+	Version                string    `json:"version"`
+	Channel                string    `json:"channel"`
+	Severity               string    `json:"severity"`
+	CreatedAt              time.Time `json:"created_at"`
+	Platform               string    `json:"platform"`
+	Architecture           string    `json:"architecture"`
+	BinaryFormat           string    `json:"binary_format"`
+	Targets                []Target  `json:"targets"`
+	HostdAPIMin            uint16    `json:"hostd_api_min"`
+	HostdAPIMax            uint16    `json:"hostd_api_max"`
+	RuntimeAPIMin          uint16    `json:"runtime_api_min"`
+	RuntimeAPIMax          uint16    `json:"runtime_api_max"`
+	MinimumVersion         string    `json:"minimum_permitted_version,omitempty"`
+	RevokedVersions        []string  `json:"revoked_versions,omitempty"`
+	RolloutPolicyRevision  uint64    `json:"rollout_policy_revision"`
+	SupervisorMaintenance  bool      `json:"supervisor_maintenance_required"`
+	Rollout                Rollout   `json:"rollout"`
+	Revoked                bool      `json:"revoked,omitempty"`
+	Stability              string    `json:"stability,omitempty"`
+	NativeTested           bool      `json:"native_tested,omitempty"`
+	TestedWindowsBuilds    []string  `json:"tested_windows_builds,omitempty"`
+	OpenSSHPackageID       string    `json:"openssh_package_id,omitempty"`
+	OpenSSHApprovedVersion string    `json:"openssh_approved_version,omitempty"`
 }
 
 type Target struct {
@@ -75,13 +81,28 @@ func Decode(reader io.Reader, now time.Time) (Index, error) {
 }
 
 func (i Index) Validate(now time.Time) error {
-	if i.Schema != SchemaV1 || !valuePattern.MatchString(i.ReleaseID) || !versionPattern.MatchString(i.Version) || i.Channel != "stable" || i.CreatedAt.IsZero() || i.RolloutPolicyRevision == 0 {
+	if i.Schema != SchemaV1 || !valuePattern.MatchString(i.ReleaseID) || !versionPattern.MatchString(i.Version) || i.Channel != expectedChannel(i.Platform, i.Architecture) || i.CreatedAt.IsZero() || i.RolloutPolicyRevision == 0 {
 		return ErrInvalid
 	}
 	if i.Severity != "routine" && i.Severity != "security" && i.Severity != "critical" {
 		return ErrInvalid
 	}
 	if !validPlatform(i.Platform, i.Architecture, i.BinaryFormat) || i.HostdAPIMin == 0 || i.HostdAPIMin > i.HostdAPIMax || i.RuntimeAPIMin == 0 || i.RuntimeAPIMin > i.RuntimeAPIMax {
+		return ErrInvalid
+	}
+	if i.Platform == "windows" {
+		if i.OpenSSHPackageID != "Microsoft.OpenSSH.Preview" || !dependencyVersionPattern.MatchString(i.OpenSSHApprovedVersion) || len(i.TestedWindowsBuilds) == 0 || len(i.TestedWindowsBuilds) > 16 {
+			return ErrInvalid
+		}
+		for _, build := range i.TestedWindowsBuilds {
+			if !valuePattern.MatchString(build) {
+				return ErrInvalid
+			}
+		}
+		if i.Architecture == "amd64" && (i.Stability != "stable" || !i.NativeTested) || i.Architecture == "arm64" && (i.Stability != "beta" || i.NativeTested) {
+			return ErrInvalid
+		}
+	} else if i.Stability != "" || i.NativeTested || len(i.TestedWindowsBuilds) != 0 || i.OpenSSHPackageID != "" || i.OpenSSHApprovedVersion != "" {
 		return ErrInvalid
 	}
 	if i.MinimumVersion != "" && !versionPattern.MatchString(i.MinimumVersion) {
@@ -115,6 +136,13 @@ func (i Index) Validate(now time.Time) error {
 	}
 	_ = now
 	return nil
+}
+
+func expectedChannel(platform, architecture string) string {
+	if platform == "windows" && architecture == "arm64" {
+		return "beta"
+	}
+	return "stable"
 }
 
 func (i Index) Eligible(machineID string, now time.Time, bypassCohort bool) bool {

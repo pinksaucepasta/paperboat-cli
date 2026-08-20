@@ -140,25 +140,29 @@ func TestManagedSSHAuthorityUsesCurrentCredentialAndExactProofBodies(t *testing.
 }
 
 type rotatingManagedSSHClient struct {
-	mu         sync.Mutex
-	keys       [][]string
-	calls      int
-	hostStates []string
-	hostCalls  int
+	mu            sync.Mutex
+	keys          [][]string
+	calls         int
+	hostStates    []string
+	observeErrors []error
+	hostCalls     int
 }
 
 func (c *rotatingManagedSSHClient) ObserveManagedSSHHostKeys(context.Context, string, string, string, string, uint64, uint64, []string, []byte) (clientapi.ManagedSSHHostKeySet, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	index := c.hostCalls
+	c.hostCalls++
+	if index < len(c.observeErrors) && c.observeErrors[index] != nil {
+		return clientapi.ManagedSSHHostKeySet{}, c.observeErrors[index]
+	}
 	state := "active"
 	if len(c.hostStates) > 0 {
-		index := c.hostCalls
 		if index >= len(c.hostStates) {
 			index = len(c.hostStates) - 1
 		}
 		state = c.hostStates[index]
 	}
-	c.hostCalls++
 	return clientapi.ManagedSSHHostKeySet{State: state}, nil
 }
 
@@ -260,6 +264,56 @@ func TestManagedSSHKeyReconcilerActivatesPromotedHostWithoutRestart(t *testing.T
 			t.Fatalf("promoted host did not activate managed key: %q error=%v", updated, readErr)
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestManagedSSHKeyReconcilerFailsClosedWhenAuthorityRefreshFails(t *testing.T) {
+	key := managedSSHTestPublicKey(t)
+	home := t.TempDir()
+	client := &rotatingManagedSSHClient{keys: [][]string{{key}}, observeErrors: []error{nil, errors.New("authority unavailable")}}
+	service := &managedSSHKeyReconciler{client: client, identity: &refreshingManagedSSHIdentity{}, registration: runtimeidentity.Registration{MachineID: "machine_1", InstallationGeneration: 4}, workerGeneration: 11, setID: "set_1", publicKeys: []string{"ssh-ed25519 AAAA host"}, home: home, ownerUID: uint32(os.Getuid()), interval: 10 * time.Millisecond, timeout: time.Second}
+	if err := service.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = service.Shutdown(context.Background()) })
+	path := filepath.Join(home, ".ssh", "authorized_keys")
+	deadline := time.Now().Add(time.Second)
+	for {
+		updated, readErr := os.ReadFile(path)
+		if readErr == nil && !bytes.Contains(updated, []byte(key)) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("managed key survived failed authority refresh: %q error=%v", updated, readErr)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestManagedSSHKeyReconcilerReportsTypedInitialAuthorityFailure(t *testing.T) {
+	service := &managedSSHKeyReconciler{client: &rotatingManagedSSHClient{observeErrors: []error{errors.New("authority unavailable")}}, identity: &refreshingManagedSSHIdentity{}, registration: runtimeidentity.Registration{MachineID: "machine_1", InstallationGeneration: 4}, workerGeneration: 13, setID: "set_1", publicKeys: []string{"ssh-ed25519 AAAA host"}, home: t.TempDir(), ownerUID: uint32(os.Getuid()), interval: time.Hour, timeout: time.Second}
+	if err := service.Start(t.Context()); !errors.Is(err, ErrManagedSSHUnavailable) {
+		t.Fatalf("Start error=%v, want managed SSH unavailable", err)
+	}
+}
+
+func TestManagedSSHKeyReconcilerRemovesManagedKeysOnShutdown(t *testing.T) {
+	key := managedSSHTestPublicKey(t)
+	home := t.TempDir()
+	service := &managedSSHKeyReconciler{client: &rotatingManagedSSHClient{keys: [][]string{{key}}}, identity: &refreshingManagedSSHIdentity{}, registration: runtimeidentity.Registration{MachineID: "machine_1", InstallationGeneration: 4}, workerGeneration: 12, setID: "set_1", publicKeys: []string{"ssh-ed25519 AAAA host"}, home: home, ownerUID: uint32(os.Getuid()), interval: time.Hour, timeout: time.Second}
+	if err := service.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(home, ".ssh", "authorized_keys")
+	if installed, err := os.ReadFile(path); err != nil || !bytes.Contains(installed, []byte(key)) {
+		t.Fatalf("initial authorized_keys=%q error=%v", installed, err)
+	}
+	if err := service.Shutdown(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := os.ReadFile(path)
+	if err != nil || bytes.Contains(removed, []byte(key)) {
+		t.Fatalf("managed key remained after shutdown: %q error=%v", removed, err)
 	}
 }
 
@@ -465,6 +519,28 @@ func TestWaitForPeerEnrollmentStopsOnCancellation(t *testing.T) {
 	}
 	if enrollment.calls != 1 {
 		t.Fatalf("calls=%d", enrollment.calls)
+	}
+}
+
+func TestPeerEnrollmentRuntimeServicePersistsApprovalAfterStartup(t *testing.T) {
+	enrollment := &peerEnrollmentSequence{errors: []error{
+		peeridentityenrollment.ErrPending,
+		nil,
+	}}
+	service := newPeerEnrollmentRuntimeService(enrollment, time.Millisecond)
+	if err := service.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-service.done:
+	case <-time.After(time.Second):
+		t.Fatal("peer enrollment runtime service did not observe approval")
+	}
+	if enrollment.calls != 2 {
+		t.Fatalf("calls=%d", enrollment.calls)
+	}
+	if err := service.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 }
 

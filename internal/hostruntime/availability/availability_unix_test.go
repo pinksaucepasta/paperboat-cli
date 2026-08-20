@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -59,8 +60,9 @@ func TestResolverUsesExactProofAndStrictResponse(t *testing.T) {
 
 func TestHostClientAppliesVersionZeroAndRejectsMismatchedResponse(t *testing.T) {
 	for name, response := range map[string]hostservice.Response{
-		"valid":    {Schema: hostservice.ProtocolV1, Status: "applied", DesiredMode: "allow_sleep", DesiredVersion: 0, ObservedMode: "allow_sleep", ObservedVersion: 0, ObservedAt: time.Now().UTC(), HostServiceVersion: "test", Scope: "system", UpdateHealth: "healthy"},
-		"mismatch": {Schema: hostservice.ProtocolV1, Status: "applied", DesiredMode: "keep_awake", DesiredVersion: 1, ObservedMode: "keep_awake", ObservedVersion: 1, ObservedAt: time.Now().UTC(), HostServiceVersion: "test", Scope: "system"},
+		"valid":                            {Schema: hostservice.ProtocolV1, Status: "applied", DesiredMode: "allow_sleep", DesiredVersion: 0, ObservedMode: "allow_sleep", ObservedVersion: 0, ObservedAt: time.Now().UTC(), HostServiceVersion: "test", Scope: "system", UpdateHealth: "healthy"},
+		"valid-without-update-diagnostics": {Schema: hostservice.ProtocolV1, Status: "applied", DesiredMode: "allow_sleep", DesiredVersion: 0, ObservedMode: "allow_sleep", ObservedVersion: 0, ObservedAt: time.Now().UTC(), HostServiceVersion: "test", Scope: "system", UpdateHealth: "unknown"},
+		"mismatch":                         {Schema: hostservice.ProtocolV1, Status: "applied", DesiredMode: "keep_awake", DesiredVersion: 1, ObservedMode: "keep_awake", ObservedVersion: 1, ObservedAt: time.Now().UTC(), HostServiceVersion: "test", Scope: "system"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			root, err := os.MkdirTemp("/tmp", "pba-")
@@ -89,7 +91,7 @@ func TestHostClientAppliesVersionZeroAndRejectsMismatchedResponse(t *testing.T) 
 				t.Fatal(err)
 			}
 			observation, err := client.Apply(context.Background(), Resolution{Schema: PolicySchemaV1, UserMachineID: "um_1", Mode: "allow_sleep", Version: 0})
-			if name == "valid" && (err != nil || observation.Version != 0) {
+			if strings.HasPrefix(name, "valid") && (err != nil || observation.Version != 0) {
 				t.Fatalf("observation=%+v err=%v", observation, err)
 			}
 			if name == "mismatch" && !errors.Is(err, ErrInvalid) {

@@ -143,6 +143,9 @@ func TestInventoryClassifiesSSHAuthorityTransitions(t *testing.T) {
 			} else if len(status.Health) != 1 || status.Health[0].Code != test.health {
 				t.Fatalf("health=%#v", status.Health)
 			}
+			if test.name == "local integration unavailable" && status.Health[0].Recovery != managedSSHDoctorRecovery {
+				t.Fatalf("recovery=%q", status.Health[0].Recovery)
+			}
 		})
 	}
 }

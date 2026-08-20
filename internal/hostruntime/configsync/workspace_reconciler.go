@@ -28,6 +28,7 @@ type WorkspaceReconcilerConfig struct {
 	Descriptor    RuntimeDescriptor
 	Resolutions   ConflictResolutionAuthority
 	ChezmoiBinary string
+	ChezmoiRunner ChezmoiRunner
 	Clock         func() time.Time
 }
 
@@ -59,6 +60,7 @@ type PlaintextWorkspaceReconciler struct {
 	descriptor    RuntimeDescriptor
 	resolutions   ConflictResolutionAuthority
 	chezmoiBinary string
+	chezmoiRunner ChezmoiRunner
 	clock         func() time.Time
 
 	mu          sync.Mutex
@@ -92,7 +94,7 @@ func NewPlaintextWorkspaceReconciler(config WorkspaceReconcilerConfig) (*Plainte
 		homeRoot: config.HomeRoot, stateRoot: config.StateRoot,
 		baselinePath: filepath.Join(config.StateRoot, "baseline.json"),
 		descriptor:   config.Descriptor, resolutions: config.Resolutions,
-		chezmoiBinary: config.ChezmoiBinary, clock: config.Clock,
+		chezmoiBinary: config.ChezmoiBinary, chezmoiRunner: config.ChezmoiRunner, clock: config.Clock,
 	}
 	if err := recoverApplyJournal(
 		filepath.Join(config.StateRoot, "apply-journal.json"), config.HomeRoot,
@@ -169,7 +171,7 @@ func (r *PlaintextWorkspaceReconciler) Reconcile(ctx context.Context, repository
 	}
 	remoteSource, err := NewChezmoiSource(ChezmoiSourceConfig{
 		Binary: r.chezmoiBinary, RuntimeRoot: remoteRuntime, SourceRoot: repositoryRoot,
-		HomeRoot: remoteHome,
+		HomeRoot: remoteHome, Runner: r.chezmoiRunner,
 	})
 	if err != nil {
 		return PreparedPublication{}, err
@@ -362,7 +364,7 @@ func (r *PlaintextWorkspaceReconciler) Reconcile(ctx context.Context, repository
 	}
 	localSource, err := NewChezmoiSource(ChezmoiSourceConfig{
 		Binary: r.chezmoiBinary, RuntimeRoot: localRuntime, SourceRoot: repositoryRoot,
-		HomeRoot: r.homeRoot,
+		HomeRoot: r.homeRoot, Runner: r.chezmoiRunner,
 	})
 	if err != nil {
 		return PreparedPublication{}, err
@@ -584,7 +586,7 @@ func (r *PlaintextWorkspaceReconciler) materializeRevision(
 	}
 	baseSource, err := NewChezmoiSource(ChezmoiSourceConfig{
 		Binary: r.chezmoiBinary, RuntimeRoot: baseRuntime, SourceRoot: repositoryRoot,
-		HomeRoot: baseHome,
+		HomeRoot: baseHome, Runner: r.chezmoiRunner,
 	})
 	if err == nil {
 		err = baseSource.Apply(ctx)
@@ -660,7 +662,7 @@ func readVerifiedState(root, relative string, expected FileState, maxBytes int64
 	path := filepath.Join(root, filepath.FromSlash(relative))
 	info, err := os.Lstat(path)
 	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 ||
-		info.Size() != expected.Bytes || info.Mode().Perm() != expected.Mode.Perm() {
+		info.Size() != expected.Bytes || snapshotFileMode(info) != expected.Mode.Perm() {
 		return nil, errors.Join(ErrSourceChanged, err)
 	}
 	value, err := os.ReadFile(path)
@@ -866,7 +868,7 @@ func (r *PlaintextWorkspaceReconciler) preserveConflicts(
 				return err
 			}
 			if info, statErr := os.Lstat(target); statErr == nil {
-				if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 {
+				if !privateControlFile(target, info) {
 					return ErrConfigRepositoryInvalid
 				}
 				continue

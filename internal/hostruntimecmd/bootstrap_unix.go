@@ -31,6 +31,7 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostinstall"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/identity"
 	"github.com/pinksaucepasta/paperboat/internal/httptransport"
+	"github.com/pinksaucepasta/paperboat/internal/machinename"
 )
 
 var fetchBootstrapArtifact = bootstrap.FetchVerifiedArtifact
@@ -39,16 +40,32 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	flags := flag.NewFlagSet("bootstrap", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	serverURL := flags.String("server", "", "Paperboat server URL")
-	token := flags.String("enrollment-token", "", "Dashboard enrollment token")
+	legacyToken := flags.String("enrollment-token", "", "dashboard enrollment token (deprecated; use --enrollment-token-file)")
+	tokenFile := flags.String("enrollment-token-file", "", "absolute owner-only dashboard enrollment token file")
 	name := flags.String("name", "", "User machine name")
 	shell := flags.String("shell", "", "Absolute login shell (default: auto-detect)")
 	stateRoot := flags.String("state-root", "", "Paperboat runtime state directory")
+	acceptBetaPlatform := flags.Bool("accept-beta-platform", false, "accept enrollment on a beta platform")
 	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
 		return errors.New("bootstrap accepts flags only")
+	}
+	if *legacyToken != "" && *tokenFile != "" {
+		return errors.New("use only one enrollment token source")
+	}
+	token := strings.TrimSpace(*legacyToken)
+	if *tokenFile != "" {
+		var tokenErr error
+		token, tokenErr = bootstrap.ReadEnrollmentTokenFile(*tokenFile)
+		if tokenErr != nil {
+			return errors.New("enrollment token file must be an absolute regular owner-only file")
+		}
 	}
 	reader := bufio.NewReader(stdin)
 	if err := promptBootstrapValue(reader, stderr, "User machine name", name); err != nil {
 		return err
+	}
+	if err := machinename.Validate(strings.TrimSpace(*name)); err != nil {
+		return fmt.Errorf("invalid machine name: %w", err)
 	}
 	account, err := user.Current()
 	if err != nil || account.Username == "" {
@@ -94,18 +111,25 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	if _, err := rand.Read(verifierBytes); err != nil {
 		return err
 	}
-	config := bootstrap.Config{ServerURL: *serverURL, EnrollmentToken: *token, DisplayName: *name, WorkspaceRoot: workspace, Verifier: base64.RawURLEncoding.EncodeToString(verifierBytes), PublicIdentityKey: base64.RawURLEncoding.EncodeToString(identityStore.Current().Public()), RuntimeVersions: map[string]string{"pb": buildinfo.Version}}
+	config := bootstrap.Config{ServerURL: *serverURL, EnrollmentToken: token, DisplayName: *name, WorkspaceRoot: workspace, Verifier: base64.RawURLEncoding.EncodeToString(verifierBytes), PublicIdentityKey: base64.RawURLEncoding.EncodeToString(identityStore.Current().Public()), RuntimeVersions: map[string]string{"pb": buildinfo.Version}, AcceptBetaPlatform: *acceptBetaPlatform}
 	pairing, err := bootstrap.CreatePairing(ctx, config)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "Pairing code: %s\n", pairing.UserCode)
-	fmt.Fprintln(stderr, "Waiting for approval in the Paperboat dashboard...")
+	if *tokenFile != "" {
+		if err := bootstrap.ConsumeEnrollmentTokenFile(*tokenFile); err != nil {
+			return fmt.Errorf("consume enrollment token file: %w", err)
+		}
+	}
+	fmt.Fprintln(stderr, "Completing one-shot machine enrollment...")
 	material, err := bootstrap.WaitForMaterial(ctx, config, pairing.ExpiresAt, 2*time.Second)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(stderr, "Pairing approved. Setting up the managed host service...")
+	if err := saveBootstrapRegistration(identityStore, *serverURL, material, "", 0); err != nil {
+		return fmt.Errorf("save machine registration: %w", err)
+	}
+	fmt.Fprintln(stderr, "Enrollment accepted. Setting up the managed host service...")
 	client, err := enrollment.NewClient(nil, 15*time.Second)
 	if err != nil {
 		return errors.Join(err, reportInstallationFailureWithEnrollmentCredential(ctx, material, "artifact_verification"))

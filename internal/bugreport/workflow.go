@@ -183,7 +183,7 @@ func openExactBundle(bundle diagnostics.Bundle) (*os.File, error) {
 		return nil, errors.New("local daemon returned an invalid bundle")
 	}
 	pathInfo, err := os.Lstat(bundle.Path)
-	if err != nil || !pathInfo.Mode().IsRegular() || pathInfo.Mode().Perm()&0o077 != 0 || pathInfo.Size() != bundle.Bytes {
+	if err != nil || !safeBundleFile(bundle.Path, pathInfo) || pathInfo.Size() != bundle.Bytes {
 		return nil, errors.Join(errors.New("local diagnostic bundle is unsafe or changed"), err)
 	}
 	file, err := os.Open(bundle.Path)

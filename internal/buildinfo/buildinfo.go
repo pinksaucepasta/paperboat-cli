@@ -5,15 +5,20 @@ package buildinfo
 // Version is the CLI version. Replaced by release builds.
 var Version = "dev"
 
+// WindowsPublisher is the required Authenticode signer subject fragment for
+// Windows release components. Release builds replace it with the legal
+// publisher name encoded in the signing certificate.
+var WindowsPublisher = "Paperboat"
+
 // Commit is the source revision. Replaced by release builds.
 var Commit = "unknown"
 
 // ProtocolVersion is the control-plane contract understood by this binary.
 var ProtocolVersion = "1"
 
-// DefaultServerURL is the default paperboat-server base URL. Replaced by
-// release builds; empty requires server_url or --server at runtime.
-var DefaultServerURL = ""
+// DefaultServerURL is the first-party Paperboat control plane. Private builds
+// may replace it with -ldflags, but official binaries work without setup.
+var DefaultServerURL = "https://api.pprbt.dev"
 
 // DefaultReleaseURL is the HTTPS origin serving the signed TUF repository.
 // Release builds replace it with the production release origin.

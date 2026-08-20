@@ -168,6 +168,9 @@ type Peer struct {
 	UID int `json:"uid"`
 	GID int `json:"gid"`
 	PID int `json:"pid"`
+	// SID is set only for Windows named-pipe peers. Windows authorization never
+	// relies on the Unix UID/GID fields.
+	SID string `json:"sid,omitempty"`
 }
 
 type HealthItem struct {
@@ -184,6 +187,7 @@ type MachineStatus struct {
 	EnvironmentID   string     `json:"environment_id,omitempty"`
 	WorkspaceRoot   string     `json:"workspace_root,omitempty"`
 	Alias           string     `json:"alias"`
+	Platform        string     `json:"platform,omitempty"`
 	Eligible        bool       `json:"eligible"`
 	RuntimeState    string     `json:"runtime_state"`
 	Generation      uint64     `json:"generation"`

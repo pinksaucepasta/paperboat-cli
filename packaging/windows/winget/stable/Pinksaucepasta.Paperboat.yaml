@@ -1,0 +1,6 @@
+# Template: render all {{...}} values before submission.
+PackageIdentifier: Pinksaucepasta.Paperboat
+PackageVersion: "{{VERSION}}"
+DefaultLocale: en-US
+ManifestType: version
+ManifestVersion: 1.6.0

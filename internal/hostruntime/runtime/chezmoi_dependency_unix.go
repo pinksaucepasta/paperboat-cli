@@ -19,8 +19,6 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
 )
 
-const chezmoiVersion = "2.71.0"
-
 var chezmoiDigests = map[string]string{
 	"darwin/amd64": "12b78b365528597ad701f5117fa71f6c42b5b1e65d8075e19c48472ad81faf30",
 	"darwin/arm64": "8b03d7be6b5d500a503c712ae6da7dd6817b6c3328223b4ae8be5a2fa3a",

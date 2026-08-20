@@ -33,7 +33,7 @@ func TestOpenSSHConfigInstallRepairAndExactUninstall(t *testing.T) {
 	}
 	alternate := config
 	alternate.ProxyCommand = `"/opt/paperboat/pb" __ssh-proxy --host %h --port %p`
-	alternate.KnownHostsCommand = `"/opt/paperboat/pb" __ssh-known-hosts --host %H --port %p`
+	alternate.KnownHostsCommand = `"/opt/paperboat/pb" __ssh-known-hosts --host %h --port %p`
 	if err := ValidateOpenSSHConfig(alternate); !errors.Is(err, ErrOpenSSHConfigConflict) {
 		t.Fatalf("path-specific validation error=%v", err)
 	}
@@ -47,7 +47,7 @@ func TestOpenSSHConfigInstallRepairAndExactUninstall(t *testing.T) {
 		t.Fatalf("main config=%q", main)
 	}
 	owned := string(readOpenSSHTestFile(t, filepath.Join(directory, "paperboat_config")))
-	for _, required := range []string{"Host *.pprbt", "ProxyCommand " + config.ProxyCommand, "KnownHostsCommand " + config.KnownHostsCommand, "IdentityAgent \"" + config.AgentSocket + "\"", "StrictHostKeyChecking yes", "CheckHostIP no", "UserKnownHostsFile none", "GlobalKnownHostsFile none"} {
+	for _, required := range []string{"Host *.pprbt", "ProxyCommand " + config.ProxyCommand, "KnownHostsCommand " + config.KnownHostsCommand, "IdentityAgent \"" + config.AgentSocket + "\"", "IdentityFile \"" + config.IdentityFile + "\"", "IdentitiesOnly yes", "BatchMode yes", "PasswordAuthentication no", "KbdInteractiveAuthentication no", "StrictHostKeyChecking yes", "CheckHostIP no", "UserKnownHostsFile none", "GlobalKnownHostsFile none"} {
 		if !strings.Contains(owned, required) {
 			t.Fatalf("owned config missing %q: %q", required, owned)
 		}
@@ -87,6 +87,23 @@ func TestOpenSSHConfigInstallRepairAndExactUninstall(t *testing.T) {
 	}
 }
 
+func TestOpenSSHConfigRendersCanonicalAndDisplayAliasUserPort(t *testing.T) {
+	home := openSSHTestHome(t)
+	config := openSSHTestConfig(home, "pprbt")
+	config.Targets = []OpenSSHAliasTarget{{Alias: "victus-windows-e2e-fresh", DisplayName: "Victus-Windows-E2E-Fresh", User: "Pujan", Port: 38222}}
+	if _, err := InstallOpenSSHConfig(config); err != nil {
+		t.Fatal(err)
+	}
+	owned := string(readOpenSSHTestFile(t, filepath.Join(home, ".ssh", "paperboat_config")))
+	want := "Host victus-windows-e2e-fresh.pprbt Victus-Windows-E2E-Fresh.pprbt\n    User Pujan\n    Port 38222\n"
+	if !strings.Contains(owned, want) {
+		t.Fatalf("owned config missing authoritative target: %q", owned)
+	}
+	if err := ValidateOpenSSHConfig(config); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestOpenSSHConfigRemovesCreatedMainConfigOnUninstall(t *testing.T) {
 	home := openSSHTestHome(t)
 	if _, err := InstallOpenSSHConfig(openSSHTestConfig(home, "pprbt")); err != nil {
@@ -97,6 +114,57 @@ func TestOpenSSHConfigRemovesCreatedMainConfigOnUninstall(t *testing.T) {
 	}
 	if _, err := os.Lstat(filepath.Join(home, ".ssh", "config")); !os.IsNotExist(err) {
 		t.Fatalf("created main config remains: %v", err)
+	}
+}
+
+func TestOpenSSHConfigAtomicallyUpgradesLegacyManagedFragment(t *testing.T) {
+	home := openSSHTestHome(t)
+	config := openSSHTestConfig(home, "pprbt")
+	if _, err := InstallOpenSSHConfig(config); err != nil {
+		t.Fatal(err)
+	}
+	directory := filepath.Join(home, ".ssh")
+	legacy := []byte(openSSHBeginMarker + "\n" +
+		"Host *.pprbt\n" +
+		"    ProxyCommand " + config.ProxyCommand + "\n" +
+		"    KnownHostsCommand " + config.KnownHostsCommand + "\n" +
+		"    IdentityAgent \"" + config.AgentSocket + "\"\n" +
+		"    IdentitiesOnly yes\n" +
+		"    BatchMode yes\n" +
+		"    PasswordAuthentication no\n" +
+		"    KbdInteractiveAuthentication no\n" +
+		"    StrictHostKeyChecking yes\n" +
+		"    CheckHostIP no\n" +
+		"    UserKnownHostsFile none\n" +
+		"    GlobalKnownHostsFile none\n" + openSSHEndMarker + "\n")
+	if !validLegacyOwnedOpenSSHContent(legacy, "pprbt") {
+		t.Fatal("test legacy fragment is invalid")
+	}
+	var record openSSHInstallRecord
+	recordPath := filepath.Join(directory, ".paperboat-config-install-v1.json")
+	if err := json.Unmarshal(readOpenSSHTestFile(t, recordPath), &record); err != nil {
+		t.Fatal(err)
+	}
+	record.OwnedHash = hashOpenSSHBytes(legacy)
+	recordJSON, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "paperboat_config"), legacy, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(recordPath, append(recordJSON, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	upgraded, err := InstallOpenSSHConfig(config)
+	if err != nil || !upgraded.Changed {
+		t.Fatalf("upgrade=%+v error=%v", upgraded, err)
+	}
+	if err := ValidateOpenSSHConfig(config); err != nil {
+		t.Fatalf("validate upgraded config: %v", err)
+	}
+	if validLegacyOwnedOpenSSHContent(readOpenSSHTestFile(t, filepath.Join(directory, "paperboat_config")), "pprbt") {
+		t.Fatal("legacy fragment remains after upgrade")
 	}
 }
 
@@ -111,10 +179,17 @@ func TestGeneratedOpenSSHConfigIsAcceptedByInstalledClient(t *testing.T) {
 	}
 	command := exec.Command(executable, "-G", "-F", filepath.Join(home, ".ssh", "paperboat_config"), "probe.pprbt")
 	var stderr bytes.Buffer
-	command.Stdout = &bytes.Buffer{}
+	var stdout bytes.Buffer
+	command.Stdout = &stdout
 	command.Stderr = &stderr
 	if err := command.Run(); err != nil {
 		t.Fatalf("OpenSSH rejected generated config: %v: %s", err, stderr.String())
+	}
+	effective := strings.ToLower(stdout.String())
+	for _, required := range []string{"identitiesonly yes", "batchmode yes", "passwordauthentication no", "kbdinteractiveauthentication no"} {
+		if !strings.Contains(effective, required+"\n") {
+			t.Fatalf("OpenSSH effective config missing %q:\n%s", required, stdout.String())
+		}
 	}
 }
 
@@ -215,8 +290,9 @@ func openSSHTestConfig(home, suffix string) OpenSSHConfig {
 	return OpenSSHConfig{
 		Home: home, OwnerUID: uint32(os.Getuid()), AliasSuffix: suffix,
 		ProxyCommand:      "\"/usr/local/bin/pb\" internal ssh-proxy --host %h --port %p",
-		KnownHostsCommand: "\"/usr/local/bin/pb\" internal ssh-known-hosts --host %H --port %p",
+		KnownHostsCommand: "\"/usr/local/bin/pb\" internal ssh-known-hosts --host %h --port %p",
 		AgentSocket:       filepath.Join(home, ".paperboat", "run", "ssh-agent.sock"),
+		IdentityFile:      ManagedIdentityPublicKeyPath(home),
 	}
 }
 

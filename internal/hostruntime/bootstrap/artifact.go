@@ -99,7 +99,11 @@ func FetchVerifiedReleaseIndex(ctx context.Context, repositoryURL, stateDirector
 	if err := client.Refresh(); err != nil {
 		return releaseindex.Index{}, err
 	}
-	name := "release-index-stable-" + runtime.GOOS + "-" + runtime.GOARCH + ".json"
+	channel := "stable"
+	if runtime.GOOS == "windows" && runtime.GOARCH == "arm64" {
+		channel = "beta"
+	}
+	name := "release-index-" + channel + "-" + runtime.GOOS + "-" + runtime.GOARCH + ".json"
 	info, err := client.GetTargetInfo(name)
 	if err != nil {
 		return releaseindex.Index{}, err
@@ -111,7 +115,7 @@ func FetchVerifiedReleaseIndex(ctx context.Context, repositoryURL, stateDirector
 	decoder := json.NewDecoder(strings.NewReader(string(*info.Custom)))
 	decoder.DisallowUnknownFields()
 	var extra any
-	if decoder.Decode(&custom) != nil || decoder.Decode(&extra) != io.EOF || custom.Schema != ReleaseIndexTargetSchemaV1 || custom.Kind != "release-index" || custom.Channel != "stable" || custom.Platform != runtime.GOOS || custom.Architecture != runtime.GOARCH {
+	if decoder.Decode(&custom) != nil || decoder.Decode(&extra) != io.EOF || custom.Schema != ReleaseIndexTargetSchemaV1 || custom.Kind != "release-index" || custom.Channel != channel || custom.Platform != runtime.GOOS || custom.Architecture != runtime.GOARCH {
 		return releaseindex.Index{}, ErrArtifactMismatch
 	}
 	path, _, err := client.DownloadTarget(info, "", "")
@@ -289,15 +293,4 @@ func secureArtifactHTTPClient(base *http.Client, origin string) *http.Client {
 		return nil
 	}
 	return result
-}
-
-func secureDirectory(path string) error {
-	if err := os.MkdirAll(path, 0o700); err != nil {
-		return err
-	}
-	info, err := os.Lstat(path)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 {
-		return ErrArtifactTarget
-	}
-	return nil
 }

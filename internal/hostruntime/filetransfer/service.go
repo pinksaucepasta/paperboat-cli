@@ -716,14 +716,6 @@ func validDigest(value string) bool {
 func validBasename(value string) bool {
 	return value != "" && utf8.ValidString(value) && len(value) <= 255 && value == filepath.Base(value) && value != "." && value != ".." && !strings.ContainsAny(value, "/\\\x00")
 }
-func syncDir(path string) error {
-	directory, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer directory.Close()
-	return directory.Sync()
-}
 
 type contextReader struct {
 	ctx      context.Context

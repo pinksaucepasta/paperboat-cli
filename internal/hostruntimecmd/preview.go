@@ -152,11 +152,7 @@ func agentPreviewConfiguration() (string, string, error) {
 	if tokenFile == "" || !filepath.IsAbs(tokenFile) || filepath.Clean(tokenFile) != tokenFile {
 		return "", "", errors.New("local host-runtime preview authorization is unavailable")
 	}
-	info, err := os.Lstat(tokenFile)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 || info.Size() > 4096 {
-		return "", "", errors.New("local host-runtime preview authorization is unavailable")
-	}
-	data, err := os.ReadFile(tokenFile)
+	data, err := readPreviewAuthorizationToken(tokenFile)
 	token := strings.TrimSpace(string(data))
 	if err != nil || len(token) < 32 || len(token) > 512 {
 		return "", "", errors.New("local host-runtime preview authorization is unavailable")

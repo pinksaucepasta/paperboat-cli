@@ -1,0 +1,214 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Common WiX v4 source. The amd64 and arm64 wixproj files provide the
+  architecture/channel constants. All payloads must come from a release-built
+  staging directory; this source never invents binaries or signing evidence.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="Paperboat"
+      Manufacturer="Paperboat"
+      Version="$(var.PaperboatMSIVersion)"
+      UpgradeCode="{6B5F6B0A-40B2-4B9E-9E2A-7CF2F6C2D3D4}"
+      Scope="perMachine"
+      Compressed="yes">
+    <SummaryInformation Description="Paperboat native Windows $(var.PaperboatChannel) package" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Paperboat is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Property Id="PAPERBOAT_HOSTD_SERVICE_IMAGE">
+      <RegistrySearch
+          Id="ExistingPaperboatHostdService"
+          Root="HKLM"
+          Key="SYSTEM\CurrentControlSet\Services\PaperboatHostd"
+          Name="ImagePath"
+          Type="raw" />
+    </Property>
+    <Property Id="PAPERBOAT_UPDATED_SERVICE_IMAGE">
+      <RegistrySearch
+          Id="ExistingPaperboatUpdatedService"
+          Root="HKLM"
+          Key="SYSTEM\CurrentControlSet\Services\PaperboatUpdated"
+          Name="ImagePath"
+          Type="raw" />
+    </Property>
+    <Launch
+        Condition="Installed OR WIX_UPGRADE_DETECTED OR (NOT PAPERBOAT_HOSTD_SERVICE_IMAGE AND NOT PAPERBOAT_UPDATED_SERVICE_IMAGE)"
+        Message="Paperboat cannot install because PaperboatHostd or PaperboatUpdated already exists and is not owned by this MSI. Remove the conflict or run pb doctor --repair, then retry." />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Paperboat">
+        <Directory Id="BINDIR" Name="bin" />
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="DATAROOT" Name="Paperboat">
+        <Directory Id="SSHSTATE" Name="ssh" />
+        <Directory Id="UPDATES" Name="updates">
+          <Directory Id="CURRENTSLOT" Name="current" />
+          <Directory Id="ROLLBACKSLOT" Name="rollback" />
+        </Directory>
+        <Directory Id="LOGS" Name="logs" />
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Complete" Title="Paperboat" Level="1">
+      <ComponentGroupRef Id="ProgramComponents" />
+      <ComponentGroupRef Id="ServiceComponents" />
+      <ComponentGroupRef Id="StateComponents" />
+      <ComponentGroupRef Id="OpenSSHProvisioningHook" />
+    </Feature>
+
+    <!--
+      Dynamic preview services and PaperboatSshd are created after MSI
+      installation and therefore cannot be represented by ServiceControl
+      rows. Run the signed installed CLI while it still exists, with the
+      elevated LocalSystem token, before MSI removes payload files. The
+      upgrade guard is mandatory: RemoveExistingProducts uninstalls the old
+      product during a major upgrade, but that must not retire live runtime
+      services or shared SSH state.
+    -->
+    <CustomAction
+        Id="CleanupPaperboatDynamicServices"
+        FileRef="CliBinary"
+        ExeCommand="__msi-cleanup --full-uninstall"
+        Execute="deferred"
+        Impersonate="no"
+        Return="check"
+        HideTarget="yes" />
+    <?if $(var.QualificationRollbackHook) = 1 ?>
+    <CustomAction
+        Id="QualificationInjectedRollback"
+        Error="Paperboat qualification injected a transactional rollback after files and registry state were written." />
+    <?endif?>
+    <InstallExecuteSequence>
+      <Custom
+          Action="CleanupPaperboatDynamicServices"
+          Before="RemoveFiles"
+          Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <?if $(var.QualificationRollbackHook) = 1 ?>
+      <Custom
+          Action="QualificationInjectedRollback"
+          Before="InstallServices"
+          Condition="PAPERBOAT_QUALIFY_ROLLBACK = 1" />
+      <?endif?>
+    </InstallExecuteSequence>
+  </Package>
+
+  <Fragment>
+    <ComponentGroup Id="ProgramComponents" Directory="BINDIR">
+      <Component Id="CliComponent" Guid="{F3E5F8E2-BD39-4CC4-BD4C-6FD34E5C8F01}">
+        <File Id="CliBinary" Source="$(var.StagingDir)\pb.exe" KeyPath="yes" Vital="yes" />
+      </Component>
+      <Component Id="LauncherComponent" Guid="{F3E5F8E2-BD39-4CC4-BD4C-6FD34E5C8F02}">
+        <File Id="LauncherBinary" Source="$(var.StagingDir)\pb-launcher.exe" KeyPath="yes" Vital="yes" />
+      </Component>
+      <Component Id="RuntimeComponent" Guid="{F3E5F8E2-BD39-4CC4-BD4C-6FD34E5C8F03}">
+        <File Id="RuntimeBinary" Source="$(var.StagingDir)\paperboat-runtime.exe" KeyPath="yes" Vital="yes" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+
+  <Fragment>
+    <ComponentGroup Id="ServiceComponents" Directory="BINDIR">
+      <Component Id="HostSupervisorServiceComponent" Guid="{F3E5F8E2-BD39-4CC4-BD4C-6FD34E5C8F04}">
+        <File Id="HostSupervisorBinary" Source="$(var.StagingDir)\paperboat-hostd.exe" KeyPath="yes" Vital="yes" />
+        <ServiceInstall
+            Id="HostSupervisorServiceInstall"
+            Name="PaperboatHostd"
+            DisplayName="Paperboat Host Supervisor"
+            Description="Paperboat machine host supervisor"
+            Type="ownProcess"
+            Start="demand"
+            ErrorControl="normal"
+            Account="LocalSystem"
+            Arguments="__runtime-hostd" />
+        <ServiceControl
+            Id="HostSupervisorServiceControl"
+            Name="PaperboatHostd"
+            Stop="both"
+            Remove="uninstall"
+            Wait="yes" />
+      </Component>
+      <Component Id="UpdaterServiceComponent" Guid="{F3E5F8E2-BD39-4CC4-BD4C-6FD34E5C8F05}">
+        <File Id="UpdaterBinary" Source="$(var.StagingDir)\paperboat-updater.exe" KeyPath="yes" Vital="yes" />
+        <ServiceInstall
+            Id="UpdaterServiceInstall"
+            Name="PaperboatUpdated"
+            DisplayName="Paperboat Updater"
+            Description="Paperboat signed update coordinator"
+            Type="ownProcess"
+            Start="demand"
+            ErrorControl="normal"
+            Account="LocalSystem"
+            Arguments="__runtime-updated" />
+        <ServiceControl
+            Id="UpdaterServiceControl"
+            Name="PaperboatUpdated"
+            Stop="both"
+            Remove="uninstall"
+            Wait="yes" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+
+  <Fragment>
+    <ComponentGroup Id="StateComponents">
+      <Component Id="MachineStateComponent" Directory="DATAROOT" Guid="{F3E5F8E2-BD39-4CC4-BD4C-6FD34E5C8F06}">
+        <CreateFolder>
+          <PermissionEx Sddl="D:P(A;;FA;;;SY)(A;;FA;;;BA)" />
+        </CreateFolder>
+        <RegistryKey Root="HKLM" Key="Software\Paperboat">
+          <RegistryValue Name="InstallRoot" Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
+          <RegistryValue Name="BinaryRoot" Type="string" Value="[BINDIR]" />
+          <RegistryValue Name="StateRoot" Type="string" Value="[DATAROOT]" />
+          <RegistryValue Name="Architecture" Type="string" Value="$(var.WixPlatform)" />
+          <RegistryValue Name="Channel" Type="string" Value="$(var.PaperboatChannel)" />
+          <RegistryValue Name="ReleaseVersion" Type="string" Value="$(var.PaperboatVersion)" />
+          <RegistryValue Name="InboundFirewall" Type="string" Value="none" />
+        </RegistryKey>
+      </Component>
+      <Component Id="UpdateCurrentSlotComponent" Directory="CURRENTSLOT" Guid="{F3E5F8E2-BD39-4CC4-BD4C-6FD34E5C8F07}">
+        <CreateFolder>
+          <PermissionEx Sddl="D:P(A;;FA;;;SY)(A;;FA;;;BA)" />
+        </CreateFolder>
+      </Component>
+      <Component Id="UpdateRollbackSlotComponent" Directory="ROLLBACKSLOT" Guid="{F3E5F8E2-BD39-4CC4-BD4C-6FD34E5C8F08}">
+        <CreateFolder>
+          <PermissionEx Sddl="D:P(A;;FA;;;SY)(A;;FA;;;BA)" />
+        </CreateFolder>
+      </Component>
+      <Component Id="LogsComponent" Directory="LOGS" Guid="{F3E5F8E2-BD39-4CC4-BD4C-6FD34E5C8F09}">
+        <CreateFolder>
+          <PermissionEx Sddl="D:P(A;;FA;;;SY)(A;;FA;;;BA)" />
+        </CreateFolder>
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+
+  <Fragment>
+    <ComponentGroup Id="OpenSSHProvisioningHook" Directory="SSHSTATE">
+      <Component Id="OpenSSHProvisioningHookComponent" Guid="{F3E5F8E2-BD39-4CC4-BD4C-6FD34E5C8F0A}">
+        <CreateFolder>
+          <PermissionEx Sddl="D:P(A;;FA;;;SY)(A;;FA;;;BA)" />
+        </CreateFolder>
+        <File
+            Id="OpenSSHProvisioningMetadata"
+            Source="$(var.PackagingRoot)\wix\assets\openssh-provisioning.json"
+            Name="provisioning-hook.json"
+            KeyPath="yes"
+            Vital="yes" />
+        <RegistryKey Root="HKLM" Key="Software\Paperboat\OpenSSH">
+          <RegistryValue Name="PackageId" Type="string" Value="Microsoft.OpenSSH.Preview" />
+          <RegistryValue Name="ApprovedVersion" Type="string" Value="10.0.0.0" />
+          <RegistryValue Name="Service" Type="string" Value="PaperboatSshd" />
+          <RegistryValue Name="Provisioner" Type="string" Value="Paperboat host setup" />
+          <RegistryValue Name="StateRoot" Type="string" Value="[SSHSTATE]" />
+          <RegistryValue Name="CapabilityInstallation" Type="string" Value="never" />
+          <RegistryValue Name="ExistingSystemSshd" Type="string" Value="preserve" />
+        </RegistryKey>
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>

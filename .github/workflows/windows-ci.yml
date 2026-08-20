@@ -1,0 +1,423 @@
+name: Windows qualification
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_amd64_ltsc:
+        description: Run the registered Windows 11 IoT Enterprise LTSC amd64 runner
+        required: true
+        type: boolean
+        default: false
+      run_arm64_native:
+        description: Run the registered native Windows arm64 runner
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-qualification-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-native-amd64:
+    name: Windows amd64 native tests
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Validate first-party Windows packaging contract
+        shell: pwsh
+        run: |
+          & ./packaging/windows/scripts/validate.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          go test -count=1 ./packaging/windows/...
+      - name: Verify native amd64 runner
+        shell: pwsh
+        run: |
+          if (-not [Environment]::Is64BitOperatingSystem) {
+            throw "The Windows amd64 qualification job requires a 64-bit operating system."
+          }
+          if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() -ne "X64") {
+            throw "The Windows amd64 qualification job did not receive an x64 runner."
+          }
+          "Runner OS: $([System.Runtime.InteropServices.RuntimeInformation]::OSDescription)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+      - name: Verify PowerShell 5.1 and PowerShell 7
+        shell: pwsh
+        run: |
+          $windowsPowerShell = & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.ToString()'
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace(($windowsPowerShell -join ""))) {
+            throw "PowerShell 5.1 is unavailable."
+          }
+          $pwsh = & pwsh -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.ToString()'
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace(($pwsh -join ""))) {
+            throw "PowerShell 7 is unavailable."
+          }
+          "PowerShell 5.1: $($windowsPowerShell -join ' ')" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "PowerShell 7: $($pwsh -join ' ')" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+      - name: Verify cmd.exe
+        shell: cmd
+        run: ver
+      - name: Run the complete native amd64 test suite
+        shell: pwsh
+        run: go test -count=1 ./...
+      - name: Build and validate an amd64 PE
+        shell: pwsh
+        env:
+          CGO_ENABLED: "0"
+          GOOS: windows
+          GOARCH: amd64
+        run: |
+          $artifact = Join-Path $env:RUNNER_TEMP "paperboat-amd64.exe"
+          go build -trimpath -o $artifact ./cmd/pb
+          $bytes = [IO.File]::ReadAllBytes($artifact)
+          if ($bytes.Length -lt 0x40 -or $bytes[0] -ne 0x4d -or $bytes[1] -ne 0x5a) {
+            throw "The amd64 artifact is not an MZ executable."
+          }
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+          if ($peOffset -lt 0 -or $peOffset + 26 -gt $bytes.Length -or
+              $bytes[$peOffset] -ne 0x50 -or $bytes[$peOffset + 1] -ne 0x45 -or
+              $bytes[$peOffset + 2] -ne 0 -or $bytes[$peOffset + 3] -ne 0) {
+            throw "The amd64 artifact has no valid PE signature."
+          }
+          $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+          $optionalMagic = [BitConverter]::ToUInt16($bytes, $peOffset + 24)
+          if ($machine -ne 0x8664 -or $optionalMagic -ne 0x20b) {
+            throw ("The amd64 artifact has machine 0x{0:x4} and optional header 0x{1:x4}." -f $machine, $optionalMagic)
+          }
+          "Validated PE32+ amd64 artifact: $artifact" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+      - name: Install pinned WiX 5.0.2 for native qualification
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          dotnet tool install --global wix --version 5.0.2 --no-cache
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned WiX 5.0.2 installation failed.' }
+          $wix = Join-Path $env:USERPROFILE '.dotnet\tools\wix.exe'
+          if (-not (Test-Path -LiteralPath $wix -PathType Leaf)) { throw "WiX was not installed at $wix." }
+          $version = (& $wix --version | Out-String).Trim()
+          if ($version -notmatch '(^|[^0-9])5\.0\.2([^0-9]|$)') { throw "Expected WiX 5.0.2, got $version." }
+          "PAPERBOAT_WINDOWS_E2E_WIX=$wix" >> $env:GITHUB_ENV
+      - name: Build native amd64 qualification inputs
+        shell: pwsh
+        run: |
+          & ./packaging/windows/scripts/Build-NativeQualificationArtifacts.ps1 `
+            -Version '2026.08.18.0' `
+            -UpgradeVersion '2026.08.18.1' `
+            -Architecture amd64 `
+            -WixCommand $env:PAPERBOAT_WINDOWS_E2E_WIX `
+            -OutputDirectory (Join-Path $env:RUNNER_TEMP 'paperboat-native-amd64-qualification')
+          if ($LASTEXITCODE -ne 0) { throw 'Native amd64 qualification input build failed.' }
+      - name: Run native amd64 MSI, SCM, preview, and ConPTY qualification
+        shell: pwsh
+        run: |
+          & ./packaging/windows/scripts/Invoke-NativeWindowsQualification.ps1 `
+            -MsiPath $env:PAPERBOAT_WINDOWS_E2E_MSI `
+            -UpgradeMsiPath $env:PAPERBOAT_WINDOWS_E2E_UPGRADE_MSI `
+            -Version '2026.08.18.0' `
+            -UpgradeVersion '2026.08.18.1' `
+            -Architecture amd64 `
+            -ServiceFixturePath $env:PAPERBOAT_WINDOWS_E2E_SERVICE_FIXTURE `
+            -OutputDirectory $env:PAPERBOAT_WINDOWS_E2E_OUTPUT
+          if ($LASTEXITCODE -ne 0) { throw 'Native amd64 Windows qualification failed.' }
+      - name: Upload native amd64 qualification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-native-amd64-qualification
+          path: ${{ runner.temp }}/paperboat-native-amd64-qualification
+          if-no-files-found: warn
+          retention-days: 14
+
+  windows-cross-test-packages:
+    name: Windows ${{ matrix.arch }} compile-all-test-packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Compile all Windows packages and test packages
+        env:
+          GOARCH: ${{ matrix.arch }}
+          GOOS: windows
+          CGO_ENABLED: "0"
+        shell: bash
+        run: |
+          set -euo pipefail
+          output_dir="$(mktemp -d)"
+          trap 'rm -rf "$output_dir"' EXIT
+          go build -trimpath ./...
+          mapfile -t packages < <(go list -e -f '{{if or .GoFiles .CgoFiles}}{{.ImportPath}}{{end}}' ./... | sed '/^$/d')
+          test_package_count=0
+          for package in "${packages[@]}"; do
+            test_package_count=$((test_package_count + 1))
+            go test -c -vet=off -trimpath -tags paperboat_native_e2e,paperboat_native_network_e2e -o "$output_dir/test-${test_package_count}.exe" "$package"
+          done
+          test "$test_package_count" -gt 0
+          go build -trimpath -o "$output_dir/pb.exe" ./cmd/pb
+          go build -trimpath -o "$output_dir/pb-launcher.exe" ./cmd/pb-launcher
+          printf 'Compiled %s Windows packages and test packages for %s.\n' "$test_package_count" "$GOARCH" >> "$GITHUB_STEP_SUMMARY"
+          export PE_OUTPUT_DIR="$output_dir"
+          export PE_EXPECTED_ARCH="$GOARCH"
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          expected_machine = {"amd64": 0x8664, "arm64": 0xAA64}[os.environ["PE_EXPECTED_ARCH"]]
+          output_dir = Path(os.environ["PE_OUTPUT_DIR"])
+          artifacts = sorted(output_dir.glob("*.exe"))
+          if not artifacts:
+              raise SystemExit("no Windows PE artifacts were produced")
+          for artifact in artifacts:
+              data = artifact.read_bytes()
+              if len(data) < 0x40 or data[:2] != b"MZ":
+                  raise SystemExit(f"{artifact} is not an MZ executable")
+              pe_offset = int.from_bytes(data[0x3C:0x40], "little")
+              if pe_offset < 0 or pe_offset + 26 > len(data) or data[pe_offset:pe_offset + 4] != b"PE\0\0":
+                  raise SystemExit(f"{artifact} has no valid PE signature")
+              machine = int.from_bytes(data[pe_offset + 4:pe_offset + 6], "little")
+              optional_magic = int.from_bytes(data[pe_offset + 24:pe_offset + 26], "little")
+              if machine != expected_machine or optional_magic != 0x20B:
+                  raise SystemExit(
+                      f"{artifact} has machine 0x{machine:04x} and optional header 0x{optional_magic:04x}; "
+                      f"expected machine 0x{expected_machine:04x} and PE32+"
+                  )
+          print(f"Validated {len(artifacts)} PE32+ {os.environ['PE_EXPECTED_ARCH']} artifacts.")
+          PY
+
+  windows-amd64-iot-ltsc:
+    name: Windows 11 IoT Enterprise LTSC amd64 qualification (manual)
+    if: github.event_name == 'workflow_dispatch' && inputs.run_amd64_ltsc
+    runs-on: [self-hosted, windows, amd64, paperboat-windows-11-iot-ltsc]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Validate first-party Windows packaging contract
+        shell: pwsh
+        run: |
+          & ./packaging/windows/scripts/validate.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          go test -count=1 ./packaging/windows/...
+      - name: Verify target architecture and Windows build
+        shell: pwsh
+        run: |
+          if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() -ne "X64") {
+            throw "The IoT Enterprise LTSC qualification runner must be amd64."
+          }
+          Get-ComputerInfo -Property WindowsProductName,WindowsVersion,OsBuildNumber |
+            Out-String | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+      - name: Run the complete native IoT amd64 test suite
+        shell: pwsh
+        run: go test -count=1 ./...
+      - name: Install pinned WiX 5.0.2 for IoT MSI qualification
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          dotnet tool install --global wix --version 5.0.2 --no-cache
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned WiX 5.0.2 installation failed.' }
+          $wix = Join-Path $env:USERPROFILE '.dotnet\tools\wix.exe'
+          if (-not (Test-Path -LiteralPath $wix -PathType Leaf)) { throw "WiX was not installed at $wix." }
+          $version = (& $wix --version | Out-String).Trim()
+          if ($version -notmatch '(^|[^0-9])5\.0\.2([^0-9]|$)') { throw "Expected WiX 5.0.2, got $version." }
+          "PAPERBOAT_WINDOWS_E2E_WIX=$wix" >> $env:GITHUB_ENV
+      - name: Build native IoT amd64 qualification inputs
+        shell: pwsh
+        run: |
+          & ./packaging/windows/scripts/Build-NativeQualificationArtifacts.ps1 `
+            -Version '2026.08.18.0' `
+            -UpgradeVersion '2026.08.18.1' `
+            -Architecture amd64 `
+            -WixCommand $env:PAPERBOAT_WINDOWS_E2E_WIX `
+            -OutputDirectory (Join-Path $env:RUNNER_TEMP 'paperboat-iot-amd64-qualification')
+          if ($LASTEXITCODE -ne 0) { throw 'Native IoT amd64 qualification input build failed.' }
+      - name: Run native IoT amd64 MSI, SCM, preview, and ConPTY qualification
+        shell: pwsh
+        run: |
+          & ./packaging/windows/scripts/Invoke-NativeWindowsQualification.ps1 `
+            -MsiPath $env:PAPERBOAT_WINDOWS_E2E_MSI `
+            -UpgradeMsiPath $env:PAPERBOAT_WINDOWS_E2E_UPGRADE_MSI `
+            -Version '2026.08.18.0' `
+            -UpgradeVersion '2026.08.18.1' `
+            -Architecture amd64 `
+            -ServiceFixturePath $env:PAPERBOAT_WINDOWS_E2E_SERVICE_FIXTURE `
+            -OutputDirectory $env:PAPERBOAT_WINDOWS_E2E_OUTPUT
+          if ($LASTEXITCODE -ne 0) { throw 'Native IoT amd64 Windows qualification failed.' }
+      - name: Upload native IoT amd64 qualification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-native-iot-amd64-qualification
+          path: ${{ runner.temp }}/paperboat-iot-amd64-qualification
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Qualify pinned WinGet OpenSSH and PaperboatSshd end to end
+        shell: pwsh
+        env:
+          PAPERBOAT_WINDOWS_OPENSSH_NATIVE: "1"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $serviceExecutable = Join-Path $env:RUNNER_TEMP 'paperboat-openssh-service.exe'
+          go build -trimpath -o $serviceExecutable ./cmd/pb
+          if ($LASTEXITCODE -ne 0) { throw 'Paperboat OpenSSH service wrapper build failed.' }
+          $env:PAPERBOAT_SERVICE_EXECUTABLE = $serviceExecutable
+          $nativeTests = @(
+            'TestNativeProvisionAndService',
+            'TestNativeRepairStoppedService',
+            'TestNativeUninstallOwnership',
+            'TestNativeFirewallProfiles',
+            'TestNativeSCMCrashRecovery'
+          )
+          foreach ($testName in $nativeTests) {
+            go test -count=1 -v -run ("^$testName`$") ./internal/windowsopenssh
+            if ($LASTEXITCODE -ne 0) { throw "Native Paperboat OpenSSH qualification failed: $testName" }
+          }
+
+  windows-arm64-native:
+    name: Windows arm64 native E2E (manual, hardware required)
+    if: github.event_name == 'workflow_dispatch' && inputs.run_arm64_native && vars.WINDOWS_ARM64_NATIVE_RUNNER_ENABLED == 'true'
+    runs-on: [self-hosted, windows, arm64, paperboat-windows-arm64]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Validate first-party Windows packaging contract
+        shell: pwsh
+        run: |
+          & ./packaging/windows/scripts/validate.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          go test -count=1 ./packaging/windows/...
+      - name: Verify native arm64 runner
+        shell: pwsh
+        run: |
+          if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() -ne "Arm64") {
+            throw "The Windows arm64 qualification job did not receive an ARM64 runner."
+          }
+      - name: Run the complete native arm64 test suite
+        shell: pwsh
+        run: go test -count=1 ./...
+      - name: Install pinned WiX 5.0.2 for native ARM64 qualification
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          dotnet tool install --global wix --version 5.0.2 --no-cache
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned WiX 5.0.2 installation failed.' }
+          $wix = Join-Path $env:USERPROFILE '.dotnet\tools\wix.exe'
+          if (-not (Test-Path -LiteralPath $wix -PathType Leaf)) { throw "WiX was not installed at $wix." }
+          $version = (& $wix --version | Out-String).Trim()
+          if ($version -notmatch '(^|[^0-9])5\.0\.2([^0-9]|$)') { throw "Expected WiX 5.0.2, got $version." }
+          "PAPERBOAT_WINDOWS_E2E_WIX=$wix" >> $env:GITHUB_ENV
+      - name: Build native ARM64 qualification inputs
+        shell: pwsh
+        run: |
+          & ./packaging/windows/scripts/Build-NativeQualificationArtifacts.ps1 `
+            -Version '2026.08.18.0' `
+            -UpgradeVersion '2026.08.18.1' `
+            -Architecture arm64 `
+            -WixCommand $env:PAPERBOAT_WINDOWS_E2E_WIX `
+            -OutputDirectory (Join-Path $env:RUNNER_TEMP 'paperboat-native-arm64-qualification')
+          if ($LASTEXITCODE -ne 0) { throw 'Native ARM64 qualification input build failed.' }
+      - name: Run native ARM64 MSI, SCM, preview, and ConPTY qualification
+        shell: pwsh
+        run: |
+          & ./packaging/windows/scripts/Invoke-NativeWindowsQualification.ps1 `
+            -MsiPath $env:PAPERBOAT_WINDOWS_E2E_MSI `
+            -UpgradeMsiPath $env:PAPERBOAT_WINDOWS_E2E_UPGRADE_MSI `
+            -Version '2026.08.18.0' `
+            -UpgradeVersion '2026.08.18.1' `
+            -Architecture arm64 `
+            -ServiceFixturePath $env:PAPERBOAT_WINDOWS_E2E_SERVICE_FIXTURE `
+            -OutputDirectory $env:PAPERBOAT_WINDOWS_E2E_OUTPUT
+          if ($LASTEXITCODE -ne 0) { throw 'Native ARM64 Windows qualification failed.' }
+      - name: Record native ARM64 qualification evidence
+        shell: pwsh
+        run: |
+          $evidence = [ordered]@{
+            schema = 'paperboat.windows-native-evidence/v1'
+            platform = 'windows'
+            architecture = 'arm64'
+            stability = 'beta'
+            status = 'native_verified'
+            native_tested = $true
+            cross_compile_not_native_evidence = $true
+            reason = 'native_arm64_runner_completed_full_qualification'
+            runner = $env:RUNNER_NAME
+            workflow = $env:GITHUB_WORKFLOW
+            run_id = $env:GITHUB_RUN_ID
+            commit = $env:GITHUB_SHA
+          }
+          $evidencePath = Join-Path $env:PAPERBOAT_WINDOWS_E2E_OUTPUT 'arm64-native-evidence.json'
+          $evidence | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $evidencePath -Encoding UTF8
+          $evidence | ConvertTo-Json -Depth 8 | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+      - name: Upload native ARM64 qualification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-native-arm64-qualification
+          path: ${{ runner.temp }}/paperboat-native-arm64-qualification
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Qualify native ARM64 WinGet OpenSSH and PaperboatSshd
+        shell: pwsh
+        env:
+          PAPERBOAT_WINDOWS_OPENSSH_NATIVE: "1"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $serviceExecutable = Join-Path $env:RUNNER_TEMP 'paperboat-openssh-service-arm64.exe'
+          go build -trimpath -o $serviceExecutable ./cmd/pb
+          if ($LASTEXITCODE -ne 0) { throw 'Paperboat ARM64 OpenSSH service wrapper build failed.' }
+          $env:PAPERBOAT_SERVICE_EXECUTABLE = $serviceExecutable
+          go test -count=1 -v -run '^TestNativeProvisionAndService$' ./internal/windowsopenssh
+          if ($LASTEXITCODE -ne 0) { throw 'Native ARM64 Paperboat OpenSSH qualification failed.' }
+
+  windows-arm64-native-unavailable:
+    name: Windows arm64 native status (blocked_no_hardware)
+    if: vars.WINDOWS_ARM64_NATIVE_RUNNER_ENABLED != 'true' || !inputs.run_arm64_native
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Record that native ARM64 evidence is unavailable
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence_dir="$RUNNER_TEMP/paperboat-native-arm64-status"
+          mkdir -p "$evidence_dir"
+          python3 ./packaging/windows/scripts/write-arm64-native-evidence.py \
+            --output "$evidence_dir/arm64-native-evidence.json" \
+            --status blocked_no_hardware \
+            --reason no_native_arm64_runner_available \
+            --runner "${RUNNER_NAME:-ubuntu-host}" \
+            --workflow "${GITHUB_WORKFLOW:-Windows qualification}" \
+            --run-id "${GITHUB_RUN_ID:-}" \
+            --commit "${GITHUB_SHA:-}"
+          printf 'native_windows_arm64_e2e: blocked_no_hardware\n' >> "$GITHUB_STEP_SUMMARY"
+          printf 'native_windows_arm64_native_tested: false\n' >> "$GITHUB_STEP_SUMMARY"
+          printf 'Cross-compilation is not native evidence; ARM64 remains beta.\n' >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload blocked ARM64 evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-arm64-native-status
+          path: ${{ runner.temp }}/paperboat-native-arm64-status/arm64-native-evidence.json
+          if-no-files-found: error
+          retention-days: 14

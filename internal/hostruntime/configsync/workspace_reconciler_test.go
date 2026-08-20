@@ -4,6 +4,9 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -61,7 +64,7 @@ func TestWorkspaceReconcilerPublishesCleanMergeFromPersistedBase(t *testing.T) {
 	descriptor := testRuntimeDescriptor()
 	reconciler, err := NewPlaintextWorkspaceReconciler(WorkspaceReconcilerConfig{
 		HomeRoot: homeRoot, StateRoot: stateRoot, Descriptor: descriptor,
-		ChezmoiBinary: writeChezmoiTestShim(t, root),
+		ChezmoiBinary: "test-chezmoi", ChezmoiRunner: runTestChezmoi,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -208,8 +211,116 @@ func writeTestFile(t *testing.T, path, value string) {
 	}
 }
 
+func runTestChezmoi(ctx context.Context, _ string, arguments ...string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if len(arguments) < 3 || arguments[0] != "--config" {
+		return ErrConfigRepositoryInvalid
+	}
+	config, err := os.ReadFile(arguments[1])
+	if err != nil {
+		return err
+	}
+	values := map[string]string{}
+	for _, line := range strings.Split(string(config), "\n") {
+		key, value, ok := strings.Cut(line, " = ")
+		if !ok {
+			continue
+		}
+		decoded, decodeErr := strconv.Unquote(value)
+		if decodeErr != nil {
+			return decodeErr
+		}
+		values[key] = decoded
+	}
+	sourceRoot, homeRoot := values["sourceDir"], values["destDir"]
+	copyOne := func(from, to string) error {
+		value, readErr := os.ReadFile(from)
+		if readErr != nil {
+			return readErr
+		}
+		info, statErr := os.Stat(from)
+		if statErr != nil {
+			return statErr
+		}
+		return os.WriteFile(to, value, info.Mode().Perm())
+	}
+	operation := arguments[2]
+	var paths []string
+	for index, argument := range arguments[3:] {
+		if argument == "--" {
+			paths = arguments[index+4:]
+			break
+		}
+	}
+	switch operation {
+	case "apply":
+		if len(paths) == 0 {
+			entries, readErr := os.ReadDir(sourceRoot)
+			if readErr != nil {
+				return readErr
+			}
+			for _, entry := range entries {
+				if !entry.IsDir() && filepath.Ext(entry.Name()) == ".txt" {
+					if err := copyOne(filepath.Join(sourceRoot, entry.Name()), filepath.Join(homeRoot, entry.Name())); err != nil {
+						return err
+					}
+				}
+			}
+			return nil
+		}
+		for _, target := range paths {
+			if err := copyOne(filepath.Join(sourceRoot, filepath.Base(target)), target); err != nil {
+				return err
+			}
+		}
+	case "add":
+		for _, target := range paths {
+			if err := copyOne(target, filepath.Join(sourceRoot, filepath.Base(target))); err != nil {
+				return err
+			}
+		}
+	case "forget":
+		if len(paths) != 1 {
+			return ErrConfigRepositoryInvalid
+		}
+		return os.Remove(filepath.Join(sourceRoot, filepath.Base(paths[0])))
+	default:
+		return ErrConfigRepositoryInvalid
+	}
+	return nil
+}
+
 func writeChezmoiTestShim(t *testing.T, root string) string {
 	t.Helper()
+	if runtime.GOOS == "windows" {
+		powerShellPath := filepath.Join(root, "chezmoi-test.ps1")
+		powerShell := `param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Rest)
+$configIndex = [Array]::IndexOf($Rest, '--config')
+if ($configIndex -lt 0 -or $configIndex + 2 -ge $Rest.Length) { exit 2 }
+$config = $Rest[$configIndex + 1]
+$sourceDir = ((Get-Content -LiteralPath $config | Where-Object { $_ -match '^sourceDir = ' }) -replace '^sourceDir = "(.*)"$','$1') -replace '\\\\','\'
+$destDir = ((Get-Content -LiteralPath $config | Where-Object { $_ -match '^destDir = ' }) -replace '^destDir = "(.*)"$','$1') -replace '\\\\','\'
+$operationIndex = $configIndex + 2
+$operation = $Rest[$operationIndex]
+switch ($operation) {
+  'apply' { Get-ChildItem -LiteralPath $sourceDir -Filter '*.txt' -File | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $destDir $_.Name) -Force } }
+  'add' { for ($i = $operationIndex + 1; $i -lt $Rest.Length; $i++) { if ($Rest[$i] -ne '--') { Copy-Item -LiteralPath $Rest[$i] -Destination (Join-Path $sourceDir (Split-Path $Rest[$i] -Leaf)) -Force } } }
+  'forget' { $value = $Rest[$Rest.Length - 1]; Remove-Item -LiteralPath (Join-Path $sourceDir (Split-Path $value -Leaf)) -Force -ErrorAction SilentlyContinue }
+  default { exit 2 }
+}
+`
+		if err := os.WriteFile(powerShellPath, []byte(powerShell), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(root, "chezmoi-test.cmd")
+		command := "@powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"%~dp0chezmoi-test.ps1\" %*\r\n"
+		if err := os.WriteFile(path, []byte(command), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
 	path := filepath.Join(root, "chezmoi-test")
 	script := `#!/bin/sh
 set -eu

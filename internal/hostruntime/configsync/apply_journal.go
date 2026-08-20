@@ -93,19 +93,23 @@ func recoverApplyJournal(path, homeRoot, repositoryID, assignmentID string, maxB
 		return nil
 	}
 	maxJournalBytes := encodedApplyJournalLimit(maxBytes)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 ||
-		info.Mode().Perm()&0o077 != 0 || info.Size() > maxJournalBytes {
+	if err != nil || !privateControlFile(path, info) || info.Size() > maxJournalBytes {
 		return errors.Join(ErrApplyJournalInvalid, err)
 	}
 	file, err := os.Open(path)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
 	var journal applyJournal
 	decoder := json.NewDecoder(io.LimitReader(file, maxJournalBytes))
 	decoder.DisallowUnknownFields()
-	if decoder.Decode(&journal) != nil || !errors.Is(decoder.Decode(&struct{}{}), io.EOF) ||
+	decodeErr := decoder.Decode(&journal)
+	trailingErr := decoder.Decode(&struct{}{})
+	closeErr := file.Close()
+	if closeErr != nil {
+		return closeErr
+	}
+	if decodeErr != nil || !errors.Is(trailingErr, io.EOF) ||
 		journal.Format != "paperboat-config-apply-journal-v1" ||
 		journal.RepositoryID != repositoryID || journal.AssignmentID != assignmentID {
 		return ErrApplyJournalInvalid
@@ -191,26 +195,7 @@ func restoreApplyJournalEntry(homeRoot string, entry applyJournalEntry) error {
 	if !entry.Mode.IsRegular() {
 		return ErrApplyJournalInvalid
 	}
-	//paperboat:allow-source-policy atomic-replacement owner=config-sync reason=journal-restore-staging
-	temporary, err := os.CreateTemp(filepath.Dir(target), ".paperboat-restore-*")
-	if err != nil {
-		return err
-	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-	err = temporary.Chmod(entry.Mode.Perm())
-	if err == nil {
-		_, err = temporary.Write(entry.Content)
-	}
-	if err == nil {
-		err = temporary.Sync()
-	}
-	err = errors.Join(err, temporary.Close())
-	if err != nil {
-		return err
-	}
-	//paperboat:allow-source-policy atomic-replacement owner=config-sync reason=journaled-workspace-restore
-	return os.Rename(temporaryPath, target)
+	return restoreRegularFile(target, entry.Content, entry.Mode.Perm())
 }
 
 func ensurePrivateParent(root, parent string) error {

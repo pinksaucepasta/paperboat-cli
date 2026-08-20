@@ -207,6 +207,7 @@ func mapMachines(machines []api.UserMachine) []localapi.MachineStatus {
 			EnvironmentID:     machine.EnvironmentID,
 			WorkspaceRoot:     machine.WorkspaceRoot,
 			Alias:             alias,
+			Platform:          machine.Platform,
 			Eligible:          generation > 0 && machine.State != "revoked" && machine.State != "deleted",
 			RuntimeState:      runtimeState(machine, generation),
 			Generation:        generation,
@@ -234,7 +235,7 @@ func mapMachines(machines []api.UserMachine) []localapi.MachineStatus {
 			if code == "" {
 				code = "ssh_key_rejected"
 			}
-			status.Health = []localapi.HealthItem{{Code: code, Severity: "warning", Title: "Local SSH integration is not ready", Recovery: "Restart the Paperboat local service after checking OpenSSH and authentication", ETag: code}}
+			status.Health = []localapi.HealthItem{{Code: code, Severity: "warning", Title: "Managed SSH is not ready", Recovery: managedSSHDoctorRecovery, ETag: code}}
 		} else if generation > 0 && machine.SSHAuthority.TargetGeneration != generation {
 			status.Health = []localapi.HealthItem{{Code: "ssh_target_not_ready", Severity: "warning", Title: "SSH target is not ready", Recovery: "Ensure the machine's existing SSH service is listening on loopback", ETag: "ssh_target_not_ready"}}
 		} else if generation > 0 && machine.SSHAuthority.HostKeyGeneration != generation {

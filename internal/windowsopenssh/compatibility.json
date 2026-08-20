@@ -1,0 +1,13 @@
+{
+  "schema": "paperboat.windows-openssh/v1",
+  "package_id": "Microsoft.OpenSSH.Preview",
+  "approved_version": "10.0.0.0",
+  "minimum_version": "10.0.0.0",
+  "maximum_version": "10.0.0.0",
+  "architectures": ["amd64", "arm64"],
+  "expected_publisher": "Microsoft",
+  "expected_binary_names": ["ssh.exe", "sshd.exe", "scp.exe", "sftp.exe", "sftp-server.exe", "ssh-keygen.exe"],
+  "expected_install_root": "%ProgramFiles%\\OpenSSH",
+  "tested_windows_builds": ["26100"],
+  "configuration_schema": "paperboat.windows-openssh/v1"
+}

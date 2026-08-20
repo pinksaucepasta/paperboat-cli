@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -69,10 +70,16 @@ func allowedHostAddresses() map[string]struct{} {
 
 func excludedInterface(name string) bool {
 	name = strings.ToLower(name)
-	for _, prefix := range []string{"br-", "cni", "docker", "flannel", "tailscale", "tap", "tun", "utun", "veth", "virbr", "wg", "zt"} {
+	for _, prefix := range []string{"br-", "cni", "docker", "flannel", "tailscale", "tap", "tun", "utun", "virbr", "wg", "zt"} {
 		if strings.HasPrefix(name, prefix) {
 			return true
 		}
+	}
+	// Linux container peers use veth* names. Windows Hyper-V uses
+	// "vEthernet (...)" for real external switches, so a platform-neutral veth
+	// prefix would remove the machine's only usable LAN interface.
+	if runtime.GOOS != "windows" && strings.HasPrefix(name, "veth") {
+		return true
 	}
 	return false
 }

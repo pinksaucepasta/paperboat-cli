@@ -561,7 +561,7 @@
       "id": "cli.command.transcripts",
       "path": "transcripts/cli/commands.json",
       "type": "transcripts",
-      "sha256": "55eefb142be883a9c521c949eb219b36767039e907ac8cc48686c9f7b99005ac",
+      "sha256": "790e45c4510ae9aa98d3c5d671ec2770c99a96fe43fc50400a77b7a8f6f149c6",
       "owner": "cli",
       "review": "preview-ownership-review",
       "consumers": [

@@ -37,13 +37,11 @@ type Options struct {
 	OwnerUID int
 	OwnerGID int
 	// SecurityDescriptor is an optional SDDL descriptor. If empty, Write uses
-	// the protected SYSTEM-and-Administrators-only descriptor below. Windows
+	// a protected descriptor for the current owner, SYSTEM, and Administrators. Windows
 	// does not have meaningful POSIX UID/GID ownership, so callers must leave
 	// OwnerUID and OwnerGID as -1 and use an ACL instead.
 	SecurityDescriptor string
 }
-
-const defaultSecurityDescriptor = "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
 
 // Write creates a same-directory temporary file, installs a protected DACL
 // before writing its contents, flushes it, then replaces the destination with
@@ -63,11 +61,16 @@ func Write(path string, data []byte, options Options) error {
 	}
 	descriptor := options.SecurityDescriptor
 	if descriptor == "" {
-		descriptor = defaultSecurityDescriptor
+		resolved, err := currentOwnerSecurityDescriptor()
+		if err != nil {
+			return &Error{Stage: StageOwner, Path: path, Err: err}
+		}
+		descriptor = resolved
 	}
 	if _, err := windows.SecurityDescriptorFromString(descriptor); err != nil {
 		return &Error{Stage: StageValidate, Path: path, Err: err}
 	}
+	//paperboat:allow-source-policy atomic-replacement owner=atomicfile-windows reason=same-directory-protected-staging
 	temporary, err := os.CreateTemp(parent, ".paperboat-*")
 	if err != nil {
 		return &Error{Stage: StageCreate, Path: path, Err: err}
@@ -101,6 +104,27 @@ func Write(path string, data []byte, options Options) error {
 		return &Error{Stage: StageReplace, Path: path, Err: err}
 	}
 	return nil
+}
+
+func currentOwnerSecurityDescriptor() (string, error) {
+	token, err := windows.OpenCurrentProcessToken()
+	if err != nil {
+		return "", err
+	}
+	defer token.Close()
+	user, err := token.GetTokenUser()
+	if err != nil || user == nil || user.User.Sid == nil || !user.User.Sid.IsValid() {
+		if err == nil {
+			err = errors.New("current Windows token has no valid owner SID")
+		}
+		return "", err
+	}
+	sid := user.User.Sid.String()
+	descriptor := "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
+	if sid != "S-1-5-18" {
+		descriptor += "(A;;FA;;;" + sid + ")"
+	}
+	return descriptor, nil
 }
 
 func secureDirectory(path string) error {

@@ -1,5 +1,3 @@
-//go:build darwin || linux
-
 package localapi
 
 import (
@@ -12,7 +10,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
@@ -121,14 +118,18 @@ func (c *Client) Watch(ctx context.Context, after uint64) (<-chan Snapshot, <-ch
 	return updates, errorsOut
 }
 
-func NewClient(socketPath string, timeout time.Duration) (*Client, error) {
-	if !filepath.IsAbs(socketPath) || len(socketPath) > maxUnixSocketPath || timeout <= 0 || timeout > time.Minute {
-		return nil, ErrInvalidConfig
-	}
+func newClient(socketPath string, timeout time.Duration) *Client {
 	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-		return (&net.Dialer{Timeout: timeout}).DialContext(ctx, "unix", socketPath)
+		return dialLocal(ctx, socketPath, timeout)
 	}, DisableCompression: true, MaxConnsPerHost: 4, MaxIdleConnsPerHost: 4, IdleConnTimeout: timeout}
-	return &Client{http: &http.Client{Transport: transport}, timeout: timeout, socket: socketPath}, nil
+	return &Client{http: &http.Client{Transport: transport}, timeout: timeout, socket: socketPath}
+}
+
+func (c *Client) dial(ctx context.Context) (net.Conn, error) {
+	if c == nil {
+		return nil, net.ErrClosed
+	}
+	return dialLocal(ctx, c.socket, c.timeout)
 }
 
 // OpenPeerStream upgrades one authenticated local Unix HTTP request into a
@@ -141,7 +142,7 @@ func (c *Client) OpenPeerStream(ctx context.Context, value PeerStreamRequest) (n
 	if err != nil || len(body) > maxJSONBytes {
 		return nil, ErrInvalidConfig
 	}
-	connection, err := (&net.Dialer{Timeout: c.timeout}).DialContext(ctx, "unix", c.socket)
+	connection, err := c.dial(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -190,7 +191,7 @@ func (c *Client) PrepareFileTransfer(ctx context.Context, value FileTransferKeyR
 	if err != nil || len(body) > maxJSONBytes {
 		return nil, ErrInvalidConfig
 	}
-	connection, err := (&net.Dialer{Timeout: c.timeout}).DialContext(ctx, "unix", c.socket)
+	connection, err := c.dial(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -251,7 +252,7 @@ func (c *Client) OpenFileTransferStream(ctx context.Context, handle string) (net
 	if c == nil || ctx == nil || !safeValue(handle) {
 		return nil, ErrInvalidConfig
 	}
-	connection, err := (&net.Dialer{Timeout: c.timeout}).DialContext(ctx, "unix", c.socket)
+	connection, err := c.dial(ctx)
 	if err != nil {
 		return nil, err
 	}

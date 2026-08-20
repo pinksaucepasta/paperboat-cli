@@ -593,6 +593,13 @@ func TestSafeErrorMessageBoundsDiagnostics(t *testing.T) {
 	}
 }
 
+func TestSafeErrorMessageRedactsStructuredTransportDiagnostics(t *testing.T) {
+	err := errors.New("peer path 3 failed (class 12): read Noise response (prologue=secret local=fingerprint handle=private): EOF")
+	if got := safeErrorMessage(err); got != "peer path 3 failed" {
+		t.Fatalf("message=%q", got)
+	}
+}
+
 func TestWriteErrorBoundsFinalEnvelopeMessage(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	writeError(recorder, http.StatusServiceUnavailable, "req_0123456789abcdef01234567", "peer_stream_unavailable", "peer stream is unavailable: "+strings.Repeat("x", 700))

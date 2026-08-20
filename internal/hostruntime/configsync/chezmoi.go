@@ -21,13 +21,17 @@ type ChezmoiSourceConfig struct {
 	RuntimeRoot string
 	SourceRoot  string
 	HomeRoot    string
+	Runner      ChezmoiRunner
 }
+
+type ChezmoiRunner func(context.Context, string, ...string) error
 
 type ChezmoiSource struct {
 	binary     string
 	configPath string
 	sourceRoot string
 	homeRoot   string
+	runner     ChezmoiRunner
 }
 
 func NewChezmoiSource(config ChezmoiSourceConfig) (*ChezmoiSource, error) {
@@ -36,9 +40,12 @@ func NewChezmoiSource(config ChezmoiSourceConfig) (*ChezmoiSource, error) {
 		!canonicalAbsolutePath(config.HomeRoot) {
 		return nil, ErrConfigRepositoryInvalid
 	}
+	if config.Runner == nil {
+		config.Runner = runChezmoi
+	}
 	return &ChezmoiSource{
 		binary: config.Binary, configPath: filepath.Join(config.RuntimeRoot, "chezmoi.toml"),
-		sourceRoot: config.SourceRoot, homeRoot: config.HomeRoot,
+		sourceRoot: config.SourceRoot, homeRoot: config.HomeRoot, runner: config.Runner,
 	}, nil
 }
 
@@ -63,7 +70,7 @@ func (s *ChezmoiSource) ApplyPaths(ctx context.Context, paths []string) error {
 			arguments = append(arguments, filepath.Join(s.homeRoot, filepath.FromSlash(path)))
 		}
 	}
-	return runChezmoi(ctx, s.binary, arguments...)
+	return s.runner(ctx, s.binary, arguments...)
 }
 
 func (s *ChezmoiSource) Add(ctx context.Context, paths []string) error {
@@ -80,7 +87,7 @@ func (s *ChezmoiSource) Add(ctx context.Context, paths []string) error {
 		}
 		arguments = append(arguments, filepath.Join(s.homeRoot, filepath.FromSlash(path)))
 	}
-	return runChezmoi(ctx, s.binary, arguments...)
+	return s.runner(ctx, s.binary, arguments...)
 }
 
 func (s *ChezmoiSource) Forget(ctx context.Context, path string) error {
@@ -90,7 +97,7 @@ func (s *ChezmoiSource) Forget(ctx context.Context, path string) error {
 	if err := s.writeConfig(); err != nil {
 		return err
 	}
-	return runChezmoi(ctx, s.binary, "--config", s.configPath, "forget", "--", filepath.Join(s.homeRoot, filepath.FromSlash(path)))
+	return s.runner(ctx, s.binary, "--config", s.configPath, "forget", "--", filepath.Join(s.homeRoot, filepath.FromSlash(path)))
 }
 
 func (s *ChezmoiSource) writeConfig() error {

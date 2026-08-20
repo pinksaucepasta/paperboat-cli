@@ -5,8 +5,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-
-	shlex "github.com/anmitsu/go-shlex"
 )
 
 const (
@@ -25,19 +23,26 @@ func ParseDroppedFile(input string) (source Source, consumed bool) {
 	if value == "" {
 		return Source{}, false
 	}
-	tokens, err := shlex.Split(value, true)
-	if err != nil || len(tokens) != 1 {
+	candidate, ok := droppedFileCandidate(value)
+	if !ok {
 		return Source{}, false
 	}
-	candidate := tokens[0]
 	if strings.HasPrefix(candidate, "file://") {
-		parsed, parseErr := url.Parse(candidate)
-		if parseErr != nil || parsed.Scheme != "file" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Host != "" && parsed.Host != "localhost" {
-			return Source{}, false
-		}
-		candidate = parsed.Path
-		if runtime.GOOS == "windows" && len(candidate) >= 3 && candidate[0] == '/' && candidate[2] == ':' {
-			candidate = candidate[1:]
+		if runtime.GOOS == "windows" && len(candidate) >= 12 && isASCIILetter(candidate[7]) && candidate[8] == ':' && strings.EqualFold(candidate[9:12], "%5c") {
+			decoded, decodeErr := url.PathUnescape(candidate[7:])
+			if decodeErr != nil {
+				return Source{}, false
+			}
+			candidate = decoded
+		} else {
+			parsed, parseErr := url.Parse(candidate)
+			if parseErr != nil || parsed.Scheme != "file" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Host != "" && parsed.Host != "localhost" {
+				return Source{}, false
+			}
+			candidate = parsed.Path
+			if runtime.GOOS == "windows" && len(candidate) >= 3 && candidate[0] == '/' && candidate[2] == ':' {
+				candidate = candidate[1:]
+			}
 		}
 	}
 	if !filepath.IsAbs(candidate) {
@@ -48,4 +53,8 @@ func ParseDroppedFile(input string) (source Source, consumed bool) {
 		return Source{}, false
 	}
 	return resolved, true
+}
+
+func isASCIILetter(value byte) bool {
+	return value >= 'A' && value <= 'Z' || value >= 'a' && value <= 'z'
 }

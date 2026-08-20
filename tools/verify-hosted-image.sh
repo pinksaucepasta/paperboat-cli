@@ -28,6 +28,8 @@ if grep -E '^CMD' "$dockerfile" >/dev/null; then
 fi
 grep -F 'ListenAddress 127.0.0.1' "$entrypoint" >/dev/null
 grep -F 'HostKey $ssh_state/ssh_host_ed25519_key' "$entrypoint" >/dev/null
+grep -F 'ssh-keygen -q -y -f "$ssh_state/ssh_host_ed25519_key"' "$entrypoint" >/dev/null
+grep -F 'install -m 0644 -o root -g root "$temporary_public" "$ssh_host_public"' "$entrypoint" >/dev/null
 grep -F '/usr/sbin/sshd -t' "$entrypoint" >/dev/null
 grep -F 'PAPERBOAT_CONTAINER_MODE must be hosted or self-hosted' "$entrypoint" >/dev/null
 grep -F 'PAPERBOAT_RELEASE_REPOSITORY must use https' "$entrypoint" >/dev/null

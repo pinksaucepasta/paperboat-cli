@@ -143,7 +143,7 @@ func TestBaselineRoundTripUsesPrivateFile(t *testing.T) {
 		t.Fatalf("baseline = %#v, %v", got, err)
 	}
 	info, err := os.Stat(path)
-	if err != nil || info.Mode().Perm() != 0o600 {
+	if err != nil || !privateControlFile(path, info) {
 		t.Fatalf("mode = %v, %v", info.Mode(), err)
 	}
 	data, err := os.ReadFile(path)

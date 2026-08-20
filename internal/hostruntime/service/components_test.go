@@ -5,12 +5,16 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
 
 func splitLayout(t *testing.T, platform string) Layout {
 	t.Helper()
+	if runtime.GOOS == "windows" && platform != "windows" {
+		t.Skip("POSIX split-service filesystem semantics are not applicable on Windows")
+	}
 	root := filepath.Join(t.TempDir(), "paperboat")
 	releases := filepath.Join(root, "releases")
 	layout := Layout{
@@ -25,6 +29,10 @@ func splitLayout(t *testing.T, platform string) Layout {
 		CLIRollback:     filepath.Join(releases, "cli-rollback", "pb"),
 		UpdateStateRoot: filepath.Join(t.TempDir(), "updated"),
 		HostdSocket:     filepath.Join(t.TempDir(), "hostd", "hostd.sock"),
+	}
+	if runtime.GOOS == "windows" {
+		layout.HostdBinary += ".exe"
+		layout.UpdaterBinary += ".exe"
 	}
 	for _, binary := range []string{layout.HostdBinary, layout.UpdaterBinary} {
 		if err := os.MkdirAll(filepath.Dir(binary), 0o755); err != nil {
@@ -54,6 +62,21 @@ func TestDefaultSplitLayoutsAreFixedAndBounded(t *testing.T) {
 				t.Fatalf("release retention paths overlap: %+v", layout)
 			}
 		})
+	}
+}
+
+func TestDefaultWindowsLayoutUsesCanonicalSeparators(t *testing.T) {
+	layout, err := DefaultLayout("windows")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if layout.ReleasesRoot != `C:\Program Files\Paperboat\releases` || layout.RuntimeCurrent != `C:\Program Files\Paperboat\releases\runtime-current\paperboat-runtime.exe` {
+		t.Fatalf("non-canonical Windows layout: %+v", layout)
+	}
+	for _, value := range []string{layout.ReleasesRoot, layout.RuntimeCurrent, layout.RuntimeRollback, layout.CLICurrent} {
+		if strings.Contains(value, `\\`) {
+			t.Fatalf("layout path contains a duplicate separator: %q", value)
+		}
 	}
 }
 

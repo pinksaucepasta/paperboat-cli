@@ -58,8 +58,8 @@ func TestResolveUsernamePrecedence(t *testing.T) {
 		hasRegistered bool
 		want          string
 	}{
-		{name: "requested", requested: "deploy", openSSH: "deploy", registered: "hosted", local: "local", hasRegistered: true, want: "deploy"},
-		{name: "openssh", openSSH: "configured", registered: "hosted", local: "local", hasRegistered: true, want: "configured"},
+		{name: "requested registered", requested: "hosted", openSSH: "hosted", registered: "hosted", local: "local", hasRegistered: true, want: "hosted"},
+		{name: "openssh registered", openSSH: "hosted", registered: "hosted", local: "local", hasRegistered: true, want: "hosted"},
 		{name: "registered", registered: "hosted", local: "local", hasRegistered: true, want: "hosted"},
 		{name: "local only without registered user", local: "local", want: "local"},
 	}
@@ -80,7 +80,10 @@ func TestResolveUsernameRejectsConflictAndUnsafeValues(t *testing.T) {
 	if _, err := ResolveUsername("", "", "", "local", true); !errors.Is(err, ErrSSHUsernameMissing) {
 		t.Fatalf("registered-user absence error = %v", err)
 	}
-	for _, value := range []string{"-oProxyCommand=x", "user@host", "bad user", "bad\nuser", ""} {
+	if _, err := ResolveUsername("root", "", "deploy", "local", true); !errors.Is(err, ErrSSHUsernameNotAllowed) {
+		t.Fatalf("unregistered user error = %v", err)
+	}
+	for _, value := range []string{"-oProxyCommand=x", "user@host", "bad user", "bad;user", "bad\nuser", ""} {
 		_, err := ResolveUsername(value, "", "", "", false)
 		if value == "" {
 			if !errors.Is(err, ErrSSHUsernameMissing) {
@@ -89,6 +92,16 @@ func TestResolveUsernameRejectsConflictAndUnsafeValues(t *testing.T) {
 		} else if !errors.Is(err, ErrSSHUsernameInvalid) {
 			t.Fatalf("ResolveUsername(%q) error = %v", value, err)
 		}
+	}
+}
+
+func TestResolveUsernameWindowsIsCaseInsensitiveAndCanonical(t *testing.T) {
+	got, err := ResolveUsernameForPlatform("pujan", "Pujan", "Pujan", "local", true, "windows")
+	if err != nil || got != "Pujan" {
+		t.Fatalf("ResolveUsernameForPlatform() = %q, %v", got, err)
+	}
+	if _, err := ResolveUsernameForPlatform("pujan", "", "Pujan", "local", true, "linux"); !errors.Is(err, ErrSSHUsernameNotAllowed) {
+		t.Fatalf("Linux username comparison error = %v", err)
 	}
 }
 

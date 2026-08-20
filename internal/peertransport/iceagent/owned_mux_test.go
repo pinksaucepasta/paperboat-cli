@@ -137,6 +137,10 @@ func TestOwnedUDPMuxAgentsNominateAndExchange(t *testing.T) {
 	if string(received) != string(payload) {
 		t.Fatalf("payload=%q", received)
 	}
+	// Prove the nominated connection carries Paperboat's pinned native QUIC,
+	// not only raw ICE application packets. On Windows this exercises the real
+	// Winsock-owned UDP mux and Hyper-V external interface discovery path.
+	assertVNetNativeQUIC(t, leftConn, rightConn, []byte("owned-mux-native-quic"))
 
 	if err := left.Close(); err != nil {
 		t.Fatal(err)
@@ -147,6 +151,68 @@ func TestOwnedUDPMuxAgentsNominateAndExchange(t *testing.T) {
 	if _, err := leftSocket.WriteTo([]byte("closed"), rightSocket.LocalAddr()); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("owned socket remained open: %v", err)
 	}
+}
+
+func TestOwnedUDP6MuxAgentsNominateAndCarryNativeQUIC(t *testing.T) {
+	leftSocket, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6unspecified})
+	if err != nil {
+		t.Skipf("IPv6 unavailable: %v", err)
+	}
+	rightSocket, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6unspecified})
+	if err != nil {
+		_ = leftSocket.Close()
+		t.Skipf("IPv6 unavailable: %v", err)
+	}
+	leftConfig := Config{LocalUfrag: "left-owned-ipv6", LocalPwd: "left-ipv6-password-123456789012345678"}
+	rightConfig := Config{LocalUfrag: "right-owned-ipv6", LocalPwd: "right-ipv6-password-12345678901234567"}
+	left, err := NewWithUDPMux(leftConfig, OwnedMuxConfig{IPv6: leftSocket})
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := NewWithUDPMux(rightConfig, OwnedMuxConfig{IPv6: rightSocket})
+	if err != nil {
+		_ = left.Close()
+		t.Fatal(err)
+	}
+	defer right.Close()
+	defer left.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	leftCandidates := gatherCandidates(t, ctx, left)
+	rightCandidates := gatherCandidates(t, ctx, right)
+	for _, candidate := range leftCandidates {
+		if err := right.AddRemoteCandidate(candidate); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, candidate := range rightCandidates {
+		if err := left.AddRemoteCandidate(candidate); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rightResult := make(chan struct {
+		connection net.Conn
+		err        error
+	}, 1)
+	go func() {
+		connection, connectErr := right.Connect(ctx, RoleControlled, leftConfig.LocalUfrag, leftConfig.LocalPwd)
+		rightResult <- struct {
+			connection net.Conn
+			err        error
+		}{connection, connectErr}
+	}()
+	leftConn, err := left.Connect(ctx, RoleControlling, rightConfig.LocalUfrag, rightConfig.LocalPwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rightConnected := <-rightResult
+	if rightConnected.err != nil {
+		_ = leftConn.Close()
+		t.Fatal(rightConnected.err)
+	}
+	defer rightConnected.connection.Close()
+	defer leftConn.Close()
+	assertVNetNativeQUIC(t, leftConn, rightConnected.connection, []byte("owned-ipv6-native-quic"))
 }
 
 func TestNewWithUDPMuxRejectsMismatchedPortsAndClosesSockets(t *testing.T) {

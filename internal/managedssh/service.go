@@ -36,12 +36,19 @@ func StartAgentService(parent context.Context, config AgentServiceConfig) (*Agen
 	if err != nil {
 		return nil, err
 	}
-	socket := filepath.Join(filepath.Clean(config.RuntimeDirectory), "paperboat-ssh-agent.sock")
+	socket, err := ownerAgentSocket(config.RuntimeDirectory)
+	if err != nil {
+		return nil, err
+	}
 	var delegate *DelegatedAgent
 	if config.InheritedAgentSocket != "" {
 		delegate, err = DialOwnerAgent(config.InheritedAgentSocket, socket, config.DelegateTimeout)
 		if err != nil {
-			return nil, err
+			// Delegation only preserves the caller's ordinary SSH identities for
+			// optional agent forwarding. The Paperboat-managed identity is the
+			// authoritative login credential and must remain available when an
+			// inherited desktop agent is stale, locked, or temporarily unavailable.
+			delegate = nil
 		}
 	}
 	aggregate, err := NewAggregate(managed, delegate)

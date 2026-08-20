@@ -382,13 +382,20 @@ type peerTransferKeyDelivery struct {
 }
 
 func (d *peerTransferKeyDelivery) exchange(stream io.ReadWriter, context peercontext.Context) error {
-	if d == nil {
+	if d == nil || context.OperationID == "" || context.Consumer != "file_transfer_key" {
 		return ErrPeerTerminalInvalid
 	}
+	binding := d.binding
+	// The file transfer binding identifies the encrypted transfer, while the
+	// peer descriptor has a fresh idempotency operation for each attempt. The
+	// authenticated descriptor context is authoritative for the control frame;
+	// reusing the transfer operation ID would make fallback attempts conflict
+	// at the server.
+	binding.OperationID = context.OperationID
 	if d.vault != nil {
-		return transfercrypto.ReceiveKey(stream, d.binding, context, d.vault)
+		return transfercrypto.ReceiveKey(stream, binding, context, d.vault)
 	}
-	return transfercrypto.DeliverKey(stream, d.binding, d.material)
+	return transfercrypto.DeliverKey(stream, binding, d.material)
 }
 
 type completedPeerConn struct{}
@@ -904,9 +911,6 @@ func (t *PeerTerminalTunnel) dial(ctx context.Context, info resolver.ConnectInfo
 		transfer = &api.PeerAttemptTransfer{TransferID: keyDelivery.binding.TransferID, Generation: keyDelivery.binding.Generation, ExpiresAt: keyDelivery.binding.ExpiresAt}
 	}
 	sourceConfig := directpath.APIDescriptorSourceConfig{Client: client, EnvironmentID: info.Terminal.EnvironmentID, Purpose: purpose, Consumer: descriptorConsumer, Transfer: transfer, AccountID: profile.Account.ID, RootPublicKey: authority.RootPublic, ControllingEndpointID: profile.CLIClientSessionID, ControlledEndpointID: info.ProjectID, ControllingCertificateFingerprint: hex.EncodeToString(localFingerprint[:]), ControlledCertificateFingerprint: hex.EncodeToString(peerFingerprint[:]), OperationID: func(generation directpath.Generation) string {
-		if keyDelivery != nil {
-			return keyDelivery.binding.OperationID
-		}
 		return peerOperationID(profile.CLIClientSessionID, info.ProjectID, purpose, t.operationSeed, operationScope, generation)
 	}}
 	sourceConfig.AllowedPaths = peerAllowedPaths(mode)
@@ -917,6 +921,22 @@ func (t *PeerTerminalTunnel) dial(ctx context.Context, info resolver.ConnectInfo
 		return nil, err
 	}
 	mark("descriptor_source_ready")
+	var oneShotDescriptors map[connectionmanager.Path]*directpath.APIDescriptorSource
+	if oneShotPeerOperation(application, keyDelivery) && (mode == connectionmanager.ModeAuto || mode == connectionmanager.ModeRelayRace) {
+		oneShotDescriptors = make(map[connectionmanager.Path]*directpath.APIDescriptorSource, 3)
+		for _, path := range oneShotDescriptorPaths(mode) {
+			allowedPaths, ok := peerDescriptorAllowedPaths(path)
+			if !ok {
+				return nil, ErrPeerTerminalInvalid
+			}
+			candidateConfig := sourceConfig
+			candidateConfig.AllowedPaths = allowedPaths
+			oneShotDescriptors[path], err = directpath.NewAPIDescriptorSource(candidateConfig)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
 	var probes *directpath.APIDescriptorSource
 	var directRecovery, relayRecovery, wssRecovery *directpath.APIDescriptorSource
 	if keyDelivery == nil && !application.health {
@@ -964,9 +984,9 @@ func (t *PeerTerminalTunnel) dial(ctx context.Context, info resolver.ConnectInfo
 	if monitor != nil && !sharedNetwork {
 		mapping = observedSocketMapping{source: monitor, record: func(protocol, result string) { t.recordRouterMapping(fingerprint, protocol, result) }}
 	}
-	connector := &terminalRaceConnector{owner: t, lifetime: ownerCtx, target: info.Terminal, consumer: consumer, application: application, keyDelivery: keyDelivery, descriptors: descriptors, probes: probes, directRecovery: directRecovery, relayRecovery: relayRecovery, wssRecovery: wssRecovery, attempts: attempts, clientAuthority: &authority, descriptorCalls: make(map[uint64]*terminalDescriptorCall), health: quality, mapping: mapping}
+	connector := &terminalRaceConnector{owner: t, lifetime: ownerCtx, target: info.Terminal, consumer: consumer, application: application, keyDelivery: keyDelivery, descriptors: descriptors, oneShotDescriptors: oneShotDescriptors, probes: probes, directRecovery: directRecovery, relayRecovery: relayRecovery, wssRecovery: wssRecovery, attempts: attempts, clientAuthority: &authority, descriptorCalls: make(map[terminalDescriptorKey]*terminalDescriptorCall), health: quality, mapping: mapping}
 	connector.networkGeneration.Store(network)
-	raceConfig := peerRaceConfig(t.config.Race, application.health, mode)
+	raceConfig := peerRaceConfig(t.config.Race, application.health, keyDelivery != nil, mode)
 	racer, err := connectionmanager.NewRacer(raceConfig, connector)
 	if err != nil {
 		return nil, err
@@ -1273,12 +1293,26 @@ func acquirePeerReplacementLease(ctx context.Context, shared bool, manager *tran
 	return peerReplacementLease{lease: lease, connection: lease.Connection, path: lease.Path}, nil
 }
 
-func peerRaceConfig(config connectionmanager.Config, health bool, mode connectionmanager.Mode) connectionmanager.Config {
-	if health && mode == connectionmanager.ModeAuto {
-		// Health probes are one-shot and retain no standby. Race all reachable
-		// paths without a client-only direct preference window so the client and
-		// host cannot select different winners for the same attempt.
-		config.RelayDelay = 0
+func oneShotPeerOperation(application peerApplication, keyDelivery *peerTransferKeyDelivery) bool {
+	return application.health || keyDelivery != nil
+}
+
+func peerRaceConfig(config connectionmanager.Config, health, keyDelivery bool, mode connectionmanager.Mode) connectionmanager.Config {
+	if health && (mode == connectionmanager.ModeAuto || mode == connectionmanager.ModeRelayRace) {
+		// These one-off operations own a monotonic descriptor admission. Acquire
+		// the next candidate descriptor only after the prior carrier has failed.
+		// Relay reachability is proved independently, so avoid direct admission
+		// until both relay paths have been exhausted.
+		config.SequentialFallback = true
+		config.RelayFirst = true
+		config.OneShot = true
+	} else if keyDelivery && (mode == connectionmanager.ModeAuto || mode == connectionmanager.ModeRelayRace) {
+		// Transfer-key exchanges perform authenticated carrier setup. Do not
+		// give relay candidates the health probe's small sequential budget; let
+		// the overall connect deadline bound each candidate instead. The
+		// application exchange happens after carrier selection, so racer-level
+		// one-shot cancellation must not close the carrier before that exchange.
+		config.RelayFirst = true
 	}
 	return config
 }
@@ -1340,6 +1374,30 @@ func peerAllowedPaths(mode connectionmanager.Mode) []string {
 		return []string{"relay_quic", "relay_wss"}
 	default:
 		return []string{"direct_quic", "relay_quic", "relay_wss"}
+	}
+}
+
+func peerDescriptorAllowedPaths(path connectionmanager.Path) ([]string, bool) {
+	switch path {
+	case connectionmanager.PathDirectQUIC:
+		return []string{"direct_quic"}, true
+	case connectionmanager.PathRelayQUIC:
+		return []string{"relay_quic"}, true
+	case connectionmanager.PathWSS:
+		return []string{"relay_wss"}, true
+	default:
+		return nil, false
+	}
+}
+
+func oneShotDescriptorPaths(mode connectionmanager.Mode) []connectionmanager.Path {
+	switch mode {
+	case connectionmanager.ModeAuto:
+		return []connectionmanager.Path{connectionmanager.PathRelayQUIC, connectionmanager.PathWSS, connectionmanager.PathDirectQUIC}
+	case connectionmanager.ModeRelayRace:
+		return []connectionmanager.Path{connectionmanager.PathRelayQUIC, connectionmanager.PathWSS}
+	default:
+		return nil
 	}
 }
 
@@ -2796,24 +2854,25 @@ func (c *terminalPathCandidate) Close() error {
 }
 
 type terminalRaceConnector struct {
-	owner             *PeerTerminalTunnel
-	lifetime          context.Context
-	target            *resolver.TerminalTarget
-	consumer          string
-	application       peerApplication
-	keyDelivery       *peerTransferKeyDelivery
-	descriptors       *directpath.APIDescriptorSource
-	probes            *directpath.APIDescriptorSource
-	directRecovery    *directpath.APIDescriptorSource
-	relayRecovery     *directpath.APIDescriptorSource
-	wssRecovery       *directpath.APIDescriptorSource
-	attempts          *peerAttemptTracker
-	clientAuthority   *clientauthority.Authority
-	networkGeneration atomic.Uint64
-	descriptorMu      sync.Mutex
-	descriptorCalls   map[uint64]*terminalDescriptorCall
-	health            *terminalHealthRecorder
-	mapping           directpath.SocketMappingSource
+	owner              *PeerTerminalTunnel
+	lifetime           context.Context
+	target             *resolver.TerminalTarget
+	consumer           string
+	application        peerApplication
+	keyDelivery        *peerTransferKeyDelivery
+	descriptors        *directpath.APIDescriptorSource
+	oneShotDescriptors map[connectionmanager.Path]*directpath.APIDescriptorSource
+	probes             *directpath.APIDescriptorSource
+	directRecovery     *directpath.APIDescriptorSource
+	relayRecovery      *directpath.APIDescriptorSource
+	wssRecovery        *directpath.APIDescriptorSource
+	attempts           *peerAttemptTracker
+	clientAuthority    *clientauthority.Authority
+	networkGeneration  atomic.Uint64
+	descriptorMu       sync.Mutex
+	descriptorCalls    map[terminalDescriptorKey]*terminalDescriptorCall
+	health             *terminalHealthRecorder
+	mapping            directpath.SocketMappingSource
 }
 
 type terminalDescriptorCall struct {
@@ -2823,12 +2882,45 @@ type terminalDescriptorCall struct {
 	err        error
 }
 
-func (c *terminalRaceConnector) descriptor(ctx context.Context, generation uint64) (directpath.AttemptDescriptor, peersession.Authority, error) {
+type terminalDescriptorKey struct {
+	generation uint64
+	path       connectionmanager.Path
+}
+
+func newTerminalDescriptorKey(generation uint64, path connectionmanager.Path, pathScoped bool) (terminalDescriptorKey, error) {
+	if generation == 0 || path != connectionmanager.PathDirectQUIC && path != connectionmanager.PathRelayQUIC && path != connectionmanager.PathWSS {
+		return terminalDescriptorKey{}, ErrPeerTerminalInvalid
+	}
+	key := terminalDescriptorKey{generation: generation}
+	if pathScoped {
+		key.path = path
+	}
+	return key, nil
+}
+
+func (c *terminalRaceConnector) descriptor(ctx context.Context, generation uint64, path connectionmanager.Path) (directpath.AttemptDescriptor, peersession.Authority, error) {
 	if c == nil || ctx == nil || generation == 0 || c.descriptors == nil || c.owner == nil || c.clientAuthority == nil {
 		return directpath.AttemptDescriptor{}, peersession.Authority{}, ErrPeerTerminalInvalid
 	}
+	// Ordinary transport races retain their established shared-attempt policy.
+	// Health probes and transfer-key exchanges use path-scoped descriptors.
+	// Each candidate must have its own server-side operation and allowed-path
+	// policy. The encrypted transfer binding remains separate and is rebound to
+	// the authenticated descriptor context during key exchange.
+	oneShot := oneShotPeerOperation(c.application, c.keyDelivery)
+	key, err := newTerminalDescriptorKey(generation, path, oneShot)
+	if err != nil {
+		return directpath.AttemptDescriptor{}, peersession.Authority{}, err
+	}
+	source := c.descriptors
+	if oneShot {
+		source = c.oneShotDescriptors[path]
+		if source == nil {
+			return directpath.AttemptDescriptor{}, peersession.Authority{}, ErrPeerTerminalInvalid
+		}
+	}
 	c.descriptorMu.Lock()
-	if call := c.descriptorCalls[generation]; call != nil {
+	if call := c.descriptorCalls[key]; call != nil {
 		c.descriptorMu.Unlock()
 		select {
 		case <-call.ready:
@@ -2838,14 +2930,14 @@ func (c *terminalRaceConnector) descriptor(ctx context.Context, generation uint6
 		}
 	}
 	call := &terminalDescriptorCall{ready: make(chan struct{})}
-	c.descriptorCalls[generation] = call
+	c.descriptorCalls[key] = call
 	c.descriptorMu.Unlock()
 
 	attempt, network := c.owner.attempt.Add(1), c.networkGeneration.Load()
 	if attempt == 0 || attempt > math.MaxInt64 || network == 0 || network > math.MaxInt64 {
 		call.err = ErrPeerTerminalInvalid
 	} else {
-		call.descriptor, call.err = c.descriptors.Acquire(ctx, directpath.Generation{Attempt: attempt, Network: network})
+		call.descriptor, call.err = source.Acquire(ctx, directpath.Generation{Attempt: attempt, Network: network})
 		if call.err == nil {
 			call.authority, call.err = peersession.New(peersession.Config{Descriptor: call.descriptor.Document, LocalCertificate: c.clientAuthority.LocalCertificate, PeerCertificate: c.clientAuthority.MachineCertificate, LocalNoisePrivate: c.clientAuthority.LocalKeys.NoisePrivate, Consumer: call.descriptor.Document.Consumer})
 			if call.err == nil && c.keyDelivery != nil {
@@ -2862,13 +2954,13 @@ func (c *terminalRaceConnector) descriptor(ctx context.Context, generation uint6
 	close(call.ready)
 	c.descriptorMu.Lock()
 	for len(c.descriptorCalls) > terminalGenerationHistory {
-		oldest := generation
+		oldest := key
 		for candidate := range c.descriptorCalls {
-			if candidate < oldest {
+			if candidate.generation < oldest.generation || candidate.generation == oldest.generation && candidate.path < oldest.path {
 				oldest = candidate
 			}
 		}
-		if oldest == generation {
+		if oldest == key {
 			break
 		}
 		delete(c.descriptorCalls, oldest)
@@ -3179,7 +3271,7 @@ func (c *terminalRaceConnector) Connect(ctx context.Context, attempt connectionm
 	if c == nil || c.owner == nil || ctx == nil || c.lifetime == nil || attempt.Generation == 0 {
 		return nil, ErrPeerTerminalInvalid
 	}
-	descriptor, sessionAuthority, err := c.descriptor(ctx, attempt.Generation)
+	descriptor, sessionAuthority, err := c.descriptor(ctx, attempt.Generation, attempt.Path)
 	if err != nil {
 		return nil, err
 	}

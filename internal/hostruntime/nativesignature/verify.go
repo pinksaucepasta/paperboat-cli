@@ -1,7 +1,6 @@
-// Package nativesignature verifies the operating-system signature that binds
-// a staged Paperboat executable to a trusted native publisher. TUF establishes
-// the release identity; this package is a second, platform-native gate before
-// an artifact can be activated.
+// Package nativesignature verifies optional operating-system signatures. TUF
+// establishes release identity and the Windows PE validator establishes the
+// executable format; Windows Authenticode is not a Paperboat release gate.
 package nativesignature
 
 import (
@@ -9,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
-	"strings"
 )
 
 var ErrInvalid = errors.New("native executable signature verification failed")
@@ -51,7 +49,9 @@ func (v Verifier) Verify(ctx context.Context, path, platform, architecture strin
 	case "darwin":
 		return v.verifyDarwin(ctx, path)
 	case "windows":
-		return v.verifyWindows(ctx, path)
+		// Authenticode is intentionally optional. Release integrity comes from
+		// the TUF target digest and PE machine validation performed by callers.
+		return nil
 	default:
 		return ErrInvalid
 	}
@@ -66,19 +66,6 @@ func (v Verifier) verifyDarwin(ctx context.Context, path string) error {
 	}
 	if _, err := v.Runner.Run(ctx, "spctl", "--assess", "--type", "execute", "--verbose=4", path); err != nil {
 		return fmt.Errorf("%w: gatekeeper assessment", ErrInvalid)
-	}
-	return nil
-}
-
-func (v Verifier) verifyWindows(ctx context.Context, path string) error {
-	// The path is encoded as a PowerShell single-quoted literal. Runner still
-	// invokes powershell.exe directly, never through cmd.exe. Status must be
-	// Valid, which includes Authenticode chain validation by Windows.
-	escapedPath := strings.ReplaceAll(path, "'", "''")
-	script := "$signature = Get-AuthenticodeSignature -LiteralPath '" + escapedPath + "'; if ($signature.Status -ne 'Valid') { Write-Error ('Authenticode status: ' + $signature.Status); exit 1 }; [Console]::Out.Write($signature.Status)"
-	output, err := v.Runner.Run(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script)
-	if err != nil || strings.TrimSpace(string(output)) != "Valid" {
-		return fmt.Errorf("%w: authenticode", ErrInvalid)
 	}
 	return nil
 }

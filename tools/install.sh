@@ -5,11 +5,15 @@ repository=${PAPERBOAT_GITHUB_REPOSITORY:-pinksaucepasta/paperboat-cli}
 version=${PAPERBOAT_VERSION:-latest}
 install_dir=${PAPERBOAT_INSTALL_DIR:-"${HOME}/.local/bin"}
 setup_mode=
+pair_mode=host
 pair=false
 enrollment_token=
+enrollment_token_file=
 machine_name=
 ssh_port=
 recovery_output=
+if [ -n "${PAPERBOAT_ENROLLMENT_TOKEN:-}" ]; then enrollment_token=$PAPERBOAT_ENROLLMENT_TOKEN; pair=true; fi
+if [ -n "${PAPERBOAT_MACHINE_NAME:-}" ]; then machine_name=$PAPERBOAT_MACHINE_NAME; fi
 
 usage() {
   cat <<'EOF'
@@ -24,6 +28,8 @@ Options:
   --setup MODE               Run setup after install: receive, session, or host
   --pair                     Pair this machine as a host after install
   --enrollment-token TOKEN   Use a dashboard-issued single-use pairing token
+  --enrollment-token-file FILE  Read the token from an absolute owner-only file
+  --setup-mode MODE          Pair as host or client (default: host)
   --name NAME                Set the machine name
   --ssh-port PORT            Existing SSH port; valid only with --setup host
   --recovery-output FILE     Save the account recovery key during setup
@@ -39,13 +45,15 @@ EOF
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --version|--install-dir|--setup|--enrollment-token|--name|--ssh-port|--recovery-output)
+    --version|--install-dir|--setup|--setup-mode|--enrollment-token|--enrollment-token-file|--name|--ssh-port|--recovery-output)
       [ "$#" -ge 2 ] || { echo "pb installer: $1 requires a value" >&2; exit 2; }
       case "$1" in
         --version) version=$2 ;;
         --install-dir) install_dir=$2 ;;
         --setup) setup_mode=$2 ;;
+        --setup-mode) pair_mode=$2 ;;
         --enrollment-token) enrollment_token=$2 ;;
+        --enrollment-token-file) enrollment_token_file=$2 ;;
         --name) machine_name=$2 ;;
         --ssh-port) ssh_port=$2 ;;
         --recovery-output) recovery_output=$2 ;;
@@ -63,6 +71,10 @@ case "$setup_mode" in
   ""|receive|session|host) ;;
   *) echo "pb installer: --setup must be receive, session, or host" >&2; exit 2 ;;
 esac
+case "$pair_mode" in
+  host|client) ;;
+  *) echo "pb installer: --setup-mode must be host or client" >&2; exit 2 ;;
+esac
 if [ -n "$ssh_port" ] && [ "$setup_mode" != host ]; then
   echo "pb installer: --ssh-port is valid only with --setup host" >&2
   exit 2
@@ -73,6 +85,14 @@ if [ -n "$recovery_output" ] && [ -z "$setup_mode" ]; then
 fi
 if [ -n "$enrollment_token" ] && [ "$pair" != true ]; then
   echo "pb installer: --enrollment-token requires --pair" >&2
+  exit 2
+fi
+if [ -n "$enrollment_token_file" ] && [ "$pair" != true ]; then
+  echo "pb installer: --enrollment-token-file requires --pair" >&2
+  exit 2
+fi
+if [ -n "$enrollment_token" ] && [ -n "$enrollment_token_file" ]; then
+  echo "pb installer: use only one enrollment token source" >&2
   exit 2
 fi
 if [ "$pair" = true ] && [ -n "$setup_mode" ]; then
@@ -140,7 +160,12 @@ esac
 set --
 if [ -n "$machine_name" ]; then set -- "$@" --name "$machine_name"; fi
 if [ "$pair" = true ]; then
+	first=${enrollment_token%${enrollment_token#?}}
+	second=${enrollment_token#?}; second=${second%${second#?}}
+	case "$first" in 0|2|4|6|8|B|D|F|H|J|L|N|P|R|T|V|X|Z) pair_mode=host ;; *) pair_mode=client ;; esac
+	set -- "$@" --setup-mode "$pair_mode"
   if [ -n "$enrollment_token" ]; then set -- "$@" --enrollment-token "$enrollment_token"; fi
+  if [ -n "$enrollment_token_file" ]; then set -- "$@" --enrollment-token-file "$enrollment_token_file"; fi
   exec "$target" pair "$@"
 fi
 if [ -n "$setup_mode" ]; then

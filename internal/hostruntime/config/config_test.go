@@ -13,7 +13,7 @@ func TestFromEnvDefaultsToBYOD(t *testing.T) {
 }
 
 func TestValidateResourceLimitsAreCompleteAndBounded(t *testing.T) {
-	base := Config{Profile: BYOD, StateRoot: "/tmp/helper", Version: "1", Limits: DefaultLimits, Resources: DefaultResources}
+	base := Config{Profile: BYOD, StateRoot: t.TempDir(), Version: "1", Limits: DefaultLimits, Resources: DefaultResources}
 	if err := base.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -37,7 +37,7 @@ func TestValidateResourceLimitsAreCompleteAndBounded(t *testing.T) {
 }
 
 func TestValidateRejectsHostedLifecycleUnsafeLimits(t *testing.T) {
-	c := Config{Profile: Hosted, StateRoot: "/tmp/helper", Version: "1", Limits: DefaultLimits}
+	c := Config{Profile: Hosted, StateRoot: t.TempDir(), Version: "1", Limits: DefaultLimits}
 	c.Limits.MutationDeadline = DefaultLimits.MutationDeadline + 1
 	if err := c.Validate(); err == nil {
 		t.Fatal("expected invalid limits")

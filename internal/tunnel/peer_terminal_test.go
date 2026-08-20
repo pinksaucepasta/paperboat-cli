@@ -1284,15 +1284,76 @@ func TestPrivatePreviewCandidateAllowsMultipleHTTP3Attachments(t *testing.T) {
 	}
 }
 
-func TestHealthAutoUsesFirstAuthenticatedPathWithoutPreferenceHold(t *testing.T) {
+func TestOneShotAutoOperationsUseSequentialFallback(t *testing.T) {
 	base := connectionmanager.Config{RelayDelay: time.Second, WSSDelay: 2 * time.Second, ConnectTimeout: 10 * time.Second}
-	health := peerRaceConfig(base, true, connectionmanager.ModeAuto)
-	if health.RelayDelay != 0 || health.WSSDelay != base.WSSDelay || health.ConnectTimeout != base.ConnectTimeout {
-		t.Fatalf("health config=%+v", health)
+	for _, test := range []struct {
+		name        string
+		health      bool
+		keyDelivery bool
+	}{{name: "health", health: true}, {name: "key delivery", keyDelivery: true}} {
+		t.Run(test.name, func(t *testing.T) {
+			config := peerRaceConfig(base, test.health, test.keyDelivery, connectionmanager.ModeAuto)
+			wantSequential, wantOneShot := test.health, test.health
+			if config.OneShot != wantOneShot || config.SequentialFallback != wantSequential || !config.RelayFirst || config.RelayDelay != base.RelayDelay || config.WSSDelay != base.WSSDelay || config.ConnectTimeout != base.ConnectTimeout {
+				t.Fatalf("config=%+v", config)
+			}
+		})
 	}
-	interactive := peerRaceConfig(base, false, connectionmanager.ModeAuto)
-	if interactive != base {
+	interactive := peerRaceConfig(base, false, false, connectionmanager.ModeAuto)
+	if interactive != base || interactive.OneShot || interactive.SequentialFallback || interactive.RelayFirst {
 		t.Fatalf("interactive config changed: %+v", interactive)
+	}
+}
+
+func TestTransferKeyOperationsUsePathScopedDescriptors(t *testing.T) {
+	if !oneShotPeerOperation(peerApplication{}, &peerTransferKeyDelivery{}) {
+		t.Fatal("transfer-key operation must use path-scoped descriptors")
+	}
+	if oneShotPeerOperation(peerApplication{}, nil) {
+		t.Fatal("ordinary interactive operation must retain shared descriptors")
+	}
+	if !oneShotPeerOperation(peerApplication{health: true}, nil) {
+		t.Fatal("health operation must use path-scoped descriptors")
+	}
+}
+
+func TestOneShotDescriptorKeySeparatesFallbackPaths(t *testing.T) {
+	direct, err := newTerminalDescriptorKey(7, connectionmanager.PathDirectQUIC, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay, err := newTerminalDescriptorKey(7, connectionmanager.PathRelayQUIC, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wss, err := newTerminalDescriptorKey(7, connectionmanager.PathWSS, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if direct == relay || direct == wss || relay == wss {
+		t.Fatalf("descriptor keys must isolate fallback paths: direct=%+v relay=%+v wss=%+v", direct, relay, wss)
+	}
+	sharedDirect, err := newTerminalDescriptorKey(7, connectionmanager.PathDirectQUIC, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sharedWSS, err := newTerminalDescriptorKey(7, connectionmanager.PathWSS, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sharedDirect != sharedWSS {
+		t.Fatalf("ordinary transport descriptor key changed: direct=%+v wss=%+v", sharedDirect, sharedWSS)
+	}
+}
+
+func TestRelayFirstOneShotDescriptorRequestsOnlyRelayQUIC(t *testing.T) {
+	paths := oneShotDescriptorPaths(connectionmanager.ModeAuto)
+	if len(paths) != 3 || paths[0] != connectionmanager.PathRelayQUIC {
+		t.Fatalf("relay-first paths=%v", paths)
+	}
+	allowedPaths, ok := peerDescriptorAllowedPaths(paths[0])
+	if !ok || !slices.Equal(allowedPaths, []string{"relay_quic"}) {
+		t.Fatalf("relay descriptor paths=%v ok=%t", allowedPaths, ok)
 	}
 }
 

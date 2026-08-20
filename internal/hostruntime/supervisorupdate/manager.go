@@ -342,6 +342,7 @@ func (m *Manager) recoverLocked() error {
 		for _, item := range candidate {
 			if !regularMatches(item.current, componentFromState(item.target)) && regularFile(item.rollback) {
 				_ = os.Remove(item.current)
+				//paperboat:allow-source-policy atomic-replacement owner=supervisor-update reason=verified-reboot-rollback-restoration
 				if err := os.Rename(item.rollback, item.current); err != nil {
 					return ErrBlocked
 				}
@@ -467,6 +468,7 @@ func restoreRotations(items []struct {
 				return err
 			}
 		}
+		//paperboat:allow-source-policy atomic-replacement owner=supervisor-update reason=verified-component-rollback-restoration
 		if err := os.Rename(item.rollback, item.current); err != nil {
 			return err
 		}
@@ -551,6 +553,7 @@ func writeArtifact(ctx context.Context, stream io.ReadCloser, path string, targe
 		return ErrInvalidRelease
 	}
 	defer stream.Close()
+	//paperboat:allow-source-policy atomic-replacement owner=supervisor-update reason=same-directory-verified-component-staging
 	file, err := os.CreateTemp(filepath.Dir(path), ".paperboat-supervisor-")
 	if err != nil {
 		return err
@@ -584,6 +587,7 @@ func writeArtifact(ctx context.Context, stream io.ReadCloser, path string, targe
 	if verifier == nil || verifier.Verify(ctx, temp, target.Platform, target.Architecture) != nil {
 		return ErrInvalidRelease
 	}
+	//paperboat:allow-source-policy atomic-replacement owner=supervisor-update reason=verified-staged-component-publication
 	if err := os.Rename(temp, path); err != nil {
 		return err
 	}
@@ -599,10 +603,13 @@ func rotate(current, rollback, staged string, owner int) error {
 			return err
 		}
 	}
+	//paperboat:allow-source-policy atomic-replacement owner=supervisor-update reason=current-to-rollback-slot-transition
 	if err := os.Rename(current, rollback); err != nil {
 		return err
 	}
+	//paperboat:allow-source-policy atomic-replacement owner=supervisor-update reason=verified-staged-slot-activation
 	if err := os.Rename(staged, current); err != nil {
+		//paperboat:allow-source-policy atomic-replacement owner=supervisor-update reason=restore-rollback-after-activation-failure
 		_ = os.Rename(rollback, current)
 		return err
 	}

@@ -133,6 +133,16 @@ type Config struct {
 	RelayDelay     time.Duration
 	WSSDelay       time.Duration
 	ConnectTimeout time.Duration
+	// SequentialFallback starts only one candidate at a time. The next path
+	// starts only after the previous candidate has failed with a fallback-safe
+	// error.
+	SequentialFallback bool
+	// RelayFirst prioritizes relay QUIC, then WSS, before direct QUIC for a
+	// sequential one-shot operation. It leaves normal interactive racing alone.
+	RelayFirst bool
+	// OneShot stops after its first trusted connection. It is for one-off health
+	// checks and ephemeral setup operations that have no use for a warm standby.
+	OneShot bool
 }
 
 func (c Config) validate() error {
@@ -217,6 +227,9 @@ func (r *Racer) connect(ctx context.Context, generation uint64, mode Mode, netwo
 	if err != nil {
 		return Selection{}, err
 	}
+	if r.config.RelayFirst && (mode == ModeAuto || mode == ModeRelayRace) {
+		candidates = relayFirstCandidates(candidates)
+	}
 	relayRace := mode == ModeRelayRace
 	if excluded != 0 || only != 0 {
 		filtered := make([]candidate, 0, len(candidates)-1)
@@ -235,6 +248,14 @@ func (r *Racer) connect(ctx context.Context, generation uint64, mode Mode, netwo
 			return Selection{}, &Failure{Class: FailureReachability, Path: path, Cause: errors.New("no eligible peer path remains")}
 		}
 		candidates[0].delay = 0
+	}
+	if r.config.SequentialFallback {
+		// Candidate delays are normally a latency-race trigger. A monotonic
+		// control-plane attempt must not authorize a second carrier until the
+		// first candidate has conclusively failed.
+		for index := 1; index < len(candidates); index++ {
+			candidates[index].fallbackOnly = true
+		}
 	}
 	attemptCtx, cancel := context.WithTimeout(ctx, r.config.ConnectTimeout)
 	cancelOnReturn := true
@@ -259,7 +280,15 @@ func (r *Racer) connect(ctx context.Context, generation uint64, mode Mode, netwo
 				results <- result{index: index, err: attemptCtx.Err()}
 				return
 			}
-			connection, connectErr := r.connector.Connect(attemptCtx, Attempt{Generation: generation, Path: item.path})
+			candidateCtx, cancelCandidate := r.candidateContext(attemptCtx, index, len(candidates))
+			connection, connectErr := r.connector.Connect(candidateCtx, Attempt{Generation: generation, Path: item.path})
+			candidateErr := candidateCtx.Err()
+			cancelCandidate()
+			if errors.Is(candidateErr, context.DeadlineExceeded) {
+				// This deadline belongs to the sequential policy, not to the
+				// control plane. It must advance to the next authorized path.
+				connectErr = &Failure{Class: FailureTimeout, Path: item.path, Cause: errors.Join(connectErr, candidateErr)}
+			}
 			if nilConnection(connection) {
 				connection = nil
 				if connectErr == nil {
@@ -283,7 +312,7 @@ func (r *Racer) connect(ctx context.Context, generation uint64, mode Mode, netwo
 			results <- result{index: index, connection: connection, relayRegion: relayRegion, err: connectErr}
 		}(index, item)
 	}
-	if mode == ModeAuto || mode == ModeRelayRace {
+	if (mode == ModeAuto || mode == ModeRelayRace) && !r.config.SequentialFallback {
 		for index := range candidates {
 			candidates[index].begin()
 		}
@@ -344,6 +373,11 @@ func (r *Racer) connect(ctx context.Context, generation uint64, mode Mode, netwo
 		if outcome.err == nil {
 			if mode == ModeAuto || relayRace {
 				winner = Selection{Generation: generation, Path: path, RelayRegion: outcome.relayRegion, Connection: outcome.connection}
+				if r.config.OneShot {
+					cancel()
+					go drainCandidateResults(results, candidates, len(candidates)-completed, winner.Connection)
+					return winner, nil
+				}
 				standby := make(chan StandbyResult, 2)
 				winner.StandbyReady = standby
 				cancelOnReturn = false
@@ -512,6 +546,33 @@ func (r *Racer) connect(ctx context.Context, generation uint64, mode Mode, netwo
 		return Selection{}, &Failure{Class: FailureTimeout, Cause: attemptCtx.Err()}
 	}
 	return Selection{}, errors.Join(failures...)
+}
+
+func (r *Racer) candidateContext(ctx context.Context, index, total int) (context.Context, context.CancelFunc) {
+	if r == nil || !r.config.SequentialFallback || index >= total-1 {
+		return ctx, func() {}
+	}
+	budget := r.config.RelayDelay
+	if index == 1 {
+		// These are per-candidate budgets, not absolute offsets on the former
+		// parallel-race timeline. Production commonly uses equal delays, so
+		// subtracting RelayDelay would skip the second candidate.
+		budget = r.config.WSSDelay
+	}
+	return context.WithTimeout(ctx, budget)
+}
+
+func relayFirstCandidates(candidates []candidate) []candidate {
+	ordered := make([]candidate, 0, len(candidates))
+	for _, path := range [...]Path{PathRelayQUIC, PathWSS, PathDirectQUIC} {
+		for index := range candidates {
+			item := &candidates[index]
+			if item.path == path {
+				ordered = append(ordered, candidate{path: item.path, delay: item.delay, fallbackOnly: item.fallbackOnly, start: make(chan struct{})})
+			}
+		}
+	}
+	return ordered
 }
 
 func (r *Racer) awaitWarmFallback(ctx context.Context, generation uint64, results <-chan result, candidates []candidate, remaining int, ready chan<- StandbyResult) {

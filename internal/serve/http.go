@@ -26,11 +26,7 @@ func NewHandler(config HandlerConfig) (http.Handler, error) {
 			serveSingleFile(writer, request, config.Source)
 		})), nil
 	}
-	root, err := os.OpenRoot(config.Source.Path)
-	if err != nil {
-		return nil, err
-	}
-	return safetyHeaders(&directoryHandler{source: config.Source, root: root, spa: config.SPA}), nil
+	return safetyHeaders(&directoryHandler{source: config.Source, spa: config.SPA}), nil
 }
 
 func serveSingleFile(writer http.ResponseWriter, request *http.Request, source Source) {
@@ -59,7 +55,6 @@ func serveSingleFile(writer http.ResponseWriter, request *http.Request, source S
 
 type directoryHandler struct {
 	source Source
-	root   *os.Root
 	spa    bool
 }
 
@@ -72,22 +67,33 @@ func (h *directoryHandler) ServeHTTP(writer http.ResponseWriter, request *http.R
 		http.Error(writer, "source unavailable", http.StatusGone)
 		return
 	}
+	root, err := os.OpenRoot(h.source.Path)
+	if err != nil {
+		http.Error(writer, "source unavailable", http.StatusGone)
+		return
+	}
+	defer root.Close()
+	info, err := root.Stat(".")
+	if err != nil || !os.SameFile(h.source.info, info) {
+		http.Error(writer, "source unavailable", http.StatusGone)
+		return
+	}
 	relative, ok := requestPath(request.URL.Path)
 	if !ok {
 		http.NotFound(writer, request)
 		return
 	}
-	if h.servePath(writer, request, relative) {
+	if h.servePath(root, writer, request, relative) {
 		return
 	}
-	if h.spa && navigationRequest(request, relative) && h.servePath(writer, request, "index.html") {
+	if h.spa && navigationRequest(request, relative) && h.servePath(root, writer, request, "index.html") {
 		return
 	}
 	http.NotFound(writer, request)
 }
 
-func (h *directoryHandler) servePath(writer http.ResponseWriter, request *http.Request, relative string) bool {
-	file, err := h.root.Open(relative)
+func (h *directoryHandler) servePath(root *os.Root, writer http.ResponseWriter, request *http.Request, relative string) bool {
+	file, err := root.Open(relative)
 	if err != nil {
 		return false
 	}
@@ -98,7 +104,7 @@ func (h *directoryHandler) servePath(writer http.ResponseWriter, request *http.R
 		if relative == "." {
 			index = "index.html"
 		}
-		file, err = h.root.Open(index)
+		file, err = root.Open(index)
 		if err != nil {
 			return false
 		}
@@ -181,8 +187,6 @@ func (h safetyHandler) Close() error {
 	}
 	return nil
 }
-
-func (h *directoryHandler) Close() error { return h.root.Close() }
 
 func safetyHeaders(next http.Handler) http.Handler {
 	return safetyHandler{next: next}

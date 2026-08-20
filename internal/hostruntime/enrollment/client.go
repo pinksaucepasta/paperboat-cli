@@ -18,7 +18,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
@@ -452,8 +451,7 @@ func loadRuntimeIdentity(root string, now time.Time, expiryGrace time.Duration) 
 	if err != nil {
 		return RuntimeIdentity{}, err
 	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o600 || stat.Nlink != 1 || info.Size() > 32<<10 {
+	if !secureIdentityFile(path, info, 32<<10) {
 		return RuntimeIdentity{}, ErrInvalid
 	}
 	body, err := os.ReadFile(path)

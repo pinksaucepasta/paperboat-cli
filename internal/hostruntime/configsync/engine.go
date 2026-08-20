@@ -146,12 +146,13 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 		return nil
 	}
 	cancel()
-	_ = watcher.Close()
 	select {
 	case <-done:
 	case <-ctx.Done():
+		_ = watcher.Close()
 		return ctx.Err()
 	}
+	_ = watcher.Close()
 	flushTimeout := e.descriptor.Policy.ShutdownFlushTimeout
 	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < flushTimeout {
 		flushTimeout = time.Until(deadline)

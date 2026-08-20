@@ -62,7 +62,7 @@ func Prepare(paths []string, limits Limits) (*PreparedBatch, error) {
 		if before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() {
 			return nil, fmt.Errorf("%s is not a regular file", path)
 		}
-		file, err := os.Open(path)
+		file, err := openSourceFile(path)
 		if err != nil {
 			return nil, fmt.Errorf("open file: %w", err)
 		}

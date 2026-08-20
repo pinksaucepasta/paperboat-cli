@@ -77,13 +77,7 @@ func Run(ctx context.Context, config DaemonConfig) error {
 	var managedSSHRuntime *ManagedSSHRuntime
 	if config.ManagedSSH != nil {
 		managedSSHRuntime, err = StartManagedSSH(ctx, *config.ManagedSSH)
-		if source, ok := config.Source.(*AuthenticatedMachineSource); ok {
-			if err != nil {
-				source.SSHLocalCode = ManagedSSHHealthCode(err)
-			} else {
-				source.SSHLocalReady = true
-			}
-		}
+		reportManagedSSHStartup(config.Source, recorder, err)
 		defer func() {
 			if managedSSHRuntime != nil {
 				_ = managedSSHRuntime.Close()

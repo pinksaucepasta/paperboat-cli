@@ -1,4 +1,4 @@
-//go:build darwin || linux
+//go:build darwin || linux || windows
 
 package runtime
 
@@ -197,6 +197,9 @@ func (s *networkChangeService) Start(context.Context) error {
 func (s *networkChangeService) Shutdown(ctx context.Context) error {
 	if s == nil {
 		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	s.mu.Lock()
 	if s.closed {

@@ -39,7 +39,6 @@ import (
 	"text/tabwriter"
 	"time"
 
-	shlex "github.com/anmitsu/go-shlex"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/pinksaucepasta/paperboat/internal/api"
 	sessionauth "github.com/pinksaucepasta/paperboat/internal/auth"
@@ -66,6 +65,7 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/localapi"
 	"github.com/pinksaucepasta/paperboat/internal/localdaemon"
 	"github.com/pinksaucepasta/paperboat/internal/localwait"
+	"github.com/pinksaucepasta/paperboat/internal/machinename"
 	"github.com/pinksaucepasta/paperboat/internal/managedssh"
 	"github.com/pinksaucepasta/paperboat/internal/paste"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/connectionmanager"
@@ -85,6 +85,7 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/telemetry"
 	"github.com/pinksaucepasta/paperboat/internal/tunnel"
 	"github.com/pinksaucepasta/paperboat/internal/userpaths"
+	"github.com/pinksaucepasta/paperboat/internal/windowsopenssh"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -166,6 +167,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 func userFacingError(err error) string {
 	if err == nil {
 		return ""
+	}
+	var peerFailure *connectionmanager.Failure
+	if errors.As(err, &peerFailure) {
+		return "The secure connection could not be established. Retry; if this continues, run `pb doctor`."
 	}
 	if errors.Is(err, context.Canceled) {
 		return "Operation canceled."
@@ -311,6 +316,31 @@ func updatedRuntimeCommand() *cobra.Command {
 	}, SilenceUsage: true, SilenceErrors: true}
 }
 
+func windowsSSHDServiceCommand() *cobra.Command {
+	command := &cobra.Command{
+		Use:    "__windows-sshd-service",
+		Hidden: true,
+		Args:   commandArgs(cobra.NoArgs),
+		RunE: func(command *cobra.Command, _ []string) error {
+			sshdPath, err := command.Flags().GetString("sshd")
+			if err != nil {
+				return err
+			}
+			configPath, err := command.Flags().GetString("config")
+			if err != nil {
+				return err
+			}
+			return windowsopenssh.RunServiceHost(sshdPath, configPath)
+		},
+		SilenceUsage: true, SilenceErrors: true,
+	}
+	command.Flags().String("sshd", "", "managed sshd executable")
+	command.Flags().String("config", "", "managed sshd configuration")
+	_ = command.MarkFlagRequired("sshd")
+	_ = command.MarkFlagRequired("config")
+	return command
+}
+
 func localDaemonCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:    "__local-daemon",
@@ -346,6 +376,9 @@ func localDaemonCommand() *cobra.Command {
 			var managedConfig *localdaemon.ManagedSSHConfig
 			if store, storeErr := config.ProfileStoreFor(cfg); storeErr == nil {
 				if profile, profileErr := store.Load(cfg.ServerURL); profileErr == nil {
+					source.AutoApprovePeerEnrollments = func(ctx context.Context, client *api.Client, machines []api.UserMachine) error {
+						return localdaemon.ApproveOwnedPeerEnrollments(ctx, store, profile, client, machines)
+					}
 					if executable, executableErr := os.Executable(); executableErr == nil {
 						home, homeErr := os.UserHomeDir()
 						if homeErr == nil {
@@ -478,6 +511,25 @@ func doctorCommandV1() *cobra.Command {
 		Short: "Check Paperboat connectivity and readiness",
 		Args:  commandArgs(cobra.MaximumNArgs(1)),
 		RunE: func(command *cobra.Command, args []string) error {
+			repair, _ := command.Flags().GetBool("repair")
+			if repair {
+				if len(args) != 0 {
+					return errors.New("doctor --repair does not accept a machine")
+				}
+				if runtime.GOOS == "windows" {
+					doctorArgs := []string{"doctor", "--repair"}
+					if jsonOutput, _ := command.Flags().GetBool("json"); jsonOutput {
+						doctorArgs = append(doctorArgs, "--json")
+					}
+					if code := hostruntimecmd.Execute(command.Context(), doctorArgs, command.InOrStdin(), command.OutOrStdout(), command.ErrOrStderr()); code != 0 {
+						return exitCodeError{code: code}
+					}
+					return nil
+				}
+				if err := repairWindowsOpenSSH(command.Context()); err != nil {
+					return err
+				}
+			}
 			_, snapshot, err := localDaemonSnapshot(command, localdaemon.InstallCurrentUserService)
 			if err != nil {
 				return fmt.Errorf("read local Paperboat diagnostics: %w", err)
@@ -516,6 +568,7 @@ func doctorCommandV1() *cobra.Command {
 		},
 	}
 	command.Flags().Bool("json", false, "print JSON")
+	command.Flags().Bool("repair", false, "repair Paperboat-owned local dependencies")
 	return command
 }
 
@@ -1285,6 +1338,13 @@ func configRuntimeCommand() *cobra.Command {
 					return err
 				}
 			}
+			handled, err := enterWindowsConfigService(stateRoot)
+			if err != nil {
+				return err
+			}
+			if handled {
+				return nil
+			}
 			store, err := identity.Open(identity.Config{StateRoot: stateRoot})
 			if err != nil {
 				return fmt.Errorf("open machine identity: %w", err)
@@ -1299,7 +1359,7 @@ func configRuntimeCommand() *cobra.Command {
 			}
 			chezmoi := strings.TrimSpace(os.Getenv("PAPERBOAT_CHEZMOI_PATH"))
 			if chezmoi == "" {
-				chezmoi = "/usr/local/bin/chezmoi"
+				chezmoi = defaultChezmoiPath()
 			}
 			hosts := []string{"github.com"}
 			if raw := strings.TrimSpace(os.Getenv("PAPERBOAT_CONFIG_REPOSITORY_HOSTS")); raw != "" {
@@ -1340,6 +1400,12 @@ func previewRuntimeCommand() *cobra.Command {
 			}
 			if stateRoot == "" || name == "" || port == 0 || indefinite && (duration != 0 || expiresAt != nil) || !indefinite && duration <= 0 && expiresAt == nil {
 				return invocationError(errors.New("invalid preview runtime descriptor"))
+			}
+			if handled, serviceErr := enterWindowsPreviewService(command.Context(), stateRoot, name); handled || serviceErr != nil {
+				return serviceErr
+			}
+			if handled, testErr := runWindowsPreviewNativeE2E(command.Context(), stateRoot, name); handled {
+				return testErr
 			}
 			store, err := identity.Open(identity.Config{StateRoot: stateRoot})
 			if err != nil {
@@ -1392,6 +1458,12 @@ func privatePreviewRuntimeCommand() *cobra.Command {
 			}
 			if !filepath.IsAbs(stateRoot) || name == "" || indefinite == (expiresAt != nil) {
 				return invocationError(errors.New("invalid private preview runtime descriptor"))
+			}
+			if handled, serviceErr := enterWindowsPreviewService(command.Context(), stateRoot, name); handled || serviceErr != nil {
+				return serviceErr
+			}
+			if handled, testErr := runWindowsPreviewNativeE2E(command.Context(), stateRoot, name); handled {
+				return testErr
 			}
 			remote, err := hostruntimeentry.ReadPrivatePreviewService(stateRoot, name)
 			if err != nil {
@@ -1472,6 +1544,12 @@ func serveRuntimeCommand() *cobra.Command {
 			if stateRoot == "" || name == "" || !filepath.IsAbs(descriptorPath) || indefinite == (expiresAt != nil) {
 				return invocationError(errors.New("invalid serve runtime descriptor"))
 			}
+			if handled, serviceErr := enterWindowsPreviewService(command.Context(), stateRoot, name); handled || serviceErr != nil {
+				return serviceErr
+			}
+			if handled, testErr := runWindowsPreviewNativeE2E(command.Context(), stateRoot, name); handled {
+				return testErr
+			}
 			controlURL := ""
 			if store, openErr := identity.Open(identity.Config{StateRoot: stateRoot}); openErr == nil {
 				if registration, registrationErr := store.Registration(); registrationErr == nil {
@@ -1522,11 +1600,16 @@ func pairCommand() *cobra.Command {
 				return fmt.Errorf("open machine identity: %w", err)
 			}
 			registration, err := identityStore.Registration()
-			if errors.Is(err, os.ErrNotExist) {
-				return errors.New("run `pb setup` before pairing this machine")
+			fresh := errors.Is(err, os.ErrNotExist)
+			if fresh {
+				registration = identity.Registration{}
 			}
 			if err != nil {
-				return fmt.Errorf("load machine registration: %w", err)
+				if fresh {
+					err = nil
+				} else {
+					return fmt.Errorf("load machine registration: %w", err)
+				}
 			}
 			serverURL, err := command.Flags().GetString("server")
 			if err != nil {
@@ -1537,16 +1620,37 @@ func pairCommand() *cobra.Command {
 				if err != nil {
 					return err
 				}
-				if serverURL != registration.ServerURL {
+				if !fresh && serverURL != registration.ServerURL {
 					return errors.New("this machine is set up for a different Paperboat server")
 				}
 			}
+			if fresh && serverURL == "" {
+				serverURL = strings.TrimSpace(buildinfo.DefaultServerURL)
+			}
+			if fresh && serverURL == "" {
+				return errors.New("fresh pairing requires --server")
+			}
+			if fresh {
+				token, _ := command.Flags().GetString("enrollment-token")
+				tokenFile, _ := command.Flags().GetString("enrollment-token-file")
+				if strings.TrimSpace(token) == "" && strings.TrimSpace(tokenFile) == "" {
+					return errors.New("fresh pairing requires --enrollment-token or --enrollment-token-file")
+				}
+				if runtime.GOOS == "windows" {
+					if _, err := setupPlatformHostPrerequisites(command.Context()); err != nil {
+						return fmt.Errorf("prepare Windows OpenSSH: %w", err)
+					}
+				}
+			}
 			publicIdentityKey := base64.RawURLEncoding.EncodeToString(identityStore.Current().Public())
-			if registration.PublicIdentityKey != publicIdentityKey {
+			if !fresh && registration.PublicIdentityKey != publicIdentityKey {
 				return errors.New("machine setup identity does not match the current key; run `pb setup` to repair it")
 			}
-			arguments := []string{"bootstrap", "--server", registration.ServerURL}
-			for _, name := range []string{"enrollment-token", "name", "shell", "state-root"} {
+			if !fresh {
+				serverURL = registration.ServerURL
+			}
+			arguments := []string{"bootstrap", "--server", serverURL}
+			for _, name := range []string{"enrollment-token", "enrollment-token-file", "name", "shell", "state-root", "setup-mode"} {
 				value, err := command.Flags().GetString(name)
 				if err != nil {
 					return err
@@ -1555,25 +1659,16 @@ func pairCommand() *cobra.Command {
 					arguments = append(arguments, "--"+name, value)
 				}
 			}
+			acceptBetaPlatform, err := command.Flags().GetBool("accept-beta-platform")
+			if err != nil {
+				return err
+			}
+			if acceptBetaPlatform {
+				arguments = append(arguments, "--accept-beta-platform")
+			}
 			code := hostruntimecmd.Execute(command.Context(), arguments, command.InOrStdin(), command.OutOrStdout(), command.ErrOrStderr())
 			if code != 0 {
 				return exitCodeError{code: code}
-			}
-			client, err := backendClient(actionContext(command, nil))
-			if err != nil {
-				return fmt.Errorf("refresh paired machine registration: %w", err)
-			}
-			machine, err := doctorUserMachine(command.Context(), client, registration.MachineID)
-			if err != nil {
-				return fmt.Errorf("refresh paired machine registration: %w", err)
-			}
-			registration.EnvironmentID = machine.EnvironmentID
-			registration.InstallationGeneration = machine.InstallationGeneration
-			registration.SetupRoles = append([]string(nil), machine.SetupRoles...)
-			registration.SetupMode = "host"
-			registration.UpdatedAt = time.Now().UTC()
-			if err := identityStore.SaveRegistration(registration); err != nil {
-				return fmt.Errorf("save paired machine registration: %w", err)
 			}
 			return nil
 		},
@@ -1581,9 +1676,12 @@ func pairCommand() *cobra.Command {
 		SilenceErrors: true,
 	}
 	command.Flags().String("enrollment-token", "", "single-use pairing token")
+	command.Flags().String("enrollment-token-file", "", "absolute protected file containing a single-use pairing token")
 	command.Flags().String("name", "", "machine name")
 	command.Flags().String("shell", "", "absolute login shell")
 	command.Flags().String("state-root", "", "runtime state directory")
+	command.Flags().String("setup-mode", "host", "enrollment role: host or client")
+	command.Flags().Bool("accept-beta-platform", false, "accept enrollment on a beta platform such as Windows arm64")
 	return command
 }
 
@@ -1593,6 +1691,13 @@ func setupCommand() *cobra.Command {
 		Short: "Set up this machine for Paperboat",
 		Args:  commandArgs(cobra.NoArgs),
 		RunE: func(command *cobra.Command, _ []string) error {
+			acceptBetaPlatform, err := command.Flags().GetBool("accept-beta-platform")
+			if err != nil {
+				return err
+			}
+			if runtime.GOOS == "windows" && runtime.GOARCH == "arm64" && !acceptBetaPlatform {
+				return invocationError(errors.New("Windows arm64 is beta; rerun with --accept-beta-platform to continue"))
+			}
 			mode, err := command.Flags().GetString("mode")
 			if err != nil {
 				return err
@@ -1600,6 +1705,17 @@ func setupCommand() *cobra.Command {
 			mode, err = resolveSetupMode(mode, term.IsTerminal(int(os.Stdin.Fd())), command.ErrOrStderr())
 			if err != nil {
 				return err
+			}
+			if mode == "host" && runtime.GOOS == "windows" {
+				sshPort, setupErr := setupPlatformHostPrerequisites(command.Context())
+				if setupErr != nil {
+					return fmt.Errorf("prepare Windows OpenSSH: %w", setupErr)
+				}
+				if sshPort != 0 {
+					if err := command.Flags().Set("ssh-port", strconv.Itoa(int(sshPort))); err != nil {
+						return err
+					}
+				}
 			}
 			sshPortValue := uint(0)
 			if mode == "host" {
@@ -1670,7 +1786,8 @@ func setupCommand() *cobra.Command {
 				SetupMode:   setupAPIMode,
 				DisplayName: strings.TrimSpace(name), Platform: runtime.GOOS, Architecture: runtime.GOARCH,
 				WorkspaceRoot: workspaceRoot, PublicIdentityKey: publicIdentityKey,
-				RuntimeVersions: map[string]string{"pb": buildinfo.Version},
+				RuntimeVersions:    map[string]string{"pb": buildinfo.Version},
+				AcceptBetaPlatform: acceptBetaPlatform,
 			})
 			if err != nil {
 				if errors.Is(err, api.ErrUnauthenticated) {
@@ -1703,10 +1820,10 @@ func setupCommand() *cobra.Command {
 			}
 			if mode == "session" {
 				if previousMode != "" && previousMode != "session" {
-					if err := hostruntimeentry.RemoveAllPreviewServices(command.Context(), stateRoot); err != nil {
+					if err := cleanupDurablePreviewServices(command); err != nil {
 						return fmt.Errorf("stop durable previews before session-mode transition: %w", err)
 					}
-					if code := hostruntimecmd.Execute(command.Context(), []string{"service", "uninstall"}, command.InOrStdin(), command.OutOrStdout(), command.ErrOrStderr()); code != 0 {
+					if code := hostruntimecmd.Execute(command.Context(), []string{"service", "uninstall-persisted"}, command.InOrStdin(), command.OutOrStdout(), command.ErrOrStderr()); code != 0 {
 						return errors.New("session mode was saved, but persistent service removal failed; retry `pb setup --mode session`")
 					}
 				}
@@ -1819,6 +1936,7 @@ func setupCommand() *cobra.Command {
 	command.Flags().String("mode", "", "installation mode: receive, session, or host")
 	command.Flags().String("state-root", "", "runtime state directory")
 	command.Flags().Uint("ssh-port", 22, "existing loopback sshd port")
+	command.Flags().Bool("accept-beta-platform", false, "accept enrollment on a beta operating-system platform")
 	command.Flags().String("recovery-output", "", "new absolute file for the account recovery key")
 	return command
 }
@@ -1895,7 +2013,7 @@ func unpairCommand() *cobra.Command {
 			if registration.ServerURL != d.cfg.ServerURL {
 				return errors.New("this machine is registered to a different Paperboat server")
 			}
-			if err := hostruntimeentry.RemoveAllPreviewServices(command.Context(), stateRoot); err != nil {
+			if err := cleanupDurablePreviewServices(command); err != nil {
 				return fmt.Errorf("stop durable previews before unpairing: %w", err)
 			}
 			machine, err := client.UnpairMachine(command.Context(), registration.MachineID)
@@ -1909,7 +2027,7 @@ func unpairCommand() *cobra.Command {
 			if err := identityStore.SaveRegistration(registration); err != nil {
 				return fmt.Errorf("save machine registration: %w", err)
 			}
-			code := hostruntimecmd.Execute(command.Context(), []string{"service", "uninstall"}, command.InOrStdin(), command.OutOrStdout(), command.ErrOrStderr())
+			code := hostruntimecmd.Execute(command.Context(), []string{"service", "uninstall-persisted"}, command.InOrStdin(), command.OutOrStdout(), command.ErrOrStderr())
 			if code != 0 {
 				return errors.New("host authority was revoked, but local service removal failed; retry `pb unpair`")
 			}
@@ -1978,6 +2096,9 @@ func uninstallCommand() *cobra.Command {
 			if _, configErr := managedssh.UninstallOpenSSHConfig(home, uint32(os.Geteuid())); configErr != nil {
 				return fmt.Errorf("remove managed OpenSSH configuration: %w", configErr)
 			}
+			if identityErr := managedssh.UninstallManagedIdentityPublicKey(home, uint32(os.Geteuid())); identityErr != nil {
+				return fmt.Errorf("remove managed SSH public identity: %w", identityErr)
+			}
 			if code := hostruntimecmd.Execute(command.Context(), []string{"purge"}, command.InOrStdin(), command.OutOrStdout(), command.ErrOrStderr()); code != 0 {
 				return errors.New("system Paperboat removal failed")
 			}
@@ -1994,7 +2115,7 @@ func uninstallCommand() *cobra.Command {
 }
 
 func cleanupDurablePreviewServices(command *cobra.Command) error {
-	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" && runtime.GOOS != "windows" {
 		return nil
 	}
 	roots := make(map[string]struct{})
@@ -2011,8 +2132,16 @@ func cleanupDurablePreviewServices(command *cobra.Command) error {
 		}
 		roots[filepath.Clean(root)] = struct{}{}
 	}
-	var result error
+	rootList := make([]string, 0, len(roots))
 	for root := range roots {
+		rootList = append(rootList, root)
+	}
+	sort.Strings(rootList)
+	if runtime.GOOS == "windows" {
+		return cleanupDurablePreviewServicesWindows(command.Context(), rootList)
+	}
+	var result error
+	for _, root := range rootList {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(command.Context()), 30*time.Second)
 		err := hostruntimeentry.RemoveAllPreviewServices(cleanupCtx, root)
 		cancel()
@@ -2199,6 +2328,7 @@ func newRootCommand() *cobra.Command {
 	sshProxyCommand := &cobra.Command{Use: "__ssh-proxy", Hidden: true, Args: commandArgs(cobra.NoArgs), RunE: actionSSHProxy}
 	sshProxyCommand.Flags().String("host", "", "")
 	sshProxyCommand.Flags().String("port", "", "")
+	sshProxyCommand.Flags().String("user", "", "")
 	sshProxyCommand.Flags().String("transport", "", "")
 	root.AddCommand(sshProxyCommand)
 	sshKnownHostsCommand := &cobra.Command{Use: "__ssh-known-hosts", Hidden: true, Args: commandArgs(cobra.NoArgs), RunE: actionSSHKnownHosts}
@@ -2290,6 +2420,7 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(hostdRuntimeCommand())
 	root.AddCommand(runtimeWorkerCommand())
 	root.AddCommand(updatedRuntimeCommand())
+	root.AddCommand(windowsSSHDServiceCommand())
 	root.AddCommand(localDaemonCommand())
 	root.AddCommand(statusCommand())
 	root.AddCommand(waitCommand())
@@ -2299,6 +2430,7 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(serveRuntimeCommand())
 	root.AddCommand(privilegedHostServiceCommand())
 	root.AddCommand(privilegedServiceOperationCommand())
+	root.AddCommand(msiCleanupCommand())
 	root.AddCommand(configRuntimeCommand())
 	configureShellCompletion(root)
 	return root
@@ -2787,7 +2919,11 @@ func runHomeAction(command *cobra.Command, action string) error {
 }
 
 func versionDisplay(version string) string {
-	return brandDisplay(version, "") + "\n"
+	display := brandDisplay(version, "")
+	if runtime.GOOS == "windows" && runtime.GOARCH == "arm64" {
+		display += "\n  Platform Windows arm64 (beta)"
+	}
+	return display + "\n"
 }
 
 func homeBrand(command *cobra.Command, revealEmail bool) string {
@@ -3276,6 +3412,22 @@ func actionHomeMachines(command *cobra.Command) error {
 				runErr = actionHomeMachinePreviews(command, client, machine)
 			case "send":
 				runErr = actionHomeSendToMachine(command, machine)
+			case "rename":
+				fmt.Fprintf(command.ErrOrStderr(), "New name for %s: ", machine.DisplayName)
+				name, readErr := bufio.NewReader(io.LimitReader(command.InOrStdin(), 257)).ReadString('\n')
+				if readErr != nil && !errors.Is(readErr, io.EOF) {
+					runErr = readErr
+					break
+				}
+				name = strings.TrimSpace(name)
+				if name == "" {
+					runErr = errors.New("machine name must not be empty")
+					break
+				}
+				runErr = executeInteractiveCommand(command, []string{"machine", "rename", machine.ID, name})
+				if runErr == nil {
+					machine.DisplayName = name
+				}
 			case "allow-sleep":
 				runErr = executeInteractiveCommand(command, []string{"machine", "availability", machine.ID, "--mode", "allow-sleep"})
 			case "keep-awake":
@@ -3295,6 +3447,7 @@ func actionHomeMachines(command *cobra.Command) error {
 
 func machineHomeActions(machine api.UserMachine) []selector.Item {
 	actions := make([]selector.Item, 0, 8)
+	actions = append(actions, selector.Item{ID: "rename", Title: "Rename", Description: "Change this machine's display name"})
 	if machine.Capabilities.TerminalHost.Configured {
 		actions = append(actions,
 			selector.Item{ID: "terminal", Title: "Create terminal session", Description: "Start and attach to a new durable session"},
@@ -3544,7 +3697,7 @@ func actionHomeSendToMachine(command *cobra.Command, machine api.UserMachine) er
 }
 
 func droppedFilePaths(value string) ([]string, error) {
-	paths, err := shlex.Split(strings.TrimSpace(value), true)
+	paths, err := splitDroppedPaths(strings.TrimSpace(value))
 	if err != nil || len(paths) == 0 {
 		return nil, errors.New("drop or paste at least one valid file or folder path")
 	}
@@ -4584,7 +4737,7 @@ func userMachineCobraCommand() *cobra.Command {
 		}
 		return command.Help()
 	}}
-	add := &cobra.Command{Use: "add", Short: "Start machine enrollment in the dashboard", Args: commandArgs(cobra.NoArgs), RunE: func(command *cobra.Command, args []string) error {
+	add := &cobra.Command{Use: "add", Short: "Print a one-shot machine enrollment command", Args: commandArgs(cobra.NoArgs), RunE: func(command *cobra.Command, args []string) error {
 		ctx := actionContext(command, args)
 		cfg, err := config.Load(ctx.String("config"))
 		if err != nil {
@@ -4599,17 +4752,35 @@ func userMachineCobraCommand() *cobra.Command {
 		if strings.TrimSpace(cfg.ServerURL) == "" {
 			return errors.New("Paperboat server is not configured; set server_url or use --server")
 		}
-		clientConfiguration, err := api.New(cfg.ServerURL, config.Credential{}, nil).ClientConfiguration(ctx.Context)
+		role, _ := command.Flags().GetString("role")
+		name, _ := command.Flags().GetString("name")
+		if role != "host" && role != "client" {
+			return errors.New("--role must be host or client")
+		}
+		authSource, err := sessionauth.NewSource(cfg)
 		if err != nil {
-			return friendlyCommandError(fmt.Errorf("load Paperboat client configuration: %w", err))
+			return err
 		}
-		target := clientConfiguration.MachinesURL
-		if err := openBrowser(target); err != nil {
-			fmt.Fprintln(command.ErrOrStderr(), "Could not open a browser automatically. Open the enrollment URL shown below.")
+		credential, err := authSource.Credential()
+		if err != nil {
+			return err
 		}
-		fmt.Fprintf(command.OutOrStdout(), "Continue machine enrollment at %s\n", target)
+		client := api.New(cfg.ServerURL, credential, nil)
+		shell, _ := command.Flags().GetString("shell")
+		result, err := client.StartMachineEnrollment(ctx.Context, fmt.Sprintf("cli-%d", time.Now().UnixNano()), role, shell)
+		if err != nil {
+			return friendlyCommandError(err)
+		}
+		parameter := result.BootstrapToken
+		if name != "" {
+			parameter = name + "-" + parameter
+		}
+		fmt.Fprintf(command.OutOrStdout(), "Linux/macOS:\ncurl -fsSL 'https://get.pprbt.dev/install?p=%s' | bash\n\nWindows PowerShell:\nirm 'https://get.pprbt.dev/install?p=%s' | iex\n", parameter, parameter)
 		return nil
 	}}
+	add.Flags().String("role", "host", "machine role: host or client")
+	add.Flags().String("shell", "posix", "installer shell: posix or powershell")
+	add.Flags().String("name", "", "optional machine hostname")
 	list := &cobra.Command{Use: "list", Short: "List enrolled machines", Args: commandArgs(cobra.NoArgs), RunE: func(command *cobra.Command, args []string) error {
 		ctx := actionContext(command, args)
 		client, err := backendClient(ctx)
@@ -4636,6 +4807,33 @@ func userMachineCobraCommand() *cobra.Command {
 		return writer.Flush()
 	}}
 	list.Flags().Bool("json", false, "print JSON")
+	rename := &cobra.Command{Use: "rename <machine> <name>", Short: "Rename a machine", Args: commandArgs(cobra.ExactArgs(2)), RunE: func(command *cobra.Command, args []string) error {
+		newName := strings.TrimSpace(args[1])
+		if err := machinename.Validate(newName); err != nil {
+			return invocationError(fmt.Errorf("invalid machine name: %w", err))
+		}
+		ctx := actionContext(command, args)
+		client, err := backendClient(ctx)
+		if err != nil {
+			return err
+		}
+		machine, err := resolveUserMachine(ctx.Context, client, args[0])
+		if err != nil {
+			return friendlyCommandError(err)
+		}
+		fmt.Fprintf(command.ErrOrStderr(), "Machine: %s (%s)\n", machine.DisplayName, machine.ID)
+		updated, err := client.RenameUserMachine(ctx.Context, machine.ID, newName)
+		if err != nil {
+			return friendlyCommandError(err)
+		}
+		jsonOutput, _ := command.Flags().GetBool("json")
+		if jsonOutput {
+			return json.NewEncoder(command.OutOrStdout()).Encode(map[string]any{"version": "1", "machine": updated, "outcome": "renamed"})
+		}
+		fmt.Fprintf(command.OutOrStdout(), "Renamed machine %s to %s (%s).\n", machine.DisplayName, updated.DisplayName, updated.ID)
+		return nil
+	}}
+	rename.Flags().Bool("json", false, "print JSON")
 	revoke := &cobra.Command{Use: "revoke <machine>", Short: "Disconnect and revoke a machine", Args: commandArgs(cobra.ExactArgs(1)), RunE: func(cobraCommand *cobra.Command, args []string) error {
 		if confirmed, _ := cobraCommand.Flags().GetBool("yes"); !confirmed {
 			return errors.New("machine revocation requires --yes")
@@ -4704,12 +4902,7 @@ func userMachineCobraCommand() *cobra.Command {
 	availability.Flags().String("mode", "", "availability mode: allow-sleep or keep-awake")
 	availability.Flags().Bool("yes", false, "confirm keep-awake power behavior")
 	availability.Flags().Bool("json", false, "print JSON")
-	pendingTrust := &cobra.Command{Use: "pending", Short: "List machines awaiting trust approval", Args: commandArgs(cobra.NoArgs), RunE: actionRun(e2eePending)}
-	pendingTrust.Flags().Bool("json", false, "print JSON")
-	approveTrust := &cobra.Command{Use: "approve <request-id>", Short: "Approve a machine after comparing its trust code", Args: commandArgs(cobra.ExactArgs(1)), RunE: actionRun(e2eeApproveMachine)}
-	approveTrust.Flags().String("code", "", "trust code shown by the machine")
-	approveTrust.Flags().Bool("json", false, "print JSON")
-	machine.AddCommand(add, list, revoke, availability, pendingTrust, approveTrust)
+	machine.AddCommand(add, list, rename, revoke, availability)
 	return machine
 }
 
@@ -5076,123 +5269,6 @@ func exportSetupRecoveryKey(command *cobra.Command) error {
 		return fmt.Errorf("machine setup completed, but close recovery-key file: %w", err)
 	}
 	fmt.Fprintf(command.OutOrStdout(), "Recovery key written to %s\n", output)
-	return nil
-}
-
-func e2eePending(c *command.Context) error {
-	client, _, _, err := e2eeClient(c)
-	if err != nil {
-		return err
-	}
-	pending, err := client.PendingE2EEEndpoints(c.Context)
-	if err != nil {
-		return err
-	}
-	if c.Bool("json") {
-		return json.NewEncoder(c.Writer).Encode(pending)
-	}
-	if len(pending) == 0 {
-		fmt.Fprintln(c.Writer, "No machines are awaiting trust approval.")
-		return nil
-	}
-	w := tabwriter.NewWriter(c.Writer, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "REQUEST ID\tMACHINE ID\tGENERATION\tTRUST CODE\tEXPIRES")
-	for _, item := range pending {
-		fmt.Fprintf(w, "%s\t%s\t%d\t%s\t%s\n", item.RequestID, item.EndpointID, item.Generation, item.SafetyCode, item.ExpiresAt.UTC().Format(time.RFC3339))
-	}
-	return w.Flush()
-}
-
-func e2eeApproveMachine(c *command.Context) error {
-	client, store, profile, err := e2eeClient(c)
-	if err != nil {
-		return err
-	}
-	code := strings.TrimSpace(c.String("code"))
-	if code == "" {
-		return invocationError(errors.New("--code is required after comparing the trust code shown by the machine"))
-	}
-	result, err := identitybootstrap.ApproveMachine(c.Context, identitybootstrap.ApprovalRequest{Store: store, Client: client, Issuer: profile.Issuer, AccountID: profile.Account.ID, CLIClientSessionID: profile.CLIClientSessionID, RequestID: c.Args().First(), SafetyCode: code})
-	if err != nil {
-		return err
-	}
-	if c.Bool("json") {
-		return json.NewEncoder(c.Writer).Encode(map[string]any{"approved": true, "request_id": c.Args().First(), "certificate_fingerprint": result.CertificateFingerprint, "root_fingerprint": result.RootFingerprint})
-	}
-	fmt.Fprintf(c.Writer, "Trusted machine %s\nIdentity fingerprint: %s\n", c.Args().First(), result.CertificateFingerprint)
-	return nil
-}
-
-func e2eeRecoveryExport(c *command.Context) error {
-	output := strings.TrimSpace(c.String("output"))
-	if output == "" || !filepath.IsAbs(output) {
-		return invocationError(errors.New("--output must be an absolute path"))
-	}
-	_, store, profile, err := e2eeClient(c)
-	if err != nil {
-		return err
-	}
-	seed, err := store.ExportPeerAccountRootSeed(profile.Issuer, profile.Account.ID)
-	if err != nil {
-		return err
-	}
-	defer clear(seed)
-	encoded, err := recoverykey.Encode(seed)
-	if err != nil {
-		return err
-	}
-	file, err := os.OpenFile(output, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		return fmt.Errorf("create recovery-key file: %w", err)
-	}
-	if _, writeErr := io.WriteString(file, encoded+"\n"); writeErr != nil {
-		_ = file.Close()
-		return fmt.Errorf("write recovery-key file: %w", writeErr)
-	}
-	if closeErr := file.Close(); closeErr != nil {
-		return fmt.Errorf("close recovery-key file: %w", closeErr)
-	}
-	fmt.Fprintf(c.Writer, "Recovery key written to %s\n", output)
-	return nil
-}
-
-func e2eeRecoveryImport(c *command.Context) error {
-	input := strings.TrimSpace(c.String("input"))
-	if input == "" || !filepath.IsAbs(input) {
-		return invocationError(errors.New("--input must be an absolute path"))
-	}
-	info, err := os.Lstat(input)
-	if err != nil {
-		return err
-	}
-	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 {
-		return errors.New("recovery-key file must be a regular owner-only file")
-	}
-	encoded, err := os.ReadFile(input)
-	if err != nil {
-		return err
-	}
-	seed, err := recoverykey.Decode(strings.TrimSpace(string(encoded)))
-	clear(encoded)
-	if err != nil {
-		return err
-	}
-	defer clear(seed)
-	client, store, profile, err := e2eeClient(c)
-	if err != nil {
-		return err
-	}
-	if err := store.ImportPeerAccountRootSeed(profile.Issuer, profile.Account.ID, seed); err != nil {
-		return err
-	}
-	result, err := identitybootstrap.Bootstrap(c.Context, identitybootstrap.Request{Store: store, Client: client, Issuer: profile.Issuer, AccountID: profile.Account.ID, CLIClientSessionID: profile.CLIClientSessionID})
-	if err != nil {
-		return err
-	}
-	if c.Bool("json") {
-		return json.NewEncoder(c.Writer).Encode(map[string]any{"recovered": true, "root_fingerprint": result.RootFingerprint, "certificate_fingerprint": result.CertificateFingerprint})
-	}
-	fmt.Fprintf(c.Writer, "E2EE identity recovered\nRoot fingerprint: %s\nCertificate fingerprint: %s\n", result.RootFingerprint, result.CertificateFingerprint)
 	return nil
 }
 
@@ -6388,7 +6464,7 @@ func readOwnerOnlyJSON(path string, target any) error {
 
 func readOwnerOnlyFile(path string, limit int64) ([]byte, error) {
 	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+	if err != nil || !ownerOnlyRegularFile(path, info) {
 		return nil, errors.Join(servelease.ErrInvalid, err)
 	}
 	file, err := os.Open(path)
@@ -6397,7 +6473,7 @@ func readOwnerOnlyFile(path string, limit int64) ([]byte, error) {
 	}
 	defer file.Close()
 	opened, err := file.Stat()
-	if err != nil || !os.SameFile(info, opened) || !opened.Mode().IsRegular() || opened.Mode().Perm()&0o077 != 0 {
+	if err != nil || !os.SameFile(info, opened) || !ownerOnlyRegularFile(path, opened) {
 		return nil, errors.Join(servelease.ErrInvalid, err)
 	}
 	data, err := io.ReadAll(io.LimitReader(file, limit+1))
@@ -7063,7 +7139,7 @@ func enrichLocalServeSources(items []api.Preview) []api.Preview {
 		}
 		path := filepath.Join(stateRoot, "previews", "active", entry.Name())
 		info, statErr := os.Lstat(path)
-		if statErr != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+		if statErr != nil || !ownerOnlyRegularFile(path, info) {
 			continue
 		}
 		file, openErr := os.Open(path)
@@ -7071,7 +7147,7 @@ func enrichLocalServeSources(items []api.Preview) []api.Preview {
 			continue
 		}
 		openedInfo, openedStatErr := file.Stat()
-		if openedStatErr != nil || !openedInfo.Mode().IsRegular() || openedInfo.Mode().Perm()&0o077 != 0 || !os.SameFile(info, openedInfo) {
+		if openedStatErr != nil || !ownerOnlyRegularFile(path, openedInfo) || !os.SameFile(info, openedInfo) {
 			file.Close()
 			continue
 		}
@@ -7591,7 +7667,7 @@ func resolveWarmUserMachine(ctx context.Context, requested string) (api.UserMach
 	if err != nil || !status.Eligible || status.Generation == 0 {
 		return api.UserMachine{}, false
 	}
-	return api.UserMachine{ID: status.ID, EnvironmentID: status.EnvironmentID, WorkspaceRoot: status.WorkspaceRoot, Alias: status.Alias, DisplayName: status.Alias, State: "ready", Online: status.RuntimeState == "ready", InstallationGeneration: int64(status.Generation)}, true
+	return api.UserMachine{ID: status.ID, EnvironmentID: status.EnvironmentID, WorkspaceRoot: status.WorkspaceRoot, Alias: status.Alias, DisplayName: status.Alias, Platform: status.Platform, State: "ready", Online: status.RuntimeState == "ready", InstallationGeneration: int64(status.Generation)}, true
 }
 
 func resolveTerminalSession(ctx context.Context, client *api.Client, target environmentTarget, ref string) (api.TerminalSession, error) {
@@ -7744,7 +7820,7 @@ func actionSSH(command *cobra.Command, args []string) error {
 		return friendlyCommandError(err)
 	}
 	_ = client
-	destination, err := managedssh.ResolveDestination(managedssh.DestinationInput{Alias: machine.Alias, AliasSuffix: managedssh.AliasSuffix, RegisteredPort: target.Port, RequestedUser: requestedUser, RegisteredUser: target.OSUser, HasRegisteredUser: true})
+	destination, err := managedssh.ResolveDestination(managedssh.DestinationInput{Alias: machine.Alias, AliasSuffix: managedssh.AliasSuffix, RegisteredPort: target.Port, RequestedUser: requestedUser, RegisteredUser: target.OSUser, HasRegisteredUser: true, Platform: machine.Platform})
 	if err != nil {
 		return err
 	}
@@ -7772,7 +7848,13 @@ func resolveSSHRequestedUser(targetUser, flagUser string) (string, error) {
 }
 
 func openSSHArguments(destination managedssh.Destination, passthrough []string, includePassthrough bool) []string {
-	arguments := make([]string, 0, len(passthrough)+3)
+	arguments := []string{
+		"-o", "BatchMode=yes",
+		"-o", "IdentitiesOnly=yes",
+		"-o", "PreferredAuthentications=publickey",
+		"-o", "PasswordAuthentication=no",
+		"-o", "KbdInteractiveAuthentication=no",
+	}
 	if destination.Port != 22 {
 		arguments = append(arguments, "-p", strconv.Itoa(int(destination.Port)))
 	}
@@ -7795,6 +7877,10 @@ func actionSSHProxy(command *cobra.Command, _ []string) error {
 	}
 	host, _ := command.Flags().GetString("host")
 	portText, _ := command.Flags().GetString("port")
+	proxyUser, _ := command.Flags().GetString("user")
+	if err := managedssh.ValidateUsername(proxyUser); err != nil {
+		return err
+	}
 	alias, err := managedssh.ParseAliasHost(host, managedssh.AliasSuffix)
 	if err != nil {
 		return err
@@ -7803,6 +7889,9 @@ func actionSSHProxy(command *cobra.Command, _ []string) error {
 	_, machine, target, err := resolveSSHCommandTargetLive(ctx, alias)
 	if err != nil {
 		return friendlyCommandError(err)
+	}
+	if _, err := managedssh.ResolveDestination(managedssh.DestinationInput{Alias: machine.Alias, AliasSuffix: managedssh.AliasSuffix, RegisteredPort: target.Port, RequestedUser: proxyUser, RegisteredUser: target.OSUser, HasRegisteredUser: true, Platform: machine.Platform}); err != nil {
+		return err
 	}
 	if _, err := managedssh.ValidateDestinationPort(portText, target.Port); err != nil {
 		return err
@@ -7863,7 +7952,10 @@ func copySSHProxy(connection io.ReadWriteCloser, halfCloser interface{ CloseWrit
 			return result.copyErr
 		}
 		return nil
-	default:
+	case <-time.After(25 * time.Millisecond):
+		// Keep remote EOF bounded when OpenSSH intentionally leaves stdin open,
+		// while giving an already-failed input copy a deterministic chance to
+		// publish its authoritative transport error.
 		return nil
 	}
 }
@@ -7976,6 +8068,9 @@ func actionSSHDoctor(command *cobra.Command, args []string) error {
 	agentSocket := filepath.Join(paths.RuntimeRoot, "paperboat-ssh-agent.sock")
 	if err := managedssh.ValidateInstalledOpenSSHConfig(home, uint32(os.Geteuid()), managedssh.AliasSuffix, agentSocket); err != nil {
 		return fmt.Errorf("managed OpenSSH configuration is not ready; rerun `pb auth login`: %w", err)
+	}
+	if err := managedssh.ValidateManagedIdentityPublicKey(home, uint32(os.Geteuid()), identity.PublicKey); err != nil {
+		return fmt.Errorf("managed SSH public identity is not ready; rerun `pb auth login`: %w", err)
 	}
 	if err := managedssh.ProbeAgentIdentity(command.Context(), agentSocket, identity.Fingerprint, 5*time.Second); err != nil {
 		return fmt.Errorf("managed SSH agent is not ready; rerun `pb auth login`: %w", err)
@@ -8227,7 +8322,7 @@ func actionRemoteExec(c *command.Context, requested string, request tunnel.ExecR
 	if request.CWD == "" {
 		request.CWD = machine.WorkspaceRoot
 	}
-	if !filepath.IsAbs(request.CWD) {
+	if !remoteAbsolutePath(machine.Platform, machine.WorkspaceRoot, request.CWD) {
 		err = invocationError(errors.New("--cwd must be an absolute path"))
 		return fail(2, "invalid_request", false, false, err)
 	}
@@ -8507,7 +8602,33 @@ func actionRemoteExec(c *command.Context, requested string, request tunnel.ExecR
 	return finishExecResult(c.Writer, c.ErrWriter, request.OperationID, jsonOutput, sawTerminalEvent, code, err)
 }
 
+func remoteAbsolutePath(platform, workspaceRoot, path string) bool {
+	windowsTarget := strings.EqualFold(strings.TrimSpace(platform), "windows") || strings.TrimSpace(platform) == "" && windowsAbsolutePath(workspaceRoot)
+	if !windowsTarget {
+		return filepath.IsAbs(path)
+	}
+	return windowsAbsolutePath(path)
+}
+
+func windowsAbsolutePath(path string) bool {
+	if strings.ContainsAny(path, "\x00\r\n") || path == "" || strings.TrimSpace(path) != path {
+		return false
+	}
+	path = strings.ReplaceAll(path, "/", `\`)
+	if len(path) >= 3 && ((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) && path[1] == ':' && path[2] == '\\' {
+		return true
+	}
+	if strings.HasPrefix(path, `\\`) {
+		parts := strings.Split(path[2:], `\`)
+		return len(parts) >= 2 && parts[0] != "" && parts[1] != ""
+	}
+	return false
+}
+
 func finishExecResult(stdout, stderr io.Writer, operationID string, jsonOutput, sawTerminalEvent bool, code int, err error) error {
+	if err == nil && !sawTerminalEvent {
+		err = tunnel.ErrTransportLost
+	}
 	if err == nil {
 		if code != 0 {
 			return exitCodeError{code: code}
@@ -10157,6 +10278,19 @@ func manageConfigService(ctx context.Context, machineID string, install bool) er
 	if registration.MachineID != machineID {
 		return nil
 	}
+	if windowsConfig, windowsService, windowsErr := windowsConfigServiceDefinition(stateRoot); windowsService {
+		if windowsErr != nil {
+			return windowsErr
+		}
+		installer, installErr := service.New(windowsConfig)
+		if installErr != nil {
+			return installErr
+		}
+		if install {
+			return installer.Install(ctx)
+		}
+		return installer.Uninstall(ctx)
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return err
@@ -10576,8 +10710,12 @@ func collectLocalDoctor() localDoctorReport {
 		report.CredentialState = "invalid_or_expired"
 		report.RecoveryActions = append(report.RecoveryActions, "run pb pair to renew host authority")
 	}
-	home, homeErr := os.UserHomeDir()
-	if homeErr == nil {
+	if runtime.GOOS == "windows" {
+		report.ConfigService = windowsConfigServiceStatus()
+		if report.ConfigService == "invalid" {
+			report.RecoveryActions = append(report.RecoveryActions, "repair the Windows config-sync service")
+		}
+	} else if home, homeErr := os.UserHomeDir(); homeErr == nil {
 		definition := filepath.Join(home, ".config", "systemd", "user", "paperboat-runtime-config.service")
 		if runtime.GOOS == "darwin" {
 			definition = filepath.Join(home, "Library", "LaunchAgents", service.ConfigLabel+".plist")
@@ -10605,6 +10743,9 @@ func localConfigServiceState() string {
 			return "active"
 		}
 		return "installed_inactive"
+	}
+	if runtime.GOOS == "windows" {
+		return windowsConfigServiceStatus()
 	}
 	account, err := user.Current()
 	if err != nil {

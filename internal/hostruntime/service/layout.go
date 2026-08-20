@@ -1,6 +1,7 @@
 package service
 
 import (
+	"path"
 	"path/filepath"
 	"strings"
 )
@@ -49,7 +50,7 @@ func DefaultLayout(platform string) (Layout, error) {
 	default:
 		return Layout{}, ErrUnsupportedPlatform
 	}
-	join := filepath.Join
+	join := path.Join
 	if platform == "windows" {
 		join = windowsPathJoin
 	}
@@ -119,11 +120,11 @@ func (l Layout) Validate() error {
 	return nil
 }
 
-func absoluteForPlatform(platform, path string) bool {
+func absoluteForPlatform(platform, value string) bool {
 	if platform != "windows" {
-		return filepath.IsAbs(path) && filepath.Clean(path) == path
+		return pathpkgIsCleanAbsolute(value)
 	}
-	return len(path) >= 3 && ((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) && path[1] == ':' && path[2] == '\\' || strings.HasPrefix(path, `\\.\pipe\`)
+	return len(value) >= 3 && ((value[0] >= 'A' && value[0] <= 'Z') || (value[0] >= 'a' && value[0] <= 'z')) && value[1] == ':' && value[2] == '\\' || strings.HasPrefix(value, `\\.\pipe\`)
 }
 
 func windowsPathJoin(elements ...string) string {
@@ -133,17 +134,25 @@ func windowsPathJoin(elements ...string) string {
 			result = strings.TrimRight(element, `\\`)
 			continue
 		}
-		result += `\\` + strings.Trim(element, `\\`)
+		result += `\` + strings.Trim(element, `\`)
 	}
 	return result
 }
 
-func withinForPlatform(platform, root, path string) bool {
+func withinForPlatform(platform, root, value string) bool {
 	if platform != "windows" {
-		return within(root, path)
+		if !pathpkgIsCleanAbsolute(root) || !pathpkgIsCleanAbsolute(value) {
+			return false
+		}
+		root = strings.TrimRight(root, "/") + "/"
+		return strings.HasPrefix(value, root)
 	}
-	root = strings.TrimRight(strings.ToLower(root), `\\`) + `\\`
-	return strings.HasPrefix(strings.ToLower(path), root)
+	root = strings.TrimRight(strings.ToLower(root), `\`) + `\`
+	return strings.HasPrefix(strings.ToLower(value), root)
+}
+
+func pathpkgIsCleanAbsolute(value string) bool {
+	return path.IsAbs(value) && path.Clean(value) == value
 }
 
 func within(root, path string) bool {

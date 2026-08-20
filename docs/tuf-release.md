@@ -18,22 +18,88 @@ missing and creates one signed release index per platform and architecture:
 - Every macOS component must be signed with the production Developer ID, submitted to Apple
   notarization, and stapled before it enters the signed TUF repository. The updater runs both
   `codesign --verify --deep --strict` and a Gatekeeper `spctl --assess` check before activation.
-- Every Windows component must carry a valid production Authenticode signature before it enters
-  the signed TUF repository. The updater checks `Get-AuthenticodeSignature` and accepts only a
-  `Valid` chain status before activation.
+- Windows components do not require Authenticode. Their exact TUF target digest, length, PE
+  header, architecture, protected staging directory, and owner checks remain mandatory.
 - Linux components have no native publisher-signature requirement in this release. Their exact
   TUF target digest, length, ELF header, architecture, protected staging directory, and owner
   checks remain mandatory.
 
-The GitHub release workflow builds artifacts only. It must not be used as evidence that macOS or
-Windows artifacts are eligible for TUF publication: the platform signing and verification ceremony
-is a required release-authority step, using keys outside GitHub Actions and CI.
+The GitHub release workflow builds and qualifies artifacts, then waits at the protected
+`paperboat-tuf-published` environment. The release authority downloads the completed handoffs,
+stages the canonical `<component>-<os>-<arch>` files, performs the offline TUF signing ceremony, and
+publishes `metadata/` and `targets/`. Approve that environment only after the public HTTPS TUF
+origin serves the same release. The publication job independently runs
+`TestProductionTUFRepository` for the tagged version before creating a GitHub release or publishing
+the hosted image. CI never receives the TUF private keys.
+
+Windows amd64 stable publication is fail-closed. `paperboat-tuf publish` requires an absolute
+`-windows-amd64-native-evidence` JSON file. The signer rejects a missing file, a non-passing
+status, a false `native_tested` value, the wrong platform or architecture, missing components, or
+any component path, SHA-256, or length that does not exactly match the final signed artifact. It
+does not infer native qualification from `windows/amd64`.
+
+The evidence is added as a signed TUF target named
+`windows-amd64-native-qualification.json`. Each Windows amd64 component target includes a signed
+binding to that evidence target, its evidence digest, release version, Windows build, runner,
+status, and that component's digest and length. Later rollout mutations revalidate those bindings
+and refuse to re-sign an amd64 release that lacks valid evidence.
+
+Create evidence only after the final artifact bytes are available. If optional Authenticode
+signing is used, create evidence after signing and RFC 3161 timestamping. It must use this exact
+schema and cover `cli`, `runtime`, `hostd`,
+`updater`, and `launcher` once each:
+
+```json
+{
+  "schema": "paperboat.windows-native-qualification/v1",
+  "release_version": "YYYY.MM.DD.X",
+  "platform": "windows",
+  "architecture": "amd64",
+  "status": "passed",
+  "native_tested": true,
+  "windows_build": "26100",
+  "runner": "windows-11-iot-amd64",
+  "artifacts": [
+    {
+      "component": "cli",
+      "target_path": "cli-windows-amd64",
+      "sha256": "<lowercase final artifact sha256>",
+      "length": 12345,
+      "platform": "windows",
+      "architecture": "amd64",
+      "status": "passed"
+    }
+  ]
+}
+```
+
+`status` must be `passed` globally and per artifact. `windows_build` and `runner` identify the
+native qualification environment. A cross-build, emulator run, skipped test, or an ARM64 result
+cannot satisfy this amd64 gate. Windows arm64 remains beta with `native_tested: false` until its
+own native hardware qualification exists.
+
+The release workflow produces this file deterministically with
+`packaging/windows/scripts/convert-native-qualification-evidence.py`. It accepts only a passed
+native amd64 lifecycle report and hashes the final signed release PE files. Publication re-runs
+the converter in verification mode against the downloaded signed handoff, then includes
+`windows-amd64-native-qualification.json` in the release assets. The release authority supplies
+that exact file to `paperboat-tuf publish`; a missing report, changed signed PE, or changed
+evidence blocks publication.
+
+Windows packaging inputs are maintained in `packaging/windows`. The deterministic portable ZIP
+builder and WiX source validation run in CI, while WiX MSI compilation requires a Windows
+toolchain. The checked-in metadata marks Authenticode as externally required and contains no
+certificate, private key, or signing result. The release authority must compile the amd64 MSI
+for the stable channel and the arm64 MSI for the beta channel, sign every PE and MSI externally,
+RFC 3161 timestamp it, refresh checksums after signing, and only then render or submit the
+corresponding WinGet manifest template.
 
 ```sh
 paperboat-tuf publish \
   -repository /Users/pujan.pm/.local/share/paperboat-release/tuf-production \
   -version YYYY.MM.DD.X \
   -artifacts /absolute/path/to/artifacts \
+  -windows-amd64-native-evidence /absolute/path/to/windows-amd64-native-qualification.json \
   -rollout-revision 1 \
   -percentage 5 \
   -severity routine
