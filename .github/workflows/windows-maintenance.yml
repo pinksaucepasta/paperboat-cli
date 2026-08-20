@@ -222,6 +222,14 @@ jobs:
           if (($machinePath -split ';') -notcontains $bin) {
             [Environment]::SetEnvironmentVariable('Path', ($machinePath.TrimEnd(';') + ';' + $bin), 'Machine')
           }
+          # The MSI qualification intentionally removed the product. Restore
+          # the owned OpenSSH service through the same elevated repair path a
+          # user gets from `pb doctor --repair`; Hostd depends on this loopback
+          # target and must not be started before it exists.
+          $repairOutput = & $runtime __runtime-service repair 2>&1
+          $repairExit = $LASTEXITCODE
+          $repairOutput | Out-Host
+          if ($repairExit -ne 0) { throw "Paperboat repair failed with exit code $repairExit" }
           try { Start-Service PaperboatHostd -ErrorAction Stop } catch {
             Write-Output 'HOSTD_START_FAILED'
             Get-CimInstance Win32_Service -Filter "Name='PaperboatHostd'" | Format-List Name,State,StartName,PathName
