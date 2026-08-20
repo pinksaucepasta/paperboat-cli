@@ -99,6 +99,10 @@ jobs:
           Restart-Service PaperboatSshd -Force -ErrorAction Stop
           Start-Sleep -Seconds 3
           if ((Get-Service PaperboatSshd).Status -ne 'Running') { throw 'PaperboatSshd did not remain running after clean restart' }
+          Test-NetConnection -ComputerName 127.0.0.1 -Port 38222 -InformationLevel Detailed | Format-List
+          Test-NetConnection -ComputerName ::1 -Port 38222 -InformationLevel Detailed | Format-List
+          $sshKeyscan = Get-Command ssh-keyscan.exe -ErrorAction SilentlyContinue
+          if ($sshKeyscan) { & $sshKeyscan.Source -T 5 -p 38222 127.0.0.1 2>&1 | Select-Object -First 12 }
           if ((Get-Service PaperboatHostd).Status -ne 'Running') {
             Write-Output 'STARTING_PAPERBOAT_HOSTD=TRUE'
             Start-Service PaperboatHostd -ErrorAction Stop
