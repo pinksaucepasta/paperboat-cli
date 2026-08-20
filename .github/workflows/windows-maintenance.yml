@@ -93,7 +93,9 @@ jobs:
             Write-Output "HOSTKEY_OWNER=$($hostKeyAcl.Owner)"
             Write-Output "HOSTKEY_SDDL=$($hostKeyAcl.Sddl)"
           }
-          if ((Get-Service PaperboatSshd).Status -ne 'Running') { Start-Service PaperboatSshd -ErrorAction Stop }
+          Restart-Service PaperboatSshd -Force -ErrorAction Stop
+          Start-Sleep -Seconds 3
+          if ((Get-Service PaperboatSshd).Status -ne 'Running') { throw 'PaperboatSshd did not remain running after clean restart' }
           if ((Get-Service PaperboatHostd).Status -ne 'Running') {
             Write-Output 'STARTING_PAPERBOAT_HOSTD=TRUE'
             Start-Service PaperboatHostd -ErrorAction Stop
