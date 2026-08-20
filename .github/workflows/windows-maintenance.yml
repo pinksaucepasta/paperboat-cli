@@ -33,6 +33,7 @@ jobs:
             Sort-Object LastWriteTime -Descending |
             Select-Object -First 30 FullName,Length,LastWriteTime
           Get-Content -LiteralPath 'C:\ProgramData\Paperboat\PaperboatHostd-worker-startup-error.log' -Tail 80 -ErrorAction SilentlyContinue
+          Get-Content -LiteralPath 'C:\ProgramData\Paperboat\ssh\logs\service.log' -Tail 120 -ErrorAction SilentlyContinue
           Get-Content -LiteralPath 'C:\ProgramData\Paperboat\manual-out.log' -Tail 80 -ErrorAction SilentlyContinue
           Get-WinEvent -LogName Application -MaxEvents 100 -ErrorAction SilentlyContinue |
             Where-Object { $_.Message -match 'Paperboat' } |
