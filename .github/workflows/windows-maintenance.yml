@@ -252,6 +252,15 @@ jobs:
           $repairExit = $repairProcess.ExitCode
           Get-Content -LiteralPath $repairLog,($repairLog + '.err') -ErrorAction SilentlyContinue | Out-Host
           if ($repairExit -ne 0) { Write-Output "Paperboat aggregate repair returned exit code $repairExit; verifying owned SSH repair independently." }
+          if (-not (Get-Service PaperboatSshd -ErrorAction SilentlyContinue)) {
+            $sshd = 'C:\Program Files\OpenSSH\sshd.exe'
+            $sshdConfig = 'C:\ProgramData\Paperboat\ssh\sshd_config'
+            if (-not (Test-Path -LiteralPath $sshd) -or -not (Test-Path -LiteralPath $sshdConfig)) { throw 'Pinned OpenSSH binaries or Paperboat sshd configuration are missing after repair.' }
+            $serviceCommand = '"' + $runtime + '" __windows-sshd-service --sshd "' + $sshd + '" --config "' + $sshdConfig + '"'
+            New-Service -Name PaperboatSshd -BinaryPathName $serviceCommand -DisplayName 'PaperboatSshd' -Description 'Paperboat managed loopback-only OpenSSH service' -StartupType Automatic | Out-Null
+            sc.exe failure PaperboatSshd reset= 86400 actions= restart/5000/restart/15000/""/0 | Out-Host
+          }
+          Start-Service PaperboatSshd -ErrorAction Stop
           try { Start-Service PaperboatHostd -ErrorAction Stop } catch {
             Write-Output 'HOSTD_START_FAILED'
             Get-CimInstance Win32_Service -Filter "Name='PaperboatHostd'" | Format-List Name,State,StartName,PathName
