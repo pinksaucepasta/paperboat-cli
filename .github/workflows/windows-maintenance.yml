@@ -191,6 +191,7 @@ jobs:
               # this remains correct on non-English Windows images too.
               $systemSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
               $adminsSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
+              icacls.exe $hostKeys /inheritance:r /remove:g '*S-1-5-32-545' '*S-1-5-11' /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /C | Out-Host
               Get-ChildItem -LiteralPath $hostKeys -File -Recurse | ForEach-Object {
                 $acl = New-Object System.Security.AccessControl.FileSecurity
                 $acl.SetAccessRuleProtection($true, $false)
