@@ -232,6 +232,17 @@ jobs:
           if (($machinePath -split ';') -notcontains $bin) {
             [Environment]::SetEnvironmentVariable('Path', ($machinePath.TrimEnd(';') + ';' + $bin), 'Machine')
           }
+          $winget = (Get-Command winget.exe -ErrorAction SilentlyContinue).Source
+          if (-not $winget) {
+            $appInstaller = Get-AppxPackage -AllUsers Microsoft.DesktopAppInstaller | Sort-Object Version -Descending | Select-Object -First 1
+            if ($appInstaller) { $winget = Join-Path $appInstaller.InstallLocation 'winget.exe' }
+          }
+          if (-not $winget -or -not (Test-Path -LiteralPath $winget)) { throw 'Microsoft-signed WinGet App Installer is unavailable.' }
+          $wingetLog = Join-Path $env:RUNNER_TEMP 'paperboat-openssh-winget.log'
+          $wingetArgs = @('install','--exact','--id','Microsoft.OpenSSH.Preview','--version','10.0.0.0','--source','winget','--scope','machine','--silent','--accept-source-agreements','--accept-package-agreements','--disable-interactivity')
+          $wingetProcess = Start-Process -FilePath $winget -ArgumentList $wingetArgs -Wait -PassThru -RedirectStandardOutput $wingetLog -RedirectStandardError ($wingetLog + '.err')
+          Get-Content -LiteralPath $wingetLog,($wingetLog + '.err') -ErrorAction SilentlyContinue | Out-Host
+          if ($wingetProcess.ExitCode -ne 0 -and -not (Test-Path -LiteralPath 'C:\Program Files\OpenSSH\sshd.exe')) { throw "Pinned OpenSSH WinGet install failed with exit code $($wingetProcess.ExitCode)." }
           # The MSI qualification intentionally removed the product. Restore
           # the owned OpenSSH service through the same elevated repair path a
           # user gets from `pb doctor --repair`; Hostd depends on this loopback
