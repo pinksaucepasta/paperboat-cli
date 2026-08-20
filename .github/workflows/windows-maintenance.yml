@@ -212,4 +212,15 @@ jobs:
             throw
           }
           Start-Service PaperboatUpdated
+          $deadline = (Get-Date).AddSeconds(90)
+          do {
+            $paperboatSshd = Get-Service PaperboatSshd -ErrorAction SilentlyContinue
+            if ($null -ne $paperboatSshd) { break }
+            Start-Sleep -Seconds 2
+          } while ((Get-Date) -lt $deadline)
+          if ($null -eq $paperboatSshd) {
+            Get-Content -LiteralPath 'C:\ProgramData\Paperboat\ssh\logs\service.log' -Tail 120 -ErrorAction SilentlyContinue
+            throw 'PaperboatSshd was not recreated by Hostd within 90 seconds.'
+          }
+          if ($paperboatSshd.Status -ne 'Running') { Start-Service PaperboatSshd -ErrorAction Stop }
           Get-Service PaperboatHostd,PaperboatUpdated,PaperboatSshd | Format-Table Name,Status,StartType
