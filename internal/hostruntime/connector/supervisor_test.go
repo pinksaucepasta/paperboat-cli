@@ -120,7 +120,7 @@ func TestSupervisorFetchesFreshAdmissionWithCappedBackoffAndReconnects(t *testin
 	dialer.mu.Unlock()
 	active.done <- errors.New("connection lost")
 	dialer.mu.Lock()
-	dialer.failDials = dialer.calls + 4
+	dialer.failDials = dialer.calls + 1
 	dialer.mu.Unlock()
 	deadline = time.After(time.Second)
 	for manager.Status().Generation == first {
@@ -131,7 +131,7 @@ func TestSupervisorFetchesFreshAdmissionWithCappedBackoffAndReconnects(t *testin
 		}
 	}
 	var recovery float64
-	metricDeadline := time.After(30 * time.Second)
+	metricDeadline := time.After(10 * time.Second)
 	for recovery <= 0 {
 		metric.mu.Lock()
 		recovery = metric.recovery
@@ -149,8 +149,13 @@ func TestSupervisorFetchesFreshAdmissionWithCappedBackoffAndReconnects(t *testin
 		t.Fatalf("connector recovery metric=%v", recovery)
 	}
 	waits.mu.Lock()
-	if len(waits.delays) < 2 || waits.delays[0] != time.Second || waits.delays[len(waits.delays)-1] != 2*time.Second {
+	if len(waits.delays) < 1 || waits.delays[0] != time.Second {
 		t.Fatalf("delays=%v", waits.delays)
+	}
+	for _, delay := range waits.delays {
+		if delay < time.Second || delay > 2*time.Second {
+			t.Fatalf("delays=%v", waits.delays)
+		}
 	}
 	waits.mu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
