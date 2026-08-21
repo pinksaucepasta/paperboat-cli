@@ -55,5 +55,6 @@ func dacl(value string) string {
 	if end < 0 {
 		return value[start:]
 	}
-	return value[start : start+2+end]
+	value = value[start : start+2+end]
+	return strings.Replace(value, "D:P", "D:", 1)
 }
