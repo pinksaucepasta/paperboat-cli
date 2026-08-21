@@ -84,20 +84,35 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 			t.Fatalf("WiX uninstall cleanup contract is missing %q", requiredText)
 		}
 	}
-	workflowPath := filepath.Join(root, "..", "..", ".github", "workflows", "windows-ci.yml")
+	workflowPath := filepath.Join(root, "..", "..", ".github", "workflows", "platform-qualification.yml")
 	workflow, err := os.ReadFile(workflowPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, requiredText := range []string{
 		"windows-2025",
-		"Invoke-NativeWindowsQualification.ps1",
-		"write-arm64-native-evidence.py",
-		"blocked_no_hardware",
-		"PAPERBOAT_WINDOWS_E2E_SERVICE_FIXTURE",
+		"windows-11-arm",
+		"architecture: amd64",
+		"architecture: arm64",
+		"windows_arm64_stability: beta",
 	} {
 		if !strings.Contains(string(workflow), requiredText) {
-			t.Fatalf("windows CI is missing %q", requiredText)
+			t.Fatalf("platform qualification is missing %q", requiredText)
+		}
+	}
+	releaseWorkflow, err := os.ReadFile(filepath.Join(root, "..", "..", ".github", "workflows", "release.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, requiredText := range []string{
+		"Invoke-NativeWindowsQualification.ps1",
+		"write-arm64-native-evidence.py",
+		"PAPERBOAT_WINDOWS_E2E_SERVICE_FIXTURE",
+		"windows-amd64-native-release-qualification",
+		"windows-arm64-native-release-qualification",
+	} {
+		if !strings.Contains(string(releaseWorkflow), requiredText) {
+			t.Fatalf("release candidate qualification is missing %q", requiredText)
 		}
 	}
 }

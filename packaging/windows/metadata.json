@@ -106,7 +106,7 @@
       "channel": "beta",
       "stability": "beta",
       "native_e2e": "required_before_stable_promotion",
-      "native_hardware_evidence": "blocked_no_hardware_until_runner_exists"
+      "native_hardware_evidence": "github_hosted_native_beta_gate"
     }
   ],
   "signing": {

@@ -2,8 +2,22 @@ name: Update assurance
 
 on:
   pull_request:
+    paths:
+      - "internal/hostruntime/**"
+      - "internal/updater/**"
+      - "deploy/hosted/**"
+      - "tools/verify-hosted-image.sh"
+      - "tools/verify-container-compose.sh"
+      - ".github/workflows/update-assurance.yml"
   push:
     branches: [main]
+    paths:
+      - "internal/hostruntime/**"
+      - "internal/updater/**"
+      - "deploy/hosted/**"
+      - "tools/verify-hosted-image.sh"
+      - "tools/verify-container-compose.sh"
+      - ".github/workflows/update-assurance.yml"
 
 permissions:
   contents: read
@@ -35,26 +49,6 @@ jobs:
           ./internal/hostruntime/updated
           ./internal/hostruntime/updateflow
           ./internal/hostruntime/workerupdate
-
-  windows-build:
-    name: Windows build (${{ matrix.arch }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        arch: [amd64, arm64]
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
-        with:
-          go-version-file: go.mod
-          cache: true
-      - name: Build Windows pb
-        env:
-          CGO_ENABLED: "0"
-          GOOS: windows
-          GOARCH: ${{ matrix.arch }}
-        run: go build -trimpath ./cmd/pb
 
   container:
     name: Container deployment checks

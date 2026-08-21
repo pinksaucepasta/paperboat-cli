@@ -4,8 +4,12 @@ set -eu
 script_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repository_root=$(CDPATH= cd -- "$script_directory/../../.." && pwd)
 workflow="$repository_root/.github/workflows/release.yml"
+publication_workflow="$repository_root/.github/workflows/publish-release.yml"
+qualification_workflow="$repository_root/.github/workflows/platform-qualification.yml"
 
 test -f "$workflow"
+test -f "$publication_workflow"
+test -f "$qualification_workflow"
 
 if command -v rg >/dev/null 2>&1; then
     text_search() { rg "$@"; }
@@ -38,11 +42,14 @@ require_text 'actions/attest-build-provenance'
 require_text 'merge-signing-manifests.py'
 require_text 'pb-windows-{0}.exe'
 require_text 'convert-native-qualification-evidence.py'
-require_text 'windows-amd64-native-qualification'
+require_text 'windows-native-qualification'
 require_text 'windows-amd64-native-release-qualification'
-require_text 'needs: [release-unix, windows-package, windows-winget, windows-amd64-native-qualification]'
+require_text 'windows-arm64-native-release-qualification'
+require_text 'needs: [release-unix, windows-package, windows-winget, windows-native-qualification]'
+require_text 'release-candidate-${{ env.RELEASE_VERSION }}'
+require_text 'release-candidate.json'
 
-if text_search -n "Add-WindowsCapability|winget install ['\"]openssh preview|for target in .*windows/" "$workflow" >/dev/null; then
+if text_search -n "Add-WindowsCapability|winget install ['\"]openssh preview|for target in .*windows/" "$workflow" "$publication_workflow" "$qualification_workflow" >/dev/null; then
     echo 'release workflow contains a forbidden Windows packaging path' >&2
     exit 1
 fi
@@ -51,12 +58,14 @@ python_command=python3
 if ! command -v "$python_command" >/dev/null 2>&1; then
     python_command=python
 fi
-"$python_command" - "$workflow" <<'PY'
+"$python_command" - "$workflow" "$publication_workflow" "$qualification_workflow" <<'PY'
 import pathlib
 import re
 import sys
 
 workflow = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+publication_workflow = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+qualification_workflow = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
 
 def job(name: str) -> str:
     match = re.search(rf"^  {re.escape(name)}:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:|\Z)", workflow, re.MULTILINE | re.DOTALL)
@@ -77,29 +86,57 @@ if "runs-on: ${{ matrix.runner }}" not in windows or windows.count("runner: wind
 if "stable" not in windows or "beta" not in windows:
     raise SystemExit("windows-package must declare stable and beta channels")
 
-publication = job("publication")
-if "if: always()" not in publication:
-    raise SystemExit("publication must run its explicit dependency gate")
-if "needs: [release-unix, windows-package, windows-winget, windows-amd64-native-qualification]" not in workflow:
-    raise SystemExit("publication dependencies do not include all Windows handoffs")
-if "windows-amd64-native-qualification.result" not in publication:
-    raise SystemExit("publication does not gate on native Windows amd64 qualification")
-if "--verify-evidence native-qualification/windows-amd64-native-qualification.json" not in publication:
-    raise SystemExit("publication does not verify native qualification against final signed artifacts")
-if "paperboat-tuf-published" not in publication or "TestProductionTUFRepository" not in publication:
-    raise SystemExit("publication is not blocked on public offline-signed TUF metadata")
+candidate = job("candidate-assembly")
+if "if: always()" not in candidate:
+    raise SystemExit("candidate assembly must run its explicit dependency gate")
+if "needs: [release-unix, windows-package, windows-winget, windows-native-qualification]" not in workflow:
+    raise SystemExit("candidate dependencies do not include all platform handoffs")
+if "windows-native-qualification.result" not in candidate:
+    raise SystemExit("candidate does not gate on native Windows amd64 qualification")
+if "--verify-evidence native-qualification/windows-amd64-native-qualification.json" not in candidate:
+    raise SystemExit("candidate does not verify native qualification against final artifacts")
 
-qualification = job("windows-amd64-native-qualification")
-if "needs: windows-package" not in qualification or "runner: windows-2025" not in qualification or "runs-on: ${{ matrix.runner }}" not in qualification:
-    raise SystemExit("native Windows amd64 qualification must consume the signed package on a GitHub-hosted windows-2025 runner")
+qualification = job("windows-native-qualification")
+if "needs: windows-package" not in qualification or "runner: windows-2025" not in qualification or "runner: windows-11-arm" not in qualification or "runs-on: ${{ matrix.runner }}" not in qualification:
+    raise SystemExit("native Windows qualification must consume final amd64 and arm64 packages on GitHub-hosted runners")
 for required in (
     "Invoke-NativeWindowsQualification.ps1",
     "convert-native-qualification-evidence.py",
     "--artifacts-dir (Join-Path $env:GITHUB_WORKSPACE 'input')",
     "windows-amd64-native-release-qualification",
+    "windows-arm64-native-release-qualification",
+    "write-arm64-native-evidence.py",
 ):
     if required not in qualification:
         raise SystemExit(f"native Windows amd64 qualification is missing {required}")
+
+for required in (
+    "candidate_run_id:",
+    "run-id: ${{ inputs.candidate_run_id }}",
+    "release-candidate-${{ inputs.version }}",
+    "Refuse mutable or conflicting release identity",
+    "gh release create \"$RELEASE_VERSION\" --target \"$RELEASE_COMMIT\"",
+    "TestProductionTUFRepository",
+    "paperboat-tuf-published",
+):
+    if required not in publication_workflow:
+        raise SystemExit(f"publication workflow is missing {required}")
+if "go build" in publication_workflow or "go test ./..." in publication_workflow:
+    raise SystemExit("publication workflow must not rebuild release binaries or rerun the general suite")
+
+for required in (
+    "ubuntu-24.04",
+    "ubuntu-24.04-arm",
+    "macos-14",
+    "windows-2025",
+    "windows-11-arm",
+    "Windows arm64 beta independent cross-build",
+    "native_windows_arm64_runner: windows-11-arm",
+):
+    if required not in qualification_workflow:
+        raise SystemExit(f"platform qualification workflow is missing {required}")
+if "self-hosted" in qualification_workflow:
+    raise SystemExit("platform qualification must use GitHub-hosted runners only")
 PY
 
 "$python_command" "$script_directory/test_convert_native_qualification_evidence.py"

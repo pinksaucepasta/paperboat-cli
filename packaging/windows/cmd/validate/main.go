@@ -185,7 +185,7 @@ func validatePolicy(policy metadata) error {
 	}
 	wantTargets := []target{
 		{Architecture: "amd64", WixPlatform: "x64", WingetArchitecture: "x64", Channel: "stable", Stability: "stable", NativeE2E: "required_before_stable_release", NativeHardwareEvidence: "release_gate"},
-		{Architecture: "arm64", WixPlatform: "arm64", WingetArchitecture: "arm64", Channel: "beta", Stability: "beta", NativeE2E: "required_before_stable_promotion", NativeHardwareEvidence: "blocked_no_hardware_until_runner_exists"},
+		{Architecture: "arm64", WixPlatform: "arm64", WingetArchitecture: "arm64", Channel: "beta", Stability: "beta", NativeE2E: "required_before_stable_promotion", NativeHardwareEvidence: "github_hosted_native_beta_gate"},
 	}
 	if !sameTargets(policy.Targets, wantTargets) {
 		return fmt.Errorf("architecture/channel targets are incorrect")

@@ -1,0 +1,185 @@
+name: Publish qualified release
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_run_id:
+        description: Successful Release candidate workflow run ID
+        required: true
+        type: string
+      version:
+        description: Release version from the candidate manifest
+        required: true
+        type: string
+      commit:
+        description: Exact qualified commit SHA
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+  attestations: write
+  actions: read
+
+concurrency:
+  group: production-release-publication
+  cancel-in-progress: false
+
+env:
+  RELEASE_VERSION: ${{ inputs.version }}
+  RELEASE_COMMIT: ${{ inputs.commit }}
+
+jobs:
+  publish:
+    name: Publish exact qualified candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment:
+      name: paperboat-tuf-published
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.commit }}
+          fetch-depth: 1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Validate publication inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./tools/release-version.sh validate "$RELEASE_VERSION"
+          test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
+          case "${{ inputs.candidate_run_id }}" in *[!0-9]*|'') echo 'candidate_run_id must be numeric' >&2; exit 1;; esac
+      - name: Download immutable candidate by run ID
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-candidate-${{ inputs.version }}
+          path: dist
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.candidate_run_id }}
+      - name: Verify candidate identity and every artifact hash
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+
+          root = Path('dist')
+          manifest_path = root / 'release-candidate.json'
+          manifest = json.loads(manifest_path.read_text())
+          expected = {
+              'schema': 'paperboat.release-candidate/v1',
+              'version': os.environ['RELEASE_VERSION'],
+              'commit': os.environ['RELEASE_COMMIT'],
+              'repository': os.environ['GITHUB_REPOSITORY'],
+              'run_id': os.environ['CANDIDATE_RUN_ID'],
+          }
+          for key, value in expected.items():
+              if str(manifest.get(key)) != str(value):
+                  raise SystemExit(f'candidate {key} mismatch: {manifest.get(key)!r} != {value!r}')
+          declared = {entry['name']: entry for entry in manifest['artifacts']}
+          actual = {path.name for path in root.iterdir() if path.is_file() and path.name != manifest_path.name}
+          if actual != set(declared):
+              raise SystemExit(f'candidate file set mismatch: actual={sorted(actual)} declared={sorted(declared)}')
+          for name, entry in declared.items():
+              path = root / name
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              if digest != entry['sha256'] or path.stat().st_size != entry['size']:
+                  raise SystemExit(f'candidate artifact mismatch: {name}')
+          PY
+          (cd dist && sha256sum --check SHA256SUMS)
+        env:
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+      - name: Refuse mutable or conflicting release identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          existing="$(git ls-remote --tags origin "refs/tags/$RELEASE_VERSION" | awk 'NR == 1 {print $1}')"
+          if [[ -n "$existing" && "$existing" != "$RELEASE_COMMIT" ]]; then
+            echo "Release tag points to $existing instead of qualified commit $RELEASE_COMMIT and will never be moved." >&2
+            exit 1
+          fi
+      - name: Publish or resume GitHub release with immutable assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! gh release view "$RELEASE_VERSION" >/dev/null 2>&1; then
+            gh release create "$RELEASE_VERSION" --target "$RELEASE_COMMIT" --generate-notes --draft
+          fi
+          mkdir -p existing-assets
+          while IFS= read -r -d '' file; do
+            name="$(basename "$file")"
+            if gh release download "$RELEASE_VERSION" --pattern "$name" --dir existing-assets >/dev/null 2>&1; then
+              test "$(sha256sum "$file" | cut -d' ' -f1)" = "$(sha256sum "existing-assets/$name" | cut -d' ' -f1)" || {
+                echo "Existing release asset differs and will not be overwritten: $name" >&2
+                exit 1
+              }
+              rm -f "existing-assets/$name"
+            else
+              gh release upload "$RELEASE_VERSION" "$file"
+            fi
+          done < <(find dist -maxdepth 1 -type f -print0)
+          if [[ "$(gh release view "$RELEASE_VERSION" --json isDraft --jq .isDraft)" == true ]]; then
+            gh release edit "$RELEASE_VERSION" --draft=false
+          fi
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Build and publish hosted image from qualified commit
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: deploy/hosted/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: PAPERBOAT_VERSION=${{ inputs.version }}
+          tags: |
+            ghcr.io/pinksaucepasta/paperboat-hosted:${{ inputs.version }}
+            ghcr.io/pinksaucepasta/paperboat-hosted:latest
+      - name: Wait for automatic production TUF publication and verify it
+        env:
+          PAPERBOAT_TEST_TUF_REPOSITORY_URL: ${{ vars.PAPERBOAT_PRODUCTION_TUF_REPOSITORY_URL }}
+          PAPERBOAT_TEST_TUF_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$PAPERBOAT_TEST_TUF_REPOSITORY_URL"
+          case "$PAPERBOAT_TEST_TUF_REPOSITORY_URL" in https://*) ;; *) exit 1;; esac
+          deadline=$((SECONDS + 600))
+          until go test ./internal/hostruntime/bootstrap -run '^TestProductionTUFRepository$' -count=1; do
+            if (( SECONDS >= deadline )); then
+              echo 'Automatic production TUF publication did not become verifiable within 10 minutes.' >&2
+              exit 1
+            fi
+            sleep 15
+          done
+      - name: Verify public release assets remain byte-identical
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir public
+          gh release download "$RELEASE_VERSION" --dir public
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          manifest = json.loads(Path('dist/release-candidate.json').read_text())
+          for entry in manifest['artifacts']:
+              path = Path('public') / entry['name']
+              if hashlib.sha256(path.read_bytes()).hexdigest() != entry['sha256']:
+                  raise SystemExit(f'public artifact changed: {entry["name"]}')
+          PY

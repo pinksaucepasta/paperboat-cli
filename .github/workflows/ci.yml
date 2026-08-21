@@ -13,8 +13,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  check:
-    runs-on: ubuntu-latest
+  quality:
+    name: Fast repository quality contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
@@ -23,4 +25,42 @@ jobs:
           cache: true
       - name: Install repository check dependencies
         run: sudo apt-get update && sudo apt-get install -y ripgrep
-      - run: make check race static-analysis vulnerability-check license-check
+      - name: Run non-duplicated quality checks
+        run: >-
+          make verify-toolchain contracts dependencies source-policy metrics-check
+          hosted-image-check fmt-check generate-check tidy-check vet build
+
+  race:
+    name: Linux race detector
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: make race
+
+  supply-chain:
+    name: Static, vulnerability, and license checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run independent supply-chain gates in parallel
+        shell: bash
+        run: |
+          set -euo pipefail
+          make static-analysis & static_pid=$!
+          make vulnerability-check & vulnerability_pid=$!
+          make license-check & license_pid=$!
+          status=0
+          wait "$static_pid" || status=1
+          wait "$vulnerability_pid" || status=1
+          wait "$license_pid" || status=1
+          exit "$status"

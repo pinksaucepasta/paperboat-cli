@@ -23,7 +23,7 @@ ledger consistency only. It does not create native Windows evidence.
 | Target | Intended channel | Current ledger readiness | Native evidence | Promotion rule |
 | --- | --- | --- | --- | --- |
 | Windows amd64 | stable | blocked | required, not yet complete | every release-blocking feature and the full native amd64 matrix must reach `stable_ready` or its applicable native gate must pass |
-| Windows arm64 | beta | beta blocked | `native_windows_arm64_e2e: blocked_no_hardware` | beta may ship only with the complete implementation, signed artifacts, and `arm64_cross_verified`; stable promotion is technically blocked until `arm64_native_verified` |
+| Windows arm64 | beta | native hosted beta gate | `native_windows_arm64_tested: true` | beta ships with the complete implementation, cross-build evidence, and native GitHub-hosted ARM64 evidence; promotion to stable remains an explicit product decision |
 
 “Windows amd64 stable” is the target release contract, not a claim that the current
 checkout is stable. “Windows arm64 beta” is the intended channel, not a substitute for
@@ -86,14 +86,14 @@ not evidence for all five Windows/macOS/Linux directions.
 | `windows_amd64_cross_build` | `pass` | The full repository builds for Windows amd64; this is compile evidence only. |
 | `windows_arm64_cross_build` | `pass` | The full repository builds for Windows arm64; this is compile evidence only. |
 | `windows_amd64_native_full_matrix` | `in_progress` | Must pass on standard Windows 11 and the Windows 11 IoT Enterprise LTSC target, including installation, host, service, transport, interop, update, rollback, and uninstall. |
-| `native_windows_arm64_e2e` | `blocked_no_hardware` | Explicitly skipped because no native ARM64 machine is available. This never counts as a pass. |
+| `native_windows_arm64_e2e` | `pass` | Runs on GitHub-hosted `windows-11-arm`; evidence remains tagged as beta and does not silently promote the channel. |
 | `windows_arm64_beta_cross_gate` | `pass` | The complete ARM64 source, test-package, MSI, ZIP, updater, and release-policy cross gate passes. Native ARM64 evidence remains explicitly unavailable and is not counted. |
 | `windows_amd64_stable_release` | `blocked` | Stable cannot be published while native amd64 qualification, host runtime, installer lifecycle, or interoperability is incomplete. |
 | `windows_artifact_signing` | `blocked` | TUF, SHA-256, PE architecture, SBOM, provenance, and malware-scan evidence are required before publication. Authenticode is optional. |
 
 Allowed gate statuses are `not_started`, `in_progress`, `blocked`,
-`blocked_no_hardware`, `pass`, `fail`, and `not_applicable`. A skipped ARM64 native
-test has `blocked_no_hardware`, not `pass` and not `arm64_native_verified`.
+`pass`, `fail`, and `not_applicable`. Windows ARM64 native evidence is produced only by
+the GitHub-hosted ARM64 runner; cross-compilation cannot produce native evidence.
 
 ## Locked Windows setup and security invariants
 
@@ -338,9 +338,10 @@ true:
 Windows arm64 can publish as beta only when the implementation has the same intended
 feature set, every applicable build/test/release artifact is cross-verified and protected
 by the same TUF, checksum, SBOM, and provenance controls,
-the beta channel is explicit everywhere, and `native_windows_arm64_e2e` remains recorded
-as `blocked_no_hardware`. It cannot be promoted to stable until the complete native
-ARM64 matrix reaches `arm64_native_verified`.
+the beta channel is explicit everywhere, and `native_windows_arm64_e2e` passes on the
+GitHub-hosted `windows-11-arm` runner against the exact candidate artifact. Native
+evidence does not silently promote the channel; stable promotion remains an explicit,
+reviewed product decision after the complete ARM64 matrix reaches `arm64_native_verified`.
 
 ## Updating the ledger
 
@@ -353,6 +354,6 @@ Every state change must include:
 - the corresponding evidence catalog entry and date;
 - any remaining blocker or recovery action.
 
-Never convert `blocked_no_hardware` to a pass because an emulator succeeded. Never mark
-a whole group complete from one representative test. Run the validator and review the
-diff before committing a ledger update.
+Never convert cross-compilation or emulation into native evidence. Never mark a whole
+group complete from one representative test. Run the validator and review the diff
+before committing a ledger update.
