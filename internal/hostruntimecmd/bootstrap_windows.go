@@ -122,7 +122,10 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	if err := saveBootstrapRegistration(identityStore, *serverURL, material, windowsAccountName(account.Username), sshConfig.Port); err != nil {
 		return fmt.Errorf("save machine registration: %w", err)
 	}
-	if material.ClientSession != nil {
+	// Host-only enrollment does not promise a local CLI profile. Keep the
+	// machine enrollment one-shot even when the account already has an E2E
+	// root; CLI identity bootstrap is required only for client setup.
+	if material.ClientSession != nil && material.SetupMode != "host" {
 		if err := installBootstrapCLI(ctx, material.ClientSession, *serverURL); err != nil {
 			return fmt.Errorf("initialize Paperboat CLI session: %w", err)
 		}
