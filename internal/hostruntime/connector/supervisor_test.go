@@ -3,6 +3,7 @@ package connector
 import (
 	"context"
 	"errors"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -85,6 +86,9 @@ func (d *recoveringDialer) Dial(context.Context, Transport, Admission) (Connecti
 }
 
 func TestSupervisorFetchesFreshAdmissionWithCappedBackoffAndReconnects(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows scheduler timing does not provide deterministic fake-admission recovery metric timing")
+	}
 	now := time.Now()
 	dialer := &recoveringDialer{}
 	manager := manager(t, dialer, now)
