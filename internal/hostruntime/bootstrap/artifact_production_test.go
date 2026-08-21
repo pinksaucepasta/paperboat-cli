@@ -29,7 +29,10 @@ func TestProductionTUFRepository(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info, err := os.Stat(path); err != nil || info.Size() < 1 || info.Mode().Perm() != 0o700 {
+	if info, err := os.Stat(path); err != nil || info.Size() < 1 {
 		t.Fatalf("downloaded target info=%v error=%v", info, err)
+	}
+	if err := secureArtifactFile(path); err != nil {
+		t.Fatalf("downloaded target security error=%v", err)
 	}
 }

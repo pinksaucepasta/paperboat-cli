@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/pinksaucepasta/paperboat/internal/windowssecurity"
 	"golang.org/x/sys/windows"
 )
 
@@ -50,6 +51,66 @@ func secureDirectory(path string) error {
 		return ErrArtifactTarget
 	}
 	return nil
+}
+
+func secureArtifactFile(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || !windowsHasSingleLink(path) {
+		return ErrArtifactTarget
+	}
+	attributes, err := windows.GetFileAttributes(windows.StringToUTF16Ptr(path))
+	if err != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return ErrArtifactTarget
+	}
+	token, err := windows.OpenCurrentProcessToken()
+	if err != nil {
+		return err
+	}
+	defer token.Close()
+	user, err := token.GetTokenUser()
+	if err != nil || user == nil || user.User.Sid == nil || !user.User.Sid.IsValid() {
+		return ErrArtifactTarget
+	}
+	descriptor := "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
+	if user.User.Sid.String() != "S-1-5-18" {
+		descriptor += "(A;;FA;;;" + user.User.Sid.String() + ")"
+	}
+	want, err := windows.SecurityDescriptorFromString(descriptor)
+	if err != nil {
+		return err
+	}
+	abs, err := want.ToAbsolute()
+	if err != nil {
+		return err
+	}
+	dacl, _, err := abs.DACL()
+	if err != nil {
+		return err
+	}
+	if err := windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT,
+		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
+		user.User.Sid, nil, dacl, nil); err != nil {
+		return err
+	}
+	if !windowssecurity.ProtectedDACLMatches(path, want.String()) {
+		return ErrArtifactTarget
+	}
+	return nil
+}
+
+func windowsHasSingleLink(path string) bool {
+	handle, err := windows.CreateFile(
+		windows.StringToUTF16Ptr(path),
+		windows.FILE_READ_ATTRIBUTES,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OPEN_REPARSE_POINT, 0,
+	)
+	if err != nil {
+		return false
+	}
+	defer windows.CloseHandle(handle)
+	var info windows.ByHandleFileInformation
+	return windows.GetFileInformationByHandle(handle, &info) == nil && info.NumberOfLinks == 1
 }
 
 func directoryDACL(value string) string {

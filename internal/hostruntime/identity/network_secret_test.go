@@ -22,6 +22,6 @@ func TestNetworkFingerprintSecretIsDurableAndPrivate(t *testing.T) {
 	}
 	info, err := os.Lstat(filepath.Join(store.config.StateRoot, "network-fingerprint-secret.json"))
 	if err != nil || !secureIdentityPath(filepath.Join(store.config.StateRoot, "network-fingerprint-secret.json"), info, true) {
-		t.Fatalf("secret mode=%v err=%v", info.Mode(), err)
+		t.Fatalf("secret info=%v err=%v", info, err)
 	}
 }

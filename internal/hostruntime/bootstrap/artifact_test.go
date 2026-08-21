@@ -118,8 +118,8 @@ func TestFetchVerifiedArtifactThroughTUF(t *testing.T) {
 	if err != nil || string(got) != string(body) {
 		t.Fatalf("artifact=%q err=%v", got, err)
 	}
-	if info, err := os.Stat(path); err != nil || info.Mode().Perm() != 0o700 {
-		t.Fatalf("mode=%v err=%v", info.Mode(), err)
+	if err := secureArtifactFile(path); err != nil {
+		t.Fatalf("artifact security error=%v", err)
 	}
 }
 

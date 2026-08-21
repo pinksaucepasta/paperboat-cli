@@ -58,8 +58,8 @@ func TestEnrollBindsKeyAndPersistsPrivateIdentity(t *testing.T) {
 	}
 	path := filepath.Join(stateRoot, "runtime-identity.json")
 	info, err := os.Stat(path)
-	if err != nil || info.Mode().Perm() != 0o600 {
-		t.Fatalf("identity mode: %v %v", info, err)
+	if err != nil || !secureIdentityFile(path, info, 32<<10) {
+		t.Fatalf("identity file: %v %v", info, err)
 	}
 	body, _ := os.ReadFile(path)
 	if !strings.Contains(string(body), `"helper_id":"helper_1"`) || !strings.Contains(string(body), `"key_id":"`+result.KeyID+`"`) {

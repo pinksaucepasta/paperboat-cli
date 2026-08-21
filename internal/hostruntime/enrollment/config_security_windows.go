@@ -9,7 +9,7 @@ import (
 )
 
 func secureEnrollmentConfigFile(path string, info os.FileInfo, maximum int64) bool {
-	if info == nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() > maximum {
+	if info == nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() > maximum || !windowsHasSingleLink(path) {
 		return false
 	}
 	token, err := windows.OpenCurrentProcessToken()

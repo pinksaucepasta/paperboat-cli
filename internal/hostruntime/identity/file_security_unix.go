@@ -7,7 +7,7 @@ import (
 	"syscall"
 )
 
-func secureIdentityFile(info os.FileInfo, requirePrivateMode bool) bool {
+func secureIdentityFile(_ string, info os.FileInfo, requirePrivateMode bool) bool {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || stat.Nlink != 1 {
 		return false
@@ -16,5 +16,5 @@ func secureIdentityFile(info os.FileInfo, requirePrivateMode bool) bool {
 }
 
 func secureIdentityPath(_ string, info os.FileInfo, requirePrivateMode bool) bool {
-	return secureIdentityFile(info, requirePrivateMode)
+	return secureIdentityFile("", info, requirePrivateMode)
 }

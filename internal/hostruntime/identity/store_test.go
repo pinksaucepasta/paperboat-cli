@@ -36,8 +36,9 @@ func TestStoreCreatesPrivateStableSigningIdentityAndRotatesAtomically(t *testing
 	if !ed25519.Verify(first.Public(), message, first.Sign(message)) {
 		t.Fatal("signature failed")
 	}
-	info, err := os.Stat(filepath.Join(root, "machine-identity.json"))
-	if err != nil || info.Mode().Perm() != 0o600 {
+	path := filepath.Join(root, "machine-identity.json")
+	info, err := os.Stat(path)
+	if err != nil || !secureIdentityPath(path, info, true) {
 		t.Fatalf("info=%v err=%v", info, err)
 	}
 	reopened, err := Open(Config{StateRoot: root})

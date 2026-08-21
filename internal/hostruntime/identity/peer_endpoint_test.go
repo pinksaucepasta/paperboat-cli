@@ -28,8 +28,9 @@ func TestPeerEndpointKeysRemainLocalAndAcceptOnlyMatchingCertificate(t *testing.
 	if err != nil || endpoint.Generation != 4 || len(endpoint.Certificate) != 0 {
 		t.Fatalf("endpoint=%+v err=%v", endpoint, err)
 	}
-	info, err := os.Stat(filepath.Join(root, "peer-endpoint.json"))
-	if err != nil || info.Mode().Perm() != 0o600 {
+	path := filepath.Join(root, "peer-endpoint.json")
+	info, err := os.Stat(path)
+	if err != nil || !secureIdentityPath(path, info, true) {
 		t.Fatalf("info=%v err=%v", info, err)
 	}
 	rootPublic, rootPrivate, _ := ed25519.GenerateKey(nil)

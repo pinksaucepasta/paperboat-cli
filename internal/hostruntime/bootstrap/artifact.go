@@ -266,6 +266,9 @@ func fetchVerifiedArtifact(ctx context.Context, target ArtifactTarget, stateDire
 	if err := os.Chmod(path, 0o700); err != nil {
 		return "", err
 	}
+	if err := secureArtifactFile(path); err != nil {
+		return "", err
+	}
 	return path, nil
 }
 

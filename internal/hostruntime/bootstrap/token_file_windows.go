@@ -10,7 +10,7 @@ import (
 )
 
 func secureEnrollmentTokenFile(path string, info os.FileInfo) bool {
-	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() == 0 || info.Size() > 512 {
+	if info == nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() == 0 || info.Size() > 512 || !windowsHasSingleLink(path) {
 		return false
 	}
 	attributes, err := windows.GetFileAttributes(windows.StringToUTF16Ptr(path))
