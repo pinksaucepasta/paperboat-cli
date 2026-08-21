@@ -57,6 +57,7 @@ jobs:
           $resultPath = Join-Path $root 'result.txt'
           $logPath = Join-Path $root 'enroll.log'
           $taskName = 'PaperboatQualificationReenroll'
+          Remove-Item -LiteralPath $resultPath,$logPath -Force -ErrorAction SilentlyContinue
           [IO.File]::WriteAllText($tokenPath, $token, (New-Object Text.UTF8Encoding($false)))
           icacls.exe $tokenPath /inheritance:r /grant:r 'SYSTEM:F' 'VICTUS\Pujan:F' | Out-Null
           @'
@@ -75,8 +76,12 @@ jobs:
           '@ | Set-Content -LiteralPath $scriptPath -Encoding UTF8
           icacls.exe $scriptPath /inheritance:r /grant:r 'SYSTEM:F' 'VICTUS\Pujan:RX' | Out-Null
 
-          $pwsh = 'C:\Program Files\PowerShell\7\pwsh.exe'
-          if (-not (Test-Path -LiteralPath $pwsh -PathType Leaf)) { throw "PowerShell 7 is missing at $pwsh" }
+          $pwsh = @(
+            'C:\Program Files\PowerShell\7\pwsh.exe',
+            'C:\Program Files\PowerShell\7-preview\pwsh.exe',
+            'C:\Users\Pujan\.cache\codex-runtimes\codex-primary-runtime\dependencies\native\powershell\pwsh.exe'
+          ) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+          if (-not $pwsh) { throw 'PowerShell 7 is missing from every qualified location.' }
           $action = New-ScheduledTaskAction -Execute $pwsh -Argument "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$scriptPath`""
           $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5)
           Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -User 'VICTUS\Pujan' -Password $env:VICTUS_RECOVERY_PASSWORD -RunLevel Highest -Force | Out-Null
