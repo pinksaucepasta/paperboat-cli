@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -96,10 +97,42 @@ func protectHostKeyFileWithSDDL(path, expectedSDDL string) error {
 		information |= windows.GROUP_SECURITY_INFORMATION
 		setGroup = group
 	}
+	// Assigning the protected SYSTEM owner is a machine-security operation.
+	// Administrator tokens on GitHub-hosted Windows runners have the privilege
+	// present but disabled, unlike the LocalSystem service context used on a
+	// normal unattended host.
+	if err := enableRestorePrivilege(); err != nil {
+		return err
+	}
 	if err := windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, information, setOwner, setGroup, dacl, nil); err != nil {
 		return err
 	}
 	return verifyHostKeyFile(path, expectedSDDL)
+}
+
+func enableRestorePrivilege() error {
+	var token windows.Token
+	if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY|windows.TOKEN_ADJUST_PRIVILEGES, &token); err != nil {
+		return err
+	}
+	defer token.Close()
+	name, err := windows.UTF16PtrFromString("SeRestorePrivilege")
+	if err != nil {
+		return err
+	}
+	var luid windows.LUID
+	if err := windows.LookupPrivilegeValue(nil, name, &luid); err != nil {
+		return err
+	}
+	privileges := windows.Tokenprivileges{PrivilegeCount: 1}
+	privileges.AllPrivileges()[0] = windows.LUIDAndAttributes{Luid: luid, Attributes: windows.SE_PRIVILEGE_ENABLED}
+	if err := windows.AdjustTokenPrivileges(token, false, &privileges, uint32(unsafe.Sizeof(privileges)), nil, nil); err != nil {
+		return err
+	}
+	if err := windows.GetLastError(); err != windows.ERROR_SUCCESS {
+		return err
+	}
+	return nil
 }
 
 func verifyHostKeyFiles(paths ...string) error {
