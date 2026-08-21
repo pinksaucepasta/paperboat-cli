@@ -90,6 +90,28 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'PowerShell 7 is unavailable.' }
           & cmd.exe /d /c ver
           if ($LASTEXITCODE -ne 0) { throw 'cmd.exe is unavailable.' }
+      - name: Provision pinned OpenSSH client for native contract tests
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $packageId = 'Microsoft.OpenSSH.Preview'
+          $version = '10.0.0.0'
+          $sshCandidates = @(
+            'C:\Windows\System32\OpenSSH',
+            'C:\Program Files\OpenSSH',
+            'C:\Program Files\OpenSSH-Win64'
+          )
+          $ssh = $sshCandidates | ForEach-Object { Join-Path $_ 'ssh.exe' } | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+          if ([string]::IsNullOrWhiteSpace($ssh)) {
+            & winget install --exact --id $packageId --version $version --source winget --scope machine --silent --accept-source-agreements --accept-package-agreements --disable-interactivity
+            if ($LASTEXITCODE -ne 0) { throw "Pinned OpenSSH installation failed with exit code $LASTEXITCODE." }
+            $ssh = $sshCandidates | ForEach-Object { Join-Path $_ 'ssh.exe' } | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+          }
+          if ([string]::IsNullOrWhiteSpace($ssh)) { throw 'Pinned OpenSSH client was not found after installation.' }
+          $sshDirectory = Split-Path -Parent $ssh
+          $sshDirectory | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "OpenSSH client: $ssh" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
       - name: Record native Windows arm64 beta contract evidence
         if: matrix.os == 'windows' && matrix.architecture == 'arm64'
         shell: pwsh
