@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -134,7 +135,7 @@ func run(args []string) error {
 		return errors.New("production signing is restricted to the macOS release workstation")
 	}
 	if len(args) == 0 {
-		return errors.New("usage: paperboat-tuf <init|publish|publish-bootstrap|promote|pause|quarantine|refresh|rotate|status>")
+		return errors.New("usage: paperboat-tuf <init|publish|publish-bootstrap|promote|pause|quarantine|refresh|rotate|status|verify-published>")
 	}
 	switch args[0] {
 	case "init":
@@ -204,9 +205,102 @@ func run(args []string) error {
 			return errors.New("usage: paperboat-tuf status -repository DIR")
 		}
 		return status(*repo)
+	case "verify-published":
+		fs := flag.NewFlagSet("verify-published", flag.ContinueOnError)
+		repo := fs.String("repository", "", "repository directory")
+		if err := fs.Parse(args[1:]); err != nil || fs.NArg() != 0 {
+			return errors.New("usage: paperboat-tuf verify-published -repository DIR")
+		}
+		return verifyPublished(*repo)
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+// verifyPublished checks the complete metadata set as it will be served. In
+// particular, it catches a partial publication that leaves timestamp.json or
+// snapshot.json present while omitting the versioned files they reference.
+func verifyPublished(repo string) error {
+	root, targets, snapshot, timestamp, err := loadSet(repo)
+	if err != nil {
+		return fmt.Errorf("load published metadata: %w", err)
+	}
+	if err := verifyRoot(root); err != nil {
+		return fmt.Errorf("verify root: %w", err)
+	}
+	if err := root.VerifyDelegate("targets", targets); err != nil {
+		return fmt.Errorf("verify targets: %w", err)
+	}
+	if err := root.VerifyDelegate("snapshot", snapshot); err != nil {
+		return fmt.Errorf("verify snapshot: %w", err)
+	}
+	if err := root.VerifyDelegate("timestamp", timestamp); err != nil {
+		return fmt.Errorf("verify timestamp: %w", err)
+	}
+	for _, item := range []struct {
+		name string
+		body []byte
+	}{
+		{fmt.Sprintf("%d.root.json", root.Signed.Version), mustMetadataBytes(root)},
+		{fmt.Sprintf("%d.targets.json", targets.Signed.Version), mustMetadataBytes(targets)},
+		{fmt.Sprintf("%d.snapshot.json", snapshot.Signed.Version), mustMetadataBytes(snapshot)},
+	} {
+		if err := verifyPublishedFile(filepath.Join(repo, "metadata", item.name), item.body); err != nil {
+			return err
+		}
+	}
+	if err := verifyPublishedFile(filepath.Join(repo, "metadata", "timestamp.json"), mustMetadataBytes(timestamp)); err != nil {
+		return err
+	}
+	if meta, ok := timestamp.Signed.Meta["snapshot.json"]; ok {
+		if err := verifyMetaReference(repo, fmt.Sprintf("%d.snapshot.json", meta.Version), meta); err != nil {
+			return err
+		}
+	} else {
+		return errors.New("timestamp does not reference snapshot.json")
+	}
+	for name, meta := range snapshot.Signed.Meta {
+		if err := verifyMetaReference(repo, fmt.Sprintf("%d.%s", meta.Version, name), meta); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func verifyMetaReference(repo, name string, meta *metadata.MetaFiles) error {
+	body, err := os.ReadFile(filepath.Join(repo, "metadata", name))
+	if err != nil {
+		return fmt.Errorf("missing referenced metadata %s: %w", name, err)
+	}
+	if meta.Length != 0 && int64(len(body)) != meta.Length {
+		return fmt.Errorf("metadata length mismatch %s", name)
+	}
+	if digest, ok := meta.Hashes["sha256"]; ok {
+		sum := sha256.Sum256(body)
+		if !bytes.Equal(sum[:], digest) {
+			return fmt.Errorf("metadata hash mismatch %s", name)
+		}
+	}
+	return nil
+}
+
+func mustMetadataBytes[T metadata.Roles](value *metadata.Metadata[T]) []byte {
+	body, err := value.ToBytes(false)
+	if err != nil {
+		panic(err)
+	}
+	return body
+}
+
+func verifyPublishedFile(path string, expected []byte) error {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("missing published metadata %s: %w", filepath.Base(path), err)
+	}
+	if !bytes.Equal(body, expected) {
+		return fmt.Errorf("published metadata differs from signed set: %s", filepath.Base(path))
+	}
+	return nil
 }
 
 // publishBootstrap adds only the unified bootstrap binary. It does not create

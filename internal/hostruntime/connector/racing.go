@@ -24,6 +24,7 @@ type racingConnector struct {
 	ctx            context.Context
 	cfg            *v1.ClientCommonConfig
 	preferencePath string
+	fallbackDelay  time.Duration
 	mu             sync.Mutex
 	winner         frpclient.Connector
 	raceCancel     context.CancelFunc
@@ -34,7 +35,13 @@ type racingConnector struct {
 }
 
 func newRacingConnector(ctx context.Context, cfg *v1.ClientCommonConfig, preferencePath string) frpclient.Connector {
-	return &racingConnector{ctx: ctx, cfg: cfg, preferencePath: preferencePath, newConnector: frpclient.NewConnector}
+	return &racingConnector{
+		ctx:            ctx,
+		cfg:            cfg,
+		preferencePath: preferencePath,
+		fallbackDelay:  200 * time.Millisecond,
+		newConnector:   frpclient.NewConnector,
+	}
 }
 
 type connectorOpenResult struct {
@@ -78,7 +85,7 @@ func (c *racingConnector) Open() error {
 		}()
 	}
 	start(first)
-	timer := time.NewTimer(200 * time.Millisecond)
+	timer := time.NewTimer(c.fallbackDelay)
 	defer timer.Stop()
 	startedSecond := false
 	var failures error

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"os"
@@ -13,6 +14,34 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/releaseindex"
 	"github.com/theupdateframework/go-tuf/v2/metadata"
 )
+
+func TestVerifyMetaReferenceRejectsMissingAndMismatchedVersionedMetadata(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.Mkdir(filepath.Join(repo, "metadata"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"signed":{"version":7}}`)
+	digest := sha256.Sum256(body)
+	meta := metadata.MetaFile(7)
+	meta.Length = int64(len(body))
+	meta.Hashes = metadata.Hashes{"sha256": digest[:]}
+	if err := verifyMetaReference(repo, "7.snapshot.json", meta); err == nil {
+		t.Fatal("missing versioned metadata unexpectedly verified")
+	}
+	path := filepath.Join(repo, "metadata", "7.snapshot.json")
+	if err := os.WriteFile(path, []byte("wrong"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyMetaReference(repo, "7.snapshot.json", meta); err == nil {
+		t.Fatal("hash-mismatched versioned metadata unexpectedly verified")
+	}
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyMetaReference(repo, "7.snapshot.json", meta); err != nil {
+		t.Fatalf("valid versioned metadata rejected: %v", err)
+	}
+}
 
 func TestPublishedReleaseIndexMatchesRuntimeContract(t *testing.T) {
 	components := make([]componentTarget, 0, 5)

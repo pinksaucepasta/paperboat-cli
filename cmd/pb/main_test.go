@@ -2082,7 +2082,7 @@ func TestMachineAddPrintsOneShotEnrollmentCommands(t *testing.T) {
 	if code := run(context.Background(), []string{"--config", configPath, "machine", "add", "--role", "client", "--name", "Victus"}, &output, &output); code != 0 {
 		t.Fatalf("exit=%d output=%q", code, output.String())
 	}
-	if !strings.Contains(output.String(), "Victus-one-shot-token") || !strings.Contains(output.String(), "get.pprbt.dev/install?p=") || strings.Contains(output.String(), "--setup-mode") || strings.Contains(output.String(), "PAPERBOAT_SERVER") {
+	if !strings.Contains(output.String(), "Victus-one-shot-token") || !strings.Contains(output.String(), "get.pprbt.dev/install?p=") || !strings.Contains(output.String(), "PowerShell or Command Prompt") || !strings.Contains(output.String(), "GetTempPath") || strings.Contains(output.String(), "iex") || strings.Contains(output.String(), "--setup-mode") || strings.Contains(output.String(), "PAPERBOAT_SERVER") {
 		t.Fatalf("output=%q", output.String())
 	}
 }
@@ -2289,6 +2289,7 @@ func quote(value string) string {
 
 func writeTestProfile(t *testing.T, dir, configPath, serverURL string) {
 	t.Helper()
+	isolateCommandCredentialLocation(t, dir)
 	profileDir := filepath.Join(dir, "credentials")
 	configJSON := `{"server_url":` + quote(serverURL) + `,"auth":{"allow_file_fallback":true,"profile_dir":` + quote(profileDir) + `},"connect":{"ready_timeout_seconds":30,"poll_interval_seconds":1,"dial_retries":0}}`
 	if err := os.WriteFile(configPath, []byte(configJSON), 0o600); err != nil {

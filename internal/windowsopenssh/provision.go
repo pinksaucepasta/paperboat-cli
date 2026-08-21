@@ -17,6 +17,7 @@ import (
 const (
 	MinimumWingetVersion = "1.7.0"
 	ServiceName          = "PaperboatSshd"
+	securityModuleImport = "$m=Join-Path $env:WINDIR 'System32\\WindowsPowerShell\\v1.0\\Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1';Import-Module -Name $m -ErrorAction Stop;"
 )
 
 var (
@@ -64,6 +65,8 @@ type Config struct {
 	StateRoot         string
 	ApprovedVersion   string
 	ExpectedPublisher string
+	OwnerSID          string
+	ServiceExecutable string
 	Port              uint16
 	Runner            Runner
 }
@@ -87,11 +90,20 @@ func DefaultConfig(runner Runner) Config {
 	}
 	programFiles := os.Getenv("ProgramFiles")
 	programData := os.Getenv("ProgramData")
+	// Elevated Windows processes normally inherit these variables, but service
+	// repair can be launched from a restricted environment. The documented
+	// machine-wide locations remain authoritative in that case.
+	if programFiles == "" {
+		programFiles = `C:\Program Files`
+	}
+	if programData == "" {
+		programData = `C:\ProgramData`
+	}
 	return Config{
 		Platform: runtime.GOOS, Architecture: runtime.GOARCH,
 		InstallRoot: filepath.Join(programFiles, "OpenSSH"),
 		StateRoot:   filepath.Join(programData, "Paperboat", "ssh"), ApprovedVersion: ApprovedVersion,
-		ExpectedPublisher: compatibility.ExpectedPublisher, Port: 38222, Runner: runner,
+		ExpectedPublisher: compatibility.ExpectedPublisher, OwnerSID: platformOwnerSID(), Port: 38222, Runner: runner,
 	}
 }
 
@@ -193,7 +205,7 @@ func verifyBinary(ctx context.Context, config Config, path string) error {
 	} else if config.Architecture == "arm64" {
 		expectedMachine = "0xaa64"
 	}
-	script := "$p='" + escaped + "';$s=Get-AuthenticodeSignature -LiteralPath $p;" +
+	script := securityModuleImport + "$p='" + escaped + "';$s=Get-AuthenticodeSignature -LiteralPath $p;" +
 		"$v=(Get-Item -LiteralPath $p).VersionInfo.FileVersion;" +
 		"if($s.Status -ne 'Valid' -or $s.SignerCertificate.Subject -notlike '*" + expectedPublisher + "*'){exit 41};" +
 		"if($v -notlike '" + expectedVersion + "*'){exit 42};" +
@@ -219,7 +231,7 @@ func validate(config Config) error {
 func resolveWinget(ctx context.Context, runner Runner) (string, error) {
 	resolveCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	script := "$p=Get-AppxPackage -Name Microsoft.DesktopAppInstaller -ErrorAction Stop|Sort-Object Version -Descending|Select-Object -First 1;" +
+	script := securityModuleImport + "$p=Get-AppxPackage -Name Microsoft.DesktopAppInstaller -ErrorAction Stop|Sort-Object Version -Descending|Select-Object -First 1;" +
 		"$w=Join-Path $p.InstallLocation 'winget.exe';$s=Get-AuthenticodeSignature -LiteralPath $w;" +
 		"if($s.Status -ne 'Valid' -or $s.SignerCertificate.Subject -notlike '*Microsoft*'){exit 41};Write-Output $w"
 	output, err := runner.Run(resolveCtx, "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script)

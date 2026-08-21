@@ -17,6 +17,7 @@ func removeSharedLock(path string) error {
 		if err == nil || time.Now().After(deadline) || !sharedLockRemovalRetryable(err) {
 			return err
 		}
+		//paperboat:allow-source-policy sleep owner=config-lock reason=bounded-Windows-sharing-violation-retry
 		time.Sleep(10 * time.Millisecond)
 	}
 }

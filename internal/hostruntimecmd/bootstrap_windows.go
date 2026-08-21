@@ -102,8 +102,9 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	if _, err := rand.Read(verifier); err != nil {
 		return err
 	}
+	_, reusableIdentityErr := enrollment.LoadRuntimeIdentityForRenewal(*stateRoot, time.Now().UTC())
 	sshConfig := windowsopenssh.DefaultConfig(nil)
-	config := bootstrap.Config{ServerURL: *serverURL, EnrollmentToken: token, DisplayName: *name, WorkspaceRoot: home, Verifier: base64.RawURLEncoding.EncodeToString(verifier), PublicIdentityKey: base64.RawURLEncoding.EncodeToString(identityStore.Current().Public()), RuntimeVersions: map[string]string{"pb": buildinfo.Version}, AcceptBetaPlatform: *acceptBetaPlatform, SSHUser: windowsAccountName(account.Username), SSHPort: sshConfig.Port}
+	config := bootstrap.Config{ServerURL: *serverURL, EnrollmentToken: token, DisplayName: *name, WorkspaceRoot: home, Verifier: base64.RawURLEncoding.EncodeToString(verifier), PublicIdentityKey: base64.RawURLEncoding.EncodeToString(identityStore.Current().Public()), RuntimeVersions: map[string]string{"pb": buildinfo.Version}, AcceptBetaPlatform: *acceptBetaPlatform, SSHUser: windowsAccountName(account.Username), SSHPort: sshConfig.Port, CanReuseRuntimeIdentity: reusableIdentityErr == nil}
 	pairing, err := bootstrap.CreatePairing(ctx, config)
 	if err != nil {
 		return err
@@ -125,7 +126,12 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	if err != nil {
 		return err
 	}
-	if !material.ReuseIdentity {
+	if material.ReuseIdentity {
+		runtimeIdentity, loadErr := enrollment.LoadRuntimeIdentityForRenewal(*stateRoot, time.Now().UTC())
+		if loadErr != nil || runtimeIdentity.HelperID != material.HelperID || runtimeIdentity.EnvironmentID != material.EnvironmentID {
+			return errors.New("server attempted to reuse an unavailable Windows runtime identity")
+		}
+	} else {
 		client, clientErr := enrollment.NewClient(nil, 15*time.Second)
 		if clientErr != nil {
 			return clientErr

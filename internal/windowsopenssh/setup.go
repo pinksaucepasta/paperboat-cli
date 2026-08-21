@@ -66,13 +66,16 @@ func setupFromResult(ctx context.Context, config Config, result Result) (SetupRe
 	} else if err != nil {
 		return SetupResult{}, err
 	}
-	if err := protectHostKeyFiles(hostKey, hostKey+".pub"); err != nil {
+	if err := protectHostKeyFiles(hostKey); err != nil {
+		return SetupResult{}, err
+	}
+	if err := protectHostPublicKeyFile(hostKey+".pub", config.OwnerSID); err != nil {
 		return SetupResult{}, err
 	}
 	if err := ValidateServiceConfig(config.Runner, result.SSHDPath, configPath); err != nil {
 		return SetupResult{}, err
 	}
-	serviceExecutable, err := paperboatServiceExecutable()
+	serviceExecutable, err := paperboatServiceExecutable(config.ServiceExecutable)
 	if err != nil {
 		return SetupResult{}, err
 	}
@@ -91,8 +94,11 @@ func setupFromResult(ctx context.Context, config Config, result Result) (SetupRe
 	return SetupResult{Result: result, CreatedHostKey: created}, nil
 }
 
-func paperboatServiceExecutable() (string, error) {
-	path := os.Getenv("PAPERBOAT_SERVICE_EXECUTABLE")
+func paperboatServiceExecutable(configured string) (string, error) {
+	path := configured
+	if path == "" {
+		path = os.Getenv("PAPERBOAT_SERVICE_EXECUTABLE")
+	}
 	if path == "" {
 		var err error
 		path, err = os.Executable()

@@ -38,6 +38,13 @@ func commandRuntimeTestRoot(t *testing.T) string {
 	return root
 }
 
+func isolateCommandCredentialLocation(t *testing.T, root string) {
+	t.Helper()
+	previous := xdg.ConfigHome
+	xdg.ConfigHome = root
+	t.Cleanup(func() { xdg.ConfigHome = previous })
+}
+
 func waitForCommandSocket(t *testing.T, path string) {
 	t.Helper()
 	client, err := localapi.NewClient(path, 100*time.Millisecond)

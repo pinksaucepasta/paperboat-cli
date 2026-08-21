@@ -88,11 +88,11 @@ evidence blocks publication.
 
 Windows packaging inputs are maintained in `packaging/windows`. The deterministic portable ZIP
 builder and WiX source validation run in CI, while WiX MSI compilation requires a Windows
-toolchain. The checked-in metadata marks Authenticode as externally required and contains no
-certificate, private key, or signing result. The release authority must compile the amd64 MSI
-for the stable channel and the arm64 MSI for the beta channel, sign every PE and MSI externally,
-RFC 3161 timestamp it, refresh checksums after signing, and only then render or submit the
-corresponding WinGet manifest template.
+toolchain. The release authority compiles the amd64 MSI for the stable channel and the arm64 MSI
+for the beta channel, binds their exact bytes into TUF, refreshes checksums, and only then renders
+or submits the corresponding WinGet manifest template. Authenticode is optional and must never be
+represented as present when no certificate was used. When optional signing is used, all evidence,
+checksums, manifests, and TUF metadata are generated from the final timestamped bytes.
 
 ```sh
 paperboat-tuf publish \
@@ -122,7 +122,15 @@ go test ./internal/hostruntime/bootstrap -run '^TestProductionTUFRepository$' -c
 
 paperboat-tuf refresh \
   -repository /Users/pujan.pm/.local/share/paperboat-release/tuf-production
+
+paperboat-tuf verify-published \
+  -repository /Users/pujan.pm/.local/share/paperboat-release/tuf-production
 ```
+
+`verify-published` must pass against the complete directory that will be uploaded. It verifies
+the signed roles and every versioned metadata file referenced by timestamp and snapshot. Upload
+the whole verified `metadata/` and `targets/` trees as one staged publication; never copy only
+the mutable `snapshot.json` or `timestamp.json` files.
 
 Rollout changes are release-authority operations. The dashboard or control plane may request
 them, but it cannot authorize them. Run the selected command on the signing workstation, review

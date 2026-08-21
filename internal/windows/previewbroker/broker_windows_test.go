@@ -6,6 +6,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"os"
 	"testing"
 	"time"
 
@@ -21,8 +23,9 @@ func TestNativeBrokerAuthenticatesAndBoundsOperations(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	ready := make(chan struct{})
+	pipeName := fmt.Sprintf(`\\.\pipe\PaperboatPreviewBroker-Test-%d`, os.Getpid())
 	go func() {
-		done <- (Server{OwnerSID: user.User.Sid.String(), Token: token, Ready: ready, Handle: func(_ context.Context, body []byte) error {
+		done <- (Server{OwnerSID: user.User.Sid.String(), Token: token, Ready: ready, PipeName: pipeName, Handle: func(_ context.Context, body []byte) error {
 			if string(body) == `{"fail":true}` {
 				return errors.New("fixture rejected")
 			}
@@ -45,16 +48,16 @@ func TestNativeBrokerAuthenticatesAndBoundsOperations(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("broker readiness was not reported")
 	}
-	err = Request(context.Background(), user.User.Sid.String(), token, []byte(`{"ok":true}`))
+	err = requestPipe(context.Background(), pipeName, user.User.Sid.String(), token, []byte(`{"ok":true}`))
 	if err != nil {
 		t.Fatalf("broker request: %v", err)
 	}
-	if err := Request(context.Background(), user.User.Sid.String(), token, []byte(`{"fail":true}`)); !errors.Is(err, ErrRejected) {
+	if err := requestPipe(context.Background(), pipeName, user.User.Sid.String(), token, []byte(`{"fail":true}`)); !errors.Is(err, ErrRejected) {
 		t.Fatalf("rejection = %v", err)
 	}
 	wrong := append([]byte(nil), token...)
 	wrong[0] ^= 0xff
-	if err := Request(context.Background(), user.User.Sid.String(), wrong, []byte(`{}`)); !errors.Is(err, ErrUnavailable) {
+	if err := requestPipe(context.Background(), pipeName, user.User.Sid.String(), wrong, []byte(`{}`)); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("wrong token = %v", err)
 	}
 }

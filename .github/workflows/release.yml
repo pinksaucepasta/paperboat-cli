@@ -483,9 +483,17 @@ jobs:
             'TestNativeFirewallProfiles',
             'TestNativeSCMCrashRecovery'
           )
-          foreach ($testName in $nativeTests) {
-            go test -count=1 -v -run ("^$testName`$") ./internal/windowsopenssh
-            if ($LASTEXITCODE -ne 0) { throw "Final Windows OpenSSH qualification failed: $testName" }
+          # The installed host runtime continuously reconciles authorized_keys.
+          # Suspend it while the uninstall-ownership test proves that OpenSSH
+          # state is absent, then restore normal host operation unconditionally.
+          Stop-Service -Name PaperboatHostd -Force -ErrorAction Stop
+          try {
+            foreach ($testName in $nativeTests) {
+              go test -count=1 -v -run ("^$testName`$") ./internal/windowsopenssh
+              if ($LASTEXITCODE -ne 0) { throw "Final Windows OpenSSH qualification failed: $testName" }
+            }
+          } finally {
+            Start-Service -Name PaperboatHostd -ErrorAction Continue
           }
       - name: Convert native report into final-artifact TUF evidence
         if: matrix.publish_evidence

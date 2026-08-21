@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostinstall"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntimeentry"
 	"github.com/pinksaucepasta/paperboat/internal/windows/elevation"
 	"github.com/pinksaucepasta/paperboat/internal/windowsopenssh"
@@ -138,6 +139,7 @@ func dispatchElevatedOperation(ctx context.Context, request elevation.Request) e
 		}
 	case elevation.OperationOpenSSH:
 		config := windowsopenssh.DefaultConfig(nil)
+		config.OwnerSID = request.OwnerSID
 		switch request.Action {
 		case elevation.ActionOpenSSHSetup:
 			_, err := windowsopenssh.Setup(ctx, config)
@@ -157,7 +159,14 @@ func repairWindowsInstallation(ctx context.Context) error {
 	if errors.Is(runtimeErr, hostinstall.ErrNotInstalled) {
 		runtimeErr = nil
 	}
-	_, sshErr := windowsopenssh.Repair(ctx, windowsopenssh.DefaultConfig(nil))
+	sshConfig := windowsopenssh.DefaultConfig(nil)
+	if installed, err := hostinstall.LoadWindowsRuntimeConfig(); err == nil {
+		sshConfig.OwnerSID = installed.OwnerSID
+	}
+	if layout, err := service.DefaultLayout("windows"); err == nil {
+		sshConfig.ServiceExecutable = layout.RuntimeCurrent
+	}
+	_, sshErr := windowsopenssh.Repair(ctx, sshConfig)
 	return errors.Join(runtimeErr, sshErr)
 }
 

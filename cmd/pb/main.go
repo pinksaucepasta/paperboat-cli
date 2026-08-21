@@ -4775,7 +4775,8 @@ func userMachineCobraCommand() *cobra.Command {
 		if name != "" {
 			parameter = name + "-" + parameter
 		}
-		fmt.Fprintf(command.OutOrStdout(), "Linux/macOS:\ncurl -fsSL 'https://get.pprbt.dev/install?p=%s' | bash\n\nWindows PowerShell:\nirm 'https://get.pprbt.dev/install?p=%s' | iex\n", parameter, parameter)
+		windowsURL := "https://get.pprbt.dev/install?p=" + parameter
+		fmt.Fprintf(command.OutOrStdout(), "Linux/macOS:\ncurl -fsSL 'https://get.pprbt.dev/install?p=%s' | bash\n\nWindows (PowerShell or Command Prompt):\n%s\n", parameter, windowsEnrollmentCommand(windowsURL))
 		return nil
 	}}
 	add.Flags().String("role", "host", "machine role: host or client")
@@ -4904,6 +4905,11 @@ func userMachineCobraCommand() *cobra.Command {
 	availability.Flags().Bool("json", false, "print JSON")
 	machine.AddCommand(add, list, rename, revoke, availability)
 	return machine
+}
+
+func windowsEnrollmentCommand(installerURL string) string {
+	path := "([IO.Path]::Combine([IO.Path]::GetTempPath(),'paperboat-install.ps1'))"
+	return "powershell -NoLogo -NoProfile -Command \"iwr -UseBasicParsing '" + installerURL + "' -OutFile " + path + "; & " + path + "\""
 }
 
 func waitForAvailabilityObservation(ctx context.Context, client *api.Client, machineID string, current api.AvailabilityPolicy, timeout time.Duration) api.AvailabilityPolicy {

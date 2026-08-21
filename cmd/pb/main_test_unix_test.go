@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/adrg/xdg"
 	"github.com/pinksaucepasta/paperboat/internal/localapi"
 )
 
@@ -23,6 +24,13 @@ func commandRuntimeTestRoot(t *testing.T) string {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(root) })
 	return root
+}
+
+func isolateCommandCredentialLocation(t *testing.T, root string) {
+	t.Helper()
+	previous := xdg.ConfigHome
+	xdg.ConfigHome = root
+	t.Cleanup(func() { xdg.ConfigHome = previous })
 }
 
 func waitForCommandSocket(t *testing.T, path string) {

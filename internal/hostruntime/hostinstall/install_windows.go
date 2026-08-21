@@ -159,6 +159,11 @@ func Install(ctx context.Context, request Request) error {
 	if err := installWindowsServices(ctx, layout, ""); err != nil {
 		return fmt.Errorf("install Paperboat Windows services: %w", err)
 	}
+	sshConfig := windowsopenssh.DefaultConfig(nil)
+	sshConfig.OwnerSID = request.OwnerSID
+	if err := windowsopenssh.InstallService(ctx, layout.RuntimeCurrent, filepath.Join(sshConfig.InstallRoot, "sshd.exe"), filepath.Join(sshConfig.StateRoot, "sshd_config")); err != nil {
+		return fmt.Errorf("bind Paperboat OpenSSH service to protected runtime: %w", err)
+	}
 	return nil
 }
 

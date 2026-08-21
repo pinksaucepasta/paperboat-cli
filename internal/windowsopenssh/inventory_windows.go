@@ -51,6 +51,7 @@ func inventoryPowerShell(config Config) string {
 	installRoot := quotePowerShell(config.InstallRoot)
 	return strings.Join([]string{
 		"$ErrorActionPreference='Stop'",
+		securityModuleImport,
 		"function A($p){$f=[IO.File]::Open($p,'Open','Read','Read');try{$r=[IO.BinaryReader]::new($f);if($r.ReadUInt16()-ne 0x5a4d){return ''};$f.Position=0x3c;$o=$r.ReadUInt32();$f.Position=$o;if($r.ReadUInt32()-ne 0x00004550){return ''};switch($r.ReadUInt16()){0x8664{'amd64'};0xaa64{'arm64'};default{''}}}finally{$f.Dispose()}}",
 		"function B($p){$i=Get-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue;if($null -eq $i){return [pscustomobject]@{path=$p;exists=$false;regular=$false;reparse_point=$false;signature_valid=$false;publisher='';version='';architecture=''}};$s=Get-AuthenticodeSignature -LiteralPath $p;$v=$i.VersionInfo.FileVersion;[pscustomobject]@{path=$p;exists=$true;regular=(-not $i.PSIsContainer);reparse_point=(($i.Attributes -band [IO.FileAttributes]::ReparsePoint)-ne 0);signature_valid=($s.Status -eq 'Valid');publisher=([string]$s.SignerCertificate.Subject);version=([string]$v);architecture=(A $p)}}",
 		"function S($n){$x=Get-CimInstance Win32_Service -Filter (\"Name='\"+$n+\"'\") -ErrorAction SilentlyContinue;if($null -eq $x){return [pscustomobject]@{name=$n;exists=$false;state='';process_id=0;path_name=''}};[pscustomobject]@{name=$n;exists=$true;state=([string]$x.State);process_id=[uint32]$x.ProcessId;path_name=([string]$x.PathName)}}",

@@ -44,13 +44,18 @@ type Server struct {
 	Token    []byte
 	Handle   func(context.Context, []byte) error
 	Ready    chan<- struct{}
+	PipeName string
 }
 
 func (s Server) Run(ctx context.Context) error {
 	if !validSID(s.OwnerSID) || len(s.Token) != tokenBytes || s.Handle == nil {
 		return ErrUnavailable
 	}
-	listener, err := winio.ListenPipe(PipeName, &winio.PipeConfig{SecurityDescriptor: "D:P(A;;GRGW;;;SY)(A;;GRGW;;;" + s.OwnerSID + ")", InputBufferSize: maxPayload + tokenBytes + 4, OutputBufferSize: 4096})
+	pipeName := s.PipeName
+	if pipeName == "" {
+		pipeName = PipeName
+	}
+	listener, err := winio.ListenPipe(pipeName, &winio.PipeConfig{SecurityDescriptor: "D:P(A;;GRGW;;;SY)(A;;GRGW;;;" + s.OwnerSID + ")", InputBufferSize: maxPayload + tokenBytes + 4, OutputBufferSize: 4096})
 	if err != nil {
 		return err
 	}
@@ -109,12 +114,16 @@ func (s Server) serve(parent context.Context, conn net.Conn) {
 }
 
 func Request(ctx context.Context, ownerSID string, token, payload []byte) error {
+	return requestPipe(ctx, PipeName, ownerSID, token, payload)
+}
+
+func requestPipe(ctx context.Context, pipeName, ownerSID string, token, payload []byte) error {
 	if !validSID(ownerSID) || len(token) != tokenBytes || len(payload) == 0 || len(payload) > maxPayload {
 		return ErrUnavailable
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	conn, err := winio.DialPipeAccessImpLevel(dialCtx, PipeName, windows.GENERIC_READ|windows.GENERIC_WRITE, winio.PipeImpLevelIdentification)
+	conn, err := winio.DialPipeAccessImpLevel(dialCtx, pipeName, windows.GENERIC_READ|windows.GENERIC_WRITE, winio.PipeImpLevelIdentification)
 	if err != nil {
 		return errors.Join(ErrUnavailable, err)
 	}

@@ -91,7 +91,10 @@ func TestNativeRepairStoppedService(t *testing.T) {
 	if output, err := config.Runner.Run(ctx, "icacls.exe", hostKey, "/grant", "*S-1-1-0:R"); err != nil {
 		t.Fatalf("weaken Paperboat host-key ACL: %v: %s", err, boundedOutput(output))
 	}
-	defer func() { _ = protectHostKeyFiles(hostKey, hostKey+".pub") }()
+	defer func() {
+		_ = protectHostKeyFiles(hostKey)
+		_ = protectHostPublicKeyFile(hostKey+".pub", config.OwnerSID)
+	}()
 	if err := verifyHostKeyFiles(hostKey); err == nil {
 		t.Fatal("deliberately weakened Paperboat host-key ACL unexpectedly validated")
 	}
@@ -103,8 +106,11 @@ func TestNativeRepairStoppedService(t *testing.T) {
 		t.Fatalf("incomplete repair result: %+v", repaired)
 	}
 	assertNativeServiceSID(t)
-	if err := verifyHostKeyFiles(hostKey, hostKey+".pub"); err != nil {
+	if err := verifyHostKeyFiles(hostKey); err != nil {
 		t.Fatalf("repair did not restore protected host-key ACLs: %v", err)
+	}
+	if err := verifyHostKeyFile(hostKey+".pub", hostKeySDDL+"(A;;FR;;;"+config.OwnerSID+")"); err != nil {
+		t.Fatalf("repair did not grant the enrolled owner read-only host-public-key access: %v", err)
 	}
 	qualified, err := Qualify(ctx, config, repaired.SetupResult.Result)
 	if err != nil || !qualified.Authenticated || !qualified.Exec || !qualified.PTY || !qualified.SCPUpload || !qualified.SCPDownload || !qualified.SFTPUpload || !qualified.SFTPDownload {

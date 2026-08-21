@@ -180,6 +180,11 @@ func TestRacingConnectorRetriesQUICImmediatelyWhenPreferredTCPFails(t *testing.T
 		t.Fatal(err)
 	}
 	r := newRacingConnector(context.Background(), &v1.ClientCommonConfig{}, path).(*racingConnector)
+	// Make the normal stagger deliberately long so this test proves that the
+	// preferred transport's failure starts the fallback immediately. A
+	// wall-clock assertion at the production 200 ms boundary is sensitive to
+	// Windows runner scheduling and does not distinguish the two code paths.
+	r.fallbackDelay = 2 * time.Second
 	selected := make(chan Transport, 2)
 	var quic *fakeRaceConnector
 	r.newConnector = func(ctx context.Context, config *v1.ClientCommonConfig) frpclient.Connector {
@@ -198,7 +203,7 @@ func TestRacingConnectorRetriesQUICImmediatelyWhenPreferredTCPFails(t *testing.T
 	if err := r.Open(); err != nil {
 		t.Fatal(err)
 	}
-	if time.Since(started) >= 200*time.Millisecond {
+	if time.Since(started) >= time.Second {
 		t.Fatal("preferred TCP failure waited for the fallback stagger")
 	}
 	if first, second := <-selected, <-selected; first != TCPMux || second != QUIC || r.winner != quic {

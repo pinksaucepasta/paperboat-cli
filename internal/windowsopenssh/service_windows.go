@@ -31,6 +31,7 @@ func InstallService(ctx context.Context, serviceExecutable, sshdPath, configPath
 	defer manager.Disconnect()
 	service, err := manager.OpenService(ServiceName)
 	arguments := []string{"__windows-sshd-service", "--sshd", sshdPath, "--config", configPath}
+	restartRequired := false
 	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
 		service, err = manager.CreateService(ServiceName, serviceExecutable, mgr.Config{
 			DisplayName: "Paperboat OpenSSH Server", Description: "Loopback-only OpenSSH endpoint managed by Paperboat",
@@ -44,10 +45,11 @@ func InstallService(ctx context.Context, serviceExecutable, sshdPath, configPath
 			return configErr
 		}
 		expectedCommand := windows.EscapeArg(serviceExecutable) + " __windows-sshd-service --sshd " + windows.EscapeArg(sshdPath) + " --config " + windows.EscapeArg(configPath)
-		if !sameServiceCommand(current.BinaryPathName, serviceExecutable, sshdPath, configPath) && !sameLegacyServiceCommand(current.BinaryPathName, sshdPath, configPath) {
+		if !samePaperboatServiceCommand(current.BinaryPathName, sshdPath, configPath) && !sameLegacyServiceCommand(current.BinaryPathName, sshdPath, configPath) {
 			service.Close()
 			return ErrServiceOwnership
 		}
+		restartRequired = !sameServiceCommand(current.BinaryPathName, serviceExecutable, sshdPath, configPath)
 		current.BinaryPathName = expectedCommand
 		current.StartType = mgr.StartAutomatic
 		current.SidType = windows.SERVICE_SID_TYPE_UNRESTRICTED
@@ -62,6 +64,16 @@ func InstallService(ctx context.Context, serviceExecutable, sshdPath, configPath
 	}
 	if err := service.SetRecoveryActionsOnNonCrashFailures(true); err != nil {
 		return err
+	}
+	if restartRequired {
+		if status, queryErr := service.Query(); queryErr == nil && status.State != svc.Stopped {
+			if _, stopErr := service.Control(svc.Stop); stopErr != nil && !errors.Is(stopErr, windows.ERROR_SERVICE_NOT_ACTIVE) {
+				return stopErr
+			}
+			if err := waitForServiceState(ctx, service, svc.Stopped, 30*time.Second); err != nil {
+				return err
+			}
+		}
 	}
 	if err := service.Start(); err != nil && !errors.Is(err, windows.ERROR_SERVICE_ALREADY_RUNNING) {
 		return err
@@ -86,14 +98,48 @@ func InstallService(ctx context.Context, serviceExecutable, sshdPath, configPath
 	}
 }
 
+func waitForServiceState(ctx context.Context, service *mgr.Service, wanted svc.State, timeout time.Duration) error {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	for {
+		status, err := service.Query()
+		if err != nil {
+			return err
+		}
+		if status.State == wanted {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return context.DeadlineExceeded
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
 func sameServiceCommand(command, serviceExecutable, sshdPath, configPath string) bool {
-	command = strings.ToLower(command)
-	return strings.Contains(command, strings.ToLower(filepath.Clean(serviceExecutable))) && strings.Contains(command, " __windows-sshd-service ") && strings.Contains(command, strings.ToLower(filepath.Clean(sshdPath))) && strings.Contains(command, strings.ToLower(filepath.Clean(configPath)))
+	arguments, err := windows.DecomposeCommandLine(command)
+	return err == nil && len(arguments) == 6 && sameWindowsPath(arguments[0], serviceExecutable) &&
+		arguments[1] == "__windows-sshd-service" && arguments[2] == "--sshd" && sameWindowsPath(arguments[3], sshdPath) &&
+		arguments[4] == "--config" && sameWindowsPath(arguments[5], configPath)
+}
+
+func samePaperboatServiceCommand(command, sshdPath, configPath string) bool {
+	arguments, err := windows.DecomposeCommandLine(command)
+	return err == nil && len(arguments) == 6 && arguments[1] == "__windows-sshd-service" && arguments[2] == "--sshd" &&
+		sameWindowsPath(arguments[3], sshdPath) && arguments[4] == "--config" && sameWindowsPath(arguments[5], configPath)
 }
 
 func sameLegacyServiceCommand(command, sshdPath, configPath string) bool {
-	command = strings.ToLower(command)
-	return strings.Contains(command, strings.ToLower(filepath.Clean(sshdPath))) && strings.Contains(command, " -d -f ") && strings.Contains(command, strings.ToLower(filepath.Clean(configPath)))
+	arguments, err := windows.DecomposeCommandLine(command)
+	return err == nil && len(arguments) == 4 && sameWindowsPath(arguments[0], sshdPath) && strings.EqualFold(arguments[1], "-D") &&
+		strings.EqualFold(arguments[2], "-f") && sameWindowsPath(arguments[3], configPath)
+}
+
+func sameWindowsPath(first, second string) bool {
+	return strings.EqualFold(filepath.Clean(first), filepath.Clean(second))
 }
 
 // RemoveServiceOwned stops and deletes only a PaperboatSshd registration whose
@@ -120,7 +166,7 @@ func RemoveServiceOwned(ctx context.Context, config Config) error {
 	if err != nil {
 		return err
 	}
-	serviceExecutable, err := paperboatServiceExecutable()
+	serviceExecutable, err := paperboatServiceExecutable(config.ServiceExecutable)
 	if err != nil {
 		return err
 	}

@@ -22,6 +22,9 @@ func TestWebSocketTransportUsesExactAuthenticatedBinaryProtocol(t *testing.T) {
 		if err == nil && messageType == websocket.MessageBinary {
 			serverMessages <- append([]byte(nil), raw...)
 			_ = connection.Write(context.Background(), websocket.MessageBinary, []byte("remote"))
+			// Keep the peer alive for the client's normal close handshake. An
+			// immediate CloseNow is surfaced by Winsock as an aborted connection.
+			_, _, _ = connection.Read(context.Background())
 		}
 	})
 	defer server.Close()

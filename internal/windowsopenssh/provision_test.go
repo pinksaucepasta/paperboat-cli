@@ -76,6 +76,20 @@ func TestSupportedWingetVersion(t *testing.T) {
 	}
 }
 
+func TestWindowsSignatureScriptsImportSecurityModuleBySystemPath(t *testing.T) {
+	runner := &fakeRunner{}
+	_, _ = resolveWinget(context.Background(), runner)
+	if len(runner.calls) != 1 {
+		t.Fatalf("resolve calls = %d, want 1", len(runner.calls))
+	}
+	script := runner.calls[0].args[len(runner.calls[0].args)-1]
+	for _, required := range []string{"$env:WINDIR", "Microsoft.PowerShell.Security.psd1", "Import-Module -Name $m -ErrorAction Stop", "Get-AuthenticodeSignature"} {
+		if !strings.Contains(script, required) {
+			t.Fatalf("resolve script missing %q: %s", required, script)
+		}
+	}
+}
+
 func TestProvisionDoesNotFallBackWhenWingetIsUnavailable(t *testing.T) {
 	errAt := 1
 	if runtime.GOOS == "windows" {
