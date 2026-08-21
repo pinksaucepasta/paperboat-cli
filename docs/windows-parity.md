@@ -86,7 +86,7 @@ not evidence for all five Windows/macOS/Linux directions.
 | `windows_amd64_cross_build` | `pass` | The full repository builds for Windows amd64; this is compile evidence only. |
 | `windows_arm64_cross_build` | `pass` | The full repository builds for Windows arm64; this is compile evidence only. |
 | `windows_amd64_native_full_matrix` | `in_progress` | Must pass on standard Windows 11 and the Windows 11 IoT Enterprise LTSC target, including installation, host, service, transport, interop, update, rollback, and uninstall. |
-| `native_windows_arm64_e2e` | `pass` | Runs on GitHub-hosted `windows-11-arm`; evidence remains tagged as beta and does not silently promote the channel. |
+| `native_windows_arm64_e2e` | `blocked_no_hardware` | Native ARM64 execution is intentionally unavailable; ARM64 remains beta and only cross-build/package evidence is accepted. |
 | `windows_arm64_beta_cross_gate` | `pass` | The complete ARM64 source, test-package, MSI, ZIP, updater, and release-policy cross gate passes. Native ARM64 evidence remains explicitly unavailable and is not counted. |
 | `windows_amd64_stable_release` | `blocked` | Stable cannot be published while native amd64 qualification, host runtime, installer lifecycle, or interoperability is incomplete. |
 | `windows_artifact_signing` | `blocked` | TUF, SHA-256, PE architecture, SBOM, provenance, and malware-scan evidence are required before publication. Authenticode is optional. |
@@ -145,9 +145,8 @@ The seeded matrix is deliberately conservative:
 The current native LTSC amd64 evidence is intentionally narrow:
 
 The ledger retains the explicit `blocked_no_hardware` state for ARM64 promotion
-semantics. The hosted `windows-11-arm` qualification lane now supplies native beta
-evidence, but ARM64 remains beta by product policy and is not promoted to stable by
-that evidence.
+semantics. The qualification workflow provides ARM64 cross-build and artifact
+evidence only; no native ARM64 runner is required or claimed.
 
 - `os.credentials` has `windows_amd64_client: amd64_native_verified` for the recorded
   Credential Manager round-trip, DPAPI-protected fallback, deletion, missing-credential,
@@ -343,8 +342,8 @@ true:
 Windows arm64 can publish as beta only when the implementation has the same intended
 feature set, every applicable build/test/release artifact is cross-verified and protected
 by the same TUF, checksum, SBOM, and provenance controls,
-the beta channel is explicit everywhere, and `native_windows_arm64_e2e` passes on the
-GitHub-hosted `windows-11-arm` runner against the exact candidate artifact. Native
+the beta channel is explicit everywhere, and `native_windows_arm64_e2e` is explicitly
+`blocked_no_hardware` because no native ARM64 runner is available. Cross-build
 evidence does not silently promote the channel; stable promotion remains an explicit,
 reviewed product decision after the complete ARM64 matrix reaches `arm64_native_verified`.
 
