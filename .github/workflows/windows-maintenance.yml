@@ -33,6 +33,18 @@ jobs:
           Get-Process paperboat*,pwsh -ErrorAction SilentlyContinue | Select-Object Id,Name,Path,SessionId,StartTime
           Get-ChildItem 'C:\PaperboatRecovery' -Force -ErrorAction SilentlyContinue | Select-Object Name,Length,LastWriteTime
           Get-Content 'C:\PaperboatRecovery\enroll.log' -Tail 100 -ErrorAction SilentlyContinue
+          $probe = 'PaperboatQualificationTaskProbe'
+          $probeOutput = 'C:\PaperboatRecovery\task-probe.txt'
+          Remove-Item $probeOutput -Force -ErrorAction SilentlyContinue
+          $probeAction = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\cmd.exe" -Argument "/c whoami > `"$probeOutput`""
+          $probeTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5)
+          $probePrincipal = New-ScheduledTaskPrincipal -UserId 'VICTUS\Pujan' -LogonType Interactive -RunLevel Highest
+          Register-ScheduledTask -TaskName $probe -Action $probeAction -Trigger $probeTrigger -Principal $probePrincipal -Force | Out-Null
+          Start-ScheduledTask -TaskName $probe
+          Start-Sleep -Seconds 5
+          Get-ScheduledTaskInfo -TaskName $probe | Format-List LastTaskResult,LastRunTime,NextRunTime
+          Get-Content $probeOutput -ErrorAction SilentlyContinue
+          Unregister-ScheduledTask -TaskName $probe -Confirm:$false -ErrorAction SilentlyContinue
   reenroll-victus:
     if: inputs.action == 'reenroll-victus'
     runs-on: [self-hosted, Windows, X64, paperboat-windows-11-iot-ltsc]
