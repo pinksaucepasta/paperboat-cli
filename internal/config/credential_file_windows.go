@@ -7,9 +7,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
+	"github.com/pinksaucepasta/paperboat/internal/windowssecurity"
 	"golang.org/x/sys/windows"
 )
 
@@ -87,25 +87,5 @@ func credentialFilePrivate(path string) bool {
 	if err != nil {
 		return false
 	}
-	got, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
-	if err != nil || got == nil {
-		return false
-	}
-	control, _, err := got.Control()
-	if err != nil || control&windows.SE_DACL_PROTECTED == 0 {
-		return false
-	}
-	return daclSection(got.String()) == daclSection(want.String())
-}
-
-func daclSection(sddl string) string {
-	start := strings.Index(sddl, "D:")
-	if start < 0 {
-		return ""
-	}
-	end := strings.Index(sddl[start+2:], "S:")
-	if end < 0 {
-		return sddl[start:]
-	}
-	return sddl[start : start+2+end]
+	return windowssecurity.ProtectedDACLMatches(path, want.String())
 }

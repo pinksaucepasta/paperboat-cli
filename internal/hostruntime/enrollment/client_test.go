@@ -153,7 +153,7 @@ func TestLoadConfigRequiresPrivateRegularFile(t *testing.T) {
 	if _, err := LoadConfig(path); err == nil {
 		t.Fatal("public enrollment config accepted")
 	}
-	if err := os.Chmod(path, 0o600); err != nil {
+	if err := makeEnrollmentConfigPrivate(path); err != nil {
 		t.Fatal(err)
 	}
 	config, err := LoadConfig(path)

@@ -714,6 +714,20 @@ func (i *Interceptor) uploadAsync(seq uint64, policy policySnapshot, paths []str
 	framed = append(framed, startMarker...)
 	framed = append(framed, body...)
 	framed = append(framed, endMarker...)
+	// Give bytes already accepted by Write a chance to reach the worker before
+	// publishing the replacement. This preserves terminal stream order when a
+	// paste upload completes between two small input writes.
+	if DefaultPartialFlushDelay > 0 {
+		timer := time.NewTimer(DefaultPartialFlushDelay)
+		select {
+		case <-timer.C:
+		case <-i.ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return
+		}
+	}
 	select {
 	case i.completed <- uploadCompletion{seq: seq, framed: framed, err: err}:
 	case <-i.ctx.Done():

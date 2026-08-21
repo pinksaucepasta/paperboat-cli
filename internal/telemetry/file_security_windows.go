@@ -4,10 +4,9 @@ package telemetry
 
 import (
 	"errors"
-	"io/fs"
-	"strings"
-
+	"github.com/pinksaucepasta/paperboat/internal/windowssecurity"
 	"golang.org/x/sys/windows"
+	"io/fs"
 )
 
 func telemetrySecurityDescriptor() (*windows.SECURITY_DESCRIPTOR, error) {
@@ -48,22 +47,5 @@ func telemetryFilePrivate(path string, _ fs.FileInfo) bool {
 	if err != nil {
 		return false
 	}
-	got, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
-	if err != nil {
-		return false
-	}
-	control, _, err := got.Control()
-	return err == nil && control&windows.SE_DACL_PROTECTED != 0 && daclSection(got.String()) == daclSection(want.String())
-}
-
-func daclSection(sddl string) string {
-	start := strings.Index(sddl, "D:")
-	if start < 0 {
-		return ""
-	}
-	end := strings.Index(sddl[start+2:], "S:")
-	if end < 0 {
-		return sddl[start:]
-	}
-	return sddl[start : start+2+end]
+	return windowssecurity.ProtectedDACLMatches(path, want.String())
 }

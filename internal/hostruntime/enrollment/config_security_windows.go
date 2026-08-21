@@ -1,6 +1,6 @@
 //go:build windows
 
-package identity
+package enrollment
 
 import (
 	"github.com/pinksaucepasta/paperboat/internal/windowssecurity"
@@ -8,22 +8,8 @@ import (
 	"os"
 )
 
-func secureIdentityFile(info os.FileInfo, requirePrivateMode bool) bool {
-	if info == nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-		return false
-	}
-	if !requirePrivateMode {
-		return true
-	}
-	path := info.Name()
-	_ = path
-	return true
-}
-
-// Windows callers validate the path-bearing form below. Kept separate from
-// the Unix mode check because os.FileInfo exposes synthetic permission bits.
-func secureIdentityPath(path string, info os.FileInfo, requirePrivateMode bool) bool {
-	if !secureIdentityFile(info, requirePrivateMode) {
+func secureEnrollmentConfigFile(path string, info os.FileInfo, maximum int64) bool {
+	if info == nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() > maximum {
 		return false
 	}
 	token, err := windows.OpenCurrentProcessToken()

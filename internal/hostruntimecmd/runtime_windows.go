@@ -15,6 +15,7 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostdproto"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostinstall"
 	hostservice "github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
+	"github.com/pinksaucepasta/paperboat/internal/windowssecurity"
 	"golang.org/x/sys/windows"
 )
 
@@ -134,16 +135,8 @@ func validWindowsHostdTokenACLForSID(path, enrolledSID string) bool {
 	if sid, err := windows.StringToSid(enrolledSID); err != nil || sid == nil || !sid.IsValid() {
 		return false
 	}
-	descriptor, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
-	if err != nil || descriptor == nil || !descriptor.IsValid() {
-		return false
-	}
-	control, _, err := descriptor.Control()
-	if err != nil || control&windows.SE_DACL_PROTECTED == 0 {
-		return false
-	}
 	want := "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + enrolledSID + ")"
-	return windowsHostdTokenDACL(descriptor.String()) == windowsHostdTokenDACL(want)
+	return windowssecurity.ProtectedDACLMatches(path, want)
 }
 
 func windowsHostdTokenDACL(value string) string {

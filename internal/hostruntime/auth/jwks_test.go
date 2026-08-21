@@ -180,7 +180,7 @@ func TestJWKSPersistenceLoadsOnlyFreshValidatedMaterial(t *testing.T) {
 		t.Fatal(err)
 	}
 	info, err := os.Lstat(path)
-	if err != nil || info.Mode().Perm() != 0o600 || !info.Mode().IsRegular() {
+	if err != nil || !secureJWKSFile(path, info) {
 		t.Fatalf("persisted info=%v err=%v", info, err)
 	}
 	offline, err := NewJWKSCache(JWKSConfig{Clock: clock, TTL: time.Minute, PersistencePath: path, Fetcher: fetcherFunc(func(context.Context) (io.ReadCloser, error) {

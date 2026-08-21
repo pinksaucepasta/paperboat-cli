@@ -146,7 +146,7 @@ func LoadConfig(path string) (Config, error) {
 		return Config{}, ErrInvalid
 	}
 	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 || info.Size() > 32<<10 {
+	if err != nil || !secureEnrollmentConfigFile(path, info, 32<<10) {
 		return Config{}, ErrInvalid
 	}
 	body, err := os.ReadFile(path)
