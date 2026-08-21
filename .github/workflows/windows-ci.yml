@@ -242,13 +242,13 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-go-build-
       - name: Validate first-party Windows packaging contract
-        shell: pwsh
+        shell: powershell
         run: |
           & ./packaging/windows/scripts/validate.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           go test -count=1 ./packaging/windows/...
       - name: Verify target architecture and Windows build
-        shell: pwsh
+        shell: powershell
         run: |
           if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() -ne "X64") {
             throw "The IoT Enterprise LTSC qualification runner must be amd64."
@@ -256,10 +256,10 @@ jobs:
           Get-ComputerInfo -Property WindowsProductName,WindowsVersion,OsBuildNumber |
             Out-String | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
       - name: Run the complete native IoT amd64 test suite
-        shell: pwsh
+        shell: powershell
         run: go test -count=1 ./...
       - name: Install pinned WiX 5.0.2 for IoT MSI qualification
-        shell: pwsh
+        shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
           dotnet tool install --global wix --version 5.0.2 --no-cache
@@ -270,7 +270,7 @@ jobs:
           if ($version -notmatch '(^|[^0-9])5\.0\.2([^0-9]|$)') { throw "Expected WiX 5.0.2, got $version." }
           "PAPERBOAT_WINDOWS_E2E_WIX=$wix" >> $env:GITHUB_ENV
       - name: Build native IoT amd64 qualification inputs
-        shell: pwsh
+        shell: powershell
         run: |
           & ./packaging/windows/scripts/Build-NativeQualificationArtifacts.ps1 `
             -Version '2026.08.18.0' `
@@ -280,7 +280,7 @@ jobs:
             -OutputDirectory (Join-Path $env:RUNNER_TEMP 'paperboat-iot-amd64-qualification')
           if ($LASTEXITCODE -ne 0) { throw 'Native IoT amd64 qualification input build failed.' }
       - name: Run native IoT amd64 MSI, SCM, preview, and ConPTY qualification
-        shell: pwsh
+        shell: powershell
         run: |
           & ./packaging/windows/scripts/Invoke-NativeWindowsQualification.ps1 `
             -MsiPath $env:PAPERBOAT_WINDOWS_E2E_MSI `
@@ -300,7 +300,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
       - name: Qualify pinned WinGet OpenSSH and PaperboatSshd end to end
-        shell: pwsh
+        shell: powershell
         env:
           PAPERBOAT_WINDOWS_OPENSSH_NATIVE: "1"
         run: |
