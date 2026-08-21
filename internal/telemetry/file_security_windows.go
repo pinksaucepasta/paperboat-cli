@@ -5,6 +5,7 @@ package telemetry
 import (
 	"errors"
 	"io/fs"
+	"strings"
 
 	"golang.org/x/sys/windows"
 )
@@ -52,5 +53,17 @@ func telemetryFilePrivate(path string, _ fs.FileInfo) bool {
 		return false
 	}
 	control, _, err := got.Control()
-	return err == nil && control&windows.SE_DACL_PROTECTED != 0 && got.String() == want.String()
+	return err == nil && control&windows.SE_DACL_PROTECTED != 0 && daclSection(got.String()) == daclSection(want.String())
+}
+
+func daclSection(sddl string) string {
+	start := strings.Index(sddl, "D:")
+	if start < 0 {
+		return ""
+	}
+	end := strings.Index(sddl[start+2:], "S:")
+	if end < 0 {
+		return sddl[start:]
+	}
+	return sddl[start : start+2+end]
 }

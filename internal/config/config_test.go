@@ -87,8 +87,8 @@ func TestSaveUsesRestrictedPermissions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o600 {
-		t.Fatalf("config permissions = %o, want 600", info.Mode().Perm())
+	if !configTestFilePrivate(path, info) {
+		t.Fatalf("config file is not private: mode=%o", info.Mode().Perm())
 	}
 }
 

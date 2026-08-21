@@ -173,10 +173,10 @@ func TestFileSecretStoreRejectsLoosePermissions(t *testing.T) {
 	}
 	s := FileSecretStore{Dir: dir}
 	p := s.path("bad")
-	if err := os.WriteFile(p, []byte("secret"), 0o644); err != nil {
+	if err := writeTestCredential(p, "secret"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Get("bad"); err == nil || !strings.Contains(err.Error(), "0600") {
+	if _, err := s.Get("bad"); err == nil || !credentialPermissionError(err) {
 		t.Fatalf("err = %v", err)
 	}
 }
@@ -593,7 +593,7 @@ func TestPublishCredentialLocation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(b), customDir) {
+	if !configTestPathsEqual(string(b), customDir) {
 		t.Fatalf("location = %s", b)
 	}
 }

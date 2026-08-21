@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
 	"golang.org/x/sys/windows"
@@ -55,6 +56,9 @@ func readCredentialFile(path string) ([]byte, error) {
 	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 		return nil, err
 	}
+	if !credentialFilePrivate(path) {
+		return nil, fmt.Errorf("credential file must have a protected owner-only ACL")
+	}
 	attributes, err := windows.GetFileAttributes(windows.StringToUTF16Ptr(path))
 	if err != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
 		return nil, errors.Join(ErrCredentialStoreUnavailable, err)
@@ -72,4 +76,36 @@ func readCredentialFile(path string) ([]byte, error) {
 	result := append([]byte(nil), plain[1:]...)
 	clear(plain)
 	return result, nil
+}
+
+func credentialFilePrivate(path string) bool {
+	wantSDDL, err := currentUserCredentialSDDL()
+	if err != nil {
+		return false
+	}
+	want, err := windows.SecurityDescriptorFromString(wantSDDL)
+	if err != nil {
+		return false
+	}
+	got, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+	if err != nil || got == nil {
+		return false
+	}
+	control, _, err := got.Control()
+	if err != nil || control&windows.SE_DACL_PROTECTED == 0 {
+		return false
+	}
+	return daclSection(got.String()) == daclSection(want.String())
+}
+
+func daclSection(sddl string) string {
+	start := strings.Index(sddl, "D:")
+	if start < 0 {
+		return ""
+	}
+	end := strings.Index(sddl[start+2:], "S:")
+	if end < 0 {
+		return sddl[start:]
+	}
+	return sddl[start : start+2+end]
 }

@@ -100,7 +100,7 @@ func TestWorkflowCreatesBundleButReportsEndMarkerFailure(t *testing.T) {
 func testBundle(t *testing.T, content []byte) diagnostics.Bundle {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "bugreport-pb-0123456789abcdef0123456789abcdef.zip")
-	if err := os.WriteFile(path, content, 0o600); err != nil {
+	if err := writeTestBundle(path, content); err != nil {
 		t.Fatal(err)
 	}
 	return diagnostics.Bundle{Schema: diagnostics.BundleSchemaV1, Correlation: "pb-0123456789abcdef0123456789abcdef", CreatedAt: time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC), Path: path, Bytes: int64(len(content)), Categories: []string{"manifest", "recent_events", "redacted_events", "status"}}

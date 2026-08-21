@@ -110,7 +110,7 @@ func (l *sharedLock) Unlock() error {
 	if owner.Token != l.token {
 		return nil
 	}
-	return os.RemoveAll(l.path)
+	return removeSharedLock(l.path)
 }
 
 var (
