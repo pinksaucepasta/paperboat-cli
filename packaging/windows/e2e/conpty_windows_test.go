@@ -57,6 +57,12 @@ func findPowerShell7() (string, error) {
 	if matches, _ := filepath.Glob(filepath.Join(systemDrive, "Users", "*", "AppData", "Local", "Microsoft", "PowerShell", "7", "pwsh.exe")); len(matches) > 0 {
 		candidates = append(candidates, matches...)
 	}
+	if matches, _ := filepath.Glob(filepath.Join(systemDrive, "Users", "*", "AppData", "Local", "Programs", "PowerShell", "7", "pwsh.exe")); len(matches) > 0 {
+		candidates = append(candidates, matches...)
+	}
+	if matches, _ := filepath.Glob(filepath.Join(systemDrive, "Users", "*", "AppData", "Local", "Microsoft", "WinGet", "Packages", "Microsoft.PowerShell*", "*", "pwsh.exe")); len(matches) > 0 {
+		candidates = append(candidates, matches...)
+	}
 	// Codex ships a native PowerShell runtime on Windows. It is a supported
 	// PowerShell 7 executable even when the interactive user's package is not
 	// registered in LocalSystem's PATH.
