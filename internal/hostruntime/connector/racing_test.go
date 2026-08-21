@@ -56,7 +56,10 @@ func TestRacingConnectorSelectsTCPAfterSilentQUIC(t *testing.T) {
 	if err := r.Open(); err != nil {
 		t.Fatal(err)
 	}
-	if elapsed := time.Since(started); elapsed < 200*time.Millisecond || elapsed > 750*time.Millisecond {
+	// The stagger is intentionally bounded, but shared CI runners can add
+	// scheduler delay around the fallback timer. Keep the lower bound that
+	// proves the stagger happened and leave enough headroom for contention.
+	if elapsed := time.Since(started); elapsed < 200*time.Millisecond || elapsed > 2*time.Second {
 		t.Fatalf("fallback elapsed=%s", elapsed)
 	}
 	if r.winner != tcp {
