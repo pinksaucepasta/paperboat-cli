@@ -340,6 +340,33 @@ func (i *Interceptor) run() {
 			timerArmed = true
 		}
 	}
+	// An upload completion may race with ordinary bytes that were already
+	// accepted by Write. Drain that accepted input before publishing the
+	// completion so a later paste cannot overtake bytes that followed it in
+	// the terminal stream.
+	drainAcceptedInput := func() error {
+		for input != nil {
+			select {
+			case p, ok := <-input:
+				if !ok {
+					inputClosed = true
+					input = nil
+					return nil
+				}
+				i.queued.Add(-1)
+				i.stateMu.Lock()
+				i.buf = append(i.buf, p...)
+				err := i.drain()
+				i.stateMu.Unlock()
+				if err != nil {
+					return err
+				}
+			default:
+				return nil
+			}
+		}
+		return nil
+	}
 	handleWriteErr := func(err error) (fatal bool) {
 		if errors.Is(err, tunnel.ErrWriteUncertain) {
 			i.Discard()
@@ -370,6 +397,9 @@ func (i *Interceptor) run() {
 				return
 			}
 		case completion := <-i.completed:
+			if err := drainAcceptedInput(); err != nil && handleWriteErr(err) {
+				return
+			}
 			completionBuffer[completion.seq] = completion
 			for {
 				ready, ok := completionBuffer[nextCompletion]
@@ -789,6 +819,24 @@ func parseCandidate(line string) (pathCandidate, bool) {
 		return pathCandidate{}, false
 	}
 	if strings.HasPrefix(strings.ToLower(localPath), "file:") {
+		if runtime.GOOS == "windows" {
+			// Terminal applications commonly emit the legacy Windows spelling
+			// file://C:\\path or file://localhostC:\\path rather than a
+			// standards-compliant file:///C:/path URI. Accept only those
+			// unambiguous local-drive forms.
+			raw := localPath[len("file://"):]
+			if strings.HasPrefix(strings.ToLower(raw), "localhost") {
+				raw = raw[len("localhost"):]
+			}
+			if len(raw) >= 2 && raw[1] == ':' && ((raw[0] >= 'a' && raw[0] <= 'z') || (raw[0] >= 'A' && raw[0] <= 'Z')) {
+				decoded, decodeErr := url.PathUnescape(raw)
+				if decodeErr != nil {
+					return pathCandidate{}, false
+				}
+				localPath = decoded
+				goto filePathDecoded
+			}
+		}
 		u, err := url.Parse(localPath)
 		if err != nil || !strings.EqualFold(u.Scheme, "file") ||
 			(u.Host != "" && !strings.EqualFold(u.Host, "localhost")) ||
@@ -802,6 +850,7 @@ func parseCandidate(line string) (pathCandidate, bool) {
 	} else if hasUnquotedGlob {
 		return pathCandidate{}, false
 	}
+filePathDecoded:
 	localPath = filepath.FromSlash(localPath)
 	if !filepath.IsAbs(localPath) {
 		return pathCandidate{}, false
