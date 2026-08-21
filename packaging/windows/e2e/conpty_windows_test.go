@@ -63,6 +63,28 @@ func findPowerShell7() (string, error) {
 	if matches, _ := filepath.Glob(filepath.Join(systemDrive, "Users", "*", "AppData", "Local", "Microsoft", "WinGet", "Packages", "Microsoft.PowerShell*", "*", "pwsh.exe")); len(matches) > 0 {
 		candidates = append(candidates, matches...)
 	}
+	for _, root := range []string{
+		filepath.Join(systemDrive, "Program Files", "PowerShell"),
+		filepath.Join(systemDrive, "Users", "*", "scoop", "apps", "pwsh", "current"),
+		filepath.Join(systemDrive, "Users", "*", "scoop", "apps", "powershell", "current"),
+	} {
+		if matches, _ := filepath.Glob(filepath.Join(root, "*", "pwsh.exe")); len(matches) > 0 {
+			candidates = append(candidates, matches...)
+		}
+		if matches, _ := filepath.Glob(filepath.Join(root, "pwsh.exe")); len(matches) > 0 {
+			candidates = append(candidates, matches...)
+		}
+	}
+	// PowerShell registers the canonical install directory here even when
+	// LocalSystem does not inherit the interactive user's PATH.
+	if output, err := exec.Command("reg.exe", "query", `HKLM\SOFTWARE\Microsoft\PowerShellCore\InstalledVersions`, "/s", "/v", "InstallLocation").Output(); err == nil {
+		for _, line := range strings.Split(string(output), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) >= 3 && strings.EqualFold(fields[len(fields)-2], "REG_SZ") {
+				candidates = append(candidates, filepath.Join(strings.TrimSpace(strings.Join(fields[len(fields)-1:], " ")), "pwsh.exe"))
+			}
+		}
+	}
 	// Codex ships a native PowerShell runtime on Windows. It is a supported
 	// PowerShell 7 executable even when the interactive user's package is not
 	// registered in LocalSystem's PATH.
