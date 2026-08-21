@@ -494,7 +494,7 @@ func (c *Config) Save() error {
 		return fmt.Errorf("encode config: %w", err)
 	}
 	data = append(data, '\n')
-	if err := atomicfile.Write(c.path, data, atomicfile.Options{Mode: 0o600, OwnerUID: os.Geteuid(), OwnerGID: os.Getegid()}); err != nil {
+	if err := atomicfile.Write(c.path, data, atomicfile.CurrentOwnerOptions(0o600)); err != nil {
 		return fmt.Errorf("replace config %s: %w", c.path, err)
 	}
 	return nil

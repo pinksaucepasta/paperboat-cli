@@ -35,6 +35,13 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Cache Go build artifacts
+        uses: actions/cache@v4
+        with:
+          path: ~/AppData/Local/go-build
+          key: ${{ runner.os }}-${{ runner.arch }}-go-build-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-go-build-
       - name: Validate first-party Windows packaging contract
         shell: pwsh
         run: |
@@ -157,6 +164,13 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Cache Go build artifacts
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/go-build
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ matrix.arch }}-go-build-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-${{ matrix.arch }}-go-build-
       - name: Compile all Windows packages and test packages
         env:
           GOARCH: ${{ matrix.arch }}
@@ -217,6 +231,13 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Cache Go build artifacts
+        uses: actions/cache@v4
+        with:
+          path: ~/AppData/Local/go-build
+          key: ${{ runner.os }}-${{ runner.arch }}-go-build-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-go-build-
       - name: Validate first-party Windows packaging contract
         shell: pwsh
         run: |
@@ -308,6 +329,13 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Cache Go build artifacts
+        uses: actions/cache@v4
+        with:
+          path: ~/AppData/Local/go-build
+          key: ${{ runner.os }}-${{ runner.arch }}-go-build-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-go-build-
       - name: Validate first-party Windows packaging contract
         shell: pwsh
         run: |

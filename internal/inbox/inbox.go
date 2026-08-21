@@ -420,7 +420,7 @@ func saveJournal(root string, value journal) error {
 	if err != nil {
 		return err
 	}
-	return atomicfile.Write(filepath.Join(root, journalName), append(body, '\n'), atomicfile.Options{Mode: 0o600, OwnerUID: os.Geteuid(), OwnerGID: os.Getegid()})
+	return atomicfile.Write(filepath.Join(root, journalName), append(body, '\n'), atomicfile.CurrentOwnerOptions(0o600))
 }
 
 func boundJournal(value *journal) {

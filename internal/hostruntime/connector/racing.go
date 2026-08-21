@@ -195,5 +195,5 @@ func (c *racingConnector) savePreference(transport Transport) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	return atomicfile.Write(c.preferencePath, data, atomicfile.Options{Mode: 0o600, OwnerUID: os.Geteuid(), OwnerGID: os.Getegid()})
+	return atomicfile.Write(c.preferencePath, data, atomicfile.CurrentOwnerOptions(0o600))
 }

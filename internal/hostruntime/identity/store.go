@@ -171,7 +171,7 @@ func (s *Store) write(key Key) error {
 	if err != nil {
 		return err
 	}
-	return atomicfile.Write(s.path, encoded, atomicfile.Options{Mode: 0o600, OwnerUID: os.Geteuid(), OwnerGID: os.Getegid()})
+	return atomicfile.Write(s.path, encoded, atomicfile.CurrentOwnerOptions(0o600))
 }
 
 func privateDirectory(path string) error {

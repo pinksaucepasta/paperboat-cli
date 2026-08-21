@@ -101,5 +101,5 @@ func (s *Store) writePrivateDocument(name, _ string, encoded []byte) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	return atomicfile.Write(path, encoded, atomicfile.Options{Mode: 0o600, OwnerUID: os.Geteuid(), OwnerGID: os.Getegid()})
+	return atomicfile.Write(path, encoded, atomicfile.CurrentOwnerOptions(0o600))
 }

@@ -262,7 +262,7 @@ func (c *JWKSCache) persist(document []byte, validatedAt time.Time) error {
 	if err != nil {
 		return err
 	}
-	return atomicfile.Write(path, body, atomicfile.Options{Mode: 0o600, OwnerUID: os.Geteuid(), OwnerGID: os.Getegid()})
+	return atomicfile.Write(path, body, atomicfile.CurrentOwnerOptions(0o600))
 }
 
 type jwksDocument struct {
