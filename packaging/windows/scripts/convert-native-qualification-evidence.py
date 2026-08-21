@@ -60,7 +60,10 @@ def load_json(path: Path) -> dict[str, Any]:
     try:
         if path.is_symlink() or not path.is_file() or path.stat().st_size > 1 << 20:
             raise EvidenceError(f"{path} is not a bounded regular JSON file")
-        value = json.loads(path.read_text(encoding="utf-8"))
+        # Windows tooling commonly emits UTF-8 JSON with a BOM.  ``utf-8-sig``
+        # accepts both BOM-prefixed and ordinary UTF-8 files while keeping the
+        # parser strict for other encodings.
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise EvidenceError(f"cannot read {path}: {exc}") from exc
     if not isinstance(value, dict):

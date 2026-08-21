@@ -96,6 +96,13 @@ class NativeQualificationEvidenceTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("not a passed", result.stderr)
 
+    def test_accepts_bom_prefixed_report_from_windows_tooling(self) -> None:
+        report = json.loads(self.report.read_text(encoding="utf-8"))
+        self.report.write_bytes(("\ufeff" + json.dumps(report)).encode("utf-8"))
+        result = self.invoke("--output", str(self.evidence))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.evidence.read_text(encoding="utf-8"))["status"], "passed")
+
     def test_rejects_report_without_complete_native_lifecycle(self) -> None:
         self.write_report(events=[{"name": "preflight", "status": "passed", "detail": "ok"}])
         result = self.invoke("--output", str(self.evidence))
