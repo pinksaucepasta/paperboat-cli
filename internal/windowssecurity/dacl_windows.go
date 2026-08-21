@@ -35,12 +35,7 @@ func ProtectedDACLMatches(path, expected string) bool {
 	if err != nil || user == nil || user.User.Sid == nil {
 		return false
 	}
-	adminSID, err := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
-	if err != nil {
-		return false
-	}
-	member, err := token.IsMember(adminSID)
-	if err != nil || !member {
+	if !user.User.Sid.IsWellKnown(windows.WinAccountAdministratorSid) {
 		return false
 	}
 	return actual == dacl(strings.Replace(expected, user.User.Sid.String(), "LA", 1))
