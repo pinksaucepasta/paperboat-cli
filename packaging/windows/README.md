@@ -8,8 +8,8 @@ The package policy is deliberately separate from the runtime implementation:
 
 - `amd64` is published on the `stable` channel after the native release gates
   pass.
-- `arm64` is published on the `beta` channel until a native Windows arm64 test
-  runner has executed the complete qualification matrix.
+- `arm64` is published on the `beta` channel even though the hosted native Windows
+  arm64 contract runner is available; stable promotion remains an explicit release decision.
 - Both architectures use the same files, protocols, service names, local
   state layout, and intended feature set. Beta is evidence status, not a
   reduced implementation.

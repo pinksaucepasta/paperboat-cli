@@ -58,7 +58,7 @@ schema and cover `cli`, `runtime`, `hostd`,
   "status": "passed",
   "native_tested": true,
   "windows_build": "26100",
-  "runner": "windows-11-iot-amd64",
+  "runner": "windows-2025",
   "artifacts": [
     {
       "component": "cli",
@@ -75,8 +75,8 @@ schema and cover `cli`, `runtime`, `hostd`,
 
 `status` must be `passed` globally and per artifact. `windows_build` and `runner` identify the
 native qualification environment. A cross-build, emulator run, skipped test, or an ARM64 result
-cannot satisfy this amd64 gate. Windows arm64 remains beta with `native_tested: false` until its
-own native hardware qualification exists.
+cannot satisfy this amd64 gate. Windows arm64 remains beta by channel policy, even when its
+hosted native runner produces qualifying execution evidence.
 
 The release workflow produces this file deterministically with
 `packaging/windows/scripts/convert-native-qualification-evidence.py`. It accepts only a passed
