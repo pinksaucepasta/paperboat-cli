@@ -112,7 +112,7 @@ jobs:
         include:
           - architecture: amd64
             channel: stable
-            runner: [self-hosted, Windows, X64, paperboat-windows-11-iot-ltsc]
+            runner: windows-2025
           - architecture: arm64
             channel: beta
             runner: windows-2025
@@ -370,11 +370,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: standard-windows-11
+          - target: windows-2025-amd64
             runner: windows-2025
-            publish_evidence: false
-          - target: windows-11-iot-enterprise-ltsc
-            runner: [self-hosted, Windows, X64, paperboat-windows-11-iot-ltsc]
             publish_evidence: true
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
@@ -462,10 +459,6 @@ jobs:
         shell: powershell
         env:
           PAPERBOAT_WINDOWS_OPENSSH_NATIVE: "1"
-          # The runner service is LocalSystem, but the disposable Victus
-          # qualification account is Pujan. The SSH service probe must target
-          # the enrolled Windows account rather than the runner identity.
-          PAPERBOAT_WINDOWS_SSH_IDENTITY: "Pujan"
         run: |
           $ErrorActionPreference = 'Stop'
           # The preceding native MSI qualification intentionally verifies a
