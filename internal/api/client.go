@@ -353,6 +353,7 @@ type PendingEndpointIdentity struct {
 	RequestID      string    `json:"request_id"`
 	EndpointID     string    `json:"endpoint_id"`
 	Role           string    `json:"role,omitempty"`
+	State          string    `json:"state,omitempty"`
 	Generation     uint64    `json:"generation"`
 	NoisePublicKey string    `json:"noise_public_key"`
 	QUICPublicKey  string    `json:"quic_public_key"`

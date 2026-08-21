@@ -75,7 +75,7 @@ func TestEnrollExistingRootStoresVerifierOnlyIdentityAndIsIdempotent(t *testing.
 	}
 	raw, _ := certificate.MarshalBinary()
 	certificateFingerprint := sha256.Sum256(raw)
-	client := &existingEnrollmentClient{root: root, pending: api.PendingEndpointIdentity{RequestID: "per_0123456789abcdef", EndpointID: "cli_1", Role: "cli", Generation: 1, NoisePublicKey: base64.RawURLEncoding.EncodeToString(keys.NoisePublic[:]), QUICPublicKey: base64.RawURLEncoding.EncodeToString(quicPublic), CreatedAt: now.Add(-time.Minute), ExpiresAt: now.Add(4 * time.Minute), SafetyCode: "abcde-fghij"}, certificate: api.EndpointCertificateDocument{Version: 1, AccountID: "account_1", RootFingerprint: hex.EncodeToString(rootFingerprint[:]), EndpointID: "cli_1", Role: "cli", Generation: 1, Serial: 1, IssuedAt: certificate.Claims.IssuedAt.Format(time.RFC3339), ExpiresAt: certificate.Claims.ExpiresAt.Format(time.RFC3339), Certificate: base64.RawURLEncoding.EncodeToString(raw), CertificateFingerprint: hex.EncodeToString(certificateFingerprint[:])}}
+	client := &existingEnrollmentClient{root: root, pending: api.PendingEndpointIdentity{RequestID: "per_0123456789abcdef", EndpointID: "cli_1", Role: "cli", State: "pending", Generation: 1, NoisePublicKey: base64.RawURLEncoding.EncodeToString(keys.NoisePublic[:]), QUICPublicKey: base64.RawURLEncoding.EncodeToString(quicPublic), CreatedAt: now.Add(-time.Minute), ExpiresAt: now.Add(4 * time.Minute), SafetyCode: "abcde-fghij"}, certificate: api.EndpointCertificateDocument{Version: 1, AccountID: "account_1", RootFingerprint: hex.EncodeToString(rootFingerprint[:]), EndpointID: "cli_1", Role: "cli", Generation: 1, Serial: 1, IssuedAt: certificate.Claims.IssuedAt.Format(time.RFC3339), ExpiresAt: certificate.Claims.ExpiresAt.Format(time.RFC3339), Certificate: base64.RawURLEncoding.EncodeToString(raw), CertificateFingerprint: hex.EncodeToString(certificateFingerprint[:])}}
 	request := ExistingRootRequest{Store: store, Client: client, Issuer: "https://api.example.test", AccountID: "account_1", CLIClientSessionID: "cli_1", Now: func() time.Time { return now }, PollInterval: time.Millisecond, Timeout: time.Second}
 	first, err := EnrollExistingRoot(context.Background(), request)
 	if err != nil {
@@ -98,6 +98,40 @@ func TestEnrollExistingRootStoresVerifierOnlyIdentityAndIsIdempotent(t *testing.
 	}
 }
 
+func TestEnrollExistingRootRecoversAlreadyFulfilledEnrollmentAfterLocalPersistenceFailure(t *testing.T) {
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	rootPublic, rootPrivate, _ := ed25519.GenerateKey(nil)
+	rootFingerprint := sha256.Sum256(rootPublic)
+	rootDir := t.TempDir()
+	store := config.ProfileStore{Path: rootDir, Secrets: config.FileSecretStore{Dir: filepath.Join(rootDir, "secrets")}}
+	keys, err := store.PeerEndpointKeys("https://api.example.test", "account_1", "cli_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	quicPublic := keys.QUICPrivate.Public().(ed25519.PublicKey)
+	certificate, err := endpointidentity.Sign(rootPrivate, endpointidentity.Claims{AccountID: "account_1", Role: endpointidentity.RoleCLI, EndpointID: "cli_1", NoisePublicKey: keys.NoisePublic, QUICPublicKey: quicPublic, Generation: 1, Serial: 1, IssuedAt: now.Add(-10 * time.Minute), ExpiresAt: now.Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := certificate.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificateFingerprint := sha256.Sum256(raw)
+	client := &existingEnrollmentClient{
+		root:        api.E2EERoot{Version: 1, PublicKey: base64.RawURLEncoding.EncodeToString(rootPublic), Fingerprint: hex.EncodeToString(rootFingerprint[:]), Generation: 1},
+		pending:     api.PendingEndpointIdentity{RequestID: "per_0123456789abcdef", EndpointID: "cli_1", Role: "cli", State: "fulfilled", Generation: 1, NoisePublicKey: base64.RawURLEncoding.EncodeToString(keys.NoisePublic[:]), QUICPublicKey: base64.RawURLEncoding.EncodeToString(quicPublic), CreatedAt: now.Add(-10 * time.Minute), ExpiresAt: now.Add(-5 * time.Minute), SafetyCode: "abcde-fghij"},
+		certificate: api.EndpointCertificateDocument{Version: 1, AccountID: "account_1", RootFingerprint: hex.EncodeToString(rootFingerprint[:]), EndpointID: "cli_1", Role: "cli", Generation: 1, Serial: 1, IssuedAt: certificate.Claims.IssuedAt.Format(time.RFC3339), ExpiresAt: certificate.Claims.ExpiresAt.Format(time.RFC3339), Certificate: base64.RawURLEncoding.EncodeToString(raw), CertificateFingerprint: hex.EncodeToString(certificateFingerprint[:])},
+	}
+	result, err := EnrollExistingRoot(context.Background(), ExistingRootRequest{Store: store, Client: client, Issuer: "https://api.example.test", AccountID: "account_1", CLIClientSessionID: "cli_1", Now: func() time.Time { return now }, PollInterval: time.Millisecond, Timeout: time.Second})
+	if err != nil || result.CertificateFingerprint != hex.EncodeToString(certificateFingerprint[:]) || client.certReads != 1 {
+		t.Fatalf("result=%+v certificate reads=%d err=%v", result, client.certReads, err)
+	}
+	if _, err := store.LoadPeerCertificate("https://api.example.test", "cli_1"); err != nil {
+		t.Fatalf("issued certificate was not recovered: %v", err)
+	}
+}
+
 func TestEnrollExistingRootExpiresWhileApprovalIsPending(t *testing.T) {
 	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
 	rootPublic, _, _ := ed25519.GenerateKey(nil)
@@ -109,7 +143,7 @@ func TestEnrollExistingRootExpiresWhileApprovalIsPending(t *testing.T) {
 		t.Fatal(err)
 	}
 	quicPublic := keys.QUICPrivate.Public().(ed25519.PublicKey)
-	client := &existingEnrollmentClient{root: api.E2EERoot{Version: 1, PublicKey: base64.RawURLEncoding.EncodeToString(rootPublic), Fingerprint: hex.EncodeToString(rootFingerprint[:]), Generation: 1}, pending: api.PendingEndpointIdentity{RequestID: "per_0123456789abcdef", EndpointID: "cli_1", Role: "cli", Generation: 1, NoisePublicKey: base64.RawURLEncoding.EncodeToString(keys.NoisePublic[:]), QUICPublicKey: base64.RawURLEncoding.EncodeToString(quicPublic), CreatedAt: now, ExpiresAt: now.Add(time.Minute), SafetyCode: "abcde-fghij"}}
+	client := &existingEnrollmentClient{root: api.E2EERoot{Version: 1, PublicKey: base64.RawURLEncoding.EncodeToString(rootPublic), Fingerprint: hex.EncodeToString(rootFingerprint[:]), Generation: 1}, pending: api.PendingEndpointIdentity{RequestID: "per_0123456789abcdef", EndpointID: "cli_1", Role: "cli", State: "pending", Generation: 1, NoisePublicKey: base64.RawURLEncoding.EncodeToString(keys.NoisePublic[:]), QUICPublicKey: base64.RawURLEncoding.EncodeToString(quicPublic), CreatedAt: now, ExpiresAt: now.Add(time.Minute), SafetyCode: "abcde-fghij"}}
 	err = nil
 	_, err = EnrollExistingRoot(context.Background(), ExistingRootRequest{Store: store, Client: client, Issuer: "https://api.example.test", AccountID: "account_1", CLIClientSessionID: "cli_1", Now: func() time.Time { return now }, PollInterval: time.Millisecond, Timeout: 10 * time.Millisecond})
 	if !errors.Is(err, ErrEnrollmentExpired) {

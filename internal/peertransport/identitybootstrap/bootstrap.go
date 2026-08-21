@@ -180,7 +180,14 @@ func validateRemoteRoot(root api.E2EERoot) (ed25519.PublicKey, [sha256.Size]byte
 }
 
 func validatePendingCLIEnrollment(pending api.PendingEndpointIdentity, endpointID string, noise [32]byte, quic ed25519.PublicKey, now time.Time) error {
-	if !boundedID(pending.RequestID) || pending.EndpointID != endpointID || pending.Role != "cli" || pending.Generation != 1 || !pending.ExpiresAt.After(now) || pending.CreatedAt.After(now.Add(time.Minute)) {
+	if !boundedID(pending.RequestID) || pending.EndpointID != endpointID || pending.Role != "cli" || (pending.State != "pending" && pending.State != "fulfilled") || pending.Generation != 1 || pending.CreatedAt.After(now.Add(time.Minute)) {
+		return ErrInvalid
+	}
+	// A fulfilled enrollment is deliberately replayable with the same bound
+	// operation and public keys, even after its approval window has elapsed:
+	// the caller must be able to recover an already-issued certificate after a
+	// local persistence failure. A pending request still has a strict expiry.
+	if pending.State == "pending" && !pending.ExpiresAt.After(now) {
 		return ErrInvalid
 	}
 	expectedNoise := base64.RawURLEncoding.EncodeToString(noise[:])
