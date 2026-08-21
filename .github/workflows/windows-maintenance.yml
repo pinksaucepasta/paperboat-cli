@@ -74,6 +74,8 @@ jobs:
           icacls.exe $tokenPath /inheritance:r /grant:r 'SYSTEM:F' 'VICTUS\Pujan:F' | Out-Null
           @'
           $ErrorActionPreference = 'Stop'
+          $env:PSModulePath = "$env:WINDIR\System32\WindowsPowerShell\v1.0\Modules;$env:ProgramFiles\WindowsPowerShell\Modules"
+          Import-Module Microsoft.PowerShell.Security -ErrorAction Stop
           $token = [IO.File]::ReadAllText('C:\PaperboatRecovery\enrollment-token').Trim()
           try {
             & 'C:\PaperboatRecovery\pb.exe' pair --server 'https://api.pprbt.dev' --enrollment-token $token --name victus --setup-mode=host *>&1 |
