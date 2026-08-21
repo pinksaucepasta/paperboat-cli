@@ -258,6 +258,40 @@ jobs:
       - name: Run the complete native IoT amd64 test suite
         shell: powershell
         run: go test -count=1 ./...
+      - name: Reset dedicated Victus Paperboat qualification state
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $serviceNames = @('PaperboatHostd', 'PaperboatUpdated') + @(
+            Get-CimInstance -ClassName Win32_Service -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -like 'PaperboatPreview-*' } |
+              Select-Object -ExpandProperty Name
+          )
+          foreach ($name in $serviceNames) {
+            $service = Get-Service -Name $name -ErrorAction SilentlyContinue
+            if ($null -ne $service) {
+              if ($service.Status -ne 'Stopped') { Stop-Service -Name $name -Force -ErrorAction SilentlyContinue }
+              & sc.exe delete $name | Out-Null
+            }
+          }
+          $uninstallRoots = @(
+            'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
+            'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+          )
+          foreach ($root in $uninstallRoots) {
+            Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue | ForEach-Object {
+              $entry = Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue
+              if ($null -ne $entry -and $entry.DisplayName -eq 'Paperboat' -and $entry.PSChildName -match '^\{[0-9A-Fa-f-]+\}$') {
+                & msiexec.exe /x $entry.PSChildName /qn /norestart | Out-Null
+              }
+            }
+          }
+          Remove-Item -LiteralPath 'HKLM:\Software\Paperboat' -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath 'C:\Program Files\Paperboat' -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath 'C:\ProgramData\Paperboat' -Recurse -Force -ErrorAction SilentlyContinue
+          if ((Get-Service -Name PaperboatHostd -ErrorAction SilentlyContinue) -or (Get-Service -Name PaperboatUpdated -ErrorAction SilentlyContinue)) {
+            throw 'Dedicated Paperboat qualification state could not be removed.'
+          }
       - name: Install pinned WiX 5.0.2 for IoT MSI qualification
         shell: powershell
         run: |
