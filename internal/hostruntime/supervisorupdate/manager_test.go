@@ -160,6 +160,20 @@ func newTestManager(t *testing.T, root string, active workerupdate.Release, old,
 
 func validELF(marker byte) []byte {
 	value := make([]byte, 64)
+	if runtime.GOOS == "windows" {
+		value = make([]byte, 128)
+		copy(value[:2], "MZ")
+		binary.LittleEndian.PutUint32(value[0x3c:0x40], 64)
+		copy(value[64:68], "PE\x00\x00")
+		machine := uint16(0x8664)
+		if runtime.GOARCH == "arm64" {
+			machine = 0xaa64
+		}
+		binary.LittleEndian.PutUint16(value[68:70], machine)
+		binary.LittleEndian.PutUint16(value[84:86], 0x20b)
+		value[len(value)-1] = marker
+		return value
+	}
 	if runtime.GOOS == "darwin" {
 		binary.LittleEndian.PutUint32(value[:4], 0xfeedfacf)
 		cpu := uint32(0x01000007)
