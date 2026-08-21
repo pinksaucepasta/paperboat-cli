@@ -144,6 +144,11 @@ The seeded matrix is deliberately conservative:
 
 The current native LTSC amd64 evidence is intentionally narrow:
 
+The ledger retains the explicit `blocked_no_hardware` state for ARM64 promotion
+semantics. The hosted `windows-11-arm` qualification lane now supplies native beta
+evidence, but ARM64 remains beta by product policy and is not promoted to stable by
+that evidence.
+
 - `os.credentials` has `windows_amd64_client: amd64_native_verified` for the recorded
   Credential Manager round-trip, DPAPI-protected fallback, deletion, missing-credential,
   and access-denied tests. Host-profile, multi-account, reboot, and service-profile
