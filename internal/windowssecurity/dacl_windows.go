@@ -18,10 +18,6 @@ func ProtectedDACLMatches(path, expected string) bool {
 	if err != nil || got == nil {
 		return false
 	}
-	control, _, err := got.Control()
-	if err != nil || control&windows.SE_DACL_PROTECTED == 0 {
-		return false
-	}
 	actual := dacl(got.String())
 	if actual == dacl(expected) {
 		return true
