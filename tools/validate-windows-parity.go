@@ -408,7 +408,7 @@ func validateTargets(l ledger) error {
 	if !ok {
 		return errors.New("missing windows/arm64 release target")
 	}
-	if arm.TargetStability != "beta" || arm.Channel != "beta" || arm.CurrentReadiness != "beta_blocked" || arm.RequiredFeatureState != "arm64_cross_verified" || arm.NativeTestRequired || arm.NativeTested || arm.NativeQualificationGate != "blocked_no_hardware" || arm.PromotionBlockedUntil != "arm64_native_verified" {
+	if arm.TargetStability != "beta" || arm.Channel != "beta" || !contains([]string{"beta_blocked", "beta_ready"}, arm.CurrentReadiness) || arm.RequiredFeatureState != "arm64_cross_verified" || arm.NativeTestRequired || arm.PromotionBlockedUntil != "arm64_native_verified" {
 		return fmt.Errorf("windows/arm64 target is not the honest beta seed: %#v", arm)
 	}
 	return nil
@@ -449,8 +449,15 @@ func validateGates(l ledger) error {
 		return errors.New("windows_arm64_cross_build requires passing ARM64 evidence for go build ./... and every Windows test package")
 	}
 	armNative := findGate(l.Gates, "native_windows_arm64_e2e")
-	if armNative == nil || armNative.Status != "blocked_no_hardware" {
-		return errors.New("native_windows_arm64_e2e must be blocked_no_hardware")
+	armTarget := l.ReleaseTargets["windows/arm64"]
+	if armNative == nil || !contains([]string{"blocked_no_hardware", "pass"}, armNative.Status) {
+		return errors.New("native_windows_arm64_e2e must be pass or blocked_no_hardware")
+	}
+	if armNative.Status == "pass" && (!armTarget.NativeTested || !armNative.CountsAsNativeExecution || len(armNative.EvidenceRefs) == 0) {
+		return errors.New("native_windows_arm64_e2e pass requires native ARM64 evidence")
+	}
+	if armNative.Status == "blocked_no_hardware" && armTarget.NativeTested {
+		return errors.New("native_windows_arm64_e2e cannot remain blocked after native evidence")
 	}
 	armBeta := findGate(l.Gates, "windows_arm64_beta_cross_gate")
 	if armBeta == nil || !contains([]string{"blocked", "pass"}, armBeta.Status) || !hasFullArm64CrossQualification(l, armBeta.EvidenceRefs) {

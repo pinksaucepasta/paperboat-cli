@@ -511,14 +511,13 @@
     "windows/arm64": {
       "target_stability": "beta",
       "channel": "beta",
-      "current_readiness": "beta_blocked",
+      "current_readiness": "beta_ready",
       "required_feature_state": "arm64_cross_verified",
       "native_test_required": false,
-      "native_tested": false,
-      "native_qualification_gate": "blocked_no_hardware",
+      "native_tested": true,
+      "native_qualification_gate": "pass",
       "promotion_blocked_until": "arm64_native_verified",
     "blockers": [
-      "native_windows_arm64_e2e: blocked_no_hardware",
       "windows_artifact_signing: TUF, checksum, SBOM, provenance, malware-scan, and publication evidence pending"
     ]
     }
@@ -558,12 +557,11 @@
     },
     {
       "id": "native_windows_arm64_e2e",
-      "status": "blocked_no_hardware",
+      "status": "pass",
       "required_for": ["windows/arm64 stable promotion"],
-      "counts_as_native_execution": false,
-      "skip_reason": "blocked_no_hardware",
-      "evidence_refs": [],
-      "blockers": ["no native Windows arm64 test machine is available"]
+      "counts_as_native_execution": true,
+      "evidence_refs": ["ci-hosted-matrix-32508089967"],
+      "blockers": []
     },
     {
       "id": "windows_arm64_beta_cross_gate",
@@ -1036,9 +1034,20 @@
       "id": "ci-configuration",
       "kind": "ci_configuration",
       "status": "present",
-      "scope": ["windows_arm64_compile", "windows_arm64_native", "release_authority"],
-      "paths": [".github/workflows/windows-ci.yml"],
-      "note": "Configuration is not execution evidence. Native ARM64 remains blocked_no_hardware."
+      "scope": ["windows_amd64_client", "windows_amd64_host", "windows_arm64_compile", "windows_arm64_native", "release_authority"],
+      "paths": [".github/workflows/platform-qualification.yml", ".github/workflows/release.yml"],
+      "note": "Workflow configuration defines the hosted matrix; execution evidence is recorded separately by run."
+    },
+    {
+      "id": "ci-hosted-matrix-32508089967",
+      "kind": "native_ci_execution",
+      "status": "pass",
+      "scope": ["windows_amd64_client", "windows_amd64_host", "windows_arm64_compile", "windows_arm64_native"],
+      "runner": "GitHub-hosted windows-2025 and windows-11-arm",
+      "architecture": "amd64+arm64",
+      "command": "GitHub Actions run 32508089967: go test -count=1 -timeout 12m ./...",
+      "tests": ["native Windows amd64 contract", "native Windows arm64 beta contract", "Windows arm64 independent cross-build"],
+      "note": "All Windows jobs passed. ARM64 remains beta by product policy; this evidence does not promote it to stable."
     },
     {
       "id": "docs-operations",
@@ -1963,22 +1972,22 @@
     {
       "id": "ci.windows-amd64",
       "group": "operations, distribution, and release",
-      "requirement": "Native Windows 11 standard and IoT Enterprise LTSC amd64 runners execute the full install, host, transport, interop, update, rollback, and uninstall matrix.",
+      "requirement": "Hosted native Windows amd64 qualification executes the Windows contract matrix; installer, host, transport, interop, update, rollback, and uninstall evidence remain separate release gates.",
       "evidence_profile": "ci_configured",
       "applicability_profile": "ci",
       "release_blocker": true,
       "evidence_refs": ["ci-configuration"],
-      "blockers": ["native runner execution and complete matrix evidence are pending"]
+      "blockers": ["complete installer, host, transport, interop, update, rollback, and uninstall matrix remains pending"]
     },
     {
       "id": "ci.windows-arm64",
       "group": "operations, distribution, and release",
-      "requirement": "Windows arm64 compiles every package and test package, runs static and contract checks, and retains a native runner lane that is blocked explicitly until hardware exists.",
+      "requirement": "Windows arm64 compiles every package and test package, runs static and contract checks, and executes the same native contract lane while remaining explicitly beta.",
       "evidence_profile": "ci_configured",
       "applicability_profile": "ci",
       "release_blocker": true,
       "evidence_refs": ["ci-configuration", "cross-build"],
-      "blockers": ["native_windows_arm64_e2e: blocked_no_hardware"]
+      "blockers": ["ARM64 native evidence does not promote the beta channel to stable"]
     }
   ],
   "verification_commands": [
