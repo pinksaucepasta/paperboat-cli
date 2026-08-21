@@ -687,8 +687,12 @@ func (c *Conn) readCarrier(carrier *physicalCarrier) {
 				if disposition == applicationIgnoreLate {
 					continue
 				}
-				c.failFrameProtocol(carrier, kind, sequence, "ack_carrier_not_application")
-				return
+				// A responder may emit a cumulative acknowledgement while the
+				// initial carrier is still prepared and before the initiator's
+				// COMMIT reaches it. ACKs carry no application data and are safe
+				// to discard at this boundary; treating one as a protocol fault
+				// makes loopback carriers scheduler-dependent on Windows.
+				continue
 			}
 			c.mu.Lock()
 			if sequence > c.sendNext {
