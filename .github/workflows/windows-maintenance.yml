@@ -23,16 +23,80 @@ jobs:
     runs-on: [self-hosted, Windows, X64, paperboat-windows-11-iot-ltsc]
     timeout-minutes: 20
     steps:
-      - name: Run one-shot Windows enrollment
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.6'
+          cache: true
+      - name: Build current Windows runtime
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path 'C:\PaperboatRecovery' -Force | Out-Null
+          go build -trimpath -buildvcs=false -o 'C:\PaperboatRecovery\pb.exe' ./cmd/pb
+      - name: Enroll as the interactive machine owner
         shell: powershell
         env:
           PAPERBOAT_INSTALLER_URL: ${{ secrets.VICTUS_RECOVERY_INSTALLER_URL }}
+          VICTUS_RECOVERY_PASSWORD: ${{ secrets.VICTUS_RECOVERY_PASSWORD }}
         run: |
           $ErrorActionPreference = 'Stop'
           if (-not $env:PAPERBOAT_INSTALLER_URL.StartsWith('https://get.pprbt.dev/install?p=victus-')) {
             throw 'The scoped Victus enrollment URL is missing or invalid.'
           }
-          Invoke-RestMethod -Uri $env:PAPERBOAT_INSTALLER_URL | Invoke-Expression
+          if ([string]::IsNullOrWhiteSpace($env:VICTUS_RECOVERY_PASSWORD)) {
+            throw 'The scoped Victus recovery credential is missing.'
+          }
+          $parameter = $env:PAPERBOAT_INSTALLER_URL.Substring($env:PAPERBOAT_INSTALLER_URL.IndexOf('?p=') + 3)
+          $token = $parameter.Substring('victus-'.Length)
+          if ([string]::IsNullOrWhiteSpace($token)) { throw 'The enrollment token is empty.' }
+
+          $root = 'C:\PaperboatRecovery'
+          $tokenPath = Join-Path $root 'enrollment-token'
+          $scriptPath = Join-Path $root 'enroll.ps1'
+          $resultPath = Join-Path $root 'result.txt'
+          $logPath = Join-Path $root 'enroll.log'
+          $taskName = 'PaperboatQualificationReenroll'
+          [IO.File]::WriteAllText($tokenPath, $token, (New-Object Text.UTF8Encoding($false)))
+          icacls.exe $tokenPath /inheritance:r /grant:r 'SYSTEM:F' 'VICTUS\Pujan:F' | Out-Null
+          @'
+          $ErrorActionPreference = 'Stop'
+          $token = [IO.File]::ReadAllText('C:\PaperboatRecovery\enrollment-token').Trim()
+          try {
+            & 'C:\PaperboatRecovery\pb.exe' pair --server 'https://api.pprbt.dev' --enrollment-token $token --name victus --setup-mode=host *>&1 |
+              Tee-Object -FilePath 'C:\PaperboatRecovery\enroll.log'
+            if ($LASTEXITCODE -ne 0) { throw "pb pair exited $LASTEXITCODE" }
+            [IO.File]::WriteAllText('C:\PaperboatRecovery\result.txt', 'success')
+          } catch {
+            $_ | Out-String | Add-Content -LiteralPath 'C:\PaperboatRecovery\enroll.log'
+            [IO.File]::WriteAllText('C:\PaperboatRecovery\result.txt', 'failure')
+            exit 1
+          }
+          '@ | Set-Content -LiteralPath $scriptPath -Encoding UTF8
+          icacls.exe $scriptPath /inheritance:r /grant:r 'SYSTEM:F' 'VICTUS\Pujan:RX' | Out-Null
+
+          $pwsh = 'C:\Program Files\PowerShell\7\pwsh.exe'
+          if (-not (Test-Path -LiteralPath $pwsh -PathType Leaf)) { throw "PowerShell 7 is missing at $pwsh" }
+          $action = New-ScheduledTaskAction -Execute $pwsh -Argument "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$scriptPath`""
+          $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5)
+          Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -User 'VICTUS\Pujan' -Password $env:VICTUS_RECOVERY_PASSWORD -RunLevel Highest -Force | Out-Null
+          try {
+            Start-ScheduledTask -TaskName $taskName
+            $deadline = (Get-Date).AddMinutes(12)
+            while ((Get-Date) -lt $deadline -and -not (Test-Path -LiteralPath $resultPath -PathType Leaf)) {
+              Start-Sleep -Seconds 2
+            }
+            if (-not (Test-Path -LiteralPath $resultPath -PathType Leaf)) { throw 'Owner-scoped enrollment timed out.' }
+            $result = [IO.File]::ReadAllText($resultPath).Trim()
+            if ($result -ne 'success') {
+              Get-Content -LiteralPath $logPath -ErrorAction SilentlyContinue
+              throw 'Owner-scoped enrollment failed.'
+            }
+          } finally {
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $tokenPath,$scriptPath -Force -ErrorAction SilentlyContinue
+          }
+
           foreach ($service in @('PaperboatHostd', 'PaperboatUpdated', 'PaperboatSshd')) {
             $item = Get-Service -Name $service -ErrorAction Stop
             if ($item.Status -ne 'Running') { throw "$service is not running after enrollment" }
@@ -44,7 +108,11 @@ jobs:
           if (-not (Test-Path -LiteralPath 'C:\Program Files\Paperboat\bin\pb.exe' -PathType Leaf)) {
             throw 'pb.exe is absent after enrollment.'
           }
-          Write-Output 'One-shot Victus enrollment and local service/PATH checks passed.'
+          $runtime = Get-Content -LiteralPath 'C:\ProgramData\Paperboat\runtime-install.json' -Raw | ConvertFrom-Json
+          if ($runtime.user -ine 'VICTUS\Pujan' -or $runtime.owner_sid -eq 'S-1-5-18') {
+            throw "Enrollment owner is invalid: user=$($runtime.user) sid=$($runtime.owner_sid)"
+          }
+          Write-Output 'Victus owner-scoped enrollment and local service/PATH checks passed.'
 
   clean-victus:
     if: inputs.action == 'clean-victus-qualification-residue'
