@@ -328,6 +328,25 @@ jobs:
             -WixCommand $env:PAPERBOAT_WINDOWS_E2E_WIX `
             -OutputDirectory (Join-Path $env:RUNNER_TEMP 'paperboat-iot-amd64-qualification')
           if ($LASTEXITCODE -ne 0) { throw 'Native IoT amd64 qualification input build failed.' }
+      - name: Ensure PowerShell 7 for native ConPTY qualification
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $candidates = @(
+            (Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'),
+            (Join-Path $env:ProgramFiles 'PowerShell\7-preview\pwsh.exe')
+          )
+          $candidates += @(Get-ChildItem -LiteralPath "$env:SystemDrive\Users" -Filter 'pwsh.exe' -File -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '\\(PowerShell|pwsh)\\' } |
+            Select-Object -ExpandProperty FullName)
+          $pwsh = $candidates | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -First 1
+          if (-not $pwsh) {
+            & winget.exe install --exact --id Microsoft.PowerShell --source winget --scope machine --silent --accept-source-agreements --accept-package-agreements
+            if ($LASTEXITCODE -ne 0) { throw 'PowerShell 7 is unavailable and WinGet installation failed.' }
+            $pwsh = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'
+          }
+          if (-not (Test-Path -LiteralPath $pwsh -PathType Leaf)) { throw "PowerShell 7 executable was not found: $pwsh" }
+          "PAPERBOAT_PWSH_PATH=$pwsh" >> $env:GITHUB_ENV
       - name: Run native IoT amd64 MSI, SCM, preview, and ConPTY qualification
         shell: powershell
         run: |
