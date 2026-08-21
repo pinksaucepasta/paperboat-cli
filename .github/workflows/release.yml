@@ -462,6 +462,10 @@ jobs:
         shell: powershell
         env:
           PAPERBOAT_WINDOWS_OPENSSH_NATIVE: "1"
+          # The runner service is LocalSystem, but the disposable Victus
+          # qualification account is Pujan. The SSH service probe must target
+          # the enrolled Windows account rather than the runner identity.
+          PAPERBOAT_WINDOWS_SSH_IDENTITY: "Pujan"
         run: |
           $ErrorActionPreference = 'Stop'
           # The preceding native MSI qualification intentionally verifies a

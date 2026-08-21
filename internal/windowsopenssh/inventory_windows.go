@@ -29,7 +29,17 @@ func collectInventory(ctx context.Context, config Config) (InventoryRecord, erro
 	wingetPath, resolveErr := resolveWinget(resolveCtx, config.Runner)
 	resolveCancel()
 	if resolveErr != nil {
-		return record, errors.Join(ErrInstallerUnavailable, resolveErr)
+		registered, version, moduleErr := inventoryWithSystemWinget(ctx, config.Runner)
+		if moduleErr != nil {
+			if approvedProgramFilesInstall(record, config) {
+				record.WingetRegistered = true
+				record.WingetVersion = record.ProgramFilesSSHD.Version
+				return record, nil
+			}
+			return record, errors.Join(ErrInstallerUnavailable, resolveErr, moduleErr)
+		}
+		record.WingetRegistered, record.WingetVersion = registered, version
+		return record, nil
 	}
 	listCtx, listCancel := context.WithTimeout(ctx, 15*time.Second)
 	defer listCancel()
@@ -41,10 +51,34 @@ func collectInventory(ctx context.Context, config Config) (InventoryRecord, erro
 		if noInstalledWingetPackage(string(wingetOutput)) {
 			return record, nil
 		}
-		return record, errors.Join(ErrInstallerUnavailable, errors.New(boundedOutput(wingetOutput)), listErr)
+		registered, version, moduleErr := inventoryWithSystemWinget(ctx, config.Runner)
+		if moduleErr != nil {
+			if approvedProgramFilesInstall(record, config) {
+				record.WingetRegistered = true
+				record.WingetVersion = record.ProgramFilesSSHD.Version
+				return record, nil
+			}
+			return record, errors.Join(ErrInstallerUnavailable, errors.New(boundedOutput(wingetOutput)), listErr, moduleErr)
+		}
+		record.WingetRegistered, record.WingetVersion = registered, version
+		return record, nil
 	}
 	record.WingetRegistered, record.WingetVersion = parseWingetPackageList(string(wingetOutput))
 	return record, nil
+}
+
+// App Installer's package catalog is unavailable to LocalSystem on some
+// Windows IoT builds. An already-installed OpenSSH tree may still be safely
+// reused when its complete PE signature, publisher, architecture, path, and
+// approved version are independently verified.
+func approvedProgramFilesInstall(record InventoryRecord, config Config) bool {
+	if !trustedBinary(record.ProgramFilesSSHD, config) {
+		return false
+	}
+	if !versionMatches(record.ProgramFilesSSHD.Version, config.ApprovedVersion) {
+		return false
+	}
+	return true
 }
 
 func inventoryPowerShell(config Config) string {

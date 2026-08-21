@@ -281,6 +281,12 @@ func qualificationPowerShellCommand(script string) string {
 }
 
 func currentWindowsSSHIdentity() (string, error) {
+	if configured := strings.TrimSpace(os.Getenv("PAPERBOAT_WINDOWS_SSH_IDENTITY")); configured != "" {
+		if !validWindowsSSHIdentity(configured) {
+			return "", fmt.Errorf("invalid configured Windows SSH identity")
+		}
+		return configured, nil
+	}
 	account, err := user.Current()
 	if err != nil || account == nil {
 		return "", errors.Join(ErrQualification, err)

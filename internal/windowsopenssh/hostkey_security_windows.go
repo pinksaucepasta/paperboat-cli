@@ -23,7 +23,17 @@ func protectHostPublicKeyFile(path, ownerSID, serviceSID string) error {
 	if _, err := windows.StringToSid(serviceSID); err != nil {
 		return err
 	}
-	return protectHostKeyFileWithSDDL(path, hostKeySDDL+"(A;;FR;;;"+serviceSID+")(A;;FR;;;"+ownerSID+")")
+	// The SYSTEM service context can also be the enrolled owner during
+	// unattended qualification. Avoid emitting a duplicate SYSTEM read ACE
+	// beside the existing SYSTEM full-control ACE; Windows canonicalizes the
+	// duplicate differently and exact ACL verification would become unstable.
+	ownerACE := "(A;;FR;;;" + ownerSID + ")"
+	if systemSID, err := windows.StringToSid("S-1-5-18"); err == nil {
+		if owner, err := windows.StringToSid(ownerSID); err == nil && owner.Equals(systemSID) {
+			ownerACE = ""
+		}
+	}
+	return protectHostKeyFileWithSDDL(path, hostKeySDDL+"(A;;FR;;;"+serviceSID+")"+ownerACE)
 }
 
 func protectHostKeyFiles(paths ...string) error {

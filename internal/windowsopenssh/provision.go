@@ -124,32 +124,50 @@ func provision(ctx context.Context, config Config, force bool) (Result, error) {
 		return Result{}, firewallErr
 	}
 	wingetPath := config.WingetPath
+	useSystemModule := false
 	if wingetPath == "" {
 		var err error
 		wingetPath, err = resolveWinget(ctx, config.Runner)
 		if err != nil {
-			return Result{}, err
+			if moduleErr := ensureSystemWingetModule(ctx, config.Runner); moduleErr != nil {
+				return Result{}, errors.Join(err, moduleErr)
+			}
+			useSystemModule = true
 		}
 	}
-	verifyCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	versionOutput, err := config.Runner.Run(verifyCtx, wingetPath, "--version")
-	if err != nil || !supportedWingetVersion(string(versionOutput)) {
-		return Result{}, errors.Join(ErrInstallerUnavailable, err)
+	if !useSystemModule {
+		verifyCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		versionOutput, err := config.Runner.Run(verifyCtx, wingetPath, "--version")
+		cancel()
+		if err != nil || !supportedWingetVersion(string(versionOutput)) {
+			if config.WingetPath != "" {
+				return Result{}, errors.Join(ErrInstallerUnavailable, err)
+			}
+			if moduleErr := ensureSystemWingetModule(ctx, config.Runner); moduleErr != nil {
+				return Result{}, errors.Join(ErrInstallerUnavailable, err, moduleErr)
+			}
+			useSystemModule = true
+		}
 	}
-	installCtx, cancelInstall := context.WithTimeout(ctx, 10*time.Minute)
-	defer cancelInstall()
-	installArgs := []string{
-		"install", "--exact", "--id", PackageID, "--version", config.ApprovedVersion,
-		"--source", "winget", "--scope", "machine", "--silent",
-		"--accept-source-agreements", "--accept-package-agreements", "--disable-interactivity",
-	}
-	if force {
-		installArgs = append(installArgs, "--force")
-	}
-	output, err := config.Runner.Run(installCtx, wingetPath, installArgs...)
-	if err != nil {
-		return Result{}, fmt.Errorf("%w: %s", ErrInstallFailed, boundedOutput(output))
+	if useSystemModule {
+		if err := installWithSystemWinget(ctx, config, force); err != nil {
+			return Result{}, err
+		}
+	} else {
+		installCtx, cancelInstall := context.WithTimeout(ctx, 10*time.Minute)
+		installArgs := []string{
+			"install", "--exact", "--id", PackageID, "--version", config.ApprovedVersion,
+			"--source", "winget", "--scope", "machine", "--silent",
+			"--accept-source-agreements", "--accept-package-agreements", "--disable-interactivity",
+		}
+		if force {
+			installArgs = append(installArgs, "--force")
+		}
+		output, err := config.Runner.Run(installCtx, wingetPath, installArgs...)
+		cancelInstall()
+		if err != nil {
+			return Result{}, fmt.Errorf("%w: %s", ErrInstallFailed, boundedOutput(output))
+		}
 	}
 	afterFirewall, firewallErr := snapshotFirewall(ctx, config)
 	if firewallErr != nil {
