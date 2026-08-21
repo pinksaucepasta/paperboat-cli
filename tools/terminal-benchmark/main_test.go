@@ -125,7 +125,11 @@ func TestWaitUntilReadyDoesNotQueueDuplicateCommands(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := bytes.Count(writes.Bytes(), []byte("printf 'PBR%sQ")); got != 1 || attempts != 1 {
+	needle := []byte("printf 'PBR")
+	if runtime.GOOS == "windows" {
+		needle = []byte("echo PBR")
+	}
+	if got := bytes.Count(writes.Bytes(), needle); got != 1 || attempts != 1 {
 		t.Fatalf("readiness writes = %d attempts = %d", got, attempts)
 	}
 }

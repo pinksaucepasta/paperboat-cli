@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -300,7 +301,7 @@ func runProbe(ctx context.Context, writer io.Writer, matcher *streamMatcher, run
 	marker := "PB" + value + "Q"
 	started := time.Now()
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		if _, err := io.WriteString(writer, "printf 'PB%sQ\\n' '"+value+"'\n"); err != nil {
+		if _, err := io.WriteString(writer, shellEcho("PB"+value+"Q")); err != nil {
 			return 0, attempt + 1, fmt.Errorf("write probe %d attempt %d: %w", index, attempt+1, err)
 		}
 		probeCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -320,7 +321,7 @@ func waitUntilReady(ctx context.Context, writer io.Writer, matcher *streamMatche
 	readyCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	marker := "PBR" + runPrefix + "Q"
-	if _, err := io.WriteString(writer, "printf 'PBR%sQ\\n' '"+runPrefix+"'\n"); err != nil {
+	if _, err := io.WriteString(writer, shellEcho("PBR"+runPrefix+"Q")); err != nil {
 		return 1, fmt.Errorf("write readiness probe: %w", err)
 	}
 	for {
@@ -337,6 +338,13 @@ func waitUntilReady(ctx context.Context, writer io.Writer, matcher *streamMatche
 			return 1, fmt.Errorf("wait for responsive shell: %w", err)
 		}
 	}
+}
+
+func shellEcho(value string) string {
+	if runtime.GOOS == "windows" {
+		return "echo " + value + "\r\n"
+	}
+	return "printf '" + value + "\\n'\n"
 }
 
 func randomRunPrefix(reader io.Reader) (string, error) {
