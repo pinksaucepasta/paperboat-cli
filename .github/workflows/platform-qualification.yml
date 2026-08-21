@@ -158,4 +158,4 @@ jobs:
         shell: bash
         run: |
           printf 'windows_arm64_stability: beta\n' >> "$GITHUB_STEP_SUMMARY"
-          printf 'native_windows_arm64_runner: windows-11-arm\n' >> "$GITHUB_STEP_SUMMARY"
+          printf 'native_windows_arm64_e2e: blocked_no_hardware\n' >> "$GITHUB_STEP_SUMMARY"

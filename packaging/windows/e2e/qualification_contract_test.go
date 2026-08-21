@@ -91,7 +91,7 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 	}
 	for _, requiredText := range []string{
 		"windows-2025",
-		"windows-11-arm",
+		"native_windows_arm64_e2e: blocked_no_hardware",
 		"architecture: amd64",
 		"architecture: arm64",
 		"windows_arm64_stability: beta",

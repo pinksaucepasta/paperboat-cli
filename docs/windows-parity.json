@@ -557,11 +557,11 @@
     },
     {
       "id": "native_windows_arm64_e2e",
-      "status": "pass",
+      "status": "blocked",
       "required_for": ["windows/arm64 stable promotion"],
       "counts_as_native_execution": true,
-      "evidence_refs": ["ci-hosted-matrix-32508089967"],
-      "blockers": []
+      "evidence_refs": [],
+      "blockers": ["native Windows arm64 hardware is unavailable; arm64 remains beta"]
     },
     {
       "id": "windows_arm64_beta_cross_gate",

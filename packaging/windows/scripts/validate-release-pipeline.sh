@@ -133,9 +133,8 @@ for required in (
     "ubuntu-24.04-arm",
     "macos-14",
     "windows-2025",
-    "windows-11-arm",
     "Windows arm64 beta independent cross-build",
-    "native_windows_arm64_runner: windows-11-arm",
+    "native_windows_arm64_e2e: blocked_no_hardware",
 ):
     if required not in qualification_workflow:
         raise SystemExit(f"platform qualification workflow is missing {required}")
