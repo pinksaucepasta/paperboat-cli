@@ -63,6 +63,15 @@ func findPowerShell7() (string, error) {
 	if matches, _ := filepath.Glob(filepath.Join(systemDrive, "Users", "*", "AppData", "Local", "Microsoft", "WinGet", "Packages", "Microsoft.PowerShell*", "*", "pwsh.exe")); len(matches) > 0 {
 		candidates = append(candidates, matches...)
 	}
+	for _, pattern := range []string{
+		filepath.Join(systemDrive, "Users", "*", "AppData", "Local", "Microsoft", "WinGet", "Packages", "Microsoft.PowerShell*", "*", "*", "pwsh.exe"),
+		filepath.Join(systemDrive, "Users", "*", "AppData", "Local", "Microsoft", "WindowsApps", "pwsh.exe"),
+		filepath.Join(systemDrive, "Windows", "System32", "config", "systemprofile", "AppData", "Local", "Microsoft", "WindowsApps", "pwsh.exe"),
+	} {
+		if matches, _ := filepath.Glob(pattern); len(matches) > 0 {
+			candidates = append(candidates, matches...)
+		}
+	}
 	for _, root := range []string{
 		filepath.Join(systemDrive, "Program Files", "PowerShell"),
 		filepath.Join(systemDrive, "Users", "*", "scoop", "apps", "pwsh", "current"),
@@ -77,11 +86,14 @@ func findPowerShell7() (string, error) {
 	}
 	// PowerShell registers the canonical install directory here even when
 	// LocalSystem does not inherit the interactive user's PATH.
-	if output, err := exec.Command("reg.exe", "query", `HKLM\SOFTWARE\Microsoft\PowerShellCore\InstalledVersions`, "/s", "/v", "InstallLocation").Output(); err == nil {
-		for _, line := range strings.Split(string(output), "\n") {
-			fields := strings.Fields(line)
-			if len(fields) >= 3 && strings.EqualFold(fields[len(fields)-2], "REG_SZ") {
-				candidates = append(candidates, filepath.Join(strings.TrimSpace(strings.Join(fields[len(fields)-1:], " ")), "pwsh.exe"))
+	for _, registryRoot := range []string{`HKLM\SOFTWARE\Microsoft\PowerShellCore\InstalledVersions`} {
+		candidates = appendRegistryPowerShellPaths(candidates, registryRoot)
+	}
+	if hives, err := exec.Command("reg.exe", "query", `HKEY_USERS`).Output(); err == nil {
+		for _, line := range strings.Split(string(hives), "\n") {
+			key := strings.TrimSpace(line)
+			if strings.HasPrefix(strings.ToUpper(key), `HKEY_USERS\S-1-`) {
+				candidates = appendRegistryPowerShellPaths(candidates, key+`\Software\Microsoft\PowerShellCore\InstalledVersions`)
 			}
 		}
 	}
@@ -100,6 +112,20 @@ func findPowerShell7() (string, error) {
 		}
 	}
 	return exec.LookPath("pwsh.exe")
+}
+
+func appendRegistryPowerShellPaths(candidates []string, key string) []string {
+	output, err := exec.Command("reg.exe", "query", key, "/s", "/v", "InstallLocation").Output()
+	if err != nil {
+		return candidates
+	}
+	for _, line := range strings.Split(string(output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 3 && strings.EqualFold(fields[len(fields)-2], "REG_SZ") {
+			candidates = append(candidates, filepath.Join(strings.Join(fields[len(fields)-1:], " "), "pwsh.exe"))
+		}
+	}
+	return candidates
 }
 
 func TestNativeConPTYCmd(t *testing.T) {
