@@ -14,11 +14,10 @@ checksum() {
   shasum -a 256 "$1" | awk '{print $1}'
 }
 
-darwin_amd64="paperboat_${tag}_darwin_amd64.tar.gz"
 darwin_arm64="paperboat_${tag}_darwin_arm64.tar.gz"
 linux_amd64="paperboat_${tag}_linux_amd64.tar.gz"
 linux_arm64="paperboat_${tag}_linux_arm64.tar.gz"
-for file in "$darwin_amd64" "$darwin_arm64" "$linux_amd64" "$linux_arm64"; do
+for file in "$darwin_arm64" "$linux_amd64" "$linux_arm64"; do
   test -f "$dist/$file"
 done
 
@@ -28,13 +27,8 @@ class Paperboat < Formula
   homepage "https://github.com/$repo"
   version "$tag"
   on_macos do
-    if Hardware::CPU.arm?
-      url "$base/$darwin_arm64"
-      sha256 "$(checksum "$dist/$darwin_arm64")"
-    else
-      url "$base/$darwin_amd64"
-      sha256 "$(checksum "$dist/$darwin_amd64")"
-    end
+    url "$base/$darwin_arm64"
+    sha256 "$(checksum "$dist/$darwin_arm64")"
   end
 
   on_linux do

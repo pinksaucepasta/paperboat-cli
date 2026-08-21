@@ -87,7 +87,7 @@ jobs:
           test -n "${DEFAULT_RELEASE_URL}" || { echo "PAPERBOAT_DEFAULT_RELEASE_URL repository variable is required" >&2; exit 1; }
           case "${DEFAULT_SERVER_URL}" in https://*) ;; *) echo "PAPERBOAT_DEFAULT_SERVER_URL must use https" >&2; exit 1 ;; esac
           mkdir -p dist stage
-          for target in darwin/amd64 darwin/arm64 linux/amd64 linux/arm64; do
+          for target in darwin/arm64 linux/amd64 linux/arm64; do
             os="${target%/*}"
             arch="${target#*/}"
             suffix=""

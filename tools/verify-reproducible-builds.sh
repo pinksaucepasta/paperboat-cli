@@ -26,7 +26,7 @@ fi
 build_set() {
   output_dir=$1
   mkdir -p "$output_dir"
-  for target in darwin/amd64 darwin/arm64 linux/amd64 linux/arm64; do
+  for target in darwin/arm64 linux/amd64 linux/arm64; do
     os=${target%/*}
     arch=${target#*/}
     output="$output_dir/pb-$os-$arch"

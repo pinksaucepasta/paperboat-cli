@@ -20,7 +20,6 @@ import (
 )
 
 var chezmoiDigests = map[string]string{
-	"darwin/amd64": "12b78b365528597ad701f5117fa71f6c42b5b1e65d8075e19c48472ad81faf30",
 	"darwin/arm64": "8b03d7be6b5d500a503c712ae6da7dd6817b6c3328223b4ae8be5a2fa3a",
 	"linux/amd64":  "6ea2040ecc0e82d3dac604289e100b0157afefcd94ebb818e5f6e31655156d34",
 	"linux/arm64":  "d8fb35f9d43237b4f6d022cad40e1094957b990cfaee5f3b131ded65422b0983",
