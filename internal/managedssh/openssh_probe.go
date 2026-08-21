@@ -44,8 +44,16 @@ func ProbeOpenSSH(ctx context.Context, executable string, timeout time.Duration)
 	if err != nil {
 		return OpenSSHCapabilities{}, err
 	}
+	// The inboxed Windows OpenSSH client can take several seconds to cold-start
+	// under the hosted runner, even though subsequent invocations are fast. Keep
+	// the caller's cancellation semantics, but give native Windows process
+	// startup a bounded grace period so capability probing is not flaky.
+	probeTimeout := timeout
+	if runtime.GOOS == "windows" && probeTimeout < 10*time.Second {
+		probeTimeout = 10 * time.Second
+	}
 	capabilities := OpenSSHCapabilities{Executable: resolved}
-	versionCtx, cancel := context.WithTimeout(ctx, timeout)
+	versionCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 	versionOutput, err := runOpenSSHProbe(versionCtx, resolved, "-V")
 	cancel()
 	if err != nil {
@@ -84,7 +92,7 @@ func ProbeOpenSSH(ctx context.Context, executable string, timeout time.Duration)
 		if err := os.WriteFile(path, []byte(probe.content), 0o600); err != nil {
 			return OpenSSHCapabilities{}, err
 		}
-		probeCtx, cancel := context.WithTimeout(ctx, timeout)
+		probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 		_, probeErr := runOpenSSHProbe(probeCtx, resolved, "-G", "-F", path, "probe.invalid")
 		cancel()
 		if probeErr == nil {
@@ -101,6 +109,10 @@ func ProbeOpenSSH(ctx context.Context, executable string, timeout time.Duration)
 
 func runOpenSSHProbe(ctx context.Context, executable string, arguments ...string) (string, error) {
 	command := exec.CommandContext(ctx, executable, arguments...)
+	// Windows OpenSSH can block when stdin is inherited as the null device. An
+	// empty pipe gives it an actual EOF, which is what non-interactive probes
+	// need and avoids the native client's no-stdin hang.
+	command.Stdin = bytes.NewReader(nil)
 	output := &limitedBuffer{remaining: 64 << 10}
 	command.Stdout, command.Stderr = output, output
 	err := command.Run()
