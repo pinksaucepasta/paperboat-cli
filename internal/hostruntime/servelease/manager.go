@@ -243,6 +243,13 @@ func (m *Manager) completeExpired(lease Lease) {
 }
 
 func (m *Manager) load() error {
+	info, err := os.Lstat(m.config.StatePath)
+	if err != nil {
+		return err
+	}
+	if !secureStateFile(m.config.StatePath, info) {
+		return ErrInvalid
+	}
 	file, err := os.Open(m.config.StatePath)
 	if err != nil {
 		return err
@@ -285,7 +292,7 @@ func (m *Manager) persistLocked() error {
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return err
 	}
-	return atomicfile.Write(m.config.StatePath, data, atomicfile.Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1})
+	return atomicfile.Write(m.config.StatePath, data, atomicfile.CurrentOwnerOptions(0o600))
 }
 
 func (m *Manager) Shutdown(ctx context.Context) error {

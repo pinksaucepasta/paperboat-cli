@@ -18,7 +18,13 @@ func commandLocalAPIServerConfig(path string, source localapi.SnapshotSource) (l
 	return localapi.ServerConfig{SocketPath: path, OwnerUID: -1, OwnerGID: -1, OwnerSID: sid, Source: source}, nil
 }
 
-func commandRuntimeTestRoot(t *testing.T) string { t.Helper(); return t.TempDir() }
+func commandRuntimeTestRoot(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	t.Setenv("LOCALAPPDATA", root)
+	t.Setenv("APPDATA", root)
+	return root
+}
 
 func waitForCommandSocket(t *testing.T, path string) {
 	t.Helper()

@@ -114,9 +114,22 @@ func TestSupervisorFetchesFreshAdmissionWithCappedBackoffAndReconnects(t *testin
 			t.Fatalf("connector did not recover: status=%#v dial_calls=%d admissions=%d", manager.Status(), calls, generation)
 		}
 	}
-	metric.mu.Lock()
-	recovery := metric.recovery
-	metric.mu.Unlock()
+	var recovery float64
+	metricDeadline := time.After(time.Second)
+	metricTimedOut := false
+	for recovery <= 0 && !metricTimedOut {
+		metric.mu.Lock()
+		recovery = metric.recovery
+		metric.mu.Unlock()
+		if recovery > 0 {
+			break
+		}
+		select {
+		case <-poll.C:
+		case <-metricDeadline:
+			metricTimedOut = true
+		}
+	}
 	if recovery <= 0 {
 		t.Fatalf("connector recovery metric=%v", recovery)
 	}

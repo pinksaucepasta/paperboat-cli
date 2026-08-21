@@ -61,7 +61,7 @@ func TestManagerRecoversLeaseAcrossRuntimeRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o600 {
+	if !secureStateFile(statePath, info) {
 		t.Fatalf("lease state permissions=%v", info.Mode().Perm())
 	}
 	expired := make(chan Lease, 1)
