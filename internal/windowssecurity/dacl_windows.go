@@ -18,6 +18,10 @@ func ProtectedDACLMatches(path, expected string) bool {
 	if err != nil || got == nil {
 		return false
 	}
+	control, _, err := got.Control()
+	if err != nil || control&windows.SE_DACL_PROTECTED == 0 {
+		return false
+	}
 	actual := dacl(got.String())
 	if actual == dacl(expected) {
 		return true
@@ -42,10 +46,9 @@ func dacl(value string) string {
 	if start < 0 {
 		return ""
 	}
-	end := strings.Index(value[start+2:], "S:")
-	if end < 0 {
-		return strings.Replace(value[start:], "D:P", "D:", 1)
+	open := strings.IndexByte(value[start:], '(')
+	if open < 0 {
+		return ""
 	}
-	value = value[start : start+2+end]
-	return strings.Replace(value, "D:P", "D:", 1)
+	return "D:" + value[start+open:]
 }
