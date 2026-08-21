@@ -200,7 +200,8 @@ func TestNativeFirewallProfiles(t *testing.T) {
 	if os.Getenv("PAPERBOAT_WINDOWS_OPENSSH_NATIVE") != "1" {
 		t.Skip("set PAPERBOAT_WINDOWS_OPENSSH_NATIVE=1 on the native qualification runner")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	// Setup verifies six signed OpenSSH binaries and may need to query Windows
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	config := DefaultConfig(nil)
 	setup, err := Setup(ctx, config)
@@ -238,7 +239,10 @@ func TestNativeSCMCrashRecovery(t *testing.T) {
 	if os.Getenv("PAPERBOAT_WINDOWS_OPENSSH_NATIVE") != "1" {
 		t.Skip("set PAPERBOAT_WINDOWS_OPENSSH_NATIVE=1 on the native qualification runner")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	// Setup verifies six signed OpenSSH binaries and may need to query Windows
+	// trust services after preceding lifecycle tests. Keep this qualification
+	// bounded, but allow the full verification/recovery sequence to complete.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	config := DefaultConfig(nil)
 	setup, err := Setup(ctx, config)
