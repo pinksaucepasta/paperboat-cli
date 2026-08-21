@@ -3,9 +3,10 @@
 package configsync
 
 import (
+	"errors"
 	"os"
-	"strings"
 
+	"github.com/pinksaucepasta/paperboat/internal/windowssecurity"
 	"golang.org/x/sys/windows"
 )
 
@@ -25,18 +26,29 @@ func privateControlFile(path string, info os.FileInfo) bool {
 	if err != nil || control&windows.SE_DACL_PROTECTED == 0 {
 		return false
 	}
-	want, err := windows.SecurityDescriptorFromString("D:P(A;;FA;;;SY)(A;;FA;;;BA)")
-	return err == nil && controlFileDACL(descriptor.String()) == controlFileDACL(want.String())
+	want, err := currentPrivateFileDescriptor()
+	if err != nil {
+		return false
+	}
+	return windowssecurity.ProtectedDACLMatches(path, want.String())
 }
 
-func controlFileDACL(value string) string {
-	index := strings.Index(value, "D:")
-	if index < 0 {
-		return ""
+func currentPrivateFileDescriptor() (*windows.SECURITY_DESCRIPTOR, error) {
+	token, err := windows.OpenCurrentProcessToken()
+	if err != nil {
+		return nil, err
 	}
-	open := strings.IndexByte(value[index:], '(')
-	if open < 0 {
-		return ""
+	defer token.Close()
+	user, err := token.GetTokenUser()
+	if err != nil || user == nil || user.User.Sid == nil || !user.User.Sid.IsValid() {
+		if err == nil {
+			err = errors.New("current Windows token has no valid user SID")
+		}
+		return nil, err
 	}
-	return "D:" + value[index+open:]
+	sddl := "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
+	if user.User.Sid.String() != "S-1-5-18" {
+		sddl += "(A;;FA;;;" + user.User.Sid.String() + ")"
+	}
+	return windows.SecurityDescriptorFromString(sddl)
 }

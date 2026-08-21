@@ -143,6 +143,9 @@ func newTestManager(t *testing.T, root string, active workerupdate.Release, old,
 		UpdaterCurrent: filepath.Join(root, "updater"), UpdaterRollback: filepath.Join(root, "rollback-updater"), UpdaterStaged: filepath.Join(root, "staged-updater"),
 		LauncherCurrent: filepath.Join(root, "launcher"), LauncherRollback: filepath.Join(root, "rollback-launcher"), LauncherStaged: filepath.Join(root, "staged-launcher"),
 	}
+	if err := prepareSupervisorUpdateTestRoot(root); err != nil {
+		t.Fatal(err)
+	}
 	fetcher := testFetcher{content: map[string][]byte{"hostd": next, "updater": next, "launcher": next}}
 	var activation Activator
 	if activator != nil {

@@ -560,11 +560,7 @@ func writeArtifact(ctx context.Context, stream io.ReadCloser, path string, targe
 	}
 	temp := file.Name()
 	defer os.Remove(temp)
-	if err := file.Chmod(0o700); err != nil {
-		_ = file.Close()
-		return err
-	}
-	if err := file.Chown(uid, gid); err != nil {
+	if err := prepareSupervisorArtifact(temp, file, uid, gid); err != nil {
 		_ = file.Close()
 		return err
 	}
@@ -618,7 +614,7 @@ func rotate(current, rollback, staged string, owner int) error {
 
 func regularMatches(path string, target workerupdate.ComponentTarget) bool {
 	linkInfo, err := os.Lstat(path)
-	if err != nil || !linkInfo.Mode().IsRegular() || linkInfo.Mode()&os.ModeSymlink != 0 || linkInfo.Mode().Perm()&0o022 != 0 {
+	if err != nil || !supervisorFileIsSecure(path, linkInfo) {
 		return false
 	}
 	file, err := os.Open(path)
@@ -639,15 +635,15 @@ func regularMatches(path string, target workerupdate.ComponentTarget) bool {
 
 func regularFile(path string) bool {
 	info, err := os.Lstat(path)
-	return err == nil && info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0
+	return err == nil && supervisorFileIsUsable(path, info)
 }
 
 func ensureDirectory(path string, uid, gid int) error {
 	info, err := os.Lstat(path)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o022 != 0 {
+	if err != nil || !supervisorDirectoryIsSecure(path, info) {
 		return ErrInvalidConfig
 	}
-	if err := os.Chown(path, uid, gid); err != nil {
+	if err := setSupervisorDirectoryOwner(path, uid, gid); err != nil {
 		return err
 	}
 	return nil
