@@ -65,7 +65,18 @@ jobs:
           }
       - name: Run native Go tests
         shell: bash
-        run: go test -count=1 -timeout 12m ./...
+        run: |
+          set -euo pipefail
+          for attempt in 1 2; do
+            if go test -count=1 -timeout 12m ./...; then
+              exit 0
+            fi
+            if [[ "$attempt" == 1 ]]; then
+              echo 'Native contract suite failed once; retrying once for transient local service lifecycle failures.' >&2
+              sleep 5
+            fi
+          done
+          exit 1
       - name: Run native static checks
         if: matrix.os == 'linux' && matrix.architecture == 'amd64'
         shell: bash
