@@ -27,7 +27,7 @@ func ProtectedDACLMatches(path, expected string) bool {
 		return true
 	}
 	token, err := windows.OpenCurrentProcessToken()
-	if err != nil || !token.IsElevated() {
+	if err != nil {
 		return false
 	}
 	defer token.Close()
