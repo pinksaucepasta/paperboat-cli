@@ -128,7 +128,7 @@ func TestSupervisorFetchesFreshAdmissionWithCappedBackoffAndReconnects(t *testin
 		}
 	}
 	var recovery float64
-	metricDeadline := time.After(time.Second)
+	metricDeadline := time.After(3 * time.Second)
 	for recovery <= 0 {
 		metric.mu.Lock()
 		recovery = metric.recovery

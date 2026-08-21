@@ -19,6 +19,9 @@ func currentUserSID() (*windows.SID, error) {
 }
 
 func inboxSDDL(sid *windows.SID) string {
+	if sid.String() == "S-1-5-18" {
+		return "D:P(A;OICI;FA;;;SY)"
+	}
 	return "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;" + sid.String() + ")"
 }
 

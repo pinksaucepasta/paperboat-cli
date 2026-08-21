@@ -89,7 +89,7 @@ func TestWindowsDiskRingAndBundleUseCurrentUserACL(t *testing.T) {
 }
 
 func TestWindowsDiagnosticOwnerMustMatchCurrentUser(t *testing.T) {
-	if _, err := resolveDiagnosticOwner(DiskConfig{OwnerSID: "S-1-5-18"}); !errors.Is(err, ErrInvalid) {
+	if _, err := resolveDiagnosticOwner(DiskConfig{OwnerSID: "S-1-5-19"}); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("owner mismatch err=%v", err)
 	}
 }

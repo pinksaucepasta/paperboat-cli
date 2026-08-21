@@ -757,6 +757,12 @@ func ensureProtectedDirectory(path, ownerSID string) error {
 }
 
 func protectedSDDL(ownerSID string, directory bool) string {
+	if ownerSID == "S-1-5-18" {
+		if directory {
+			return "D:P(A;OICI;FA;;;SY)"
+		}
+		return "D:P(A;;FA;;;SY)"
+	}
 	if directory {
 		return "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;" + ownerSID + ")"
 	}

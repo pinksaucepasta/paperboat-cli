@@ -21,7 +21,11 @@ func secureEnrollmentConfigFile(path string, info os.FileInfo, maximum int64) bo
 	if err != nil || user == nil || user.User.Sid == nil {
 		return false
 	}
-	want, err := windows.SecurityDescriptorFromString("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + user.User.Sid.String() + ")")
+	sddl := "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
+	if user.User.Sid.String() != "S-1-5-18" {
+		sddl += "(A;;FA;;;" + user.User.Sid.String() + ")"
+	}
+	want, err := windows.SecurityDescriptorFromString(sddl)
 	if err != nil {
 		return false
 	}

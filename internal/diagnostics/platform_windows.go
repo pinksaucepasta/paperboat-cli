@@ -30,6 +30,9 @@ func resolveDiagnosticOwner(config DiskConfig) (diagnosticOwner, error) {
 }
 
 func diagnosticSDDL(owner diagnosticOwner) string {
+	if owner.sid == "S-1-5-18" {
+		return "D:P(A;;FA;;;SY)"
+	}
 	return "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + owner.sid + ")"
 }
 

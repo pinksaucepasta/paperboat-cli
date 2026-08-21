@@ -33,7 +33,11 @@ func secureEnrollmentTokenFile(path string, info os.FileInfo) bool {
 	if err != nil || control&windows.SE_DACL_PROTECTED == 0 {
 		return false
 	}
-	want, err := windows.SecurityDescriptorFromString("D:P(A;;FA;;;SY)(A;;FA;;;" + user.User.Sid.String() + ")")
+	sddl := "D:P(A;;FA;;;SY)"
+	if user.User.Sid.String() != "S-1-5-18" {
+		sddl += "(A;;FA;;;" + user.User.Sid.String() + ")"
+	}
+	want, err := windows.SecurityDescriptorFromString(sddl)
 	return err == nil && tokenFileDACL(descriptor.String()) == tokenFileDACL(want.String())
 }
 
