@@ -24,7 +24,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Run one-shot Windows enrollment
-        shell: pwsh
+        shell: powershell
         env:
           PAPERBOAT_INSTALLER_URL: ${{ secrets.VICTUS_RECOVERY_INSTALLER_URL }}
         run: |
