@@ -69,7 +69,7 @@ func setupFromResult(ctx context.Context, config Config, result Result) (SetupRe
 	if err := protectHostKeyFiles(hostKey); err != nil {
 		return SetupResult{}, err
 	}
-	if err := protectHostPublicKeyFile(hostKey+".pub", config.OwnerSID); err != nil {
+	if err := protectHostPublicKeyFile(hostKey+".pub", config.OwnerSID, config.ServiceSID); err != nil {
 		return SetupResult{}, err
 	}
 	if err := ValidateServiceConfig(config.Runner, result.SSHDPath, configPath); err != nil {

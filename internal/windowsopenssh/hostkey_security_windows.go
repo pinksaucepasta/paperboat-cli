@@ -13,14 +13,17 @@ import (
 
 const hostKeySDDL = "O:SYG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)"
 
-func protectHostPublicKeyFile(path, ownerSID string) error {
-	if ownerSID == "" {
-		return errors.New("Windows OpenSSH owner SID is required")
+func protectHostPublicKeyFile(path, ownerSID, serviceSID string) error {
+	if ownerSID == "" || serviceSID == "" {
+		return errors.New("Windows OpenSSH owner and service SIDs are required")
 	}
 	if _, err := windows.StringToSid(ownerSID); err != nil {
 		return err
 	}
-	return protectHostKeyFileWithSDDL(path, hostKeySDDL+"(A;;FR;;;"+ownerSID+")")
+	if _, err := windows.StringToSid(serviceSID); err != nil {
+		return err
+	}
+	return protectHostKeyFileWithSDDL(path, hostKeySDDL+"(A;;FR;;;"+serviceSID+")(A;;FR;;;"+ownerSID+")")
 }
 
 func protectHostKeyFiles(paths ...string) error {

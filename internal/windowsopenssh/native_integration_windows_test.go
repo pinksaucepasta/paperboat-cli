@@ -93,7 +93,7 @@ func TestNativeRepairStoppedService(t *testing.T) {
 	}
 	defer func() {
 		_ = protectHostKeyFiles(hostKey)
-		_ = protectHostPublicKeyFile(hostKey+".pub", config.OwnerSID)
+		_ = protectHostPublicKeyFile(hostKey+".pub", config.OwnerSID, config.ServiceSID)
 	}()
 	if err := verifyHostKeyFiles(hostKey); err == nil {
 		t.Fatal("deliberately weakened Paperboat host-key ACL unexpectedly validated")
@@ -109,7 +109,7 @@ func TestNativeRepairStoppedService(t *testing.T) {
 	if err := verifyHostKeyFiles(hostKey); err != nil {
 		t.Fatalf("repair did not restore protected host-key ACLs: %v", err)
 	}
-	if err := verifyHostKeyFile(hostKey+".pub", hostKeySDDL+"(A;;FR;;;"+config.OwnerSID+")"); err != nil {
+	if err := verifyHostKeyFile(hostKey+".pub", hostKeySDDL+"(A;;FR;;;"+config.ServiceSID+")(A;;FR;;;"+config.OwnerSID+")"); err != nil {
 		t.Fatalf("repair did not grant the enrolled owner read-only host-public-key access: %v", err)
 	}
 	qualified, err := Qualify(ctx, config, repaired.SetupResult.Result)
