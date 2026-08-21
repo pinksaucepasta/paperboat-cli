@@ -58,6 +58,18 @@ jobs:
           $logPath = Join-Path $root 'enroll.log'
           $taskName = 'PaperboatQualificationReenroll'
           Remove-Item -LiteralPath $resultPath,$logPath -Force -ErrorAction SilentlyContinue
+          foreach ($service in @('PaperboatHostd', 'PaperboatUpdated', 'PaperboatSshd')) {
+            Stop-Service -Name $service -Force -ErrorAction SilentlyContinue
+            sc.exe delete $service | Out-Null
+          }
+          Get-Service 'PaperboatPreview-*' -ErrorAction SilentlyContinue | ForEach-Object {
+            Stop-Service -Name $_.Name -Force -ErrorAction SilentlyContinue
+            sc.exe delete $_.Name | Out-Null
+          }
+          Get-Process paperboat*,sshd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath 'C:\Program Files\Paperboat','C:\ProgramData\Paperboat','C:\Users\Pujan\AppData\Local\Paperboat' -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath 'HKLM:\Software\Paperboat' -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $root -Force | Out-Null
           [IO.File]::WriteAllText($tokenPath, $token, (New-Object Text.UTF8Encoding($false)))
           icacls.exe $tokenPath /inheritance:r /grant:r 'SYSTEM:F' 'VICTUS\Pujan:F' | Out-Null
           @'
