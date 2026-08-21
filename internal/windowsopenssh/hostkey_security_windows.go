@@ -164,7 +164,10 @@ func verifyHostKeyFile(path, expectedSDDL string) error {
 	// the exact ACEs below, AI does not permit inherited access.
 	actual := strings.Replace(descriptor.String(), "D:PAI", "D:P", 1)
 	if actual != expectedSDDL {
-		return fmt.Errorf("%w: host key ACL", ErrUntrustedBinary)
+		// Include only the path and canonical descriptor. This is safe diagnostic
+		// metadata (the descriptor contains SIDs, never key material) and makes
+		// native qualification failures actionable instead of opaque.
+		return fmt.Errorf("%w: host key ACL for %s (got %s, want %s)", ErrUntrustedBinary, path, actual, expectedSDDL)
 	}
 	return nil
 }
