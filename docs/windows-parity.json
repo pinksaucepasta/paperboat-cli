@@ -879,7 +879,7 @@
       "architecture": "amd64",
       "command": "networkmonitor-windows-amd64.test.exe -test.v -test.timeout 1m -test.run TestNativeWindowsObserverReceivesExternalInterfaceChange; SYSTEM toggles vEthernet (Default Switch) for 15 seconds with finally restoration",
       "tests": ["TestNativeWindowsObserverReceivesExternalInterfaceChange"],
-      "paths": ["internal/peertransport/networkmonitor/monitor.go", "internal/peertransport/networkmonitor/monitor_windows_native_test.go", "internal/hostruntime/runtime/network_change_unix.go", ".github/workflows/windows-ci.yml"],
+      "paths": ["internal/peertransport/networkmonitor/monitor.go", "internal/peertransport/networkmonitor/monitor_windows_native_test.go", "internal/hostruntime/runtime/network_change_unix.go", ".github/workflows/platform-qualification.yml"],
       "note": "The production Tailscale-backed Windows observer started natively, produced a stable opaque fingerprint, and detected a controlled Hyper-V Default Switch disable/enable as generation 1, interface-address reason, rebind required, dual-stack viable. The adapter was restored by a SYSTEM task finally block, the task was removed, SSH stayed available through the untouched path, and PaperboatSshd remained running. A 3-second toggle coalesced without an event; holding the change for 15 seconds passed, documenting the backend debounce requirement. The qualification-only test is separately tagged paperboat_native_network_e2e and compiled for amd64 and ARM64 by CI; it requires external controlled mutation and is not run by ordinary unit CI. Active session/path replacement, VPN, NAT rebinding, and sleep/wake remain separate evidence."
     },
     {
