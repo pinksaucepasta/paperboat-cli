@@ -14,3 +14,7 @@ func secureIdentityFile(info os.FileInfo, requirePrivateMode bool) bool {
 	}
 	return !requirePrivateMode || info.Mode().Perm() == 0o600
 }
+
+func secureIdentityPath(_ string, info os.FileInfo, requirePrivateMode bool) bool {
+	return secureIdentityFile(info, requirePrivateMode)
+}

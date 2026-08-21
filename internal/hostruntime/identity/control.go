@@ -42,7 +42,7 @@ func (s *Store) SaveMachineControl(value MachineControl) error {
 func (s *Store) MachineControl(now time.Time, expiryGrace time.Duration) (MachineControl, error) {
 	path := filepath.Join(s.config.StateRoot, "machine-control.json")
 	info, err := os.Lstat(path)
-	if err != nil || !secureIdentityFile(info, true) || info.Size() > 32<<10 {
+	if err != nil || !secureIdentityPath(path, info, true) || info.Size() > 32<<10 {
 		return MachineControl{}, ErrInvalidStore
 	}
 	encoded, err := os.ReadFile(path)

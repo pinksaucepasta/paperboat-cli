@@ -69,7 +69,7 @@ func (s *Store) PeerEndpoint() (PeerEndpoint, error) {
 func (s *Store) recoverableUnsignedPeerEndpoint(generation uint64) bool {
 	path := filepath.Join(s.config.StateRoot, "peer-endpoint.json")
 	info, err := os.Lstat(path)
-	if err != nil || !secureIdentityFile(info, true) || info.Size() > 16<<10 {
+	if err != nil || !secureIdentityPath(path, info, true) || info.Size() > 16<<10 {
 		return false
 	}
 	body, err := os.ReadFile(path)
@@ -122,7 +122,7 @@ func (s *Store) loadPeerEndpoint(generation uint64, machineID string) (PeerEndpo
 	if err != nil {
 		return PeerEndpoint{}, err
 	}
-	if !secureIdentityFile(info, true) || info.Size() > 16<<10 {
+	if !secureIdentityPath(path, info, true) || info.Size() > 16<<10 {
 		return PeerEndpoint{}, ErrInvalidStore
 	}
 	encoded, err := os.ReadFile(path)

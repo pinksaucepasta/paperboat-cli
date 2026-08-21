@@ -814,7 +814,15 @@ func parseCandidate(line string) (pathCandidate, bool) {
 	if start == end {
 		return pathCandidate{}, false
 	}
-	localPath, hasUnquotedGlob, ok := decodeCandidateWord(trimmed)
+	var localPath string
+	var hasUnquotedGlob, ok bool
+	if runtime.GOOS == "windows" && strings.HasPrefix(strings.ToLower(trimmed), "file://") {
+		// Keep backslashes in legacy Windows file URIs intact. POSIX shell
+		// decoding would incorrectly consume them before URI handling.
+		localPath, ok = trimmed, true
+	} else {
+		localPath, hasUnquotedGlob, ok = decodeCandidateWord(trimmed)
+	}
 	if !ok || localPath == "" {
 		return pathCandidate{}, false
 	}
@@ -863,6 +871,9 @@ func decodeCandidateWord(word string) (string, bool, bool) {
 		candidate := word
 		if len(candidate) >= 2 && (candidate[0] == '"' && candidate[len(candidate)-1] == '"' || candidate[0] == '\'' && candidate[len(candidate)-1] == '\'') {
 			candidate = candidate[1 : len(candidate)-1]
+		}
+		if strings.Contains(candidate, `\ `) && filepath.IsAbs(filepath.FromSlash(candidate)) {
+			return strings.ReplaceAll(candidate, `\ `, " "), false, true
 		}
 		if !strings.ContainsAny(candidate, "\x00\r\n") && filepath.IsAbs(filepath.FromSlash(candidate)) {
 			return candidate, false, true

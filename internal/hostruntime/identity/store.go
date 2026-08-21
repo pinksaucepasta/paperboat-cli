@@ -122,7 +122,7 @@ func (s *Store) load() (Key, error) {
 	if err != nil {
 		return Key{}, err
 	}
-	if !secureIdentityFile(info, true) {
+	if !secureIdentityPath(s.path, info, true) {
 		return Key{}, ErrInvalidStore
 	}
 	encoded, err := os.ReadFile(s.path)
@@ -160,7 +160,7 @@ func (s *Store) load() (Key, error) {
 
 func (s *Store) write(key Key) error {
 	if info, err := os.Lstat(s.path); err == nil {
-		if !secureIdentityFile(info, false) {
+		if !secureIdentityPath(s.path, info, false) {
 			return ErrInvalidStore
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {

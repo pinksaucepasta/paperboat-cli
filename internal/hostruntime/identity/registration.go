@@ -75,7 +75,7 @@ func (s *Store) Registration() (Registration, error) {
 	if err != nil {
 		return Registration{}, err
 	}
-	if !secureIdentityFile(info, true) {
+	if !secureIdentityPath(path, info, true) {
 		return Registration{}, ErrInvalidStore
 	}
 	encoded, err := os.ReadFile(path)

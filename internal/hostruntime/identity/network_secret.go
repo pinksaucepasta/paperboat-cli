@@ -21,7 +21,7 @@ func (s *Store) NetworkFingerprintSecret() ([]byte, error) {
 	path := filepath.Join(s.config.StateRoot, "network-fingerprint-secret.json")
 	info, err := os.Lstat(path)
 	if err == nil {
-		if !secureIdentityFile(info, true) || info.Size() > 1024 {
+		if !secureIdentityPath(path, info, true) || info.Size() > 1024 {
 			return nil, ErrInvalidStore
 		}
 		encoded, readErr := os.ReadFile(path)

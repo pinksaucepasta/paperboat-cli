@@ -211,7 +211,7 @@ func (c *JWKSCache) loadPersisted() {
 		return
 	}
 	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o600 || info.Size() < 1 || info.Size() > c.config.MaxBytes+4096 {
+	if err != nil || !secureJWKSFile(path, info) || info.Size() < 1 || info.Size() > c.config.MaxBytes+4096 {
 		return
 	}
 	body, err := os.ReadFile(path)
