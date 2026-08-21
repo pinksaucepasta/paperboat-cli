@@ -87,7 +87,7 @@ jobs:
           ./packaging/windows/scripts/validate-release-pipeline.sh
           go test -count=1 ./packaging/windows/...
       - name: Verify Windows shell and packaging contract
-        if: matrix.os == 'windows'
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -102,7 +102,7 @@ jobs:
           & cmd.exe /d /c ver
           if ($LASTEXITCODE -ne 0) { throw 'cmd.exe is unavailable.' }
       - name: Provision pinned OpenSSH client for native contract tests
-        if: matrix.os == 'windows'
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
