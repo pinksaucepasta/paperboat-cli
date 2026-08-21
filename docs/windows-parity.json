@@ -514,8 +514,8 @@
       "current_readiness": "beta_ready",
       "required_feature_state": "arm64_cross_verified",
       "native_test_required": false,
-      "native_tested": true,
-      "native_qualification_gate": "pass",
+      "native_tested": false,
+      "native_qualification_gate": "blocked_no_hardware",
       "promotion_blocked_until": "arm64_native_verified",
     "blockers": [
       "windows_artifact_signing: TUF, checksum, SBOM, provenance, malware-scan, and publication evidence pending"
@@ -557,11 +557,12 @@
     },
     {
       "id": "native_windows_arm64_e2e",
-      "status": "blocked",
+      "status": "blocked_no_hardware",
       "required_for": ["windows/arm64 stable promotion"],
-      "counts_as_native_execution": true,
+      "counts_as_native_execution": false,
       "evidence_refs": [],
-      "blockers": ["native Windows arm64 hardware is unavailable; arm64 remains beta"]
+      "blockers": ["native Windows arm64 hardware is unavailable; arm64 remains beta"],
+      "skip_reason": "blocked_no_hardware"
     },
     {
       "id": "windows_arm64_beta_cross_gate",
