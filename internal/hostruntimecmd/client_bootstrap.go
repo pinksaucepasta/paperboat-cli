@@ -56,3 +56,7 @@ func installBootstrapCLI(ctx context.Context, session *bootstrap.ClientSession, 
 	}
 	return localdaemon.InstallCurrentUserService(ctx, executable, cfg.Path(), cfg.ServerURL)
 }
+
+func shouldInstallBootstrapCLI(material bootstrap.Material) bool {
+	return material.ClientSession != nil && material.SetupMode != "host"
+}
