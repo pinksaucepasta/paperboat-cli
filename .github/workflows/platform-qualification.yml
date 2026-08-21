@@ -56,7 +56,9 @@ jobs:
         run: |
           set -euo pipefail
           actual="$(go env GOOS)/$(go env GOARCH)"
-          expected="${{ matrix.os }}/${{ matrix.architecture }}"
+          expected_os="${{ matrix.os }}"
+          [[ "$expected_os" == macos ]] && expected_os=darwin
+          expected="$expected_os/${{ matrix.architecture }}"
           test "$actual" = "$expected" || {
             echo "Runner architecture mismatch: got $actual, expected $expected" >&2
             exit 1
