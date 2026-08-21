@@ -50,5 +50,25 @@ func dacl(value string) string {
 	if open < 0 {
 		return ""
 	}
-	return "D:" + value[start+open:]
+	body := value[start+open:]
+	var result strings.Builder
+	seen := make(map[string]struct{})
+	for len(body) > 0 {
+		begin := strings.IndexByte(body, '(')
+		if begin < 0 {
+			break
+		}
+		end := strings.IndexByte(body[begin:], ')')
+		if end < 0 {
+			return ""
+		}
+		ace := body[begin : begin+end+1]
+		ace = strings.ReplaceAll(ace, "S-1-5-18", "SY")
+		if _, ok := seen[ace]; !ok {
+			seen[ace] = struct{}{}
+			result.WriteString(ace)
+		}
+		body = body[begin+end+1:]
+	}
+	return "D:" + result.String()
 }
