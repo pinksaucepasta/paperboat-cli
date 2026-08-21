@@ -72,8 +72,8 @@ for forbidden in ("windows/amd64", "windows/arm64", "package-zip", "paperboat_.*
         raise SystemExit(f"release-unix still owns Windows assets: {forbidden}")
 
 windows = job("windows-package")
-if "runs-on: ${{ matrix.runner }}" not in windows or "runner: windows-2025" not in windows or "runner: [self-hosted, Windows, X64, paperboat-windows-11-iot-ltsc]" not in windows:
-    raise SystemExit("windows-package must run natively on windows-2025 for arm64 and the registered native amd64 runner for amd64")
+if "runs-on: ${{ matrix.runner }}" not in windows or windows.count("runner: windows-2025") < 2:
+    raise SystemExit("windows-package must run amd64 and arm64 builds on GitHub-hosted windows-2025 runners")
 if "stable" not in windows or "beta" not in windows:
     raise SystemExit("windows-package must declare stable and beta channels")
 
@@ -90,8 +90,8 @@ if "paperboat-tuf-published" not in publication or "TestProductionTUFRepository"
     raise SystemExit("publication is not blocked on public offline-signed TUF metadata")
 
 qualification = job("windows-amd64-native-qualification")
-if "needs: windows-package" not in qualification or "runner: windows-2025" not in qualification or "runner: [self-hosted, Windows, X64, paperboat-windows-11-iot-ltsc]" not in qualification or "runs-on: ${{ matrix.runner }}" not in qualification:
-    raise SystemExit("native Windows amd64 qualification must consume the signed package on standard Windows 11 and the registered IoT LTSC runner")
+if "needs: windows-package" not in qualification or "runner: windows-2025" not in qualification or "runs-on: ${{ matrix.runner }}" not in qualification:
+    raise SystemExit("native Windows amd64 qualification must consume the signed package on a GitHub-hosted windows-2025 runner")
 for required in (
     "Invoke-NativeWindowsQualification.ps1",
     "convert-native-qualification-evidence.py",
