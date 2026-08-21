@@ -22,6 +22,7 @@ func saveBootstrapRegistration(store *identity.Store, serverURL string, material
 		return err
 	}
 	key := store.Current()
+	sshUser, sshPort = bootstrapSSHFields(material.SetupMode, sshUser, sshPort)
 	return store.SaveRegistration(identity.Registration{
 		ServerURL:              strings.TrimRight(strings.TrimSpace(serverURL), "/"),
 		MachineID:              material.UserMachineID,
@@ -36,4 +37,11 @@ func saveBootstrapRegistration(store *identity.Store, serverURL string, material
 		SSHPort:                sshPort,
 		UpdatedAt:              time.Now().UTC(),
 	})
+}
+
+func bootstrapSSHFields(setupMode, sshUser string, sshPort uint16) (string, uint16) {
+	if setupMode != "host" {
+		return "", 0
+	}
+	return strings.TrimSpace(sshUser), sshPort
 }
