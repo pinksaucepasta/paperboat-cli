@@ -74,6 +74,9 @@ jobs:
       - name: Verify cmd.exe
         shell: cmd
         run: ver
+      - name: Verify Windows protected ACL semantics
+        shell: pwsh
+        run: go test -count=1 -run TestReadWindowsHostdTokenAcceptsExactTokenFile -v ./internal/hostruntimecmd
       - name: Run the complete native amd64 test suite
         shell: pwsh
         run: |

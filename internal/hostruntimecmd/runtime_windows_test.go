@@ -28,7 +28,13 @@ func TestReadWindowsHostdTokenAcceptsExactTokenFile(t *testing.T) {
 		if descriptorErr != nil || descriptor == nil {
 			t.Fatal(err)
 		}
-		t.Fatalf("%v (dacl %q)", err, windowsHostdTokenDACL(descriptor.String()))
+		user, userErr := windows.GetCurrentProcessToken().GetTokenUser()
+		if userErr != nil || user == nil || user.User.Sid == nil {
+			t.Fatalf("%v (dacl %q; current SID unavailable: %v)", err, windowsHostdTokenDACL(descriptor.String()), userErr)
+		}
+		control, _, controlErr := descriptor.Control()
+		expected := "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + user.User.Sid.String() + ")"
+		t.Fatalf("%v (sid %q; control %#x err %v; dacl %q; expected %q)", err, user.User.Sid.String(), control, controlErr, descriptor.String(), expected)
 	}
 	if !bytes.Equal(got, want) {
 		t.Fatalf("token = %x, want %x", got, want)
