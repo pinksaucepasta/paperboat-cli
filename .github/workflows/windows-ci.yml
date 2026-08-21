@@ -274,6 +274,10 @@ jobs:
               & sc.exe delete $name | Out-Null
             }
           }
+          $serviceDeadline = (Get-Date).AddSeconds(30)
+          while ((Get-Service -Name PaperboatHostd,PaperboatUpdated -ErrorAction SilentlyContinue) -and (Get-Date) -lt $serviceDeadline) {
+            Start-Sleep -Milliseconds 250
+          }
           $uninstallRoots = @(
             'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
             'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
@@ -287,10 +291,21 @@ jobs:
             }
           }
           Remove-Item -LiteralPath 'HKLM:\Software\Paperboat' -Recurse -Force -ErrorAction SilentlyContinue
-          Remove-Item -LiteralPath 'C:\Program Files\Paperboat' -Recurse -Force -ErrorAction SilentlyContinue
+          Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+            $_.ExecutablePath -and $_.ExecutablePath.StartsWith('C:\Program Files\Paperboat\', [StringComparison]::OrdinalIgnoreCase)
+          } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+          $installDeadline = (Get-Date).AddSeconds(30)
+          do {
+            Remove-Item -LiteralPath 'C:\Program Files\Paperboat' -Recurse -Force -ErrorAction SilentlyContinue
+            if (-not (Test-Path -LiteralPath 'C:\Program Files\Paperboat')) { break }
+            Start-Sleep -Milliseconds 250
+          } while ((Get-Date) -lt $installDeadline)
           Remove-Item -LiteralPath 'C:\ProgramData\Paperboat' -Recurse -Force -ErrorAction SilentlyContinue
           if ((Get-Service -Name PaperboatHostd -ErrorAction SilentlyContinue) -or (Get-Service -Name PaperboatUpdated -ErrorAction SilentlyContinue)) {
             throw 'Dedicated Paperboat qualification state could not be removed.'
+          }
+          if ((Test-Path -LiteralPath 'C:\Program Files\Paperboat') -or (Test-Path -LiteralPath 'HKLM:\Software\Paperboat')) {
+            throw 'Dedicated Paperboat qualification files or registry state could not be removed.'
           }
       - name: Install pinned WiX 5.0.2 for IoT MSI qualification
         shell: powershell
