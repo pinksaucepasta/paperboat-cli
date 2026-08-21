@@ -37,9 +37,6 @@ jobs:
           - os: windows
             architecture: amd64
             runner: windows-2025
-          - os: windows
-            architecture: arm64
-            runner: windows-11-arm
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -122,12 +119,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'PowerShell 7 is unavailable.' }
           & cmd.exe /d /c ver
           if ($LASTEXITCODE -ne 0) { throw 'cmd.exe is unavailable.' }
-      - name: Record native Windows arm64 beta contract evidence
-        if: matrix.os == 'windows' && matrix.architecture == 'arm64'
-        shell: pwsh
-        run: |
-          "windows_arm64_stability: beta" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
-          "native_windows_arm64_tested: true" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
 
   windows-arm64-cross:
     name: Windows arm64 beta independent cross-build

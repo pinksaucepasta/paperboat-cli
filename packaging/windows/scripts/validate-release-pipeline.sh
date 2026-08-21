@@ -45,7 +45,7 @@ require_text 'convert-native-qualification-evidence.py'
 require_text 'windows-native-qualification'
 require_text 'windows-amd64-native-release-qualification'
 require_text 'windows-arm64-native-release-qualification'
-require_text 'needs: [release-unix, windows-package, windows-winget, windows-native-qualification]'
+require_text 'windows-arm64-beta-evidence'
 require_text 'release-candidate-${{ env.RELEASE_VERSION }}'
 require_text 'release-candidate.json'
 
@@ -89,26 +89,30 @@ if "stable" not in windows or "beta" not in windows:
 candidate = job("candidate-assembly")
 if "if: always()" not in candidate:
     raise SystemExit("candidate assembly must run its explicit dependency gate")
-if "needs: [release-unix, windows-package, windows-winget, windows-native-qualification]" not in workflow:
+if "needs: [release-unix, windows-package, windows-winget, windows-native-qualification, windows-arm64-beta-evidence]" not in workflow:
     raise SystemExit("candidate dependencies do not include all platform handoffs")
 if "windows-native-qualification.result" not in candidate:
     raise SystemExit("candidate does not gate on native Windows amd64 qualification")
+if "windows-arm64-beta-evidence.result" not in candidate:
+    raise SystemExit("candidate does not gate on Windows arm64 beta evidence")
 if "--verify-evidence native-qualification/windows-amd64-native-qualification.json" not in candidate:
     raise SystemExit("candidate does not verify native qualification against final artifacts")
 
 qualification = job("windows-native-qualification")
-if "needs: windows-package" not in qualification or "runner: windows-2025" not in qualification or "runner: windows-11-arm" not in qualification or "runs-on: ${{ matrix.runner }}" not in qualification:
-    raise SystemExit("native Windows qualification must consume final amd64 and arm64 packages on GitHub-hosted runners")
+if "needs: windows-package" not in qualification or "runner: windows-2025" not in qualification or "runs-on: ${{ matrix.runner }}" not in qualification:
+    raise SystemExit("native Windows qualification must consume the final amd64 package on a GitHub-hosted Windows runner")
 for required in (
     "Invoke-NativeWindowsQualification.ps1",
     "convert-native-qualification-evidence.py",
     "--artifacts-dir (Join-Path $env:GITHUB_WORKSPACE 'input')",
     "windows-amd64-native-release-qualification",
-    "windows-arm64-native-release-qualification",
-    "write-arm64-native-evidence.py",
 ):
     if required not in qualification:
         raise SystemExit(f"native Windows amd64 qualification is missing {required}")
+arm_beta = job("windows-arm64-beta-evidence")
+for required in ("needs: windows-package", "blocked_no_hardware", "write-arm64-native-evidence.py", "windows-arm64-native-release-qualification"):
+    if required not in arm_beta:
+        raise SystemExit(f"Windows arm64 beta evidence is missing {required}")
 
 for required in (
     "candidate_run_id:",
