@@ -9,6 +9,7 @@ on:
         type: choice
         options:
           - reenroll-victus
+          - inspect-recovery
           - restore-victus-qualification-state
           - inspect-victus-health
           - prepare-victus-clean-qualification
@@ -18,6 +19,20 @@ permissions:
   contents: read
 
 jobs:
+  inspect-recovery:
+    if: inputs.action == 'inspect-recovery'
+    runs-on: [self-hosted, Windows, X64, paperboat-windows-11-iot-ltsc]
+    timeout-minutes: 5
+    steps:
+      - name: Inspect recovery task
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Get-ScheduledTask -TaskName 'PaperboatQualificationReenroll' -ErrorAction SilentlyContinue | Format-List *
+          Get-ScheduledTaskInfo -TaskName 'PaperboatQualificationReenroll' -ErrorAction SilentlyContinue | Format-List *
+          Get-Process paperboat*,pwsh -ErrorAction SilentlyContinue | Select-Object Id,Name,Path,SessionId,StartTime
+          Get-ChildItem 'C:\PaperboatRecovery' -Force -ErrorAction SilentlyContinue | Select-Object Name,Length,LastWriteTime
+          Get-Content 'C:\PaperboatRecovery\enroll.log' -Tail 100 -ErrorAction SilentlyContinue
   reenroll-victus:
     if: inputs.action == 'reenroll-victus'
     runs-on: [self-hosted, Windows, X64, paperboat-windows-11-iot-ltsc]
