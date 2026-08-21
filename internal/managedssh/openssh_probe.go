@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -73,6 +74,11 @@ func ProbeOpenSSH(ctx context.Context, executable string, timeout time.Duration)
 		{"agent", "Host probe.invalid\n    IdentityAgent none\n", func() { capabilities.IdentityAgent = true }},
 		{"known-hosts", "Host probe.invalid\n    KnownHostsCommand /usr/bin/true\n", func() { capabilities.KnownHostsCommand = true }},
 	}
+	knownHostsCommand := "/usr/bin/true"
+	if runtime.GOOS == "windows" {
+		knownHostsCommand = `cmd.exe /d /c exit 0`
+	}
+	probes[3].content = "Host probe.invalid\n    KnownHostsCommand " + knownHostsCommand + "\n"
 	for _, probe := range probes {
 		path := filepath.Join(directory, probe.name+".conf")
 		if err := os.WriteFile(path, []byte(probe.content), 0o600); err != nil {
