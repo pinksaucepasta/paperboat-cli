@@ -7,6 +7,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -53,12 +54,12 @@ func TestRuntimeWorkerEntryActivatesFencedHostdLease(t *testing.T) {
 
 	workerCtx, stopWorker := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	var output bytes.Buffer
+	output := &lockedBuffer{}
 	go func() {
 		done <- runWorker(workerCtx, []string{
 			"--socket", filepath.Join(root, "socket", "hostd.sock"), "--token-file", tokenPath,
 			"--worker-id", "runtime-test", "--version", "test", "--heartbeat", "1s",
-		}, bytes.NewReader(nil), &output, &bytes.Buffer{})
+		}, bytes.NewReader(nil), output, &bytes.Buffer{})
 	}()
 	deadline = time.Now().Add(time.Second)
 	for server.Status().State != hostdproto.StateActive || output.String() != "ready 1 1\nactive 1 1\n" {
@@ -74,4 +75,21 @@ func TestRuntimeWorkerEntryActivatesFencedHostdLease(t *testing.T) {
 	if output.String() != "ready 1 1\nactive 1 1\n" {
 		t.Fatalf("output=%q", output.String())
 	}
+}
+
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.String()
 }
