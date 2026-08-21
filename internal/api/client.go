@@ -352,12 +352,23 @@ type E2EERoot struct {
 type PendingEndpointIdentity struct {
 	RequestID      string    `json:"request_id"`
 	EndpointID     string    `json:"endpoint_id"`
+	Role           string    `json:"role,omitempty"`
 	Generation     uint64    `json:"generation"`
 	NoisePublicKey string    `json:"noise_public_key"`
 	QUICPublicKey  string    `json:"quic_public_key"`
 	CreatedAt      time.Time `json:"created_at"`
 	ExpiresAt      time.Time `json:"expires_at"`
 	SafetyCode     string    `json:"safety_code"`
+}
+
+// CLIEndpointRequestInput contains only public endpoint keys. The request is
+// signed later by an already paired CLI and never carries a root private key.
+type CLIEndpointRequestInput struct {
+	OperationID    string `json:"operation_id"`
+	EndpointID     string `json:"endpoint_id"`
+	Generation     uint64 `json:"generation"`
+	NoisePublicKey string `json:"noise_public_key"`
+	QUICPublicKey  string `json:"quic_public_key"`
 }
 
 func (c *Client) E2EERoot(ctx context.Context) (E2EERoot, error) {
@@ -372,6 +383,20 @@ func (c *Client) PendingE2EEEndpoints(ctx context.Context) ([]PendingEndpointIde
 	var out []PendingEndpointIdentity
 	if err := c.doStrict(ctx, http.MethodGet, "/v1/e2ee/pending-endpoints", nil, &out); err != nil {
 		return nil, err
+	}
+	return out, nil
+}
+
+// RequestCLIEndpoint creates or exactly replays a pending existing-account
+// CLI endpoint enrollment request. Unlike machine endpoint enrollment this
+// route uses the authenticated CLI session and carries no machine proof.
+func (c *Client) RequestCLIEndpoint(ctx context.Context, input CLIEndpointRequestInput) (PendingEndpointIdentity, error) {
+	if strings.TrimSpace(input.OperationID) == "" || strings.TrimSpace(input.EndpointID) == "" || input.Generation == 0 || strings.TrimSpace(input.NoisePublicKey) == "" || strings.TrimSpace(input.QUICPublicKey) == "" {
+		return PendingEndpointIdentity{}, errors.New("CLI endpoint enrollment request is invalid")
+	}
+	var out PendingEndpointIdentity
+	if err := c.doWithHeaders(ctx, http.MethodPost, "/v1/e2ee/endpoint-requests", input, &out, http.Header{"Idempotency-Key": []string{input.OperationID}}); err != nil {
+		return PendingEndpointIdentity{}, err
 	}
 	return out, nil
 }

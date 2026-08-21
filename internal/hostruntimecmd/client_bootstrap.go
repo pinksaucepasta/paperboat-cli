@@ -47,8 +47,16 @@ func installBootstrapCLI(ctx context.Context, session *bootstrap.ClientSession, 
 			return fmt.Errorf("existing Paperboat profile belongs to another client session")
 		}
 	}
-	if _, err := identitybootstrap.Bootstrap(ctx, identitybootstrap.Request{Store: store, Client: client, Issuer: cfg.ServerURL, AccountID: me.ID, CLIClientSessionID: session.SessionID}); err != nil {
-		return fmt.Errorf("bootstrap CLI peer identity: %w", err)
+	if _, rootErr := client.E2EERoot(ctx); rootErr == nil {
+		if _, err := identitybootstrap.EnrollExistingRoot(ctx, identitybootstrap.ExistingRootRequest{Store: store, Client: client, Issuer: cfg.ServerURL, AccountID: me.ID, CLIClientSessionID: session.SessionID}); err != nil {
+			return fmt.Errorf("enroll CLI peer identity with paired device: %w", err)
+		}
+	} else if api.IsNotFound(rootErr) {
+		if _, err := identitybootstrap.Bootstrap(ctx, identitybootstrap.Request{Store: store, Client: client, Issuer: cfg.ServerURL, AccountID: me.ID, CLIClientSessionID: session.SessionID}); err != nil {
+			return fmt.Errorf("bootstrap CLI peer identity: %w", err)
+		}
+	} else {
+		return fmt.Errorf("read account E2EE root: %w", rootErr)
 	}
 	executable, err := os.Executable()
 	if err != nil {

@@ -64,6 +64,35 @@ func TestApproveMachineRequiresExactSafetyCodeAndSignsPublishedKeys(t *testing.T
 	}
 }
 
+func TestApproveCLIRequiresCLIRoleAndSignsNewSessionKeys(t *testing.T) {
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	root := t.TempDir()
+	store := config.ProfileStore{Path: root, Secrets: config.FileSecretStore{Dir: filepath.Join(root, "secrets")}}
+	keys, err := store.PeerIdentityKeys("https://api.example.test", "account_1", "cli_existing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootPublic := keys.RootPrivate.Public().(ed25519.PublicKey)
+	rootFingerprint := sha256.Sum256(rootPublic)
+	clearKeys(&keys)
+	noise := sha256.Sum256([]byte("cli-noise"))
+	quicPublic, _, _ := ed25519.GenerateKey(nil)
+	code := machineSafetyCode("cli_new", 1, noise, quicPublic)
+	client := &approvalClient{root: api.E2EERoot{Version: 1, PublicKey: base64.RawURLEncoding.EncodeToString(rootPublic), Fingerprint: hex.EncodeToString(rootFingerprint[:]), Generation: 1}, pending: []api.PendingEndpointIdentity{{RequestID: "per_0123456789abcdef", EndpointID: "cli_new", Role: "cli", Generation: 1, NoisePublicKey: base64.RawURLEncoding.EncodeToString(noise[:]), QUICPublicKey: base64.RawURLEncoding.EncodeToString(quicPublic), CreatedAt: now.Add(-time.Minute), ExpiresAt: now.Add(4 * time.Minute), SafetyCode: code}}}
+	result, err := ApproveCLI(context.Background(), ApprovalRequest{Store: store, Client: client, Issuer: "https://api.example.test", AccountID: "account_1", CLIClientSessionID: "cli_existing", RequestID: "per_0123456789abcdef", SafetyCode: code, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := base64.RawURLEncoding.DecodeString(client.registered.Certificate)
+	certificate, err := endpointidentity.Verify(raw, rootPublic, endpointidentity.Expected{AccountID: "account_1", Role: endpointidentity.RoleCLI, EndpointID: "cli_new", Generation: 1}, now)
+	if err != nil || client.registered.Role != "cli" || certificate.Claims.NoisePublicKey != noise || string(certificate.Claims.QUICPublicKey) != string(quicPublic) || result.CertificateFingerprint != client.registered.CertificateFingerprint {
+		t.Fatalf("certificate=%+v document=%+v result=%+v err=%v", certificate, client.registered, result, err)
+	}
+	if _, err := ApproveMachine(context.Background(), ApprovalRequest{Store: store, Client: client, Issuer: "https://api.example.test", AccountID: "account_1", CLIClientSessionID: "cli_existing", RequestID: "per_0123456789abcdef", SafetyCode: code, Now: func() time.Time { return now }}); err == nil {
+		t.Fatal("machine signer accepted a CLI request")
+	}
+}
+
 func machineSafetyCode(endpointID string, generation uint64, noise [32]byte, quic []byte) string {
 	buffer := append([]byte("paperboat-machine-endpoint-v1\x00"+endpointID+"\x00"), make([]byte, 8)...)
 	binary.BigEndian.PutUint64(buffer[len(buffer)-8:], generation)

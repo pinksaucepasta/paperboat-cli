@@ -70,6 +70,69 @@ func (s ProfileStore) ImportPeerAccountRootSeed(issuer, accountID string, seed [
 	return storePeerKey(s.Secrets, ref, "account_root_seed", seed)
 }
 
+// LoadPeerAccountRootPublic returns the account root public key without
+// requiring custody of the account root private seed. Newly enrolled CLI
+// endpoints use this verifier-only record when validating peer certificates.
+func (s ProfileStore) LoadPeerAccountRootPublic(issuer, accountID string) (public ed25519.PublicKey, resultErr error) {
+	if s.Path == "" || s.Secrets == nil || !validCredentialID(accountID) {
+		return nil, ErrCredentialStoreUnavailable
+	}
+	issuer, err := NormalizeIssuer(issuer)
+	if err != nil {
+		return nil, err
+	}
+	lock := newSharedLock(s.profilePath(issuer) + ".peer-identity.lock")
+	if err := lock.Lock(); err != nil {
+		return nil, err
+	}
+	defer func() {
+		resultErr = errors.Join(resultErr, lock.Unlock())
+		if resultErr != nil {
+			clear(public)
+			public = nil
+		}
+	}()
+	value, found, err := loadPeerKey(s.Secrets, peerIdentitySecretRef(issuer, accountID, "account-root-public"), "account_root_public")
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, ErrSecretNotFound
+	}
+	return ed25519.PublicKey(value), nil
+}
+
+// SavePeerAccountRootPublic persists the verifier-only account root public
+// key. It is idempotent but rejects replacement, so an account cannot be
+// silently rebound to a different root after enrollment.
+func (s ProfileStore) SavePeerAccountRootPublic(issuer, accountID string, public ed25519.PublicKey) (resultErr error) {
+	if s.Path == "" || s.Secrets == nil || !validCredentialID(accountID) || len(public) != ed25519.PublicKeySize {
+		return ErrCredentialStoreUnavailable
+	}
+	issuer, err := NormalizeIssuer(issuer)
+	if err != nil {
+		return err
+	}
+	lock := newSharedLock(s.profilePath(issuer) + ".peer-identity.lock")
+	if err := lock.Lock(); err != nil {
+		return err
+	}
+	defer func() { resultErr = errors.Join(resultErr, lock.Unlock()) }()
+	ref := peerIdentitySecretRef(issuer, accountID, "account-root-public")
+	existing, found, err := loadPeerKey(s.Secrets, ref, "account_root_public")
+	if err != nil {
+		return err
+	}
+	defer clear(existing)
+	if found {
+		if subtle.ConstantTimeCompare(existing, public) != 1 {
+			return errors.New("peer account root public key conflicts with local state")
+		}
+		return nil
+	}
+	return storePeerKey(s.Secrets, ref, "account_root_public", public)
+}
+
 type PeerIdentityKeys struct {
 	RootPrivate  ed25519.PrivateKey
 	NoisePrivate [32]byte
@@ -182,6 +245,86 @@ func (s ProfileStore) PeerIdentityKeysForExistingRoot(issuer, accountID, endpoin
 	return s.peerIdentityKeys(issuer, accountID, endpointID, false)
 }
 
+// PeerEndpointKeys loads or creates only the endpoint transport keys. It never
+// creates or loads an account root private key, which is the required custody
+// boundary for a CLI enrolled into an account that already has a root.
+func (s ProfileStore) PeerEndpointKeys(issuer, accountID, endpointID string) (identity PeerIdentityKeys, resultErr error) {
+	if s.Path == "" || s.Secrets == nil || !validCredentialID(accountID) || !validCredentialID(endpointID) {
+		return PeerIdentityKeys{}, ErrCredentialStoreUnavailable
+	}
+	issuer, err := NormalizeIssuer(issuer)
+	if err != nil {
+		return PeerIdentityKeys{}, err
+	}
+	lock := newSharedLock(s.profilePath(issuer) + ".peer-identity.lock")
+	if err := lock.Lock(); err != nil {
+		return PeerIdentityKeys{}, fmt.Errorf("lock peer identity: %w", err)
+	}
+	defer func() {
+		resultErr = errors.Join(resultErr, lock.Unlock())
+		if resultErr != nil {
+			clearPeerIdentity(&identity)
+		}
+	}()
+
+	noiseRef := peerIdentitySecretRef(issuer, endpointID, "endpoint-noise")
+	quicRef := peerIdentitySecretRef(issuer, endpointID, "endpoint-quic")
+	noisePrivate, noiseExists, err := loadPeerKey(s.Secrets, noiseRef, "endpoint_noise_x25519")
+	if err != nil {
+		return PeerIdentityKeys{}, err
+	}
+	quicSeed, quicExists, err := loadPeerKey(s.Secrets, quicRef, "endpoint_quic_seed")
+	if err != nil {
+		clear(noisePrivate)
+		return PeerIdentityKeys{}, err
+	}
+	defer clear(noisePrivate)
+	defer clear(quicSeed)
+	if noiseExists != quicExists {
+		return PeerIdentityKeys{}, errors.New("peer endpoint identity is incomplete")
+	}
+
+	created := make([]string, 0, 2)
+	rollback := func() {
+		for index := len(created) - 1; index >= 0; index-- {
+			_ = s.Secrets.Delete(created[index])
+		}
+	}
+	if !noiseExists {
+		noiseKey, err := ecdh.X25519().GenerateKey(rand.Reader)
+		if err != nil {
+			return PeerIdentityKeys{}, fmt.Errorf("generate endpoint Noise identity: %w", err)
+		}
+		noisePrivate = append([]byte(nil), noiseKey.Bytes()...)
+		quicSeed = make([]byte, ed25519.SeedSize)
+		if _, err := rand.Read(quicSeed); err != nil {
+			return PeerIdentityKeys{}, fmt.Errorf("generate endpoint QUIC identity: %w", err)
+		}
+		if err := storePeerKey(s.Secrets, noiseRef, "endpoint_noise_x25519", noisePrivate); err != nil {
+			return PeerIdentityKeys{}, err
+		}
+		created = append(created, noiseRef)
+		if err := storePeerKey(s.Secrets, quicRef, "endpoint_quic_seed", quicSeed); err != nil {
+			rollback()
+			return PeerIdentityKeys{}, err
+		}
+		created = append(created, quicRef)
+	}
+	if len(noisePrivate) != 32 || len(quicSeed) != ed25519.SeedSize {
+		rollback()
+		return PeerIdentityKeys{}, errors.New("peer endpoint key size is invalid")
+	}
+	noiseKey, err := ecdh.X25519().NewPrivateKey(noisePrivate)
+	if err != nil {
+		rollback()
+		return PeerIdentityKeys{}, errors.New("peer Noise identity is invalid")
+	}
+	identity.QUICPrivate = ed25519.NewKeyFromSeed(quicSeed)
+	copy(identity.NoisePrivate[:], noisePrivate)
+	copy(identity.NoisePublic[:], noiseKey.PublicKey().Bytes())
+	return identity, nil
+}
+
 func (s ProfileStore) DeletePeerEndpointIdentity(issuer, endpointID string) (resultErr error) {
 	if s.Path == "" || s.Secrets == nil || !validCredentialID(endpointID) {
 		return ErrCredentialStoreUnavailable
@@ -222,7 +365,10 @@ func (s ProfileStore) DeletePeerAccountRoot(issuer, accountID string) (resultErr
 		return err
 	}
 	defer func() { resultErr = errors.Join(resultErr, lock.Unlock()) }()
-	return s.Secrets.Delete(peerIdentitySecretRef(issuer, accountID, "account-root"))
+	return errors.Join(
+		s.Secrets.Delete(peerIdentitySecretRef(issuer, accountID, "account-root")),
+		s.Secrets.Delete(peerIdentitySecretRef(issuer, accountID, "account-root-public")),
+	)
 }
 
 func (s ProfileStore) peerIdentityKeys(issuer, accountID, endpointID string, createRoot bool) (identity PeerIdentityKeys, resultErr error) {

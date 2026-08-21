@@ -29,6 +29,18 @@ func ApproveOwnedPeerEnrollments(ctx context.Context, store config.ProfileStore,
 		return err
 	}
 	for _, request := range pending {
+		if request.Role == "cli" {
+			if _, err := identitybootstrap.ApproveCLI(ctx, identitybootstrap.ApprovalRequest{
+				Store: store, Client: client, Issuer: profile.Issuer, AccountID: profile.Account.ID,
+				CLIClientSessionID: profile.CLIClientSessionID, RequestID: request.RequestID, SafetyCode: request.SafetyCode,
+			}); err != nil {
+				return err
+			}
+			continue
+		}
+		if request.Role != "" && request.Role != "machine" {
+			return errors.New("automatic peer enrollment returned an invalid endpoint role")
+		}
 		if _, ok := owned[request.EndpointID]; !ok {
 			continue
 		}

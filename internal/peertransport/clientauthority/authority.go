@@ -45,10 +45,8 @@ func Resolve(ctx context.Context, request Request) (Authority, error) {
 	if ctx == nil || request.Client == nil || request.AccountID == "" || request.CLIClientSessionID == "" || request.MachineID == "" || request.MachineGeneration == 0 || request.Now.IsZero() {
 		return Authority{}, ErrInvalid
 	}
-	keys, err := request.Store.PeerIdentityKeysForExistingRoot(request.Issuer, request.AccountID, request.CLIClientSessionID)
-	if err != nil {
-		return Authority{}, err
-	}
+	var keys config.PeerIdentityKeys
+	var err error
 	fail := func(err error) (Authority, error) {
 		clear(keys.RootPrivate)
 		clear(keys.NoisePrivate[:])
@@ -56,7 +54,30 @@ func Resolve(ctx context.Context, request Request) (Authority, error) {
 		clear(keys.QUICPrivate)
 		return Authority{}, err
 	}
-	rootPublic := append(ed25519.PublicKey(nil), keys.RootPrivate.Public().(ed25519.PublicKey)...)
+	rootPublic, rootErr := request.Store.LoadPeerAccountRootPublic(request.Issuer, request.AccountID)
+	if errors.Is(rootErr, config.ErrSecretNotFound) {
+		// Profiles created before verifier-only root custody was introduced keep
+		// the root seed. Preserve compatibility while ensuring the resolved
+		// authority never needs to retain that private key.
+		legacy, legacyErr := request.Store.PeerIdentityKeysForExistingRoot(request.Issuer, request.AccountID, request.CLIClientSessionID)
+		if legacyErr != nil {
+			return fail(legacyErr)
+		}
+		keys = legacy
+		rootPublic = append(ed25519.PublicKey(nil), keys.RootPrivate.Public().(ed25519.PublicKey)...)
+	} else if rootErr != nil {
+		return fail(rootErr)
+	} else {
+		keys, err = request.Store.PeerEndpointKeys(request.Issuer, request.AccountID, request.CLIClientSessionID)
+		if err != nil {
+			clear(rootPublic)
+			return fail(err)
+		}
+	}
+	if len(rootPublic) != ed25519.PublicKeySize {
+		clear(rootPublic)
+		return fail(ErrInvalid)
+	}
 	localState, err := request.Store.LoadPeerCertificate(request.Issuer, request.CLIClientSessionID)
 	if err != nil {
 		return fail(err)

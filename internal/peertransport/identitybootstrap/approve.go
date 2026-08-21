@@ -32,6 +32,16 @@ type ApprovalRequest struct {
 }
 
 func ApproveMachine(ctx context.Context, request ApprovalRequest) (Result, error) {
+	return approveEndpoint(ctx, request, endpointidentity.RoleMachine)
+}
+
+// ApproveCLI signs a pending CLI endpoint request with the existing account
+// root. The caller must be an already paired CLI daemon for that same account.
+func ApproveCLI(ctx context.Context, request ApprovalRequest) (Result, error) {
+	return approveEndpoint(ctx, request, endpointidentity.RoleCLI)
+}
+
+func approveEndpoint(ctx context.Context, request ApprovalRequest, wantRole endpointidentity.Role) (Result, error) {
 	if ctx == nil || request.Client == nil || !boundedID(request.AccountID) || !boundedID(request.CLIClientSessionID) || !boundedID(request.RequestID) || len(request.SafetyCode) != 11 || request.SafetyCode[5] != '-' {
 		return Result{}, ErrInvalid
 	}
@@ -73,6 +83,15 @@ func ApproveMachine(ctx context.Context, request ApprovalRequest) (Result, error
 	if selected == nil || selected.SafetyCode != request.SafetyCode || !selected.ExpiresAt.After(now) || selected.CreatedAt.After(now.Add(time.Minute)) || selected.Generation == 0 || !boundedID(selected.EndpointID) {
 		return Result{}, ErrInvalid
 	}
+	selectedRole := endpointidentity.RoleMachine
+	if selected.Role == "cli" {
+		selectedRole = endpointidentity.RoleCLI
+	} else if selected.Role != "" && selected.Role != "machine" {
+		return Result{}, ErrInvalid
+	}
+	if selectedRole != wantRole {
+		return Result{}, ErrInvalid
+	}
 	noise, noiseErr := base64.RawURLEncoding.Strict().DecodeString(selected.NoisePublicKey)
 	quic, quicErr := base64.RawURLEncoding.Strict().DecodeString(selected.QUICPublicKey)
 	if noiseErr != nil || quicErr != nil || len(noise) != 32 || len(quic) != ed25519.PublicKeySize || base64.RawURLEncoding.EncodeToString(noise) != selected.NoisePublicKey || base64.RawURLEncoding.EncodeToString(quic) != selected.QUICPublicKey || allZero(noise) || allZero(quic) {
@@ -82,7 +101,7 @@ func ApproveMachine(ctx context.Context, request ApprovalRequest) (Result, error
 	}
 	var noisePublic [32]byte
 	copy(noisePublic[:], noise)
-	certificate, err := endpointidentity.Sign(keys.RootPrivate, endpointidentity.Claims{AccountID: request.AccountID, Role: endpointidentity.RoleMachine, EndpointID: selected.EndpointID, NoisePublicKey: noisePublic, QUICPublicKey: ed25519.PublicKey(quic), Generation: selected.Generation, Serial: 1, IssuedAt: now, ExpiresAt: now.Add(CertificateLifetime)})
+	certificate, err := endpointidentity.Sign(keys.RootPrivate, endpointidentity.Claims{AccountID: request.AccountID, Role: wantRole, EndpointID: selected.EndpointID, NoisePublicKey: noisePublic, QUICPublicKey: ed25519.PublicKey(quic), Generation: selected.Generation, Serial: 1, IssuedAt: now, ExpiresAt: now.Add(CertificateLifetime)})
 	clear(noise)
 	clear(quic)
 	if err != nil {
@@ -93,8 +112,12 @@ func ApproveMachine(ctx context.Context, request ApprovalRequest) (Result, error
 		return Result{}, err
 	}
 	fingerprint := sha256.Sum256(raw)
-	operationID := "op_peer_machine_cert_" + hex.EncodeToString(fingerprint[:16])
-	document := api.EndpointCertificateDocument{Version: 1, AccountID: request.AccountID, RootFingerprint: hex.EncodeToString(rootFingerprint[:]), EndpointID: selected.EndpointID, Role: "machine", Generation: selected.Generation, Serial: 1, IssuedAt: now.Format(time.RFC3339), ExpiresAt: now.Add(CertificateLifetime).Format(time.RFC3339), Certificate: base64.RawURLEncoding.EncodeToString(raw), CertificateFingerprint: hex.EncodeToString(fingerprint[:])}
+	roleName, operationPrefix := "machine", "op_peer_machine_cert_"
+	if wantRole == endpointidentity.RoleCLI {
+		roleName, operationPrefix = "cli", "op_peer_cli_cert_"
+	}
+	operationID := operationPrefix + hex.EncodeToString(fingerprint[:16])
+	document := api.EndpointCertificateDocument{Version: 1, AccountID: request.AccountID, RootFingerprint: hex.EncodeToString(rootFingerprint[:]), EndpointID: selected.EndpointID, Role: roleName, Generation: selected.Generation, Serial: 1, IssuedAt: now.Format(time.RFC3339), ExpiresAt: now.Add(CertificateLifetime).Format(time.RFC3339), Certificate: base64.RawURLEncoding.EncodeToString(raw), CertificateFingerprint: hex.EncodeToString(fingerprint[:])}
 	response, err := request.Client.RegisterEndpointCertificate(ctx, operationID, document)
 	if err != nil {
 		return Result{}, err
