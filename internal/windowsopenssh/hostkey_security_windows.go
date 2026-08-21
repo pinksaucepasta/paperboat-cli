@@ -162,12 +162,26 @@ func verifyHostKeyFile(path, expectedSDDL string) error {
 	// Windows may retain the informational auto-inherited (AI) control bit
 	// after replacing and protecting the DACL. With DACL_PROTECTED set and
 	// the exact ACEs below, AI does not permit inherited access.
-	actual := strings.Replace(descriptor.String(), "D:PAI", "D:P", 1)
-	if actual != expectedSDDL {
+	actual := normalizeHostKeySDDL(descriptor.String())
+	// SDDL serialization may use well-known aliases (for example `LA` for
+	// the local administrator SID) even when the descriptor was supplied with
+	// the numeric SID. Canonicalize the expected descriptor through Windows as
+	// well, so verification compares the security descriptor rather than the
+	// spelling of equivalent SIDs.
+	expectedDescriptor, expectedErr := windows.SecurityDescriptorFromString(expectedSDDL)
+	if expectedErr != nil {
+		return expectedErr
+	}
+	expected := normalizeHostKeySDDL(expectedDescriptor.String())
+	if actual != expected {
 		// Include only the path and canonical descriptor. This is safe diagnostic
 		// metadata (the descriptor contains SIDs, never key material) and makes
 		// native qualification failures actionable instead of opaque.
-		return fmt.Errorf("%w: host key ACL for %s (got %s, want %s)", ErrUntrustedBinary, path, actual, expectedSDDL)
+		return fmt.Errorf("%w: host key ACL for %s (got %s, want %s)", ErrUntrustedBinary, path, actual, expected)
 	}
 	return nil
+}
+
+func normalizeHostKeySDDL(sddl string) string {
+	return strings.Replace(sddl, "D:PAI", "D:P", 1)
 }
