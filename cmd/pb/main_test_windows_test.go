@@ -4,10 +4,12 @@ package main
 
 import (
 	"context"
-	"github.com/pinksaucepasta/paperboat/internal/localapi"
-	"github.com/pinksaucepasta/paperboat/internal/localdaemon"
 	"testing"
 	"time"
+
+	"github.com/adrg/xdg"
+	"github.com/pinksaucepasta/paperboat/internal/localapi"
+	"github.com/pinksaucepasta/paperboat/internal/localdaemon"
 )
 
 func commandLocalAPIServerConfig(path string, source localapi.SnapshotSource) (localapi.ServerConfig, error) {
@@ -23,6 +25,16 @@ func commandRuntimeTestRoot(t *testing.T) string {
 	root := t.TempDir()
 	t.Setenv("LOCALAPPDATA", root)
 	t.Setenv("APPDATA", root)
+	previous := []string{xdg.Home, xdg.ConfigHome, xdg.CacheHome, xdg.DataHome, xdg.StateHome, xdg.RuntimeDir}
+	xdg.Home = root
+	xdg.ConfigHome = root
+	xdg.CacheHome = root
+	xdg.DataHome = root
+	xdg.StateHome = root
+	xdg.RuntimeDir = root
+	t.Cleanup(func() {
+		xdg.Home, xdg.ConfigHome, xdg.CacheHome, xdg.DataHome, xdg.StateHome, xdg.RuntimeDir = previous[0], previous[1], previous[2], previous[3], previous[4], previous[5]
+	})
 	return root
 }
 
