@@ -26,7 +26,11 @@ func secureDirectory(path string) error {
 	if err != nil || user == nil || user.User.Sid == nil || !user.User.Sid.IsValid() {
 		return ErrArtifactTarget
 	}
-	want, err := windows.SecurityDescriptorFromString("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;" + user.User.Sid.String() + ")")
+	sddl := "D:P(A;OICI;FA;;;SY)"
+	if user.User.Sid.String() != "S-1-5-18" {
+		sddl += "(A;OICI;FA;;;" + user.User.Sid.String() + ")"
+	}
+	want, err := windows.SecurityDescriptorFromString(sddl)
 	if err != nil {
 		return err
 	}

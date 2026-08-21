@@ -174,7 +174,7 @@ func TestRunMeasuresEchoingSubprocess(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	command := []string{"sh"}
 	if runtime.GOOS == "windows" {
-		command = []string{"cmd.exe", "/d", "/s", "/c"}
+		command = []string{"cmd.exe", "/d", "/q", "/k"}
 	}
 	err := run(context.Background(), append([]string{"-samples=3", "-warmup=1", "-startup-delay=0", "-interval=0", "-probe-timeout=1s", "-mode=quic", "--"}, command...), &stdout, &stderr)
 	if err != nil {
@@ -194,8 +194,8 @@ func TestRunStartsUnrecordedLoadBeforeProbes(t *testing.T) {
 	load := "printf load-started"
 	command := []string{"sh"}
 	if runtime.GOOS == "windows" {
-		load = "Write-Output load-started"
-		command = []string{"cmd.exe", "/d", "/s", "/c"}
+		load = "echo load-started"
+		command = []string{"cmd.exe", "/d", "/q", "/k"}
 	}
 	err := run(context.Background(), append([]string{"-samples=1", "-warmup=0", "-startup-delay=0", "-load-warmup=0", "-load-command=" + load, "-interval=0", "-probe-timeout=1s", "-mode=quic", "--"}, command...), &stdout, &stderr)
 	if err != nil {

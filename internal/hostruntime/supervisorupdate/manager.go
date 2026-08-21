@@ -650,6 +650,9 @@ func ensureDirectory(path string, uid, gid int) error {
 }
 
 func syncDir(paths ...string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
 	for _, path := range paths {
 		directory, err := os.Open(path)
 		if err != nil {
