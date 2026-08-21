@@ -214,3 +214,29 @@ func TestBootstrapRequiresPairingWhenRemoteRootExistsWithoutLocalCustody(t *test
 		t.Fatalf("secret entries=%v err=%v", entries, readErr)
 	}
 }
+
+func TestValidateRemoteRootRejectsFingerprintAndCanonicalEncodingSubstitution(t *testing.T) {
+	public, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint := sha256.Sum256(public)
+	valid := api.E2EERoot{Version: 1, PublicKey: base64.RawURLEncoding.EncodeToString(public), Fingerprint: hex.EncodeToString(fingerprint[:]), Generation: 1}
+	if got, _, err := validateRemoteRoot(valid); err != nil || !bytes.Equal(got, public) {
+		t.Fatalf("valid root rejected: %v", err)
+	}
+	cases := []api.E2EERoot{
+		func() api.E2EERoot {
+			v := valid
+			v.Fingerprint = hex.EncodeToString(bytes.Repeat([]byte{0}, sha256.Size))
+			return v
+		}(),
+		func() api.E2EERoot { v := valid; v.PublicKey = base64.URLEncoding.EncodeToString(public); return v }(),
+		func() api.E2EERoot { v := valid; v.Generation = 2; return v }(),
+	}
+	for index, candidate := range cases {
+		if _, _, err := validateRemoteRoot(candidate); !errors.Is(err, ErrInvalid) {
+			t.Errorf("case %d accepted substituted root: %v", index, err)
+		}
+	}
+}
