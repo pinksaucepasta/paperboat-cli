@@ -262,7 +262,7 @@ jobs:
             $runtimeDirectory = Split-Path -Parent $runtime
             $binDirectory = 'C:\Program Files\Paperboat\bin'
             New-Item -ItemType Directory -Force -Path $runtimeDirectory,$binDirectory | Out-Null
-            go build -trimpath -o $runtime ./cmd/pb
+            go build -buildvcs=false -trimpath -o $runtime ./cmd/pb
             if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $runtime -PathType Leaf)) {
               throw "Restored runtime was missing and the source rebuild failed: $runtime"
             }
