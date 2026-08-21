@@ -123,6 +123,35 @@ func (h hostStub) Apply(_ context.Context, resolution Resolution) (Observation, 
 	return Observation{Schema: PolicySchemaV1, Mode: resolution.Mode, Version: resolution.Version, Status: "applied", ObservedAt: time.Now().UTC(), HostServiceVersion: "test", HostServiceScope: "system", UpdateHealth: "healthy"}, nil
 }
 
+type immediateResolver struct{}
+
+func (immediateResolver) Resolve(context.Context) (Resolution, error) {
+	return Resolution{Schema: PolicySchemaV1, UserMachineID: "um_1", Mode: "keep_awake", Version: 3}, nil
+}
+
+func TestServicePublishesInitialObservationBeforeStartReturns(t *testing.T) {
+	host := hostStub{applied: make(chan Resolution, 2)}
+	service, err := NewService(immediateResolver{}, host, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := service.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	observation := service.Observation()
+	if observation == nil || observation.Version != 3 || observation.Status != "applied" {
+		t.Fatalf("initial observation=%+v", observation)
+	}
+	cancel()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), time.Second)
+	defer shutdownCancel()
+	if err := service.Shutdown(shutdownCtx); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestServiceStartsOfflineAndEventuallyPublishesObservation(t *testing.T) {
 	resolver := &flakyResolver{}
 	host := hostStub{applied: make(chan Resolution, 1)}
