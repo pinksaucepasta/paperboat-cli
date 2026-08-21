@@ -141,6 +141,11 @@ jobs:
     runs-on: [self-hosted, Windows, X64, paperboat-windows-11-iot-ltsc]
     timeout-minutes: 10
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
       - name: Restore live Paperboat state
         shell: powershell
         run: |
@@ -253,7 +258,17 @@ jobs:
           }
 
           $runtime = 'C:\Program Files\Paperboat\releases\runtime-current\paperboat-runtime.exe'
-          if (-not (Test-Path -LiteralPath $runtime -PathType Leaf)) { throw "Restored runtime is missing: $runtime" }
+          if (-not (Test-Path -LiteralPath $runtime -PathType Leaf)) {
+            $runtimeDirectory = Split-Path -Parent $runtime
+            $binDirectory = 'C:\Program Files\Paperboat\bin'
+            New-Item -ItemType Directory -Force -Path $runtimeDirectory,$binDirectory | Out-Null
+            go build -trimpath -o $runtime ./cmd/pb
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $runtime -PathType Leaf)) {
+              throw "Restored runtime was missing and the source rebuild failed: $runtime"
+            }
+            Copy-Item -LiteralPath $runtime -Destination (Join-Path $binDirectory 'pb.exe') -Force
+            Write-Output 'Rebuilt the missing Victus runtime from the pinned workflow source.'
+          }
           if (-not (Get-Service PaperboatHostd -ErrorAction SilentlyContinue)) {
             New-Service -Name PaperboatHostd -BinaryPathName ('"' + $runtime + '" __runtime-hostd') -DisplayName 'PaperboatHostd' -Description 'Paperboat stable host supervisor' -StartupType Automatic | Out-Null
           }
