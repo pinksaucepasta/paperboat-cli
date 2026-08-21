@@ -142,7 +142,7 @@ func New(config Config) (*Manager, error) {
 	if config.NativeVerifier == nil {
 		config.NativeVerifier = nativesignature.New(nil)
 	}
-	if config.Fetcher == nil || config.Workloads == nil || config.OwnerUID < 0 || config.OwnerGID < 0 || config.GrantTTL <= 0 || config.GrantTTL > DefaultGrantTTL || validateRelease(config.Active) != nil || validatePaths(config.Paths) != nil {
+	if config.Fetcher == nil || config.Workloads == nil || !supervisorOwnerIDsValid(config.OwnerUID, config.OwnerGID) || config.GrantTTL <= 0 || config.GrantTTL > DefaultGrantTTL || validateRelease(config.Active) != nil || validatePaths(config.Paths) != nil {
 		return nil, ErrInvalidConfig
 	}
 	for _, path := range allPaths(config.Paths) {
