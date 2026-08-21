@@ -14,7 +14,11 @@ func makeEnrollmentConfigPrivate(path string) error {
 	if err != nil {
 		return err
 	}
-	descriptor, err := windows.SecurityDescriptorFromString("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + user.User.Sid.String() + ")")
+	sddl := "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
+	if user.User.Sid.String() != "S-1-5-18" {
+		sddl += "(A;;FA;;;" + user.User.Sid.String() + ")"
+	}
+	descriptor, err := windows.SecurityDescriptorFromString(sddl)
 	if err != nil {
 		return err
 	}

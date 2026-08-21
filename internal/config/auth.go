@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
@@ -35,11 +36,27 @@ type sharedLockOwner struct {
 type sharedLock struct {
 	path  string
 	token string
+	local *sync.Mutex
 }
 
-func newSharedLock(path string) *sharedLock { return &sharedLock{path: path + ".d"} }
+var sharedLockMu sync.Map
+
+func newSharedLock(path string) *sharedLock {
+	key := path + ".d"
+	local, _ := sharedLockMu.LoadOrStore(key, &sync.Mutex{})
+	return &sharedLock{path: key, local: local.(*sync.Mutex)}
+}
 
 func (l *sharedLock) Lock() error {
+	if l.local != nil {
+		l.local.Lock()
+	}
+	locked := false
+	defer func() {
+		if !locked && l.local != nil {
+			l.local.Unlock()
+		}
+	}()
 	if err := os.MkdirAll(filepath.Dir(l.path), 0o700); err != nil {
 		return err
 	}
@@ -57,6 +74,7 @@ func (l *sharedLock) Lock() error {
 				_ = os.RemoveAll(l.path)
 				return err
 			}
+			locked = true
 			return nil
 		} else if !os.IsExist(err) {
 			return err
@@ -96,6 +114,11 @@ func sharedLockIsStale(path, hostname string) (bool, error) {
 }
 
 func (l *sharedLock) Unlock() error {
+	defer func() {
+		if l.local != nil {
+			l.local.Unlock()
+		}
+	}()
 	b, err := os.ReadFile(filepath.Join(l.path, "owner.json"))
 	if os.IsNotExist(err) {
 		return nil

@@ -20,7 +20,11 @@ func TestEnrollmentTokenFileWindowsProtectedACL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sd, err := windows.SecurityDescriptorFromString("D:P(A;;FA;;;SY)(A;;FA;;;" + user.User.Sid.String() + ")")
+	sddl := "D:P(A;;FA;;;SY)"
+	if user.User.Sid.String() != "S-1-5-18" {
+		sddl += "(A;;FA;;;" + user.User.Sid.String() + ")"
+	}
+	sd, err := windows.SecurityDescriptorFromString(sddl)
 	if err != nil {
 		t.Fatal(err)
 	}

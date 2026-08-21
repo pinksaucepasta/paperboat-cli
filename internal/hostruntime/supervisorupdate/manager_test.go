@@ -170,7 +170,8 @@ func validELF(marker byte) []byte {
 			machine = 0xaa64
 		}
 		binary.LittleEndian.PutUint16(value[68:70], machine)
-		binary.LittleEndian.PutUint16(value[84:86], 0x20b)
+		binary.LittleEndian.PutUint16(value[84:86], 0xf0)
+		binary.LittleEndian.PutUint16(value[88:90], 0x20b)
 		value[len(value)-1] = marker
 		return value
 	}
