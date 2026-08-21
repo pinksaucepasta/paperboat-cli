@@ -39,7 +39,13 @@ func installBootstrapCLI(ctx context.Context, session *bootstrap.ClientSession, 
 	}
 	profile := config.Profile{Issuer: cfg.ServerURL, Account: config.Account{ID: me.ID, Email: me.Email, DisplayName: me.DisplayName}, CLIClientSessionID: session.SessionID, AccessExpiresAt: cred.ExpiresAt}
 	if err := store.Save(profile, cred); err != nil {
-		return err
+		if !errors.Is(err, config.ErrProfileExists) {
+			return err
+		}
+		existing, loadErr := store.Load(cfg.ServerURL)
+		if loadErr != nil || existing.CLIClientSessionID != session.SessionID {
+			return fmt.Errorf("existing Paperboat profile belongs to another client session")
+		}
 	}
 	if _, err := identitybootstrap.Bootstrap(ctx, identitybootstrap.Request{Store: store, Client: client, Issuer: cfg.ServerURL, AccountID: me.ID, CLIClientSessionID: session.SessionID}); err != nil {
 		return fmt.Errorf("bootstrap CLI peer identity: %w", err)
