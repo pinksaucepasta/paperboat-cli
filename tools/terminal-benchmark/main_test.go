@@ -135,6 +135,9 @@ func TestWaitUntilReadyDoesNotQueueDuplicateCommands(t *testing.T) {
 }
 
 func TestRunProbeRetriesWithFreshMarkerAfterUncertainTimeout(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("sub-10ms cancellation ordering is not deterministic on Windows")
+	}
 	chunks := make(chan []byte, 1)
 	done := make(chan error, 1)
 	var writes bytes.Buffer
