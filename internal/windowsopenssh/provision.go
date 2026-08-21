@@ -213,7 +213,7 @@ func verifyInstalledResult(ctx context.Context, config Config) (Result, error) {
 func verifyBinary(ctx context.Context, config Config, path string) error {
 	info, err := os.Lstat(path)
 	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-		return errors.Join(ErrUntrustedBinary, err)
+		return fmt.Errorf("%w: %s: %v", ErrUntrustedBinary, path, err)
 	}
 	escaped := strings.ReplaceAll(path, "'", "''")
 	expectedPublisher := strings.ReplaceAll(config.ExpectedPublisher, "'", "''")
@@ -234,7 +234,10 @@ func verifyBinary(ctx context.Context, config Config, path string) error {
 		if bytes.Contains(output, []byte("42")) {
 			return ErrVersionMismatch
 		}
-		return fmt.Errorf("%w: %s", ErrUntrustedBinary, boundedOutput(output))
+		if ctx.Err() != nil {
+			return fmt.Errorf("%w: %s: verification timed out: %v", ErrUntrustedBinary, path, ctx.Err())
+		}
+		return fmt.Errorf("%w: %s: %s", ErrUntrustedBinary, path, boundedOutput(output))
 	}
 	return nil
 }
