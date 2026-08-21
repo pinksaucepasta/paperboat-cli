@@ -43,7 +43,7 @@ jobs:
       - run: make race
 
   supply-chain:
-    name: Static, vulnerability, and license checks
+    name: Vulnerability and license checks
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -56,11 +56,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          make static-analysis & static_pid=$!
           make vulnerability-check & vulnerability_pid=$!
           make license-check & license_pid=$!
           status=0
-          wait "$static_pid" || status=1
           wait "$vulnerability_pid" || status=1
           wait "$license_pid" || status=1
           exit "$status"

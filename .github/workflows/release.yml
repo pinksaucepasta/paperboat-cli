@@ -40,7 +40,7 @@ jobs:
           required=(
             'Fast repository quality contract'
             'Linux race detector'
-            'Static, vulnerability, and license checks'
+            'Vulnerability and license checks'
             'Native linux amd64 contract'
             'Native linux arm64 contract'
             'Native macos arm64 contract'

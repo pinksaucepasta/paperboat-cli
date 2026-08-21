@@ -55,13 +55,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          case "${{ matrix.os }}/${{ matrix.architecture }}" in
-            linux/amd64) test "$(uname -m)" = x86_64 ;;
-            linux/arm64) test "$(uname -m)" = aarch64 ;;
-            macos/arm64) test "$(uname -m)" = arm64 ;;
-            windows/amd64) test "${PROCESSOR_ARCHITECTURE}" = AMD64 ;;
-            windows/arm64) test "${PROCESSOR_ARCHITECTURE}" = ARM64 ;;
-          esac
+          actual="$(go env GOOS)/$(go env GOARCH)"
+          expected="${{ matrix.os }}/${{ matrix.architecture }}"
+          test "$actual" = "$expected" || {
+            echo "Runner architecture mismatch: got $actual, expected $expected" >&2
+            exit 1
+          }
       - name: Run native Go tests
         shell: bash
         run: go test -count=1 -timeout 12m ./...
@@ -116,7 +115,7 @@ jobs:
           while IFS= read -r package; do
             name="$(printf '%s' "$package" | sha256sum | cut -d' ' -f1)"
             CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go test -c -vet=off -trimpath -o "$output_dir/$name.test.exe" "$package"
-          done < <(go list -e -f '{{if or .GoFiles .CgoFiles}}{{.ImportPath}}{{end}}' ./... | sed '/^$/d')
+          done < <(CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go list -e -f '{{if or .GoFiles .CgoFiles}}{{.ImportPath}}{{end}}' ./... | sed '/^$/d')
           CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build -trimpath -o "$output_dir/pb.exe" ./cmd/pb
           CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build -trimpath -o "$output_dir/pb-launcher.exe" ./cmd/pb-launcher
           python3 - "$output_dir" <<'PY'

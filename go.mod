@@ -17,7 +17,7 @@ require (
 	github.com/fatedier/frp v0.70.1
 	github.com/flynn/noise v1.1.0
 	github.com/fsnotify/fsnotify v1.9.0
-	github.com/go-git/go-git/v5 v5.19.1
+	github.com/go-git/go-git/v5 v5.19.2
 	github.com/godbus/dbus/v5 v5.2.2
 	github.com/google/renameio/v2 v2.0.2
 	github.com/hashicorp/yamux v0.1.1
