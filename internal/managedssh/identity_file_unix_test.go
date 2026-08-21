@@ -64,3 +64,18 @@ func TestManagedIdentityPublicKeyPreservesConflictingFile(t *testing.T) {
 		t.Fatalf("conflicting file changed: %q error=%v", value, err)
 	}
 }
+
+func TestManagedIdentityPublicKeyRotatesOwnedSelector(t *testing.T) {
+	home := openSSHTestHome(t)
+	first := managedIdentityTestPublicKey(t)
+	second := managedIdentityTestPublicKey(t)
+	if err := InstallManagedIdentityPublicKey(home, uint32(os.Getuid()), first); err != nil {
+		t.Fatal(err)
+	}
+	if err := InstallManagedIdentityPublicKey(home, uint32(os.Getuid()), second); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateManagedIdentityPublicKey(home, uint32(os.Getuid()), second); err != nil {
+		t.Fatal(err)
+	}
+}

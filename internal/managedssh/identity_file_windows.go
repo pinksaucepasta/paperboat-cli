@@ -25,7 +25,10 @@ func InstallManagedIdentityPublicKey(home string, ownerUID uint32, publicKey str
 	if err != nil {
 		return err
 	}
-	if exists && !isManagedIdentityPublicKey(existing, publicKey) {
+	// A prior Paperboat-owned public selector may belong to a rotated CLI
+	// session. It is safe to replace that public-only file atomically; only an
+	// unowned or malformed file is a conflict.
+	if exists && !isManagedIdentityPublicKey(existing, "") {
 		return ErrManagedIdentityFileConflict
 	}
 	if bytes.Equal(existing, expected) {
