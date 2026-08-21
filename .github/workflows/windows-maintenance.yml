@@ -8,6 +8,7 @@ on:
         required: true
         type: choice
         options:
+          - reenroll-victus
           - restore-victus-qualification-state
           - inspect-victus-health
           - prepare-victus-clean-qualification
@@ -17,6 +18,34 @@ permissions:
   contents: read
 
 jobs:
+  reenroll-victus:
+    if: inputs.action == 'reenroll-victus'
+    runs-on: [self-hosted, Windows, X64, paperboat-windows-11-iot-ltsc]
+    timeout-minutes: 20
+    steps:
+      - name: Run one-shot Windows enrollment
+        shell: pwsh
+        env:
+          PAPERBOAT_INSTALLER_URL: ${{ secrets.VICTUS_RECOVERY_INSTALLER_URL }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:PAPERBOAT_INSTALLER_URL.StartsWith('https://get.pprbt.dev/install?p=victus-')) {
+            throw 'The scoped Victus enrollment URL is missing or invalid.'
+          }
+          Invoke-RestMethod -Uri $env:PAPERBOAT_INSTALLER_URL | Invoke-Expression
+          foreach ($service in @('PaperboatHostd', 'PaperboatUpdated', 'PaperboatSshd')) {
+            $item = Get-Service -Name $service -ErrorAction Stop
+            if ($item.Status -ne 'Running') { throw "$service is not running after enrollment" }
+          }
+          $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+          if (-not (($machinePath -split ';').Trim().TrimEnd('\') -contains 'C:\Program Files\Paperboat\bin')) {
+            throw 'Paperboat bin is absent from the machine PATH after enrollment.'
+          }
+          if (-not (Test-Path -LiteralPath 'C:\Program Files\Paperboat\bin\pb.exe' -PathType Leaf)) {
+            throw 'pb.exe is absent after enrollment.'
+          }
+          Write-Output 'One-shot Victus enrollment and local service/PATH checks passed.'
+
   clean-victus:
     if: inputs.action == 'clean-victus-qualification-residue'
     runs-on: [self-hosted, Windows, X64, paperboat-windows-11-iot-ltsc]
