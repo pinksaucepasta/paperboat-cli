@@ -101,7 +101,7 @@ func protectHostKeyFileWithSDDL(path, expectedSDDL string) error {
 	// Administrator tokens on GitHub-hosted Windows runners have the privilege
 	// present but disabled, unlike the LocalSystem service context used on a
 	// normal unattended host.
-	if err := enableRestorePrivilege(); err != nil {
+	if err := enableHostKeyPrivileges(); err != nil {
 		return err
 	}
 	if err := windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, information, setOwner, setGroup, dacl, nil); err != nil {
@@ -110,22 +110,25 @@ func protectHostKeyFileWithSDDL(path, expectedSDDL string) error {
 	return verifyHostKeyFile(path, expectedSDDL)
 }
 
-func enableRestorePrivilege() error {
+func enableHostKeyPrivileges() error {
 	var token windows.Token
 	if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY|windows.TOKEN_ADJUST_PRIVILEGES, &token); err != nil {
 		return err
 	}
 	defer token.Close()
-	name, err := windows.UTF16PtrFromString("SeRestorePrivilege")
-	if err != nil {
-		return err
+	privilegeNames := []string{"SeRestorePrivilege", "SeTakeOwnershipPrivilege"}
+	privileges := windows.Tokenprivileges{PrivilegeCount: uint32(len(privilegeNames))}
+	for i, privilegeName := range privilegeNames {
+		name, err := windows.UTF16PtrFromString(privilegeName)
+		if err != nil {
+			return err
+		}
+		var luid windows.LUID
+		if err := windows.LookupPrivilegeValue(nil, name, &luid); err != nil {
+			return err
+		}
+		privileges.AllPrivileges()[i] = windows.LUIDAndAttributes{Luid: luid, Attributes: windows.SE_PRIVILEGE_ENABLED}
 	}
-	var luid windows.LUID
-	if err := windows.LookupPrivilegeValue(nil, name, &luid); err != nil {
-		return err
-	}
-	privileges := windows.Tokenprivileges{PrivilegeCount: 1}
-	privileges.AllPrivileges()[0] = windows.LUIDAndAttributes{Luid: luid, Attributes: windows.SE_PRIVILEGE_ENABLED}
 	if err := windows.AdjustTokenPrivileges(token, false, &privileges, uint32(unsafe.Sizeof(privileges)), nil, nil); err != nil {
 		return err
 	}
