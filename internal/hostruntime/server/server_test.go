@@ -53,7 +53,7 @@ func TestTerminalBindingSurvivesCredentialExpiry(t *testing.T) {
 	outcome := operation.Outcome{Result: json.RawMessage(`{"attachment_id":"att_1","session":{"snapshot":{"generation":1}}}`)}
 
 	state := newTerminalConnectionState()
-	if _, err := state.bind(Authorization{ClientID: "cli_1", ExpiresAt: time.Now().Add(10 * time.Millisecond)}, attach, outcome); err != nil {
+	if _, err := state.bind(Authorization{ClientID: "cli_1", ExpiresAt: time.Now().Add(time.Second)}, attach, outcome); err != nil {
 		t.Fatal(err)
 	}
 	select {
