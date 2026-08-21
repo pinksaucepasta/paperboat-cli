@@ -98,7 +98,7 @@ jobs:
           if (-not $pwsh) { throw 'PowerShell 7 is missing from every qualified location.' }
           $action = New-ScheduledTaskAction -Execute $pwsh -Argument "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$scriptPath`""
           $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5)
-          $principal = New-ScheduledTaskPrincipal -UserId 'VICTUS\Pujan' -LogonType InteractiveToken -RunLevel Highest
+          $principal = New-ScheduledTaskPrincipal -UserId 'VICTUS\Pujan' -LogonType Interactive -RunLevel Highest
           Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
           try {
             Start-ScheduledTask -TaskName $taskName
