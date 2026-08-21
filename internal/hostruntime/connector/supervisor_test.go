@@ -86,7 +86,7 @@ func (d *recoveringDialer) Dial(context.Context, Transport, Admission) (Connecti
 
 func TestSupervisorFetchesFreshAdmissionWithCappedBackoffAndReconnects(t *testing.T) {
 	now := time.Now()
-	dialer := &recoveringDialer{failDials: 4}
+	dialer := &recoveringDialer{}
 	manager := manager(t, dialer, now)
 	source := &admissionSource{now: now, calls: make(chan uint64, 16)}
 	waits := &recordingWaiter{}
@@ -119,6 +119,9 @@ func TestSupervisorFetchesFreshAdmissionWithCappedBackoffAndReconnects(t *testin
 	active := dialer.connections[len(dialer.connections)-1]
 	dialer.mu.Unlock()
 	active.done <- errors.New("connection lost")
+	dialer.mu.Lock()
+	dialer.failDials = dialer.calls + 4
+	dialer.mu.Unlock()
 	deadline = time.After(time.Second)
 	for manager.Status().Generation == first {
 		select {
@@ -146,7 +149,7 @@ func TestSupervisorFetchesFreshAdmissionWithCappedBackoffAndReconnects(t *testin
 		t.Fatalf("connector recovery metric=%v", recovery)
 	}
 	waits.mu.Lock()
-	if len(waits.delays) < 2 || waits.delays[0] != time.Second || waits.delays[1] != 2*time.Second {
+	if len(waits.delays) < 2 || waits.delays[0] != time.Second || waits.delays[len(waits.delays)-1] != 2*time.Second {
 		t.Fatalf("delays=%v", waits.delays)
 	}
 	waits.mu.Unlock()

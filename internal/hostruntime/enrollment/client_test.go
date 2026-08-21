@@ -146,7 +146,7 @@ func TestHostedBootstrapUsesHelperProofAndValidatesMemoryOnlyMaterial(t *testing
 func TestLoadConfigRequiresPrivateRegularFile(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "enroll.json")
-	body := `{"control_url":"https://api.test","state_root":"` + filepath.Join(root, "state") + `","enrollment_credential":"` + strings.Repeat("x", 32) + `"}`
+	body := `{"control_url":"https://api.test","state_root":"` + filepath.ToSlash(filepath.Join(root, "state")) + `","enrollment_credential":"` + strings.Repeat("x", 32) + `"}`
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
