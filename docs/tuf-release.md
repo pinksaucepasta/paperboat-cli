@@ -75,8 +75,8 @@ schema and cover `cli`, `runtime`, `hostd`,
 
 `status` must be `passed` globally and per artifact. `windows_build` and `runner` identify the
 native qualification environment. A cross-build, emulator run, skipped test, or an ARM64 result
-cannot satisfy this amd64 gate. Windows arm64 remains beta by channel policy, even when its
-hosted native runner produces qualifying execution evidence.
+cannot satisfy this amd64 gate. Windows arm64 remains beta by channel policy, and the current
+release path records native ARM64 execution as `blocked_no_hardware`.
 
 The release workflow produces this file deterministically with
 `packaging/windows/scripts/convert-native-qualification-evidence.py`. It accepts only a passed
