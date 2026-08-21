@@ -35,7 +35,7 @@ func ProtectedDACLMatches(path, expected string) bool {
 	if err != nil || user == nil || user.User.Sid == nil {
 		return false
 	}
-	localAdminSID, err := windows.StringToSid("LA")
+	localAdminSID, err := windows.CreateWellKnownSid(windows.WinAccountAdministratorSid)
 	if err != nil || localAdminSID == nil || !user.User.Sid.Equals(localAdminSID) {
 		return false
 	}
