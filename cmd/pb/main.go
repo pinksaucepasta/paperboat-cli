@@ -4908,8 +4908,8 @@ func userMachineCobraCommand() *cobra.Command {
 }
 
 func windowsEnrollmentCommand(installerURL string) string {
-	path := "([IO.Path]::Combine([IO.Path]::GetTempPath(),'paperboat-install.ps1'))"
-	return "powershell -NoLogo -NoProfile -Command \"iwr -UseBasicParsing '" + installerURL + "' -OutFile " + path + "; & " + path + "\""
+	path := `"$env:TEMP\pb.ps1"`
+	return "iwr '" + installerURL + "' -OutFile " + path + "; & " + path
 }
 
 func waitForAvailabilityObservation(ctx context.Context, client *api.Client, machineID string, current api.AvailabilityPolicy, timeout time.Duration) api.AvailabilityPolicy {
