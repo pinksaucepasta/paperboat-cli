@@ -103,9 +103,8 @@ func WaitForMaterial(ctx context.Context, config Config, expiresAt time.Time, in
 		var material Material
 		err := request(ctx, client(config), http.MethodPost, base+"/v1/machines/pairings/installation", body, &material)
 		if err == nil {
-			validEnrollment := material.ReuseIdentity && material.EnrollmentID == "" && material.EnrollmentCredential == "" || !material.ReuseIdentity && material.EnrollmentID != "" && len(material.EnrollmentCredential) >= 32
-			if material.Schema != "paperboat.byod-installation/v1" || material.UserMachineID == "" || material.UserMachineEnrollmentID == "" || material.EnvironmentID == "" || material.HelperID == "" || !validEnrollment || !validLoopbackAddress(material.HelperListenAddress) || material.InstallationGeneration < 1 || material.SetupMode != "host" || !hasRole(material.SetupRoles, "host") || !time.Now().UTC().Before(material.ExpiresAt) || material.Artifact == nil || VerifyArtifactTarget(*material.Artifact) != nil {
-				return Material{}, ErrInvalid
+			if validationErr := validateMaterial(material); validationErr != nil {
+				return Material{}, validationErr
 			}
 			return material, nil
 		}
@@ -121,6 +120,36 @@ func WaitForMaterial(ctx context.Context, config Config, expiresAt time.Time, in
 		}
 	}
 	return Material{}, ErrPairingExpired
+}
+
+func validateMaterial(material Material) error {
+	validEnrollment := material.ReuseIdentity && material.EnrollmentID == "" && material.EnrollmentCredential == "" || !material.ReuseIdentity && material.EnrollmentID != "" && len(material.EnrollmentCredential) >= 32
+	checks := []struct {
+		invalid bool
+		reason  string
+	}{
+		{material.Schema != "paperboat.byod-installation/v1", "schema"},
+		{material.UserMachineID == "", "user machine id"},
+		{material.UserMachineEnrollmentID == "", "enrollment id"},
+		{material.EnvironmentID == "", "environment id"},
+		{material.HelperID == "", "helper id"},
+		{!validEnrollment, "enrollment credential"},
+		{!validLoopbackAddress(material.HelperListenAddress), "helper listen address"},
+		{material.InstallationGeneration < 1, "installation generation"},
+		{material.SetupMode != "host", "setup mode"},
+		{!hasRole(material.SetupRoles, "host"), "host role"},
+		{!time.Now().UTC().Before(material.ExpiresAt), "expiration"},
+		{material.Artifact == nil, "artifact"},
+	}
+	for _, check := range checks {
+		if check.invalid {
+			return fmt.Errorf("%w: %s", ErrInvalid, check.reason)
+		}
+	}
+	if err := VerifyArtifactTarget(*material.Artifact); err != nil {
+		return fmt.Errorf("%w: artifact target: %v", ErrInvalid, err)
+	}
+	return nil
 }
 
 func hasRole(roles []string, wanted string) bool {
