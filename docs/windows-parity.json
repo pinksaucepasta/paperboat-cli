@@ -1043,12 +1043,12 @@
       "id": "ci-hosted-matrix-32508089967",
       "kind": "native_ci_execution",
       "status": "pass",
-      "scope": ["windows_amd64_client", "windows_amd64_host", "windows_arm64_compile", "windows_arm64_native"],
-      "runner": "GitHub-hosted windows-2025 and windows-11-arm",
-      "architecture": "amd64+arm64",
+      "scope": ["windows_amd64_client", "windows_amd64_host", "windows_arm64_compile"],
+      "runner": "GitHub-hosted windows-2025",
+      "architecture": "amd64+arm64-cross",
       "command": "GitHub Actions run 32508089967: go test -count=1 -timeout 12m ./...",
       "tests": ["native Windows amd64 contract", "native Windows arm64 beta contract", "Windows arm64 independent cross-build"],
-      "note": "All Windows jobs passed. ARM64 remains beta by product policy; this evidence does not promote it to stable."
+      "note": "The retained evidence covers native amd64 execution and ARM64 cross-build/contract checks only. It is not native ARM64 execution evidence; the native ARM64 gate is explicitly blocked_no_hardware."
     },
     {
       "id": "docs-operations",
