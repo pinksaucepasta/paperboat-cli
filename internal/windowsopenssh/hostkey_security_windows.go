@@ -68,12 +68,18 @@ func protectHostKeyFileWithSDDL(path, expectedSDDL string) error {
 		return err
 	}
 	info, statErr := os.Lstat(path)
-	if statErr != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-		return errors.Join(ErrUntrustedBinary, statErr)
+	if statErr != nil {
+		return fmt.Errorf("%w: host key path %s: %v", ErrUntrustedBinary, path, statErr)
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%w: host key path %s is not a regular non-symlink file", ErrUntrustedBinary, path)
 	}
 	attributes, attrErr := windows.GetFileAttributes(windows.StringToUTF16Ptr(path))
-	if attrErr != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-		return errors.Join(ErrUntrustedBinary, attrErr)
+	if attrErr != nil {
+		return fmt.Errorf("%w: host key attributes %s: %v", ErrUntrustedBinary, path, attrErr)
+	}
+	if attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return fmt.Errorf("%w: host key path %s is a reparse point", ErrUntrustedBinary, path)
 	}
 	if verifyHostKeyFile(path, expectedSDDL) == nil {
 		return nil
