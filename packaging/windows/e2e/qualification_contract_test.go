@@ -109,7 +109,7 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 		"write-arm64-native-evidence.py",
 		"PAPERBOAT_WINDOWS_E2E_SERVICE_FIXTURE",
 		"windows-amd64-native-release-qualification",
-		"windows-arm64-native-release-qualification",
+		"windows-arm64-beta-release-qualification",
 	} {
 		if !strings.Contains(string(releaseWorkflow), requiredText) {
 			t.Fatalf("release candidate qualification is missing %q", requiredText)

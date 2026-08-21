@@ -45,7 +45,6 @@ jobs:
             'Native linux arm64 contract'
             'Native macos arm64 contract'
             'Native windows amd64 contract'
-            'Native windows arm64 contract'
             'Windows arm64 beta independent cross-build'
           )
           checks="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/check-runs?per_page=100")"
@@ -587,7 +586,7 @@ jobs:
             --workflow "$GITHUB_WORKFLOW" --run-id "$GITHUB_RUN_ID" --commit "$GITHUB_SHA"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: windows-arm64-native-release-qualification
+          name: windows-arm64-beta-release-qualification
           path: windows-arm64-native-qualification.json
           if-no-files-found: error
           retention-days: 14
@@ -641,7 +640,7 @@ jobs:
       - name: Download Windows arm64 native beta qualification evidence
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: windows-arm64-native-release-qualification
+          name: windows-arm64-beta-release-qualification
           path: native-qualification-arm64
       - name: Verify and merge Windows release handoffs
         shell: bash

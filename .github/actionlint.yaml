@@ -1,3 +1,1 @@
-self-hosted-runner:
-  labels:
-    - windows-11-arm
+# No native ARM64 runner is required. ARM64 is cross-built and explicitly beta.

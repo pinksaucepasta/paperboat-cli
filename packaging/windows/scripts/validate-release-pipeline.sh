@@ -44,7 +44,7 @@ require_text 'pb-windows-{0}.exe'
 require_text 'convert-native-qualification-evidence.py'
 require_text 'windows-native-qualification'
 require_text 'windows-amd64-native-release-qualification'
-require_text 'windows-arm64-native-release-qualification'
+require_text 'windows-arm64-beta-release-qualification'
 require_text 'windows-arm64-beta-evidence'
 require_text 'release-candidate-${{ env.RELEASE_VERSION }}'
 require_text 'release-candidate.json'
@@ -110,7 +110,7 @@ for required in (
     if required not in qualification:
         raise SystemExit(f"native Windows amd64 qualification is missing {required}")
 arm_beta = job("windows-arm64-beta-evidence")
-for required in ("needs: windows-package", "blocked_no_hardware", "write-arm64-native-evidence.py", "windows-arm64-native-release-qualification"):
+for required in ("needs: windows-package", "blocked_no_hardware", "write-arm64-native-evidence.py", "windows-arm64-beta-release-qualification"):
     if required not in arm_beta:
         raise SystemExit(f"Windows arm64 beta evidence is missing {required}")
 
