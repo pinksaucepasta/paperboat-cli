@@ -187,6 +187,11 @@ func (s *Service) Start(ctx context.Context) error {
 	s.cancel, s.done = cancel, make(chan struct{})
 	done := s.done
 	s.mu.Unlock()
+	// Resolve and apply once before returning. This prevents the runtime's
+	// first heartbeat from reporting a durable "pending" state merely because
+	// the reconciliation goroutine has not received its first scheduler tick.
+	// Failures remain retryable in the background and do not prevent startup.
+	_ = s.applyOnce(runCtx)
 	go s.run(runCtx, done)
 	return nil
 }
@@ -195,21 +200,7 @@ func (s *Service) run(ctx context.Context, done chan struct{}) {
 	defer close(done)
 	backoff := time.Second
 	for {
-		resolution, err := s.resolver.Resolve(ctx)
-		if err == nil {
-			var observation Observation
-			observation, err = s.host.Apply(ctx, resolution)
-			if err == nil {
-				s.mu.Lock()
-				if observation.UpdateRollbacks > s.lastRollbacks && s.metrics != nil {
-					_ = s.metrics.Record("paperboat_runtime_update_rollbacks_total", float64(observation.UpdateRollbacks-s.lastRollbacks), nil)
-				}
-				s.lastRollbacks = observation.UpdateRollbacks
-				copy := observation
-				s.current = &copy
-				s.mu.Unlock()
-			}
-		}
+		err := s.applyOnce(ctx)
 		wait := backoff
 		if err == nil {
 			wait, backoff = s.interval, time.Second
@@ -227,6 +218,26 @@ func (s *Service) run(ctx context.Context, done chan struct{}) {
 		case <-timer.C:
 		}
 	}
+}
+
+func (s *Service) applyOnce(ctx context.Context) error {
+	resolution, err := s.resolver.Resolve(ctx)
+	if err != nil {
+		return err
+	}
+	observation, err := s.host.Apply(ctx, resolution)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if observation.UpdateRollbacks > s.lastRollbacks && s.metrics != nil {
+		_ = s.metrics.Record("paperboat_runtime_update_rollbacks_total", float64(observation.UpdateRollbacks-s.lastRollbacks), nil)
+	}
+	s.lastRollbacks = observation.UpdateRollbacks
+	copy := observation
+	s.current = &copy
+	return nil
 }
 
 func (s *Service) Shutdown(ctx context.Context) error {
