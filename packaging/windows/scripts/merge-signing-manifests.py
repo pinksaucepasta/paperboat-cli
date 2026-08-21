@@ -36,7 +36,9 @@ def main() -> None:
     manifests = []
     for path in handoffs:
         try:
-            manifest = json.loads(path.read_text(encoding="utf-8"))
+            # Windows signing tools commonly write JSON with a UTF-8 BOM.
+            # ``utf-8-sig`` accepts both BOM-prefixed and plain UTF-8 files.
+            manifest = json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, json.JSONDecodeError) as exc:
             fail(f"cannot read Windows signing handoff {path.name}: {exc}")
         if manifest.get("schema") != "paperboat.windows-signing/v1":
