@@ -122,6 +122,11 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	if err := saveBootstrapRegistration(identityStore, *serverURL, material, windowsAccountName(account.Username), sshConfig.Port); err != nil {
 		return fmt.Errorf("save machine registration: %w", err)
 	}
+	if material.ClientSession != nil {
+		if err := installBootstrapCLI(ctx, material.ClientSession, *serverURL); err != nil {
+			return fmt.Errorf("initialize Paperboat CLI session: %w", err)
+		}
+	}
 	artifactPath, err := bootstrap.FetchVerifiedArtifact(ctx, *material.Artifact, filepath.Join(*stateRoot, "tuf"), windowsArtifactHTTPClient())
 	if err != nil {
 		return err

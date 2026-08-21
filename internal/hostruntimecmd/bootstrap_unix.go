@@ -126,6 +126,11 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	if err != nil {
 		return err
 	}
+	if material.ClientSession != nil {
+		if err := installBootstrapCLI(ctx, material.ClientSession, *serverURL); err != nil {
+			return fmt.Errorf("initialize Paperboat CLI session: %w", err)
+		}
+	}
 	if err := saveBootstrapRegistration(identityStore, *serverURL, material, "", 0); err != nil {
 		return fmt.Errorf("save machine registration: %w", err)
 	}

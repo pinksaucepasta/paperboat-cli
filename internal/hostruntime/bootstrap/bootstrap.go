@@ -62,6 +62,17 @@ type Material struct {
 	InstallationGeneration  int64           `json:"installation_generation"`
 	SetupRoles              []string        `json:"setup_roles"`
 	SetupMode               string          `json:"setup_mode"`
+	ClientSession           *ClientSession  `json:"client_session,omitempty"`
+}
+
+type ClientSession struct {
+	Schema       string `json:"schema"`
+	SessionID    string `json:"session_id"`
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	TokenType    string `json:"token_type"`
+	ExpiresIn    int    `json:"expires_in"`
+	Scope        string `json:"scope"`
 }
 
 func CreatePairing(ctx context.Context, config Config) (Pairing, error) {
