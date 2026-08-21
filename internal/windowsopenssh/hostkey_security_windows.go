@@ -116,9 +116,7 @@ func enableHostKeyPrivileges() error {
 		return err
 	}
 	defer token.Close()
-	privilegeNames := []string{"SeRestorePrivilege", "SeTakeOwnershipPrivilege"}
-	privileges := windows.Tokenprivileges{PrivilegeCount: uint32(len(privilegeNames))}
-	for i, privilegeName := range privilegeNames {
+	for _, privilegeName := range []string{"SeRestorePrivilege", "SeTakeOwnershipPrivilege"} {
 		name, err := windows.UTF16PtrFromString(privilegeName)
 		if err != nil {
 			return err
@@ -127,13 +125,14 @@ func enableHostKeyPrivileges() error {
 		if err := windows.LookupPrivilegeValue(nil, name, &luid); err != nil {
 			return err
 		}
-		privileges.AllPrivileges()[i] = windows.LUIDAndAttributes{Luid: luid, Attributes: windows.SE_PRIVILEGE_ENABLED}
-	}
-	if err := windows.AdjustTokenPrivileges(token, false, &privileges, uint32(unsafe.Sizeof(privileges)), nil, nil); err != nil {
-		return err
-	}
-	if err := windows.GetLastError(); err != windows.ERROR_SUCCESS {
-		return err
+		privileges := windows.Tokenprivileges{PrivilegeCount: 1}
+		privileges.AllPrivileges()[0] = windows.LUIDAndAttributes{Luid: luid, Attributes: windows.SE_PRIVILEGE_ENABLED}
+		if err := windows.AdjustTokenPrivileges(token, false, &privileges, uint32(unsafe.Sizeof(privileges)), nil, nil); err != nil {
+			return err
+		}
+		if err := windows.GetLastError(); err != windows.ERROR_SUCCESS {
+			return err
+		}
 	}
 	return nil
 }
