@@ -228,7 +228,7 @@ jobs:
           )
           & ./packaging/windows/scripts/sign-and-verify.ps1 `
             -Path $pePaths `
-            -Architecture $env:PAPERBOAT_ARCH `
+            -Architecture $env:PAPERBOAT_ARCH
           if (-not $?) { throw 'Windows PE signing or verification failed.' }
       - name: Build MSI with WiX 5.0.2
         shell: powershell
@@ -251,7 +251,7 @@ jobs:
           $msi = Join-Path $env:PAPERBOAT_WINDOWS_DIST ("paperboat_{0}_windows_{1}.msi" -f $env:RELEASE_VERSION, $env:PAPERBOAT_ARCH)
           & ./packaging/windows/scripts/sign-and-verify.ps1 `
             -Path @($msi) `
-            -Architecture $env:PAPERBOAT_ARCH `
+            -Architecture $env:PAPERBOAT_ARCH
           if (-not $?) { throw 'Windows MSI signing or verification failed.' }
       - name: Package verified Windows ZIP
         shell: powershell
