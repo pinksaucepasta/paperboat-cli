@@ -225,7 +225,13 @@ func (i *Interceptor) Write(p []byte) (int, error) {
 	if i.closed {
 		return 0, io.ErrClosedPipe
 	}
-	if i.directInput && len(p) > 0 && i.queued.Load() == 0 && i.stateMu.TryLock() {
+	if i.directInput && len(p) > 0 && i.queued.Load() == 0 {
+		// Wait for the parser to finish the preceding batch before deciding
+		// whether these bytes are ordinary terminal input. TryLock made this
+		// path fall back to the async queue whenever an upload was being
+		// started, which both delayed keystrokes and exposed destination writes
+		// to callers concurrently reading their output buffer.
+		i.stateMu.Lock()
 		if !i.inPaste && len(i.buf) == 0 && !bytes.Contains(p, startMarker) && partialSuffix(p, startMarker) == 0 {
 			n, err := i.writeDest(p)
 			i.stateMu.Unlock()

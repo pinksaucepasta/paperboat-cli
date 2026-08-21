@@ -206,7 +206,14 @@ func (c *frpConnection) Drain(ctx context.Context) error {
 }
 func (c *frpConnection) Retire() error { return c.client.Retire() }
 func (c *frpConnection) Close() error {
-	c.once.Do(func() { close(c.closed); c.cancel(); c.client.Close() })
+	// Close the FRP client before cancelling Run.  Some client implementations
+	// report Run's return as the lifecycle completion signal, so cancelling
+	// first can make Done fire while the underlying client is still open.
+	c.once.Do(func() {
+		c.client.Close()
+		c.cancel()
+		close(c.closed)
+	})
 	return nil
 }
 func (c *frpConnection) Done() <-chan error           { return c.done }
