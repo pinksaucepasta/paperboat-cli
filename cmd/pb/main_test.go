@@ -1648,13 +1648,13 @@ func TestResolveSetupModeRequiresExplicitModeWithoutTTY(t *testing.T) {
 	if _, err := resolveSetupMode("", false, io.Discard); err == nil || !strings.Contains(err.Error(), "requires --mode") {
 		t.Fatalf("err=%v, want non-interactive mode requirement", err)
 	}
-	for _, mode := range []string{"client", "session", "host"} {
+	for _, mode := range []string{"client", "host"} {
 		got, err := resolveSetupMode(mode, false, io.Discard)
 		if err != nil || got != mode {
 			t.Fatalf("resolveSetupMode(%q)=(%q,%v)", mode, got, err)
 		}
 	}
-	if _, err := resolveSetupMode("interactive", false, io.Discard); err == nil || !strings.Contains(err.Error(), "client, session, or host") {
+	if _, err := resolveSetupMode("session", false, io.Discard); err == nil || !strings.Contains(err.Error(), "client or host") {
 		t.Fatalf("err=%v, want supported modes", err)
 	}
 }
@@ -1700,9 +1700,9 @@ func TestMachineStatusSummarySeparatesAvailabilityFromMode(t *testing.T) {
 			want:    "Offline  ·  Client",
 		},
 		{
-			name:    "inactive session",
+			name:    "legacy session is shown as client",
 			machine: api.UserMachine{SetupMode: "session"},
-			want:    "Session only",
+			want:    "Offline  ·  Client",
 		},
 		{
 			name:    "legacy host inferred from capability",
@@ -3115,18 +3115,6 @@ func TestResolveSSHCommandTargetFastUsesWarmSnapshotAndCache(t *testing.T) {
 }
 
 func TestSelectTerminalSessionPrefersWarmMachineSnapshot(t *testing.T) {
-	root := commandRuntimeTestRoot(t)
-	runtimeRoot := filepath.Join(root, "runtime")
-	if err := os.MkdirAll(runtimeRoot, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("HOME", filepath.Join(root, "home"))
-	if err := os.MkdirAll(filepath.Join(root, "home"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("XDG_RUNTIME_DIR", runtimeRoot)
-	t.Setenv("TMPDIR", runtimeRoot)
-
 	var catalogCalls int32
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -3141,31 +3129,14 @@ func TestSelectTerminalSessionPrefersWarmMachineSnapshot(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	paths, err := localdaemon.CurrentUserPaths()
-	if err != nil {
-		t.Fatal(err)
-	}
 	now := time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC)
 	snapshot := localapi.Snapshot{
 		Schema: localapi.SnapshotSchemaV1, Generation: 1, ObservedAt: now, DaemonState: "ready",
 		Machines: []localapi.MachineStatus{{ID: "mch_1", EnvironmentID: "env_1", WorkspaceRoot: "/root", Alias: "hn-byod-ready", Eligible: true, RuntimeState: "ready", Generation: 4, SelectedPath: "none", TransferReadiness: "unavailable", PreviewReadiness: "unavailable", SSHReadiness: "unavailable", NATMappingIPv4: "unknown", NATMappingIPv6: "unknown", CaptivePortal: "unknown", PMTU: "unknown", RouterProtocol: "unknown", RouterMapping: "unknown", MappingLifetime: "unknown", UpdateHealth: "unknown"}},
 	}
-	store, err := localapi.NewSnapshotStore(&snapshot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	serverConfig, err := commandLocalAPIServerConfig(paths.SocketPath, store)
-	if err != nil {
-		t.Fatal(err)
-	}
-	server, err := localapi.NewServer(serverConfig)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- server.Run(ctx) }()
-	waitForCommandSocket(t, paths.SocketPath)
+	previous := loadWarmMachineSnapshot
+	loadWarmMachineSnapshot = func(context.Context) (localapi.Snapshot, error) { return snapshot, nil }
+	t.Cleanup(func() { loadWarmMachineSnapshot = previous })
 
 	session, target, machine, err := selectTerminalSession(context.Background(), api.New(backend.URL, config.Credential{AccessToken: "token"}, backend.Client()), "hn-byod-ready", "", "")
 	if err != nil {
@@ -3176,10 +3147,6 @@ func TestSelectTerminalSessionPrefersWarmMachineSnapshot(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&catalogCalls); got != 0 {
 		t.Fatalf("warm machine resolution consulted the catalog %d times", got)
-	}
-	cancel()
-	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatalf("server err=%v", err)
 	}
 }
 

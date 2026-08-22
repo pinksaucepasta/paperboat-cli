@@ -1293,15 +1293,10 @@ func atomicWrite(path string, body []byte, mode os.FileMode) error {
 		return err
 	}
 	//paperboat:allow-source-policy atomic-replacement owner=tuf-repository reason=verified-metadata-publication
-	if err := os.Rename(name, path); err != nil {
+	if err := replaceFile(name, path); err != nil {
 		return err
 	}
-	dir, err := os.Open(filepath.Dir(path))
-	if err != nil {
-		return err
-	}
-	defer dir.Close()
-	if err := dir.Sync(); err != nil {
+	if err := syncDirectory(filepath.Dir(path)); err != nil {
 		return err
 	}
 	ok = true

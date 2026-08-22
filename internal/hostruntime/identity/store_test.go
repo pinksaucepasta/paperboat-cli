@@ -134,6 +134,37 @@ func TestNonHostRegistrationRejectsSSHConfiguration(t *testing.T) {
 	}
 }
 
+func TestLegacySessionRegistrationLoadsAsClient(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "identity")
+	store, err := Open(Config{StateRoot: root, Random: bytes.NewReader(bytes.Repeat([]byte{9}, 32))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := store.Current()
+	registration := Registration{
+		ServerURL: "https://api.example.test", MachineID: "mch_legacy", EnvironmentID: "env_legacy",
+		PublicKeyID: key.ID, PublicIdentityKey: base64.RawURLEncoding.EncodeToString(key.Public()),
+		InboxPath: filepath.Join(root, "inbox"), InstallationGeneration: 1, SetupMode: "client",
+		SetupRoles: []string{"interactive"}, UpdatedAt: time.Now().UTC(),
+	}
+	if err := store.SaveRegistration(registration); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "machine-registration.json")
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body = bytes.Replace(body, []byte(`"setup_mode":"client"`), []byte(`"setup_mode":"session"`), 1)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.Registration()
+	if err != nil || loaded.SetupMode != "client" {
+		t.Fatalf("legacy registration=%+v err=%v", loaded, err)
+	}
+}
+
 type failingReader struct{}
 
 func (failingReader) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }

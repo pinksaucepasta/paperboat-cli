@@ -57,7 +57,7 @@ func (s *Store) SaveRegistration(value Registration) error {
 }
 
 func validSetupMode(mode string) bool {
-	return mode == "client" || mode == "session" || mode == "host"
+	return mode == "client" || mode == "host"
 }
 
 func setupModeFromRoles(roles []string) string {
@@ -69,7 +69,7 @@ func setupModeFromRoles(roles []string) string {
 			return "client"
 		}
 	}
-	return "session"
+	return "client"
 }
 
 func (s *Store) Registration() (Registration, error) {
@@ -99,6 +99,9 @@ func (s *Store) Registration() (Registration, error) {
 	}
 	if value.SetupMode == "" {
 		value.SetupMode = setupModeFromRoles(value.SetupRoles)
+	}
+	if value.SetupMode == "session" {
+		value.SetupMode = "client"
 	}
 	if !validSetupMode(value.SetupMode) || value.SSHPort == 0 != (strings.TrimSpace(value.SSHUser) == "") ||
 		value.SetupMode != "host" && (value.SSHPort != 0 || strings.TrimSpace(value.SSHUser) != "") {

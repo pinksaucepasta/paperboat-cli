@@ -6,7 +6,7 @@
       "id": "cli.behavior",
       "path": "cli/behavior.json",
       "type": "command-behavior",
-      "sha256": "02f452e3b252bbf167f64955fdc1b911eb32d1010b1c13fe2099040ac2641a87",
+      "sha256": "1c9faf3112fdb630a489f8e5f430da4946f2e7289d4089090d17eab66c5b3b5a",
       "owner": "cli",
       "review": "preview-ownership-review",
       "consumers": [

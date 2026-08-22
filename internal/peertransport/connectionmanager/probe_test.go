@@ -276,10 +276,13 @@ func TestProbeSchedulerTransfersEligibleTrustedConnection(t *testing.T) {
 			return nil
 		}),
 	)
+	// Advance the network generation before the scheduler starts. Starting the
+	// goroutine first races a completed first probe against NetworkChanged and
+	// can legitimately promote the old generation before the change arrives.
+	s.NetworkChanged()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- s.Run(ctx) }()
-	s.NetworkChanged()
 	attempt := <-promoted
 	if attempt.Generation != 1 || attempt.NetworkGeneration != 2 || connection.closeCount() != 0 {
 		t.Fatalf("attempt=%+v closes=%d", attempt, connection.closeCount())

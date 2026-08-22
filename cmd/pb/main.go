@@ -1802,18 +1802,6 @@ func setupCommand() *cobra.Command {
 			if err := identityStore.SaveRegistration(registration); err != nil {
 				return fmt.Errorf("save machine registration: %w", err)
 			}
-			if mode == "session" {
-				if previousMode != "" && previousMode != "session" {
-					if err := cleanupDurablePreviewServices(command); err != nil {
-						return fmt.Errorf("stop durable previews before session-mode transition: %w", err)
-					}
-					if code := hostruntimecmd.Execute(command.Context(), []string{"service", "uninstall-persisted"}, command.InOrStdin(), command.OutOrStdout(), command.ErrOrStderr()); code != 0 {
-						return errors.New("session mode was saved, but persistent service removal failed; retry `pb setup --mode session`")
-					}
-				}
-				fmt.Fprintf(command.OutOrStdout(), "Set up %s (%s) in session mode\n", machine.DisplayName, machine.ID)
-				return exportSetupRecoveryKey(command)
-			}
 			operationID := "machine-control-" + strings.TrimPrefix(newIdempotencyKey(), "pb-")
 			controlBody, err := json.Marshal(struct {
 				OperationID string `json:"operation_id"`
@@ -1853,23 +1841,7 @@ func setupCommand() *cobra.Command {
 					Artifact: artifact,
 				}, command.InOrStdin(), command.OutOrStdout(), command.ErrOrStderr())
 				if installErr != nil {
-					rollbackCtx, cancelRollback := setupRollbackContext(command.Context())
-					defer cancelRollback()
-					rolledBack, rollbackErr := client.SetupMachine(rollbackCtx, api.MachineSetupInput{
-						SetupMode: "session", DisplayName: strings.TrimSpace(name), Platform: runtime.GOOS, Architecture: runtime.GOARCH,
-						WorkspaceRoot: workspaceRoot, PublicIdentityKey: publicIdentityKey, RuntimeVersions: map[string]string{"pb": buildinfo.Version},
-					})
-					if rollbackErr == nil {
-						registration, loadErr := identityStore.Registration()
-						if loadErr == nil {
-							registration.SetupMode, registration.SetupRoles = "session", append([]string(nil), rolledBack.SetupRoles...)
-							registration.InstallationGeneration, registration.UpdatedAt = rolledBack.InstallationGeneration, time.Now().UTC()
-							rollbackErr = identityStore.SaveRegistration(registration)
-						} else {
-							rollbackErr = loadErr
-						}
-					}
-					return errors.Join(fmt.Errorf("install client service: %w", installErr), rollbackErr)
+					return fmt.Errorf("install client service: %w; retry `pb setup --mode client`", installErr)
 				}
 			}
 			if mode == "host" {
@@ -1880,13 +1852,13 @@ func setupCommand() *cobra.Command {
 						rollbackCtx, cancelRollback := setupRollbackContext(command.Context())
 						defer cancelRollback()
 						rolledBack, rollbackErr := client.SetupMachine(rollbackCtx, api.MachineSetupInput{
-							SetupMode: "session", DisplayName: strings.TrimSpace(name), Platform: runtime.GOOS, Architecture: runtime.GOARCH,
+							SetupMode: "client", DisplayName: strings.TrimSpace(name), Platform: runtime.GOOS, Architecture: runtime.GOARCH,
 							WorkspaceRoot: workspaceRoot, PublicIdentityKey: publicIdentityKey, RuntimeVersions: map[string]string{"pb": buildinfo.Version},
 						})
 						if rollbackErr == nil {
 							registration, loadErr := identityStore.Registration()
 							if loadErr == nil {
-								registration.SetupMode, registration.SetupRoles = "session", append([]string(nil), rolledBack.SetupRoles...)
+								registration.SetupMode, registration.SetupRoles = "client", append([]string(nil), rolledBack.SetupRoles...)
 								registration.InstallationGeneration, registration.UpdatedAt = rolledBack.InstallationGeneration, time.Now().UTC()
 								rollbackErr = identityStore.SaveRegistration(registration)
 							} else {
@@ -1917,7 +1889,7 @@ func setupCommand() *cobra.Command {
 		SilenceUsage: true, SilenceErrors: true,
 	}
 	command.Flags().String("name", "", "machine name")
-	command.Flags().String("mode", "", "installation mode: client, session, or host")
+	command.Flags().String("mode", "", "installation mode: client or host")
 	command.Flags().String("state-root", "", "runtime state directory")
 	command.Flags().Uint("ssh-port", 22, "existing loopback sshd port")
 	command.Flags().String("recovery-output", "", "new absolute file for the account recovery key")
@@ -1927,19 +1899,18 @@ func setupCommand() *cobra.Command {
 func resolveSetupMode(value string, interactive bool, output io.Writer) (string, error) {
 	value = strings.ToLower(strings.TrimSpace(value))
 	if value != "" {
-		if slices.Contains([]string{"client", "session", "host"}, value) {
+		if slices.Contains([]string{"client", "host"}, value) {
 			return value, nil
 		}
-		return "", invocationError(errors.New("--mode must be client, session, or host"))
+		return "", invocationError(errors.New("--mode must be client or host"))
 	}
 	if !interactive {
-		return "", invocationError(errors.New("non-interactive setup requires --mode client, session, or host"))
+		return "", invocationError(errors.New("non-interactive setup requires --mode client or host"))
 	}
 	choice, err := selector.Choose(selector.Options{
 		Title: "Set up this machine", Subtitle: "Choose what Paperboat may do on this machine",
 		Items: []selector.Item{
 			{ID: "client", Title: "Client", Description: "Receive files and launch previews in the background"},
-			{ID: "session", Title: "Session", Description: "Use only while this terminal session is attached"},
 			{ID: "host", Title: "Host", Description: "Run terminals and Codex, receive files, and launch previews"},
 		},
 		Stdin: os.Stdin, Output: output, Footer: "enter select  esc cancel",
@@ -3461,10 +3432,6 @@ func chooseMachineHomeAction(command *cobra.Command, machine api.UserMachine) (s
 }
 
 func machineStatusSummary(machine api.UserMachine) string {
-	mode := effectiveMachineMode(machine)
-	if mode == "session" {
-		return "Session only"
-	}
 	return machineAvailabilityLabel(machine) + "  ·  " + machineModeLabel(machine)
 }
 
@@ -3490,8 +3457,6 @@ func machineModeLabel(machine api.UserMachine) string {
 		return "Host"
 	case "client":
 		return "Client"
-	case "session":
-		return "Session only"
 	default:
 		return "Limited"
 	}
@@ -3519,8 +3484,10 @@ func sortMachinesForDisplay(machines []api.UserMachine, favorites favoriteSet, c
 
 func effectiveMachineMode(machine api.UserMachine) string {
 	switch machine.SetupMode {
-	case "host", "client", "session":
+	case "host", "client":
 		return machine.SetupMode
+	case "session":
+		return "client"
 	}
 	if machine.Capabilities.TerminalHost.Configured || machine.Capabilities.CodexHost.Configured {
 		return "host"
@@ -7635,16 +7602,20 @@ func resolveUserMachine(ctx context.Context, client *api.Client, requested strin
 // resolveWarmUserMachine uses the daemon's authenticated inventory snapshot
 // for selection. Operation descriptors remain fetched from the control plane;
 // this only removes a redundant catalog round trip on an already-warm client.
-func resolveWarmUserMachine(ctx context.Context, requested string) (api.UserMachine, bool) {
+var loadWarmMachineSnapshot = func(ctx context.Context) (localapi.Snapshot, error) {
 	paths, err := localdaemon.CurrentUserPaths()
 	if err != nil {
-		return api.UserMachine{}, false
+		return localapi.Snapshot{}, err
 	}
 	client, err := localapi.NewClient(paths.SocketPath, 300*time.Millisecond)
 	if err != nil {
-		return api.UserMachine{}, false
+		return localapi.Snapshot{}, err
 	}
-	snapshot, err := client.Snapshot(ctx)
+	return client.Snapshot(ctx)
+}
+
+func resolveWarmUserMachine(ctx context.Context, requested string) (api.UserMachine, bool) {
+	snapshot, err := loadWarmMachineSnapshot(ctx)
 	if err != nil {
 		return api.UserMachine{}, false
 	}
