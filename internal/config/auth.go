@@ -329,7 +329,7 @@ func (s ProfileStore) Save(p Profile, cred Credential) (resultErr error) {
 	p.RefreshSecretRef = secretRef(issuer, "refresh")
 	p.UpdatedAt = time.Now().UTC()
 	lock := newSharedLock(s.profilePath(issuer) + ".lock")
-	if err := os.MkdirAll(filepath.Dir(s.profilePath(issuer)), 0o700); err != nil {
+	if err := ensureProfileDirectory(filepath.Dir(s.profilePath(issuer))); err != nil {
 		return err
 	}
 	if err := lock.Lock(); err != nil {
@@ -381,7 +381,7 @@ func (s ProfileStore) Replace(p Profile, cred Credential) (resultErr error) {
 	p.RefreshSecretRef = secretRef(issuer, "refresh")
 	p.UpdatedAt = time.Now().UTC()
 	path := s.profilePath(issuer)
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	if err := ensureProfileDirectory(filepath.Dir(path)); err != nil {
 		return err
 	}
 	lock := newSharedLock(path + ".lock")
@@ -439,7 +439,7 @@ func (s ProfileStore) Switch(expectedSessionID string, p Profile, cred Credentia
 	p.RefreshSecretRef = secretRef(issuer, "refresh")
 	p.UpdatedAt = time.Now().UTC()
 	path := s.profilePath(issuer)
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	if err := ensureProfileDirectory(filepath.Dir(path)); err != nil {
 		return err
 	}
 	lock := newSharedLock(path + ".lock")
@@ -525,7 +525,7 @@ func (s ProfileStore) Remove(issuer string) (Credential, error) {
 		return Credential{}, err
 	}
 	path := s.profilePath(issuer)
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	if err := ensureProfileDirectory(filepath.Dir(path)); err != nil {
 		return Credential{}, err
 	}
 	lock := newSharedLock(path + ".lock")
@@ -583,7 +583,7 @@ func (s ProfileStore) QueueRevocation(issuer, cliClientSessionID, refreshToken s
 	}
 	path := s.pendingRevocationPath(issuer, cliClientSessionID)
 	lock := newSharedLock(path + ".lock")
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	if err := ensureProfileDirectory(filepath.Dir(path)); err != nil {
 		return err
 	}
 	if err := lock.Lock(); err != nil {
@@ -810,7 +810,7 @@ func (s ProfileStore) QueueActiveRevocation(issuer string) (resultErr error) {
 		return err
 	}
 	profilePath := s.profilePath(issuer)
-	if err := os.MkdirAll(filepath.Dir(profilePath), 0o700); err != nil {
+	if err := ensureProfileDirectory(filepath.Dir(profilePath)); err != nil {
 		return err
 	}
 	lock := newSharedLock(profilePath + ".lock")
@@ -876,7 +876,7 @@ func (s ProfileStore) CredentialWithRefresh(issuer string, refreshBefore time.Du
 		return Credential{}, err
 	}
 	path := s.profilePath(issuer)
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	if err := ensureProfileDirectory(filepath.Dir(path)); err != nil {
 		return Credential{}, err
 	}
 	lock := newSharedLock(path + ".lock")
