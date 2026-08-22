@@ -1853,9 +1853,9 @@ func setupCommand() *cobra.Command {
 			}); err != nil {
 				return fmt.Errorf("save machine control credential: %w", err)
 			}
-			if mode == "receive" {
+			if mode == "client" {
 				if machine.Installation == nil {
-					return errors.New("server did not return TUF receive installation material")
+					return errors.New("server did not return TUF client installation material")
 				}
 				artifact := bootstrap.ArtifactTarget{
 					Schema: machine.Installation.Artifact.Schema, Kind: machine.Installation.Artifact.Kind,
@@ -1885,14 +1885,14 @@ func setupCommand() *cobra.Command {
 							rollbackErr = loadErr
 						}
 					}
-					return errors.Join(fmt.Errorf("install receive service: %w", installErr), rollbackErr)
+					return errors.Join(fmt.Errorf("install client service: %w", installErr), rollbackErr)
 				}
 			}
 			if mode == "host" {
 				arguments := []string{"bootstrap", "--server", d.cfg.ServerURL, "--state-root", stateRoot, "--name", strings.TrimSpace(name)}
 				if code := hostruntimecmd.Execute(command.Context(), arguments, command.InOrStdin(), command.OutOrStdout(), command.ErrOrStderr()); code != 0 {
 					bootstrapErr := error(exitCodeError{code: code})
-					if previousMode != "receive" && previousMode != "host" {
+					if previousMode != "client" && previousMode != "host" {
 						rollbackCtx, cancelRollback := setupRollbackContext(command.Context())
 						defer cancelRollback()
 						rolledBack, rollbackErr := client.SetupMachine(rollbackCtx, api.MachineSetupInput{
@@ -1933,7 +1933,7 @@ func setupCommand() *cobra.Command {
 		SilenceUsage: true, SilenceErrors: true,
 	}
 	command.Flags().String("name", "", "machine name")
-	command.Flags().String("mode", "", "installation mode: receive, session, or host")
+	command.Flags().String("mode", "", "installation mode: client, session, or host")
 	command.Flags().String("state-root", "", "runtime state directory")
 	command.Flags().Uint("ssh-port", 22, "existing loopback sshd port")
 	command.Flags().Bool("accept-beta-platform", false, "accept enrollment on a beta operating-system platform")
@@ -1944,18 +1944,18 @@ func setupCommand() *cobra.Command {
 func resolveSetupMode(value string, interactive bool, output io.Writer) (string, error) {
 	value = strings.ToLower(strings.TrimSpace(value))
 	if value != "" {
-		if slices.Contains([]string{"receive", "session", "host"}, value) {
+		if slices.Contains([]string{"client", "session", "host"}, value) {
 			return value, nil
 		}
-		return "", invocationError(errors.New("--mode must be receive, session, or host"))
+		return "", invocationError(errors.New("--mode must be client, session, or host"))
 	}
 	if !interactive {
-		return "", invocationError(errors.New("non-interactive setup requires --mode receive, session, or host"))
+		return "", invocationError(errors.New("non-interactive setup requires --mode client, session, or host"))
 	}
 	choice, err := selector.Choose(selector.Options{
 		Title: "Set up this machine", Subtitle: "Choose what Paperboat may do on this machine",
 		Items: []selector.Item{
-			{ID: "receive", Title: "Receive", Description: "Receive files and launch previews in the background"},
+			{ID: "client", Title: "Client", Description: "Receive files and launch previews in the background"},
 			{ID: "session", Title: "Session", Description: "Use only while this terminal session is attached"},
 			{ID: "host", Title: "Host", Description: "Run terminals and Codex, receive files, and launch previews"},
 		},
@@ -2022,7 +2022,7 @@ func unpairCommand() *cobra.Command {
 			}
 			registration.InstallationGeneration = machine.InstallationGeneration
 			registration.SetupRoles = machine.SetupRoles
-			registration.SetupMode = "receive"
+			registration.SetupMode = "client"
 			registration.UpdatedAt = time.Now().UTC()
 			if err := identityStore.SaveRegistration(registration); err != nil {
 				return fmt.Errorf("save machine registration: %w", err)
@@ -2035,9 +2035,9 @@ func unpairCommand() *cobra.Command {
 			receiveSetup.SetIn(command.InOrStdin())
 			receiveSetup.SetOut(command.OutOrStdout())
 			receiveSetup.SetErr(command.ErrOrStderr())
-			receiveSetup.SetArgs([]string{"--mode", "receive", "--name", machine.DisplayName, "--state-root", stateRoot})
+			receiveSetup.SetArgs([]string{"--mode", "client", "--name", machine.DisplayName, "--state-root", stateRoot})
 			if err := receiveSetup.ExecuteContext(command.Context()); err != nil {
-				return fmt.Errorf("host authority was revoked, but receive service setup failed: %w", err)
+				return fmt.Errorf("host authority was revoked, but client service setup failed: %w", err)
 			}
 			fmt.Fprintf(command.OutOrStdout(), "Unpaired %s (%s)\n", machine.DisplayName, machine.ID)
 			return nil
@@ -3509,8 +3509,8 @@ func machineModeLabel(machine api.UserMachine) string {
 	switch effectiveMachineMode(machine) {
 	case "host":
 		return "Host"
-	case "receive":
-		return "Receive only"
+	case "client":
+		return "Client"
 	case "session":
 		return "Session only"
 	default:
@@ -3540,14 +3540,14 @@ func sortMachinesForDisplay(machines []api.UserMachine, favorites favoriteSet, c
 
 func effectiveMachineMode(machine api.UserMachine) string {
 	switch machine.SetupMode {
-	case "host", "receive", "session":
+	case "host", "client", "session":
 		return machine.SetupMode
 	}
 	if machine.Capabilities.TerminalHost.Configured || machine.Capabilities.CodexHost.Configured {
 		return "host"
 	}
 	if machine.Capabilities.FileReceive.Configured || machine.Capabilities.PreviewLaunch.Configured {
-		return "receive"
+		return "client"
 	}
 	return ""
 }
@@ -6506,7 +6506,7 @@ func validateLocalServeCapability(command *cobra.Command, registration identity.
 			continue
 		}
 		if !machine.Capabilities.PreviewLaunch.Configured {
-			return &api.APIError{Code: "machine_capability_unavailable", Message: "This device is not configured to launch previews. Run `pb setup --mode receive` or `pb pair`."}
+			return &api.APIError{Code: "machine_capability_unavailable", Message: "This device is not configured to launch previews. Run `pb setup --mode client` or `pb pair`."}
 		}
 		if !machine.Online || !machine.Capabilities.PreviewLaunch.Observed {
 			return &api.APIError{Code: "machine_offline", Message: "This device's preview runtime is offline. Run `pb doctor`, then retry."}
@@ -10712,7 +10712,7 @@ func collectLocalDoctor() localDoctorReport {
 		} else {
 			report.CredentialState = "valid"
 		}
-	} else if registration.SetupMode == "host" || registration.SetupMode == "receive" {
+	} else if registration.SetupMode == "host" || registration.SetupMode == "client" {
 		report.CredentialState = "invalid_or_expired"
 		report.RecoveryActions = append(report.RecoveryActions, "run pb pair to renew host authority")
 	}

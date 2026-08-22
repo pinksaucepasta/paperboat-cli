@@ -388,7 +388,7 @@ func Validate(request Request, _ int) error {
 	if request.UserMachineID == "" {
 		return fmt.Errorf("%w: machine ID", ErrInvalidRequest)
 	}
-	if request.SetupMode != "host" && request.SetupMode != "receive" {
+	if request.SetupMode != "host" && request.SetupMode != "client" {
 		return fmt.Errorf("%w: setup mode", ErrInvalidRequest)
 	}
 	if err := bootstrap.VerifyArtifactTarget(request.Artifact); err != nil || request.Artifact.Platform != "windows" {

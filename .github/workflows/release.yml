@@ -579,7 +579,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gh release create "$RELEASE_VERSION" --target "$GITHUB_SHA" --generate-notes --latest || true
+          if gh release view "$RELEASE_VERSION" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_VERSION" --draft=true --target "$GITHUB_SHA"
+          else
+            gh release create "$RELEASE_VERSION" --target "$GITHUB_SHA" --generate-notes --draft
+          fi
           while IFS= read -r -d '' file; do gh release upload "$RELEASE_VERSION" "$file" --clobber; done < <(find dist -maxdepth 1 -type f -print0)
       - name: Verify production TUF publication
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
@@ -587,3 +591,10 @@ jobs:
           go-version-file: go.mod
           cache: true
       - run: go test ./internal/hostruntime/bootstrap -run '^TestProductionTUFRepository$' -count=1
+      - name: Finalize verified GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release edit "$RELEASE_VERSION" --draft=false --latest --target "$GITHUB_SHA"

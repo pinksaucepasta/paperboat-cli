@@ -126,7 +126,7 @@ func TestNonHostRegistrationRejectsSSHConfiguration(t *testing.T) {
 	registration := Registration{
 		ServerURL: "https://api.example.test", MachineID: "mch_1", EnvironmentID: "env_1",
 		PublicKeyID: key.ID, PublicIdentityKey: base64.RawURLEncoding.EncodeToString(key.Public()),
-		InboxPath: filepath.Join(root, "inbox"), InstallationGeneration: 1, SetupMode: "receive",
+		InboxPath: filepath.Join(root, "inbox"), InstallationGeneration: 1, SetupMode: "client",
 		SetupRoles: []string{"interactive"}, SSHUser: "developer", SSHPort: 22, UpdatedAt: time.Now().UTC(),
 	}
 	if err := store.SaveRegistration(registration); !errors.Is(err, ErrInvalidStore) {

@@ -210,3 +210,16 @@ func TestValidateWorkspaceRejectsSymlink(t *testing.T) {
 		t.Fatal("expected symlink workspace to be rejected")
 	}
 }
+
+func TestValidateMaterialAcceptsClientCLISetup(t *testing.T) {
+	material := Material{
+		Schema: "paperboat.byod-installation/v1", UserMachineID: "um_1", UserMachineEnrollmentID: "ume_1",
+		EnvironmentID: "env_1", HelperID: "helper_1", EnrollmentID: "enroll_1",
+		EnrollmentCredential: "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOP", ExpiresAt: time.Now().UTC().Add(time.Minute),
+		Artifact:            &ArtifactTarget{Schema: ArtifactTargetSchemaV1, Kind: ArtifactKindPB, Version: "1.0.0", Platform: runtime.GOOS, Architecture: runtime.GOARCH, RepositoryURL: "https://example.test/tuf", TargetPath: "pb-" + runtime.GOOS + "-" + runtime.GOARCH},
+		HelperListenAddress: "127.0.0.1:38080", InstallationGeneration: 1, SetupMode: "client", SetupRoles: []string{"interactive"},
+	}
+	if err := validateMaterial(material); err != nil {
+		t.Fatalf("client material rejected: %v", err)
+	}
+}

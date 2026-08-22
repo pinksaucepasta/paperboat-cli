@@ -57,13 +57,16 @@ func (s *Store) SaveRegistration(value Registration) error {
 }
 
 func validSetupMode(mode string) bool {
-	return mode == "receive" || mode == "session" || mode == "host"
+	return mode == "client" || mode == "session" || mode == "host"
 }
 
 func setupModeFromRoles(roles []string) string {
 	for _, role := range roles {
 		if role == "host" {
 			return "host"
+		}
+		if role == "interactive" {
+			return "client"
 		}
 	}
 	return "session"

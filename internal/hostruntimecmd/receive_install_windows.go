@@ -44,7 +44,7 @@ func InstallReceive(ctx context.Context, config ReceiveInstallConfig, _ io.Reade
 	if err != nil {
 		return err
 	}
-	request := hostinstall.Request{Schema: hostinstall.SchemaV1, Platform: runtime.GOOS, User: windowsAccountName(account.Username), Group: "Paperboat", OwnerSID: sid, Executable: artifactPath, Artifact: config.Artifact, Home: home, Path: os.Getenv("PATH"), StateRoot: config.StateRoot, WorkspaceRoot: config.WorkspaceRoot, ControlURL: config.ControlURL, UserMachineID: config.MachineID, Shell: filepath.Join(os.Getenv("WINDIR"), "System32", "WindowsPowerShell", "v1.0", "powershell.exe"), HelperListenAddress: config.ListenAddress, SetupMode: "receive"}
+	request := hostinstall.Request{Schema: hostinstall.SchemaV1, Platform: runtime.GOOS, User: windowsAccountName(account.Username), Group: "Paperboat", OwnerSID: sid, Executable: artifactPath, Artifact: config.Artifact, Home: home, Path: os.Getenv("PATH"), StateRoot: config.StateRoot, WorkspaceRoot: config.WorkspaceRoot, ControlURL: config.ControlURL, UserMachineID: config.MachineID, Shell: filepath.Join(os.Getenv("WINDIR"), "System32", "WindowsPowerShell", "v1.0", "powershell.exe"), HelperListenAddress: config.ListenAddress, SetupMode: "client"}
 	executable, err := os.Executable()
 	if err != nil {
 		return err

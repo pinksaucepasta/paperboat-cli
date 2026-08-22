@@ -297,7 +297,7 @@ func TestRevokeProductionPreviewByNameUsesAuthenticatedControlFlow(t *testing.T)
 		t.Fatal(err)
 	}
 	key := store.Current()
-	if err := store.SaveRegistration(identity.Registration{ServerURL: server.URL, MachineID: "machine_local", EnvironmentID: "env_local", PublicKeyID: key.ID, PublicIdentityKey: base64.RawURLEncoding.EncodeToString(key.Public()), InboxPath: filepath.Join(root, "Inbox"), InstallationGeneration: 1, SetupMode: "receive", UpdatedAt: time.Now().UTC()}); err != nil {
+	if err := store.SaveRegistration(identity.Registration{ServerURL: server.URL, MachineID: "machine_local", EnvironmentID: "env_local", PublicKeyID: key.ID, PublicIdentityKey: base64.RawURLEncoding.EncodeToString(key.Public()), InboxPath: filepath.Join(root, "Inbox"), InstallationGeneration: 1, SetupMode: "client", UpdatedAt: time.Now().UTC()}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.SaveMachineControl(identity.MachineControl{MachineID: "machine_local", EnvironmentID: "env_local", InstallationGeneration: 1, Credential: machineToken, ExpiresAt: time.Now().UTC().Add(time.Hour), KeyID: key.ID}); err != nil {

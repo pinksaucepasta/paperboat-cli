@@ -1648,19 +1648,19 @@ func TestResolveSetupModeRequiresExplicitModeWithoutTTY(t *testing.T) {
 	if _, err := resolveSetupMode("", false, io.Discard); err == nil || !strings.Contains(err.Error(), "requires --mode") {
 		t.Fatalf("err=%v, want non-interactive mode requirement", err)
 	}
-	for _, mode := range []string{"receive", "session", "host"} {
+	for _, mode := range []string{"client", "session", "host"} {
 		got, err := resolveSetupMode(mode, false, io.Discard)
 		if err != nil || got != mode {
 			t.Fatalf("resolveSetupMode(%q)=(%q,%v)", mode, got, err)
 		}
 	}
-	if _, err := resolveSetupMode("interactive", false, io.Discard); err == nil || !strings.Contains(err.Error(), "receive, session, or host") {
+	if _, err := resolveSetupMode("interactive", false, io.Discard); err == nil || !strings.Contains(err.Error(), "client, session, or host") {
 		t.Fatalf("err=%v, want supported modes", err)
 	}
 }
 
 func TestMachineHomeActionsFollowConfiguredCapabilities(t *testing.T) {
-	machine := api.UserMachine{ID: "machine_actions", SetupMode: "receive", Capabilities: api.MachineCapabilities{
+	machine := api.UserMachine{ID: "machine_actions", SetupMode: "client", Capabilities: api.MachineCapabilities{
 		FileReceive: api.MachineCapability{Configured: true}, PreviewLaunch: api.MachineCapability{Configured: true},
 	}}
 	actions := machineHomeActions(machine)
@@ -1695,9 +1695,9 @@ func TestMachineStatusSummarySeparatesAvailabilityFromMode(t *testing.T) {
 			want:    "Online  ·  Host",
 		},
 		{
-			name:    "offline receive",
-			machine: api.UserMachine{SetupMode: "receive", Platform: "darwin", Architecture: "arm64"},
-			want:    "Offline  ·  Receive only",
+			name:    "offline client",
+			machine: api.UserMachine{SetupMode: "client", Platform: "darwin", Architecture: "arm64"},
+			want:    "Offline  ·  Client",
 		},
 		{
 			name:    "inactive session",

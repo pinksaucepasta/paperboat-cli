@@ -116,7 +116,7 @@ func Install(ctx context.Context, request Request) error {
 		}
 		return errors.Join(err, hostErr, rollbackFiles(paths, journal))
 	}
-	if request.SetupMode == "receive" {
+	if request.SetupMode == "client" {
 		obsoleteHost, hostErr := hostInstaller(request, paths)
 		if hostErr != nil {
 			return errors.Join(hostErr, worker.Uninstall(ctx), rollbackFiles(paths, journal))
@@ -217,7 +217,7 @@ func installers(request Request, paths installPaths) (*service.Installer, *servi
 	if err != nil {
 		return nil, nil, err
 	}
-	if request.SetupMode == "receive" {
+	if request.SetupMode == "client" {
 		return worker, nil, nil
 	}
 	host, err := hostInstaller(request, paths)
@@ -512,7 +512,7 @@ func secureRootDirectory(path string, mode os.FileMode) error {
 
 func Validate(request Request, sudoUID int) error {
 	if request.Schema != SchemaV1 || request.Platform != runtime.GOOS || !validRunIdentity(request) || sudoUID != request.UID ||
-		request.UserMachineID == "" || !slices.Contains([]string{"receive", "host"}, request.SetupMode) || strings.ContainsAny(request.UserMachineID, "\x00\r\n") {
+		request.UserMachineID == "" || !slices.Contains([]string{"client", "host"}, request.SetupMode) || strings.ContainsAny(request.UserMachineID, "\x00\r\n") {
 		return fmt.Errorf("%w: identity contract", ErrInvalidRequest)
 	}
 	account, err := user.Lookup(request.User)

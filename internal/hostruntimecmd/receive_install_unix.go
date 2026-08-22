@@ -59,7 +59,7 @@ func InstallReceive(ctx context.Context, config ReceiveInstallConfig, stdin io.R
 		Executable: artifactPath, Artifact: config.Artifact,
 		Home: account.HomeDir, Path: servicePath, StateRoot: config.StateRoot, WorkspaceRoot: config.WorkspaceRoot,
 		ControlURL: config.ControlURL, UserMachineID: config.MachineID, Shell: shell,
-		HelperListenAddress: config.ListenAddress, SetupMode: "receive",
+		HelperListenAddress: config.ListenAddress, SetupMode: "client",
 	}
 	previousGeneration := workerGeneration(config.StateRoot)
 	fmt.Fprintln(stderr, "Administrator approval is required to install the receive service.")

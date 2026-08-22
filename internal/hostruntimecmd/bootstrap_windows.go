@@ -44,11 +44,8 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	if flags.Parse(args) != nil || flags.NArg() != 0 {
 		return errors.New("bootstrap accepts flags only")
 	}
-	if *setupMode != "host" && *setupMode != "client" && *setupMode != "receive" {
+	if *setupMode != "host" && *setupMode != "client" {
 		return errors.New("setup-mode must be host or client")
-	}
-	if *setupMode == "client" {
-		*setupMode = "receive"
 	}
 	if *legacyToken != "" && *tokenFile != "" {
 		return errors.New("use only one enrollment token source")

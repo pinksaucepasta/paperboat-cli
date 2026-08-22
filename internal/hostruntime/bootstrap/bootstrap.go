@@ -135,8 +135,9 @@ func WaitForMaterial(ctx context.Context, config Config, expiresAt time.Time, in
 
 func validateMaterial(material Material) error {
 	validEnrollment := material.ReuseIdentity && material.EnrollmentID == "" && material.EnrollmentCredential == "" || !material.ReuseIdentity && material.EnrollmentID != "" && len(material.EnrollmentCredential) >= 32
-	validSetupMode := material.SetupMode == "host" || material.SetupMode == "receive"
-	validSetupRole := (material.SetupMode == "host" && hasRole(material.SetupRoles, "host")) || (material.SetupMode == "receive" && hasRole(material.SetupRoles, "interactive"))
+	validSetupMode := material.SetupMode == "host" || material.SetupMode == "client"
+	validSetupRole := (material.SetupMode == "host" && hasRole(material.SetupRoles, "host")) ||
+		(material.SetupMode == "client" && hasRole(material.SetupRoles, "interactive"))
 	checks := []struct {
 		invalid bool
 		reason  string
