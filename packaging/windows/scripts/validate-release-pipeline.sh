@@ -4,15 +4,18 @@ set -eu
 repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)
 workflow="$repository_root/.github/workflows/release.yml"
 qualification="$repository_root/.github/workflows/platform-qualification.yml"
+ci="$repository_root/.github/workflows/ci.yml"
 test -f "$workflow"
 test -f "$qualification"
+test -f "$ci"
 
-python3 - "$workflow" "$qualification" <<'PY'
+python3 - "$workflow" "$qualification" "$ci" <<'PY'
 import pathlib
 import sys
 
 release = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
 qualification = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+ci = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
 
 for required in (
     "release-linux:", "release-macos:", "release-windows:",
@@ -32,6 +35,11 @@ for required in (
     "windows-amd64-native-qualification.json", "windows-arm64-native-qualification.json",
     "Publish immutable GitHub release assets", "Atomically publish TUF and current.json to Hetzner",
     "Verify public updater and current release", "Mark verified GitHub release latest",
+    "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+    "actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e",
+    "actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
+    "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+    "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
 ):
     if required not in release:
         raise SystemExit(f"release workflow is missing {required!r}")
@@ -51,6 +59,10 @@ for required in (
 qualification_triggers = qualification[qualification.index("on:"):qualification.index("permissions:")]
 if "pull_request:" in qualification_triggers or "push:" in qualification_triggers:
     raise SystemExit("native platform qualification must run from the tag release workflow or explicit manual dispatch only")
+
+ci_triggers = ci[ci.index("on:"):ci.index("permissions:")]
+if "pull_request:" not in ci_triggers or "push:" in ci_triggers:
+    raise SystemExit("CI must validate pull requests without duplicating the locally preflighted main push")
 
 if "qemu" in release.lower() or "qemu" in qualification.lower():
     raise SystemExit("release workflows must not use QEMU")
