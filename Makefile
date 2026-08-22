@@ -13,7 +13,7 @@ GOFMT       := $(shell GOTOOLCHAIN=local go env GOROOT 2>/dev/null)/bin/gofmt
 GO_FILES    := $(shell find . -path ./.git -prune -o -name '*.go' -print)
 LDFLAGS     := -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Version=$(VERSION) -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Commit=$(COMMIT) -X github.com/pinksaucepasta/paperboat/internal/buildinfo.ProtocolVersion=$(PROTOCOL_VERSION) -X github.com/pinksaucepasta/paperboat/internal/buildinfo.DefaultReleaseURL=$(DEFAULT_RELEASE_URL)
 
-.PHONY: binary-size-check build check clean complete container-compose-check contracts cross-build dependencies fmt fmt-check fuzz generate generate-check hosted-image-check install license-check lint metrics-check metrics-generate race release-metadata reproducible-builds source-policy static-analysis test tidy tidy-check uninstall verification verify-toolchain vet vulnerability-check
+.PHONY: binary-size-check build check clean complete container-compose-check contracts cross-build dependencies fmt fmt-check fuzz generate generate-check hosted-image-check install license-check lint metrics-check metrics-generate preflight race release-metadata reproducible-builds source-policy static-analysis test tidy tidy-check uninstall verification verify-toolchain vet vulnerability-check
 
 contracts:
 	@./testdata/contracts/validate.sh
@@ -124,6 +124,17 @@ check: verify-toolchain contracts dependencies source-policy metrics-check hoste
 complete: check race cross-build
 
 verification: complete fuzz reproducible-builds static-analysis vulnerability-check license-check binary-size-check
+
+# Run the five local checks required before consuming hosted-runner time.
+# Native platform execution, Victus E2E, release packaging, and publication
+# remain separate workflow/integration gates.
+preflight:
+	@$(MAKE) check
+	@$(MAKE) race
+	@$(MAKE) cross-build
+	@./packaging/windows/scripts/validate-release-pipeline.sh
+	@command -v actionlint >/dev/null 2>&1 || { echo 'actionlint is required for preflight; install it before running make preflight' >&2; exit 1; }
+	@actionlint .github/workflows/*.yml
 
 clean:
 	rm -rf bin dist coverage.out

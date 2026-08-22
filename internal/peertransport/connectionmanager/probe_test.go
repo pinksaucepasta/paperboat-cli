@@ -115,9 +115,8 @@ func TestProbeSchedulerNetworkChangeCancelsActiveStaleProbe(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- s.Run(ctx) }()
-	s.NetworkChanged()
 	first := <-started
-	if first.NetworkGeneration != 2 {
+	if first.Generation != 1 || first.NetworkGeneration != 1 {
 		t.Fatalf("first=%+v", first)
 	}
 	s.NetworkChanged()
@@ -127,7 +126,7 @@ func TestProbeSchedulerNetworkChangeCancelsActiveStaleProbe(t *testing.T) {
 		t.Fatal("old-network probe was not canceled")
 	}
 	second := <-started
-	if second.Generation != 2 || second.NetworkGeneration != 3 {
+	if second.Generation != 2 || second.NetworkGeneration != 2 {
 		t.Fatalf("second=%+v", second)
 	}
 	cancel()
