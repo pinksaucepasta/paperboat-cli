@@ -173,12 +173,19 @@ func RemoveServiceOwned(ctx context.Context, config Config) error {
 	if !sameOwnedServiceCommand(current.BinaryPathName, serviceExecutable, config) {
 		return ErrServiceOwnership
 	}
-	_, _ = service.Control(svc.Stop)
-	if ctx != nil {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(500 * time.Millisecond):
+	status, queryErr := service.Query()
+	if queryErr != nil {
+		return queryErr
+	}
+	if status.State != svc.Stopped {
+		if _, err := service.Control(svc.Stop); err != nil && !errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE) {
+			return err
+		}
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		if err := waitForServiceState(ctx, service, svc.Stopped, 30*time.Second); err != nil {
+			return err
 		}
 	}
 	return service.Delete()

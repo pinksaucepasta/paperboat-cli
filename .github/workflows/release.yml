@@ -12,7 +12,9 @@ on:
         type: string
 
 concurrency:
-  group: release-candidate-${{ github.repository }}-${{ github.sha }}-${{ inputs.version || github.ref_name }}
+  # One release may own the GitHub latest selector and origin transaction at a
+  # time, even when different version tags are pushed close together.
+  group: release-publication-${{ github.repository }}
   cancel-in-progress: false
 
 permissions:
@@ -620,7 +622,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          (cd dist && find . -maxdepth 1 -type f ! -name SHA256SUMS -print | LC_ALL=C sort | while IFS= read -r file; do sha256sum "$file"; done) > dist/SHA256SUMS
+          tools/generate-release-checksums.sh dist
       - name: Generate final SPDX SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
@@ -631,7 +633,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          (cd dist && find . -maxdepth 1 -type f ! -name SHA256SUMS -print | LC_ALL=C sort | while IFS= read -r file; do sha256sum "$file"; done) > dist/SHA256SUMS
+          tools/generate-release-checksums.sh dist
       - name: Attest final release assets and preserve provenance handoff
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
@@ -745,12 +747,44 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if gh release view "$RELEASE_VERSION" >/dev/null 2>&1; then
-            gh release edit "$RELEASE_VERSION" --draft=false --latest=false --target "$GITHUB_SHA"
-          else
+          if ! gh release view "$RELEASE_VERSION" >/dev/null 2>&1; then
             gh release create "$RELEASE_VERSION" --target "$GITHUB_SHA" --generate-notes --latest=false
           fi
-          while IFS= read -r -d '' file; do gh release upload "$RELEASE_VERSION" "$file" --clobber; done < <(find dist -maxdepth 1 -type f -print0)
+          existing=$(gh release view "$RELEASE_VERSION" --json assets --jq '.assets[].name')
+          while IFS= read -r -d '' file; do
+            name=$(basename "$file")
+            if ! printf '%s\n' "$existing" | grep -Fxq "$name"; then
+              gh release upload "$RELEASE_VERSION" "$file"
+            fi
+          done < <(find dist -maxdepth 1 -type f -print0)
+      - name: Download and verify immutable GitHub release bytes
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          github_assets="$RUNNER_TEMP/github-release-assets"
+          test ! -e "$github_assets" || { echo 'GitHub release download directory already exists' >&2; exit 1; }
+          mkdir "$github_assets"
+          gh release download "$RELEASE_VERSION" --dir "$github_assets"
+          python3 - "$GITHUB_WORKSPACE/dist" "$github_assets" <<'PY'
+          import hashlib, json, pathlib, sys
+          candidate, downloaded = map(pathlib.Path, sys.argv[1:])
+          manifest = json.loads((candidate / 'release-candidate.json').read_text())
+          expected = {item['name']: item for item in manifest['artifacts']}
+          expected['release-candidate.json'] = {
+              'size': (candidate / 'release-candidate.json').stat().st_size,
+              'sha256': hashlib.sha256((candidate / 'release-candidate.json').read_bytes()).hexdigest(),
+          }
+          actual = {path.name for path in downloaded.iterdir() if path.is_file()}
+          if actual != set(expected):
+              raise SystemExit('GitHub release asset set differs from the immutable candidate')
+          for name, descriptor in expected.items():
+              body = (downloaded / name).read_bytes()
+              if len(body) != descriptor['size'] or hashlib.sha256(body).hexdigest() != descriptor['sha256']:
+                  raise SystemExit(f'GitHub release asset differs from the immutable candidate: {name}')
+          PY
+          printf 'PAPERBOAT_GITHUB_RELEASE_ASSETS=%s\n' "$github_assets" >> "$GITHUB_ENV"
       - name: Configure pinned Hetzner publication identity
         env:
           PAPERBOAT_RELEASE_SSH_KEY: ${{ secrets.PAPERBOAT_RELEASE_SSH_KEY }}
@@ -806,62 +840,71 @@ jobs:
             -percentage 100 \
             -severity routine
           "$signer" verify-published -repository "$PAPERBOAT_TUF_REPOSITORY"
-      - name: Atomically publish TUF and current.json to Hetzner
+      - name: Assemble isolated release origin
+        shell: bash
+        run: |
+          set -euo pipefail
+          publish="$RUNNER_TEMP/paperboat-production-release"
+          test ! -e "$publish" || { echo 'staged release origin already exists' >&2; exit 1; }
+          mkdir -p "$publish/tuf"
+          cp -R "$PAPERBOAT_TUF_REPOSITORY/metadata" "$PAPERBOAT_TUF_REPOSITORY/targets" "$publish/tuf/"
+          install -m 0755 "$PAPERBOAT_GITHUB_RELEASE_ASSETS/install.sh" "$publish/install"
+          install -m 0644 "$PAPERBOAT_GITHUB_RELEASE_ASSETS/install.ps1" "$publish/windows"
+          printf '{"schema":"paperboat.release-current/v1","version":"%s"}\n' "$RELEASE_VERSION" > "$publish/current.json"
+          bundle="$RUNNER_TEMP/paperboat-release-$RELEASE_VERSION.tgz"
+          tar -C "$publish" -czf "$bundle" current.json install windows tuf
+          digest=$(sha256sum "$bundle" | awk '{print $1}')
+          {
+            printf 'PAPERBOAT_STAGED_RELEASE=%s\n' "$publish"
+            printf 'PAPERBOAT_RELEASE_BUNDLE=%s\n' "$bundle"
+            printf 'PAPERBOAT_RELEASE_BUNDLE_SHA256=%s\n' "$digest"
+          } >> "$GITHUB_ENV"
+      - name: Verify staged release consumers before activation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d "$PAPERBOAT_STAGED_RELEASE/tuf/metadata" || { echo 'staged TUF metadata is unavailable' >&2; exit 1; }
+          test -d "$PAPERBOAT_GITHUB_RELEASE_ASSETS" || { echo 'downloaded GitHub release assets are unavailable' >&2; exit 1; }
+          export PAPERBOAT_TEST_REQUIRE_STAGED=1
+          export PAPERBOAT_TEST_RELEASE_DIRECTORY="$PAPERBOAT_STAGED_RELEASE"
+          export PAPERBOAT_TEST_GITHUB_RELEASE_DIRECTORY="$PAPERBOAT_GITHUB_RELEASE_ASSETS"
+          export PAPERBOAT_TEST_TUF_VERSION="$RELEASE_VERSION"
+          go test ./internal/hostruntime/bootstrap -run '^TestStagedTUFRepository$' -count=1
+      - name: Activate verified release atomically on Hetzner
         env:
           RELEASE_HOST: ${{ vars.PAPERBOAT_RELEASE_HOST }}
         shell: bash
         run: |
           set -euo pipefail
-          publish="$RUNNER_TEMP/paperboat-production-release"
-          mkdir -p "$publish/tuf"
-          cp -R "$PAPERBOAT_TUF_REPOSITORY/metadata" "$PAPERBOAT_TUF_REPOSITORY/targets" "$publish/tuf/"
-          install -m 0755 dist/install.sh "$publish/install"
-          install -m 0644 dist/install.ps1 "$publish/windows"
-          printf '{"schema":"paperboat.release-current/v1","version":"%s"}\n' "$RELEASE_VERSION" > "$publish/current.json"
-          bundle="$RUNNER_TEMP/paperboat-release-$RELEASE_VERSION.tgz"
-          tar -C "$publish" -czf "$bundle" current.json install windows tuf
-          digest=$(sha256sum "$bundle" | awk '{print $1}')
+          test -f "$PAPERBOAT_RELEASE_BUNDLE" || { echo 'verified release bundle is unavailable' >&2; exit 1; }
+          test -n "$PAPERBOAT_RELEASE_BUNDLE_SHA256" || { echo 'verified release bundle digest is unavailable' >&2; exit 1; }
           remote_bundle="/opt/paperboat/releases/staging/paperboat-release-$RELEASE_VERSION-$GITHUB_SHA.tgz"
           remote_script="/opt/paperboat/releases/staging/publish-tuf-origin-$GITHUB_RUN_ID.sh"
-          scp -i "$HOME/.ssh/paperboat-release" -o BatchMode=yes -o StrictHostKeyChecking=yes "$bundle" "root@$RELEASE_HOST:$remote_bundle"
+          scp -i "$HOME/.ssh/paperboat-release" -o BatchMode=yes -o StrictHostKeyChecking=yes "$PAPERBOAT_RELEASE_BUNDLE" "root@$RELEASE_HOST:$remote_bundle"
           scp -i "$HOME/.ssh/paperboat-release" -o BatchMode=yes -o StrictHostKeyChecking=yes tools/publish-tuf-origin.sh "root@$RELEASE_HOST:$remote_script"
           ssh -i "$HOME/.ssh/paperboat-release" -o BatchMode=yes -o StrictHostKeyChecking=yes "root@$RELEASE_HOST" \
-            "chmod 0700 '$remote_script' && '$remote_script' '$remote_bundle' /opt/paperboat/releases '$RELEASE_VERSION' '$digest'"
-      - name: Verify public updater and current release
-        env:
-          PAPERBOAT_TEST_TUF_REPOSITORY_URL: ${{ vars.PAPERBOAT_DEFAULT_RELEASE_URL }}
-          PAPERBOAT_TEST_TUF_VERSION: ${{ env.RELEASE_VERSION }}
-          PAPERBOAT_CURRENT_URL: https://api.pprbt.dev/current.json
-          PAPERBOAT_INSTALL_URL: ${{ vars.PAPERBOAT_INSTALL_URL }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -n "$PAPERBOAT_INSTALL_URL" || { echo 'PAPERBOAT_INSTALL_URL is required' >&2; exit 1; }
-          go test ./internal/hostruntime/bootstrap -run '^TestProductionTUFRepository$' -count=1
-          current=$(curl --fail --silent --show-error "$PAPERBOAT_CURRENT_URL")
-          python3 - "$RELEASE_VERSION" "$current" <<'PY'
-          import json, sys
-          if json.loads(sys.argv[2]) != {"schema": "paperboat.release-current/v1", "version": sys.argv[1]}:
-              raise SystemExit('public current.json does not match the release')
-          PY
-          token=0123456789ABCDEFGHJKMNPQRS
-          curl --fail --silent --show-error -A 'curl/8.0' "${PAPERBOAT_INSTALL_URL}?p=$token" -o "$RUNNER_TEMP/install-public"
-          curl --fail --silent --show-error -A 'WindowsPowerShell/5.1' "${PAPERBOAT_INSTALL_URL}?p=$token" -o "$RUNNER_TEMP/windows-public"
-          python3 - "$GITHUB_WORKSPACE/dist/install.sh" "$RUNNER_TEMP/install-public" "$GITHUB_WORKSPACE/dist/install.ps1" "$RUNNER_TEMP/windows-public" "$token" <<'PY'
-          import pathlib, sys
-          unix_source, unix_public, windows_source, windows_public = (pathlib.Path(value).read_bytes() for value in sys.argv[1:5])
-          token = sys.argv[5].encode()
-          unix_prefix = b"PAPERBOAT_ENROLLMENT_TOKEN='" + token + b"' PAPERBOAT_MACHINE_NAME=''\n"
-          windows_prefix = b"$env:PAPERBOAT_ENROLLMENT_TOKEN='" + token + b"';"
-          if unix_public != unix_prefix + unix_source:
-              raise SystemExit('public Unix installer does not match the qualified release source')
-          if windows_public != windows_prefix + windows_source:
-              raise SystemExit('public Windows installer does not match the qualified release source')
-          PY
+            "chmod 0700 '$remote_script' && '$remote_script' '$remote_bundle' /opt/paperboat/releases '$RELEASE_VERSION' '$PAPERBOAT_RELEASE_BUNDLE_SHA256'"
       - name: Mark verified GitHub release latest
+        # The origin exchange is the release commit point. GitHub's latest
+        # marker is only a convenience pointer and is retried after the
+        # exchange; a transient GitHub API failure must not roll back or
+        # re-run a release that clients may already have observed.
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          gh release edit "$RELEASE_VERSION" --draft=false --latest --target "$GITHUB_SHA"
+          for attempt in 1 2 3 4 5; do
+            if gh release edit "$RELEASE_VERSION" --draft=false --latest --target "$GITHUB_SHA"; then
+              echo "GitHub latest pointer updated on attempt $attempt"
+              exit 0
+            fi
+            if [ "$attempt" -lt 5 ]; then
+              delay=$((attempt * 5))
+              echo "GitHub latest pointer update failed; retrying in ${delay}s" >&2
+              sleep "$delay"
+            fi
+          done
+          echo "::warning::GitHub latest pointer remains stale; retry gh release edit for $RELEASE_VERSION. The verified origin is already active." >&2
+          exit 1

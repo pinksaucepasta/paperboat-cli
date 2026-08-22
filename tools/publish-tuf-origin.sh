@@ -15,15 +15,69 @@ expected_sha=$4
 [[ "$version" =~ ^20[0-9]{2}\.[0-9]{2}\.[0-9]{2}\.(0|[1-9][0-9]*)$ ]] || { echo "invalid release version" >&2; exit 1; }
 [[ "$expected_sha" =~ ^[a-f0-9]{64}$ ]] || { echo "invalid bundle digest" >&2; exit 1; }
 [[ -f "$bundle" && ! -L "$bundle" ]] || { echo "staged bundle is unavailable" >&2; exit 1; }
-
 actual_sha=$(sha256sum "$bundle" | awk '{print $1}')
 [[ "$actual_sha" == "$expected_sha" ]] || { echo "staged bundle digest mismatch" >&2; exit 1; }
 
-stage=$(mktemp -d "$release_root/staging/${version}.XXXXXX")
-trap 'rm -rf "$stage"' EXIT
-tar -xzf "$bundle" -C "$stage" --no-same-owner --no-same-permissions
+verify_live_mount_contract() {
+  mapfile -t containers < <(docker ps -q)
+  ((${#containers[@]} > 0)) || { echo "no running containers are available to verify the release mount" >&2; return 1; }
+  docker inspect "${containers[@]}" | python3 -c '
+import json
+import sys
 
-python3 - "$stage/current.json" "$version" <<'PY'
+containers = json.load(sys.stdin)
+parent_source = "/opt/paperboat/releases"
+old_source = parent_source + "/current"
+destination = "/srv/paperboat-releases"
+parent_mount = False
+for container in containers:
+    for mount in container.get("Mounts", []):
+        source = mount.get("Source")
+        if source == old_source:
+            raise SystemExit("a running container still bind-mounts the old current release directory")
+        if source == parent_source and mount.get("Destination") == destination and mount.get("Type") == "bind" and mount.get("RW") is False:
+            parent_mount = True
+if not parent_mount:
+    raise SystemExit("no running container exposes the read-only releases parent mount")
+'
+}
+
+atomic_exchange() {
+  python3 - "$1" "$2" <<'PY'
+import ctypes
+import os
+import sys
+
+libc = ctypes.CDLL(None, use_errno=True)
+renameat2 = getattr(libc, "renameat2", None)
+if renameat2 is None:
+    raise SystemExit("renameat2 is unavailable")
+renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+renameat2.restype = ctypes.c_int
+if renameat2(-100, os.fsencode(sys.argv[1]), -100, os.fsencode(sys.argv[2]), 2) != 0:
+    error = ctypes.get_errno()
+    raise OSError(error, os.strerror(error))
+PY
+}
+
+live="$release_root/current"
+staging="$release_root/staging"
+[[ -d "$live" && ! -L "$live" ]] || { echo "live release is unavailable" >&2; exit 1; }
+[[ -d "$staging" && ! -L "$staging" ]] || { echo "release staging directory is unavailable" >&2; exit 1; }
+
+# A successful prior activation deliberately retains its exchanged-out tree.
+# It is safe to remove only now, before this release creates its transaction.
+find "$staging" -mindepth 1 -maxdepth 1 -type d -name 'activation-*' -print0 | while IFS= read -r -d '' previous; do
+  rm -rf -- "$previous"
+done
+
+transaction=$(mktemp -d "$staging/activation-${version}.XXXXXX")
+next="$transaction/next"
+mkdir "$next"
+tar -xzf "$bundle" -C "$next" --no-same-owner --no-same-permissions
+[[ -z "$(find "$next" -type l -print -quit)" ]] || { echo "staged release contains a symlink" >&2; exit 1; }
+
+python3 - "$next/current.json" "$version" <<'PY'
 import json, pathlib, sys
 path = pathlib.Path(sys.argv[1])
 value = json.loads(path.read_text())
@@ -32,39 +86,20 @@ if value != {"schema": "paperboat.release-current/v1", "version": sys.argv[2]}:
 PY
 
 for required in install windows tuf/metadata/root.json tuf/metadata/targets.json tuf/metadata/snapshot.json tuf/metadata/timestamp.json; do
-  [[ -s "$stage/$required" && ! -L "$stage/$required" ]] || { echo "release bundle is missing $required" >&2; exit 1; }
+  [[ -s "$next/$required" && ! -L "$next/$required" ]] || { echo "release bundle is missing $required" >&2; exit 1; }
+done
+for directory in "$next/tuf/metadata" "$next/tuf/targets"; do
+  [[ -d "$directory" && ! -L "$directory" ]] || { echo "release bundle is missing a TUF directory" >&2; exit 1; }
+  [[ -z "$(find "$directory" -mindepth 1 -type d -print -quit)" ]] || { echo "release bundle contains nested TUF paths" >&2; exit 1; }
+  [[ -z "$(find "$directory" -mindepth 1 ! -type f -print -quit)" ]] || { echo "release bundle contains a non-regular TUF file" >&2; exit 1; }
 done
 
-live="$release_root/current"
-mkdir -p "$live/tuf/metadata" "$live/tuf/targets"
+chown -R 501:root "$next"
+chmod 0700 "$next"
+verify_live_mount_contract
 
-atomic_install() {
-  local source=$1 destination=$2 mode=${3:-0644}
-  local temporary
-  temporary=$(mktemp "$(dirname "$destination")/.paperboat-release.XXXXXX")
-  install -m "$mode" "$source" "$temporary"
-  mv -f "$temporary" "$destination"
-}
-
-# Consistent targets and versioned metadata are immutable and become visible
-# before any top-level metadata points at them.
-find "$stage/tuf/targets" -maxdepth 1 -type f -print0 | while IFS= read -r -d '' source; do
-  atomic_install "$source" "$live/tuf/targets/$(basename "$source")"
-done
-find "$stage/tuf/metadata" -maxdepth 1 -type f ! -name root.json ! -name targets.json ! -name snapshot.json ! -name timestamp.json -print0 | while IFS= read -r -d '' source; do
-  atomic_install "$source" "$live/tuf/metadata/$(basename "$source")"
-done
-
-atomic_install "$stage/install" "$live/install" 0755
-atomic_install "$stage/windows" "$live/windows"
-atomic_install "$stage/tuf/metadata/root.json" "$live/tuf/metadata/root.json"
-atomic_install "$stage/tuf/metadata/targets.json" "$live/tuf/metadata/targets.json"
-atomic_install "$stage/tuf/metadata/snapshot.json" "$live/tuf/metadata/snapshot.json"
-# Timestamp is the TUF repository commit point.
-atomic_install "$stage/tuf/metadata/timestamp.json" "$live/tuf/metadata/timestamp.json"
-# current.json is an unsigned discovery hint and is always committed last.
-atomic_install "$stage/current.json" "$live/current.json"
-
-chown -R 501:root "$live"
-chmod 0700 "$live"
-echo "published $version"
+# This must remain the final command. The server resolves current through the
+# releases-parent mount on every request, so the exchange exposes TUF,
+# installers, and current.json together. The old tree stays in transaction/next
+# until a later release performs its pre-activation cleanup.
+atomic_exchange "$live" "$next"

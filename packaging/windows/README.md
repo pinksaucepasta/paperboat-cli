@@ -29,11 +29,14 @@ The MSI uses these stable paths:
 ```text
 C:\\Program Files\\Paperboat\\
   bin\\
-    pb.exe
-    pb-launcher.exe
+    pb.exe                  # stable public launcher
+    pb-launcher.exe          # source copied to pb.exe on Client renewal
     paperboat-runtime.exe
     paperboat-hostd.exe
     paperboat-updater.exe
+  releases\\
+    cli-current\\
+      pb.exe                  # protected full CLI seeded by the MSI
 
 C:\\ProgramData\\Paperboat\\
   ssh\\
@@ -48,10 +51,10 @@ staging directory; this repository does not fabricate service binaries. The
 OpenSSH integration file is installed under the Paperboat-owned SSH state root
 and contains no credentials or private material.
 
-The MSI appends `C:\Program Files\Paperboat\bin` to the machine PATH. New
-PowerShell, cmd.exe, Windows Terminal, and other processes can therefore run
-`pb` immediately after installation without a manual PATH command. Uninstall
-removes only Paperboat's PATH entry.
+The MSI appends `C:\Program Files\Paperboat\bin` to the machine PATH. Its
+public `pb.exe` is a stable launcher that resolves the protected current CLI
+slot, so Client re-enrollment and ordinary updates never leave PATH pointing at
+an older full CLI. Uninstall removes only Paperboat's PATH entry.
 
 ## Build inputs
 

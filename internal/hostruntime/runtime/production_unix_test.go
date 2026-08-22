@@ -410,15 +410,18 @@ func TestProductionHelperRequiresHTTPSControl(t *testing.T) {
 	}
 }
 
-func TestInstalledHostModeOverridesReceiveRegistrationDuringUpgrade(t *testing.T) {
-	if shouldRunReceiveCoordinator("receive", "host") {
-		t.Fatal("host installation started the receive coordinator")
+func TestInstalledHostModeOverridesClientRegistrationDuringUpgrade(t *testing.T) {
+	if shouldRunClientCoordinator("client", "host") {
+		t.Fatal("host installation started the client coordinator")
 	}
-	if !shouldRunReceiveCoordinator("receive", "receive") {
-		t.Fatal("receive installation did not start the receive coordinator")
+	if !shouldRunClientCoordinator("client", "client") {
+		t.Fatal("client installation did not start the client coordinator")
 	}
-	if shouldRunReceiveCoordinator("host", "host") {
-		t.Fatal("host registration started the receive coordinator")
+	if shouldRunClientCoordinator("host", "host") {
+		t.Fatal("host registration started the client coordinator")
+	}
+	if shouldRunClientCoordinator("receive", "client") {
+		t.Fatal("retired receive registration started the client coordinator")
 	}
 }
 

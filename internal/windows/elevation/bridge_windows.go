@@ -123,6 +123,51 @@ func RunOpenSSH(ctx context.Context, executable, action string) error {
 	return runOperation(ctx, executable, OperationOpenSSH, action, nil)
 }
 
+// LaunchDetached starts a pinned executable with a full administrator token
+// and returns after Windows has accepted the process. The child owns its own
+// bounded completion/status protocol; this function deliberately does not
+// wait for it, which permits safe self-removal after the caller exits.
+func LaunchDetached(ctx context.Context, executable string, arguments []string) error {
+	if ctx == nil {
+		return fmt.Errorf("%w: nil context", ErrElevationProtocol)
+	}
+	validated, handle, err := pinExecutable(executable)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrElevationUnavailable, err)
+	}
+	defer windows.CloseHandle(handle)
+	quoted := make([]string, len(arguments))
+	for index, argument := range arguments {
+		quoted[index] = quoteWindowsArgument(argument)
+	}
+	launcher := shellExecuteExForRun
+	if isCurrentProcessElevatedForRun() {
+		launcher = createProcessForRun
+	}
+	launchCh := make(chan launchResult, 1)
+	go func() {
+		process, launchErr := launcher(validated, strings.Join(quoted, " "), filepath.Dir(validated))
+		launchCh <- launchResult{handle: process, err: launchErr}
+	}()
+	var launched launchResult
+	select {
+	case launched = <-launchCh:
+	case <-ctx.Done():
+		go func() {
+			late := <-launchCh
+			stopProcess(late.handle)
+		}()
+		return contextError(ctx, ctx)
+	}
+	if launched.err != nil {
+		return classifyLaunchError(launched.err)
+	}
+	if launched.handle == 0 {
+		return fmt.Errorf("%w: detached helper returned no process handle", ErrElevationUnavailable)
+	}
+	return windows.CloseHandle(launched.handle)
+}
+
 // IsCurrentProcessElevated reports whether the current process has a full UAC
 // administrator token. It is used to avoid re-elevating the hidden child.
 func IsCurrentProcessElevated() bool {
@@ -170,7 +215,11 @@ func runOperation(ctx context.Context, executable, operation, action string, pay
 	}
 	defer windows.CloseHandle(executableHandle)
 
-	operationCtx, cancel := context.WithTimeout(ctx, MaxOperationDuration)
+	duration := operationDuration(operation, action)
+	// The child receives the strict request expiry below. Keep the launcher
+	// alive for a short result grace so the child can commit its named timeout
+	// result instead of being terminated at the exact same instant.
+	operationCtx, cancel := context.WithTimeout(ctx, duration+bridgeCancelGrace)
 	defer cancel()
 	select {
 	case <-operationCtx.Done():
@@ -199,7 +248,7 @@ func runOperation(ctx context.Context, executable, operation, action string, pay
 		Payload:    encoded,
 		CancelPath: paths.cancel,
 		CreatedAt:  now,
-		ExpiresAt:  now.Add(MaxOperationDuration),
+		ExpiresAt:  now.Add(duration),
 	}
 	if err := validateRequest(request); err != nil {
 		cleanup()
@@ -268,9 +317,9 @@ func runOperation(ctx context.Context, executable, operation, action string, pay
 	case statusOK:
 		return nil
 	case statusCanceled:
-		return ErrElevationCanceled
+		return resultContextError(ErrElevationCanceled, result.ErrorMessage)
 	case statusTimedOut:
-		return ErrElevationTimedOut
+		return resultContextError(ErrElevationTimedOut, result.ErrorMessage)
 	case statusError:
 		return &RemoteError{Code: result.ErrorCode, Message: result.ErrorMessage}
 	default:
@@ -322,7 +371,10 @@ func Execute(ctx context.Context, requestPath, resultPath, cancelPath string, ha
 		return errors.Join(ErrElevationTimedOut, writeErr)
 	}
 
-	operationCtx, cancel := context.WithTimeout(ctx, MaxOperationDuration)
+	// Honor the launcher-issued expiry instead of starting a fresh five-minute
+	// clock in the elevated child. Otherwise a blocked child can outlive the
+	// caller's bounded request and keep the result placeholder empty.
+	operationCtx, cancel := context.WithDeadline(ctx, request.ExpiresAt)
 	defer cancel()
 	watchDone := make(chan struct{})
 	go watchCancellation(operationCtx, cancel, handles.cancel, watchDone)
@@ -333,11 +385,14 @@ func Execute(ctx context.Context, requestPath, resultPath, cancelPath string, ha
 
 	result := Result{Schema: SchemaV1, RequestID: request.RequestID, Status: statusOK}
 	switch {
+	// An expiry observed after a handler returns is still an indeterminate
+	// activation. Never report success when the caller's deadline already
+	// elapsed before the protected result was committed.
+	case errors.Is(operationContextErr, context.Canceled) || errors.Is(operationErr, context.Canceled):
+		result.Status, result.ErrorCode, result.ErrorMessage = statusCanceled, "canceled", boundedContextMessage(ErrElevationCanceled, operationErr)
+	case errors.Is(operationContextErr, context.DeadlineExceeded) || errors.Is(operationErr, context.DeadlineExceeded):
+		result.Status, result.ErrorCode, result.ErrorMessage = statusTimedOut, "deadline_exceeded", boundedContextMessage(ErrElevationTimedOut, operationErr)
 	case operationErr == nil:
-	case errors.Is(operationErr, context.Canceled) || errors.Is(operationContextErr, context.Canceled):
-		result.Status, result.ErrorCode, result.ErrorMessage = statusCanceled, "canceled", ErrElevationCanceled.Error()
-	case errors.Is(operationErr, context.DeadlineExceeded) || errors.Is(operationContextErr, context.DeadlineExceeded):
-		result.Status, result.ErrorCode, result.ErrorMessage = statusTimedOut, "deadline_exceeded", ErrElevationTimedOut.Error()
 	default:
 		result.Status, result.ErrorCode, result.ErrorMessage = statusError, operationFailed, sanitizeMessage(operationErr.Error(), 2048)
 	}
@@ -346,6 +401,29 @@ func Execute(ctx context.Context, requestPath, resultPath, cancelPath string, ha
 		return errors.Join(operationErr, writeErr)
 	}
 	return writeErr
+}
+
+func resultContextError(base error, message string) error {
+	message = strings.TrimSpace(message)
+	if message == "" || message == base.Error() {
+		return base
+	}
+	return fmt.Errorf("%w: %s", base, message)
+}
+
+// boundedContextMessage keeps the operation phase when a cancellation or
+// deadline is raised from within a handler. The caller can then retry from the
+// resume journal without guessing whether staging, SCM activation, or cleanup
+// was interrupted.
+func boundedContextMessage(base, operationErr error) string {
+	if operationErr == nil {
+		return base.Error()
+	}
+	message := sanitizeMessage(operationErr.Error(), 2048)
+	if message == "" {
+		return base.Error()
+	}
+	return message
 }
 
 func contextError(parent, bounded context.Context) error {

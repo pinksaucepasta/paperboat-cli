@@ -98,6 +98,11 @@ func main() {
 
 var errUsage = errors.New("command usage error")
 
+// currentLocalDaemonPaths is kept behind a small seam so command tests can
+// use a private local API endpoint. Production callers use the platform
+// owner's stable paths supplied by localdaemon.CurrentUserPaths.
+var currentLocalDaemonPaths = localdaemon.CurrentUserPaths
+
 type exitCodeError struct{ code int }
 
 func (e exitCodeError) Error() string { return "" }
@@ -107,6 +112,50 @@ type usageError struct{ err error }
 
 func (e usageError) Error() string { return e.err.Error() }
 func (e usageError) Unwrap() error { return errUsage }
+
+type uninstallCleanupError struct{ err error }
+
+func (e uninstallCleanupError) Error() string {
+	steps := uninstallFailureStepNames(e.err)
+	if len(steps) == 0 {
+		return "Paperboat local removal was incomplete. Retry `pb uninstall`."
+	}
+	return "Paperboat local removal was incomplete after attempting every step. Failed: " + strings.Join(steps, ", ") + ". Retry `pb uninstall`."
+}
+func (e uninstallCleanupError) Unwrap() error { return e.err }
+
+type uninstallStepFailure struct {
+	name string
+	err  error
+}
+
+func (e uninstallStepFailure) Error() string { return e.name + ": " + e.err.Error() }
+func (e uninstallStepFailure) Unwrap() error { return e.err }
+
+func uninstallFailureStepNames(err error) []string {
+	seen := make(map[string]struct{})
+	var names []string
+	var visit func(error)
+	visit = func(current error) {
+		if current == nil {
+			return
+		}
+		var failure uninstallStepFailure
+		if errors.As(current, &failure) {
+			if _, exists := seen[failure.name]; !exists {
+				seen[failure.name] = struct{}{}
+				names = append(names, failure.name)
+			}
+		}
+		if joined, ok := current.(interface{ Unwrap() []error }); ok {
+			for _, child := range joined.Unwrap() {
+				visit(child)
+			}
+		}
+	}
+	visit(err)
+	return names
+}
 
 func invocationError(err error) error {
 	if err == nil {
@@ -189,6 +238,10 @@ func userFacingError(err error) string {
 	}
 	if errors.Is(err, identitybootstrap.ErrPairingRequired) {
 		return "This CLI needs the account recovery key before private transport can be enabled. Rerun `pb auth login --recovery-key /absolute/recovery-key-file`."
+	}
+	var uninstallErr uninstallCleanupError
+	if errors.As(err, &uninstallErr) {
+		return uninstallErr.Error()
 	}
 	if message := friendlyAPIError(err); message != "" {
 		return sentence(message)
@@ -364,7 +417,7 @@ func localDaemonCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			paths, err := localdaemon.CurrentUserPaths()
+			paths, err := currentLocalDaemonPaths()
 			if err != nil {
 				return err
 			}
@@ -1196,7 +1249,7 @@ func localDaemonSnapshot(command *cobra.Command, install localDaemonServiceInsta
 	if command == nil || install == nil {
 		return nil, localapi.Snapshot{}, errors.New("invalid local daemon client configuration")
 	}
-	paths, err := localdaemon.CurrentUserPaths()
+	paths, err := currentLocalDaemonPaths()
 	if err != nil {
 		return nil, localapi.Snapshot{}, err
 	}
@@ -1835,7 +1888,7 @@ func setupCommand() *cobra.Command {
 					Architecture: machine.Installation.Artifact.Architecture, RepositoryURL: machine.Installation.Artifact.RepositoryURL,
 					TargetPath: machine.Installation.Artifact.TargetPath,
 				}
-				installErr := hostruntimecmd.InstallReceive(command.Context(), hostruntimecmd.ReceiveInstallConfig{
+				installErr := hostruntimecmd.InstallClient(command.Context(), hostruntimecmd.ClientInstallConfig{
 					StateRoot: stateRoot, WorkspaceRoot: workspaceRoot, ControlURL: machine.Installation.ControlURL,
 					MachineID: machine.ID, ListenAddress: machine.Installation.HelperListenAddress,
 					Artifact: artifact,
@@ -1985,12 +2038,12 @@ func unpairCommand() *cobra.Command {
 			if code != 0 {
 				return errors.New("host authority was revoked, but local service removal failed; retry `pb unpair`")
 			}
-			receiveSetup := setupCommand()
-			receiveSetup.SetIn(command.InOrStdin())
-			receiveSetup.SetOut(command.OutOrStdout())
-			receiveSetup.SetErr(command.ErrOrStderr())
-			receiveSetup.SetArgs([]string{"--mode", "client", "--name", machine.DisplayName, "--state-root", stateRoot})
-			if err := receiveSetup.ExecuteContext(command.Context()); err != nil {
+			clientSetup := setupCommand()
+			clientSetup.SetIn(command.InOrStdin())
+			clientSetup.SetOut(command.OutOrStdout())
+			clientSetup.SetErr(command.ErrOrStderr())
+			clientSetup.SetArgs([]string{"--mode", "client", "--name", machine.DisplayName, "--state-root", stateRoot})
+			if err := clientSetup.ExecuteContext(command.Context()); err != nil {
 				return fmt.Errorf("host authority was revoked, but client service setup failed: %w", err)
 			}
 			fmt.Fprintf(command.OutOrStdout(), "Unpaired %s (%s)\n", machine.DisplayName, machine.ID)
@@ -2030,36 +2083,72 @@ func uninstallCommand() *cobra.Command {
 			if strings.TrimSpace(second) != hostname {
 				return errors.New("hostname confirmation did not match")
 			}
-			if err := cleanupDurablePreviewServices(command); err != nil {
-				return fmt.Errorf("stop durable previews before uninstalling: %w", err)
-			}
-			executable, err := os.Executable()
-			if err != nil {
-				return err
-			}
-			serviceCtx, cancelService := context.WithTimeout(context.WithoutCancel(command.Context()), 30*time.Second)
-			serviceErr := localdaemon.RemoveCurrentUserService(serviceCtx, executable)
-			cancelService()
-			if serviceErr != nil {
-				return fmt.Errorf("stop local daemon before uninstalling: %w", serviceErr)
-			}
+			preservedInboxes, inboxErr := uninstallInboxPaths(command)
+			executable, executableErr := os.Executable()
 			home, homeErr := os.UserHomeDir()
-			if homeErr != nil {
-				return homeErr
+			productHandoffReady := !platformProductHandoffRequired()
+			daemonStopConfirmed := false
+			cleanupErr := performUninstallCleanup([]uninstallCleanupStep{
+				{name: "resolve Paperboat Inbox preservation", run: func() error { return inboxErr }},
+				{name: "stop durable previews", run: func() error { return cleanupUninstallDurablePreviewServices(command) }},
+				{name: "stop local daemon", run: func() error {
+					if executableErr != nil {
+						return executableErr
+					}
+					serviceCtx, cancelService := context.WithTimeout(context.WithoutCancel(command.Context()), 30*time.Second)
+					defer cancelService()
+					err := localdaemon.RemoveCurrentUserService(serviceCtx, executable)
+					if err == nil {
+						daemonStopConfirmed = true
+					}
+					return err
+				}},
+				{name: "remove managed OpenSSH configuration", run: func() error {
+					if homeErr != nil {
+						return homeErr
+					}
+					_, err := managedssh.UninstallOpenSSHConfig(home, uint32(os.Geteuid()))
+					return err
+				}},
+				{name: "remove managed SSH public identity", run: func() error {
+					if homeErr != nil {
+						return homeErr
+					}
+					return managedssh.UninstallManagedIdentityPublicKey(home, uint32(os.Geteuid()))
+				}},
+				{name: "remove system Paperboat runtime", run: func() error {
+					return purgePlatformRuntime(command)
+				}},
+				{name: "remove installed Paperboat product", run: func() error {
+					if platformRequiresConfirmedDaemonStop() && !daemonStopConfirmed {
+						return errors.New("local daemon ownership or termination was not confirmed; product removal was skipped")
+					}
+					if inboxErr != nil {
+						return errors.New("Paperboat Inbox location could not be proven; product removal was skipped")
+					}
+					productCtx, cancelProduct := context.WithTimeout(context.WithoutCancel(command.Context()), 5*time.Minute)
+					defer cancelProduct()
+					err := removePlatformProductInstallation(productCtx, preservedInboxes, command.OutOrStdout())
+					if err == nil {
+						productHandoffReady = true
+					}
+					return err
+				}},
+				{name: "remove user Paperboat state", run: func() error {
+					if inboxErr != nil {
+						return errors.New("Paperboat Inbox location could not be proven; state removal was skipped")
+					}
+					if !productHandoffReady {
+						return errors.New("Windows cleanup helper did not start; state removal was skipped so uninstall can be retried safely")
+					}
+					return purgeUserPaperboatState(command, preservedInboxes)
+				}},
+			})
+			if cleanupErr != nil {
+				fmt.Fprintln(command.OutOrStdout(), "Paperboat attempted every local removal step. The Paperboat Inbox was preserved.")
+				return uninstallCleanupError{err: cleanupErr}
 			}
-			if _, configErr := managedssh.UninstallOpenSSHConfig(home, uint32(os.Geteuid())); configErr != nil {
-				return fmt.Errorf("remove managed OpenSSH configuration: %w", configErr)
-			}
-			if identityErr := managedssh.UninstallManagedIdentityPublicKey(home, uint32(os.Geteuid())); identityErr != nil {
-				return fmt.Errorf("remove managed SSH public identity: %w", identityErr)
-			}
-			if code := hostruntimecmd.Execute(command.Context(), []string{"purge"}, command.InOrStdin(), command.OutOrStdout(), command.ErrOrStderr()); code != 0 {
-				return errors.New("system Paperboat removal failed")
-			}
-			if err := purgeUserPaperboatState(command); err != nil {
-				return fmt.Errorf("remove user Paperboat state: %w", err)
-			}
-			fmt.Fprintln(command.OutOrStdout(), "Paperboat was completely removed. The Paperboat Inbox was preserved.")
+			fmt.Fprintln(command.OutOrStdout(), platformUninstallSuccessMessage())
 			return nil
 		},
 		SilenceUsage: true, SilenceErrors: true,
@@ -2068,10 +2157,43 @@ func uninstallCommand() *cobra.Command {
 	return command
 }
 
+type uninstallCleanupStep struct {
+	name string
+	run  func() error
+}
+
+// performUninstallCleanup deliberately runs every step. Complete uninstall is
+// a local recovery boundary: a stopped service, unavailable broker, or failed
+// network-shaped cleanup must never strand later-owned files or MSI state.
+func performUninstallCleanup(steps []uninstallCleanupStep) error {
+	var result error
+	for _, step := range steps {
+		if step.run == nil {
+			result = errors.Join(result, uninstallStepFailure{name: step.name, err: errors.New("cleanup is unavailable")})
+			continue
+		}
+		if err := step.run(); err != nil {
+			result = errors.Join(result, uninstallStepFailure{name: step.name, err: err})
+		}
+	}
+	return result
+}
+
 func cleanupDurablePreviewServices(command *cobra.Command) error {
 	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" && runtime.GOOS != "windows" {
 		return nil
 	}
+	rootList, err := durablePreviewStateRoots(command)
+	if err != nil {
+		return err
+	}
+	if runtime.GOOS == "windows" {
+		return cleanupDurablePreviewServicesWindows(command.Context(), rootList)
+	}
+	return cleanupDurablePreviewStateRoots(command, rootList)
+}
+
+func durablePreviewStateRoots(command *cobra.Command) ([]string, error) {
 	roots := make(map[string]struct{})
 	if root := strings.TrimSpace(os.Getenv("PAPERBOAT_RUNTIME_STATE_ROOT")); root != "" {
 		roots[filepath.Clean(root)] = struct{}{}
@@ -2082,7 +2204,7 @@ func cleanupDurablePreviewServices(command *cobra.Command) error {
 	if root, _ := command.Flags().GetString("state-root"); strings.TrimSpace(root) != "" {
 		root, err := filepath.Abs(root)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		roots[filepath.Clean(root)] = struct{}{}
 	}
@@ -2091,9 +2213,10 @@ func cleanupDurablePreviewServices(command *cobra.Command) error {
 		rootList = append(rootList, root)
 	}
 	sort.Strings(rootList)
-	if runtime.GOOS == "windows" {
-		return cleanupDurablePreviewServicesWindows(command.Context(), rootList)
-	}
+	return rootList, nil
+}
+
+func cleanupDurablePreviewStateRoots(command *cobra.Command, rootList []string) error {
 	var result error
 	for _, root := range rootList {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(command.Context()), 30*time.Second)
@@ -2104,7 +2227,7 @@ func cleanupDurablePreviewServices(command *cobra.Command) error {
 	return result
 }
 
-func purgeUserPaperboatState(command *cobra.Command) error {
+func purgeUserPaperboatState(command *cobra.Command, preserved []string) error {
 	var paths []string
 	configPath, _ := command.Flags().GetString("config")
 	if configPath != "" {
@@ -2141,13 +2264,120 @@ func purgeUserPaperboatState(command *cobra.Command) error {
 	}
 	var result error
 	for _, path := range paths {
-		if !filepath.IsAbs(path) || path == string(os.PathSeparator) {
+		if !filepath.IsAbs(path) || filesystemRoot(path) {
 			result = errors.Join(result, errors.New("refusing unsafe Paperboat removal path"))
 			continue
 		}
-		result = errors.Join(result, os.RemoveAll(path))
+		result = errors.Join(result, removePathPreserving(path, preserved))
 	}
 	return result
+}
+
+func uninstallInboxPaths(command *cobra.Command) ([]string, error) {
+	roots := make(map[string]struct{})
+	if root, err := helperconfig.DefaultStateRoot(os.Getenv); err == nil {
+		roots[filepath.Clean(root)] = struct{}{}
+	}
+	if root, err := command.Flags().GetString("state-root"); err == nil && strings.TrimSpace(root) != "" {
+		absolute, absoluteErr := filepath.Abs(root)
+		if absoluteErr != nil {
+			return nil, absoluteErr
+		}
+		roots[filepath.Clean(absolute)] = struct{}{}
+	}
+	paths := make(map[string]struct{})
+	if path, err := inbox.DefaultPath(); err == nil {
+		paths[filepath.Clean(path)] = struct{}{}
+	}
+	for root := range roots {
+		registrationPath := filepath.Join(root, "machine-registration.json")
+		info, err := os.Lstat(registrationPath)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() > 8192 {
+			return nil, errors.New("Paperboat machine registration is unsafe; Inbox preservation cannot be proven")
+		}
+		encoded, err := os.ReadFile(registrationPath)
+		if err != nil {
+			return nil, err
+		}
+		var registration struct {
+			InboxPath string `json:"inbox_path"`
+		}
+		if err := json.Unmarshal(encoded, &registration); err != nil || !filepath.IsAbs(registration.InboxPath) || filepath.Clean(registration.InboxPath) != registration.InboxPath || filesystemRoot(registration.InboxPath) {
+			return nil, errors.New("Paperboat machine registration has an invalid Inbox path")
+		}
+		paths[registration.InboxPath] = struct{}{}
+	}
+	result := make([]string, 0, len(paths))
+	for path := range paths {
+		result = append(result, path)
+	}
+	sort.Strings(result)
+	return result, nil
+}
+
+func removePathPreserving(root string, preserved []string) error {
+	root = filepath.Clean(root)
+	if !filepath.IsAbs(root) || filesystemRoot(root) {
+		return errors.New("refusing unsafe Paperboat removal path")
+	}
+	for _, keep := range preserved {
+		keep = filepath.Clean(keep)
+		if pathWithinOrEqual(keep, root) {
+			// The cleanup root is the Inbox or is nested inside it. Preserve the
+			// complete Inbox tree, including user-created content unknown to us.
+			return nil
+		}
+	}
+	containsInbox := false
+	for _, keep := range preserved {
+		if pathWithinOrEqual(root, filepath.Clean(keep)) {
+			containsInbox = true
+			break
+		}
+	}
+	if !containsInbox {
+		return os.RemoveAll(root)
+	}
+	info, err := os.Lstat(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	unsafeTraversal, traversalErr := unsafeCleanupPathTraversal(root, info)
+	if traversalErr != nil {
+		return traversalErr
+	}
+	if unsafeTraversal || !info.IsDir() {
+		return errors.New("refusing to traverse an unsafe Paperboat cleanup path containing the Inbox")
+	}
+	entries, err := os.ReadDir(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var result error
+	for _, entry := range entries {
+		child := filepath.Join(root, entry.Name())
+		result = errors.Join(result, removePathPreserving(child, preserved))
+	}
+	return result
+}
+
+func pathWithinOrEqual(root, candidate string) bool {
+	relative, err := filepath.Rel(root, candidate)
+	return err == nil && (relative == "." || relative != ".." && !strings.HasPrefix(relative, ".."+string(os.PathSeparator)))
+}
+
+func filesystemRoot(path string) bool {
+	path = filepath.Clean(path)
+	return path == filepath.VolumeName(path)+string(os.PathSeparator)
 }
 
 type relayListResult struct {
@@ -2385,6 +2615,7 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(privilegedHostServiceCommand())
 	root.AddCommand(privilegedServiceOperationCommand())
 	root.AddCommand(msiCleanupCommand())
+	root.AddCommand(platformUninstallHelperCommand())
 	root.AddCommand(configRuntimeCommand())
 	configureShellCompletion(root)
 	return root
@@ -2652,7 +2883,7 @@ func localCompletion(command *cobra.Command, kind, environment, prefix string) (
 func localCompletionKinds(command *cobra.Command, kinds map[string]bool, environment, prefix string) ([]string, cobra.ShellCompDirective) {
 	ctx, cancel := context.WithTimeout(shellCompletionContext(command), shellCompletionDeadline)
 	defer cancel()
-	paths, err := localdaemon.CurrentUserPaths()
+	paths, err := currentLocalDaemonPaths()
 	if err != nil {
 		return nil, cobra.ShellCompDirectiveNoFileComp
 	}
@@ -5723,7 +5954,7 @@ func buildDeps(c *command.Context) (*deps, error) {
 		if peerErr != nil {
 			return nil, peerErr
 		}
-		paths, pathsErr := localdaemon.CurrentUserPaths()
+		paths, pathsErr := currentLocalDaemonPaths()
 		if pathsErr != nil {
 			return nil, pathsErr
 		}
@@ -7603,7 +7834,7 @@ func resolveUserMachine(ctx context.Context, client *api.Client, requested strin
 // for selection. Operation descriptors remain fetched from the control plane;
 // this only removes a redundant catalog round trip on an already-warm client.
 var loadWarmMachineSnapshot = func(ctx context.Context) (localapi.Snapshot, error) {
-	paths, err := localdaemon.CurrentUserPaths()
+	paths, err := currentLocalDaemonPaths()
 	if err != nil {
 		return localapi.Snapshot{}, err
 	}
@@ -8013,7 +8244,7 @@ func actionSSHDoctor(command *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	paths, err := localdaemon.CurrentUserPaths()
+	paths, err := currentLocalDaemonPaths()
 	if err != nil {
 		return err
 	}

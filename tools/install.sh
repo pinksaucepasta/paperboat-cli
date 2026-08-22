@@ -3,6 +3,7 @@ set -eu
 
 repository=${PAPERBOAT_GITHUB_REPOSITORY:-pinksaucepasta/paperboat-cli}
 version=${PAPERBOAT_VERSION:-latest}
+release_metadata_url=${PAPERBOAT_RELEASE_METADATA_URL:-https://api.pprbt.dev/current.json}
 install_dir=${PAPERBOAT_INSTALL_DIR:-"${HOME}/.local/bin"}
 setup_mode=
 pair_mode=host
@@ -15,15 +16,35 @@ recovery_output=
 if [ -n "${PAPERBOAT_ENROLLMENT_TOKEN:-}" ]; then enrollment_token=$PAPERBOAT_ENROLLMENT_TOKEN; pair=true; fi
 if [ -n "${PAPERBOAT_MACHINE_NAME:-}" ]; then machine_name=$PAPERBOAT_MACHINE_NAME; fi
 
+release_checksum() {
+  checksum_file=$1
+  asset_name=$2
+  awk -v asset="$asset_name" '
+    function valid_sha256(value) {
+      return length(value) == 64 && value ~ /^[0-9A-Fa-f]+$/
+    }
+    {
+      digest = $1
+      path = $2
+      if (!valid_sha256(digest)) next
+      sub(/^\*/, "", path)
+      if (path == asset || path == "./" asset) {
+        print tolower(digest)
+        exit
+      }
+    }
+  ' "$checksum_file"
+}
+
 usage() {
   cat <<'EOF'
-Install Paperboat from GitHub Releases.
+Install the current Paperboat release.
 
 Usage:
   install.sh [options]
 
 Options:
-  --version VERSION          Install a specific release (default: latest)
+  --version VERSION          Install a specific release (default: current)
   --install-dir DIRECTORY    Install pb here (default: ~/.local/bin)
   --setup MODE               Run setup after install: client or host
   --pair                     Pair this machine as a host after install
@@ -118,9 +139,13 @@ fi
 
 asset="pb-${os}-${arch}"
 if [ "$version" = latest ]; then
-  latest_url="https://github.com/${repository}/releases/latest"
-  tag_url=$(curl -fLsS --proto '=https' --tlsv1.2 -o /dev/null -w '%{url_effective}' "$latest_url")
-  version=${tag_url##*/}
+  case "$release_metadata_url" in
+    https://*) ;;
+    *) echo "pb installer: release metadata URL must use HTTPS" >&2; exit 1 ;;
+  esac
+  current=$(curl -fLsS --proto '=https' --tlsv1.2 "$release_metadata_url")
+  version=$(printf '%s' "$current" | tr -d '\r\n\t ' | sed -n 's|^{"schema":"paperboat.release-current/v1","version":"\([0-9A-Za-z._-]*\)"}$|\1|p')
+  [ -n "$version" ] || { echo "pb installer: release metadata is invalid" >&2; exit 1; }
 fi
 case "$version" in
   ""|*/*|*[!0-9A-Za-z._-]*) echo "pb installer: invalid release version" >&2; exit 1 ;;
@@ -132,7 +157,7 @@ trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
 echo "Downloading Paperboat for ${os}/${arch}..." >&2
 curl -fL --proto '=https' --tlsv1.2 "$release_base/$asset" -o "$tmp_dir/$asset"
 curl -fL --proto '=https' --tlsv1.2 "$release_base/SHA256SUMS" -o "$tmp_dir/SHA256SUMS"
-expected=$(awk -v file="$asset" '$2 == file || $2 == "*" file { print $1; exit }' "$tmp_dir/SHA256SUMS")
+expected=$(release_checksum "$tmp_dir/SHA256SUMS" "$asset")
 [ -n "$expected" ] || { echo "pb installer: checksum for $asset is missing" >&2; exit 1; }
 if command -v shasum >/dev/null 2>&1; then
   actual=$(shasum -a 256 "$tmp_dir/$asset" | awk '{print $1}')

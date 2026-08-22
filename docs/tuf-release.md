@@ -40,16 +40,31 @@ platform and architecture:
   TUF target digest, length, ELF header, architecture, protected staging directory, and owner
   checks remain mandatory.
 
-The GitHub release workflow builds and qualifies artifacts, publishes immutable GitHub assets
-without marking the release latest, signs
-TUF with release-role keys from the `paperboat-tuf-published` environment, atomically publishes
-the canonical Unix `install` and Windows `windows` bootstrap scripts together with `metadata/`,
-`targets/`, and `current.json`, verifies the public origin, and only then marks the GitHub release
-latest. Root keys are never available to CI.
+The GitHub release workflow is globally serialized across versions. It builds and qualifies
+artifacts, creates a non-latest GitHub release without replacing existing assets, downloads that
+release again, and checks every downloaded byte against the immutable candidate manifest. It then
+signs TUF with release-role keys from the `paperboat-tuf-published` environment and assembles an
+isolated origin containing the canonical Unix `install` and Windows `windows` bootstrap scripts,
+`metadata/`, `targets/`, and `current.json`.
+
+Before any origin change, the real client consumers verify every component for Linux amd64 and
+arm64, macOS arm64, and Windows amd64 and arm64 from the isolated origin. This gate also binds the
+installers, direct bootstrap aliases, component targets, and Windows native evidence to the exact
+downloaded GitHub assets. Only then does the workflow execute one final server-side
+`renameat2(RENAME_EXCHANGE)` of the complete origin directory. After that exchange, it retries
+marking the already-published GitHub release latest as a non-blocking convenience-pointer update.
+If GitHub's API remains unavailable, the release is still valid and live through `current.json` and
+TUF; retry `gh release edit <version> --draft=false --latest --target <commit>` later. The server
+must mount `/opt/paperboat/releases` read-only at `/srv/paperboat-releases` and resolve `current`
+per request; a legacy bind mount of `/opt/paperboat/releases/current` blocks activation. There is
+no post-activation rollback or cleanup because clients may already have observed the newer TUF
+timestamp. The workflow never advances `current.json` or TUF until the non-latest GitHub release
+exists and every downloaded release asset has been byte-verified.
+Root keys are never available to CI.
 `PAPERBOAT_INSTALL_URL` is the exact user-facing HTTPS install endpoint, currently
 `https://get.pprbt.dev/install`. The protected authority gate validates it before allocating
-platform builders, and post-publication verification fetches both its Unix and PowerShell
-responses and compares them byte-for-byte with the qualified installer sources.
+platform builders. The isolated pre-activation verifier compares both installer sources
+byte-for-byte with the immutable GitHub release assets.
 
 Windows publication is fail-closed for both architectures. `paperboat-tuf publish` requires
 absolute `-windows-amd64-native-evidence` and `-windows-arm64-native-evidence` JSON files. The signer rejects a missing file, a non-passing
@@ -125,7 +140,8 @@ paperboat-tuf status \
 
 Use `-supervisor-maintenance` only when hostd, updater, or launcher must be activated. Those
 components are staged automatically but use the separate maintenance approval flow while
-protected workloads exist. Ordinary releases replace only CLI and runtime.
+protected workloads exist. Every release replaces all five components together: `cli`, `runtime`,
+`hostd`, `updater`, and `launcher`. They use the same signed release index and TUF target bindings.
 
 Publish only `metadata/` and `targets/` to the configured HTTPS origin. Promote the signed
 cohort only after the public repository and canary continuity tests pass. Timestamp expires

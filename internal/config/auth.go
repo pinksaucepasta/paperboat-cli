@@ -426,7 +426,8 @@ func (s ProfileStore) Replace(p Profile, cred Credential) (resultErr error) {
 
 // Switch compares, retains, and replaces the active session under one issuer
 // lock so overlapping account switches cannot associate credentials with a
-// stale client session ID.
+// stale client session ID. Replaying the current session replaces its
+// credentials without queuing that same active session for revocation.
 func (s ProfileStore) Switch(expectedSessionID string, p Profile, cred Credential) (resultErr error) {
 	issuer, err := NormalizeIssuer(p.Issuer)
 	if err != nil {
@@ -457,16 +458,21 @@ func (s ProfileStore) Switch(expectedSessionID string, p Profile, cred Credentia
 	if err != nil {
 		return err
 	}
-	if err := s.QueueRevocation(issuer, previous.CLIClientSessionID, previousCred.RefreshToken, previous.Account.ID); err != nil {
-		return err
+	queuePrevious := previous.CLIClientSessionID != p.CLIClientSessionID
+	if queuePrevious {
+		if err := s.QueueRevocation(issuer, previous.CLIClientSessionID, previousCred.RefreshToken, previous.Account.ID); err != nil {
+			return err
+		}
 	}
 	rollback := func(cause error) error {
 		var rollbackErrs []error
 		rollbackErrs = append(rollbackErrs,
 			s.Secrets.Set(previous.RefreshSecretRef, previousCred.RefreshToken),
 			s.Secrets.Set(previous.AccessSecretRef, previousCred.AccessToken),
-			s.DiscardRevocation(issuer, previous.CLIClientSessionID),
 		)
+		if queuePrevious {
+			rollbackErrs = append(rollbackErrs, s.DiscardRevocation(issuer, previous.CLIClientSessionID))
+		}
 		return errors.Join(cause, errors.Join(rollbackErrs...))
 	}
 	if err := s.Secrets.Set(p.RefreshSecretRef, cred.RefreshToken); err != nil {

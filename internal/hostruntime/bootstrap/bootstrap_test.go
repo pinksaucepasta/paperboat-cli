@@ -197,6 +197,40 @@ func TestWaitForMaterialExpiresAfterTransientErrors(t *testing.T) {
 	}
 }
 
+func TestRecoverMaterialIgnoresLocalPairingExpiry(t *testing.T) {
+	workspace, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	materialExpiry := time.Now().UTC().Add(time.Hour)
+	calls := 0
+	var server *httptest.Server
+	server = httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		calls++
+		var body struct {
+			Verifier          string `json:"verifier"`
+			PublicIdentityKey string `json:"public_identity_key"`
+			RuntimeEnrolled   bool   `json:"runtime_enrolled"`
+		}
+		if json.NewDecoder(request.Body).Decode(&body) != nil || body.Verifier != "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOP" || body.PublicIdentityKey != testPublicIdentityKey || !body.RuntimeEnrolled {
+			t.Fatalf("recovery body=%v", body)
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		manifest := descriptor(server.URL, "0.0.0-development")
+		_ = json.NewEncoder(writer).Encode(map[string]any{"data": Material{
+			Schema: "paperboat.byod-installation/v1", UserMachineID: "um_1", UserMachineEnrollmentID: "ume_1", EnvironmentID: "env_1", ControlURL: server.URL,
+			HelperID: "helper_1", EnrollmentID: "enroll_1", EnrollmentCredential: "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOP", ExpiresAt: materialExpiry,
+			Artifact: &manifest, HelperListenAddress: "127.0.0.1:38080", InstallationGeneration: 1, SetupRoles: []string{"host"}, SetupMode: "host",
+		}})
+	}))
+	defer server.Close()
+	config := Config{ServerURL: server.URL, EnrollmentToken: "", DisplayName: "Studio", WorkspaceRoot: workspace, Verifier: "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOP", PublicIdentityKey: testPublicIdentityKey, HTTP: server.Client()}
+	material, err := RecoverMaterial(context.Background(), config, true)
+	if err != nil || calls != 1 || !material.ExpiresAt.Equal(materialExpiry) {
+		t.Fatalf("material=%+v requests=%d err=%v", material, calls, err)
+	}
+}
+
 func TestValidateWorkspaceRejectsSymlink(t *testing.T) {
 	root, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
@@ -214,10 +248,11 @@ func TestValidateWorkspaceRejectsSymlink(t *testing.T) {
 func TestValidateMaterialAcceptsClientCLISetup(t *testing.T) {
 	material := Material{
 		Schema: "paperboat.byod-installation/v1", UserMachineID: "um_1", UserMachineEnrollmentID: "ume_1",
-		EnvironmentID: "env_1", HelperID: "helper_1", EnrollmentID: "enroll_1",
+		EnvironmentID: "env_1", ControlURL: "https://example.test", HelperID: "helper_1", EnrollmentID: "enroll_1",
 		EnrollmentCredential: "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOP", ExpiresAt: time.Now().UTC().Add(time.Minute),
 		Artifact:            &ArtifactTarget{Schema: ArtifactTargetSchemaV1, Kind: ArtifactKindPB, Version: "1.0.0", Platform: runtime.GOOS, Architecture: runtime.GOARCH, RepositoryURL: "https://example.test/tuf", TargetPath: "pb-" + runtime.GOOS + "-" + runtime.GOARCH},
 		HelperListenAddress: "127.0.0.1:38080", InstallationGeneration: 1, SetupMode: "client", SetupRoles: []string{"interactive"},
+		ClientSession: &ClientSession{Schema: "paperboat.cli-session/v1", SessionID: "cls_1", AccessToken: "access-012345678901234567890123456789", RefreshToken: "refresh-012345678901234567890123456789", TokenType: "Bearer", ExpiresIn: 3600},
 	}
 	if err := validateMaterial(material); err != nil {
 		t.Fatalf("client material rejected: %v", err)

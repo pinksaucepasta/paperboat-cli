@@ -49,6 +49,9 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 		"Assert-OwnedPreviewCleanupFixturePresent",
 		"PaperboatSshd",
 		"ReleaseVersion",
+		"cli-current",
+		"--version",
+		"Stable CLI target is missing",
 		"repair",
 		"upgrade",
 		"uninstall",
@@ -63,7 +66,12 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 	}
 	for _, requiredText := range []string{
 		"CleanupPaperboatDynamicServices",
-		"FileRef=\"CliBinary\"",
+		"FileRef=\"RuntimeBinary\"",
+		"Source=\"$(var.StagingDir)\\pb-launcher.exe\" Name=\"pb.exe\"",
+		"CLIReleaseComponents",
+		"Directory Id=\"CLICURRENTSLOT\" Name=\"cli-current\"",
+		"Source=\"$(var.StagingDir)\\pb.exe\" Name=\"pb.exe\"",
+		"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)",
 		"__msi-cleanup --full-uninstall",
 		"Execute=\"deferred\"",
 		"Impersonate=\"no\"",

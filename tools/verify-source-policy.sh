@@ -4,6 +4,12 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 cd "$root"
 
+metadata_files=$(find . -path './.git' -prune -o -type f \( -name '._*' -o -name '.DS_Store' \) -print)
+if [ -n "$metadata_files" ]; then
+	printf 'source-metadata: macOS metadata files are not allowed:\n%s\n' "$metadata_files" >&2
+	exit 1
+fi
+
 check() {
 	rule=$1
 	pattern=$2

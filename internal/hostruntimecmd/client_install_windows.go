@@ -17,16 +17,16 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/windows/elevation"
 )
 
-type ReceiveInstallConfig struct {
+type ClientInstallConfig struct {
 	StateRoot, WorkspaceRoot, ControlURL, MachineID, ListenAddress string
 	Artifact                                                       bootstrap.ArtifactTarget
 }
 
-// InstallReceive shares the same verified artifact, slots, service contract,
-// and rollback behavior as bootstrap. No receive-only Windows service exists.
-func InstallReceive(ctx context.Context, config ReceiveInstallConfig, _ io.Reader, stdout, _ io.Writer) error {
+// InstallClient shares the same verified artifact, slots, service contract,
+// and rollback behavior as bootstrap. No Client-only Windows service exists.
+func InstallClient(ctx context.Context, config ClientInstallConfig, _ io.Reader, stdout, _ io.Writer) error {
 	if !filepath.IsAbs(config.StateRoot) || !filepath.IsAbs(config.WorkspaceRoot) || config.MachineID == "" {
-		return errors.New("invalid Windows receive installation")
+		return errors.New("invalid Windows Client installation")
 	}
 	artifactPath, err := bootstrap.FetchVerifiedArtifact(ctx, config.Artifact, filepath.Join(config.StateRoot, "tuf"), windowsArtifactHTTPClient())
 	if err != nil {
@@ -52,6 +52,6 @@ func InstallReceive(ctx context.Context, config ReceiveInstallConfig, _ io.Reade
 	if err := elevation.RunRuntimeService(ctx, executable, elevation.ActionInstallCommit, request); err != nil {
 		return err
 	}
-	fmt.Fprintln(stdout, "Paperboat Windows receive service is ready.")
+	fmt.Fprintln(stdout, "Paperboat Windows Client service is ready.")
 	return nil
 }

@@ -71,7 +71,7 @@ func (m *CoordinatorPreviewManager) Shutdown(ctx context.Context) error {
 
 func (m *CoordinatorPreviewManager) Launch(ctx context.Context, input server.PreviewLaunchRequest) (preview.ControlRecord, error) {
 	if !filepath.IsAbs(m.Executable) || !filepath.IsAbs(m.StateRoot) {
-		return preview.ControlRecord{}, launchFailure("preview_runner_launch_failure", "Preview runtime configuration is invalid.", false, false, "none", "Run `pb doctor` and repair the receive service.")
+		return preview.ControlRecord{}, launchFailure("preview_runner_launch_failure", "Preview runtime configuration is invalid.", false, false, "none", "Run `pb doctor` and repair the client service.")
 	}
 	probeCtx, cancelProbe := context.WithTimeout(ctx, 2*time.Second)
 	connection, probeErr := (&net.Dialer{}).DialContext(probeCtx, "tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(input.Port))))

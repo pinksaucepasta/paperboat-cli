@@ -236,8 +236,8 @@ func NewProductionHost(ctx context.Context, version string, environ func(string)
 		store, openErr := runtimeidentity.Open(runtimeidentity.Config{StateRoot: runtimeConfig.StateRoot})
 		if openErr == nil {
 			registration, registrationErr := store.Registration()
-			if registrationErr == nil && shouldRunReceiveCoordinator(registration.SetupMode, environ("PAPERBOAT_SETUP_MODE")) {
-				return newProductionReceiveCoordinator(ctx, version, environ, runtimeConfig, bootState, recoveryExitSignal, metrics, registration)
+			if registrationErr == nil && shouldRunClientCoordinator(registration.SetupMode, environ("PAPERBOAT_SETUP_MODE")) {
+				return newProductionClientCoordinator(ctx, version, environ, runtimeConfig, bootState, recoveryExitSignal, metrics, registration)
 			}
 		}
 	}
@@ -757,11 +757,11 @@ func existingSSHHostPublicKeyPathsUnix() []string {
 	return result
 }
 
-func shouldRunReceiveCoordinator(registrationMode, installedMode string) bool {
-	return registrationMode == "receive" && installedMode != "host"
+func shouldRunClientCoordinator(registrationMode, installedMode string) bool {
+	return registrationMode == "client" && installedMode != "host"
 }
 
-func newProductionReceiveCoordinator(ctx context.Context, version string, environ func(string) string, runtimeConfig runtimeconfig.Config, bootState workerBootState, recoveryExitSignal string, metrics *observability.Registry, registration runtimeidentity.Registration) (*Host, error) {
+func newProductionClientCoordinator(ctx context.Context, version string, environ func(string) string, runtimeConfig runtimeconfig.Config, bootState workerBootState, recoveryExitSignal string, metrics *observability.Registry, registration runtimeidentity.Registration) (*Host, error) {
 	controlURL, err := validatedControlURL(environ("PAPERBOAT_CONTROL_URL"))
 	if err != nil || registration.MachineID != environ("PAPERBOAT_MACHINE_ID") || registration.EnvironmentID == "" {
 		return nil, errors.Join(ErrProductionInvalid, err)
@@ -776,7 +776,7 @@ func newProductionReceiveCoordinator(ctx context.Context, version string, enviro
 		if _, err := rand.Read(value); err != nil {
 			return "", err
 		}
-		return "op_receive_" + hex.EncodeToString(value), nil
+		return "op_client_" + hex.EncodeToString(value), nil
 	}
 	control, err := machinecontrol.NewSource(machinecontrol.Config{ControlURL: controlURL.String(), StateRoot: runtimeConfig.StateRoot, Transport: transport, Timeout: 15 * time.Second, RenewBefore: 10 * time.Minute, OperationID: operationID})
 	if err != nil {
@@ -873,7 +873,7 @@ func newProductionReceiveCoordinator(ctx context.Context, version string, enviro
 	if err != nil {
 		return nil, err
 	}
-	return NewReceiveCoordinator(ctx, HostConfig{Runtime: runtimeConfig, ListenAddress: listen, WorkspaceRoot: registration.InboxPath, EnvironmentID: registration.EnvironmentID, MachineID: registration.MachineID, InboxPath: registration.InboxPath, ShutdownTimeout: 30 * time.Second, RecoveryExitSignal: recoveryExitSignal, FileTransferPolicy: transferPolicy}, HostDependencies{Authorizer: authorizer, AuthorizationService: authorizationRefresh, Connector: connectorService, PreviewLauncher: previewManager, PreviewRecovery: previewManager, RuntimeObservationService: serviceGroup{regionalMonitor, observation}, Metrics: metrics, ServeLeases: serveLeases, LocalControlToken: localControlToken})
+	return NewClientCoordinator(ctx, HostConfig{Runtime: runtimeConfig, ListenAddress: listen, WorkspaceRoot: registration.InboxPath, EnvironmentID: registration.EnvironmentID, MachineID: registration.MachineID, InboxPath: registration.InboxPath, ShutdownTimeout: 30 * time.Second, RecoveryExitSignal: recoveryExitSignal, FileTransferPolicy: transferPolicy}, HostDependencies{Authorizer: authorizer, AuthorizationService: authorizationRefresh, Connector: connectorService, PreviewLauncher: previewManager, PreviewRecovery: previewManager, RuntimeObservationService: serviceGroup{regionalMonitor, observation}, Metrics: metrics, ServeLeases: serveLeases, LocalControlToken: localControlToken})
 }
 
 type peerEnrollmentEnsurer interface {

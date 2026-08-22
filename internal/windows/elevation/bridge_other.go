@@ -8,4 +8,6 @@ func RunRuntimeService(context.Context, string, string, any) error { return ErrU
 
 func RunOpenSSH(context.Context, string, string) error { return ErrUnsupported }
 
+func LaunchDetached(context.Context, string, []string) error { return ErrUnsupported }
+
 func IsCurrentProcessElevated() bool { return false }

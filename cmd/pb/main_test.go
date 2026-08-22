@@ -36,7 +36,6 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/httptransport"
 	"github.com/pinksaucepasta/paperboat/internal/inbox"
 	"github.com/pinksaucepasta/paperboat/internal/localapi"
-	"github.com/pinksaucepasta/paperboat/internal/localdaemon"
 	"github.com/pinksaucepasta/paperboat/internal/localwait"
 	"github.com/pinksaucepasta/paperboat/internal/managedssh"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/connectionmanager"
@@ -319,7 +318,7 @@ func TestDoctorIndependentPathChecksRequireAuthenticatedSuccess(t *testing.T) {
 }
 
 func TestShellCompletionIsBoundedSilentAndResourceSpecific(t *testing.T) {
-	rootPath := t.TempDir()
+	rootPath := commandRuntimeTestRoot(t)
 	t.Setenv("HOME", rootPath)
 	t.Setenv("XDG_STATE_HOME", filepath.Join(rootPath, "state"))
 	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(rootPath, "runtime"))
@@ -356,6 +355,95 @@ func TestShellCompletionIsBoundedSilentAndResourceSpecific(t *testing.T) {
 				t.Fatalf("completion exposed forbidden category %q: %q", forbidden, value)
 			}
 		}
+	}
+}
+
+func TestPerformUninstallCleanupRunsEveryStepAndAggregatesFailures(t *testing.T) {
+	var calls []string
+	failure := errors.New("control service unavailable")
+	err := performUninstallCleanup([]uninstallCleanupStep{
+		{name: "previews", run: func() error { calls = append(calls, "previews"); return failure }},
+		{name: "daemon", run: func() error { calls = append(calls, "daemon"); return nil }},
+		{name: "runtime", run: func() error { calls = append(calls, "runtime"); return errors.New("service removal failed") }},
+		{name: "user state", run: func() error { calls = append(calls, "user-state"); return nil }},
+		{name: "product", run: func() error { calls = append(calls, "product"); return nil }},
+	})
+	if got, want := strings.Join(calls, ","), "previews,daemon,runtime,user-state,product"; got != want {
+		t.Fatalf("cleanup calls = %q, want %q", got, want)
+	}
+	if !errors.Is(err, failure) || !strings.Contains(err.Error(), "previews:") || !strings.Contains(err.Error(), "runtime:") {
+		t.Fatalf("cleanup error = %v", err)
+	}
+}
+
+func TestRemovePathPreservingKeepsNestedInboxAndRemovesOtherState(t *testing.T) {
+	root := t.TempDir()
+	inboxPath := filepath.Join(root, "state", "Paperboat Inbox")
+	if err := os.MkdirAll(inboxPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(inboxPath, "keep.txt")
+	if err := os.WriteFile(sentinel, []byte("user content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{filepath.Join(root, "state", "runtime.json"), filepath.Join(root, "cache", "artifact.bin")} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("remove"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := removePathPreserving(root, []string{inboxPath}); err != nil {
+		t.Fatal(err)
+	}
+	if content, err := os.ReadFile(sentinel); err != nil || string(content) != "user content" {
+		t.Fatalf("Inbox sentinel content=%q error=%v", content, err)
+	}
+	for _, path := range []string{filepath.Join(root, "state", "runtime.json"), filepath.Join(root, "cache")} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("non-Inbox state remains at %s: %v", path, err)
+		}
+	}
+}
+
+func TestRemovePathPreservingNeverRemovesCleanupRootInsideInbox(t *testing.T) {
+	inboxPath := t.TempDir()
+	stateRoot := filepath.Join(inboxPath, "custom-state")
+	if err := os.MkdirAll(stateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(stateRoot, "user-named-file.txt")
+	if err := os.WriteFile(sentinel, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := removePathPreserving(stateRoot, []string{inboxPath}); err != nil {
+		t.Fatal(err)
+	}
+	if content, err := os.ReadFile(sentinel); err != nil || string(content) != "keep" {
+		t.Fatalf("Inbox subtree changed: content=%q error=%v", content, err)
+	}
+}
+
+func TestRemovePathPreservingRefusesSymlinkAncestorOfInbox(t *testing.T) {
+	external := t.TempDir()
+	if err := os.Mkdir(filepath.Join(external, "Inbox"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(external, "user-data.txt")
+	if err := os.WriteFile(sentinel, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(t.TempDir(), "paperboat-state")
+	if err := os.Symlink(external, root); err != nil {
+		t.Fatal(err)
+	}
+	err := removePathPreserving(root, []string{filepath.Join(root, "Inbox")})
+	if err == nil || !strings.Contains(err.Error(), "unsafe Paperboat cleanup path") {
+		t.Fatalf("symlink ancestor error = %v", err)
+	}
+	if content, err := os.ReadFile(sentinel); err != nil || string(content) != "keep" {
+		t.Fatalf("external user data content=%q error=%v", content, err)
 	}
 }
 
@@ -412,6 +500,12 @@ func TestUserFacingErrorSanitizesInfrastructureFailures(t *testing.T) {
 			name: "pairing required",
 			err:  identitybootstrap.ErrPairingRequired,
 			want: "needs the account recovery key",
+		},
+		{
+			name:   "uninstall cleanup keeps safe stage",
+			err:    uninstallCleanupError{err: uninstallStepFailure{name: "stop local daemon", err: &net.DNSError{Err: "no such host", Name: "api.secret.example"}}},
+			want:   "Failed: stop local daemon",
+			forbid: []string{"api.secret.example", "no such host", "Paperboat is unreachable"},
 		},
 		{
 			name:   "peer transport details",
@@ -2705,7 +2799,7 @@ func TestDoctorCommandUsesOwnerSocketAndStableJSON(t *testing.T) {
 	defer backend.Close()
 	configPath := filepath.Join(root, "config.json")
 	writeTestProfile(t, root, configPath, backend.URL)
-	paths, err := localdaemon.CurrentUserPaths()
+	paths, err := currentLocalDaemonPaths()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2766,7 +2860,7 @@ func TestWaitCommandUsesLocalWatchAndStableExitResults(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
 	t.Setenv("XDG_RUNTIME_DIR", runtimeRoot)
 	t.Setenv("TMPDIR", runtimeRoot)
-	paths, err := localdaemon.CurrentUserPaths()
+	paths, err := currentLocalDaemonPaths()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2834,7 +2928,7 @@ func TestBugreportCommandUsesDaemonBundleAndStableJSON(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
 	t.Setenv("XDG_RUNTIME_DIR", runtimeRoot)
 	t.Setenv("TMPDIR", runtimeRoot)
-	paths, err := localdaemon.CurrentUserPaths()
+	paths, err := currentLocalDaemonPaths()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2934,7 +3028,7 @@ func TestLocalDaemonSnapshotInstallsOnlyForUnavailableSocket(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv(config.EnvConfigPath, configPath)
-	paths, err := localdaemon.CurrentUserPaths()
+	paths, err := currentLocalDaemonPaths()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3042,7 +3136,7 @@ func TestResolveSSHCommandTargetFastUsesWarmSnapshotAndCache(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	paths, err := localdaemon.CurrentUserPaths()
+	paths, err := currentLocalDaemonPaths()
 	if err != nil {
 		t.Fatal(err)
 	}

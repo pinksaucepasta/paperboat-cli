@@ -107,14 +107,10 @@ func WaitForMaterial(ctx context.Context, config Config, expiresAt time.Time, in
 	if interval <= 0 {
 		interval = 2 * time.Second
 	}
-	body, _ := json.Marshal(map[string]string{"verifier": config.Verifier})
+	body, _ := json.Marshal(map[string]string{"verifier": config.Verifier, "public_identity_key": config.PublicIdentityKey})
 	for time.Now().UTC().Before(expiresAt) {
-		var material Material
-		err := request(ctx, client(config), http.MethodPost, base+"/v1/machines/pairings/installation", body, &material)
+		material, err := requestMaterial(ctx, config, base, body)
 		if err == nil {
-			if validationErr := validateMaterial(material); validationErr != nil {
-				return Material{}, validationErr
-			}
 			return material, nil
 		}
 		if !errors.Is(err, ErrApprovalPending) && !transientBootstrapError(err) {
@@ -131,11 +127,46 @@ func WaitForMaterial(ctx context.Context, config Config, expiresAt time.Time, in
 	return Material{}, ErrPairingExpired
 }
 
+// RecoverMaterial makes one verifier-bound renewal/replay request without
+// applying the original pairing deadline. A protected paired resume journal
+// can outlive that deadline after the server issued material but the client
+// crashed before persisting or installing it.
+func RecoverMaterial(ctx context.Context, config Config, runtimeEnrolled bool) (Material, error) {
+	base, err := validate(config)
+	if err != nil {
+		return Material{}, err
+	}
+	body, _ := json.Marshal(map[string]any{"verifier": config.Verifier, "public_identity_key": config.PublicIdentityKey, "runtime_enrolled": runtimeEnrolled})
+	return requestMaterial(ctx, config, base, body)
+}
+
+func requestMaterial(ctx context.Context, config Config, base string, body []byte) (Material, error) {
+	var material Material
+	if err := request(ctx, client(config), http.MethodPost, base+"/v1/machines/pairings/installation", body, &material); err != nil {
+		return Material{}, err
+	}
+	if err := validateMaterial(material); err != nil {
+		return Material{}, err
+	}
+	if normalizeBootstrapURL(material.ControlURL) != normalizeBootstrapURL(config.ServerURL) {
+		return Material{}, fmt.Errorf("%w: control URL does not match pairing server", ErrInvalid)
+	}
+	return material, nil
+}
+
 func validateMaterial(material Material) error {
+	return validateMaterialFreshness(material, true)
+}
+
+// validateMaterialFreshness validates all server material fields. Resume
+// loading skips only freshness so an expired, securely bound journal can ask
+// the server for renewed material instead of being mistaken for corruption.
+func validateMaterialFreshness(material Material, requireFresh bool) error {
 	validEnrollment := material.ReuseIdentity && material.EnrollmentID == "" && material.EnrollmentCredential == "" || !material.ReuseIdentity && material.EnrollmentID != "" && len(material.EnrollmentCredential) >= 32
 	validSetupMode := material.SetupMode == "host" || material.SetupMode == "client"
 	validSetupRole := (material.SetupMode == "host" && hasRole(material.SetupRoles, "host")) ||
 		(material.SetupMode == "client" && hasRole(material.SetupRoles, "interactive"))
+	validClientSession := material.ClientSession == nil && material.SetupMode == "host" || material.ClientSession != nil && material.SetupMode == "client" && validBootstrapClientSession(*material.ClientSession)
 	checks := []struct {
 		invalid bool
 		reason  string
@@ -145,12 +176,14 @@ func validateMaterial(material Material) error {
 		{material.UserMachineEnrollmentID == "", "enrollment id"},
 		{material.EnvironmentID == "", "environment id"},
 		{material.HelperID == "", "helper id"},
+		{!validBootstrapControlURL(material.ControlURL), "control URL"},
 		{!validEnrollment, "enrollment credential"},
 		{!validLoopbackAddress(material.HelperListenAddress), "helper listen address"},
 		{material.InstallationGeneration < 1, "installation generation"},
 		{!validSetupMode, "setup mode"},
 		{!validSetupRole, "setup role"},
-		{!time.Now().UTC().Before(material.ExpiresAt), "expiration"},
+		{!validClientSession, "client session"},
+		{requireFresh && !time.Now().UTC().Before(material.ExpiresAt), "expiration"},
 		{material.Artifact == nil, "artifact"},
 	}
 	for _, check := range checks {
@@ -162,6 +195,26 @@ func validateMaterial(material Material) error {
 		return fmt.Errorf("%w: artifact target: %v", ErrInvalid, err)
 	}
 	return nil
+}
+
+func validBootstrapControlURL(raw string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	return err == nil && (parsed.Scheme == "https" || parsed.Scheme == "http") && parsed.User == nil && parsed.Hostname() != "" && parsed.RawQuery == "" && parsed.Fragment == ""
+}
+
+func normalizeBootstrapURL(raw string) string {
+	return strings.TrimRight(strings.TrimSpace(raw), "/")
+}
+
+func validBootstrapClientSession(session ClientSession) bool {
+	return session.Schema == "paperboat.cli-session/v1" && boundedBootstrapValue(session.SessionID, 1, 256) &&
+		boundedBootstrapValue(session.AccessToken, 32, 16<<10) && boundedBootstrapValue(session.RefreshToken, 32, 16<<10) &&
+		session.TokenType == "Bearer" && session.ExpiresIn > 0 && session.ExpiresIn <= 7*24*60*60 &&
+		(len(session.Scope) == 0 || boundedBootstrapValue(session.Scope, 1, 4<<10))
+}
+
+func boundedBootstrapValue(value string, minimum, maximum int) bool {
+	return len(value) >= minimum && len(value) <= maximum && !strings.ContainsAny(value, "\x00\r\n")
 }
 
 func hasRole(roles []string, wanted string) bool {

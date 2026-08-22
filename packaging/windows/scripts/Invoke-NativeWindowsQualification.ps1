@@ -208,6 +208,17 @@ function Assert-InstalledPayload {
         $path = Join-Path $script:binaryRoot $file
         Assert-Qualification (Test-Path -LiteralPath $path -PathType Leaf) "Installed payload is missing $path."
     }
+    $cliTarget = Join-Path $script:installRoot 'releases\cli-current\pb.exe'
+    Assert-Qualification (Test-Path -LiteralPath $cliTarget -PathType Leaf) "Stable CLI target is missing $cliTarget."
+    $launcherOutput = @(& (Join-Path $script:binaryRoot 'pb.exe') --version 2>&1)
+    $launcherExitCode = $LASTEXITCODE
+    Assert-Qualification ($launcherExitCode -eq 0) "Installed stable launcher failed --version with exit code ${launcherExitCode}: $($launcherOutput -join ' ')."
+    $launcherVersion = ($launcherOutput -join ' ').Trim()
+    $matchingVersionLines = @($launcherOutput | Where-Object { $_ -match "Version\s+$([regex]::Escape($ExpectedVersion))$" })
+    Assert-Qualification ($matchingVersionLines.Count -eq 1) "Installed stable launcher returned version '$launcherVersion', expected Version $ExpectedVersion exactly once."
+    $stableLauncherHash = (Get-FileHash -LiteralPath (Join-Path $script:binaryRoot 'pb.exe') -Algorithm SHA256).Hash
+    $namedLauncherHash = (Get-FileHash -LiteralPath (Join-Path $script:binaryRoot 'pb-launcher.exe') -Algorithm SHA256).Hash
+    Assert-Qualification ($stableLauncherHash -eq $namedLauncherHash) 'bin\pb.exe is not the stable Paperboat launcher.'
     $machinePathEntries = @(Get-MachinePathEntries)
     $expectedPathEntry = ConvertTo-NormalizedMachinePathEntry $script:binaryRoot
     $paperboatPathEntryCount = @($machinePathEntries | Where-Object { $_ -ieq $expectedPathEntry }).Count
@@ -232,7 +243,7 @@ function Assert-InstalledPayload {
         Assert-Qualification ($service.PathName -match [regex]::Escape((Join-Path $script:binaryRoot $expectedBinary))) "$($service.Name) does not point at its installed binary: $($service.PathName)"
         Assert-Qualification ($service.PathName -match [regex]::Escape($expectedArgument)) "$($service.Name) is missing its fixed runtime argument: $($service.PathName)"
     }
-    Add-QualificationEvent -Name 'msi_payload_assertions' -Status 'passed' -Detail "version=$ExpectedVersion; services=PaperboatHostd,PaperboatUpdated"
+    Add-QualificationEvent -Name 'msi_payload_assertions' -Status 'passed' -Detail "version=$ExpectedVersion; services=PaperboatHostd,PaperboatUpdated; stable_launcher_version=true"
 }
 
 function New-OwnedPreviewCleanupFixture {

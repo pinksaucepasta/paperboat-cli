@@ -12,27 +12,27 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/server"
 )
 
-type receiveServiceStub struct{}
+type clientServiceStub struct{}
 
-func (receiveServiceStub) Start(context.Context) error    { return nil }
-func (receiveServiceStub) Shutdown(context.Context) error { return nil }
-func (receiveServiceStub) Capabilities() []string         { return nil }
+func (clientServiceStub) Start(context.Context) error    { return nil }
+func (clientServiceStub) Shutdown(context.Context) error { return nil }
+func (clientServiceStub) Capabilities() []string         { return nil }
 
-type receivePreviewLauncher struct{}
+type clientPreviewLauncher struct{}
 
-func (receivePreviewLauncher) Launch(context.Context, server.PreviewLaunchRequest) (preview.ControlRecord, error) {
+func (clientPreviewLauncher) Launch(context.Context, server.PreviewLaunchRequest) (preview.ControlRecord, error) {
 	return preview.ControlRecord{}, nil
 }
 
-func TestReceiveCoordinatorExposesOnlyReceiveRoutes(t *testing.T) {
+func TestClientCoordinatorExposesOnlyClientRoutes(t *testing.T) {
 	root := t.TempDir()
-	host, err := NewReceiveCoordinator(context.Background(), HostConfig{
+	host, err := NewClientCoordinator(context.Background(), HostConfig{
 		Runtime:       runtimeconfig.Config{Profile: runtimeconfig.BYOD, StateRoot: root, Version: "test", Limits: runtimeconfig.DefaultLimits, Resources: runtimeconfig.DefaultResources},
 		ListenAddress: "127.0.0.1:0", WorkspaceRoot: root, InboxPath: filepath.Join(root, "Inbox"), MachineID: "machine_test",
 	}, HostDependencies{
 		Authorizer: func(string) (server.Authorizer, error) { return hostAuthorizer{}, nil },
-		Connector:  receiveServiceStub{}, RuntimeObservationService: receiveServiceStub{},
-		PreviewLauncher: receivePreviewLauncher{},
+		Connector:  clientServiceStub{}, RuntimeObservationService: clientServiceStub{},
+		PreviewLauncher: clientPreviewLauncher{},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -56,6 +56,6 @@ func TestReceiveCoordinatorExposesOnlyReceiveRoutes(t *testing.T) {
 		}
 	}
 	if host.sessions != nil {
-		t.Fatal("receive coordinator initialized terminal sessions")
+		t.Fatal("client coordinator initialized terminal sessions")
 	}
 }

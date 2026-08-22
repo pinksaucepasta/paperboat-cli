@@ -61,19 +61,73 @@ type tufReleaseIndexCustom struct {
 	Architecture string `json:"architecture"`
 }
 type tufReleaseComponentCustom struct {
+	Schema              string                                `json:"schema"`
+	Kind                string                                `json:"kind"`
+	Component           string                                `json:"component"`
+	Version             string                                `json:"version"`
+	Platform            string                                `json:"platform"`
+	Architecture        string                                `json:"architecture"`
+	BinaryFormat        string                                `json:"binary_format"`
+	NativeQualification *tufWindowsNativeQualificationBinding `json:"native_qualification,omitempty"`
+}
+
+type tufWindowsNativeQualificationBinding struct {
+	Schema         string `json:"schema"`
+	EvidenceTarget string `json:"evidence_target"`
+	EvidenceSHA256 string `json:"evidence_sha256"`
+	ReleaseVersion string `json:"release_version"`
+	Platform       string `json:"platform"`
+	Architecture   string `json:"architecture"`
+	Status         string `json:"status"`
+	NativeTested   bool   `json:"native_tested"`
+	WindowsBuild   string `json:"windows_build"`
+	Runner         string `json:"runner"`
+	ArtifactSHA256 string `json:"artifact_sha256"`
+	ArtifactLength int64  `json:"artifact_length"`
+}
+
+type tufWindowsNativeQualificationTargetCustom struct {
 	Schema       string `json:"schema"`
 	Kind         string `json:"kind"`
-	Component    string `json:"component"`
-	Version      string `json:"version"`
 	Platform     string `json:"platform"`
 	Architecture string `json:"architecture"`
+	Status       string `json:"status"`
+}
+
+type tufWindowsNativeQualification struct {
+	Schema         string                              `json:"schema"`
+	ReleaseVersion string                              `json:"release_version"`
+	Platform       string                              `json:"platform"`
+	Architecture   string                              `json:"architecture"`
+	Status         string                              `json:"status"`
+	NativeTested   bool                                `json:"native_tested"`
+	WindowsBuild   string                              `json:"windows_build"`
+	Runner         string                              `json:"runner"`
+	Artifacts      []tufWindowsNativeQualifiedArtifact `json:"artifacts"`
+}
+
+type tufWindowsNativeQualifiedArtifact struct {
+	Component    string `json:"component"`
+	TargetPath   string `json:"target_path"`
+	SHA256       string `json:"sha256"`
+	Length       int64  `json:"length"`
+	Platform     string `json:"platform"`
+	Architecture string `json:"architecture"`
+	Status       string `json:"status"`
 }
 
 // FetchVerifiedReleaseIndex fetches the fixed stable selector through TUF.
 // Unsigned discovery data cannot influence the selected target name.
 func FetchVerifiedReleaseIndex(ctx context.Context, repositoryURL, stateDirectory string, httpClient *http.Client, now time.Time) (releaseindex.Index, error) {
+	return fetchVerifiedReleaseIndex(ctx, repositoryURL, stateDirectory, httpClient, now, runtime.GOOS, runtime.GOARCH)
+}
+
+// fetchVerifiedReleaseIndex is the runtime-independent form used by the
+// staged release contract. Production callers must use the exported wrapper,
+// which remains bound to the executing platform.
+func fetchVerifiedReleaseIndex(ctx context.Context, repositoryURL, stateDirectory string, httpClient *http.Client, now time.Time, platform, architecture string) (releaseindex.Index, error) {
 	parsed, err := url.Parse(repositoryURL)
-	if err != nil || parsed.Scheme != "https" || parsed.User != nil || parsed.Hostname() == "" || parsed.RawQuery != "" || parsed.Fragment != "" || !filepath.IsAbs(stateDirectory) || filepath.Clean(stateDirectory) != stateDirectory {
+	if !supportedReleasePlatform(platform, architecture) || err != nil || parsed.Scheme != "https" || parsed.User != nil || parsed.Hostname() == "" || parsed.RawQuery != "" || parsed.Fragment != "" || !filepath.IsAbs(stateDirectory) || filepath.Clean(stateDirectory) != stateDirectory {
 		return releaseindex.Index{}, ErrArtifactTarget
 	}
 	if err := secureDirectory(stateDirectory); err != nil {
@@ -100,7 +154,7 @@ func FetchVerifiedReleaseIndex(ctx context.Context, repositoryURL, stateDirector
 		return releaseindex.Index{}, err
 	}
 	channel := "stable"
-	name := "release-index-" + channel + "-" + runtime.GOOS + "-" + runtime.GOARCH + ".json"
+	name := "release-index-" + channel + "-" + platform + "-" + architecture + ".json"
 	info, err := client.GetTargetInfo(name)
 	if err != nil {
 		return releaseindex.Index{}, err
@@ -112,7 +166,7 @@ func FetchVerifiedReleaseIndex(ctx context.Context, repositoryURL, stateDirector
 	decoder := json.NewDecoder(strings.NewReader(string(*info.Custom)))
 	decoder.DisallowUnknownFields()
 	var extra any
-	if decoder.Decode(&custom) != nil || decoder.Decode(&extra) != io.EOF || custom.Schema != ReleaseIndexTargetSchemaV1 || custom.Kind != "release-index" || custom.Channel != channel || custom.Platform != runtime.GOOS || custom.Architecture != runtime.GOARCH {
+	if decoder.Decode(&custom) != nil || decoder.Decode(&extra) != io.EOF || custom.Schema != ReleaseIndexTargetSchemaV1 || custom.Kind != "release-index" || custom.Channel != channel || custom.Platform != platform || custom.Architecture != architecture {
 		return releaseindex.Index{}, ErrArtifactMismatch
 	}
 	path, _, err := client.DownloadTarget(info, "", "")
@@ -125,7 +179,7 @@ func FetchVerifiedReleaseIndex(ctx context.Context, repositoryURL, stateDirector
 	}
 	defer file.Close()
 	index, err := releaseindex.Decode(file, now)
-	if err != nil || index.Platform != runtime.GOOS || index.Architecture != runtime.GOARCH {
+	if err != nil || index.Platform != platform || index.Architecture != architecture {
 		return releaseindex.Index{}, ErrArtifactMismatch
 	}
 	return index, nil
@@ -137,7 +191,20 @@ func FetchVerifiedReleaseIndex(ctx context.Context, repositoryURL, stateDirector
 // The caller receives only a local verified artifact path; it must still stage
 // the bytes into its own privileged release directory.
 func FetchVerifiedReleaseComponent(ctx context.Context, repositoryURL, stateDirectory string, index releaseindex.Index, component string, httpClient *http.Client, now time.Time) (string, error) {
-	if index.Validate(now) != nil || index.Platform != runtime.GOOS || index.Architecture != runtime.GOARCH || !filepath.IsAbs(stateDirectory) || filepath.Clean(stateDirectory) != stateDirectory {
+	return fetchVerifiedReleaseComponent(ctx, repositoryURL, stateDirectory, index, component, httpClient, now, runtime.GOOS, runtime.GOARCH)
+}
+
+// fetchVerifiedReleaseComponent lets the staged-release contract exercise
+// every supported native target from one isolated signed repository. It is
+// intentionally unexported so running software remains platform-bound.
+func fetchVerifiedReleaseComponent(ctx context.Context, repositoryURL, stateDirectory string, index releaseindex.Index, component string, httpClient *http.Client, now time.Time, platform, architecture string) (string, error) {
+	return fetchVerifiedReleaseComponentWithRoot(ctx, repositoryURL, stateDirectory, index, component, httpClient, now, trustedRoot, platform, architecture)
+}
+
+// fetchVerifiedReleaseComponentWithRoot is split from the production wrapper
+// so tests can exercise malformed signed metadata with an isolated test root.
+func fetchVerifiedReleaseComponentWithRoot(ctx context.Context, repositoryURL, stateDirectory string, index releaseindex.Index, component string, httpClient *http.Client, now time.Time, root []byte, platform, architecture string) (string, error) {
+	if !supportedReleasePlatform(platform, architecture) || index.Validate(now) != nil || index.Platform != platform || index.Architecture != architecture || !filepath.IsAbs(stateDirectory) || filepath.Clean(stateDirectory) != stateDirectory {
 		return "", ErrArtifactTarget
 	}
 	target, ok := index.Component(component)
@@ -151,7 +218,7 @@ func FetchVerifiedReleaseComponent(ctx context.Context, repositoryURL, stateDire
 	if err != nil || parsed.Scheme != "https" || parsed.User != nil || parsed.Hostname() == "" || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return "", ErrArtifactTarget
 	}
-	configuration, err := config.New(strings.TrimRight(repositoryURL, "/")+"/metadata/", trustedRoot)
+	configuration, err := config.New(strings.TrimRight(repositoryURL, "/")+"/metadata/", root)
 	if err != nil {
 		return "", err
 	}
@@ -172,16 +239,21 @@ func FetchVerifiedReleaseComponent(ctx context.Context, repositoryURL, stateDire
 		return "", err
 	}
 	info, err := client.GetTargetInfo(target.TargetPath)
-	digest, hasDigest := info.Hashes["sha256"]
-	if err != nil || !hasDigest || info.Length != target.Length || hex.EncodeToString(digest) != target.SHA256 || info.Custom == nil {
+	if err != nil || info == nil {
 		return "", ErrArtifactMismatch
 	}
-	var custom tufReleaseComponentCustom
-	decoder := json.NewDecoder(strings.NewReader(string(*info.Custom)))
-	decoder.DisallowUnknownFields()
-	var extra any
-	if decoder.Decode(&custom) != nil || decoder.Decode(&extra) != io.EOF || custom.Schema != "paperboat.tuf-component/v1" || custom.Kind != "component" || custom.Component != component || custom.Version != index.Version || custom.Platform != target.Platform || custom.Architecture != target.Architecture {
+	digest, hasDigest := info.Hashes["sha256"]
+	if !hasDigest || info.Length != target.Length || hex.EncodeToString(digest) != target.SHA256 || info.Custom == nil {
 		return "", ErrArtifactMismatch
+	}
+	custom, ok := decodeReleaseComponentCustom(*info.Custom)
+	if !ok || !validReleaseComponentCustom(custom, index, target, component) {
+		return "", ErrArtifactMismatch
+	}
+	if target.Platform == "windows" {
+		if err := verifyWindowsNativeQualification(client, custom.NativeQualification, index, target); err != nil {
+			return "", err
+		}
 	}
 	path, _, err := client.DownloadTarget(info, "", "")
 	if err != nil {
@@ -190,23 +262,162 @@ func FetchVerifiedReleaseComponent(ctx context.Context, repositoryURL, stateDire
 	return path, nil
 }
 
+// validReleaseComponentCustom requires the signed target descriptor to agree
+// with the signed release-index entry. Keeping this decoder strict prevents a
+// publisher and verifier schema drift from silently weakening that binding.
+func decodeReleaseComponentCustom(raw json.RawMessage) (tufReleaseComponentCustom, bool) {
+	var custom tufReleaseComponentCustom
+	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	decoder.DisallowUnknownFields()
+	var extra any
+	if decoder.Decode(&custom) != nil || decoder.Decode(&extra) != io.EOF {
+		return tufReleaseComponentCustom{}, false
+	}
+	return custom, true
+}
+
+func validReleaseComponentCustom(custom tufReleaseComponentCustom, index releaseindex.Index, target releaseindex.Target, component string) bool {
+	base :=
+		custom.Schema == "paperboat.tuf-component/v1" &&
+			custom.Kind == "component" &&
+			custom.Component == component &&
+			custom.Version == index.Version &&
+			custom.Platform == target.Platform &&
+			custom.Architecture == target.Architecture &&
+			custom.BinaryFormat == target.BinaryFormat
+	if !base {
+		return false
+	}
+	if target.Platform == "windows" {
+		return custom.NativeQualification != nil
+	}
+	return custom.NativeQualification == nil
+}
+
+func verifyWindowsNativeQualification(client *updater.Updater, binding *tufWindowsNativeQualificationBinding, index releaseindex.Index, target releaseindex.Target) error {
+	if !validWindowsNativeQualificationBinding(binding, index, target) {
+		return ErrArtifactMismatch
+	}
+	info, err := client.GetTargetInfo(binding.EvidenceTarget)
+	if err != nil {
+		return ErrArtifactMismatch
+	}
+	digest, hasDigest := info.Hashes["sha256"]
+	if !hasDigest || hex.EncodeToString(digest) != binding.EvidenceSHA256 || info.Length < 1 || info.Length > 1<<20 || info.Custom == nil || !validWindowsNativeQualificationTargetCustom(*info.Custom, target.Architecture) {
+		return ErrArtifactMismatch
+	}
+	path, _, err := client.DownloadTarget(info, "", "")
+	if err != nil {
+		return err
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if !validWindowsNativeQualificationEvidence(body, binding, index) {
+		return ErrArtifactMismatch
+	}
+	return nil
+}
+
+func validWindowsNativeQualificationBinding(binding *tufWindowsNativeQualificationBinding, index releaseindex.Index, target releaseindex.Target) bool {
+	return binding != nil &&
+		index.Platform == "windows" &&
+		index.Architecture == target.Architecture &&
+		binding.Schema == "paperboat.windows-native-qualification/v1" &&
+		binding.EvidenceTarget == "windows-"+target.Architecture+"-native-qualification.json" &&
+		len(binding.EvidenceSHA256) == 64 && lowerHex(binding.EvidenceSHA256) &&
+		binding.ReleaseVersion == index.Version &&
+		binding.Platform == "windows" &&
+		binding.Architecture == target.Architecture &&
+		binding.Status == "passed" &&
+		binding.NativeTested &&
+		safeQualificationValue(binding.WindowsBuild) &&
+		safeQualificationValue(binding.Runner) &&
+		binding.ArtifactSHA256 == target.SHA256 &&
+		binding.ArtifactLength == target.Length
+}
+
+func validWindowsNativeQualificationTargetCustom(raw json.RawMessage, architecture string) bool {
+	var custom tufWindowsNativeQualificationTargetCustom
+	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	decoder.DisallowUnknownFields()
+	var extra any
+	return decoder.Decode(&custom) == nil && decoder.Decode(&extra) == io.EOF &&
+		custom.Schema == "paperboat.windows-native-qualification/v1" &&
+		custom.Kind == "windows-native-qualification" &&
+		custom.Platform == "windows" &&
+		custom.Architecture == architecture &&
+		custom.Status == "passed"
+}
+
+func validWindowsNativeQualificationEvidence(raw []byte, binding *tufWindowsNativeQualificationBinding, index releaseindex.Index) bool {
+	var qualification tufWindowsNativeQualification
+	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	decoder.DisallowUnknownFields()
+	var extra any
+	if decoder.Decode(&qualification) != nil || decoder.Decode(&extra) != io.EOF || binding == nil ||
+		qualification.Schema != "paperboat.windows-native-qualification/v1" ||
+		qualification.ReleaseVersion != index.Version ||
+		qualification.Platform != "windows" ||
+		qualification.Architecture != index.Architecture ||
+		qualification.Status != "passed" || !qualification.NativeTested ||
+		qualification.WindowsBuild != binding.WindowsBuild || qualification.Runner != binding.Runner ||
+		!safeQualificationValue(qualification.WindowsBuild) || !safeQualificationValue(qualification.Runner) ||
+		index.Stability != "stable" || !index.NativeTested || len(index.TestedWindowsBuilds) != 1 ||
+		qualification.WindowsBuild != index.TestedWindowsBuilds[0] || len(qualification.Artifacts) != len(index.Targets) {
+		return false
+	}
+	expected := make(map[string]releaseindex.Target, len(index.Targets))
+	for _, component := range index.Targets {
+		expected[component.Component] = component
+	}
+	for _, artifact := range qualification.Artifacts {
+		component, ok := expected[artifact.Component]
+		if !ok || artifact.TargetPath != component.TargetPath || artifact.SHA256 != component.SHA256 || artifact.Length != component.Length || artifact.Platform != "windows" || artifact.Architecture != index.Architecture || artifact.Status != "passed" {
+			return false
+		}
+		delete(expected, artifact.Component)
+	}
+	return len(expected) == 0
+}
+
+func safeQualificationValue(value string) bool {
+	return len(value) >= 1 && len(value) <= 128 && !strings.ContainsAny(value, "\x00\r\n")
+}
+
+func lowerHex(value string) bool {
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == 32 && value == strings.ToLower(value)
+}
+
+func supportedReleasePlatform(platform, architecture string) bool {
+	return platform == "linux" && (architecture == "amd64" || architecture == "arm64") ||
+		platform == "darwin" && architecture == "arm64" ||
+		platform == "windows" && (architecture == "amd64" || architecture == "arm64")
+}
+
 func VerifyArtifactTarget(target ArtifactTarget) error {
+	return verifyArtifactTarget(target, runtime.GOOS, runtime.GOARCH)
+}
+
+func verifyArtifactTarget(target ArtifactTarget, platform, architecture string) error {
 	parsed, err := url.Parse(target.RepositoryURL)
 	wantPath := "pb-" + target.Platform + "-" + target.Architecture
-	if err != nil || parsed.Scheme != "https" || parsed.User != nil || parsed.Hostname() == "" || parsed.RawQuery != "" || parsed.Fragment != "" ||
-		target.Schema != ArtifactTargetSchemaV1 || target.Kind != ArtifactKindPB || target.Version == "" || target.Platform != runtime.GOOS ||
-		target.Architecture != runtime.GOARCH || target.TargetPath != wantPath || strings.Contains(target.TargetPath, "/") {
+	if !supportedReleasePlatform(platform, architecture) || err != nil || parsed.Scheme != "https" || parsed.User != nil || parsed.Hostname() == "" || parsed.RawQuery != "" || parsed.Fragment != "" ||
+		target.Schema != ArtifactTargetSchemaV1 || target.Kind != ArtifactKindPB || target.Version == "" || target.Platform != platform ||
+		target.Architecture != architecture || target.TargetPath != wantPath || strings.Contains(target.TargetPath, "/") {
 		return ErrArtifactTarget
 	}
 	return nil
 }
 
 func FetchVerifiedArtifact(ctx context.Context, target ArtifactTarget, stateDirectory string, httpClient *http.Client) (string, error) {
-	return fetchVerifiedArtifact(ctx, target, stateDirectory, httpClient, trustedRoot)
+	return fetchVerifiedArtifact(ctx, target, stateDirectory, httpClient, trustedRoot, runtime.GOOS, runtime.GOARCH)
 }
 
-func fetchVerifiedArtifact(ctx context.Context, target ArtifactTarget, stateDirectory string, httpClient *http.Client, root []byte) (string, error) {
-	if err := VerifyArtifactTarget(target); err != nil {
+func fetchVerifiedArtifact(ctx context.Context, target ArtifactTarget, stateDirectory string, httpClient *http.Client, root []byte, platform, architecture string) (string, error) {
+	if err := verifyArtifactTarget(target, platform, architecture); err != nil {
 		return "", err
 	}
 	if !filepath.IsAbs(stateDirectory) || filepath.Clean(stateDirectory) != stateDirectory {

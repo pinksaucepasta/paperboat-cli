@@ -510,28 +510,28 @@ type ProjectPage struct {
 // connector rather than a Paperboat-managed Fly VM. The control plane owns its
 // lifecycle and authorization; the CLI only needs enough metadata to select it.
 type UserMachine struct {
-	ID                     string               `json:"id"`
-	EnvironmentID          string               `json:"environment_id"`
-	DisplayName            string               `json:"display_name"`
-	Alias                  string               `json:"alias"`
-	State                  string               `json:"state"`
-	Online                 bool                 `json:"online"`
-	Platform               string               `json:"platform"`
-	Architecture           string               `json:"architecture"`
-	WorkspaceRoot          string               `json:"workspace_root"`
-	SetupRoles             []string             `json:"setup_roles"`
-	SetupMode              string               `json:"setup_mode"`
-	Capabilities           MachineCapabilities  `json:"capabilities"`
-	PublicIdentityKey      string               `json:"public_identity_key"`
-	InstallationGeneration int64                `json:"installation_generation"`
-	Availability           AvailabilityPolicy   `json:"availability"`
-	RuntimeDiagnostics     RuntimeDiagnostics   `json:"runtime_diagnostics"`
-	Installation           *ReceiveInstallation `json:"installation,omitempty"`
-	SSHAuthority           SSHAuthority         `json:"-"`
-	SSHLocalReady          bool                 `json:"-"`
-	SSHLocalCode           string               `json:"-"`
-	SSHUser                string               `json:"-"`
-	SSHPort                uint16               `json:"-"`
+	ID                     string              `json:"id"`
+	EnvironmentID          string              `json:"environment_id"`
+	DisplayName            string              `json:"display_name"`
+	Alias                  string              `json:"alias"`
+	State                  string              `json:"state"`
+	Online                 bool                `json:"online"`
+	Platform               string              `json:"platform"`
+	Architecture           string              `json:"architecture"`
+	WorkspaceRoot          string              `json:"workspace_root"`
+	SetupRoles             []string            `json:"setup_roles"`
+	SetupMode              string              `json:"setup_mode"`
+	Capabilities           MachineCapabilities `json:"capabilities"`
+	PublicIdentityKey      string              `json:"public_identity_key"`
+	InstallationGeneration int64               `json:"installation_generation"`
+	Availability           AvailabilityPolicy  `json:"availability"`
+	RuntimeDiagnostics     RuntimeDiagnostics  `json:"runtime_diagnostics"`
+	Installation           *ClientInstallation `json:"installation,omitempty"`
+	SSHAuthority           SSHAuthority        `json:"-"`
+	SSHLocalReady          bool                `json:"-"`
+	SSHLocalCode           string              `json:"-"`
+	SSHUser                string              `json:"-"`
+	SSHPort                uint16              `json:"-"`
 }
 
 type SSHAuthority struct {
@@ -589,7 +589,7 @@ type MachineArtifact struct {
 	TargetPath    string `json:"target_path"`
 }
 
-type ReceiveInstallation struct {
+type ClientInstallation struct {
 	ControlURL          string          `json:"control_url"`
 	HelperListenAddress string          `json:"helper_listen_address"`
 	Artifact            MachineArtifact `json:"artifact"`

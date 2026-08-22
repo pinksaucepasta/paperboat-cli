@@ -115,7 +115,7 @@ type Host struct {
 	workloadFingerprint string
 }
 
-func NewReceiveCoordinator(ctx context.Context, config HostConfig, dependencies HostDependencies) (_ *Host, resultErr error) {
+func NewClientCoordinator(ctx context.Context, config HostConfig, dependencies HostDependencies) (_ *Host, resultErr error) {
 	if err := config.Runtime.Validate(); err != nil || !LoopbackAddress(config.ListenAddress) || !filepath.IsAbs(config.WorkspaceRoot) || config.MachineID == "" || dependencies.Authorizer == nil || dependencies.Connector == nil || dependencies.RuntimeObservationService == nil {
 		return nil, errors.Join(ErrHostInvalid, err)
 	}

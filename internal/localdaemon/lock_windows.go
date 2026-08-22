@@ -12,15 +12,17 @@ import (
 	"sync"
 
 	"github.com/pinksaucepasta/paperboat/internal/localapi"
+	"github.com/pinksaucepasta/paperboat/internal/windowssecurity"
 	"golang.org/x/sys/windows"
 )
 
 const processLockSecurity = "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;"
 
 type processLock struct {
-	file   *os.File
-	region windows.Overlapped
-	mu     sync.Mutex
+	file      *os.File
+	region    windows.Overlapped
+	ownerPath string
+	mu        sync.Mutex
 }
 
 func acquireProcessLock(path, ownerSID string) (*processLock, error) {
@@ -67,10 +69,22 @@ func acquireProcessLock(path, ownerSID string) (*processLock, error) {
 	if err == nil {
 		_, err = fmt.Fprintf(file, "%d\r\n", os.Getpid())
 	}
+	if err == nil {
+		err = file.Sync()
+	}
+	ownerPath := path + ".owner.json"
+	if err == nil {
+		var record windowsDaemonOwnerRecord
+		record, err = currentWindowsDaemonOwnerRecord()
+		if err == nil {
+			err = writeWindowsDaemonOwnerRecord(ownerPath, ownerSID, record)
+		}
+	}
 	if err != nil {
 		_ = windows.UnlockFileEx(windows.Handle(file.Fd()), 0, 1, 0, &lock.region)
 		return closeWith(fmt.Errorf("record local daemon PID: %w", err))
 	}
+	lock.ownerPath = ownerPath
 	return lock, nil
 }
 
@@ -150,23 +164,13 @@ func setWindowsLockACL(path, ownerSID string) error {
 }
 
 func verifyWindowsLockACL(path, ownerSID string) error {
-	descriptor, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
-	if err != nil || descriptor == nil {
-		return localapi.ErrUnsafeSocket
-	}
-	control, _, err := descriptor.Control()
-	if err != nil || control&windows.SE_DACL_PROTECTED == 0 || windowsLockDACL(descriptor.String()) != windowsLockDACL(windowsLockSDDL(ownerSID)) {
+	// Windows can serialize a protected DACL as D:PAI even when the requested
+	// descriptor was D:P. The inherited-ACL marker is not a permission grant;
+	// compare the protected DACL's exact ACE set instead of its raw SDDL.
+	if !windowssecurity.ProtectedDACLMatches(path, windowsLockSDDL(ownerSID)) {
 		return localapi.ErrUnsafeSocket
 	}
 	return nil
-}
-
-func windowsLockDACL(value string) string {
-	index := strings.Index(value, "D:")
-	if index < 0 {
-		return ""
-	}
-	return value[index:]
 }
 
 func (l *processLock) CanRemoveStaleSocket(context.Context, string) bool {
@@ -185,5 +189,10 @@ func (l *processLock) Close() error {
 	file := l.file
 	l.file = nil
 	unlockErr := windows.UnlockFileEx(windows.Handle(file.Fd()), 0, 1, 0, &l.region)
-	return errors.Join(unlockErr, file.Close())
+	closeErr := file.Close()
+	removeErr := os.Remove(l.ownerPath)
+	if errors.Is(removeErr, os.ErrNotExist) {
+		removeErr = nil
+	}
+	return errors.Join(unlockErr, closeErr, removeErr)
 }

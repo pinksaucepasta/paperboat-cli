@@ -9,6 +9,10 @@ active_signing_state="$repository_root/tools/tuf-repository/active-signing-state
 installer="$repository_root/tools/install.sh"
 windows_installer="$repository_root/tools/install.ps1"
 publisher="$repository_root/tools/publish-tuf-origin.sh"
+checksum_generator="$repository_root/tools/generate-release-checksums.sh"
+checksum_test="$repository_root/tools/test-install-checksums.sh"
+current_release_test="$repository_root/tools/test-install-current-release.sh"
+publisher_test="$repository_root/tools/test-publish-tuf-origin.sh"
 test -f "$workflow"
 test -f "$qualification"
 test -f "$ci"
@@ -16,6 +20,10 @@ test -f "$active_signing_state"
 test -f "$installer"
 test -f "$windows_installer"
 test -f "$publisher"
+test -f "$checksum_generator"
+test -f "$checksum_test"
+test -f "$current_release_test"
+test -f "$publisher_test"
 
 python3 - "$workflow" "$qualification" "$ci" "$active_signing_state" "$installer" "$windows_installer" "$publisher" <<'PY'
 import json
@@ -28,6 +36,7 @@ ci = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
 active_state_path = pathlib.Path(sys.argv[4])
 active_state = json.loads(active_state_path.read_text(encoding="utf-8"))
 installer = pathlib.Path(sys.argv[5]).read_text(encoding="utf-8")
+installer_path = pathlib.Path(sys.argv[5])
 windows_installer_path = pathlib.Path(sys.argv[6])
 windows_installer = windows_installer_path.read_text(encoding="utf-8")
 publisher = pathlib.Path(sys.argv[7]).read_text(encoding="utf-8")
@@ -51,8 +60,9 @@ for required in (
     "validate-signers", "active-signing-state.json", "trusted-root.json",
     "paperboat-tuf", "publish-tuf-origin.sh", "PAPERBOAT_RELEASE_SSH_KEY",
     "windows-amd64-native-qualification.json", "windows-arm64-native-qualification.json",
-    "Publish immutable GitHub release assets", "Atomically publish TUF and current.json to Hetzner",
-    "Verify public updater and current release", "Mark verified GitHub release latest",
+    "Publish immutable GitHub release assets", "Download and verify immutable GitHub release bytes",
+    "Assemble isolated release origin", "Verify staged release consumers before activation",
+    "Mark verified GitHub release latest", "Activate verified release atomically on Hetzner",
     "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
     "actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e",
     "actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
@@ -120,12 +130,17 @@ for forbidden in ("{ 'receive' }", "{ 'session' }", "--setup-mode=receive", "--s
 sibling_server_installer = windows_installer_path.parents[2] / "paperboat-server/deploy/releases/windows"
 if sibling_server_installer.is_file() and sibling_server_installer.read_bytes() != windows_installer_path.read_bytes():
     raise SystemExit("client-owned Windows installer differs from the checked-out server compatibility copy")
-for required in ("install -m 0755 tools/install.sh dist/install.sh", "install -m 0644 tools/install.ps1 dist/install.ps1", 'install -m 0644 dist/install.ps1 "$publish/windows"', 'tar -C "$publish" -czf "$bundle" current.json install windows tuf', "dist/install.ps1", "public Windows installer does not match the qualified release source", "public Unix installer does not match the qualified release source"):
+sibling_server_posix_installer = installer_path.parents[2] / "paperboat-server/deploy/releases/install"
+if sibling_server_posix_installer.is_file() and sibling_server_posix_installer.read_bytes() != installer_path.read_bytes():
+    raise SystemExit("client-owned POSIX installer differs from the checked-out server compatibility copy")
+for required in ("install -m 0755 tools/install.sh dist/install.sh", "install -m 0644 tools/install.ps1 dist/install.ps1", 'install -m 0644 "$PAPERBOAT_GITHUB_RELEASE_ASSETS/install.ps1" "$publish/windows"', 'tar -C "$publish" -czf "$bundle" current.json install windows tuf', "dist/install.ps1", "GitHub release asset differs from the immutable candidate"):
     if required not in release:
         raise SystemExit(f"release workflow does not carry Windows installer contract {required!r}")
-for required in ("for required in install windows tuf/metadata/root.json", 'atomic_install "$stage/windows" "$live/windows"'):
+for required in ("atomic_exchange", "renameat2", "current.json", "verify_live_mount_contract", "/opt/paperboat/releases", "/srv/paperboat-releases", "docker inspect", "pre-activation cleanup", "atomic_exchange \"$live\" \"$next\""):
     if required not in publisher:
-        raise SystemExit(f"atomic publisher does not carry Windows installer contract {required!r}")
+        raise SystemExit(f"release publisher is missing transaction contract {required!r}")
+if "rollback" in publisher:
+    raise SystemExit("release publisher must never roll back an observed TUF timestamp")
 for required in ("environment: paperboat-tuf-published", "timeout-minutes: 5", "Validate release version", "release-version.sh validate", "Validate release endpoints", "PAPERBOAT_INSTALL_URL", "PAPERBOAT_INSTALL_URL must use https", "Fetch public current root chain", "PAPERBOAT_DEFAULT_RELEASE_URL", "--proto '=https'", "--max-filesize 1048576", "1 through 64", "Validate online signer authorization", "validate-signers"):
     if required not in authority_job:
         raise SystemExit(f"release authority gate is missing {required!r}")
@@ -145,6 +160,8 @@ if "package-manifests.sh" in linux_job:
     raise SystemExit("per-architecture Linux jobs cannot generate a manifest that requires every Unix archive")
 if manifest_command not in assembly_job:
     raise SystemExit("candidate assembly must generate the package manifest after downloading every Unix archive")
+if release.count("tools/generate-release-checksums.sh dist") != 2:
+    raise SystemExit("release workflow must use the canonical checksum generator before and after SBOM generation")
 for forbidden in ("Install-Module", "Repair-WinGetPackageManager", "Add-AppxPackage", "winget.exe"):
     if forbidden in winget_job:
         raise SystemExit(f"WinGet manifest validation must not bootstrap external tooling: {forbidden}")
@@ -152,8 +169,6 @@ if "[void]$view.Execute()" not in winget_renderer or "StringData(1)).Trim()" not
     raise SystemExit("WinGet renderer must suppress COM output, trim, and validate Windows Installer property values")
 if "actions/setup-go@" not in publication_job or publication_job.index("actions/setup-go@") > publication_job.index("Sign and verify production TUF release"):
     raise SystemExit("release publication must set up Go before building the TUF signer")
-if '${{ vars.PAPERBOAT_INSTALL_URL }}' not in publication_job or '"${PAPERBOAT_INSTALL_URL}?p=$token"' not in publication_job or "PAPERBOAT_SERVER_URL" in publication_job:
-    raise SystemExit("public installer verification must use the configured user-facing install endpoint")
 if 'install -m 0600 tools/tuf-repository/active-signing-state.json "$repository/.signing-state.json"' not in publication_job:
     raise SystemExit("release publication must use the validated active signing-state source")
 if "PAPERBOAT_TUF_KEY_TIMESTAMP_1" in publication_job:
@@ -166,14 +181,55 @@ if publication_validate < publication_fetch or publication_validate > publicatio
 
 ordered = (
     "Publish immutable GitHub release assets",
+    "Download and verify immutable GitHub release bytes",
     "Sign and verify production TUF release",
-    "Atomically publish TUF and current.json to Hetzner",
-    "Verify public updater and current release",
+    "Assemble isolated release origin",
+    "Verify staged release consumers before activation",
+    "Activate verified release atomically on Hetzner",
     "Mark verified GitHub release latest",
 )
 positions = [release.index(item) for item in ordered]
 if positions != sorted(positions):
     raise SystemExit("release publication transaction is out of order")
+if "--latest=false" not in publication_job or "Publish immutable GitHub release assets" not in publication_job:
+    raise SystemExit("immutable GitHub release must be non-latest before public activation")
+for forbidden in ("--clobber", 'gh release edit "$RELEASE_VERSION" --draft=false --latest=false'):
+    if forbidden in publication_job:
+        raise SystemExit(f"immutable GitHub release path contains forbidden mutation {forbidden!r}")
+if "gh release download \"$RELEASE_VERSION\"" not in publication_job or "GitHub release asset set differs from the immutable candidate" not in publication_job:
+    raise SystemExit("published GitHub assets must be downloaded and byte-verified")
+if "go test ./internal/hostruntime/bootstrap -run '^TestStagedTUFRepository$' -count=1" not in publication_job:
+    raise SystemExit("release publication must verify every staged consumer before activation")
+for required in ("PAPERBOAT_TEST_REQUIRE_STAGED=1", 'PAPERBOAT_TEST_RELEASE_DIRECTORY="$PAPERBOAT_STAGED_RELEASE"', 'PAPERBOAT_TEST_GITHUB_RELEASE_DIRECTORY="$PAPERBOAT_GITHUB_RELEASE_ASSETS"', "staged TUF metadata is unavailable"):
+    if required not in publication_job:
+        raise SystemExit(f"staged consumer verification is not fail-closed: missing {required!r}")
+if "${{ env.PAPERBOAT_TUF_REPOSITORY }}" in publication_job:
+    raise SystemExit("staged consumer verification must not rely on step-time expression expansion of GITHUB_ENV")
+activation = publication_job.index("- name: Activate verified release atomically on Hetzner")
+mark_latest = publication_job.index("- name: Mark verified GitHub release latest")
+if "\n      - name:" in publication_job[activation + 1:mark_latest]:
+    raise SystemExit("origin activation must be immediately followed only by the GitHub latest pointer update")
+if "\n      - name:" in publication_job[mark_latest + 1:]:
+    raise SystemExit("GitHub latest pointer update must be the final workflow step")
+if "gh release edit" in publication_job[:activation]:
+    raise SystemExit("GitHub latest must not be changed before origin activation")
+for required in ("continue-on-error: true", "for attempt in 1 2 3 4 5", "sleep \"$delay\"", "GitHub latest pointer remains stale"):
+    if required not in publication_job[mark_latest:]:
+        raise SystemExit(f"GitHub latest pointer update must be retryable and non-blocking: missing {required!r}")
+activation_job = publication_job[activation:mark_latest]
+if "atomic_exchange" in activation_job or "Finalize" in activation_job or "finalize" in activation_job:
+    raise SystemExit("origin activation step must delegate one atomic exchange and contain no cleanup/finalization")
+for forbidden in ("Verify public updater and current release", "Finalize verified release activation", "finalize /opt/paperboat/releases"):
+    if forbidden in publication_job:
+        raise SystemExit(f"post-activation workflow action is forbidden: {forbidden}")
+if "group: release-publication-${{ github.repository }}" not in release:
+    raise SystemExit("release workflow must serialize publication globally across versions")
+if "/releases/latest" in installer or "PAPERBOAT_RELEASE_METADATA_URL" not in installer or "https://api.pprbt.dev/current.json" not in installer:
+    raise SystemExit("Unix installer must resolve its default release through current.json")
 PY
+
+"$checksum_test"
+"$current_release_test"
+"$publisher_test"
 
 for script in "$(dirname -- "$0")"/*.sh; do sh -n "$script"; done

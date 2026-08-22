@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/pinksaucepasta/paperboat/internal/windowssecurity"
 	"golang.org/x/sys/windows"
 )
 
@@ -51,17 +52,7 @@ func validatePlatformTarget(path string, info fs.FileInfo) error {
 	if err != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
 		return ErrUnsafeTarget
 	}
-	descriptor, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT,
-		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
-	if err != nil || !descriptor.IsValid() {
-		return ErrUnsafeTarget
-	}
-	owner, _, err := descriptor.Owner()
-	if err != nil || owner == nil || owner.String() != "S-1-5-18" {
-		return ErrUnsafeTarget
-	}
-	control, _, err := descriptor.Control()
-	if err != nil || control&windows.SE_DACL_PROTECTED == 0 || descriptor.String() != "O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)" {
+	if !windowssecurity.ProtectedDACLMatches(path, "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)") {
 		return ErrUnsafeTarget
 	}
 	return nil

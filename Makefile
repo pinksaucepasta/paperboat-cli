@@ -8,8 +8,10 @@ PROTOCOL_VERSION ?= 1
 DEFAULT_RELEASE_URL ?=
 GO_VERSION  := 1.26.6
 SQLC_VERSION := v1.30.0
+GO_ROOT     := $(shell GOTOOLCHAIN=go$(GO_VERSION) go env GOROOT)
+export PATH := $(GO_ROOT)/bin:$(PATH)
 GO          := GOTOOLCHAIN=local go
-GOFMT       := $(shell GOTOOLCHAIN=local go env GOROOT 2>/dev/null)/bin/gofmt
+GOFMT       := $(GO_ROOT)/bin/gofmt
 GO_FILES    := $(shell find . -path ./.git -prune -o -name '*.go' -print)
 LDFLAGS     := -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Version=$(VERSION) -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Commit=$(COMMIT) -X github.com/pinksaucepasta/paperboat/internal/buildinfo.ProtocolVersion=$(PROTOCOL_VERSION) -X github.com/pinksaucepasta/paperboat/internal/buildinfo.DefaultReleaseURL=$(DEFAULT_RELEASE_URL)
 
@@ -72,10 +74,10 @@ uninstall:
 	rm -f $(BINDIR)/$(BINARY)
 
 test:
-	$(GO) test ./...
+	$(GO) test -count=1 -timeout 12m ./...
 
 race:
-	$(GO) test -race ./...
+	$(GO) test -race -count=1 -timeout 12m ./...
 
 fuzz: verify-toolchain
 	@./tools/run-fuzz-targets.sh

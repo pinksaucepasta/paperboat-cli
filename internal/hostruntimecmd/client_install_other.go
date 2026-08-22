@@ -10,11 +10,11 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/bootstrap"
 )
 
-type ReceiveInstallConfig struct {
+type ClientInstallConfig struct {
 	StateRoot, WorkspaceRoot, ControlURL, MachineID, ListenAddress string
 	Artifact                                                       bootstrap.ArtifactTarget
 }
 
-func InstallReceive(context.Context, ReceiveInstallConfig, io.Reader, io.Writer, io.Writer) error {
-	return errors.New("receive service installation is supported only on macOS and Linux")
+func InstallClient(context.Context, ClientInstallConfig, io.Reader, io.Writer, io.Writer) error {
+	return errors.New("Client service installation is supported only on macOS, Linux, and Windows")
 }

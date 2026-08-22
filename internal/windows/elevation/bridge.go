@@ -35,6 +35,10 @@ const (
 	MaxRequestBytes      = 128 << 10
 	MaxResultBytes       = 16 << 10
 	MaxOperationDuration = 5 * time.Minute
+	// Runtime activation only touches local files and SCM registrations. It
+	// must not leave a one-shot installer waiting behind an opaque privileged
+	// child for the general five-minute maintenance window.
+	RuntimeActivationDuration = 90 * time.Second
 )
 
 var (
@@ -136,6 +140,16 @@ func validOperationAction(operation, action string) bool {
 
 func actionNeedsPayload(operation, action string) bool {
 	return operation == OperationRuntimeService && (action == ActionInstall || action == ActionInstallCommit || action == ActionCommit || action == ActionUninstall || action == ActionCleanupPreviews || action == ActionInstallPreview || action == ActionRemovePreview)
+}
+
+// operationDuration is part of the bridge contract: the launcher and elevated
+// child use the same expiry. That gives callers a bounded result even if an
+// individual SCM or firewall API blocks during runtime activation.
+func operationDuration(operation, action string) time.Duration {
+	if operation == OperationRuntimeService && (action == ActionInstall || action == ActionInstallCommit || action == ActionCommit || action == ActionUninstall) {
+		return RuntimeActivationDuration
+	}
+	return MaxOperationDuration
 }
 
 func validateRequest(request Request) error {

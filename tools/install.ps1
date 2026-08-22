@@ -20,6 +20,16 @@ $dir = Join-Path $env:LOCALAPPDATA 'Paperboat\bootstrap'
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 $exe = Join-Path $dir ("pb-$version-$arch.exe")
 $sums = Join-Path $dir 'SHA256SUMS'
+function Get-ReleaseChecksum([string]$Path, [string]$Asset) {
+  foreach ($line in Get-Content -LiteralPath $Path) {
+    if ($line -notmatch '^(?<hash>[0-9A-Fa-f]{64})[ \t]+\*?(?<name>(?:\./)?[^ \t]+)$') { continue }
+    $name = $Matches.name
+    if ([string]::Equals($name, $Asset, [System.StringComparison]::Ordinal) -or [string]::Equals($name, "./$Asset", [System.StringComparison]::Ordinal)) {
+      return $Matches.hash.ToLowerInvariant()
+    }
+  }
+  return ''
+}
 function Download-ReleaseFile([string]$url, [string]$output) {
   $temporary = "$output.download"
   Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
@@ -33,7 +43,7 @@ function Download-ReleaseFile([string]$url, [string]$output) {
   Move-Item -LiteralPath $temporary -Destination $output -Force
 }
 Download-ReleaseFile "$releaseBase/SHA256SUMS" $sums
-$expected = ((Get-Content -Raw $sums) -split "`r?`n" | Where-Object { $_ -match "\s\*?$([regex]::Escape($asset))$" } | ForEach-Object { ($_ -split '\s+')[0] } | Select-Object -First 1)
+$expected = Get-ReleaseChecksum $sums $asset
 if ([string]::IsNullOrWhiteSpace($expected)) { throw "Release checksum for $asset is missing." }
 $existingHash = if (Test-Path -LiteralPath $exe -PathType Leaf) { (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant() } else { '' }
 if ($existingHash -ne $expected.ToLowerInvariant()) { Download-ReleaseFile "$releaseBase/$asset" $exe }

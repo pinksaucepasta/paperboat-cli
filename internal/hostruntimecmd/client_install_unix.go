@@ -19,12 +19,12 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostinstall"
 )
 
-type ReceiveInstallConfig struct {
+type ClientInstallConfig struct {
 	StateRoot, WorkspaceRoot, ControlURL, MachineID, ListenAddress string
 	Artifact                                                       bootstrap.ArtifactTarget
 }
 
-func InstallReceive(ctx context.Context, config ReceiveInstallConfig, stdin io.Reader, stdout, stderr io.Writer) error {
+func InstallClient(ctx context.Context, config ClientInstallConfig, stdin io.Reader, stdout, stderr io.Writer) error {
 	account, err := user.Current()
 	if err != nil {
 		return err
@@ -62,7 +62,7 @@ func InstallReceive(ctx context.Context, config ReceiveInstallConfig, stdin io.R
 		HelperListenAddress: config.ListenAddress, SetupMode: "client",
 	}
 	previousGeneration := workerGeneration(config.StateRoot)
-	fmt.Fprintln(stderr, "Administrator approval is required to install the receive service.")
+	fmt.Fprintln(stderr, "Administrator approval is required to install the Client service.")
 	installCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
 	if err := authorizeServiceInstall(installCtx, artifactPath, request, stdin, stdout, stderr); err != nil {
@@ -85,7 +85,7 @@ func InstallReceive(ctx context.Context, config ReceiveInstallConfig, stdin io.R
 			if err := workerCommand.Commit(); err != nil {
 				return err
 			}
-			fmt.Fprintln(stdout, "Paperboat receive service is ready.")
+			fmt.Fprintln(stdout, "Paperboat Client service is ready.")
 			return nil
 		}
 		if response != nil && response.Body != nil {
@@ -93,7 +93,7 @@ func InstallReceive(ctx context.Context, config ReceiveInstallConfig, stdin io.R
 		}
 		select {
 		case <-readyCtx.Done():
-			return errors.Join(errors.New("receive service did not become ready"), authorizeServiceOperation(ctx, artifactPath, "uninstall", request, stdout, stderr), workerCommand.Rollback())
+			return errors.Join(errors.New("Client service did not become ready"), authorizeServiceOperation(ctx, artifactPath, "uninstall", request, stdout, stderr), workerCommand.Rollback())
 		case <-time.After(time.Second):
 		}
 	}
