@@ -104,6 +104,53 @@ func TestCISigningPublishesCompleteSupportedRelease(t *testing.T) {
 	if _, exists := targets.Signed.Targets["cli-darwin-arm64"]; !exists {
 		t.Fatal("macOS arm64 target was not published")
 	}
+	wantNames := map[string]bool{
+		"windows-amd64-native-qualification.json": false,
+		"windows-arm64-native-qualification.json": false,
+	}
+	for _, target := range supportedReleaseTargets() {
+		for _, component := range []string{"cli", "runtime", "hostd", "updater", "launcher"} {
+			wantNames[component+"-"+target.platform+"-"+target.architecture] = false
+		}
+		wantNames["pb-"+target.platform+"-"+target.architecture] = false
+		wantNames["release-index-stable-"+target.platform+"-"+target.architecture+".json"] = false
+	}
+	if len(targets.Signed.Targets) != len(wantNames) {
+		t.Fatalf("published target count=%d, want %d", len(targets.Signed.Targets), len(wantNames))
+	}
+	for name := range targets.Signed.Targets {
+		if _, ok := wantNames[name]; !ok {
+			t.Fatalf("unexpected published target %q", name)
+		}
+		wantNames[name] = true
+	}
+	for name, found := range wantNames {
+		if !found {
+			t.Fatalf("required published target %q is missing", name)
+		}
+	}
+	for _, target := range supportedReleaseTargets() {
+		cliName := "cli-" + target.platform + "-" + target.architecture
+		aliasName := "pb-" + target.platform + "-" + target.architecture
+		cli, alias := targets.Signed.Targets[cliName], targets.Signed.Targets[aliasName]
+		if cli.Length != alias.Length || !bytes.Equal(cli.Hashes["sha256"], alias.Hashes["sha256"]) {
+			t.Fatalf("bootstrap alias %q does not match %q", aliasName, cliName)
+		}
+		var custom struct {
+			Schema       string `json:"schema"`
+			Kind         string `json:"kind"`
+			Version      string `json:"version"`
+			Platform     string `json:"platform"`
+			Architecture string `json:"architecture"`
+		}
+		if alias.Custom == nil || json.Unmarshal(*alias.Custom, &custom) != nil || custom.Schema != "paperboat.tuf-target/v1" || custom.Kind != "pb" || custom.Version != version || custom.Platform != target.platform || custom.Architecture != target.architecture {
+			t.Fatalf("bootstrap alias %q custom metadata is invalid: %+v", aliasName, custom)
+		}
+		publishedAlias := filepath.Join(repository, "targets", hex.EncodeToString(alias.Hashes["sha256"])+"."+aliasName)
+		if body, err := os.ReadFile(publishedAlias); err != nil || !bytes.Equal(body, []byte("test release artifact "+cliName)) {
+			t.Fatalf("published bootstrap alias %q error=%v", aliasName, err)
+		}
+	}
 }
 
 func TestCIOnlineSigningRejectsUnauthorizedKeyWithoutLoadingRootKeys(t *testing.T) {

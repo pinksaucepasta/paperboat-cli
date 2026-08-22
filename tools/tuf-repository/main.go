@@ -589,6 +589,29 @@ func publish(repo, version, artifacts string, qualificationEvidencePaths map[str
 				return err
 			}
 		}
+		// Direct bootstrap and CLI self-update select this fixed target name.
+		// Keep it as an exact alias of the qualified CLI bytes while
+		// component-aware runtime updaters use cli-* through a release index.
+		cliName := "cli-" + platform + "-" + architecture
+		aliasName := "pb-" + platform + "-" + architecture
+		aliasInfo, err := metadata.TargetFile().FromFile(componentPaths[cliName], "sha256")
+		if err != nil {
+			return fmt.Errorf("bootstrap alias %s: %w", aliasName, err)
+		}
+		cliInfo := componentFiles[cliName]
+		if aliasInfo.Length != cliInfo.Length || !bytes.Equal(aliasInfo.Hashes["sha256"], cliInfo.Hashes["sha256"]) {
+			return fmt.Errorf("bootstrap alias %s does not match %s", aliasName, cliName)
+		}
+		aliasCustom, err := json.Marshal(map[string]string{"schema": "paperboat.tuf-target/v1", "kind": "pb", "version": version, "platform": platform, "architecture": architecture})
+		if err != nil {
+			return err
+		}
+		aliasRaw := json.RawMessage(aliasCustom)
+		aliasInfo.Custom, aliasInfo.Path = &aliasRaw, aliasName
+		targets.Signed.Targets[aliasName] = aliasInfo
+		if err := copyConsistentTarget(repo, componentPaths[cliName], aliasName, aliasInfo); err != nil {
+			return err
+		}
 		indexName := "release-index-" + channel + "-" + platform + "-" + architecture + ".json"
 		indexBody, err := json.Marshal(releaseIndex{Schema: "paperboat.release-index/v1", ReleaseID: "rel_" + version, Version: version, Channel: channel, Severity: severity, CreatedAt: createdAt, Platform: platform, Architecture: architecture, BinaryFormat: format, Targets: components, HostdAPIMin: 1, HostdAPIMax: 2, RuntimeAPIMin: 1, RuntimeAPIMax: 2, RolloutPolicyRevision: rolloutRevision, SupervisorMaintenance: supervisorMaintenance, Rollout: rolloutPolicy{Schema: "paperboat.release-rollout/v1", CohortSeed: "release-" + version, Percentage: percentage}, Stability: stability, NativeTested: nativeTested, TestedWindowsBuilds: testedBuilds, OpenSSHPackageID: openSSHID, OpenSSHApprovedVersion: openSSHVersion})
 		if err != nil {

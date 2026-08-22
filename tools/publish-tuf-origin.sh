@@ -31,7 +31,7 @@ if value != {"schema": "paperboat.release-current/v1", "version": sys.argv[2]}:
     raise SystemExit("current.json does not match the release")
 PY
 
-for required in install tuf/metadata/root.json tuf/metadata/targets.json tuf/metadata/snapshot.json tuf/metadata/timestamp.json; do
+for required in install windows tuf/metadata/root.json tuf/metadata/targets.json tuf/metadata/snapshot.json tuf/metadata/timestamp.json; do
   [[ -s "$stage/$required" && ! -L "$stage/$required" ]] || { echo "release bundle is missing $required" >&2; exit 1; }
 done
 
@@ -56,6 +56,7 @@ find "$stage/tuf/metadata" -maxdepth 1 -type f ! -name root.json ! -name targets
 done
 
 atomic_install "$stage/install" "$live/install" 0755
+atomic_install "$stage/windows" "$live/windows"
 atomic_install "$stage/tuf/metadata/root.json" "$live/tuf/metadata/root.json"
 atomic_install "$stage/tuf/metadata/targets.json" "$live/tuf/metadata/targets.json"
 atomic_install "$stage/tuf/metadata/snapshot.json" "$live/tuf/metadata/snapshot.json"

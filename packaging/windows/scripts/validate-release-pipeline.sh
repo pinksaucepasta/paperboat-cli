@@ -6,12 +6,18 @@ workflow="$repository_root/.github/workflows/release.yml"
 qualification="$repository_root/.github/workflows/platform-qualification.yml"
 ci="$repository_root/.github/workflows/ci.yml"
 active_signing_state="$repository_root/tools/tuf-repository/active-signing-state.json"
+installer="$repository_root/tools/install.sh"
+windows_installer="$repository_root/tools/install.ps1"
+publisher="$repository_root/tools/publish-tuf-origin.sh"
 test -f "$workflow"
 test -f "$qualification"
 test -f "$ci"
 test -f "$active_signing_state"
+test -f "$installer"
+test -f "$windows_installer"
+test -f "$publisher"
 
-python3 - "$workflow" "$qualification" "$ci" "$active_signing_state" <<'PY'
+python3 - "$workflow" "$qualification" "$ci" "$active_signing_state" "$installer" "$windows_installer" "$publisher" <<'PY'
 import json
 import pathlib
 import sys
@@ -21,6 +27,10 @@ qualification = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
 ci = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
 active_state_path = pathlib.Path(sys.argv[4])
 active_state = json.loads(active_state_path.read_text(encoding="utf-8"))
+installer = pathlib.Path(sys.argv[5]).read_text(encoding="utf-8")
+windows_installer_path = pathlib.Path(sys.argv[6])
+windows_installer = windows_installer_path.read_text(encoding="utf-8")
+publisher = pathlib.Path(sys.argv[7]).read_text(encoding="utf-8")
 winget_renderer = (pathlib.Path(sys.argv[1]).parents[2] / "packaging/windows/scripts/render-winget.ps1").read_text(encoding="utf-8")
 
 for required in (
@@ -92,11 +102,37 @@ if active_state != expected_active_state:
 for name, job in (("platform qualification", qualification_job), ("Linux release", linux_job), ("macOS release", macos_job), ("Windows release", windows_job)):
     if "needs: release-authority" not in job:
         raise SystemExit(f"{name} must wait for protected release authority validation")
-for required in ("environment: paperboat-tuf-published", "timeout-minutes: 5", "Validate release version", "release-version.sh validate", "Fetch public current root chain", "PAPERBOAT_DEFAULT_RELEASE_URL", "--proto '=https'", "--max-filesize 1048576", "1 through 64", "Validate online signer authorization", "validate-signers"):
+for required in ('"dist/pb-${os}-${arch}"', '"dist/pb-darwin-arm64"', '("pb-windows-{0}.exe" -f $env:PAPERBOAT_ARCH)'):
+    if required not in release:
+        raise SystemExit(f"release workflow is missing direct installer asset {required!r}")
+for required in ("--setup MODE               Run setup after install: client or host", "--setup client", '""|client|host)'):
+    if required not in installer:
+        raise SystemExit(f"installer is missing canonical setup contract {required!r}")
+for forbidden in ("--setup receive", "receive, session, or host", '""|receive|session|host)'):
+    if forbidden in installer:
+        raise SystemExit(f"installer retains retired setup vocabulary {forbidden!r}")
+for required in ("$role = if", "{ 'host' } else { 'client' }", "$setupMode = $role", '"--setup-mode=$setupMode"', 'pb-windows-$arch.exe'):
+    if required not in windows_installer:
+        raise SystemExit(f"Windows installer is missing canonical enrollment contract {required!r}")
+for forbidden in ("{ 'receive' }", "{ 'session' }", "--setup-mode=receive", "--setup-mode=session"):
+    if forbidden in windows_installer:
+        raise SystemExit(f"Windows installer retains retired setup-mode mapping {forbidden!r}")
+sibling_server_installer = windows_installer_path.parents[2] / "paperboat-server/deploy/releases/windows"
+if sibling_server_installer.is_file() and sibling_server_installer.read_bytes() != windows_installer_path.read_bytes():
+    raise SystemExit("client-owned Windows installer differs from the checked-out server compatibility copy")
+for required in ("install -m 0755 tools/install.sh dist/install.sh", "install -m 0644 tools/install.ps1 dist/install.ps1", 'install -m 0644 dist/install.ps1 "$publish/windows"', 'tar -C "$publish" -czf "$bundle" current.json install windows tuf', "dist/install.ps1", "public Windows installer does not match the qualified release source", "public Unix installer does not match the qualified release source"):
+    if required not in release:
+        raise SystemExit(f"release workflow does not carry Windows installer contract {required!r}")
+for required in ("for required in install windows tuf/metadata/root.json", 'atomic_install "$stage/windows" "$live/windows"'):
+    if required not in publisher:
+        raise SystemExit(f"atomic publisher does not carry Windows installer contract {required!r}")
+for required in ("environment: paperboat-tuf-published", "timeout-minutes: 5", "Validate release version", "release-version.sh validate", "Validate release endpoints", "PAPERBOAT_INSTALL_URL", "PAPERBOAT_INSTALL_URL must use https", "Fetch public current root chain", "PAPERBOAT_DEFAULT_RELEASE_URL", "--proto '=https'", "--max-filesize 1048576", "1 through 64", "Validate online signer authorization", "validate-signers"):
     if required not in authority_job:
         raise SystemExit(f"release authority gate is missing {required!r}")
 if authority_job.index("release-version.sh validate") > authority_job.index("Fetch public current root chain") or authority_job.index("release-version.sh validate") > authority_job.index("actions/setup-go@"):
     raise SystemExit("release version validation must run before network/toolchain work in the authority gate")
+if authority_job.index("Validate release endpoints") > authority_job.index("Fetch public current root chain") or authority_job.index("Validate release endpoints") > authority_job.index("actions/setup-go@"):
+    raise SystemExit("release endpoint validation must run before network/toolchain work in the authority gate")
 for forbidden in ("PAPERBOAT_RELEASE_SSH_KEY", "PAPERBOAT_RELEASE_KNOWN_HOSTS", "PAPERBOAT_RELEASE_HOST", "root@$RELEASE_HOST"):
     if forbidden in authority_job:
         raise SystemExit(f"read-only release authority gate must not receive publication credential {forbidden!r}")
@@ -116,6 +152,8 @@ if "[void]$view.Execute()" not in winget_renderer or "StringData(1)).Trim()" not
     raise SystemExit("WinGet renderer must suppress COM output, trim, and validate Windows Installer property values")
 if "actions/setup-go@" not in publication_job or publication_job.index("actions/setup-go@") > publication_job.index("Sign and verify production TUF release"):
     raise SystemExit("release publication must set up Go before building the TUF signer")
+if '${{ vars.PAPERBOAT_INSTALL_URL }}' not in publication_job or '"${PAPERBOAT_INSTALL_URL}?p=$token"' not in publication_job or "PAPERBOAT_SERVER_URL" in publication_job:
+    raise SystemExit("public installer verification must use the configured user-facing install endpoint")
 if 'install -m 0600 tools/tuf-repository/active-signing-state.json "$repository/.signing-state.json"' not in publication_job:
     raise SystemExit("release publication must use the validated active signing-state source")
 if "PAPERBOAT_TUF_KEY_TIMESTAMP_1" in publication_job:

@@ -1,7 +1,9 @@
 # TUF Release Operations
 
 Production Paperboat updates use The Update Framework. The updater embeds the initial public
-root and selects a fixed `release-index-stable-<os>-<arch>.json` target. The control plane and
+root and selects a fixed `release-index-stable-<os>-<arch>.json` target. Direct bootstrap and
+CLI self-update select `pb-<os>-<arch>`, a signed byte-for-byte alias of the matching
+`cli-<os>-<arch>` component. The control plane and
 unsigned `current.json` may supply only the fixed repository URL as a cache hint. Private keys
 must never be copied into this repository, Hetzner, or a runtime machine. Online release-role
 keys are stored as protected GitHub Environment secrets; root keys remain offline.
@@ -26,7 +28,8 @@ fetched repository immediately before signing. The shared non-secret alias sourc
 
 Build `cli`, `runtime`, `hostd`, `updater`, and `launcher` for every supported OS and
 architecture. Name each file `<component>-<os>-<arch>`. Publishing fails if any component is
-missing and creates one signed release index per platform and architecture:
+missing and creates one signed release index plus the required `pb-<os>-<arch>` CLI alias per
+platform and architecture:
 
 - Every macOS component must be signed with the production Developer ID, submitted to Apple
   notarization, and stapled before it enters the signed TUF repository. The updater runs both
@@ -40,8 +43,13 @@ missing and creates one signed release index per platform and architecture:
 The GitHub release workflow builds and qualifies artifacts, publishes immutable GitHub assets
 without marking the release latest, signs
 TUF with release-role keys from the `paperboat-tuf-published` environment, atomically publishes
-`metadata/`, `targets/`, and `current.json`, verifies the public origin, and only then marks the
-GitHub release latest. Root keys are never available to CI.
+the canonical Unix `install` and Windows `windows` bootstrap scripts together with `metadata/`,
+`targets/`, and `current.json`, verifies the public origin, and only then marks the GitHub release
+latest. Root keys are never available to CI.
+`PAPERBOAT_INSTALL_URL` is the exact user-facing HTTPS install endpoint, currently
+`https://get.pprbt.dev/install`. The protected authority gate validates it before allocating
+platform builders, and post-publication verification fetches both its Unix and PowerShell
+responses and compares them byte-for-byte with the qualified installer sources.
 
 Windows publication is fail-closed for both architectures. `paperboat-tuf publish` requires
 absolute `-windows-amd64-native-evidence` and `-windows-arm64-native-evidence` JSON files. The signer rejects a missing file, a non-passing

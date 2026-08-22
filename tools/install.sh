@@ -25,7 +25,7 @@ Usage:
 Options:
   --version VERSION          Install a specific release (default: latest)
   --install-dir DIRECTORY    Install pb here (default: ~/.local/bin)
-  --setup MODE               Run setup after install: receive, session, or host
+  --setup MODE               Run setup after install: client or host
   --pair                     Pair this machine as a host after install
   --enrollment-token TOKEN   Use a dashboard-issued single-use pairing token
   --enrollment-token-file FILE  Read the token from an absolute owner-only file
@@ -39,7 +39,7 @@ Options:
 Examples:
   curl -fsSL https://get.pprbt.dev/install | bash
   curl -fsSL https://get.pprbt.dev/install | bash -s -- --pair --enrollment-token TOKEN
-  curl -fsSL https://get.pprbt.dev/install | bash -s -- --setup receive
+  curl -fsSL https://get.pprbt.dev/install | bash -s -- --setup client
 EOF
 }
 
@@ -68,8 +68,8 @@ while [ "$#" -gt 0 ]; do
 done
 
 case "$setup_mode" in
-  ""|receive|session|host) ;;
-  *) echo "pb installer: --setup must be receive, session, or host" >&2; exit 2 ;;
+  ""|client|host) ;;
+  *) echo "pb installer: --setup must be client or host" >&2; exit 2 ;;
 esac
 case "$pair_mode" in
   host|client) ;;
