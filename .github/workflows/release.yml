@@ -30,11 +30,19 @@ env:
 
 jobs:
   release-linux:
-    name: Build Linux release assets
+    name: Build Linux ${{ matrix.architecture }} release assets
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            runner: blacksmith-2vcpu-ubuntu-2404
+          - architecture: arm64
+            runner: blacksmith-2vcpu-ubuntu-2404-arm
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -59,10 +67,9 @@ jobs:
           test -n "${DEFAULT_RELEASE_URL}" || { echo "PAPERBOAT_DEFAULT_RELEASE_URL repository variable is required" >&2; exit 1; }
           case "${DEFAULT_SERVER_URL}" in https://*) ;; *) echo "PAPERBOAT_DEFAULT_SERVER_URL must use https" >&2; exit 1 ;; esac
           mkdir -p dist stage
-          for target in linux/amd64 linux/arm64; do
-            os="${target%/*}"
-            arch="${target#*/}"
-            suffix=""
+          os=linux
+          arch="${{ matrix.architecture }}"
+          suffix=""
             CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath \
               -ldflags="-s -w -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Version=${VERSION} -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Commit=${GITHUB_SHA} -X github.com/pinksaucepasta/paperboat/internal/buildinfo.ProtocolVersion=1 -X github.com/pinksaucepasta/paperboat/internal/buildinfo.DefaultServerURL=${DEFAULT_SERVER_URL} -X github.com/pinksaucepasta/paperboat/internal/buildinfo.DefaultReleaseURL=${DEFAULT_RELEASE_URL}" \
               -o "stage/pb${suffix}" ./cmd/pb
@@ -78,13 +85,12 @@ jobs:
             cp "stage/pb-launcher${suffix}" "dist/launcher-${os}-${arch}"
             tar -C stage -czf "dist/paperboat_${VERSION}_${os}_${arch}.tar.gz" pb pb-launcher
             rm "stage/pb${suffix}" "stage/pb-launcher${suffix}"
-          done
           bash tools/package-manifests.sh dist "${GITHUB_REPOSITORY}" "${VERSION}"
           cp tools/install.sh dist/install.sh
       - name: Upload Unix release handoff
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: release-linux
+          name: release-linux-${{ matrix.architecture }}
           path: dist
           if-no-files-found: error
           retention-days: 14
@@ -419,7 +425,12 @@ jobs:
       - name: Download Linux release handoff
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: release-linux
+          name: release-linux-amd64
+          path: dist
+      - name: Download Linux ARM64 release handoff
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-linux-arm64
           path: dist
       - name: Download macOS release handoff
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
