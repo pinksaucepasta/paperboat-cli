@@ -18,12 +18,18 @@ The current root-v2 online role aliases are `targets-1`, `targets-2`, `snapshot-
 rotation must update both the protected GitHub Environment secret name and the workflow's
 ephemeral signing-state binding before the next tag is created.
 Every tag or manual release first enters the protected `paperboat-tuf-published` environment,
-validates the release version, fetches the served root and its numbered chain from the public
-HTTPS TUF repository, verifies that chain from the client-embedded trusted root, and validates
-all four online secrets against the active roles. The early gate never receives the SSH
-publication credential. Linux, macOS, Windows, and native platform jobs cannot start unless this
-read-only gate passes. Publication repeats the chain and signer validation against the freshly
-fetched repository immediately before signing. The shared non-secret alias source is
+validates the install, server, and release HTTPS endpoints, then uses the protected SSH identity
+only for a read-only readiness command proving that one running server container has the exact
+parent bind mount
+`/opt/paperboat/releases` to `/srv/paperboat-releases` read-only and resolves
+`PAPERBOAT_RELEASE_DIRECTORY=/srv/paperboat-releases/current`. It also validates the release
+version, fetches the served root and its numbered chain from the public HTTPS TUF repository,
+verifies that chain from the client-embedded trusted root, and validates all four online secrets
+against the active roles. A cheap Windows amd64 Git-Bash contract job then validates the release
+workflow and first-party Windows packaging before any native platform job is allocated. Every
+native platform must then qualify before any release package job is allocated. Publication
+repeats the chain and signer validation against the freshly fetched
+repository immediately before signing. The shared non-secret alias source is
 `tools/tuf-repository/active-signing-state.json`; signer validation never writes metadata.
 
 Build `cli`, `runtime`, `hostd`, `updater`, and `launcher` for every supported OS and
@@ -112,9 +118,12 @@ native qualification environment. A cross-build, emulator run, skipped test, or 
 the other architecture cannot satisfy either gate. Both Windows architectures are stable and
 must pass their native runner before publication.
 
-The release workflow produces both evidence files after each architecture's native qualification
-and hashes the final release PE files. Publication includes both architecture-specific evidence
-files in the release assets; a missing report, changed PE, or changed evidence blocks publication.
+The release workflow runs the full native MSI qualification on each native Windows runner. It
+uses the final signed release MSI for the fresh install, builds an architecture-native upgrade
+MSI and service fixture, requires the passed report to match both MSI hashes/version/architecture,
+then produces both evidence files from the final release PE files. Publication includes both
+architecture-specific evidence files in the release assets; a missing report, failed lifecycle
+event, changed MSI, changed PE, or changed evidence blocks publication.
 
 Windows packaging inputs are maintained in `packaging/windows`. The deterministic portable ZIP
 builder and WiX source validation run in CI, while WiX MSI compilation requires a Windows

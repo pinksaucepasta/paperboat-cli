@@ -31,6 +31,10 @@ select_checksum_backend() {
 checksum_backend=$(select_checksum_backend)
 checksum_sha256sum=$(command -v sha256sum || true)
 checksum_shasum=$(command -v shasum || true)
+if test -z "$checksum_sha256sum" && test -z "$checksum_shasum"; then
+  echo 'publisher test: sha256sum or shasum is required' >&2
+  exit 1
+fi
 
 run_checksum() {
   local backend=$1
@@ -50,9 +54,6 @@ run_checksum() {
       ;;
   esac
 }
-
-CHECKSUM_SHA256SUM_COMMAND=$checksum_sha256sum
-CHECKSUM_SHASUM_COMMAND=$checksum_shasum
 
 # Build command shims so both checksum branches are exercised even when the
 # host only ships one of the two platform-specific command names. The shim
@@ -88,14 +89,49 @@ EOF
 fi
 chmod 0700 "$checksum_test_bin/sha256sum" "$checksum_test_bin/shasum"
 
-preferred_checksum_path="$temporary/checksum-preferred"
-fallback_checksum_path="$temporary/checksum-fallback"
-mkdir -p "$preferred_checksum_path" "$fallback_checksum_path"
-cp "$checksum_test_bin/sha256sum" "$preferred_checksum_path/sha256sum"
-cp "$checksum_test_bin/shasum" "$fallback_checksum_path/shasum"
-chmod 0700 "$preferred_checksum_path/sha256sum" "$fallback_checksum_path/shasum"
-test "$(PATH="$preferred_checksum_path" select_checksum_backend)" = sha256sum
-test "$(PATH="$fallback_checksum_path" select_checksum_backend)" = shasum
+# Keep the shim commands selected for the entire test. In particular, do not
+# restore an absent host command after exercising the alternate branch: Git
+# Bash on Windows normally provides sha256sum but not shasum, and doing so
+# would make the later snapshot test call an empty command path.
+CHECKSUM_SHA256SUM_COMMAND="$checksum_test_bin/sha256sum"
+CHECKSUM_SHASUM_COMMAND="$checksum_test_bin/shasum"
+
+run_test_publisher() {
+  # The production publisher intentionally requires sha256sum on its Linux
+  # deployment host. Supply the deterministic shim while this test simulates
+  # a shasum-only development host, so its validation paths still execute
+  # instead of passing early because a deployment-only command is absent.
+  PATH="$checksum_test_bin:$PATH" "$test_publisher" "$@"
+}
+
+assert_isolated_checksum_backend() {
+  local path=$1
+  local expected=$2
+  local unexpected
+  if test "$expected" = sha256sum; then
+    unexpected=shasum
+  else
+    unexpected=sha256sum
+  fi
+
+  test "$(PATH="$path" select_checksum_backend)" = "$expected"
+  if PATH="$path" command -v "$unexpected" >/dev/null 2>&1; then
+    echo "publisher test: isolated $expected host unexpectedly exposes $unexpected" >&2
+    return 1
+  fi
+}
+
+# Model both supported host environments explicitly. These directories each
+# contain exactly one checksum command, so backend selection is tested without
+# relying on which tools happen to be installed on the developer or runner.
+sha256sum_only_path="$temporary/checksum-sha256sum-only"
+shasum_only_path="$temporary/checksum-shasum-only"
+mkdir -p "$sha256sum_only_path" "$shasum_only_path"
+cp "$checksum_test_bin/sha256sum" "$sha256sum_only_path/sha256sum"
+cp "$checksum_test_bin/shasum" "$shasum_only_path/shasum"
+chmod 0700 "$sha256sum_only_path/sha256sum" "$shasum_only_path/shasum"
+assert_isolated_checksum_backend "$sha256sum_only_path" sha256sum
+assert_isolated_checksum_backend "$shasum_only_path" shasum
 
 checksum_fixture="$temporary/checksum-fixture"
 printf 'paperboat checksum fixture\n' > "$checksum_fixture"
@@ -108,9 +144,6 @@ checksum_sha256sum_digest=$(printf 'paperboat checksum stream\n' | run_checksum 
 checksum_shasum_digest=$(printf 'paperboat checksum stream\n' | run_checksum shasum | awk '{print $1}')
 test "$checksum_sha256sum_digest" = "$checksum_shasum_digest"
 
-CHECKSUM_SHA256SUM_COMMAND=$checksum_sha256sum
-CHECKSUM_SHASUM_COMMAND=$checksum_shasum
-
 snapshot_directory_with_backend() {
   local backend=$1
   local directory=$2
@@ -118,6 +151,34 @@ snapshot_directory_with_backend() {
     cd "$directory"
     while IFS= read -r -d '' file; do
       run_checksum "$backend" "$file"
+    done < <(find . -type f -print0 | LC_ALL=C sort -z)
+  )
+}
+
+run_native_checksum() {
+  local backend=$1
+  shift
+  case "$backend" in
+    sha256sum)
+      "$checksum_sha256sum" "$@"
+      ;;
+    shasum)
+      "$checksum_shasum" -a 256 "$@"
+      ;;
+    *)
+      echo "publisher test: unsupported checksum backend: $backend" >&2
+      return 1
+      ;;
+  esac
+}
+
+snapshot_directory_with_native_backend() {
+  local backend=$1
+  local directory=$2
+  (
+    cd "$directory"
+    while IFS= read -r -d '' file; do
+      run_native_checksum "$backend" "$file"
     done < <(find . -type f -print0 | LC_ALL=C sort -z)
   )
 }
@@ -130,14 +191,14 @@ test "$(snapshot_directory_with_backend sha256sum "$checksum_snapshot_fixture")"
   "$(snapshot_directory_with_backend shasum "$checksum_snapshot_fixture")"
 
 snapshot() {
-  snapshot_directory_with_backend "$checksum_backend" "$release_root/current"
+  snapshot_directory_with_native_backend "$checksum_backend" "$release_root/current"
 }
 snapshot_directory() {
-  snapshot_directory_with_backend "$checksum_backend" "$1"
+  snapshot_directory_with_native_backend "$checksum_backend" "$1"
 }
 before=$(snapshot)
 
-if "$test_publisher" "$temporary/missing.tgz" "$release_root" 2026.08.22.23 "$(printf x | run_checksum "$checksum_backend" | awk '{print $1}')" >/dev/null 2>&1; then
+if run_test_publisher "$temporary/missing.tgz" "$release_root" 2026.08.22.23 "$(printf x | run_checksum "$checksum_backend" | awk '{print $1}')" >/dev/null 2>&1; then
   echo 'publisher accepted a missing bundle' >&2
   exit 1
 fi
@@ -152,7 +213,7 @@ for name in root targets snapshot timestamp; do printf x > "$candidate/tuf/metad
 bundle="$temporary/candidate.tgz"
 tar -C "$candidate" -czf "$bundle" current.json install windows tuf
 digest=$(run_checksum "$checksum_backend" "$bundle" | awk '{print $1}')
-if "$test_publisher" "$bundle" "$release_root" 2026.08.22.23 "$digest" >/dev/null 2>&1; then
+if run_test_publisher "$bundle" "$release_root" 2026.08.22.23 "$digest" >/dev/null 2>&1; then
   echo 'publisher accepted an invalid current.json' >&2
   exit 1
 fi
@@ -173,11 +234,17 @@ case "${1:-}" in
     ;;
   inspect)
     case "${PAPERBOAT_TEST_DOCKER_MODE:?}" in
-      parent)
-        printf '[{"Mounts":[{"Type":"bind","Source":"%s","Destination":"/srv/paperboat-releases","RW":false}]}]\n' "$PAPERBOAT_TEST_RELEASE_ROOT"
+      good)
+        printf '[{"Mounts":[{"Type":"bind","Source":"%s","Destination":"/srv/paperboat-releases","RW":false}],"Config":{"Env":["PAPERBOAT_RELEASE_DIRECTORY=/srv/paperboat-releases/current"]}}]\n' "$PAPERBOAT_TEST_RELEASE_ROOT"
+        ;;
+      wrong-env)
+        printf '[{"Mounts":[{"Type":"bind","Source":"%s","Destination":"/srv/paperboat-releases","RW":false}],"Config":{"Env":["PAPERBOAT_RELEASE_DIRECTORY=/srv/other"]}}]\n' "$PAPERBOAT_TEST_RELEASE_ROOT"
+        ;;
+      split)
+        printf '[{"Mounts":[{"Type":"bind","Source":"%s","Destination":"/srv/paperboat-releases","RW":false}],"Config":{"Env":[]}}, {"Mounts":[],"Config":{"Env":["PAPERBOAT_RELEASE_DIRECTORY=/srv/paperboat-releases/current"]}}]\n' "$PAPERBOAT_TEST_RELEASE_ROOT"
         ;;
       stale)
-        printf '[{"Mounts":[{"Type":"bind","Source":"%s/current","Destination":"/srv/paperboat-releases","RW":false}]}]\n' "$PAPERBOAT_TEST_RELEASE_ROOT"
+        printf '[{"Mounts":[{"Type":"bind","Source":"%s/current","Destination":"/srv/paperboat-releases","RW":false}],"Config":{"Env":["PAPERBOAT_RELEASE_DIRECTORY=/srv/paperboat-releases/current"]}}]\n' "$PAPERBOAT_TEST_RELEASE_ROOT"
         ;;
       *) exit 2 ;;
     esac
@@ -196,7 +263,7 @@ EOF
   tar -C "$candidate" -czf "$bundle" current.json install windows tuf
   digest=$(run_checksum "$checksum_backend" "$bundle" | awk '{print $1}')
   expected_candidate=$(snapshot_directory "$candidate")
-  PATH="$temporary/bin:$PATH" PAPERBOAT_TEST_DOCKER_MODE=parent PAPERBOAT_TEST_RELEASE_ROOT="$release_root" "$test_publisher" "$bundle" "$release_root" "$candidate_version" "$digest"
+  PATH="$temporary/bin:$PATH" PAPERBOAT_TEST_DOCKER_MODE=good PAPERBOAT_TEST_RELEASE_ROOT="$release_root" run_test_publisher "$bundle" "$release_root" "$candidate_version" "$digest"
   set -- "$release_root"/staging/activation-*
   test "$#" -eq 1 && test -d "$1"
   transaction=$1
@@ -212,8 +279,19 @@ EOF
   next_bundle="$temporary/next.tgz"
   tar -C "$next" -czf "$next_bundle" current.json install windows tuf
   next_digest=$(run_checksum "$checksum_backend" "$next_bundle" | awk '{print $1}')
+  live_before_wrong_env=$(snapshot)
+  if PATH="$temporary/bin:$PATH" PAPERBOAT_TEST_DOCKER_MODE=wrong-env PAPERBOAT_TEST_RELEASE_ROOT="$release_root" run_test_publisher "$next_bundle" "$release_root" 2026.08.22.24 "$next_digest" >/dev/null 2>&1; then
+    echo 'publisher accepted a release mount with the wrong runtime directory' >&2
+    exit 1
+  fi
+  test "$live_before_wrong_env" = "$(snapshot)"
+  if PATH="$temporary/bin:$PATH" PAPERBOAT_TEST_DOCKER_MODE=split PAPERBOAT_TEST_RELEASE_ROOT="$release_root" run_test_publisher "$next_bundle" "$release_root" 2026.08.22.24 "$next_digest" >/dev/null 2>&1; then
+    echo 'publisher accepted split release mount and runtime configuration containers' >&2
+    exit 1
+  fi
+  test "$live_before_wrong_env" = "$(snapshot)"
   live_before_stale=$(snapshot)
-  if PATH="$temporary/bin:$PATH" PAPERBOAT_TEST_DOCKER_MODE=stale PAPERBOAT_TEST_RELEASE_ROOT="$release_root" "$test_publisher" "$next_bundle" "$release_root" 2026.08.22.24 "$next_digest" >/dev/null 2>&1; then
+  if PATH="$temporary/bin:$PATH" PAPERBOAT_TEST_DOCKER_MODE=stale PAPERBOAT_TEST_RELEASE_ROOT="$release_root" run_test_publisher "$next_bundle" "$release_root" 2026.08.22.24 "$next_digest" >/dev/null 2>&1; then
     echo 'publisher accepted a stale current-directory bind mount' >&2
     exit 1
   fi

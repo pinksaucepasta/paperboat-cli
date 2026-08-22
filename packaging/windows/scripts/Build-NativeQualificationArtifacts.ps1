@@ -16,7 +16,12 @@ param(
     [string] $WixCommand,
 
     [Parameter(Mandatory = $true)]
-    [string] $OutputDirectory
+    [string] $OutputDirectory,
+
+    # The release workflow supplies the already signed final MSI here. Native
+    # qualification must exercise that exact fresh-install payload rather than
+    # compiling a second unsigned copy of the release MSI.
+    [string] $FreshMsiPath = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -28,6 +33,22 @@ $stageRoot = Join-Path $outputRoot 'stage'
 $msiRoot = Join-Path $outputRoot 'msi'
 $channel = 'stable'
 New-Item -ItemType Directory -Force -Path $stageRoot, $msiRoot | Out-Null
+
+$freshMsi = if ([string]::IsNullOrWhiteSpace($FreshMsiPath)) {
+    Join-Path $msiRoot ("paperboat_{0}_windows_{1}.msi" -f $Version, $Architecture)
+} else {
+    [IO.Path]::GetFullPath($FreshMsiPath)
+}
+if (-not [string]::IsNullOrWhiteSpace($FreshMsiPath) -and -not (Test-Path -LiteralPath $freshMsi -PathType Leaf)) {
+    throw "The supplied final fresh MSI is missing: $freshMsi"
+}
+$versionParts = $Version.Split('.')
+$upgradeVersionParts = $UpgradeVersion.Split('.')
+$versionDate = [DateTime]::new([int]$versionParts[0], [int]$versionParts[1], [int]$versionParts[2])
+$upgradeVersionDate = [DateTime]::new([int]$upgradeVersionParts[0], [int]$upgradeVersionParts[1], [int]$upgradeVersionParts[2])
+if ($upgradeVersionDate -lt $versionDate -or ($upgradeVersionDate -eq $versionDate -and [int]$upgradeVersionParts[3] -le [int]$versionParts[3])) {
+    throw "Upgrade version $UpgradeVersion must be greater than release version $Version."
+}
 
 $nativeArchitecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
 $expectedArchitecture = if ($Architecture -eq 'amd64') { 'X64' } else { 'Arm64' }
@@ -102,18 +123,22 @@ try {
     $env:CGO_ENABLED = '0'
     $env:GOOS = 'windows'
     $env:GOARCH = if ($Architecture -eq 'amd64') { 'amd64' } else { 'arm64' }
-    Build-Payload -PayloadVersion $Version -PayloadDirectory (Join-Path $stageRoot 'fresh')
+    if ([string]::IsNullOrWhiteSpace($FreshMsiPath)) {
+        Build-Payload -PayloadVersion $Version -PayloadDirectory (Join-Path $stageRoot 'fresh')
+    }
     Build-Payload -PayloadVersion $UpgradeVersion -PayloadDirectory (Join-Path $stageRoot 'upgrade')
-    & (Join-Path $PSScriptRoot 'build-msi.ps1') `
-        -Version $Version `
-        -Architecture $Architecture `
-        -Channel $channel `
-        -StagingDirectory (Join-Path $stageRoot 'fresh') `
-        -OutputDirectory $msiRoot `
-        -WixCommand $WixCommand `
-        -ExpectedWixVersion '5.0.2' `
-        -QualificationRollbackHook
-    if ($LASTEXITCODE -ne 0) { throw 'Fresh qualification MSI build failed.' }
+    if ([string]::IsNullOrWhiteSpace($FreshMsiPath)) {
+        & (Join-Path $PSScriptRoot 'build-msi.ps1') `
+            -Version $Version `
+            -Architecture $Architecture `
+            -Channel $channel `
+            -StagingDirectory (Join-Path $stageRoot 'fresh') `
+            -OutputDirectory $msiRoot `
+            -WixCommand $WixCommand `
+            -ExpectedWixVersion '5.0.2' `
+            -QualificationRollbackHook
+        if ($LASTEXITCODE -ne 0) { throw 'Fresh qualification MSI build failed.' }
+    }
     & (Join-Path $PSScriptRoot 'build-msi.ps1') `
         -Version $UpgradeVersion `
         -Architecture $Architecture `
@@ -126,19 +151,24 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Upgrade qualification MSI build failed.' }
     $fixture = Join-Path $outputRoot 'paperboat-windows-service-fixture.exe'
     Invoke-GoBuild -Output $fixture -Package './packaging/windows/e2e/service-fixture'
-    foreach ($payload in @(
-        (Join-Path $stageRoot 'fresh\pb.exe'),
-        (Join-Path $stageRoot 'fresh\pb-launcher.exe'),
-        (Join-Path $stageRoot 'fresh\paperboat-runtime.exe'),
-        (Join-Path $stageRoot 'fresh\paperboat-hostd.exe'),
-        (Join-Path $stageRoot 'fresh\paperboat-updater.exe'),
+    $payloads = @(
         (Join-Path $stageRoot 'upgrade\pb.exe'),
         (Join-Path $stageRoot 'upgrade\pb-launcher.exe'),
         (Join-Path $stageRoot 'upgrade\paperboat-runtime.exe'),
         (Join-Path $stageRoot 'upgrade\paperboat-hostd.exe'),
         (Join-Path $stageRoot 'upgrade\paperboat-updater.exe'),
         $fixture
-    )) {
+    )
+    if ([string]::IsNullOrWhiteSpace($FreshMsiPath)) {
+        $payloads = @(
+            (Join-Path $stageRoot 'fresh\pb.exe'),
+            (Join-Path $stageRoot 'fresh\pb-launcher.exe'),
+            (Join-Path $stageRoot 'fresh\paperboat-runtime.exe'),
+            (Join-Path $stageRoot 'fresh\paperboat-hostd.exe'),
+            (Join-Path $stageRoot 'fresh\paperboat-updater.exe')
+        ) + $payloads
+    }
+    foreach ($payload in $payloads) {
         Assert-NativePE -Path $payload
     }
 }
@@ -146,7 +176,6 @@ finally {
     Pop-Location
 }
 
-$freshMsi = Join-Path $msiRoot ("paperboat_{0}_windows_{1}.msi" -f $Version, $Architecture)
 $upgradeMsi = Join-Path $msiRoot ("paperboat_{0}_windows_{1}.msi" -f $UpgradeVersion, $Architecture)
 foreach ($path in @($freshMsi, $upgradeMsi)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {

@@ -19,27 +19,57 @@ actual_sha=$(sha256sum "$bundle" | awk '{print $1}')
 [[ "$actual_sha" == "$expected_sha" ]] || { echo "staged bundle digest mismatch" >&2; exit 1; }
 
 verify_live_mount_contract() {
+  local release_root=$1
+  local live="$release_root/current"
+  local staging="$release_root/staging"
+  [[ -d "$release_root" && ! -L "$release_root" ]] || { echo "release root is unavailable" >&2; return 1; }
+  [[ -d "$live" && ! -L "$live" ]] || { echo "live release is unavailable" >&2; return 1; }
+  [[ -d "$staging" && ! -L "$staging" ]] || { echo "release staging directory is unavailable" >&2; return 1; }
+  [[ -d "$live/tuf/metadata" && ! -L "$live/tuf/metadata" ]] || { echo "live TUF metadata is unavailable" >&2; return 1; }
+  [[ -d "$live/tuf/targets" && ! -L "$live/tuf/targets" ]] || { echo "live TUF targets are unavailable" >&2; return 1; }
   mapfile -t containers < <(docker ps -q)
   ((${#containers[@]} > 0)) || { echo "no running containers are available to verify the release mount" >&2; return 1; }
-  docker inspect "${containers[@]}" | python3 -c '
+  local inspect
+  inspect=$(mktemp) || return 1
+  if ! docker inspect "${containers[@]}" > "$inspect"; then
+    rm -f -- "$inspect"
+    return 1
+  fi
+  if ! python3 - "$release_root" "$inspect" <<'PY'
 import json
 import sys
 
-containers = json.load(sys.stdin)
-parent_source = "/opt/paperboat/releases"
+containers = json.load(open(sys.argv[2], encoding="utf-8"))
+parent_source = sys.argv[1]
 old_source = parent_source + "/current"
 destination = "/srv/paperboat-releases"
-parent_mount = False
+runtime = destination + "/current"
+ready = False
 for container in containers:
-    for mount in container.get("Mounts", []):
-        source = mount.get("Source")
-        if source == old_source:
-            raise SystemExit("a running container still bind-mounts the old current release directory")
-        if source == parent_source and mount.get("Destination") == destination and mount.get("Type") == "bind" and mount.get("RW") is False:
-            parent_mount = True
-if not parent_mount:
-    raise SystemExit("no running container exposes the read-only releases parent mount")
-'
+    mounts = container.get("Mounts", [])
+    if any(mount.get("Source") == old_source for mount in mounts):
+        raise SystemExit("a running container still bind-mounts the old current release directory")
+    parent_mount = any(
+        mount.get("Source") == parent_source
+        and mount.get("Destination") == destination
+        and mount.get("Type") == "bind"
+        and mount.get("RW") is False
+        for mount in mounts
+    )
+    runtime_env = runtime in {
+        value.split("=", 1)[1]
+        for value in container.get("Config", {}).get("Env", [])
+        if value.startswith("PAPERBOAT_RELEASE_DIRECTORY=")
+    }
+    ready = ready or (parent_mount and runtime_env)
+if not ready:
+    raise SystemExit("no single running container exposes the read-only releases parent mount and current runtime directory")
+PY
+  then
+    rm -f -- "$inspect"
+    return 1
+  fi
+  rm -f -- "$inspect"
 }
 
 atomic_exchange() {
@@ -96,7 +126,7 @@ done
 
 chown -R 501:root "$next"
 chmod 0700 "$next"
-verify_live_mount_contract
+verify_live_mount_contract "$release_root"
 
 # This must remain the final command. The server resolves current through the
 # releases-parent mount on every request, so the exchange exposes TUF,

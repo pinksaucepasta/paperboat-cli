@@ -49,11 +49,84 @@ jobs:
       - name: Validate release endpoints
         env:
           INSTALL_URL: ${{ vars.PAPERBOAT_INSTALL_URL }}
+          SERVER_URL: ${{ vars.PAPERBOAT_DEFAULT_SERVER_URL }}
+          RELEASE_URL: ${{ vars.PAPERBOAT_DEFAULT_RELEASE_URL }}
         shell: bash
         run: |
           set -euo pipefail
           test -n "$INSTALL_URL" || { echo 'PAPERBOAT_INSTALL_URL is required' >&2; exit 1; }
           case "$INSTALL_URL" in https://*) ;; *) echo 'PAPERBOAT_INSTALL_URL must use https' >&2; exit 1 ;; esac
+          test -n "$SERVER_URL" || { echo 'PAPERBOAT_DEFAULT_SERVER_URL is required' >&2; exit 1; }
+          case "$SERVER_URL" in https://*) ;; *) echo 'PAPERBOAT_DEFAULT_SERVER_URL must use https' >&2; exit 1 ;; esac
+          test -n "$RELEASE_URL" || { echo 'PAPERBOAT_DEFAULT_RELEASE_URL is required' >&2; exit 1; }
+          case "$RELEASE_URL" in https://*) ;; *) echo 'PAPERBOAT_DEFAULT_RELEASE_URL must use https' >&2; exit 1 ;; esac
+      - name: Configure protected release origin read-only identity
+        env:
+          PAPERBOAT_RELEASE_SSH_KEY: ${{ secrets.PAPERBOAT_RELEASE_SSH_KEY }}
+          PAPERBOAT_RELEASE_KNOWN_HOSTS: ${{ secrets.PAPERBOAT_RELEASE_KNOWN_HOSTS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$PAPERBOAT_RELEASE_SSH_KEY" || { echo 'PAPERBOAT_RELEASE_SSH_KEY is required' >&2; exit 1; }
+          test -n "$PAPERBOAT_RELEASE_KNOWN_HOSTS" || { echo 'PAPERBOAT_RELEASE_KNOWN_HOSTS is required' >&2; exit 1; }
+          install -d -m 0700 "$HOME/.ssh"
+          printf '%s\n' "$PAPERBOAT_RELEASE_SSH_KEY" > "$HOME/.ssh/paperboat-release"
+          chmod 0600 "$HOME/.ssh/paperboat-release"
+          printf '%s\n' "$PAPERBOAT_RELEASE_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 0600 "$HOME/.ssh/known_hosts"
+      - name: Verify read-only publication origin readiness
+        env:
+          RELEASE_HOST: ${{ vars.PAPERBOAT_RELEASE_HOST }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$RELEASE_HOST" || { echo 'PAPERBOAT_RELEASE_HOST is required' >&2; exit 1; }
+          ssh -i "$HOME/.ssh/paperboat-release" -o BatchMode=yes -o StrictHostKeyChecking=yes "root@$RELEASE_HOST" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          release_root=/opt/paperboat/releases
+          live="$release_root/current"
+          staging="$release_root/staging"
+          [[ -d "$release_root" && ! -L "$release_root" ]] || { echo 'release root is unavailable' >&2; exit 1; }
+          [[ -d "$live" && ! -L "$live" ]] || { echo 'live release is unavailable' >&2; exit 1; }
+          [[ -d "$staging" && ! -L "$staging" ]] || { echo 'release staging directory is unavailable' >&2; exit 1; }
+          [[ -d "$live/tuf/metadata" && ! -L "$live/tuf/metadata" ]] || { echo 'live TUF metadata is unavailable' >&2; exit 1; }
+          [[ -d "$live/tuf/targets" && ! -L "$live/tuf/targets" ]] || { echo 'live TUF targets are unavailable' >&2; exit 1; }
+          mapfile -t containers < <(docker ps -q)
+          ((${#containers[@]} > 0)) || { echo 'no running containers are available to verify the release mount' >&2; exit 1; }
+          inspect=$(mktemp)
+          trap 'rm -f "$inspect"' EXIT
+          docker inspect "${containers[@]}" > "$inspect"
+          python3 - "$release_root" "$inspect" <<'PY'
+          import json
+          import sys
+
+          release_root = sys.argv[1]
+          old_source = release_root + "/current"
+          destination = "/srv/paperboat-releases"
+          runtime = destination + "/current"
+          containers = json.load(open(sys.argv[2], encoding="utf-8"))
+          ready = False
+          for container in containers:
+              mounts = container.get("Mounts", [])
+              if any(mount.get("Source") == old_source for mount in mounts):
+                  raise SystemExit("a running container still bind-mounts the old current release directory")
+              parent_mount = any(
+                  mount.get("Source") == release_root
+                  and mount.get("Destination") == destination
+                  and mount.get("Type") == "bind"
+                  and mount.get("RW") is False
+                  for mount in mounts
+              )
+              runtime_env = runtime in {
+                  value.split("=", 1)[1]
+                  for value in container.get("Config", {}).get("Env", [])
+                  if value.startswith("PAPERBOAT_RELEASE_DIRECTORY=")
+              }
+              ready = ready or (parent_mount and runtime_env)
+          if not ready:
+              raise SystemExit("no single running container exposes the read-only releases parent mount and current runtime directory")
+          PY
+          REMOTE
       - name: Fetch public current root chain
         env:
           RELEASE_URL: ${{ vars.PAPERBOAT_DEFAULT_RELEASE_URL }}
@@ -108,14 +181,43 @@ jobs:
 
   platform-qualification:
     name: Native platform qualification
-    needs: release-authority
+    needs: [release-authority, windows-release-contract]
     uses: ./.github/workflows/platform-qualification.yml
+
+  windows-release-contract:
+    name: Validate Windows release contracts
+    needs: release-authority
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    runs-on: blacksmith-2vcpu-windows-2025
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Validate Windows release pipeline contract
+        shell: cmd
+        run: '"C:\\Program Files\\Git\\bin\\bash.exe" --noprofile --norc -e -o pipefail -c "./packaging/windows/scripts/validate-release-pipeline.sh"'
+      - name: Validate first-party Windows packaging contract
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & go run ./packaging/windows/cmd/validate --root packaging/windows
+          if ($LASTEXITCODE -ne 0) { throw 'Windows packaging contract validation failed.' }
+          & go test -count=1 ./packaging/windows/cmd/... ./packaging/windows/manifest/...
+          if ($LASTEXITCODE -ne 0) { throw 'Windows packaging tests failed.' }
 
   release-linux:
     name: Build Linux ${{ matrix.architecture }} release assets
-    needs: release-authority
+    needs: [release-authority, windows-release-contract, platform-qualification]
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     permissions:
       contents: read
     strategy:
@@ -179,9 +281,10 @@ jobs:
 
   release-macos:
     name: Build macOS release assets
-    needs: release-authority
+    needs: [release-authority, windows-release-contract, platform-qualification]
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
     runs-on: blacksmith-6vcpu-macos-latest
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -224,9 +327,10 @@ jobs:
 
   release-windows:
     name: Windows ${{ matrix.architecture }} (${{ matrix.channel }}) package
-    needs: release-authority
+    needs: [release-authority, windows-release-contract, platform-qualification]
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     permissions:
       contents: read
     strategy:
@@ -265,16 +369,6 @@ jobs:
         run: |
           'C:\Program Files\PowerShell\7' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           'C:\Program Files\Python313' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-      - name: Validate Windows release pipeline contract
-        shell: cmd
-        run: '"C:\\Program Files\\Git\\bin\\bash.exe" --noprofile --norc -e -o pipefail -c "./packaging/windows/scripts/validate-release-pipeline.sh"'
-      - name: Validate first-party Windows packaging contract
-        shell: powershell
-        run: |
-          & go run ./packaging/windows/cmd/validate --root packaging/windows
-          if ($LASTEXITCODE -ne 0) { throw 'Windows packaging contract validation failed.' }
-          & go test -count=1 ./packaging/windows/cmd/... ./packaging/windows/manifest/...
-          if ($LASTEXITCODE -ne 0) { throw 'Windows packaging tests failed.' }
       - name: Install pinned WiX Toolset
         shell: powershell
         run: |
@@ -359,6 +453,83 @@ jobs:
             -Path @($msi) `
             -Architecture $env:PAPERBOAT_ARCH
           if (-not $?) { throw 'Windows MSI signing or verification failed.' }
+      - name: Build native Windows upgrade fixture and service fixture
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $parts = $env:RELEASE_VERSION.Split('.')
+          $revision = [int]$parts[3]
+          if ($revision -lt 99) {
+            $upgradeVersion = '{0}.{1}.{2}.{3}' -f $parts[0], $parts[1], $parts[2], ($revision + 1)
+          } else {
+            $upgradeDate = [DateTime]::new([int]$parts[0], [int]$parts[1], [int]$parts[2]).AddDays(1)
+            $upgradeVersion = '{0:0000}.{1:00}.{2:00}.0' -f $upgradeDate.Year, $upgradeDate.Month, $upgradeDate.Day
+          }
+          $msi = Join-Path $env:PAPERBOAT_WINDOWS_DIST ("paperboat_{0}_windows_{1}.msi" -f $env:RELEASE_VERSION, $env:PAPERBOAT_ARCH)
+          $qualificationRoot = Join-Path $env:GITHUB_WORKSPACE ("native-qualification\windows-{0}" -f $env:PAPERBOAT_ARCH)
+          New-Item -ItemType Directory -Force -Path $qualificationRoot | Out-Null
+          & ./packaging/windows/scripts/Build-NativeQualificationArtifacts.ps1 `
+            -Version $env:RELEASE_VERSION `
+            -UpgradeVersion $upgradeVersion `
+            -Architecture $env:PAPERBOAT_ARCH `
+            -WixCommand $env:PAPERBOAT_WIX_PATH `
+            -OutputDirectory $qualificationRoot `
+            -FreshMsiPath $msi
+          if ($LASTEXITCODE -ne 0) { throw 'Native Windows upgrade and service fixtures failed to build.' }
+          "PAPERBOAT_WINDOWS_UPGRADE_VERSION=$upgradeVersion" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding UTF8
+      - name: Execute full native Windows MSI qualification
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & ./packaging/windows/scripts/Invoke-NativeWindowsQualification.ps1 `
+            -MsiPath $env:PAPERBOAT_WINDOWS_E2E_MSI `
+            -UpgradeMsiPath $env:PAPERBOAT_WINDOWS_E2E_UPGRADE_MSI `
+            -Version $env:RELEASE_VERSION `
+            -UpgradeVersion $env:PAPERBOAT_WINDOWS_UPGRADE_VERSION `
+            -Architecture $env:PAPERBOAT_ARCH `
+            -ServiceFixturePath $env:PAPERBOAT_WINDOWS_E2E_SERVICE_FIXTURE `
+            -OutputDirectory $env:PAPERBOAT_WINDOWS_E2E_OUTPUT
+          if ($LASTEXITCODE -ne 0) { throw 'Full native Windows MSI qualification failed.' }
+      - name: Require passed native Windows qualification report
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $reportPath = Join-Path $env:PAPERBOAT_WINDOWS_E2E_OUTPUT 'native-windows-qualification.json'
+          if (-not (Test-Path -LiteralPath $reportPath -PathType Leaf)) { throw "Native qualification report is missing: $reportPath" }
+          $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json
+          $msi = Join-Path $env:PAPERBOAT_WINDOWS_DIST ("paperboat_{0}_windows_{1}.msi" -f $env:RELEASE_VERSION, $env:PAPERBOAT_ARCH)
+          $msiHash = (Get-FileHash -LiteralPath $msi -Algorithm SHA256).Hash.ToLowerInvariant()
+          $upgradeHash = (Get-FileHash -LiteralPath $env:PAPERBOAT_WINDOWS_E2E_UPGRADE_MSI -Algorithm SHA256).Hash.ToLowerInvariant()
+          $releaseParts = $env:RELEASE_VERSION.Split('.')
+          $upgradeParts = $env:PAPERBOAT_WINDOWS_UPGRADE_VERSION.Split('.')
+          $releaseDate = [DateTime]::new([int]$releaseParts[0], [int]$releaseParts[1], [int]$releaseParts[2])
+          $upgradeDate = [DateTime]::new([int]$upgradeParts[0], [int]$upgradeParts[1], [int]$upgradeParts[2])
+          if ($upgradeDate -lt $releaseDate -or ($upgradeDate -eq $releaseDate -and [int]$upgradeParts[3] -le [int]$releaseParts[3])) {
+            throw "Upgrade fixture version $env:PAPERBOAT_WINDOWS_UPGRADE_VERSION is not greater than release $env:RELEASE_VERSION."
+          }
+          $requiredEvents = @('preflight', 'native_go_e2e', 'msi_path_fixtures', 'msiexec_fresh_install', 'msi_repair_assertions', 'dynamic_preview_cleanup_fixture', 'msiexec_upgrade', 'msi_upgrade_assertions', 'msiexec_uninstall', 'msi_uninstall_assertions', 'msiexec_reinstall', 'msi_reinstall_assertions', 'msiexec_reinstall_uninstall')
+          if ($report.schema -ne 'paperboat.windows-native-qualification-report/v1' -or
+              $report.platform -ne 'windows' -or
+              $report.architecture -ne $env:PAPERBOAT_ARCH -or
+              $report.stability -ne 'stable' -or
+              $report.version -ne $env:RELEASE_VERSION -or
+              $report.upgrade_version -ne $env:PAPERBOAT_WINDOWS_UPGRADE_VERSION -or
+              $report.status -ne 'passed' -or
+              $report.native_tested -ne $true -or
+              [string]::IsNullOrWhiteSpace([string]$report.windows_build) -or
+              [string]::IsNullOrWhiteSpace([string]$report.runner) -or
+              $report.msi_sha256 -ne $msiHash -or
+              $report.upgrade_msi_sha256 -ne $upgradeHash) {
+            throw 'Native qualification report does not describe the passed final and upgrade MSI bytes.'
+          }
+          $failedEvents = @($report.events | Where-Object { $_.status -in @('failed', 'blocked') })
+          if ($failedEvents.Count -ne 0) { throw 'Native qualification report contains failed or blocked events.' }
+          foreach ($eventName in $requiredEvents) {
+            if (@($report.events | Where-Object { $_.name -eq $eventName -and $_.status -eq 'passed' }).Count -eq 0) {
+              throw "Native qualification report is missing passed event $eventName."
+            }
+          }
+          "PAPERBOAT_WINDOWS_NATIVE_REPORT=$reportPath" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding UTF8
       - name: Package verified Windows ZIP
         shell: powershell
         run: |
@@ -413,6 +584,7 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
+          $report = Get-Content -LiteralPath $env:PAPERBOAT_WINDOWS_NATIVE_REPORT -Raw | ConvertFrom-Json
           $components = @('cli', 'runtime', 'hostd', 'updater', 'launcher')
           $artifacts = foreach ($component in $components) {
             $name = "$component-windows-$env:PAPERBOAT_ARCH"
@@ -435,8 +607,8 @@ jobs:
             architecture = $env:PAPERBOAT_ARCH
             status = 'passed'
             native_tested = $true
-            windows_build = [Environment]::OSVersion.Version.Build.ToString()
-            runner = $env:RUNNER_NAME
+            windows_build = [string]$report.windows_build
+            runner = [string]$report.runner
             artifacts = @($artifacts)
           } | ConvertTo-Json -Depth 5
           $path = Join-Path $env:PAPERBOAT_WINDOWS_DIST ("windows-{0}-native-qualification.json" -f $env:PAPERBOAT_ARCH)
@@ -550,6 +722,7 @@ jobs:
       needs.windows-winget.result == 'success'
     needs: [release-authority, platform-qualification, release-linux, release-macos, release-windows, windows-winget]
     runs-on: blacksmith-2vcpu-ubuntu-2404-arm
+    timeout-minutes: 30
     permissions:
       contents: read
       id-token: write
@@ -704,6 +877,7 @@ jobs:
       id-token: write
       attestations: write
     runs-on: blacksmith-2vcpu-ubuntu-2404-arm
+    timeout-minutes: 30
     environment: paperboat-tuf-published
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

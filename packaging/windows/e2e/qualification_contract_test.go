@@ -113,9 +113,17 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 	for _, requiredText := range []string{
 		"platform-qualification",
 		"release-windows",
+		"needs: [release-authority, windows-release-contract, platform-qualification]",
 		"windows-winget",
 		"windows-amd64",
 		"windows-arm64",
+		"Build native Windows upgrade fixture and service fixture",
+		"Execute full native Windows MSI qualification",
+		"Require passed native Windows qualification report",
+		"Build-NativeQualificationArtifacts.ps1",
+		"Invoke-NativeWindowsQualification.ps1",
+		"-FreshMsiPath",
+		"PAPERBOAT_WINDOWS_NATIVE_REPORT",
 	} {
 		if !strings.Contains(string(releaseWorkflow), requiredText) {
 			t.Fatalf("release candidate qualification is missing %q", requiredText)

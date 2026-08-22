@@ -48,6 +48,7 @@ winget_renderer = (pathlib.Path(sys.argv[1]).parents[2] / "packaging/windows/scr
 
 for required in (
     "release-authority:", "release-linux:", "release-macos:", "release-windows:",
+    "windows-release-contract:",
     "runner: blacksmith-2vcpu-ubuntu-2404",
     "runner: blacksmith-2vcpu-ubuntu-2404-arm",
     "runner: blacksmith-2vcpu-windows-2025", "runner: windows-11-arm",
@@ -64,6 +65,9 @@ for required in (
     "validate-signers", "active-signing-state.json", "trusted-root.json",
     "paperboat-tuf", "publish-tuf-origin.sh", "PAPERBOAT_RELEASE_SSH_KEY",
     "windows-amd64-native-qualification.json", "windows-arm64-native-qualification.json",
+    "Build native Windows upgrade fixture and service fixture", "Execute full native Windows MSI qualification",
+    "Require passed native Windows qualification report", "Build-NativeQualificationArtifacts.ps1",
+    "Invoke-NativeWindowsQualification.ps1", "-FreshMsiPath", "PAPERBOAT_WINDOWS_NATIVE_REPORT",
     "Publish immutable GitHub release assets", "Download and verify immutable GitHub release bytes",
     "Assemble isolated release origin", "Verify staged release consumers before activation",
     "Mark verified GitHub release latest", "Activate verified release atomically on Hetzner",
@@ -78,6 +82,7 @@ for required in (
 
 for required in (
     "workflow_call:", "platform-contract:",
+    "timeout-minutes: 30",
     "runner: blacksmith-2vcpu-ubuntu-2404",
     "runner: blacksmith-2vcpu-ubuntu-2404-arm",
     "runner: blacksmith-6vcpu-macos-latest",
@@ -103,7 +108,8 @@ if "publish-release.yml" in release or "update-assurance.yml" in release:
 
 linux_job = release[release.index("  release-linux:"):release.index("  release-macos:")]
 authority_job = release[release.index("  release-authority:"):release.index("  platform-qualification:")]
-qualification_job = release[release.index("  platform-qualification:"):release.index("  release-linux:")]
+qualification_job = release[release.index("  platform-qualification:"):release.index("  windows-release-contract:")]
+windows_contract_job = release[release.index("  windows-release-contract:"):release.index("  release-linux:")]
 macos_job = release[release.index("  release-macos:"):release.index("  release-windows:")]
 windows_job = release[release.index("  release-windows:"):release.index("  windows-winget:")]
 assembly_job = release[release.index("  candidate-assembly:"):release.index("  release-publication:")]
@@ -113,9 +119,36 @@ expected_active_state = {"schema": "paperboat.tuf-signing-state/v1", "roles": {"
 manifest_command = 'bash tools/package-manifests.sh dist "${GITHUB_REPOSITORY}" "${RELEASE_VERSION}"'
 if active_state != expected_active_state:
     raise SystemExit("active TUF signing state does not match the current root-v2 role aliases")
-for name, job in (("platform qualification", qualification_job), ("Linux release", linux_job), ("macOS release", macos_job), ("Windows release", windows_job)):
-    if "needs: release-authority" not in job:
-        raise SystemExit(f"{name} must wait for protected release authority validation")
+if "needs: [release-authority, windows-release-contract]" not in qualification_job:
+    raise SystemExit("platform qualification must wait for protected release authority and the Windows contract gate")
+for name, job in (("Linux release", linux_job), ("macOS release", macos_job), ("Windows release", windows_job)):
+    if "needs: [release-authority, windows-release-contract, platform-qualification]" not in job:
+        raise SystemExit(f"{name} must wait for protected authority, the Windows contract gate, and native platform qualification")
+for required in (
+    "runs-on: blacksmith-2vcpu-windows-2025", "timeout-minutes: 15",
+    "Validate Windows release pipeline contract",
+    '"C:\\\\Program Files\\\\Git\\\\bin\\\\bash.exe" --noprofile --norc -e -o pipefail -c "./packaging/windows/scripts/validate-release-pipeline.sh"',
+    "Validate first-party Windows packaging contract",
+    "go run ./packaging/windows/cmd/validate --root packaging/windows",
+    "go test -count=1 ./packaging/windows/cmd/... ./packaging/windows/manifest/...",
+):
+    if required not in windows_contract_job:
+        raise SystemExit(f"Windows release contract gate is missing {required!r}")
+for forbidden in ("Validate Windows release pipeline contract", "Validate first-party Windows packaging contract"):
+    if forbidden in windows_job:
+        raise SystemExit(f"Windows package matrix must not repeat the early contract gate: {forbidden}")
+for name, job in (
+    ("release authority", authority_job),
+    ("Windows release contract", windows_contract_job),
+    ("Linux release", linux_job),
+    ("macOS release", macos_job),
+    ("Windows release", windows_job),
+    ("WinGet", winget_job),
+    ("candidate assembly", assembly_job),
+    ("release publication", publication_job),
+):
+    if "timeout-minutes:" not in job:
+        raise SystemExit(f"{name} must have a bounded job timeout")
 for required in ('"dist/pb-${os}-${arch}"', '"dist/pb-darwin-arm64"', '("pb-windows-{0}.exe" -f $env:PAPERBOAT_ARCH)'):
     if required not in release:
         raise SystemExit(f"release workflow is missing direct installer asset {required!r}")
@@ -140,21 +173,23 @@ if sibling_server_posix_installer.is_file() and sibling_server_posix_installer.r
 for required in ("install -m 0755 tools/install.sh dist/install.sh", "install -m 0644 tools/install.ps1 dist/install.ps1", 'install -m 0644 "$PAPERBOAT_GITHUB_RELEASE_ASSETS/install.ps1" "$publish/windows"', 'tar -C "$publish" -czf "$bundle" current.json install windows tuf', "dist/install.ps1", "GitHub release asset differs from the immutable candidate"):
     if required not in release:
         raise SystemExit(f"release workflow does not carry Windows installer contract {required!r}")
-for required in ("atomic_exchange", "renameat2", "current.json", "verify_live_mount_contract", "/opt/paperboat/releases", "/srv/paperboat-releases", "docker inspect", "pre-activation cleanup", "atomic_exchange \"$live\" \"$next\""):
+for required in ("atomic_exchange", "renameat2", "current.json", "verify_live_mount_contract", "/opt/paperboat/releases", "/srv/paperboat-releases", "PAPERBOAT_RELEASE_DIRECTORY", "no single running container exposes the read-only releases parent mount and current runtime directory", "docker inspect", "pre-activation cleanup", "atomic_exchange \"$live\" \"$next\""):
     if required not in publisher:
         raise SystemExit(f"release publisher is missing transaction contract {required!r}")
 if "rollback" in publisher:
     raise SystemExit("release publisher must never roll back an observed TUF timestamp")
-for required in ("environment: paperboat-tuf-published", "timeout-minutes: 5", "Validate release version", "release-version.sh validate", "Validate release endpoints", "PAPERBOAT_INSTALL_URL", "PAPERBOAT_INSTALL_URL must use https", "Fetch public current root chain", "PAPERBOAT_DEFAULT_RELEASE_URL", "--proto '=https'", "--max-filesize 1048576", "1 through 64", "Validate online signer authorization", "validate-signers"):
+for required in ("environment: paperboat-tuf-published", "timeout-minutes: 5", "Validate release version", "release-version.sh validate", "Validate release endpoints", "PAPERBOAT_INSTALL_URL", "PAPERBOAT_INSTALL_URL must use https", "PAPERBOAT_DEFAULT_SERVER_URL", "PAPERBOAT_DEFAULT_SERVER_URL must use https", "PAPERBOAT_DEFAULT_RELEASE_URL", "PAPERBOAT_DEFAULT_RELEASE_URL must use https", "Configure protected release origin read-only identity", "Verify read-only publication origin readiness", "PAPERBOAT_RELEASE_SSH_KEY", "PAPERBOAT_RELEASE_KNOWN_HOSTS", "PAPERBOAT_RELEASE_HOST", "root@$RELEASE_HOST", "/opt/paperboat/releases", "/srv/paperboat-releases", "PAPERBOAT_RELEASE_DIRECTORY", "no single running container exposes the read-only releases parent mount and current runtime directory", "Fetch public current root chain", "--proto '=https'", "--max-filesize 1048576", "1 through 64", "Validate online signer authorization", "validate-signers"):
     if required not in authority_job:
         raise SystemExit(f"release authority gate is missing {required!r}")
 if authority_job.index("release-version.sh validate") > authority_job.index("Fetch public current root chain") or authority_job.index("release-version.sh validate") > authority_job.index("actions/setup-go@"):
     raise SystemExit("release version validation must run before network/toolchain work in the authority gate")
-if authority_job.index("Validate release endpoints") > authority_job.index("Fetch public current root chain") or authority_job.index("Validate release endpoints") > authority_job.index("actions/setup-go@"):
+if authority_job.index("Validate release endpoints") > authority_job.index("Configure protected release origin read-only identity") or authority_job.index("Validate release endpoints") > authority_job.index("Fetch public current root chain") or authority_job.index("Validate release endpoints") > authority_job.index("actions/setup-go@"):
     raise SystemExit("release endpoint validation must run before network/toolchain work in the authority gate")
-for forbidden in ("PAPERBOAT_RELEASE_SSH_KEY", "PAPERBOAT_RELEASE_KNOWN_HOSTS", "PAPERBOAT_RELEASE_HOST", "root@$RELEASE_HOST"):
+if authority_job.index("Verify read-only publication origin readiness") > authority_job.index("Fetch public current root chain"):
+    raise SystemExit("release origin readiness must run before TUF/network work in the authority gate")
+for forbidden in ("scp ", "publish-tuf-origin.sh", "atomic_exchange", "gh release"):
     if forbidden in authority_job:
-        raise SystemExit(f"read-only release authority gate must not receive publication credential {forbidden!r}")
+        raise SystemExit(f"read-only release authority gate contains a publication mutation {forbidden!r}")
 if "needs: [release-authority," not in assembly_job or "always()" in assembly_job:
     raise SystemExit("candidate assembly must skip without allocating a runner unless release authority and all handoffs succeed")
 for dependency in ("release-authority", "platform-qualification", "release-linux", "release-macos", "release-windows", "windows-winget"):
@@ -232,7 +267,7 @@ if "/releases/latest" in installer or "PAPERBOAT_RELEASE_METADATA_URL" not in in
     raise SystemExit("Unix installer must resolve its default release through current.json")
 PY
 
-for required in select_checksum_backend run_checksum sha256sum shasum; do
+for required in select_checksum_backend run_checksum run_test_publisher assert_isolated_checksum_backend run_native_checksum snapshot_directory_with_native_backend sha256sum_only_path shasum_only_path; do
   grep -Fq -- "$required" "$publisher_test" || {
     echo "publisher checksum contract is missing $required" >&2
     exit 1
@@ -242,6 +277,12 @@ if grep -Fq -- 'xargs -0 shasum' "$publisher_test"; then
   echo 'publisher checksum contract must not depend on a host-specific xargs shasum command' >&2
   exit 1
 fi
+for forbidden in 'CHECKSUM_SHA256SUM_COMMAND=$checksum_sha256sum' 'CHECKSUM_SHASUM_COMMAND=$checksum_shasum'; do
+  if grep -Fq -- "$forbidden" "$publisher_test"; then
+    echo "publisher checksum contract must not restore an absent host command: $forbidden" >&2
+    exit 1
+  fi
+done
 for required in PAPERBOAT_CHECKSUM_BACKEND sha256sum shasum; do
   grep -Fq -- "$required" "$manifest_generator" || {
     echo "package manifest checksum contract is missing $required" >&2
