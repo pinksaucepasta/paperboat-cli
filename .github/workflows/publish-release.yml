@@ -1,6 +1,20 @@
 name: Publish qualified release
 
 on:
+  workflow_call:
+    inputs:
+      candidate_run_id:
+        required: true
+        type: string
+      version:
+        required: true
+        type: string
+      commit:
+        required: true
+        type: string
+    secrets:
+      RELEASE_TOKEN:
+        required: false
   workflow_dispatch:
     inputs:
       candidate_run_id:
@@ -62,7 +76,7 @@ jobs:
         with:
           name: release-candidate-${{ inputs.version }}
           path: dist
-          github-token: ${{ github.token }}
+          github-token: ${{ secrets.RELEASE_TOKEN || github.token }}
           repository: ${{ github.repository }}
           run-id: ${{ inputs.candidate_run_id }}
       - name: Verify candidate identity and every artifact hash
@@ -101,7 +115,7 @@ jobs:
           CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
       - name: Refuse mutable or conflicting release identity
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
         shell: bash
         run: |
           set -euo pipefail
@@ -114,7 +128,7 @@ jobs:
           fi
       - name: Publish or resume GitHub release with immutable assets
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
         shell: bash
         run: |
           set -euo pipefail
@@ -142,7 +156,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ github.token }}
+          password: ${{ secrets.RELEASE_TOKEN || github.token }}
       - name: Build and publish hosted image from qualified commit
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -173,7 +187,7 @@ jobs:
           done
       - name: Verify public release assets remain byte-identical
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
         shell: bash
         run: |
           set -euo pipefail

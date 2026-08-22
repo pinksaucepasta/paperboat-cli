@@ -16,8 +16,9 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write
   actions: read
+  packages: write
   checks: read
   id-token: write
   attestations: write
@@ -756,3 +757,20 @@ jobs:
           if-no-files-found: error
           retention-days: 30
           compression-level: 0
+
+  release-publication:
+    name: Publish qualified release to production
+    needs: candidate-assembly
+    if: needs.candidate-assembly.result == 'success'
+    permissions:
+      contents: write
+      packages: write
+      actions: read
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/publish-release.yml
+    with:
+      candidate_run_id: ${{ github.run_id }}
+      version: ${{ inputs.version || github.ref_name }}
+      commit: ${{ github.sha }}
+    secrets: inherit
