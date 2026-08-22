@@ -1270,7 +1270,7 @@ func localDaemonSnapshot(command *cobra.Command, install localDaemonServiceInsta
 	if err == nil {
 		return client, snapshot, nil
 	}
-	if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ECONNREFUSED) {
+	if !localDaemonSocketUnavailable(err) {
 		return nil, localapi.Snapshot{}, err
 	}
 	executable, executableErr := os.Executable()
@@ -1306,7 +1306,7 @@ func localDaemonSnapshot(command *cobra.Command, install localDaemonServiceInsta
 		if err == nil {
 			return client, snapshot, nil
 		}
-		if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ECONNREFUSED) {
+		if !localDaemonSocketUnavailable(err) {
 			return nil, localapi.Snapshot{}, err
 		}
 		select {
@@ -1693,11 +1693,6 @@ func pairCommand() *cobra.Command {
 				tokenFile, _ := command.Flags().GetString("enrollment-token-file")
 				if strings.TrimSpace(token) == "" && strings.TrimSpace(tokenFile) == "" {
 					return errors.New("fresh pairing requires --enrollment-token or --enrollment-token-file")
-				}
-				if runtime.GOOS == "windows" {
-					if _, err := setupPlatformHostPrerequisites(command.Context()); err != nil {
-						return fmt.Errorf("prepare Windows OpenSSH: %w", err)
-					}
 				}
 			}
 			publicIdentityKey := base64.RawURLEncoding.EncodeToString(identityStore.Current().Public())

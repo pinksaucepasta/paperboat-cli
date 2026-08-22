@@ -75,7 +75,7 @@ func TestStagedTUFRepository(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			githubBootstrap := readStagedRegularFile(t, filepath.Join(githubRoot, bootstrap.TargetPath))
+			githubBootstrap := readStagedRegularFile(t, filepath.Join(githubRoot, stagedBootstrapAssetName(target.platform, bootstrap.TargetPath)))
 			if !bytes.Equal(bootstrapBody, githubBootstrap) {
 				t.Fatal("staged bootstrap target differs from the immutable GitHub asset")
 			}
@@ -118,6 +118,22 @@ func TestStagedTUFRepository(t *testing.T) {
 				assertSignedTargetMatchesFile(t, filepath.Join(repositoryRoot, "metadata", "targets.json"), evidence, filepath.Join(githubRoot, evidence))
 			}
 		})
+	}
+}
+
+func stagedBootstrapAssetName(platform, targetPath string) string {
+	if platform == "windows" {
+		return targetPath + ".exe"
+	}
+	return targetPath
+}
+
+func TestStagedBootstrapAssetNameUsesWindowsExecutableSuffix(t *testing.T) {
+	if got := stagedBootstrapAssetName("windows", "pb-windows-amd64"); got != "pb-windows-amd64.exe" {
+		t.Fatalf("Windows bootstrap asset = %q", got)
+	}
+	if got := stagedBootstrapAssetName("linux", "pb-linux-amd64"); got != "pb-linux-amd64" {
+		t.Fatalf("Linux bootstrap asset = %q", got)
 	}
 }
 

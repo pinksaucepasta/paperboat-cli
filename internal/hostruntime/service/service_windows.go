@@ -106,14 +106,18 @@ func (WindowsController) Apply(ctx context.Context, definitionPath string, upgra
 	defer manager.Disconnect()
 	service, err := manager.OpenService(definition.Name)
 	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
-		service, err = manager.CreateService(definition.Name, definition.Executable, mgr.Config{
+		config := mgr.Config{
 			DisplayName: definition.DisplayName, Description: definition.Description,
 			StartType: mgr.StartAutomatic, ErrorControl: mgr.ErrorNormal,
 			// LocalSystem is deliberate for the privileged service boundary.
 			// hostd obtains the enrolled interactive token before creating a
 			// user workload, so workloads never run as SYSTEM.
 			ServiceStartName: "LocalSystem",
-		}, definition.Arguments...)
+		}
+		if definition.Name == "PaperboatHostd" {
+			config.SidType = windows.SERVICE_SID_TYPE_UNRESTRICTED
+		}
+		service, err = manager.CreateService(definition.Name, definition.Executable, config, definition.Arguments...)
 		if err != nil {
 			return err
 		}
@@ -128,6 +132,9 @@ func (WindowsController) Apply(ctx context.Context, definitionPath string, upgra
 		current.DisplayName = definition.DisplayName
 		current.Description = definition.Description
 		current.StartType = mgr.StartAutomatic
+		if definition.Name == "PaperboatHostd" {
+			current.SidType = windows.SERVICE_SID_TYPE_UNRESTRICTED
+		}
 		if err := service.UpdateConfig(current); err != nil {
 			return err
 		}

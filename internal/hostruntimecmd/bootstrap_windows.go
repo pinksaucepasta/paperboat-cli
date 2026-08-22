@@ -24,6 +24,7 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/enrollment"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostinstall"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/identity"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/machinecontrol"
 	"github.com/pinksaucepasta/paperboat/internal/httptransport"
 	"github.com/pinksaucepasta/paperboat/internal/machinename"
 	"github.com/pinksaucepasta/paperboat/internal/windows/elevation"
@@ -231,6 +232,9 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 			return fmt.Errorf("persist runtime enrollment progress: %w", err)
 		}
 	}
+	if err := ensureWindowsMachineControl(ctx, material, *stateRoot); err != nil {
+		return fmt.Errorf("persist machine control credential: %w", err)
+	}
 	request := hostinstall.Request{Schema: hostinstall.SchemaV1, Platform: runtime.GOOS, User: windowsAccountName(account.Username), Group: "Paperboat", OwnerSID: sid, Executable: artifactPath, Artifact: *material.Artifact, Home: home, Path: os.Getenv("PATH"), StateRoot: *stateRoot, WorkspaceRoot: home, ControlURL: material.ControlURL, UserMachineID: material.UserMachineID, Shell: filepath.Join(os.Getenv("WINDIR"), "System32", "WindowsPowerShell", "v1.0", "powershell.exe"), HelperListenAddress: material.HelperListenAddress, SetupMode: *setupMode}
 	if err := hostinstall.Validate(request, 0); err != nil {
 		return fmt.Errorf("validate Windows host installation request: %w", err)
@@ -264,6 +268,18 @@ func ensureWindowsRuntimeEnrollment(ctx context.Context, material bootstrap.Mate
 		return clientErr
 	}
 	_, err = client.Enroll(ctx, enrollment.Config{ControlURL: material.ControlURL, StateRoot: stateRoot, EnrollmentCredential: material.EnrollmentCredential})
+	return err
+}
+
+func ensureWindowsMachineControl(ctx context.Context, material bootstrap.Material, stateRoot string) error {
+	if material.SetupMode != "client" {
+		return nil
+	}
+	source, err := machinecontrol.NewSource(machinecontrol.Config{ControlURL: material.ControlURL, StateRoot: stateRoot, Timeout: 15 * time.Second})
+	if err != nil {
+		return err
+	}
+	_, err = source.EnsureInitial(ctx)
 	return err
 }
 

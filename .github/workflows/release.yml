@@ -981,9 +981,9 @@ jobs:
           set -euo pipefail
           test -n "$RELEASE_HOST" || { echo 'PAPERBOAT_RELEASE_HOST is required' >&2; exit 1; }
           repository="$RUNNER_TEMP/tuf-production"
-          mkdir -p "$repository"
+          mkdir -p "$repository/targets"
           ssh -i "$HOME/.ssh/paperboat-release" -o BatchMode=yes -o StrictHostKeyChecking=yes "root@$RELEASE_HOST" \
-            'tar -C /opt/paperboat/releases/current/tuf -cf - metadata targets' | tar -C "$repository" -xf -
+            'tar -C /opt/paperboat/releases/current/tuf -cf - metadata' | tar -C "$repository" -xf -
           install -m 0600 tools/tuf-repository/active-signing-state.json "$repository/.signing-state.json"
           echo "PAPERBOAT_TUF_REPOSITORY=$repository" >> "$GITHUB_ENV"
       - name: Sign and verify production TUF release

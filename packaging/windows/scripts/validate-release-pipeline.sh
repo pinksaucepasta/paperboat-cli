@@ -158,9 +158,17 @@ for required in ("--setup MODE               Run setup after install: client or 
 for forbidden in ("--setup receive", "receive, session, or host", '""|receive|session|host)'):
     if forbidden in installer:
         raise SystemExit(f"installer retains retired setup vocabulary {forbidden!r}")
-for required in ("$role = if", "{ 'host' } else { 'client' }", "$setupMode = $role", '"--setup-mode=$setupMode"', 'pb-windows-$arch.exe'):
+for required in ("$role = if", "{ 'host' } else { 'client' }", "$setupMode = $role", '"--setup-mode=$setupMode"', '$asset = "paperboat_${version}_windows_${arch}.msi"', "[Environment]::GetFolderPath([Environment+SpecialFolder]::System)", "'msiexec.exe'", "'/i'", "'/qn'", "'/norestart'", "'/L*v'", 'WaitForExit(1200000)', 'function Assert-InstalledVersion', r"'Paperboat\bin\pb.exe'", '& $installedPb pair --server $server --enrollment-token $token --name $name "--setup-mode=$setupMode"'):
     if required not in windows_installer:
         raise SystemExit(f"Windows installer is missing canonical enrollment contract {required!r}")
+if 'pb-windows-$arch.exe' in windows_installer:
+    raise SystemExit('Windows installer must not bootstrap pairing through a downloaded direct executable')
+if '-Verb RunAs' not in windows_installer:
+    raise SystemExit('Windows installer must explicitly elevate the per-machine MSI')
+if r"\\bVersion\\s+" in windows_installer or r"\\s*$" in windows_installer:
+    raise SystemExit('Windows installer contains doubled regex escapes that do not match version output')
+if r"(?m)^.*\bVersion\s+" not in windows_installer:
+    raise SystemExit('Windows installer version assertion regex is missing')
 for forbidden in ("{ 'receive' }", "{ 'session' }", "--setup-mode=receive", "--setup-mode=session"):
     if forbidden in windows_installer:
         raise SystemExit(f"Windows installer retains retired setup-mode mapping {forbidden!r}")
@@ -215,6 +223,8 @@ if "PAPERBOAT_TUF_KEY_TIMESTAMP_1" in publication_job:
 publication_validate = publication_job.index('"$signer" validate-signers')
 publication_publish = publication_job.index('"$signer" publish')
 publication_fetch = publication_job.index("Fetch current production TUF repository")
+if 'mkdir -p "$repository/targets"' not in publication_job or "-cf - metadata targets" in publication_job:
+    raise SystemExit("release publication must fetch only small TUF metadata and create an empty target staging directory")
 if publication_validate < publication_fetch or publication_validate > publication_publish or "internal/hostruntime/bootstrap/trusted-root.json" not in publication_job[publication_validate:publication_publish]:
     raise SystemExit("release publication must revalidate its freshly fetched root chain immediately before signing")
 

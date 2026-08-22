@@ -9,6 +9,8 @@ release_root="$temporary/releases"
 mkdir -p "$release_root/current/tuf/metadata" "$release_root/current/tuf/targets" "$release_root/staging"
 printf 'previous current\n' > "$release_root/current/current.json"
 printf 'previous timestamp\n' > "$release_root/current/tuf/metadata/timestamp.json"
+printf 'historical target bytes\n' > "$release_root/current/tuf/targets/historical-only"
+printf 'superseded target bytes\n' > "$release_root/current/tuf/targets/shared-target"
 
 # The production script deliberately pins its release root. Substitute only
 # that guard for this local failure-atomicity test; no activation is attempted.
@@ -260,15 +262,23 @@ EOF
 
   candidate_version=2026.08.22.23
   printf '{"schema":"paperboat.release-current/v1","version":"%s"}\n' "$candidate_version" > "$candidate/current.json"
+  printf 'new target bytes\n' > "$candidate/tuf/targets/new-only"
+  printf 'replacement target bytes\n' > "$candidate/tuf/targets/shared-target"
   tar -C "$candidate" -czf "$bundle" current.json install windows tuf
   digest=$(run_checksum "$checksum_backend" "$bundle" | awk '{print $1}')
-  expected_candidate=$(snapshot_directory "$candidate")
+  expected="$temporary/expected"
+  cp -R "$candidate" "$expected"
+  cp "$release_root/current/tuf/targets/historical-only" "$expected/tuf/targets/historical-only"
+  expected_candidate=$(snapshot_directory "$expected")
   PATH="$temporary/bin:$PATH" PAPERBOAT_TEST_DOCKER_MODE=good PAPERBOAT_TEST_RELEASE_ROOT="$release_root" run_test_publisher "$bundle" "$release_root" "$candidate_version" "$digest"
   set -- "$release_root"/staging/activation-*
   test "$#" -eq 1 && test -d "$1"
   transaction=$1
   test "$expected_candidate" = "$(snapshot)"
   test "$before" = "$(snapshot_directory "$transaction/next")"
+  test "$(cat "$release_root/current/tuf/targets/shared-target")" = 'replacement target bytes'
+  test "$(cat "$release_root/current/tuf/targets/historical-only")" = 'historical target bytes'
+  test "$(stat -c %i "$release_root/current/tuf/targets/historical-only")" = "$(stat -c %i "$transaction/next/tuf/targets/historical-only")"
 
   next="$temporary/next"
   mkdir -p "$next/tuf/metadata" "$next/tuf/targets"

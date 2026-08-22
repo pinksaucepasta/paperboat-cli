@@ -92,7 +92,7 @@ func installWindowsCurrentUserService(ctx context.Context, executable, configPat
 func defaultStartWindowsDetachedDaemon(executable string, arguments []string) error {
 	command := exec.Command(executable, arguments...)
 	command.SysProcAttr = &windows.SysProcAttr{
-		CreationFlags: windows.DETACHED_PROCESS | windows.CREATE_NEW_PROCESS_GROUP,
+		CreationFlags: windows.DETACHED_PROCESS | windows.CREATE_NEW_PROCESS_GROUP | windows.CREATE_BREAKAWAY_FROM_JOB,
 		HideWindow:    true,
 	}
 	if err := command.Start(); err != nil {
