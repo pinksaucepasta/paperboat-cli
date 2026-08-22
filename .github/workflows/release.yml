@@ -411,34 +411,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
-      - name: Cache pinned WinGet bootstrap module
+      - name: Cache pinned WinGet validator assets
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ~\Documents\PowerShell\Modules\Microsoft.WinGet.Client\1.9.25190
-          key: winget-client-module-1.9.25190-${{ runner.os }}-${{ runner.arch }}
+          path: ~\.paperboat-ci\winget-v1.29.280
+          key: winget-validator-assets-v1.29.280-${{ runner.os }}-${{ runner.arch }}
       - name: Install pinned WinGet validator
-        shell: powershell
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $moduleVersion = [version]'1.9.25190'
-          $module = Get-Module -ListAvailable -Name Microsoft.WinGet.Client |
-            Where-Object Version -EQ $moduleVersion |
-            Select-Object -First 1
-          if ($null -eq $module) {
-            Install-Module -Name Microsoft.WinGet.Client -RequiredVersion $moduleVersion -Repository PSGallery -Scope CurrentUser -Force -AllowClobber
-          }
-          Import-Module Microsoft.WinGet.Client -RequiredVersion $moduleVersion -Force
-          Repair-WinGetPackageManager -Version '1.29.280' -Force
-          $windowsApps = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps'
-          $env:PATH = "$windowsApps;$env:PATH"
-          $winget = Get-Command winget.exe -ErrorAction Stop
-          $actualVersion = (& $winget.Path --version | Out-String).Trim()
-          if ($LASTEXITCODE -ne 0 -or $actualVersion -ne 'v1.29.280') {
-            throw "Expected pinned winget v1.29.280, got '$actualVersion'."
-          }
-          $windowsApps | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        shell: pwsh
+        run: ./packaging/windows/scripts/install-winget-validator.ps1
       - name: Download final signed MSI handoffs
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
