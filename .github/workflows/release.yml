@@ -140,7 +140,7 @@ jobs:
         include:
           - architecture: amd64
             channel: stable
-            runner: windows-2025
+            runner: blacksmith-2vcpu-windows-2025
           - architecture: arm64
             channel: beta
             runner: windows-11-arm

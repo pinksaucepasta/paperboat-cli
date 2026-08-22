@@ -29,16 +29,16 @@ jobs:
         include:
           - os: linux
             architecture: amd64
-            runner: ubuntu-24.04
+            runner: blacksmith-2vcpu-ubuntu-2404
           - os: linux
             architecture: arm64
             runner: blacksmith-2vcpu-ubuntu-2404-arm
           - os: macos
             architecture: arm64
-            runner: macos-14
+            runner: blacksmith-6vcpu-macos-latest
           - os: windows
             architecture: amd64
-            runner: windows-2025
+            runner: blacksmith-2vcpu-windows-2025
           - os: windows
             architecture: arm64
             runner: windows-11-arm
