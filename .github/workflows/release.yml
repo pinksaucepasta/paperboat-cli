@@ -1,6 +1,9 @@
 name: Release candidate
 
 on:
+  push:
+    tags:
+      - '20??.??.??.*'
   workflow_dispatch:
     inputs:
       version:
@@ -9,7 +12,7 @@ on:
         type: string
 
 concurrency:
-  group: release-candidate-${{ github.repository }}-${{ github.sha }}-${{ inputs.version }}
+  group: release-candidate-${{ github.repository }}-${{ github.sha }}-${{ inputs.version || github.ref_name }}
   cancel-in-progress: false
 
 permissions:
@@ -20,7 +23,9 @@ permissions:
   attestations: write
 
 env:
-  RELEASE_VERSION: ${{ inputs.version }}
+  # Tag pushes are the normal release entry point. Keep workflow_dispatch for
+  # explicit reruns and derive the same immutable version in both cases.
+  RELEASE_VERSION: ${{ inputs.version || github.ref_name }}
 
 jobs:
   qualified-commit:
