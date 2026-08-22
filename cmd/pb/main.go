@@ -103,6 +103,11 @@ var errUsage = errors.New("command usage error")
 // owner's stable paths supplied by localdaemon.CurrentUserPaths.
 var currentLocalDaemonPaths = localdaemon.CurrentUserPaths
 
+// installLocalDaemonService owns the one production boundary that registers
+// the local daemon. Command tests replace it with an in-process sentinel: a
+// Go test executable must never be registered as a detached daemon service.
+var installLocalDaemonService localDaemonServiceInstaller = localdaemon.InstallCurrentUserService
+
 type exitCodeError struct{ code int }
 
 func (e exitCodeError) Error() string { return "" }
@@ -491,7 +496,7 @@ func statusCommand() *cobra.Command {
 		Short: "Show local Paperboat machine status",
 		Args:  commandArgs(cobra.MaximumNArgs(1)),
 		RunE: func(command *cobra.Command, args []string) error {
-			_, snapshot, err := localDaemonSnapshot(command, localdaemon.InstallCurrentUserService)
+			_, snapshot, err := localDaemonSnapshot(command, installLocalDaemonService)
 			if err != nil {
 				return fmt.Errorf("read local Paperboat status: %w", err)
 			}
@@ -583,7 +588,7 @@ func doctorCommandV1() *cobra.Command {
 					return err
 				}
 			}
-			_, snapshot, err := localDaemonSnapshot(command, localdaemon.InstallCurrentUserService)
+			_, snapshot, err := localDaemonSnapshot(command, installLocalDaemonService)
 			if err != nil {
 				return fmt.Errorf("read local Paperboat diagnostics: %w", err)
 			}
@@ -1012,7 +1017,7 @@ func bugreportCommand() *cobra.Command {
 			record, _ := command.Flags().GetBool("record")
 			upload, _ := command.Flags().GetBool("upload")
 			jsonOutput, _ := command.Flags().GetBool("json")
-			localClient, _, err := localDaemonSnapshot(command, localdaemon.InstallCurrentUserService)
+			localClient, _, err := localDaemonSnapshot(command, installLocalDaemonService)
 			if err != nil {
 				return fmt.Errorf("start local Paperboat daemon: %w", err)
 			}
@@ -1151,7 +1156,7 @@ func waitCommand() *cobra.Command {
 			if timeout <= 0 || timeout > 24*time.Hour {
 				return invocationError(errors.New("--timeout must be greater than zero and no more than 24h"))
 			}
-			client, snapshot, err := localDaemonSnapshot(command, localdaemon.InstallCurrentUserService)
+			client, snapshot, err := localDaemonSnapshot(command, installLocalDaemonService)
 			if err != nil {
 				return fmt.Errorf("start local Paperboat daemon: %w", err)
 			}
@@ -5376,7 +5381,7 @@ func ensureLocalDaemonService(ctx context.Context, cfg *config.Config) error {
 			return err
 		}
 	}
-	return localdaemon.InstallCurrentUserService(ctx, executable, configPath, cfg.ServerURL)
+	return installLocalDaemonService(ctx, executable, configPath, cfg.ServerURL)
 }
 
 func ensureCLIIdentity(ctx context.Context, store config.ProfileStore, profile config.Profile, credential config.Credential) error {

@@ -4,21 +4,23 @@ import (
 	"context"
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 )
 
 func TestProbeOpenSSHReportsRequiredCapabilities(t *testing.T) {
-	executable, err := exec.LookPath("ssh")
-	if err != nil {
-		t.Skip("OpenSSH client is not installed")
+	capabilities, err := ProbeOpenSSH(context.Background(), "ssh", 2*time.Second)
+	if runtime.GOOS != "windows" && errors.Is(err, ErrOpenSSHUnavailable) {
+		t.Skip("supported OpenSSH client is not installed")
 	}
-	capabilities, err := ProbeOpenSSH(context.Background(), executable, 2*time.Second)
 	if err != nil || !capabilities.Ready() || capabilities.Version == "" || capabilities.Executable == "" {
 		t.Fatalf("capabilities=%+v error=%v", capabilities, err)
+	}
+	if runtime.GOOS == "windows" && strings.Contains(strings.ToLower(strings.ReplaceAll(capabilities.Executable, "/", `\`)), `\git\`) {
+		t.Fatalf("bare Windows OpenSSH probe selected Git for Windows client: %q", capabilities.Executable)
 	}
 }
 
@@ -60,10 +62,6 @@ func TestIsolatedOpenSSHProbeEnvironmentDoesNotInheritUserState(t *testing.T) {
 }
 
 func TestProbeOpenSSHIgnoresUserConfiguration(t *testing.T) {
-	executable, err := exec.LookPath("ssh")
-	if err != nil {
-		t.Skip("OpenSSH client is not installed")
-	}
 	home := t.TempDir()
 	sshDirectory := filepath.Join(home, ".ssh")
 	if err := os.MkdirAll(sshDirectory, 0o700); err != nil {
@@ -76,7 +74,10 @@ func TestProbeOpenSSHIgnoresUserConfiguration(t *testing.T) {
 	}
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
-	capabilities, err := ProbeOpenSSH(context.Background(), executable, 2*time.Second)
+	capabilities, err := ProbeOpenSSH(context.Background(), "ssh", 2*time.Second)
+	if runtime.GOOS != "windows" && errors.Is(err, ErrOpenSSHUnavailable) {
+		t.Skip("supported OpenSSH client is not installed")
+	}
 	if err != nil || !capabilities.Ready() {
 		t.Fatalf("user configuration affected probe: capabilities=%+v error=%v", capabilities, err)
 	}

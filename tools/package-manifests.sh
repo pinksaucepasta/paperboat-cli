@@ -10,8 +10,35 @@ if ! printf '%s\n' "$tag" | grep -Eq '^[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.(0|[1-9][0-
 fi
 base="https://github.com/$repo/releases/download/$tag"
 
+checksum_backend=${PAPERBOAT_CHECKSUM_BACKEND:-auto}
+case "$checksum_backend" in
+  auto)
+    if command -v sha256sum >/dev/null 2>&1; then
+      checksum_backend=sha256sum
+    elif command -v shasum >/dev/null 2>&1; then
+      checksum_backend=shasum
+    else
+      echo 'package manifest: sha256sum or shasum is required' >&2
+      exit 1
+    fi
+    ;;
+  sha256sum|shasum)
+    command -v "$checksum_backend" >/dev/null 2>&1 || {
+      echo "package manifest: $checksum_backend is required" >&2
+      exit 1
+    }
+    ;;
+  *)
+    echo "package manifest: unsupported checksum backend: $checksum_backend" >&2
+    exit 1
+    ;;
+esac
+
 checksum() {
-  shasum -a 256 "$1" | awk '{print $1}'
+  case "$checksum_backend" in
+    sha256sum) sha256sum "$1" | awk '{print $1}' ;;
+    shasum) shasum -a 256 "$1" | awk '{print $1}' ;;
+  esac
 }
 
 darwin_arm64="paperboat_${tag}_darwin_arm64.tar.gz"

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 )
 
@@ -36,25 +35,6 @@ func (e OpenSSHExecutor) Execute(executable string, arguments, environment []str
 		command.Env = append([]string(nil), environment...)
 	}
 	return command.Run()
-}
-
-func resolveOpenSSHExecutable(value string) (string, error) {
-	if value == "" {
-		value = "ssh.exe"
-	}
-	path, err := exec.LookPath(value)
-	if err != nil {
-		return "", err
-	}
-	path, err = filepath.Abs(path)
-	if err != nil || filepath.Clean(path) != path || !strings.EqualFold(filepath.Ext(path), ".exe") {
-		return "", ErrOpenSSHExecution
-	}
-	info, err := os.Stat(path)
-	if err != nil || !info.Mode().IsRegular() {
-		return "", ErrOpenSSHExecution
-	}
-	return path, nil
 }
 
 func validProcessValues(values []string) bool {

@@ -37,13 +37,9 @@ func ProbeOpenSSH(ctx context.Context, executable string, timeout time.Duration)
 	if strings.TrimSpace(executable) == "" {
 		executable = "ssh"
 	}
-	resolved, err := exec.LookPath(executable)
+	resolved, err := resolveOpenSSHExecutable(executable)
 	if err != nil {
 		return OpenSSHCapabilities{}, ErrOpenSSHUnavailable
-	}
-	resolved, err = filepath.Abs(resolved)
-	if err != nil {
-		return OpenSSHCapabilities{}, err
 	}
 	// The inboxed Windows OpenSSH client can take several seconds to cold-start
 	// under the hosted runner, even though subsequent invocations are fast. Keep

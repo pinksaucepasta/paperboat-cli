@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -581,6 +582,169 @@ func TestCancelIsIdempotentAndRemovesPartial(t *testing.T) {
 	}
 }
 
+func TestCancelWaitsForActiveAppendBeforeRemovingPartial(t *testing.T) {
+	service, _, root := newService(t)
+	created, err := service.Create(context.Background(), requestFor([]byte("x")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := created[0].ID
+	reader := &blockedUploadReader{started: make(chan struct{}), release: make(chan struct{})}
+	appendDone := make(chan error, 1)
+	go func() {
+		_, appendErr := service.Append(context.Background(), id, 0, reader)
+		appendDone <- appendErr
+	}()
+	select {
+	case <-reader.started:
+	case <-time.After(time.Second):
+		t.Fatal("append did not begin reading")
+	}
+	cancelDone := make(chan error, 1)
+	go func() { cancelDone <- service.Cancel(context.Background(), id) }()
+	select {
+	case err := <-cancelDone:
+		t.Fatalf("cancel returned before active append closed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(reader.release)
+	select {
+	case err := <-appendDone:
+		if !hasCode(err, Canceled) {
+			t.Fatalf("append err=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("append did not stop after cancellation")
+	}
+	select {
+	case err := <-cancelDone:
+		if err != nil {
+			t.Fatalf("cancel err=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancel did not finish after append closed")
+	}
+	if _, err := os.Stat(filepath.Join(root, id+".part")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("partial remains after cancellation: %v", err)
+	}
+}
+
+func TestAppendDoesNotCommitWhenCancellationArrivesWithEOF(t *testing.T) {
+	service, _, root := newService(t)
+	created, err := service.Create(context.Background(), requestFor([]byte("x")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := created[0].ID
+	if _, err := service.Append(context.Background(), id, 0, cancellationOnEOFReader{cancel: func() { service.signalCancel(id) }}); !hasCode(err, Canceled) {
+		t.Fatalf("append err=%v", err)
+	}
+	transfer, err := service.Get(context.Background(), id)
+	if err != nil || transfer.CommittedOffset != 0 || transfer.State != "created" {
+		t.Fatalf("transfer=%#v err=%v", transfer, err)
+	}
+	info, err := os.Stat(filepath.Join(root, id+".part"))
+	if err != nil || info.Size() != 0 {
+		t.Fatalf("partial info=%#v err=%v", info, err)
+	}
+}
+
+func TestCancelTimeoutRetainsFilesAndCancellationForRetry(t *testing.T) {
+	service, _, root := newService(t)
+	service.config.CancellationDrainTimeout = 25 * time.Millisecond
+	created, err := service.Create(context.Background(), requestFor([]byte("x")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := created[0].ID
+	reader := &blockedUploadReader{started: make(chan struct{}), release: make(chan struct{})}
+	appendDone := make(chan error, 1)
+	go func() {
+		_, appendErr := service.Append(context.Background(), id, 0, reader)
+		appendDone <- appendErr
+	}()
+	select {
+	case <-reader.started:
+	case <-time.After(time.Second):
+		t.Fatal("append did not begin reading")
+	}
+	if err := service.Cancel(context.Background(), id); !hasCode(err, StorageUnavailable) {
+		t.Fatalf("cancel err=%v", err)
+	}
+	select {
+	case <-service.CancellationSignal(id):
+	default:
+		t.Fatal("cancellation signal was not retained after drain timeout")
+	}
+	if _, err := os.Stat(filepath.Join(root, id+".part")); err != nil {
+		t.Fatalf("drain timeout removed partial: %v", err)
+	}
+	close(reader.release)
+	select {
+	case err := <-appendDone:
+		if !hasCode(err, Canceled) {
+			t.Fatalf("append err=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("append did not stop after cancellation")
+	}
+	if err := service.Cancel(context.Background(), id); err != nil {
+		t.Fatalf("retry cancel err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, id+".part")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("retry cancel retained partial: %v", err)
+	}
+}
+
+func TestCancelAndAppendRegistrationRaceLeavesNoWriterOrPartial(t *testing.T) {
+	for iteration := 0; iteration < 64; iteration++ {
+		t.Run(fmt.Sprintf("iteration-%d", iteration), func(t *testing.T) {
+			service, _, root := newService(t)
+			created, err := service.Create(context.Background(), requestFor([]byte("x")))
+			if err != nil {
+				t.Fatal(err)
+			}
+			id := created[0].ID
+			reader := &cancelSignalReader{started: make(chan struct{}), signal: service.CancellationSignal(id)}
+			start := make(chan struct{})
+			appendDone := make(chan error, 1)
+			cancelDone := make(chan error, 1)
+			go func() {
+				<-start
+				_, appendErr := service.Append(context.Background(), id, 0, reader)
+				appendDone <- appendErr
+			}()
+			go func() {
+				<-start
+				cancelDone <- service.Cancel(context.Background(), id)
+			}()
+			close(start)
+			select {
+			case err := <-appendDone:
+				if !hasCode(err, Canceled) {
+					t.Fatalf("append err=%v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("append did not finish")
+			}
+			select {
+			case err := <-cancelDone:
+				if err != nil {
+					t.Fatalf("cancel err=%v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("cancel did not finish")
+			}
+			if _, active := service.writes.Load(id); active {
+				t.Fatal("active writer registration remains")
+			}
+			if _, err := os.Stat(filepath.Join(root, id+".part")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("partial remains after concurrent cancellation: %v", err)
+			}
+		})
+	}
+}
+
 func TestCreateEnforcesExactFileAndBatchBoundaries(t *testing.T) {
 	service, _, _ := newService(t)
 	files := make([]File, MaxBatchFiles)
@@ -605,6 +769,37 @@ func TestCreateEnforcesExactFileAndBatchBoundaries(t *testing.T) {
 type diskFullReader struct{}
 
 func (diskFullReader) Read([]byte) (int, error) { return 0, syscall.ENOSPC }
+
+type blockedUploadReader struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (r *blockedUploadReader) Read([]byte) (int, error) {
+	r.once.Do(func() { close(r.started) })
+	<-r.release
+	return 0, io.EOF
+}
+
+type cancellationOnEOFReader struct{ cancel func() }
+
+func (r cancellationOnEOFReader) Read([]byte) (int, error) {
+	r.cancel()
+	return 0, io.EOF
+}
+
+type cancelSignalReader struct {
+	started chan struct{}
+	signal  <-chan struct{}
+	once    sync.Once
+}
+
+func (r *cancelSignalReader) Read([]byte) (int, error) {
+	r.once.Do(func() { close(r.started) })
+	<-r.signal
+	return 0, io.EOF
+}
 
 func TestAppendReportsDiskFullWithoutCommittingOffset(t *testing.T) {
 	service, _, _ := newService(t)

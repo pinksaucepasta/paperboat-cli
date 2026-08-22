@@ -3080,6 +3080,77 @@ func TestLocalDaemonSnapshotInstallsOnlyForUnavailableSocket(t *testing.T) {
 	}
 }
 
+func TestCommandUsesTestSafeLocalDaemonInstaller(t *testing.T) {
+	root := commandRuntimeTestRoot(t)
+	home, runtimeRoot := filepath.Join(root, "home"), filepath.Join(root, "runtime")
+	for _, directory := range []string{home, runtimeRoot} {
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	t.Setenv("XDG_RUNTIME_DIR", runtimeRoot)
+	t.Setenv("TMPDIR", runtimeRoot)
+	configPath := filepath.Join(root, "config.json")
+	if err := os.WriteFile(configPath, []byte(`{"server_url":"https://api.paperboat.test"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	previous := installLocalDaemonService
+	called := false
+	installLocalDaemonService = func(_ context.Context, executable, gotConfigPath, server string) error {
+		called = true
+		if !strings.HasSuffix(strings.ToLower(executable), ".test") && !strings.HasSuffix(strings.ToLower(executable), ".test.exe") {
+			t.Fatalf("expected test executable, got %q", executable)
+		}
+		if gotConfigPath != configPath || server != "https://api.paperboat.test" {
+			t.Fatalf("config=%q server=%q", gotConfigPath, server)
+		}
+		return errors.New("test installer sentinel")
+	}
+	t.Cleanup(func() { installLocalDaemonService = previous })
+
+	var stdout, stderr bytes.Buffer
+	if code := run(context.Background(), []string{"--config", configPath, "status"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if !called {
+		t.Fatalf("test-safe local daemon installer was not called: stderr=%q", stderr.String())
+	}
+}
+
+func TestEnsureLocalDaemonServiceUsesInstallerBoundary(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(configPath, []byte(`{"server_url":"https://api.paperboat.test"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := installLocalDaemonService
+	calls := 0
+	sentinel := errors.New("test installer sentinel")
+	installLocalDaemonService = func(_ context.Context, executable, gotConfigPath, server string) error {
+		calls++
+		if !strings.HasSuffix(strings.ToLower(executable), ".test") && !strings.HasSuffix(strings.ToLower(executable), ".test.exe") {
+			t.Fatalf("expected test executable, got %q", executable)
+		}
+		if gotConfigPath != configPath || server != "https://api.paperboat.test" {
+			t.Fatalf("config=%q server=%q", gotConfigPath, server)
+		}
+		return sentinel
+	}
+	t.Cleanup(func() { installLocalDaemonService = previous })
+	if err := ensureLocalDaemonService(context.Background(), cfg); !errors.Is(err, sentinel) {
+		t.Fatalf("ensure error=%v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("installer calls=%d, want 1", calls)
+	}
+}
+
 func TestResolveSSHCommandTargetFastUsesWarmSnapshotAndCache(t *testing.T) {
 	root := commandRuntimeTestRoot(t)
 	home := filepath.Join(root, "home")

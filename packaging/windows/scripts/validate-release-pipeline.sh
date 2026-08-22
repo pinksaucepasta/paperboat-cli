@@ -13,6 +13,8 @@ checksum_generator="$repository_root/tools/generate-release-checksums.sh"
 checksum_test="$repository_root/tools/test-install-checksums.sh"
 current_release_test="$repository_root/tools/test-install-current-release.sh"
 publisher_test="$repository_root/tools/test-publish-tuf-origin.sh"
+manifest_generator="$repository_root/tools/package-manifests.sh"
+manifest_test="$repository_root/tools/test-package-manifests.sh"
 test -f "$workflow"
 test -f "$qualification"
 test -f "$ci"
@@ -24,6 +26,8 @@ test -f "$checksum_generator"
 test -f "$checksum_test"
 test -f "$current_release_test"
 test -f "$publisher_test"
+test -f "$manifest_generator"
+test -f "$manifest_test"
 
 python3 - "$workflow" "$qualification" "$ci" "$active_signing_state" "$installer" "$windows_installer" "$publisher" <<'PY'
 import json
@@ -228,8 +232,26 @@ if "/releases/latest" in installer or "PAPERBOAT_RELEASE_METADATA_URL" not in in
     raise SystemExit("Unix installer must resolve its default release through current.json")
 PY
 
+for required in select_checksum_backend run_checksum sha256sum shasum; do
+  grep -Fq -- "$required" "$publisher_test" || {
+    echo "publisher checksum contract is missing $required" >&2
+    exit 1
+  }
+done
+if grep -Fq -- 'xargs -0 shasum' "$publisher_test"; then
+  echo 'publisher checksum contract must not depend on a host-specific xargs shasum command' >&2
+  exit 1
+fi
+for required in PAPERBOAT_CHECKSUM_BACKEND sha256sum shasum; do
+  grep -Fq -- "$required" "$manifest_generator" || {
+    echo "package manifest checksum contract is missing $required" >&2
+    exit 1
+  }
+done
+
 "$checksum_test"
 "$current_release_test"
 "$publisher_test"
+"$manifest_test"
 
 for script in "$(dirname -- "$0")"/*.sh; do sh -n "$script"; done

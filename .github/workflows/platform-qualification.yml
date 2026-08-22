@@ -80,22 +80,17 @@ jobs:
             $ssh = $sshCandidates | ForEach-Object { Join-Path $_ 'ssh.exe' } | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
           }
           if ([string]::IsNullOrWhiteSpace($ssh)) { throw 'Pinned OpenSSH client was not found after installation.' }
-          Split-Path -Parent $ssh | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          "OpenSSH client: $ssh" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          $ssh = [System.IO.Path]::GetFullPath($ssh)
+          if (-not (Test-Path -LiteralPath $ssh -PathType Leaf)) { throw "Pinned OpenSSH client path is not a file: $ssh" }
+          $versionOutput = (& $ssh -V 2>&1 | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($versionOutput)) { throw "Pinned OpenSSH client failed version check: $ssh" }
+          "PAPERBOAT_OPENSSH_PATH=$ssh" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "OpenSSH client: $ssh ($versionOutput)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
       - name: Run native Go tests
         shell: bash
         run: |
           set -euo pipefail
-          for attempt in 1 2; do
-            if go test -count=1 -timeout 12m ./...; then
-              exit 0
-            fi
-            if [[ "$attempt" == 1 ]]; then
-              echo 'Native contract suite failed once; retrying once for transient local service lifecycle failures.' >&2
-              sleep 5
-            fi
-          done
-          exit 1
+          go test -count=1 -timeout 12m ./...
       - name: Run native static checks
         if: matrix.os == 'linux' && matrix.architecture == 'amd64'
         shell: bash

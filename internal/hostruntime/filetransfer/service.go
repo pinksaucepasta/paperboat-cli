@@ -25,6 +25,11 @@ const (
 	MaxBatchBytes = int64(500 << 20)
 	MaxBatchFiles = 10
 	Retention     = 7 * 24 * time.Hour
+
+	// cancellationDrainTimeout bounds a DELETE while an HTTP upload is
+	// unwinding. We must not remove a partial file until its active writer has
+	// closed it: Windows rejects removal of an open file.
+	cancellationDrainTimeout = 5 * time.Second
 )
 
 type Policy struct {
@@ -114,14 +119,15 @@ type CreateRequest struct {
 }
 
 type Config struct {
-	Root             string
-	PublishRoot      string
-	LocalMachineID   string
-	Store            *store.Store
-	EraseTransferKey func(string) error
-	Now              func() time.Time
-	Random           io.Reader
-	Policy           *PolicyStore
+	Root                     string
+	PublishRoot              string
+	LocalMachineID           string
+	Store                    *store.Store
+	EraseTransferKey         func(string) error
+	Now                      func() time.Time
+	Random                   io.Reader
+	Policy                   *PolicyStore
+	CancellationDrainTimeout time.Duration
 }
 
 type Service struct {
@@ -130,12 +136,15 @@ type Service struct {
 	active  int
 	locks   sync.Map
 	cancels sync.Map
+	writes  sync.Map
 }
 
 type transferCancellation struct {
 	once sync.Once
 	done chan struct{}
 }
+
+type transferWrite struct{ done chan struct{} }
 
 func New(config Config) (*Service, error) {
 	if config.Now == nil {
@@ -305,6 +314,8 @@ func (s *Service) Append(ctx context.Context, id string, offset int64, body io.R
 	lock := s.lock(id)
 	lock.Lock()
 	defer lock.Unlock()
+	finish := s.beginWrite(id)
+	defer finish()
 	transfer, err := s.config.Store.FileTransfer(ctx, id)
 	if err != nil {
 		return store.FileTransfer{}, &Error{Code: InvalidPath, Cause: err}
@@ -340,6 +351,12 @@ func (s *Service) Append(ctx context.Context, id string, offset int64, body io.R
 		}
 		return transfer, classifyIO(err)
 	}
+	select {
+	case <-canceled:
+		_ = file.Truncate(offset)
+		return transfer, &Error{Code: Canceled}
+	default:
+	}
 	if written > remaining {
 		_ = file.Truncate(offset)
 		return transfer, &Error{Code: InvalidSize}
@@ -363,6 +380,8 @@ func (s *Service) AppendEncrypted(ctx context.Context, id string, ordinal uint64
 	lock := s.lock(id)
 	lock.Lock()
 	defer lock.Unlock()
+	finish := s.beginWrite(id)
+	defer finish()
 	transfer, err := s.config.Store.FileTransfer(ctx, id)
 	if err != nil || transfer.E2EETransferID == "" || transfer.TransferGeneration == 0 {
 		return store.FileTransfer{}, &Error{Code: InvalidPath, Cause: err}
@@ -670,6 +689,9 @@ func (s *Service) cancelBatchLocked(ctx context.Context, transfers []store.FileT
 	if len(transfers) > 0 {
 		result = s.config.Store.CancelFileTransferBatch(ctx, transfers[0].BatchID)
 	}
+	if err := s.waitForWrites(ctx, transfers); err != nil {
+		return errors.Join(result, &Error{Code: StorageUnavailable, Cause: err})
+	}
 	for _, transfer := range transfers {
 		for _, path := range []string{s.partialPath(transfer.ID), s.contentPath(transfer.ID), s.publishedPath(transfer)} {
 			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -699,6 +721,37 @@ func (s *Service) signalCancel(id string) {
 	cancel.once.Do(func() { close(cancel.done) })
 }
 func (s *Service) CancellationSignal(id string) <-chan struct{} { return s.cancelSignal(id) }
+
+func (s *Service) beginWrite(id string) func() {
+	write := &transferWrite{done: make(chan struct{})}
+	s.writes.Store(id, write)
+	return func() {
+		close(write.done)
+		s.writes.CompareAndDelete(id, write)
+	}
+}
+
+func (s *Service) waitForWrites(ctx context.Context, transfers []store.FileTransfer) error {
+	timeout := s.config.CancellationDrainTimeout
+	if timeout <= 0 {
+		timeout = cancellationDrainTimeout
+	}
+	drain, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	for _, transfer := range transfers {
+		value, ok := s.writes.Load(transfer.ID)
+		if !ok {
+			continue
+		}
+		write := value.(*transferWrite)
+		select {
+		case <-write.done:
+		case <-drain.Done():
+			return drain.Err()
+		}
+	}
+	return nil
+}
 func (s *Service) newID(prefix string) (string, error) {
 	var value [16]byte
 	if _, err := io.ReadFull(s.config.Random, value[:]); err != nil {

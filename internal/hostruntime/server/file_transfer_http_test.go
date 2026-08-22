@@ -617,7 +617,16 @@ func TestFileTransferHTTPDeleteInterruptsBlockedUpload(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("delete did not interrupt upload")
 	}
+	select {
+	case <-body.closed:
+	default:
+		t.Fatal("delete completed before it closed the blocked upload body")
+	}
 	if patchResponse.Code != 499 {
 		t.Fatalf("patch status=%d body=%s", patchResponse.Code, patchResponse.Body.String())
+	}
+	transfer, err := handler.config.Service.Get(context.Background(), id)
+	if err != nil || transfer.State != "canceled" {
+		t.Fatalf("transfer=%#v err=%v", transfer, err)
 	}
 }

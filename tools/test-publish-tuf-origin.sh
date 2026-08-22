@@ -17,15 +17,127 @@ sed "s|/opt/paperboat/releases|$release_root|g" "$publisher" > "$test_publisher"
 chmod 0700 "$test_publisher"
 test "$(awk 'NF { line=$0 } END { print line }' "$publisher")" = 'atomic_exchange "$live" "$next"'
 
+select_checksum_backend() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s\n' sha256sum
+  elif command -v shasum >/dev/null 2>&1; then
+    printf '%s\n' shasum
+  else
+    echo 'publisher test: sha256sum or shasum is required' >&2
+    return 1
+  fi
+}
+
+checksum_backend=$(select_checksum_backend)
+checksum_sha256sum=$(command -v sha256sum || true)
+checksum_shasum=$(command -v shasum || true)
+
+run_checksum() {
+  local backend=$1
+  shift
+  case "$backend" in
+    sha256sum)
+      test -n "$CHECKSUM_SHA256SUM_COMMAND"
+      "$CHECKSUM_SHA256SUM_COMMAND" "$@"
+      ;;
+    shasum)
+      test -n "$CHECKSUM_SHASUM_COMMAND"
+      "$CHECKSUM_SHASUM_COMMAND" -a 256 "$@"
+      ;;
+    *)
+      echo "publisher test: unsupported checksum backend: $backend" >&2
+      return 1
+      ;;
+  esac
+}
+
+CHECKSUM_SHA256SUM_COMMAND=$checksum_sha256sum
+CHECKSUM_SHASUM_COMMAND=$checksum_shasum
+
+# Build command shims so both checksum branches are exercised even when the
+# host only ships one of the two platform-specific command names. The shim
+# delegates to the real command available on this host and only translates
+# the shasum -a 256 argument shape.
+checksum_test_bin="$temporary/checksum-bin"
+mkdir -p "$checksum_test_bin"
+if test -n "$checksum_sha256sum"; then
+  cat > "$checksum_test_bin/sha256sum" <<EOF
+#!/bin/sh
+exec "$checksum_sha256sum" "\$@"
+EOF
+else
+  cat > "$checksum_test_bin/sha256sum" <<EOF
+#!/bin/sh
+exec "$checksum_shasum" -a 256 "\$@"
+EOF
+fi
+if test -n "$checksum_shasum"; then
+  cat > "$checksum_test_bin/shasum" <<EOF
+#!/bin/sh
+exec "$checksum_shasum" "\$@"
+EOF
+else
+  cat > "$checksum_test_bin/shasum" <<EOF
+#!/bin/sh
+set -eu
+if test "\${1:-}" = -a && test "\${2:-}" = 256; then
+  shift 2
+fi
+exec "$checksum_sha256sum" "\$@"
+EOF
+fi
+chmod 0700 "$checksum_test_bin/sha256sum" "$checksum_test_bin/shasum"
+
+preferred_checksum_path="$temporary/checksum-preferred"
+fallback_checksum_path="$temporary/checksum-fallback"
+mkdir -p "$preferred_checksum_path" "$fallback_checksum_path"
+cp "$checksum_test_bin/sha256sum" "$preferred_checksum_path/sha256sum"
+cp "$checksum_test_bin/shasum" "$fallback_checksum_path/shasum"
+chmod 0700 "$preferred_checksum_path/sha256sum" "$fallback_checksum_path/shasum"
+test "$(PATH="$preferred_checksum_path" select_checksum_backend)" = sha256sum
+test "$(PATH="$fallback_checksum_path" select_checksum_backend)" = shasum
+
+checksum_fixture="$temporary/checksum-fixture"
+printf 'paperboat checksum fixture\n' > "$checksum_fixture"
+CHECKSUM_SHA256SUM_COMMAND="$checksum_test_bin/sha256sum"
+CHECKSUM_SHASUM_COMMAND="$checksum_test_bin/shasum"
+checksum_sha256sum_digest=$(run_checksum sha256sum "$checksum_fixture" | awk '{print $1}')
+checksum_shasum_digest=$(run_checksum shasum "$checksum_fixture" | awk '{print $1}')
+test "$checksum_sha256sum_digest" = "$checksum_shasum_digest"
+checksum_sha256sum_digest=$(printf 'paperboat checksum stream\n' | run_checksum sha256sum | awk '{print $1}')
+checksum_shasum_digest=$(printf 'paperboat checksum stream\n' | run_checksum shasum | awk '{print $1}')
+test "$checksum_sha256sum_digest" = "$checksum_shasum_digest"
+
+CHECKSUM_SHA256SUM_COMMAND=$checksum_sha256sum
+CHECKSUM_SHASUM_COMMAND=$checksum_shasum
+
+snapshot_directory_with_backend() {
+  local backend=$1
+  local directory=$2
+  (
+    cd "$directory"
+    while IFS= read -r -d '' file; do
+      run_checksum "$backend" "$file"
+    done < <(find . -type f -print0 | LC_ALL=C sort -z)
+  )
+}
+
+checksum_snapshot_fixture="$temporary/checksum-snapshot"
+mkdir -p "$checksum_snapshot_fixture/nested directory"
+printf 'first snapshot file\n' > "$checksum_snapshot_fixture/first"
+printf 'second snapshot file\n' > "$checksum_snapshot_fixture/nested directory/second"
+test "$(snapshot_directory_with_backend sha256sum "$checksum_snapshot_fixture")" = \
+  "$(snapshot_directory_with_backend shasum "$checksum_snapshot_fixture")"
+
 snapshot() {
-  (cd "$release_root/current" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256)
+  snapshot_directory_with_backend "$checksum_backend" "$release_root/current"
 }
 snapshot_directory() {
-  (cd "$1" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256)
+  snapshot_directory_with_backend "$checksum_backend" "$1"
 }
 before=$(snapshot)
 
-if "$test_publisher" "$temporary/missing.tgz" "$release_root" 2026.08.22.23 "$(printf x | shasum -a 256 | awk '{print $1}')" >/dev/null 2>&1; then
+if "$test_publisher" "$temporary/missing.tgz" "$release_root" 2026.08.22.23 "$(printf x | run_checksum "$checksum_backend" | awk '{print $1}')" >/dev/null 2>&1; then
   echo 'publisher accepted a missing bundle' >&2
   exit 1
 fi
@@ -39,7 +151,7 @@ printf x > "$candidate/windows"
 for name in root targets snapshot timestamp; do printf x > "$candidate/tuf/metadata/$name.json"; done
 bundle="$temporary/candidate.tgz"
 tar -C "$candidate" -czf "$bundle" current.json install windows tuf
-digest=$(shasum -a 256 "$bundle" | awk '{print $1}')
+digest=$(run_checksum "$checksum_backend" "$bundle" | awk '{print $1}')
 if "$test_publisher" "$bundle" "$release_root" 2026.08.22.23 "$digest" >/dev/null 2>&1; then
   echo 'publisher accepted an invalid current.json' >&2
   exit 1
@@ -82,7 +194,7 @@ EOF
   candidate_version=2026.08.22.23
   printf '{"schema":"paperboat.release-current/v1","version":"%s"}\n' "$candidate_version" > "$candidate/current.json"
   tar -C "$candidate" -czf "$bundle" current.json install windows tuf
-  digest=$(shasum -a 256 "$bundle" | awk '{print $1}')
+  digest=$(run_checksum "$checksum_backend" "$bundle" | awk '{print $1}')
   expected_candidate=$(snapshot_directory "$candidate")
   PATH="$temporary/bin:$PATH" PAPERBOAT_TEST_DOCKER_MODE=parent PAPERBOAT_TEST_RELEASE_ROOT="$release_root" "$test_publisher" "$bundle" "$release_root" "$candidate_version" "$digest"
   set -- "$release_root"/staging/activation-*
@@ -99,7 +211,7 @@ EOF
   for name in root targets snapshot timestamp; do printf x > "$next/tuf/metadata/$name.json"; done
   next_bundle="$temporary/next.tgz"
   tar -C "$next" -czf "$next_bundle" current.json install windows tuf
-  next_digest=$(shasum -a 256 "$next_bundle" | awk '{print $1}')
+  next_digest=$(run_checksum "$checksum_backend" "$next_bundle" | awk '{print $1}')
   live_before_stale=$(snapshot)
   if PATH="$temporary/bin:$PATH" PAPERBOAT_TEST_DOCKER_MODE=stale PAPERBOAT_TEST_RELEASE_ROOT="$release_root" "$test_publisher" "$next_bundle" "$release_root" 2026.08.22.24 "$next_digest" >/dev/null 2>&1; then
     echo 'publisher accepted a stale current-directory bind mount' >&2

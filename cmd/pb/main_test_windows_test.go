@@ -252,7 +252,10 @@ func commandRuntimeTestRoot(t *testing.T) string {
 	sequence := atomic.AddUint64(&commandRuntimeTestSequence, 1)
 	stateRoot := filepath.Join(root, "state")
 	runtimeRoot := filepath.Join(root, "runtime")
-	socketPath := `\\.\pipe\paperboat-test-` + strconv.FormatUint(sequence, 10)
+	// Named pipes are global on Windows. The process ID prevents a retry from
+	// colliding with a pipe retained by an earlier test process, while the
+	// sequence keeps roots distinct inside this process.
+	socketPath := `\\.\pipe\paperboat-test-` + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatUint(sequence, 10)
 	previousPaths := currentLocalDaemonPaths
 	currentLocalDaemonPaths = func() (localapi.Paths, error) {
 		return localapi.Paths{
@@ -274,6 +277,26 @@ func commandRuntimeTestRoot(t *testing.T) string {
 		xdg.Home, xdg.ConfigHome, xdg.CacheHome, xdg.DataHome, xdg.StateHome, xdg.RuntimeDir = previous[0], previous[1], previous[2], previous[3], previous[4], previous[5]
 	})
 	return root
+}
+
+func TestCommandRuntimeTestRootUsesProcessScopedNamedPipes(t *testing.T) {
+	firstRoot := commandRuntimeTestRoot(t)
+	first, err := currentLocalDaemonPaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRoot := commandRuntimeTestRoot(t)
+	second, err := currentLocalDaemonPaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefix := `\\.\pipe\paperboat-test-` + strconv.Itoa(os.Getpid()) + "-"
+	if !strings.HasPrefix(first.SocketPath, prefix) || !strings.HasPrefix(second.SocketPath, prefix) {
+		t.Fatalf("pipes must include the test process ID: first=%q second=%q", first.SocketPath, second.SocketPath)
+	}
+	if first.SocketPath == second.SocketPath || first.RuntimeRoot == second.RuntimeRoot || firstRoot == secondRoot {
+		t.Fatalf("test roots must be distinct: first=%#v second=%#v", first, second)
+	}
 }
 
 func isolateCommandCredentialLocation(t *testing.T, root string) {
