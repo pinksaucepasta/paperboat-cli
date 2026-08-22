@@ -104,7 +104,7 @@ jobs:
             runner: windows-2025
           - architecture: arm64
             channel: beta
-            runner: windows-2025
+            runner: windows-11-arm
     env:
       PAPERBOAT_ARCH: ${{ matrix.architecture }}
       PAPERBOAT_CHANNEL: ${{ matrix.channel }}
