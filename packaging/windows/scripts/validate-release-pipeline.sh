@@ -87,7 +87,7 @@ if "stable" not in windows or "beta" not in windows:
     raise SystemExit("windows-package must declare stable and beta channels")
 
 candidate = job("candidate-assembly")
-if "if: always()" not in candidate:
+if "always()" not in candidate:
     raise SystemExit("candidate assembly must run its explicit dependency gate")
 if "needs: [release-unix, windows-package, windows-winget, windows-native-qualification, windows-arm64-beta-evidence]" not in workflow:
     raise SystemExit("candidate dependencies do not include all platform handoffs")
