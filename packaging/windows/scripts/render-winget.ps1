@@ -87,7 +87,10 @@ foreach ($channel in @('stable', 'beta')) {
         if ($manifestContent -match '\{\{[^}]+\}\}') {
             throw "Unrendered WinGet placeholder remains in $($template.Name)."
         }
-        $content | Set-Content -LiteralPath (Join-Path $destinationDirectory $template.Name) -Encoding utf8
+        # Persist the validated manifest, not the source template comments. The
+        # comments intentionally mention placeholder syntax and would make the
+        # submitted artifact fail the final placeholder scan.
+        $manifestContent | Set-Content -LiteralPath (Join-Path $destinationDirectory $template.Name) -Encoding utf8
     }
 }
 
