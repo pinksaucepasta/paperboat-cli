@@ -131,6 +131,122 @@ func TestCIOnlineSigningRejectsUnauthorizedKeyWithoutLoadingRootKeys(t *testing.
 	}
 }
 
+func TestSigningStateThresholdRequiresUniqueAuthorizedKeys(t *testing.T) {
+	t.Setenv("PAPERBOAT_TUF_CI", "1")
+	for index, name := range roles {
+		seed := bytes.Repeat([]byte{byte(index + 1)}, ed25519.SeedSize)
+		t.Setenv(tufKeyEnvironmentName(name), base64.RawStdEncoding.EncodeToString(seed))
+	}
+	repository := filepath.Join(t.TempDir(), "repository")
+	if err := initialize(repository); err != nil {
+		t.Fatal(err)
+	}
+	root, _, _, _, err := loadSet(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := initialSigningState()
+	state.Roles["targets"] = []string{"targets-1", "targets-1"}
+	if err := validateSigningState(root, state, "targets"); err == nil || !strings.Contains(err.Error(), "unique authorized keys") {
+		t.Fatalf("duplicate threshold error = %v", err)
+	}
+}
+
+func TestValidateSignersTrustsRootChainAndDoesNotMutateRepository(t *testing.T) {
+	t.Setenv("PAPERBOAT_TUF_CI", "1")
+	for index, name := range roles {
+		seed := bytes.Repeat([]byte{byte(index + 1)}, ed25519.SeedSize)
+		t.Setenv(tufKeyEnvironmentName(name), base64.RawStdEncoding.EncodeToString(seed))
+	}
+	repository := filepath.Join(t.TempDir(), "repository")
+	if err := initialize(repository); err != nil {
+		t.Fatal(err)
+	}
+	trustedRoot := filepath.Join(repository, "metadata", "1.root.json")
+	root, _, _, _, err := loadSet(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	timestamp2Seed := bytes.Repeat([]byte{88}, ed25519.SeedSize)
+	t.Setenv(tufKeyEnvironmentName("timestamp-2"), base64.RawStdEncoding.EncodeToString(timestamp2Seed))
+	timestamp2, err := metadata.KeyFromPublicKey(ed25519.NewKeyFromSeed(timestamp2Seed).Public())
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldTimestampID := root.Signed.Roles["timestamp"].KeyIDs[0]
+	if err := root.Signed.RevokeKey(oldTimestampID, "timestamp"); err != nil {
+		t.Fatal(err)
+	}
+	if err := root.Signed.AddKey(timestamp2, "timestamp"); err != nil {
+		t.Fatal(err)
+	}
+	root.Signed.Version = 2
+	root.ClearSignatures()
+	if err := sign(root, "root-1", "root-2", "root-3"); err != nil {
+		t.Fatal(err)
+	}
+	rootBody := mustMetadataBytes(root)
+	if err := os.WriteFile(filepath.Join(repository, "metadata", "2.root.json"), rootBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repository, "metadata", "root.json"), rootBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state := initialSigningState()
+	state.Roles["timestamp"] = []string{"timestamp-2"}
+	if err := writeSigningState(repository, state); err != nil {
+		t.Fatal(err)
+	}
+	stateBefore, err := os.ReadFile(signingStatePath(repository))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootBefore, err := os.ReadFile(filepath.Join(repository, "metadata", "root.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateSigners(repository, trustedRoot); err != nil {
+		t.Fatal(err)
+	}
+	stateAfter, _ := os.ReadFile(signingStatePath(repository))
+	rootAfter, _ := os.ReadFile(filepath.Join(repository, "metadata", "root.json"))
+	if !bytes.Equal(stateBefore, stateAfter) || !bytes.Equal(rootBefore, rootAfter) {
+		t.Fatal("signer validation mutated the repository")
+	}
+	t.Setenv(tufKeyEnvironmentName("timestamp-2"), base64.RawStdEncoding.EncodeToString(bytes.Repeat([]byte{99}, ed25519.SeedSize)))
+	if err := validateSigners(repository, trustedRoot); err == nil || !strings.Contains(err.Error(), "timestamp-2 is not authorized for timestamp") {
+		t.Fatalf("unauthorized rotated timestamp key error = %v", err)
+	}
+}
+
+func TestValidateSignersRejectsUnchainedServedRoot(t *testing.T) {
+	t.Setenv("PAPERBOAT_TUF_CI", "1")
+	for index, name := range roles {
+		seed := bytes.Repeat([]byte{byte(index + 1)}, ed25519.SeedSize)
+		t.Setenv(tufKeyEnvironmentName(name), base64.RawStdEncoding.EncodeToString(seed))
+	}
+	repository := filepath.Join(t.TempDir(), "repository")
+	if err := initialize(repository); err != nil {
+		t.Fatal(err)
+	}
+	trustedRoot := filepath.Join(repository, "metadata", "1.root.json")
+	served, err := metadata.Root().FromFile(filepath.Join(repository, "metadata", "root.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	served.Signed.Version++
+	served.ClearSignatures()
+	if err := sign(served, "root-1", "root-2", "root-3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repository, "metadata", "root.json"), mustMetadataBytes(served), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateSigners(repository, trustedRoot); err == nil || !strings.Contains(err.Error(), "served root does not match") {
+		t.Fatalf("unchained served root error = %v", err)
+	}
+}
+
 func TestVerifyMetaReferenceRejectsMissingAndMismatchedVersionedMetadata(t *testing.T) {
 	repo := t.TempDir()
 	if err := os.Mkdir(filepath.Join(repo, "metadata"), 0o700); err != nil {

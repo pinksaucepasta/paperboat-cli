@@ -11,6 +11,18 @@ Ed25519 seeds are macOS Keychain items under service
 `com.pinksaucepasta.paperboat.tuf.production`. The local repository is
 `/Users/pujan.pm/.local/share/paperboat-release/tuf-production`; `.signing-state.json` is
 local signing state and must not be published. Root is 2-of-3 and targets is 2-of-2.
+The current root-v2 online role aliases are `targets-1`, `targets-2`, `snapshot-1`, and
+`timestamp-2`. `timestamp-1` was revoked by root v2 and must not be supplied to CI. A role
+rotation must update both the protected GitHub Environment secret name and the workflow's
+ephemeral signing-state binding before the next tag is created.
+Every tag or manual release first enters the protected `paperboat-tuf-published` environment,
+validates the release version, fetches the served root and its numbered chain from the public
+HTTPS TUF repository, verifies that chain from the client-embedded trusted root, and validates
+all four online secrets against the active roles. The early gate never receives the SSH
+publication credential. Linux, macOS, Windows, and native platform jobs cannot start unless this
+read-only gate passes. Publication repeats the chain and signer validation against the freshly
+fetched repository immediately before signing. The shared non-secret alias source is
+`tools/tuf-repository/active-signing-state.json`; signer validation never writes metadata.
 
 Build `cli`, `runtime`, `hostd`, `updater`, and `launcher` for every supported OS and
 architecture. Name each file `<component>-<os>-<arch>`. Publishing fails if any component is

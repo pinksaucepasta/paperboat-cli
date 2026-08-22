@@ -29,12 +29,81 @@ env:
   RELEASE_VERSION: ${{ inputs.version || github.ref_name }}
 
 jobs:
+  release-authority:
+    name: Validate protected release authority
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    runs-on: blacksmith-2vcpu-ubuntu-2404-arm
+    timeout-minutes: 5
+    environment: paperboat-tuf-published
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Validate release version
+        shell: bash
+        run: ./tools/release-version.sh validate "${RELEASE_VERSION}"
+      - name: Fetch public current root chain
+        env:
+          RELEASE_URL: ${{ vars.PAPERBOAT_DEFAULT_RELEASE_URL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$RELEASE_URL" || { echo 'PAPERBOAT_DEFAULT_RELEASE_URL is required' >&2; exit 1; }
+          case "$RELEASE_URL" in https://*) ;; *) echo 'PAPERBOAT_DEFAULT_RELEASE_URL must use https' >&2; exit 1 ;; esac
+          repository="$RUNNER_TEMP/tuf-authority"
+          metadata="$repository/metadata"
+          mkdir -p "$metadata"
+          base="${RELEASE_URL%/}/metadata"
+          curl_root() {
+            curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+              --connect-timeout 5 --max-time 15 --max-filesize 1048576 --retry 2 --retry-all-errors \
+              --output "$2" "$base/$1"
+          }
+          curl_root root.json "$metadata/root.json"
+          root_version=$(python3 - "$metadata/root.json" <<'PY'
+          import json, sys
+          value = json.load(open(sys.argv[1], encoding='utf-8')).get('signed', {}).get('version')
+          if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 64:
+              raise SystemExit('served TUF root version must be an integer from 1 through 64')
+          print(value)
+          PY
+          )
+          for version in $(seq 1 "$root_version"); do
+            curl_root "$version.root.json" "$metadata/$version.root.json"
+          done
+          install -m 0600 tools/tuf-repository/active-signing-state.json "$repository/.signing-state.json"
+          echo "PAPERBOAT_TUF_AUTHORITY_REPOSITORY=$repository" >> "$GITHUB_ENV"
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Validate online signer authorization
+        env:
+          PAPERBOAT_TUF_CI: "1"
+          PAPERBOAT_TUF_KEY_TARGETS_1: ${{ secrets.PAPERBOAT_TUF_KEY_TARGETS_1 }}
+          PAPERBOAT_TUF_KEY_TARGETS_2: ${{ secrets.PAPERBOAT_TUF_KEY_TARGETS_2 }}
+          PAPERBOAT_TUF_KEY_SNAPSHOT_1: ${{ secrets.PAPERBOAT_TUF_KEY_SNAPSHOT_1 }}
+          PAPERBOAT_TUF_KEY_TIMESTAMP_2: ${{ secrets.PAPERBOAT_TUF_KEY_TIMESTAMP_2 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in PAPERBOAT_TUF_KEY_TARGETS_1 PAPERBOAT_TUF_KEY_TARGETS_2 PAPERBOAT_TUF_KEY_SNAPSHOT_1 PAPERBOAT_TUF_KEY_TIMESTAMP_2; do
+            test -n "${!name}" || { echo "$name is required" >&2; exit 1; }
+          done
+          go run ./tools/tuf-repository validate-signers \
+            -repository "$PAPERBOAT_TUF_AUTHORITY_REPOSITORY" \
+            -trusted-root "$GITHUB_WORKSPACE/internal/hostruntime/bootstrap/trusted-root.json"
+
   platform-qualification:
     name: Native platform qualification
+    needs: release-authority
     uses: ./.github/workflows/platform-qualification.yml
 
   release-linux:
     name: Build Linux ${{ matrix.architecture }} release assets
+    needs: release-authority
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
     runs-on: ${{ matrix.runner }}
     permissions:
@@ -100,6 +169,7 @@ jobs:
 
   release-macos:
     name: Build macOS release assets
+    needs: release-authority
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
     runs-on: blacksmith-6vcpu-macos-latest
     permissions:
@@ -143,6 +213,7 @@ jobs:
 
   release-windows:
     name: Windows ${{ matrix.architecture }} (${{ matrix.channel }}) package
+    needs: release-authority
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
     runs-on: ${{ matrix.runner }}
     permissions:
@@ -458,22 +529,21 @@ jobs:
 
   candidate-assembly:
     name: Assemble immutable qualified candidate
-    if: (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')) && always()
-    needs: [platform-qualification, release-linux, release-macos, release-windows, windows-winget]
+    if: >-
+      (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')) &&
+      needs.release-authority.result == 'success' &&
+      needs.platform-qualification.result == 'success' &&
+      needs.release-linux.result == 'success' &&
+      needs.release-macos.result == 'success' &&
+      needs.release-windows.result == 'success' &&
+      needs.windows-winget.result == 'success'
+    needs: [release-authority, platform-qualification, release-linux, release-macos, release-windows, windows-winget]
     runs-on: blacksmith-2vcpu-ubuntu-2404-arm
     permissions:
       contents: read
       id-token: write
       attestations: write
     steps:
-      - name: Block candidate assembly unless all verified handoffs succeeded
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ "${{ needs.platform-qualification.result }}" != "success" || "${{ needs.release-linux.result }}" != "success" || "${{ needs.release-macos.result }}" != "success" || "${{ needs.release-windows.result }}" != "success" || "${{ needs.windows-winget.result }}" != "success" ]]; then
-            echo 'Candidate assembly is blocked because a required build, packaging, WinGet, or native Windows qualification handoff did not succeed.' >&2
-            exit 1
-          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
@@ -690,9 +760,7 @@ jobs:
           mkdir -p "$repository"
           ssh -i "$HOME/.ssh/paperboat-release" -o BatchMode=yes -o StrictHostKeyChecking=yes "root@$RELEASE_HOST" \
             'tar -C /opt/paperboat/releases/current/tuf -cf - metadata targets' | tar -C "$repository" -xf -
-          cat > "$repository/.signing-state.json" <<'JSON'
-          {"schema":"paperboat.tuf-signing-state/v1","roles":{"root":["root-1","root-2","root-3"],"targets":["targets-1","targets-2"],"snapshot":["snapshot-1"],"timestamp":["timestamp-1"]}}
-          JSON
+          install -m 0600 tools/tuf-repository/active-signing-state.json "$repository/.signing-state.json"
           echo "PAPERBOAT_TUF_REPOSITORY=$repository" >> "$GITHUB_ENV"
       - name: Sign and verify production TUF release
         env:
@@ -700,15 +768,18 @@ jobs:
           PAPERBOAT_TUF_KEY_TARGETS_1: ${{ secrets.PAPERBOAT_TUF_KEY_TARGETS_1 }}
           PAPERBOAT_TUF_KEY_TARGETS_2: ${{ secrets.PAPERBOAT_TUF_KEY_TARGETS_2 }}
           PAPERBOAT_TUF_KEY_SNAPSHOT_1: ${{ secrets.PAPERBOAT_TUF_KEY_SNAPSHOT_1 }}
-          PAPERBOAT_TUF_KEY_TIMESTAMP_1: ${{ secrets.PAPERBOAT_TUF_KEY_TIMESTAMP_1 }}
+          PAPERBOAT_TUF_KEY_TIMESTAMP_2: ${{ secrets.PAPERBOAT_TUF_KEY_TIMESTAMP_2 }}
         shell: bash
         run: |
           set -euo pipefail
-          for name in PAPERBOAT_TUF_KEY_TARGETS_1 PAPERBOAT_TUF_KEY_TARGETS_2 PAPERBOAT_TUF_KEY_SNAPSHOT_1 PAPERBOAT_TUF_KEY_TIMESTAMP_1; do
+          for name in PAPERBOAT_TUF_KEY_TARGETS_1 PAPERBOAT_TUF_KEY_TARGETS_2 PAPERBOAT_TUF_KEY_SNAPSHOT_1 PAPERBOAT_TUF_KEY_TIMESTAMP_2; do
             test -n "${!name}" || { echo "$name is required" >&2; exit 1; }
           done
           signer="$RUNNER_TEMP/paperboat-tuf"
           go build -trimpath -o "$signer" ./tools/tuf-repository
+          "$signer" validate-signers \
+            -repository "$PAPERBOAT_TUF_REPOSITORY" \
+            -trusted-root "$GITHUB_WORKSPACE/internal/hostruntime/bootstrap/trusted-root.json"
           "$signer" publish \
             -repository "$PAPERBOAT_TUF_REPOSITORY" \
             -version "$RELEASE_VERSION" \

@@ -1,0 +1,1 @@
+{"schema":"paperboat.tuf-signing-state/v1","roles":{"root":["root-1","root-2","root-3"],"targets":["targets-1","targets-2"],"snapshot":["snapshot-1"],"timestamp":["timestamp-2"]}}

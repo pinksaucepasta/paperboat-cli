@@ -138,7 +138,7 @@ func run(args []string) error {
 		return errors.New("production signing is restricted to the macOS release workstation")
 	}
 	if len(args) == 0 {
-		return errors.New("usage: paperboat-tuf <init|publish|publish-bootstrap|promote|pause|quarantine|refresh|rotate|status|verify-published>")
+		return errors.New("usage: paperboat-tuf <init|publish|publish-bootstrap|promote|pause|quarantine|refresh|rotate|status|validate-signers|verify-published>")
 	}
 	switch args[0] {
 	case "init":
@@ -209,6 +209,14 @@ func run(args []string) error {
 			return errors.New("usage: paperboat-tuf status -repository DIR")
 		}
 		return status(*repo)
+	case "validate-signers":
+		fs := flag.NewFlagSet("validate-signers", flag.ContinueOnError)
+		repo := fs.String("repository", "", "repository directory")
+		trustedRoot := fs.String("trusted-root", "", "absolute trusted root metadata file")
+		if err := fs.Parse(args[1:]); err != nil || fs.NArg() != 0 {
+			return errors.New("usage: paperboat-tuf validate-signers -repository DIR -trusted-root FILE")
+		}
+		return validateSigners(*repo, *trustedRoot)
 	case "verify-published":
 		fs := flag.NewFlagSet("verify-published", flag.ContinueOnError)
 		repo := fs.String("repository", "", "repository directory")
@@ -219,6 +227,62 @@ func run(args []string) error {
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+// validateSigners performs the release authority gate without changing the
+// repository. It first advances from the client's embedded trusted root
+// through every numbered root, then binds the configured online private keys
+// to the roles authorized by that trusted current root.
+func validateSigners(repo, trustedRootPath string) error {
+	repo, err := validateRepository(repo, true)
+	if err != nil {
+		return err
+	}
+	if !filepath.IsAbs(trustedRootPath) || filepath.Clean(trustedRootPath) != trustedRootPath {
+		return errors.New("trusted root path must be absolute and clean")
+	}
+	trusted, err := metadata.Root().FromFile(trustedRootPath)
+	if err != nil {
+		return fmt.Errorf("load trusted root: %w", err)
+	}
+	if err := verifyRoot(trusted); err != nil {
+		return fmt.Errorf("verify trusted root: %w", err)
+	}
+	current := trusted
+	for version := trusted.Signed.Version + 1; ; version++ {
+		path := filepath.Join(repo, "metadata", fmt.Sprintf("%d.root.json", version))
+		next, loadErr := metadata.Root().FromFile(path)
+		if errors.Is(loadErr, os.ErrNotExist) {
+			break
+		}
+		if loadErr != nil {
+			return fmt.Errorf("load root version %d: %w", version, loadErr)
+		}
+		if next.Signed.Version != version {
+			return fmt.Errorf("root version %d has invalid signed version %d", version, next.Signed.Version)
+		}
+		if err := current.VerifyDelegate("root", next); err != nil {
+			return fmt.Errorf("verify root version %d with previous root: %w", version, err)
+		}
+		if err := verifyRoot(next); err != nil {
+			return fmt.Errorf("verify root version %d with new root: %w", version, err)
+		}
+		current = next
+	}
+	served, err := metadata.Root().FromFile(filepath.Join(repo, "metadata", "root.json"))
+	if err != nil {
+		return fmt.Errorf("load served root: %w", err)
+	}
+	if served.Signed.Version != current.Signed.Version || !bytes.Equal(mustMetadataBytes(served), mustMetadataBytes(current)) {
+		return errors.New("served root does not match the trusted numbered root chain")
+	}
+	state, err := loadSigningState(repo, current, "targets", "snapshot", "timestamp")
+	if err != nil {
+		return err
+	}
+	count := len(state.Roles["targets"]) + len(state.Roles["snapshot"]) + len(state.Roles["timestamp"])
+	fmt.Printf("root=%d online_signers=%d validated\n", current.Signed.Version, count)
+	return nil
 }
 
 // verifyPublished checks the complete metadata set as it will be served. In
@@ -1148,6 +1212,7 @@ func validateSigningState(root *metadata.Metadata[metadata.RootType], state sign
 		if configured == nil || len(state.Roles[role]) < configured.Threshold {
 			return errors.New("TUF signing state does not satisfy role thresholds")
 		}
+		authorizedKeyIDs := make(map[string]struct{}, len(state.Roles[role]))
 		for _, name := range state.Roles[role] {
 			private, err := loadKey(name)
 			if err != nil {
@@ -1171,6 +1236,10 @@ func validateSigningState(root *metadata.Metadata[metadata.RootType], state sign
 			if !found {
 				return fmt.Errorf("Keychain item %s is not authorized for %s", name, role)
 			}
+			authorizedKeyIDs[id] = struct{}{}
+		}
+		if len(authorizedKeyIDs) < configured.Threshold {
+			return errors.New("TUF signing state does not satisfy role thresholds with unique authorized keys")
 		}
 	}
 	return nil
