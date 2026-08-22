@@ -15,21 +15,6 @@ on:
     secrets:
       RELEASE_TOKEN:
         required: false
-  workflow_dispatch:
-    inputs:
-      candidate_run_id:
-        description: Successful Release candidate workflow run ID
-        required: true
-        type: string
-      version:
-        description: Release version from the candidate manifest
-        required: true
-        type: string
-      commit:
-        description: Exact qualified commit SHA
-        required: true
-        type: string
-
 permissions:
   contents: write
   packages: write
