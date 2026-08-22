@@ -19,8 +19,8 @@ env:
   GOFLAGS: -buildvcs=false
 
 jobs:
-  native-contract:
-    name: Native ${{ matrix.os }} ${{ matrix.architecture }} contract
+  platform-contract:
+    name: Platform ${{ matrix.os }} ${{ matrix.architecture }} contract
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
@@ -39,6 +39,9 @@ jobs:
           - os: windows
             architecture: amd64
             runner: windows-2025
+          - os: windows
+            architecture: arm64
+            runner: windows-11-arm
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
