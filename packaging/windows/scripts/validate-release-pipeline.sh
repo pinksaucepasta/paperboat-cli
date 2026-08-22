@@ -74,6 +74,7 @@ if "publish-release.yml" in release or "update-assurance.yml" in release:
 linux_job = release[release.index("  release-linux:"):release.index("  release-macos:")]
 assembly_job = release[release.index("  candidate-assembly:"):release.index("  release-publication:")]
 winget_job = release[release.index("  windows-winget:"):release.index("  candidate-assembly:")]
+publication_job = release[release.index("  release-publication:"):]
 manifest_command = 'bash tools/package-manifests.sh dist "${GITHUB_REPOSITORY}" "${RELEASE_VERSION}"'
 if "package-manifests.sh" in linux_job:
     raise SystemExit("per-architecture Linux jobs cannot generate a manifest that requires every Unix archive")
@@ -84,6 +85,8 @@ for forbidden in ("Install-Module", "Repair-WinGetPackageManager", "Add-AppxPack
         raise SystemExit(f"WinGet manifest validation must not bootstrap external tooling: {forbidden}")
 if "[void]$view.Execute()" not in winget_renderer or "StringData(1)).Trim()" not in winget_renderer or "MSI property $PropertyName is empty" not in winget_renderer:
     raise SystemExit("WinGet renderer must suppress COM output, trim, and validate Windows Installer property values")
+if "actions/setup-go@" not in publication_job or publication_job.index("actions/setup-go@") > publication_job.index("Sign and verify production TUF release"):
+    raise SystemExit("release publication must set up Go before building the TUF signer")
 
 ordered = (
     "Publish immutable GitHub release assets",

@@ -621,6 +621,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+      - name: Set up release toolchain
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
       - name: Download immutable candidate
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -734,11 +739,6 @@ jobs:
           scp -i "$HOME/.ssh/paperboat-release" -o BatchMode=yes -o StrictHostKeyChecking=yes tools/publish-tuf-origin.sh "root@$RELEASE_HOST:$remote_script"
           ssh -i "$HOME/.ssh/paperboat-release" -o BatchMode=yes -o StrictHostKeyChecking=yes "root@$RELEASE_HOST" \
             "chmod 0700 '$remote_script' && '$remote_script' '$remote_bundle' /opt/paperboat/releases '$RELEASE_VERSION' '$digest'"
-      - name: Verify production TUF publication
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: go.mod
-          cache: true
       - name: Verify public updater and current release
         env:
           PAPERBOAT_TEST_TUF_REPOSITORY_URL: ${{ vars.PAPERBOAT_DEFAULT_RELEASE_URL }}
