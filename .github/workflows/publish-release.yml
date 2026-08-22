@@ -136,25 +136,6 @@ jobs:
           if [[ "$(gh release view "$RELEASE_VERSION" --json isDraft --jq .isDraft)" == true ]]; then
             gh release edit "$RELEASE_VERSION" --draft=false
           fi
-      - name: Log in to GHCR
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.RELEASE_TOKEN || github.token }}
-      - name: Set up Buildx for multi-architecture image publication
-        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3
-      - name: Build and publish hosted image from qualified commit
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: .
-          file: deploy/hosted/Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          build-args: PAPERBOAT_VERSION=${{ inputs.version }}
-          tags: |
-            ghcr.io/pinksaucepasta/paperboat-hosted:${{ inputs.version }}
-            ghcr.io/pinksaucepasta/paperboat-hosted:latest
       - name: Wait for automatic production TUF publication and verify it
         env:
           PAPERBOAT_TEST_TUF_REPOSITORY_URL: ${{ vars.PAPERBOAT_PRODUCTION_TUF_REPOSITORY_URL }}
@@ -188,4 +169,70 @@ jobs:
               path = Path('public') / entry['name']
               if hashlib.sha256(path.read_bytes()).hexdigest() != entry['sha256']:
                   raise SystemExit(f'public artifact changed: {entry["name"]}')
+
+  hosted-image:
+    name: Build hosted image (${{ matrix.architecture }}) on native runner
+    needs: publish
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            runner: ubuntu-24.04
+          - architecture: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.commit }}
+          fetch-depth: 1
+      - name: Validate native runner architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(go env GOOS)/$(go env GOARCH)" = "linux/${{ matrix.architecture }}"
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.RELEASE_TOKEN || github.token }}
+      - name: Set up native Buildx builder
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3
+      - name: Build and push native hosted image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: deploy/hosted/Dockerfile
+          platforms: linux/${{ matrix.architecture }}
+          push: true
+          build-args: PAPERBOAT_VERSION=${{ inputs.version }}
+          tags: ghcr.io/pinksaucepasta/paperboat-hosted:${{ inputs.version }}-${{ matrix.architecture }}
+
+  hosted-image-manifest:
+    name: Publish hosted image manifest
+    needs: hosted-image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.RELEASE_TOKEN || github.token }}
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3
+      - name: Create multi-architecture manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          image=ghcr.io/pinksaucepasta/paperboat-hosted
+          docker buildx imagetools create \
+            --tag "$image:${{ inputs.version }}" \
+            --tag "$image:latest" \
+            "$image:${{ inputs.version }}-amd64" \
+            "$image:${{ inputs.version }}-arm64"
           PY

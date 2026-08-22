@@ -104,7 +104,9 @@ jobs:
             runner: windows-2025
           - architecture: arm64
             channel: beta
-            runner: windows-11-arm
+            # Native Windows ARM64 runner label supplied by the repository's
+            # self-hosted ARM builder.
+            runner: [self-hosted, windows, arm64]
     env:
       PAPERBOAT_ARCH: ${{ matrix.architecture }}
       PAPERBOAT_CHANNEL: ${{ matrix.channel }}
