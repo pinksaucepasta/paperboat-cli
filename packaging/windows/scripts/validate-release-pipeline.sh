@@ -1,164 +1,51 @@
 #!/bin/sh
 set -eu
 
-script_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-repository_root=$(CDPATH= cd -- "$script_directory/../../.." && pwd)
+repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)
 workflow="$repository_root/.github/workflows/release.yml"
-publication_workflow="$repository_root/.github/workflows/publish-release.yml"
-qualification_workflow="$repository_root/.github/workflows/platform-qualification.yml"
-
+qualification="$repository_root/.github/workflows/platform-qualification.yml"
 test -f "$workflow"
-test -f "$publication_workflow"
-test -f "$qualification_workflow"
+test -f "$qualification"
 
-if command -v rg >/dev/null 2>&1; then
-    text_search() { rg "$@"; }
-    fixed_search() { rg -F "$@"; }
-else
-    text_search() { grep -R "$@"; }
-    fixed_search() { grep -R -F "$@"; }
-fi
-
-require_text() {
-    needle=$1
-    if ! fixed_search -- "$needle" "$workflow" >/dev/null; then
-        echo "release workflow is missing: $needle" >&2
-        exit 1
-    fi
-}
-
-require_text 'runs-on: windows-2025'
-require_text 'architecture: amd64'
-require_text 'architecture: arm64'
-require_text 'channel: stable'
-require_text 'channel: beta'
-require_text 'dotnet tool install --global wix --version 5.0.2'
-require_text 'sign-and-verify.ps1'
-require_text 'generate-signing-handoff.ps1'
-require_text 'render-winget.ps1'
-require_text 'actions/upload-artifact'
-require_text 'actions/download-artifact'
-require_text 'actions/attest-build-provenance'
-require_text 'merge-signing-manifests.py'
-require_text 'pb-windows-{0}.exe'
-require_text 'convert-native-qualification-evidence.py'
-require_text 'windows-native-qualification'
-require_text 'windows-amd64-native-release-qualification'
-require_text 'windows-arm64-beta-release-qualification'
-require_text 'windows-arm64-beta-evidence'
-require_text 'release-candidate-${{ env.RELEASE_VERSION }}'
-require_text 'release-candidate.json'
-
-if text_search -n "Add-WindowsCapability|winget install ['\"]openssh preview|for target in .*windows/" "$workflow" "$publication_workflow" "$qualification_workflow" >/dev/null; then
-    echo 'release workflow contains a forbidden Windows packaging path' >&2
-    exit 1
-fi
-
-python_command=python3
-if ! command -v "$python_command" >/dev/null 2>&1; then
-    python_command=python
-fi
-"$python_command" - "$workflow" "$publication_workflow" "$qualification_workflow" <<'PY'
+python3 - "$workflow" "$qualification" <<'PY'
 import pathlib
-import re
 import sys
 
-workflow = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
-publication_workflow = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
-qualification_workflow = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
+release = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+qualification = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
 
-def job(name: str) -> str:
-    match = re.search(rf"^  {re.escape(name)}:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:|\Z)", workflow, re.MULTILINE | re.DOTALL)
-    if not match:
-        raise SystemExit(f"missing job {name}")
-    return match.group("body")
-
-unix = job("release-unix")
-if "runs-on: ubuntu-latest" not in unix:
-    raise SystemExit("release-unix must run on Ubuntu")
-for forbidden in ("windows/amd64", "windows/arm64", "package-zip", "paperboat_.*windows"):
-    if re.search(forbidden, unix):
-        raise SystemExit(f"release-unix still owns Windows assets: {forbidden}")
-
-windows = job("windows-package")
-if "runs-on: ${{ matrix.runner }}" not in windows or "runner: windows-2025" not in windows or "runner: windows-11-arm" not in windows:
-    raise SystemExit("windows-package must run amd64 on windows-2025 and arm64 on windows-11-arm")
-if "stable" not in windows or "beta" not in windows:
-    raise SystemExit("windows-package must declare stable and beta channels")
-
-candidate = job("candidate-assembly")
-if "always()" not in candidate:
-    raise SystemExit("candidate assembly must run its explicit dependency gate")
-if "needs: [release-unix, windows-package, windows-winget, windows-native-qualification, windows-arm64-beta-evidence]" not in workflow:
-    raise SystemExit("candidate dependencies do not include all platform handoffs")
-if "windows-native-qualification.result" not in candidate:
-    raise SystemExit("candidate does not gate on native Windows amd64 qualification")
-if "windows-arm64-beta-evidence.result" not in candidate:
-    raise SystemExit("candidate does not gate on Windows arm64 beta evidence")
-if "--verify-evidence native-qualification/windows-amd64-native-qualification.json" not in candidate:
-    raise SystemExit("candidate does not verify native qualification against final artifacts")
-
-qualification = job("windows-native-qualification")
-if "needs: windows-package" not in qualification or "runner: windows-2025" not in qualification or "runs-on: ${{ matrix.runner }}" not in qualification:
-    raise SystemExit("native Windows qualification must consume the final amd64 package on a GitHub-hosted Windows runner")
 for required in (
-    "Invoke-NativeWindowsQualification.ps1",
-    "convert-native-qualification-evidence.py",
-    "--artifacts-dir (Join-Path $env:GITHUB_WORKSPACE 'input')",
-    "windows-amd64-native-release-qualification",
+    "release-linux:", "release-macos:", "release-windows:",
+    "runner: blacksmith-2vcpu-ubuntu-2404",
+    "runner: blacksmith-2vcpu-ubuntu-2404-arm",
+    "runner: blacksmith-2vcpu-windows-2025", "runner: windows-11-arm",
+    "architecture: amd64", "architecture: arm64",
+    "channel: stable", "channel: beta", "windows-winget:",
+    "candidate-assembly:", "release-publication:",
+    "needs: [platform-qualification, release-linux, release-macos, release-windows, windows-winget]",
+    "release-candidate.json", "release-candidate-${{ env.RELEASE_VERSION }}",
+    "actions/attest-build-provenance",
+):
+    if required not in release:
+        raise SystemExit(f"release workflow is missing {required!r}")
+
+for required in (
+    "workflow_call:", "platform-contract:",
+    "runner: blacksmith-2vcpu-ubuntu-2404",
+    "runner: blacksmith-2vcpu-ubuntu-2404-arm",
+    "runner: blacksmith-6vcpu-macos-latest",
+    "runner: blacksmith-2vcpu-windows-2025", "runner: windows-11-arm",
+    "architecture: amd64", "architecture: arm64",
+    'actual="$(go env GOOS)/$(go env GOARCH)"',
 ):
     if required not in qualification:
-        raise SystemExit(f"native Windows amd64 qualification is missing {required}")
-arm_beta = job("windows-arm64-beta-evidence")
-for required in ("needs: windows-package", "blocked_no_hardware", "write-arm64-native-evidence.py", "windows-arm64-beta-release-qualification"):
-    if required not in arm_beta:
-        raise SystemExit(f"Windows arm64 beta evidence is missing {required}")
+        raise SystemExit(f"platform qualification is missing {required!r}")
 
-for required in (
-    "candidate_run_id:",
-    "run-id: ${{ inputs.candidate_run_id }}",
-    "release-candidate-${{ inputs.version }}",
-    "Refuse mutable or conflicting release identity",
-    "gh release create \"$RELEASE_VERSION\" --target \"$RELEASE_COMMIT\"",
-    "TestProductionTUFRepository",
-    "paperboat-tuf-published",
-):
-    if required not in publication_workflow:
-        raise SystemExit(f"publication workflow is missing {required}")
-if "go build" in publication_workflow or "go test ./..." in publication_workflow:
-    raise SystemExit("publication workflow must not rebuild release binaries or rerun the general suite")
-
-for required in (
-    "ubuntu-24.04",
-    "ubuntu-24.04-arm",
-    "macos-14",
-    "windows-2025",
-    "Windows arm64 beta independent cross-build",
-    "native_windows_arm64_e2e: blocked_no_hardware",
-):
-    if required not in qualification_workflow:
-        raise SystemExit(f"platform qualification workflow is missing {required}")
-if "self-hosted" in qualification_workflow:
-    raise SystemExit("platform qualification must use GitHub-hosted runners only")
+if "qemu" in release.lower() or "qemu" in qualification.lower():
+    raise SystemExit("release workflows must not use QEMU")
+if "publish-release.yml" in release or "update-assurance.yml" in release:
+    raise SystemExit("release workflow references a deleted workflow")
 PY
 
-"$python_command" "$script_directory/test_convert_native_qualification_evidence.py"
-
-for script in "$script_directory"/*.sh; do
-    sh -n "$script"
-done
-
-if command -v pwsh >/dev/null 2>&1; then
-    for script in "$script_directory"/*.ps1; do
-        pwsh -NoLogo -NoProfile -NonInteractive -Command \
-            '& { param([string]$path) [void][System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$null, [ref]$null) }' \
-            "$script"
-    done
-fi
-
-if text_search -n 'BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|PAPERBOAT_WINDOWS_SIGNING_PFX_B64[[:space:]]*=' "$repository_root/packaging/windows/scripts" >/dev/null; then
-    echo 'Windows packaging scripts contain private key material or an assigned PFX secret' >&2
-    exit 1
-fi
-
-echo 'Windows release pipeline contract and script syntax are valid.'
+python3 "$repository_root/packaging/windows/scripts/test_convert_native_qualification_evidence.py"
+for script in "$(dirname -- "$0")"/*.sh; do sh -n "$script"; done

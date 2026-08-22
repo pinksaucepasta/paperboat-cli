@@ -91,10 +91,10 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 	}
 	for _, requiredText := range []string{
 		"windows-2025",
-		"native_windows_arm64_e2e: blocked_no_hardware",
+		"windows-11-arm",
 		"architecture: amd64",
 		"architecture: arm64",
-		"windows_arm64_stability: beta",
+		"blacksmith-2vcpu-ubuntu-2404-arm",
 	} {
 		if !strings.Contains(string(workflow), requiredText) {
 			t.Fatalf("platform qualification is missing %q", requiredText)
@@ -105,11 +105,11 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, requiredText := range []string{
-		"Invoke-NativeWindowsQualification.ps1",
-		"write-arm64-native-evidence.py",
-		"PAPERBOAT_WINDOWS_E2E_SERVICE_FIXTURE",
-		"windows-amd64-native-release-qualification",
-		"windows-arm64-beta-release-qualification",
+		"platform-qualification",
+		"release-windows",
+		"windows-winget",
+		"windows-amd64",
+		"windows-arm64",
 	} {
 		if !strings.Contains(string(releaseWorkflow), requiredText) {
 			t.Fatalf("release candidate qualification is missing %q", requiredText)
