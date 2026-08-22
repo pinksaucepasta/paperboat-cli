@@ -732,9 +732,30 @@ jobs:
       actions: read
       id-token: write
       attestations: write
-    uses: ./.github/workflows/publish-release.yml
-    with:
-      candidate_run_id: ${{ github.run_id }}
-      version: ${{ inputs.version || github.ref_name }}
-      commit: ${{ github.sha }}
-    secrets: inherit
+    runs-on: ubuntu-24.04
+    environment: paperboat-tuf-published
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Download immutable candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-candidate-${{ env.RELEASE_VERSION }}
+          path: dist
+          github-token: ${{ secrets.RELEASE_TOKEN || github.token }}
+          run-id: ${{ github.run_id }}
+      - name: Publish immutable GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_VERSION" --target "$GITHUB_SHA" --generate-notes --latest || true
+          while IFS= read -r -d '' file; do gh release upload "$RELEASE_VERSION" "$file" --clobber; done < <(find dist -maxdepth 1 -type f -print0)
+      - name: Verify production TUF publication
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test ./internal/hostruntime/bootstrap -run '^TestProductionTUFRepository$' -count=1
