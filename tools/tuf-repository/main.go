@@ -322,7 +322,7 @@ func publishBootstrap(repo, artifact, version, platform, architecture string) er
 	if err != nil {
 		return err
 	}
-	state, err := loadSigningState(repo, root)
+	state, err := loadSigningState(repo, root, "targets", "snapshot", "timestamp")
 	if err != nil {
 		return err
 	}
@@ -463,7 +463,7 @@ func publish(repo, version, artifacts string, qualificationEvidencePaths map[str
 	if err != nil {
 		return err
 	}
-	state, err := loadSigningState(repo, root)
+	state, err := loadSigningState(repo, root, "targets", "snapshot", "timestamp")
 	if err != nil {
 		return err
 	}
@@ -728,7 +728,7 @@ func refresh(repo string) error {
 	if err != nil {
 		return err
 	}
-	state, err := loadSigningState(repo, root)
+	state, err := loadSigningState(repo, root, "snapshot", "timestamp")
 	if err != nil {
 		return err
 	}
@@ -762,7 +762,7 @@ func mutateRollout(repo, operation string, revision uint64, percentage uint8) er
 	if err != nil {
 		return err
 	}
-	state, err := loadSigningState(repo, root)
+	state, err := loadSigningState(repo, root, "targets", "snapshot", "timestamp")
 	if err != nil {
 		return err
 	}
@@ -1118,7 +1118,7 @@ func initialSigningState() signingState {
 
 func signingStatePath(repo string) string { return filepath.Join(repo, ".signing-state.json") }
 
-func loadSigningState(repo string, root *metadata.Metadata[metadata.RootType]) (signingState, error) {
+func loadSigningState(repo string, root *metadata.Metadata[metadata.RootType], requiredRoles ...string) (signingState, error) {
 	body, err := os.ReadFile(signingStatePath(repo))
 	if err != nil {
 		return signingState{}, err
@@ -1130,14 +1130,20 @@ func loadSigningState(repo string, root *metadata.Metadata[metadata.RootType]) (
 	if decoder.Decode(&state) != nil || decoder.Decode(&extra) != io.EOF || state.Schema != "paperboat.tuf-signing-state/v1" {
 		return signingState{}, errors.New("TUF signing state is invalid")
 	}
-	if err := validateSigningState(root, state); err != nil {
+	if err := validateSigningState(root, state, requiredRoles...); err != nil {
 		return signingState{}, err
 	}
 	return state, nil
 }
 
-func validateSigningState(root *metadata.Metadata[metadata.RootType], state signingState) error {
-	for _, role := range []string{"root", "targets", "snapshot", "timestamp"} {
+func validateSigningState(root *metadata.Metadata[metadata.RootType], state signingState, requiredRoles ...string) error {
+	if len(requiredRoles) == 0 {
+		requiredRoles = []string{"root", "targets", "snapshot", "timestamp"}
+	}
+	for _, role := range requiredRoles {
+		if role != "root" && role != "targets" && role != "snapshot" && role != "timestamp" {
+			return fmt.Errorf("unknown TUF signing role %q", role)
+		}
 		configured := root.Signed.Roles[role]
 		if configured == nil || len(state.Roles[role]) < configured.Threshold {
 			return errors.New("TUF signing state does not satisfy role thresholds")

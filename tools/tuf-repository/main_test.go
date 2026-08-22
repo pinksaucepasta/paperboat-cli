@@ -46,6 +46,7 @@ func TestCIKeyEnvironmentAndSupportedTargets(t *testing.T) {
 }
 
 func TestCISigningPublishesCompleteSupportedRelease(t *testing.T) {
+	t.Setenv("PAPERBOAT_TUF_CI", "1")
 	for index, name := range roles {
 		seed := bytes.Repeat([]byte{byte(index + 1)}, ed25519.SeedSize)
 		t.Setenv(tufKeyEnvironmentName(name), base64.RawStdEncoding.EncodeToString(seed))
@@ -53,6 +54,11 @@ func TestCISigningPublishesCompleteSupportedRelease(t *testing.T) {
 	repository := filepath.Join(t.TempDir(), "repository")
 	if err := initialize(repository); err != nil {
 		t.Fatal(err)
+	}
+	// Online publication must not require the offline root keys after the
+	// repository and signing state have been initialized.
+	for _, name := range []string{"root-1", "root-2", "root-3"} {
+		t.Setenv(tufKeyEnvironmentName(name), "not-an-offline-root-key")
 	}
 	artifacts := t.TempDir()
 	version := "2026.08.22.13"
@@ -97,6 +103,31 @@ func TestCISigningPublishesCompleteSupportedRelease(t *testing.T) {
 	}
 	if _, exists := targets.Signed.Targets["cli-darwin-arm64"]; !exists {
 		t.Fatal("macOS arm64 target was not published")
+	}
+}
+
+func TestCIOnlineSigningRejectsUnauthorizedKeyWithoutLoadingRootKeys(t *testing.T) {
+	t.Setenv("PAPERBOAT_TUF_CI", "1")
+	for index, name := range roles {
+		seed := bytes.Repeat([]byte{byte(index + 1)}, ed25519.SeedSize)
+		t.Setenv(tufKeyEnvironmentName(name), base64.RawStdEncoding.EncodeToString(seed))
+	}
+	repository := filepath.Join(t.TempDir(), "repository")
+	if err := initialize(repository); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"root-1", "root-2", "root-3"} {
+		t.Setenv(tufKeyEnvironmentName(name), "not-an-offline-root-key")
+	}
+	unauthorizedSeed := bytes.Repeat([]byte{99}, ed25519.SeedSize)
+	t.Setenv(tufKeyEnvironmentName("targets-1"), base64.RawStdEncoding.EncodeToString(unauthorizedSeed))
+	root, _, _, _, err := loadSet(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = loadSigningState(repository, root, "targets", "snapshot", "timestamp")
+	if err == nil || !strings.Contains(err.Error(), "targets-1 is not authorized for targets") {
+		t.Fatalf("unauthorized online key error = %v", err)
 	}
 }
 
