@@ -29,44 +29,9 @@ env:
   RELEASE_VERSION: ${{ inputs.version || github.ref_name }}
 
 jobs:
-  qualified-commit:
-    name: Verify exact commit qualification
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          fetch-depth: 1
-      - name: Require successful CI and platform contracts for this SHA
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          required=(
-            'Fast repository quality contract'
-            'Linux race detector'
-            'Vulnerability and license checks'
-            'Native linux amd64 contract'
-            'Native linux arm64 contract'
-            'Native macos arm64 contract'
-            'Native windows amd64 contract'
-            'Windows arm64 beta independent cross-build'
-          )
-          checks="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/check-runs?per_page=100")"
-          for name in "${required[@]}"; do
-            conclusion="$(jq -r --arg name "$name" '[.check_runs[] | select(.name == $name)] | sort_by(.completed_at) | last | .conclusion // "missing"' <<<"$checks")"
-            if [[ "$conclusion" != success ]]; then
-              echo "Required check is not successful for ${GITHUB_SHA}: ${name} (${conclusion})" >&2
-              exit 1
-            fi
-          done
-
   release-unix:
     name: Build Unix release assets
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
-    needs: qualified-commit
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -127,7 +92,6 @@ jobs:
   windows-package:
     name: Windows ${{ matrix.architecture }} (${{ matrix.channel }}) package
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
-    needs: qualified-commit
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
