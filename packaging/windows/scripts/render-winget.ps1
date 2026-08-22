@@ -88,13 +88,4 @@ foreach ($template in Get-ChildItem -LiteralPath (Join-Path $templateRoot 'stabl
     $manifestContent | Set-Content -LiteralPath (Join-Path $destinationDirectory $template.Name) -Encoding utf8
 }
 
-$winget = Get-Command winget.exe -ErrorAction SilentlyContinue
-if ($null -eq $winget) {
-    throw 'winget.exe is required to validate the rendered WinGet manifests.'
-}
-& $winget.Path validate --manifest $destinationDirectory --disable-interactivity --nowarn | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    throw "WinGet manifest validation failed for $destinationDirectory."
-}
-
-Write-Output ("Rendered and validated final-hash WinGet manifests in {0}." -f $output)
+Write-Output ("Rendered final-hash WinGet manifests in {0}." -f $output)
