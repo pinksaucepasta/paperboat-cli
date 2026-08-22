@@ -6,7 +6,7 @@
       "id": "cli.behavior",
       "path": "cli/behavior.json",
       "type": "command-behavior",
-      "sha256": "7ae90bb0266b03eff56ca1b2c14560ba2d0775aa449cda4b701626704fd05cc8",
+      "sha256": "02f452e3b252bbf167f64955fdc1b911eb32d1010b1c13fe2099040ac2641a87",
       "owner": "cli",
       "review": "preview-ownership-review",
       "consumers": [
@@ -17,7 +17,7 @@
       "id": "cli.command-tree",
       "path": "cli/command-tree.json",
       "type": "command-tree",
-      "sha256": "31ff9ac993aca637e851ce1aa50de75dfb079ad3660ff83404172d1d94a4e770",
+      "sha256": "ffff0b183510ae585d00c94b16c5c0ff984769e8faed5f7bf84828b0b959ad89",
       "owner": "cli",
       "review": "preview-ownership-review",
       "consumers": [
@@ -561,7 +561,7 @@
       "id": "cli.command.transcripts",
       "path": "transcripts/cli/commands.json",
       "type": "transcripts",
-      "sha256": "790e45c4510ae9aa98d3c5d671ec2770c99a96fe43fc50400a77b7a8f6f149c6",
+      "sha256": "3b7d46e58e2c983f6fa536cad8bf52d2e60d96636f97ee6e5db6fb3f87ee8c5f",
       "owner": "cli",
       "review": "preview-ownership-review",
       "consumers": [

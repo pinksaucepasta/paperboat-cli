@@ -185,7 +185,7 @@ func validatePolicy(policy metadata) error {
 	}
 	wantTargets := []target{
 		{Architecture: "amd64", WixPlatform: "x64", WingetArchitecture: "x64", Channel: "stable", Stability: "stable", NativeE2E: "required_before_stable_release", NativeHardwareEvidence: "release_gate"},
-		{Architecture: "arm64", WixPlatform: "arm64", WingetArchitecture: "arm64", Channel: "beta", Stability: "beta", NativeE2E: "required_before_stable_promotion", NativeHardwareEvidence: "github_hosted_native_beta_gate"},
+		{Architecture: "arm64", WixPlatform: "arm64", WingetArchitecture: "arm64", Channel: "stable", Stability: "stable", NativeE2E: "required_before_stable_release", NativeHardwareEvidence: "release_gate"},
 	}
 	if !sameTargets(policy.Targets, wantTargets) {
 		return fmt.Errorf("architecture/channel targets are incorrect")
@@ -250,7 +250,7 @@ func validateWix(root string, policy metadata) error {
 		channel  string
 	}{
 		{path: "wix/Paperboat.amd64.wixproj", platform: "x64", channel: "stable"},
-		{path: "wix/Paperboat.arm64.wixproj", platform: "arm64", channel: "beta"},
+		{path: "wix/Paperboat.arm64.wixproj", platform: "arm64", channel: "stable"},
 	} {
 		projectBytes, err := read(root, project.path)
 		if err != nil {
@@ -279,10 +279,7 @@ func validateWinget(root string) error {
 	}{
 		{path: "winget/stable/Pinksaucepasta.Paperboat.yaml", identifier: "Pinksaucepasta.Paperboat"},
 		{path: "winget/stable/Pinksaucepasta.Paperboat.locale.en-US.yaml", identifier: "Pinksaucepasta.Paperboat"},
-		{path: "winget/stable/Pinksaucepasta.Paperboat.installer.yaml", identifier: "Pinksaucepasta.Paperboat", architectures: []string{"x64"}},
-		{path: "winget/beta/Pinksaucepasta.Paperboat.Beta.yaml", identifier: "Pinksaucepasta.Paperboat.Beta"},
-		{path: "winget/beta/Pinksaucepasta.Paperboat.Beta.locale.en-US.yaml", identifier: "Pinksaucepasta.Paperboat.Beta"},
-		{path: "winget/beta/Pinksaucepasta.Paperboat.Beta.installer.yaml", identifier: "Pinksaucepasta.Paperboat.Beta", architectures: []string{"x64", "arm64"}},
+		{path: "winget/stable/Pinksaucepasta.Paperboat.installer.yaml", identifier: "Pinksaucepasta.Paperboat", architectures: []string{"x64", "arm64"}},
 	}
 	for _, template := range templates {
 		data, err := read(root, template.path)
@@ -300,9 +297,6 @@ func validateWinget(root string) error {
 			if !strings.Contains(text, "Architecture: "+architecture) {
 				return fmt.Errorf("%s is missing architecture %s", template.path, architecture)
 			}
-		}
-		if template.path == "winget/stable/Pinksaucepasta.Paperboat.installer.yaml" && strings.Contains(text, "Architecture: arm64") {
-			return fmt.Errorf("stable WinGet template cannot expose arm64")
 		}
 	}
 	return nil

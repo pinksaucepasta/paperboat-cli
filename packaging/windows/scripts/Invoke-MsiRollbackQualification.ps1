@@ -79,7 +79,7 @@ Assert-Qualification (@(Get-PaperboatProducts).Count -eq 0) 'ARP product remains
 [ordered]@{
     schema = 'paperboat.windows-msi-rollback-qualification/v1'
     status = 'passed'
-    architecture = 'amd64'
+    architecture = if ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq 'Arm64') { 'arm64' } else { 'amd64' }
     native_tested = $true
     windows_build = (Get-CimInstance Win32_OperatingSystem).BuildNumber
     service_conflict_exit_code = $serviceConflictExitCode

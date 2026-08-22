@@ -134,7 +134,8 @@ try {
   $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
   try { $rng.GetBytes($token) } finally { $rng.Dispose() }
   [IO.File]::WriteAllBytes($tokenPath,$token)
-  $artifact = @{schema='paperboat.tuf-target/v1';kind='pb';version='2026.08.19.1';platform='windows';architecture='amd64';repository_url='https://updates.invalid';target_path='pb-windows-amd64'}
+  $architecture = if ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq 'Arm64') { 'arm64' } else { 'amd64' }
+  $artifact = @{schema='paperboat.tuf-target/v1';kind='pb';version='2026.08.19.1';platform='windows';architecture=$architecture;repository_url='https://updates.invalid';target_path="pb-windows-$architecture"}
   [IO.File]::WriteAllText($configPath, (@{schema='paperboat.windows-runtime-install/v1';owner_sid=$ownerSID;user="$env:COMPUTERNAME\$testUserName";state_root=$stateRoot;workspace_root="C:\Users\$testUserName";control_url='https://control.invalid';machine_id='machine_native_preview_reboot_e2e';token_file=$tokenPath;installed_at=[DateTime]::UtcNow.ToString('o');committed=$true;artifact=$artifact} | ConvertTo-Json -Depth 5 -Compress), $utf8NoBom)
   & icacls.exe $configPath /inheritance:r /grant:r '*S-1-5-18:F' '*S-1-5-32-544:F' "*$ownerSID`:F" | Out-Null
   $tokenACL = Get-Acl $tokenPath

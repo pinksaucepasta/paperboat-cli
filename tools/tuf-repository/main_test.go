@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"os"
@@ -14,6 +16,89 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/releaseindex"
 	"github.com/theupdateframework/go-tuf/v2/metadata"
 )
+
+func TestCIKeyEnvironmentAndSupportedTargets(t *testing.T) {
+	seed := bytes.Repeat([]byte{7}, ed25519.SeedSize)
+	t.Setenv(tufKeyEnvironmentName("targets-1"), base64.RawStdEncoding.EncodeToString(seed))
+	key, err := loadKey("targets-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(key.Seed(), seed) {
+		t.Fatal("environment key seed changed while loading")
+	}
+	want := []releaseTargetPlatform{
+		{platform: "darwin", architecture: "arm64"},
+		{platform: "linux", architecture: "amd64"},
+		{platform: "linux", architecture: "arm64"},
+		{platform: "windows", architecture: "amd64"},
+		{platform: "windows", architecture: "arm64"},
+	}
+	got := supportedReleaseTargets()
+	if len(got) != len(want) {
+		t.Fatalf("targets=%v, want %v", got, want)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("target[%d]=%v, want %v", index, got[index], want[index])
+		}
+	}
+}
+
+func TestCISigningPublishesCompleteSupportedRelease(t *testing.T) {
+	for index, name := range roles {
+		seed := bytes.Repeat([]byte{byte(index + 1)}, ed25519.SeedSize)
+		t.Setenv(tufKeyEnvironmentName(name), base64.RawStdEncoding.EncodeToString(seed))
+	}
+	repository := filepath.Join(t.TempDir(), "repository")
+	if err := initialize(repository); err != nil {
+		t.Fatal(err)
+	}
+	artifacts := t.TempDir()
+	version := "2026.08.22.13"
+	qualified := map[string][]windowsNativeQualifiedArtifact{"amd64": {}, "arm64": {}}
+	for _, target := range supportedReleaseTargets() {
+		for _, component := range []string{"cli", "runtime", "hostd", "updater", "launcher"} {
+			name := component + "-" + target.platform + "-" + target.architecture
+			body := []byte("test release artifact " + name)
+			if err := os.WriteFile(filepath.Join(artifacts, name), body, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if target.platform == "windows" {
+				digest := sha256.Sum256(body)
+				qualified[target.architecture] = append(qualified[target.architecture], windowsNativeQualifiedArtifact{Component: component, TargetPath: name, SHA256: hex.EncodeToString(digest[:]), Length: int64(len(body)), Platform: "windows", Architecture: target.architecture, Status: "passed"})
+			}
+		}
+	}
+	evidencePaths := make(map[string]string, 2)
+	for _, architecture := range []string{"amd64", "arm64"} {
+		evidence, err := json.Marshal(windowsNativeQualification{Schema: windowsNativeQualificationSchema, ReleaseVersion: version, Platform: "windows", Architecture: architecture, Status: "passed", NativeTested: true, WindowsBuild: "26100", Runner: "windows-" + architecture + "-test", Artifacts: qualified[architecture]})
+		if err != nil {
+			t.Fatal(err)
+		}
+		evidencePath := filepath.Join(artifacts, windowsNativeQualificationTarget(architecture))
+		if err := os.WriteFile(evidencePath, evidence, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		evidencePaths[architecture] = evidencePath
+	}
+	if err := publish(repository, version, artifacts, evidencePaths, 1, 100, "routine", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyPublished(repository); err != nil {
+		t.Fatal(err)
+	}
+	targets, err := metadata.Targets().FromFile(filepath.Join(repository, "metadata", "targets.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := targets.Signed.Targets["cli-darwin-amd64"]; exists {
+		t.Fatal("unsupported macOS amd64 target was published")
+	}
+	if _, exists := targets.Signed.Targets["cli-darwin-arm64"]; !exists {
+		t.Fatal("macOS arm64 target was not published")
+	}
+}
 
 func TestVerifyMetaReferenceRejectsMissingAndMismatchedVersionedMetadata(t *testing.T) {
 	repo := t.TempDir()
@@ -81,39 +166,45 @@ func TestRolloutMutationsAreMonotonicAndSignedIndexCompatible(t *testing.T) {
 	}
 }
 
-func TestWindowsAMD64QualificationRequiresExplicitPassedArtifactEvidence(t *testing.T) {
-	components := windowsAMD64Components()
-	qualification := validWindowsAMD64Qualification(components)
-	if err := validateWindowsAMD64Qualification(qualification, qualification.ReleaseVersion, components); err != nil {
-		t.Fatalf("valid qualification rejected: %v", err)
-	}
-	for name, mutate := range map[string]func(*windowsAMD64Qualification){
-		"native-tested-false": func(q *windowsAMD64Qualification) { q.NativeTested = false },
-		"not-passed":          func(q *windowsAMD64Qualification) { q.Status = "skipped" },
-		"wrong-architecture":  func(q *windowsAMD64Qualification) { q.Architecture = "arm64" },
-		"missing-component":   func(q *windowsAMD64Qualification) { q.Artifacts = q.Artifacts[:4] },
-		"changed-hash":        func(q *windowsAMD64Qualification) { q.Artifacts[0].SHA256 = strings.Repeat("b", 64) },
-	} {
-		t.Run(name, func(t *testing.T) {
-			candidate := qualification
-			candidate.Artifacts = append([]windowsAMD64QualifiedArtifact(nil), qualification.Artifacts...)
-			mutate(&candidate)
-			if err := validateWindowsAMD64Qualification(candidate, candidate.ReleaseVersion, components); err == nil {
-				t.Fatal("invalid qualification unexpectedly accepted")
+func TestWindowsNativeQualificationRequiresExplicitPassedArtifactEvidence(t *testing.T) {
+	for _, architecture := range []string{"amd64", "arm64"} {
+		t.Run(architecture, func(t *testing.T) {
+			components := windowsComponents(architecture)
+			qualification := validWindowsQualification(architecture, components)
+			if err := validateWindowsNativeQualification(qualification, qualification.ReleaseVersion, architecture, components); err != nil {
+				t.Fatalf("valid qualification rejected: %v", err)
+			}
+			for name, mutate := range map[string]func(*windowsNativeQualification){
+				"native-tested-false": func(q *windowsNativeQualification) { q.NativeTested = false },
+				"not-passed":          func(q *windowsNativeQualification) { q.Status = "skipped" },
+				"wrong-architecture": func(q *windowsNativeQualification) {
+					q.Architecture = map[string]string{"amd64": "arm64", "arm64": "amd64"}[architecture]
+				},
+				"missing-component": func(q *windowsNativeQualification) { q.Artifacts = q.Artifacts[:4] },
+				"changed-hash":      func(q *windowsNativeQualification) { q.Artifacts[0].SHA256 = strings.Repeat("b", 64) },
+			} {
+				t.Run(name, func(t *testing.T) {
+					candidate := qualification
+					candidate.Artifacts = append([]windowsNativeQualifiedArtifact(nil), qualification.Artifacts...)
+					mutate(&candidate)
+					if err := validateWindowsNativeQualification(candidate, candidate.ReleaseVersion, architecture, components); err == nil {
+						t.Fatal("invalid qualification unexpectedly accepted")
+					}
+				})
 			}
 		})
 	}
 }
 
 func TestLoadWindowsAMD64QualificationRequiresAbsoluteStrictEvidence(t *testing.T) {
-	if _, _, _, err := loadWindowsAMD64Qualification(""); err == nil {
+	if _, _, _, err := loadWindowsNativeQualification("", "amd64"); err == nil {
 		t.Fatal("missing qualification evidence unexpectedly accepted")
 	}
 	path := filepath.Join(t.TempDir(), "qualification.json")
 	if err := os.WriteFile(path, []byte(`{"schema":"paperboat.windows-native-qualification/v1","unexpected":true}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, _, err := loadWindowsAMD64Qualification(path); err == nil {
+	if _, _, _, err := loadWindowsNativeQualification(path, "amd64"); err == nil {
 		t.Fatal("unknown qualification evidence field unexpectedly accepted")
 	}
 }
@@ -125,7 +216,7 @@ func TestWindowsAMD64SignedQualificationBindsEvidenceAndEveryComponent(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	evidenceInfo, err := metadata.TargetFile().FromBytes(windowsAMD64QualificationTarget, evidenceBody, "sha256")
+	evidenceInfo, err := metadata.TargetFile().FromBytes(windowsNativeQualificationTarget("amd64"), evidenceBody, "sha256")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,9 +224,9 @@ func TestWindowsAMD64SignedQualificationBindsEvidenceAndEveryComponent(t *testin
 	if err := os.Mkdir(filepath.Join(repo, "targets"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	writeTargetForTest(t, repo, windowsAMD64QualificationTarget, evidenceInfo, evidenceBody)
+	writeTargetForTest(t, repo, windowsNativeQualificationTarget("amd64"), evidenceInfo, evidenceBody)
 	evidenceDigest := hex.EncodeToString(evidenceInfo.Hashes["sha256"])
-	targetFiles := map[string]*metadata.TargetFiles{windowsAMD64QualificationTarget: evidenceInfo}
+	targetFiles := map[string]*metadata.TargetFiles{windowsNativeQualificationTarget("amd64"): evidenceInfo}
 	for componentIndex := range components {
 		component := &components[componentIndex]
 		body := []byte(component.Component + "-binary")
@@ -163,12 +254,12 @@ func TestWindowsAMD64SignedQualificationBindsEvidenceAndEveryComponent(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	evidenceInfo, err = metadata.TargetFile().FromBytes(windowsAMD64QualificationTarget, evidenceBody, "sha256")
+	evidenceInfo, err = metadata.TargetFile().FromBytes(windowsNativeQualificationTarget("amd64"), evidenceBody, "sha256")
 	if err != nil {
 		t.Fatal(err)
 	}
-	targetFiles[windowsAMD64QualificationTarget] = evidenceInfo
-	writeTargetForTest(t, repo, windowsAMD64QualificationTarget, evidenceInfo, evidenceBody)
+	targetFiles[windowsNativeQualificationTarget("amd64")] = evidenceInfo
+	writeTargetForTest(t, repo, windowsNativeQualificationTarget("amd64"), evidenceInfo, evidenceBody)
 	evidenceDigest = hex.EncodeToString(evidenceInfo.Hashes["sha256"])
 	for _, component := range components {
 		info := targetFiles[component.TargetPath]
@@ -181,7 +272,7 @@ func TestWindowsAMD64SignedQualificationBindsEvidenceAndEveryComponent(t *testin
 		info.Custom = &raw
 	}
 	index := releaseIndex{Version: qualification.ReleaseVersion, Platform: "windows", Architecture: "amd64", Stability: "stable", NativeTested: true, TestedWindowsBuilds: []string{qualification.WindowsBuild}, Targets: components}
-	if err := validateWindowsAMD64SignedQualification(repo, targetFiles, index); err != nil {
+	if err := validateWindowsNativeSignedQualification(repo, targetFiles, index); err != nil {
 		t.Fatalf("valid signed qualification rejected: %v", err)
 	}
 	var custom componentTargetCustom
@@ -195,25 +286,33 @@ func TestWindowsAMD64SignedQualificationBindsEvidenceAndEveryComponent(t *testin
 	}
 	raw := json.RawMessage(customBody)
 	targetFiles[components[0].TargetPath].Custom = &raw
-	if err := validateWindowsAMD64SignedQualification(repo, targetFiles, index); err == nil {
+	if err := validateWindowsNativeSignedQualification(repo, targetFiles, index); err == nil {
 		t.Fatal("hash-mismatched signed qualification unexpectedly accepted")
 	}
 }
 
 func windowsAMD64Components() []componentTarget {
+	return windowsComponents("amd64")
+}
+
+func windowsComponents(architecture string) []componentTarget {
 	components := make([]componentTarget, 0, 5)
 	for _, component := range []string{"cli", "runtime", "hostd", "updater", "launcher"} {
-		components = append(components, componentTarget{Component: component, TargetPath: component + "-windows-amd64", SHA256: strings.Repeat("a", 64), Length: 100, Platform: "windows", Architecture: "amd64", BinaryFormat: "pe"})
+		components = append(components, componentTarget{Component: component, TargetPath: component + "-windows-" + architecture, SHA256: strings.Repeat("a", 64), Length: 100, Platform: "windows", Architecture: architecture, BinaryFormat: "pe"})
 	}
 	return components
 }
 
-func validWindowsAMD64Qualification(components []componentTarget) windowsAMD64Qualification {
-	artifacts := make([]windowsAMD64QualifiedArtifact, 0, len(components))
+func validWindowsAMD64Qualification(components []componentTarget) windowsNativeQualification {
+	return validWindowsQualification("amd64", components)
+}
+
+func validWindowsQualification(architecture string, components []componentTarget) windowsNativeQualification {
+	artifacts := make([]windowsNativeQualifiedArtifact, 0, len(components))
 	for _, component := range components {
-		artifacts = append(artifacts, windowsAMD64QualifiedArtifact{Component: component.Component, TargetPath: component.TargetPath, SHA256: component.SHA256, Length: component.Length, Platform: "windows", Architecture: "amd64", Status: "passed"})
+		artifacts = append(artifacts, windowsNativeQualifiedArtifact{Component: component.Component, TargetPath: component.TargetPath, SHA256: component.SHA256, Length: component.Length, Platform: "windows", Architecture: architecture, Status: "passed"})
 	}
-	return windowsAMD64Qualification{Schema: windowsAMD64QualificationSchema, ReleaseVersion: "2026.08.18.9", Platform: "windows", Architecture: "amd64", Status: "passed", NativeTested: true, WindowsBuild: "26100", Runner: "windows-11-iot-amd64", Artifacts: artifacts}
+	return windowsNativeQualification{Schema: windowsNativeQualificationSchema, ReleaseVersion: "2026.08.18.9", Platform: "windows", Architecture: architecture, Status: "passed", NativeTested: true, WindowsBuild: "26100", Runner: "windows-11-" + architecture, Artifacts: artifacts}
 }
 
 func writeTargetForTest(t *testing.T, repo, name string, info *metadata.TargetFiles, body []byte) {

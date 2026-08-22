@@ -1659,13 +1659,6 @@ func pairCommand() *cobra.Command {
 					arguments = append(arguments, "--"+name, value)
 				}
 			}
-			acceptBetaPlatform, err := command.Flags().GetBool("accept-beta-platform")
-			if err != nil {
-				return err
-			}
-			if acceptBetaPlatform {
-				arguments = append(arguments, "--accept-beta-platform")
-			}
 			code := hostruntimecmd.Execute(command.Context(), arguments, command.InOrStdin(), command.OutOrStdout(), command.ErrOrStderr())
 			if code != 0 {
 				return exitCodeError{code: code}
@@ -1681,7 +1674,6 @@ func pairCommand() *cobra.Command {
 	command.Flags().String("shell", "", "absolute login shell")
 	command.Flags().String("state-root", "", "runtime state directory")
 	command.Flags().String("setup-mode", "host", "enrollment role: host or client")
-	command.Flags().Bool("accept-beta-platform", false, "accept enrollment on a beta platform such as Windows arm64")
 	return command
 }
 
@@ -1691,13 +1683,6 @@ func setupCommand() *cobra.Command {
 		Short: "Set up this machine for Paperboat",
 		Args:  commandArgs(cobra.NoArgs),
 		RunE: func(command *cobra.Command, _ []string) error {
-			acceptBetaPlatform, err := command.Flags().GetBool("accept-beta-platform")
-			if err != nil {
-				return err
-			}
-			if runtime.GOOS == "windows" && runtime.GOARCH == "arm64" && !acceptBetaPlatform {
-				return invocationError(errors.New("Windows arm64 is beta; rerun with --accept-beta-platform to continue"))
-			}
 			mode, err := command.Flags().GetString("mode")
 			if err != nil {
 				return err
@@ -1786,8 +1771,7 @@ func setupCommand() *cobra.Command {
 				SetupMode:   setupAPIMode,
 				DisplayName: strings.TrimSpace(name), Platform: runtime.GOOS, Architecture: runtime.GOARCH,
 				WorkspaceRoot: workspaceRoot, PublicIdentityKey: publicIdentityKey,
-				RuntimeVersions:    map[string]string{"pb": buildinfo.Version},
-				AcceptBetaPlatform: acceptBetaPlatform,
+				RuntimeVersions: map[string]string{"pb": buildinfo.Version},
 			})
 			if err != nil {
 				if errors.Is(err, api.ErrUnauthenticated) {
@@ -1936,7 +1920,6 @@ func setupCommand() *cobra.Command {
 	command.Flags().String("mode", "", "installation mode: client, session, or host")
 	command.Flags().String("state-root", "", "runtime state directory")
 	command.Flags().Uint("ssh-port", 22, "existing loopback sshd port")
-	command.Flags().Bool("accept-beta-platform", false, "accept enrollment on a beta operating-system platform")
 	command.Flags().String("recovery-output", "", "new absolute file for the account recovery key")
 	return command
 }
@@ -2919,11 +2902,7 @@ func runHomeAction(command *cobra.Command, action string) error {
 }
 
 func versionDisplay(version string) string {
-	display := brandDisplay(version, "")
-	if runtime.GOOS == "windows" && runtime.GOARCH == "arm64" {
-		display += "\n  Platform Windows arm64 (beta)"
-	}
-	return display + "\n"
+	return brandDisplay(version, "") + "\n"
 }
 
 func homeBrand(command *cobra.Command, revealEmail bool) string {

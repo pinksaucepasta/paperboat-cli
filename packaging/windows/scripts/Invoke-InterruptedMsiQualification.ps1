@@ -124,7 +124,7 @@ Assert-Qualification ((Get-PaperboatSshdPath) -eq $state.baseline_paperboat_sshd
 Write-Json $reportPath ([ordered]@{
     schema = 'paperboat.windows-interrupted-msi-qualification/v1'
     status = 'passed'
-    architecture = 'amd64'
+    architecture = if ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq 'Arm64') { 'arm64' } else { 'amd64' }
     native_tested = $true
     windows_build = (Get-CimInstance Win32_OperatingSystem).BuildNumber
     version = $Version

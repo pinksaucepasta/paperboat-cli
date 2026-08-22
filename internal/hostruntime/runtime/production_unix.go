@@ -22,7 +22,6 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
-	gort "runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -1286,9 +1285,6 @@ func (s *runtimeObservationSender) updateObservation(now time.Time, availability
 		state, target, errorCode = "failed", s.reporterVersion, "recovery_required"
 	}
 	channel := "stable"
-	if gort.GOOS == "windows" && gort.GOARCH == "arm64" {
-		channel = "beta"
-	}
 	return &runtimeUpdateObservation{
 		Schema:                 "paperboat.update-observation/v1",
 		State:                  state,

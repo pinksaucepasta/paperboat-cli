@@ -14,5 +14,17 @@ Installers:
     AppsAndFeaturesEntries:
       - DisplayName: Paperboat
         ProductCode: "{{WINDOWS_AMD64_MSI_PRODUCT_CODE}}"
+  - Architecture: arm64
+    InstallerType: msi
+    InstallerUrl: "{{WINDOWS_ARM64_MSI_URL}}"
+    InstallerSha256: "{{WINDOWS_ARM64_MSI_SHA256}}"
+    Scope: machine
+    InstallerSwitches:
+      Silent: /qn /norestart
+      SilentWithProgress: /qb /norestart
+    UpgradeBehavior: install
+    AppsAndFeaturesEntries:
+      - DisplayName: Paperboat
+        ProductCode: "{{WINDOWS_ARM64_MSI_PRODUCT_CODE}}"
 ManifestType: installer
 ManifestVersion: 1.6.0

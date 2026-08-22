@@ -26,7 +26,7 @@ $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\..'))
 $outputRoot = [IO.Path]::GetFullPath($OutputDirectory)
 $stageRoot = Join-Path $outputRoot 'stage'
 $msiRoot = Join-Path $outputRoot 'msi'
-$channel = if ($Architecture -eq 'amd64') { 'stable' } else { 'beta' }
+$channel = 'stable'
 New-Item -ItemType Directory -Force -Path $stageRoot, $msiRoot | Out-Null
 
 $nativeArchitecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
@@ -156,7 +156,7 @@ foreach ($path in @($freshMsi, $upgradeMsi)) {
 $manifest = [ordered]@{
     schema = 'paperboat.windows-native-qualification-inputs/v1'
     architecture = $Architecture
-    stability = if ($Architecture -eq 'amd64') { 'stable' } else { 'beta' }
+    stability = 'stable'
     version = $Version
     upgrade_version = $UpgradeVersion
     fresh_msi = $freshMsi

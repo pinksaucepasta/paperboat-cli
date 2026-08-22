@@ -100,9 +100,6 @@ func FetchVerifiedReleaseIndex(ctx context.Context, repositoryURL, stateDirector
 		return releaseindex.Index{}, err
 	}
 	channel := "stable"
-	if runtime.GOOS == "windows" && runtime.GOARCH == "arm64" {
-		channel = "beta"
-	}
 	name := "release-index-" + channel + "-" + runtime.GOOS + "-" + runtime.GOARCH + ".json"
 	info, err := client.GetTargetInfo(name)
 	if err != nil {

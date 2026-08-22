@@ -37,7 +37,6 @@ type Config struct {
 	CanReuseRuntimeIdentity                                                             bool
 	RuntimeVersions                                                                     map[string]string
 	HTTP                                                                                *http.Client
-	AcceptBetaPlatform                                                                  bool
 }
 
 type Pairing struct {
@@ -84,7 +83,6 @@ func CreatePairing(ctx context.Context, config Config) (Pairing, error) {
 		"enrollment_token": config.EnrollmentToken, "verifier": config.Verifier,
 		"display_name": config.DisplayName, "platform": runtime.GOOS, "architecture": runtime.GOARCH,
 		"workspace_root": config.WorkspaceRoot, "runtime_versions": config.RuntimeVersions, "public_identity_key": config.PublicIdentityKey,
-		"accept_beta_platform":       config.AcceptBetaPlatform,
 		"can_reuse_runtime_identity": config.CanReuseRuntimeIdentity,
 		"ssh_user":                   strings.TrimSpace(config.SSHUser), "ssh_port": config.SSHPort,
 	})

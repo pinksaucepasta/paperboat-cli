@@ -202,7 +202,7 @@ function Assert-InstalledPayload {
     Assert-Qualification ($registry.ReleaseVersion -eq $ExpectedVersion) "ReleaseVersion=$($registry.ReleaseVersion), expected $ExpectedVersion."
     $expectedWixPlatform = if ($Architecture -eq 'amd64') { 'x64' } else { 'arm64' }
     Assert-Qualification ($registry.Architecture -eq $expectedWixPlatform) "Architecture=$($registry.Architecture), expected $expectedWixPlatform."
-    Assert-Qualification ($registry.Channel -eq $(if ($Architecture -eq 'amd64') { 'stable' } else { 'beta' })) 'Installed channel is incorrect.'
+    Assert-Qualification ($registry.Channel -eq 'stable') 'Installed channel is incorrect.'
 
     foreach ($file in @('pb.exe', 'pb-launcher.exe', 'paperboat-runtime.exe', 'paperboat-hostd.exe', 'paperboat-updater.exe')) {
         $path = Join-Path $script:binaryRoot $file
@@ -362,7 +362,7 @@ function Write-QualificationReport {
         schema = 'paperboat.windows-native-qualification-report/v1'
         platform = 'windows'
         architecture = $Architecture
-        stability = if ($Architecture -eq 'amd64') { 'stable' } else { 'beta' }
+        stability = 'stable'
         native_tested = $true
         version = $Version
         status = if ($Failure -eq '') { 'passed' } else { 'failed' }

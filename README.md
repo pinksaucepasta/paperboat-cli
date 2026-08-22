@@ -172,15 +172,13 @@ Android archives target API 24 and link against Bionic so Termux uses Android's 
 Native Windows MSI, portable ZIP, and WinGet packaging sources live in
 [`packaging/windows`](packaging/windows). The MSI builder runs only with an installed WiX
 Toolset on Windows and emits unsigned output. Authenticode signing and RFC 3161 timestamping
-are optional release-authority enhancements. Windows amd64 is the stable target and Windows
-arm64 is the explicit beta target.
+are optional release-authority enhancements. Windows amd64 and arm64 are stable targets after
+their native release qualification passes.
 
 ## Stack
 
 Go - distributed as native static binaries for Windows, macOS, and Linux (Cobra, Go 1.26.6).
-Windows amd64 is stable after native release qualification. Windows arm64 ships the same
-feature set as an explicit beta; hosted native ARM64 evidence does not automatically promote
-the channel to stable.
+Windows amd64 and arm64 are stable after native release qualification.
 
 ## Layout
 

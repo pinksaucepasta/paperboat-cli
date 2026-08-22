@@ -35,7 +35,7 @@ class MergeSigningManifestsTest(unittest.TestCase):
                     "schema": "paperboat.windows-signing/v1",
                     "release": release,
                     "architecture": architecture,
-                    "channel": "stable" if architecture == "amd64" else "beta",
+                    "channel": "stable",
                     "artifacts": artifacts,
                 }
                 (dist / f"windows-signing-manifest-{architecture}.json").write_bytes(

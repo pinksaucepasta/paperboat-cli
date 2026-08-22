@@ -23,7 +23,7 @@ $scriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
 $staging = [IO.Path]::GetFullPath($StagingDirectory)
 $msi = [IO.Path]::GetFullPath($MsiPath)
 $zip = [IO.Path]::GetFullPath($ZipPath)
-$channel = if ($Architecture -eq 'amd64') { 'stable' } else { 'beta' }
+$channel = 'stable'
 $msiPlatform = if ($Architecture -eq 'amd64') { 'x64' } else { 'Arm64' }
 
 $requiredPayloads = @(
@@ -76,8 +76,8 @@ try {
     if ($metadata.platform -ne 'windows' -or $metadata.architecture -ne $Architecture -or $metadata.channel -ne $channel -or $metadata.stability -ne $channel) {
         throw 'Portable ZIP release metadata does not match its Windows target.'
     }
-    if ($Architecture -eq 'arm64' -and $metadata.native_e2e -ne 'required_before_stable_promotion') {
-        throw 'ARM64 portable ZIP does not preserve the native-hardware stable-promotion gate.'
+    if ($metadata.native_e2e -ne 'required_before_stable_release') {
+        throw 'Portable ZIP does not preserve the native-hardware stable release gate.'
     }
 }
 finally {

@@ -610,14 +610,13 @@ type MachineCapabilities struct {
 }
 
 type MachineSetupInput struct {
-	SetupMode          string            `json:"setup_mode"`
-	DisplayName        string            `json:"display_name"`
-	Platform           string            `json:"platform"`
-	Architecture       string            `json:"architecture"`
-	WorkspaceRoot      string            `json:"workspace_root"`
-	PublicIdentityKey  string            `json:"public_identity_key"`
-	RuntimeVersions    map[string]string `json:"runtime_versions"`
-	AcceptBetaPlatform bool              `json:"accept_beta_platform,omitempty"`
+	SetupMode         string            `json:"setup_mode"`
+	DisplayName       string            `json:"display_name"`
+	Platform          string            `json:"platform"`
+	Architecture      string            `json:"architecture"`
+	WorkspaceRoot     string            `json:"workspace_root"`
+	PublicIdentityKey string            `json:"public_identity_key"`
+	RuntimeVersions   map[string]string `json:"runtime_versions"`
 }
 
 type MachineEnrollmentStart struct {

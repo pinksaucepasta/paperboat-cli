@@ -3,7 +3,6 @@
 package runtime
 
 import (
-	gort "runtime"
 	"testing"
 	"time"
 
@@ -18,9 +17,6 @@ func TestRuntimeUpdateObservationUsesPlatformChannelAndFences(t *testing.T) {
 		t.Fatalf("observation=%+v", observation)
 	}
 	wantChannel := "stable"
-	if gort.GOOS == "windows" && gort.GOARCH == "arm64" {
-		wantChannel = "beta"
-	}
 	if observation.Channel != wantChannel {
 		t.Fatalf("channel=%q want %q", observation.Channel, wantChannel)
 	}

@@ -39,12 +39,12 @@ if ($month -lt 1 -or $month -gt 12 -or $day -lt 1 -or $day -gt 31 -or $revision 
 # and build below 65536. Keep the full release version in release metadata and
 # map it deterministically to YY.M.(DD*100+revision) for Windows Installer.
 $msiVersion = '{0}.{1}.{2}' -f ($year % 100), $month, (($day * 100) + $revision)
-$expectedChannel = if ($Architecture -eq 'amd64') { 'stable' } else { 'beta' }
+$expectedChannel = 'stable'
 if ([string]::IsNullOrWhiteSpace($Channel)) {
     $Channel = $expectedChannel
 }
-if ($Channel -notin @('stable', 'beta')) {
-    throw 'Channel must be stable or beta.'
+if ($Channel -ne 'stable') {
+    throw 'Channel must be stable.'
 }
 if ($Channel -ne $expectedChannel) {
     throw "Architecture $Architecture requires channel $expectedChannel."

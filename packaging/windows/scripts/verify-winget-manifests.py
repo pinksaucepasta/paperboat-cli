@@ -35,8 +35,7 @@ def main() -> None:
             raise SystemExit(f"final MSI is missing from publication directory: {path.name}")
 
     stable = args.dist / "Pinksaucepasta.Paperboat.installer.yaml"
-    beta = args.dist / "Pinksaucepasta.Paperboat.Beta.installer.yaml"
-    for path in (stable, beta):
+    for path in (stable,):
         if not path.is_file():
             raise SystemExit(f"rendered WinGet installer manifest is missing: {path.name}")
         content = path.read_text(encoding="utf-8")
@@ -45,21 +44,15 @@ def main() -> None:
         require(content, f"PackageVersion: \"{args.release}\"", path.name)
 
     stable_content = stable.read_text(encoding="utf-8")
-    beta_content = beta.read_text(encoding="utf-8")
     stable_hash = digest(stable_msi)
     arm64_hash = digest(arm64_msi)
     require(stable_content, f"Architecture: x64", stable.name)
     require(stable_content, f"InstallerSha256: \"{stable_hash}\"", stable.name)
     require(stable_content, f"paperboat_{args.release}_windows_amd64.msi", stable.name)
-    if "Architecture: arm64" in stable_content:
-        raise SystemExit("stable WinGet manifest must not expose arm64")
-    require(beta_content, f"Architecture: x64", beta.name)
-    require(beta_content, f"Architecture: arm64", beta.name)
-    require(beta_content, f"InstallerSha256: \"{stable_hash}\"", beta.name)
-    require(beta_content, f"InstallerSha256: \"{arm64_hash}\"", beta.name)
-    require(beta_content, f"paperboat_{args.release}_windows_amd64.msi", beta.name)
-    require(beta_content, f"paperboat_{args.release}_windows_arm64.msi", beta.name)
-    print("Rendered WinGet manifests match the final MSI hashes and architecture channels.")
+    require(stable_content, f"Architecture: arm64", stable.name)
+    require(stable_content, f"InstallerSha256: \"{arm64_hash}\"", stable.name)
+    require(stable_content, f"paperboat_{args.release}_windows_arm64.msi", stable.name)
+    print("Rendered WinGet manifests match both final stable MSI hashes.")
 
 
 if __name__ == "__main__":

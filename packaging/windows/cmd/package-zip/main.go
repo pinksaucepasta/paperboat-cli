@@ -82,7 +82,7 @@ func fillDefaults(opts *options) error {
 	if opts.architecture != "amd64" && opts.architecture != "arm64" {
 		return fmt.Errorf("architecture must be amd64 or arm64")
 	}
-	expectedChannel := map[string]string{"amd64": "stable", "arm64": "beta"}[opts.architecture]
+	expectedChannel := "stable"
 	if opts.channel == "" {
 		opts.channel = expectedChannel
 	}
@@ -133,7 +133,7 @@ func packageArchive(opts options) error {
 		Architecture:       opts.architecture,
 		Channel:            opts.channel,
 		Stability:          opts.channel,
-		NativeE2E:          map[string]string{"amd64": "required_before_stable_release", "arm64": "required_before_stable_promotion"}[opts.architecture],
+		NativeE2E:          "required_before_stable_release",
 		SigningStatus:      "tuf_checksums_required",
 		IncludedComponents: []string{"cli", "launcher"},
 	}

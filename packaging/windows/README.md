@@ -8,11 +8,9 @@ The package policy is deliberately separate from the runtime implementation:
 
 - `amd64` is published on the `stable` channel after the native release gates
   pass.
-- `arm64` is published on the `beta` channel even though the hosted native Windows
-  arm64 contract runner is available; stable promotion remains an explicit release decision.
+- `arm64` is published on the `stable` channel after its native release gates pass.
 - Both architectures use the same files, protocols, service names, local
-  state layout, and intended feature set. Beta is evidence status, not a
-  reduced implementation.
+  state layout, and intended feature set.
 - The MSI is machine-wide. The portable ZIP is a client package and does not
   install services or change system configuration.
 - `pb.exe` and `pb-launcher.exe` embed the `longPathAware` application manifest.
@@ -83,8 +81,8 @@ Build an unsigned MSI on a Windows machine with WiX Toolset v4 or newer:
 ```
 
 For arm64, use `-Architecture arm64`. The script selects the matching WiX
-platform and enforces the metadata channel (`stable` for amd64 and `beta` for
-arm64). It never downloads WiX and never invokes a signing tool.
+platform and enforces the stable metadata channel for both architectures. It never downloads
+WiX and never invokes a signing tool.
 
 The resulting MSI may be unsigned. Release integrity is provided by TUF target
 signatures, SHA-256 checksums, PE architecture validation, SBOM, and
@@ -111,8 +109,7 @@ already a release build dependency, and uses only the Go standard library.
 
 ## WinGet templates
 
-`winget/stable` is the stable amd64 MSI template. `winget/beta` is an explicit
-beta package template that includes amd64 and arm64 MSI entries. URL, version,
+`winget/stable` is the stable package template with amd64 and arm64 MSI entries. URL, version,
 product-code, and SHA-256 values remain placeholders until a release has been
 built and the release authority has completed signing and verification.
 

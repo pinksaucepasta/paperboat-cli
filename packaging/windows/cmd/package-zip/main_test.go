@@ -66,7 +66,7 @@ func TestPackageArchiveEntriesAndMetadata(t *testing.T) {
 	if err := packageArchive(options{
 		version:          "2026.08.18.1",
 		architecture:     "arm64",
-		channel:          "beta",
+		channel:          "stable",
 		stagingDirectory: staging,
 		outputPath:       output,
 		epoch:            0,
@@ -101,14 +101,14 @@ func TestPackageArchiveEntriesAndMetadata(t *testing.T) {
 	if err := metadataEntry.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if metadata.Architecture != "arm64" || metadata.Channel != "beta" || metadata.SigningStatus != "tuf_checksums_required" {
+	if metadata.Architecture != "arm64" || metadata.Channel != "stable" || metadata.SigningStatus != "tuf_checksums_required" {
 		t.Fatalf("unexpected metadata: %+v", metadata)
 	}
 }
 
 func TestFillDefaultsRejectsArchitectureChannelMismatch(t *testing.T) {
-	opts := options{version: "2026.08.18.0", architecture: "arm64", channel: "stable", stagingDirectory: "stage", outputPath: "out.zip"}
+	opts := options{version: "2026.08.18.0", architecture: "arm64", channel: "beta", stagingDirectory: "stage", outputPath: "out.zip"}
 	if err := fillDefaults(&opts); err == nil {
-		t.Fatal("expected arm64 stable mismatch to fail")
+		t.Fatal("expected arm64 beta mismatch to fail")
 	}
 }

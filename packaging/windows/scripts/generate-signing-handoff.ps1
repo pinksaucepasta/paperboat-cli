@@ -8,7 +8,7 @@ param(
     [string] $Architecture,
 
     [Parameter(Mandatory = $true)]
-    [ValidateSet('stable', 'beta')]
+    [ValidateSet('stable')]
     [string] $Channel,
 
     [Parameter(Mandatory = $true)]
@@ -30,7 +30,7 @@ Set-StrictMode -Version Latest
 $scriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $scriptDirectory 'signing-common.ps1')
 
-$expectedChannel = if ($Architecture -eq 'amd64') { 'stable' } else { 'beta' }
+$expectedChannel = 'stable'
 if ($Channel -ne $expectedChannel) {
     throw "Architecture $Architecture requires channel $expectedChannel."
 }

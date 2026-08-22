@@ -99,7 +99,7 @@ func (i Index) Validate(now time.Time) error {
 				return ErrInvalid
 			}
 		}
-		if i.Architecture == "amd64" && (i.Stability != "stable" || !i.NativeTested) || i.Architecture == "arm64" && (i.Stability != "beta" || i.NativeTested) {
+		if i.Stability != "stable" || !i.NativeTested {
 			return ErrInvalid
 		}
 	} else if i.Stability != "" || i.NativeTested || len(i.TestedWindowsBuilds) != 0 || i.OpenSSHPackageID != "" || i.OpenSSHApprovedVersion != "" {
@@ -139,9 +139,6 @@ func (i Index) Validate(now time.Time) error {
 }
 
 func expectedChannel(platform, architecture string) string {
-	if platform == "windows" && architecture == "arm64" {
-		return "beta"
-	}
 	return "stable"
 }
 

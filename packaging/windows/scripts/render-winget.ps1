@@ -74,35 +74,27 @@ $replacements = @{
 }
 
 Remove-Item -LiteralPath $output -Recurse -Force -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Force -Path (Join-Path $output 'stable'), (Join-Path $output 'beta') | Out-Null
-foreach ($channel in @('stable', 'beta')) {
-    $sourceDirectory = Join-Path $templateRoot $channel
-    $destinationDirectory = Join-Path $output $channel
-    foreach ($template in Get-ChildItem -LiteralPath $sourceDirectory -Filter '*.yaml' -File | Sort-Object Name) {
-        $content = Get-Content -LiteralPath $template.FullName -Raw
-        foreach ($replacement in $replacements.GetEnumerator()) {
-            $content = $content.Replace($replacement.Key, $replacement.Value)
-        }
-        $manifestContent = ($content -split "`r?`n" | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
-        if ($manifestContent -match '\{\{[^}]+\}\}') {
-            throw "Unrendered WinGet placeholder remains in $($template.Name)."
-        }
-        # Persist the validated manifest, not the source template comments. The
-        # comments intentionally mention placeholder syntax and would make the
-        # submitted artifact fail the final placeholder scan.
-        $manifestContent | Set-Content -LiteralPath (Join-Path $destinationDirectory $template.Name) -Encoding utf8
+$destinationDirectory = Join-Path $output 'stable'
+New-Item -ItemType Directory -Force -Path $destinationDirectory | Out-Null
+foreach ($template in Get-ChildItem -LiteralPath (Join-Path $templateRoot 'stable') -Filter '*.yaml' -File | Sort-Object Name) {
+    $content = Get-Content -LiteralPath $template.FullName -Raw
+    foreach ($replacement in $replacements.GetEnumerator()) {
+        $content = $content.Replace($replacement.Key, $replacement.Value)
     }
+    $manifestContent = ($content -split "`r?`n" | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
+    if ($manifestContent -match '\{\{[^}]+\}\}') {
+        throw "Unrendered WinGet placeholder remains in $($template.Name)."
+    }
+    $manifestContent | Set-Content -LiteralPath (Join-Path $destinationDirectory $template.Name) -Encoding utf8
 }
 
 $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
 if ($null -eq $winget) {
     throw 'winget.exe is required to validate the rendered WinGet manifests.'
 }
-foreach ($manifestDirectory in @((Join-Path $output 'stable'), (Join-Path $output 'beta'))) {
-    & $winget.Path validate --manifest $manifestDirectory --disable-interactivity --nowarn | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        throw "WinGet manifest validation failed for $manifestDirectory."
-    }
+& $winget.Path validate --manifest $destinationDirectory --disable-interactivity --nowarn | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "WinGet manifest validation failed for $destinationDirectory."
 }
 
 Write-Output ("Rendered and validated final-hash WinGet manifests in {0}." -f $output)

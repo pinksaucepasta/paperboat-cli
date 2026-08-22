@@ -128,6 +128,10 @@ jobs:
               -o "stage/${tool}" "./cmd/${tool}"
           done
           cp stage/pb "dist/pb_${VERSION}_darwin_arm64"
+          cp stage/pb "dist/cli-darwin-arm64"
+          cp stage/pb "dist/runtime-darwin-arm64"
+          cp stage/pb "dist/hostd-darwin-arm64"
+          cp stage/pb "dist/updater-darwin-arm64"
           cp stage/pb-launcher "dist/launcher-darwin-arm64"
           tar -C stage -czf "dist/paperboat_${VERSION}_darwin_arm64.tar.gz" pb pb-launcher
           cp tools/install.sh dist/install.sh
@@ -152,7 +156,7 @@ jobs:
             channel: stable
             runner: blacksmith-2vcpu-windows-2025
           - architecture: arm64
-            channel: beta
+            channel: stable
             runner: windows-11-arm
     env:
       PAPERBOAT_ARCH: ${{ matrix.architecture }}
@@ -324,6 +328,38 @@ jobs:
           foreach ($sourceName in $tufFiles.Keys) {
             Copy-Item -LiteralPath (Join-Path $env:PAPERBOAT_WINDOWS_STAGE $sourceName) -Destination (Join-Path $env:PAPERBOAT_WINDOWS_DIST $tufFiles[$sourceName])
           }
+      - name: Bind native Windows evidence to final release bytes
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $components = @('cli', 'runtime', 'hostd', 'updater', 'launcher')
+          $artifacts = foreach ($component in $components) {
+            $name = "$component-windows-$env:PAPERBOAT_ARCH"
+            $path = Join-Path $env:PAPERBOAT_WINDOWS_DIST $name
+            $item = Get-Item -LiteralPath $path -ErrorAction Stop
+            @{
+              component = $component
+              target_path = $name
+              sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+              length = $item.Length
+              platform = 'windows'
+              architecture = $env:PAPERBOAT_ARCH
+              status = 'passed'
+            }
+          }
+          $evidence = @{
+            schema = 'paperboat.windows-native-qualification/v1'
+            release_version = $env:RELEASE_VERSION
+            platform = 'windows'
+            architecture = $env:PAPERBOAT_ARCH
+            status = 'passed'
+            native_tested = $true
+            windows_build = [Environment]::OSVersion.Version.Build.ToString()
+            runner = $env:RUNNER_NAME
+            artifacts = @($artifacts)
+          } | ConvertTo-Json -Depth 5
+          $path = Join-Path $env:PAPERBOAT_WINDOWS_DIST ("windows-{0}-native-qualification.json" -f $env:PAPERBOAT_ARCH)
+          [IO.File]::WriteAllText($path, $evidence + "`n", [Text.UTF8Encoding]::new($false))
       - name: Generate signing manifest, checksums, SBOM, and provenance handoff
         shell: powershell
         run: |
@@ -420,7 +456,7 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "${{ needs.platform-qualification.result }}" != "success" || "${{ needs.release-linux.result }}" != "success" || "${{ needs.release-macos.result }}" != "success" || "${{ needs.release-windows.result }}" != "success" || "${{ needs.windows-winget.result }}" != "success" ]]; then
-            echo 'Candidate assembly is blocked because a required build, packaging, WinGet, or native Windows amd64 qualification handoff did not succeed.' >&2
+            echo 'Candidate assembly is blocked because a required build, packaging, WinGet, or native Windows qualification handoff did not succeed.' >&2
             exit 1
           fi
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -473,7 +509,6 @@ jobs:
         run: |
           set -euo pipefail
           cp dist/winget/stable/*.yaml dist/
-          cp dist/winget/beta/*.yaml dist/
           python3 packaging/windows/scripts/verify-winget-manifests.py --dist dist --release "${RELEASE_VERSION}"
           rm -rf dist/winget
       - name: Generate final release checksums
@@ -573,25 +608,133 @@ jobs:
           path: dist
           github-token: ${{ secrets.RELEASE_TOKEN || github.token }}
           run-id: ${{ github.run_id }}
-      - name: Publish immutable GitHub release
+      - name: Verify immutable candidate manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          root = Path('dist')
+          manifest = json.loads((root / 'release-candidate.json').read_text())
+          if manifest.get('schema') != 'paperboat.release-candidate/v1' or manifest.get('version') != os.environ['RELEASE_VERSION'] or manifest.get('commit') != os.environ['GITHUB_SHA'] or manifest.get('repository') != os.environ['GITHUB_REPOSITORY'] or str(manifest.get('run_id')) != os.environ['GITHUB_RUN_ID']:
+              raise SystemExit('candidate identity does not match this workflow run')
+          expected = {item['name']: item for item in manifest.get('artifacts', [])}
+          actual = {path.name for path in root.iterdir() if path.is_file() and path.name != 'release-candidate.json'}
+          if set(expected) != actual:
+              raise SystemExit('candidate file set does not match its manifest')
+          for name, item in expected.items():
+              body = (root / name).read_bytes()
+              if len(body) != item['size'] or hashlib.sha256(body).hexdigest() != item['sha256']:
+                  raise SystemExit(f'candidate artifact mismatch: {name}')
+          PY
+      - name: Publish immutable GitHub release assets
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
         shell: bash
         run: |
           set -euo pipefail
           if gh release view "$RELEASE_VERSION" >/dev/null 2>&1; then
-            gh release edit "$RELEASE_VERSION" --draft=true --target "$GITHUB_SHA"
+            gh release edit "$RELEASE_VERSION" --draft=false --latest=false --target "$GITHUB_SHA"
           else
-            gh release create "$RELEASE_VERSION" --target "$GITHUB_SHA" --generate-notes --draft
+            gh release create "$RELEASE_VERSION" --target "$GITHUB_SHA" --generate-notes --latest=false
           fi
           while IFS= read -r -d '' file; do gh release upload "$RELEASE_VERSION" "$file" --clobber; done < <(find dist -maxdepth 1 -type f -print0)
+      - name: Configure pinned Hetzner publication identity
+        env:
+          PAPERBOAT_RELEASE_SSH_KEY: ${{ secrets.PAPERBOAT_RELEASE_SSH_KEY }}
+          PAPERBOAT_RELEASE_KNOWN_HOSTS: ${{ secrets.PAPERBOAT_RELEASE_KNOWN_HOSTS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$PAPERBOAT_RELEASE_SSH_KEY" || { echo 'PAPERBOAT_RELEASE_SSH_KEY is required' >&2; exit 1; }
+          test -n "$PAPERBOAT_RELEASE_KNOWN_HOSTS" || { echo 'PAPERBOAT_RELEASE_KNOWN_HOSTS is required' >&2; exit 1; }
+          install -d -m 0700 "$HOME/.ssh"
+          printf '%s\n' "$PAPERBOAT_RELEASE_SSH_KEY" > "$HOME/.ssh/paperboat-release"
+          chmod 0600 "$HOME/.ssh/paperboat-release"
+          printf '%s\n' "$PAPERBOAT_RELEASE_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 0600 "$HOME/.ssh/known_hosts"
+      - name: Fetch current production TUF repository
+        env:
+          RELEASE_HOST: ${{ vars.PAPERBOAT_RELEASE_HOST }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$RELEASE_HOST" || { echo 'PAPERBOAT_RELEASE_HOST is required' >&2; exit 1; }
+          repository="$RUNNER_TEMP/tuf-production"
+          mkdir -p "$repository"
+          ssh -i "$HOME/.ssh/paperboat-release" -o BatchMode=yes -o StrictHostKeyChecking=yes "root@$RELEASE_HOST" \
+            'tar -C /opt/paperboat/releases/current/tuf -cf - metadata targets' | tar -C "$repository" -xf -
+          cat > "$repository/.signing-state.json" <<'JSON'
+          {"schema":"paperboat.tuf-signing-state/v1","roles":{"root":["root-1","root-2","root-3"],"targets":["targets-1","targets-2"],"snapshot":["snapshot-1"],"timestamp":["timestamp-1"]}}
+          JSON
+          echo "PAPERBOAT_TUF_REPOSITORY=$repository" >> "$GITHUB_ENV"
+      - name: Sign and verify production TUF release
+        env:
+          PAPERBOAT_TUF_CI: "1"
+          PAPERBOAT_TUF_KEY_TARGETS_1: ${{ secrets.PAPERBOAT_TUF_KEY_TARGETS_1 }}
+          PAPERBOAT_TUF_KEY_TARGETS_2: ${{ secrets.PAPERBOAT_TUF_KEY_TARGETS_2 }}
+          PAPERBOAT_TUF_KEY_SNAPSHOT_1: ${{ secrets.PAPERBOAT_TUF_KEY_SNAPSHOT_1 }}
+          PAPERBOAT_TUF_KEY_TIMESTAMP_1: ${{ secrets.PAPERBOAT_TUF_KEY_TIMESTAMP_1 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in PAPERBOAT_TUF_KEY_TARGETS_1 PAPERBOAT_TUF_KEY_TARGETS_2 PAPERBOAT_TUF_KEY_SNAPSHOT_1 PAPERBOAT_TUF_KEY_TIMESTAMP_1; do
+            test -n "${!name}" || { echo "$name is required" >&2; exit 1; }
+          done
+          signer="$RUNNER_TEMP/paperboat-tuf"
+          go build -trimpath -o "$signer" ./tools/tuf-repository
+          "$signer" publish \
+            -repository "$PAPERBOAT_TUF_REPOSITORY" \
+            -version "$RELEASE_VERSION" \
+            -artifacts "$GITHUB_WORKSPACE/dist" \
+            -windows-amd64-native-evidence "$GITHUB_WORKSPACE/dist/windows-amd64-native-qualification.json" \
+            -windows-arm64-native-evidence "$GITHUB_WORKSPACE/dist/windows-arm64-native-qualification.json" \
+            -rollout-revision "$GITHUB_RUN_ID" \
+            -percentage 100 \
+            -severity routine
+          "$signer" verify-published -repository "$PAPERBOAT_TUF_REPOSITORY"
+      - name: Atomically publish TUF and current.json to Hetzner
+        env:
+          RELEASE_HOST: ${{ vars.PAPERBOAT_RELEASE_HOST }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          publish="$RUNNER_TEMP/paperboat-production-release"
+          mkdir -p "$publish/tuf"
+          cp -R "$PAPERBOAT_TUF_REPOSITORY/metadata" "$PAPERBOAT_TUF_REPOSITORY/targets" "$publish/tuf/"
+          install -m 0755 dist/install.sh "$publish/install"
+          printf '{"schema":"paperboat.release-current/v1","version":"%s"}\n' "$RELEASE_VERSION" > "$publish/current.json"
+          bundle="$RUNNER_TEMP/paperboat-release-$RELEASE_VERSION.tgz"
+          tar -C "$publish" -czf "$bundle" current.json install tuf
+          digest=$(sha256sum "$bundle" | awk '{print $1}')
+          remote_bundle="/opt/paperboat/releases/staging/paperboat-release-$RELEASE_VERSION-$GITHUB_SHA.tgz"
+          remote_script="/opt/paperboat/releases/staging/publish-tuf-origin-$GITHUB_RUN_ID.sh"
+          scp -i "$HOME/.ssh/paperboat-release" -o BatchMode=yes -o StrictHostKeyChecking=yes "$bundle" "root@$RELEASE_HOST:$remote_bundle"
+          scp -i "$HOME/.ssh/paperboat-release" -o BatchMode=yes -o StrictHostKeyChecking=yes tools/publish-tuf-origin.sh "root@$RELEASE_HOST:$remote_script"
+          ssh -i "$HOME/.ssh/paperboat-release" -o BatchMode=yes -o StrictHostKeyChecking=yes "root@$RELEASE_HOST" \
+            "chmod 0700 '$remote_script' && '$remote_script' '$remote_bundle' /opt/paperboat/releases '$RELEASE_VERSION' '$digest'"
       - name: Verify production TUF publication
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
           cache: true
-      - run: go test ./internal/hostruntime/bootstrap -run '^TestProductionTUFRepository$' -count=1
-      - name: Finalize verified GitHub release
+      - name: Verify public updater and current release
+        env:
+          PAPERBOAT_TEST_TUF_REPOSITORY_URL: ${{ vars.PAPERBOAT_DEFAULT_RELEASE_URL }}
+          PAPERBOAT_TEST_TUF_VERSION: ${{ env.RELEASE_VERSION }}
+          PAPERBOAT_CURRENT_URL: https://api.pprbt.dev/current.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/hostruntime/bootstrap -run '^TestProductionTUFRepository$' -count=1
+          current=$(curl --fail --silent --show-error "$PAPERBOAT_CURRENT_URL")
+          python3 - "$RELEASE_VERSION" "$current" <<'PY'
+          import json, sys
+          if json.loads(sys.argv[2]) != {"schema": "paperboat.release-current/v1", "version": sys.argv[1]}:
+              raise SystemExit('public current.json does not match the release')
+          PY
+      - name: Mark verified GitHub release latest
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
         shell: bash

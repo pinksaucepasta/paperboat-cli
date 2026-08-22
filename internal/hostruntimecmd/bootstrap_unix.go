@@ -45,7 +45,6 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	name := flags.String("name", "", "User machine name")
 	shell := flags.String("shell", "", "Absolute login shell (default: auto-detect)")
 	stateRoot := flags.String("state-root", "", "Paperboat runtime state directory")
-	acceptBetaPlatform := flags.Bool("accept-beta-platform", false, "accept enrollment on a beta platform")
 	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
 		return errors.New("bootstrap accepts flags only")
 	}
@@ -111,7 +110,7 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	if _, err := rand.Read(verifierBytes); err != nil {
 		return err
 	}
-	config := bootstrap.Config{ServerURL: *serverURL, EnrollmentToken: token, DisplayName: *name, WorkspaceRoot: workspace, Verifier: base64.RawURLEncoding.EncodeToString(verifierBytes), PublicIdentityKey: base64.RawURLEncoding.EncodeToString(identityStore.Current().Public()), RuntimeVersions: map[string]string{"pb": buildinfo.Version}, AcceptBetaPlatform: *acceptBetaPlatform}
+	config := bootstrap.Config{ServerURL: *serverURL, EnrollmentToken: token, DisplayName: *name, WorkspaceRoot: workspace, Verifier: base64.RawURLEncoding.EncodeToString(verifierBytes), PublicIdentityKey: base64.RawURLEncoding.EncodeToString(identityStore.Current().Public()), RuntimeVersions: map[string]string{"pb": buildinfo.Version}}
 	pairing, err := bootstrap.CreatePairing(ctx, config)
 	if err != nil {
 		return err

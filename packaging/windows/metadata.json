@@ -103,10 +103,10 @@
       "architecture": "arm64",
       "wix_platform": "arm64",
       "winget_architecture": "arm64",
-      "channel": "beta",
-      "stability": "beta",
-      "native_e2e": "required_before_stable_promotion",
-      "native_hardware_evidence": "github_hosted_native_beta_gate"
+      "channel": "stable",
+      "stability": "stable",
+      "native_e2e": "required_before_stable_release",
+      "native_hardware_evidence": "release_gate"
     }
   ],
   "signing": {

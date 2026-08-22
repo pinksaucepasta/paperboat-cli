@@ -39,7 +39,6 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	tokenFile := flags.String("enrollment-token-file", "", "absolute dashboard enrollment token file")
 	name := flags.String("name", "", "User machine name")
 	stateRoot := flags.String("state-root", "", "Paperboat runtime state directory")
-	acceptBetaPlatform := flags.Bool("accept-beta-platform", false, "accept enrollment on a beta platform")
 	setupMode := flags.String("setup-mode", "host", "enrollment role: host or client")
 	if flags.Parse(args) != nil || flags.NArg() != 0 {
 		return errors.New("bootstrap accepts flags only")
@@ -101,7 +100,7 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	}
 	_, reusableIdentityErr := enrollment.LoadRuntimeIdentityForRenewal(*stateRoot, time.Now().UTC())
 	sshConfig := windowsopenssh.DefaultConfig(nil)
-	config := bootstrap.Config{ServerURL: *serverURL, EnrollmentToken: token, DisplayName: *name, WorkspaceRoot: home, Verifier: base64.RawURLEncoding.EncodeToString(verifier), PublicIdentityKey: base64.RawURLEncoding.EncodeToString(identityStore.Current().Public()), RuntimeVersions: map[string]string{"pb": buildinfo.Version}, AcceptBetaPlatform: *acceptBetaPlatform, SSHUser: windowsAccountName(account.Username), SSHPort: sshConfig.Port, CanReuseRuntimeIdentity: reusableIdentityErr == nil}
+	config := bootstrap.Config{ServerURL: *serverURL, EnrollmentToken: token, DisplayName: *name, WorkspaceRoot: home, Verifier: base64.RawURLEncoding.EncodeToString(verifier), PublicIdentityKey: base64.RawURLEncoding.EncodeToString(identityStore.Current().Public()), RuntimeVersions: map[string]string{"pb": buildinfo.Version}, SSHUser: windowsAccountName(account.Username), SSHPort: sshConfig.Port, CanReuseRuntimeIdentity: reusableIdentityErr == nil}
 	pairing, err := bootstrap.CreatePairing(ctx, config)
 	if err != nil {
 		return err
