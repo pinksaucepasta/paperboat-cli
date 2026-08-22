@@ -19,6 +19,7 @@ import (
 
 	"github.com/pinksaucepasta/paperboat/internal/buildinfo"
 	"github.com/pinksaucepasta/paperboat/internal/config"
+	"github.com/pinksaucepasta/paperboat/internal/remotepath"
 )
 
 // ErrUnauthenticated means the server rejected the reused credential. Callers
@@ -1537,33 +1538,13 @@ func (c *Client) MachineSSHDescriptor(ctx context.Context, machineID, operationI
 func validateOperationDescriptor(out ExecDescriptor, machineID, operationID, expectedScope, operationKind string) error {
 	quic, quicErr := url.Parse(out.Endpoints.QUIC)
 	wss, wssErr := url.Parse(out.Endpoints.WSS)
-	if out.OperationID != operationID || out.Environment == nil || out.Environment.ID == "" || out.Environment.Kind != "byod" || out.Environment.ResourceID != machineID || out.Environment.State != "ready" || !remoteAbsolutePath(out.Environment.Root) ||
+	if out.OperationID != operationID || out.Environment == nil || out.Environment.ID == "" || out.Environment.Kind != "byod" || out.Environment.ResourceID != machineID || out.Environment.State != "ready" || !remotepath.Absolute(out.Environment.Root) ||
 		quicErr != nil || quic.Scheme != "quic" || quic.Hostname() == "" || quic.User != nil || quic.Path != "" || quic.RawQuery != "" || quic.Fragment != "" ||
 		wssErr != nil || wss.Scheme != "wss" || wss.Hostname() == "" || wss.User != nil || wss.Path != "/v1/runtime" || wss.RawQuery != "" || wss.Fragment != "" ||
 		out.Auth.Method != "bearer" || out.Auth.Token == "" || len(out.Auth.Scopes) != 1 || out.Auth.Scopes[0] != expectedScope || out.ExpiresAt.IsZero() || out.Auth.ExpiresAt.IsZero() || !out.ExpiresAt.Equal(out.Auth.ExpiresAt) {
 		return fmt.Errorf("invalid %s descriptor", operationKind)
 	}
 	return nil
-}
-
-// remoteAbsolutePath validates a path described by a remote host. filepath.IsAbs
-// cannot be used here because its result depends on the client's operating
-// system, while a Windows client can consume a Linux descriptor and vice versa.
-func remoteAbsolutePath(value string) bool {
-	if value == "" || strings.ContainsRune(value, 0) {
-		return false
-	}
-	if strings.HasPrefix(value, "/") {
-		return true
-	}
-	if len(value) >= 3 && ((value[0] >= 'A' && value[0] <= 'Z') || (value[0] >= 'a' && value[0] <= 'z')) && value[1] == ':' && (value[2] == '\\' || value[2] == '/') {
-		return true
-	}
-	if strings.HasPrefix(value, `\\`) {
-		parts := strings.Split(strings.TrimPrefix(value, `\\`), `\`)
-		return len(parts) >= 2 && parts[0] != "" && parts[1] != ""
-	}
-	return false
 }
 
 func (c *Client) MachineFileTransferDescriptor(ctx context.Context, destinationMachineID, sourceMachineID, sessionID string) (FileTransfer, error) {

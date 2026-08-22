@@ -189,30 +189,49 @@ func NewClientCoordinator(ctx context.Context, config HostConfig, dependencies H
 	if err != nil {
 		return nil, err
 	}
-	components := []Component{
-		{Capability: "storage", Required: true, Service: shutdownService{shutdown: func(context.Context) error { return durable.Close() }}},
-		{Capability: "file_transfer_cleanup", Required: true, Service: &filetransfer.CleanupWorker{Service: transferService}},
+	components := []stablehostd.Component{
+		{Name: "storage", Required: true, Service: shutdownService{shutdown: func(context.Context) error { return durable.Close() }}},
+		{Name: "file_transfer_cleanup", Required: true, Service: &filetransfer.CleanupWorker{Service: transferService}},
 	}
 	if dependencies.AuthorizationService != nil {
-		components = append(components, Component{Capability: "authorization", Required: false, Service: dependencies.AuthorizationService})
+		components = append(components, stablehostd.Component{Name: "authorization", Required: false, Service: dependencies.AuthorizationService})
 	}
 	if dependencies.PreviewRecovery != nil {
-		components = append(components, Component{Capability: "preview_recovery", Required: false, Service: dependencies.PreviewRecovery})
+		components = append(components, stablehostd.Component{Name: "preview_recovery", Required: false, Service: dependencies.PreviewRecovery})
 	}
 	if dependencies.ServeLeases != nil {
-		components = append(components, Component{Capability: "serve_lease", Required: false, Service: dependencies.ServeLeases})
+		components = append(components, stablehostd.Component{Name: "serve_lease", Required: false, Service: dependencies.ServeLeases})
 	}
 	components = append(components,
-		Component{Capability: "runtime_observation", Required: true, Service: dependencies.RuntimeObservationService},
-		Component{Capability: "edge", Required: true, Service: dependencies.Connector},
-		Component{Capability: "control_plane", Required: true, Service: httpService},
+		stablehostd.Component{Name: "runtime_observation", Required: true, Service: dependencies.RuntimeObservationService},
+		stablehostd.Component{Name: "edge", Required: true, Service: dependencies.Connector},
+		stablehostd.Component{Name: "control_plane", Required: true, Service: httpService},
 	)
-	runtime, err := NewRuntime(Config{Version: config.Runtime.Version, Components: components, ShutdownTimeout: config.ShutdownTimeout})
+	// Client mode still participates in the same stable-hostd update fence as
+	// host mode. Transfers, previews, connector state, and the local control
+	// plane belong to the stable daemon; the replaceable worker is only the
+	// versioned coordination lifecycle. Without this composition, the Windows
+	// SCM owner calls StartStable on a coordinator with no stable daemon and
+	// fails every Client installation with ErrHostInvalid.
+	daemon, err := stablehostd.New(stablehostd.Config{
+		Workloads:       stablehostd.Workloads{Transfers: transferService, ServeLeases: dependencies.ServeLeases},
+		Components:      components,
+		ShutdownTimeout: config.ShutdownTimeout,
+	})
+	if err != nil {
+		return nil, errors.Join(ErrHostInvalid, err)
+	}
+	workerComponents := []Component{{Capability: "worker_lifecycle", Required: true, Service: workerLifecycleService{}}}
+	runtime, err := NewRuntime(Config{Version: config.Runtime.Version, Components: workerComponents, ShutdownTimeout: config.ShutdownTimeout})
 	if err != nil {
 		return nil, err
 	}
-	healthSource.set(runtime, components)
-	return &Host{runtime: runtime, http: httpService, handler: mux, cleanupUnstarted: durable.Close}, nil
+	workers, err := stablehostd.NewWorkerController(daemon)
+	if err != nil {
+		return nil, errors.Join(ErrHostInvalid, err)
+	}
+	healthSource.set(runtime, workerComponents)
+	return &Host{runtime: runtime, hostd: daemon, workers: workers, http: httpService, handler: mux, health: healthSource, transferRoot: filepath.Join(config.Runtime.StateRoot, "file-transfers"), cleanupUnstarted: durable.Close}, nil
 }
 
 func transferWorkloadCount(root string) uint64 {

@@ -77,6 +77,7 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/privatepreviewproxy"
 	"github.com/pinksaucepasta/paperboat/internal/processlifetime"
 	"github.com/pinksaucepasta/paperboat/internal/prompt"
+	"github.com/pinksaucepasta/paperboat/internal/remotepath"
 	"github.com/pinksaucepasta/paperboat/internal/resolver"
 	"github.com/pinksaucepasta/paperboat/internal/selector"
 	servepkg "github.com/pinksaucepasta/paperboat/internal/serve"
@@ -8790,26 +8791,7 @@ func actionRemoteExec(c *command.Context, requested string, request tunnel.ExecR
 }
 
 func remoteAbsolutePath(platform, workspaceRoot, path string) bool {
-	windowsTarget := strings.EqualFold(strings.TrimSpace(platform), "windows") || strings.TrimSpace(platform) == "" && windowsAbsolutePath(workspaceRoot)
-	if !windowsTarget {
-		return filepath.IsAbs(path)
-	}
-	return windowsAbsolutePath(path)
-}
-
-func windowsAbsolutePath(path string) bool {
-	if strings.ContainsAny(path, "\x00\r\n") || path == "" || strings.TrimSpace(path) != path {
-		return false
-	}
-	path = strings.ReplaceAll(path, "/", `\`)
-	if len(path) >= 3 && ((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) && path[1] == ':' && path[2] == '\\' {
-		return true
-	}
-	if strings.HasPrefix(path, `\\`) {
-		parts := strings.Split(path[2:], `\`)
-		return len(parts) >= 2 && parts[0] != "" && parts[1] != ""
-	}
-	return false
+	return remotepath.AbsoluteForTarget(platform, workspaceRoot, path)
 }
 
 func finishExecResult(stdout, stderr io.Writer, operationID string, jsonOutput, sawTerminalEvent bool, code int, err error) error {

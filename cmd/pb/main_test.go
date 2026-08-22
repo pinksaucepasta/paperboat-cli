@@ -584,6 +584,32 @@ func TestExecConnectInfoPreservesRequestedPath(t *testing.T) {
 	}
 }
 
+func TestRemoteExecAbsolutePathUsesTargetPlatform(t *testing.T) {
+	tests := []struct {
+		name          string
+		platform      string
+		workspaceRoot string
+		cwd           string
+		want          bool
+	}{
+		{name: "Windows client to Linux root", platform: "linux", workspaceRoot: "/root", cwd: "/root", want: true},
+		{name: "Windows client to macOS root", platform: "darwin", workspaceRoot: "/Users/paperboat", cwd: "/tmp", want: true},
+		{name: "Unix client to Windows root", platform: "windows", workspaceRoot: `C:\workspace`, cwd: `C:\workspace`, want: true},
+		{name: "platform inferred from Linux workspace", workspaceRoot: "/root", cwd: "/root/project", want: true},
+		{name: "platform inferred from Windows workspace", workspaceRoot: `C:\workspace`, cwd: `D:\project`, want: true},
+		{name: "Linux rejects Windows cwd", platform: "linux", workspaceRoot: "/root", cwd: `C:\workspace`},
+		{name: "Windows rejects Linux cwd", platform: "windows", workspaceRoot: `C:\workspace`, cwd: "/root"},
+		{name: "relative cwd rejected", platform: "linux", workspaceRoot: "/root", cwd: "project"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := remoteAbsolutePath(test.platform, test.workspaceRoot, test.cwd); got != test.want {
+				t.Fatalf("remoteAbsolutePath(%q, %q, %q) = %v, want %v", test.platform, test.workspaceRoot, test.cwd, got, test.want)
+			}
+		})
+	}
+}
+
 type execInputTestConn struct {
 	mu         sync.Mutex
 	writes     [][]byte

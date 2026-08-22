@@ -14,6 +14,7 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/binarytarget"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/nativesignature"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/workerupdate"
 	"golang.org/x/sys/windows"
 )
 
@@ -21,9 +22,11 @@ import (
 // Release metadata is never accepted over the local service command channel.
 type WindowsConfig struct {
 	StateRoot, RuntimeCurrent, RuntimeRollback, RuntimeStaged, CLICurrent, CLIRollback string
-	OwnerSID, MachineID, RepositoryURL, TokenFile, InstallState                        string
+	OwnerSID, MachineID, RepositoryURL, TokenFile, InstallState, ControlSocket         string
+	ActiveVersion                                                                      string
 	Architecture                                                                       string
 	VerifyExecutable                                                                   func(context.Context, string, string) error
+	ResolveRelease                                                                     workerupdate.Resolver
 }
 
 var ErrInvalidWindowsConfig = errors.New("invalid Windows updater configuration")
@@ -62,8 +65,11 @@ func RunWindows(ctx context.Context, config WindowsConfig) error {
 	if err := applyWindowsUpdateACL(filepath.Join(config.StateRoot, "service-state.json"), config.OwnerSID); err != nil {
 		return err
 	}
-	<-ctx.Done()
-	return nil
+	controller, err := newWindowsController(config)
+	if err != nil {
+		return err
+	}
+	return controller.run(ctx)
 }
 
 func validWindowsConfig(config WindowsConfig) bool {
@@ -73,7 +79,7 @@ func validWindowsConfig(config WindowsConfig) bool {
 		}
 	}
 	sid, err := windows.StringToSid(config.OwnerSID)
-	return err == nil && sid != nil && sid.IsValid() && config.MachineID != "" && config.RepositoryURL != "" && (config.Architecture == "amd64" || config.Architecture == "arm64")
+	return err == nil && sid != nil && sid.IsValid() && config.MachineID != "" && config.RepositoryURL != "" && validPipePath(config.ControlSocket) && exactReleasePattern.MatchString(config.ActiveVersion) && (config.Architecture == "amd64" || config.Architecture == "arm64")
 }
 func recoverWindowsSlots(ctx context.Context, config WindowsConfig) error {
 	verify := config.VerifyExecutable

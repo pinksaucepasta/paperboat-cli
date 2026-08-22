@@ -59,3 +59,27 @@ func TestClientCoordinatorExposesOnlyClientRoutes(t *testing.T) {
 		t.Fatal("client coordinator initialized terminal sessions")
 	}
 }
+
+func TestClientCoordinatorSupportsStableHostLifecycle(t *testing.T) {
+	root := t.TempDir()
+	host, err := NewClientCoordinator(context.Background(), HostConfig{
+		Runtime:       runtimeconfig.Config{Profile: runtimeconfig.BYOD, StateRoot: root, Version: "test", Limits: runtimeconfig.DefaultLimits, Resources: runtimeconfig.DefaultResources},
+		ListenAddress: "127.0.0.1:0", WorkspaceRoot: root, InboxPath: filepath.Join(root, "Inbox"), MachineID: "machine_test",
+	}, HostDependencies{
+		Authorizer: func(string) (server.Authorizer, error) { return hostAuthorizer{}, nil },
+		Connector:  clientServiceStub{}, RuntimeObservationService: clientServiceStub{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := host.StartStable(t.Context()); err != nil {
+		t.Fatalf("start stable Client coordinator: %v", err)
+	}
+	status := host.WorkloadStatus()
+	if status.Generation == 0 {
+		t.Fatalf("workload status = %#v, want initialized generation", status)
+	}
+	if err := host.ShutdownStable(context.Background()); err != nil {
+		t.Fatalf("shutdown stable Client coordinator: %v", err)
+	}
+}

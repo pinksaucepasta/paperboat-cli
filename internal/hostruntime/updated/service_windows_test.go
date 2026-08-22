@@ -4,10 +4,16 @@ package updated
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
+
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/workerupdate"
 )
 
 func acceptRecoveryFixture(_ context.Context, path, architecture string) error {
@@ -147,5 +153,130 @@ func TestRecoverWindowsSlotsRejectsUntrustedCurrentWithoutFallingBack(t *testing
 	}
 	if body, _ := os.ReadFile(config.RuntimeRollback); string(body) != "previous" {
 		t.Fatalf("rollback changed after current validation failure: %q", body)
+	}
+}
+
+func TestWindowsControllerStatusAndSignedCheck(t *testing.T) {
+	controller, err := newWindowsController(WindowsConfig{
+		ActiveVersion: "2026.08.22.27",
+		OwnerSID:      "S-1-5-21-1-2-3-1001",
+		ControlSocket: `\\.\pipe\PaperboatUpdatedControl-Test`,
+		ResolveRelease: func(context.Context) (workerupdate.Release, bool, error) {
+			return workerupdate.Release{Version: "2026.08.22.28"}, true, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, err := controller.invoke(context.Background(), ControlRequest{Schema: ControlProtocolV1, Operation: "status"})
+	if err != nil || status.Version != "2026.08.22.27" || status.Updated {
+		t.Fatalf("status=%#v err=%v", status, err)
+	}
+	checked, err := controller.invoke(context.Background(), ControlRequest{Schema: ControlProtocolV1, Operation: "check"})
+	if err != nil || checked.Version != "2026.08.22.28" || checked.Updated || checked.Observation.CheckedAt.IsZero() {
+		t.Fatalf("check=%#v err=%v", checked, err)
+	}
+}
+
+func TestWindowsControllerActivationFailsClosed(t *testing.T) {
+	controller, err := newWindowsController(WindowsConfig{
+		ActiveVersion: "2026.08.22.27",
+		OwnerSID:      "S-1-5-21-1-2-3-1001",
+		ControlSocket: `\\.\pipe\PaperboatUpdatedControl-Test`,
+		ResolveRelease: func(context.Context) (workerupdate.Release, bool, error) {
+			return workerupdate.Release{}, false, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, operation := range []string{"update", "approve-maintenance"} {
+		_, err := controller.invoke(context.Background(), ControlRequest{Schema: ControlProtocolV1, Operation: operation, Release: map[string]string{"approve-maintenance": "2026.08.22.28"}[operation]})
+		if !errors.Is(err, ErrWindowsActivationUnavailable) {
+			t.Fatalf("%s err=%v", operation, err)
+		}
+	}
+}
+
+func TestWindowsControllerRespondsWithoutClientHalfClose(t *testing.T) {
+	controller, err := newWindowsController(WindowsConfig{
+		ActiveVersion: "2026.08.22.27",
+		OwnerSID:      "S-1-5-21-1-2-3-1001",
+		ControlSocket: `\\.\pipe\PaperboatUpdatedControl-Test`,
+		ResolveRelease: func(context.Context) (workerupdate.Release, bool, error) {
+			return workerupdate.Release{}, false, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, server := net.Pipe()
+	defer client.Close()
+	done := make(chan error, 1)
+	go func() {
+		done <- controller.handle(server)
+		_ = server.Close()
+	}()
+	if err := json.NewEncoder(client).Encode(ControlRequest{Schema: ControlProtocolV1, Operation: "status"}); err != nil {
+		t.Fatal(err)
+	}
+	var response ControlResponse
+	if err := json.NewDecoder(client).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Status != "ok" || response.Version != "2026.08.22.27" {
+		t.Fatalf("response=%#v", response)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWindowsControllerSerializesTUFChecks(t *testing.T) {
+	var active atomic.Int32
+	var maximum atomic.Int32
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{}, 2)
+	controller, err := newWindowsController(WindowsConfig{
+		ActiveVersion: "2026.08.22.27",
+		OwnerSID:      "S-1-5-21-1-2-3-1001",
+		ControlSocket: `\\.\pipe\PaperboatUpdatedControl-Test`,
+		ResolveRelease: func(context.Context) (workerupdate.Release, bool, error) {
+			current := active.Add(1)
+			for {
+				observed := maximum.Load()
+				if current <= observed || maximum.CompareAndSwap(observed, current) {
+					break
+				}
+			}
+			entered <- struct{}{}
+			<-release
+			active.Add(-1)
+			return workerupdate.Release{Version: "2026.08.22.28"}, true, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var group sync.WaitGroup
+	group.Add(2)
+	for range 2 {
+		go func() {
+			defer group.Done()
+			_, _ = controller.checkRelease(context.Background())
+		}()
+	}
+	<-entered
+	select {
+	case <-entered:
+		t.Fatal("TUF resolver calls overlapped")
+	default:
+	}
+	release <- struct{}{}
+	<-entered
+	release <- struct{}{}
+	group.Wait()
+	if maximum.Load() != 1 {
+		t.Fatalf("maximum concurrent TUF resolvers=%d", maximum.Load())
 	}
 }

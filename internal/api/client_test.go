@@ -97,19 +97,6 @@ func TestMachineSSHDescriptorRequiresExactScope(t *testing.T) {
 	}
 }
 
-func TestRemoteAbsolutePathIsIndependentOfClientPlatform(t *testing.T) {
-	for _, value := range []string{"/srv/workspace", `C:\Users\paperboat\workspace`, "D:/workspace", `\\server\share\workspace`} {
-		if !remoteAbsolutePath(value) {
-			t.Errorf("remoteAbsolutePath(%q) = false", value)
-		}
-	}
-	for _, value := range []string{"", "relative/path", `C:relative`, `\\server`, "bad\x00path"} {
-		if remoteAbsolutePath(value) {
-			t.Errorf("remoteAbsolutePath(%q) = true", value)
-		}
-	}
-}
-
 func TestClientConfigurationRejectsInvalidURL(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		writeData(w, http.StatusOK, ClientConfiguration{Version: "1", MachinesURL: "/dashboard/machines"})

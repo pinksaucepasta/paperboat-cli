@@ -27,7 +27,7 @@ func runUpdated(ctx context.Context, args []string, _ io.Writer, _ io.Writer) er
 	if err != nil {
 		return err
 	}
-	workerConfig := updated.WindowsConfig{StateRoot: layout.UpdateStateRoot, RuntimeCurrent: layout.RuntimeCurrent, RuntimeRollback: layout.RuntimeRollback, RuntimeStaged: layout.RuntimeStaged, CLICurrent: layout.CLICurrent, CLIRollback: layout.CLIRollback, OwnerSID: config.OwnerSID, MachineID: config.MachineID, RepositoryURL: config.ControlURL, TokenFile: config.TokenFile, InstallState: filepath.Join(hostinstall.WindowsProgramDataRoot(), "runtime-install.json"), Architecture: config.Artifact.Architecture}
+	workerConfig := updated.WindowsConfig{StateRoot: layout.UpdateStateRoot, RuntimeCurrent: layout.RuntimeCurrent, RuntimeRollback: layout.RuntimeRollback, RuntimeStaged: layout.RuntimeStaged, CLICurrent: layout.CLICurrent, CLIRollback: layout.CLIRollback, OwnerSID: config.OwnerSID, MachineID: config.MachineID, RepositoryURL: config.Artifact.RepositoryURL, TokenFile: config.TokenFile, InstallState: filepath.Join(hostinstall.WindowsProgramDataRoot(), "runtime-install.json"), ControlSocket: `\\.\pipe\PaperboatUpdatedControl`, ActiveVersion: config.Artifact.Version, Architecture: config.Artifact.Architecture}
 	return service.RunWindowsSystemService("PaperboatUpdated", func(serviceCtx context.Context) error {
 		return updated.RunWindows(serviceCtx, workerConfig)
 	})
