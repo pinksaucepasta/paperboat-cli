@@ -60,18 +60,21 @@ func TestWorkflowAcrossLocalAndControlAPIsUploadsExactDaemonBundle(t *testing.T)
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- localServer.Run(ctx) }()
-	for deadline := time.Now().Add(time.Second); ; {
-		if _, err := os.Stat(socket); err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("local API socket did not start")
-		}
-		time.Sleep(time.Millisecond)
-	}
 	localClient, err := localapi.NewClient(socket, time.Second)
 	if err != nil {
 		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(time.Second); ; {
+		readyContext, readyCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		_, readyErr := localClient.Snapshot(readyContext)
+		readyCancel()
+		if readyErr == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("local API did not become ready: %v", readyErr)
+		}
+		time.Sleep(time.Millisecond)
 	}
 	var uploaded []byte
 	var controlServer *httptest.Server

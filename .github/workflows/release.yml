@@ -89,7 +89,6 @@ jobs:
             cp "stage/pb-launcher${suffix}" "dist/launcher-${os}-${arch}"
             tar -C stage -czf "dist/paperboat_${VERSION}_${os}_${arch}.tar.gz" pb pb-launcher
             rm "stage/pb${suffix}" "stage/pb-launcher${suffix}"
-          bash tools/package-manifests.sh dist "${GITHUB_REPOSITORY}" "${VERSION}"
           cp tools/install.sh dist/install.sh
       - name: Upload Unix release handoff
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -405,12 +404,41 @@ jobs:
     needs: release-windows
     if: (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')) && needs.release-windows.result == 'success'
     runs-on: blacksmith-2vcpu-windows-2025
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 1
+      - name: Cache pinned WinGet bootstrap module
+        uses: actions/cache@v4
+        with:
+          path: ~\Documents\PowerShell\Modules\Microsoft.WinGet.Client\1.9.25190
+          key: winget-client-module-1.9.25190-${{ runner.os }}-${{ runner.arch }}
+      - name: Install pinned WinGet validator
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $moduleVersion = [version]'1.9.25190'
+          $module = Get-Module -ListAvailable -Name Microsoft.WinGet.Client |
+            Where-Object Version -EQ $moduleVersion |
+            Select-Object -First 1
+          if ($null -eq $module) {
+            Install-Module -Name Microsoft.WinGet.Client -RequiredVersion $moduleVersion -Repository PSGallery -Scope CurrentUser -Force -AllowClobber
+          }
+          Import-Module Microsoft.WinGet.Client -RequiredVersion $moduleVersion -Force
+          Repair-WinGetPackageManager -Version '1.29.280' -Force
+          $windowsApps = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps'
+          $env:PATH = "$windowsApps;$env:PATH"
+          $winget = Get-Command winget.exe -ErrorAction Stop
+          $actualVersion = (& $winget.Path --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actualVersion -ne 'v1.29.280') {
+            throw "Expected pinned winget v1.29.280, got '$actualVersion'."
+          }
+          $windowsApps | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - name: Download final signed MSI handoffs
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -492,6 +520,11 @@ jobs:
         with:
           name: windows-winget
           path: dist/winget
+      - name: Generate Homebrew manifest from complete Unix release set
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash tools/package-manifests.sh dist "${GITHUB_REPOSITORY}" "${RELEASE_VERSION}"
       - name: Verify and merge Windows release handoffs
         shell: bash
         run: |

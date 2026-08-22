@@ -21,6 +21,7 @@ for required in (
     "runner: blacksmith-2vcpu-windows-2025", "runner: windows-11-arm",
     "architecture: amd64", "architecture: arm64",
     "channel: stable", "windows-winget:",
+    "winget-client-module-1.9.25190", "Repair-WinGetPackageManager -Version '1.29.280'",
     "candidate-assembly:", "release-publication:",
     "needs: [platform-qualification, release-linux, release-macos, release-windows, windows-winget]",
     "release-candidate.json", "release-candidate-${{ env.RELEASE_VERSION }}",
@@ -47,10 +48,22 @@ for required in (
     if required not in qualification:
         raise SystemExit(f"platform qualification is missing {required!r}")
 
+qualification_triggers = qualification[qualification.index("on:"):qualification.index("permissions:")]
+if "pull_request:" in qualification_triggers or "push:" in qualification_triggers:
+    raise SystemExit("native platform qualification must run from the tag release workflow or explicit manual dispatch only")
+
 if "qemu" in release.lower() or "qemu" in qualification.lower():
     raise SystemExit("release workflows must not use QEMU")
 if "publish-release.yml" in release or "update-assurance.yml" in release:
     raise SystemExit("release workflow references a deleted workflow")
+
+linux_job = release[release.index("  release-linux:"):release.index("  release-macos:")]
+assembly_job = release[release.index("  candidate-assembly:"):release.index("  release-publication:")]
+manifest_command = 'bash tools/package-manifests.sh dist "${GITHUB_REPOSITORY}" "${RELEASE_VERSION}"'
+if "package-manifests.sh" in linux_job:
+    raise SystemExit("per-architecture Linux jobs cannot generate a manifest that requires every Unix archive")
+if manifest_command not in assembly_job:
+    raise SystemExit("candidate assembly must generate the package manifest after downloading every Unix archive")
 
 ordered = (
     "Publish immutable GitHub release assets",

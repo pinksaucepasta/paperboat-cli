@@ -41,7 +41,11 @@ func (s *Server) listen(ctx context.Context) (net.Listener, error) {
 		if s.config.Stale == nil || !s.config.Stale.CanRemoveStaleSocket(ctx, s.config.SocketPath) {
 			return nil, ErrUnsafeSocket
 		}
-		if err := removeVerifiedSocket(s.config.SocketPath, info, s.config.OwnerUID); err != nil {
+		identity, err := socketIdentityFromInfo(info)
+		if err != nil {
+			return nil, ErrUnsafeSocket
+		}
+		if err := removeVerifiedSocket(s.config.SocketPath, identity, s.config.OwnerUID); err != nil {
 			return nil, err
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -52,6 +56,12 @@ func (s *Server) listen(ctx context.Context) (net.Listener, error) {
 		return nil, err
 	}
 	listener.SetUnlinkOnClose(false)
+	identity, err := socketIdentityFromListener(listener, s.config.SocketPath, os.Geteuid())
+	if err != nil {
+		_ = listener.Close()
+		return nil, err
+	}
+	removeOwnSocket := func() { _ = removeVerifiedSocket(s.config.SocketPath, identity, s.config.OwnerUID) }
 	if os.Geteuid() == 0 {
 		err = os.Chown(s.config.SocketPath, s.config.OwnerUID, s.config.OwnerGID)
 	}
@@ -60,29 +70,78 @@ func (s *Server) listen(ctx context.Context) (net.Listener, error) {
 	}
 	if err != nil {
 		_ = listener.Close()
-		_ = os.Remove(s.config.SocketPath)
+		removeOwnSocket()
 		return nil, err
 	}
-	socketInfo, err := os.Lstat(s.config.SocketPath)
-	if err != nil {
+	if err := verifySocketIdentity(s.config.SocketPath, identity, s.config.OwnerUID); err != nil {
 		_ = listener.Close()
-		_ = os.Remove(s.config.SocketPath)
+		removeOwnSocket()
 		return nil, err
 	}
-	s.cleanup = func() { _ = removeVerifiedSocket(s.config.SocketPath, socketInfo, s.config.OwnerUID) }
+	s.cleanup = removeOwnSocket
 	return listener, nil
 }
 
-func removeVerifiedSocket(path string, expected os.FileInfo, ownerUID int) error {
+type socketIdentity struct {
+	device uint64
+	inode  uint64
+}
+
+func socketIdentityFromInfo(info os.FileInfo) (socketIdentity, error) {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return socketIdentity{}, ErrUnsafeSocket
+	}
+	return socketIdentity{device: uint64(stat.Dev), inode: uint64(stat.Ino)}, nil
+}
+
+func socketIdentityFromListener(listener *net.UnixListener, path string, ownerUID int) (socketIdentity, error) {
+	raw, err := listener.SyscallConn()
+	if err != nil {
+		return socketIdentity{}, err
+	}
+	var stat syscall.Stat_t
+	var controlErr error
+	if err := raw.Control(func(fd uintptr) { controlErr = syscall.Fstat(int(fd), &stat) }); err != nil {
+		return socketIdentity{}, err
+	}
+	if controlErr != nil {
+		return socketIdentity{}, controlErr
+	}
+	if stat.Mode&syscall.S_IFMT != syscall.S_IFSOCK {
+		return socketIdentity{}, ErrUnsafeSocket
+	}
+	// Darwin's socket descriptor identity is not the filesystem vnode identity.
+	// Use Fstat to prove the listener itself is a socket, then capture the pathname
+	// vnode that all later cleanup must match exactly.
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSocket == 0 || info.Mode()&os.ModeSymlink != 0 || fileOwner(info) != ownerUID {
+		return socketIdentity{}, ErrUnsafeSocket
+	}
+	return socketIdentityFromInfo(info)
+}
+
+func verifySocketIdentity(path string, expected socketIdentity, ownerUID int) error {
 	current, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil
+		return ErrUnsafeSocket
 	}
 	if err != nil {
 		return err
 	}
-	if expected == nil || current.Mode()&os.ModeSocket == 0 || current.Mode()&os.ModeSymlink != 0 || fileOwner(current) != ownerUID || !os.SameFile(expected, current) {
+	actual, err := socketIdentityFromInfo(current)
+	if err != nil || current.Mode()&os.ModeSocket == 0 || current.Mode()&os.ModeSymlink != 0 || fileOwner(current) != ownerUID || actual != expected {
 		return ErrUnsafeSocket
+	}
+	return nil
+}
+
+func removeVerifiedSocket(path string, expected socketIdentity, ownerUID int) error {
+	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err := verifySocketIdentity(path, expected, ownerUID); err != nil {
+		return err
 	}
 	return os.Remove(path)
 }

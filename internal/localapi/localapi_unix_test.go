@@ -933,6 +933,31 @@ func TestLocalAPINeverRemovesReplacementAtSocketPath(t *testing.T) {
 		t.Fatalf("replacement value=%q err=%v", value, err)
 	}
 
+	replacementSocketPath := filepath.Join(root, "replacement.sock")
+	replacementServer, err := NewServer(ServerConfig{SocketPath: replacementSocketPath, OwnerUID: os.Geteuid(), OwnerGID: os.Getegid(), Source: snapshotSourceFunc(func(context.Context) (Snapshot, error) { return validSnapshot(), nil })})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owned, err := replacementServer.listen(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(replacementSocketPath); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := net.ListenUnix("unix", &net.UnixAddr{Name: replacementSocketPath, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement.SetUnlinkOnClose(false)
+	_ = owned.Close()
+	replacementServer.cleanup()
+	if info, err := os.Lstat(replacementSocketPath); err != nil || info.Mode()&os.ModeSocket == 0 {
+		t.Fatalf("replacement socket was removed: info=%v err=%v", info, err)
+	}
+	_ = replacement.Close()
+	_ = os.Remove(replacementSocketPath)
+
 	staleSocket := filepath.Join(root, "stale.sock")
 	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: staleSocket, Net: "unix"})
 	if err != nil {
@@ -1092,11 +1117,23 @@ func waitForSocket(t *testing.T, path string) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)
 	for {
-		if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSocket != 0 {
+		transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", path)
+		}}
+		client := &http.Client{Transport: transport, Timeout: 100 * time.Millisecond}
+		request, err := http.NewRequest(http.MethodGet, "http://paperboat.local/v1/snapshot", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response, err := client.Do(request)
+		if err == nil {
+			_ = response.Body.Close()
+			transport.CloseIdleConnections()
 			return
 		}
+		transport.CloseIdleConnections()
 		if time.Now().After(deadline) {
-			t.Fatal("local API socket was not created")
+			t.Fatalf("local API did not become ready: %v", err)
 		}
 		time.Sleep(time.Millisecond)
 	}

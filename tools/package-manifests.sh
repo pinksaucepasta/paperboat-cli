@@ -18,7 +18,10 @@ darwin_arm64="paperboat_${tag}_darwin_arm64.tar.gz"
 linux_amd64="paperboat_${tag}_linux_amd64.tar.gz"
 linux_arm64="paperboat_${tag}_linux_arm64.tar.gz"
 for file in "$darwin_arm64" "$linux_amd64" "$linux_arm64"; do
-  test -f "$dist/$file"
+  if [ ! -f "$dist/$file" ]; then
+    echo "missing release archive required for package manifest: $dist/$file" >&2
+    exit 1
+  fi
 done
 
 cat > "$dist/paperboat.rb" <<EOF
