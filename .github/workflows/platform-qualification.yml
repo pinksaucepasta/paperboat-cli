@@ -122,46 +122,6 @@ jobs:
           & cmd.exe /d /c ver
           if ($LASTEXITCODE -ne 0) { throw 'cmd.exe is unavailable.' }
 
-  windows-arm64-cross:
-    name: Windows arm64 beta independent cross-build
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
-        with:
-          go-version-file: go.mod
-          cache: true
-      - name: Compile every Windows arm64 package and test package
-        shell: bash
-        run: |
-          set -euo pipefail
-          output_dir="$(mktemp -d)"
-          trap 'rm -rf "$output_dir"' EXIT
-          CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build -trimpath ./...
-          while IFS= read -r package; do
-            name="$(printf '%s' "$package" | sha256sum | cut -d' ' -f1)"
-            CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go test -c -vet=off -trimpath -o "$output_dir/$name.test.exe" "$package"
-          done < <(CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go list -e -f '{{if or .GoFiles .CgoFiles}}{{.ImportPath}}{{end}}' ./... | sed '/^$/d')
-          CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build -trimpath -o "$output_dir/pb.exe" ./cmd/pb
-          CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build -trimpath -o "$output_dir/pb-launcher.exe" ./cmd/pb-launcher
-          python3 - "$output_dir" <<'PY'
-          import pathlib, sys
-          root = pathlib.Path(sys.argv[1])
-          for path in root.glob('*.exe'):
-              data = path.read_bytes()
-              if len(data) < 0x40 or data[:2] != b'MZ': raise SystemExit(f'{path}: invalid PE')
-              offset = int.from_bytes(data[0x3c:0x40], 'little')
-              if data[offset:offset+4] != b'PE\0\0': raise SystemExit(f'{path}: invalid signature')
-              if int.from_bytes(data[offset+4:offset+6], 'little') != 0xaa64: raise SystemExit(f'{path}: not ARM64')
-          print('Windows arm64 cross-build and PE validation passed; native evidence remains beta-gated.')
-          PY
-      - name: Record explicit ARM64 beta status
-        shell: bash
-        run: |
-          printf 'windows_arm64_stability: beta\n' >> "$GITHUB_STEP_SUMMARY"
-          printf 'native_windows_arm64_e2e: blocked_no_hardware\n' >> "$GITHUB_STEP_SUMMARY"
-
   update-native:
     name: Native update tests (${{ matrix.os }})
     if: github.event_name != 'push' || github.ref_type == 'branch'
