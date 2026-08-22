@@ -123,7 +123,12 @@ func startManagedSSHAuthenticationServer(t *testing.T, allowed ssh.PublicKey) (n
 				status := make([]byte, 4)
 				binary.BigEndian.PutUint32(status, 0)
 				_, _ = channel.SendRequest("exit-status", false, status)
-				_ = channel.Close()
+				// Complete the server-to-client stream before closing the channel.
+				// Closing immediately after exit-status can make OpenSSH report a
+				// spurious broken pipe even though authentication and the command
+				// succeeded, especially under contention on Linux runners.
+				_ = channel.CloseWrite()
+				_, _ = io.Copy(io.Discard, channel)
 				done <- nil
 				return
 			}
