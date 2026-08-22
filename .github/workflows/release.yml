@@ -30,6 +30,7 @@ env:
 jobs:
   qualified-commit:
     name: Verify exact commit qualification
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -63,6 +64,7 @@ jobs:
 
   release-unix:
     name: Build Unix release assets
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
     needs: qualified-commit
     runs-on: ubuntu-latest
     permissions:
@@ -123,6 +125,7 @@ jobs:
 
   windows-package:
     name: Windows ${{ matrix.architecture }} (${{ matrix.channel }}) package
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
     needs: qualified-commit
     runs-on: ${{ matrix.runner }}
     permissions:
@@ -350,7 +353,7 @@ jobs:
   windows-winget:
     name: Render final-hash WinGet manifests
     needs: windows-package
-    if: needs.windows-package.result == 'success'
+    if: (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')) && needs.windows-package.result == 'success'
     runs-on: windows-2025
     permissions:
       contents: read
@@ -391,7 +394,7 @@ jobs:
   windows-native-qualification:
     name: Qualify final Windows ${{ matrix.architecture }} ${{ matrix.stability }} assets
     needs: windows-package
-    if: needs.windows-package.result == 'success'
+    if: (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')) && needs.windows-package.result == 'success'
     strategy:
       fail-fast: false
       matrix:
@@ -554,7 +557,7 @@ jobs:
   windows-arm64-beta-evidence:
     name: Record Windows arm64 beta cross-build evidence
     needs: windows-package
-    if: needs.windows-package.result == 'success'
+    if: (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')) && needs.windows-package.result == 'success'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -598,7 +601,7 @@ jobs:
 
   candidate-assembly:
     name: Assemble immutable qualified candidate
-    if: always()
+    if: (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')) && always()
     needs: [release-unix, windows-package, windows-winget, windows-native-qualification, windows-arm64-beta-evidence]
     runs-on: ubuntu-latest
     permissions:
