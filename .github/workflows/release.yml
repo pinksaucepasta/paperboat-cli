@@ -411,11 +411,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
-      - name: Cache pinned WinGet validator assets
+      - name: Cache pinned WinGet bootstrap module
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ~\.paperboat-ci\winget-v1.29.280
-          key: winget-validator-assets-v1.29.280-${{ runner.os }}-${{ runner.arch }}
+          path: ~\Documents\PowerShell\Modules\Microsoft.WinGet.Client\1.9.25190
+          key: winget-client-module-1.9.25190-${{ runner.os }}-${{ runner.arch }}
       - name: Install pinned WinGet validator
         shell: pwsh
         run: ./packaging/windows/scripts/install-winget-validator.ps1

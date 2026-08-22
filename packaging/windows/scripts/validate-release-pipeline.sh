@@ -27,7 +27,7 @@ for required in (
     "runner: blacksmith-2vcpu-windows-2025", "runner: windows-11-arm",
     "architecture: amd64", "architecture: arm64",
     "channel: stable", "windows-winget:",
-    "winget-validator-assets-v1.29.280", "install-winget-validator.ps1",
+    "winget-client-module-1.9.25190", "install-winget-validator.ps1",
     "candidate-assembly:", "release-publication:",
     "needs: [platform-qualification, release-linux, release-macos, release-windows, windows-winget]",
     "release-candidate.json", "release-candidate-${{ env.RELEASE_VERSION }}",
@@ -83,17 +83,15 @@ if manifest_command not in assembly_job:
 if "shell: pwsh" not in winget_job or "GH_TOKEN" in winget_job or "GITHUB_TOKEN" in winget_job:
     raise SystemExit("WinGet bootstrap must use PowerShell 7 without a repository-scoped GitHub token")
 for required in (
-    "v1.29.280/Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle",
-    "0809fa9f52e395d6e7de692331dce847ac991952675116bb4d8aae2ddcc20946",
-    "v1.29.280/DesktopAppInstaller_Dependencies.zip",
-    "3bbfcaa5cb011c48fac48d896d64a5c7c6898859a9f3d01555c8cd000f4e2962",
-    "Add-AppxPackage -Path $bundle -DependencyPath", "Get-AppxPackage -Name Microsoft.DesktopAppInstaller",
+    "Microsoft.WinGet.Client", "[version]'1.9.25190'",
+    "Repair-WinGetPackageManager -Version '1.29.280' -Force",
+    "Remove-Item Env:GH_TOKEN", "Remove-Item Env:GITHUB_TOKEN",
     "actualVersion -ne 'v1.29.280'",
 ):
     if required not in winget_bootstrap:
         raise SystemExit(f"pinned WinGet bootstrap is missing {required!r}")
-if "Repair-WinGetPackageManager" in winget_bootstrap or "ExtractToDirectory" in winget_bootstrap or "/latest" in winget_bootstrap:
-    raise SystemExit("WinGet bootstrap must not dynamically resolve or repair a latest release")
+if "Add-AppxPackage" in winget_bootstrap or "ExtractToDirectory" in winget_bootstrap or "/latest" in winget_bootstrap:
+    raise SystemExit("WinGet bootstrap must not register AppX directly or resolve a latest release")
 
 ordered = (
     "Publish immutable GitHub release assets",
