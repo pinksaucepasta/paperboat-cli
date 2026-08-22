@@ -45,7 +45,7 @@ function Get-MsiProperty {
     $installer = New-Object -ComObject WindowsInstaller.Installer
     $database = $installer.OpenDatabase($Path, 0)
     $view = $database.OpenView("SELECT Value FROM Property WHERE Property='$PropertyName'")
-    $view.Execute()
+    [void]$view.Execute()
     $record = $view.Fetch()
     if ($null -eq $record) {
         throw "MSI property $PropertyName is missing from $([IO.Path]::GetFileName($Path))."

@@ -82,8 +82,8 @@ if manifest_command not in assembly_job:
 for forbidden in ("Install-Module", "Repair-WinGetPackageManager", "Add-AppxPackage", "winget.exe"):
     if forbidden in winget_job:
         raise SystemExit(f"WinGet manifest validation must not bootstrap external tooling: {forbidden}")
-if "StringData(1)).Trim()" not in winget_renderer or "MSI property $PropertyName is empty" not in winget_renderer:
-    raise SystemExit("WinGet renderer must trim and validate Windows Installer property values")
+if "[void]$view.Execute()" not in winget_renderer or "StringData(1)).Trim()" not in winget_renderer or "MSI property $PropertyName is empty" not in winget_renderer:
+    raise SystemExit("WinGet renderer must suppress COM output, trim, and validate Windows Installer property values")
 
 ordered = (
     "Publish immutable GitHub release assets",
