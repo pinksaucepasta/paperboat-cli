@@ -175,6 +175,7 @@ func TestValidateDirectoryRejectsBadInstallerFields(t *testing.T) {
 		{name: "silent switch", oldValue: "Silent: /qn /norestart", newValue: "Silent: /quiet"},
 		{name: "progress switch", oldValue: "SilentWithProgress: /qb /norestart", newValue: "SilentWithProgress: /passive"},
 		{name: "upgrade behavior", oldValue: "UpgradeBehavior: install", newValue: "UpgradeBehavior: uninstallPrevious"},
+		{name: "product GUID whitespace", oldValue: "{22222222-2222-2222-2222-222222222222}", newValue: " {22222222-2222-2222-2222-222222222222}"},
 		{name: "product GUID", oldValue: "{22222222-2222-2222-2222-222222222222}", newValue: "not-a-guid"},
 	}
 	for _, test := range tests {

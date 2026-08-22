@@ -16,6 +16,7 @@ import sys
 release = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
 qualification = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
 ci = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
+winget_renderer = (pathlib.Path(sys.argv[1]).parents[2] / "packaging/windows/scripts/render-winget.ps1").read_text(encoding="utf-8")
 
 for required in (
     "release-linux:", "release-macos:", "release-windows:",
@@ -81,6 +82,8 @@ if manifest_command not in assembly_job:
 for forbidden in ("Install-Module", "Repair-WinGetPackageManager", "Add-AppxPackage", "winget.exe"):
     if forbidden in winget_job:
         raise SystemExit(f"WinGet manifest validation must not bootstrap external tooling: {forbidden}")
+if "StringData(1)).Trim()" not in winget_renderer or "MSI property $PropertyName is empty" not in winget_renderer:
+    raise SystemExit("WinGet renderer must trim and validate Windows Installer property values")
 
 ordered = (
     "Publish immutable GitHub release assets",

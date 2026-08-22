@@ -50,7 +50,11 @@ function Get-MsiProperty {
     if ($null -eq $record) {
         throw "MSI property $PropertyName is missing from $([IO.Path]::GetFileName($Path))."
     }
-    return [string]$record.StringData(1)
+    $value = ([string]$record.StringData(1)).Trim()
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        throw "MSI property $PropertyName is empty in $([IO.Path]::GetFileName($Path))."
+    }
+    return $value
 }
 
 $amd64MsiPath = [IO.Path]::GetFullPath($Amd64Msi)
