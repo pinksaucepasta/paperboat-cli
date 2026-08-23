@@ -3,12 +3,23 @@
 package service
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
 )
+
+func TestOnlyContextCanceledDoesNotHideJoinedFailure(t *testing.T) {
+	if !onlyContextCanceled(context.Canceled) || !onlyContextCanceled(errors.Join(context.Canceled, context.Canceled)) {
+		t.Fatal("cancellation-only result was not recognized")
+	}
+	if onlyContextCanceled(nil) || onlyContextCanceled(errors.Join(context.Canceled, errors.New("sidecar failed"))) {
+		t.Fatal("real sidecar failure was hidden by joined cancellation")
+	}
+}
 
 func TestSessionPriority(t *testing.T) {
 	cases := []struct {

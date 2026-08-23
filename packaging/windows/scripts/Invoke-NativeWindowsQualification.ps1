@@ -812,12 +812,32 @@ function Invoke-S4UDPAPIQualification {
         }
         if (-not [string]::IsNullOrWhiteSpace($ownerSID)) {
             try {
-                $ownerProfiles = @(Get-CimInstance -ClassName Win32_UserProfile -Filter "SID='$ownerSID'" -ErrorAction Stop)
-                foreach ($ownerProfile in $ownerProfiles) {
-                    Remove-CimInstance -InputObject $ownerProfile -ErrorAction Stop
-                }
-                if (@(Get-CimInstance -ClassName Win32_UserProfile -Filter "SID='$ownerSID'" -ErrorAction Stop).Count -ne 0) {
-                    throw 'temporary owner profile remains after cleanup'
+                $profileDeadline = [DateTime]::UtcNow.AddSeconds(30)
+                $lastProfileError = $null
+                do {
+                    $ownerProfiles = @(Get-CimInstance -ClassName Win32_UserProfile -Filter "SID='$ownerSID'" -ErrorAction Stop)
+                    if ($ownerProfiles.Count -eq 0) {
+                        break
+                    }
+                    foreach ($ownerProfile in $ownerProfiles) {
+                        try {
+                            Remove-CimInstance -InputObject $ownerProfile -ErrorAction Stop
+                            $lastProfileError = $null
+                        }
+                        catch {
+                            $lastProfileError = $_.Exception
+                        }
+                    }
+                    if ([DateTime]::UtcNow -lt $profileDeadline) {
+                        Start-Sleep -Milliseconds 500
+                    }
+                } while ([DateTime]::UtcNow -lt $profileDeadline)
+                $remainingProfiles = @(Get-CimInstance -ClassName Win32_UserProfile -Filter "SID='$ownerSID'" -ErrorAction Stop)
+                if ($remainingProfiles.Count -ne 0) {
+                    if ($null -ne $lastProfileError) {
+                        throw "temporary owner profile remains after bounded cleanup: $($lastProfileError.Message)"
+                    }
+                    throw 'temporary owner profile remains after bounded cleanup'
                 }
             }
             catch {

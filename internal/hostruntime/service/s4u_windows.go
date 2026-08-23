@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -74,16 +75,38 @@ func (p *loadedOwnerProfile) Close() error {
 	if p == nil {
 		return nil
 	}
-	var err error
+	var result error
 	if p.key != 0 {
-		err = unloadUserProfile(p.token, p.key)
+		unloaded := false
+		deadline := time.Now().Add(15 * time.Second)
+		for {
+			err := unloadUserProfile(p.token, p.key)
+			if err == nil {
+				unloaded = true
+				break
+			}
+			if !errors.Is(err, windows.ERROR_BUSY) && !errors.Is(err, windows.ERROR_SHARING_VIOLATION) && !errors.Is(err, windows.ERROR_LOCK_VIOLATION) && !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+				result = errors.Join(result, err)
+				break
+			}
+			if !time.Now().Before(deadline) {
+				result = errors.Join(result, err)
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		if !unloaded {
+			return result
+		}
 		p.key = 0
 	}
 	if p.token != 0 {
-		err = errors.Join(err, p.token.Close())
+		if err := p.token.Close(); err != nil {
+			return errors.Join(result, err)
+		}
 		p.token = 0
 	}
-	return err
+	return result
 }
 
 var (
@@ -117,7 +140,7 @@ func s4uOwnerToken(ownerSID string) (windows.Token, uint32, *loadedOwnerProfile,
 	}
 	defer source.Close()
 	var token windows.Token
-	access := uint32(windows.TOKEN_ASSIGN_PRIMARY | windows.TOKEN_DUPLICATE | windows.TOKEN_QUERY | windows.TOKEN_ADJUST_DEFAULT | windows.TOKEN_ADJUST_SESSIONID | windows.TOKEN_ADJUST_PRIVILEGES)
+	access := uint32(windows.TOKEN_ASSIGN_PRIMARY | windows.TOKEN_DUPLICATE | windows.TOKEN_IMPERSONATE | windows.TOKEN_QUERY | windows.TOKEN_ADJUST_DEFAULT | windows.TOKEN_ADJUST_SESSIONID | windows.TOKEN_ADJUST_PRIVILEGES)
 	if err := windows.DuplicateTokenEx(source, access, nil, windows.SecurityImpersonation, windows.TokenPrimary, &token); err != nil {
 		return 0, 0, nil, err
 	}

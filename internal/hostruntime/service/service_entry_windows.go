@@ -105,11 +105,12 @@ func (s *systemServiceEntry) Execute(_ []string, requests <-chan svc.ChangeReque
 type serviceEntry struct{ config ServiceEntryConfig }
 
 func (s *serviceEntry) Execute(_ []string, requests <-chan svc.ChangeRequest, statuses chan<- svc.Status) (bool, uint32) {
-	statuses <- svc.Status{State: svc.StartPending}
+	statuses <- svc.Status{State: svc.StartPending, WaitHint: 90_000, CheckPoint: 1}
 	parentCtx, cancelParent := context.WithCancel(context.Background())
 	defer cancelParent()
 	var sidecar PrivilegedSidecar
 	sidecarExited := false
+	var sidecarExitErr error
 	if s.config.StartPrivilegedSidecar != nil {
 		var err error
 		sidecar, err = s.config.StartPrivilegedSidecar(parentCtx)
@@ -124,27 +125,96 @@ func (s *serviceEntry) Execute(_ []string, requests <-chan svc.ChangeRequest, st
 			statuses <- stoppedServiceStatus(1, true)
 			return true, 1
 		}
-		defer func() {
-			cancelParent()
-			if !sidecarExited {
-				<-sidecar.Done
-			}
-		}()
 	}
 	process, err := launchEnrolledProcess(s.config)
 	if err != nil {
 		if s.config.LaunchFailure != nil {
 			s.config.LaunchFailure(err)
 		}
+		cancelParent()
+		if sidecar.Done != nil {
+			select {
+			case sidecarErr := <-sidecar.Done:
+				if sidecarErr != nil && !onlyContextCanceled(sidecarErr) && s.config.LaunchFailure != nil {
+					s.config.LaunchFailure(sidecarErr)
+				}
+			case <-time.After(15 * time.Second):
+				if s.config.LaunchFailure != nil {
+					s.config.LaunchFailure(windows.ERROR_TIMEOUT)
+				}
+			}
+		}
 		statuses <- stoppedServiceStatus(1, true)
 		return true, 1
 	}
-	defer process.Close()
+	processClosed := false
+	closeProcess := func() error {
+		if processClosed {
+			return nil
+		}
+		if err := process.Close(); err != nil {
+			return err
+		}
+		processClosed = true
+		return nil
+	}
+	finish := func(code uint32, failed bool) (bool, uint32) {
+		cleanupDone := make(chan error, 1)
+		go func() {
+			cleanupErr := closeProcess()
+			if cleanupErr != nil {
+				cleanupErr = errors.Join(cleanupErr, closeProcess())
+			}
+			cancelParent()
+			cleanupErr = errors.Join(cleanupErr, sidecarExitErr)
+			if !sidecarExited && sidecar.Done != nil {
+				select {
+				case sidecarErr := <-sidecar.Done:
+					sidecarExited = true
+					if sidecarErr != nil && !onlyContextCanceled(sidecarErr) {
+						cleanupErr = errors.Join(cleanupErr, sidecarErr)
+					}
+				case <-time.After(15 * time.Second):
+					cleanupErr = errors.Join(cleanupErr, windows.ERROR_TIMEOUT)
+				}
+			}
+			cleanupDone <- cleanupErr
+		}()
+		checkpoint := uint32(1)
+		statuses <- svc.Status{State: svc.StopPending, WaitHint: 90_000, CheckPoint: checkpoint}
+		progress := time.NewTicker(5 * time.Second)
+		defer progress.Stop()
+		var closeErr error
+	waitForCleanup:
+		for {
+			select {
+			case closeErr = <-cleanupDone:
+				break waitForCleanup
+			case <-progress.C:
+				checkpoint++
+				statuses <- svc.Status{State: svc.StopPending, WaitHint: 90_000, CheckPoint: checkpoint}
+			}
+		}
+		if closeErr != nil {
+			if s.config.LaunchFailure != nil {
+				s.config.LaunchFailure(closeErr)
+			}
+			code = 1
+			failed = true
+		}
+		statuses <- stoppedServiceStatus(code, failed)
+		return failed, code
+	}
+	var waitHandle windows.Handle
+	if err := windows.DuplicateHandle(windows.CurrentProcess(), process.process, windows.CurrentProcess(), &waitHandle, 0, false, windows.DUPLICATE_SAME_ACCESS); err != nil {
+		return finish(1, true)
+	}
 	done := make(chan uint32, 1)
 	go func() {
-		_, _ = windows.WaitForSingleObject(process.process, windows.INFINITE)
+		defer windows.Close(waitHandle)
+		_, _ = windows.WaitForSingleObject(waitHandle, windows.INFINITE)
 		var code uint32
-		_ = windows.GetExitCodeProcess(process.process, &code)
+		_ = windows.GetExitCodeProcess(waitHandle, &code)
 		done <- code
 	}()
 	accepts := svc.AcceptStop | svc.AcceptShutdown | svc.AcceptSessionChange
@@ -154,12 +224,12 @@ func (s *serviceEntry) Execute(_ []string, requests <-chan svc.ChangeRequest, st
 	defer ownerChecks.Stop()
 	for {
 		select {
-		case <-sidecar.Done:
+		case sidecarErr := <-sidecar.Done:
 			sidecarExited = true
-			_ = process.closeJob()
-			<-done
-			statuses <- stoppedServiceStatus(1, true)
-			return true, 1
+			if sidecarErr != nil && !onlyContextCanceled(sidecarErr) {
+				sidecarExitErr = sidecarErr
+			}
+			return finish(1, true)
 		case code := <-done:
 			if shouldDeleteOneShotService(s.config.DeleteOnExit, code, workloadInterrupted) {
 				_ = deleteOwnWindowsService(s.config.Name)
@@ -168,8 +238,7 @@ func (s *serviceEntry) Execute(_ []string, requests <-chan svc.ChangeRequest, st
 			if failed && code == 0 {
 				code = 1
 			}
-			statuses <- stoppedServiceStatus(code, failed)
-			return failed, code
+			return finish(code, failed)
 		case <-ownerChecks.C:
 			exists, checkErr := enrolledOwnerExists(s.config.EnrolledSID)
 			if checkErr != nil || exists {
@@ -178,27 +247,25 @@ func (s *serviceEntry) Execute(_ []string, requests <-chan svc.ChangeRequest, st
 			if s.config.LaunchFailure != nil {
 				s.config.LaunchFailure(ErrEnrolledOwnerMissing)
 			}
-			_ = process.closeJob()
-			<-done
-			statuses <- stoppedServiceStatus(1, true)
-			return true, 1
+			return finish(1, true)
 		case request := <-requests:
 			switch request.Cmd {
 			case svc.Interrogate:
 				statuses <- request.CurrentStatus
 			case svc.Stop, svc.Shutdown:
-				statuses <- svc.Status{State: svc.StopPending, Accepts: accepts}
-				_ = process.closeJob()
-				code := <-done
-				statuses <- svc.Status{State: svc.Stopped, Win32ExitCode: code}
-				return false, code
+				return finish(0, false)
 			case svc.SessionChange:
 				// Lock, unlock, disconnect, and fast-user switching retain the
 				// enrolled workload. Only the enrolled user's logoff/termination
 				// closes its job; SCM recovery waits for a new owner session.
 				if shouldTerminateForSessionChange(request, process.sessionID) {
 					workloadInterrupted = true
-					_ = process.closeJob()
+					if err := process.closeJob(); err != nil {
+						if s.config.LaunchFailure != nil {
+							s.config.LaunchFailure(err)
+						}
+						return finish(1, true)
+					}
 				}
 			}
 		}
@@ -257,6 +324,28 @@ func shouldTerminateForSessionChange(request svc.ChangeRequest, sessionID uint32
 	return sessionChangeFor(request, sessionID) && (request.EventType == windows.WTS_SESSION_LOGOFF || request.EventType == windows.WTS_SESSION_TERMINATE)
 }
 
+func onlyContextCanceled(err error) bool {
+	if err == nil {
+		return false
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		children := joined.Unwrap()
+		if len(children) == 0 {
+			return false
+		}
+		for _, child := range children {
+			if !onlyContextCanceled(child) {
+				return false
+			}
+		}
+		return true
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return onlyContextCanceled(wrapped.Unwrap())
+	}
+	return err == context.Canceled
+}
+
 func validateServiceEntry(config ServiceEntryConfig) error {
 	if config.Name == "" || len(config.Name) > 256 || !filepath.IsAbs(config.Executable) || strings.EqualFold(filepath.Ext(config.Executable), ".exe") == false || len(config.Arguments) > 32 || !validServiceSID(config.EnrolledSID) {
 		return ErrWindowsServiceEntry
@@ -283,36 +372,97 @@ func validateServiceEntry(config ServiceEntryConfig) error {
 }
 
 type enrolledProcess struct {
-	process   windows.Handle
-	job       windows.Handle
-	sessionID uint32
-	profile   *loadedOwnerProfile
+	process                 windows.Handle
+	job                     windows.Handle
+	jobTerminationRequested bool
+	sessionID               uint32
+	profile                 *loadedOwnerProfile
 }
 
 func (p *enrolledProcess) Close() error {
-	var err error
-	err = p.closeJob()
+	if err := p.closeJob(); err != nil {
+		return err
+	}
 	if p.process != 0 {
-		err = errors.Join(err, windows.Close(p.process))
+		waitResult, waitErr := windows.WaitForSingleObject(p.process, 15_000)
+		if waitErr != nil {
+			return waitErr
+		}
+		if waitResult != windows.WAIT_OBJECT_0 {
+			return windows.ERROR_TIMEOUT
+		}
+		if err := windows.Close(p.process); err != nil {
+			return err
+		}
 		p.process = 0
 	}
+	if p.job != 0 {
+		if err := waitWindowsJobEmpty(p.job, 15*time.Second); err != nil {
+			return err
+		}
+		if err := windows.Close(p.job); err != nil {
+			return err
+		}
+		p.job = 0
+	}
 	if p.profile != nil {
-		err = errors.Join(err, p.profile.Close())
+		if err := p.profile.Close(); err != nil {
+			return err
+		}
 		p.profile = nil
 	}
-	return err
+	return nil
 }
 
 func (p *enrolledProcess) closeJob() error {
-	if p.job == 0 {
+	if p.job == 0 || p.jobTerminationRequested {
 		return nil
 	}
-	err := windows.Close(p.job)
-	p.job = 0
-	return err
+	if err := windows.TerminateJobObject(p.job, 1); err != nil {
+		return err
+	}
+	p.jobTerminationRequested = true
+	return nil
 }
 
-func launchEnrolledProcess(config ServiceEntryConfig) (*enrolledProcess, error) {
+type windowsJobBasicAccountingInformation struct {
+	PerProcessUserTime       int64
+	PerJobUserTime           int64
+	ThisPeriodUserTime       int64
+	ThisPeriodKernelTime     int64
+	TotalPageFaultCount      uint32
+	TotalProcesses           uint32
+	ActiveProcesses          uint32
+	TotalTerminatedProcesses uint32
+}
+
+var _ [48 - unsafe.Sizeof(windowsJobBasicAccountingInformation{})]byte
+var _ [unsafe.Sizeof(windowsJobBasicAccountingInformation{}) - 48]byte
+var _ [40 - unsafe.Offsetof(windowsJobBasicAccountingInformation{}.ActiveProcesses)]byte
+var _ [unsafe.Offsetof(windowsJobBasicAccountingInformation{}.ActiveProcesses) - 40]byte
+
+func waitWindowsJobEmpty(job windows.Handle, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		var accounting windowsJobBasicAccountingInformation
+		var returned uint32
+		if err := windows.QueryInformationJobObject(job, windows.JobObjectBasicAccountingInformation, uintptr(unsafe.Pointer(&accounting)), uint32(unsafe.Sizeof(accounting)), &returned); err != nil {
+			return err
+		}
+		if returned < uint32(unsafe.Sizeof(accounting)) {
+			return windows.ERROR_INVALID_DATA
+		}
+		if accounting.ActiveProcesses == 0 {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			return windows.ERROR_TIMEOUT
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func launchEnrolledProcess(config ServiceEntryConfig) (result *enrolledProcess, resultErr error) {
 	dropPrivileges, err := enableOwnerLaunchPrivileges()
 	if err != nil {
 		return nil, err
@@ -326,12 +476,12 @@ func launchEnrolledProcess(config ServiceEntryConfig) (*enrolledProcess, error) 
 	if profile != nil {
 		defer func() {
 			if profile != nil {
-				_ = profile.Close()
+				resultErr = errors.Join(resultErr, profile.Close())
 			}
 		}()
 	}
 	var primary windows.Token
-	access := uint32(windows.TOKEN_ASSIGN_PRIMARY | windows.TOKEN_DUPLICATE | windows.TOKEN_QUERY | windows.TOKEN_ADJUST_DEFAULT | windows.TOKEN_ADJUST_SESSIONID | windows.TOKEN_ADJUST_PRIVILEGES)
+	access := uint32(windows.TOKEN_ASSIGN_PRIMARY | windows.TOKEN_DUPLICATE | windows.TOKEN_IMPERSONATE | windows.TOKEN_QUERY | windows.TOKEN_ADJUST_DEFAULT | windows.TOKEN_ADJUST_SESSIONID | windows.TOKEN_ADJUST_PRIVILEGES)
 	if err := windows.DuplicateTokenEx(queried, access, nil, windows.SecurityImpersonation, windows.TokenPrimary, &primary); err != nil {
 		return nil, err
 	}
@@ -371,34 +521,49 @@ func launchEnrolledProcess(config ServiceEntryConfig) (*enrolledProcess, error) 
 	}
 	job, err := killOnCloseJob()
 	if err != nil {
-		_ = windows.Close(processInfo.Thread)
-		_ = windows.TerminateProcess(processInfo.Process, 1)
-		_ = windows.Close(processInfo.Process)
-		return nil, err
+		return nil, errors.Join(err, cleanFailedEnrolledLaunch(processInfo, 0))
 	}
 	if err := windows.AssignProcessToJobObject(job, processInfo.Process); err != nil {
-		_ = windows.Close(job)
-		_ = windows.Close(processInfo.Thread)
-		_ = windows.TerminateProcess(processInfo.Process, 1)
-		_ = windows.Close(processInfo.Process)
-		return nil, err
+		return nil, errors.Join(err, cleanFailedEnrolledLaunch(processInfo, job))
 	}
 	if _, err := windows.ResumeThread(processInfo.Thread); err != nil {
-		_ = windows.Close(job)
-		_ = windows.Close(processInfo.Thread)
-		_ = windows.TerminateProcess(processInfo.Process, 1)
-		_ = windows.Close(processInfo.Process)
-		return nil, err
+		return nil, errors.Join(err, cleanFailedEnrolledLaunch(processInfo, job))
 	}
 	if err := windows.Close(processInfo.Thread); err != nil {
-		_ = windows.Close(job)
-		_ = windows.TerminateProcess(processInfo.Process, 1)
-		_ = windows.Close(processInfo.Process)
-		return nil, err
+		return nil, errors.Join(err, cleanFailedEnrolledLaunch(processInfo, job))
 	}
-	result := &enrolledProcess{process: processInfo.Process, job: job, sessionID: sessionID, profile: profile}
+	result = &enrolledProcess{process: processInfo.Process, job: job, sessionID: sessionID, profile: profile}
 	profile = nil
 	return result, nil
+}
+
+func cleanFailedEnrolledLaunch(info windows.ProcessInformation, job windows.Handle) error {
+	var result error
+	if info.Thread != 0 {
+		result = errors.Join(result, windows.Close(info.Thread))
+	}
+	if job != 0 {
+		result = errors.Join(result, windows.TerminateJobObject(job, 1))
+	}
+	if info.Process != 0 {
+		result = errors.Join(result, windows.TerminateProcess(info.Process, 1))
+		waitResult, waitErr := windows.WaitForSingleObject(info.Process, 15_000)
+		if waitErr != nil {
+			result = errors.Join(result, waitErr)
+		} else if waitResult != windows.WAIT_OBJECT_0 {
+			result = errors.Join(result, windows.ERROR_TIMEOUT)
+		} else {
+			result = errors.Join(result, windows.Close(info.Process))
+		}
+	}
+	if job != 0 {
+		if err := waitWindowsJobEmpty(job, 15*time.Second); err != nil {
+			result = errors.Join(result, err)
+		} else {
+			result = errors.Join(result, windows.Close(job))
+		}
+	}
+	return result
 }
 
 func enrolledSessionToken(enrolledSID string) (windows.Token, uint32, *loadedOwnerProfile, error) {
