@@ -128,6 +128,9 @@ func (s *serviceEntry) Execute(_ []string, requests <-chan svc.ChangeRequest, st
 	}
 	process, err := launchEnrolledProcess(s.config)
 	if err != nil {
+		if process != nil {
+			err = errors.Join(err, process.Close())
+		}
 		if s.config.LaunchFailure != nil {
 			s.config.LaunchFailure(err)
 		}
@@ -209,13 +212,26 @@ func (s *serviceEntry) Execute(_ []string, requests <-chan svc.ChangeRequest, st
 	if err := windows.DuplicateHandle(windows.CurrentProcess(), process.process, windows.CurrentProcess(), &waitHandle, 0, false, windows.DUPLICATE_SAME_ACCESS); err != nil {
 		return finish(1, true)
 	}
-	done := make(chan uint32, 1)
+	done := make(chan struct {
+		code uint32
+		err  error
+	}, 1)
 	go func() {
-		defer windows.Close(waitHandle)
-		_, _ = windows.WaitForSingleObject(waitHandle, windows.INFINITE)
+		waitResult, waitErr := windows.WaitForSingleObject(waitHandle, windows.INFINITE)
 		var code uint32
-		_ = windows.GetExitCodeProcess(waitHandle, &code)
-		done <- code
+		var exitErr error
+		if waitErr != nil {
+			exitErr = waitErr
+		} else if waitResult != windows.WAIT_OBJECT_0 {
+			exitErr = windows.ERROR_INVALID_HANDLE
+		} else {
+			exitErr = windows.GetExitCodeProcess(waitHandle, &code)
+		}
+		exitErr = errors.Join(exitErr, windows.Close(waitHandle))
+		done <- struct {
+			code uint32
+			err  error
+		}{code: code, err: exitErr}
 	}()
 	accepts := svc.AcceptStop | svc.AcceptShutdown | svc.AcceptSessionChange
 	statuses <- svc.Status{State: svc.Running, Accepts: accepts}
@@ -230,11 +246,19 @@ func (s *serviceEntry) Execute(_ []string, requests <-chan svc.ChangeRequest, st
 				sidecarExitErr = sidecarErr
 			}
 			return finish(1, true)
-		case code := <-done:
-			if shouldDeleteOneShotService(s.config.DeleteOnExit, code, workloadInterrupted) {
-				_ = deleteOwnWindowsService(s.config.Name)
+		case exit := <-done:
+			code := exit.code
+			if exit.err != nil && s.config.LaunchFailure != nil {
+				s.config.LaunchFailure(exit.err)
 			}
-			failed := code != 0 || workloadInterrupted
+			var deleteErr error
+			if shouldDeleteOneShotService(s.config.DeleteOnExit, code, workloadInterrupted) {
+				deleteErr = deleteOwnWindowsService(s.config.Name)
+				if deleteErr != nil && s.config.LaunchFailure != nil {
+					s.config.LaunchFailure(deleteErr)
+				}
+			}
+			failed := exit.err != nil || code != 0 || workloadInterrupted || deleteErr != nil
 			if failed && code == 0 {
 				code = 1
 			}
@@ -284,12 +308,12 @@ func enrolledOwnerExists(value string) (bool, error) {
 	return err == nil, err
 }
 
-func deleteOwnWindowsService(name string) error {
+func deleteOwnWindowsService(name string) (resultErr error) {
 	manager, err := mgr.Connect()
 	if err != nil {
 		return err
 	}
-	defer manager.Disconnect()
+	defer func() { resultErr = errors.Join(resultErr, manager.Disconnect()) }()
 	current, err := manager.OpenService(name)
 	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
 		return nil
@@ -297,7 +321,7 @@ func deleteOwnWindowsService(name string) error {
 	if err != nil {
 		return err
 	}
-	defer current.Close()
+	defer func() { resultErr = errors.Join(resultErr, current.Close()) }()
 	err = current.Delete()
 	if errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
 		return nil
@@ -458,6 +482,7 @@ func waitWindowsJobEmpty(job windows.Handle, timeout time.Duration) error {
 		if !time.Now().Before(deadline) {
 			return windows.ERROR_TIMEOUT
 		}
+		//paperboat:allow-source-policy sleep owner=windows-service reason=bounded-job-accounting-quiescence-poll
 		time.Sleep(20 * time.Millisecond)
 	}
 }
@@ -467,12 +492,19 @@ func launchEnrolledProcess(config ServiceEntryConfig) (result *enrolledProcess, 
 	if err != nil {
 		return nil, err
 	}
-	defer dropPrivileges()
+	defer func() { resultErr = errors.Join(resultErr, dropPrivileges()) }()
 	queried, sessionID, profile, err := enrolledSessionToken(config.EnrolledSID)
 	if err != nil {
-		return nil, err
+		var cleanupErr error
+		if profile != nil {
+			cleanupErr = errors.Join(cleanupErr, profile.Close())
+		}
+		if queried != 0 {
+			cleanupErr = errors.Join(cleanupErr, queried.Close())
+		}
+		return nil, errors.Join(err, cleanupErr)
 	}
-	defer queried.Close()
+	defer func() { resultErr = errors.Join(resultErr, queried.Close()) }()
 	if profile != nil {
 		defer func() {
 			if profile != nil {
@@ -485,7 +517,7 @@ func launchEnrolledProcess(config ServiceEntryConfig) (result *enrolledProcess, 
 	if err := windows.DuplicateTokenEx(queried, access, nil, windows.SecurityImpersonation, windows.TokenPrimary, &primary); err != nil {
 		return nil, err
 	}
-	defer primary.Close()
+	defer func() { resultErr = errors.Join(resultErr, primary.Close()) }()
 	if err := validateOwnerToken(primary, config.EnrolledSID); err != nil {
 		return nil, err
 	}
@@ -576,6 +608,7 @@ func enrolledSessionToken(enrolledSID string) (windows.Token, uint32, *loadedOwn
 	if count == 0 || sessions == nil {
 		return s4uOwnerToken(enrolledSID)
 	}
+	var closeErr error
 	candidates := append([]windows.WTS_SESSION_INFO(nil), unsafe.Slice(sessions, int(count))...)
 	sort.Slice(candidates, func(i, j int) bool {
 		left, right := sessionPriority(candidates[i].State), sessionPriority(candidates[j].State)
@@ -596,9 +629,10 @@ func enrolledSessionToken(enrolledSID string) (windows.Token, uint32, *loadedOwn
 		if err == nil && user != nil && user.User.Sid != nil && user.User.Sid.String() == enrolledSID {
 			return token, candidate.SessionID, nil, nil
 		}
-		_ = token.Close()
+		closeErr = errors.Join(closeErr, token.Close())
 	}
-	return s4uOwnerToken(enrolledSID)
+	resultToken, resultSession, resultProfile, resultErr := s4uOwnerToken(enrolledSID)
+	return resultToken, resultSession, resultProfile, errors.Join(closeErr, resultErr)
 }
 
 func sessionPriority(state uint32) int {
@@ -663,8 +697,7 @@ func killOnCloseJob() (windows.Handle, error) {
 	limits := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
 	limits.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
 	if _, err := windows.SetInformationJobObject(job, windows.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&limits)), uint32(unsafe.Sizeof(limits))); err != nil {
-		_ = windows.Close(job)
-		return 0, err
+		return 0, errors.Join(err, windows.Close(job))
 	}
 	return job, nil
 }

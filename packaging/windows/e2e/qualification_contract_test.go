@@ -95,7 +95,13 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 		"refusing to overwrite an unmanaged service declaration",
 		"Get-PaperboatPreviewDeclarations",
 		"Get-CimInstance -ClassName Win32_Service -ErrorAction Stop",
-		"PaperboatPreview-0123456789abcdef",
+		"SHA256",
+		"$instance = $nameHash.Substring(0, 16)",
+		"$descriptorRoot = Join-Path $script:stateRoot 'previews\\active'",
+		"'--descriptor', $descriptorPath",
+		"'--port', '38123'",
+		"'--indefinite'",
+		"service_generation",
 		"New-OwnedPreviewCleanupFixture",
 		"Assert-OwnedPreviewCleanupFixturePresent",
 		"PaperboatSshd",
@@ -107,8 +113,29 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 		"upgrade",
 		"uninstall",
 		"native_s4u_dpapi",
+		"native_msi_cleanup",
 		"TestNativePrepareS4UDPAPIQualification",
 		"TestNativeLoggedOutS4UDPAPIQualification",
+		"MsiCleanupTestExecutable",
+		"runtime-current",
+		"Assert-PaperboatSshdAbsent",
+		"Set-QualificationRuntimeCurrentACL",
+		"TestNativeApplyQualificationRuntimeCurrentACL",
+		"PAPERBOAT_WINDOWS_E2E_ACL_PATH",
+		"PAPERBOAT_WINDOWS_E2E_ACL_SID",
+		"Assert-QualificationRuntimeCurrentACL",
+		"Stage-PreMsiRuntimeCurrentFixture",
+		"Remove-PreMsiRuntimeCurrentFixture",
+		"Invoke-NativeGoTests",
+		"native_go_preview_e2e",
+		"^TestNativeDurablePreviewServiceLifecycle$",
+		"Assert-PreMsiRuntimeCurrentFixtureIntegrity",
+		"0x1200a9",
+		"$script:preMsiRuntimeCurrentHash",
+		"$resolvedFixturePath.StartsWith($outputRootWithSeparator",
+		"$destinationHash -eq $sourceHash",
+		"$actualHash -eq $script:preMsiRuntimeCurrentHash",
+		"exact_file=true; empty_directories=true; install_root_absent=true",
 		"New-LocalUser",
 		"Invoke-OwnerQualificationTest",
 		"[Diagnostics.ProcessStartInfo]::new()",
@@ -152,14 +179,28 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 		"TestNativeLegacyOwnerFullSecurityMigration",
 		"native_legacy_security_migration",
 		"role_artifact_allowlist",
+		"Assert-InstalledMachineACL -Path $versionsRoot -Directory $true",
+		"Assert-InstalledMachineACL -Path $immutableReleaseRoot -Directory $true",
+		"Assert-InstalledMachineACL -Path $path -Directory $false",
+		"-test.run', '^TestNativeMSIPreview",
+		"runtime-current service/declaration removal and ownership-conflict preservation cases passed",
 	} {
 		if !strings.Contains(string(harness), requiredText) {
 			t.Fatalf("native MSI harness is missing %q", requiredText)
 		}
 	}
-	for _, forbiddenText := range []string{"Start-Process -FilePath $ownerPreparationExecutable", "-Credential $credential", "-LoadUserProfile"} {
+	for _, forbiddenText := range []string{"Start-Process -FilePath $ownerPreparationExecutable", "-Credential $credential", "-LoadUserProfile", "^TestNativeMSIPreviewCleanup$", "Set-Acl -LiteralPath $Path -AclObject $security", "$security.SetOwner($system)"} {
 		if strings.Contains(string(harness), forbiddenText) {
 			t.Fatalf("native MSI harness retains Session 0 alternate-credential launch %q", forbiddenText)
+		}
+	}
+	artifactBuilder, err := os.ReadFile(filepath.Join(root, "scripts", "Build-NativeQualificationArtifacts.ps1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, requiredText := range []string{"paperboat-windows-msi-cleanup.test.exe", "msi_cleanup_test_executable", "PAPERBOAT_WINDOWS_E2E_MSI_CLEANUP_TEST", "paperboat-windows-hostinstall.test.exe", "hostinstall_test_executable"} {
+		if !strings.Contains(string(artifactBuilder), requiredText) {
+			t.Fatalf("native qualification artifact builder is missing %q", requiredText)
 		}
 	}
 	wixSource, err := os.ReadFile(filepath.Join(root, "wix", "Paperboat.wxs"))
@@ -168,7 +209,10 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 	}
 	for _, requiredText := range []string{
 		"CleanupPaperboatDynamicServices",
-		"FileRef=\"RuntimeBinary\"",
+		"FileRef=\"CLICurrentSeedBinary\"",
+		"ReleaseVersionsSecurityComponent",
+		"ActiveReleaseSecurityComponent",
+		"O:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)",
 		"Source=\"$(var.StagingDir)\\pb-launcher.exe\" Name=\"pb.exe\"",
 		"CLIReleaseComponents",
 		"Directory Id=\"CLICURRENTSLOT\" Name=\"cli-current\"",
@@ -191,6 +235,9 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 		if !strings.Contains(string(wixSource), requiredText) {
 			t.Fatalf("WiX uninstall cleanup contract is missing %q", requiredText)
 		}
+	}
+	if strings.Contains(string(wixSource), "FileRef=\"RuntimeBinary\"") {
+		t.Fatal("WiX uninstall cleanup incorrectly invokes the runtime-role artifact")
 	}
 	workflowPath := filepath.Join(root, "..", "..", ".github", "workflows", "platform-qualification.yml")
 	workflow, err := os.ReadFile(workflowPath)
@@ -229,6 +276,8 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 		"PAPERBOAT_WINDOWS_E2E_S4U_FIXTURE",
 		"PAPERBOAT_WINDOWS_E2E_S4U_TEST",
 		"PAPERBOAT_WINDOWS_E2E_HOSTINSTALL_TEST",
+		"PAPERBOAT_WINDOWS_E2E_MSI_CLEANUP_TEST",
+		"-MsiCleanupTestExecutable",
 		"native_legacy_security_migration",
 		"native_s4u_dpapi",
 		"role_artifact_allowlist",
@@ -236,6 +285,28 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 		if !strings.Contains(string(releaseWorkflow), requiredText) {
 			t.Fatalf("release candidate qualification is missing %q", requiredText)
 		}
+	}
+}
+
+func TestQualificationRuntimeCurrentFixtureIsIsolatedBeforeMsi(t *testing.T) {
+	root := packagingWindowsRoot(t)
+	harnessBytes, err := os.ReadFile(filepath.Join(root, "scripts", "Invoke-NativeWindowsQualification.ps1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness := string(harnessBytes)
+	stage := strings.LastIndex(harness, "Stage-PreMsiRuntimeCurrentFixture")
+	preview := strings.Index(harness, "Invoke-NativeGoTests -RunPattern '^TestNativeDurablePreviewServiceLifecycle$'")
+	cleanup := strings.LastIndex(harness, "Remove-PreMsiRuntimeCurrentFixture")
+	msiPathFixtures := strings.LastIndex(harness, "Stage-MsiPathFixtures")
+	if stage < 0 || preview < 0 || cleanup < 0 || msiPathFixtures < 0 {
+		t.Fatal("native qualification harness is missing the RuntimeCurrent fixture lifecycle")
+	}
+	if stage >= preview || preview >= cleanup || cleanup >= msiPathFixtures {
+		t.Fatalf("RuntimeCurrent fixture is not isolated before MSI: stage=%d preview=%d cleanup=%d msi_path_fixtures=%d", stage, preview, cleanup, msiPathFixtures)
+	}
+	if !strings.Contains(harness, "preMsiRunPattern = '^(TestNativeSCMHostdAndUpdaterLifecycle|") {
+		t.Fatal("pre-MSI native test invocation is not explicitly disjoint from durable preview")
 	}
 }
 

@@ -30,6 +30,9 @@ param(
     [Parameter(Mandatory = $true)]
     [string] $HostinstallTestExecutable,
 
+    [Parameter(Mandatory = $true)]
+    [string] $MsiCleanupTestExecutable,
+
     [string] $NativeTestExecutable = '',
 
     [Parameter(Mandatory = $true)]
@@ -43,7 +46,15 @@ $script:events = @()
 $script:installedByHarness = $false
 $script:upgradeInstalled = $false
 $script:dynamicPreviewServiceName = $null
-$script:preexistingPaperboatSshd = $null
+$script:dynamicPreviewDescriptorPath = $null
+$script:runtimeCurrentFixtureCreated = $false
+$script:preMsiRuntimeCurrentFixtureCreated = $false
+$script:preMsiRuntimeCurrentPath = $null
+$script:preMsiRuntimeCurrentRoot = $null
+$script:preMsiRuntimeCurrentReleasesRoot = $null
+$script:preMsiRuntimeCurrentHash = $null
+$script:preMsiRuntimeCurrentStaged = $false
+$script:qualificationSID = $null
 $script:msiexec = Join-Path $env:SystemRoot 'System32\msiexec.exe'
 $script:installRoot = Join-Path ${env:ProgramFiles} 'Paperboat'
 $script:binaryRoot = Join-Path $script:installRoot 'bin'
@@ -58,6 +69,7 @@ $resolvedFixturePath = [IO.Path]::GetFullPath($ServiceFixturePath)
 $resolvedS4UFixturePath = [IO.Path]::GetFullPath($S4UFixturePath)
 $resolvedS4UTestExecutable = [IO.Path]::GetFullPath($S4UTestExecutable)
 $resolvedHostinstallTestExecutable = [IO.Path]::GetFullPath($HostinstallTestExecutable)
+$resolvedMsiCleanupTestExecutable = [IO.Path]::GetFullPath($MsiCleanupTestExecutable)
 $reportPath = Join-Path $resolvedOutputDirectory 'native-windows-qualification.json'
 
 function Add-QualificationEvent {
@@ -80,6 +92,125 @@ function Assert-Qualification {
     )
     if (-not $Condition) {
         throw "qualification_assertion_failed: $Message"
+    }
+}
+
+function Assert-QualificationRegularFile {
+    param([Parameter(Mandatory = $true)][string] $Path)
+    Assert-Qualification (Test-Path -LiteralPath $Path -PathType Leaf) "Qualification file is missing: $Path"
+    $item = Get-Item -Force -LiteralPath $Path
+    Assert-Qualification (-not $item.PSIsContainer) "Qualification file is a directory: $Path"
+    Assert-Qualification ((($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)) "Qualification file is a reparse point: $Path"
+}
+
+function Assert-InstalledMachineACL {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][bool] $Directory
+    )
+    Assert-Qualification (Test-Path -LiteralPath $Path) "Installed ACL target is missing: $Path"
+    $item = Get-Item -Force -LiteralPath $Path
+    Assert-Qualification ((($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)) "Installed ACL target is a reparse point: $Path"
+    Assert-Qualification ($Directory -eq $item.PSIsContainer) "Installed ACL target type is wrong: $Path"
+    $acl = Get-Acl -LiteralPath $Path
+    $systemSID = 'S-1-5-18'
+    $administratorsSID = 'S-1-5-32-544'
+    $usersSID = 'S-1-5-32-545'
+    $ownerSID = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    Assert-Qualification ($ownerSID -eq $systemSID) "Installed ACL owner is $ownerSID, expected LocalSystem: $Path"
+    Assert-Qualification ($acl.AreAccessRulesProtected) "Installed ACL inherits mutable parent permissions: $Path"
+    $rules = @($acl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))
+    Assert-Qualification ($rules.Count -eq 3) "Installed ACL has $($rules.Count) explicit rules, expected 3: $Path"
+    $expectedInheritance = if ($Directory) {
+        [Security.AccessControl.InheritanceFlags]::ObjectInherit -bor [Security.AccessControl.InheritanceFlags]::ContainerInherit
+    } else {
+        [Security.AccessControl.InheritanceFlags]::None
+    }
+    foreach ($expected in @(
+        @{ SID = $systemSID; Rights = [int64][Security.AccessControl.FileSystemRights]::FullControl },
+        @{ SID = $administratorsSID; Rights = [int64][Security.AccessControl.FileSystemRights]::FullControl },
+        @{ SID = $usersSID; Rights = [int64]0x1200a9 }
+    )) {
+        $matching = @($rules | Where-Object { $_.IdentityReference.Value -eq $expected.SID })
+        Assert-Qualification ($matching.Count -eq 1) "Installed ACL does not contain exactly one rule for $($expected.SID): $Path"
+        $rule = $matching[0]
+        Assert-Qualification ([int64]$rule.FileSystemRights -eq $expected.Rights) "Installed ACL rights for $($expected.SID) are $($rule.FileSystemRights): $Path"
+        Assert-Qualification ($rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow) "Installed ACL denies expected principal $($expected.SID): $Path"
+        Assert-Qualification ($rule.InheritanceFlags -eq $expectedInheritance) "Installed ACL inheritance flags for $($expected.SID) are $($rule.InheritanceFlags): $Path"
+        Assert-Qualification ($rule.PropagationFlags -eq [Security.AccessControl.PropagationFlags]::None) "Installed ACL propagation flags for $($expected.SID) are $($rule.PropagationFlags): $Path"
+    }
+}
+
+function Set-QualificationRuntimeCurrentACL {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][bool] $Directory,
+        [Parameter(Mandatory = $true)][string] $QualificationSID
+    )
+    Assert-Qualification (Test-Path -LiteralPath $Path) "Runtime-current ACL target is missing: $Path"
+    $item = Get-Item -Force -LiteralPath $Path
+    Assert-Qualification ($Directory -eq $item.PSIsContainer) "Runtime-current ACL target type is wrong: $Path"
+    $variableNames = @(
+        'PAPERBOAT_WINDOWS_E2E_ACL_PATH',
+        'PAPERBOAT_WINDOWS_E2E_ACL_DIRECTORY',
+        'PAPERBOAT_WINDOWS_E2E_ACL_SID'
+    )
+    $previous = @{}
+    foreach ($variableName in $variableNames) {
+        $previous[$variableName] = [Environment]::GetEnvironmentVariable($variableName, 'Process')
+    }
+    try {
+        $directoryValue = if ($Directory) { '1' } else { '0' }
+        [Environment]::SetEnvironmentVariable('PAPERBOAT_WINDOWS_E2E_ACL_PATH', $Path, 'Process')
+        [Environment]::SetEnvironmentVariable('PAPERBOAT_WINDOWS_E2E_ACL_DIRECTORY', $directoryValue, 'Process')
+        [Environment]::SetEnvironmentVariable('PAPERBOAT_WINDOWS_E2E_ACL_SID', $QualificationSID, 'Process')
+        $arguments = @('-test.v', '-test.run', '^TestNativeApplyQualificationRuntimeCurrentACL$', '-test.count', '1', '-test.timeout', '1m')
+        & $resolvedHostinstallTestExecutable @arguments
+        $exitCode = $LASTEXITCODE
+        Assert-Qualification ($exitCode -eq 0) "Native runtime-current ACL helper failed with exit code $exitCode."
+    }
+    finally {
+        foreach ($variableName in $variableNames) {
+            [Environment]::SetEnvironmentVariable($variableName, $previous[$variableName], 'Process')
+        }
+    }
+}
+
+function Assert-QualificationRuntimeCurrentACL {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][bool] $Directory,
+        [Parameter(Mandatory = $true)][string] $QualificationSID
+    )
+    Assert-Qualification (Test-Path -LiteralPath $Path) "Runtime-current ACL target is missing: $Path"
+    $item = Get-Item -Force -LiteralPath $Path
+    Assert-Qualification ((($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)) "Runtime-current ACL target is a reparse point: $Path"
+    Assert-Qualification ($Directory -eq $item.PSIsContainer) "Runtime-current ACL target type is wrong: $Path"
+    $acl = Get-Acl -LiteralPath $Path
+    $systemSID = 'S-1-5-18'
+    $administratorsSID = 'S-1-5-32-544'
+    Assert-Qualification ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -eq $systemSID) "Runtime-current ACL owner is not LocalSystem: $Path"
+    Assert-Qualification ($acl.AreAccessRulesProtected) "Runtime-current ACL inherits mutable parent permissions: $Path"
+    $rules = @($acl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))
+    Assert-Qualification ($rules.Count -eq 3) "Runtime-current ACL has $($rules.Count) explicit rules, expected 3: $Path"
+    $expectedInheritance = if ($Directory) {
+        [Security.AccessControl.InheritanceFlags]::ObjectInherit -bor [Security.AccessControl.InheritanceFlags]::ContainerInherit
+    }
+    else {
+        [Security.AccessControl.InheritanceFlags]::None
+    }
+    foreach ($expected in @(
+        @{ SID = $systemSID; Rights = [int64][Security.AccessControl.FileSystemRights]::FullControl },
+        @{ SID = $administratorsSID; Rights = [int64][Security.AccessControl.FileSystemRights]::FullControl },
+        @{ SID = $QualificationSID; Rights = [int64]0x1200a9 }
+    )) {
+        $matching = @($rules | Where-Object { $_.IdentityReference.Value -eq $expected.SID })
+        Assert-Qualification ($matching.Count -eq 1) "Runtime-current ACL does not contain exactly one rule for $($expected.SID): $Path"
+        $rule = $matching[0]
+        Assert-Qualification ([int64]$rule.FileSystemRights -eq $expected.Rights) "Runtime-current ACL rights for $($expected.SID) are $($rule.FileSystemRights): $Path"
+        Assert-Qualification ($rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow) "Runtime-current ACL denies expected principal $($expected.SID): $Path"
+        Assert-Qualification ($rule.InheritanceFlags -eq $expectedInheritance) "Runtime-current ACL inheritance flags for $($expected.SID) are $($rule.InheritanceFlags): $Path"
+        Assert-Qualification ($rule.PropagationFlags -eq [Security.AccessControl.PropagationFlags]::None) "Runtime-current ACL propagation flags for $($expected.SID) are $($rule.PropagationFlags): $Path"
     }
 }
 
@@ -359,6 +490,8 @@ function Assert-Preflight {
     Assert-Qualification ([IO.Path]::GetExtension($resolvedS4UTestExecutable) -ieq '.exe') "Windows S4U test executable must be an .exe."
     Assert-Qualification (Test-Path -LiteralPath $resolvedHostinstallTestExecutable -PathType Leaf) "Windows host-install qualification test executable is missing: $resolvedHostinstallTestExecutable"
     Assert-Qualification ([IO.Path]::GetExtension($resolvedHostinstallTestExecutable) -ieq '.exe') "Windows host-install qualification test executable must be an .exe."
+    Assert-Qualification (Test-Path -LiteralPath $resolvedMsiCleanupTestExecutable -PathType Leaf) "Windows MSI cleanup qualification test executable is missing: $resolvedMsiCleanupTestExecutable"
+    Assert-Qualification ([IO.Path]::GetExtension($resolvedMsiCleanupTestExecutable) -ieq '.exe') "Windows MSI cleanup qualification test executable must be an .exe."
     Assert-Qualification ([Environment]::Is64BitOperatingSystem) 'Qualification requires a 64-bit Windows operating system.'
     $nativeArchitecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
     $expectedArchitecture = if ($Architecture -eq 'amd64') { 'X64' } else { 'Arm64' }
@@ -366,6 +499,9 @@ function Assert-Preflight {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
     Assert-Qualification ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) 'Qualification must run with administrator rights.'
+    $script:qualificationSID = Get-QualificationSID $identity.User
+    Assert-Qualification (-not [string]::IsNullOrWhiteSpace($script:qualificationSID)) 'Qualification identity has no SID for runtime-current ACL validation.'
+    Assert-Qualification ($script:qualificationSID -notin @('S-1-5-18', 'S-1-5-32-544')) 'Qualification identity must be a non-trusted user SID for runtime-current ACL validation.'
     Assert-Qualification (@(Get-PaperboatServices).Count -eq 0) 'PaperboatHostd or PaperboatUpdated already exists; refusing to overwrite an unmanaged test state.'
     Assert-Qualification (@(Get-PaperboatPreviewServices).Count -eq 0) 'A PaperboatPreview-* service already exists; refusing to overwrite an unmanaged test state.'
     Assert-Qualification (@(Get-PaperboatPreviewDeclarations).Count -eq 0) 'A PaperboatPreview-* service declaration already exists; refusing to overwrite an unmanaged test state.'
@@ -375,7 +511,11 @@ function Assert-Preflight {
         $definitionPath = Join-Path $script:stateRoot "services\$definitionName"
         Assert-Qualification (-not (Test-Path -LiteralPath $definitionPath)) "$definitionPath already exists; refusing to overwrite an unmanaged service declaration."
     }
-    $script:preexistingPaperboatSshd = @(Get-CimInstance -ClassName Win32_Service -ErrorAction Stop | Where-Object { $_.Name -eq 'PaperboatSshd' } | Select-Object -First 1)
+    # The OpenSSH marker cannot distinguish a service that predates this MSI
+    # run from one installed by it. Refuse any pre-existing PaperboatSshd so
+    # cleanup never mutates an ambiguous owner.
+    $paperboatSshd = @(Get-CimInstance -ClassName Win32_Service -ErrorAction Stop | Where-Object { $_.Name -eq 'PaperboatSshd' })
+    Assert-Qualification ($paperboatSshd.Count -eq 0) 'PaperboatSshd already exists; refusing to run MSI qualification against an ambiguous service owner.'
     Add-QualificationEvent -Name 'preflight' -Status 'passed' -Detail "native_architecture=$nativeArchitecture; requested_architecture=$Architecture"
 }
 
@@ -411,9 +551,13 @@ function Assert-InstalledPayload {
         Assert-Qualification (Test-Path -LiteralPath $path -PathType Leaf) "Installed payload is missing $path."
     }
     $immutableReleaseRoot = Join-Path $script:installRoot "releases\versions\$ExpectedVersion"
+    $versionsRoot = Join-Path $script:installRoot 'releases\versions'
+    Assert-InstalledMachineACL -Path $versionsRoot -Directory $true
+    Assert-InstalledMachineACL -Path $immutableReleaseRoot -Directory $true
     foreach ($file in @('paperboat-runtime.exe', 'paperboat-hostd.exe', 'paperboat-updater.exe')) {
         $path = Join-Path $immutableReleaseRoot $file
         Assert-Qualification (Test-Path -LiteralPath $path -PathType Leaf) "Installed immutable payload is missing $path."
+        Assert-InstalledMachineACL -Path $path -Directory $false
     }
     foreach ($probe in @(
         @{ File = 'paperboat-runtime.exe'; Arguments = @('auth') },
@@ -463,36 +607,77 @@ function Assert-InstalledPayload {
         Assert-Qualification ($service.PathName -match [regex]::Escape((Join-Path $immutableReleaseRoot $expectedBinary))) "$($service.Name) does not point at its immutable installed binary: $($service.PathName)"
         Assert-Qualification ($service.PathName -match [regex]::Escape($expectedArgument)) "$($service.Name) is missing its fixed runtime argument: $($service.PathName)"
     }
+    Assert-PaperboatSshdAbsent -Phase "installed-$ExpectedVersion"
     Add-QualificationEvent -Name 'msi_payload_assertions' -Status 'passed' -Detail "version=$ExpectedVersion; services=PaperboatHostd,PaperboatUpdated; stable_launcher_version=true"
 }
 
+function Assert-PaperboatSshdAbsent {
+    param([Parameter(Mandatory = $true)][string] $Phase)
+    $current = @(Get-CimInstance -ClassName Win32_Service -ErrorAction Stop | Where-Object { $_.Name -eq 'PaperboatSshd' })
+    Assert-Qualification ($current.Count -eq 0) "PaperboatSshd appeared during MSI $Phase without an explicitly owned qualification fixture."
+    Add-QualificationEvent -Name 'openssh_isolation' -Status 'passed' -Detail "phase=$Phase; service_absent=true"
+}
+
 function New-OwnedPreviewCleanupFixture {
-    $name = 'PaperboatPreview-0123456789abcdef'
-    $definitionRoot = Join-Path $script:stateRoot 'services'
-    $definitionPath = Join-Path $definitionRoot ($name + '.json')
-    $previewStateRoot = Join-Path $script:stateRoot 'previews\msi-cleanup-fixture'
-    $descriptorPath = Join-Path $previewStateRoot 'descriptor.json'
-    New-Item -ItemType Directory -Force -Path $definitionRoot, $previewStateRoot | Out-Null
-    $arguments = @(
-        '__runtime-preview',
-        '--state-root', $previewStateRoot,
-        '--name', 'msi-cleanup-fixture',
-        '--descriptor', $descriptorPath,
-        '--service-definition', $definitionPath
-    )
+	$logicalName = 'msi-cleanup-fixture'
+	$hash = [Security.Cryptography.SHA256]::Create()
+	try {
+		$nameHash = (($hash.ComputeHash([Text.Encoding]::UTF8.GetBytes($logicalName)) | ForEach-Object { $_.ToString('x2') }) -join '')
+	}
+	finally {
+		$hash.Dispose()
+	}
+	$instance = $nameHash.Substring(0, 16)
+	$name = 'PaperboatPreview-' + $instance
+	$definitionRoot = Join-Path $script:stateRoot 'services'
+	$definitionPath = Join-Path $definitionRoot ($name + '.json')
+	$previewStateRoot = $script:stateRoot
+	$descriptorRoot = Join-Path $script:stateRoot 'previews\active'
+	$descriptorPath = Join-Path $descriptorRoot ($instance + '.json')
+	$runtimeCurrent = Join-Path $script:installRoot 'releases\runtime-current\paperboat-runtime.exe'
+	$runtimeSource = Join-Path $script:installRoot "releases\versions\$Version\paperboat-runtime.exe"
+	$runtimeCurrentRoot = Split-Path -Parent $runtimeCurrent
+	New-Item -ItemType Directory -Force -Path $definitionRoot, $descriptorRoot | Out-Null
+	New-Item -ItemType Directory -Force -Path $runtimeCurrentRoot | Out-Null
+    Copy-Item -LiteralPath $runtimeSource -Destination $runtimeCurrent -Force
+    Assert-Qualification (Test-Path -LiteralPath $runtimeCurrent -PathType Leaf) 'Runtime-current cleanup fixture was not created.'
+    Set-QualificationRuntimeCurrentACL -Path $runtimeCurrentRoot -Directory $true -QualificationSID $script:qualificationSID
+    Set-QualificationRuntimeCurrentACL -Path $runtimeCurrent -Directory $false -QualificationSID $script:qualificationSID
+    Assert-QualificationRuntimeCurrentACL -Path $runtimeCurrentRoot -Directory $true -QualificationSID $script:qualificationSID
+    Assert-QualificationRuntimeCurrentACL -Path $runtimeCurrent -Directory $false -QualificationSID $script:qualificationSID
+	$script:runtimeCurrentFixtureCreated = $true
+	$arguments = @(
+		'__runtime-preview',
+		'--state-root', $previewStateRoot,
+		'--name', $logicalName,
+		'--descriptor', $descriptorPath,
+		'--service-definition', $definitionPath,
+		'--port', '38123',
+		'--indefinite'
+	)
     $definition = [ordered]@{
         schema = 'paperboat.windows-service/v1'
         name = $name
         display_name = $name
         description = 'Paperboat MSI cleanup qualification fixture'
-        executable = (Join-Path $script:binaryRoot 'pb.exe')
+        executable = $runtimeCurrent
         arguments = $arguments
         environment = @{ PAPERBOAT_RUNTIME_SERVICE_SCOPE = 'system' }
         account = 'SYSTEM'
-    }
-    $utf8NoBom = New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $false
-    [IO.File]::WriteAllText($definitionPath, ($definition | ConvertTo-Json -Depth 10), $utf8NoBom)
-    $commandLine = (Quote-WindowsArgument $definition.executable) + ' ' + (($arguments | ForEach-Object { Quote-WindowsArgument $_ }) -join ' ')
+	}
+	$utf8NoBom = New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $false
+	[IO.File]::WriteAllText($definitionPath, ($definition | ConvertTo-Json -Depth 10), $utf8NoBom)
+	$descriptor = [ordered]@{
+		schema = 'paperboat.preview-runtime/v1'
+		name = $logicalName
+		bind_address = '127.0.0.1'
+		port = 38123
+		service_generation = [uint64]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
+		indefinite = $true
+		service_definition = $definitionPath
+	}
+	[IO.File]::WriteAllText($descriptorPath, ($descriptor | ConvertTo-Json -Depth 10), $utf8NoBom)
+	$commandLine = (Quote-WindowsArgument $definition.executable) + ' ' + (($arguments | ForEach-Object { Quote-WindowsArgument $_ }) -join ' ')
     New-Service `
         -Name $name `
         -BinaryPathName $commandLine `
@@ -500,10 +685,11 @@ function New-OwnedPreviewCleanupFixture {
         -Description 'Paperboat MSI cleanup qualification fixture' `
         -StartupType Manual `
         -ErrorAction Stop | Out-Null
-    $script:dynamicPreviewServiceName = $name
+	$script:dynamicPreviewServiceName = $name
+	$script:dynamicPreviewDescriptorPath = $descriptorPath
     $service = Get-CimInstance -ClassName Win32_Service -Filter "Name='$name'" -ErrorAction Stop
     Assert-Qualification ($null -ne $service) "Owned preview cleanup fixture $name was not registered with SCM."
-    Add-QualificationEvent -Name 'dynamic_preview_cleanup_fixture' -Status 'passed' -Detail "service=$name; state=stopped; definition=$definitionPath"
+	Add-QualificationEvent -Name 'dynamic_preview_cleanup_fixture' -Status 'passed' -Detail "logical_name=$logicalName; service=$name; state=stopped; definition=$definitionPath; descriptor=$descriptorPath; executable=$runtimeCurrent; runtime_file=$($script:runtimeCurrentFixtureCreated); runtime_acl=protected; policy=indefinite"
 }
 
 function Assert-OwnedPreviewCleanupFixturePresent {
@@ -512,7 +698,14 @@ function Assert-OwnedPreviewCleanupFixturePresent {
     }
     $service = Get-CimInstance -ClassName Win32_Service -Filter "Name='$($script:dynamicPreviewServiceName)'" -ErrorAction Stop
     Assert-Qualification ($null -ne $service) "Owned preview service $($script:dynamicPreviewServiceName) disappeared during upgrade."
-    Assert-Qualification (Test-Path -LiteralPath (Join-Path $script:stateRoot "services\$($script:dynamicPreviewServiceName).json") -PathType Leaf) 'Owned preview declaration disappeared during upgrade.'
+	Assert-Qualification (Test-Path -LiteralPath (Join-Path $script:stateRoot "services\$($script:dynamicPreviewServiceName).json") -PathType Leaf) 'Owned preview declaration disappeared during upgrade.'
+	Assert-Qualification (Test-Path -LiteralPath $script:dynamicPreviewDescriptorPath -PathType Leaf) 'Owned preview descriptor disappeared during upgrade.'
+    Assert-Qualification $script:runtimeCurrentFixtureCreated 'Runtime-current cleanup fixture was not recorded as created.'
+    $runtimeCurrent = Join-Path $script:installRoot 'releases\runtime-current\paperboat-runtime.exe'
+    $runtimeCurrentRoot = Split-Path -Parent $runtimeCurrent
+    Assert-Qualification (Test-Path -LiteralPath $runtimeCurrent -PathType Leaf) 'Runtime-current cleanup fixture disappeared during upgrade.'
+    Assert-QualificationRuntimeCurrentACL -Path $runtimeCurrentRoot -Directory $true -QualificationSID $script:qualificationSID
+    Assert-QualificationRuntimeCurrentACL -Path $runtimeCurrent -Directory $false -QualificationSID $script:qualificationSID
 }
 
 function Convert-ToMsiVersion {
@@ -526,9 +719,12 @@ function Assert-Uninstalled {
     Assert-Qualification ($services.Count -eq 0) "Paperboat SCM services remain after uninstall: $($services.Name -join ', ')."
     $previewServices = Get-PaperboatPreviewServices
     Assert-Qualification ($previewServices.Count -eq 0) "PaperboatPreview-* services remain after uninstall: $($previewServices.Name -join ', ')."
-    if (-not [string]::IsNullOrWhiteSpace($script:dynamicPreviewServiceName)) {
-        Assert-Qualification (-not (Test-Path -LiteralPath (Join-Path $script:stateRoot "services\$($script:dynamicPreviewServiceName).json"))) 'The owned preview service declaration remains after uninstall.'
-    }
+	if (-not [string]::IsNullOrWhiteSpace($script:dynamicPreviewServiceName)) {
+		Assert-Qualification (-not (Test-Path -LiteralPath (Join-Path $script:stateRoot "services\$($script:dynamicPreviewServiceName).json"))) 'The owned preview service declaration remains after uninstall.'
+	}
+	if (-not [string]::IsNullOrWhiteSpace($script:dynamicPreviewDescriptorPath)) {
+		Assert-Qualification (-not (Test-Path -LiteralPath $script:dynamicPreviewDescriptorPath)) 'The owned preview descriptor remains after uninstall.'
+	}
     Assert-Qualification (-not (Test-Path -LiteralPath $script:installRoot)) "Install root remains after uninstall: $($script:installRoot)"
     if (Test-Path -LiteralPath $script:registryPath) {
         $registry = Get-ItemProperty -LiteralPath $script:registryPath -ErrorAction Stop
@@ -540,19 +736,110 @@ function Assert-Uninstalled {
         })
         Assert-Qualification ($productFiles.Count -eq 0) 'Product binaries or provisioning metadata remain in ProgramData after uninstall.'
     }
-    $paperboatSshd = @(Get-CimInstance -ClassName Win32_Service -ErrorAction Stop | Where-Object { $_.Name -eq 'PaperboatSshd' })
-    if ($null -ne $script:preexistingPaperboatSshd -and $script:preexistingPaperboatSshd.Count -gt 0) {
-        Assert-Qualification ($paperboatSshd.Count -eq 1) 'Pre-existing PaperboatSshd was removed or duplicated by MSI uninstall.'
-        Assert-Qualification ($paperboatSshd[0].PathName -eq $script:preexistingPaperboatSshd[0].PathName) 'Pre-existing PaperboatSshd configuration changed during MSI uninstall.'
-    } else {
-        Assert-Qualification ($paperboatSshd.Count -eq 0) 'PaperboatSshd was left behind by MSI uninstall without a pre-existing service.'
-    }
+    Assert-PaperboatSshdAbsent -Phase 'uninstall'
     Assert-Qualification (@(Get-InstalledPaperboatProducts).Count -eq 0) 'An ARP Paperboat product entry remains after uninstall.'
     $machinePathEntries = @(Get-MachinePathEntries)
     $expectedPathEntry = ConvertTo-NormalizedMachinePathEntry $script:binaryRoot
     $paperboatPathEntryCount = @($machinePathEntries | Where-Object { $_ -ieq $expectedPathEntry }).Count
     Assert-Qualification ($paperboatPathEntryCount -eq 0) "Paperboat bin remains in the machine PATH after uninstall; found $paperboatPathEntryCount normalized entries for $expectedPathEntry."
-    Add-QualificationEvent -Name 'msi_uninstall_assertions' -Status 'passed' -Detail 'fixed services, dynamic preview services, PATH ownership, PaperboatSshd ownership preservation, binaries, product registry, ARP entry, and provisioning metadata were verified.'
+    Add-QualificationEvent -Name 'msi_uninstall_assertions' -Status 'passed' -Detail 'fixed services, dynamic preview services, PATH ownership, PaperboatSshd preflight absence, binaries, product registry, ARP entry, and provisioning metadata were verified.'
+}
+
+function Assert-PreMsiRuntimeCurrentFixtureIntegrity {
+    Assert-QualificationRegularFile -Path $script:preMsiRuntimeCurrentPath
+    $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $script:preMsiRuntimeCurrentPath).Hash.ToUpperInvariant()
+    Assert-Qualification ($actualHash -eq $script:preMsiRuntimeCurrentHash) "Pre-MSI runtime-current fixture hash differs from its trusted source: expected=$($script:preMsiRuntimeCurrentHash) actual=$actualHash"
+    foreach ($directory in @($script:installRoot, $script:preMsiRuntimeCurrentReleasesRoot, $script:preMsiRuntimeCurrentRoot)) {
+        Assert-Qualification (Test-Path -LiteralPath $directory -PathType Container) "Pre-MSI runtime-current ancestor is missing: $directory"
+        $item = Get-Item -Force -LiteralPath $directory
+        Assert-Qualification ((($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)) "Pre-MSI runtime-current ancestor is a reparse point: $directory"
+        Assert-QualificationRuntimeCurrentACL -Path $directory -Directory $true -QualificationSID $script:qualificationSID
+    }
+    Assert-QualificationRuntimeCurrentACL -Path $script:preMsiRuntimeCurrentPath -Directory $false -QualificationSID $script:qualificationSID
+}
+
+function Stage-PreMsiRuntimeCurrentFixture {
+    $runtimeCurrent = Join-Path $script:installRoot 'releases\runtime-current\paperboat-runtime.exe'
+    $runtimeCurrentRoot = Split-Path -Parent $runtimeCurrent
+    $releasesRoot = Split-Path -Parent $runtimeCurrentRoot
+    Assert-Qualification (-not (Test-Path -LiteralPath $script:installRoot)) "Cannot stage pre-MSI runtime-current fixture because install root already exists: $($script:installRoot)"
+    Assert-QualificationRegularFile -Path $resolvedFixturePath
+    $outputRootWithSeparator = $resolvedOutputDirectory.TrimEnd('\') + '\'
+    Assert-Qualification ($resolvedFixturePath.StartsWith($outputRootWithSeparator, [StringComparison]::OrdinalIgnoreCase)) "Runtime-current fixture must be the hash-bound native artifact under the qualification output root: $resolvedFixturePath"
+    Assert-Qualification (-not [String]::Equals($resolvedFixturePath, $runtimeCurrent, [StringComparison]::OrdinalIgnoreCase)) 'Runtime-current fixture source must not be the destination path.'
+    $sourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $resolvedFixturePath).Hash.ToUpperInvariant()
+
+    $script:preMsiRuntimeCurrentPath = $runtimeCurrent
+    $script:preMsiRuntimeCurrentRoot = $runtimeCurrentRoot
+    $script:preMsiRuntimeCurrentReleasesRoot = $releasesRoot
+    $script:preMsiRuntimeCurrentHash = $sourceHash
+    # Mark ownership before creating anything so the caller's finally block
+    # also cleans up a partially staged fixture, without ever recursing.
+    $script:preMsiRuntimeCurrentFixtureCreated = $true
+    New-Item -ItemType Directory -Force -Path $runtimeCurrentRoot | Out-Null
+    Copy-Item -LiteralPath $resolvedFixturePath -Destination $runtimeCurrent -Force
+    Assert-QualificationRegularFile -Path $runtimeCurrent
+    $destinationHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $runtimeCurrent).Hash.ToUpperInvariant()
+    Assert-Qualification ($destinationHash -eq $sourceHash) "Runtime-current fixture hash differs from its trusted source: source=$sourceHash destination=$destinationHash"
+    Set-QualificationRuntimeCurrentACL -Path $script:installRoot -Directory $true -QualificationSID $script:qualificationSID
+    Set-QualificationRuntimeCurrentACL -Path $releasesRoot -Directory $true -QualificationSID $script:qualificationSID
+    Set-QualificationRuntimeCurrentACL -Path $runtimeCurrentRoot -Directory $true -QualificationSID $script:qualificationSID
+    Set-QualificationRuntimeCurrentACL -Path $runtimeCurrent -Directory $false -QualificationSID $script:qualificationSID
+    Assert-PreMsiRuntimeCurrentFixtureIntegrity
+    $script:preMsiRuntimeCurrentStaged = $true
+    Add-QualificationEvent -Name 'native_runtime_current_fixture' -Status 'passed' -Detail "path=$runtimeCurrent; source=$resolvedFixturePath; sha256=$sourceHash; owner=SYSTEM; acl=protected"
+}
+
+function Remove-PreMsiRuntimeCurrentFixture {
+    if (-not $script:preMsiRuntimeCurrentFixtureCreated) {
+        return
+    }
+    $runtimeCurrent = $script:preMsiRuntimeCurrentPath
+    $runtimeCurrentRoot = $script:preMsiRuntimeCurrentRoot
+    $releasesRoot = $script:preMsiRuntimeCurrentReleasesRoot
+    Assert-Qualification (@(Get-PaperboatPreviewServices).Count -eq 0) 'Cannot remove the pre-MSI runtime-current fixture while a PaperboatPreview-* service remains.'
+    if (Test-Path -LiteralPath $runtimeCurrent) {
+        Assert-PreMsiRuntimeCurrentFixtureIntegrity
+        Remove-Item -LiteralPath $runtimeCurrent -Force
+        Assert-Qualification (-not (Test-Path -LiteralPath $runtimeCurrent)) "Pre-MSI runtime-current fixture remains after exact-file cleanup: $runtimeCurrent"
+    }
+    elseif ($script:preMsiRuntimeCurrentStaged) {
+        throw "qualification_assertion_failed: staged pre-MSI runtime-current fixture disappeared before cleanup: $runtimeCurrent"
+    }
+    foreach ($directory in @($runtimeCurrentRoot, $releasesRoot, $script:installRoot)) {
+        if (-not (Test-Path -LiteralPath $directory)) {
+            continue
+        }
+        $item = Get-Item -Force -LiteralPath $directory
+        Assert-Qualification ($item.PSIsContainer) "Pre-MSI runtime-current cleanup target is not a directory: $directory"
+        Assert-Qualification ((($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)) "Pre-MSI runtime-current cleanup target is a reparse point: $directory"
+        $children = @(Get-ChildItem -Force -LiteralPath $directory -ErrorAction Stop)
+        Assert-Qualification ($children.Count -eq 0) "Pre-MSI runtime-current cleanup found unexpected contents under $directory"
+        Remove-Item -LiteralPath $directory -Force
+        Assert-Qualification (-not (Test-Path -LiteralPath $directory)) "Pre-MSI runtime-current cleanup target remains: $directory"
+    }
+    Assert-Qualification (-not (Test-Path -LiteralPath $script:installRoot)) "Install root remains after pre-MSI runtime-current cleanup: $($script:installRoot)"
+    $script:preMsiRuntimeCurrentFixtureCreated = $false
+    $script:preMsiRuntimeCurrentStaged = $false
+    Add-QualificationEvent -Name 'native_runtime_current_fixture_cleanup' -Status 'passed' -Detail "path=$runtimeCurrent; exact_file=true; empty_directories=true; install_root_absent=true"
+}
+
+function Invoke-NativeGoTests {
+    param(
+        [Parameter(Mandatory = $true)][string] $RunPattern,
+        [Parameter(Mandatory = $true)][string] $Description,
+        [Parameter(Mandatory = $true)][string] $Timeout
+    )
+    if ($NativeTestExecutable -ne '') {
+        $resolvedNativeTestExecutable = [IO.Path]::GetFullPath($NativeTestExecutable)
+        Assert-Qualification (Test-Path -LiteralPath $resolvedNativeTestExecutable -PathType Leaf) "Native Windows qualification test executable is missing: $resolvedNativeTestExecutable"
+        $nativeTestArguments = @('-test.v', '-test.run', $RunPattern, '-test.count', '1', '-test.timeout', $Timeout)
+        & $resolvedNativeTestExecutable @nativeTestArguments
+    }
+    else {
+        & go test -count=1 -tags paperboat_native_e2e -v -run $RunPattern ./packaging/windows/e2e
+    }
+    Assert-Qualification ($LASTEXITCODE -eq 0) "Native Windows qualification Go tests failed for $Description with exit code $LASTEXITCODE."
 }
 
 function Invoke-GoQualification {
@@ -562,18 +849,27 @@ function Invoke-GoQualification {
     try {
         Push-Location $repositoryRoot
         try {
-            Add-QualificationEvent -Name 'native_go_e2e' -Status 'started' -Detail 'SCM hostd/updater, durable preview, and ConPTY tests'
-            if ($NativeTestExecutable -ne '') {
-                $resolvedNativeTestExecutable = [IO.Path]::GetFullPath($NativeTestExecutable)
-                Assert-Qualification (Test-Path -LiteralPath $resolvedNativeTestExecutable -PathType Leaf) "Native Windows qualification test executable is missing: $resolvedNativeTestExecutable"
-                $nativeTestArguments = @('-test.v', '-test.run', '^TestNative', '-test.count', '1', '-test.timeout', '5m')
-                & $resolvedNativeTestExecutable @nativeTestArguments
+            $preMsiRunPattern = '^(TestNativeSCMHostdAndUpdaterLifecycle|TestNativeConPTYPowerShell51|TestNativeConPTYPowerShell7|TestNativeConPTYCmd|TestNativeLongPathFilesystemLifecycle)$'
+            Add-QualificationEvent -Name 'native_go_e2e' -Status 'started' -Detail 'pre-MSI SCM hostd/updater, ConPTY, and long-path tests; durable preview is isolated on RuntimeCurrent'
+            Invoke-NativeGoTests -RunPattern $preMsiRunPattern -Description 'pre-MSI native tests' -Timeout '5m'
+            Add-QualificationEvent -Name 'native_go_e2e' -Status 'passed' -Detail 'pre-MSI SCM hostd/updater, ConPTY, and long-path tests'
+
+            try {
+                Stage-PreMsiRuntimeCurrentFixture
+                Assert-PreMsiRuntimeCurrentFixtureIntegrity
+                Add-QualificationEvent -Name 'native_go_preview_e2e' -Status 'started' -Detail 'durable preview service against hash-bound RuntimeCurrent fixture'
+                Invoke-NativeGoTests -RunPattern '^TestNativeDurablePreviewServiceLifecycle$' -Description 'durable preview RuntimeCurrent test' -Timeout '5m'
+                Add-QualificationEvent -Name 'native_go_preview_e2e' -Status 'passed' -Detail 'durable preview service against hash-bound RuntimeCurrent fixture'
             }
-            else {
-                & go test -count=1 -tags paperboat_native_e2e -v ./packaging/windows/e2e
+            finally {
+                Remove-PreMsiRuntimeCurrentFixture
             }
-            Assert-Qualification ($LASTEXITCODE -eq 0) "Native Windows qualification Go tests failed with exit code $LASTEXITCODE."
-            Add-QualificationEvent -Name 'native_go_e2e' -Status 'passed' -Detail 'SCM hostd/updater, durable preview, and ConPTY tests'
+
+            Add-QualificationEvent -Name 'native_msi_cleanup' -Status 'started' -Detail 'runtime-current PaperboatPreview ownership and bounded slot cleanup'
+			$cleanupArguments = @('-test.v', '-test.run', '^TestNativeMSIPreview', '-test.count', '1', '-test.timeout', '2m')
+			& $resolvedMsiCleanupTestExecutable @cleanupArguments
+			Assert-Qualification ($LASTEXITCODE -eq 0) "Native Windows MSI cleanup qualification failed with exit code $LASTEXITCODE."
+			Add-QualificationEvent -Name 'native_msi_cleanup' -Status 'passed' -Detail 'runtime-current service/declaration removal and ownership-conflict preservation cases passed'
         }
         finally {
             Pop-Location

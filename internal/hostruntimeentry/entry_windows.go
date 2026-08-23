@@ -48,6 +48,11 @@ type WindowsPreviewMutation struct {
 var ErrPreviewServiceMissing = hostruntime.ErrPreviewServiceMissing
 var ErrPreviewServiceFailed = hostruntime.ErrPreviewServiceFailed
 
+var (
+	loadWindowsPreviewRuntimeConfig = hostinstall.LoadWindowsRuntimeConfig
+	evalWindowsPreviewExecutable    = filepath.EvalSymlinks
+)
+
 func RunConfigWorker(ctx context.Context, config ConfigWorkerConfig) error {
 	return hostruntime.RunProductionConfigWorker(ctx, config)
 }
@@ -152,24 +157,41 @@ func ApplyWindowsPreviewMutation(ctx context.Context, request WindowsPreviewMuta
 	if !validWindowsPreviewMutationShape(request) {
 		return errors.New("invalid elevated Windows preview mutation")
 	}
-	install, err := hostinstall.LoadWindowsRuntimeConfig()
+	install, err := loadWindowsPreviewRuntimeConfig()
 	if err != nil || request.Root != install.StateRoot {
 		return errors.New("Windows preview mutation does not match the enrolled runtime")
 	}
-	layout, err := hostservice.DefaultLayout("windows")
-	if err != nil {
-		return err
-	}
-	executable, err := filepath.EvalSymlinks(layout.RuntimeCurrent)
-	if err != nil {
-		return err
-	}
+	var executable string
 	switch request.Kind {
 	case "preview":
+		layout, layoutErr := hostservice.DefaultLayout("windows")
+		if layoutErr != nil {
+			return layoutErr
+		}
+		executable, err = evalWindowsPreviewExecutable(layout.RuntimeCurrent)
+		if err != nil {
+			return err
+		}
 		_, err = hostruntime.InstallPreviewService(ctx, executable, request.Root, request.Name, request.Port, request.ExpiresAt, request.Indefinite)
 	case "private":
+		layout, layoutErr := hostservice.DefaultLayout("windows")
+		if layoutErr != nil {
+			return layoutErr
+		}
+		executable, err = evalWindowsPreviewExecutable(layout.RuntimeCurrent)
+		if err != nil {
+			return err
+		}
 		_, err = hostruntime.InstallPrivatePreviewService(ctx, executable, request.Root, request.Name, request.Remote, request.ExpiresAt, request.Indefinite, request.Maximum)
 	case "serve":
+		layout, layoutErr := hostservice.DefaultLayout("windows")
+		if layoutErr != nil {
+			return layoutErr
+		}
+		executable, err = evalWindowsPreviewExecutable(layout.RuntimeCurrent)
+		if err != nil {
+			return err
+		}
 		var source servepkg.Source
 		source, err = servepkg.ResolvePinnedSource(request.SourcePath, request.SourceKind, request.SourceID)
 		if err == nil {

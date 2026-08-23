@@ -35,9 +35,5 @@ func prepareAtomicDirectory(directory string) error {
 // with os.Open and calling Sync returns access denied, so there is no second
 // POSIX-style directory fsync to perform after declaration removal.
 func syncServiceDirectory(path string) error {
-	info, err := os.Lstat(path)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return ErrInvalidDefinition
-	}
-	return nil
+	return validateWindowsDirectoryNoReparse(path)
 }

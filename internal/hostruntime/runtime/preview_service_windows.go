@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/url"
@@ -79,6 +80,21 @@ func (*PreviewServiceFailureError) Unwrap() error { return ErrPreviewServiceFail
 
 var windowsPreviewLocks sync.Map
 
+// These seams keep orphan cleanup deterministic in unit tests while the
+// production implementation remains the native SCM/declaration path.
+var (
+	removeWindowsPreviewService            = hostservice.RemoveWindowsPreviewService
+	listWindowsPreviewServiceArtifacts     = hostservice.ListWindowsPreviewServiceArtifacts
+	validateWindowsPreviewServiceOwnership = hostservice.ValidateWindowsPreviewServiceOwnership
+)
+
+func lockWindowsPreviewStateRoot(root string) func() {
+	lockAny, _ := windowsPreviewLocks.LoadOrStore(root, &sync.Mutex{})
+	lock := lockAny.(*sync.Mutex)
+	lock.Lock()
+	return lock.Unlock
+}
+
 func previewDescriptorPath(root, name string) string {
 	sum := sha256.Sum256([]byte(name))
 	return filepath.Join(root, "previews", "active", hex.EncodeToString(sum[:8])+".json")
@@ -135,10 +151,11 @@ func installWindowsPreviewService(ctx context.Context, executable, root, name st
 	if ctx == nil || !filepath.IsAbs(executable) || !filepath.IsAbs(root) || name == "" || kinds != 1 || indefinite == (expires != nil) {
 		return PreviewRuntimeDescriptor{}, ErrProductionInvalid
 	}
-	lockAny, _ := windowsPreviewLocks.LoadOrStore(root, &sync.Mutex{})
-	lock := lockAny.(*sync.Mutex)
-	lock.Lock()
-	defer lock.Unlock()
+	layout, err := hostservice.DefaultLayout("windows")
+	if err != nil || !exactWindowsPreviewPath(executable, layout.RuntimeCurrent) {
+		return PreviewRuntimeDescriptor{}, errors.Join(ErrProductionInvalid, err)
+	}
+	defer lockWindowsPreviewStateRoot(root)()
 	if maximum > 0 {
 		active, err := activePrivatePreviewServices(root, time.Now().UTC())
 		if err != nil {
@@ -148,14 +165,20 @@ func installWindowsPreviewService(ctx context.Context, executable, root, name st
 			return PreviewRuntimeDescriptor{}, ErrPreviewAlreadyActive
 		}
 	}
+	if err := validateWindowsPreviewDirectoryPath(filepath.Join(root, "previews", "active"), true); err != nil {
+		return PreviewRuntimeDescriptor{}, err
+	}
 	path := previewDescriptorPath(root, name)
 	if current, err := readPreviewRuntimeDescriptor(path); err == nil && (current.Indefinite || current.ExpiresAt != nil && current.ExpiresAt.After(time.Now().UTC())) {
 		return PreviewRuntimeDescriptor{}, ErrPreviewAlreadyActive
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return PreviewRuntimeDescriptor{}, err
 	}
-	definition, _, err := previewServiceDefinition(root, name, runtime.GOOS)
+	definition, serviceName, err := previewServiceDefinition(root, name, runtime.GOOS)
 	if err != nil {
+		return PreviewRuntimeDescriptor{}, err
+	}
+	if err := hostservice.ValidateWindowsPreviewServiceOwnership(ctx, serviceName, root); err != nil {
 		return PreviewRuntimeDescriptor{}, err
 	}
 	descriptor := PreviewRuntimeDescriptor{Schema: "paperboat.preview-runtime/v1", Name: name, BindAddress: "127.0.0.1", Port: port, ServiceGeneration: uint64(time.Now().UTC().UnixNano()), Indefinite: indefinite, ExpiresAt: expires, ServiceDefinition: definition, Serve: served, PrivateRemote: remote}
@@ -177,18 +200,23 @@ func installWindowsPreviewService(ctx context.Context, executable, root, name st
 	}
 	installer, err := hostservice.New(hostservice.Config{Platform: "windows", Kind: hostservice.PreviewKind, Instance: previewServiceInstance(name), ConfigRoot: root, Executable: executable, User: "SYSTEM", Group: "Administrators", Arguments: args, Environment: map[string]string{"PAPERBOAT_RUNTIME_SERVICE_SCOPE": "system"}, Controller: hostservice.WindowsController{}})
 	if err != nil {
-		_ = os.Remove(path)
-		return PreviewRuntimeDescriptor{}, err
+		return PreviewRuntimeDescriptor{}, errors.Join(err, removeWindowsPreviewDescriptor(path))
 	}
 	if installer.DefinitionPath() != definition {
-		_ = os.Remove(path)
-		return PreviewRuntimeDescriptor{}, ErrProductionInvalid
+		return PreviewRuntimeDescriptor{}, errors.Join(ErrProductionInvalid, removeWindowsPreviewDescriptor(path))
 	}
 	if err := installer.Install(ctx); err != nil {
-		_ = os.Remove(path)
-		return PreviewRuntimeDescriptor{}, err
+		return PreviewRuntimeDescriptor{}, errors.Join(err, removeWindowsPreviewDescriptor(path))
 	}
 	return descriptor, nil
+}
+
+func removeWindowsPreviewDescriptor(path string) error {
+	err := os.Remove(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
 }
 func activePrivatePreviewServices(root string, now time.Time) (int, error) {
 	entries, err := os.ReadDir(filepath.Join(root, "previews", "active"))
@@ -217,80 +245,411 @@ func previewServiceDefinition(_ string, name, platform string) (string, string, 
 	instance := previewServiceInstance(name)
 	return filepath.Join(`C:\ProgramData\Paperboat\services`, "PaperboatPreview-"+instance+`.json`), "PaperboatPreview-" + instance, nil
 }
-func retirePreviewService(ctx context.Context, name, definition string, _ hostservice.Runner) error {
+func retirePreviewServiceWithRoot(ctx context.Context, root, name, definition string, _ hostservice.Runner) error {
 	expected, _, err := previewServiceDefinition("", name, "windows")
-	if err != nil || expected != definition {
-		return ErrProductionInvalid
+	if ctx == nil || !validWindowsPreviewStateRoot(root) || err != nil || !exactWindowsPreviewPath(expected, definition) {
+		return errors.Join(ErrProductionInvalid, err)
 	}
 	if os.Getenv("PAPERBOAT_WINDOWS_PREVIEW_OWNER_WORKLOAD") == "1" && os.Getenv("PAPERBOAT_RUNTIME_SERVICE_SCOPE") == "user" {
 		// The LocalSystem service parent owns SCM deletion after this enrolled
 		// owner child exits. The child may remove only its user-state descriptor.
 		return nil
 	}
-	installer, err := hostservice.New(hostservice.Config{Platform: "windows", Kind: hostservice.PreviewKind, Instance: previewServiceInstance(name), ConfigRoot: `C:\ProgramData\Paperboat`, Executable: os.Args[0], User: "SYSTEM", Group: "Administrators", Arguments: []string{"__runtime-preview"}, Controller: hostservice.WindowsController{}})
+	_, serviceName, err := previewServiceDefinition("", name, "windows")
+	if err != nil {
+		return errors.Join(ErrProductionInvalid, err)
+	}
+	return removeWindowsPreviewService(ctx, serviceName, root)
+}
+
+func exactWindowsPreviewPath(left, right string) bool {
+	return filepath.IsAbs(left) && filepath.IsAbs(right) && filepath.Clean(left) == left && filepath.Clean(right) == right && strings.EqualFold(left, right)
+}
+
+func validateWindowsPreviewDirectoryPath(path string, allowMissingTail bool) error {
+	if !filepath.IsAbs(path) {
+		return ErrProductionInvalid
+	}
+	current := filepath.Clean(path)
+	for {
+		info, err := os.Lstat(current)
+		if errors.Is(err, os.ErrNotExist) && allowMissingTail {
+			parent := filepath.Dir(current)
+			if parent == current {
+				return nil
+			}
+			current = parent
+			continue
+		}
+		if err != nil {
+			return errors.Join(ErrProductionInvalid, err)
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return ErrProductionInvalid
+		}
+		attributes, err := windows.GetFileAttributes(windows.StringToUTF16Ptr(current))
+		if err != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+			return errors.Join(ErrProductionInvalid, err)
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return nil
+		}
+		current = parent
+	}
+}
+
+func readWindowsPreviewActiveEntries(root string) ([]os.DirEntry, error) {
+	active := filepath.Join(root, "previews", "active")
+	if err := validateWindowsPreviewDirectoryPath(active, true); err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(active)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	return entries, err
+}
+
+func validateWindowsPreviewDescriptorAncestors(path string) error {
+	if !filepath.IsAbs(path) {
+		return ErrProductionInvalid
+	}
+	current := filepath.Dir(filepath.Clean(path))
+	for {
+		info, err := os.Lstat(current)
+		if err != nil {
+			return errors.Join(ErrProductionInvalid, err)
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return ErrProductionInvalid
+		}
+		attributes, err := windows.GetFileAttributes(windows.StringToUTF16Ptr(current))
+		if err != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+			return errors.Join(ErrProductionInvalid, err)
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return nil
+		}
+		current = parent
+	}
+}
+
+func validateWindowsPreviewDescriptorPath(path, root, name string) error {
+	if !exactWindowsPreviewPath(path, previewDescriptorPath(root, name)) {
+		return ErrProductionInvalid
+	}
+	return validateWindowsPreviewDescriptorAncestors(path)
+}
+
+func retireCompletedServeService(ctx context.Context, name, path, definition string, runner hostservice.Runner) error {
+	root, err := windowsPreviewStateRootFromDescriptorPath(path)
 	if err != nil {
 		return err
 	}
-	return installer.Uninstall(ctx)
+	return retireCompletedServeServiceWithRoot(ctx, root, name, path, definition, runner)
 }
-func retireCompletedServeService(ctx context.Context, name, path, definition string, runner hostservice.Runner) error {
-	if definition != "" {
-		if err := retirePreviewService(ctx, name, definition, runner); err != nil {
-			return err
-		}
+
+func retireCompletedServeServiceWithRoot(ctx context.Context, root, name, path, definition string, runner hostservice.Runner) error {
+	if ctx == nil || !validWindowsPreviewStateRoot(root) || name == "" || !filepath.IsAbs(path) || definition == "" {
+		return ErrProductionInvalid
+	}
+	if err := validatePlannedWindowsPreviewDescriptor(path, root, name, definition); err != nil {
+		return err
+	}
+	if err := retirePreviewServiceWithRoot(ctx, root, name, definition, runner); err != nil {
+		return err
+	}
+	if err := validatePlannedWindowsPreviewDescriptor(path, root, name, definition); err != nil {
+		return err
 	}
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return nil
 }
+
+func validatePlannedWindowsPreviewDescriptor(path, root, name, definition string) error {
+	if err := validateWindowsPreviewDescriptorPath(path, root, name); err != nil {
+		return err
+	}
+	descriptor, err := readPreviewRuntimeDescriptor(path)
+	if err != nil {
+		return errors.Join(ErrProductionInvalid, err)
+	}
+	if descriptor.Name != name || !exactWindowsPreviewPath(descriptor.ServiceDefinition, definition) {
+		return ErrProductionInvalid
+	}
+	return nil
+}
 func RemovePreviewService(ctx context.Context, root, name string) error {
-	d, err := readPreviewRuntimeDescriptor(previewDescriptorPath(root, name))
+	if ctx == nil || !validWindowsPreviewStateRoot(root) || name == "" {
+		return ErrProductionInvalid
+	}
+	defer lockWindowsPreviewStateRoot(root)()
+	path := previewDescriptorPath(root, name)
+	d, err := readPreviewRuntimeDescriptor(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil
+		_, serviceName, nameErr := previewServiceDefinition("", name, "windows")
+		if nameErr != nil {
+			return errors.Join(ErrProductionInvalid, nameErr)
+		}
+		return removeWindowsPreviewService(ctx, serviceName, root)
 	}
 	if err != nil || d.Name != name {
 		return errors.Join(ErrProductionInvalid, err)
 	}
-	return retireCompletedServeService(ctx, name, previewDescriptorPath(root, name), d.ServiceDefinition, hostservice.ExecRunner{})
+	return retireCompletedServeServiceWithRoot(ctx, root, name, path, d.ServiceDefinition, hostservice.ExecRunner{})
 }
-func RemoveAllPreviewServices(ctx context.Context, root string) error {
-	entries, err := os.ReadDir(filepath.Join(root, "previews", "active"))
-	if errors.Is(err, os.ErrNotExist) {
+
+type windowsPreviewCleanupPlan struct {
+	root             string
+	name             string
+	serviceName      string
+	descriptorPath   string
+	definition       string
+	removeDescriptor bool
+}
+
+func preflightWindowsPreviewDescriptor(root, path string, descriptor PreviewRuntimeDescriptor) (windowsPreviewCleanupPlan, error) {
+	if descriptor.Name == "" || descriptor.ServiceDefinition == "" {
+		return windowsPreviewCleanupPlan{}, ErrProductionInvalid
+	}
+	expectedDefinition, serviceName, err := previewServiceDefinition("", descriptor.Name, "windows")
+	if err != nil || !exactWindowsPreviewPath(path, previewDescriptorPath(root, descriptor.Name)) || !exactWindowsPreviewPath(descriptor.ServiceDefinition, expectedDefinition) {
+		return windowsPreviewCleanupPlan{}, errors.Join(ErrProductionInvalid, err)
+	}
+	return windowsPreviewCleanupPlan{
+		root: root, name: descriptor.Name, serviceName: serviceName,
+		descriptorPath: path, definition: descriptor.ServiceDefinition, removeDescriptor: true,
+	}, nil
+}
+
+func windowsPreviewArtifactMap(artifacts []hostservice.WindowsPreviewServiceArtifact) (map[string]hostservice.WindowsPreviewServiceArtifact, error) {
+	byName := make(map[string]hostservice.WindowsPreviewServiceArtifact, len(artifacts))
+	for _, artifact := range artifacts {
+		if !isWindowsPreviewArtifactName(artifact.Name) {
+			return nil, fmt.Errorf("invalid preview service artifact %q: %w", artifact.Name, ErrProductionInvalid)
+		}
+		key := strings.ToLower(artifact.Name)
+		if _, exists := byName[key]; exists {
+			return nil, fmt.Errorf("duplicate preview service artifact %q: %w", artifact.Name, ErrProductionInvalid)
+		}
+		byName[key] = artifact
+	}
+	return byName, nil
+}
+
+func isWindowsPreviewArtifactName(name string) bool {
+	if !strings.HasPrefix(name, "PaperboatPreview-") {
+		return false
+	}
+	instance := strings.TrimPrefix(name, "PaperboatPreview-")
+	if len(instance) != 16 {
+		return false
+	}
+	for _, character := range instance {
+		if character < '0' || character > '9' && character < 'a' || character > 'f' {
+			return false
+		}
+	}
+	return true
+}
+
+func preflightWindowsPreviewArtifact(ctx context.Context, root string, artifact hostservice.WindowsPreviewServiceArtifact) (windowsPreviewCleanupPlan, error) {
+	if !artifact.HasDeclaration {
+		if artifact.HasService {
+			return windowsPreviewCleanupPlan{}, fmt.Errorf("preview service %s has no declaration: %w", artifact.Name, ErrProductionInvalid)
+		}
+		return windowsPreviewCleanupPlan{}, nil
+	}
+	if !validWindowsPreviewStateRoot(artifact.DeclarationRoot) || !strings.EqualFold(filepath.Clean(artifact.DeclarationRoot), filepath.Clean(root)) {
+		return windowsPreviewCleanupPlan{}, nil
+	}
+	if err := validateWindowsPreviewServiceOwnership(ctx, artifact.Name, root); err != nil {
+		return windowsPreviewCleanupPlan{}, err
+	}
+	return windowsPreviewCleanupPlan{root: root, name: artifact.Name, serviceName: artifact.Name}, nil
+}
+
+func validateWindowsPreviewArtifactForDescriptor(artifact hostservice.WindowsPreviewServiceArtifact, root string) error {
+	if !artifact.HasDeclaration && artifact.HasService {
+		return fmt.Errorf("preview service %s has no declaration: %w", artifact.Name, ErrProductionInvalid)
+	}
+	if artifact.HasDeclaration && (!validWindowsPreviewStateRoot(artifact.DeclarationRoot) || !strings.EqualFold(filepath.Clean(artifact.DeclarationRoot), filepath.Clean(root))) {
+		return fmt.Errorf("preview service %s has a conflicting declaration root: %w", artifact.Name, ErrProductionInvalid)
+	}
+	if !artifact.HasDeclaration && !artifact.HasService {
+		return fmt.Errorf("preview service %s has no ownership artifact: %w", artifact.Name, ErrProductionInvalid)
+	}
+	return nil
+}
+
+func applyWindowsPreviewCleanupPlan(ctx context.Context, plan windowsPreviewCleanupPlan) error {
+	if plan.removeDescriptor {
+		if err := retireCompletedServeServiceWithRoot(ctx, plan.root, plan.name, plan.descriptorPath, plan.definition, hostservice.ExecRunner{}); err != nil {
+			return err
+		}
 		return nil
 	}
+	return removeWindowsPreviewService(ctx, plan.serviceName, plan.root)
+}
+
+func RemoveAllPreviewServices(ctx context.Context, root string) error {
+	if ctx == nil || !validWindowsPreviewStateRoot(root) {
+		return ErrProductionInvalid
+	}
+	defer lockWindowsPreviewStateRoot(root)()
+	artifacts, err := listWindowsPreviewServiceArtifacts()
 	if err != nil {
 		return err
 	}
-	var result error
+	artifactByName, err := windowsPreviewArtifactMap(artifacts)
+	if err != nil {
+		return err
+	}
+	entries, err := readWindowsPreviewActiveEntries(root)
+	if err != nil {
+		return err
+	}
+	var preflightErr error
+	plans := make([]windowsPreviewCleanupPlan, 0, len(entries)+len(artifacts))
+	ownedArtifacts := make(map[string]bool, len(entries))
 	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+		if entry.IsDir() {
+			if strings.EqualFold(filepath.Ext(entry.Name()), ".json") {
+				preflightErr = errors.Join(preflightErr, fmt.Errorf("preview descriptor %s is a directory: %w", entry.Name(), ErrProductionInvalid))
+			}
 			continue
 		}
-		d, e := readPreviewRuntimeDescriptor(filepath.Join(root, "previews", "active", entry.Name()))
-		if e == nil && d.ServiceDefinition != "" {
-			result = errors.Join(result, retireCompletedServeService(ctx, d.Name, filepath.Join(root, "previews", "active", entry.Name()), d.ServiceDefinition, hostservice.ExecRunner{}))
+		if !strings.EqualFold(filepath.Ext(entry.Name()), ".json") {
+			continue
+		}
+		path := filepath.Join(root, "previews", "active", entry.Name())
+		d, e := readPreviewRuntimeDescriptor(path)
+		if e != nil {
+			preflightErr = errors.Join(preflightErr, fmt.Errorf("read preview service %s: %w", entry.Name(), e))
+			continue
+		}
+		plan, e := preflightWindowsPreviewDescriptor(root, path, d)
+		if e != nil {
+			preflightErr = errors.Join(preflightErr, fmt.Errorf("validate preview service %s: %w", entry.Name(), e))
+			continue
+		}
+		artifact, ok := artifactByName[strings.ToLower(plan.serviceName)]
+		if !ok {
+			preflightErr = errors.Join(preflightErr, fmt.Errorf("preview service %s has no ownership artifact: %w", plan.serviceName, ErrProductionInvalid))
+			continue
+		}
+		if e := validateWindowsPreviewArtifactForDescriptor(artifact, root); e != nil {
+			preflightErr = errors.Join(preflightErr, e)
+			continue
+		}
+		if e := validateWindowsPreviewServiceOwnership(ctx, plan.serviceName, root); e != nil {
+			preflightErr = errors.Join(preflightErr, fmt.Errorf("validate preview service %s ownership: %w", plan.serviceName, e))
+			continue
+		}
+		ownedArtifacts[strings.ToLower(plan.serviceName)] = true
+		plans = append(plans, plan)
+	}
+	for _, artifact := range artifacts {
+		key := strings.ToLower(artifact.Name)
+		if ownedArtifacts[key] {
+			continue
+		}
+		plan, e := preflightWindowsPreviewArtifact(ctx, root, artifact)
+		if e != nil {
+			preflightErr = errors.Join(preflightErr, fmt.Errorf("validate preview artifact %s: %w", artifact.Name, e))
+			continue
+		}
+		if plan.serviceName != "" {
+			plans = append(plans, plan)
 		}
 	}
-	return result
+	if preflightErr != nil {
+		// Every service, declaration, and descriptor is checked before the first
+		// mutation. A later ownership conflict therefore cannot leave a partial
+		// uninstall behind.
+		return preflightErr
+	}
+	for _, plan := range plans {
+		if err := applyWindowsPreviewCleanupPlan(ctx, plan); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 func ReconcileExpiredPreviewServices(ctx context.Context, root string, now time.Time) error {
-	entries, err := os.ReadDir(filepath.Join(root, "previews", "active"))
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
+	if ctx == nil || !validWindowsPreviewStateRoot(root) || now.IsZero() {
+		return ErrProductionInvalid
 	}
+	defer lockWindowsPreviewStateRoot(root)()
+	entries, err := readWindowsPreviewActiveEntries(root)
 	if err != nil {
 		return err
 	}
-	var result error
+	if len(entries) == 0 {
+		return nil
+	}
+	artifacts, err := listWindowsPreviewServiceArtifacts()
+	if err != nil {
+		return err
+	}
+	artifactByName, err := windowsPreviewArtifactMap(artifacts)
+	if err != nil {
+		return err
+	}
+	var preflightErr error
+	plans := make([]windowsPreviewCleanupPlan, 0, len(entries))
 	for _, entry := range entries {
+		if entry.IsDir() {
+			if strings.EqualFold(filepath.Ext(entry.Name()), ".json") {
+				preflightErr = errors.Join(preflightErr, fmt.Errorf("preview descriptor %s is a directory: %w", entry.Name(), ErrProductionInvalid))
+			}
+			continue
+		}
+		if !strings.EqualFold(filepath.Ext(entry.Name()), ".json") {
+			continue
+		}
 		path := filepath.Join(root, "previews", "active", entry.Name())
 		d, e := readPreviewRuntimeDescriptor(path)
-		if e == nil && !d.Indefinite && d.ExpiresAt != nil && !d.ExpiresAt.After(now) {
-			result = errors.Join(result, retireCompletedServeService(ctx, d.Name, path, d.ServiceDefinition, hostservice.ExecRunner{}))
+		if e != nil {
+			preflightErr = errors.Join(preflightErr, fmt.Errorf("read preview service %s: %w", entry.Name(), e))
+			continue
+		}
+		plan, e := preflightWindowsPreviewDescriptor(root, path, d)
+		if e != nil {
+			preflightErr = errors.Join(preflightErr, fmt.Errorf("validate preview service %s: %w", entry.Name(), e))
+			continue
+		}
+		if d.Indefinite || d.ExpiresAt == nil || d.ExpiresAt.After(now) {
+			continue
+		}
+		artifact, ok := artifactByName[strings.ToLower(plan.serviceName)]
+		if !ok {
+			preflightErr = errors.Join(preflightErr, fmt.Errorf("expired preview service %s has no ownership artifact: %w", plan.serviceName, ErrProductionInvalid))
+			continue
+		}
+		if e := validateWindowsPreviewArtifactForDescriptor(artifact, root); e != nil {
+			preflightErr = errors.Join(preflightErr, e)
+			continue
+		}
+		if e := validateWindowsPreviewServiceOwnership(ctx, plan.serviceName, root); e != nil {
+			preflightErr = errors.Join(preflightErr, fmt.Errorf("validate expired preview service %s ownership: %w", plan.serviceName, e))
+			continue
+		}
+		plans = append(plans, plan)
+	}
+	if preflightErr != nil {
+		return preflightErr
+	}
+	for _, plan := range plans {
+		if err := applyWindowsPreviewCleanupPlan(ctx, plan); err != nil {
+			return err
 		}
 	}
-	return result
+	return nil
 }
 func WaitPreviewServiceReady(ctx context.Context, root, name string) (preview.ControlRecord, error) {
 	path := previewDescriptorPath(root, name)
@@ -364,13 +723,41 @@ func MarkPrivatePreviewServiceFailed(root, name string, cause error) error {
 	})
 }
 func CompletePrivatePreviewService(ctx context.Context, root, name string) error {
-	d, err := readPreviewRuntimeDescriptor(previewDescriptorPath(root, name))
-	if err != nil || d.PrivateRemote == nil {
+	if ctx == nil || !validWindowsPreviewStateRoot(root) || name == "" {
+		return ErrProductionInvalid
+	}
+	defer lockWindowsPreviewStateRoot(root)()
+	path := previewDescriptorPath(root, name)
+	d, err := readPreviewRuntimeDescriptor(path)
+	if err != nil || d.Name != name || d.PrivateRemote == nil {
 		return errors.Join(ErrProductionInvalid, err)
 	}
-	return retireCompletedServeService(ctx, name, previewDescriptorPath(root, name), d.ServiceDefinition, hostservice.ExecRunner{})
+	return retireCompletedServeServiceWithRoot(ctx, root, name, path, d.ServiceDefinition, hostservice.ExecRunner{})
+}
+
+func validWindowsPreviewStateRoot(path string) bool {
+	return filepath.IsAbs(path) && filepath.Clean(path) == path && filepath.VolumeName(path) != ""
+}
+
+func windowsPreviewStateRootFromDescriptorPath(path string) (string, error) {
+	if !filepath.IsAbs(path) {
+		return "", ErrProductionInvalid
+	}
+	active := filepath.Dir(path)
+	if filepath.Base(active) != "active" || filepath.Base(filepath.Dir(active)) != "previews" {
+		return "", ErrProductionInvalid
+	}
+	root := filepath.Dir(filepath.Dir(active))
+	if !validWindowsPreviewStateRoot(root) {
+		return "", ErrProductionInvalid
+	}
+	return root, nil
 }
 func mutatePrivate(root, name string, mutate func(*PreviewRuntimeDescriptor) error) error {
+	if !validWindowsPreviewStateRoot(root) || name == "" || mutate == nil {
+		return ErrProductionInvalid
+	}
+	defer lockWindowsPreviewStateRoot(root)()
 	path := previewDescriptorPath(root, name)
 	d, err := readPreviewRuntimeDescriptor(path)
 	if err != nil || d.Name != name || d.PrivateRemote == nil {
@@ -440,6 +827,9 @@ func previewDescriptorSDDL(path string) (string, error) {
 }
 
 func validatePreviewDescriptorSecurity(path string) error {
+	if err := validateWindowsPreviewDescriptorAncestors(path); err != nil {
+		return err
+	}
 	info, err := os.Lstat(path)
 	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 		return errors.Join(ErrProductionInvalid, err)

@@ -496,6 +496,7 @@ jobs:
             -S4UFixturePath $env:PAPERBOAT_WINDOWS_E2E_S4U_FIXTURE `
             -S4UTestExecutable $env:PAPERBOAT_WINDOWS_E2E_S4U_TEST `
             -HostinstallTestExecutable $env:PAPERBOAT_WINDOWS_E2E_HOSTINSTALL_TEST `
+            -MsiCleanupTestExecutable $env:PAPERBOAT_WINDOWS_E2E_MSI_CLEANUP_TEST `
             -OutputDirectory $env:PAPERBOAT_WINDOWS_E2E_OUTPUT
           if ($LASTEXITCODE -ne 0) { throw 'Full native Windows MSI qualification failed.' }
       - name: Require passed native Windows qualification report
@@ -515,7 +516,7 @@ jobs:
           if ($upgradeDate -lt $releaseDate -or ($upgradeDate -eq $releaseDate -and [int]$upgradeParts[3] -le [int]$releaseParts[3])) {
             throw "Upgrade fixture version $env:PAPERBOAT_WINDOWS_UPGRADE_VERSION is not greater than release $env:RELEASE_VERSION."
           }
-          $requiredEvents = @('preflight', 'native_s4u_dpapi', 'native_legacy_security_migration', 'native_go_e2e', 'msi_path_fixtures', 'role_artifact_allowlist', 'msiexec_fresh_install', 'msi_repair_assertions', 'dynamic_preview_cleanup_fixture', 'msiexec_upgrade', 'msi_upgrade_assertions', 'msiexec_uninstall', 'msi_uninstall_assertions', 'msiexec_reinstall', 'msi_reinstall_assertions', 'msiexec_reinstall_uninstall')
+          $requiredEvents = @('preflight', 'native_s4u_dpapi', 'native_legacy_security_migration', 'native_go_e2e', 'native_msi_cleanup', 'openssh_isolation', 'msi_path_fixtures', 'role_artifact_allowlist', 'msiexec_fresh_install', 'msi_repair_assertions', 'dynamic_preview_cleanup_fixture', 'msiexec_upgrade', 'msi_upgrade_assertions', 'msiexec_uninstall', 'msi_uninstall_assertions', 'msiexec_reinstall', 'msi_reinstall_assertions', 'msiexec_reinstall_uninstall')
           if ($report.schema -ne 'paperboat.windows-native-qualification-report/v1' -or
               $report.platform -ne 'windows' -or
               $report.architecture -ne $env:PAPERBOAT_ARCH -or

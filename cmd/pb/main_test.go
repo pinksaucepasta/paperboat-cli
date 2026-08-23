@@ -135,7 +135,7 @@ func TestWindowsArtifactCommandAllowlist(t *testing.T) {
 	tests := []struct {
 		role, command string
 		want          bool
-	}{{"cli", "auth", true}, {"runtime", "__runtime-worker", true}, {"runtime", "auth", false}, {"hostd", "__runtime-hostd", true}, {"hostd", "__runtime-updated", false}, {"updater", "__runtime-updated", true}, {"updater", "__runtime-activate", true}, {"updater", "__runtime-worker", false}, {"unknown", "__runtime-hostd", false}}
+	}{{"cli", "auth", true}, {"cli", "__msi-cleanup", true}, {"runtime", "__runtime-worker", true}, {"runtime", "auth", false}, {"runtime", "__msi-cleanup", false}, {"hostd", "__runtime-hostd", true}, {"hostd", "__runtime-updated", false}, {"updater", "__runtime-updated", true}, {"updater", "__runtime-activate", true}, {"updater", "__runtime-worker", false}, {"unknown", "__runtime-hostd", false}}
 	for _, test := range tests {
 		if got := windowsArtifactCommandAllowed(test.role, []string{test.command}); got != test.want {
 			t.Fatalf("role=%q command=%q got=%v want=%v", test.role, test.command, got, test.want)

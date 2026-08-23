@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -39,6 +40,12 @@ func RunProductionServeWorker(ctx context.Context, config ProductionServeWorkerC
 	if ctx == nil || !filepath.IsAbs(config.StateRoot) || config.Name == "" || !filepath.IsAbs(config.DescriptorPath) ||
 		config.ServiceDefinition != "" && !filepath.IsAbs(config.ServiceDefinition) || config.Indefinite == (config.ExpiresAt != nil) {
 		return ErrProductionInvalid
+	}
+	if runtime.GOOS == "windows" {
+		expectedDescriptorPath := filepath.Join(config.StateRoot, "previews", "active", previewServiceInstance(config.Name)+".json")
+		if filepath.Clean(config.DescriptorPath) != config.DescriptorPath || !strings.EqualFold(config.DescriptorPath, expectedDescriptorPath) {
+			return ErrProductionInvalid
+		}
 	}
 	descriptor, err := readPreviewRuntimeDescriptor(config.DescriptorPath)
 	if err != nil || descriptor.Schema != "paperboat.preview-runtime/v1" || descriptor.Name != config.Name ||
@@ -75,7 +82,9 @@ func RunProductionServeWorker(ctx context.Context, config ProductionServeWorkerC
 	if config.ExpiresAt != nil {
 		duration = time.Until(config.ExpiresAt.UTC())
 		if duration <= 0 {
-			_ = os.Remove(config.DescriptorPath)
+			if err := os.Remove(config.DescriptorPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
 			return nil
 		}
 	}
@@ -142,6 +151,12 @@ func RunProductionServeWorker(ctx context.Context, config ProductionServeWorkerC
 }
 
 func reconcileInvalidServeSource(ctx context.Context, config ProductionServeWorkerConfig, public bool) error {
+	if runtime.GOOS == "windows" {
+		expectedDescriptorPath := filepath.Join(config.StateRoot, "previews", "active", previewServiceInstance(config.Name)+".json")
+		if filepath.Clean(config.DescriptorPath) != config.DescriptorPath || !strings.EqualFold(config.DescriptorPath, expectedDescriptorPath) {
+			return ErrProductionInvalid
+		}
+	}
 	if public {
 		if err := revokeProductionPreviewByName(ctx, config.ControlURL, config.StateRoot, config.Name, config.Transport); err != nil {
 			return err
@@ -152,7 +167,7 @@ func reconcileInvalidServeSource(ctx context.Context, config ProductionServeWork
 		runner = hostservice.ExecRunner{}
 	}
 	if config.ServiceDefinition != "" {
-		if err := retirePreviewService(ctx, config.Name, config.ServiceDefinition, runner); err != nil {
+		if err := retirePreviewServiceWithRoot(ctx, config.StateRoot, config.Name, config.ServiceDefinition, runner); err != nil {
 			return err
 		}
 	}

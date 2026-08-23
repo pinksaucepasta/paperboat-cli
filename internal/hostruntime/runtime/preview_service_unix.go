@@ -330,6 +330,10 @@ func retirePreviewService(ctx context.Context, name, definition string, runner h
 	return errors.Join(removeErr, (hostservice.LaunchdController{Runner: runner, UID: uid, Label: label, UserDomain: true}).Remove(ctx, definition))
 }
 
+func retirePreviewServiceWithRoot(ctx context.Context, _ string, name, definition string, runner hostservice.Runner) error {
+	return retirePreviewService(ctx, name, definition, runner)
+}
+
 func retireCompletedServeService(ctx context.Context, name, descriptorPath, definition string, runner hostservice.Runner) error {
 	if ctx == nil || name == "" || !filepath.IsAbs(descriptorPath) || definition != "" && !filepath.IsAbs(definition) {
 		return ErrProductionInvalid

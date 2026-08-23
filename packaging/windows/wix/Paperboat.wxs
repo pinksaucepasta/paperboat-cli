@@ -78,7 +78,7 @@
     -->
     <CustomAction
         Id="CleanupPaperboatDynamicServices"
-        FileRef="RuntimeBinary"
+        FileRef="CLICurrentSeedBinary"
         ExeCommand="__msi-cleanup --full-uninstall"
         Execute="deferred"
         Impersonate="no"
@@ -133,11 +133,25 @@
 
   <Fragment>
     <ComponentGroup Id="ServiceComponents" Directory="ACTIVERELEASE">
+      <Component Id="ReleaseVersionsSecurityComponent" Directory="VERSIONS" Guid="{5F72FCD4-1D71-44D3-8D42-0D19CD0F44A4}">
+        <CreateFolder>
+          <PermissionEx Sddl="O:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)" />
+        </CreateFolder>
+      </Component>
+      <Component Id="ActiveReleaseSecurityComponent" Guid="{5F72FCD4-1D71-44D3-8D42-0D19CD0F44A5}">
+        <CreateFolder>
+          <PermissionEx Sddl="O:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)" />
+        </CreateFolder>
+      </Component>
       <Component Id="RuntimeComponent" Guid="{5F72FCD4-1D71-44D3-8D42-0D19CD0F44A1}">
-        <File Id="RuntimeBinary" Source="$(var.StagingDir)\paperboat-runtime.exe" KeyPath="yes" Vital="yes" />
+        <File Id="RuntimeBinary" Source="$(var.StagingDir)\paperboat-runtime.exe" KeyPath="yes" Vital="yes">
+          <PermissionEx Sddl="O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)" />
+        </File>
       </Component>
       <Component Id="HostSupervisorServiceComponent" Guid="{614E6D9D-4014-44DA-B6FD-3D1CC018E6A2}">
-        <File Id="HostSupervisorBinary" Source="$(var.StagingDir)\paperboat-hostd.exe" KeyPath="yes" Vital="yes" />
+        <File Id="HostSupervisorBinary" Source="$(var.StagingDir)\paperboat-hostd.exe" KeyPath="yes" Vital="yes">
+          <PermissionEx Sddl="O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)" />
+        </File>
         <ServiceInstall
             Id="HostSupervisorServiceInstall"
             Name="PaperboatHostd"
@@ -156,7 +170,9 @@
             Wait="yes" />
       </Component>
       <Component Id="UpdaterServiceComponent" Guid="{A781783F-740B-45B9-AEC9-281BF52ABF39}">
-        <File Id="UpdaterBinary" Source="$(var.StagingDir)\paperboat-updater.exe" KeyPath="yes" Vital="yes" />
+        <File Id="UpdaterBinary" Source="$(var.StagingDir)\paperboat-updater.exe" KeyPath="yes" Vital="yes">
+          <PermissionEx Sddl="O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)" />
+        </File>
         <ServiceInstall
             Id="UpdaterServiceInstall"
             Name="PaperboatUpdated"

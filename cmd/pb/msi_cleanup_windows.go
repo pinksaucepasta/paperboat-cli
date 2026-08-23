@@ -4,12 +4,15 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -30,11 +33,22 @@ const (
 	msiPaperboatPrivatePreview      = "__runtime-private-preview"
 )
 
-var errMSIServiceOwnership = errors.New("paperboat_msi_service_ownership_conflict")
+var (
+	errMSIServiceOwnership = errors.New("paperboat_msi_service_ownership_conflict")
+	errMSIPreviewOwnership = errors.New("paperboat_msi_preview_ownership_conflict")
+	errMSIRuntimeResidue   = errors.New("paperboat_msi_runtime_residue")
+
+	msiGetFileAttributes     = windows.GetFileAttributes
+	msiServiceAbsenceTimeout = 30 * time.Second
+	msiServicePollInterval   = 100 * time.Millisecond
+)
 
 type msiCleanupPaths struct {
 	InstallRoot      string
 	BinaryRoot       string
+	RuntimeCurrent   string
+	RuntimeRollback  string
+	RuntimeStaged    string
 	StateRoot        string
 	ServiceRoot      string
 	OpenSSHRoot      string
@@ -83,14 +97,291 @@ func runMSIFullUninstallCleanup(ctx context.Context, output io.Writer) error {
 	if err != nil {
 		return err
 	}
+	return runMSIFullUninstallCleanupWithPaths(ctx, paths, output)
+}
 
+func runMSIFullUninstallCleanupWithPaths(ctx context.Context, paths msiCleanupPaths, output io.Writer) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// Runtime slot ownership must be proved before any SCM, declaration, or
+	// descriptor mutation. This also makes a missing runtime executable safe:
+	// its exact slot and all existing ancestors are still validated.
+	if err := preflightMSIRuntimeSlots(paths); err != nil {
+		return fmt.Errorf("preflight Paperboat runtime slots: %w", err)
+	}
 	if err := removePaperboatPreviewServices(ctx, paths, output); err != nil {
 		return fmt.Errorf("remove Paperboat dynamic services: %w", err)
 	}
 	if err := removePaperboatOpenSSHState(ctx, paths, output); err != nil {
 		return fmt.Errorf("remove Paperboat OpenSSH state: %w", err)
 	}
+	if err := removePaperboatRuntimeSlots(ctx, paths, output); err != nil {
+		return fmt.Errorf("remove Paperboat runtime slots: %w", err)
+	}
 	return nil
+}
+
+func removePaperboatRuntimeSlots(ctx context.Context, paths msiCleanupPaths, output io.Writer) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := preflightMSIRuntimeSlots(paths); err != nil {
+		return err
+	}
+	for _, slot := range []struct {
+		name string
+		path string
+	}{
+		{name: "runtime-current", path: paths.RuntimeCurrent},
+		{name: "runtime-rollback", path: paths.RuntimeRollback},
+		{name: "runtime-staged", path: paths.RuntimeStaged},
+	} {
+		if slot.path == "" {
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		removed, err := removeOwnedPaperboatRuntimeSlot(slot.path, paths.InstallRoot)
+		if err != nil {
+			return fmt.Errorf("remove %s: %w", slot.name, err)
+		}
+		if removed {
+			writeMSICleanupEvent(output, "removed Paperboat runtime slot %s", slot.name)
+		}
+	}
+	return nil
+}
+
+func removeOwnedPaperboatRuntimeSlot(path, installRoot string) (bool, error) {
+	slotDirectory, releasesDirectory, err := exactMSIRuntimeSlotDirectories(path, installRoot)
+	if err != nil {
+		return false, err
+	}
+
+	for _, directory := range []string{installRoot, releasesDirectory, slotDirectory} {
+		exists, validateErr := validateExistingMSIDirectory(directory)
+		if validateErr != nil {
+			return false, validateErr
+		}
+		if !exists {
+			return false, nil
+		}
+	}
+
+	info, statErr := os.Lstat(path)
+	if errors.Is(statErr, os.ErrNotExist) {
+		return removeEmptyMSIRuntimeDirectories(slotDirectory, releasesDirectory)
+	}
+	if statErr != nil {
+		return false, statErr
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return false, errMSIServiceOwnership
+	}
+	attributes, attrErr := msiGetFileAttributes(windows.StringToUTF16Ptr(path))
+	if attrErr != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return false, errors.Join(errMSIServiceOwnership, attrErr)
+	}
+	if err := validateMSIRuntimeSlotContents(slotDirectory, filepath.Base(slotDirectory)); err != nil {
+		return false, err
+	}
+
+	// Revalidate the exact file and every ancestor immediately before deletion.
+	// The preflight above protects the mutation plan; this final check protects
+	// the planned path from a replacement between preflight and Remove.
+	stillOwned, finalErr := revalidateMSIRuntimeSlotBeforeDelete(path, installRoot)
+	if finalErr != nil {
+		return false, finalErr
+	}
+	if !stillOwned {
+		return removeEmptyMSIRuntimeDirectories(slotDirectory, releasesDirectory)
+	}
+	if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+		return false, removeErr
+	}
+	_, removeErr := removeEmptyMSIRuntimeDirectories(slotDirectory, releasesDirectory)
+	if removeErr != nil {
+		return false, removeErr
+	}
+	return true, nil
+}
+
+func revalidateMSIRuntimeSlotBeforeDelete(path, installRoot string) (bool, error) {
+	slotDirectory, releasesDirectory, err := exactMSIRuntimeSlotDirectories(path, installRoot)
+	if err != nil {
+		return false, err
+	}
+	for _, directory := range []string{installRoot, releasesDirectory, slotDirectory} {
+		exists, validateErr := validateExistingMSIDirectory(directory)
+		if validateErr != nil {
+			return false, validateErr
+		}
+		if !exists {
+			return false, nil
+		}
+	}
+	exists, validateErr := validateMSIRegularFile(path, false)
+	if errors.Is(validateErr, os.ErrNotExist) {
+		return false, nil
+	}
+	if validateErr != nil {
+		return false, validateErr
+	}
+	if !exists {
+		return false, nil
+	}
+	if err := validateMSIRuntimeSlotContents(slotDirectory, filepath.Base(slotDirectory)); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func exactMSIRuntimeSlotDirectories(path, installRoot string) (slotDirectory, releasesDirectory string, err error) {
+	if !filepath.IsAbs(path) || !filepath.IsAbs(installRoot) {
+		return "", "", errMSIServiceOwnership
+	}
+	releasesDirectory = filepath.Join(installRoot, "releases")
+	for _, slotName := range []string{"runtime-current", "runtime-rollback", "runtime-staged"} {
+		expected := filepath.Join(releasesDirectory, slotName, "paperboat-runtime.exe")
+		if sameWindowsPath(path, expected) {
+			slotDirectory := filepath.Dir(expected)
+			if !underWindowsPath(releasesDirectory, installRoot) || !underWindowsPath(slotDirectory, installRoot) {
+				return "", "", errMSIServiceOwnership
+			}
+			return slotDirectory, releasesDirectory, nil
+		}
+	}
+	return "", "", errMSIServiceOwnership
+}
+
+func validateExistingMSIDirectory(path string) (bool, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return true, errMSIServiceOwnership
+	}
+	return true, validateMSIDirectory(path)
+}
+
+func preflightMSIRuntimeSlots(paths msiCleanupPaths) error {
+	for _, slot := range []struct {
+		name string
+		path string
+	}{
+		{name: "runtime-current", path: paths.RuntimeCurrent},
+		{name: "runtime-rollback", path: paths.RuntimeRollback},
+		{name: "runtime-staged", path: paths.RuntimeStaged},
+	} {
+		if slot.path == "" {
+			continue
+		}
+		slotDirectory, releasesDirectory, err := exactMSIRuntimeSlotDirectories(slot.path, paths.InstallRoot)
+		if err != nil {
+			return fmt.Errorf("validate %s path: %w", slot.name, err)
+		}
+		for _, directory := range []string{paths.InstallRoot, releasesDirectory, slotDirectory} {
+			exists, validateErr := validateExistingMSIDirectory(directory)
+			if validateErr != nil {
+				return fmt.Errorf("validate %s ancestor %s: %w", slot.name, directory, validateErr)
+			}
+			if !exists {
+				break
+			}
+		}
+		if _, err := validateMSIRegularFile(slot.path, true); err != nil {
+			return fmt.Errorf("validate %s executable: %w", slot.name, err)
+		}
+		exists, validateErr := validateExistingMSIDirectory(slotDirectory)
+		if validateErr != nil {
+			return fmt.Errorf("revalidate %s slot: %w", slot.name, validateErr)
+		}
+		if exists {
+			if err := validateMSIRuntimeSlotContents(slotDirectory, slot.name); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func validateMSIRegularFile(path string, allowMissing bool) (bool, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		if allowMissing {
+			return false, nil
+		}
+		return false, os.ErrNotExist
+	}
+	if err != nil {
+		return true, err
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return true, errMSIServiceOwnership
+	}
+	attributes, attrErr := msiGetFileAttributes(windows.StringToUTF16Ptr(path))
+	if attrErr != nil {
+		return true, errors.Join(errMSIServiceOwnership, attrErr)
+	}
+	if attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return true, errMSIServiceOwnership
+	}
+	return true, nil
+}
+
+func validateMSIRuntimeSlotContents(slotDirectory, slotName string) error {
+	entries, err := os.ReadDir(slotDirectory)
+	if err != nil {
+		return fmt.Errorf("scan %s slot: %w", slotName, err)
+	}
+	for _, entry := range entries {
+		if !strings.EqualFold(entry.Name(), "paperboat-runtime.exe") {
+			return errors.Join(errMSIRuntimeResidue, errMSIServiceOwnership,
+				fmt.Errorf("preserve %s because slot contains unexpected entry %s", slotName, entry.Name()))
+		}
+	}
+	return nil
+}
+
+func removeEmptyMSIRuntimeDirectories(slotDirectory, releasesDirectory string) (bool, error) {
+	if exists, err := validateExistingMSIDirectory(slotDirectory); err != nil {
+		return false, err
+	} else if !exists {
+		return false, nil
+	}
+	if err := validateMSIRuntimeSlotContents(slotDirectory, filepath.Base(slotDirectory)); err != nil {
+		return false, err
+	}
+	removedSlot := false
+	if err := os.Remove(slotDirectory); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		if errors.Is(err, windows.ERROR_DIR_NOT_EMPTY) {
+			return false, errors.Join(errMSIRuntimeResidue, errMSIServiceOwnership)
+		}
+		return false, err
+	}
+	removedSlot = true
+
+	if exists, err := validateExistingMSIDirectory(releasesDirectory); err != nil {
+		return removedSlot, err
+	} else if !exists {
+		return removedSlot, nil
+	}
+	if err := os.Remove(releasesDirectory); err != nil && !errors.Is(err, os.ErrNotExist) &&
+		!errors.Is(err, windows.ERROR_DIR_NOT_EMPTY) {
+		return removedSlot, err
+	}
+	return removedSlot, nil
 }
 
 func msiCleanupPathsForCurrentInstall() (msiCleanupPaths, error) {
@@ -104,6 +395,9 @@ func msiCleanupPathsForCurrentInstall() (msiCleanupPaths, error) {
 	return msiCleanupPaths{
 		InstallRoot:      installRoot,
 		BinaryRoot:       filepath.Join(installRoot, "bin"),
+		RuntimeCurrent:   filepath.Join(installRoot, "releases", "runtime-current", "paperboat-runtime.exe"),
+		RuntimeRollback:  filepath.Join(installRoot, "releases", "runtime-rollback", "paperboat-runtime.exe"),
+		RuntimeStaged:    filepath.Join(installRoot, "releases", "runtime-staged", "paperboat-runtime.exe"),
 		StateRoot:        stateRoot,
 		ServiceRoot:      filepath.Join(stateRoot, "services"),
 		OpenSSHRoot:      filepath.Join(programFiles, "OpenSSH"),
@@ -111,16 +405,82 @@ func msiCleanupPathsForCurrentInstall() (msiCleanupPaths, error) {
 	}, nil
 }
 
-func removePaperboatPreviewServices(ctx context.Context, paths msiCleanupPaths, output io.Writer) error {
+type msiPreviewServiceCandidate struct {
+	name    string
+	service *mgr.Service
+}
+
+type msiPreviewCleanupFile struct {
+	name string
+	path string
+}
+
+type msiPreviewCleanupPlan struct {
+	services     []msiPreviewServiceCandidate
+	declarations []msiPreviewCleanupFile
+	descriptors  []msiPreviewCleanupFile
+}
+
+func msiPreviewOwnershipConflict(format string, args ...any) error {
+	return errors.Join(errMSIPreviewOwnership, fmt.Errorf(format, args...))
+}
+
+func closeMSIPreviewServiceCandidates(candidates []msiPreviewServiceCandidate) error {
+	var result error
+	for index := range candidates {
+		if candidates[index].service != nil {
+			result = errors.Join(result, candidates[index].service.Close())
+			candidates[index].service = nil
+		}
+	}
+	return result
+}
+
+func removePaperboatPreviewServices(ctx context.Context, paths msiCleanupPaths, output io.Writer) (resultErr error) {
+	if err := preflightMSIRuntimeSlots(paths); err != nil {
+		return fmt.Errorf("preflight Paperboat runtime slots: %w", err)
+	}
 	manager, err := mgr.Connect()
+	if err != nil {
+		return msiPreviewOwnershipConflict("connect SCM while proving Paperboat preview ownership: %w", err)
+	}
+	defer func() { resultErr = errors.Join(resultErr, manager.Disconnect()) }()
+
+	plan, err := preflightPaperboatPreviewCleanup(manager, paths, output)
 	if err != nil {
 		return err
 	}
-	defer manager.Disconnect()
+	for index := range plan.services {
+		candidate := &plan.services[index]
+		if err := validateMSIPreviewServiceOwnership(candidate.service, candidate.name, paths); err != nil {
+			return errors.Join(err, closeMSIPreviewServiceCandidates(plan.services[index:]))
+		}
+		if err := removeSCMService(ctx, manager, candidate.service, candidate.name); err != nil {
+			closeErr := closeMSIPreviewServiceCandidates(plan.services[index+1:])
+			candidate.service = nil
+			return errors.Join(err, closeErr)
+		}
+		candidate.service = nil
+		writeMSICleanupEvent(output, "removed Paperboat dynamic service %s", candidate.name)
+	}
+	if err := verifyPlannedPreviewDefinitionsRemovedWithContext(ctx, manager, plan.declarations); err != nil {
+		return err
+	}
+	if err := removePlannedPreviewDescriptorsWithPaths(ctx, manager, plan.descriptors, paths, output); err != nil {
+		return err
+	}
+	return removePlannedPreviewDefinitionFilesWithPaths(ctx, manager, plan.declarations, paths, output)
+}
+
+func preflightPaperboatPreviewCleanup(manager *mgr.Mgr, paths msiCleanupPaths, output io.Writer) (msiPreviewCleanupPlan, error) {
+	plan := msiPreviewCleanupPlan{}
+	fail := func(err error) (msiPreviewCleanupPlan, error) {
+		return msiPreviewCleanupPlan{}, errors.Join(err, closeMSIPreviewServiceCandidates(plan.services))
+	}
 
 	names, err := manager.ListServices()
 	if err != nil {
-		return err
+		return fail(msiPreviewOwnershipConflict("list Paperboat preview services while proving ownership: %w", err))
 	}
 	for _, name := range names {
 		if !isPaperboatPreviewServiceName(name) {
@@ -131,59 +491,65 @@ func removePaperboatPreviewServices(ctx context.Context, paths msiCleanupPaths, 
 			continue
 		}
 		if openErr != nil {
-			return fmt.Errorf("open %s: %w", name, openErr)
+			return fail(msiPreviewOwnershipConflict("open %s while proving ownership: %w", name, openErr))
 		}
-		config, configErr := service.Config()
-		if configErr != nil {
-			_ = service.Close()
-			return fmt.Errorf("read %s configuration: %w", name, configErr)
-		}
-
-		definitionPath := filepath.Join(paths.ServiceRoot, name+".json")
-		definition, definitionExists, definitionErr := readMSIServiceDefinition(definitionPath)
-		if definitionErr != nil && !errors.Is(definitionErr, os.ErrNotExist) {
+		if ownershipErr := validateMSIPreviewServiceOwnership(service, name, paths); ownershipErr != nil {
 			writeMSICleanupEvent(output, "preserving %s because its Paperboat ownership declaration is invalid", name)
-			_ = service.Close()
-			continue
+			return fail(errors.Join(ownershipErr, service.Close()))
 		}
-
-		owned := false
-		if definitionExists {
-			owned = ownedPaperboatPreviewDefinition(definitionPath, definition, name, paths) && ownedSCMConfiguration(config, definition, paths)
-		} else {
-			owned = ownedPaperboatPreviewSCMConfiguration(name, config, paths)
-		}
-		if !owned {
-			writeMSICleanupEvent(output, "preserving %s because SCM ownership could not be proven", name)
-			_ = service.Close()
-			continue
-		}
-
-		if err := removeSCMService(ctx, manager, service, name); err != nil {
-			return err
-		}
-		writeMSICleanupEvent(output, "removed Paperboat dynamic service %s", name)
+		plan.services = append(plan.services, msiPreviewServiceCandidate{name: name, service: service})
 	}
 
-	if err := removeOwnedPreviewDescriptors(paths, output); err != nil {
-		return err
+	declarations, err := scanOwnedPreviewDefinitions(paths, output)
+	if err != nil {
+		return fail(err)
 	}
-	return removeOwnedPreviewDefinitions(ctx, manager, paths, output)
+	plan.declarations = declarations
+	descriptors, err := scanOwnedPreviewDescriptors(paths)
+	if err != nil {
+		return fail(err)
+	}
+	plan.descriptors = descriptors
+	return plan, nil
 }
 
-func removeOwnedPreviewDefinitions(ctx context.Context, manager *mgr.Mgr, paths msiCleanupPaths, output io.Writer) error {
-	entries, err := os.ReadDir(paths.ServiceRoot)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
+func validateMSIPreviewServiceOwnership(service *mgr.Service, name string, paths msiCleanupPaths) error {
+	config, configErr := service.Config()
+	if configErr != nil {
+		return msiPreviewOwnershipConflict("read %s configuration while proving ownership: %w", name, configErr)
+	}
+	definitionPath := filepath.Join(paths.ServiceRoot, name+".json")
+	definition, definitionExists, definitionErr := readMSIServiceDefinition(definitionPath)
+	if definitionErr != nil && !errors.Is(definitionErr, os.ErrNotExist) {
+		return msiPreviewOwnershipConflict("preserve %s because its Paperboat ownership declaration is invalid: %w", name, definitionErr)
+	}
+	owned := false
+	if definitionExists {
+		owned = ownedPaperboatPreviewDefinition(definitionPath, definition, name, paths) && ownedSCMConfiguration(config, definition, paths)
+	} else {
+		owned = ownedPaperboatPreviewSCMConfiguration(name, config, paths)
+	}
+	if !owned {
+		return msiPreviewOwnershipConflict("preserve %s because SCM ownership could not be proven", name)
+	}
+	return nil
+}
+
+func scanOwnedPreviewDefinitions(paths msiCleanupPaths, output io.Writer) ([]msiPreviewCleanupFile, error) {
+	exists, err := validateExistingMSIDirectory(paths.ServiceRoot)
+	if errors.Is(err, os.ErrNotExist) || !exists {
+		return nil, nil
 	}
 	if err != nil {
-		return err
+		return nil, msiPreviewOwnershipConflict("validate Paperboat service declaration root: %w", err)
 	}
-	if err := validateMSIDirectory(paths.ServiceRoot); err != nil {
-		return err
+	entries, err := os.ReadDir(paths.ServiceRoot)
+	if err != nil {
+		return nil, msiPreviewOwnershipConflict("scan Paperboat service declarations while proving ownership: %w", err)
 	}
+	var files []msiPreviewCleanupFile
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".json") {
+		if !strings.HasSuffix(strings.ToLower(entry.Name()), ".json") {
 			continue
 		}
 		name := strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name()))
@@ -191,91 +557,206 @@ func removeOwnedPreviewDefinitions(ctx context.Context, manager *mgr.Mgr, paths 
 			continue
 		}
 		path := filepath.Join(paths.ServiceRoot, entry.Name())
-		definition, exists, readErr := readMSIServiceDefinition(path)
-		if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+		exists, ownershipErr := validateOwnedMSIServiceDefinition(path, name, paths)
+		if ownershipErr != nil {
 			writeMSICleanupEvent(output, "preserving dynamic declaration %s because it is invalid", entry.Name())
+			return nil, msiPreviewOwnershipConflict("preserve dynamic declaration %s because it is invalid: %w", entry.Name(), ownershipErr)
+		}
+		if !exists {
+			return nil, msiPreviewOwnershipConflict("preserve dynamic declaration %s because ownership could not be proven", entry.Name())
+		}
+		files = append(files, msiPreviewCleanupFile{name: entry.Name(), path: path})
+	}
+	return files, nil
+}
+
+func validateOwnedMSIServiceDefinition(path, name string, paths msiCleanupPaths) (bool, error) {
+	rootExists, rootErr := validateExistingMSIDirectory(filepath.Dir(path))
+	if rootErr != nil {
+		return true, rootErr
+	}
+	if !rootExists {
+		return false, nil
+	}
+	definition, exists, err := readMSIServiceDefinition(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return true, err
+	}
+	if !exists || !ownedPaperboatPreviewDefinition(path, definition, name, paths) {
+		return exists, errMSIPreviewOwnership
+	}
+	return true, nil
+}
+
+func validateOwnedMSIPreviewDescriptor(path string, paths msiCleanupPaths) (bool, error) {
+	rootExists, rootErr := validateExistingMSIDirectory(filepath.Dir(path))
+	if rootErr != nil {
+		return true, rootErr
+	}
+	if !rootExists {
+		return false, nil
+	}
+	exists, err := validateMSIRegularFile(path, true)
+	if err != nil || !exists {
+		return exists, err
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return true, err
+	}
+	if len(body) > 64<<10 {
+		return true, errMSIPreviewOwnership
+	}
+	logicalName, definitionName, definitionPath, descriptorErr := parseOwnedMSIPreviewDescriptor(body, paths)
+	if descriptorErr != nil {
+		return true, errMSIPreviewOwnership
+	}
+	expectedDescriptor := filepath.Join(paths.StateRoot, "previews", "active", msiPreviewInstance(logicalName)+".json")
+	if !sameWindowsPath(path, expectedDescriptor) {
+		return true, errMSIPreviewOwnership
+	}
+	definition, definitionExists, definitionErr := readMSIServiceDefinition(definitionPath)
+	if definitionErr != nil {
+		return true, definitionErr
+	}
+	logicalDefinitionName, logicalNameOK := paperboatPreviewLogicalName(definition.Arguments)
+	if !definitionExists || !logicalNameOK || logicalDefinitionName != logicalName || !ownedPaperboatPreviewDefinition(definitionPath, definition, definitionName, paths) {
+		return true, errMSIPreviewOwnership
+	}
+	return true, nil
+}
+
+func parseOwnedMSIPreviewDescriptor(body []byte, paths msiCleanupPaths) (string, string, string, error) {
+	if len(body) > 64<<10 {
+		return "", "", "", errMSIPreviewOwnership
+	}
+	var descriptor msiPreviewDescriptor
+	decoder := json.NewDecoder(strings.NewReader(string(body)))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&descriptor) != nil {
+		return "", "", "", errMSIPreviewOwnership
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) || descriptor.Schema != "paperboat.preview-runtime/v1" || descriptor.Name == "" {
+		return "", "", "", errMSIPreviewOwnership
+	}
+	definitionName := strings.TrimSuffix(filepath.Base(descriptor.ServiceDefinition), filepath.Ext(descriptor.ServiceDefinition))
+	definitionPath := filepath.Join(paths.ServiceRoot, definitionName+".json")
+	if !isPaperboatPreviewServiceName(definitionName) || !sameWindowsPath(descriptor.ServiceDefinition, definitionPath) {
+		return "", "", "", errMSIPreviewOwnership
+	}
+	return descriptor.Name, definitionName, definitionPath, nil
+}
+
+func scanOwnedPreviewDescriptors(paths msiCleanupPaths) ([]msiPreviewCleanupFile, error) {
+	activeRoot := filepath.Join(paths.StateRoot, "previews", "active")
+	exists, err := validateExistingMSIDirectory(activeRoot)
+	if errors.Is(err, os.ErrNotExist) || !exists {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, msiPreviewOwnershipConflict("validate Paperboat preview descriptor root: %w", err)
+	}
+	entries, err := os.ReadDir(activeRoot)
+	if err != nil {
+		return nil, msiPreviewOwnershipConflict("scan Paperboat preview descriptors while proving ownership: %w", err)
+	}
+	var files []msiPreviewCleanupFile
+	for _, entry := range entries {
+		if !strings.EqualFold(filepath.Ext(entry.Name()), ".json") {
 			continue
 		}
-		if !exists || !ownedPaperboatPreviewDefinition(path, definition, name, paths) {
+		path := filepath.Join(activeRoot, entry.Name())
+		exists, ownershipErr := validateOwnedMSIPreviewDescriptor(path, paths)
+		if ownershipErr != nil {
+			return nil, msiPreviewOwnershipConflict("preserve preview descriptor %s because its ownership declaration is invalid: %w", entry.Name(), ownershipErr)
+		}
+		if !exists {
+			return nil, msiPreviewOwnershipConflict("preserve preview descriptor %s because it disappeared while ownership was being proven", entry.Name())
+		}
+		files = append(files, msiPreviewCleanupFile{name: entry.Name(), path: path})
+	}
+	return files, nil
+}
+
+func removePlannedPreviewDescriptorsWithPaths(ctx context.Context, manager *mgr.Mgr, files []msiPreviewCleanupFile, paths msiCleanupPaths, output io.Writer) error {
+	for _, file := range files {
+		exists, validateErr := validateOwnedMSIPreviewDescriptor(file.path, paths)
+		if validateErr != nil {
+			return msiPreviewOwnershipConflict("preserve preview descriptor %s because ownership changed before removal: %w", file.name, validateErr)
+		}
+		if !exists {
+			writeMSICleanupEvent(output, "preview descriptor %s was already absent", file.name)
 			continue
 		}
-		service, openErr := manager.OpenService(name)
-		if openErr == nil {
-			_ = service.Close()
-			return fmt.Errorf("owned dynamic service %s still exists after cleanup", name)
+		body, readErr := os.ReadFile(file.path)
+		if readErr != nil {
+			return msiPreviewOwnershipConflict("preserve preview descriptor %s because it changed before removal: %w", file.name, readErr)
 		}
-		if !errors.Is(openErr, windows.ERROR_SERVICE_DOES_NOT_EXIST) && !errors.Is(openErr, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
-			return fmt.Errorf("verify removal of %s: %w", name, openErr)
+		serviceName, _, _, parseErr := parseOwnedMSIPreviewDescriptor(body, paths)
+		if parseErr != nil {
+			return msiPreviewOwnershipConflict("preserve preview descriptor %s because its service ownership changed before removal: %w", file.name, parseErr)
 		}
-		if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-			return fmt.Errorf("remove dynamic service declaration %s: %w", entry.Name(), removeErr)
+		if err := waitForMSIServiceAbsence(ctx, manager, serviceName); err != nil {
+			return err
 		}
-		writeMSICleanupEvent(output, "removed Paperboat dynamic service declaration %s", entry.Name())
+		exists, validateErr = validateOwnedMSIPreviewDescriptor(file.path, paths)
+		if validateErr != nil {
+			return msiPreviewOwnershipConflict("preserve preview descriptor %s because ownership changed before removal", file.name)
+		}
+		if !exists {
+			writeMSICleanupEvent(output, "preview descriptor %s was already absent", file.name)
+			continue
+		}
+		if removeErr := os.Remove(file.path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			return fmt.Errorf("remove preview descriptor %s: %w", file.name, removeErr)
+		}
+		writeMSICleanupEvent(output, "removed Paperboat preview descriptor %s", file.name)
 	}
 	return nil
 }
 
-func removeOwnedPreviewDescriptors(paths msiCleanupPaths, output io.Writer) error {
-	activeRoot := filepath.Join(paths.StateRoot, "previews", "active")
-	entries, err := os.ReadDir(activeRoot)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
+func verifyPlannedPreviewDefinitionsRemovedWithContext(ctx context.Context, manager *mgr.Mgr, files []msiPreviewCleanupFile) error {
+	for _, file := range files {
+		name := strings.TrimSuffix(file.name, filepath.Ext(file.name))
+		if err := waitForMSIServiceAbsence(ctx, manager, name); err != nil {
+			return err
+		}
 	}
-	if err != nil {
-		return err
-	}
-	if err := validateMSIDirectory(activeRoot); err != nil {
-		return err
-	}
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.EqualFold(filepath.Ext(entry.Name()), ".json") {
+	return nil
+}
+
+func removePlannedPreviewDefinitionFilesWithPaths(ctx context.Context, manager *mgr.Mgr, files []msiPreviewCleanupFile, paths msiCleanupPaths, output io.Writer) error {
+	for _, file := range files {
+		name := strings.TrimSuffix(file.name, filepath.Ext(file.name))
+		if err := waitForMSIServiceAbsence(ctx, manager, name); err != nil {
+			return err
+		}
+		exists, validateErr := validateOwnedMSIServiceDefinition(file.path, name, paths)
+		if validateErr != nil {
+			return msiPreviewOwnershipConflict("preserve dynamic service declaration %s because ownership changed before removal: %w", file.name, validateErr)
+		}
+		if !exists {
+			writeMSICleanupEvent(output, "dynamic service declaration %s was already absent", file.name)
 			continue
 		}
-		path := filepath.Join(activeRoot, entry.Name())
-		info, statErr := os.Lstat(path)
-		if statErr != nil {
-			if errors.Is(statErr, os.ErrNotExist) {
-				continue
-			}
-			return statErr
+		if removeErr := os.Remove(file.path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			return fmt.Errorf("remove dynamic service declaration %s: %w", file.name, removeErr)
 		}
-		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-			continue
-		}
-		body, readErr := os.ReadFile(path)
-		if readErr != nil || len(body) > 64<<10 {
-			continue
-		}
-		var descriptor msiPreviewDescriptor
-		if json.Unmarshal(body, &descriptor) != nil || descriptor.Schema != "paperboat.preview-runtime/v1" || descriptor.Name == "" {
-			continue
-		}
-		definitionName := strings.TrimSuffix(filepath.Base(descriptor.ServiceDefinition), filepath.Ext(descriptor.ServiceDefinition))
-		definitionPath := filepath.Join(paths.ServiceRoot, definitionName+".json")
-		if !isPaperboatPreviewServiceName(definitionName) || !sameWindowsPath(descriptor.ServiceDefinition, definitionPath) {
-			continue
-		}
-		definition, definitionExists, definitionErr := readMSIServiceDefinition(definitionPath)
-		if definitionExists && (definitionErr != nil || !ownedPaperboatPreviewDefinition(definitionPath, definition, definitionName, paths)) {
-			continue
-		}
-		if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-			return fmt.Errorf("remove preview descriptor %s: %w", entry.Name(), removeErr)
-		}
-		writeMSICleanupEvent(output, "removed Paperboat preview descriptor %s", entry.Name())
+		writeMSICleanupEvent(output, "removed Paperboat dynamic service declaration %s", file.name)
 	}
 	return nil
 }
 
 func readMSIServiceDefinition(path string) (msiWindowsServiceDefinition, bool, error) {
-	info, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) {
+	exists, err := validateMSIRegularFile(path, true)
+	if errors.Is(err, os.ErrNotExist) || !exists {
 		return msiWindowsServiceDefinition{}, false, os.ErrNotExist
 	}
 	if err != nil {
-		return msiWindowsServiceDefinition{}, false, err
-	}
-	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 		return msiWindowsServiceDefinition{}, true, errMSIServiceOwnership
 	}
 	body, err := os.ReadFile(path)
@@ -304,7 +785,7 @@ func ownedPaperboatPreviewDefinition(path string, definition msiWindowsServiceDe
 		strings.EqualFold(definition.Name, name) &&
 		isSystemAccount(definition.Account) &&
 		allowedPaperboatServiceExecutable(definition.Executable, paths) &&
-		validPaperboatPreviewArguments(definition.Arguments, path)
+		validPaperboatPreviewArguments(definition.Arguments, name, path, paths)
 }
 
 func ownedSCMConfiguration(config mgr.Config, definition msiWindowsServiceDefinition, paths msiCleanupPaths) bool {
@@ -315,10 +796,7 @@ func ownedSCMConfiguration(config mgr.Config, definition msiWindowsServiceDefini
 	if err != nil || !sameWindowsPath(executable, definition.Executable) {
 		return false
 	}
-	// Older Paperboat Windows service definitions lost their arguments when
-	// updated in SCM. A valid declaration remains authoritative for uninstall,
-	// but any arguments still present must agree exactly with that declaration.
-	return len(args) == 0 || sameStringSlice(args, definition.Arguments)
+	return sameStringSlice(args, definition.Arguments)
 }
 
 func ownedPaperboatPreviewSCMConfiguration(name string, config mgr.Config, paths msiCleanupPaths) bool {
@@ -329,24 +807,64 @@ func ownedPaperboatPreviewSCMConfiguration(name string, config mgr.Config, paths
 	if err != nil || !allowedPaperboatServiceExecutable(executable, paths) {
 		return false
 	}
-	return validPaperboatPreviewArguments(args, filepath.Join(paths.ServiceRoot, name+".json"))
+	return validPaperboatPreviewArguments(args, name, filepath.Join(paths.ServiceRoot, name+".json"), paths)
 }
 
-func validPaperboatPreviewArguments(args []string, definitionPath string) bool {
-	if len(args) == 0 || (args[0] != msiPaperboatPreviewCommand && args[0] != msiPaperboatServeCommand && args[0] != msiPaperboatPrivatePreview) {
+func validPaperboatPreviewArguments(args []string, serviceName, definitionPath string, paths msiCleanupPaths) bool {
+	if len(args) < 10 || !isPaperboatPreviewServiceName(serviceName) || (args[0] != msiPaperboatPreviewCommand && args[0] != msiPaperboatServeCommand && args[0] != msiPaperboatPrivatePreview) {
 		return false
 	}
-	count := 0
-	for index, arg := range args {
-		if arg != "--service-definition" {
-			continue
-		}
-		count++
-		if index+1 >= len(args) || !sameWindowsPath(args[index+1], definitionPath) {
+	if args[1] != "--state-root" || !sameWindowsPath(args[2], paths.StateRoot) || args[3] != "--name" || args[4] == "" || args[5] != "--descriptor" || args[7] != "--service-definition" || !sameWindowsPath(args[8], definitionPath) {
+		return false
+	}
+	if !strings.EqualFold(serviceName, msiPaperboatServicePrefix+msiPreviewInstance(args[4])) {
+		return false
+	}
+	expectedDescriptor := filepath.Join(paths.StateRoot, "previews", "active", msiPreviewInstance(args[4])+".json")
+	if !sameWindowsPath(args[6], expectedDescriptor) {
+		return false
+	}
+	index := 9
+	if args[0] == msiPaperboatPreviewCommand {
+		if index+2 > len(args) || args[index] != "--port" {
 			return false
 		}
+		port, err := strconv.ParseUint(args[index+1], 10, 16)
+		if err != nil || port == 0 {
+			return false
+		}
+		index += 2
 	}
-	return count == 1
+	if index >= len(args) {
+		return false
+	}
+	switch args[index] {
+	case "--indefinite":
+		index++
+	case "--expires-at":
+		if index+2 > len(args) || args[index+1] == "" {
+			return false
+		}
+		if _, err := time.Parse(time.RFC3339Nano, args[index+1]); err != nil {
+			return false
+		}
+		index += 2
+	default:
+		return false
+	}
+	return index == len(args)
+}
+
+func paperboatPreviewLogicalName(args []string) (string, bool) {
+	if len(args) < 5 || args[3] != "--name" || args[4] == "" {
+		return "", false
+	}
+	return args[4], true
+}
+
+func msiPreviewInstance(name string) string {
+	sum := sha256.Sum256([]byte(name))
+	return hex.EncodeToString(sum[:8])
 }
 
 func decomposeWindowsServiceCommand(command string) (string, []string, error) {
@@ -361,62 +879,64 @@ func allowedPaperboatServiceExecutable(path string, paths msiCleanupPaths) bool 
 	if !filepath.IsAbs(path) || !strings.EqualFold(filepath.Ext(path), ".exe") {
 		return false
 	}
-	base := strings.ToLower(filepath.Base(path))
-	if base != "pb.exe" && base != "paperboat-runtime.exe" && base != "paperboat-hostd.exe" && base != "paperboat-updater.exe" {
+	if !strings.EqualFold(filepath.Base(path), "paperboat-runtime.exe") || !sameWindowsPath(path, paths.RuntimeCurrent) {
 		return false
 	}
-	if !underWindowsPath(path, paths.BinaryRoot) &&
-		!underWindowsPath(path, filepath.Join(paths.StateRoot, "updates", "current")) &&
-		!underWindowsPath(path, filepath.Join(paths.StateRoot, "updates", "rollback")) {
-		return false
-	}
-	info, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) {
+	exists, err := validateMSIRegularFile(path, true)
+	if errors.Is(err, os.ErrNotExist) || !exists {
 		return true
 	}
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-		return false
-	}
-	attributes, attrErr := windows.GetFileAttributes(windows.StringToUTF16Ptr(path))
-	return attrErr == nil && attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT == 0
+	return err == nil
 }
 
 func removeSCMService(ctx context.Context, manager *mgr.Mgr, service *mgr.Service, name string) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if err := stopMSIService(ctx, service); err != nil {
-		_ = service.Close()
-		return fmt.Errorf("stop %s: %w", name, err)
+	if stopErr := stopMSIService(ctx, service); stopErr != nil {
+		return fmt.Errorf("stop %s: %w", name, errors.Join(stopErr, service.Close()))
 	}
-	if err := service.Delete(); err != nil && !errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
-		_ = service.Close()
-		return fmt.Errorf("delete %s: %w", name, err)
+	if deleteErr := service.Delete(); deleteErr != nil && !errors.Is(deleteErr, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
+		return fmt.Errorf("delete %s: %w", name, errors.Join(deleteErr, service.Close()))
 	}
 	if err := service.Close(); err != nil {
 		return fmt.Errorf("close %s: %w", name, err)
 	}
-	deadline := time.NewTimer(30 * time.Second)
-	defer deadline.Stop()
-	for {
+	return waitForMSIServiceAbsence(ctx, manager, name)
+}
+
+func waitForMSIServiceAbsence(ctx context.Context, manager *mgr.Mgr, name string) error {
+	return waitForMSIServiceAbsenceWithProbe(ctx, name, func() error {
 		probe, err := manager.OpenService(name)
+		if probe != nil {
+			err = errors.Join(err, probe.Close())
+		}
+		return err
+	})
+}
+
+func waitForMSIServiceAbsenceWithProbe(ctx context.Context, name string, probe func() error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	boundedCtx, cancel := context.WithTimeout(ctx, msiServiceAbsenceTimeout)
+	defer cancel()
+	for {
+		err := probe()
 		if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
 			return nil
 		}
 		if err != nil && !errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
-			return fmt.Errorf("wait for %s removal: %w", name, err)
+			return msiPreviewOwnershipConflict("verify removal of %s: %w", name, err)
 		}
-		if probe != nil {
-			_ = probe.Close()
-		}
-		timer := time.NewTimer(100 * time.Millisecond)
+		timer := time.NewTimer(msiServicePollInterval)
 		select {
-		case <-ctx.Done():
+		case <-boundedCtx.Done():
 			timer.Stop()
-			return ctx.Err()
-		case <-deadline.C:
-			timer.Stop()
-			return fmt.Errorf("wait for %s removal: timeout", name)
+			if errors.Is(boundedCtx.Err(), context.DeadlineExceeded) {
+				return msiPreviewOwnershipConflict("wait for %s removal: timeout", name)
+			}
+			return boundedCtx.Err()
 		case <-timer.C:
 		}
 	}
@@ -480,7 +1000,7 @@ func removePaperboatOpenSSHState(ctx context.Context, paths msiCleanupPaths, out
 	return nil
 }
 
-func paperboatOpenSSHMarkerOwned() (bool, error) {
+func paperboatOpenSSHMarkerOwned() (owned bool, resultErr error) {
 	key, err := registry.OpenKey(registry.LOCAL_MACHINE, msiPaperboatOpenSSHRegistryPath, registry.QUERY_VALUE|registry.WOW64_64KEY)
 	if err == registry.ErrNotExist {
 		return false, nil
@@ -488,7 +1008,7 @@ func paperboatOpenSSHMarkerOwned() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	defer key.Close()
+	defer func() { resultErr = errors.Join(resultErr, key.Close()) }()
 	required := map[string]string{
 		"PackageId":              windowsopenssh.PackageID,
 		"Service":                windowsopenssh.ServiceName,
@@ -534,7 +1054,7 @@ func isSystemAccount(value string) bool {
 }
 
 func sameWindowsPath(left, right string) bool {
-	return filepath.IsAbs(left) && filepath.IsAbs(right) && strings.EqualFold(filepath.Clean(left), filepath.Clean(right))
+	return filepath.IsAbs(left) && filepath.IsAbs(right) && filepath.Clean(left) == left && filepath.Clean(right) == right && strings.EqualFold(left, right)
 }
 
 func underWindowsPath(path, root string) bool {
@@ -557,7 +1077,7 @@ func validateMSIDirectory(path string) error {
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return errMSIServiceOwnership
 	}
-	attributes, attrErr := windows.GetFileAttributes(windows.StringToUTF16Ptr(path))
+	attributes, attrErr := msiGetFileAttributes(windows.StringToUTF16Ptr(path))
 	if attrErr != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
 		return errors.Join(errMSIServiceOwnership, attrErr)
 	}

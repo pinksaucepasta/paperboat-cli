@@ -4,17 +4,29 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
+)
+
+const (
+	windowsServiceDefinitionRoot   = `C:\ProgramData\Paperboat\services`
+	windowsServiceDeleteTimeout    = 30 * time.Second
+	windowsServiceDeleteDelay      = 500 * time.Millisecond
+	windowsServiceOperationTimeout = 30 * time.Second
 )
 
 type windowsServiceDefinition struct {
@@ -26,6 +38,17 @@ type windowsServiceDefinition struct {
 	Arguments   []string          `json:"arguments"`
 	Environment map[string]string `json:"environment,omitempty"`
 	Account     string            `json:"account"`
+}
+
+// WindowsPreviewServiceArtifact is the ownership inventory used by preview
+// cleanup. A service without its declaration is deliberately not considered
+// owned: callers must surface that residue instead of deleting an ambiguous
+// SCM entry.
+type WindowsPreviewServiceArtifact struct {
+	Name            string
+	HasService      bool
+	HasDeclaration  bool
+	DeclarationRoot string
 }
 
 func windowsServiceName(kind, instance string) string {
@@ -59,19 +82,242 @@ func isWindowsPreviewServiceName(name string) bool {
 	return strings.HasPrefix(name, prefix) && safeInstance(strings.TrimPrefix(name, prefix))
 }
 
-func safeExecutableWindows(path string) error {
-	if !filepath.IsAbs(path) || !strings.EqualFold(filepath.Ext(path), ".exe") {
+func windowsServiceNameFromDefinitionPath(path string) (string, error) {
+	if !filepath.IsAbs(path) || filepath.Ext(path) != ".json" {
+		return "", ErrInvalidDefinition
+	}
+	name := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	switch name {
+	case "PaperboatHostd", "PaperboatUpdated", "PaperboatHost", "PaperboatRuntimeConfig", "PaperboatLocalDaemon", "PaperboatRuntime":
+		return name, nil
+	default:
+		if isWindowsPreviewServiceName(name) {
+			return name, nil
+		}
+		return "", ErrInvalidDefinition
+	}
+}
+
+var windowsServiceProbe = probeWindowsService
+
+var windowsServiceList = listWindowsServices
+
+func probeWindowsService(name string) (owned bool, resultErr error) {
+	manager, err := mgr.Connect()
+	if err != nil {
+		return false, err
+	}
+	defer func() { resultErr = errors.Join(resultErr, manager.Disconnect()) }()
+	service, err := manager.OpenService(name)
+	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+		return false, nil
+	}
+	if errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if err := service.Close(); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+func listWindowsServices() (result []string, resultErr error) {
+	manager, err := mgr.Connect()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { resultErr = errors.Join(resultErr, manager.Disconnect()) }()
+	names, err := manager.ListServices()
+	if err != nil {
+		return nil, err
+	}
+	result = make([]string, 0)
+	for _, name := range names {
+		if isWindowsPreviewServiceName(name) {
+			result = append(result, name)
+		}
+	}
+	sort.Strings(result)
+	return result, nil
+}
+
+func validateWindowsPreviewDeclarationEntry(entry os.DirEntry) error {
+	if !entry.IsDir() {
+		return nil
+	}
+	name := strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name()))
+	if strings.EqualFold(filepath.Ext(entry.Name()), ".json") && isWindowsPreviewServiceName(name) {
+		return fmt.Errorf("preview declaration %s is a directory: %w", entry.Name(), ErrInvalidDefinition)
+	}
+	return nil
+}
+
+// ListWindowsPreviewServiceArtifacts inventories both SCM services and
+// declarations. It is intentionally fail-closed for malformed declarations;
+// an uninstall caller must not silently skip a state it cannot validate.
+func ListWindowsPreviewServiceArtifacts() ([]WindowsPreviewServiceArtifact, error) {
+	serviceNames, err := windowsServiceList()
+	if err != nil {
+		return nil, err
+	}
+	byName := make(map[string]WindowsPreviewServiceArtifact, len(serviceNames))
+	for _, name := range serviceNames {
+		byName[name] = WindowsPreviewServiceArtifact{Name: name, HasService: true}
+	}
+	entries, err := readWindowsServiceDefinitionEntries()
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range entries {
+		if err := validateWindowsPreviewDeclarationEntry(entry); err != nil {
+			return nil, err
+		}
+		if entry.IsDir() || !strings.EqualFold(filepath.Ext(entry.Name()), ".json") {
+			continue
+		}
+		name := strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name()))
+		if !isWindowsPreviewServiceName(name) {
+			continue
+		}
+		path := filepath.Join(windowsServiceDefinitionRoot, entry.Name())
+		definition, err := readWindowsServiceDefinitionForRemoval(path)
+		if err != nil {
+			return nil, fmt.Errorf("validate preview declaration %s: %w", entry.Name(), err)
+		}
+		stateRoot, ok := windowsPreviewStateRoot(definition.Arguments)
+		if !ok {
+			return nil, fmt.Errorf("validate preview declaration %s: %w", entry.Name(), ErrInvalidDefinition)
+		}
+		if err := validateWindowsPreviewDefinition(path, name, stateRoot, definition); err != nil {
+			return nil, fmt.Errorf("validate preview declaration %s: %w", entry.Name(), err)
+		}
+		artifact := byName[name]
+		artifact.Name = name
+		artifact.HasDeclaration = true
+		artifact.DeclarationRoot = stateRoot
+		byName[name] = artifact
+	}
+	result := make([]WindowsPreviewServiceArtifact, 0, len(byName))
+	for _, artifact := range byName {
+		result = append(result, artifact)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
+	return result, nil
+}
+
+func readWindowsServiceDefinitionEntries() ([]os.DirEntry, error) {
+	info, err := os.Lstat(windowsServiceDefinitionRoot)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return nil, ErrInvalidDefinition
+	}
+	if err := validateWindowsDirectoryNoReparse(windowsServiceDefinitionRoot); err != nil {
+		return nil, err
+	}
+	return os.ReadDir(windowsServiceDefinitionRoot)
+}
+
+func windowsPreviewStateRoot(args []string) (string, bool) {
+	var root string
+	count := 0
+	for index, arg := range args {
+		if arg != "--state-root" {
+			continue
+		}
+		count++
+		if count != 1 || index+1 >= len(args) || args[index+1] == "" {
+			return "", false
+		}
+		root = args[index+1]
+	}
+	return root, count == 1
+}
+
+func validateWindowsDirectoryNoReparse(path string) error {
+	if !filepath.IsAbs(path) {
 		return ErrInvalidDefinition
 	}
 	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return ErrInvalidDefinition
 	}
 	attributes, err := windows.GetFileAttributes(windows.StringToUTF16Ptr(path))
 	if err != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-		return ErrInvalidDefinition
+		return errors.Join(ErrInvalidDefinition, err)
 	}
 	return nil
+}
+
+func validateWindowsAncestorDirectories(path string, allowMissingTail bool) error {
+	if !filepath.IsAbs(path) {
+		return ErrInvalidDefinition
+	}
+	current := filepath.Dir(filepath.Clean(path))
+	for {
+		err := validateWindowsDirectoryNoReparse(current)
+		if errors.Is(err, os.ErrNotExist) && allowMissingTail {
+			parent := filepath.Dir(current)
+			if parent == current {
+				return nil
+			}
+			current = parent
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return nil
+		}
+		current = parent
+	}
+}
+
+func validateWindowsRegularFileNoReparse(path string, allowMissing bool) error {
+	if !filepath.IsAbs(path) {
+		return ErrInvalidDefinition
+	}
+	if err := validateWindowsAncestorDirectories(path, allowMissing); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return errors.Join(ErrInvalidDefinition, err)
+		}
+		return err
+	}
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) && allowMissing {
+		return nil
+	}
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.Join(ErrInvalidDefinition, err)
+	}
+	attributes, err := windows.GetFileAttributes(windows.StringToUTF16Ptr(path))
+	if err != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return errors.Join(ErrInvalidDefinition, err)
+	}
+	return nil
+}
+
+func safeExecutableWindows(path string) error {
+	return validateWindowsExecutable(path, false)
+}
+
+func validateWindowsExecutable(path string, allowMissing bool) error {
+	if !filepath.IsAbs(path) || !strings.EqualFold(filepath.Ext(path), ".exe") {
+		return ErrInvalidDefinition
+	}
+	return validateWindowsRegularFileNoReparse(path, allowMissing)
 }
 
 func renderWindowsService(config Config) ([]byte, error) {
@@ -99,17 +345,36 @@ func renderWindowsService(config Config) ([]byte, error) {
 // installer; callers cannot pass an arbitrary executable through Apply.
 type WindowsController struct{}
 
-func (WindowsController) Apply(ctx context.Context, definitionPath string, upgrading bool) error {
+func (WindowsController) Apply(ctx context.Context, definitionPath string, upgrading bool) (resultErr error) {
 	definition, err := readWindowsServiceDefinition(definitionPath)
 	if err != nil {
 		return err
 	}
+	if isWindowsPreviewServiceName(definition.Name) {
+		stateRoot, ok := windowsPreviewStateRoot(definition.Arguments)
+		if !ok {
+			return ErrInvalidDefinition
+		}
+		if err := validateWindowsPreviewDefinition(definitionPath, definition.Name, stateRoot, definition); err != nil {
+			return err
+		}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	operationCtx, cancel := context.WithTimeout(ctx, windowsServiceOperationTimeout)
+	defer cancel()
 	manager, err := mgr.Connect()
 	if err != nil {
 		return err
 	}
-	defer manager.Disconnect()
+	defer func() {
+		if disconnectErr := manager.Disconnect(); disconnectErr != nil {
+			resultErr = errors.Join(resultErr, disconnectErr)
+		}
+	}()
 	service, err := manager.OpenService(definition.Name)
+	existing := err == nil
 	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
 		config := mgr.Config{
 			DisplayName: definition.DisplayName, Description: definition.Description,
@@ -128,7 +393,13 @@ func (WindowsController) Apply(ctx context.Context, definitionPath string, upgra
 		}
 	} else if err != nil {
 		return err
-	} else {
+	}
+	defer func() {
+		if closeErr := service.Close(); closeErr != nil {
+			resultErr = errors.Join(resultErr, closeErr)
+		}
+	}()
+	if existing {
 		current, configErr := service.Config()
 		if configErr != nil {
 			return configErr
@@ -146,10 +417,11 @@ func (WindowsController) Apply(ctx context.Context, definitionPath string, upgra
 			return err
 		}
 		if upgrading {
-			_ = stopWindowsService(ctx, service)
+			if err := stopWindowsService(operationCtx, service); err != nil {
+				return err
+			}
 		}
 	}
-	defer service.Close()
 	if definition.Name == "PaperboatHostd" || definition.Name == "PaperboatUpdated" || isWindowsPreviewServiceName(definition.Name) {
 		// Owner-scoped workloads run behind a privileged token bridge. If the
 		// enrolled owner logs off or the child fails, SCM retries the bridge with
@@ -182,84 +454,105 @@ func (WindowsController) Apply(ctx context.Context, definitionPath string, upgra
 	// already registered and still completing its bounded startup. Querying the
 	// authoritative state avoids reporting a failed install when SCM transitions
 	// the same process to Running moments later.
-	return waitWindowsService(ctx, service, svc.Running)
+	return waitWindowsService(operationCtx, service, svc.Running)
 }
 
-func (WindowsController) Remove(ctx context.Context, definitionPath string) error {
-	definition, err := readWindowsServiceDefinition(definitionPath)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	if definition.Name == "" {
+func (WindowsController) Remove(ctx context.Context, definitionPath string) (resultErr error) {
+	definition, err := readWindowsServiceDefinitionForRemoval(definitionPath)
+	if errors.Is(err, os.ErrNotExist) {
+		name, nameErr := windowsServiceNameFromDefinitionPath(definitionPath)
+		if nameErr != nil {
+			return nameErr
+		}
+		exists, probeErr := windowsServiceProbe(name)
+		if probeErr != nil {
+			return probeErr
+		}
+		if exists {
+			return fmt.Errorf("%w: registered service %q has no declaration", ErrInvalidDefinition, name)
+		}
 		return nil
 	}
+	if err != nil {
+		return err
+	}
+	if isWindowsPreviewServiceName(definition.Name) {
+		stateRoot, ok := windowsPreviewStateRoot(definition.Arguments)
+		if !ok || validateWindowsPreviewDefinition(definitionPath, definition.Name, stateRoot, definition) != nil {
+			return ErrInvalidDefinition
+		}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	deleteCtx, cancel := context.WithTimeout(ctx, windowsServiceDeleteTimeout)
+	defer cancel()
 	manager, err := mgr.Connect()
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if manager != nil {
+			resultErr = errors.Join(resultErr, manager.Disconnect())
+		}
+	}()
 	service, err := manager.OpenService(definition.Name)
 	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
-		manager.Disconnect()
 		return nil
 	}
+	if errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
+		var serviceCloseErr error
+		if service != nil {
+			serviceCloseErr = service.Close()
+		}
+		disconnectErr := manager.Disconnect()
+		manager = nil
+		return errors.Join(serviceCloseErr, disconnectErr, waitWindowsServiceDeletion(deleteCtx, definition.Name))
+	}
 	if err != nil {
-		manager.Disconnect()
 		return err
 	}
-	if err := stopWindowsService(ctx, service); err != nil && !errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE) {
-		service.Close()
-		manager.Disconnect()
+	defer func() {
+		if service != nil {
+			resultErr = errors.Join(resultErr, service.Close())
+		}
+	}()
+	config, configErr := service.Config()
+	if configErr != nil {
+		return configErr
+	}
+	if !windowsServiceConfigurationOwnsDefinition(config, definition) {
+		return ErrInvalidDefinition
+	}
+	if err := stopWindowsService(deleteCtx, service); err != nil && !errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE) {
 		return err
 	}
 	if err := service.Delete(); err != nil && !errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
-		service.Close()
-		manager.Disconnect()
 		return err
 	}
 	if err := service.Close(); err != nil {
-		manager.Disconnect()
 		return err
 	}
-	manager.Disconnect()
-	// Closing the last service handle is what lets SCM finalize a pending
-	// deletion. Give SCM that window before polling so the poll itself does not
-	// continuously reopen and pin the marked-for-delete service.
-	timer := time.NewTimer(500 * time.Millisecond)
-	select {
-	case <-ctx.Done():
-		timer.Stop()
-		return ctx.Err()
-	case <-timer.C:
-	}
-	for {
-		probeManager, connectErr := mgr.Connect()
-		if connectErr != nil {
-			return connectErr
-		}
-		probe, openErr := probeManager.OpenService(definition.Name)
-		if errors.Is(openErr, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
-			probeManager.Disconnect()
-			return nil
-		}
-		if openErr != nil {
-			probeManager.Disconnect()
-			return openErr
-		}
-		_ = probe.Close()
-		probeManager.Disconnect()
-		timer = time.NewTimer(500 * time.Millisecond)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
-		}
-	}
+	service = nil
+	disconnectErr := manager.Disconnect()
+	manager = nil
+	return errors.Join(disconnectErr, waitWindowsServiceDeletion(deleteCtx, definition.Name))
 }
 
 func readWindowsServiceDefinition(path string) (windowsServiceDefinition, error) {
+	return readWindowsServiceDefinitionWithExecutablePolicy(path, false)
+}
+
+func readWindowsServiceDefinitionForRemoval(path string) (windowsServiceDefinition, error) {
+	return readWindowsServiceDefinitionWithExecutablePolicy(path, true)
+}
+
+func readWindowsServiceDefinitionWithExecutablePolicy(path string, allowMissingExecutable bool) (windowsServiceDefinition, error) {
 	if !filepath.IsAbs(path) || filepath.Ext(path) != ".json" {
 		return windowsServiceDefinition{}, ErrInvalidDefinition
+	}
+	if err := validateWindowsRegularFileNoReparse(path, false); err != nil {
+		return windowsServiceDefinition{}, err
 	}
 	body, err := os.ReadFile(path)
 	if err != nil {
@@ -271,24 +564,342 @@ func readWindowsServiceDefinition(path string) (windowsServiceDefinition, error)
 	var definition windowsServiceDefinition
 	decoder := json.NewDecoder(strings.NewReader(string(body)))
 	decoder.DisallowUnknownFields()
-	if decoder.Decode(&definition) != nil || definition.Schema != "paperboat.windows-service/v1" || definition.Name == "" || safeExecutableWindows(definition.Executable) != nil || len(definition.Arguments) == 0 || !safeValues(definition.Arguments) || !safeEnvironment(definition.Environment) {
+	expectedName, nameErr := windowsServiceNameFromDefinitionPath(path)
+	decodeErr := decoder.Decode(&definition)
+	var extra any
+	trailingErr := decoder.Decode(&extra)
+	executableErr := validateWindowsExecutable(definition.Executable, allowMissingExecutable)
+	if decodeErr != nil || trailingErr != io.EOF || nameErr != nil || !strings.EqualFold(definition.Name, expectedName) || definition.Schema != "paperboat.windows-service/v1" || definition.Name == "" || executableErr != nil || len(definition.Arguments) == 0 || !safeValues(definition.Arguments) || !safeEnvironment(definition.Environment) {
 		return windowsServiceDefinition{}, ErrInvalidDefinition
 	}
 	return definition, nil
 }
 
-func stopWindowsService(ctx context.Context, service *mgr.Service) error {
-	_, err := service.Control(svc.Stop)
-	if err != nil && !errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE) {
+func windowsServiceConfigurationOwnsDefinition(config mgr.Config, definition windowsServiceDefinition) bool {
+	wantPath := windows.ComposeCommandLine(append([]string{definition.Executable}, definition.Arguments...))
+	return strings.EqualFold(config.BinaryPathName, wantPath) && isWindowsSystemAccount(config.ServiceStartName)
+}
+
+func exactWindowsPath(left, right string) bool {
+	return filepath.IsAbs(left) && filepath.IsAbs(right) && filepath.Clean(left) == left && filepath.Clean(right) == right && strings.EqualFold(left, right)
+}
+
+func windowsPreviewInstanceFromName(name string) string {
+	sum := sha256.Sum256([]byte(name))
+	return hex.EncodeToString(sum[:8])
+}
+
+func validateWindowsPreviewArguments(args []string, serviceName, stateRoot, definitionPath string) error {
+	if len(args) < 10 || !safeValues(args) || !isWindowsPreviewServiceName(serviceName) || !validWindowsStateRoot(stateRoot) {
+		return ErrInvalidDefinition
+	}
+	command := args[0]
+	if command != "__runtime-preview" && command != "__runtime-private-preview" && command != "__runtime-serve" {
+		return ErrInvalidDefinition
+	}
+	if args[1] != "--state-root" || !exactWindowsPath(args[2], stateRoot) || args[3] != "--name" || args[4] == "" || args[5] != "--descriptor" || args[7] != "--service-definition" {
+		return ErrInvalidDefinition
+	}
+	instance := windowsPreviewInstanceFromName(args[4])
+	if !strings.EqualFold(serviceName, "PaperboatPreview-"+instance) {
+		return ErrInvalidDefinition
+	}
+	expectedDescriptor := filepath.Join(stateRoot, "previews", "active", instance+".json")
+	if !exactWindowsPath(args[6], expectedDescriptor) || !exactWindowsPath(args[8], definitionPath) {
+		return ErrInvalidDefinition
+	}
+	index := 9
+	if command == "__runtime-preview" {
+		if index+2 > len(args) || args[index] != "--port" {
+			return ErrInvalidDefinition
+		}
+		port, err := strconv.ParseUint(args[index+1], 10, 16)
+		if err != nil || port == 0 {
+			return ErrInvalidDefinition
+		}
+		index += 2
+	}
+	if index >= len(args) {
+		return ErrInvalidDefinition
+	}
+	switch args[index] {
+	case "--indefinite":
+		index++
+	case "--expires-at":
+		if index+2 > len(args) || args[index+1] == "" {
+			return ErrInvalidDefinition
+		}
+		expires, err := time.Parse(time.RFC3339Nano, args[index+1])
+		if err != nil || expires.UTC().Format(time.RFC3339Nano) != args[index+1] {
+			return ErrInvalidDefinition
+		}
+		index += 2
+	default:
+		return ErrInvalidDefinition
+	}
+	if index != len(args) {
+		return ErrInvalidDefinition
+	}
+	return nil
+}
+
+func validateWindowsPreviewDeclarationRoot() error {
+	info, err := os.Lstat(windowsServiceDefinitionRoot)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
 		return err
 	}
-	return waitWindowsService(ctx, service, svc.Stopped)
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return ErrInvalidDefinition
+	}
+	return validateWindowsDirectoryNoReparse(windowsServiceDefinitionRoot)
+}
+
+func validateWindowsPreviewDefinition(path, serviceName, stateRoot string, definition windowsServiceDefinition) error {
+	if !isWindowsPreviewServiceName(serviceName) || !validWindowsStateRoot(stateRoot) || !exactWindowsPath(path, filepath.Join(windowsServiceDefinitionRoot, serviceName+".json")) || !strings.EqualFold(definition.Name, serviceName) || !isWindowsSystemAccount(definition.Account) {
+		return ErrInvalidDefinition
+	}
+	layout, err := DefaultLayout("windows")
+	if err != nil || !exactWindowsPath(definition.Executable, layout.RuntimeCurrent) {
+		return errors.Join(ErrInvalidDefinition, err)
+	}
+	if err := validateWindowsExecutable(definition.Executable, true); err != nil {
+		return err
+	}
+	return validateWindowsPreviewArguments(definition.Arguments, serviceName, stateRoot, path)
+}
+
+// ValidateWindowsPreviewServiceOwnership proves that a declaration and its
+// SCM registration both describe the exact Paperboat preview service. It does
+// not mutate either object and is used as the preflight phase for bulk cleanup.
+func ValidateWindowsPreviewServiceOwnership(ctx context.Context, name, stateRoot string) (resultErr error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	_ = ctx
+	if !isWindowsPreviewServiceName(name) || !validWindowsStateRoot(stateRoot) {
+		return ErrInvalidDefinition
+	}
+	if err := validateWindowsPreviewDeclarationRoot(); err != nil {
+		return err
+	}
+	definitionPath := filepath.Join(windowsServiceDefinitionRoot, name+".json")
+	definition, err := readWindowsServiceDefinitionForRemoval(definitionPath)
+	if errors.Is(err, os.ErrNotExist) {
+		exists, probeErr := windowsServiceProbe(name)
+		if probeErr != nil {
+			return probeErr
+		}
+		if exists {
+			return ErrInvalidDefinition
+		}
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	declaredRoot, ok := windowsPreviewStateRoot(definition.Arguments)
+	if !ok || !sameWindowsServicePath(declaredRoot, stateRoot) {
+		return ErrInvalidDefinition
+	}
+	if err := validateWindowsPreviewDefinition(definitionPath, name, stateRoot, definition); err != nil {
+		return err
+	}
+	manager, err := mgr.Connect()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if manager != nil {
+			resultErr = errors.Join(resultErr, manager.Disconnect())
+		}
+	}()
+	service, err := manager.OpenService(name)
+	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+		return nil
+	}
+	if errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
+		disconnectErr := manager.Disconnect()
+		manager = nil
+		return errors.Join(disconnectErr, waitWindowsServiceDeletion(ctx, name))
+	}
+	if err != nil {
+		return err
+	}
+	config, configErr := service.Config()
+	closeErr := service.Close()
+	if configErr != nil || closeErr != nil {
+		return errors.Join(configErr, closeErr)
+	}
+	if !windowsServiceConfigurationOwnsDefinition(config, definition) {
+		return ErrInvalidDefinition
+	}
+	return nil
+}
+
+func isWindowsSystemAccount(value string) bool {
+	value = strings.TrimSpace(value)
+	return strings.EqualFold(value, "SYSTEM") || strings.EqualFold(value, "LocalSystem") || strings.EqualFold(value, `NT AUTHORITY\SYSTEM`)
+}
+
+func waitWindowsServiceDeletion(ctx context.Context, name string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return pollWindowsServiceDeletion(ctx, windowsServiceDeleteTimeout, windowsServiceDeleteDelay, func() (resultErr error) {
+		manager, err := mgr.Connect()
+		if err != nil {
+			return err
+		}
+		defer func() { resultErr = errors.Join(resultErr, manager.Disconnect()) }()
+		service, err := manager.OpenService(name)
+		if err != nil {
+			return err
+		}
+		return service.Close()
+	})
+}
+
+func pollWindowsServiceDeletion(ctx context.Context, timeout, delay time.Duration, probe func() error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if timeout <= 0 || delay <= 0 || probe == nil {
+		return ErrInvalidDefinition
+	}
+	deadlineCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	wait := func(duration time.Duration) error {
+		timer := time.NewTimer(duration)
+		defer timer.Stop()
+		select {
+		case <-deadlineCtx.Done():
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return deadlineCtx.Err()
+		case <-timer.C:
+			return nil
+		}
+	}
+	if err := wait(delay); err != nil {
+		return err
+	}
+	for {
+		err := probe()
+		if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+			return nil
+		}
+		if err != nil && !errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
+			return err
+		}
+		if err := wait(delay); err != nil {
+			return err
+		}
+	}
+}
+
+// RemoveWindowsPreviewService removes one preview only after its declaration
+// and SCM command both prove ownership of the supplied runtime state root.
+// Missing executables are allowed during this removal-only validation because
+// the declaration and SCM command remain the ownership evidence.
+func RemoveWindowsPreviewService(ctx context.Context, name, stateRoot string) error {
+	if !isWindowsPreviewServiceName(name) || !validWindowsStateRoot(stateRoot) {
+		return ErrInvalidDefinition
+	}
+	if err := ValidateWindowsPreviewServiceOwnership(ctx, name, stateRoot); err != nil {
+		return err
+	}
+	definitionPath := filepath.Join(windowsServiceDefinitionRoot, name+".json")
+	if err := (WindowsController{}).Remove(ctx, definitionPath); err != nil {
+		return err
+	}
+	// The service removal and declaration deletion are separate mutations. The
+	// declaration may have been replaced while SCM was deleting the service,
+	// so prove the exact production declaration again immediately before the
+	// file removal instead of relying on the earlier preflight.
+	if err := ValidateWindowsPreviewServiceOwnership(ctx, name, stateRoot); err != nil {
+		return err
+	}
+	if _, err := readOwnedWindowsPreviewDefinitionForRemoval(definitionPath, name, stateRoot); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if err := os.Remove(definitionPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if _, err := os.Lstat(windowsServiceDefinitionRoot); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	return syncServiceDirectory(windowsServiceDefinitionRoot)
+}
+
+func readOwnedWindowsPreviewDefinitionForRemoval(path, name, stateRoot string) (windowsServiceDefinition, error) {
+	definition, err := readWindowsServiceDefinitionForRemoval(path)
+	if err != nil {
+		return windowsServiceDefinition{}, err
+	}
+	if err := validateWindowsPreviewDefinition(path, name, stateRoot, definition); err != nil {
+		return windowsServiceDefinition{}, err
+	}
+	return definition, nil
+}
+
+func validWindowsStateRoot(path string) bool {
+	return filepath.IsAbs(path) && filepath.Clean(path) == path && filepath.VolumeName(path) != ""
+}
+
+func sameWindowsServicePath(left, right string) bool {
+	return validWindowsStateRoot(left) && validWindowsStateRoot(right) && strings.EqualFold(filepath.Clean(left), filepath.Clean(right))
+}
+
+func stopWindowsService(ctx context.Context, service *mgr.Service) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	operationCtx, cancel := context.WithTimeout(ctx, windowsServiceOperationTimeout)
+	defer cancel()
+	for {
+		status, err := service.Query()
+		if err != nil {
+			return err
+		}
+		if status.State == svc.Stopped {
+			return nil
+		}
+		if status.State != svc.StopPending {
+			_, controlErr := service.Control(svc.Stop)
+			if controlErr != nil && !errors.Is(controlErr, windows.ERROR_SERVICE_NOT_ACTIVE) &&
+				!errors.Is(controlErr, windows.ERROR_SERVICE_CANNOT_ACCEPT_CTRL) &&
+				!errors.Is(controlErr, windows.ERROR_SERVICE_REQUEST_TIMEOUT) {
+				return controlErr
+			}
+		}
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-operationCtx.Done():
+			timer.Stop()
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return operationCtx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 func waitWindowsService(ctx context.Context, service *mgr.Service, want svc.State) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	operationCtx, cancel := context.WithTimeout(ctx, windowsServiceOperationTimeout)
+	defer cancel()
 	for {
 		status, err := service.Query()
 		if err != nil {
@@ -299,9 +910,12 @@ func waitWindowsService(ctx context.Context, service *mgr.Service, want svc.Stat
 		}
 		timer := time.NewTimer(100 * time.Millisecond)
 		select {
-		case <-ctx.Done():
+		case <-operationCtx.Done():
 			timer.Stop()
-			return ctx.Err()
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return operationCtx.Err()
 		case <-timer.C:
 		}
 	}

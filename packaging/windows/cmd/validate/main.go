@@ -225,6 +225,7 @@ func validateWix(root string, policy metadata) error {
 		`<Directory Id="CLICURRENTSLOT" Name="cli-current" />`,
 		`<Directory Id="ACTIVERELEASE" Name="$(var.PaperboatVersion)" />`,
 		`<ComponentGroup Id="ServiceComponents" Directory="ACTIVERELEASE">`,
+		`FileRef="CLICurrentSeedBinary"`,
 		`Source="$(var.StagingDir)\pb.exe" Name="pb.exe"`,
 		`O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)`,
 		`Value="PaperboatSshd"`,
@@ -236,6 +237,27 @@ func validateWix(root string, policy metadata) error {
 		if !strings.Contains(string(source), required) {
 			return fmt.Errorf("wix/Paperboat.wxs is missing %q", required)
 		}
+	}
+	directoryACL := `O:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)`
+	fileACL := `O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)`
+	for _, contract := range []struct {
+		kind, id, acl string
+	}{
+		{kind: "Component", id: "ReleaseVersionsSecurityComponent", acl: directoryACL},
+		{kind: "Component", id: "ActiveReleaseSecurityComponent", acl: directoryACL},
+		{kind: "File", id: "RuntimeBinary", acl: fileACL},
+		{kind: "File", id: "HostSupervisorBinary", acl: fileACL},
+		{kind: "File", id: "UpdaterBinary", acl: fileACL},
+	} {
+		elementPattern := `(?s)<` + contract.kind + `\b[^>]*\bId="` + regexp.QuoteMeta(contract.id) + `"[^>]*>.*?</` + contract.kind + `>`
+		element := regexp.MustCompile(elementPattern).Find(source)
+		permission := `<PermissionEx Sddl="` + contract.acl + `" />`
+		if element == nil || !strings.Contains(string(element), permission) {
+			return fmt.Errorf("wix/Paperboat.wxs does not bind ACL %q to %s %s", contract.acl, contract.kind, contract.id)
+		}
+	}
+	if strings.Contains(string(source), `FileRef="RuntimeBinary"`) {
+		return fmt.Errorf("WiX uninstall cleanup must not invoke the runtime-role artifact")
 	}
 	componentGUID := regexp.MustCompile(`Guid="([^"]+)"`)
 	seenGUIDs := make(map[string]struct{})

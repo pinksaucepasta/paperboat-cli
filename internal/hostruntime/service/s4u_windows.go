@@ -93,6 +93,7 @@ func (p *loadedOwnerProfile) Close() error {
 				result = errors.Join(result, err)
 				break
 			}
+			//paperboat:allow-source-policy sleep owner=windows-service reason=bounded-user-profile-unload-retry
 			time.Sleep(50 * time.Millisecond)
 		}
 		if !unloaded {
@@ -125,7 +126,7 @@ var (
 	procUnloadUserProfile       = modUserenv.NewProc("UnloadUserProfile")
 )
 
-func s4uOwnerToken(ownerSID string) (windows.Token, uint32, *loadedOwnerProfile, error) {
+func s4uOwnerToken(ownerSID string) (resultToken windows.Token, resultSession uint32, resultProfile *loadedOwnerProfile, resultErr error) {
 	sid, err := windows.StringToSid(ownerSID)
 	if err != nil || sid == nil || !sid.IsValid() {
 		return 0, 0, nil, ErrWindowsServiceEntry
@@ -138,20 +139,18 @@ func s4uOwnerToken(ownerSID string) (windows.Token, uint32, *loadedOwnerProfile,
 	if err != nil {
 		return 0, 0, nil, err
 	}
-	defer source.Close()
+	defer func() { resultErr = errors.Join(resultErr, source.Close()) }()
 	var token windows.Token
 	access := uint32(windows.TOKEN_ASSIGN_PRIMARY | windows.TOKEN_DUPLICATE | windows.TOKEN_IMPERSONATE | windows.TOKEN_QUERY | windows.TOKEN_ADJUST_DEFAULT | windows.TOKEN_ADJUST_SESSIONID | windows.TOKEN_ADJUST_PRIVILEGES)
 	if err := windows.DuplicateTokenEx(source, access, nil, windows.SecurityImpersonation, windows.TokenPrimary, &token); err != nil {
 		return 0, 0, nil, err
 	}
 	if err := validateOwnerToken(token, ownerSID); err != nil {
-		_ = token.Close()
-		return 0, 0, nil, err
+		return 0, 0, nil, errors.Join(err, token.Close())
 	}
 	profile, err := loadOwnerProfile(token, account, domain)
 	if err != nil {
-		_ = token.Close()
-		return 0, 0, nil, fmt.Errorf("load enrolled owner profile: %w", err)
+		return 0, 0, nil, errors.Join(fmt.Errorf("load enrolled owner profile: %w", err), token.Close())
 	}
 	// A logged-out S4U workload deliberately has no WTS session. Session
 	// logoff events must not terminate it; its Job Object owns shutdown.
@@ -293,14 +292,17 @@ func loadOwnerProfile(token windows.Token, account, domain string) (*loadedOwner
 			return nil, err
 		}
 	}
-	info := profileInfo{Size: uint32(unsafe.Sizeof(profileInfo{})), Flags: profileNoUI, UserName: userName, ServerName: serverName}
-	if err := loadUserProfile(token, &info); err != nil {
-		return nil, err
-	}
+	// Duplicate the token before loading the profile. If duplication fails,
+	// there is no loaded profile handle to recover. Loading first and then
+	// dropping the only UnloadUserProfile token on a duplication error leaves a
+	// profile hive resident with no retryable handle.
 	var duplicate windows.Handle
 	if err := windows.DuplicateHandle(windows.CurrentProcess(), windows.Handle(token), windows.CurrentProcess(), &duplicate, 0, false, windows.DUPLICATE_SAME_ACCESS); err != nil {
-		_ = unloadUserProfile(token, info.Profile)
 		return nil, err
+	}
+	info := profileInfo{Size: uint32(unsafe.Sizeof(profileInfo{})), Flags: profileNoUI, UserName: userName, ServerName: serverName}
+	if err := loadUserProfile(token, &info); err != nil {
+		return nil, errors.Join(err, windows.Close(duplicate))
 	}
 	return &loadedOwnerProfile{token: windows.Token(duplicate), key: info.Profile}, nil
 }
@@ -355,24 +357,24 @@ func adjustTokenPrivileges(token windows.Token, disableAll bool, privileges *win
 	return nil
 }
 
-func enableOwnerLaunchPrivileges() (func(), error) {
+func enableOwnerLaunchPrivileges() (resultCleanup func() error, resultErr error) {
 	runtime.LockOSThread()
 	if err := windows.ImpersonateSelf(windows.SecurityImpersonation); err != nil {
 		runtime.UnlockOSThread()
 		return nil, err
 	}
-	cleanup := func() {
+	cleanup := func() error {
 		if err := windows.RevertToSelf(); err != nil {
-			panic(fmt.Sprintf("Paperboat owner-token launch could not revert thread impersonation: %v", err))
+			return err
 		}
 		runtime.UnlockOSThread()
+		return nil
 	}
 	var token windows.Token
 	if err := windows.OpenThreadToken(windows.CurrentThread(), windows.TOKEN_QUERY|windows.TOKEN_ADJUST_PRIVILEGES, false, &token); err != nil {
-		cleanup()
-		return nil, err
+		return nil, errors.Join(err, cleanup())
 	}
-	defer token.Close()
+	defer func() { resultErr = errors.Join(resultErr, token.Close()) }()
 	// LoadUserProfile requires backup/restore privileges; LsaLogonUser and
 	// CreateProcessAsUser require the remaining privileges when hostd runs as
 	// LocalSystem. Enable each explicitly and fail on NOT_ALL_ASSIGNED.
@@ -383,18 +385,15 @@ func enableOwnerLaunchPrivileges() (func(), error) {
 	for index, value := range names {
 		name, err := windows.UTF16PtrFromString(value)
 		if err != nil {
-			cleanup()
-			return nil, err
+			return nil, errors.Join(err, cleanup())
 		}
 		if err := windows.LookupPrivilegeValue(nil, name, &privileges.AllPrivileges()[index].Luid); err != nil {
-			cleanup()
-			return nil, err
+			return nil, errors.Join(err, cleanup())
 		}
 		privileges.AllPrivileges()[index].Attributes = windows.SE_PRIVILEGE_ENABLED
 	}
 	if err := adjustTokenPrivileges(token, false, privileges); err != nil {
-		cleanup()
-		return nil, err
+		return nil, errors.Join(err, cleanup())
 	}
 	return cleanup, nil
 }

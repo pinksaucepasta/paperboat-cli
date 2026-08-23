@@ -4,8 +4,11 @@ package hostruntimeentry
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
+
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostinstall"
 )
 
 func TestWindowsWorkerEntriesValidateTheirNativeContracts(t *testing.T) {
@@ -32,5 +35,38 @@ func TestWindowsPreviewMutationShapeAllowsLifecycleOperationsWithoutExpiry(t *te
 	}
 	if validWindowsPreviewMutationShape(WindowsPreviewMutation{Kind: "preview", Root: `C:\Paperboat\state`, Name: "preview"}) {
 		t.Fatal("preview mutation without an expiry policy was accepted")
+	}
+}
+
+func TestApplyWindowsPreviewMutationLifecycleDoesNotRequireRuntimeCurrent(t *testing.T) {
+	previousLoad := loadWindowsPreviewRuntimeConfig
+	previousEval := evalWindowsPreviewExecutable
+	t.Cleanup(func() {
+		loadWindowsPreviewRuntimeConfig = previousLoad
+		evalWindowsPreviewExecutable = previousEval
+	})
+
+	root := t.TempDir()
+	loadWindowsPreviewRuntimeConfig = func() (hostinstall.WindowsRuntimeConfig, error) {
+		return hostinstall.WindowsRuntimeConfig{StateRoot: root}, nil
+	}
+	evaluated := false
+	evalWindowsPreviewExecutable = func(string) (string, error) {
+		evaluated = true
+		return "", errors.New("runtime-current must not be resolved for lifecycle mutation")
+	}
+
+	for _, mutation := range []WindowsPreviewMutation{
+		{Kind: "remove", Root: root, Name: "remove"},
+		{Kind: "reconcile", Root: root, Name: "reconcile", Now: time.Now().UTC()},
+		{Kind: "remove_all", Root: root, Name: "remove-all"},
+	} {
+		evaluated = false
+		if err := ApplyWindowsPreviewMutation(context.Background(), mutation); err != nil {
+			t.Fatalf("%s mutation returned error: %v", mutation.Kind, err)
+		}
+		if evaluated {
+			t.Fatalf("%s mutation resolved RuntimeCurrent", mutation.Kind)
+		}
 	}
 }
