@@ -122,7 +122,7 @@ func createProtectedTemporary(parent, descriptor string) (*os.File, string, erro
 		if !strings.HasPrefix(descriptor, "O:SY") {
 			return nil, "", windows.ERROR_INVALID_SECURITY_DESCR
 		}
-		creationDescriptorText = "O:BA" + strings.TrimPrefix(descriptor, "O:SY")
+		creationDescriptorText = strings.TrimPrefix(descriptor, "O:SY")
 		administratorsOwner, err = windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
 		if err != nil {
 			return nil, "", err
@@ -146,28 +146,70 @@ func createProtectedTemporary(parent, descriptor string) (*os.File, string, erro
 		if err != nil {
 			return nil, "", err
 		}
-		handle, err := windows.CreateFile(pathUTF16, windows.GENERIC_READ|windows.GENERIC_WRITE|windows.READ_CONTROL|windows.WRITE_DAC|windows.WRITE_OWNER, 0, &attributes, windows.CREATE_NEW, windows.FILE_ATTRIBUTE_NORMAL, 0)
+		var handle windows.Handle
+		create := func() error {
+			var createErr error
+			handle, createErr = windows.CreateFile(pathUTF16, windows.GENERIC_READ|windows.GENERIC_WRITE|windows.READ_CONTROL|windows.WRITE_DAC|windows.WRITE_OWNER, 0, &attributes, windows.CREATE_NEW, windows.FILE_ATTRIBUTE_NORMAL|windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
+			return createErr
+		}
+		if transitionToSystem {
+			err = windowssecurity.WithRestorePrivilegeAndOwner(administratorsOwner, create)
+		} else {
+			err = create()
+		}
 		runtime.KeepAlive(creationDescriptor)
-		if errors.Is(err, windows.ERROR_FILE_EXISTS) || errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
+		if err == windows.ERROR_FILE_EXISTS || err == windows.ERROR_ALREADY_EXISTS {
 			continue
 		}
 		if err != nil {
+			if handle != 0 {
+				closeErr := windows.CloseHandle(handle)
+				removeErr := os.Remove(path)
+				if errors.Is(removeErr, os.ErrNotExist) {
+					removeErr = nil
+				}
+				err = errors.Join(err, closeErr, removeErr)
+			}
 			return nil, "", err
 		}
 		if transitionToSystem {
 			transitionErr := error(nil)
-			if !windowssecurity.HandleOwnerMatchesSID(handle, administratorsOwner) || !windowssecurity.ProtectedHandleDACLMatches(handle, creationDescriptorText) {
-				transitionErr = windows.ERROR_INVALID_SECURITY_DESCR
+			if !windowssecurity.HandleOwnerMatchesSID(handle, administratorsOwner) {
+				transitionErr = fmt.Errorf("validate protected temporary creation owner: %w", windows.ERROR_INVALID_SECURITY_DESCR)
+			} else if !windowssecurity.ProtectedHandleDACLMatches(handle, creationDescriptorText) {
+				transitionErr = fmt.Errorf("validate protected temporary creation DACL: %w", windows.ERROR_INVALID_SECURITY_DESCR)
 			}
-			dacl, _, daclErr := finalDescriptor.DACL()
+			absoluteDescriptor, absoluteErr := finalDescriptor.ToAbsolute()
+			transitionErr = errors.Join(transitionErr, absoluteErr)
+			var dacl *windows.ACL
+			var daclErr error
+			if transitionErr == nil {
+				dacl, _, daclErr = absoluteDescriptor.DACL()
+			}
 			transitionErr = errors.Join(transitionErr, daclErr)
 			if transitionErr == nil {
 				transitionErr = windowssecurity.WithRestorePrivilege(func() error {
-					return windows.SetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, systemOwner, nil, dacl, nil)
+					if err := windows.SetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil); err != nil {
+						return err
+					}
+					runtime.KeepAlive(absoluteDescriptor)
+					if !windowssecurity.ProtectedHandleDACLMatches(handle, descriptor) {
+						return fmt.Errorf("validate protected temporary final DACL: %w", windows.ERROR_INVALID_SECURITY_DESCR)
+					}
+					return windows.SetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION, systemOwner, nil, nil, nil)
 				})
+				runtime.KeepAlive(absoluteDescriptor)
 			}
-			if transitionErr == nil && (!windowssecurity.HandleOwnerMatchesSID(handle, systemOwner) || !windowssecurity.ProtectedHandleDACLMatches(handle, descriptor)) {
-				transitionErr = windows.ERROR_INVALID_SECURITY_DESCR
+			if transitionErr == nil && !windowssecurity.HandleOwnerMatchesSID(handle, systemOwner) {
+				actual := "unavailable"
+				if current, queryErr := windows.GetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION); queryErr == nil && current != nil {
+					if currentOwner, _, ownerQueryErr := current.Owner(); ownerQueryErr == nil && currentOwner != nil {
+						actual = currentOwner.String()
+					}
+				}
+				transitionErr = fmt.Errorf("validate protected temporary final owner (got %s want %s): %w", actual, systemOwner.String(), windows.ERROR_INVALID_SECURITY_DESCR)
+			} else if transitionErr == nil && !windowssecurity.ProtectedHandleDACLMatches(handle, descriptor) {
+				transitionErr = fmt.Errorf("validate protected temporary final DACL: %w", windows.ERROR_INVALID_SECURITY_DESCR)
 			}
 			if transitionErr != nil {
 				windows.CloseHandle(handle)

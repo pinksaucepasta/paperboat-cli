@@ -847,11 +847,13 @@ func ensureWindowsMachineDirectory(path, ownerSID string) error {
 		return err
 	}
 	_, statErr := os.Lstat(path)
-	created := false
 	if errors.Is(statErr, os.ErrNotExist) {
 		if err := createWindowsRuntimeRoot(path, trustedOwner, windowsRuntimeCurrentRootDACL(ownerSID)); err == nil {
-			created = true
-		} else if !errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
+			// Creation and the BA-to-SYSTEM owner transition were verified through
+			// one nonshared, non-reparse handle. Do not weaken that proof by
+			// resolving the path again after the trusted handle is closed.
+			return nil
+		} else if err != windows.ERROR_ALREADY_EXISTS {
 			return err
 		}
 	} else if statErr != nil {
@@ -874,7 +876,7 @@ func ensureWindowsMachineDirectory(path, ownerSID string) error {
 	// cut between protected creation and the owner transfer may leave the one
 	// exact Administrators-owned transitional state. Reject every other owner
 	// without rewriting it.
-	if !created && !windowssecurity.HandleOwnerMatchesSID(handle, trustedOwner) {
+	if !windowssecurity.HandleOwnerMatchesSID(handle, trustedOwner) {
 		administrators, ownerErr := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
 		if ownerErr != nil || !windowssecurity.HandleOwnerMatchesSID(handle, administrators) || !windowssecurity.ProtectedHandleDACLMatches(handle, windowsRuntimeCurrentRootDACL(ownerSID)) {
 			return fmt.Errorf("validate existing Windows runtime root owner: %w", ErrInvalidRequest)
@@ -904,17 +906,64 @@ func windowsRuntimeCurrentRootDACL(ownerSID string) string {
 }
 
 func windowsRuntimeSecurityMatches(path string, owner *windows.SID, dacl string) bool {
-	return windowssecurity.OwnerMatchesSID(path, owner) && windowssecurity.ProtectedDACLMatches(path, dacl)
+	handle, err := openWindowsRuntimeSecurityObject(path)
+	if err != nil {
+		return false
+	}
+	defer windows.CloseHandle(handle)
+	return windowsRuntimeHandleSecurityMatches(handle, owner, dacl)
 }
 
 func validateWindowsRuntimeSecurity(path string, owner *windows.SID, dacl, stage string) error {
-	if !windowssecurity.OwnerMatchesSID(path, owner) {
+	handle, err := openWindowsRuntimeSecurityObject(path)
+	if err != nil {
+		return fmt.Errorf("open Windows runtime %s security: %w", stage, err)
+	}
+	defer windows.CloseHandle(handle)
+	if !windowssecurity.HandleOwnerMatchesSID(handle, owner) {
 		return fmt.Errorf("validate Windows runtime %s filesystem owner: %w", stage, ErrInvalidRequest)
 	}
-	if !windowssecurity.ProtectedDACLMatches(path, dacl) {
-		return fmt.Errorf("validate Windows runtime %s protected DACL: %w", stage, ErrInvalidRequest)
+	if !windowssecurity.ProtectedHandleDACLMatches(handle, dacl) {
+		actual := "unavailable"
+		if current, queryErr := windows.GetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION); queryErr == nil && current != nil {
+			actual = current.String()
+		}
+		return fmt.Errorf("validate Windows runtime %s protected DACL (got %s want %s): %w", stage, actual, dacl, ErrInvalidRequest)
 	}
 	return nil
+}
+
+func openWindowsRuntimeSecurityObject(path string) (windows.Handle, error) {
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || (!info.IsDir() && !info.Mode().IsRegular()) {
+		if err == nil {
+			err = ErrInvalidRequest
+		}
+		return 0, err
+	}
+	pathUTF16, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return 0, err
+	}
+	flags := uint32(windows.FILE_FLAG_OPEN_REPARSE_POINT)
+	if info.IsDir() {
+		flags |= windows.FILE_FLAG_BACKUP_SEMANTICS
+	}
+	handle, err := windows.CreateFile(pathUTF16, windows.GENERIC_READ|windows.READ_CONTROL, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil, windows.OPEN_EXISTING, flags, 0)
+	if err != nil {
+		return 0, err
+	}
+	var information windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(handle, &information); err != nil {
+		windows.CloseHandle(handle)
+		return 0, err
+	}
+	isDirectory := information.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0
+	if information.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 || isDirectory != info.IsDir() {
+		windows.CloseHandle(handle)
+		return 0, ErrInvalidRequest
+	}
+	return handle, nil
 }
 
 func windowsRuntimeMigrationSecurityMatches(path string, legacyOwner, trustedOwner *windows.SID, legacyDACL, currentDACL string) bool {
@@ -963,15 +1012,27 @@ func applyWindowsHandleOwnedDACL(handle windows.Handle, owner *windows.SID, acce
 	if err != nil {
 		return err
 	}
-	dacl, _, err := descriptor.DACL()
+	absoluteDescriptor, err := descriptor.ToAbsolute()
+	if err != nil {
+		return err
+	}
+	dacl, _, err := absoluteDescriptor.DACL()
 	if err != nil {
 		return err
 	}
 	if err := windowssecurity.WithRestorePrivilege(func() error {
-		return windows.SetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, owner, nil, dacl, nil)
+		if setErr := windows.SetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil); setErr != nil {
+			return setErr
+		}
+		runtime.KeepAlive(absoluteDescriptor)
+		if !windowssecurity.ProtectedHandleDACLMatches(handle, access) {
+			return fmt.Errorf("validate rewritten object protected DACL: %w", ErrInvalidRequest)
+		}
+		return windows.SetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION, owner, nil, nil, nil)
 	}); err != nil {
 		return err
 	}
+	runtime.KeepAlive(absoluteDescriptor)
 	if !windowsRuntimeHandleSecurityMatches(handle, owner, access) {
 		return ErrInvalidRequest
 	}
@@ -986,15 +1047,27 @@ func applyWindowsOwnedDACL(path string, owner *windows.SID, access string) error
 	if err != nil {
 		return err
 	}
-	dacl, _, err := descriptor.DACL()
+	absoluteDescriptor, err := descriptor.ToAbsolute()
+	if err != nil {
+		return err
+	}
+	dacl, _, err := absoluteDescriptor.DACL()
 	if err != nil {
 		return err
 	}
 	if err := windowssecurity.WithRestorePrivilege(func() error {
-		return windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, owner, nil, dacl, nil)
+		if setErr := windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil); setErr != nil {
+			return setErr
+		}
+		runtime.KeepAlive(absoluteDescriptor)
+		if !windowssecurity.ProtectedDACLMatches(path, access) {
+			return fmt.Errorf("validate rewritten object protected DACL: %w", ErrInvalidRequest)
+		}
+		return windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION, owner, nil, nil, nil)
 	}); err != nil {
 		return err
 	}
+	runtime.KeepAlive(absoluteDescriptor)
 	if err := validateWindowsRuntimeSecurity(path, owner, access, "rewritten object"); err != nil {
 		return err
 	}
@@ -1005,7 +1078,7 @@ func createWindowsRuntimeRoot(path string, owner *windows.SID, dacl string) erro
 	// Administrators is a trusted creation owner in an elevated token. The
 	// final protected DACL gives the enrolled user read/execute only, so the
 	// object is safe while its owner is transferred to SYSTEM.
-	descriptor, err := windows.SecurityDescriptorFromString("O:BA" + dacl)
+	descriptor, err := windows.SecurityDescriptorFromString(dacl)
 	if err != nil {
 		return err
 	}
@@ -1017,10 +1090,16 @@ func createWindowsRuntimeRoot(path string, owner *windows.SID, dacl string) erro
 	if err != nil {
 		return err
 	}
-	err = windowssecurity.WithRestorePrivilege(func() error {
+	administrators, err := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
+	if err != nil {
+		return err
+	}
+	created := false
+	err = windowssecurity.WithRestorePrivilegeAndOwner(administrators, func() error {
 		if err := windows.CreateDirectory(pathUTF16, &attributes); err != nil {
 			return err
 		}
+		created = true
 		handle, openErr := windows.CreateFile(pathUTF16, windows.READ_CONTROL|windows.WRITE_DAC|windows.WRITE_OWNER, 0, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
 		if openErr != nil {
 			return openErr
@@ -1033,10 +1112,6 @@ func createWindowsRuntimeRoot(path string, owner *windows.SID, dacl string) erro
 		if information.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 || information.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
 			return ErrInvalidRequest
 		}
-		administrators, ownerErr := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
-		if ownerErr != nil {
-			return ownerErr
-		}
 		if !windowssecurity.HandleOwnerMatchesSID(handle, administrators) || !windowssecurity.ProtectedHandleDACLMatches(handle, dacl) {
 			return windows.ERROR_INVALID_SECURITY_DESCR
 		}
@@ -1044,11 +1119,23 @@ func createWindowsRuntimeRoot(path string, owner *windows.SID, dacl string) erro
 		if descriptorErr != nil {
 			return descriptorErr
 		}
-		finalDACL, _, descriptorErr := finalDescriptor.DACL()
+		absoluteDescriptor, descriptorErr := finalDescriptor.ToAbsolute()
 		if descriptorErr != nil {
 			return descriptorErr
 		}
-		if descriptorErr = windows.SetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, owner, nil, finalDACL, nil); descriptorErr != nil {
+		finalDACL, _, descriptorErr := absoluteDescriptor.DACL()
+		if descriptorErr != nil {
+			return descriptorErr
+		}
+		descriptorErr = windows.SetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, finalDACL, nil)
+		runtime.KeepAlive(absoluteDescriptor)
+		if descriptorErr != nil {
+			return descriptorErr
+		}
+		if !windowssecurity.ProtectedHandleDACLMatches(handle, dacl) {
+			return fmt.Errorf("validate created Windows runtime root protected DACL: %w", ErrInvalidRequest)
+		}
+		if descriptorErr = windows.SetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION, owner, nil, nil, nil); descriptorErr != nil {
 			return descriptorErr
 		}
 		if !windowssecurity.HandleOwnerMatchesSID(handle, owner) || !windowssecurity.ProtectedHandleDACLMatches(handle, dacl) {
@@ -1058,9 +1145,16 @@ func createWindowsRuntimeRoot(path string, owner *windows.SID, dacl string) erro
 	})
 	runtime.KeepAlive(descriptor)
 	if err != nil {
-		return err
-	}
-	if err := validateWindowsRuntimeSecurity(path, owner, dacl, "created root"); err != nil {
+		removeErr := error(nil)
+		if created {
+			removeErr = os.Remove(path)
+			if errors.Is(removeErr, os.ErrNotExist) {
+				removeErr = nil
+			}
+		}
+		if removeErr != nil {
+			return errors.Join(err, removeErr)
+		}
 		return err
 	}
 	return nil
@@ -1334,15 +1428,54 @@ func applyWindowsACL(path, ownerSID string, directory bool) error {
 }
 
 func applyWindowsDACL(path, access string) error {
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || (!info.IsDir() && !info.Mode().IsRegular()) {
+		if err == nil {
+			err = ErrInvalidRequest
+		}
+		return err
+	}
+	pathUTF16, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return err
+	}
+	flags := uint32(windows.FILE_FLAG_OPEN_REPARSE_POINT)
+	if info.IsDir() {
+		flags |= windows.FILE_FLAG_BACKUP_SEMANTICS
+	}
+	handle, err := windows.CreateFile(pathUTF16, windows.READ_CONTROL|windows.WRITE_DAC, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, flags, 0)
+	if err != nil {
+		return err
+	}
+	defer windows.CloseHandle(handle)
+	var information windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(handle, &information); err != nil {
+		return err
+	}
+	isDirectory := information.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0
+	if information.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 || isDirectory != info.IsDir() {
+		return ErrInvalidRequest
+	}
 	descriptor, err := windows.SecurityDescriptorFromString(access)
 	if err != nil {
 		return err
 	}
-	dacl, _, err := descriptor.DACL()
+	absoluteDescriptor, err := descriptor.ToAbsolute()
 	if err != nil {
 		return err
 	}
-	return windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil)
+	dacl, _, err := absoluteDescriptor.DACL()
+	if err != nil {
+		return err
+	}
+	if err := windows.SetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil); err != nil {
+		return err
+	}
+	runtime.KeepAlive(absoluteDescriptor)
+	if !windowssecurity.ProtectedHandleDACLMatches(handle, access) {
+		return fmt.Errorf("validate rewritten Windows object protected DACL: %w", ErrInvalidRequest)
+	}
+	return nil
 }
 
 func repairWindowsTreeACL(root, ownerSID string) error {

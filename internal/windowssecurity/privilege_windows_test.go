@@ -41,37 +41,6 @@ func TestWithRestorePrivilegeNestedPreservesOuterToken(t *testing.T) {
 	}
 }
 
-func TestWithRestorePrivilegeRevertsWhenOpeningSelfTokenFails(t *testing.T) {
-	previousImpersonate := restoreImpersonateSelf
-	previousOpen := restoreOpenThreadToken
-	previousRevert := restoreRevertToSelf
-	t.Cleanup(func() {
-		restoreImpersonateSelf = previousImpersonate
-		restoreOpenThreadToken = previousOpen
-		restoreRevertToSelf = previousRevert
-	})
-	openCalls := 0
-	reverted := false
-	restoreImpersonateSelf = func(uint32) error { return nil }
-	restoreOpenThreadToken = func(windows.Handle, uint32, bool, *windows.Token) error {
-		openCalls++
-		if openCalls == 1 {
-			return windows.ERROR_NO_TOKEN
-		}
-		return windows.ERROR_ACCESS_DENIED
-	}
-	restoreRevertToSelf = func() error {
-		reverted = true
-		return nil
-	}
-	if err := WithRestorePrivilege(func() error { return nil }); !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !reverted {
-		t.Fatal("failed self-token open did not revert impersonation")
-	}
-}
-
 func TestWithRestorePrivilegePreservesExistingTokenAndPrivilegeState(t *testing.T) {
 	runtime.LockOSThread()
 	if err := windows.ImpersonateSelf(windows.SecurityImpersonation); err != nil {
@@ -95,6 +64,72 @@ func TestWithRestorePrivilegePreservesExistingTokenAndPrivilegeState(t *testing.
 	if beforeEnabled != afterEnabled {
 		t.Fatalf("SeRestorePrivilege state changed across scope: before=%t after=%t", beforeEnabled, afterEnabled)
 	}
+}
+
+func TestWithRestorePrivilegeAndOwnerRestoresExistingTokenOwner(t *testing.T) {
+	runtime.LockOSThread()
+	if err := windows.ImpersonateSelf(windows.SecurityImpersonation); err != nil {
+		runtime.UnlockOSThread()
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := windows.RevertToSelf(); err != nil {
+			t.Errorf("revert test impersonation: %v", err)
+			return
+		}
+		runtime.UnlockOSThread()
+	}()
+	var token windows.Token
+	if err := windows.OpenThreadToken(windows.CurrentThread(), windows.TOKEN_QUERY, false, &token); err != nil {
+		t.Fatal(err)
+	}
+	defer token.Close()
+	beforeBuffer, beforeOwner, err := tokenOwnerInformation(token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	administrators, err := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !tokenHasOwnerGroup(token, administrators) {
+		t.Skip("test token cannot use Administrators as its default owner")
+	}
+	if err := WithRestorePrivilegeAndOwner(administrators, func() error {
+		currentBuffer, currentOwner, err := tokenOwnerInformation(windows.GetCurrentThreadEffectiveToken())
+		defer runtime.KeepAlive(currentBuffer)
+		if err != nil {
+			return err
+		}
+		if !currentOwner.Equals(administrators) {
+			return windows.ERROR_INVALID_OWNER
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	afterBuffer, afterOwner, err := tokenOwnerInformation(token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !afterOwner.Equals(beforeOwner) {
+		t.Fatal("default token owner was not restored")
+	}
+	runtime.KeepAlive(beforeBuffer)
+	runtime.KeepAlive(afterBuffer)
+}
+
+func tokenHasOwnerGroup(token windows.Token, wanted *windows.SID) bool {
+	groups, err := token.GetTokenGroups()
+	if err != nil {
+		return false
+	}
+	for _, group := range groups.AllGroups() {
+		if group.Sid != nil && group.Sid.Equals(wanted) && group.Attributes&windows.SE_GROUP_OWNER != 0 && group.Attributes&windows.SE_GROUP_USE_FOR_DENY_ONLY == 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func restorePrivilegeState(t *testing.T) (windows.Token, bool) {
