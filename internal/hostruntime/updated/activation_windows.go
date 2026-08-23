@@ -24,6 +24,7 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/nativesignature"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/workerupdate"
+	"github.com/pinksaucepasta/paperboat/internal/windowssecurity"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
@@ -225,7 +226,7 @@ func secureWindowsReleaseDirectory(path string) error {
 	if err != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
 		return errInvalidWindowsActivation
 	}
-	return applyWindowsReleaseACL(path, "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)")
+	return applyWindowsReleaseACL(path, "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)")
 }
 
 func secureWindowsTransactionDirectory(path string) error {
@@ -248,7 +249,7 @@ func secureWindowsReleaseFile(path string) error {
 	if err != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
 		return errInvalidWindowsActivation
 	}
-	return applyWindowsReleaseACL(path, "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;BU)")
+	return applyWindowsReleaseACL(path, "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)")
 }
 
 func applyWindowsReleaseACL(path, sddl string) error {
@@ -260,7 +261,19 @@ func applyWindowsReleaseACL(path, sddl string) error {
 	if err != nil {
 		return err
 	}
-	return windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil)
+	system, err := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
+	if err != nil {
+		return err
+	}
+	if err := windowssecurity.WithRestorePrivilege(func() error {
+		return windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, system, nil, dacl, nil)
+	}); err != nil {
+		return err
+	}
+	if !windowssecurity.OwnerMatchesSID(path, system) || !windowssecurity.ProtectedDACLMatches(path, sddl) {
+		return errInvalidWindowsActivation
+	}
+	return nil
 }
 
 func matchesWindowsComponent(path string, target workerupdate.ComponentTarget) bool {
@@ -281,6 +294,13 @@ func matchesWindowsComponent(path string, target workerupdate.ComponentTarget) b
 }
 
 func readOptionalWindowsCLIRecord(path string) (string, error) {
+	if _, err := os.Lstat(path); err == nil {
+		if !windowsMachineFileSecurityMatches(path, "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)") {
+			return "", errInvalidWindowsActivation
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
 	body, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return "", nil
@@ -289,6 +309,19 @@ func readOptionalWindowsCLIRecord(path string) (string, error) {
 		return "", errInvalidWindowsActivation
 	}
 	return string(body), nil
+}
+
+func windowsMachineFileSecurityMatches(path, dacl string) bool {
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return false
+	}
+	attributes, err := windows.GetFileAttributes(windows.StringToUTF16Ptr(path))
+	if err != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return false
+	}
+	system, err := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
+	return err == nil && windowssecurity.OwnerMatchesSID(path, system) && windowssecurity.ProtectedDACLMatches(path, dacl)
 }
 
 func queryWindowsServiceTarget(name, expectedArgument string) (windowsServiceTarget, error) {
@@ -581,9 +614,14 @@ func (b *windowsSCMActivationBackend) CommitCLI(ctx context.Context, journal win
 		if err != nil {
 			return err
 		}
-		if err := atomicfile.Write(destination, body, atomicfile.Options{Mode: 0o755, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)"}); err != nil {
+		if err := windowssecurity.WithRestorePrivilege(func() error {
+			return atomicfile.Write(destination, body, atomicfile.Options{Mode: 0o755, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: "O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)"})
+		}); err != nil {
 			return err
 		}
+	}
+	if !windowsMachineFileSecurityMatches(destination, "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)") {
+		return errInvalidWindowsActivation
 	}
 	if journal.CLI.Path != "" {
 		target := workerupdate.ComponentTarget{SHA256: journal.CLI.SHA256, Length: journal.CLI.Length, Platform: "windows", Architecture: journal.Architecture}
@@ -605,7 +643,9 @@ func (b *windowsSCMActivationBackend) CommitCLI(ctx context.Context, journal win
 			return err
 		}
 	}
-	return atomicfile.Write(recordPath, []byte(journal.NewCLIRecord), atomicfile.Options{Mode: 0o644, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)"})
+	return windowssecurity.WithRestorePrivilege(func() error {
+		return atomicfile.Write(recordPath, []byte(journal.NewCLIRecord), atomicfile.Options{Mode: 0o644, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: "O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)"})
+	})
 }
 
 func commitWindowsInstallVersion(config WindowsConfig, version string) error {
@@ -628,10 +668,12 @@ func commitWindowsInstallVersion(config WindowsConfig, version string) error {
 	if err != nil {
 		return err
 	}
-	if err := atomicfile.Write(config.InstallState, updated, atomicfile.Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1}); err != nil {
+	if err := windowssecurity.WithRestorePrivilege(func() error {
+		return atomicfile.Write(config.InstallState, updated, atomicfile.Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: "O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;" + config.OwnerSID + ")"})
+	}); err != nil {
 		return err
 	}
-	return applyWindowsReleaseACL(config.InstallState, "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GR;;;"+config.OwnerSID+")")
+	return applyWindowsReleaseACL(config.InstallState, "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;"+config.OwnerSID+")")
 }
 
 func reconcileWindowsInstallVersion(ctx context.Context, config WindowsConfig) error {

@@ -126,7 +126,11 @@ func validateWindowsReadOnlyOwnerFile(path, ownerSID string) error {
 	if err := secureWindowsFileShape(path); err != nil {
 		return err
 	}
-	want := "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GR;;;" + ownerSID + ")"
+	system, err := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
+	if err != nil || !windowssecurity.OwnerMatchesSID(path, system) {
+		return ErrInvalidWindowsConfig
+	}
+	want := "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;" + ownerSID + ")"
 	if !windowssecurity.ProtectedDACLMatches(path, want) {
 		return ErrInvalidWindowsConfig
 	}

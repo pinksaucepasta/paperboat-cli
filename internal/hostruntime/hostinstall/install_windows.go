@@ -9,6 +9,7 @@ package hostinstall
 import (
 	"context"
 	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -119,11 +120,11 @@ func LoadWindowsRuntimeConfig() (WindowsRuntimeConfig, error) {
 	}
 	fileDACL := windowsRuntimeCurrentFileDACL(config.OwnerSID)
 	rootDACL := windowsRuntimeCurrentRootDACL(config.OwnerSID)
-	if !windowsRuntimeSecurityMatches(WindowsProgramDataRoot(), trustedOwner, rootDACL) {
-		return WindowsRuntimeConfig{}, fmt.Errorf("validate Windows runtime root security: %w", ErrInvalidRequest)
+	if err := validateWindowsRuntimeSecurity(WindowsProgramDataRoot(), trustedOwner, rootDACL, "root"); err != nil {
+		return WindowsRuntimeConfig{}, err
 	}
-	if !windowsRuntimeSecurityMatches(WindowsInstallConfigPath(), trustedOwner, fileDACL) {
-		return WindowsRuntimeConfig{}, fmt.Errorf("validate Windows runtime config security: %w", ErrInvalidRequest)
+	if err := validateWindowsRuntimeSecurity(WindowsInstallConfigPath(), trustedOwner, fileDACL, "config"); err != nil {
+		return WindowsRuntimeConfig{}, err
 	}
 	if err := secureWindowsFile(WindowsHostdTokenPath(), ""); err != nil {
 		return WindowsRuntimeConfig{}, fmt.Errorf("validate Windows runtime token file: %w", err)
@@ -132,8 +133,8 @@ func LoadWindowsRuntimeConfig() (WindowsRuntimeConfig, error) {
 	if err != nil || tokenInfo.Size() != 32 {
 		return WindowsRuntimeConfig{}, fmt.Errorf("validate Windows runtime token size: %w", ErrInvalidRequest)
 	}
-	if !windowsRuntimeSecurityMatches(WindowsHostdTokenPath(), trustedOwner, fileDACL) {
-		return WindowsRuntimeConfig{}, fmt.Errorf("validate Windows runtime token security: %w", ErrInvalidRequest)
+	if err := validateWindowsRuntimeSecurity(WindowsHostdTokenPath(), trustedOwner, fileDACL, "token"); err != nil {
+		return WindowsRuntimeConfig{}, err
 	}
 	return config, nil
 }
@@ -673,7 +674,11 @@ func seedWindowsImmutableRelease(ctx context.Context, request Request, layout se
 		if err := verifyWindowsInstalledBinary(ctx, destination, request.Artifact.Architecture); err != nil {
 			return err
 		}
-		if err := applyWindowsDACL(destination, "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;BU)"); err != nil {
+		trustedOwner, ownerErr := windowsRuntimeTrustedOwner()
+		if ownerErr != nil {
+			return ownerErr
+		}
+		if err := applyWindowsOwnedDACL(destination, trustedOwner, "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)"); err != nil {
 			return err
 		}
 	}
@@ -691,7 +696,11 @@ func ensureWindowsImmutableDirectory(path string) error {
 	if err != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
 		return ErrInvalidRequest
 	}
-	return applyWindowsDACL(path, "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)")
+	trustedOwner, err := windowsRuntimeTrustedOwner()
+	if err != nil {
+		return err
+	}
+	return applyWindowsOwnedDACL(path, trustedOwner, "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)")
 }
 
 func Validate(request Request, _ int) error {
@@ -743,7 +752,7 @@ func writeWindowsConfig(config WindowsRuntimeConfig) error {
 		return err
 	}
 	fileDACL := windowsRuntimeCurrentFileDACL(config.OwnerSID)
-	if err := withWindowsRestorePrivilege(func() error {
+	if err := windowssecurity.WithRestorePrivilege(func() error {
 		return atomicfile.Write(WindowsInstallConfigPath(), body, atomicfile.Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: "O:SY" + fileDACL})
 	}); err != nil {
 		return err
@@ -789,7 +798,7 @@ func ensureWindowsToken(ownerSID string) error {
 	if _, err := rand.Read(token); err != nil {
 		return err
 	}
-	if err := withWindowsRestorePrivilege(func() error {
+	if err := windowssecurity.WithRestorePrivilege(func() error {
 		return atomicfile.Write(path, token, atomicfile.Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: "O:SY" + windowsRuntimeCurrentFileDACL(ownerSID)})
 	}); err != nil {
 		return err
@@ -850,15 +859,25 @@ func windowsRuntimeLegacyRootDACL(ownerSID string) string {
 }
 
 func windowsRuntimeCurrentFileDACL(ownerSID string) string {
-	return "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GR;;;" + ownerSID + ")"
+	return "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;" + ownerSID + ")"
 }
 
 func windowsRuntimeCurrentRootDACL(ownerSID string) string {
-	return "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;" + ownerSID + ")"
+	return "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;" + ownerSID + ")"
 }
 
 func windowsRuntimeSecurityMatches(path string, owner *windows.SID, dacl string) bool {
 	return windowssecurity.OwnerMatchesSID(path, owner) && windowssecurity.ProtectedDACLMatches(path, dacl)
+}
+
+func validateWindowsRuntimeSecurity(path string, owner *windows.SID, dacl, stage string) error {
+	if !windowssecurity.OwnerMatchesSID(path, owner) {
+		return fmt.Errorf("validate Windows runtime %s filesystem owner: %w", stage, ErrInvalidRequest)
+	}
+	if !windowssecurity.ProtectedDACLMatches(path, dacl) {
+		return fmt.Errorf("validate Windows runtime %s protected DACL: %w", stage, ErrInvalidRequest)
+	}
+	return nil
 }
 
 func windowsRuntimeMigrationSecurityMatches(path string, legacyOwner, trustedOwner *windows.SID, legacyDACL, currentDACL string) bool {
@@ -877,13 +896,13 @@ func applyWindowsOwnedDACL(path string, owner *windows.SID, access string) error
 	if err != nil {
 		return err
 	}
-	if err := withWindowsRestorePrivilege(func() error {
+	if err := windowssecurity.WithRestorePrivilege(func() error {
 		return windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, owner, nil, dacl, nil)
 	}); err != nil {
 		return err
 	}
-	if !windowsRuntimeSecurityMatches(path, owner, access) {
-		return ErrInvalidRequest
+	if err := validateWindowsRuntimeSecurity(path, owner, access, "rewritten object"); err != nil {
+		return err
 	}
 	return nil
 }
@@ -901,76 +920,22 @@ func createWindowsRuntimeRoot(path string, owner *windows.SID, dacl string) erro
 	if err != nil {
 		return err
 	}
-	err = withWindowsRestorePrivilege(func() error { return windows.CreateDirectory(pathUTF16, &attributes) })
+	err = windowssecurity.WithRestorePrivilege(func() error { return windows.CreateDirectory(pathUTF16, &attributes) })
 	runtime.KeepAlive(descriptor)
 	if err != nil {
 		return err
 	}
-	if !windowsRuntimeSecurityMatches(path, owner, dacl) {
-		return ErrInvalidRequest
+	if err := validateWindowsRuntimeSecurity(path, owner, dacl, "created root"); err != nil {
+		return err
 	}
 	return nil
 }
 
-func withWindowsRestorePrivilege(operation func() error) (result error) {
-	if operation == nil {
-		return ErrInvalidRequest
-	}
-	runtime.LockOSThread()
-	if err := windows.ImpersonateSelf(windows.SecurityImpersonation); err != nil {
-		runtime.UnlockOSThread()
-		return err
-	}
-	defer func() {
-		revertErr := windows.RevertToSelf()
-		result = errors.Join(result, revertErr)
-		if revertErr == nil {
-			runtime.UnlockOSThread()
-		}
-	}()
-	var token windows.Token
-	if err := windows.OpenThreadToken(windows.CurrentThread(), windows.TOKEN_QUERY|windows.TOKEN_ADJUST_PRIVILEGES, false, &token); err != nil {
-		return err
-	}
-	defer func() { result = errors.Join(result, token.Close()) }()
-	name, err := windows.UTF16PtrFromString("SeRestorePrivilege")
-	if err != nil {
-		return err
-	}
-	var luid windows.LUID
-	if err := windows.LookupPrivilegeValue(nil, name, &luid); err != nil {
-		return err
-	}
-	desired := windows.Tokenprivileges{PrivilegeCount: 1}
-	desired.AllPrivileges()[0] = windows.LUIDAndAttributes{Luid: luid, Attributes: windows.SE_PRIVILEGE_ENABLED}
-	var previous windows.Tokenprivileges
-	var previousLength uint32
-	if err := windows.AdjustTokenPrivileges(token, false, &desired, uint32(unsafe.Sizeof(previous)), &previous, &previousLength); err != nil {
-		return err
-	}
-	if lastErr := windows.GetLastError(); lastErr != windows.ERROR_SUCCESS {
-		return lastErr
-	}
-	defer func() {
-		if previousLength == 0 {
-			return
-		}
-		restoreErr := windows.AdjustTokenPrivileges(token, false, &previous, 0, nil, nil)
-		if restoreErr == nil {
-			if lastErr := windows.GetLastError(); lastErr != windows.ERROR_SUCCESS {
-				restoreErr = lastErr
-			}
-		}
-		result = errors.Join(result, restoreErr)
-	}()
-	return operation()
-}
-
 func stageWindowsBinary(ctx context.Context, source, current, rollback string, artifact bootstrap.ArtifactTarget, ownerSID string) error {
-	if err := ensureWindowsDirectory(filepath.Dir(current), ownerSID); err != nil {
+	if err := ensureWindowsExecutableDirectory(filepath.Dir(current), ownerSID); err != nil {
 		return fmt.Errorf("prepare runtime slot: %w", err)
 	}
-	if err := ensureWindowsDirectory(filepath.Dir(rollback), ownerSID); err != nil {
+	if err := ensureWindowsExecutableDirectory(filepath.Dir(rollback), ownerSID); err != nil {
 		return fmt.Errorf("prepare runtime rollback slot: %w", err)
 	}
 	if err := secureWindowsFile(source, ""); err != nil {
@@ -981,22 +946,25 @@ func stageWindowsBinary(ctx context.Context, source, current, rollback string, a
 	if err := nativesignature.New(nil).Verify(sourceVerifyCtx, source, "windows", artifact.Architecture); err != nil {
 		return fmt.Errorf("%w: downloaded runtime Authenticode: %v", ErrInvalidRequest, err)
 	}
-	input, err := os.Open(source)
-	if err != nil {
+	body, err := os.ReadFile(source)
+	if err != nil || len(body) < 1 || len(body) > 256<<20 {
+		return fmt.Errorf("%w: read staged runtime", ErrInvalidRequest)
+	}
+	var suffix [16]byte
+	if _, err := rand.Read(suffix[:]); err != nil {
 		return err
 	}
-	defer input.Close()
 	//paperboat:allow-source-policy atomic-replacement owner=windows-host-install reason=same-directory-verified-runtime-staging
-	temporary, err := os.CreateTemp(filepath.Dir(current), ".paperboat-runtime-*.exe")
-	if err != nil {
-		return err
-	}
-	temporaryPath := temporary.Name()
+	temporaryPath := filepath.Join(filepath.Dir(current), ".paperboat-runtime-"+hex.EncodeToString(suffix[:])+".exe")
 	defer os.Remove(temporaryPath)
-	written, copyErr := io.Copy(temporary, io.LimitReader(input, 256<<20+1))
-	closeErr := temporary.Close()
-	if copyErr != nil || closeErr != nil || written < 1 || written > 256<<20 {
-		return fmt.Errorf("%w: copy staged runtime", ErrInvalidRequest)
+	publicDACL := "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)"
+	if ownerSID != "" {
+		publicDACL = "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;" + ownerSID + ")"
+	}
+	if err := windowssecurity.WithRestorePrivilege(func() error {
+		return atomicfile.Write(temporaryPath, body, atomicfile.Options{Mode: 0o755, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: "O:SY" + publicDACL})
+	}); err != nil {
+		return err
 	}
 	if err := binarytarget.Validate(temporaryPath, "windows", artifact.Architecture); err != nil {
 		return fmt.Errorf("%w: staged runtime executable format", ErrInvalidRequest)
@@ -1006,7 +974,11 @@ func stageWindowsBinary(ctx context.Context, source, current, rollback string, a
 	if err := nativesignature.New(nil).Verify(verifyCtx, temporaryPath, "windows", artifact.Architecture); err != nil {
 		return fmt.Errorf("%w: staged runtime Authenticode: %v", ErrInvalidRequest, err)
 	}
-	if err := applyWindowsACL(temporaryPath, ownerSID, false); err != nil {
+	trustedOwner, err := windowsRuntimeTrustedOwner()
+	if err != nil {
+		return err
+	}
+	if err := validateWindowsRuntimeSecurity(temporaryPath, trustedOwner, publicDACL, "staged executable"); err != nil {
 		return err
 	}
 	if err := os.Remove(rollback); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -1029,9 +1001,37 @@ func stageWindowsBinary(ctx context.Context, source, current, rollback string, a
 	return nil
 }
 
+func ensureWindowsExecutableDirectory(path, readerSID string) error {
+	if !safeAbsolute(path) {
+		return ErrInvalidRequest
+	}
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return ErrInvalidRequest
+	}
+	attributes, err := windows.GetFileAttributes(windows.StringToUTF16Ptr(path))
+	if err != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return ErrInvalidRequest
+	}
+	if readerSID == "" {
+		readerSID = "BU"
+	} else if !validSID(readerSID) {
+		return ErrInvalidRequest
+	}
+	dacl := "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;" + readerSID + ")"
+	trustedOwner, err := windowsRuntimeTrustedOwner()
+	if err != nil {
+		return err
+	}
+	return applyWindowsOwnedDACL(path, trustedOwner, dacl)
+}
+
 // Built-in Users may read and execute the public CLI, but only SYSTEM and
 // Administrators may replace its launcher or its active release slot.
-const windowsCLIEntrypointDACL = "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)"
+const windowsCLIEntrypointDACL = "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)"
 
 // windowsCLIEntrypointPaths returns the stable launcher installed by the MSI
 // and the public command path. The latter must always be a launcher: the CLI
@@ -1046,6 +1046,13 @@ func installWindowsCLIEntrypoint(ctx context.Context, layout service.Layout, arc
 	if err := verifyWindowsInstalledBinary(ctx, launcher, architecture); err != nil {
 		return fmt.Errorf("verify installed stable launcher: %w", err)
 	}
+	trustedOwner, err := windowsRuntimeTrustedOwner()
+	if err != nil {
+		return err
+	}
+	if err := validateWindowsRuntimeSecurity(launcher, trustedOwner, windowsCLIEntrypointDACL, "stable launcher"); err != nil {
+		return err
+	}
 	return replaceWindowsCLIEntrypoint(entrypoint, launcher)
 }
 
@@ -1056,7 +1063,11 @@ func protectWindowsCLISlots(layout service.Layout) error {
 		} else if err != nil {
 			return err
 		}
-		if err := applyWindowsDACL(path, windowsCLIEntrypointDACL); err != nil {
+		trustedOwner, ownerErr := windowsRuntimeTrustedOwner()
+		if ownerErr != nil {
+			return ownerErr
+		}
+		if err := applyWindowsOwnedDACL(path, trustedOwner, windowsCLIEntrypointDACL); err != nil {
 			return err
 		}
 	}
@@ -1075,7 +1086,9 @@ func replaceWindowsCLIEntrypoint(entrypoint, launcher string) error {
 	if err != nil || len(body) == 0 || len(body) > 256<<20 {
 		return ErrInvalidRequest
 	}
-	return atomicfile.Write(entrypoint, body, atomicfile.Options{Mode: 0o755, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: windowsCLIEntrypointDACL})
+	return windowssecurity.WithRestorePrivilege(func() error {
+		return atomicfile.Write(entrypoint, body, atomicfile.Options{Mode: 0o755, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: "O:SY" + windowsCLIEntrypointDACL})
+	})
 }
 
 func repairWindowsRuntimeBinary(ctx context.Context, config WindowsRuntimeConfig, layout service.Layout) error {

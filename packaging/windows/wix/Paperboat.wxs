@@ -109,10 +109,14 @@
         <!-- pb.exe is the stable public launcher. It selects the protected,
              rollback-capable CLI slot instead of becoming stale after a
              one-shot Client renewal. -->
-        <File Id="CliBinary" Source="$(var.StagingDir)\pb-launcher.exe" Name="pb.exe" KeyPath="yes" Vital="yes" />
+        <File Id="CliBinary" Source="$(var.StagingDir)\pb-launcher.exe" Name="pb.exe" KeyPath="yes" Vital="yes">
+          <PermissionEx Sddl="O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)" />
+        </File>
       </Component>
       <Component Id="LauncherComponent" Guid="{F3E5F8E2-BD39-4CC4-BD4C-6FD34E5C8F02}">
-        <File Id="LauncherBinary" Source="$(var.StagingDir)\pb-launcher.exe" KeyPath="yes" Vital="yes" />
+        <File Id="LauncherBinary" Source="$(var.StagingDir)\pb-launcher.exe" KeyPath="yes" Vital="yes">
+          <PermissionEx Sddl="O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)" />
+        </File>
       </Component>
       <Component Id="CliPathComponent" Guid="{F3E5F8E2-BD39-4CC4-BD4C-6FD34E5C8F0B}">
         <Environment
@@ -211,17 +215,17 @@
     <ComponentGroup Id="CLIReleaseComponents" Directory="CLICURRENTSLOT">
       <Component Id="CLIReleaseRootComponent" Directory="RELEASES" Guid="{F3E5F8E2-BD39-4CC4-BD4C-6FD34E5C8F0D}">
         <CreateFolder>
-          <PermissionEx Sddl="D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)" />
+          <PermissionEx Sddl="O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)" />
         </CreateFolder>
       </Component>
       <Component Id="CLICurrentSeedComponent" Guid="{F3E5F8E2-BD39-4CC4-BD4C-6FD34E5C8F0C}">
         <CreateFolder>
-          <PermissionEx Sddl="D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)" />
+          <PermissionEx Sddl="O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)" />
         </CreateFolder>
         <!-- Seed the immutable current CLI slot. bin\pb.exe is only the
              launcher and must have a verified target on a plain MSI install. -->
         <File Id="CLICurrentSeedBinary" Source="$(var.StagingDir)\pb.exe" Name="pb.exe" KeyPath="yes" Vital="yes">
-          <PermissionEx Sddl="D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)" />
+          <PermissionEx Sddl="O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)" />
         </File>
       </Component>
     </ComponentGroup>

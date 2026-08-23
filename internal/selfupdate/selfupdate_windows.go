@@ -22,6 +22,7 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/binarytarget"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/bootstrap"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/nativesignature"
+	"github.com/pinksaucepasta/paperboat/internal/windowssecurity"
 	"time"
 )
 
@@ -99,11 +100,15 @@ func InstallCLI(currentExecutable, verifiedArtifact string) error {
 	}
 	slotName := strings.TrimSuffix(filepath.Base(currentExecutable), filepath.Ext(currentExecutable)) + ".slot-" + hex.EncodeToString(suffix[:]) + ".exe"
 	slotPath := filepath.Join(filepath.Dir(currentExecutable), slotName)
-	if err := atomicfile.Write(slotPath, body, atomicfile.Options{Mode: 0o755, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)"}); err != nil {
+	if err := windowssecurity.WithRestorePrivilege(func() error {
+		return atomicfile.Write(slotPath, body, atomicfile.Options{Mode: 0o755, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: "O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)"})
+	}); err != nil {
 		return err
 	}
 	activePath := filepath.Join(filepath.Dir(currentExecutable), strings.TrimSuffix(filepath.Base(currentExecutable), filepath.Ext(currentExecutable))+".active")
-	if err := atomicfile.Write(activePath, []byte(slotName+"\n"), atomicfile.Options{Mode: 0o644, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)"}); err != nil {
+	if err := windowssecurity.WithRestorePrivilege(func() error {
+		return atomicfile.Write(activePath, []byte(slotName+"\n"), atomicfile.Options{Mode: 0o644, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: "O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)"})
+	}); err != nil {
 		_ = os.Remove(slotPath)
 		return err
 	}

@@ -17,6 +17,52 @@ func packagingWindowsRoot(t *testing.T) string {
 	return filepath.Clean(filepath.Join(filepath.Dir(file), ".."))
 }
 
+func TestWindowsRuntimeACLContractUsesConcreteFileRights(t *testing.T) {
+	repositoryRoot := filepath.Clean(filepath.Join(packagingWindowsRoot(t), "..", ".."))
+	contracts := map[string][]string{
+		"internal/hostruntime/hostinstall/install_windows.go": {
+			"(A;;FR;;;\" + ownerSID + \")",
+			"(A;OICI;0x1200a9;;;\" + ownerSID + \")",
+			"windowsCLIEntrypointDACL = \"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)\"",
+			"SecurityDescriptor: \"O:SY\" + windowsCLIEntrypointDACL",
+		},
+		"internal/hostruntime/updated/activation_windows.go": {
+			"Mode: 0o755, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: \"O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)\"",
+			"Mode: 0o644, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: \"O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)\"",
+			"applyWindowsReleaseACL(config.InstallState, \"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;\"+config.OwnerSID+\")\")",
+		},
+		"internal/hostruntime/updated/service_windows.go": {
+			"want := \"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;\" + ownerSID + \")\"",
+		},
+		"internal/hostruntimecmd/runtime_windows.go": {
+			"want += \"(A;;FR;;;\" + enrolledSID + \")\"",
+		},
+		"internal/selfupdate/selfupdate_windows.go": {
+			"Mode: 0o755, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: \"O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)\"",
+			"Mode: 0o644, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: \"O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)\"",
+		},
+		"internal/launcher/target_windows.go": {
+			"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)",
+			"windowssecurity.OwnerMatchesSID(path, system)",
+		},
+	}
+	for relative, required := range contracts {
+		body, err := os.ReadFile(filepath.Join(repositoryRoot, relative))
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(body)
+		if strings.Contains(text, "GRGX") || strings.Contains(text, "(A;;GR;;;") {
+			t.Fatalf("%s uses generic rights that Windows remaps during secure creation", relative)
+		}
+		for _, fragment := range required {
+			if !strings.Contains(text, fragment) {
+				t.Fatalf("%s is missing concrete ACL contract %q", relative, fragment)
+			}
+		}
+	}
+}
+
 func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 	root := packagingWindowsRoot(t)
 	required := []string{
@@ -122,7 +168,7 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 		"CLIReleaseComponents",
 		"Directory Id=\"CLICURRENTSLOT\" Name=\"cli-current\"",
 		"Source=\"$(var.StagingDir)\\pb.exe\" Name=\"pb.exe\"",
-		"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)",
+		"O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)",
 		"__msi-cleanup --full-uninstall",
 		"Execute=\"deferred\"",
 		"Impersonate=\"no\"",

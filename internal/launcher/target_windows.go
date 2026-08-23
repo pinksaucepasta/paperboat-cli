@@ -19,10 +19,15 @@ import (
 
 func resolveTargetPath(path string) (string, error) {
 	activePath := filepath.Join(filepath.Dir(path), strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))+".active")
-	file, err := os.Open(activePath)
-	if errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Lstat(activePath); errors.Is(err, os.ErrNotExist) {
 		return path, nil
+	} else if err != nil {
+		return "", fmt.Errorf("%w: inspect active slot: %v", ErrUnsafeTarget, err)
 	}
+	if !validMachineFileSecurity(activePath, "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)") {
+		return "", fmt.Errorf("%w: active slot permissions are unsafe", ErrUnsafeTarget)
+	}
+	file, err := os.Open(activePath)
 	if err != nil {
 		return "", fmt.Errorf("%w: read active slot: %v", ErrUnsafeTarget, err)
 	}
@@ -48,14 +53,23 @@ func validatePlatformTarget(path string, info fs.FileInfo) error {
 	if !strings.EqualFold(filepath.Ext(info.Name()), ".exe") {
 		return ErrUnsafeTarget
 	}
-	attributes, err := windows.GetFileAttributes(windows.StringToUTF16Ptr(path))
-	if err != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-		return ErrUnsafeTarget
-	}
-	if !windowssecurity.ProtectedDACLMatches(path, "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)") {
+	if !validMachineFileSecurity(path, "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)") {
 		return ErrUnsafeTarget
 	}
 	return nil
+}
+
+func validMachineFileSecurity(path, dacl string) bool {
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return false
+	}
+	attributes, err := windows.GetFileAttributes(windows.StringToUTF16Ptr(path))
+	if err != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return false
+	}
+	system, err := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
+	return err == nil && windowssecurity.OwnerMatchesSID(path, system) && windowssecurity.ProtectedDACLMatches(path, dacl)
 }
 
 func Execute(target Target) error {

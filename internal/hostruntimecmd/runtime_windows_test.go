@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/pinksaucepasta/paperboat/internal/windowssecurity"
 	"golang.org/x/sys/windows"
 )
 
@@ -33,7 +34,7 @@ func TestReadWindowsHostdTokenAcceptsExactTokenFile(t *testing.T) {
 			t.Fatalf("%v (dacl %q; current SID unavailable: %v)", err, windowsHostdTokenDACL(descriptor.String()), userErr)
 		}
 		control, _, controlErr := descriptor.Control()
-		expected := "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GR;;;" + user.User.Sid.String() + ")"
+		expected := "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;" + user.User.Sid.String() + ")"
 		t.Fatalf("%v (sid %q; control %#x err %v; dacl %q; expected %q)", err, user.User.Sid.String(), control, controlErr, descriptor.String(), expected)
 	}
 	if !bytes.Equal(got, want) {
@@ -46,7 +47,7 @@ func setWindowsHostdTokenACL(path string) error {
 	if err != nil || user == nil || user.User.Sid == nil {
 		return err
 	}
-	descriptor, err := windows.SecurityDescriptorFromString("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GR;;;" + user.User.Sid.String() + ")")
+	descriptor, err := windows.SecurityDescriptorFromString("O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;" + user.User.Sid.String() + ")")
 	if err != nil {
 		return err
 	}
@@ -58,7 +59,13 @@ func setWindowsHostdTokenACL(path string) error {
 	if err != nil {
 		return err
 	}
-	return windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil)
+	owner, _, err := absolute.Owner()
+	if err != nil {
+		return err
+	}
+	return windowssecurity.WithRestorePrivilege(func() error {
+		return windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, owner, nil, dacl, nil)
+	})
 }
 
 func TestReadWindowsHostdTokenRejectsRelativePath(t *testing.T) {

@@ -226,7 +226,7 @@ func validateWix(root string, policy metadata) error {
 		`<Directory Id="ACTIVERELEASE" Name="$(var.PaperboatVersion)" />`,
 		`<ComponentGroup Id="ServiceComponents" Directory="ACTIVERELEASE">`,
 		`Source="$(var.StagingDir)\pb.exe" Name="pb.exe"`,
-		`D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)`,
+		`O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)`,
 		`Value="PaperboatSshd"`,
 		`Microsoft.OpenSSH.Preview`,
 		`Value="none"`,
