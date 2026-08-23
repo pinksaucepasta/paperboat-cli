@@ -10,29 +10,53 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// WithRestorePrivilege enables SeRestorePrivilege only on a pinned
-// self-impersonation thread, restores its exact prior state, and surfaces every
+var (
+	restoreImpersonateSelf = windows.ImpersonateSelf
+	restoreOpenThreadToken = windows.OpenThreadToken
+	restoreRevertToSelf    = windows.RevertToSelf
+)
+
+// WithRestorePrivilege enables SeRestorePrivilege only on a pinned thread. It
+// reuses an existing thread token so nested security operations cannot destroy
+// their caller's impersonation, or creates and later reverts a self-token when
+// none exists. It restores the exact prior privilege state and surfaces every
 // cleanup failure. A thread that cannot revert is never returned to Go's pool.
 func WithRestorePrivilege(operation func() error) (result error) {
 	if operation == nil {
 		return windows.ERROR_INVALID_PARAMETER
 	}
 	runtime.LockOSThread()
-	if err := windows.ImpersonateSelf(windows.SecurityImpersonation); err != nil {
-		runtime.UnlockOSThread()
-		return err
+	createdSelfToken := false
+	privilegeRestoreFailed := false
+	var token windows.Token
+	err := restoreOpenThreadToken(windows.CurrentThread(), windows.TOKEN_QUERY|windows.TOKEN_ADJUST_PRIVILEGES, false, &token)
+	if errors.Is(err, windows.ERROR_NO_TOKEN) {
+		if err = restoreImpersonateSelf(windows.SecurityImpersonation); err == nil {
+			createdSelfToken = true
+			err = restoreOpenThreadToken(windows.CurrentThread(), windows.TOKEN_QUERY|windows.TOKEN_ADJUST_PRIVILEGES, false, &token)
+		}
 	}
-	defer func() {
-		revertErr := windows.RevertToSelf()
-		result = errors.Join(result, revertErr)
+	if err != nil {
+		if !createdSelfToken {
+			runtime.UnlockOSThread()
+			return err
+		}
+		revertErr := restoreRevertToSelf()
 		if revertErr == nil {
 			runtime.UnlockOSThread()
 		}
-	}()
-	var token windows.Token
-	if err := windows.OpenThreadToken(windows.CurrentThread(), windows.TOKEN_QUERY|windows.TOKEN_ADJUST_PRIVILEGES, false, &token); err != nil {
-		return err
+		return errors.Join(err, revertErr)
 	}
+	defer func() {
+		revertErr := error(nil)
+		if createdSelfToken {
+			revertErr = restoreRevertToSelf()
+		}
+		result = errors.Join(result, revertErr)
+		if revertErr == nil && (createdSelfToken || !privilegeRestoreFailed) {
+			runtime.UnlockOSThread()
+		}
+	}()
 	defer func() { result = errors.Join(result, token.Close()) }()
 	name, err := windows.UTF16PtrFromString("SeRestorePrivilege")
 	if err != nil {
@@ -62,6 +86,7 @@ func WithRestorePrivilege(operation func() error) (result error) {
 				restoreErr = lastErr
 			}
 		}
+		privilegeRestoreFailed = restoreErr != nil
 		result = errors.Join(result, restoreErr)
 	}()
 	return operation()

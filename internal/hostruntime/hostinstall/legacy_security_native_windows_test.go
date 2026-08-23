@@ -44,6 +44,42 @@ func TestNativeLegacyOwnerFullSecurityMigration(t *testing.T) {
 		t.Fatal("new machine root was visible without its final SYSTEM owner and protected DACL")
 	}
 	if err := os.Remove(WindowsProgramDataRoot()); err != nil {
+		t.Fatalf("reset machine-root transition fixture: %v", err)
+	}
+	if err := os.Mkdir(WindowsProgramDataRoot(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	administrators, err := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentRootDACL := windowsRuntimeCurrentRootDACL(ownerSID)
+	if err := applyWindowsOwnedDACL(WindowsProgramDataRoot(), administrators, currentRootDACL); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureWindowsMachineDirectory(WindowsProgramDataRoot(), ownerSID); err != nil {
+		t.Fatalf("resume exact trusted machine-root transition: %v", err)
+	}
+	if !windowsRuntimeSecurityMatches(WindowsProgramDataRoot(), trustedOwner, currentRootDACL) {
+		t.Fatal("resumed machine root did not reach its final SYSTEM-owned state")
+	}
+	if err := os.Remove(WindowsProgramDataRoot()); err != nil {
+		t.Fatalf("reset hostile machine-root transition fixture: %v", err)
+	}
+	if err := os.Mkdir(WindowsProgramDataRoot(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	hostileTransitionDACL := "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
+	if err := applyWindowsOwnedDACL(WindowsProgramDataRoot(), administrators, hostileTransitionDACL); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureWindowsMachineDirectory(WindowsProgramDataRoot(), ownerSID); err == nil {
+		t.Fatal("Administrators-owned root with a noncanonical DACL was accepted as a resumable transition")
+	}
+	if !windowssecurity.OwnerMatchesSID(WindowsProgramDataRoot(), administrators) || !windowssecurity.ProtectedDACLMatches(WindowsProgramDataRoot(), hostileTransitionDACL) {
+		t.Fatal("rejected machine-root transition was mutated")
+	}
+	if err := os.Remove(WindowsProgramDataRoot()); err != nil {
 		t.Fatalf("reset atomic machine-root fixture: %v", err)
 	}
 	if err := os.MkdirAll(WindowsProgramDataRoot(), 0o700); err != nil {

@@ -11,8 +11,10 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"unsafe"
 
+	"github.com/pinksaucepasta/paperboat/internal/windowssecurity"
 	"golang.org/x/sys/windows"
 )
 
@@ -107,13 +109,32 @@ func Write(path string, data []byte, options Options) error {
 }
 
 func createProtectedTemporary(parent, descriptor string) (*os.File, string, error) {
-	securityDescriptor, err := windows.SecurityDescriptorFromString(descriptor)
+	finalDescriptor, err := windows.SecurityDescriptorFromString(descriptor)
+	if err != nil {
+		return nil, "", err
+	}
+	creationDescriptorText := descriptor
+	finalOwner, _, ownerErr := finalDescriptor.Owner()
+	systemOwner, systemOwnerErr := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
+	transitionToSystem := ownerErr == nil && systemOwnerErr == nil && finalOwner != nil && finalOwner.Equals(systemOwner)
+	var administratorsOwner *windows.SID
+	if transitionToSystem {
+		if !strings.HasPrefix(descriptor, "O:SY") {
+			return nil, "", windows.ERROR_INVALID_SECURITY_DESCR
+		}
+		creationDescriptorText = "O:BA" + strings.TrimPrefix(descriptor, "O:SY")
+		administratorsOwner, err = windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
+		if err != nil {
+			return nil, "", err
+		}
+	}
+	creationDescriptor, err := windows.SecurityDescriptorFromString(creationDescriptorText)
 	if err != nil {
 		return nil, "", err
 	}
 	attributes := windows.SecurityAttributes{
 		Length:             uint32(unsafe.Sizeof(windows.SecurityAttributes{})),
-		SecurityDescriptor: securityDescriptor,
+		SecurityDescriptor: creationDescriptor,
 	}
 	for attempt := 0; attempt < 16; attempt++ {
 		random := make([]byte, 16)
@@ -125,13 +146,34 @@ func createProtectedTemporary(parent, descriptor string) (*os.File, string, erro
 		if err != nil {
 			return nil, "", err
 		}
-		handle, err := windows.CreateFile(pathUTF16, windows.GENERIC_READ|windows.GENERIC_WRITE, 0, &attributes, windows.CREATE_NEW, windows.FILE_ATTRIBUTE_NORMAL, 0)
-		runtime.KeepAlive(securityDescriptor)
+		handle, err := windows.CreateFile(pathUTF16, windows.GENERIC_READ|windows.GENERIC_WRITE|windows.READ_CONTROL|windows.WRITE_DAC|windows.WRITE_OWNER, 0, &attributes, windows.CREATE_NEW, windows.FILE_ATTRIBUTE_NORMAL, 0)
+		runtime.KeepAlive(creationDescriptor)
 		if errors.Is(err, windows.ERROR_FILE_EXISTS) || errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
 			continue
 		}
 		if err != nil {
 			return nil, "", err
+		}
+		if transitionToSystem {
+			transitionErr := error(nil)
+			if !windowssecurity.HandleOwnerMatchesSID(handle, administratorsOwner) || !windowssecurity.ProtectedHandleDACLMatches(handle, creationDescriptorText) {
+				transitionErr = windows.ERROR_INVALID_SECURITY_DESCR
+			}
+			dacl, _, daclErr := finalDescriptor.DACL()
+			transitionErr = errors.Join(transitionErr, daclErr)
+			if transitionErr == nil {
+				transitionErr = windowssecurity.WithRestorePrivilege(func() error {
+					return windows.SetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, systemOwner, nil, dacl, nil)
+				})
+			}
+			if transitionErr == nil && (!windowssecurity.HandleOwnerMatchesSID(handle, systemOwner) || !windowssecurity.ProtectedHandleDACLMatches(handle, descriptor)) {
+				transitionErr = windows.ERROR_INVALID_SECURITY_DESCR
+			}
+			if transitionErr != nil {
+				windows.CloseHandle(handle)
+				_ = os.Remove(path)
+				return nil, "", transitionErr
+			}
 		}
 		file := os.NewFile(uintptr(handle), path)
 		if file == nil {

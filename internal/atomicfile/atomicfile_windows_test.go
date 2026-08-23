@@ -41,3 +41,29 @@ func TestWriteAppliesExplicitOwnerBeforeReplacement(t *testing.T) {
 		t.Fatal("atomic replacement did not retain the explicit protected DACL")
 	}
 }
+
+func TestWriteTransfersTrustedCreationOwnerToSystemBeforeReplacement(t *testing.T) {
+	administrators, err := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	member, err := windows.GetCurrentProcessToken().IsMember(administrators)
+	if err != nil || !member {
+		t.Skip("SYSTEM-owner atomic replacement requires an elevated administrator")
+	}
+	path := filepath.Join(t.TempDir(), "machine-state.json")
+	descriptor := "O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)"
+	if err := Write(path, []byte("protected\n"), Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: descriptor}); err != nil {
+		t.Fatal(err)
+	}
+	system, err := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !windowssecurity.OwnerMatchesSID(path, system) {
+		t.Fatal("atomic replacement did not transfer its trusted creation owner to SYSTEM")
+	}
+	if !windowssecurity.ProtectedDACLMatches(path, descriptor) {
+		t.Fatal("atomic replacement did not retain the explicit protected DACL")
+	}
+}

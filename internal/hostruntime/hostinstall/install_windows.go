@@ -148,6 +148,10 @@ func readWindowsRuntimeConfig() (WindowsRuntimeConfig, error) {
 	if err != nil || len(body) == 0 || len(body) > 128<<10 {
 		return WindowsRuntimeConfig{}, ErrInvalidRequest
 	}
+	return decodeWindowsRuntimeConfig(body)
+}
+
+func decodeWindowsRuntimeConfig(body []byte) (WindowsRuntimeConfig, error) {
 	var config WindowsRuntimeConfig
 	decoder := json.NewDecoder(strings.NewReader(string(body)))
 	decoder.DisallowUnknownFields()
@@ -175,7 +179,33 @@ func migrateLegacyWindowsRuntimeSecurity() (WindowsRuntimeConfig, error) {
 	if !isAdministrator() {
 		return WindowsRuntimeConfig{}, ErrNotPrivileged
 	}
-	config, err := readWindowsRuntimeConfig()
+	rootHandle, _, err := openWindowsRuntimeObject(WindowsProgramDataRoot(), true)
+	if err != nil {
+		return WindowsRuntimeConfig{}, fmt.Errorf("open legacy Windows runtime root: %w", err)
+	}
+	defer windows.CloseHandle(rootHandle)
+	configHandle, configInfo, err := openWindowsRuntimeObject(WindowsInstallConfigPath(), false)
+	if err != nil {
+		return WindowsRuntimeConfig{}, fmt.Errorf("open legacy Windows runtime config: %w", err)
+	}
+	defer windows.CloseHandle(configHandle)
+	tokenHandle, tokenInfo, err := openWindowsRuntimeObject(WindowsHostdTokenPath(), false)
+	if err != nil {
+		return WindowsRuntimeConfig{}, fmt.Errorf("open legacy Windows runtime token: %w", err)
+	}
+	defer windows.CloseHandle(tokenHandle)
+	if uint64(configInfo.FileSizeHigh)<<32|uint64(configInfo.FileSizeLow) == 0 || uint64(configInfo.FileSizeHigh)<<32|uint64(configInfo.FileSizeLow) > 128<<10 {
+		return WindowsRuntimeConfig{}, fmt.Errorf("read legacy Windows runtime config: %w", ErrInvalidRequest)
+	}
+	configBody := make([]byte, uint64(configInfo.FileSizeHigh)<<32|uint64(configInfo.FileSizeLow))
+	for offset := 0; offset < len(configBody); {
+		var configRead uint32
+		if err := windows.ReadFile(configHandle, configBody[offset:], &configRead, nil); err != nil || configRead == 0 {
+			return WindowsRuntimeConfig{}, fmt.Errorf("read legacy Windows runtime config: %w", ErrInvalidRequest)
+		}
+		offset += int(configRead)
+	}
+	config, err := decodeWindowsRuntimeConfig(configBody)
 	if err != nil {
 		return WindowsRuntimeConfig{}, fmt.Errorf("read legacy Windows runtime config: %w", err)
 	}
@@ -195,23 +225,21 @@ func migrateLegacyWindowsRuntimeSecurity() (WindowsRuntimeConfig, error) {
 	legacyRootDACL := windowsRuntimeLegacyRootDACL(config.OwnerSID)
 	currentFileDACL := windowsRuntimeCurrentFileDACL(config.OwnerSID)
 	currentRootDACL := windowsRuntimeCurrentRootDACL(config.OwnerSID)
-	if !windowsRuntimeMigrationSecurityMatches(WindowsProgramDataRoot(), legacyOwner, trustedOwner, legacyRootDACL, currentRootDACL) {
+	if !windowsRuntimeMigrationHandleSecurityMatches(rootHandle, legacyOwner, trustedOwner, legacyRootDACL, currentRootDACL) {
 		return WindowsRuntimeConfig{}, fmt.Errorf("validate legacy Windows runtime root security: %w", ErrInvalidRequest)
 	}
-	if !windowsRuntimeMigrationSecurityMatches(WindowsInstallConfigPath(), legacyOwner, trustedOwner, legacyFileDACL, currentFileDACL) {
+	if !windowsRuntimeMigrationHandleSecurityMatches(configHandle, legacyOwner, trustedOwner, legacyFileDACL, currentFileDACL) {
 		return WindowsRuntimeConfig{}, fmt.Errorf("validate legacy Windows runtime config security: %w", ErrInvalidRequest)
 	}
-	tokenErr := secureWindowsFile(WindowsHostdTokenPath(), "")
-	tokenInfo, tokenStatErr := os.Stat(WindowsHostdTokenPath())
-	if tokenErr != nil || tokenStatErr != nil || tokenInfo.Size() != 32 {
+	if uint64(tokenInfo.FileSizeHigh)<<32|uint64(tokenInfo.FileSizeLow) != 32 {
 		return WindowsRuntimeConfig{}, fmt.Errorf("validate legacy Windows runtime token file: %w", ErrInvalidRequest)
 	}
-	if !windowsRuntimeMigrationSecurityMatches(WindowsHostdTokenPath(), legacyOwner, trustedOwner, legacyFileDACL, currentFileDACL) {
+	if !windowsRuntimeMigrationHandleSecurityMatches(tokenHandle, legacyOwner, trustedOwner, legacyFileDACL, currentFileDACL) {
 		return WindowsRuntimeConfig{}, fmt.Errorf("validate legacy Windows runtime token security: %w", ErrInvalidRequest)
 	}
-	allCurrent := windowsRuntimeSecurityMatches(WindowsProgramDataRoot(), trustedOwner, currentRootDACL) &&
-		windowsRuntimeSecurityMatches(WindowsInstallConfigPath(), trustedOwner, currentFileDACL) &&
-		windowsRuntimeSecurityMatches(WindowsHostdTokenPath(), trustedOwner, currentFileDACL)
+	allCurrent := windowsRuntimeHandleSecurityMatches(rootHandle, trustedOwner, currentRootDACL) &&
+		windowsRuntimeHandleSecurityMatches(configHandle, trustedOwner, currentFileDACL) &&
+		windowsRuntimeHandleSecurityMatches(tokenHandle, trustedOwner, currentFileDACL)
 	if allCurrent {
 		return WindowsRuntimeConfig{}, fmt.Errorf("validate legacy Windows runtime transition: %w", ErrInvalidRequest)
 	}
@@ -219,20 +247,20 @@ func migrateLegacyWindowsRuntimeSecurity() (WindowsRuntimeConfig, error) {
 	// without allowing a partially trusted tree to be adopted. Each subsequent
 	// owner+DACL replacement is idempotent, so an interrupted migration can
 	// resume from any mixture of the two explicitly supported states.
-	for _, item := range []struct{ path, dacl, stage string }{
-		{WindowsHostdTokenPath(), currentFileDACL, "token"},
-		{WindowsInstallConfigPath(), currentFileDACL, "config"},
-		{WindowsProgramDataRoot(), currentRootDACL, "root"},
+	for _, item := range []struct {
+		handle windows.Handle
+		dacl   string
+		stage  string
+	}{
+		{tokenHandle, currentFileDACL, "token"},
+		{configHandle, currentFileDACL, "config"},
+		{rootHandle, currentRootDACL, "root"},
 	} {
-		if err := applyWindowsOwnedDACL(item.path, trustedOwner, item.dacl); err != nil {
+		if err := applyWindowsHandleOwnedDACL(item.handle, trustedOwner, item.dacl); err != nil {
 			return WindowsRuntimeConfig{}, fmt.Errorf("migrate Windows runtime %s security: %w", item.stage, err)
 		}
 	}
-	migrated, err := LoadWindowsRuntimeConfig()
-	if err != nil {
-		return WindowsRuntimeConfig{}, fmt.Errorf("verify migrated Windows runtime security: %w", err)
-	}
-	return migrated, nil
+	return config, nil
 }
 
 func Install(ctx context.Context, request Request) error {
@@ -837,13 +865,22 @@ func ensureWindowsMachineDirectory(path, ownerSID string) error {
 	if err != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
 		return ErrInvalidRequest
 	}
-	// A pre-existing machine root may be created by MSI under SYSTEM.
-	// Never rewrite an enrolled-user or foreign-owned root outside the explicit
-	// legacy migration path.
-	if !created && !windowssecurity.OwnerMatchesSID(path, trustedOwner) {
-		return fmt.Errorf("validate existing Windows runtime root owner: %w", ErrInvalidRequest)
+	handle, _, err := openWindowsRuntimeObject(path, true)
+	if err != nil {
+		return err
 	}
-	return applyWindowsOwnedDACL(path, trustedOwner, windowsRuntimeCurrentRootDACL(ownerSID))
+	defer windows.CloseHandle(handle)
+	// A pre-existing machine root may be created by MSI under SYSTEM. A process
+	// cut between protected creation and the owner transfer may leave the one
+	// exact Administrators-owned transitional state. Reject every other owner
+	// without rewriting it.
+	if !created && !windowssecurity.HandleOwnerMatchesSID(handle, trustedOwner) {
+		administrators, ownerErr := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
+		if ownerErr != nil || !windowssecurity.HandleOwnerMatchesSID(handle, administrators) || !windowssecurity.ProtectedHandleDACLMatches(handle, windowsRuntimeCurrentRootDACL(ownerSID)) {
+			return fmt.Errorf("validate existing Windows runtime root owner: %w", ErrInvalidRequest)
+		}
+	}
+	return applyWindowsHandleOwnedDACL(handle, trustedOwner, windowsRuntimeCurrentRootDACL(ownerSID))
 }
 
 func windowsRuntimeTrustedOwner() (*windows.SID, error) {
@@ -884,6 +921,63 @@ func windowsRuntimeMigrationSecurityMatches(path string, legacyOwner, trustedOwn
 	return windowsRuntimeSecurityMatches(path, legacyOwner, legacyDACL) || windowsRuntimeSecurityMatches(path, trustedOwner, currentDACL)
 }
 
+func windowsRuntimeHandleSecurityMatches(handle windows.Handle, owner *windows.SID, dacl string) bool {
+	return windowssecurity.HandleOwnerMatchesSID(handle, owner) && windowssecurity.ProtectedHandleDACLMatches(handle, dacl)
+}
+
+func windowsRuntimeMigrationHandleSecurityMatches(handle windows.Handle, legacyOwner, trustedOwner *windows.SID, legacyDACL, currentDACL string) bool {
+	return windowsRuntimeHandleSecurityMatches(handle, legacyOwner, legacyDACL) || windowsRuntimeHandleSecurityMatches(handle, trustedOwner, currentDACL)
+}
+
+func openWindowsRuntimeObject(path string, directory bool) (windows.Handle, windows.ByHandleFileInformation, error) {
+	pathUTF16, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return 0, windows.ByHandleFileInformation{}, err
+	}
+	flags := uint32(windows.FILE_FLAG_OPEN_REPARSE_POINT)
+	if directory {
+		flags |= windows.FILE_FLAG_BACKUP_SEMANTICS
+	}
+	handle, err := windows.CreateFile(pathUTF16, windows.GENERIC_READ|windows.READ_CONTROL|windows.WRITE_DAC|windows.WRITE_OWNER, 0, nil, windows.OPEN_EXISTING, flags, 0)
+	if err != nil {
+		return 0, windows.ByHandleFileInformation{}, err
+	}
+	var information windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(handle, &information); err != nil {
+		windows.CloseHandle(handle)
+		return 0, windows.ByHandleFileInformation{}, err
+	}
+	isDirectory := information.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0
+	if information.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 || isDirectory != directory {
+		windows.CloseHandle(handle)
+		return 0, windows.ByHandleFileInformation{}, ErrInvalidRequest
+	}
+	return handle, information, nil
+}
+
+func applyWindowsHandleOwnedDACL(handle windows.Handle, owner *windows.SID, access string) error {
+	if owner == nil || !owner.IsValid() {
+		return ErrInvalidRequest
+	}
+	descriptor, err := windows.SecurityDescriptorFromString(access)
+	if err != nil {
+		return err
+	}
+	dacl, _, err := descriptor.DACL()
+	if err != nil {
+		return err
+	}
+	if err := windowssecurity.WithRestorePrivilege(func() error {
+		return windows.SetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, owner, nil, dacl, nil)
+	}); err != nil {
+		return err
+	}
+	if !windowsRuntimeHandleSecurityMatches(handle, owner, access) {
+		return ErrInvalidRequest
+	}
+	return nil
+}
+
 func applyWindowsOwnedDACL(path string, owner *windows.SID, access string) error {
 	if owner == nil || !owner.IsValid() {
 		return ErrInvalidRequest
@@ -908,7 +1002,10 @@ func applyWindowsOwnedDACL(path string, owner *windows.SID, access string) error
 }
 
 func createWindowsRuntimeRoot(path string, owner *windows.SID, dacl string) error {
-	descriptor, err := windows.SecurityDescriptorFromString("O:SY" + dacl)
+	// Administrators is a trusted creation owner in an elevated token. The
+	// final protected DACL gives the enrolled user read/execute only, so the
+	// object is safe while its owner is transferred to SYSTEM.
+	descriptor, err := windows.SecurityDescriptorFromString("O:BA" + dacl)
 	if err != nil {
 		return err
 	}
@@ -920,7 +1017,45 @@ func createWindowsRuntimeRoot(path string, owner *windows.SID, dacl string) erro
 	if err != nil {
 		return err
 	}
-	err = windowssecurity.WithRestorePrivilege(func() error { return windows.CreateDirectory(pathUTF16, &attributes) })
+	err = windowssecurity.WithRestorePrivilege(func() error {
+		if err := windows.CreateDirectory(pathUTF16, &attributes); err != nil {
+			return err
+		}
+		handle, openErr := windows.CreateFile(pathUTF16, windows.READ_CONTROL|windows.WRITE_DAC|windows.WRITE_OWNER, 0, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+		if openErr != nil {
+			return openErr
+		}
+		defer windows.CloseHandle(handle)
+		var information windows.ByHandleFileInformation
+		if infoErr := windows.GetFileInformationByHandle(handle, &information); infoErr != nil {
+			return infoErr
+		}
+		if information.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 || information.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+			return ErrInvalidRequest
+		}
+		administrators, ownerErr := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
+		if ownerErr != nil {
+			return ownerErr
+		}
+		if !windowssecurity.HandleOwnerMatchesSID(handle, administrators) || !windowssecurity.ProtectedHandleDACLMatches(handle, dacl) {
+			return windows.ERROR_INVALID_SECURITY_DESCR
+		}
+		finalDescriptor, descriptorErr := windows.SecurityDescriptorFromString(dacl)
+		if descriptorErr != nil {
+			return descriptorErr
+		}
+		finalDACL, _, descriptorErr := finalDescriptor.DACL()
+		if descriptorErr != nil {
+			return descriptorErr
+		}
+		if descriptorErr = windows.SetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, owner, nil, finalDACL, nil); descriptorErr != nil {
+			return descriptorErr
+		}
+		if !windowssecurity.HandleOwnerMatchesSID(handle, owner) || !windowssecurity.ProtectedHandleDACLMatches(handle, dacl) {
+			return windows.ERROR_INVALID_SECURITY_DESCR
+		}
+		return nil
+	})
 	runtime.KeepAlive(descriptor)
 	if err != nil {
 		return err
