@@ -65,13 +65,14 @@ func TestEnsureInitialUsesHelperIdentityAndRetriesWithStableOperation(t *testing
 	const helperToken = "helper-identity-credential-012345678901234567890"
 	const machineToken = "machine-control-credential-012345678901234567890"
 	const rotatedMachineToken = "machine-control-credential-rotated-012345678901234567890"
+	helperExpiresAt := time.Now().UTC().Add(24 * time.Hour)
 	var operations []string
 	var machineControlCalls int
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/v1/helper-enrollments":
-			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"helper_id": "hlp_1", "machine_id": "mch_1", "environment_id": "env_1", "credential": helperToken, "expires_at": now.Add(time.Hour)}})
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"helper_id": "hlp_1", "machine_id": "mch_1", "environment_id": "env_1", "credential": helperToken, "expires_at": helperExpiresAt}})
 		case "/v1/machine-control-credentials":
 			machineControlCalls++
 			if r.Header.Get("Authorization") != "Bearer "+helperToken {
