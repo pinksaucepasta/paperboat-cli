@@ -59,12 +59,19 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 		"TestNativePrepareS4UDPAPIQualification",
 		"TestNativeLoggedOutS4UDPAPIQualification",
 		"New-LocalUser",
-		"Start-Process",
-		"-Credential",
-		"-LoadUserProfile",
+		"Invoke-OwnerQualificationTest",
+		"[Diagnostics.ProcessStartInfo]::new()",
+		"$start.CreateNoWindow = $true",
+		"$start.RedirectStandardInput = $true",
+		"$process.StandardInput.BaseStream.Write",
+		"[Runtime.InteropServices.Marshal]::SecureStringToBSTR",
+		"[Runtime.InteropServices.Marshal]::ReadInt32($credentialPointer, -4)",
+		"[Runtime.InteropServices.Marshal]::Copy",
+		"[Runtime.InteropServices.Marshal]::ZeroFreeBSTR",
+		"[Array]::Clear($credentialBytes",
+		"$process.WaitForExit(90000)",
+		"PAPERBOAT_WINDOWS_E2E_S4U_OWNER_ACCOUNT",
 		"-WorkingDirectory $workRoot",
-		"s4u-owner-prepare.test.exe",
-		"Copy-Item -LiteralPath $resolvedS4UTestExecutable",
 		"Copy-Item -LiteralPath $resolvedS4UFixturePath",
 		"TestNativeOwnerCannotMutateS4UFixture",
 		"PAPERBOAT_WINDOWS_E2E_S4U_FIXTURE_SHA256",
@@ -97,6 +104,11 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 	} {
 		if !strings.Contains(string(harness), requiredText) {
 			t.Fatalf("native MSI harness is missing %q", requiredText)
+		}
+	}
+	for _, forbiddenText := range []string{"Start-Process -FilePath $ownerPreparationExecutable", "-Credential $credential", "-LoadUserProfile"} {
+		if strings.Contains(string(harness), forbiddenText) {
+			t.Fatalf("native MSI harness retains Session 0 alternate-credential launch %q", forbiddenText)
 		}
 	}
 	wixSource, err := os.ReadFile(filepath.Join(root, "wix", "Paperboat.wxs"))

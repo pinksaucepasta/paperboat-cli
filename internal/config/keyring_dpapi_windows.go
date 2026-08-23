@@ -50,11 +50,28 @@ func currentUserCredentialSDDL() (string, error) {
 }
 
 func currentUserSID() (*windows.SID, error) {
-	user, err := windows.GetCurrentProcessToken().GetTokenUser()
+	token, err := currentEffectiveUserToken()
+	if err != nil {
+		return nil, fmt.Errorf("%w: open current Windows token: %v", ErrCredentialStoreUnavailable, err)
+	}
+	defer token.Close()
+	user, err := token.GetTokenUser()
 	if err != nil || user == nil || user.User.Sid == nil || !user.User.Sid.IsValid() {
 		return nil, fmt.Errorf("%w: resolve current Windows SID: %v", ErrCredentialStoreUnavailable, err)
 	}
 	return user.User.Sid, nil
+}
+
+func currentEffectiveUserToken() (windows.Token, error) {
+	var token windows.Token
+	err := windows.OpenThreadToken(windows.CurrentThread(), windows.TOKEN_QUERY, true, &token)
+	if err == nil {
+		return token, nil
+	}
+	if !errors.Is(err, windows.ERROR_NO_TOKEN) {
+		return 0, err
+	}
+	return windows.OpenCurrentProcessToken()
 }
 
 func ensureDPAPIDirectory(path, sddl string) error {

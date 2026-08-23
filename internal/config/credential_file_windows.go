@@ -92,7 +92,7 @@ func readCredentialFile(path string) ([]byte, error) {
 }
 
 func credentialFilePrivate(path string) bool {
-	token, err := windows.OpenCurrentProcessToken()
+	token, err := currentEffectiveUserToken()
 	if err != nil {
 		return false
 	}
