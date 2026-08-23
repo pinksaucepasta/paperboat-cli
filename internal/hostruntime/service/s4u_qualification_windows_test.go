@@ -241,6 +241,10 @@ func withQualificationOwner(t *testing.T, action func(windows.Token)) {
 	if err := validateOwnerToken(token, ownerSID); err != nil {
 		t.Fatalf("interactive qualification token does not match owner %s: %v", ownerSID, err)
 	}
+	processUser, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil || processUser == nil || processUser.User.Sid == nil || processUser.User.Sid.String() == ownerSID {
+		t.Fatalf("qualification process identity must differ from impersonated owner %s: %v", ownerSID, err)
+	}
 	stopPrivileges, err := qualificationProfilePrivilegeScope()
 	if err != nil {
 		t.Fatalf("enable owner profile-load privileges: %v", err)
@@ -301,15 +305,6 @@ func assertQualificationKeyringOwner(t *testing.T, localAppData, ref, ownerSID s
 func TestNativePrepareS4UDPAPIQualification(t *testing.T) {
 	withQualificationOwner(t, func(token windows.Token) {
 		ownerSID := requiredS4UOwnerSID(t)
-		processToken, err := windows.OpenCurrentProcessToken()
-		if err != nil {
-			t.Fatal(err)
-		}
-		processUser, processErr := processToken.GetTokenUser()
-		processToken.Close()
-		if processErr != nil || processUser == nil || processUser.User.Sid == nil || processUser.User.Sid.String() == ownerSID {
-			t.Fatalf("qualification process identity must differ from impersonated owner %s: %v", ownerSID, processErr)
-		}
 		var effectiveToken windows.Token
 		if err := windows.OpenThreadToken(windows.CurrentThread(), windows.TOKEN_QUERY, true, &effectiveToken); err != nil {
 			t.Fatalf("open effective owner token: %v", err)
