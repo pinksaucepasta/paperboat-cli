@@ -99,7 +99,7 @@ function Get-QualificationSID {
 function Assert-QualificationAncestorTrusted {
     param([Parameter(Mandatory = $true)][string] $Path)
     Assert-Qualification (Test-Path -LiteralPath $Path -PathType Container) "Qualification ancestor is missing: $Path"
-    Assert-Qualification (((Get-Item -LiteralPath $Path).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) "Qualification ancestor is a reparse point: $Path"
+    Assert-Qualification (((Get-Item -Force -LiteralPath $Path).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) "Qualification ancestor is a reparse point: $Path"
     $acl = Get-Acl -LiteralPath $Path
     $trustedSIDs = @(Get-QualificationTrustedSIDs)
     $ownerSID = Get-QualificationSID $acl.Owner
@@ -119,8 +119,7 @@ function Assert-QualificationAncestorTrusted {
     }
 }
 
-function Set-QualificationTrustedRoot {
-    param([Parameter(Mandatory = $true)][string] $Path)
+function New-QualificationRootSecurity {
     $administrators = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
     $system = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
     $inheritance = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
@@ -129,7 +128,11 @@ function Set-QualificationTrustedRoot {
     $security.SetAccessRuleProtection($true, $false)
     $security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($administrators, [Security.AccessControl.FileSystemRights]::FullControl, $inheritance, [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow))
     $security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($system, [Security.AccessControl.FileSystemRights]::FullControl, $inheritance, [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow))
-    Set-Acl -LiteralPath $Path -AclObject $security
+    return $security
+}
+
+function Assert-QualificationTrustedRoot {
+    param([Parameter(Mandatory = $true)][string] $Path)
     Assert-QualificationAncestorTrusted $Path
     $actual = Get-Acl -LiteralPath $Path
     Assert-Qualification ($actual.AreAccessRulesProtected) "Qualification root DACL is not protected: $Path"
@@ -143,6 +146,14 @@ function Set-QualificationTrustedRoot {
     Assert-Qualification ($trustedRuleSeen['S-1-5-18'] -and $trustedRuleSeen['S-1-5-32-544']) "Qualification root is missing the required System or Administrators ACE: $Path"
 }
 
+function New-QualificationTrustedRootAtomic {
+    param([Parameter(Mandatory = $true)][string] $Path)
+    Assert-Qualification (-not (Test-Path -LiteralPath $Path)) "Refusing to mutate an existing qualification root: $Path"
+    $security = New-QualificationRootSecurity
+    [IO.Directory]::CreateDirectory($Path, $security) | Out-Null
+    Assert-QualificationTrustedRoot $Path
+}
+
 function Assert-QualificationTransactionDirectory {
     param(
         [Parameter(Mandatory = $true)][string] $Path,
@@ -150,7 +161,7 @@ function Assert-QualificationTransactionDirectory {
         [Parameter(Mandatory = $true)][bool] $OwnerWritable
     )
     Assert-Qualification (Test-Path -LiteralPath $Path -PathType Container) "Qualification transaction directory is missing: $Path"
-    Assert-Qualification (((Get-Item -LiteralPath $Path).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) "Qualification transaction directory is a reparse point: $Path"
+    Assert-Qualification (((Get-Item -Force -LiteralPath $Path).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) "Qualification transaction directory is a reparse point: $Path"
     $acl = Get-Acl -LiteralPath $Path
     $trustedSIDs = @('S-1-5-18', 'S-1-5-32-544')
     Assert-Qualification ((Get-QualificationSID $acl.Owner) -in $trustedSIDs) "Qualification transaction directory has an untrusted filesystem owner: $Path"
@@ -194,9 +205,19 @@ function Test-QualificationTrustValidation {
             $foreignOwnerRejected = $true
         }
         Assert-Qualification $foreignOwnerRejected 'Qualification trust validation accepted a foreign-owned ancestor.'
+        $foreignCreationRejected = $false
+        try {
+            New-QualificationTrustedRootAtomic $foreignOwnerPath
+        }
+        catch {
+            $foreignCreationRejected = $true
+        }
+        Assert-Qualification $foreignCreationRejected 'Atomic qualification root creation accepted an existing foreign-owned path.'
+        $foreignOwnerACL = Get-Acl -LiteralPath $foreignOwnerPath
+        $foreignOwnerAfter = Get-QualificationSID $foreignOwnerACL.Owner
+        Assert-Qualification ($foreignOwnerAfter -eq $UntrustedSID) 'Atomic qualification root creation mutated the foreign-owned path.'
 
-        New-Item -ItemType Directory -Force -Path $deleteACEPath | Out-Null
-        Set-QualificationTrustedRoot $deleteACEPath
+        New-QualificationTrustedRootAtomic $deleteACEPath
         & icacls.exe $deleteACEPath /grant "*${UntrustedSID}:D" | Out-Null
         Assert-Qualification ($LASTEXITCODE -eq 0) 'Could not create the hostile delete-ACE qualification fixture.'
         $deleteACERejected = $false
@@ -208,8 +229,7 @@ function Test-QualificationTrustValidation {
         }
         Assert-Qualification $deleteACERejected 'Qualification trust validation accepted an untrusted Delete ACE.'
 
-        New-Item -ItemType Directory -Force -Path $inheritOnlyPath | Out-Null
-        Set-QualificationTrustedRoot $inheritOnlyPath
+        New-QualificationTrustedRootAtomic $inheritOnlyPath
         $inheritOnlyACL = Get-Acl -LiteralPath $inheritOnlyPath
         $untrustedIdentity = [Security.Principal.SecurityIdentifier]::new($UntrustedSID)
         $inheritOnlyACL.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($untrustedIdentity, [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit, [Security.AccessControl.PropagationFlags]::InheritOnly, [Security.AccessControl.AccessControlType]::Allow))
@@ -580,14 +600,14 @@ function Invoke-S4UDPAPIQualification {
     try {
         Assert-QualificationAncestorTrusted $programDataRoot
         if (Test-Path -LiteralPath $qualificationParent) {
-            Assert-QualificationAncestorTrusted $qualificationParent
+            Assert-QualificationTrustedRoot $qualificationParent
         }
         else {
-            New-Item -ItemType Directory -Path $qualificationParent | Out-Null
+            New-QualificationTrustedRootAtomic $qualificationParent
         }
-        Set-QualificationTrustedRoot $qualificationParent
+        Assert-QualificationTrustedRoot $qualificationParent
         New-Item -ItemType Directory -Force -Path $qualificationRoot | Out-Null
-        Assert-Qualification (((Get-Item -LiteralPath $qualificationRoot).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'S4U qualification transaction root is a reparse point.'
+        Assert-Qualification (((Get-Item -Force -LiteralPath $qualificationRoot).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'S4U qualification transaction root is a reparse point.'
         $credentialSecret = [Security.SecureString]::new()
         foreach ($requiredCharacter in @('a', 'A', '1', '!')) {
             $credentialSecret.AppendChar($requiredCharacter)
@@ -616,19 +636,19 @@ function Invoke-S4UDPAPIQualification {
         Assert-Qualification ($LASTEXITCODE -eq 0) 'Could not set the trusted owner on the S4U qualification root directory.'
         Assert-QualificationTransactionDirectory -Path $qualificationRoot -OwnerSID $ownerSID -OwnerWritable $false
         New-Item -ItemType Directory -Force -Path $workRoot | Out-Null
-        Assert-Qualification (((Get-Item -LiteralPath $workRoot).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'Owner-writable S4U work directory is a reparse point.'
+        Assert-Qualification (((Get-Item -Force -LiteralPath $workRoot).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'Owner-writable S4U work directory is a reparse point.'
         & icacls.exe $workRoot /inheritance:r /grant:r "*${ownerSID}:(OI)(CI)M" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
         Assert-Qualification ($LASTEXITCODE -eq 0) 'Could not protect the owner-writable S4U work directory.'
         & icacls.exe $workRoot /setowner '*S-1-5-32-544' | Out-Null
         Assert-Qualification ($LASTEXITCODE -eq 0) 'Could not set the trusted owner on the owner-writable S4U work directory.'
         Assert-QualificationTransactionDirectory -Path $workRoot -OwnerSID $ownerSID -OwnerWritable $true
-        Assert-Qualification (((Get-Item -LiteralPath $resolvedS4UTestExecutable).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'S4U test executable source is a reparse point.'
-        Assert-Qualification (((Get-Item -LiteralPath $resolvedS4UFixturePath).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'S4U fixture source is a reparse point.'
+        Assert-Qualification (((Get-Item -Force -LiteralPath $resolvedS4UTestExecutable).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'S4U test executable source is a reparse point.'
+        Assert-Qualification (((Get-Item -Force -LiteralPath $resolvedS4UFixturePath).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'S4U fixture source is a reparse point.'
         $sourcePreparationHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $resolvedS4UTestExecutable).Hash.ToLowerInvariant()
         $sourceFixtureHashBeforePreparation = (Get-FileHash -Algorithm SHA256 -LiteralPath $resolvedS4UFixturePath).Hash.ToLowerInvariant()
         Copy-Item -LiteralPath $resolvedS4UTestExecutable -Destination $ownerPreparationExecutable -Force
         Assert-Qualification (Test-Path -LiteralPath $ownerPreparationExecutable -PathType Leaf) 'Owner preparation executable was not isolated in the qualification directory.'
-        Assert-Qualification (((Get-Item -LiteralPath $ownerPreparationExecutable).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'Owner preparation executable is a reparse point.'
+        Assert-Qualification (((Get-Item -Force -LiteralPath $ownerPreparationExecutable).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'Owner preparation executable is a reparse point.'
         Assert-Qualification ((Get-FileHash -Algorithm SHA256 -LiteralPath $ownerPreparationExecutable).Hash.ToLowerInvariant() -eq $sourcePreparationHash) 'Owner preparation executable differs from its source.'
         $env:PAPERBOAT_WINDOWS_E2E_S4U_OWNER_SID = $ownerSID
         $env:PAPERBOAT_WINDOWS_E2E_S4U_REPORT_PATH = $reportPath
@@ -658,10 +678,10 @@ function Invoke-S4UDPAPIQualification {
         & icacls.exe $trustedRoot /setowner '*S-1-5-32-544' | Out-Null
         Assert-Qualification ($LASTEXITCODE -eq 0) 'Could not set the trusted owner on the trusted S4U fixture directory.'
         Assert-QualificationTransactionDirectory -Path $trustedRoot -OwnerSID $ownerSID -OwnerWritable $false
-        Assert-Qualification (((Get-Item -LiteralPath $trustedRoot).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'Trusted S4U fixture directory is a reparse point.'
+        Assert-Qualification (((Get-Item -Force -LiteralPath $trustedRoot).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'Trusted S4U fixture directory is a reparse point.'
         Copy-Item -LiteralPath $resolvedS4UFixturePath -Destination $qualificationFixture -Force
         Assert-Qualification (Test-Path -LiteralPath $qualificationFixture -PathType Leaf) 'S4U fixture executable was not isolated in the trusted directory.'
-        Assert-Qualification (((Get-Item -LiteralPath $qualificationFixture).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'S4U fixture executable is a reparse point.'
+        Assert-Qualification (((Get-Item -Force -LiteralPath $qualificationFixture).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'S4U fixture executable is a reparse point.'
         & icacls.exe $qualificationFixture /inheritance:r /grant:r "*${ownerSID}:RX" '*S-1-5-18:F' '*S-1-5-32-544:F' | Out-Null
         Assert-Qualification ($LASTEXITCODE -eq 0) 'Could not protect the trusted S4U fixture executable.'
         & icacls.exe $qualificationFixture /setowner '*S-1-5-32-544' | Out-Null
@@ -697,7 +717,10 @@ function Invoke-S4UDPAPIQualification {
         Add-QualificationEvent -Name 'native_s4u_dpapi' -Status 'passed' -Detail "owner_sid=$ownerSID; architecture=$Architecture; dpapi_readable=true; credential_manager_migration=true"
     }
     catch {
-        $bodyFailure = $_.Exception.Message
+        $invocation = $_.InvocationInfo
+        $scriptName = if ([string]::IsNullOrWhiteSpace($invocation.ScriptName)) { '<unknown>' } else { Split-Path -Leaf $invocation.ScriptName }
+        $stack = ([string]$_.ScriptStackTrace).Replace("`r", '').Replace("`n", ' > ')
+        $bodyFailure = "$($_.Exception.Message) [exception=$($_.Exception.GetType().FullName); error_id=$($_.FullyQualifiedErrorId); command=$($invocation.MyCommand.Name); script=$scriptName; line=$($invocation.ScriptLineNumber); column=$($invocation.OffsetInLine); stack=$stack]"
     }
     finally {
         $env:PAPERBOAT_WINDOWS_E2E_S4U_FIXTURE = $previousFixture
