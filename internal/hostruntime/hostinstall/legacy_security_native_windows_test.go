@@ -4,6 +4,7 @@ package hostinstall
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -32,6 +33,19 @@ func TestNativeLegacyOwnerFullSecurityMigration(t *testing.T) {
 	windowsProgramDataRoot = filepath.Join(t.TempDir(), "Paperboat")
 	t.Cleanup(func() { windowsProgramDataRoot = previousRoot })
 
+	trustedOwner, err := windowsRuntimeTrustedOwner()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureWindowsMachineDirectory(WindowsProgramDataRoot(), ownerSID); err != nil {
+		t.Fatalf("atomically create trusted machine root: %v", err)
+	}
+	if !windowsRuntimeSecurityMatches(WindowsProgramDataRoot(), trustedOwner, windowsRuntimeCurrentRootDACL(ownerSID)) {
+		t.Fatal("new machine root was visible without its final SYSTEM owner and protected DACL")
+	}
+	if err := os.Remove(WindowsProgramDataRoot()); err != nil {
+		t.Fatalf("reset atomic machine-root fixture: %v", err)
+	}
 	if err := os.MkdirAll(WindowsProgramDataRoot(), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -55,11 +69,11 @@ func TestNativeLegacyOwnerFullSecurityMigration(t *testing.T) {
 	legacyFile := "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + ownerSID + ")"
 	legacyRoot := "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;" + ownerSID + ")"
 	for _, path := range []string{WindowsInstallConfigPath(), WindowsHostdTokenPath()} {
-		if err := applyWindowsDACL(path, legacyFile); err != nil {
+		if err := applyWindowsOwnedDACL(path, user.User.Sid, legacyFile); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := applyWindowsDACL(WindowsProgramDataRoot(), legacyRoot); err != nil {
+	if err := applyWindowsOwnedDACL(WindowsProgramDataRoot(), user.User.Sid, legacyRoot); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := LoadWindowsRuntimeConfig(); err == nil {
@@ -91,24 +105,135 @@ func TestNativeLegacyOwnerFullSecurityMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, path := range []string{WindowsInstallConfigPath(), WindowsHostdTokenPath()} {
-		if err := applyWindowsDACL(path, legacyFile); err != nil {
+		if err := applyWindowsOwnedDACL(path, user.User.Sid, legacyFile); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := applyWindowsDACL(WindowsProgramDataRoot(), legacyRoot); err != nil {
+	if err := applyWindowsOwnedDACL(WindowsProgramDataRoot(), user.User.Sid, legacyRoot); err != nil {
 		t.Fatal(err)
 	}
 
-	migrated, err := migrateLegacyWindowsRuntimeSecurity()
+	foreignOwner, err := windows.CreateWellKnownSid(windows.WinBuiltinUsersSid)
 	if err != nil {
-		t.Fatalf("migrate legacy security: %v", err)
+		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(migrated, config) {
-		t.Fatalf("migration changed trusted configuration\n got: %+v\nwant: %+v", migrated, config)
+	for _, hostile := range []struct{ name, path, dacl string }{
+		{"root", WindowsProgramDataRoot(), legacyRoot},
+		{"config", WindowsInstallConfigPath(), legacyFile},
+		{"token", WindowsHostdTokenPath(), legacyFile},
+	} {
+		t.Run("foreign_owner_"+hostile.name, func(t *testing.T) {
+			if err := applyWindowsOwnedDACL(hostile.path, foreignOwner, hostile.dacl); err != nil {
+				t.Fatalf("install hostile owner: %v", err)
+			}
+			before := nativeWindowsSecuritySnapshot(t, WindowsProgramDataRoot(), WindowsInstallConfigPath(), WindowsHostdTokenPath())
+			if _, err := migrateLegacyWindowsRuntimeSecurity(); !errors.Is(err, ErrInvalidRequest) {
+				t.Fatalf("foreign-owned %s returned %v, want invalid request", hostile.name, err)
+			}
+			after := nativeWindowsSecuritySnapshot(t, WindowsProgramDataRoot(), WindowsInstallConfigPath(), WindowsHostdTokenPath())
+			if !reflect.DeepEqual(after, before) {
+				t.Fatalf("foreign-owned %s failure mutated runtime security\n before: %v\n  after: %v", hostile.name, before, after)
+			}
+			if err := applyWindowsOwnedDACL(hostile.path, user.User.Sid, hostile.dacl); err != nil {
+				t.Fatalf("restore legacy owner: %v", err)
+			}
+		})
 	}
-	currentFile := "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GR;;;" + ownerSID + ")"
-	currentRoot := "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;" + ownerSID + ")"
-	if !windowssecurity.ProtectedDACLMatches(WindowsInstallConfigPath(), currentFile) || !windowssecurity.ProtectedDACLMatches(WindowsHostdTokenPath(), currentFile) || !windowssecurity.ProtectedDACLMatches(WindowsProgramDataRoot(), currentRoot) {
-		t.Fatal("migration did not replace every legacy owner-FULL ACL with the read-only owner contract")
+
+	currentFile := windowsRuntimeCurrentFileDACL(ownerSID)
+	currentRoot := windowsRuntimeCurrentRootDACL(ownerSID)
+	objects := []struct{ name, path, legacy, current string }{
+		{"token", WindowsHostdTokenPath(), legacyFile, currentFile},
+		{"config", WindowsInstallConfigPath(), legacyFile, currentFile},
+		{"root", WindowsProgramDataRoot(), legacyRoot, currentRoot},
 	}
+	for _, object := range objects {
+		for _, crossed := range []struct {
+			name  string
+			owner *windows.SID
+			dacl  string
+		}{
+			{"legacy_owner_current_dacl", user.User.Sid, object.current},
+			{"trusted_owner_legacy_dacl", trustedOwner, object.legacy},
+		} {
+			t.Run("crossed_pair_"+object.name+"_"+crossed.name, func(t *testing.T) {
+				resetNativeLegacyRuntimeSecurity(t, user.User.Sid, legacyRoot, legacyFile)
+				if err := applyWindowsOwnedDACL(object.path, crossed.owner, crossed.dacl); err != nil {
+					t.Fatalf("install crossed owner/DACL pair: %v", err)
+				}
+				before := nativeWindowsSecuritySnapshot(t, WindowsProgramDataRoot(), WindowsInstallConfigPath(), WindowsHostdTokenPath())
+				if _, err := migrateLegacyWindowsRuntimeSecurity(); !errors.Is(err, ErrInvalidRequest) {
+					t.Fatalf("crossed %s pair returned %v, want invalid request", object.name, err)
+				}
+				after := nativeWindowsSecuritySnapshot(t, WindowsProgramDataRoot(), WindowsInstallConfigPath(), WindowsHostdTokenPath())
+				if !reflect.DeepEqual(after, before) {
+					t.Fatalf("crossed %s pair failure mutated runtime security", object.name)
+				}
+			})
+		}
+	}
+
+	for _, crash := range []struct {
+		name         string
+		currentPaths []string
+	}{
+		{"after_token", []string{WindowsHostdTokenPath()}},
+		{"after_token_and_config", []string{WindowsHostdTokenPath(), WindowsInstallConfigPath()}},
+	} {
+		t.Run("resume_"+crash.name, func(t *testing.T) {
+			resetNativeLegacyRuntimeSecurity(t, user.User.Sid, legacyRoot, legacyFile)
+			for _, path := range crash.currentPaths {
+				if err := applyWindowsOwnedDACL(path, trustedOwner, currentFile); err != nil {
+					t.Fatalf("prepare crash cut: %v", err)
+				}
+			}
+			migrated, err := migrateLegacyWindowsRuntimeSecurity()
+			if err != nil {
+				t.Fatalf("migrate legacy security: %v", err)
+			}
+			if !reflect.DeepEqual(migrated, config) {
+				t.Fatalf("migration changed trusted configuration\n got: %+v\nwant: %+v", migrated, config)
+			}
+			if !windowssecurity.ProtectedDACLMatches(WindowsInstallConfigPath(), currentFile) || !windowssecurity.ProtectedDACLMatches(WindowsHostdTokenPath(), currentFile) || !windowssecurity.ProtectedDACLMatches(WindowsProgramDataRoot(), currentRoot) {
+				t.Fatal("migration did not replace every legacy owner-FULL ACL with the read-only owner contract")
+			}
+			for _, path := range []string{WindowsProgramDataRoot(), WindowsInstallConfigPath(), WindowsHostdTokenPath()} {
+				if !windowssecurity.OwnerMatchesSID(path, trustedOwner) {
+					t.Fatalf("migration did not transfer %s to the trusted filesystem owner", path)
+				}
+			}
+			before := nativeWindowsSecuritySnapshot(t, WindowsProgramDataRoot(), WindowsInstallConfigPath(), WindowsHostdTokenPath())
+			if _, err := migrateLegacyWindowsRuntimeSecurity(); !errors.Is(err, ErrInvalidRequest) {
+				t.Fatalf("fully current state returned %v, want invalid request", err)
+			}
+			if after := nativeWindowsSecuritySnapshot(t, WindowsProgramDataRoot(), WindowsInstallConfigPath(), WindowsHostdTokenPath()); !reflect.DeepEqual(after, before) {
+				t.Fatal("fully current migration rejection mutated runtime security")
+			}
+		})
+	}
+}
+
+func resetNativeLegacyRuntimeSecurity(t *testing.T, owner *windows.SID, rootDACL, fileDACL string) {
+	t.Helper()
+	for _, path := range []string{WindowsInstallConfigPath(), WindowsHostdTokenPath()} {
+		if err := applyWindowsOwnedDACL(path, owner, fileDACL); err != nil {
+			t.Fatalf("reset legacy file security: %v", err)
+		}
+	}
+	if err := applyWindowsOwnedDACL(WindowsProgramDataRoot(), owner, rootDACL); err != nil {
+		t.Fatalf("reset legacy root security: %v", err)
+	}
+}
+
+func nativeWindowsSecuritySnapshot(t *testing.T, paths ...string) []string {
+	t.Helper()
+	result := make([]string, len(paths))
+	for index, path := range paths {
+		descriptor, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
+		if err != nil || descriptor == nil {
+			t.Fatalf("read %s security: %v", path, err)
+		}
+		result[index] = descriptor.String()
+	}
+	return result
 }

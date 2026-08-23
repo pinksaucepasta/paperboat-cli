@@ -3,11 +3,15 @@
 package atomicfile
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -37,16 +41,17 @@ type Options struct {
 	OwnerUID int
 	OwnerGID int
 	// SecurityDescriptor is an optional SDDL descriptor. If empty, Write uses
-	// a protected descriptor for the current owner, SYSTEM, and Administrators. Windows
-	// does not have meaningful POSIX UID/GID ownership, so callers must leave
-	// OwnerUID and OwnerGID as -1 and use an ACL instead.
+	// a protected descriptor for the current owner, SYSTEM, and Administrators.
+	// Windows does not have meaningful POSIX UID/GID ownership, so callers must
+	// leave OwnerUID and OwnerGID as -1 and use a security descriptor instead.
 	SecurityDescriptor string
 }
 
-// Write creates a same-directory temporary file, installs a protected DACL
-// before writing its contents, flushes it, then replaces the destination with
-// MOVEFILE_WRITE_THROUGH. It deliberately rejects POSIX ownership requests:
-// treating a Windows token as a UID would be fake security.
+// Write creates a same-directory temporary file with its final protected
+// security descriptor in CreateFileW, writes and flushes its contents, then
+// replaces the destination with MOVEFILE_WRITE_THROUGH. It deliberately
+// rejects POSIX ownership requests: treating a Windows token as a UID would
+// be fake security.
 func Write(path string, data []byte, options Options) error {
 	path = filepath.Clean(path)
 	if !filepath.IsAbs(path) || options.Mode.Perm() == 0 || options.Mode&^fs.ModePerm != 0 || options.OwnerUID != -1 || options.OwnerGID != -1 {
@@ -71,16 +76,11 @@ func Write(path string, data []byte, options Options) error {
 		return &Error{Stage: StageValidate, Path: path, Err: err}
 	}
 	//paperboat:allow-source-policy atomic-replacement owner=atomicfile-windows reason=same-directory-protected-staging
-	temporary, err := os.CreateTemp(parent, ".paperboat-*")
+	temporary, temporaryPath, err := createProtectedTemporary(parent, descriptor)
 	if err != nil {
 		return &Error{Stage: StageCreate, Path: path, Err: err}
 	}
-	temporaryPath := temporary.Name()
 	defer os.Remove(temporaryPath)
-	if err := applySecurityDescriptor(temporaryPath, descriptor); err != nil {
-		temporary.Close()
-		return &Error{Stage: StageOwner, Path: path, Err: err}
-	}
 	if _, err := temporary.Write(data); err != nil {
 		temporary.Close()
 		return &Error{Stage: StageWrite, Path: path, Err: err}
@@ -104,6 +104,43 @@ func Write(path string, data []byte, options Options) error {
 		return &Error{Stage: StageReplace, Path: path, Err: err}
 	}
 	return nil
+}
+
+func createProtectedTemporary(parent, descriptor string) (*os.File, string, error) {
+	securityDescriptor, err := windows.SecurityDescriptorFromString(descriptor)
+	if err != nil {
+		return nil, "", err
+	}
+	attributes := windows.SecurityAttributes{
+		Length:             uint32(unsafe.Sizeof(windows.SecurityAttributes{})),
+		SecurityDescriptor: securityDescriptor,
+	}
+	for attempt := 0; attempt < 16; attempt++ {
+		random := make([]byte, 16)
+		if _, err := rand.Read(random); err != nil {
+			return nil, "", err
+		}
+		path := filepath.Join(parent, ".paperboat-"+hex.EncodeToString(random))
+		pathUTF16, err := windows.UTF16PtrFromString(path)
+		if err != nil {
+			return nil, "", err
+		}
+		handle, err := windows.CreateFile(pathUTF16, windows.GENERIC_READ|windows.GENERIC_WRITE, 0, &attributes, windows.CREATE_NEW, windows.FILE_ATTRIBUTE_NORMAL, 0)
+		runtime.KeepAlive(securityDescriptor)
+		if errors.Is(err, windows.ERROR_FILE_EXISTS) || errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
+			continue
+		}
+		if err != nil {
+			return nil, "", err
+		}
+		file := os.NewFile(uintptr(handle), path)
+		if file == nil {
+			windows.CloseHandle(handle)
+			return nil, "", errors.New("wrap protected temporary file handle")
+		}
+		return file, path, nil
+	}
+	return nil, "", windows.ERROR_FILE_EXISTS
 }
 
 func currentOwnerSecurityDescriptor() (string, error) {
@@ -164,22 +201,4 @@ func regularNonReparse(path string, allowMissing bool) error {
 		return err
 	}
 	return nil
-}
-
-func applySecurityDescriptor(path, sddl string) error {
-	descriptor, err := windows.SecurityDescriptorFromString(sddl)
-	if err != nil {
-		return err
-	}
-	abs, err := descriptor.ToAbsolute()
-	if err != nil {
-		return err
-	}
-	dacl, _, err := abs.DACL()
-	if err != nil {
-		return err
-	}
-	return windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT,
-		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
-		nil, nil, dacl, nil)
 }

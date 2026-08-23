@@ -6,6 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/pinksaucepasta/paperboat/internal/windowssecurity"
+	"golang.org/x/sys/windows"
 )
 
 func TestWriteDefaultDescriptorAllowsOwnerAtomicReplacement(t *testing.T) {
@@ -18,5 +21,23 @@ func TestWriteDefaultDescriptorAllowsOwnerAtomicReplacement(t *testing.T) {
 		if err != nil || string(contents) != body {
 			t.Fatalf("contents=%q err=%v", contents, err)
 		}
+	}
+}
+
+func TestWriteAppliesExplicitOwnerBeforeReplacement(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "machine-state.json")
+	user, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil || user == nil || user.User.Sid == nil {
+		t.Fatal(err)
+	}
+	descriptor := "O:" + user.User.Sid.String() + "D:P(A;;FA;;;SY)(A;;FA;;;" + user.User.Sid.String() + ")"
+	if err := Write(path, []byte("protected\n"), Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: descriptor}); err != nil {
+		t.Fatal(err)
+	}
+	if !windowssecurity.OwnerMatchesSID(path, user.User.Sid) {
+		t.Fatal("atomic replacement did not retain the explicit trusted owner")
+	}
+	if !windowssecurity.ProtectedDACLMatches(path, descriptor) {
+		t.Fatal("atomic replacement did not retain the explicit protected DACL")
 	}
 }
