@@ -55,8 +55,14 @@ func TestNativeSCMHostdAndUpdaterLifecycle(t *testing.T) {
 			installed := true
 			t.Cleanup(func() {
 				if installed {
-					_ = installer.Uninstall(context.Background())
-					_ = waitServiceAbsent(test.name, 15*time.Second)
+					cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+					defer cleanupCancel()
+					if err := installer.Uninstall(cleanupCtx); err != nil {
+						t.Errorf("cleanup uninstall %s: %v", test.name, err)
+					}
+					if err := waitServiceAbsent(test.name, 15*time.Second); err != nil {
+						t.Errorf("cleanup wait for %s: %v", test.name, err)
+					}
 				}
 			})
 
@@ -146,9 +152,17 @@ func TestNativeDurablePreviewServiceLifecycle(t *testing.T) {
 		t.Fatalf("install durable preview service: %v", err)
 	}
 	t.Cleanup(func() {
-		_ = hostruntime.RemovePreviewService(context.Background(), root, name)
-		_ = removeServiceIfPresent(serviceName)
-		_ = waitServiceAbsent(serviceName, 15*time.Second)
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		if err := hostruntime.RemovePreviewService(cleanupCtx, root, name); err != nil {
+			t.Errorf("cleanup preview runtime %s: %v", serviceName, err)
+		}
+		if err := removeServiceIfPresent(serviceName); err != nil {
+			t.Errorf("cleanup preview service %s: %v", serviceName, err)
+		}
+		if err := waitServiceAbsent(serviceName, 15*time.Second); err != nil {
+			t.Errorf("cleanup wait for preview service %s: %v", serviceName, err)
+		}
 	})
 	if descriptor.Schema != "paperboat.preview-runtime/v1" || descriptor.Name != name || descriptor.Port != 32123 || descriptor.Indefinite || descriptor.ExpiresAt == nil || descriptor.ServiceDefinition == "" {
 		t.Fatalf("unexpected preview descriptor: %+v", descriptor)

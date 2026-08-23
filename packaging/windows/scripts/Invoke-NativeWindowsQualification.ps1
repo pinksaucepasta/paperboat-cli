@@ -310,15 +310,23 @@ function Invoke-Msi {
 }
 
 function Get-PaperboatServices {
-    @(Get-CimInstance -ClassName Win32_Service -ErrorAction SilentlyContinue | Where-Object {
+    @(Get-CimInstance -ClassName Win32_Service -ErrorAction Stop | Where-Object {
         $_.Name -in @('PaperboatHostd', 'PaperboatUpdated')
     })
 }
 
 function Get-PaperboatPreviewServices {
-    @(Get-CimInstance -ClassName Win32_Service -ErrorAction SilentlyContinue | Where-Object {
+    @(Get-CimInstance -ClassName Win32_Service -ErrorAction Stop | Where-Object {
         $_.Name -like 'PaperboatPreview-*'
     })
+}
+
+function Get-PaperboatPreviewDeclarations {
+    $definitionRoot = Join-Path $script:stateRoot 'services'
+    if (-not (Test-Path -LiteralPath $definitionRoot)) {
+        return @()
+    }
+    return @(Get-ChildItem -Force -File -LiteralPath $definitionRoot -Filter 'PaperboatPreview-*.json' -ErrorAction Stop)
 }
 
 function Get-InstalledPaperboatProducts {
@@ -328,8 +336,8 @@ function Get-InstalledPaperboatProducts {
         'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
     )) {
         if (Test-Path -LiteralPath $root) {
-            $entries += @(Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue | ForEach-Object {
-                $item = Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue
+            $entries += @(Get-ChildItem -LiteralPath $root -ErrorAction Stop | ForEach-Object {
+                $item = Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction Stop
                 if ($null -ne $item -and $item.DisplayName -eq 'Paperboat') {
                     $item
                 }
@@ -360,9 +368,14 @@ function Assert-Preflight {
     Assert-Qualification ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) 'Qualification must run with administrator rights.'
     Assert-Qualification (@(Get-PaperboatServices).Count -eq 0) 'PaperboatHostd or PaperboatUpdated already exists; refusing to overwrite an unmanaged test state.'
     Assert-Qualification (@(Get-PaperboatPreviewServices).Count -eq 0) 'A PaperboatPreview-* service already exists; refusing to overwrite an unmanaged test state.'
+    Assert-Qualification (@(Get-PaperboatPreviewDeclarations).Count -eq 0) 'A PaperboatPreview-* service declaration already exists; refusing to overwrite an unmanaged test state.'
     Assert-Qualification (-not (Test-Path -LiteralPath $script:registryPath)) 'HKLM:\Software\Paperboat already exists; refusing to overwrite an unmanaged test state.'
     Assert-Qualification (-not (Test-Path -LiteralPath $script:installRoot)) "$($script:installRoot) already exists; refusing to overwrite an unmanaged test state."
-    $script:preexistingPaperboatSshd = @(Get-CimInstance -ClassName Win32_Service -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'PaperboatSshd' } | Select-Object -First 1)
+    foreach ($definitionName in @('PaperboatHostd.json', 'PaperboatUpdated.json')) {
+        $definitionPath = Join-Path $script:stateRoot "services\$definitionName"
+        Assert-Qualification (-not (Test-Path -LiteralPath $definitionPath)) "$definitionPath already exists; refusing to overwrite an unmanaged service declaration."
+    }
+    $script:preexistingPaperboatSshd = @(Get-CimInstance -ClassName Win32_Service -ErrorAction Stop | Where-Object { $_.Name -eq 'PaperboatSshd' } | Select-Object -First 1)
     Add-QualificationEvent -Name 'preflight' -Status 'passed' -Detail "native_architecture=$nativeArchitecture; requested_architecture=$Architecture"
 }
 
@@ -488,7 +501,7 @@ function New-OwnedPreviewCleanupFixture {
         -StartupType Manual `
         -ErrorAction Stop | Out-Null
     $script:dynamicPreviewServiceName = $name
-    $service = Get-CimInstance -ClassName Win32_Service -Filter "Name='$name'" -ErrorAction SilentlyContinue
+    $service = Get-CimInstance -ClassName Win32_Service -Filter "Name='$name'" -ErrorAction Stop
     Assert-Qualification ($null -ne $service) "Owned preview cleanup fixture $name was not registered with SCM."
     Add-QualificationEvent -Name 'dynamic_preview_cleanup_fixture' -Status 'passed' -Detail "service=$name; state=stopped; definition=$definitionPath"
 }
@@ -497,7 +510,7 @@ function Assert-OwnedPreviewCleanupFixturePresent {
     if ([string]::IsNullOrWhiteSpace($script:dynamicPreviewServiceName)) {
         throw 'qualification_assertion_failed: dynamic preview cleanup fixture was not created.'
     }
-    $service = Get-CimInstance -ClassName Win32_Service -Filter "Name='$($script:dynamicPreviewServiceName)'" -ErrorAction SilentlyContinue
+    $service = Get-CimInstance -ClassName Win32_Service -Filter "Name='$($script:dynamicPreviewServiceName)'" -ErrorAction Stop
     Assert-Qualification ($null -ne $service) "Owned preview service $($script:dynamicPreviewServiceName) disappeared during upgrade."
     Assert-Qualification (Test-Path -LiteralPath (Join-Path $script:stateRoot "services\$($script:dynamicPreviewServiceName).json") -PathType Leaf) 'Owned preview declaration disappeared during upgrade.'
 }
@@ -518,16 +531,16 @@ function Assert-Uninstalled {
     }
     Assert-Qualification (-not (Test-Path -LiteralPath $script:installRoot)) "Install root remains after uninstall: $($script:installRoot)"
     if (Test-Path -LiteralPath $script:registryPath) {
-        $registry = Get-ItemProperty -LiteralPath $script:registryPath -ErrorAction SilentlyContinue
+        $registry = Get-ItemProperty -LiteralPath $script:registryPath -ErrorAction Stop
         Assert-Qualification ($null -eq $registry.ReleaseVersion) 'Paperboat ReleaseVersion remains after uninstall.'
     }
     if (Test-Path -LiteralPath $script:stateRoot) {
-        $productFiles = @(Get-ChildItem -LiteralPath $script:stateRoot -Recurse -File -ErrorAction SilentlyContinue | Where-Object {
+        $productFiles = @(Get-ChildItem -LiteralPath $script:stateRoot -Recurse -File -ErrorAction Stop | Where-Object {
             $_.Name -in @('provisioning-hook.json', 'paperboat-runtime.exe', 'paperboat-hostd.exe', 'paperboat-updater.exe')
         })
         Assert-Qualification ($productFiles.Count -eq 0) 'Product binaries or provisioning metadata remain in ProgramData after uninstall.'
     }
-    $paperboatSshd = @(Get-CimInstance -ClassName Win32_Service -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'PaperboatSshd' })
+    $paperboatSshd = @(Get-CimInstance -ClassName Win32_Service -ErrorAction Stop | Where-Object { $_.Name -eq 'PaperboatSshd' })
     if ($null -ne $script:preexistingPaperboatSshd -and $script:preexistingPaperboatSshd.Count -gt 0) {
         Assert-Qualification ($paperboatSshd.Count -eq 1) 'Pre-existing PaperboatSshd was removed or duplicated by MSI uninstall.'
         Assert-Qualification ($paperboatSshd[0].PathName -eq $script:preexistingPaperboatSshd[0].PathName) 'Pre-existing PaperboatSshd configuration changed during MSI uninstall.'
@@ -946,6 +959,8 @@ function Write-QualificationReport {
     }
 }
 
+$bodyFailure = $null
+$cleanupFailure = $null
 try {
     Assert-Preflight
     Invoke-S4UDPAPIQualification
@@ -1003,7 +1018,7 @@ try {
 catch {
     $failure = $_.Exception.Message
     Add-QualificationEvent -Name 'qualification' -Status 'failed' -Detail $failure
-    throw
+    $bodyFailure = $_
 }
 finally {
     if ($script:installedByHarness -or $script:upgradeInstalled) {
@@ -1016,9 +1031,16 @@ finally {
             }
         }
         catch {
+            $cleanupFailure = $_
             Add-QualificationEvent -Name 'failure_cleanup' -Status 'failed' -Detail $_.Exception.Message
         }
     }
     $failureText = ($script:events | Where-Object { $_.status -eq 'failed' } | Select-Object -First 1).detail
     Write-QualificationReport -Failure $failureText
+}
+if ($null -ne $bodyFailure) {
+    throw $bodyFailure
+}
+if ($null -ne $cleanupFailure) {
+    throw $cleanupFailure
 }
