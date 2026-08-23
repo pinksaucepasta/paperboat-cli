@@ -76,14 +76,20 @@ func (KeyringStore) Set(ref, value string) error {
 }
 
 func (KeyringStore) Get(ref string) (string, error) {
-	// Prefer the owner-DPAPI copy so interactive commands, scheduled tasks and
-	// the enrolled-owner service workload all resolve the same durable value.
+	// Prefer the machine-scope DPAPI copy protected by the enrolled owner's
+	// exact filesystem ownership and owner/SY/BA ACL so interactive commands,
+	// scheduled tasks and the S4U owner workload resolve one durable value.
 	// Fall back to Credential Manager for credentials written by older clients.
 	value, dpapiErr := getDPAPISecret(ref, nil)
 	if dpapiErr == nil {
 		if value == "" {
 			return "", fmt.Errorf("%w: DPAPI credential is empty", ErrCredentialStoreUnavailable)
 		}
+		// A previous migration may have published and verified the DPAPI
+		// authority before legacy cleanup failed. Retry cleanup on every
+		// successful read. Credential Manager is unavailable to logged-out S4U
+		// tokens, so cleanup remains best effort and never blocks the authority.
+		_ = deleteLegacyWindowsCredential(ref)
 		return value, nil
 	}
 	// Credential Manager is only a migration source for an absent DPAPI
@@ -130,15 +136,27 @@ func (KeyringStore) Get(ref string) (string, error) {
 	if err != nil || verified != value {
 		return "", errors.Join(ErrCredentialStoreUnavailable, err)
 	}
-	result, _, callErr = procCredDeleteW.Call(
+	// Publishing and verifying v2 commits the migration. Cleanup is retried on
+	// every later successful DPAPI read and cannot turn a committed migration
+	// into a false failure.
+	_ = deleteLegacyWindowsCredential(ref)
+	return value, nil
+}
+
+func deleteLegacyWindowsCredential(ref string) error {
+	target, err := windowsUTF16(windowsCredentialTarget(ref))
+	if err != nil {
+		return err
+	}
+	result, _, callErr := procCredDeleteW.Call(
 		uintptr(unsafe.Pointer(target)),
 		windowsCredentialTypeGeneric,
 		0,
 	)
 	if result == 0 && !errors.Is(callErr, windows.ERROR_NOT_FOUND) {
-		return "", windowsCredentialError("delete migrated credential", callErr)
+		return windowsCredentialError("delete migrated credential", callErr)
 	}
-	return value, nil
+	return nil
 }
 
 func (KeyringStore) Delete(ref string) error {

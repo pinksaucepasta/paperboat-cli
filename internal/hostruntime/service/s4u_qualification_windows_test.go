@@ -22,6 +22,8 @@ import (
 )
 
 const s4uFixturePathEnvironment = "PAPERBOAT_WINDOWS_E2E_S4U_FIXTURE"
+const s4uReportPathEnvironment = "PAPERBOAT_WINDOWS_E2E_S4U_REPORT_PATH"
+const s4uServiceNameEnvironment = "PAPERBOAT_WINDOWS_E2E_S4U_SERVICE_NAME"
 
 var qualificationCredWrite = windows.NewLazySystemDLL("advapi32.dll").NewProc("CredWriteW")
 
@@ -61,7 +63,7 @@ func writeLegacyCredentialManagerFixture(t *testing.T, ref, value string) {
 	}
 }
 
-func prepareProductionKeyringFixtures(t *testing.T, reportPath string) {
+func prepareProductionKeyringFixtures(t *testing.T, reportPath string, cleanup bool) {
 	t.Helper()
 	keyring := config.KeyringStore{}
 	if err := keyring.Set(reportPath, "paperboat-s4u-dpapi-v1"); err != nil {
@@ -72,17 +74,45 @@ func prepareProductionKeyringFixtures(t *testing.T, reportPath string) {
 	if value, err := keyring.Get(migratedRef); err != nil || value != "paperboat-s4u-migrated-v1" {
 		t.Fatalf("migrate owner Credential Manager fixture into Paperboat KeyringStore: value=%q err=%v", value, err)
 	}
-	t.Cleanup(func() {
-		_ = keyring.Delete(reportPath)
-		_ = keyring.Delete(migratedRef)
-	})
+	if cleanup {
+		t.Cleanup(func() {
+			_ = keyring.Delete(reportPath)
+			_ = keyring.Delete(migratedRef)
+		})
+	}
+}
+
+// TestNativePrepareS4UDPAPIQualification must run under a real interactive
+// logon token for the enrolled owner. Credential Manager rejects service,
+// network, and S4U-only logons with ERROR_NO_SUCH_LOGON_SESSION. This separate
+// phase proves the production one-time CredMan -> owner-DPAPI migration before
+// the owner logon ends and the LocalSystem -> S4U reader phase begins.
+func TestNativePrepareS4UDPAPIQualification(t *testing.T) {
+	ownerSID := requiredS4UOwnerSID(t)
+	token, err := windows.OpenCurrentProcessToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer token.Close()
+	user, err := token.GetTokenUser()
+	if err != nil || user == nil || user.User.Sid == nil || user.User.Sid.String() != ownerSID {
+		t.Fatalf("fixture preparation is not running as enrolled owner %s", ownerSID)
+	}
+	localAppData, err := token.KnownFolderPath(windows.FOLDERID_LocalAppData, windows.KF_FLAG_DEFAULT)
+	if err != nil || !filepath.IsAbs(localAppData) {
+		t.Fatalf("resolve enrolled owner LocalAppData: %v", err)
+	}
+	t.Setenv("LOCALAPPDATA", filepath.Clean(localAppData))
+	reportPath := requiredS4UReportPath(t)
+	prepareProductionKeyringFixtures(t, reportPath, false)
 }
 
 // TestNativeLoggedOutS4UDPAPIQualification is the release gate for the exact
-// cross-logon credential contract Paperboat relies on. The test process writes
-// a user-scoped DPAPI value, proves that no interactive owner token is
-// selectable, and requires the actual LocalSystem -> enrolled-owner S4U child
-// to decrypt it. It deliberately has no Git, Codex, EFS, or network dependency.
+// cross-logon credential contract Paperboat relies on. An earlier real owner
+// logon prepares machine-scope v2 DPAPI values behind the owner's strict ACL.
+// This phase proves no interactive owner token is selectable and requires the
+// actual LocalSystem -> enrolled-owner S4U child to decrypt them. It deliberately
+// has no Git, Codex, EFS, or network dependency.
 func TestNativeLoggedOutS4UDPAPIQualification(t *testing.T) {
 	fixture := requiredS4UFixture(t)
 	ownerSID := requiredS4UOwnerSID(t)
@@ -90,9 +120,8 @@ func TestNativeLoggedOutS4UDPAPIQualification(t *testing.T) {
 		t.Fatalf("owner %s has a selectable WTS token; logged-out DPAPI qualification did not run", ownerSID)
 	}
 
-	name := fmt.Sprintf("PaperboatS4UDPAPIQualification%d", os.Getpid())
-	reportPath := filepath.Join(t.TempDir(), "s4u-dpapi-report.json")
-	prepareProductionKeyringFixtures(t, reportPath)
+	name := requiredS4UServiceName(t)
+	reportPath := requiredS4UReportPath(t)
 	manager, err := mgr.Connect()
 	if err != nil {
 		t.Fatalf("connect SCM: %v", err)
@@ -218,7 +247,7 @@ func TestNativeLoggedOutS4UQualification(t *testing.T) {
 
 	name := fmt.Sprintf("PaperboatS4UQualification%d", os.Getpid())
 	reportPath := filepath.Join(t.TempDir(), "s4u-report.json")
-	prepareProductionKeyringFixtures(t, reportPath)
+	prepareProductionKeyringFixtures(t, reportPath, true)
 	if err := os.WriteFile(reportPath+".efs", []byte("paperboat-s4u-efs-v1"), 0o600); err != nil {
 		t.Fatalf("write owner EFS fixture: %v", err)
 	}
@@ -330,6 +359,29 @@ func requiredS4UOwnerSID(t *testing.T) string {
 		t.Fatalf("PAPERBOAT_WINDOWS_E2E_S4U_OWNER_SID must be an enrolled Windows SID")
 	}
 	return value
+}
+
+func requiredS4UReportPath(t *testing.T) string {
+	t.Helper()
+	path := os.Getenv(s4uReportPathEnvironment)
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path || strings.ContainsAny(path, "\x00\r\n") {
+		t.Fatalf("%s must be an absolute clean path", s4uReportPathEnvironment)
+	}
+	return path
+}
+
+func requiredS4UServiceName(t *testing.T) string {
+	t.Helper()
+	name := os.Getenv(s4uServiceNameEnvironment)
+	if len(name) < len("PaperboatS4UDPAPI-")+8 || len(name) > 80 || !strings.HasPrefix(name, "PaperboatS4UDPAPI-") {
+		t.Fatalf("%s must be a bounded Paperboat qualification service name", s4uServiceNameEnvironment)
+	}
+	for _, r := range name {
+		if r != '-' && (r < '0' || r > '9') && (r < 'A' || r > 'Z') && (r < 'a' || r > 'z') {
+			t.Fatalf("%s contains an invalid character", s4uServiceNameEnvironment)
+		}
+	}
+	return name
 }
 
 func hasSelectableOwnerWTSToken(t *testing.T, ownerSID string) bool {

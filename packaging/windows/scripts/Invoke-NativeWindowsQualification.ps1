@@ -403,20 +403,145 @@ function Invoke-GoQualification {
 function Invoke-S4UDPAPIQualification {
     $previousFixture = $env:PAPERBOAT_WINDOWS_E2E_S4U_FIXTURE
     $previousOwnerSID = $env:PAPERBOAT_WINDOWS_E2E_S4U_OWNER_SID
-    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    Assert-Qualification ($null -ne $identity.User) 'The native runner identity has no Windows SID.'
+    $previousReportPath = $env:PAPERBOAT_WINDOWS_E2E_S4U_REPORT_PATH
+    $previousServiceName = $env:PAPERBOAT_WINDOWS_E2E_S4U_SERVICE_NAME
+    $ownerName = 'pbq' + [Guid]::NewGuid().ToString('N').Substring(0, 12)
+    $credentialSecret = $null
+    $randomBytes = $null
+    $owner = $null
+    $ownerSID = ''
+    $serviceName = 'PaperboatS4UDPAPI-' + [Guid]::NewGuid().ToString('N').Substring(0, 16)
+    $fixtureRoot = Join-Path $env:ProgramData ('Paperboat\qualification\' + $ownerName)
+    $reportPath = Join-Path $fixtureRoot 's4u-dpapi-report.json'
+    $prepareStdout = Join-Path $fixtureRoot 'owner-prepare.stdout.log'
+    $prepareStderr = Join-Path $fixtureRoot 'owner-prepare.stderr.log'
+    $bodyFailure = $null
+    $cleanupFailures = @()
+    New-Item -ItemType Directory -Force -Path $fixtureRoot | Out-Null
     $env:PAPERBOAT_WINDOWS_E2E_S4U_FIXTURE = $resolvedS4UFixturePath
-    $env:PAPERBOAT_WINDOWS_E2E_S4U_OWNER_SID = $identity.User.Value
     try {
-        Add-QualificationEvent -Name 'native_s4u_dpapi' -Status 'started' -Detail "owner_sid=$($identity.User.Value); architecture=$Architecture"
+        $credentialSecret = [Security.SecureString]::new()
+        foreach ($requiredCharacter in @('a', 'A', '1', '!')) {
+            $credentialSecret.AppendChar($requiredCharacter)
+        }
+        $randomBytes = [byte[]]::new(28)
+        $randomGenerator = [Security.Cryptography.RandomNumberGenerator]::Create()
+        try {
+            $randomGenerator.GetBytes($randomBytes)
+        }
+        finally {
+            $randomGenerator.Dispose()
+        }
+        $credentialAlphabet = 'abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%^&*'
+        foreach ($randomByte in $randomBytes) {
+            $credentialSecret.AppendChar($credentialAlphabet[$randomByte % $credentialAlphabet.Length])
+        }
+        [Array]::Clear($randomBytes, 0, $randomBytes.Length)
+        $credentialSecret.MakeReadOnly()
+        $owner = New-LocalUser -Name $ownerName -Password $credentialSecret -AccountNeverExpires -PasswordNeverExpires -UserMayNotChangePassword -ErrorAction Stop
+        $ownerSID = $owner.SID.Value
+        Assert-Qualification (-not [string]::IsNullOrWhiteSpace($ownerSID)) 'Temporary S4U qualification owner has no SID.'
+        & icacls.exe $fixtureRoot /inheritance:r /grant:r "*${ownerSID}:(OI)(CI)M" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
+        Assert-Qualification ($LASTEXITCODE -eq 0) 'Could not protect the S4U qualification fixture directory.'
+        $env:PAPERBOAT_WINDOWS_E2E_S4U_OWNER_SID = $ownerSID
+        $env:PAPERBOAT_WINDOWS_E2E_S4U_REPORT_PATH = $reportPath
+        $env:PAPERBOAT_WINDOWS_E2E_S4U_SERVICE_NAME = $serviceName
+        $credential = [Management.Automation.PSCredential]::new("$env:COMPUTERNAME\$ownerName", $credentialSecret)
+        $prepareArguments = @('-test.v', '-test.run', '^TestNativePrepareS4UDPAPIQualification$', '-test.count', '1', '-test.timeout', '1m')
+        $prepare = Start-Process -FilePath $resolvedS4UTestExecutable -ArgumentList $prepareArguments -Credential $credential -LoadUserProfile -RedirectStandardOutput $prepareStdout -RedirectStandardError $prepareStderr -Wait -PassThru
+        if ($prepare.ExitCode -ne 0) {
+            $prepareOutput = @(
+                if (Test-Path -LiteralPath $prepareStdout) { Get-Content -LiteralPath $prepareStdout -Raw }
+                if (Test-Path -LiteralPath $prepareStderr) { Get-Content -LiteralPath $prepareStderr -Raw }
+            ) -join "`n"
+            throw "Owner-context Credential Manager migration preparation failed with exit code $($prepare.ExitCode): $prepareOutput"
+        }
+
+        Add-QualificationEvent -Name 'native_s4u_dpapi' -Status 'started' -Detail "owner_sid=$ownerSID; architecture=$Architecture; owner_migration_prepared=true"
         $arguments = @('-test.v', '-test.run', '^TestNativeLoggedOutS4UDPAPIQualification$', '-test.count', '1', '-test.timeout', '2m')
         & $resolvedS4UTestExecutable @arguments
         Assert-Qualification ($LASTEXITCODE -eq 0) "Native logged-out S4U DPAPI qualification failed with exit code $LASTEXITCODE."
-        Add-QualificationEvent -Name 'native_s4u_dpapi' -Status 'passed' -Detail "owner_sid=$($identity.User.Value); architecture=$Architecture; dpapi_readable=true"
+        Add-QualificationEvent -Name 'native_s4u_dpapi' -Status 'passed' -Detail "owner_sid=$ownerSID; architecture=$Architecture; dpapi_readable=true; credential_manager_migration=true"
+    }
+    catch {
+        $bodyFailure = $_.Exception.Message
     }
     finally {
         $env:PAPERBOAT_WINDOWS_E2E_S4U_FIXTURE = $previousFixture
         $env:PAPERBOAT_WINDOWS_E2E_S4U_OWNER_SID = $previousOwnerSID
+        $env:PAPERBOAT_WINDOWS_E2E_S4U_REPORT_PATH = $previousReportPath
+        $env:PAPERBOAT_WINDOWS_E2E_S4U_SERVICE_NAME = $previousServiceName
+        try {
+            $qualificationService = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+            if ($null -ne $qualificationService) {
+                if ($qualificationService.Status -ne 'Stopped') {
+                    Stop-Service -Name $serviceName -Force -ErrorAction Stop
+                    $qualificationService.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
+                }
+                & sc.exe delete $serviceName | Out-Null
+                if ($LASTEXITCODE -ne 0) {
+                    throw "sc.exe delete returned exit code $LASTEXITCODE"
+                }
+                for ($attempt = 0; $attempt -lt 20; $attempt++) {
+                    if ($null -eq (Get-Service -Name $serviceName -ErrorAction SilentlyContinue)) {
+                        break
+                    }
+                    Start-Sleep -Milliseconds 250
+                }
+                if ($null -ne (Get-Service -Name $serviceName -ErrorAction SilentlyContinue)) {
+                    throw 'qualification service remains after bounded stop/delete cleanup'
+                }
+            }
+        }
+        catch {
+            $cleanupFailures += "service $serviceName cleanup: $($_.Exception.Message)"
+        }
+        if (-not [string]::IsNullOrWhiteSpace($ownerSID)) {
+            try {
+                $ownerProfiles = @(Get-CimInstance -ClassName Win32_UserProfile -Filter "SID='$ownerSID'" -ErrorAction Stop)
+                foreach ($ownerProfile in $ownerProfiles) {
+                    Remove-CimInstance -InputObject $ownerProfile -ErrorAction Stop
+                }
+                if (@(Get-CimInstance -ClassName Win32_UserProfile -Filter "SID='$ownerSID'" -ErrorAction Stop).Count -ne 0) {
+                    throw 'temporary owner profile remains after cleanup'
+                }
+            }
+            catch {
+                $cleanupFailures += "profile $ownerSID cleanup: $($_.Exception.Message)"
+            }
+        }
+        if ($null -ne $owner) {
+            try {
+                Remove-LocalUser -Name $ownerName -ErrorAction Stop
+                if ($null -ne (Get-LocalUser -Name $ownerName -ErrorAction SilentlyContinue)) {
+                    throw 'temporary local owner remains after cleanup'
+                }
+            }
+            catch {
+                $cleanupFailures += "local user $ownerName cleanup: $($_.Exception.Message)"
+            }
+        }
+        if (Test-Path -LiteralPath $fixtureRoot) {
+            try {
+                Remove-Item -LiteralPath $fixtureRoot -Recurse -Force -ErrorAction Stop
+                if (Test-Path -LiteralPath $fixtureRoot) {
+                    throw 'qualification fixture root remains after cleanup'
+                }
+            }
+            catch {
+                $cleanupFailures += "fixture root $fixtureRoot cleanup: $($_.Exception.Message)"
+            }
+        }
+        if ($null -ne $randomBytes) {
+            [Array]::Clear($randomBytes, 0, $randomBytes.Length)
+        }
+        if ($null -ne $credentialSecret) {
+            $credentialSecret.Dispose()
+        }
+    }
+    if ($null -ne $bodyFailure -or $cleanupFailures.Count -gt 0) {
+        $allFailures = @(@($bodyFailure) + $cleanupFailures | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        throw ($allFailures -join '; ')
     }
 }
 

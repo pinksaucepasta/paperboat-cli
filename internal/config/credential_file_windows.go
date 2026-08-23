@@ -45,7 +45,20 @@ func writeCredentialFile(path string, value []byte) error {
 		return fmt.Errorf("%w: protect credential file: %v", ErrCredentialStoreUnavailable, err)
 	}
 	defer clear(protected)
-	return atomicfile.Write(path, protected, atomicfile.Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: sddl})
+	if err := atomicfile.Write(path, protected, atomicfile.Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: sddl}); err != nil {
+		return err
+	}
+	ownerSID, err := currentUserSID()
+	if err != nil {
+		return err
+	}
+	if err := windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION, ownerSID, nil, nil, nil); err != nil {
+		return fmt.Errorf("%w: set credential file owner: %v", ErrCredentialStoreUnavailable, err)
+	}
+	if !credentialFilePrivate(path) {
+		return fmt.Errorf("%w: written credential file owner or ACL is invalid", ErrCredentialStoreUnavailable)
+	}
+	return nil
 }
 
 func readCredentialFile(path string) ([]byte, error) {
@@ -79,6 +92,15 @@ func readCredentialFile(path string) ([]byte, error) {
 }
 
 func credentialFilePrivate(path string) bool {
+	token, err := windows.OpenCurrentProcessToken()
+	if err != nil {
+		return false
+	}
+	defer token.Close()
+	user, err := token.GetTokenUser()
+	if err != nil || user == nil || user.User.Sid == nil || !windowssecurity.OwnerMatchesSID(path, user.User.Sid) {
+		return false
+	}
 	wantSDDL, err := currentUserCredentialSDDL()
 	if err != nil {
 		return false

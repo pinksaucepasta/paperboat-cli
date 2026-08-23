@@ -41,6 +41,21 @@ func ProtectedDACLMatches(path, expected string) bool {
 	return actual == dacl(strings.Replace(expected, user.User.Sid.String(), "LA", 1))
 }
 
+// OwnerMatchesSID rejects attacker-owned filesystem objects even when their
+// current DACL text matches the expected protected ACL. A Windows owner can
+// restore WRITE_DAC and replace a machine-scope DPAPI credential later.
+func OwnerMatchesSID(path string, expected *windows.SID) bool {
+	if expected == nil || !expected.IsValid() {
+		return false
+	}
+	descriptor, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION)
+	if err != nil || descriptor == nil {
+		return false
+	}
+	owner, _, err := descriptor.Owner()
+	return err == nil && owner != nil && owner.Equals(expected)
+}
+
 func dacl(value string) string {
 	start := strings.Index(value, "D:")
 	if start < 0 {
