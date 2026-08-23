@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -61,6 +62,72 @@ func TestOpenSSHArgumentsPlacesRemoteCommandAfterDestination(t *testing.T) {
 	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("openSSHArguments() = %q, want %q", got, want)
+	}
+}
+
+func TestEnsureCLIIdentityForLoginFailsClosedForEstablishedLocalRoot(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/e2ee/root" {
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":{"code":"not_found","message":"root unavailable"}}`))
+	}))
+	defer server.Close()
+	root := t.TempDir()
+	store := config.ProfileStore{Path: root, Secrets: config.FileSecretStore{Dir: filepath.Join(root, "secrets")}}
+	public, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SavePeerAccountRootPublic(server.URL, "account_1", public); err != nil {
+		t.Fatal(err)
+	}
+	flags := flag.NewFlagSet("login", flag.ContinueOnError)
+	flags.String("recovery-key", "", "")
+	ctx := command.NewContext(flags)
+	profile := config.Profile{Issuer: server.URL, Account: config.Account{ID: "account_1"}, CLIClientSessionID: "cli_1"}
+	err = ensureCLIIdentityForLogin(ctx, store, profile, config.Credential{})
+	if !errors.Is(err, identitybootstrap.ErrEstablishedRootUnavailable) {
+		t.Fatalf("login enrollment error = %v", err)
+	}
+}
+
+func TestEnsureCLIIdentityForLoginBootstrapsNewAccount(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/v1/e2ee/root" {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":{"code":"not_found"}}`))
+			return
+		}
+		if r.URL.Path != "/v1/e2ee/bootstrap" {
+			http.NotFound(w, r)
+			return
+		}
+		var input api.E2EEBootstrapInput
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			t.Errorf("decode bootstrap: %v", err)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": input})
+	}))
+	defer server.Close()
+	root := t.TempDir()
+	store := config.ProfileStore{Path: root, Secrets: config.FileSecretStore{Dir: filepath.Join(root, "secrets")}}
+	flags := flag.NewFlagSet("login", flag.ContinueOnError)
+	flags.String("recovery-key", "", "")
+	ctx := command.NewContext(flags)
+	profile := config.Profile{Issuer: server.URL, Account: config.Account{ID: "account_1"}, CLIClientSessionID: "cli_1"}
+	if err := ensureCLIIdentityForLogin(ctx, store, profile, config.Credential{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ExportPeerAccountRootSeed(server.URL, profile.Account.ID); err != nil {
+		t.Fatalf("new root seed was not persisted: %v", err)
+	}
+	if _, err := store.LoadPeerCertificate(server.URL, profile.CLIClientSessionID); err != nil {
+		t.Fatalf("new endpoint certificate was not persisted: %v", err)
 	}
 }
 

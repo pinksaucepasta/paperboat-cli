@@ -37,6 +37,43 @@ func (existingRootClient) BootstrapE2EE(context.Context, string, api.E2EEBootstr
 	return api.E2EEBootstrapResult{}, errors.New("bootstrap must not run before pairing")
 }
 
+type newRootReplayClient struct {
+	bootstrap bootstrapClientFunc
+	root      api.E2EERoot
+	rootCalls int
+	requests  int
+}
+
+func (c *newRootReplayClient) E2EERoot(context.Context) (api.E2EERoot, error) {
+	c.rootCalls++
+	if c.root.PublicKey == "" {
+		return api.E2EERoot{}, &api.APIError{Status: http.StatusNotFound, Code: "not_found"}
+	}
+	return c.root, nil
+}
+
+func (c *newRootReplayClient) BootstrapE2EE(ctx context.Context, operation string, input api.E2EEBootstrapInput) (api.E2EEBootstrapResult, error) {
+	result, err := c.bootstrap(ctx, operation, input)
+	if err == nil {
+		public, decodeErr := base64.RawURLEncoding.Strict().DecodeString(input.RootPublicKey)
+		fingerprint := sha256.Sum256(public)
+		if decodeErr != nil {
+			return api.E2EEBootstrapResult{}, decodeErr
+		}
+		c.root = api.E2EERoot{Version: 1, PublicKey: input.RootPublicKey, Fingerprint: hex.EncodeToString(fingerprint[:]), Generation: 1}
+	}
+	return result, err
+}
+
+func (c *newRootReplayClient) RequestCLIEndpoint(context.Context, api.CLIEndpointRequestInput) (api.PendingEndpointIdentity, error) {
+	c.requests++
+	return api.PendingEndpointIdentity{}, errors.New("completed first-root enrollment must not request another certificate")
+}
+
+func (*newRootReplayClient) EndpointCertificate(context.Context, string, uint64) (api.EndpointCertificateDocument, error) {
+	return api.EndpointCertificateDocument{}, errors.New("completed first-root enrollment must not poll another certificate")
+}
+
 type existingEnrollmentClient struct {
 	root        api.E2EERoot
 	pending     api.PendingEndpointIdentity
@@ -91,8 +128,8 @@ func TestEnrollCLIExistingRootStoresVerifierOnlyIdentityAndIsIdempotent(t *testi
 		t.Fatal(err)
 	}
 	second, err := EnrollCLI(context.Background(), request)
-	if err != nil || first.RootFingerprint != second.RootFingerprint || first.CertificateFingerprint != second.CertificateFingerprint || client.requests != 2 {
-		t.Fatalf("first=%+v second=%+v requests=%d err=%v", first, second, client.requests, err)
+	if err != nil || client.requests != 1 || second.RootFingerprint != first.RootFingerprint || second.CertificateFingerprint != first.CertificateFingerprint {
+		t.Fatalf("second enrollment failed: requests=%d result=%+v err=%v", client.requests, second, err)
 	}
 	storedRoot, err := store.LoadPeerAccountRootPublic(request.Issuer, request.AccountID)
 	if err != nil || !bytes.Equal(storedRoot, rootPublic) {
@@ -170,7 +207,7 @@ func TestEnrollCLINewRootCreatesPersistsAndExactlyReplaysIdentity(t *testing.T) 
 	store := config.ProfileStore{Path: root, Secrets: config.FileSecretStore{Dir: filepath.Join(root, "secrets")}}
 	var firstOperation string
 	var firstInput api.E2EEBootstrapInput
-	client := bootstrapClientFunc(func(_ context.Context, operation string, input api.E2EEBootstrapInput) (api.E2EEBootstrapResult, error) {
+	client := &newRootReplayClient{bootstrap: bootstrapClientFunc(func(_ context.Context, operation string, input api.E2EEBootstrapInput) (api.E2EEBootstrapResult, error) {
 		if firstOperation == "" {
 			firstOperation, firstInput = operation, input
 		} else if operation != firstOperation || input != firstInput {
@@ -186,15 +223,58 @@ func TestEnrollCLINewRootCreatesPersistsAndExactlyReplaysIdentity(t *testing.T) 
 			t.Fatalf("certificate=%+v err=%v", certificate, err)
 		}
 		return api.E2EEBootstrapResult(input), nil
-	})
-	request := CLIRequest{Store: store, Client: client, Issuer: "https://api.example.test", AccountID: "account_1", CLIClientSessionID: "cli_1", Now: func() time.Time { return now }}
+	})}
+	request := CLIRequest{Store: store, Client: client, Issuer: "https://api.example.test", AccountID: "account_1", CLIClientSessionID: "cli_1", Now: func() time.Time { return now }, PollInterval: time.Millisecond, Timeout: time.Second}
 	first, err := EnrollCLI(context.Background(), request)
 	if err != nil {
 		t.Fatal(err)
 	}
 	second, err := EnrollCLI(context.Background(), request)
-	if err != nil || first.RootFingerprint != second.RootFingerprint || first.CertificateFingerprint != second.CertificateFingerprint {
-		t.Fatalf("first=%+v second=%+v err=%v", first, second, err)
+	if err != nil || client.requests != 0 || second.RootFingerprint != first.RootFingerprint || second.CertificateFingerprint != first.CertificateFingerprint {
+		t.Fatalf("second enrollment did not replay: requests=%d result=%+v err=%v", client.requests, second, err)
+	}
+}
+
+func TestEnrollCLIFailsClosedWhenEstablishedRootIsUnavailable(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		seed bool
+	}{
+		{name: "verifier-only", seed: false},
+		{name: "root custody", seed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			store := config.ProfileStore{Path: root, Secrets: config.FileSecretStore{Dir: filepath.Join(root, "secrets")}}
+			issuer, accountID, endpointID := "https://api.example.test", "account_1", "cli_1"
+			if tc.seed {
+				keys, err := store.PeerIdentityKeys(issuer, accountID, endpointID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				clearKeys(&keys)
+			} else {
+				public, _, err := ed25519.GenerateKey(nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := store.SavePeerAccountRootPublic(issuer, accountID, public); err != nil {
+					t.Fatal(err)
+				}
+			}
+			bootstrapped := false
+			client := bootstrapClientFunc(func(context.Context, string, api.E2EEBootstrapInput) (api.E2EEBootstrapResult, error) {
+				bootstrapped = true
+				return api.E2EEBootstrapResult{}, nil
+			})
+			_, err := EnrollCLI(context.Background(), CLIRequest{Store: store, Client: client, Issuer: issuer, AccountID: accountID, CLIClientSessionID: endpointID})
+			if !errors.Is(err, ErrEstablishedRootUnavailable) {
+				t.Fatalf("err=%v", err)
+			}
+			if bootstrapped {
+				t.Fatal("created a replacement root after server root disappeared")
+			}
+		})
 	}
 }
 

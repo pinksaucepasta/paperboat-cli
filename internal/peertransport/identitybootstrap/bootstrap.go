@@ -21,6 +21,7 @@ const CertificateLifetime = 90 * 24 * time.Hour
 var ErrInvalid = errors.New("invalid E2EE identity bootstrap")
 var ErrPairingRequired = errors.New("this account already has an E2EE root; approval from a paired CLI or a recovery key is required")
 var ErrEnrollmentExpired = errors.New("CLI endpoint enrollment request expired before approval")
+var ErrEstablishedRootUnavailable = errors.New("this account has established E2EE state, but its server root is unavailable; explicit recovery is required")
 
 type Client interface {
 	E2EERoot(context.Context) (api.E2EERoot, error)
@@ -94,11 +95,38 @@ func EnrollCLI(ctx context.Context, request CLIRequest) (Result, error) {
 	if err == nil || !api.IsNotFound(err) {
 		return result, err
 	}
+	if established, stateErr := hasEstablishedRootState(request.Store, request.Issuer, request.AccountID); stateErr != nil {
+		return Result{}, stateErr
+	} else if established {
+		return Result{}, ErrEstablishedRootUnavailable
+	}
 	return Bootstrap(ctx, Request{
 		Store: request.Store, Client: request.Client, Issuer: request.Issuer,
 		AccountID: request.AccountID, CLIClientSessionID: request.CLIClientSessionID,
 		Now: request.Now,
 	})
+}
+
+// hasEstablishedRootState distinguishes a genuinely new profile from one
+// whose server root was removed or is temporarily unavailable. A verifier
+// only profile stores the public key, while a recovery-capable profile also
+// stores the root seed. Neither state may silently fall through to bootstrap
+// and create a replacement account root.
+func hasEstablishedRootState(store config.ProfileStore, issuer, accountID string) (bool, error) {
+	if _, err := store.LoadPeerAccountRootPublic(issuer, accountID); err == nil {
+		return true, nil
+	} else if !errors.Is(err, config.ErrSecretNotFound) {
+		return false, err
+	}
+	seed, err := store.ExportPeerAccountRootSeed(issuer, accountID)
+	if err == nil {
+		clear(seed)
+		return true, nil
+	}
+	if !errors.Is(err, config.ErrSecretNotFound) {
+		return false, err
+	}
+	return false, nil
 }
 
 // EnrollExistingRoot performs the second-device CLI enrollment handshake. It
@@ -141,6 +169,24 @@ func EnrollExistingRoot(ctx context.Context, request ExistingRootRequest) (Resul
 	quicPublic, ok := keys.QUICPrivate.Public().(ed25519.PublicKey)
 	if !ok || len(quicPublic) != ed25519.PublicKeySize || keys.NoisePublic == [32]byte{} {
 		return Result{}, ErrInvalid
+	}
+	// A valid locally persisted certificate is the completed enrollment. In
+	// particular, the first call may have bootstrapped the account root; a
+	// later auth/login replay must not switch ceremonies and ask the server to
+	// issue a second certificate for the same endpoint.
+	local, localErr := request.Store.LoadPeerCertificate(request.Issuer, request.CLIClientSessionID)
+	if localErr == nil {
+		certificate, verifyErr := endpointidentity.Verify(local.Raw, rootPublic, endpointidentity.Expected{AccountID: request.AccountID, Role: endpointidentity.RoleCLI, EndpointID: request.CLIClientSessionID, Generation: 1}, now)
+		certificateFingerprint := sha256.Sum256(local.Raw)
+		matchesKeys := verifyErr == nil && certificate.Claims.NoisePublicKey == keys.NoisePublic && bytes.Equal(certificate.Claims.QUICPublicKey, quicPublic)
+		clear(local.Raw)
+		if !matchesKeys {
+			return Result{}, ErrInvalid
+		}
+		return Result{RootFingerprint: hex.EncodeToString(rootFingerprint[:]), CertificateFingerprint: hex.EncodeToString(certificateFingerprint[:]), Certificate: certificate}, nil
+	}
+	if !errors.Is(localErr, config.ErrSecretNotFound) {
+		return Result{}, localErr
 	}
 	operationID := existingEnrollmentOperationID(request.AccountID, request.CLIClientSessionID, keys.NoisePublic, quicPublic)
 	pending, err := request.Client.RequestCLIEndpoint(ctx, api.CLIEndpointRequestInput{OperationID: operationID, EndpointID: request.CLIClientSessionID, Generation: 1, NoisePublicKey: base64.RawURLEncoding.EncodeToString(keys.NoisePublic[:]), QUICPublicKey: base64.RawURLEncoding.EncodeToString(quicPublic)})
