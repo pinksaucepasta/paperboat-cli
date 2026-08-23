@@ -3,6 +3,7 @@
 package service
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +23,7 @@ import (
 )
 
 const s4uFixturePathEnvironment = "PAPERBOAT_WINDOWS_E2E_S4U_FIXTURE"
+const s4uFixtureSHA256Environment = "PAPERBOAT_WINDOWS_E2E_S4U_FIXTURE_SHA256"
 const s4uReportPathEnvironment = "PAPERBOAT_WINDOWS_E2E_S4U_REPORT_PATH"
 const s4uServiceNameEnvironment = "PAPERBOAT_WINDOWS_E2E_S4U_SERVICE_NAME"
 
@@ -104,7 +106,55 @@ func TestNativePrepareS4UDPAPIQualification(t *testing.T) {
 	}
 	t.Setenv("LOCALAPPDATA", filepath.Clean(localAppData))
 	reportPath := requiredS4UReportPath(t)
+	workingDirectory, err := os.Getwd()
+	if err != nil || !strings.EqualFold(filepath.Clean(workingDirectory), filepath.Dir(reportPath)) {
+		t.Fatalf("owner preparation working directory = %q, want %q: %v", workingDirectory, filepath.Dir(reportPath), err)
+	}
+	executable, err := os.Executable()
+	if err != nil || !strings.EqualFold(filepath.Dir(filepath.Clean(executable)), filepath.Dir(reportPath)) {
+		t.Fatalf("owner preparation executable = %q, want qualification directory %q: %v", executable, filepath.Dir(reportPath), err)
+	}
+	probePath := reportPath + ".owner-access"
+	if err := os.WriteFile(probePath, []byte("owner-access-v1"), 0o600); err != nil {
+		t.Fatalf("write owner qualification access probe: %v", err)
+	}
+	if err := os.Remove(probePath); err != nil {
+		t.Fatalf("remove owner qualification access probe: %v", err)
+	}
 	prepareProductionKeyringFixtures(t, reportPath, false)
+}
+
+// TestNativeOwnerCannotMutateS4UFixture runs as the enrolled owner after the
+// privileged harness publishes the future LocalSystem executable. The owner
+// may read and execute it, but cannot write, replace, rename, delete, or create
+// a sibling in its trusted directory.
+func TestNativeOwnerCannotMutateS4UFixture(t *testing.T) {
+	ownerSID := requiredS4UOwnerSID(t)
+	token, err := windows.OpenCurrentProcessToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer token.Close()
+	user, err := token.GetTokenUser()
+	if err != nil || user == nil || user.User.Sid == nil || user.User.Sid.String() != ownerSID {
+		t.Fatalf("fixture mutation probe is not running as enrolled owner %s", ownerSID)
+	}
+	fixture := requiredS4UFixture(t)
+	if handle, err := os.OpenFile(fixture, os.O_WRONLY|os.O_TRUNC, 0); err == nil {
+		handle.Close()
+		t.Fatal("enrolled owner could truncate the future LocalSystem fixture")
+	}
+	replacement := fixture + ".owner-replacement"
+	if err := os.WriteFile(replacement, []byte("replacement"), 0o600); err == nil {
+		t.Fatal("enrolled owner could create a sibling in the trusted fixture directory")
+	}
+	if err := os.Rename(fixture, replacement); err == nil {
+		t.Fatal("enrolled owner could rename the future LocalSystem fixture")
+	}
+	if err := os.Remove(fixture); err == nil {
+		t.Fatal("enrolled owner could delete the future LocalSystem fixture")
+	}
+	_ = requiredS4UFixture(t)
 }
 
 // TestNativeLoggedOutS4UDPAPIQualification is the release gate for the exact
@@ -344,9 +394,22 @@ func requiredS4UFixture(t *testing.T) string {
 	if err != nil || !strings.EqualFold(filepath.Ext(absolute), ".exe") {
 		t.Fatalf("S4U fixture must be an absolute .exe: %q", path)
 	}
-	info, err := os.Stat(absolute)
-	if err != nil || !info.Mode().IsRegular() {
+	info, err := os.Lstat(absolute)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 		t.Fatalf("S4U fixture is not a regular file: %q: %v", absolute, err)
+	}
+	attributes, err := windows.GetFileAttributes(windows.StringToUTF16Ptr(absolute))
+	if err != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		t.Fatalf("S4U fixture is a reparse point: %q: %v", absolute, err)
+	}
+	body, err := os.ReadFile(absolute)
+	if err != nil {
+		t.Fatalf("read S4U fixture: %v", err)
+	}
+	digest := fmt.Sprintf("%x", sha256.Sum256(body))
+	expectedDigest := strings.ToLower(strings.TrimSpace(os.Getenv(s4uFixtureSHA256Environment)))
+	if len(expectedDigest) != sha256.Size*2 || digest != expectedDigest {
+		t.Fatalf("S4U fixture SHA256 = %q, want %q", digest, expectedDigest)
 	}
 	return absolute
 }

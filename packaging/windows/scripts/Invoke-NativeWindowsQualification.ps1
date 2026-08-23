@@ -83,6 +83,157 @@ function Assert-Qualification {
     }
 }
 
+function Get-QualificationTrustedSIDs {
+    $trustedInstaller = ([Security.Principal.NTAccount]::new('NT SERVICE', 'TrustedInstaller')).Translate([Security.Principal.SecurityIdentifier]).Value
+    return @('S-1-5-18', 'S-1-5-32-544', $trustedInstaller)
+}
+
+function Get-QualificationSID {
+    param([Parameter(Mandatory = $true)] $Identity)
+    if ($Identity -is [string]) {
+        $Identity = [Security.Principal.NTAccount]::new($Identity)
+    }
+    return $Identity.Translate([Security.Principal.SecurityIdentifier]).Value
+}
+
+function Assert-QualificationAncestorTrusted {
+    param([Parameter(Mandatory = $true)][string] $Path)
+    Assert-Qualification (Test-Path -LiteralPath $Path -PathType Container) "Qualification ancestor is missing: $Path"
+    Assert-Qualification (((Get-Item -LiteralPath $Path).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) "Qualification ancestor is a reparse point: $Path"
+    $acl = Get-Acl -LiteralPath $Path
+    $trustedSIDs = @(Get-QualificationTrustedSIDs)
+    $ownerSID = Get-QualificationSID $acl.Owner
+    Assert-Qualification ($ownerSID -in $trustedSIDs) "Qualification ancestor has an untrusted owner: $Path owner=$ownerSID"
+    $dangerousRights = [int64]([Security.AccessControl.FileSystemRights]::Delete) -bor [int64]([Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles) -bor [int64]([Security.AccessControl.FileSystemRights]::ChangePermissions) -bor [int64]([Security.AccessControl.FileSystemRights]::TakeOwnership)
+    foreach ($rule in $acl.Access) {
+        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) {
+            continue
+        }
+        if (($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) {
+            continue
+        }
+        $ruleSID = Get-QualificationSID $rule.IdentityReference
+        if ($ruleSID -notin $trustedSIDs -and (([int64]$rule.FileSystemRights -band $dangerousRights) -ne 0)) {
+            throw "qualification_assertion_failed: Qualification ancestor grants an untrusted principal delete-child or ACL ownership rights: $Path sid=$ruleSID rights=$($rule.FileSystemRights)"
+        }
+    }
+}
+
+function Set-QualificationTrustedRoot {
+    param([Parameter(Mandatory = $true)][string] $Path)
+    $administrators = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+    $system = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+    $inheritance = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
+    $security = [Security.AccessControl.DirectorySecurity]::new()
+    $security.SetOwner($administrators)
+    $security.SetAccessRuleProtection($true, $false)
+    $security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($administrators, [Security.AccessControl.FileSystemRights]::FullControl, $inheritance, [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow))
+    $security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($system, [Security.AccessControl.FileSystemRights]::FullControl, $inheritance, [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow))
+    Set-Acl -LiteralPath $Path -AclObject $security
+    Assert-QualificationAncestorTrusted $Path
+    $actual = Get-Acl -LiteralPath $Path
+    Assert-Qualification ($actual.AreAccessRulesProtected) "Qualification root DACL is not protected: $Path"
+    $trustedRuleSeen = @{}
+    foreach ($rule in $actual.Access) {
+        $ruleSID = Get-QualificationSID $rule.IdentityReference
+        Assert-Qualification ($rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and $ruleSID -in @('S-1-5-18', 'S-1-5-32-544')) "Qualification root contains an unexpected ACE: $Path sid=$ruleSID"
+        Assert-Qualification ($rule.FileSystemRights -eq [Security.AccessControl.FileSystemRights]::FullControl) "Qualification root trusted ACE is not FullControl: $Path sid=$ruleSID rights=$($rule.FileSystemRights)"
+        $trustedRuleSeen[$ruleSID] = $true
+    }
+    Assert-Qualification ($trustedRuleSeen['S-1-5-18'] -and $trustedRuleSeen['S-1-5-32-544']) "Qualification root is missing the required System or Administrators ACE: $Path"
+}
+
+function Assert-QualificationTransactionDirectory {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][string] $OwnerSID,
+        [Parameter(Mandatory = $true)][bool] $OwnerWritable
+    )
+    Assert-Qualification (Test-Path -LiteralPath $Path -PathType Container) "Qualification transaction directory is missing: $Path"
+    Assert-Qualification (((Get-Item -LiteralPath $Path).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) "Qualification transaction directory is a reparse point: $Path"
+    $acl = Get-Acl -LiteralPath $Path
+    $trustedSIDs = @('S-1-5-18', 'S-1-5-32-544')
+    Assert-Qualification ((Get-QualificationSID $acl.Owner) -in $trustedSIDs) "Qualification transaction directory has an untrusted filesystem owner: $Path"
+    Assert-Qualification ($acl.AreAccessRulesProtected) "Qualification transaction directory DACL is not protected: $Path"
+    $ownerRuleSeen = $false
+    $trustedRuleSeen = @{}
+    $writeRights = [int64]([Security.AccessControl.FileSystemRights]::Write) -bor [int64]([Security.AccessControl.FileSystemRights]::Delete) -bor [int64]([Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles) -bor [int64]([Security.AccessControl.FileSystemRights]::ChangePermissions) -bor [int64]([Security.AccessControl.FileSystemRights]::TakeOwnership)
+    foreach ($rule in $acl.Access) {
+        $ruleSID = Get-QualificationSID $rule.IdentityReference
+        Assert-Qualification ($rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and ($ruleSID -in $trustedSIDs -or $ruleSID -eq $OwnerSID)) "Qualification transaction directory contains an unexpected ACE: $Path sid=$ruleSID"
+        if ($ruleSID -eq $OwnerSID) {
+            $ownerRuleSeen = $true
+            $ownerCanWrite = (([int64]$rule.FileSystemRights -band $writeRights) -ne 0)
+            Assert-Qualification ($ownerCanWrite -eq $OwnerWritable) "Qualification owner permissions do not match the directory role: $Path rights=$($rule.FileSystemRights)"
+        }
+        elseif ($ruleSID -in $trustedSIDs) {
+            Assert-Qualification ($rule.FileSystemRights -eq [Security.AccessControl.FileSystemRights]::FullControl) "Qualification trusted ACE is not FullControl: $Path sid=$ruleSID rights=$($rule.FileSystemRights)"
+            $trustedRuleSeen[$ruleSID] = $true
+        }
+    }
+    Assert-Qualification ($ownerRuleSeen) "Qualification transaction directory is missing the enrolled-owner ACE: $Path"
+    Assert-Qualification ($trustedRuleSeen['S-1-5-18'] -and $trustedRuleSeen['S-1-5-32-544']) "Qualification transaction directory is missing the required System or Administrators ACE: $Path"
+}
+
+function Test-QualificationTrustValidation {
+    param([Parameter(Mandatory = $true)][string] $UntrustedSID)
+    $fixtureBase = Join-Path $resolvedOutputDirectory ('qualification-trust-' + [Guid]::NewGuid().ToString('N'))
+    $foreignOwnerPath = Join-Path $fixtureBase 'foreign-owner'
+    $deleteACEPath = Join-Path $fixtureBase 'delete-ace'
+    $inheritOnlyPath = Join-Path $fixtureBase 'inherit-only-ace'
+    $reparsePath = Join-Path $fixtureBase 'reparse-owner'
+    try {
+        New-Item -ItemType Directory -Force -Path $foreignOwnerPath | Out-Null
+        & icacls.exe $foreignOwnerPath /setowner "*$UntrustedSID" | Out-Null
+        Assert-Qualification ($LASTEXITCODE -eq 0) 'Could not create the hostile-owner qualification fixture.'
+        $foreignOwnerRejected = $false
+        try {
+            Assert-QualificationAncestorTrusted $foreignOwnerPath
+        }
+        catch {
+            $foreignOwnerRejected = $true
+        }
+        Assert-Qualification $foreignOwnerRejected 'Qualification trust validation accepted a foreign-owned ancestor.'
+
+        New-Item -ItemType Directory -Force -Path $deleteACEPath | Out-Null
+        Set-QualificationTrustedRoot $deleteACEPath
+        & icacls.exe $deleteACEPath /grant "*${UntrustedSID}:D" | Out-Null
+        Assert-Qualification ($LASTEXITCODE -eq 0) 'Could not create the hostile delete-ACE qualification fixture.'
+        $deleteACERejected = $false
+        try {
+            Assert-QualificationAncestorTrusted $deleteACEPath
+        }
+        catch {
+            $deleteACERejected = $true
+        }
+        Assert-Qualification $deleteACERejected 'Qualification trust validation accepted an untrusted Delete ACE.'
+
+        New-Item -ItemType Directory -Force -Path $inheritOnlyPath | Out-Null
+        Set-QualificationTrustedRoot $inheritOnlyPath
+        $inheritOnlyACL = Get-Acl -LiteralPath $inheritOnlyPath
+        $untrustedIdentity = [Security.Principal.SecurityIdentifier]::new($UntrustedSID)
+        $inheritOnlyACL.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($untrustedIdentity, [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit, [Security.AccessControl.PropagationFlags]::InheritOnly, [Security.AccessControl.AccessControlType]::Allow))
+        Set-Acl -LiteralPath $inheritOnlyPath -AclObject $inheritOnlyACL
+        Assert-QualificationAncestorTrusted $inheritOnlyPath
+
+        New-Item -ItemType Junction -Path $reparsePath -Target $foreignOwnerPath | Out-Null
+        $reparseRejected = $false
+        try {
+            Assert-QualificationAncestorTrusted $reparsePath
+        }
+        catch {
+            $reparseRejected = $true
+        }
+        Assert-Qualification $reparseRejected 'Qualification trust validation accepted a reparse ancestor.'
+    }
+    finally {
+        if (Test-Path -LiteralPath $fixtureBase) {
+            Remove-Item -LiteralPath $fixtureBase -Recurse -Force -ErrorAction Stop
+            Assert-Qualification (-not (Test-Path -LiteralPath $fixtureBase)) 'Qualification trust-validation fixture remains after cleanup.'
+        }
+    }
+}
+
 function ConvertTo-NormalizedMachinePathEntry {
     param([AllowEmptyString()][string] $Value)
     if ([string]::IsNullOrWhiteSpace($Value)) {
@@ -402,6 +553,7 @@ function Invoke-GoQualification {
 
 function Invoke-S4UDPAPIQualification {
     $previousFixture = $env:PAPERBOAT_WINDOWS_E2E_S4U_FIXTURE
+    $previousFixtureSHA256 = $env:PAPERBOAT_WINDOWS_E2E_S4U_FIXTURE_SHA256
     $previousOwnerSID = $env:PAPERBOAT_WINDOWS_E2E_S4U_OWNER_SID
     $previousReportPath = $env:PAPERBOAT_WINDOWS_E2E_S4U_REPORT_PATH
     $previousServiceName = $env:PAPERBOAT_WINDOWS_E2E_S4U_SERVICE_NAME
@@ -411,15 +563,31 @@ function Invoke-S4UDPAPIQualification {
     $owner = $null
     $ownerSID = ''
     $serviceName = 'PaperboatS4UDPAPI-' + [Guid]::NewGuid().ToString('N').Substring(0, 16)
-    $fixtureRoot = Join-Path $env:ProgramData ('Paperboat\qualification\' + $ownerName)
-    $reportPath = Join-Path $fixtureRoot 's4u-dpapi-report.json'
-    $prepareStdout = Join-Path $fixtureRoot 'owner-prepare.stdout.log'
-    $prepareStderr = Join-Path $fixtureRoot 'owner-prepare.stderr.log'
+    $programDataRoot = [IO.Path]::GetFullPath([Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData))
+    $qualificationParent = Join-Path $programDataRoot 'PaperboatQualification'
+    $qualificationRoot = Join-Path $qualificationParent $ownerName
+    $workRoot = Join-Path $qualificationRoot 'work'
+    $trustedRoot = Join-Path $qualificationRoot 'trusted'
+    $ownerPreparationExecutable = Join-Path $workRoot 's4u-owner-prepare.test.exe'
+    $qualificationFixture = Join-Path $trustedRoot 's4u-fixture.exe'
+    $reportPath = Join-Path $workRoot 's4u-dpapi-report.json'
+    $prepareStdout = Join-Path $workRoot 'owner-prepare.stdout.log'
+    $prepareStderr = Join-Path $workRoot 'owner-prepare.stderr.log'
+    $mutationStdout = Join-Path $workRoot 'owner-mutation.stdout.log'
+    $mutationStderr = Join-Path $workRoot 'owner-mutation.stderr.log'
     $bodyFailure = $null
     $cleanupFailures = @()
-    New-Item -ItemType Directory -Force -Path $fixtureRoot | Out-Null
-    $env:PAPERBOAT_WINDOWS_E2E_S4U_FIXTURE = $resolvedS4UFixturePath
     try {
+        Assert-QualificationAncestorTrusted $programDataRoot
+        if (Test-Path -LiteralPath $qualificationParent) {
+            Assert-QualificationAncestorTrusted $qualificationParent
+        }
+        else {
+            New-Item -ItemType Directory -Path $qualificationParent | Out-Null
+        }
+        Set-QualificationTrustedRoot $qualificationParent
+        New-Item -ItemType Directory -Force -Path $qualificationRoot | Out-Null
+        Assert-Qualification (((Get-Item -LiteralPath $qualificationRoot).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'S4U qualification transaction root is a reparse point.'
         $credentialSecret = [Security.SecureString]::new()
         foreach ($requiredCharacter in @('a', 'A', '1', '!')) {
             $credentialSecret.AppendChar($requiredCharacter)
@@ -441,14 +609,35 @@ function Invoke-S4UDPAPIQualification {
         $owner = New-LocalUser -Name $ownerName -Password $credentialSecret -AccountNeverExpires -PasswordNeverExpires -UserMayNotChangePassword -ErrorAction Stop
         $ownerSID = $owner.SID.Value
         Assert-Qualification (-not [string]::IsNullOrWhiteSpace($ownerSID)) 'Temporary S4U qualification owner has no SID.'
-        & icacls.exe $fixtureRoot /inheritance:r /grant:r "*${ownerSID}:(OI)(CI)M" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
-        Assert-Qualification ($LASTEXITCODE -eq 0) 'Could not protect the S4U qualification fixture directory.'
+        Test-QualificationTrustValidation -UntrustedSID $ownerSID
+        & icacls.exe $qualificationRoot /inheritance:r /grant:r "*${ownerSID}:(OI)(CI)RX" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
+        Assert-Qualification ($LASTEXITCODE -eq 0) 'Could not protect the S4U qualification root directory.'
+        & icacls.exe $qualificationRoot /setowner '*S-1-5-32-544' | Out-Null
+        Assert-Qualification ($LASTEXITCODE -eq 0) 'Could not set the trusted owner on the S4U qualification root directory.'
+        Assert-QualificationTransactionDirectory -Path $qualificationRoot -OwnerSID $ownerSID -OwnerWritable $false
+        New-Item -ItemType Directory -Force -Path $workRoot | Out-Null
+        Assert-Qualification (((Get-Item -LiteralPath $workRoot).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'Owner-writable S4U work directory is a reparse point.'
+        & icacls.exe $workRoot /inheritance:r /grant:r "*${ownerSID}:(OI)(CI)M" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
+        Assert-Qualification ($LASTEXITCODE -eq 0) 'Could not protect the owner-writable S4U work directory.'
+        & icacls.exe $workRoot /setowner '*S-1-5-32-544' | Out-Null
+        Assert-Qualification ($LASTEXITCODE -eq 0) 'Could not set the trusted owner on the owner-writable S4U work directory.'
+        Assert-QualificationTransactionDirectory -Path $workRoot -OwnerSID $ownerSID -OwnerWritable $true
+        Assert-Qualification (((Get-Item -LiteralPath $resolvedS4UTestExecutable).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'S4U test executable source is a reparse point.'
+        Assert-Qualification (((Get-Item -LiteralPath $resolvedS4UFixturePath).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'S4U fixture source is a reparse point.'
+        $sourcePreparationHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $resolvedS4UTestExecutable).Hash.ToLowerInvariant()
+        $sourceFixtureHashBeforePreparation = (Get-FileHash -Algorithm SHA256 -LiteralPath $resolvedS4UFixturePath).Hash.ToLowerInvariant()
+        Copy-Item -LiteralPath $resolvedS4UTestExecutable -Destination $ownerPreparationExecutable -Force
+        Assert-Qualification (Test-Path -LiteralPath $ownerPreparationExecutable -PathType Leaf) 'Owner preparation executable was not isolated in the qualification directory.'
+        Assert-Qualification (((Get-Item -LiteralPath $ownerPreparationExecutable).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'Owner preparation executable is a reparse point.'
+        Assert-Qualification ((Get-FileHash -Algorithm SHA256 -LiteralPath $ownerPreparationExecutable).Hash.ToLowerInvariant() -eq $sourcePreparationHash) 'Owner preparation executable differs from its source.'
         $env:PAPERBOAT_WINDOWS_E2E_S4U_OWNER_SID = $ownerSID
         $env:PAPERBOAT_WINDOWS_E2E_S4U_REPORT_PATH = $reportPath
         $env:PAPERBOAT_WINDOWS_E2E_S4U_SERVICE_NAME = $serviceName
         $credential = [Management.Automation.PSCredential]::new("$env:COMPUTERNAME\$ownerName", $credentialSecret)
         $prepareArguments = @('-test.v', '-test.run', '^TestNativePrepareS4UDPAPIQualification$', '-test.count', '1', '-test.timeout', '1m')
-        $prepare = Start-Process -FilePath $resolvedS4UTestExecutable -ArgumentList $prepareArguments -Credential $credential -LoadUserProfile -RedirectStandardOutput $prepareStdout -RedirectStandardError $prepareStderr -Wait -PassThru
+        $prepare = Start-Process -FilePath $ownerPreparationExecutable -WorkingDirectory $workRoot -ArgumentList $prepareArguments -Credential $credential -LoadUserProfile -RedirectStandardOutput $prepareStdout -RedirectStandardError $prepareStderr -Wait -PassThru
+        Assert-Qualification (Test-Path -LiteralPath $prepareStdout -PathType Leaf) 'Owner preparation stdout redirect was not created in the qualification directory.'
+        Assert-Qualification (Test-Path -LiteralPath $prepareStderr -PathType Leaf) 'Owner preparation stderr redirect was not created in the qualification directory.'
         if ($prepare.ExitCode -ne 0) {
             $prepareOutput = @(
                 if (Test-Path -LiteralPath $prepareStdout) { Get-Content -LiteralPath $prepareStdout -Raw }
@@ -457,7 +646,51 @@ function Invoke-S4UDPAPIQualification {
             throw "Owner-context Credential Manager migration preparation failed with exit code $($prepare.ExitCode): $prepareOutput"
         }
 
+        Assert-Qualification ((Get-FileHash -Algorithm SHA256 -LiteralPath $ownerPreparationExecutable).Hash.ToLowerInvariant() -eq $sourcePreparationHash) 'Owner preparation executable changed during owner-context preparation.'
+        Assert-Qualification ((Get-FileHash -Algorithm SHA256 -LiteralPath $resolvedS4UFixturePath).Hash.ToLowerInvariant() -eq $sourceFixtureHashBeforePreparation) 'S4U fixture source changed during owner-context preparation.'
+        Assert-QualificationAncestorTrusted $programDataRoot
+        Assert-QualificationAncestorTrusted $qualificationParent
+        Assert-QualificationTransactionDirectory -Path $qualificationRoot -OwnerSID $ownerSID -OwnerWritable $false
+        Assert-QualificationTransactionDirectory -Path $workRoot -OwnerSID $ownerSID -OwnerWritable $true
+        New-Item -ItemType Directory -Force -Path $trustedRoot | Out-Null
+        & icacls.exe $trustedRoot /inheritance:r /grant:r "*${ownerSID}:(OI)(CI)RX" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
+        Assert-Qualification ($LASTEXITCODE -eq 0) 'Could not protect the trusted S4U fixture directory.'
+        & icacls.exe $trustedRoot /setowner '*S-1-5-32-544' | Out-Null
+        Assert-Qualification ($LASTEXITCODE -eq 0) 'Could not set the trusted owner on the trusted S4U fixture directory.'
+        Assert-QualificationTransactionDirectory -Path $trustedRoot -OwnerSID $ownerSID -OwnerWritable $false
+        Assert-Qualification (((Get-Item -LiteralPath $trustedRoot).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'Trusted S4U fixture directory is a reparse point.'
+        Copy-Item -LiteralPath $resolvedS4UFixturePath -Destination $qualificationFixture -Force
+        Assert-Qualification (Test-Path -LiteralPath $qualificationFixture -PathType Leaf) 'S4U fixture executable was not isolated in the trusted directory.'
+        Assert-Qualification (((Get-Item -LiteralPath $qualificationFixture).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'S4U fixture executable is a reparse point.'
+        & icacls.exe $qualificationFixture /inheritance:r /grant:r "*${ownerSID}:RX" '*S-1-5-18:F' '*S-1-5-32-544:F' | Out-Null
+        Assert-Qualification ($LASTEXITCODE -eq 0) 'Could not protect the trusted S4U fixture executable.'
+        & icacls.exe $qualificationFixture /setowner '*S-1-5-32-544' | Out-Null
+        Assert-Qualification ($LASTEXITCODE -eq 0) 'Could not set the trusted owner on the S4U fixture executable.'
+        $trustedFixtureHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $qualificationFixture).Hash.ToLowerInvariant()
+        Assert-Qualification ($trustedFixtureHash -eq $sourceFixtureHashBeforePreparation) 'Trusted S4U fixture differs from its source.'
+        $env:PAPERBOAT_WINDOWS_E2E_S4U_FIXTURE = $qualificationFixture
+        $env:PAPERBOAT_WINDOWS_E2E_S4U_FIXTURE_SHA256 = $trustedFixtureHash
+
+        $mutationArguments = @('-test.v', '-test.run', '^TestNativeOwnerCannotMutateS4UFixture$', '-test.count', '1', '-test.timeout', '1m')
+        $mutation = Start-Process -FilePath $ownerPreparationExecutable -WorkingDirectory $workRoot -ArgumentList $mutationArguments -Credential $credential -LoadUserProfile -RedirectStandardOutput $mutationStdout -RedirectStandardError $mutationStderr -Wait -PassThru
+        Assert-Qualification (Test-Path -LiteralPath $mutationStdout -PathType Leaf) 'Owner mutation-probe stdout redirect was not created in the work directory.'
+        Assert-Qualification (Test-Path -LiteralPath $mutationStderr -PathType Leaf) 'Owner mutation-probe stderr redirect was not created in the work directory.'
+        if ($mutation.ExitCode -ne 0) {
+            $mutationOutput = @(
+                if (Test-Path -LiteralPath $mutationStdout) { Get-Content -LiteralPath $mutationStdout -Raw }
+                if (Test-Path -LiteralPath $mutationStderr) { Get-Content -LiteralPath $mutationStderr -Raw }
+            ) -join "`n"
+            throw "Owner fixture immutability probe failed with exit code $($mutation.ExitCode): $mutationOutput"
+        }
+        Assert-Qualification ((Get-FileHash -Algorithm SHA256 -LiteralPath $qualificationFixture).Hash.ToLowerInvariant() -eq $trustedFixtureHash) 'Trusted S4U fixture changed during owner immutability probe.'
+
         Add-QualificationEvent -Name 'native_s4u_dpapi' -Status 'started' -Detail "owner_sid=$ownerSID; architecture=$Architecture; owner_migration_prepared=true"
+        Assert-QualificationAncestorTrusted $programDataRoot
+        Assert-QualificationAncestorTrusted $qualificationParent
+        Assert-QualificationTransactionDirectory -Path $qualificationRoot -OwnerSID $ownerSID -OwnerWritable $false
+        Assert-QualificationTransactionDirectory -Path $trustedRoot -OwnerSID $ownerSID -OwnerWritable $false
+        Assert-Qualification ((Get-FileHash -Algorithm SHA256 -LiteralPath $resolvedS4UFixturePath).Hash.ToLowerInvariant() -eq $trustedFixtureHash) 'S4U fixture source changed immediately before SCM qualification.'
+        Assert-Qualification ((Get-FileHash -Algorithm SHA256 -LiteralPath $qualificationFixture).Hash.ToLowerInvariant() -eq $trustedFixtureHash) 'Trusted S4U fixture changed immediately before SCM qualification.'
         $arguments = @('-test.v', '-test.run', '^TestNativeLoggedOutS4UDPAPIQualification$', '-test.count', '1', '-test.timeout', '2m')
         & $resolvedS4UTestExecutable @arguments
         Assert-Qualification ($LASTEXITCODE -eq 0) "Native logged-out S4U DPAPI qualification failed with exit code $LASTEXITCODE."
@@ -468,6 +701,7 @@ function Invoke-S4UDPAPIQualification {
     }
     finally {
         $env:PAPERBOAT_WINDOWS_E2E_S4U_FIXTURE = $previousFixture
+        $env:PAPERBOAT_WINDOWS_E2E_S4U_FIXTURE_SHA256 = $previousFixtureSHA256
         $env:PAPERBOAT_WINDOWS_E2E_S4U_OWNER_SID = $previousOwnerSID
         $env:PAPERBOAT_WINDOWS_E2E_S4U_REPORT_PATH = $previousReportPath
         $env:PAPERBOAT_WINDOWS_E2E_S4U_SERVICE_NAME = $previousServiceName
@@ -521,15 +755,37 @@ function Invoke-S4UDPAPIQualification {
                 $cleanupFailures += "local user $ownerName cleanup: $($_.Exception.Message)"
             }
         }
-        if (Test-Path -LiteralPath $fixtureRoot) {
+        if (Test-Path -LiteralPath $trustedRoot) {
             try {
-                Remove-Item -LiteralPath $fixtureRoot -Recurse -Force -ErrorAction Stop
-                if (Test-Path -LiteralPath $fixtureRoot) {
-                    throw 'qualification fixture root remains after cleanup'
+                Remove-Item -LiteralPath $trustedRoot -Recurse -Force -ErrorAction Stop
+                if (Test-Path -LiteralPath $trustedRoot) {
+                    throw 'trusted qualification root remains after cleanup'
                 }
             }
             catch {
-                $cleanupFailures += "fixture root $fixtureRoot cleanup: $($_.Exception.Message)"
+                $cleanupFailures += "trusted root $trustedRoot cleanup: $($_.Exception.Message)"
+            }
+        }
+        if (Test-Path -LiteralPath $workRoot) {
+            try {
+                Remove-Item -LiteralPath $workRoot -Recurse -Force -ErrorAction Stop
+                if (Test-Path -LiteralPath $workRoot) {
+                    throw 'owner work root remains after cleanup'
+                }
+            }
+            catch {
+                $cleanupFailures += "work root $workRoot cleanup: $($_.Exception.Message)"
+            }
+        }
+        if (Test-Path -LiteralPath $qualificationRoot) {
+            try {
+                Remove-Item -LiteralPath $qualificationRoot -Recurse -Force -ErrorAction Stop
+                if (Test-Path -LiteralPath $qualificationRoot) {
+                    throw 'qualification transaction root remains after cleanup'
+                }
+            }
+            catch {
+                $cleanupFailures += "qualification root $qualificationRoot cleanup: $($_.Exception.Message)"
             }
         }
         if ($null -ne $randomBytes) {
