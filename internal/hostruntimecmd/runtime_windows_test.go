@@ -33,7 +33,7 @@ func TestReadWindowsHostdTokenAcceptsExactTokenFile(t *testing.T) {
 			t.Fatalf("%v (dacl %q; current SID unavailable: %v)", err, windowsHostdTokenDACL(descriptor.String()), userErr)
 		}
 		control, _, controlErr := descriptor.Control()
-		expected := "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + user.User.Sid.String() + ")"
+		expected := "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GR;;;" + user.User.Sid.String() + ")"
 		t.Fatalf("%v (sid %q; control %#x err %v; dacl %q; expected %q)", err, user.User.Sid.String(), control, controlErr, descriptor.String(), expected)
 	}
 	if !bytes.Equal(got, want) {
@@ -46,7 +46,7 @@ func setWindowsHostdTokenACL(path string) error {
 	if err != nil || user == nil || user.User.Sid == nil {
 		return err
 	}
-	descriptor, err := windows.SecurityDescriptorFromString("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + user.User.Sid.String() + ")")
+	descriptor, err := windows.SecurityDescriptorFromString("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GR;;;" + user.User.Sid.String() + ")")
 	if err != nil {
 		return err
 	}

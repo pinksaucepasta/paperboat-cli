@@ -149,6 +149,7 @@ func (s *serviceEntry) Execute(_ []string, requests <-chan svc.ChangeRequest, st
 	}()
 	accepts := svc.AcceptStop | svc.AcceptShutdown | svc.AcceptSessionChange
 	statuses <- svc.Status{State: svc.Running, Accepts: accepts}
+	workloadInterrupted := false
 	ownerChecks := time.NewTicker(30 * time.Second)
 	defer ownerChecks.Stop()
 	for {
@@ -160,10 +161,13 @@ func (s *serviceEntry) Execute(_ []string, requests <-chan svc.ChangeRequest, st
 			statuses <- stoppedServiceStatus(1, true)
 			return true, 1
 		case code := <-done:
-			if s.config.DeleteOnExit {
+			if shouldDeleteOneShotService(s.config.DeleteOnExit, code, workloadInterrupted) {
 				_ = deleteOwnWindowsService(s.config.Name)
 			}
-			failed := code != 0
+			failed := code != 0 || workloadInterrupted
+			if failed && code == 0 {
+				code = 1
+			}
 			statuses <- stoppedServiceStatus(code, failed)
 			return failed, code
 		case <-ownerChecks.C:
@@ -193,6 +197,7 @@ func (s *serviceEntry) Execute(_ []string, requests <-chan svc.ChangeRequest, st
 				// enrolled workload. Only the enrolled user's logoff/termination
 				// closes its job; SCM recovery waits for a new owner session.
 				if shouldTerminateForSessionChange(request, process.sessionID) {
+					workloadInterrupted = true
 					_ = process.closeJob()
 				}
 			}

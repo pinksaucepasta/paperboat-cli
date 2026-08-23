@@ -91,13 +91,22 @@ func runWindowsDaemon(ctx context.Context, config DaemonConfig) error {
 		}()
 	}
 
-	store, err := localapi.NewSnapshotStore(nil)
-	if err != nil {
-		return err
-	}
 	diagnosticClock := config.Clock
 	if diagnosticClock == nil {
 		diagnosticClock = time.Now
+	}
+	// Publish local readiness before the first control-plane refresh. A refresh
+	// has a bounded network timeout and must not keep the named pipe absent long
+	// enough for the first command after logon or reboot to fail. Inventory.Run
+	// replaces this starting snapshot as soon as reconciliation completes.
+	store, err := localapi.NewSnapshotStore(&localapi.Snapshot{
+		Schema:      localapi.SnapshotSchemaV1,
+		Generation:  1,
+		ObservedAt:  diagnosticClock().UTC(),
+		DaemonState: "starting",
+	})
+	if err != nil {
+		return err
 	}
 	diagnosticAPI := &diagnosticService{
 		recorder:  recorder,
@@ -136,16 +145,6 @@ func runWindowsDaemon(ctx context.Context, config DaemonConfig) error {
 	if err != nil {
 		return err
 	}
-	refreshErr := inventory.Refresh(ctx)
-	refreshOutcome, refreshSeverity := "ready", "info"
-	if refreshErr != nil {
-		refreshOutcome, refreshSeverity = "degraded", "warning"
-	}
-	_ = recorder.Record("reconciliation", "inventory_refresh", refreshSeverity, map[string]string{"outcome": refreshOutcome})
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-
 	observations, err := NewObservationStore(ObservationConfig{Store: store, OwnerUID: -1, OwnerSID: ownerSID, Clock: config.Clock})
 	if err != nil {
 		return err
@@ -173,7 +172,19 @@ func runWindowsDaemon(ctx context.Context, config DaemonConfig) error {
 	defer cancel()
 	results := make(chan error, 3)
 	go func() { results <- server.Run(runCtx) }()
-	go func() { results <- inventory.runTicker(runCtx) }()
+	go func() {
+		refreshErr := inventory.Refresh(runCtx)
+		refreshOutcome, refreshSeverity := "ready", "info"
+		if refreshErr != nil {
+			refreshOutcome, refreshSeverity = "degraded", "warning"
+		}
+		_ = recorder.Record("reconciliation", "inventory_refresh", refreshSeverity, map[string]string{"outcome": refreshOutcome})
+		if runCtx.Err() != nil {
+			results <- runCtx.Err()
+			return
+		}
+		results <- inventory.runTicker(runCtx)
+	}()
 	go func() { results <- observations.Run(runCtx) }()
 	first := <-results
 	cancel()

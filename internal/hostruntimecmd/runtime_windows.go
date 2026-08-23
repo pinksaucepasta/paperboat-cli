@@ -137,7 +137,7 @@ func validWindowsHostdTokenACLForSID(path, enrolledSID string) bool {
 	}
 	want := "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
 	if enrolledSID != "S-1-5-18" {
-		want += "(A;;FA;;;" + enrolledSID + ")"
+		want += "(A;;GR;;;" + enrolledSID + ")"
 	}
 	return windowssecurity.ProtectedDACLMatches(path, want)
 }

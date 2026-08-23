@@ -312,6 +312,28 @@ func TestPreviewServiceDefinitionsAreIsolatedAndCrashRestartOnly(t *testing.T) {
 	}
 }
 
+func TestOneShotServiceDeletionRequiresNaturalSuccess(t *testing.T) {
+	tests := []struct {
+		name         string
+		deleteOnExit bool
+		exitCode     uint32
+		interrupted  bool
+		want         bool
+	}{
+		{name: "natural completion", deleteOnExit: true, want: true},
+		{name: "workload failure", deleteOnExit: true, exitCode: 1},
+		{name: "session interruption", deleteOnExit: true, interrupted: true},
+		{name: "durable service", exitCode: 0},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := shouldDeleteOneShotService(test.deleteOnExit, test.exitCode, test.interrupted); got != test.want {
+				t.Fatalf("shouldDeleteOneShotService() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
 func TestControllerFailureIsNotReportedAsSuccess(t *testing.T) {
 	control := &controller{applyErr: errors.New("manager failed")}
 	installer, err := New(Config{Platform: "linux", ConfigRoot: t.TempDir(), Executable: executable(t), User: "test", Group: "test", Arguments: []string{"run"}, Controller: control})

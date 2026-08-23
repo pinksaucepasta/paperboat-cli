@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pinksaucepasta/paperboat/internal/api"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/protocol"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/server"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/streamauth"
@@ -19,7 +20,7 @@ type streamCredentialAuthorizer struct {
 
 func (a *streamCredentialAuthorizer) Authorize(_ context.Context, frame protocol.Frame) (server.Authorization, error) {
 	a.frame = frame
-	return server.Authorization{}, nil
+	return server.Authorization{ClientID: "cli_1", UserID: "account_1", MachineID: "machine_1"}, nil
 }
 func (a *streamCredentialAuthorizer) CloseAuthorization() { a.closed = true }
 
@@ -38,11 +39,12 @@ func TestCredentialStreamAuthorizerUsesCanonicalApplicationPolicy(t *testing.T) 
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := authorize(context.Background(), header); err != nil {
+			authorization, err := authorize(context.Background(), header)
+			if err != nil {
 				t.Fatal(err)
 			}
-			if created.frame.Capability != capability || created.frame.OperationID != header.OperationID || created.frame.RequestID != header.StreamID || !created.closed {
-				t.Fatalf("frame=%+v closed=%t", created.frame, created.closed)
+			if authorization.ClientID != "cli_1" || authorization.UserID != "account_1" || authorization.MachineID != "machine_1" || created.frame.Capability != capability || created.frame.OperationID != header.OperationID || created.frame.RequestID != header.StreamID || !created.closed {
+				t.Fatalf("authorization=%+v frame=%+v closed=%t", authorization, created.frame, created.closed)
 			}
 		})
 	}
@@ -60,7 +62,9 @@ func TestDispatchAuthorizedStreamVerifiesBeforeHandlerAndBoundsBytes(t *testing.
 	called := false
 	dispatchDone := make(chan error, 1)
 	go func() {
-		dispatchDone <- DispatchAuthorizedStream(context.Background(), encoded, right, func(context.Context, streamauth.Header) error { return nil }, func(_ context.Context, got streamauth.Header, conn net.Conn) error {
+		dispatchDone <- DispatchAuthorizedStream(context.Background(), encoded, right, func(context.Context, streamauth.Header) (server.Authorization, error) {
+			return server.Authorization{}, nil
+		}, func(_ context.Context, got streamauth.Header, conn net.Conn) error {
 			called = true
 			if got.OperationID != header.OperationID || got.Consumer != header.Consumer {
 				return errors.New("wrong header")
@@ -88,9 +92,42 @@ func TestDispatchAuthorizedStreamRejectsUnauthorizedBeforeHandler(t *testing.T) 
 	left, right := net.Pipe()
 	defer left.Close()
 	called := false
-	err := DispatchAuthorizedStream(context.Background(), encoded, right, func(context.Context, streamauth.Header) error { return errors.New("denied") }, func(context.Context, streamauth.Header, net.Conn) error { called = true; return nil })
+	err := DispatchAuthorizedStream(context.Background(), encoded, right, func(context.Context, streamauth.Header) (server.Authorization, error) {
+		return server.Authorization{}, errors.New("denied")
+	}, func(context.Context, streamauth.Header, net.Conn) error { called = true; return nil })
 	if !errors.Is(err, ErrStreamDispatch) || called {
 		t.Fatalf("err=%v called=%t", err, called)
+	}
+}
+
+func TestServiceBindsReusableStreamCredentialToAuthenticatedPeer(t *testing.T) {
+	descriptor := api.PeerAttemptDescriptor{AccountID: "account_1", InitiatorEndpointID: "cli_1", ResponderEndpointID: "machine_1"}
+	header, err := streamauth.New("operation_1", "exec", "stream_1", "credential", time.Now().UTC().Add(time.Minute), 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid := server.Authorization{ClientID: "cli_1", UserID: "account_1", MachineID: "machine_1"}
+	for name, authorization := range map[string]server.Authorization{
+		"valid":             valid,
+		"different CLI":     {ClientID: "cli_2", UserID: valid.UserID, MachineID: valid.MachineID},
+		"different account": {ClientID: valid.ClientID, UserID: "account_2", MachineID: valid.MachineID},
+		"different machine": {ClientID: valid.ClientID, UserID: valid.UserID, MachineID: "machine_2"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			service := &Service{config: Config{AuthorizeStream: func(context.Context, streamauth.Header) (server.Authorization, error) {
+				return authorization, nil
+			}}}
+			actual, authorizeErr := service.authorizeStream(context.Background(), descriptor, header)
+			if name == "valid" {
+				if authorizeErr != nil || actual != valid {
+					t.Fatalf("authorization = %+v, %v", actual, authorizeErr)
+				}
+				return
+			}
+			if !errors.Is(authorizeErr, ErrStreamDispatch) {
+				t.Fatalf("authorization = %+v, %v; want identity rejection", actual, authorizeErr)
+			}
+		})
 	}
 }
 

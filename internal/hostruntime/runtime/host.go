@@ -155,6 +155,13 @@ func NewClientCoordinator(ctx context.Context, config HostConfig, dependencies H
 	if err != nil {
 		return nil, err
 	}
+	var nativePeerService Service
+	if dependencies.NativePeerFactory != nil {
+		nativePeerService, err = dependencies.NativePeerFactory(func(net.Conn) error { return ErrHostInvalid }, transferHandler, nil)
+		if err != nil || nativePeerService == nil {
+			return nil, errors.Join(ErrHostInvalid, err)
+		}
+	}
 	mux := http.NewServeMux()
 	if dependencies.ServeLeases != nil && dependencies.LocalControlToken != "" {
 		mux.Handle("/v1/serve-leases", servelease.Handler{Manager: dependencies.ServeLeases, Token: dependencies.LocalControlToken})
@@ -201,6 +208,9 @@ func NewClientCoordinator(ctx context.Context, config HostConfig, dependencies H
 	}
 	if dependencies.ServeLeases != nil {
 		components = append(components, stablehostd.Component{Name: "serve_lease", Required: false, Service: dependencies.ServeLeases})
+	}
+	if nativePeerService != nil {
+		components = append(components, stablehostd.Component{Name: "peer_transport", Required: true, Service: nativePeerService})
 	}
 	components = append(components,
 		stablehostd.Component{Name: "runtime_observation", Required: true, Service: dependencies.RuntimeObservationService},

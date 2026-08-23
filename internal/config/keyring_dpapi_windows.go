@@ -119,14 +119,31 @@ func setDPAPISecret(ref, value string, credentialErr error) error {
 }
 
 func getDPAPISecret(ref string, credentialErr error) (string, error) {
-	path, _, err := dpapiSecretPath(ref)
+	path, directory, err := dpapiSecretPath(ref)
 	if err != nil {
 		return "", err
 	}
-	protected, err := os.ReadFile(path)
+	if err := validateCredentialDirectory(directory); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", ErrSecretNotFound
+		}
+		return "", errors.Join(ErrCredentialStoreUnavailable, err)
+	}
+	if !credentialFilePrivate(directory) {
+		return "", fmt.Errorf("%w: DPAPI credential directory has an invalid ACL", ErrCredentialStoreUnavailable)
+	}
+	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return "", ErrSecretNotFound
 	}
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || !credentialFilePrivate(path) {
+		return "", errors.Join(ErrCredentialStoreUnavailable, err)
+	}
+	attributes, err := windows.GetFileAttributes(windows.StringToUTF16Ptr(path))
+	if err != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return "", errors.Join(ErrCredentialStoreUnavailable, err)
+	}
+	protected, err := os.ReadFile(path)
 	if err != nil || len(protected) == 0 || len(protected) > windowsCredentialBlobMaxBytes*4 {
 		return "", fmt.Errorf("%w: read DPAPI credential: %v", ErrCredentialStoreUnavailable, err)
 	}

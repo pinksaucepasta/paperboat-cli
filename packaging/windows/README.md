@@ -13,9 +13,9 @@ The package policy is deliberately separate from the runtime implementation:
   state layout, and intended feature set.
 - The MSI is machine-wide. The portable ZIP is a client package and does not
   install services or change system configuration.
-- `pb.exe` and `pb-launcher.exe` embed the `longPathAware` application manifest.
-  Runtime-role executables copied from `pb.exe` retain the same embedded
-  manifest. Regenerate the architecture-specific resource objects from
+- `pb.exe`, `pb-launcher.exe`, and the three role-scoped service artifacts
+  embed the `longPathAware` application manifest. Regenerate the
+  architecture-specific resource objects from
   `resources/paperboat.manifest` with
   `scripts/generate-manifest-resources.sh` when the resource toolchain changes.
 - OpenSSH provisioning is an integration hook consumed by Paperboat host setup.
@@ -31,10 +31,11 @@ C:\\Program Files\\Paperboat\\
   bin\\
     pb.exe                  # stable public launcher
     pb-launcher.exe          # source copied to pb.exe on Client renewal
-    paperboat-runtime.exe
-    paperboat-hostd.exe
-    paperboat-updater.exe
   releases\\
+    versions\\{{VERSION}}\\
+      paperboat-runtime.exe   # runtime commands only
+      paperboat-hostd.exe     # host supervisor command only
+      paperboat-updater.exe   # updater and activator commands only
     cli-current\\
       pb.exe                  # protected full CLI seeded by the MSI
 
@@ -68,10 +69,14 @@ paperboat-hostd.exe
 paperboat-updater.exe
 ```
 
-All five files are required. `paperboat-hostd.exe` and
-`paperboat-updater.exe` may be distinct role-scoped builds or the same release
-binary copied under the role name by the release authority. The packaging layer
-does not decide that implementation detail.
+All five files are required. The runtime, hostd, and updater files must be
+distinct role-stamped builds. The stable launcher is owned exclusively by MSI
+so an in-process update never replaces its own process-selection boundary.
+Its stable ABI is only: resolve the protected `cli-current` pointer, validate
+the selected executable, forward the original arguments/environment, and
+return that process's exit status. Release TUF may carry a launcher target for
+MSI construction, but the Windows in-process activation transaction explicitly
+updates only CLI, runtime, hostd, and updater.
 
 Build an unsigned MSI on a Windows machine with WiX Toolset v4 or newer:
 

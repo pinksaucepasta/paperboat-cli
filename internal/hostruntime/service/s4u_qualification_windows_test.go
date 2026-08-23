@@ -15,12 +15,140 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/pinksaucepasta/paperboat/internal/config"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
 )
 
 const s4uFixturePathEnvironment = "PAPERBOAT_WINDOWS_E2E_S4U_FIXTURE"
+
+var qualificationCredWrite = windows.NewLazySystemDLL("advapi32.dll").NewProc("CredWriteW")
+
+type qualificationWindowsCredential struct {
+	Flags              uint32
+	Type               uint32
+	TargetName         *uint16
+	Comment            *uint16
+	LastWritten        windows.Filetime
+	CredentialBlobSize uint32
+	CredentialBlob     *byte
+	Persist            uint32
+	AttributeCount     uint32
+	Attributes         unsafe.Pointer
+	TargetAlias        *uint16
+	UserName           *uint16
+}
+
+func writeLegacyCredentialManagerFixture(t *testing.T, ref, value string) {
+	t.Helper()
+	target, err := windows.UTF16PtrFromString("paperboat:" + ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	username, err := windows.UTF16PtrFromString("paperboat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob := []byte(value)
+	defer clear(blob)
+	credential := qualificationWindowsCredential{Type: 1, TargetName: target, CredentialBlobSize: uint32(len(blob)), Persist: 2, UserName: username}
+	if len(blob) > 0 {
+		credential.CredentialBlob = &blob[0]
+	}
+	if result, _, callErr := qualificationCredWrite.Call(uintptr(unsafe.Pointer(&credential)), 0); result == 0 {
+		t.Fatalf("write legacy Credential Manager fixture: %v", callErr)
+	}
+}
+
+func prepareProductionKeyringFixtures(t *testing.T, reportPath string) {
+	t.Helper()
+	keyring := config.KeyringStore{}
+	if err := keyring.Set(reportPath, "paperboat-s4u-dpapi-v1"); err != nil {
+		t.Fatalf("create owner Paperboat KeyringStore fixture: %v", err)
+	}
+	migratedRef := reportPath + "-migrated"
+	writeLegacyCredentialManagerFixture(t, migratedRef, "paperboat-s4u-migrated-v1")
+	if value, err := keyring.Get(migratedRef); err != nil || value != "paperboat-s4u-migrated-v1" {
+		t.Fatalf("migrate owner Credential Manager fixture into Paperboat KeyringStore: value=%q err=%v", value, err)
+	}
+	t.Cleanup(func() {
+		_ = keyring.Delete(reportPath)
+		_ = keyring.Delete(migratedRef)
+	})
+}
+
+// TestNativeLoggedOutS4UDPAPIQualification is the release gate for the exact
+// cross-logon credential contract Paperboat relies on. The test process writes
+// a user-scoped DPAPI value, proves that no interactive owner token is
+// selectable, and requires the actual LocalSystem -> enrolled-owner S4U child
+// to decrypt it. It deliberately has no Git, Codex, EFS, or network dependency.
+func TestNativeLoggedOutS4UDPAPIQualification(t *testing.T) {
+	fixture := requiredS4UFixture(t)
+	ownerSID := requiredS4UOwnerSID(t)
+	if hasSelectableOwnerWTSToken(t, ownerSID) {
+		t.Fatalf("owner %s has a selectable WTS token; logged-out DPAPI qualification did not run", ownerSID)
+	}
+
+	name := fmt.Sprintf("PaperboatS4UDPAPIQualification%d", os.Getpid())
+	reportPath := filepath.Join(t.TempDir(), "s4u-dpapi-report.json")
+	prepareProductionKeyringFixtures(t, reportPath)
+	manager, err := mgr.Connect()
+	if err != nil {
+		t.Fatalf("connect SCM: %v", err)
+	}
+	defer manager.Disconnect()
+	serviceHandle, err := manager.CreateService(name, fixture, mgr.Config{
+		DisplayName:      name,
+		Description:      "Paperboat native logged-out S4U DPAPI qualification fixture",
+		StartType:        mgr.StartManual,
+		ServiceStartName: "LocalSystem",
+	}, "--paperboat-s4u-dpapi-service", "--service-name", name, "--owner-sid", ownerSID, "--report", reportPath)
+	if err != nil {
+		t.Fatalf("create S4U DPAPI qualification service: %v", err)
+	}
+	defer func() { _ = stopAndDeleteS4UService(serviceHandle) }()
+	if err := serviceHandle.Start(); err != nil {
+		t.Fatalf("start S4U DPAPI qualification service: %v", err)
+	}
+	if err := waitS4UServiceState(serviceHandle, svc.Running, 30*time.Second); err != nil {
+		body, _ := os.ReadFile(reportPath + ".launch-error")
+		t.Fatalf("%v: %s", err, strings.TrimSpace(string(body)))
+	}
+	record := waitS4UReport(t, reportPath, 30*time.Second)
+	assertS4UDPAPIReport(t, record, ownerSID)
+
+	if _, err := serviceHandle.Control(svc.Stop); err != nil && !errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE) {
+		t.Fatalf("stop S4U DPAPI qualification service: %v", err)
+	}
+	if err := waitS4UServiceState(serviceHandle, svc.Stopped, 30*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	for _, pid := range []uint32{record.ChildPID, record.DescendantPID} {
+		if err := waitS4UProcessExit(pid, 15*time.Second); err != nil {
+			t.Fatalf("S4U Job Object cleanup for pid %d: %v", pid, err)
+		}
+	}
+}
+
+func assertS4UDPAPIReport(t *testing.T, record s4uQualificationReport, ownerSID string) {
+	t.Helper()
+	if record.Schema != "paperboat.windows-s4u-qualification/v1" || record.OwnerSID != ownerSID || record.ChildPID == 0 || record.DescendantPID == 0 || record.ChildPID == record.DescendantPID || record.SessionID != 0 {
+		t.Fatalf("invalid logged-out S4U DPAPI report: %+v", record)
+	}
+	if !record.Profile.Exists || !filepath.IsAbs(record.Profile.Home) || !strings.EqualFold(record.Profile.Home, record.Profile.UserProfile) || record.Environment.OwnerWorkload != "1" {
+		t.Fatalf("S4U owner profile was not loaded correctly: %+v", record)
+	}
+	if !record.JobCleanupExpected {
+		t.Fatal("S4U DPAPI fixture did not declare kill-on-close Job Object ownership")
+	}
+	if record.Limitations.DPAPI.Status != "pass" || strings.TrimSpace(record.Limitations.DPAPI.Reason) == "" {
+		t.Fatalf("logged-out S4U must decrypt the owner DPAPI credential: %+v", record.Limitations.DPAPI)
+	}
+	if record.Limitations.DPAPIMigration.Status != "pass" || strings.TrimSpace(record.Limitations.DPAPIMigration.Reason) == "" {
+		t.Fatalf("logged-out S4U must read the owner-migrated Credential Manager credential through KeyringStore: %+v", record.Limitations.DPAPIMigration)
+	}
+}
 
 type s4uQualificationReport struct {
 	Schema        string `json:"schema"`
@@ -48,6 +176,10 @@ type s4uQualificationReport struct {
 			Status string `json:"status"`
 			Reason string `json:"reason"`
 		} `json:"dpapi"`
+		DPAPIMigration struct {
+			Status string `json:"status"`
+			Reason string `json:"reason"`
+		} `json:"dpapi_credential_manager_migration"`
 		EFS struct {
 			Status string `json:"status"`
 			Reason string `json:"reason"`
@@ -86,13 +218,7 @@ func TestNativeLoggedOutS4UQualification(t *testing.T) {
 
 	name := fmt.Sprintf("PaperboatS4UQualification%d", os.Getpid())
 	reportPath := filepath.Join(t.TempDir(), "s4u-report.json")
-	protected, err := transformQualificationDPAPI([]byte("paperboat-s4u-dpapi-v1"), true)
-	if err != nil {
-		t.Fatalf("create logged-in owner DPAPI fixture: %v", err)
-	}
-	if err := os.WriteFile(reportPath+".dpapi", protected, 0o600); err != nil {
-		t.Fatalf("write owner DPAPI fixture: %v", err)
-	}
+	prepareProductionKeyringFixtures(t, reportPath)
 	if err := os.WriteFile(reportPath+".efs", []byte("paperboat-s4u-efs-v1"), 0o600); err != nil {
 		t.Fatalf("write owner EFS fixture: %v", err)
 	}
@@ -267,8 +393,11 @@ func assertS4UReport(t *testing.T, record s4uQualificationReport, ownerSID strin
 	if record.Limitations.SMB.Status != "not_qualified" || strings.TrimSpace(record.Limitations.SMB.Reason) == "" {
 		t.Fatalf("SMB limitation is not reported honestly: %+v", record.Limitations.SMB)
 	}
-	if record.Limitations.DPAPI.Status != "pass" && record.Limitations.DPAPI.Status != "fail" || strings.TrimSpace(record.Limitations.DPAPI.Reason) == "" {
-		t.Fatalf("DPAPI qualification result is invalid: %+v", record.Limitations.DPAPI)
+	if record.Limitations.DPAPI.Status != "pass" || strings.TrimSpace(record.Limitations.DPAPI.Reason) == "" {
+		t.Fatalf("logged-out S4U must decrypt the owner DPAPI credential: %+v", record.Limitations.DPAPI)
+	}
+	if record.Limitations.DPAPIMigration.Status != "pass" || strings.TrimSpace(record.Limitations.DPAPIMigration.Reason) == "" {
+		t.Fatalf("logged-out S4U must read the owner-migrated Credential Manager credential through KeyringStore: %+v", record.Limitations.DPAPIMigration)
 	}
 	for name, result := range map[string]struct{ Status, Reason string }{"EFS": {record.Limitations.EFS.Status, record.Limitations.EFS.Reason}, "Git": {record.Limitations.Git.Status, record.Limitations.Git.Reason}, "network": {record.Limitations.Network.Status, record.Limitations.Network.Reason}, "Codex": {record.Limitations.Codex.Status, record.Limitations.Codex.Reason}} {
 		if result.Status != "pass" {
@@ -278,30 +407,6 @@ func assertS4UReport(t *testing.T, record s4uQualificationReport, ownerSID strin
 		}
 	}
 	t.Logf("logged-out S4U DPAPI result: %s: %s", record.Limitations.DPAPI.Status, record.Limitations.DPAPI.Reason)
-}
-
-func transformQualificationDPAPI(value []byte, protect bool) ([]byte, error) {
-	input := windows.DataBlob{Size: uint32(len(value))}
-	if len(value) > 0 {
-		input.Data = &value[0]
-	}
-	entropyBytes := []byte("paperboat/windows-s4u-qualification/v1")
-	entropy := windows.DataBlob{Size: uint32(len(entropyBytes)), Data: &entropyBytes[0]}
-	var output windows.DataBlob
-	var err error
-	if protect {
-		err = windows.CryptProtectData(&input, nil, &entropy, 0, nil, 0x1, &output)
-	} else {
-		err = windows.CryptUnprotectData(&input, nil, &entropy, 0, nil, 0x1, &output)
-	}
-	if err != nil {
-		return nil, err
-	}
-	defer windows.LocalFree(windows.Handle(uintptr(unsafe.Pointer(output.Data))))
-	if output.Size > 1<<20 || output.Size > 0 && output.Data == nil {
-		return nil, errors.New("invalid DPAPI output")
-	}
-	return append([]byte(nil), unsafe.Slice(output.Data, int(output.Size))...), nil
 }
 
 func waitS4UServiceState(serviceHandle *mgr.Service, want svc.State, timeout time.Duration) error {

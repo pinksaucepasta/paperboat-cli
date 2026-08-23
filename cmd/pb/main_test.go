@@ -64,6 +64,18 @@ func TestOpenSSHArgumentsPlacesRemoteCommandAfterDestination(t *testing.T) {
 	}
 }
 
+func TestWindowsArtifactCommandAllowlist(t *testing.T) {
+	tests := []struct {
+		role, command string
+		want          bool
+	}{{"cli", "auth", true}, {"runtime", "__runtime-worker", true}, {"runtime", "auth", false}, {"hostd", "__runtime-hostd", true}, {"hostd", "__runtime-updated", false}, {"updater", "__runtime-updated", true}, {"updater", "__runtime-activate", true}, {"updater", "__runtime-worker", false}, {"unknown", "__runtime-hostd", false}}
+	for _, test := range tests {
+		if got := windowsArtifactCommandAllowed(test.role, []string{test.command}); got != test.want {
+			t.Fatalf("role=%q command=%q got=%v want=%v", test.role, test.command, got, test.want)
+		}
+	}
+}
+
 func TestResolveSSHRequestedUser(t *testing.T) {
 	for _, test := range []struct{ target, flag, want string }{
 		{target: "root", want: "root"},
@@ -126,6 +138,30 @@ func TestUpdateCommandContract(t *testing.T) {
 		if childErr != nil || child == nil || child.Flags().Lookup("json") == nil {
 			t.Fatalf("find %v: command=%v error=%v", path, child, childErr)
 		}
+	}
+}
+
+func TestSignedUpdateAvailableNeverOffersDowngrade(t *testing.T) {
+	for _, test := range []struct {
+		installed string
+		latest    string
+		want      bool
+	}{
+		{installed: "2026.08.22.28", latest: "2026.08.22.29", want: true},
+		{installed: "2026.08.22.28", latest: "2026.08.22.28", want: false},
+		{installed: "2026.08.22.28", latest: "2026.08.22.25", want: false},
+		{installed: "2026.08.22.28", latest: "", want: false},
+	} {
+		got, err := signedUpdateAvailable(test.installed, test.latest)
+		if err != nil {
+			t.Fatalf("signedUpdateAvailable(%q, %q): %v", test.installed, test.latest, err)
+		}
+		if got != test.want {
+			t.Fatalf("signedUpdateAvailable(%q, %q) = %t, want %t", test.installed, test.latest, got, test.want)
+		}
+	}
+	if _, err := signedUpdateAvailable("2026.08.22.28", "latest"); err == nil {
+		t.Fatal("malformed signed version was accepted")
 	}
 }
 
@@ -499,7 +535,12 @@ func TestUserFacingErrorSanitizesInfrastructureFailures(t *testing.T) {
 		{
 			name: "pairing required",
 			err:  identitybootstrap.ErrPairingRequired,
-			want: "needs the account recovery key",
+			want: "needs approval from a paired device",
+		},
+		{
+			name: "pairing approval expired",
+			err:  identitybootstrap.ErrEnrollmentExpired,
+			want: "Keep a paired device online",
 		},
 		{
 			name:   "uninstall cleanup keeps safe stage",
@@ -2394,6 +2435,79 @@ func TestFileCredentialFallbackPersistsSelection(t *testing.T) {
 	}
 }
 
+type authLoginFaultSecretStore struct {
+	values        map[string]string
+	failDeleteRef string
+}
+
+func (s *authLoginFaultSecretStore) Set(ref, value string) error {
+	s.values[ref] = value
+	return nil
+}
+
+func (s *authLoginFaultSecretStore) Get(ref string) (string, error) {
+	value, ok := s.values[ref]
+	if !ok {
+		return "", os.ErrNotExist
+	}
+	return value, nil
+}
+
+func (s *authLoginFaultSecretStore) Delete(ref string) error {
+	if ref == s.failDeleteRef {
+		return errors.New("injected old-secret deletion failure")
+	}
+	delete(s.values, ref)
+	return nil
+}
+
+func TestAuthLoginPersistenceDoesNotRejectCommittedSwitchOnOldSecretCleanupFailure(t *testing.T) {
+	dir := t.TempDir()
+	secrets := &authLoginFaultSecretStore{values: map[string]string{}}
+	store := config.ProfileStore{Path: dir, Secrets: secrets}
+	issuer := "https://api.example.com"
+	old := config.Profile{Issuer: issuer, CLIClientSessionID: "cls_old"}
+	if err := store.Save(old, config.Credential{AccessToken: "access-old", RefreshToken: "refresh-old"}); err != nil {
+		t.Fatal(err)
+	}
+	previous, err := store.Load(issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secrets.failDeleteRef = previous.AccessSecretRef
+	next := config.Profile{Issuer: issuer, CLIClientSessionID: "cls_new"}
+	if err := persistAuthorizedProfile(store, &previous, next, config.Credential{AccessToken: "access-new", RefreshToken: "refresh-new"}); err != nil {
+		t.Fatalf("auth login treated committed switch as failed: %v", err)
+	}
+	active, err := store.Load(issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := store.CredentialFor(issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active.CLIClientSessionID != "cls_new" || credential.AccessToken != "access-new" || credential.RefreshToken != "refresh-new" {
+		t.Fatalf("active = %#v, credential = %#v", active, credential)
+	}
+}
+
+func TestAuthLoginPersistenceReconcilesCommittedMutationError(t *testing.T) {
+	dir := t.TempDir()
+	store := config.ProfileStore{Path: dir, Secrets: config.FileSecretStore{Dir: filepath.Join(dir, "secrets")}}
+	profile := config.Profile{Issuer: "https://api.example.com", CLIClientSessionID: "cls_new"}
+	credential := config.Credential{AccessToken: "access-new", RefreshToken: "refresh-new"}
+	if err := store.Save(profile, credential); err != nil {
+		t.Fatal(err)
+	}
+	if err := committedProfileMutation(store, profile, credential, errors.New("injected post-commit lock failure")); err != nil {
+		t.Fatalf("committed mutation was treated as failed: %v", err)
+	}
+	if err := committedProfileMutation(store, profile, config.Credential{AccessToken: "different", RefreshToken: "refresh-new"}, errors.New("real failure")); err == nil {
+		t.Fatal("mismatched committed credential suppressed a real mutation failure")
+	}
+}
+
 func TestSessionNameReservesOnlyAutomaticShellNames(t *testing.T) {
 	if err := validateSessionName("shell-tools"); err != nil {
 		t.Fatalf("shell-tools should be valid: %v", err)
@@ -2420,6 +2534,40 @@ func writeTestProfile(t *testing.T, dir, configPath, serverURL string) {
 	err := store.Save(config.Profile{Issuer: serverURL, CLIClientSessionID: "cls_test", AccessExpiresAt: expires}, config.Credential{AccessToken: "token", RefreshToken: "refresh", ExpiresAt: expires})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestAuthStatusRejectsProfileWithMissingSecret(t *testing.T) {
+	for _, missing := range []string{"access", "refresh"} {
+		t.Run(missing, func(t *testing.T) {
+			dir := t.TempDir()
+			configPath := filepath.Join(dir, "config.json")
+			serverURL := "https://api.example.test"
+			writeTestProfile(t, dir, configPath, serverURL)
+			cfg, err := config.Load(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			store, err := config.ProfileStoreFor(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			profile, err := store.Load(serverURL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ref := profile.AccessSecretRef
+			if missing == "refresh" {
+				ref = profile.RefreshSecretRef
+			}
+			if err := store.Secrets.Delete(ref); err != nil {
+				t.Fatal(err)
+			}
+			err = newApp().Run([]string{"pb", "--config", configPath, "auth", "status", "--json"})
+			if !errors.Is(err, config.ErrSecretNotFound) || !strings.Contains(err.Error(), "pb auth login") {
+				t.Fatalf("auth status error = %v", err)
+			}
+		})
 	}
 }
 

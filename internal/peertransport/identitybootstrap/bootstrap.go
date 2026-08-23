@@ -35,6 +35,14 @@ type ExistingRootClient interface {
 	EndpointCertificate(context.Context, string, uint64) (api.EndpointCertificateDocument, error)
 }
 
+// CLIClient is the complete control-plane surface used when a CLI session is
+// being enrolled. A first account bootstraps its root; an existing account
+// requests an endpoint certificate from a paired verifier.
+type CLIClient interface {
+	Client
+	ExistingRootClient
+}
+
 type Request struct {
 	Store              config.ProfileStore
 	Client             Client
@@ -59,6 +67,38 @@ type ExistingRootRequest struct {
 	Now                func() time.Time
 	PollInterval       time.Duration
 	Timeout            time.Duration
+}
+
+type CLIRequest struct {
+	Store              config.ProfileStore
+	Client             CLIClient
+	Issuer             string
+	AccountID          string
+	CLIClientSessionID string
+	Now                func() time.Time
+	PollInterval       time.Duration
+	Timeout            time.Duration
+}
+
+// EnrollCLI selects the only valid enrollment ceremony for the account. An
+// established root is never recreated or imported implicitly: the new CLI
+// generates endpoint-only keys and waits for a paired verifier to approve
+// them. Only an account with no root may execute the first-root bootstrap.
+func EnrollCLI(ctx context.Context, request CLIRequest) (Result, error) {
+	existing := ExistingRootRequest{
+		Store: request.Store, Client: request.Client, Issuer: request.Issuer,
+		AccountID: request.AccountID, CLIClientSessionID: request.CLIClientSessionID,
+		Now: request.Now, PollInterval: request.PollInterval, Timeout: request.Timeout,
+	}
+	result, err := EnrollExistingRoot(ctx, existing)
+	if err == nil || !api.IsNotFound(err) {
+		return result, err
+	}
+	return Bootstrap(ctx, Request{
+		Store: request.Store, Client: request.Client, Issuer: request.Issuer,
+		AccountID: request.AccountID, CLIClientSessionID: request.CLIClientSessionID,
+		Now: request.Now,
+	})
 }
 
 // EnrollExistingRoot performs the second-device CLI enrollment handshake. It

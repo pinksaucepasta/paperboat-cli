@@ -14,7 +14,7 @@ import (
 
 var ErrStreamDispatch = errors.New("peer stream dispatch failed")
 
-type StreamAuthorizer func(context.Context, streamauth.Header) error
+type StreamAuthorizer func(context.Context, streamauth.Header) (server.Authorization, error)
 type StreamHandler func(context.Context, streamauth.Header, net.Conn) error
 
 // CredentialStreamAuthorizer adapts the existing application credential
@@ -22,26 +22,26 @@ type StreamHandler func(context.Context, streamauth.Header, net.Conn) error
 // authorization; the canonical protocol capability and operation binding are
 // selected here and verified by the existing host authorizer.
 func CredentialStreamAuthorizer(factory server.AuthorizerFactory) StreamAuthorizer {
-	return func(ctx context.Context, header streamauth.Header) error {
+	return func(ctx context.Context, header streamauth.Header) (server.Authorization, error) {
 		if factory == nil {
-			return ErrStreamDispatch
+			return server.Authorization{}, ErrStreamDispatch
 		}
 		authorizer, err := factory(header.Credential)
 		if err != nil || authorizer == nil {
-			return errors.Join(ErrStreamDispatch, err)
+			return server.Authorization{}, errors.Join(ErrStreamDispatch, err)
 		}
 		if closer, ok := authorizer.(server.AuthorizationCloser); ok {
 			defer closer.CloseAuthorization()
 		}
 		capability := map[string]string{"terminal": "terminal.v1", "exec": "exec.v1", "ssh": "ssh.v1", "private_preview": "preview.launch.v1", "codex": "codex.connect.v1"}[header.Consumer]
 		if capability == "" {
-			return ErrStreamDispatch
+			return server.Authorization{}, ErrStreamDispatch
 		}
-		_, err = authorizer.Authorize(ctx, protocol.Frame{Type: "request", RequestID: header.StreamID, Version: protocol.ProtocolVersion, OperationID: header.OperationID, Capability: capability})
+		authorization, err := authorizer.Authorize(ctx, protocol.Frame{Type: "request", RequestID: header.StreamID, Version: protocol.ProtocolVersion, OperationID: header.OperationID, Capability: capability})
 		if err != nil {
-			return errors.Join(ErrStreamDispatch, err)
+			return server.Authorization{}, errors.Join(ErrStreamDispatch, err)
 		}
-		return nil
+		return authorization, nil
 	}
 }
 
@@ -67,7 +67,7 @@ func DispatchParsedStream(ctx context.Context, header streamauth.Header, conn ne
 		}
 		return ErrStreamDispatch
 	}
-	if err := authorize(ctx, header); err != nil {
+	if _, err := authorize(ctx, header); err != nil {
 		_ = conn.Close()
 		return errors.Join(ErrStreamDispatch, err)
 	}

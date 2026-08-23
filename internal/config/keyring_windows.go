@@ -63,38 +63,35 @@ func windowsUTF16(value string) (*uint16, error) {
 }
 
 func (KeyringStore) Set(ref, value string) error {
+	if value == "" {
+		return fmt.Errorf("%w: refusing to store an empty credential", ErrCredentialStoreUnavailable)
+	}
 	if len(value) > windowsCredentialBlobMaxBytes {
 		return fmt.Errorf("%w: credential exceeds %d bytes", ErrCredentialStoreUnavailable, windowsCredentialBlobMaxBytes)
 	}
-	target, err := windowsUTF16(windowsCredentialTarget(ref))
-	if err != nil {
-		return err
-	}
-	username, err := windowsUTF16(keyringService)
-	if err != nil {
-		return err
-	}
-	blob := []byte(value)
-	defer clear(blob)
-	credential := windowsCredential{
-		Type:               windowsCredentialTypeGeneric,
-		TargetName:         target,
-		CredentialBlobSize: uint32(len(blob)),
-		Persist:            windowsCredentialPersistLocalMachine,
-		UserName:           username,
-	}
-	if len(blob) > 0 {
-		credential.CredentialBlob = &blob[0]
-	}
-	result, _, callErr := procCredWriteW.Call(uintptr(unsafe.Pointer(&credential)), 0)
-	if result == 0 {
-		return setDPAPISecret(ref, value, callErr)
-	}
-	_ = deleteDPAPISecret(ref)
-	return nil
+	// DPAPI is the sole write authority. Credential Manager is read only as a
+	// one-time migration source in Get. A Set therefore has one atomic replace
+	// and cannot expose different old/new values to interactive and S4U logons.
+	return setDPAPISecret(ref, value, nil)
 }
 
 func (KeyringStore) Get(ref string) (string, error) {
+	// Prefer the owner-DPAPI copy so interactive commands, scheduled tasks and
+	// the enrolled-owner service workload all resolve the same durable value.
+	// Fall back to Credential Manager for credentials written by older clients.
+	value, dpapiErr := getDPAPISecret(ref, nil)
+	if dpapiErr == nil {
+		if value == "" {
+			return "", fmt.Errorf("%w: DPAPI credential is empty", ErrCredentialStoreUnavailable)
+		}
+		return value, nil
+	}
+	// Credential Manager is only a migration source for an absent DPAPI
+	// credential. Never let a stale legacy value replace a DPAPI file that is
+	// present but corrupt, unreadable, or has an invalid ACL.
+	if !errors.Is(dpapiErr, ErrSecretNotFound) {
+		return "", dpapiErr
+	}
 	target, err := windowsUTF16(windowsCredentialTarget(ref))
 	if err != nil {
 		return "", err
@@ -107,7 +104,7 @@ func (KeyringStore) Get(ref string) (string, error) {
 		uintptr(unsafe.Pointer(&credential)),
 	)
 	if result == 0 {
-		return getDPAPISecret(ref, callErr)
+		return "", windowsCredentialError("read", callErr)
 	}
 	if credential == nil || credential.CredentialBlobSize > windowsCredentialBlobMaxBytes || (credential.CredentialBlobSize > 0 && credential.CredentialBlob == nil) {
 		if credential != nil {
@@ -118,7 +115,30 @@ func (KeyringStore) Get(ref string) (string, error) {
 	defer procCredFree.Call(uintptr(unsafe.Pointer(credential)))
 	secretBytes := unsafe.Slice(credential.CredentialBlob, int(credential.CredentialBlobSize))
 	defer clear(secretBytes)
-	return string(secretBytes), nil
+	value = string(secretBytes)
+	if value == "" {
+		return "", fmt.Errorf("%w: Credential Manager credential is empty", ErrCredentialStoreUnavailable)
+	}
+	// Migrate credentials written by older clients on first successful read.
+	// Fail closed if the cross-logon DPAPI copy cannot be established; returning
+	// a value that the owner service cannot subsequently read recreates the
+	// split-brain profile state this fallback is intended to prevent.
+	if err := setDPAPISecret(ref, value, nil); err != nil {
+		return "", err
+	}
+	verified, err := getDPAPISecret(ref, nil)
+	if err != nil || verified != value {
+		return "", errors.Join(ErrCredentialStoreUnavailable, err)
+	}
+	result, _, callErr = procCredDeleteW.Call(
+		uintptr(unsafe.Pointer(target)),
+		windowsCredentialTypeGeneric,
+		0,
+	)
+	if result == 0 && !errors.Is(callErr, windows.ERROR_NOT_FOUND) {
+		return "", windowsCredentialError("delete migrated credential", callErr)
+	}
+	return value, nil
 }
 
 func (KeyringStore) Delete(ref string) error {
@@ -131,9 +151,10 @@ func (KeyringStore) Delete(ref string) error {
 		windowsCredentialTypeGeneric,
 		0,
 	)
-	dpapiErr := deleteDPAPISecret(ref)
-	if result != 0 || errors.Is(callErr, windows.ERROR_NOT_FOUND) || dpapiErr == nil {
-		return dpapiErr
+	if result == 0 && !errors.Is(callErr, windows.ERROR_NOT_FOUND) {
+		// Keep the authoritative DPAPI value when legacy cleanup is uncertain.
+		// A retry can safely complete deletion without resurrecting old state.
+		return windowsCredentialError("delete", callErr)
 	}
-	return errors.Join(windowsCredentialError("delete", callErr), dpapiErr)
+	return deleteDPAPISecret(ref)
 }

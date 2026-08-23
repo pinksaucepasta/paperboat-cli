@@ -23,6 +23,12 @@ type bootstrapClientFunc func(context.Context, string, api.E2EEBootstrapInput) (
 func (bootstrapClientFunc) E2EERoot(context.Context) (api.E2EERoot, error) {
 	return api.E2EERoot{}, &api.APIError{Status: 404, Code: "not_found"}
 }
+func (bootstrapClientFunc) RequestCLIEndpoint(context.Context, api.CLIEndpointRequestInput) (api.PendingEndpointIdentity, error) {
+	return api.PendingEndpointIdentity{}, errors.New("existing-root enrollment must not run")
+}
+func (bootstrapClientFunc) EndpointCertificate(context.Context, string, uint64) (api.EndpointCertificateDocument, error) {
+	return api.EndpointCertificateDocument{}, errors.New("existing-root enrollment must not run")
+}
 
 type existingRootClient struct{ root api.E2EERoot }
 
@@ -42,6 +48,9 @@ type existingEnrollmentClient struct {
 func (c *existingEnrollmentClient) E2EERoot(context.Context) (api.E2EERoot, error) {
 	return c.root, nil
 }
+func (*existingEnrollmentClient) BootstrapE2EE(context.Context, string, api.E2EEBootstrapInput) (api.E2EEBootstrapResult, error) {
+	return api.E2EEBootstrapResult{}, errors.New("first-root bootstrap must not run")
+}
 func (c *existingEnrollmentClient) RequestCLIEndpoint(_ context.Context, input api.CLIEndpointRequestInput) (api.PendingEndpointIdentity, error) {
 	c.requests++
 	if input.EndpointID != c.pending.EndpointID || input.Generation != c.pending.Generation || input.NoisePublicKey != c.pending.NoisePublicKey || input.QUICPublicKey != c.pending.QUICPublicKey {
@@ -57,7 +66,7 @@ func (c *existingEnrollmentClient) EndpointCertificate(context.Context, string, 
 	return c.certificate, nil
 }
 
-func TestEnrollExistingRootStoresVerifierOnlyIdentityAndIsIdempotent(t *testing.T) {
+func TestEnrollCLIExistingRootStoresVerifierOnlyIdentityAndIsIdempotent(t *testing.T) {
 	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
 	rootPublic, rootPrivate, _ := ed25519.GenerateKey(nil)
 	rootFingerprint := sha256.Sum256(rootPublic)
@@ -76,12 +85,12 @@ func TestEnrollExistingRootStoresVerifierOnlyIdentityAndIsIdempotent(t *testing.
 	raw, _ := certificate.MarshalBinary()
 	certificateFingerprint := sha256.Sum256(raw)
 	client := &existingEnrollmentClient{root: root, pending: api.PendingEndpointIdentity{RequestID: "per_0123456789abcdef", EndpointID: "cli_1", Role: "cli", State: "pending", Generation: 1, NoisePublicKey: base64.RawURLEncoding.EncodeToString(keys.NoisePublic[:]), QUICPublicKey: base64.RawURLEncoding.EncodeToString(quicPublic), CreatedAt: now.Add(-time.Minute), ExpiresAt: now.Add(4 * time.Minute), SafetyCode: "abcde-fghij"}, certificate: api.EndpointCertificateDocument{Version: 1, AccountID: "account_1", RootFingerprint: hex.EncodeToString(rootFingerprint[:]), EndpointID: "cli_1", Role: "cli", Generation: 1, Serial: 1, IssuedAt: certificate.Claims.IssuedAt.Format(time.RFC3339), ExpiresAt: certificate.Claims.ExpiresAt.Format(time.RFC3339), Certificate: base64.RawURLEncoding.EncodeToString(raw), CertificateFingerprint: hex.EncodeToString(certificateFingerprint[:])}}
-	request := ExistingRootRequest{Store: store, Client: client, Issuer: "https://api.example.test", AccountID: "account_1", CLIClientSessionID: "cli_1", Now: func() time.Time { return now }, PollInterval: time.Millisecond, Timeout: time.Second}
-	first, err := EnrollExistingRoot(context.Background(), request)
+	request := CLIRequest{Store: store, Client: client, Issuer: "https://api.example.test", AccountID: "account_1", CLIClientSessionID: "cli_1", Now: func() time.Time { return now }, PollInterval: time.Millisecond, Timeout: time.Second}
+	first, err := EnrollCLI(context.Background(), request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := EnrollExistingRoot(context.Background(), request)
+	second, err := EnrollCLI(context.Background(), request)
 	if err != nil || first.RootFingerprint != second.RootFingerprint || first.CertificateFingerprint != second.CertificateFingerprint || client.requests != 2 {
 		t.Fatalf("first=%+v second=%+v requests=%d err=%v", first, second, client.requests, err)
 	}
@@ -155,7 +164,7 @@ func (f bootstrapClientFunc) BootstrapE2EE(ctx context.Context, operation string
 	return f(ctx, operation, input)
 }
 
-func TestBootstrapCreatesPersistsAndExactlyReplaysCLIIdentity(t *testing.T) {
+func TestEnrollCLINewRootCreatesPersistsAndExactlyReplaysIdentity(t *testing.T) {
 	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
 	root := t.TempDir()
 	store := config.ProfileStore{Path: root, Secrets: config.FileSecretStore{Dir: filepath.Join(root, "secrets")}}
@@ -178,12 +187,12 @@ func TestBootstrapCreatesPersistsAndExactlyReplaysCLIIdentity(t *testing.T) {
 		}
 		return api.E2EEBootstrapResult(input), nil
 	})
-	request := Request{Store: store, Client: client, Issuer: "https://api.example.test", AccountID: "account_1", CLIClientSessionID: "cli_1", Now: func() time.Time { return now }}
-	first, err := Bootstrap(context.Background(), request)
+	request := CLIRequest{Store: store, Client: client, Issuer: "https://api.example.test", AccountID: "account_1", CLIClientSessionID: "cli_1", Now: func() time.Time { return now }}
+	first, err := EnrollCLI(context.Background(), request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := Bootstrap(context.Background(), request)
+	second, err := EnrollCLI(context.Background(), request)
 	if err != nil || first.RootFingerprint != second.RootFingerprint || first.CertificateFingerprint != second.CertificateFingerprint {
 		t.Fatalf("first=%+v second=%+v err=%v", first, second, err)
 	}

@@ -95,6 +95,9 @@ func RunProductionServeWorker(ctx context.Context, config ProductionServeWorkerC
 			return startErr
 		}
 		waitErr := local.Wait()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		cleanupErr := retireCompletedServeService(context.Background(), config.Name, config.DescriptorPath, config.ServiceDefinition, config.ServiceRunner)
 		return errors.Join(waitErr, cleanupErr)
 	}
@@ -123,11 +126,17 @@ func RunProductionServeWorker(ctx context.Context, config ProductionServeWorkerC
 	})
 	if err != nil {
 		if errors.Is(err, context.Canceled) && ctx.Err() != nil {
-			return retireCompletedServeService(context.Background(), config.Name, config.DescriptorPath, config.ServiceDefinition, config.ServiceRunner)
+			// The service supervisor can stop the worker while public preview
+			// readiness is still in progress. Keep the durable descriptor and unit
+			// so the same serve can resume after restart or reboot.
+			return ctx.Err()
 		}
 		return err
 	}
 	waitErr := foreground.Wait()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	cleanupErr := retireCompletedServeService(context.Background(), config.Name, config.DescriptorPath, config.ServiceDefinition, config.ServiceRunner)
 	return errors.Join(waitErr, cleanupErr)
 }

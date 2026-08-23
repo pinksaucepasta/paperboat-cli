@@ -17,19 +17,21 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-	"unsafe"
 
+	"github.com/pinksaucepasta/paperboat/internal/config"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
 	"golang.org/x/sys/windows"
 )
 
 const (
-	serviceMode    = "--paperboat-s4u-service"
-	childMode      = "--paperboat-s4u-child"
-	descendantMode = "--paperboat-s4u-descendant"
-	nameFlag       = "--service-name"
-	ownerSIDFlag   = "--owner-sid"
-	reportFlag     = "--report"
+	serviceMode      = "--paperboat-s4u-service"
+	dpapiServiceMode = "--paperboat-s4u-dpapi-service"
+	childMode        = "--paperboat-s4u-child"
+	dpapiChildMode   = "--paperboat-s4u-dpapi-child"
+	descendantMode   = "--paperboat-s4u-descendant"
+	nameFlag         = "--service-name"
+	ownerSIDFlag     = "--owner-sid"
+	reportFlag       = "--report"
 )
 
 type report struct {
@@ -60,12 +62,13 @@ type environment struct {
 // A loaded profile is not evidence that the user's DPAPI master keys can be
 // unlocked, and a local S4U logon is not evidence of credentialed SMB access.
 type limitations struct {
-	SMB     limitation `json:"smb"`
-	DPAPI   limitation `json:"dpapi"`
-	EFS     limitation `json:"efs"`
-	Git     limitation `json:"git"`
-	Network limitation `json:"network"`
-	Codex   limitation `json:"codex"`
+	SMB            limitation `json:"smb"`
+	DPAPI          limitation `json:"dpapi"`
+	DPAPIMigration limitation `json:"dpapi_credential_manager_migration"`
+	EFS            limitation `json:"efs"`
+	Git            limitation `json:"git"`
+	Network        limitation `json:"network"`
+	Codex          limitation `json:"codex"`
 }
 
 type limitation struct {
@@ -80,16 +83,20 @@ func main() {
 		os.Exit(2)
 	}
 	switch mode {
-	case serviceMode:
+	case serviceMode, dpapiServiceMode:
 		executable, err := os.Executable()
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
+		child := childMode
+		if mode == dpapiServiceMode {
+			child = dpapiChildMode
+		}
 		err = service.RunWindowsService(service.ServiceEntryConfig{
 			Name:        name,
 			Executable:  executable,
-			Arguments:   []string{childMode, ownerSIDFlag, ownerSID, reportFlag, reportPath},
+			Arguments:   []string{child, ownerSIDFlag, ownerSID, reportFlag, reportPath},
 			EnrolledSID: ownerSID,
 			Environment: map[string]string{"PAPERBOAT_S4U_QUALIFICATION": "1"},
 			LaunchFailure: func(launchErr error) {
@@ -100,7 +107,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
-	case childMode:
+	case childMode, dpapiChildMode:
 		if err := writeChildReport(ownerSID, reportPath); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
@@ -121,7 +128,7 @@ func holdForJobCleanup() {
 func parse(args []string) (mode, name, ownerSID, reportPath string, err error) {
 	for index := 0; index < len(args); index++ {
 		switch args[index] {
-		case serviceMode, childMode, descendantMode:
+		case serviceMode, dpapiServiceMode, childMode, dpapiChildMode, descendantMode:
 			if mode != "" {
 				return "", "", "", "", errors.New("multiple Paperboat S4U qualification modes")
 			}
@@ -207,15 +214,21 @@ func writeChildReport(ownerSID, reportPath string) error {
 	if err := descendant.Start(); err != nil {
 		return fmt.Errorf("start S4U descendant: %w", err)
 	}
-	dpapi := limitation{Status: "fail", Reason: "logged-out S4U could not decrypt the owner-created DPAPI fixture"}
-	if protected, readErr := os.ReadFile(reportPath + ".dpapi"); readErr != nil {
+	dpapi := limitation{Status: "fail", Reason: "logged-out S4U could not read the owner-created Paperboat KeyringStore credential"}
+	if cleartext, readErr := (config.KeyringStore{}).Get(reportPath); readErr != nil {
 		dpapi.Reason += ": " + readErr.Error()
-	} else if cleartext, decryptErr := transformDPAPI(protected); decryptErr != nil {
-		dpapi.Reason += ": " + decryptErr.Error()
-	} else if string(cleartext) != "paperboat-s4u-dpapi-v1" {
-		dpapi.Reason += ": decrypted value did not match"
+	} else if cleartext != "paperboat-s4u-dpapi-v1" {
+		dpapi.Reason += ": credential value did not match"
 	} else {
-		dpapi = limitation{Status: "pass", Reason: "logged-out S4U decrypted the owner-created user-scoped DPAPI fixture"}
+		dpapi = limitation{Status: "pass", Reason: "logged-out S4U read the owner-created Paperboat KeyringStore credential from the production owner LocalAppData DPAPI store"}
+	}
+	dpapiMigration := limitation{Status: "fail", Reason: "logged-out S4U could not read the owner-migrated Credential Manager credential from Paperboat KeyringStore"}
+	if cleartext, readErr := (config.KeyringStore{}).Get(reportPath + "-migrated"); readErr != nil {
+		dpapiMigration.Reason += ": " + readErr.Error()
+	} else if cleartext != "paperboat-s4u-migrated-v1" {
+		dpapiMigration.Reason += ": credential value did not match"
+	} else {
+		dpapiMigration = limitation{Status: "pass", Reason: "logged-out S4U read the Credential Manager credential after owner migration to the production LocalAppData DPAPI store"}
 	}
 	efs := limitation{Status: "fail", Reason: "logged-out S4U could not read the owner-encrypted EFS fixture"}
 	if output, encryptErr := exec.Command("cipher.exe", "/E", "/A", reportPath+".efs").CombinedOutput(); encryptErr != nil {
@@ -265,36 +278,19 @@ func writeChildReport(ownerSID, reportPath string) error {
 		Environment:        environment{OwnerWorkload: os.Getenv("PAPERBOAT_S4U_QUALIFICATION")},
 		JobCleanupExpected: true,
 		Limitations: limitations{
-			SMB:     limitation{Status: "not_qualified", Reason: "S4U does not retain reusable user network credentials; credentialed SMB requires a separate native qualification."},
-			DPAPI:   dpapi,
-			EFS:     efs,
-			Git:     git,
-			Network: network,
-			Codex:   codex,
+			SMB:            limitation{Status: "not_qualified", Reason: "S4U does not retain reusable user network credentials; credentialed SMB requires a separate native qualification."},
+			DPAPI:          dpapi,
+			DPAPIMigration: dpapiMigration,
+			EFS:            efs,
+			Git:            git,
+			Network:        network,
+			Codex:          codex,
 		},
 	}
 	if err := writeReport(reportPath, record); err != nil {
 		return err
 	}
 	return nil
-}
-
-func transformDPAPI(value []byte) ([]byte, error) {
-	input := windows.DataBlob{Size: uint32(len(value))}
-	if len(value) > 0 {
-		input.Data = &value[0]
-	}
-	entropyBytes := []byte("paperboat/windows-s4u-qualification/v1")
-	entropy := windows.DataBlob{Size: uint32(len(entropyBytes)), Data: &entropyBytes[0]}
-	var output windows.DataBlob
-	if err := windows.CryptUnprotectData(&input, nil, &entropy, 0, nil, 0x1, &output); err != nil {
-		return nil, err
-	}
-	defer windows.LocalFree(windows.Handle(uintptr(unsafe.Pointer(output.Data))))
-	if output.Size > 1<<20 || output.Size > 0 && output.Data == nil {
-		return nil, errors.New("invalid DPAPI output")
-	}
-	return append([]byte(nil), unsafe.Slice(output.Data, int(output.Size))...), nil
 }
 
 func writeReport(path string, value report) error {

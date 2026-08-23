@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/Microsoft/go-winio"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/autoupdate"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/workerupdate"
+	"github.com/pinksaucepasta/paperboat/internal/selfupdate"
 )
 
 var ErrWindowsActivationUnavailable = errors.New("Windows updater activation is unavailable")
@@ -29,6 +31,9 @@ type windowsController struct {
 	scheduler     *autoupdate.Scheduler
 	mu            sync.Mutex
 	checkMu       sync.Mutex
+	config        WindowsConfig
+	handoff       chan struct{}
+	handoffOnce   sync.Once
 }
 
 func newWindowsController(config WindowsConfig) (*windowsController, error) {
@@ -46,6 +51,8 @@ func newWindowsController(config WindowsConfig) (*windowsController, error) {
 		ownerSID:      config.OwnerSID,
 		socketPath:    config.ControlSocket,
 		resolve:       resolve,
+		config:        config,
+		handoff:       make(chan struct{}),
 	}
 	scheduler, err := autoupdate.New(autoupdate.Config{Check: controller.checkRelease})
 	if err != nil {
@@ -69,20 +76,26 @@ func (c *windowsController) run(ctx context.Context) error {
 	}
 	defer listener.Close()
 	go func() {
-		<-ctx.Done()
+		select {
+		case <-ctx.Done():
+		case <-c.handoff:
+		}
 		_ = listener.Close()
 	}()
 	go func() { _ = c.scheduler.Run(ctx) }()
 	for {
 		connection, acceptErr := listener.Accept()
 		if acceptErr != nil {
-			if ctx.Err() != nil || errors.Is(acceptErr, net.ErrClosed) || errors.Is(acceptErr, winio.ErrPipeListenerClosed) {
+			if ctx.Err() != nil || activationRequested(c.handoff) || errors.Is(acceptErr, net.ErrClosed) || errors.Is(acceptErr, winio.ErrPipeListenerClosed) {
 				return nil
 			}
 			return acceptErr
 		}
 		_ = c.handle(connection)
 		_ = connection.Close()
+		if activationRequested(c.handoff) {
+			return nil
+		}
 	}
 }
 
@@ -115,30 +128,115 @@ func (c *windowsController) handle(connection net.Conn) error {
 	if response.Status == "" {
 		response.Status = "ok"
 	}
-	return json.NewEncoder(connection).Encode(response)
+	if err := json.NewEncoder(connection).Encode(response); err != nil {
+		return err
+	}
+	if response.Pending {
+		if err := startWindowsActivatorService(); err != nil {
+			return err
+		}
+		c.handoffOnce.Do(func() { close(c.handoff) })
+	}
+	return nil
 }
 
 func (c *windowsController) invoke(ctx context.Context, request ControlRequest) (ControlResponse, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	response := ControlResponse{Schema: ControlProtocolV1, Status: "ok", Version: c.activeVersion, Observation: c.scheduler.Snapshot()}
+	blocked, blockErr := c.activationBlocked()
+	if blockErr != nil {
+		return response, blockErr
+	}
+	if blocked && request.Operation != "status" {
+		return response, ErrWindowsActivationUnavailable
+	}
 	switch request.Operation {
 	case "status":
+		if journal, err := loadWindowsActivationJournal(c.config); err == nil {
+			if journal.Version == c.activeVersion {
+				response.Pending = journal.Stage != windowsActivationCommitted
+				response.Updated = journal.Stage == windowsActivationCommitted
+			} else if journal.PreviousVersion == c.activeVersion && journal.Stage == windowsActivationRolledBack {
+				response.ActivationFailure = "activation_failed"
+			}
+		}
 		return response, nil
 	case "check":
 		result, err := c.scheduler.CheckNow(ctx)
 		response.Version, response.Updated, response.Observation = result.Version, false, c.scheduler.Snapshot()
 		return response, err
-	case "update", "approve-maintenance":
-		return response, ErrWindowsActivationUnavailable
+	case "update":
+		if c.config.RepositoryURL == "" {
+			return response, ErrWindowsActivationUnavailable
+		}
+		c.checkMu.Lock()
+		defer c.checkMu.Unlock()
+		source := workerupdate.TUFSource{RepositoryURL: c.config.RepositoryURL, StateRoot: filepath.Join(c.config.StateRoot, "tuf"), MachineID: c.config.MachineID}
+		release, found, err := source.ResolveManual(ctx)
+		if err != nil || !found {
+			return response, err
+		}
+		comparison, compareErr := selfupdate.CompareVersions(release.Version, c.activeVersion)
+		if compareErr != nil || comparison < 0 {
+			return response, workerupdate.ErrInvalidRelease
+		}
+		if comparison == 0 {
+			return response, nil
+		}
+		if _, err := stageWindowsActivation(ctx, c.config, release); err != nil {
+			return response, err
+		}
+		response.Version, response.Pending = release.Version, true
+		return response, nil
+	case "approve-maintenance":
+		if c.config.RepositoryURL == "" {
+			return response, ErrWindowsActivationUnavailable
+		}
+		c.checkMu.Lock()
+		defer c.checkMu.Unlock()
+		source := workerupdate.TUFSource{RepositoryURL: c.config.RepositoryURL, StateRoot: filepath.Join(c.config.StateRoot, "tuf"), MachineID: c.config.MachineID}
+		release, found, err := source.ResolveSupervisorManual(ctx)
+		if err != nil || !found {
+			return response, err
+		}
+		if release.Version != request.Release {
+			return response, workerupdate.ErrInvalidRelease
+		}
+		comparison, compareErr := selfupdate.CompareVersions(release.Version, c.activeVersion)
+		if compareErr != nil || comparison <= 0 {
+			return response, workerupdate.ErrInvalidRelease
+		}
+		if _, err := stageWindowsActivation(ctx, c.config, release); err != nil {
+			return response, err
+		}
+		response.Version, response.Pending = release.Version, true
+		response.Supervisor.StagedVersion, response.Supervisor.MaintenanceRequired, response.Supervisor.Stage = release.Version, true, "activation_pending"
+		return response, nil
 	default:
 		return ControlResponse{}, ErrInvalidControl
+	}
+}
+
+func activationRequested(channel <-chan struct{}) bool {
+	select {
+	case <-channel:
+		return true
+	default:
+		return false
 	}
 }
 
 func (c *windowsController) checkRelease(ctx context.Context) (autoupdate.Result, error) {
 	c.checkMu.Lock()
 	defer c.checkMu.Unlock()
+	blocked, err := c.activationBlocked()
+	if err != nil {
+		return autoupdate.Result{Version: c.activeVersion}, err
+	}
+	if blocked {
+		return autoupdate.Result{Version: c.activeVersion}, nil
+	}
 	release, found, err := c.resolve(ctx)
 	if err != nil {
 		return autoupdate.Result{Version: c.activeVersion}, err
@@ -146,7 +244,35 @@ func (c *windowsController) checkRelease(ctx context.Context) (autoupdate.Result
 	if !found {
 		return autoupdate.Result{Version: c.activeVersion}, nil
 	}
+	if c.config.AutomaticActivation {
+		comparison, compareErr := selfupdate.CompareVersions(release.Version, c.activeVersion)
+		if compareErr != nil || comparison < 0 {
+			return autoupdate.Result{Version: c.activeVersion}, workerupdate.ErrInvalidRelease
+		}
+		if comparison == 0 {
+			return autoupdate.Result{Version: c.activeVersion}, nil
+		}
+		if _, err := stageWindowsActivation(ctx, c.config, release); err != nil {
+			return autoupdate.Result{Version: c.activeVersion}, err
+		}
+		if err := startWindowsActivatorService(); err != nil {
+			return autoupdate.Result{Version: c.activeVersion}, err
+		}
+		c.handoffOnce.Do(func() { close(c.handoff) })
+		return autoupdate.Result{Version: release.Version, Updated: true}, nil
+	}
 	return autoupdate.Result{Version: release.Version}, nil
+}
+
+func (c *windowsController) activationBlocked() (bool, error) {
+	journal, err := loadWindowsActivationJournal(c.config)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return true, err
+	}
+	return windowsActivationBlocksVersion(journal, c.activeVersion), nil
 }
 
 func controlErrorCodeWindows(err error) string {

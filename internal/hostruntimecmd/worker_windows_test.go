@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostdproto"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostinstall"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
 )
 
 func TestWindowsWorkerRejectsNonPipeEndpoint(t *testing.T) {
@@ -16,6 +18,20 @@ func TestWindowsWorkerRejectsNonPipeEndpoint(t *testing.T) {
 	}, strings.NewReader(""), nilWriter{}, nilWriter{})
 	if err == nil || !strings.Contains(err.Error(), "invalid worker invocation") {
 		t.Fatalf("err = %v, want invalid Windows worker invocation", err)
+	}
+}
+
+func TestWindowsHostdWorkerEnvironmentCarriesInstalledRole(t *testing.T) {
+	layout, err := service.DefaultLayout("windows")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, role := range []string{"host", "client"} {
+		install := hostinstall.WindowsRuntimeConfig{SetupMode: role, OwnerSID: "S-1-5-21-1", TokenFile: hostinstall.WindowsHostdTokenPath(), StateRoot: `C:\State`, Workspace: `C:\Workspace`, ControlURL: "https://api.pprbt.dev", ListenAddress: "127.0.0.1:8080", MachineID: "machine"}
+		environment := windowsHostdWorkerEnvironment(install, layout, `C:\Program Files\Paperboat\runtime.exe`)
+		if environment["PAPERBOAT_SETUP_MODE"] != role {
+			t.Fatalf("role=%q environment=%q", role, environment["PAPERBOAT_SETUP_MODE"])
+		}
 	}
 }
 

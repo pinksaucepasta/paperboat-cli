@@ -137,6 +137,11 @@ for required in (
 for forbidden in ("Validate Windows release pipeline contract", "Validate first-party Windows packaging contract"):
     if forbidden in windows_job:
         raise SystemExit(f"Windows package matrix must not repeat the early contract gate: {forbidden}")
+if "internal/buildinfo.WindowsArtifactRole=$($role.Value)" not in windows_job:
+    raise SystemExit("Windows package matrix must stamp each service artifact role")
+for role in ("runtime", "hostd", "updater"):
+    if f"Value = '{role}'" not in windows_job:
+        raise SystemExit(f"Windows package matrix must build a distinct {role} role artifact")
 for name, job in (
     ("release authority", authority_job),
     ("Windows release contract", windows_contract_job),

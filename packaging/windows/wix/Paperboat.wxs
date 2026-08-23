@@ -41,6 +41,9 @@
         <Directory Id="BINDIR" Name="bin" />
         <Directory Id="RELEASES" Name="releases">
           <Directory Id="CLICURRENTSLOT" Name="cli-current" />
+          <Directory Id="VERSIONS" Name="versions">
+            <Directory Id="ACTIVERELEASE" Name="$(var.PaperboatVersion)" />
+          </Directory>
         </Directory>
       </Directory>
     </StandardDirectory>
@@ -111,9 +114,6 @@
       <Component Id="LauncherComponent" Guid="{F3E5F8E2-BD39-4CC4-BD4C-6FD34E5C8F02}">
         <File Id="LauncherBinary" Source="$(var.StagingDir)\pb-launcher.exe" KeyPath="yes" Vital="yes" />
       </Component>
-      <Component Id="RuntimeComponent" Guid="{F3E5F8E2-BD39-4CC4-BD4C-6FD34E5C8F03}">
-        <File Id="RuntimeBinary" Source="$(var.StagingDir)\paperboat-runtime.exe" KeyPath="yes" Vital="yes" />
-      </Component>
       <Component Id="CliPathComponent" Guid="{F3E5F8E2-BD39-4CC4-BD4C-6FD34E5C8F0B}">
         <Environment
             Id="PaperboatBinPath"
@@ -128,8 +128,11 @@
   </Fragment>
 
   <Fragment>
-    <ComponentGroup Id="ServiceComponents" Directory="BINDIR">
-      <Component Id="HostSupervisorServiceComponent" Guid="{F3E5F8E2-BD39-4CC4-BD4C-6FD34E5C8F04}">
+    <ComponentGroup Id="ServiceComponents" Directory="ACTIVERELEASE">
+      <Component Id="RuntimeComponent" Guid="{5F72FCD4-1D71-44D3-8D42-0D19CD0F44A1}">
+        <File Id="RuntimeBinary" Source="$(var.StagingDir)\paperboat-runtime.exe" KeyPath="yes" Vital="yes" />
+      </Component>
+      <Component Id="HostSupervisorServiceComponent" Guid="{614E6D9D-4014-44DA-B6FD-3D1CC018E6A2}">
         <File Id="HostSupervisorBinary" Source="$(var.StagingDir)\paperboat-hostd.exe" KeyPath="yes" Vital="yes" />
         <ServiceInstall
             Id="HostSupervisorServiceInstall"
@@ -148,7 +151,7 @@
             Remove="uninstall"
             Wait="yes" />
       </Component>
-      <Component Id="UpdaterServiceComponent" Guid="{F3E5F8E2-BD39-4CC4-BD4C-6FD34E5C8F05}">
+      <Component Id="UpdaterServiceComponent" Guid="{A781783F-740B-45B9-AEC9-281BF52ABF39}">
         <File Id="UpdaterBinary" Source="$(var.StagingDir)\paperboat-updater.exe" KeyPath="yes" Vital="yes" />
         <ServiceInstall
             Id="UpdaterServiceInstall"

@@ -80,6 +80,28 @@ func TestDefaultWindowsLayoutUsesCanonicalSeparators(t *testing.T) {
 	}
 }
 
+func TestWindowsImmutableReleasePathsRejectTraversal(t *testing.T) {
+	layout, err := DefaultLayout("windows")
+	if err != nil {
+		t.Fatal(err)
+	}
+	release, err := layout.WindowsRelease("2026.08.23.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if release.Hostd != `C:\Program Files\Paperboat\releases\versions\2026.08.23.1\paperboat-hostd.exe` || release.Updater != `C:\Program Files\Paperboat\releases\versions\2026.08.23.1\paperboat-updater.exe` {
+		t.Fatalf("release=%+v", release)
+	}
+	if version, err := layout.WindowsVersionForExecutable(release.Updater); err != nil || version != "2026.08.23.1" {
+		t.Fatalf("version=%q err=%v", version, err)
+	}
+	for _, version := range []string{"../2026.08.23.1", "2026.8.23.1", "2026.08.23.01", "2026.08.23.1\\escape"} {
+		if _, err := layout.WindowsRelease(version); !errors.Is(err, ErrInvalidDefinition) {
+			t.Fatalf("version %q err=%v", version, err)
+		}
+	}
+}
+
 func TestSplitLayoutRejectsEscapingComponents(t *testing.T) {
 	layout := splitLayout(t, "linux")
 	layout.UpdaterBinary = "/tmp/paperboat-updated"

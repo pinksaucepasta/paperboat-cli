@@ -54,6 +54,11 @@ func safeWindowsServiceKind(kind, instance string) bool {
 	return kind == WorkerKind || kind == HostKind || kind == HostdKind || kind == UpdaterKind || kind == ConfigKind || kind == DaemonKind
 }
 
+func isWindowsPreviewServiceName(name string) bool {
+	const prefix = "PaperboatPreview-"
+	return strings.HasPrefix(name, prefix) && safeInstance(strings.TrimPrefix(name, prefix))
+}
+
 func safeExecutableWindows(path string) error {
 	if !filepath.IsAbs(path) || !strings.EqualFold(filepath.Ext(path), ".exe") {
 		return ErrInvalidDefinition
@@ -114,7 +119,7 @@ func (WindowsController) Apply(ctx context.Context, definitionPath string, upgra
 			// user workload, so workloads never run as SYSTEM.
 			ServiceStartName: "LocalSystem",
 		}
-		if definition.Name == "PaperboatHostd" {
+		if definition.Name == "PaperboatHostd" || definition.Name == "PaperboatUpdated" {
 			config.SidType = windows.SERVICE_SID_TYPE_UNRESTRICTED
 		}
 		service, err = manager.CreateService(definition.Name, definition.Executable, config, definition.Arguments...)
@@ -132,7 +137,9 @@ func (WindowsController) Apply(ctx context.Context, definitionPath string, upgra
 		current.DisplayName = definition.DisplayName
 		current.Description = definition.Description
 		current.StartType = mgr.StartAutomatic
-		if definition.Name == "PaperboatHostd" {
+		current.ErrorControl = mgr.ErrorNormal
+		current.ServiceStartName = "LocalSystem"
+		if definition.Name == "PaperboatHostd" || definition.Name == "PaperboatUpdated" {
 			current.SidType = windows.SERVICE_SID_TYPE_UNRESTRICTED
 		}
 		if err := service.UpdateConfig(current); err != nil {
@@ -143,10 +150,11 @@ func (WindowsController) Apply(ctx context.Context, definitionPath string, upgra
 		}
 	}
 	defer service.Close()
-	if definition.Name == "PaperboatHostd" {
-		// The hostd service is only a privileged token bridge. If the enrolled
-		// owner has logged off or the child fails, SCM retries the bridge with
-		// bounded backoff instead of leaving a LocalSystem workload behind.
+	if definition.Name == "PaperboatHostd" || definition.Name == "PaperboatUpdated" || isWindowsPreviewServiceName(definition.Name) {
+		// Owner-scoped workloads run behind a privileged token bridge. If the
+		// enrolled owner logs off or the child fails, SCM retries the bridge with
+		// bounded backoff instead of leaving a LocalSystem workload behind or
+		// permanently losing a durable preview.
 		if err := service.SetRecoveryActions([]mgr.RecoveryAction{
 			{Type: mgr.ServiceRestart, Delay: 5 * time.Second},
 			{Type: mgr.ServiceRestart, Delay: 15 * time.Second},
@@ -156,6 +164,15 @@ func (WindowsController) Apply(ctx context.Context, definitionPath string, upgra
 		}
 		if err := service.SetRecoveryActionsOnNonCrashFailures(true); err != nil {
 			return err
+		}
+	}
+	if definition.Name == "PaperboatHostd" || definition.Name == "PaperboatUpdated" {
+		installed, configErr := service.Config()
+		wantPath := windows.ComposeCommandLine(append([]string{definition.Executable}, definition.Arguments...))
+		validIdentity := configErr == nil && strings.EqualFold(installed.BinaryPathName, wantPath) && strings.EqualFold(installed.ServiceStartName, "LocalSystem") && installed.StartType == mgr.StartAutomatic && installed.ErrorControl == mgr.ErrorNormal
+		validIdentity = validIdentity && installed.SidType == windows.SERVICE_SID_TYPE_UNRESTRICTED
+		if !validIdentity {
+			return errors.Join(ErrInvalidDefinition, configErr)
 		}
 	}
 	if err := service.Start(); err != nil && !errors.Is(err, windows.ERROR_SERVICE_ALREADY_RUNNING) && !errors.Is(err, windows.ERROR_SERVICE_REQUEST_TIMEOUT) {

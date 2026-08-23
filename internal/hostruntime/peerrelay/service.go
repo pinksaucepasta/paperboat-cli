@@ -16,6 +16,7 @@ import (
 
 	"github.com/pinksaucepasta/paperboat/internal/api"
 	identitystore "github.com/pinksaucepasta/paperboat/internal/hostruntime/identity"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/server"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/candidatelease"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/directpath"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/endpointidentity"
@@ -875,6 +876,10 @@ func (s *Service) serveRelay(setupCtx, lifetime context.Context, connection *rel
 		if !claimRelay() {
 			return false, context.Canceled
 		}
+		// Relay carriers deliberately end after the E2EE key exchange. File bytes
+		// then use the qualified H3/H2 origin path; only direct QUIC retains this
+		// peer session as an HTTP data transport. Keeping that distinction avoids
+		// silently exposing an unbounded relay stream as a transfer transport.
 		return true, s.exchangeTransferKey(stream, descriptor, authority)
 	}
 	if authority.Context.Consumer == "private_preview" {
@@ -1008,7 +1013,7 @@ func (s *Service) serveRelayTransport(ctx context.Context, responder nativepeer.
 			if !containsConsumer(descriptor.StreamPolicy.AllowedConsumers, parsed.Consumer) {
 				return ErrStreamDispatch
 			}
-			authorizeErr := s.config.AuthorizeStream(authorizeCtx, parsed)
+			_, authorizeErr := s.authorizeStream(authorizeCtx, descriptor, parsed)
 			slog.Info("peer authorized stream authorized", "consumer", parsed.Consumer, "operation_id", parsed.OperationID, "stream_id", parsed.StreamID, "error", authorizeErr)
 			return authorizeErr
 		})
@@ -1051,6 +1056,17 @@ func (s *Service) serveRelayTransport(ctx context.Context, responder nativepeer.
 			_ = conn.Close()
 		}(connection, header)
 	}
+}
+
+func (s *Service) authorizeStream(ctx context.Context, descriptor api.PeerAttemptDescriptor, header streamauth.Header) (server.Authorization, error) {
+	authorization, err := s.config.AuthorizeStream(ctx, header)
+	if err != nil {
+		return server.Authorization{}, err
+	}
+	if authorization.ClientID != descriptor.InitiatorEndpointID || authorization.UserID != descriptor.AccountID || authorization.MachineID != descriptor.ResponderEndpointID {
+		return server.Authorization{}, ErrStreamDispatch
+	}
+	return authorization, nil
 }
 
 func containsConsumer(values []string, value string) bool {

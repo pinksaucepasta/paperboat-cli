@@ -438,6 +438,10 @@ func safeEnvironmentKey(value string) bool {
 	return true
 }
 
+func shouldDeleteOneShotService(deleteOnExit bool, childExitCode uint32, interrupted bool) bool {
+	return deleteOnExit && childExitCode == 0 && !interrupted
+}
+
 func safeAccount(value string) bool {
 	if value == "" || len(value) > 128 {
 		return false

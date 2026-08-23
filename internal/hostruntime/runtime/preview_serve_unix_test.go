@@ -83,7 +83,7 @@ func TestServeRuntimeDescriptorRequiresCurrentSchemaFields(t *testing.T) {
 	}
 }
 
-func TestDetachedServeShutdownStopsListenerAndRemovesDescriptor(t *testing.T) {
+func TestDetachedServeSupervisorShutdownStopsListenerAndPreservesDescriptor(t *testing.T) {
 	root := t.TempDir()
 	descriptorPath, expires := writeTestServeDescriptor(t, root, "docs", time.Now().UTC().Add(time.Hour))
 	ctx, cancel := context.WithCancel(context.Background())
@@ -104,14 +104,32 @@ func TestDetachedServeShutdownStopsListenerAndRemovesDescriptor(t *testing.T) {
 	}()
 	listenerPort := <-port
 	cancel()
-	if err := <-done; err != nil {
-		t.Fatal(err)
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("shutdown error = %v, want context canceled", err)
 	}
 	if _, err := net.DialTimeout("tcp4", net.JoinHostPort("127.0.0.1", fmt.Sprint(listenerPort)), 100*time.Millisecond); err == nil {
 		t.Fatal("listener remains after shutdown")
 	}
-	if _, err := os.Stat(descriptorPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("descriptor remains after shutdown: %v", err)
+	if _, err := os.Stat(descriptorPath); err != nil {
+		t.Fatalf("durable descriptor was removed during supervisor shutdown: %v", err)
+	}
+}
+
+func TestDetachedPublicServeStartupCancellationPreservesDescriptor(t *testing.T) {
+	root := t.TempDir()
+	descriptorPath, expires := writeTestServeDescriptor(t, root, "docs", time.Now().UTC().Add(time.Hour))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := RunProductionServeWorker(ctx, ProductionServeWorkerConfig{
+		ControlURL: "https://api.paperboat.test", StateRoot: root, Name: "docs", ExpiresAt: &expires,
+		DescriptorPath: descriptorPath,
+		PreviewRunner:  func(context.Context, servepkg.PreviewRunConfig) error { return context.Canceled },
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("startup cancellation error = %v, want context canceled", err)
+	}
+	if _, err := os.Stat(descriptorPath); err != nil {
+		t.Fatalf("durable descriptor was removed during startup cancellation: %v", err)
 	}
 }
 
@@ -155,11 +173,11 @@ func TestDetachedPrivateServePublishesOnlyLoopbackURL(t *testing.T) {
 	}
 	response.Body.Close()
 	cancel()
-	if err := <-done; err != nil {
-		t.Fatal(err)
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("shutdown error = %v, want context canceled", err)
 	}
-	if _, err := os.Stat(descriptorPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("descriptor remains after shutdown: %v", err)
+	if _, err := os.Stat(descriptorPath); err != nil {
+		t.Fatalf("durable descriptor was removed during supervisor shutdown: %v", err)
 	}
 }
 

@@ -55,6 +55,23 @@ func runHostdInner(ctx context.Context, output io.Writer) error {
 	return runOwnerHostd(ctx, output, install)
 }
 
+func windowsHostdWorkerEnvironment(install hostinstall.WindowsRuntimeConfig, layout service.Layout, runtimeExecutable string) map[string]string {
+	return map[string]string{
+		windowsOwnerWorkloadEnvironment:    "1",
+		"PAPERBOAT_WINDOWS_OWNER_SID":      install.OwnerSID,
+		"PAPERBOAT_HOSTD_SOCKET":           layout.HostdSocket,
+		"PAPERBOAT_HOSTD_TOKEN_FILE":       install.TokenFile,
+		"PAPERBOAT_RUNTIME_CURRENT":        runtimeExecutable,
+		"PAPERBOAT_RUNTIME_STATE_ROOT":     install.StateRoot,
+		"PAPERBOAT_WORKSPACE_ROOT":         install.Workspace,
+		"PAPERBOAT_CONTROL_URL":            install.ControlURL,
+		"PAPERBOAT_RUNTIME_LISTEN_ADDRESS": install.ListenAddress,
+		"PAPERBOAT_MACHINE_ID":             install.MachineID,
+		"PAPERBOAT_SETUP_MODE":             install.SetupMode,
+		"PAPERBOAT_RUNTIME_SERVICE_SCOPE":  "user",
+	}
+}
+
 // runWindowsHostdService is the only SCM-facing hostd path. The child marker
 // is generated here, not accepted from the installed service definition, so a
 // LocalSystem process cannot accidentally run the workload itself.
@@ -63,18 +80,15 @@ func runWindowsHostdService(install hostinstall.WindowsRuntimeConfig) error {
 	if err != nil {
 		return err
 	}
-	environment := map[string]string{
-		windowsOwnerWorkloadEnvironment:   "1",
-		"PAPERBOAT_WINDOWS_OWNER_SID":     install.OwnerSID,
-		"PAPERBOAT_HOSTD_SOCKET":          layout.HostdSocket,
-		"PAPERBOAT_HOSTD_TOKEN_FILE":      install.TokenFile,
-		"PAPERBOAT_RUNTIME_CURRENT":       layout.RuntimeCurrent,
-		"PAPERBOAT_RUNTIME_STATE_ROOT":    install.StateRoot,
-		"PAPERBOAT_WORKSPACE_ROOT":        install.Workspace,
-		"PAPERBOAT_CONTROL_URL":           install.ControlURL,
-		"PAPERBOAT_MACHINE_ID":            install.MachineID,
-		"PAPERBOAT_RUNTIME_SERVICE_SCOPE": "user",
+	hostdExecutable, runtimeExecutable := layout.RuntimeCurrent, layout.RuntimeCurrent
+	if executable, executableErr := os.Executable(); executableErr == nil {
+		if version, versionErr := layout.WindowsVersionForExecutable(executable); versionErr == nil {
+			if release, releaseErr := layout.WindowsRelease(version); releaseErr == nil {
+				hostdExecutable, runtimeExecutable = executable, release.Runtime
+			}
+		}
 	}
+	environment := windowsHostdWorkerEnvironment(install, layout, runtimeExecutable)
 	token, err := readWindowsHostdTokenForSID(install.TokenFile, install.OwnerSID)
 	if err != nil {
 		return err
@@ -82,7 +96,7 @@ func runWindowsHostdService(install hostinstall.WindowsRuntimeConfig) error {
 	brokerToken := previewbroker.DeriveToken(token)
 	return service.RunWindowsService(service.ServiceEntryConfig{
 		Name:        "PaperboatHostd",
-		Executable:  layout.RuntimeCurrent,
+		Executable:  hostdExecutable,
 		Arguments:   []string{"__runtime-hostd"},
 		EnrolledSID: install.OwnerSID,
 		Environment: environment,

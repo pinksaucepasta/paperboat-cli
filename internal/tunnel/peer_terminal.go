@@ -442,6 +442,8 @@ func (t *PeerTerminalTunnel) PrepareReceiveTransferKey(ctx context.Context, info
 		if err := connection.Close(); err != nil {
 			return peercontext.Context{}, nil, err
 		}
+		// Relay QUIC/WSS authenticates and delivers the E2EE key only. A nil
+		// transport explicitly selects the qualified H3/H2 origin data path.
 		return delivery.context, nil, nil
 	}
 	transport, err := newDirectTransferRoundTripper(owned, direct)
@@ -469,6 +471,8 @@ func (t *PeerTerminalTunnel) PrepareTransferKey(ctx context.Context, info resolv
 		if err := connection.Close(); err != nil {
 			return peercontext.Context{}, nil, err
 		}
+		// Relay QUIC/WSS authenticates and delivers the E2EE key only. A nil
+		// transport explicitly selects the qualified H3/H2 origin data path.
 		return delivery.context, nil, nil
 	}
 	transport, err := newDirectTransferRoundTripper(owned, direct)

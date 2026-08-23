@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,8 +15,11 @@ import (
 
 	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/binarytarget"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostinstall"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/nativesignature"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/workerupdate"
+	"github.com/pinksaucepasta/paperboat/internal/windowssecurity"
 	"golang.org/x/sys/windows"
 )
 
@@ -25,8 +30,16 @@ type WindowsConfig struct {
 	OwnerSID, MachineID, RepositoryURL, TokenFile, InstallState, ControlSocket         string
 	ActiveVersion                                                                      string
 	Architecture                                                                       string
+	HostdSocket, HealthURL                                                             string
+	AutomaticActivation                                                                bool
+	SetupMode                                                                          string
 	VerifyExecutable                                                                   func(context.Context, string, string) error
 	ResolveRelease                                                                     workerupdate.Resolver
+}
+
+func validLoopbackHealthURL(value string) bool {
+	parsed, err := url.Parse(value)
+	return err == nil && parsed.Scheme == "http" && parsed.User == nil && parsed.RawQuery == "" && parsed.Fragment == "" && parsed.Path == "/healthz" && net.ParseIP(parsed.Hostname()) != nil && net.ParseIP(parsed.Hostname()).IsLoopback() && parsed.Port() != ""
 }
 
 var ErrInvalidWindowsConfig = errors.New("invalid Windows updater configuration")
@@ -38,17 +51,28 @@ func RunWindows(ctx context.Context, config WindowsConfig) error {
 	if !validWindowsConfig(config) {
 		return ErrInvalidWindowsConfig
 	}
-	if err := secureWindowsDirectory(config.StateRoot, config.OwnerSID); err != nil {
+	if err := validateWindowsReadOnlyOwnerFile(config.TokenFile, config.OwnerSID); err != nil {
 		return err
 	}
-	if err := secureWindowsFile(config.TokenFile, config.OwnerSID); err != nil {
+	if err := validateWindowsReadOnlyOwnerFile(config.InstallState, config.OwnerSID); err != nil {
 		return err
 	}
-	if err := secureWindowsFile(config.InstallState, config.OwnerSID); err != nil {
+	if err := validateWindowsPrivilegedInstallConfig(config); err != nil {
+		return err
+	}
+	if err := secureWindowsPrivilegedTree(config.StateRoot); err != nil {
+		return err
+	}
+	if err := reconcileWindowsInstallVersion(ctx, config); err != nil {
 		return err
 	}
 	if err := recoverWindowsSlots(ctx, config); err != nil {
 		return err
+	}
+	if resumed, err := resumeWindowsActivation(ctx, config); err != nil {
+		return err
+	} else if resumed {
+		return nil
 	}
 	state := struct {
 		Schema      string    `json:"schema"`
@@ -62,7 +86,7 @@ func RunWindows(ctx context.Context, config WindowsConfig) error {
 	if err := atomicfile.Write(filepath.Join(config.StateRoot, "service-state.json"), body, atomicfile.Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1}); err != nil {
 		return err
 	}
-	if err := applyWindowsUpdateACL(filepath.Join(config.StateRoot, "service-state.json"), config.OwnerSID); err != nil {
+	if err := applyWindowsPrivilegedACL(filepath.Join(config.StateRoot, "service-state.json"), false); err != nil {
 		return err
 	}
 	controller, err := newWindowsController(config)
@@ -78,8 +102,79 @@ func validWindowsConfig(config WindowsConfig) bool {
 			return false
 		}
 	}
+	layout, layoutErr := service.DefaultLayout("windows")
 	sid, err := windows.StringToSid(config.OwnerSID)
-	return err == nil && sid != nil && sid.IsValid() && config.MachineID != "" && config.RepositoryURL != "" && validPipePath(config.ControlSocket) && exactReleasePattern.MatchString(config.ActiveVersion) && (config.Architecture == "amd64" || config.Architecture == "arm64")
+	return layoutErr == nil && err == nil && sid != nil && sid.IsValid() && config.MachineID != "" && config.RepositoryURL != "" && config.StateRoot == layout.UpdateStateRoot && config.RuntimeCurrent == layout.RuntimeCurrent && config.RuntimeRollback == layout.RuntimeRollback && config.RuntimeStaged == layout.RuntimeStaged && config.CLICurrent == layout.CLICurrent && config.CLIRollback == layout.CLIRollback && config.TokenFile == hostinstall.WindowsHostdTokenPath() && config.InstallState == hostinstall.WindowsInstallConfigPath() && config.ControlSocket == `\\.\pipe\PaperboatUpdatedControl` && config.HostdSocket == layout.HostdSocket && validLoopbackHealthURL(config.HealthURL) && exactReleasePattern.MatchString(config.ActiveVersion) && (config.Architecture == "amd64" || config.Architecture == "arm64") && (config.SetupMode == "host" || config.SetupMode == "client")
+}
+
+func validateWindowsPrivilegedInstallConfig(config WindowsConfig) error {
+	persisted, err := hostinstall.LoadWindowsRuntimeConfig()
+	if err != nil {
+		return ErrInvalidWindowsConfig
+	}
+	// ActiveVersion may legitimately differ while a protected activation
+	// journal is rolling forward/back, or while MSI has installed a newer
+	// signed updater. reconcileWindowsInstallVersion binds that one mutable
+	// field to signed TUF metadata before committing it.
+	if persisted.OwnerSID != config.OwnerSID || persisted.MachineID != config.MachineID || persisted.SetupMode != config.SetupMode || persisted.TokenFile != config.TokenFile || persisted.Artifact.Platform != "windows" || persisted.Artifact.Architecture != config.Architecture || persisted.Artifact.RepositoryURL != config.RepositoryURL || "http://"+persisted.ListenAddress+"/healthz" != config.HealthURL {
+		return ErrInvalidWindowsConfig
+	}
+	return nil
+}
+
+func validateWindowsReadOnlyOwnerFile(path, ownerSID string) error {
+	if err := secureWindowsFileShape(path); err != nil {
+		return err
+	}
+	want := "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GR;;;" + ownerSID + ")"
+	if !windowssecurity.ProtectedDACLMatches(path, want) {
+		return ErrInvalidWindowsConfig
+	}
+	return nil
+}
+
+func secureWindowsFileShape(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return ErrInvalidWindowsConfig
+	}
+	attributes, err := windows.GetFileAttributes(windows.StringToUTF16Ptr(path))
+	if err != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return ErrInvalidWindowsConfig
+	}
+	return nil
+}
+
+func secureWindowsPrivilegedTree(root string) error {
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return err
+	}
+	return filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		attributes, err := windows.GetFileAttributes(windows.StringToUTF16Ptr(path))
+		if err != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+			return ErrInvalidWindowsConfig
+		}
+		return applyWindowsPrivilegedACL(path, entry.IsDir())
+	})
+}
+
+func applyWindowsPrivilegedACL(path string, directory bool) error {
+	inherit := ""
+	if directory {
+		inherit = "OICI"
+	}
+	descriptor, err := windows.SecurityDescriptorFromString("D:P(A;" + inherit + ";FA;;;SY)(A;" + inherit + ";FA;;;BA)")
+	if err != nil {
+		return err
+	}
+	dacl, _, err := descriptor.DACL()
+	if err != nil {
+		return err
+	}
+	return windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil)
 }
 func recoverWindowsSlots(ctx context.Context, config WindowsConfig) error {
 	verify := config.VerifyExecutable
@@ -141,36 +236,4 @@ func verifyWindowsRecoveryExecutable(ctx context.Context, path, architecture str
 	verifyCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	return nativesignature.New(nil).Verify(verifyCtx, path, "windows", architecture)
-}
-func secureWindowsDirectory(path, sid string) error {
-	if err := os.MkdirAll(path, 0o700); err != nil {
-		return err
-	}
-	attributes, err := windows.GetFileAttributes(windows.StringToUTF16Ptr(path))
-	if err != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-		return ErrInvalidWindowsConfig
-	}
-	return applyWindowsUpdateACL(path, sid)
-}
-func secureWindowsFile(path, sid string) error {
-	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-		return ErrInvalidWindowsConfig
-	}
-	attributes, err := windows.GetFileAttributes(windows.StringToUTF16Ptr(path))
-	if err != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-		return ErrInvalidWindowsConfig
-	}
-	return applyWindowsUpdateACL(path, sid)
-}
-func applyWindowsUpdateACL(path, sid string) error {
-	descriptor, err := windows.SecurityDescriptorFromString("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + sid + ")")
-	if err != nil {
-		return err
-	}
-	dacl, _, err := descriptor.DACL()
-	if err != nil {
-		return err
-	}
-	return windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil)
 }

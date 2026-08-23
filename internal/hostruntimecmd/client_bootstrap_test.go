@@ -76,6 +76,21 @@ func TestBootstrapCLISameAccountReplacementQueuesOldSession(t *testing.T) {
 	}
 }
 
+func TestBootstrapProfileMutationReconcilesCommittedError(t *testing.T) {
+	store := testBootstrapProfileStore(t)
+	profile := config.Profile{Issuer: "https://api.example.test", Account: config.Account{ID: "account_1"}, CLIClientSessionID: "cli_new"}
+	credential := testBootstrapCredential("new")
+	if err := store.Save(profile, credential); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconcileBootstrapProfileMutation(store, profile, credential, errors.New("injected post-commit lock failure")); err != nil {
+		t.Fatalf("committed bootstrap mutation was rejected: %v", err)
+	}
+	if err := reconcileBootstrapProfileMutation(store, profile, testBootstrapCredential("different"), errors.New("real failure")); err == nil {
+		t.Fatal("mismatched credential suppressed a real bootstrap failure")
+	}
+}
+
 func TestBootstrapCLIRejectsCrossAccountReplacement(t *testing.T) {
 	store := testBootstrapProfileStore(t)
 	issuer := "https://api.example.test"

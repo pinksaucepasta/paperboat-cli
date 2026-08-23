@@ -132,6 +132,13 @@ func RunProductionPreviewWorker(ctx context.Context, config ProductionPreviewWor
 	stage("registered")
 	removeRemote := true
 	defer func() {
+		// A durable service can be interrupted at any startup stage, including
+		// after registration but before connector readiness. Preserve the remote
+		// route for every supervisor cancellation, not only cancellation after the
+		// worker reaches its steady-state loop.
+		if durable != nil && ctx.Err() != nil {
+			removeRemote = false
+		}
 		if removeRemote {
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
@@ -254,6 +261,14 @@ func RunProductionPreviewWorker(ctx context.Context, config ProductionPreviewWor
 	for {
 		select {
 		case <-ctx.Done():
+			// A durable worker is stopped during service restarts, user logoff,
+			// and operating-system shutdown. Keep its server route so the same
+			// descriptor and URL can reconnect when the service starts again.
+			// Foreground previews still revoke their route when their command is
+			// canceled.
+			if durable != nil {
+				removeRemote = false
+			}
 			return ctx.Err()
 		case <-expiry:
 			_, _ = registry.Expire(remote.PreviewKey)

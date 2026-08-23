@@ -21,6 +21,15 @@ param(
     [Parameter(Mandatory = $true)]
     [string] $ServiceFixturePath,
 
+    [Parameter(Mandatory = $true)]
+    [string] $S4UFixturePath,
+
+    [Parameter(Mandatory = $true)]
+    [string] $S4UTestExecutable,
+
+    [Parameter(Mandatory = $true)]
+    [string] $HostinstallTestExecutable,
+
     [string] $NativeTestExecutable = '',
 
     [Parameter(Mandatory = $true)]
@@ -46,6 +55,9 @@ $resolvedOutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
 $resolvedMsiPath = [IO.Path]::GetFullPath($MsiPath)
 $resolvedUpgradeMsiPath = [IO.Path]::GetFullPath($UpgradeMsiPath)
 $resolvedFixturePath = [IO.Path]::GetFullPath($ServiceFixturePath)
+$resolvedS4UFixturePath = [IO.Path]::GetFullPath($S4UFixturePath)
+$resolvedS4UTestExecutable = [IO.Path]::GetFullPath($S4UTestExecutable)
+$resolvedHostinstallTestExecutable = [IO.Path]::GetFullPath($HostinstallTestExecutable)
 $reportPath = Join-Path $resolvedOutputDirectory 'native-windows-qualification.json'
 
 function Add-QualificationEvent {
@@ -162,6 +174,12 @@ function Assert-Preflight {
     Assert-Qualification (Test-Path -LiteralPath $resolvedUpgradeMsiPath -PathType Leaf) "Upgrade MSI is missing: $resolvedUpgradeMsiPath"
     Assert-Qualification (Test-Path -LiteralPath $resolvedFixturePath -PathType Leaf) "Windows service fixture is missing: $resolvedFixturePath"
     Assert-Qualification ([IO.Path]::GetExtension($resolvedFixturePath) -ieq '.exe') "Windows service fixture must be an .exe."
+    Assert-Qualification (Test-Path -LiteralPath $resolvedS4UFixturePath -PathType Leaf) "Windows S4U fixture is missing: $resolvedS4UFixturePath"
+    Assert-Qualification ([IO.Path]::GetExtension($resolvedS4UFixturePath) -ieq '.exe') "Windows S4U fixture must be an .exe."
+    Assert-Qualification (Test-Path -LiteralPath $resolvedS4UTestExecutable -PathType Leaf) "Windows S4U test executable is missing: $resolvedS4UTestExecutable"
+    Assert-Qualification ([IO.Path]::GetExtension($resolvedS4UTestExecutable) -ieq '.exe') "Windows S4U test executable must be an .exe."
+    Assert-Qualification (Test-Path -LiteralPath $resolvedHostinstallTestExecutable -PathType Leaf) "Windows host-install qualification test executable is missing: $resolvedHostinstallTestExecutable"
+    Assert-Qualification ([IO.Path]::GetExtension($resolvedHostinstallTestExecutable) -ieq '.exe') "Windows host-install qualification test executable must be an .exe."
     Assert-Qualification ([Environment]::Is64BitOperatingSystem) 'Qualification requires a 64-bit Windows operating system.'
     $nativeArchitecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
     $expectedArchitecture = if ($Architecture -eq 'amd64') { 'X64' } else { 'Arm64' }
@@ -204,10 +222,28 @@ function Assert-InstalledPayload {
     Assert-Qualification ($registry.Architecture -eq $expectedWixPlatform) "Architecture=$($registry.Architecture), expected $expectedWixPlatform."
     Assert-Qualification ($registry.Channel -eq 'stable') 'Installed channel is incorrect.'
 
-    foreach ($file in @('pb.exe', 'pb-launcher.exe', 'paperboat-runtime.exe', 'paperboat-hostd.exe', 'paperboat-updater.exe')) {
+    foreach ($file in @('pb.exe', 'pb-launcher.exe')) {
         $path = Join-Path $script:binaryRoot $file
         Assert-Qualification (Test-Path -LiteralPath $path -PathType Leaf) "Installed payload is missing $path."
     }
+    $immutableReleaseRoot = Join-Path $script:installRoot "releases\versions\$ExpectedVersion"
+    foreach ($file in @('paperboat-runtime.exe', 'paperboat-hostd.exe', 'paperboat-updater.exe')) {
+        $path = Join-Path $immutableReleaseRoot $file
+        Assert-Qualification (Test-Path -LiteralPath $path -PathType Leaf) "Installed immutable payload is missing $path."
+    }
+    foreach ($probe in @(
+        @{ File = 'paperboat-runtime.exe'; Arguments = @('auth') },
+        @{ File = 'paperboat-hostd.exe'; Arguments = @('--version') },
+        @{ File = 'paperboat-updater.exe'; Arguments = @('__runtime-worker') }
+    )) {
+        $rolePath = Join-Path $immutableReleaseRoot $probe.File
+        [string[]] $roleArguments = $probe.Arguments
+        $output = @(& $rolePath @roleArguments 2>&1)
+        $exitCode = $LASTEXITCODE
+        Assert-Qualification ($exitCode -eq 2) "$($probe.File) accepted forbidden command '$($probe.Arguments -join ' ')' or returned exit code $exitCode instead of 2: $($output -join ' ')"
+        Assert-Qualification (($output -join ' ') -match 'service artifact cannot run that command') "$($probe.File) did not report the role allowlist rejection: $($output -join ' ')"
+    }
+    Add-QualificationEvent -Name 'role_artifact_allowlist' -Status 'passed' -Detail "version=$ExpectedVersion; runtime_cli_rejected=true; hostd_cli_rejected=true; updater_worker_rejected=true"
     $cliTarget = Join-Path $script:installRoot 'releases\cli-current\pb.exe'
     Assert-Qualification (Test-Path -LiteralPath $cliTarget -PathType Leaf) "Stable CLI target is missing $cliTarget."
     $launcherOutput = @(& (Join-Path $script:binaryRoot 'pb.exe') --version 2>&1)
@@ -240,7 +276,7 @@ function Assert-InstalledPayload {
         $expectedArgument = if ($service.Name -eq 'PaperboatHostd') { '__runtime-hostd' } else { '__runtime-updated' }
         Assert-Qualification ($service.StartMode -eq 'Manual') "$($service.Name) StartMode=$($service.StartMode), expected Manual from the MSI demand-start contract."
         Assert-Qualification ($service.StartName -ieq 'LocalSystem') "$($service.Name) StartName=$($service.StartName), expected LocalSystem."
-        Assert-Qualification ($service.PathName -match [regex]::Escape((Join-Path $script:binaryRoot $expectedBinary))) "$($service.Name) does not point at its installed binary: $($service.PathName)"
+        Assert-Qualification ($service.PathName -match [regex]::Escape((Join-Path $immutableReleaseRoot $expectedBinary))) "$($service.Name) does not point at its immutable installed binary: $($service.PathName)"
         Assert-Qualification ($service.PathName -match [regex]::Escape($expectedArgument)) "$($service.Name) is missing its fixed runtime argument: $($service.PathName)"
     }
     Add-QualificationEvent -Name 'msi_payload_assertions' -Status 'passed' -Detail "version=$ExpectedVersion; services=PaperboatHostd,PaperboatUpdated; stable_launcher_version=true"
@@ -364,6 +400,34 @@ function Invoke-GoQualification {
     }
 }
 
+function Invoke-S4UDPAPIQualification {
+    $previousFixture = $env:PAPERBOAT_WINDOWS_E2E_S4U_FIXTURE
+    $previousOwnerSID = $env:PAPERBOAT_WINDOWS_E2E_S4U_OWNER_SID
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    Assert-Qualification ($null -ne $identity.User) 'The native runner identity has no Windows SID.'
+    $env:PAPERBOAT_WINDOWS_E2E_S4U_FIXTURE = $resolvedS4UFixturePath
+    $env:PAPERBOAT_WINDOWS_E2E_S4U_OWNER_SID = $identity.User.Value
+    try {
+        Add-QualificationEvent -Name 'native_s4u_dpapi' -Status 'started' -Detail "owner_sid=$($identity.User.Value); architecture=$Architecture"
+        $arguments = @('-test.v', '-test.run', '^TestNativeLoggedOutS4UDPAPIQualification$', '-test.count', '1', '-test.timeout', '2m')
+        & $resolvedS4UTestExecutable @arguments
+        Assert-Qualification ($LASTEXITCODE -eq 0) "Native logged-out S4U DPAPI qualification failed with exit code $LASTEXITCODE."
+        Add-QualificationEvent -Name 'native_s4u_dpapi' -Status 'passed' -Detail "owner_sid=$($identity.User.Value); architecture=$Architecture; dpapi_readable=true"
+    }
+    finally {
+        $env:PAPERBOAT_WINDOWS_E2E_S4U_FIXTURE = $previousFixture
+        $env:PAPERBOAT_WINDOWS_E2E_S4U_OWNER_SID = $previousOwnerSID
+    }
+}
+
+function Invoke-LegacySecurityMigrationQualification {
+    Add-QualificationEvent -Name 'native_legacy_security_migration' -Status 'started' -Detail 'isolated owner-FULL root/config/token ACL fixture'
+    $arguments = @('-test.v', '-test.run', '^TestNativeLegacyOwnerFullSecurityMigration$', '-test.count', '1', '-test.timeout', '2m')
+    & $resolvedHostinstallTestExecutable @arguments
+    Assert-Qualification ($LASTEXITCODE -eq 0) "Native legacy Windows security migration qualification failed with exit code $LASTEXITCODE."
+    Add-QualificationEvent -Name 'native_legacy_security_migration' -Status 'passed' -Detail 'owner_full_rejected_before=true; owner_read_only_after=true; config_unchanged=true'
+}
+
 function Write-QualificationReport {
     param([string] $Failure = '')
     $operatingSystem = Get-CimInstance -ClassName Win32_OperatingSystem
@@ -403,6 +467,8 @@ function Write-QualificationReport {
 
 try {
     Assert-Preflight
+    Invoke-S4UDPAPIQualification
+    Invoke-LegacySecurityMigrationQualification
     Invoke-GoQualification
     Stage-MsiPathFixtures
 

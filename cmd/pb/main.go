@@ -80,6 +80,7 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/remotepath"
 	"github.com/pinksaucepasta/paperboat/internal/resolver"
 	"github.com/pinksaucepasta/paperboat/internal/selector"
+	"github.com/pinksaucepasta/paperboat/internal/selfupdate"
 	servepkg "github.com/pinksaucepasta/paperboat/internal/serve"
 	"github.com/pinksaucepasta/paperboat/internal/session"
 	"github.com/pinksaucepasta/paperboat/internal/statusbar"
@@ -189,6 +190,10 @@ func terminalArgs(minimum int) cobra.PositionalArgs {
 }
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	if !windowsArtifactCommandAllowed(buildinfo.WindowsArtifactRole, args) {
+		fmt.Fprintln(stderr, "pb: This service artifact cannot run that command.")
+		return 2
+	}
 	root := newRootCommand()
 	root.SetOut(stdout)
 	root.SetErr(stderr)
@@ -219,6 +224,25 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	return 1
 }
 
+func windowsArtifactCommandAllowed(role string, args []string) bool {
+	if role == "" || role == "cli" {
+		return true
+	}
+	if len(args) == 0 {
+		return false
+	}
+	switch role {
+	case "runtime":
+		return args[0] == "__runtime-worker" || args[0] == "__windows-sshd-service"
+	case "hostd":
+		return args[0] == "__runtime-hostd"
+	case "updater":
+		return args[0] == "__runtime-updated" || args[0] == "__runtime-activate"
+	default:
+		return false
+	}
+}
+
 func userFacingError(err error) string {
 	if err == nil {
 		return ""
@@ -240,10 +264,13 @@ func userFacingError(err error) string {
 		return "Your Paperboat session is no longer valid. Run `pb auth login`, then retry."
 	}
 	if errors.Is(err, config.ErrSecretNotFound) {
-		return "This CLI is signed in but not paired for private transport. Run `pb auth login --recovery-key /absolute/recovery-key-file`."
+		return "This CLI is signed in but not paired for private transport. Run `pb auth login` and approve it from a paired device."
 	}
 	if errors.Is(err, identitybootstrap.ErrPairingRequired) {
-		return "This CLI needs the account recovery key before private transport can be enabled. Rerun `pb auth login --recovery-key /absolute/recovery-key-file`."
+		return "This CLI needs approval from a paired device before private transport can be enabled. Rerun `pb auth login`."
+	}
+	if errors.Is(err, identitybootstrap.ErrEnrollmentExpired) {
+		return "Private transport approval expired. Keep a paired device online and rerun `pb auth login`."
 	}
 	var uninstallErr uninstallCleanupError
 	if errors.As(err, &uninstallErr) {
@@ -368,6 +395,16 @@ func runtimeWorkerCommand() *cobra.Command {
 func updatedRuntimeCommand() *cobra.Command {
 	return &cobra.Command{Use: "__runtime-updated", Hidden: true, DisableFlagParsing: true, RunE: func(command *cobra.Command, args []string) error {
 		code := hostruntimecmd.Execute(command.Context(), append([]string{"updated"}, args...), command.InOrStdin(), command.OutOrStdout(), command.ErrOrStderr())
+		if code != 0 {
+			return exitCodeError{code: code}
+		}
+		return nil
+	}, SilenceUsage: true, SilenceErrors: true}
+}
+
+func activatorRuntimeCommand() *cobra.Command {
+	return &cobra.Command{Use: "__runtime-activate", Hidden: true, DisableFlagParsing: true, RunE: func(command *cobra.Command, args []string) error {
+		code := hostruntimecmd.Execute(command.Context(), append([]string{"activate"}, args...), command.InOrStdin(), command.OutOrStdout(), command.ErrOrStderr())
 		if code != 0 {
 			return exitCodeError{code: code}
 		}
@@ -2605,6 +2642,7 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(hostdRuntimeCommand())
 	root.AddCommand(runtimeWorkerCommand())
 	root.AddCommand(updatedRuntimeCommand())
+	root.AddCommand(activatorRuntimeCommand())
 	root.AddCommand(windowsSSHDServiceCommand())
 	root.AddCommand(localDaemonCommand())
 	root.AddCommand(statusCommand())
@@ -2663,7 +2701,11 @@ func actionUpdateCheck(command *cobra.Command, _ []string) error {
 	if err != nil {
 		return fmt.Errorf("check with paperboat-updated: %w", err)
 	}
-	result := updateCheckResult{InstalledVersion: buildinfo.Version, LatestVersion: response.Version, UpdateAvailable: response.Version != "" && response.Version != buildinfo.Version, Verified: true}
+	available, err := signedUpdateAvailable(buildinfo.Version, response.Version)
+	if err != nil {
+		return fmt.Errorf("validate signed update version: %w", err)
+	}
+	result := updateCheckResult{InstalledVersion: buildinfo.Version, LatestVersion: response.Version, UpdateAvailable: available, Verified: true}
 	jsonOutput, _ := command.Flags().GetBool("json")
 	if jsonOutput {
 		return json.NewEncoder(command.OutOrStdout()).Encode(map[string]any{"schema_version": "1.0", "ok": true, "data": result})
@@ -2674,6 +2716,17 @@ func actionUpdateCheck(command *cobra.Command, _ []string) error {
 		fmt.Fprintf(command.OutOrStdout(), "pb %s is up to date.\n", buildinfo.Version)
 	}
 	return nil
+}
+
+func signedUpdateAvailable(installed, latest string) (bool, error) {
+	if latest == "" {
+		return false, nil
+	}
+	comparison, err := selfupdate.CompareVersions(latest, installed)
+	if err != nil {
+		return false, err
+	}
+	return comparison > 0, nil
 }
 
 type updateStatusResult struct {
@@ -2731,6 +2784,12 @@ func actionUpdate(command *cobra.Command, _ []string) error {
 	if err != nil {
 		return fmt.Errorf("update with paperboat-updated: %w", err)
 	}
+	if runtime.GOOS == "windows" && response.Pending {
+		response, err = waitForWindowsUpdateActivation(ctx, response.Version)
+		if err != nil {
+			return fmt.Errorf("wait for Paperboat Windows activation: %w", err)
+		}
+	}
 	result := updateResult{PreviousVersion: buildinfo.Version, Version: response.Version, CLIUpdated: response.Updated, RuntimeUpdated: response.Updated, SupervisorUpdated: response.Supervisor.Applied}
 	jsonOutput, _ := command.Flags().GetBool("json")
 	if jsonOutput {
@@ -2742,6 +2801,31 @@ func actionUpdate(command *cobra.Command, _ []string) error {
 	}
 	fmt.Fprintf(command.OutOrStdout(), "Updated Paperboat runtime to %s.\n", result.Version)
 	return nil
+}
+
+func waitForWindowsUpdateActivation(ctx context.Context, version string) (updated.ControlResponse, error) {
+	if version == "" {
+		return updated.ControlResponse{}, errors.New("updater returned an empty pending version")
+	}
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		client, err := updated.NewClient(updatedControlSocket(), 10*time.Second)
+		if err == nil {
+			status, statusErr := client.Status(ctx)
+			if statusErr == nil && status.ActivationFailure != "" {
+				return updated.ControlResponse{}, errors.New(status.ActivationFailure)
+			}
+			if statusErr == nil && status.Version == version && !status.Pending && status.Updated {
+				return status, nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return updated.ControlResponse{}, ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 func actionApproveMaintenance(command *cobra.Command, _ []string) error {
@@ -2758,6 +2842,13 @@ func actionApproveMaintenance(command *cobra.Command, _ []string) error {
 	response, err := client.ApproveMaintenance(ctx, release)
 	if err != nil {
 		return fmt.Errorf("approve supervisor maintenance: %w", err)
+	}
+	if runtime.GOOS == "windows" && response.Pending {
+		activated, waitErr := waitForWindowsUpdateActivation(ctx, response.Version)
+		if waitErr != nil {
+			return fmt.Errorf("wait for Paperboat Windows maintenance activation: %w", waitErr)
+		}
+		response.Version, response.Supervisor.Version, response.Supervisor.Applied, response.Supervisor.MaintenanceRequired = activated.Version, activated.Version, true, false
 	}
 	jsonOutput, _ := command.Flags().GetBool("json")
 	if jsonOutput {
@@ -5240,24 +5331,31 @@ func authLoginMode(c *command.Context, replace bool) error {
 	if err != nil {
 		return err
 	}
+	if err := store.Recover(cfg.ServerURL); err != nil {
+		return fmt.Errorf("recover interrupted Paperboat sign-in: %w", err)
+	}
 	if err := drainPendingRevocations(c.Context, cfg.ServerURL, store); err != nil {
 		fmt.Fprintln(os.Stderr, "Warning: an earlier session is still being revoked. Paperboat will retry automatically.")
 	}
 	var previous *config.Profile
+	repairProfile := false
 	if existingProfile, existingErr := store.Load(cfg.ServerURL); existingErr == nil {
 		if !replace {
 			credential, credentialErr := store.CredentialFor(cfg.ServerURL)
-			if credentialErr != nil {
-				return credentialErr
+			if credentialErr == nil {
+				if err := ensureCLIIdentityForLogin(c, store, existingProfile, credential); err != nil {
+					return err
+				}
+				if err := ensureLocalDaemonService(c.Context, cfg); err != nil {
+					return fmt.Errorf("repair local SSH integration: %w", err)
+				}
+				fmt.Fprintf(os.Stdout, "Signed in as %s\n", firstNonEmpty(existingProfile.Account.Email, existingProfile.Account.DisplayName, existingProfile.Account.ID))
+				return nil
 			}
-			if err := ensureCLIIdentityForLogin(c, store, existingProfile, credential); err != nil {
-				return err
-			}
-			if err := ensureLocalDaemonService(c.Context, cfg); err != nil {
-				return fmt.Errorf("repair local SSH integration: %w", err)
-			}
-			fmt.Fprintf(os.Stdout, "Signed in as %s\n", firstNonEmpty(existingProfile.Account.Email, existingProfile.Account.DisplayName, existingProfile.Account.ID))
-			return nil
+			// A profile whose credential pair is missing, corrupt, or unreadable
+			// cannot repair itself. Keep it authoritative until the replacement
+			// device authorization is fully persisted, then atomically replace it.
+			repairProfile = true
 		}
 		previous = &existingProfile
 	} else if !errors.Is(existingErr, config.ErrNoCredentials) {
@@ -5329,10 +5427,10 @@ func authLoginMode(c *command.Context, replace bool) error {
 		}
 		p := config.Profile{Issuer: cfg.ServerURL, CLIClientSessionID: tokens.CLIClientSessionID, AccessExpiresAt: expires, Account: config.Account{ID: me.ID, Email: me.Email, DisplayName: me.DisplayName}}
 		var saveErr error
-		if previous != nil {
-			saveErr = store.Switch(previous.CLIClientSessionID, p, cred)
+		if repairProfile {
+			saveErr = committedProfileMutation(store, p, cred, store.Repair(previous.CLIClientSessionID, p, cred))
 		} else {
-			saveErr = store.Save(p, cred)
+			saveErr = persistAuthorizedProfile(store, previous, p, cred)
 		}
 		if errors.Is(saveErr, config.ErrCredentialStoreUnavailable) && previous == nil && !cfg.Auth.AllowFileFallback {
 			fallbackStore, fallbackErr := fileCredentialFallback(cfg)
@@ -5380,18 +5478,17 @@ func ensureLocalDaemonService(ctx context.Context, cfg *config.Config) error {
 	return installLocalDaemonService(ctx, executable, configPath, cfg.ServerURL)
 }
 
-func ensureCLIIdentity(ctx context.Context, store config.ProfileStore, profile config.Profile, credential config.Credential) error {
-	_, err := identitybootstrap.Bootstrap(ctx, identitybootstrap.Request{Store: store, Client: api.New(profile.Issuer, credential, nil), Issuer: profile.Issuer, AccountID: profile.Account.ID, CLIClientSessionID: profile.CLIClientSessionID})
-	return err
-}
-
 func ensureCLIIdentityForLogin(c *command.Context, store config.ProfileStore, profile config.Profile, credential config.Credential) error {
 	if input := strings.TrimSpace(c.String("recovery-key")); input != "" {
 		if err := importRecoveryKey(store, profile, input); err != nil {
 			return err
 		}
+		_, err := identitybootstrap.Bootstrap(c.Context, identitybootstrap.Request{Store: store, Client: api.New(profile.Issuer, credential, nil), Issuer: profile.Issuer, AccountID: profile.Account.ID, CLIClientSessionID: profile.CLIClientSessionID})
+		return err
 	}
-	return ensureCLIIdentity(c.Context, store, profile, credential)
+	client := api.New(profile.Issuer, credential, nil)
+	_, err := identitybootstrap.EnrollCLI(c.Context, identitybootstrap.CLIRequest{Store: store, Client: client, Issuer: profile.Issuer, AccountID: profile.Account.ID, CLIClientSessionID: profile.CLIClientSessionID})
+	return err
 }
 
 func importRecoveryKey(store config.ProfileStore, profile config.Profile, input string) error {
@@ -5507,10 +5604,41 @@ func cleanupIssuedSession(issuer, cliClientSessionID, refreshToken string, store
 	return nil
 }
 
+func persistAuthorizedProfile(store config.ProfileStore, previous *config.Profile, profile config.Profile, credential config.Credential) error {
+	var err error
+	if previous != nil {
+		err = store.Switch(previous.CLIClientSessionID, profile, credential)
+	} else {
+		err = store.Save(profile, credential)
+	}
+	return committedProfileMutation(store, profile, credential, err)
+}
+
+// A lock-release or post-commit cleanup failure must not make authLogin revoke
+// a newly active session. Reconcile the authoritative profile and both secret
+// values before deciding that a mutation failed.
+func committedProfileMutation(store config.ProfileStore, profile config.Profile, credential config.Credential, mutationErr error) error {
+	if mutationErr == nil {
+		return nil
+	}
+	active, err := store.Load(profile.Issuer)
+	if err != nil || active.CLIClientSessionID != profile.CLIClientSessionID {
+		return mutationErr
+	}
+	activeCredential, err := store.CredentialFor(profile.Issuer)
+	if err != nil || activeCredential.AccessToken != credential.AccessToken || activeCredential.RefreshToken != credential.RefreshToken {
+		return mutationErr
+	}
+	return nil
+}
+
 func authStatus(c *command.Context) error {
 	cfg, store, err := requireAuthConfig(c)
 	if err != nil {
 		return err
+	}
+	if err := store.Recover(cfg.ServerURL); err != nil {
+		return fmt.Errorf("recover interrupted Paperboat sign-in: %w", err)
 	}
 	p, err := store.Load(cfg.ServerURL)
 	if errors.Is(err, config.ErrNoCredentials) {
@@ -5522,6 +5650,9 @@ func authStatus(c *command.Context) error {
 	}
 	if err != nil {
 		return err
+	}
+	if _, err := store.CredentialFor(cfg.ServerURL); err != nil {
+		return fmt.Errorf("Paperboat sign-in credentials are unavailable; run `pb auth login` to repair them: %w", err)
 	}
 	if c.Bool("json") {
 		return json.NewEncoder(os.Stdout).Encode(map[string]any{"signed_in": true, "issuer": p.Issuer, "cli_client_session_id": p.CLIClientSessionID, "access_expires_at": p.AccessExpiresAt, "account": p.Account})
@@ -5535,27 +5666,18 @@ func authLogout(c *command.Context) error {
 	if err != nil {
 		return err
 	}
-	var refreshTokens []string
-	if credential, credentialErr := store.CredentialFor(cfg.ServerURL); credentialErr == nil && strings.TrimSpace(credential.RefreshToken) != "" {
-		refreshTokens = append(refreshTokens, credential.RefreshToken)
+	if err := store.Recover(cfg.ServerURL); err != nil {
+		return fmt.Errorf("recover interrupted Paperboat sign-in: %w", err)
 	}
-	if records, recordsErr := store.PendingRevocations(cfg.ServerURL); recordsErr == nil {
-		for _, record := range records {
-			credential, credentialErr := store.PendingRevocationCredential(record)
-			if credentialErr == nil && strings.TrimSpace(credential.RefreshToken) != "" {
-				refreshTokens = append(refreshTokens, credential.RefreshToken)
-			}
+	logoutCredentials, err := store.TakeLogoutCredentials(cfg.ServerURL)
+	if err != nil {
+		return fmt.Errorf("remove local Paperboat sessions: %w", err)
+	}
+	refreshTokens := make([]string, 0, len(logoutCredentials))
+	for _, credential := range logoutCredentials {
+		if strings.TrimSpace(credential.RefreshToken) != "" {
+			refreshTokens = append(refreshTokens, credential.RefreshToken)
 		}
-	}
-	if _, removeErr := store.Remove(cfg.ServerURL); removeErr != nil && !errors.Is(removeErr, config.ErrNoCredentials) {
-		// Remove may report an unreadable credential after successfully deleting
-		// the profile. Only fail when local profile metadata still exists.
-		if _, remainingErr := store.Load(cfg.ServerURL); !errors.Is(remainingErr, config.ErrNoCredentials) {
-			return fmt.Errorf("remove local Paperboat session: %w", removeErr)
-		}
-	}
-	if err := store.DiscardPendingRevocations(cfg.ServerURL); err != nil {
-		return fmt.Errorf("clear local pending revocations: %w", err)
 	}
 	if len(refreshTokens) > 0 {
 		revokeCtx, cancel := context.WithTimeout(c.Context, 2*time.Second)

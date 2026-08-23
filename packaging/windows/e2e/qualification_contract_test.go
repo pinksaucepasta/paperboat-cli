@@ -55,6 +55,11 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 		"repair",
 		"upgrade",
 		"uninstall",
+		"native_s4u_dpapi",
+		"TestNativeLoggedOutS4UDPAPIQualification",
+		"TestNativeLegacyOwnerFullSecurityMigration",
+		"native_legacy_security_migration",
+		"role_artifact_allowlist",
 	} {
 		if !strings.Contains(string(harness), requiredText) {
 			t.Fatalf("native MSI harness is missing %q", requiredText)
@@ -124,6 +129,12 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 		"Invoke-NativeWindowsQualification.ps1",
 		"-FreshMsiPath",
 		"PAPERBOAT_WINDOWS_NATIVE_REPORT",
+		"PAPERBOAT_WINDOWS_E2E_S4U_FIXTURE",
+		"PAPERBOAT_WINDOWS_E2E_S4U_TEST",
+		"PAPERBOAT_WINDOWS_E2E_HOSTINSTALL_TEST",
+		"native_legacy_security_migration",
+		"native_s4u_dpapi",
+		"role_artifact_allowlist",
 	} {
 		if !strings.Contains(string(releaseWorkflow), requiredText) {
 			t.Fatalf("release candidate qualification is missing %q", requiredText)

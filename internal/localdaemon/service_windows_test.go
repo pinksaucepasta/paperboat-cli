@@ -8,9 +8,11 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
+	hostruntimeservice "github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
 	"golang.org/x/sys/windows"
 )
 
@@ -71,6 +73,27 @@ func TestInstallWindowsCurrentUserServiceStartsDetachedUserDaemon(t *testing.T) 
 	wantArguments := []string{"__local-daemon", "--config", configPath, "--server", "https://api.example.test"}
 	if !reflect.DeepEqual(startedArguments, wantArguments) {
 		t.Fatalf("started arguments=%q want=%q", startedArguments, wantArguments)
+	}
+}
+
+func TestResolveManagedWindowsDaemonExecutableUsesStableLauncherForReleaseSlot(t *testing.T) {
+	root := t.TempDir()
+	layout := hostruntimeservice.Layout{
+		InstallRoot: root,
+		CLICurrent:  filepath.Join(root, "releases", "cli-current", "pb.exe"),
+	}
+	launcher := filepath.Join(root, "bin", "pb.exe")
+	activeSlot := filepath.Join(filepath.Dir(layout.CLICurrent), "pb.slot-next.exe")
+	valid := func(path string) bool { return strings.EqualFold(path, launcher) }
+	if got := resolveManagedWindowsDaemonExecutable(activeSlot, layout, valid); !strings.EqualFold(got, launcher) {
+		t.Fatalf("managed daemon executable = %q, want stable launcher %q", got, launcher)
+	}
+	outside := filepath.Join(root, "fixture", "pb.exe")
+	if got := resolveManagedWindowsDaemonExecutable(outside, layout, valid); got != outside {
+		t.Fatalf("development executable = %q, want %q", got, outside)
+	}
+	if got := resolveManagedWindowsDaemonExecutable(activeSlot, layout, func(string) bool { return false }); got != activeSlot {
+		t.Fatalf("missing launcher fallback = %q, want %q", got, activeSlot)
 	}
 }
 
