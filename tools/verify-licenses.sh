@@ -24,6 +24,7 @@ test "$mathutil_version" = "v1.7.1" || {
 	echo "modernc.org/mathutil license exception requires v1.7.1, found $mathutil_version" >&2
 	exit 1
 }
+GOTOOLCHAIN=local go mod download modernc.org/mathutil@v1.7.1
 mathutil_license=$(GOTOOLCHAIN=local go env GOMODCACHE)/modernc.org/mathutil@v1.7.1/LICENSE
 test -f "$mathutil_license" || {
 	echo "modernc.org/mathutil v1.7.1 LICENSE is missing from the module cache" >&2
