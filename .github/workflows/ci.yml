@@ -23,10 +23,21 @@ jobs:
           cache: true
       - name: Install repository check dependencies
         run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - name: Fetch pinned Codex protocol source
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_root="$RUNNER_TEMP/openai-codex"
+          git init "$source_root"
+          git -C "$source_root" remote add origin https://github.com/openai/codex.git
+          git -C "$source_root" fetch --depth=1 origin refs/tags/rust-v0.149.1:refs/tags/rust-v0.149.1
+          test "$(git -C "$source_root" rev-parse 'rust-v0.149.1^{}')" = ff29a44391deccde0aba0f8390337d7f3c319ea4
+          git -C "$source_root" checkout --detach ff29a44391deccde0aba0f8390337d7f3c319ea4
+          echo "CODEX_SOURCE=$source_root" >> "$GITHUB_ENV"
       - name: Run non-duplicated quality checks
         run: >-
           make verify-toolchain contracts dependencies source-policy metrics-check
-          hosted-image-check fmt-check generate-check tidy-check vet build
+          hosted-image-check fmt-check generate-check codex-manifest-check tidy-check vet build
 
   race:
     name: Linux race detector
