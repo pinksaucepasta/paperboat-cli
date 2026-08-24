@@ -38,7 +38,8 @@ func protectedDACLMatches(got *windows.SECURITY_DESCRIPTOR, expected string) boo
 		return false
 	}
 	actual := dacl(got.String())
-	if actual == dacl(expected) {
+	expectedDACL := dacl(expected)
+	if actual == expectedDACL {
 		return true
 	}
 	token, err := windows.OpenCurrentProcessToken()
@@ -50,10 +51,14 @@ func protectedDACLMatches(got *windows.SECURITY_DESCRIPTOR, expected string) boo
 	if err != nil || user == nil || user.User.Sid == nil {
 		return false
 	}
-	if !strings.HasSuffix(user.User.Sid.String(), "-500") {
+	return daclMatchesLocalAdministratorAlias(actual, expectedDACL, user.User.Sid.String())
+}
+
+func daclMatchesLocalAdministratorAlias(actual, expected, userSID string) bool {
+	if !strings.HasSuffix(userSID, "-500") {
 		return false
 	}
-	return actual == dacl(strings.Replace(expected, user.User.Sid.String(), "LA", 1))
+	return actual == strings.ReplaceAll(expected, userSID, "LA")
 }
 
 // OwnerMatchesSID rejects attacker-owned filesystem objects even when their
