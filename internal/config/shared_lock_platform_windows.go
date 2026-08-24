@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"unsafe"
 
 	"github.com/pinksaucepasta/paperboat/internal/windowssecurity"
@@ -223,42 +222,11 @@ func openSharedLockDirectory(path string, writable bool) (windows.Handle, error)
 		windows.CloseHandle(handle)
 		return 0, fmt.Errorf("shared lock path %s is not an ordinary directory: %w", path, ErrCredentialStoreUnavailable)
 	}
-	if !sharedLockHandlePathMatches(handle, path) {
+	if !windowssecurity.HandlePathMatches(handle, path) {
 		windows.CloseHandle(handle)
 		return 0, fmt.Errorf("shared lock path %s resolves through a different filesystem object: %w", path, ErrCredentialStoreUnavailable)
 	}
 	return handle, nil
-}
-
-func sharedLockHandlePathMatches(handle windows.Handle, expected string) bool {
-	buffer := make([]uint16, 256)
-	for {
-		n, err := windows.GetFinalPathNameByHandle(handle, &buffer[0], uint32(len(buffer)), 0)
-		if err != nil || n == 0 {
-			return false
-		}
-		if n < uint32(len(buffer)) {
-			actual := windows.UTF16ToString(buffer[:n])
-			return normalizeSharedLockPath(actual) == normalizeSharedLockPath(expected)
-		}
-		if n >= 32768 {
-			return false
-		}
-		buffer = make([]uint16, n+1)
-	}
-}
-
-func normalizeSharedLockPath(path string) string {
-	if strings.HasPrefix(path, `\\?\UNC\`) {
-		path = `\\` + strings.TrimPrefix(path, `\\?\UNC\`)
-	} else {
-		path = strings.TrimPrefix(path, `\\?\`)
-	}
-	abs, err := filepath.Abs(path)
-	if err == nil {
-		path = abs
-	}
-	return strings.ToLower(filepath.Clean(path))
 }
 
 func writeSharedLockOwner(path string, data []byte) (resultErr error) {

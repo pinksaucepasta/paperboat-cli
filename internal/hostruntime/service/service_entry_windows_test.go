@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf16"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -144,7 +145,7 @@ func TestOwnerEnvironmentIsCreateProcessCompatible(t *testing.T) {
 	if len(block) < 2 || block[len(block)-1] != 0 || block[len(block)-2] != 0 {
 		t.Fatalf("owner environment is not double-NUL terminated: %#v", block)
 	}
-	if !strings.Contains(windows.UTF16ToString(block), "PAPERBOAT_CONTROL_URL=https://api.example.test") {
+	if !strings.Contains(string(utf16.Decode(block)), "PAPERBOAT_CONTROL_URL=https://api.example.test") {
 		t.Fatal("owner environment dropped the control URL required by the S4U workload")
 	}
 }

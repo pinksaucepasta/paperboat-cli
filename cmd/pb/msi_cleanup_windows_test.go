@@ -226,7 +226,7 @@ func TestMSIRuntimeSlotCleanupRejectsNonEmptySlotResidue(t *testing.T) {
 		t.Fatalf("foreign file was removed with runtime slot: %v", err)
 	}
 
-	malformed := filepath.Join(root, "releases", "runtime-current", "paperboat-runtime.exe")
+	malformed := filepath.Join(root, "malformed-runtime-current", "paperboat-runtime.exe")
 	if err := os.MkdirAll(malformed, 0o700); err != nil {
 		t.Fatal(err)
 	}

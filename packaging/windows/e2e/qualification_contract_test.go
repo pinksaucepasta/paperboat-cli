@@ -83,6 +83,7 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	harnessText := normalizeQualificationText(string(harness))
 	for _, requiredText := range []string{
 		"msiexec.exe",
 		"/i",
@@ -235,19 +236,19 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 		"-test.run', '^TestNativeMSIPreview",
 		"runtime-current service/declaration removal and ownership-conflict preservation cases passed",
 	} {
-		if !strings.Contains(string(harness), requiredText) {
+		if !strings.Contains(harnessText, requiredText) {
 			t.Fatalf("native MSI harness is missing %q", requiredText)
 		}
 	}
-	previewDeclarations := string(harness)
+	previewDeclarations := harnessText
 	if strings.Contains(previewDeclarations, "Get-ChildItem -Force -File -LiteralPath $definitionRoot") {
 		t.Fatal("preview declaration preflight must inspect directories and reparse entries, not only regular files")
 	}
-	if strings.Contains(string(harness), "$output = @(& $rolePath @roleArguments 2>&1)") {
+	if strings.Contains(harnessText, "$output = @(& $rolePath @roleArguments 2>&1)") {
 		t.Fatal("role-artifact allowlist probes must use the scoped PowerShell 5.1-safe native capture helper")
 	}
 	for _, forbiddenText := range []string{"Start-Process -FilePath $ownerPreparationExecutable", "-Credential $credential", "-LoadUserProfile", "^TestNativeMSIPreviewCleanup$", "Set-Acl -LiteralPath $Path -AclObject $security", "$security.SetOwner($system)", "[string] $NativeTestExecutable = ''", "-ExecutablePath 'go'", "$report | ConvertTo-Json -Depth 10 | Set-Content"} {
-		if strings.Contains(string(harness), forbiddenText) {
+		if strings.Contains(harnessText, forbiddenText) {
 			t.Fatalf("native MSI harness retains Session 0 alternate-credential launch %q", forbiddenText)
 		}
 	}
@@ -387,6 +388,26 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 		if !strings.Contains(string(releaseWorkflow), requiredText) {
 			t.Fatalf("release candidate qualification is missing %q", requiredText)
 		}
+	}
+}
+
+func normalizeQualificationText(value string) string {
+	value = strings.ReplaceAll(value, "\r\n", "\n")
+	return strings.ReplaceAll(value, "\r", "\n")
+}
+
+func TestNormalizeQualificationTextAcceptsWindowsAndUnixLineEndings(t *testing.T) {
+	want := "first\nsecond\nthird"
+	for name, input := range map[string]string{
+		"LF":   "first\nsecond\nthird",
+		"CRLF": "first\r\nsecond\r\nthird",
+		"CR":   "first\rsecond\rthird",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := normalizeQualificationText(input); got != want {
+				t.Fatalf("normalized text = %q, want %q", got, want)
+			}
+		})
 	}
 }
 

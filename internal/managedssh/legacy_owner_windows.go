@@ -9,7 +9,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/pinksaucepasta/paperboat/internal/windowssecurity"
 	"golang.org/x/sys/windows"
@@ -54,7 +53,7 @@ func openPinnedWindowsSSHFile(path string, extraAccess uint32) (*pinnedWindowsSS
 		windows.CloseHandle(handle)
 		return nil, false, err
 	}
-	if information.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0 || information.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 || information.NumberOfLinks != 1 || !windowsSSHHandlePathMatches(handle, path) {
+	if information.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0 || information.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 || information.NumberOfLinks != 1 || !windowssecurity.HandlePathMatches(handle, path) {
 		windows.CloseHandle(handle)
 		return nil, false, ErrOpenSSHConfigConflict
 	}
@@ -69,31 +68,6 @@ func openPinnedWindowsSSHFile(path string, extraAccess uint32) (*pinnedWindowsSS
 		return nil, false, errors.Join(ErrOpenSSHConfigConflict, err, closeErr)
 	}
 	return &pinnedWindowsSSHFile{file: file, handle: handle, value: value}, true, nil
-}
-
-func windowsSSHHandlePathMatches(handle windows.Handle, expected string) bool {
-	buffer := make([]uint16, 256)
-	for {
-		n, err := windows.GetFinalPathNameByHandle(handle, &buffer[0], uint32(len(buffer)), 0)
-		if err != nil || n == 0 {
-			return false
-		}
-		if n < uint32(len(buffer)) {
-			actual := windows.UTF16ToString(buffer[:n])
-			if strings.HasPrefix(actual, `\\?\UNC\`) {
-				actual = `\\` + strings.TrimPrefix(actual, `\\?\UNC\`)
-			} else {
-				actual = strings.TrimPrefix(actual, `\\?\`)
-			}
-			actualPath, actualErr := filepath.Abs(actual)
-			expectedPath, expectedErr := filepath.Abs(expected)
-			return actualErr == nil && expectedErr == nil && strings.EqualFold(filepath.Clean(actualPath), filepath.Clean(expectedPath))
-		}
-		if n >= 32768 {
-			return false
-		}
-		buffer = make([]uint16, n+1)
-	}
 }
 
 func migrateLegacyWindowsManagedSSHState(directory, sid string) error {
