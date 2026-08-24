@@ -18,18 +18,13 @@ func secureIdentityFile(path string, info os.FileInfo, requirePrivateMode bool) 
 	if !requirePrivateMode {
 		return true
 	}
-	token, err := windows.OpenCurrentProcessToken()
+	userSID, err := windowssecurity.CurrentEffectiveUserSID()
 	if err != nil {
 		return false
 	}
-	defer token.Close()
-	user, err := token.GetTokenUser()
-	if err != nil || user == nil || user.User.Sid == nil || !user.User.Sid.IsValid() {
-		return false
-	}
 	descriptor := "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
-	if user.User.Sid.String() != "S-1-5-18" {
-		descriptor += "(A;;FA;;;" + user.User.Sid.String() + ")"
+	if userSID.String() != "S-1-5-18" {
+		descriptor += "(A;;FA;;;" + userSID.String() + ")"
 	}
 	want, err := windows.SecurityDescriptorFromString(descriptor)
 	return err == nil && windowssecurity.ProtectedDACLMatches(path, want.String())
@@ -41,16 +36,11 @@ func secureIdentityPath(path string, info os.FileInfo, requirePrivateMode bool) 
 	if !secureIdentityFile(path, info, requirePrivateMode) {
 		return false
 	}
-	token, err := windows.OpenCurrentProcessToken()
+	userSID, err := windowssecurity.CurrentEffectiveUserSID()
 	if err != nil {
 		return false
 	}
-	defer token.Close()
-	user, err := token.GetTokenUser()
-	if err != nil || user == nil || user.User.Sid == nil {
-		return false
-	}
-	want, err := windows.SecurityDescriptorFromString("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + user.User.Sid.String() + ")")
+	want, err := windows.SecurityDescriptorFromString("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + userSID.String() + ")")
 	if err != nil {
 		return false
 	}

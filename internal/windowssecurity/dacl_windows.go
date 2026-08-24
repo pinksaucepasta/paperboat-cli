@@ -42,16 +42,11 @@ func protectedDACLMatches(got *windows.SECURITY_DESCRIPTOR, expected string) boo
 	if actual == expectedDACL {
 		return true
 	}
-	token, err := windows.OpenCurrentProcessToken()
+	userSID, err := CurrentEffectiveUserSID()
 	if err != nil {
 		return false
 	}
-	defer token.Close()
-	user, err := token.GetTokenUser()
-	if err != nil || user == nil || user.User.Sid == nil {
-		return false
-	}
-	return daclMatchesLocalAdministratorAlias(actual, expectedDACL, user.User.Sid.String())
+	return daclMatchesLocalAdministratorAlias(actual, expectedDACL, userSID.String())
 }
 
 func daclMatchesLocalAdministratorAlias(actual, expected, userSID string) bool {

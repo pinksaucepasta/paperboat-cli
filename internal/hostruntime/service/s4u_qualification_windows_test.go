@@ -21,6 +21,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
 	"github.com/pinksaucepasta/paperboat/internal/config"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/identity"
 	"github.com/pinksaucepasta/paperboat/internal/windowssecurity"
@@ -135,7 +136,35 @@ func prepareS4UPreviewIdentityFixture(t *testing.T, reportPath string) string {
 	}); err != nil {
 		t.Fatalf("save S4U preview machine-control fixture: %v", err)
 	}
+	reopened, err := identity.Open(identity.Config{StateRoot: stateRoot})
+	if err != nil {
+		t.Fatalf("reopen S4U preview identity store as effective owner: %v", err)
+	}
+	if _, err := reopened.Registration(); err != nil {
+		t.Fatalf("reopen S4U preview registration as effective owner: %v", err)
+	}
+	if _, err := reopened.MachineControl(time.Now().UTC(), 0); err != nil {
+		t.Fatalf("reopen S4U preview machine-control as effective owner: %v", err)
+	}
 	return stateRoot
+}
+
+func assertQualificationIdentityOwner(t *testing.T, stateRoot, ownerSID string) {
+	t.Helper()
+	sid, err := windows.StringToSid(ownerSID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"machine-identity.json", "machine-registration.json", "machine-control.json"} {
+		path := filepath.Join(stateRoot, name)
+		if !windowssecurity.OwnerMatchesSID(path, sid) {
+			t.Fatalf("qualification identity file %s is not owned by impersonated owner %s", name, ownerSID)
+		}
+		descriptor := "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + ownerSID + ")"
+		if !windowssecurity.ProtectedDACLMatches(path, descriptor) {
+			t.Fatalf("qualification identity file %s does not have the effective owner's protected DACL", name)
+		}
+	}
 }
 
 func qualificationProfilePrivilegeScope() (func() error, error) {
@@ -344,6 +373,10 @@ func assertQualificationKeyringOwner(t *testing.T, localAppData, ref, ownerSID s
 func TestNativePrepareS4UDPAPIQualification(t *testing.T) {
 	withQualificationOwner(t, func(token windows.Token) {
 		ownerSID := requiredS4UOwnerSID(t)
+		effectiveSID, err := windowssecurity.CurrentEffectiveUserSID()
+		if err != nil || effectiveSID.String() != ownerSID {
+			t.Fatalf("effective qualification owner SID = %v, want %s: %v", effectiveSID, ownerSID, err)
+		}
 		var effectiveToken windows.Token
 		if err := windows.OpenThreadToken(windows.CurrentThread(), windows.TOKEN_QUERY, true, &effectiveToken); err != nil {
 			t.Fatalf("open effective owner token: %v", err)
@@ -380,10 +413,47 @@ func TestNativePrepareS4UDPAPIQualification(t *testing.T) {
 		if err := os.Remove(probePath); err != nil {
 			t.Fatalf("remove owner qualification access probe: %v", err)
 		}
+		atomicProbePath := reportPath + ".atomic-owner"
+		for _, value := range []string{"effective-owner-v1", "effective-owner-v2"} {
+			if err := atomicfile.Write(atomicProbePath, []byte(value), atomicfile.CurrentOwnerOptions(0o600)); err != nil {
+				t.Fatalf("write effective-owner atomic fixture: %v", err)
+			}
+		}
+		if body, err := os.ReadFile(atomicProbePath); err != nil || string(body) != "effective-owner-v2" {
+			t.Fatalf("reopen effective-owner atomic fixture: body=%q err=%v", body, err)
+		}
+		owner, err := windows.StringToSid(ownerSID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ownerDescriptor := "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + ownerSID + ")"
+		if !windowssecurity.OwnerMatchesSID(atomicProbePath, owner) || !windowssecurity.ProtectedDACLMatches(atomicProbePath, ownerDescriptor) {
+			t.Fatal("effective-owner atomic replacement did not preserve the owner and protected DACL")
+		}
+		if err := os.Remove(atomicProbePath); err != nil {
+			t.Fatalf("remove effective-owner atomic fixture: %v", err)
+		}
+		fileSecretDirectory := reportPath + ".file-secret-owner"
+		fileSecrets := config.FileSecretStore{Dir: fileSecretDirectory}
+		const fileSecretRef = "runtime-transfer-key"
+		const fileSecretValue = "paperboat-s4u-owner-file-secret-v2"
+		if err := fileSecrets.Set(fileSecretRef, fileSecretValue); err != nil {
+			t.Fatalf("write effective-owner FileSecretStore fixture: %v", err)
+		}
+		if value, err := fileSecrets.Get(fileSecretRef); err != nil || value != fileSecretValue {
+			t.Fatalf("reopen effective-owner FileSecretStore fixture: value=%q err=%v", value, err)
+		}
+		if err := fileSecrets.Delete(fileSecretRef); err != nil {
+			t.Fatalf("delete effective-owner FileSecretStore fixture: %v", err)
+		}
+		if err := os.Remove(fileSecretDirectory); err != nil {
+			t.Fatalf("remove effective-owner FileSecretStore directory: %v", err)
+		}
 		prepareProductionKeyringFixtures(t, reportPath, false)
-		prepareS4UPreviewIdentityFixture(t, reportPath)
+		previewStateRoot := prepareS4UPreviewIdentityFixture(t, reportPath)
 		assertQualificationKeyringOwner(t, localAppData, reportPath, ownerSID)
 		assertQualificationKeyringOwner(t, localAppData, reportPath+"-migrated", ownerSID)
+		assertQualificationIdentityOwner(t, previewStateRoot, ownerSID)
 	})
 }
 

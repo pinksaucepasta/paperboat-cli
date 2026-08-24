@@ -286,19 +286,11 @@ func createProtectedTemporary(parent, descriptor string) (*os.File, string, erro
 }
 
 func currentOwnerSecurityDescriptor() (string, error) {
-	token, err := windows.OpenCurrentProcessToken()
+	userSID, err := windowssecurity.CurrentEffectiveUserSID()
 	if err != nil {
 		return "", err
 	}
-	defer token.Close()
-	user, err := token.GetTokenUser()
-	if err != nil || user == nil || user.User.Sid == nil || !user.User.Sid.IsValid() {
-		if err == nil {
-			err = errors.New("current Windows token has no valid owner SID")
-		}
-		return "", err
-	}
-	sid := user.User.Sid.String()
+	sid := userSID.String()
 	descriptor := "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
 	if sid != "S-1-5-18" {
 		descriptor += "(A;;FA;;;" + sid + ")"

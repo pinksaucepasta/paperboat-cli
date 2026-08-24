@@ -62,16 +62,11 @@ func currentUserCredentialSDDL() (string, error) {
 }
 
 func currentUserSID() (*windows.SID, error) {
-	token, err := currentEffectiveUserToken()
+	sid, err := windowssecurity.CurrentEffectiveUserSID()
 	if err != nil {
 		return nil, fmt.Errorf("%w: open current Windows token: %v", ErrCredentialStoreUnavailable, err)
 	}
-	defer token.Close()
-	user, err := token.GetTokenUser()
-	if err != nil || user == nil || user.User.Sid == nil || !user.User.Sid.IsValid() {
-		return nil, fmt.Errorf("%w: resolve current Windows SID: %v", ErrCredentialStoreUnavailable, err)
-	}
-	return user.User.Sid, nil
+	return sid, nil
 }
 
 func currentEffectiveUserToken() (windows.Token, error) {
@@ -252,8 +247,29 @@ func openDPAPISecurityObject(path string, parentReadOnly bool) (windows.Handle, 
 		access |= windows.FILE_TRAVERSE
 	}
 	handle, err := windows.CreateFile(pointer, access, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+	reducedOwnerAccess := false
+	if !parentReadOnly && errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+		// An object's owner has implicit READ_CONTROL and WRITE_DAC, but not
+		// WRITE_OWNER. S4U owner workloads therefore need the narrower handle
+		// when securing a directory they just created. Keep the full-access
+		// attempt first so trusted legacy ownership migrations retain their
+		// existing WRITE_OWNER handle; the reduced handle cannot broaden them.
+		access = windows.READ_CONTROL | windows.FILE_READ_ATTRIBUTES | windows.WRITE_DAC
+		handle, err = windows.CreateFile(pointer, access, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+		reducedOwnerAccess = err == nil
+	}
 	if err != nil {
 		return 0, windows.ByHandleFileInformation{}, "", err
+	}
+	if reducedOwnerAccess {
+		ownerSID, ownerErr := currentUserSID()
+		if ownerErr != nil || !windowssecurity.HandleOwnerMatchesSID(handle, ownerSID) {
+			windows.CloseHandle(handle)
+			if ownerErr != nil {
+				return 0, windows.ByHandleFileInformation{}, "", ownerErr
+			}
+			return 0, windows.ByHandleFileInformation{}, "", windows.ERROR_ACCESS_DENIED
+		}
 	}
 	information, finalPath, err := inspectDPAPIDirectoryHandle(handle)
 	if err != nil {
