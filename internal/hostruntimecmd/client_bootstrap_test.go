@@ -215,6 +215,10 @@ func (bootstrapClientStub) BootstrapE2EE(context.Context, string, api.E2EEBootst
 func (bootstrapClientStub) RequestCLIEndpoint(context.Context, api.CLIEndpointRequestInput) (api.PendingEndpointIdentity, error) {
 	return api.PendingEndpointIdentity{}, errors.New("not used by this test")
 }
+
+func (bootstrapClientStub) CLIEndpointRequestStatus(context.Context, string) (api.EndpointRequestStatus, error) {
+	return api.EndpointRequestStatus{}, errors.New("not used by this test")
+}
 func (bootstrapClientStub) EndpointCertificate(context.Context, string, uint64) (api.EndpointCertificateDocument, error) {
 	return api.EndpointCertificateDocument{}, errors.New("not used by this test")
 }

@@ -20,6 +20,7 @@ type bootstrapCLIClient interface {
 	E2EERoot(context.Context) (api.E2EERoot, error)
 	BootstrapE2EE(context.Context, string, api.E2EEBootstrapInput) (api.E2EEBootstrapResult, error)
 	RequestCLIEndpoint(context.Context, api.CLIEndpointRequestInput) (api.PendingEndpointIdentity, error)
+	CLIEndpointRequestStatus(context.Context, string) (api.EndpointRequestStatus, error)
 	EndpointCertificate(context.Context, string, uint64) (api.EndpointCertificateDocument, error)
 }
 

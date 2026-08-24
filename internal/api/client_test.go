@@ -273,6 +273,29 @@ func TestRequestCLIEndpointUsesBoundHTTPContract(t *testing.T) {
 	}
 }
 
+func TestCLIEndpointRequestStatusUsesExactAccountScopedContract(t *testing.T) {
+	expected := EndpointRequestStatus{
+		RequestID: "per_0123456789abcdef", AccountID: "account_1", EndpointID: "cli_session_01", Role: "cli", Generation: 1,
+		NoisePublicKey: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE", QUICPublicKey: "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI",
+		CreatedAt: time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC), ExpiresAt: time.Date(2026, 8, 3, 12, 5, 0, 0, time.UTC),
+		SafetyCode: "abcde-fghij", State: "denied",
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.EscapedPath() != "/v1/e2ee/endpoint-requests/per_0123456789abcdef" || r.Header.Get("Authorization") != "Bearer token" {
+			t.Fatalf("request=%s %s authorization=%q", r.Method, r.URL.EscapedPath(), r.Header.Get("Authorization"))
+		}
+		writeData(w, http.StatusOK, expected)
+	}))
+	defer server.Close()
+	got, err := New(server.URL, config.Credential{AccessToken: "token"}, server.Client()).CLIEndpointRequestStatus(context.Background(), expected.RequestID)
+	if err != nil || got != expected {
+		t.Fatalf("status=%+v err=%v", got, err)
+	}
+	if _, err := New(server.URL, config.Credential{AccessToken: "token"}, server.Client()).CLIEndpointRequestStatus(context.Background(), ""); err == nil {
+		t.Fatal("empty enrollment request identity was accepted")
+	}
+}
+
 func TestBootstrapE2EEUsesIdempotencyAndStrictResponse(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodPost || request.URL.Path != "/v1/e2ee/bootstrap" || request.Header.Get("Idempotency-Key") != "bootstrap-operation-0123456789" {

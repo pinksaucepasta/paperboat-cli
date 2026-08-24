@@ -363,6 +363,22 @@ type PendingEndpointIdentity struct {
 	SafetyCode     string    `json:"safety_code"`
 }
 
+// EndpointRequestStatus is the account-scoped authoritative state of a
+// one-shot endpoint enrollment request. It contains public keys only.
+type EndpointRequestStatus struct {
+	RequestID      string    `json:"request_id"`
+	AccountID      string    `json:"account_id"`
+	EndpointID     string    `json:"endpoint_id"`
+	Role           string    `json:"role"`
+	Generation     uint64    `json:"generation"`
+	NoisePublicKey string    `json:"noise_public_key"`
+	QUICPublicKey  string    `json:"quic_public_key"`
+	CreatedAt      time.Time `json:"created_at"`
+	ExpiresAt      time.Time `json:"expires_at"`
+	SafetyCode     string    `json:"safety_code"`
+	State          string    `json:"state"`
+}
+
 // CLIEndpointRequestInput contains only public endpoint keys. The request is
 // signed later by an already paired CLI and never carries a root private key.
 type CLIEndpointRequestInput struct {
@@ -399,6 +415,21 @@ func (c *Client) RequestCLIEndpoint(ctx context.Context, input CLIEndpointReques
 	var out PendingEndpointIdentity
 	if err := c.doWithHeaders(ctx, http.MethodPost, "/v1/e2ee/endpoint-requests", input, &out, http.Header{"Idempotency-Key": []string{input.OperationID}}); err != nil {
 		return PendingEndpointIdentity{}, err
+	}
+	return out, nil
+}
+
+// CLIEndpointRequestStatus reads one enrollment request through the
+// authenticated account boundary. The server deliberately returns not found
+// for both a missing request and a request owned by another account.
+func (c *Client) CLIEndpointRequestStatus(ctx context.Context, requestID string) (EndpointRequestStatus, error) {
+	if strings.TrimSpace(requestID) == "" {
+		return EndpointRequestStatus{}, errors.New("CLI endpoint enrollment request identity is invalid")
+	}
+	var out EndpointRequestStatus
+	path := "/v1/e2ee/endpoint-requests/" + url.PathEscape(requestID)
+	if err := c.doStrict(ctx, http.MethodGet, path, nil, &out); err != nil {
+		return EndpointRequestStatus{}, err
 	}
 	return out, nil
 }
