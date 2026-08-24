@@ -2,11 +2,16 @@ package localdaemon
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"reflect"
 	"sync"
 	"testing"
@@ -87,6 +92,69 @@ func TestAuthenticatedMachineSourceRunsAutomaticPeerApprovalBeforePublishing(t *
 	}
 	if calls != 1 {
 		t.Fatalf("automatic approval calls = %d", calls)
+	}
+}
+
+func TestAuthenticatedMachineSourceReportsMissingSignerWithoutHidingInventory(t *testing.T) {
+	rootPublic, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootFingerprint := sha256.Sum256(rootPublic)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/v1/machines":
+			_, _ = writer.Write([]byte(`{"data":{"items":[],"pagination":{"limit":200,"offset":0,"total":0,"next_offset":null}}}`))
+		case "/v1/e2ee/pending-endpoints":
+			_ = json.NewEncoder(writer).Encode(map[string]any{"data": []api.PendingEndpointIdentity{{RequestID: "per_cli_0123456789", EndpointID: "cli_new", Role: "cli", State: "pending", Generation: 1, CreatedAt: time.Now().UTC(), ExpiresAt: time.Now().UTC().Add(time.Minute), SafetyCode: "abcde-fghij"}}})
+		case "/v1/e2ee/root":
+			_ = json.NewEncoder(writer).Encode(map[string]any{"data": api.E2EERoot{Version: 1, PublicKey: base64.RawURLEncoding.EncodeToString(rootPublic), Fingerprint: hex.EncodeToString(rootFingerprint[:]), Generation: 1}})
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+	rootDir := t.TempDir()
+	store := config.ProfileStore{Path: rootDir, Secrets: config.FileSecretStore{Dir: filepath.Join(rootDir, "secrets")}}
+	if err := store.SavePeerAccountRootPublic(server.URL, "account_1", rootPublic); err != nil {
+		t.Fatal(err)
+	}
+	profile := config.Profile{Issuer: server.URL, Account: config.Account{ID: "account_1"}, CLIClientSessionID: "cli_daemon"}
+	var reported []PeerApprovalSignerUnavailableError
+	source := AuthenticatedMachineSource{
+		ServerURL: server.URL,
+		Auth:      &rotatingAuthSource{},
+		AutoApprovePeerEnrollments: func(ctx context.Context, client *api.Client, machines []api.UserMachine) error {
+			return ApproveOwnedPeerEnrollments(ctx, store, profile, client, machines)
+		},
+		ReportPeerApprovalSignerUnavailable: RateLimitedPeerApprovalReporter(time.Now, time.Minute, func(issue PeerApprovalSignerUnavailableError) {
+			reported = append(reported, issue)
+		}),
+	}
+	for range 2 {
+		machines, err := source.ListUserMachines(context.Background())
+		if err != nil || len(machines) != 0 {
+			t.Fatalf("machines=%+v err=%v", machines, err)
+		}
+	}
+	if len(reported) != 1 || reported[0].PendingRequests != 1 {
+		t.Fatalf("reported=%+v", reported)
+	}
+}
+
+func TestRateLimitedPeerApprovalReporterBoundsRepeatedRefreshes(t *testing.T) {
+	now := time.Date(2026, 8, 25, 0, 0, 0, 0, time.UTC)
+	var reports []PeerApprovalSignerUnavailableError
+	reporter := RateLimitedPeerApprovalReporter(func() time.Time { return now }, time.Minute, func(issue PeerApprovalSignerUnavailableError) {
+		reports = append(reports, issue)
+	})
+	reporter(PeerApprovalSignerUnavailableError{PendingRequests: 1})
+	reporter(PeerApprovalSignerUnavailableError{PendingRequests: 2})
+	now = now.Add(time.Minute)
+	reporter(PeerApprovalSignerUnavailableError{PendingRequests: 2})
+	if len(reports) != 2 || reports[0].PendingRequests != 1 || reports[1].PendingRequests != 2 {
+		t.Fatalf("reports=%+v", reports)
 	}
 }
 

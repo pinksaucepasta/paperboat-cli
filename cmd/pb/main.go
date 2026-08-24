@@ -480,6 +480,9 @@ func localDaemonCommand() *cobra.Command {
 				return err
 			}
 			source := &localdaemon.AuthenticatedMachineSource{ServerURL: cfg.ServerURL, Auth: authSource}
+			source.ReportPeerApprovalSignerUnavailable = localdaemon.RateLimitedPeerApprovalReporter(time.Now, time.Minute, func(issue localdaemon.PeerApprovalSignerUnavailableError) {
+				diagnosticlog.TryInfo("peer enrollment signer unavailable", "reason", "verifier_only", "pending_requests", issue.PendingRequests)
+			})
 			source.SourceMachineID, err = configuredMachineID()
 			if err != nil {
 				return err

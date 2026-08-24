@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/pinksaucepasta/paperboat/internal/api"
 	"github.com/pinksaucepasta/paperboat/internal/config"
+	"github.com/pinksaucepasta/paperboat/internal/peertransport/endpointidentity"
 )
 
 func TestApproveOwnedPeerEnrollmentsAutomaticCLIApproval(t *testing.T) {
@@ -115,6 +117,133 @@ func TestApproveOwnedPeerEnrollmentsAutomaticCLIApproval(t *testing.T) {
 				t.Fatalf("PUT attempts=%d want=%d", got, tc.wantAttempts)
 			}
 		})
+	}
+}
+
+func TestApproveOwnedPeerEnrollmentsVerifierOnlyReturnsTypedNonSignerForMixedPending(t *testing.T) {
+	rootDir := t.TempDir()
+	store := config.ProfileStore{Path: rootDir, Secrets: config.FileSecretStore{Dir: filepath.Join(rootDir, "secrets")}}
+	const accountID, daemonID = "account_1", "cli_daemon"
+	serverNow := time.Now().UTC().Truncate(time.Second)
+	rootPublic, rootPrivate, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootSum := sha256.Sum256(rootPublic)
+	if err := store.SavePeerAccountRootPublic("https://api.example.test", accountID, rootPublic); err != nil {
+		t.Fatal(err)
+	}
+	endpointKeys, err := store.PeerEndpointKeys("https://api.example.test", accountID, daemonID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	quicPublic := endpointKeys.QUICPrivate.Public().(ed25519.PublicKey)
+	verifierCertificate, err := endpointidentity.Sign(rootPrivate, endpointidentity.Claims{AccountID: accountID, Role: endpointidentity.RoleCLI, EndpointID: daemonID, NoisePublicKey: endpointKeys.NoisePublic, QUICPublicKey: quicPublic, Generation: 1, Serial: 1, IssuedAt: serverNow.Add(-time.Minute), ExpiresAt: serverNow.Add(time.Hour)})
+	clear(rootPrivate)
+	clearPeerKeysForTest(&endpointKeys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifierRaw, err := verifierCertificate.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SavePeerCertificate("https://api.example.test", daemonID, verifierRaw); err != nil {
+		t.Fatal(err)
+	}
+	clear(verifierRaw)
+	pending := []api.PendingEndpointIdentity{
+		{RequestID: "per_cli_0123456789", EndpointID: "cli_new", Role: "cli", State: "pending", Generation: 1, CreatedAt: serverNow, ExpiresAt: serverNow.Add(time.Minute), SafetyCode: "abcde-fghij"},
+		{RequestID: "per_machine_012345", EndpointID: "machine_1", Role: "machine", State: "pending", Generation: 1, CreatedAt: serverNow, ExpiresAt: serverNow.Add(time.Minute), SafetyCode: "klmno-pqrst"},
+	}
+	var puts int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPut {
+			atomic.AddInt32(&puts, 1)
+		}
+		switch r.URL.Path {
+		case "/v1/e2ee/pending-endpoints":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": pending})
+		case "/v1/e2ee/root":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": api.E2EERoot{Version: 1, PublicKey: base64.RawURLEncoding.EncodeToString(rootPublic), Fingerprint: hex.EncodeToString(rootSum[:]), Generation: 1}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	profile := config.Profile{Issuer: "https://api.example.test", Account: config.Account{ID: accountID}, CLIClientSessionID: daemonID}
+	client := api.New(server.URL, config.Credential{AccessToken: "token"}, server.Client())
+	err = ApproveOwnedPeerEnrollments(t.Context(), store, profile, client, []api.UserMachine{{ID: "machine_1", State: "active"}})
+	var unavailable *PeerApprovalSignerUnavailableError
+	if !errors.As(err, &unavailable) || unavailable.PendingRequests != 2 || !errors.Is(err, ErrPeerApprovalSignerUnavailable) || atomic.LoadInt32(&puts) != 0 {
+		t.Fatalf("unavailable=%+v puts=%d err=%v root=%x", unavailable, puts, err, rootSum)
+	}
+}
+
+func TestApproveOwnedPeerEnrollmentsVerifierOnlyRootFailuresRemainHard(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		saveLocalPublic bool
+		mismatchRemote  bool
+		rootStatus      int
+	}{
+		{name: "missing local verifier"},
+		{name: "remote root mismatch", saveLocalPublic: true, mismatchRemote: true},
+		{name: "root API failure", saveLocalPublic: true, rootStatus: http.StatusServiceUnavailable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rootDir := t.TempDir()
+			store := config.ProfileStore{Path: rootDir, Secrets: config.FileSecretStore{Dir: filepath.Join(rootDir, "secrets")}}
+			localPublic, _, _ := ed25519.GenerateKey(nil)
+			if tc.saveLocalPublic {
+				if err := store.SavePeerAccountRootPublic("https://api.example.test", "account_1", localPublic); err != nil {
+					t.Fatal(err)
+				}
+			}
+			remotePublic := localPublic
+			if tc.mismatchRemote {
+				remotePublic, _, _ = ed25519.GenerateKey(nil)
+			}
+			remoteFingerprint := sha256.Sum256(remotePublic)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Path {
+				case "/v1/e2ee/pending-endpoints":
+					_ = json.NewEncoder(w).Encode(map[string]any{"data": []api.PendingEndpointIdentity{{RequestID: "per_cli_0123456789", EndpointID: "cli_new", Role: "cli", State: "pending", Generation: 1, CreatedAt: time.Now().UTC(), ExpiresAt: time.Now().UTC().Add(time.Minute), SafetyCode: "abcde-fghij"}}})
+				case "/v1/e2ee/root":
+					if tc.rootStatus != 0 {
+						w.WriteHeader(tc.rootStatus)
+						_, _ = w.Write([]byte(`{"error":{"code":"temporarily_unavailable","message":"unavailable"}}`))
+						return
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{"data": api.E2EERoot{Version: 1, PublicKey: base64.RawURLEncoding.EncodeToString(remotePublic), Fingerprint: hex.EncodeToString(remoteFingerprint[:]), Generation: 1}})
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+			profile := config.Profile{Issuer: "https://api.example.test", Account: config.Account{ID: "account_1"}, CLIClientSessionID: "cli_daemon"}
+			err := ApproveOwnedPeerEnrollments(t.Context(), store, profile, api.New(server.URL, config.Credential{AccessToken: "token"}, server.Client()), nil)
+			var unavailable *PeerApprovalSignerUnavailableError
+			if err == nil || errors.As(err, &unavailable) || errors.Is(err, ErrPeerApprovalSignerUnavailable) {
+				t.Fatalf("non-custody failure was suppressed: unavailable=%+v err=%v", unavailable, err)
+			}
+		})
+	}
+}
+
+func TestApproveOwnedPeerEnrollmentsVerifierOnlyWithoutPendingNeedsNoSigner(t *testing.T) {
+	rootDir := t.TempDir()
+	store := config.ProfileStore{Path: rootDir, Secrets: config.FileSecretStore{Dir: filepath.Join(rootDir, "secrets")}}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": []api.PendingEndpointIdentity{}})
+	}))
+	defer server.Close()
+	profile := config.Profile{Issuer: server.URL, Account: config.Account{ID: "account_1"}, CLIClientSessionID: "cli_daemon"}
+	if err := ApproveOwnedPeerEnrollments(t.Context(), store, profile, api.New(server.URL, config.Credential{AccessToken: "token"}, server.Client()), nil); err != nil {
+		t.Fatal(err)
 	}
 }
 
