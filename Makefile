@@ -19,6 +19,7 @@ LDFLAGS     := -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Version
 
 contracts:
 	@./testdata/contracts/validate.sh
+	@./tools/test-release-version.sh
 
 dependencies:
 	@./tools/verify-peer-dependencies.sh
