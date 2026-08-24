@@ -668,6 +668,11 @@ func TestWindowsMachineScopeSetDoesNotMutateForeignOwnedRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	foreignOwner := changeFixtureOwnerToAdministrators(t, root)
+	sddl, err := currentUserCredentialSDDL()
+	if err != nil {
+		t.Fatal(err)
+	}
+	setWindowsFixtureSecurity(t, root, foreignOwner, sddl+"(A;;FR;;;WD)", true)
 	ref := fmt.Sprintf("native-foreign-root-%d", time.Now().UnixNano())
 	if err := (KeyringStore{}).Set(ref, "machine-secret"); !errors.Is(err, ErrCredentialStoreUnavailable) {
 		t.Fatalf("foreign-owned precreated root Set error=%v", err)

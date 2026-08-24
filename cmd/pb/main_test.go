@@ -854,6 +854,9 @@ func TestInboxPathJSONExecutesWithDisposableIdentity(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if err := inbox.EnsurePath(inboxPath); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("HOME", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(rootPath, "config"))
 	t.Setenv("XDG_STATE_HOME", filepath.Join(rootPath, "state"))

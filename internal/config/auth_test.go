@@ -987,7 +987,7 @@ func TestSharedLockSerializesAndRecoversDeadOwner(t *testing.T) {
 	}
 
 	dead := newSharedLock(path)
-	if err := os.MkdirAll(dead.path, 0o700); err != nil {
+	if err := createSharedLockDirectory(dead.path); err != nil {
 		t.Fatal(err)
 	}
 	hostname, _ := os.Hostname()

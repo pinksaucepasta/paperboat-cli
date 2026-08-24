@@ -115,8 +115,11 @@ func createProtectedTemporary(parent, descriptor string) (*os.File, string, erro
 	}
 	creationDescriptorText := descriptor
 	finalOwner, _, ownerErr := finalDescriptor.Owner()
+	if ownerErr != nil {
+		return nil, "", ownerErr
+	}
 	systemOwner, systemOwnerErr := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
-	transitionToSystem := ownerErr == nil && systemOwnerErr == nil && finalOwner != nil && finalOwner.Equals(systemOwner)
+	transitionToSystem := systemOwnerErr == nil && finalOwner != nil && finalOwner.Equals(systemOwner)
 	var administratorsOwner *windows.SID
 	if transitionToSystem {
 		if !strings.HasPrefix(descriptor, "O:SY") {
@@ -216,6 +219,61 @@ func createProtectedTemporary(parent, descriptor string) (*os.File, string, erro
 				_ = os.Remove(path)
 				return nil, "", transitionErr
 			}
+		} else {
+			// CreateFile may merge an inherited parent ACL even when the supplied
+			// descriptor is protected. Reapply the exact final DACL through the
+			// pinned handle before publication and verify both owner and DACL.
+			expectedOwner := finalOwner
+			if expectedOwner == nil {
+				currentDescriptor, currentErr := windows.GetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION)
+				if currentErr != nil || currentDescriptor == nil {
+					windows.CloseHandle(handle)
+					_ = os.Remove(path)
+					if currentErr == nil {
+						currentErr = windows.ERROR_INVALID_OWNER
+					}
+					return nil, "", currentErr
+				}
+				currentOwner, _, currentErr := currentDescriptor.Owner()
+				if currentErr != nil || currentOwner == nil || !currentOwner.IsValid() {
+					windows.CloseHandle(handle)
+					_ = os.Remove(path)
+					if currentErr == nil {
+						currentErr = windows.ERROR_INVALID_OWNER
+					}
+					return nil, "", currentErr
+				}
+				expectedOwner, currentErr = windows.StringToSid(currentOwner.String())
+				runtime.KeepAlive(currentDescriptor)
+				if currentErr != nil {
+					windows.CloseHandle(handle)
+					_ = os.Remove(path)
+					return nil, "", currentErr
+				}
+			}
+			absoluteDescriptor, absoluteErr := finalDescriptor.ToAbsolute()
+			if absoluteErr != nil {
+				windows.CloseHandle(handle)
+				_ = os.Remove(path)
+				return nil, "", absoluteErr
+			}
+			dacl, _, daclErr := absoluteDescriptor.DACL()
+			if daclErr == nil {
+				daclErr = windows.SetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil)
+			}
+			runtime.KeepAlive(absoluteDescriptor)
+			if daclErr == nil && !windowssecurity.HandleOwnerMatchesSID(handle, expectedOwner) {
+				daclErr = fmt.Errorf("validate protected temporary final owner: %w", windows.ERROR_INVALID_SECURITY_DESCR)
+			}
+			if daclErr == nil && !windowssecurity.ProtectedHandleDACLMatches(handle, descriptor) {
+				daclErr = fmt.Errorf("validate protected temporary final DACL: %w", windows.ERROR_INVALID_SECURITY_DESCR)
+			}
+			if daclErr != nil {
+				windows.CloseHandle(handle)
+				_ = os.Remove(path)
+				return nil, "", daclErr
+			}
+			runtime.KeepAlive(expectedOwner)
 		}
 		file := os.NewFile(uintptr(handle), path)
 		if file == nil {
