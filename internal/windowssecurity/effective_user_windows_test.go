@@ -52,19 +52,11 @@ func TestCurrentEffectiveUserTokenRejectsThreadFailureWithoutFallback(t *testing
 }
 
 func TestCurrentEffectiveUserTokenPreservesThreadToken(t *testing.T) {
-	process, err := windows.OpenCurrentProcessToken()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer process.Close()
-	var impersonation windows.Token
-	if err := windows.DuplicateTokenEx(process, windows.TOKEN_QUERY|windows.TOKEN_IMPERSONATE, nil, windows.SecurityImpersonation, windows.TokenImpersonation, &impersonation); err != nil {
-		t.Fatal(err)
-	}
+	const threadToken = windows.Token(0x1234)
 	processCalled := false
 	token, err := currentEffectiveUserToken(
 		func(target *windows.Token) error {
-			*target = impersonation
+			*target = threadToken
 			return nil
 		},
 		func() (windows.Token, error) {
@@ -73,14 +65,12 @@ func TestCurrentEffectiveUserTokenPreservesThreadToken(t *testing.T) {
 		},
 	)
 	if err != nil {
-		impersonation.Close()
 		t.Fatal(err)
 	}
-	defer token.Close()
 	if processCalled {
 		t.Fatal("available thread token was replaced with the process token")
 	}
-	if token != impersonation {
+	if token != threadToken {
 		t.Fatal("effective token helper did not preserve the opened thread token")
 	}
 }
