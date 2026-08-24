@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 	"unsafe"
@@ -47,9 +48,78 @@ func changeFixtureOwnerToAdministrators(t *testing.T, path string) *windows.SID 
 	return administrators
 }
 
+func preparePrivateWindowsCredentialDirectory(t *testing.T) (string, string) {
+	t.Helper()
+	t.Setenv("LOCALAPPDATA", t.TempDir())
+	directory, err := dpapiCredentialDirectory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sddl, err := currentUserCredentialSDDL()
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, err := currentUserSID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	setWindowsFixtureSecurity(t, directory, owner, sddl, true)
+	if !credentialFilePrivate(directory) {
+		t.Fatal("credential parent fixture is not current-user owned and protected")
+	}
+	return directory, sddl
+}
+
+func setWindowsFixtureSecurity(t *testing.T, path string, owner *windows.SID, sddl string, protected bool) {
+	t.Helper()
+	descriptor, err := windows.SecurityDescriptorFromString(sddl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	absolute, err := descriptor.ToAbsolute()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dacl, _, err := absolute.DACL()
+	if err != nil {
+		t.Fatal(err)
+	}
+	securityInformation := windows.SECURITY_INFORMATION(windows.OWNER_SECURITY_INFORMATION | windows.DACL_SECURITY_INFORMATION | windows.UNPROTECTED_DACL_SECURITY_INFORMATION)
+	if protected {
+		securityInformation = windows.SECURITY_INFORMATION(windows.OWNER_SECURITY_INFORMATION | windows.DACL_SECURITY_INFORMATION | windows.PROTECTED_DACL_SECURITY_INFORMATION)
+	}
+	if err := windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, securityInformation, owner, nil, dacl, nil); err != nil {
+		t.Fatal(err)
+	}
+	runtime.KeepAlive(absolute)
+}
+
+func makeWindowsNetworkTokenDirectoryFixture(t *testing.T, path string, extraACE bool) *windows.SID {
+	t.Helper()
+	administrators := changeFixtureOwnerToAdministrators(t, path)
+	sddl := "D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;S-1-5-5-0-424242)"
+	if extraACE {
+		sddl += "(A;;FR;;;WD)"
+	}
+	setWindowsFixtureSecurity(t, path, administrators, sddl, false)
+	return administrators
+}
+
 func TestWindowsCredentialTargetUsesPrivateNamespace(t *testing.T) {
 	if got, want := windowsCredentialTarget("access-token-v1-123"), "paperboat:access-token-v1-123"; got != want {
 		t.Fatalf("credential target = %q, want %q", got, want)
+	}
+}
+
+func TestWindowsCredentialReadWithoutLogonSessionIsAbsentLegacySource(t *testing.T) {
+	if err := windowsCredentialReadError(windows.ERROR_NO_SUCH_LOGON_SESSION); !errors.Is(err, ErrSecretNotFound) || errors.Is(err, ErrCredentialStoreUnavailable) {
+		t.Fatalf("network-logon legacy read error = %v", err)
+	}
+	if err := windowsCredentialReadError(windows.ERROR_ACCESS_DENIED); !errors.Is(err, ErrCredentialStoreUnavailable) {
+		t.Fatalf("access-denied legacy read error = %v", err)
 	}
 }
 
@@ -103,6 +173,152 @@ func TestWindowsDPAPIAuthorityRoundTrip(t *testing.T) {
 	}
 	if err := store.Delete(ref); err != nil {
 		t.Fatalf("idempotent delete: %v", err)
+	}
+}
+
+func cleanupWindowsKeyringFixture(ref string) {
+	target, err := windowsUTF16(windowsCredentialTarget(ref))
+	if err == nil {
+		_, _, _ = procCredDeleteW.Call(uintptr(unsafe.Pointer(target)), windowsCredentialTypeGeneric, 0)
+	}
+	_ = deleteDPAPISecret(ref)
+}
+
+func TestWindowsDeleteWithoutLogonSessionCommitsTombstone(t *testing.T) {
+	t.Setenv("LOCALAPPDATA", t.TempDir())
+	ref := fmt.Sprintf("native-delete-no-logon-%d", time.Now().UnixNano())
+	t.Cleanup(func() { cleanupWindowsKeyringFixture(ref) })
+	store := KeyringStore{}
+	if err := store.Set(ref, "authoritative-secret"); err != nil {
+		t.Fatal(err)
+	}
+	// Preserve a real legacy value to prove that the tombstone, rather than
+	// absence of a migration source, prevents resurrection.
+	writeLegacyWindowsCredential(t, ref, "stale-legacy-secret")
+	noLogonDelete := func(*uint16) (uintptr, error) {
+		return 0, windows.ERROR_NO_SUCH_LOGON_SESSION
+	}
+	if err := deleteWindowsCredential(ref, noLogonDelete); err != nil {
+		t.Fatalf("delete without Credential Manager logon session: %v", err)
+	}
+	path, _, err := dpapiSecretPath(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(body, keyringDPAPITombstone(ref)) || bytes.Contains(body, []byte("authoritative-secret")) {
+		t.Fatalf("deletion authority is not the exact ref-bound tombstone: body=%x err=%v", body, err)
+	}
+	if !credentialFilePrivate(path) {
+		t.Fatal("deletion tombstone does not have the exact credential owner and ACL")
+	}
+	if value, err := store.Get(ref); value != "" || !errors.Is(err, ErrSecretNotFound) {
+		t.Fatalf("tombstoned credential returned value=%q error=%v", value, err)
+	}
+	if err := deleteWindowsCredential(ref, noLogonDelete); err != nil {
+		t.Fatalf("idempotent delete without Credential Manager logon session: %v", err)
+	}
+
+	// An interactive retry removes both the planted legacy value and marker.
+	if err := store.Delete(ref); err != nil {
+		t.Fatalf("interactive deletion retry: %v", err)
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("tombstone remained after completed legacy cleanup: %v", err)
+	}
+	if value, err := store.Get(ref); value != "" || !errors.Is(err, ErrSecretNotFound) {
+		t.Fatalf("deleted credential returned value=%q error=%v", value, err)
+	}
+}
+
+func TestWindowsDeleteLegacyCompletionRemovesTombstone(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		result uintptr
+		err    error
+	}{
+		{name: "deleted", result: 1},
+		{name: "not-found", err: windows.ERROR_NOT_FOUND},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("LOCALAPPDATA", t.TempDir())
+			ref := fmt.Sprintf("native-delete-complete-%s-%d", test.name, time.Now().UnixNano())
+			t.Cleanup(func() { cleanupWindowsKeyringFixture(ref) })
+			if err := (KeyringStore{}).Set(ref, "delete-me"); err != nil {
+				t.Fatal(err)
+			}
+			if err := deleteWindowsCredential(ref, func(*uint16) (uintptr, error) {
+				return test.result, test.err
+			}); err != nil {
+				t.Fatalf("delete: %v", err)
+			}
+			path, _, err := dpapiSecretPath(ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("DPAPI deletion marker remained: %v", err)
+			}
+		})
+	}
+}
+
+func TestWindowsDeleteUncertainLegacyFailureStaysTombstoned(t *testing.T) {
+	t.Setenv("LOCALAPPDATA", t.TempDir())
+	ref := fmt.Sprintf("native-delete-uncertain-%d", time.Now().UnixNano())
+	t.Cleanup(func() { cleanupWindowsKeyringFixture(ref) })
+	store := KeyringStore{}
+	if err := store.Set(ref, "old-authority"); err != nil {
+		t.Fatal(err)
+	}
+	err := deleteWindowsCredential(ref, func(*uint16) (uintptr, error) {
+		return 0, windows.ERROR_ACCESS_DENIED
+	})
+	if !errors.Is(err, ErrCredentialStoreUnavailable) {
+		t.Fatalf("uncertain legacy cleanup error=%v", err)
+	}
+	path, _, pathErr := dpapiSecretPath(ref)
+	if pathErr != nil {
+		t.Fatal(pathErr)
+	}
+	body, readErr := os.ReadFile(path)
+	if readErr != nil || !bytes.Equal(body, keyringDPAPITombstone(ref)) {
+		t.Fatalf("uncertain cleanup did not retain tombstone: body=%x err=%v", body, readErr)
+	}
+	if value, err := store.Get(ref); value != "" || !errors.Is(err, ErrSecretNotFound) {
+		t.Fatalf("uncertain tombstoned credential returned value=%q error=%v", value, err)
+	}
+	if err := store.Set(ref, "explicit-new-authority"); err != nil {
+		t.Fatalf("replace tombstone: %v", err)
+	}
+	if value, err := store.Get(ref); value != "explicit-new-authority" || err != nil {
+		t.Fatalf("replacement authority value=%q error=%v", value, err)
+	}
+}
+
+func TestWindowsDPAPITombstoneIsBoundToReference(t *testing.T) {
+	t.Setenv("LOCALAPPDATA", t.TempDir())
+	ref := fmt.Sprintf("native-delete-bound-%d", time.Now().UnixNano())
+	otherRef := ref + "-other"
+	t.Cleanup(func() {
+		cleanupWindowsKeyringFixture(ref)
+		cleanupWindowsKeyringFixture(otherRef)
+	})
+	if err := setDPAPISecretTombstone(ref); err != nil {
+		t.Fatal(err)
+	}
+	if err := (KeyringStore{}).Set(otherRef, "placeholder"); err != nil {
+		t.Fatal(err)
+	}
+	otherPath, _, err := dpapiSecretPath(otherRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(otherPath, keyringDPAPITombstone(ref), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if value, err := (KeyringStore{}).Get(otherRef); value != "" || !errors.Is(err, ErrCredentialStoreUnavailable) || errors.Is(err, errDPAPISecretDeleted) {
+		t.Fatalf("wrong-ref tombstone returned value=%q error=%v", value, err)
 	}
 }
 
@@ -252,10 +468,10 @@ func TestWindowsUnreadableLegacyDPAPIRequiresInteractiveLogin(t *testing.T) {
 	}
 }
 
-func TestWindowsMachineScopeCredentialRejectsForeignOwnedDirectory(t *testing.T) {
+func TestWindowsMachineScopeCredentialMigratesTrustedAdministratorsOwnedDirectory(t *testing.T) {
 	t.Setenv("LOCALAPPDATA", t.TempDir())
 	store := KeyringStore{}
-	ref := fmt.Sprintf("native-foreign-owner-%d", time.Now().UnixNano())
+	ref := fmt.Sprintf("native-trusted-legacy-owner-%d", time.Now().UnixNano())
 	t.Cleanup(func() { _ = store.Delete(ref) })
 	if err := store.Set(ref, "machine-secret"); err != nil {
 		t.Fatal(err)
@@ -265,15 +481,22 @@ func TestWindowsMachineScopeCredentialRejectsForeignOwnedDirectory(t *testing.T)
 		t.Fatal(err)
 	}
 	changeFixtureOwnerToAdministrators(t, directory)
-	if value, err := store.Get(ref); value != "" || !errors.Is(err, ErrCredentialStoreUnavailable) {
-		t.Fatalf("foreign-owned credential directory returned value=%q error=%v", value, err)
+	if value, err := store.Get(ref); value != "machine-secret" || err != nil {
+		t.Fatalf("trusted legacy credential directory returned value=%q error=%v", value, err)
+	}
+	owner, err := currentUserSID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !windowssecurity.OwnerMatchesSID(directory, owner) || !credentialFilePrivate(directory) {
+		t.Fatal("trusted legacy credential directory was not migrated to the current owner and protected ACL")
 	}
 }
 
-func TestWindowsMachineScopeCredentialRejectsForeignOwnedFile(t *testing.T) {
+func TestWindowsMachineScopeCredentialMigratesTrustedAdministratorsOwnedFile(t *testing.T) {
 	t.Setenv("LOCALAPPDATA", t.TempDir())
 	store := KeyringStore{}
-	ref := fmt.Sprintf("native-foreign-file-owner-%d", time.Now().UnixNano())
+	ref := fmt.Sprintf("native-trusted-legacy-file-owner-%d", time.Now().UnixNano())
 	t.Cleanup(func() { _ = store.Delete(ref) })
 	if err := store.Set(ref, "machine-secret"); err != nil {
 		t.Fatal(err)
@@ -283,8 +506,133 @@ func TestWindowsMachineScopeCredentialRejectsForeignOwnedFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	changeFixtureOwnerToAdministrators(t, path)
+	if value, err := store.Get(ref); value != "machine-secret" || err != nil {
+		t.Fatalf("trusted legacy credential file returned value=%q error=%v", value, err)
+	}
+	owner, err := currentUserSID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !windowssecurity.OwnerMatchesSID(path, owner) || !credentialFilePrivate(path) {
+		t.Fatal("trusted legacy credential file was not migrated to the current owner and protected ACL")
+	}
+}
+
+func TestWindowsCredentialChildCreatedWithNetworkTokenDefaultsIsSecured(t *testing.T) {
+	directory, sddl := preparePrivateWindowsCredentialDirectory(t)
+	path := filepath.Join(directory, "profiles")
+	created := false
+	err := ensureDPAPIDirectoryWithCreate(path, sddl, func(parent windows.Handle, path, sddl string) (windows.Handle, windows.ByHandleFileInformation, string, error) {
+		created = true
+		handle, information, finalPath, err := createDPAPIDirectoryHandle(parent, path, sddl)
+		if err != nil {
+			return 0, windows.ByHandleFileInformation{}, "", err
+		}
+		makeWindowsNetworkTokenDirectoryFixture(t, path, false)
+		return handle, information, finalPath, nil
+	})
+	if err != nil {
+		t.Fatalf("secure newly created network-token directory: %v", err)
+	}
+	if !created {
+		t.Fatal("network-token creation fixture was not used")
+	}
+	if !credentialFilePrivate(path) {
+		t.Fatal("new network-token directory was not secured to the current user")
+	}
+}
+
+func TestWindowsCredentialLegacyNetworkDirectoriesMigrateUnderPrivateParent(t *testing.T) {
+	for _, name := range []string{"pending-revocations", "transactions"} {
+		t.Run(name, func(t *testing.T) {
+			directory, sddl := preparePrivateWindowsCredentialDirectory(t)
+			path := filepath.Join(directory, name)
+			if err := os.Mkdir(path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			makeWindowsNetworkTokenDirectoryFixture(t, path, false)
+			if err := ensureDPAPIDirectory(path, sddl); err != nil {
+				t.Fatalf("migrate %s network-token directory: %v", name, err)
+			}
+			if !credentialFilePrivate(path) {
+				t.Fatalf("%s network-token directory was not migrated to the current user", name)
+			}
+		})
+	}
+}
+
+func TestWindowsCredentialLegacyNetworkDirectoryRejectsExtraACE(t *testing.T) {
+	directory, sddl := preparePrivateWindowsCredentialDirectory(t)
+	path := filepath.Join(directory, "pending-revocations")
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	administrators := makeWindowsNetworkTokenDirectoryFixture(t, path, true)
+	if err := ensureDPAPIDirectory(path, sddl); !errors.Is(err, ErrCredentialStoreUnavailable) {
+		t.Fatalf("network-token directory with extra ACE error=%v", err)
+	}
+	if !windowssecurity.OwnerMatchesSID(path, administrators) {
+		t.Fatal("rejected network-token directory owner was changed")
+	}
+}
+
+func TestWindowsCredentialLegacyNetworkDirectoryDoesNotBroadenRootMigration(t *testing.T) {
+	localAppData := t.TempDir()
+	t.Setenv("LOCALAPPDATA", localAppData)
+	path := filepath.Join(localAppData, "Paperboat")
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	administrators := makeWindowsNetworkTokenDirectoryFixture(t, path, false)
+	sddl, err := currentUserCredentialSDDL()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureDPAPIDirectory(path, sddl); !errors.Is(err, ErrCredentialStoreUnavailable) {
+		t.Fatalf("network-token Paperboat root error=%v", err)
+	}
+	if !windowssecurity.OwnerMatchesSID(path, administrators) {
+		t.Fatal("rejected network-token Paperboat root owner was changed")
+	}
+}
+
+func TestWindowsMachineScopeCredentialRejectsAdministratorsOwnedFileWithExtraACE(t *testing.T) {
+	t.Setenv("LOCALAPPDATA", t.TempDir())
+	store := KeyringStore{}
+	ref := fmt.Sprintf("native-hostile-legacy-file-owner-%d", time.Now().UnixNano())
+	t.Cleanup(func() { _ = store.Delete(ref) })
+	if err := store.Set(ref, "machine-secret"); err != nil {
+		t.Fatal(err)
+	}
+	path, _, err := dpapiSecretPath(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	administrators := changeFixtureOwnerToAdministrators(t, path)
+	owner, err := currentUserSID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := windows.SecurityDescriptorFromString("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + owner.String() + ")(A;;FR;;;WD)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	absolute, err := descriptor.ToAbsolute()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dacl, _, err := absolute.DACL()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil); err != nil {
+		t.Fatal(err)
+	}
 	if value, err := store.Get(ref); value != "" || !errors.Is(err, ErrCredentialStoreUnavailable) {
-		t.Fatalf("foreign-owned credential file returned value=%q error=%v", value, err)
+		t.Fatalf("Administrators-owned credential with extra ACE returned value=%q error=%v", value, err)
+	}
+	if !windowssecurity.OwnerMatchesSID(path, administrators) {
+		t.Fatal("rejected credential file owner was mutated")
 	}
 }
 

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
+	"github.com/pinksaucepasta/paperboat/internal/windowssecurity"
 	"golang.org/x/sys/windows"
 )
 
@@ -160,10 +161,20 @@ func ValidateInstalledOpenSSHConfig(home string, ownerUID uint32, aliasSuffix, a
 	record, recordSet, err := readWindowsSSHRecord(directory, sid)
 	line := "Include ~/.ssh/paperboat_config # " + openSSHIncludeMarker + "\n"
 	lines := strings.Split(strings.TrimSuffix(string(owned), "\n"), "\n")
-	if err != nil || !mainSet || !ownedSet || !recordSet || record.Version != 1 || record.AliasSuffix != aliasSuffix || !validRecordedInclude(record.IncludeChunk, line) || bytes.Count(main, []byte(record.IncludeChunk)) != 1 || !validOwnedOpenSSHContent(owned, aliasSuffix) || record.OwnedHash != hashOpenSSHBytes(owned) || len(lines) != 15 || lines[4] != "    IdentityAgent \""+strings.ReplaceAll(agentSocket, "\\", "\\\\")+"\"" || lines[5] != "    IdentityFile \""+strings.ReplaceAll(ManagedIdentityPublicKeyPath(home), "\\", "\\\\")+"\"" {
+	wildcard := ownedWildcardLine(lines, aliasSuffix)
+	if err != nil || !mainSet || !ownedSet || !recordSet || record.Version != 1 || record.AliasSuffix != aliasSuffix ||
+		!validRecordedInclude(record.IncludeChunk, line) || bytes.Count(main, []byte(record.IncludeChunk)) != 1 ||
+		!validOwnedOpenSSHContent(owned, aliasSuffix) || record.OwnedHash != hashOpenSSHBytes(owned) || wildcard < 1 ||
+		lines[wildcard+3] != "    IdentityAgent \""+strings.ReplaceAll(agentSocket, "\\", "\\\\")+"\"" ||
+		lines[wildcard+4] != "    IdentityFile \""+strings.ReplaceAll(ManagedIdentityPublicKeyPath(home), "\\", "\\\\")+"\"" {
 		return errors.Join(ErrOpenSSHConfigConflict, err)
 	}
-	return findOpenSSHOptionConflict(main, OpenSSHConfig{AliasSuffix: aliasSuffix, ProxyCommand: strings.TrimPrefix(lines[2], "    ProxyCommand "), KnownHostsCommand: strings.TrimPrefix(lines[3], "    KnownHostsCommand ")})
+	installed := OpenSSHConfig{
+		AliasSuffix:       aliasSuffix,
+		ProxyCommand:      strings.TrimPrefix(lines[wildcard+1], "    ProxyCommand "),
+		KnownHostsCommand: strings.TrimPrefix(lines[wildcard+2], "    KnownHostsCommand "),
+	}
+	return findOpenSSHOptionConflict(main, installed)
 }
 
 func UninstallOpenSSHConfig(home string, _ uint32) (OpenSSHConfigResult, error) {
@@ -273,13 +284,7 @@ func renderOwnedOpenSSHConfig(config OpenSSHConfig) ([]byte, error) {
 func validRecordedInclude(chunk, line string) bool { return chunk == line || chunk == "\n"+line }
 func validOwnedOpenSSHContent(value []byte, suffix string) bool {
 	lines := strings.Split(strings.TrimSuffix(string(value), "\n"), "\n")
-	wildcard := -1
-	for index, line := range lines {
-		if line == "Host *."+suffix && (index-1)%3 == 0 {
-			wildcard = index
-			break
-		}
-	}
+	wildcard := ownedWildcardLine(lines, suffix)
 	if wildcard < 1 || len(lines) != wildcard+15 || lines[0] != openSSHBeginMarker || lines[len(lines)-1] != openSSHEndMarker {
 		return false
 	}
@@ -288,8 +293,32 @@ func validOwnedOpenSSHContent(value []byte, suffix string) bool {
 			return false
 		}
 	}
-	return strings.HasPrefix(lines[wildcard+1], "    ProxyCommand ") && strings.HasPrefix(lines[wildcard+2], "    KnownHostsCommand ") && strings.HasPrefix(lines[wildcard+3], "    IdentityAgent \\") && strings.HasSuffix(lines[wildcard+3], "\"") && strings.HasPrefix(lines[wildcard+4], "    IdentityFile \\") && strings.HasSuffix(lines[wildcard+4], "\"") && lines[wildcard+5] == "    IdentitiesOnly yes" && lines[wildcard+6] == "    BatchMode yes" && lines[wildcard+7] == "    PasswordAuthentication no" && lines[wildcard+8] == "    KbdInteractiveAuthentication no" && lines[wildcard+9] == "    StrictHostKeyChecking yes" && lines[wildcard+10] == "    CheckHostIP no" && lines[wildcard+11] == "    UserKnownHostsFile none" && lines[wildcard+12] == "    GlobalKnownHostsFile none" && lines[wildcard+13] == "    CanonicalizeHostname yes"
+	agent, agentValid := decodeWindowsOpenSSHOption(lines[wildcard+3], "    IdentityAgent ")
+	identity, identityValid := decodeWindowsOpenSSHOption(lines[wildcard+4], "    IdentityFile ")
+	return strings.HasPrefix(lines[wildcard+1], "    ProxyCommand ") && strings.HasPrefix(lines[wildcard+2], "    KnownHostsCommand ") && agentValid && validWindowsAgentPipe(agent) && identityValid && filepath.IsAbs(identity) && strings.EqualFold(filepath.Base(identity), ManagedIdentityPublicKeyFilename) && strings.EqualFold(filepath.Base(filepath.Dir(identity)), ".ssh") && lines[wildcard+5] == "    IdentitiesOnly yes" && lines[wildcard+6] == "    BatchMode yes" && lines[wildcard+7] == "    PasswordAuthentication no" && lines[wildcard+8] == "    KbdInteractiveAuthentication no" && lines[wildcard+9] == "    StrictHostKeyChecking yes" && lines[wildcard+10] == "    CheckHostIP no" && lines[wildcard+11] == "    UserKnownHostsFile none" && lines[wildcard+12] == "    GlobalKnownHostsFile none" && lines[wildcard+13] == "    CanonicalizeHostname yes"
 }
+
+func decodeWindowsOpenSSHOption(line, prefix string) (string, bool) {
+	if !strings.HasPrefix(line, prefix+"\"") || !strings.HasSuffix(line, "\"") {
+		return "", false
+	}
+	encoded := strings.TrimSuffix(strings.TrimPrefix(line, prefix+"\""), "\"")
+	if encoded == "" || strings.ContainsRune(encoded, '"') {
+		return "", false
+	}
+	decoded := strings.ReplaceAll(encoded, `\\`, `\`)
+	return decoded, strings.ReplaceAll(decoded, `\`, `\\`) == encoded
+}
+
+func ownedWildcardLine(lines []string, suffix string) int {
+	for index, line := range lines {
+		if line == "Host *."+suffix && (index-1)%3 == 0 {
+			return index
+		}
+	}
+	return -1
+}
+
 func validOpenSSHCommand(value string) bool {
 	return value != "" && len(value) <= 4096 && !strings.ContainsAny(value, "\r\n\x00#")
 }
@@ -380,7 +409,7 @@ func openWindowsSSHDirectory(home string, create bool) (string, string, func(), 
 		return "", "", func() {}, ErrOpenSSHConfigConflict
 	}
 	home = filepath.Clean(home)
-	if err := verifyCurrentUserOwnedPath(home, sid, true); err != nil {
+	if err := verifyCurrentUserProfileRoot(home, sid); err != nil {
 		return "", "", func() {}, err
 	}
 	directory := filepath.Join(home, ".ssh")
@@ -396,6 +425,12 @@ func openWindowsSSHDirectory(home string, create bool) (string, string, func(), 
 	unlock, err := lockWindowsSSHConfig(directory, sid)
 	if err != nil {
 		return "", "", func() {}, err
+	}
+	if create {
+		if err := migrateLegacyWindowsManagedSSHState(directory, sid); err != nil {
+			unlock()
+			return "", "", func() {}, err
+		}
 	}
 	return directory, sid, unlock, nil
 }
@@ -419,34 +454,26 @@ func lockWindowsSSHConfig(directory, sid string) (func(), error) {
 }
 
 func readWindowsSSHFile(directory, name, sid string, owned bool) ([]byte, bool, error) {
-	path := filepath.Join(directory, name)
-	if err := rejectWindowsReparseAncestors(filepath.Dir(path)); err != nil {
-		return nil, false, err
+	if filepath.Base(name) != name || name == "." || name == ".." {
+		return nil, false, ErrOpenSSHConfigConflict
 	}
-	info, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, false, nil
+	opened, exists, err := openPinnedWindowsSSHFile(filepath.Join(directory, name), 0)
+	if err != nil || !exists {
+		return nil, exists, err
 	}
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || windowsReparsePoint(path) {
+	defer opened.Close()
+	userSID, err := windows.StringToSid(sid)
+	if err != nil || userSID == nil || !userSID.IsValid() {
 		return nil, false, ErrOpenSSHConfigConflict
 	}
 	if owned {
-		if err := verifyManagedSSHACL(path, sid); err != nil {
+		if !windowssecurity.HandleOwnerMatchesSID(opened.handle, userSID) || !windowssecurity.ProtectedHandleDACLMatches(opened.handle, managedSSHSDDL(sid)) {
 			return nil, false, ErrOpenSSHConfigConflict
 		}
-	} else if err := verifyCurrentUserOwnedPath(path, sid, false); err != nil {
-		return nil, false, err
+	} else if !windowssecurity.HandleOwnerMatchesSID(opened.handle, userSID) {
+		return nil, false, ErrOpenSSHConfigConflict
 	}
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, false, err
-	}
-	defer file.Close()
-	value, err := io.ReadAll(io.LimitReader(file, maxOpenSSHConfigSize+1))
-	if err != nil || len(value) > maxOpenSSHConfigSize || bytes.IndexByte(value, 0) >= 0 {
-		return nil, false, errors.Join(ErrOpenSSHConfigConflict, err)
-	}
-	return value, true, nil
+	return append([]byte(nil), opened.value...), true, nil
 }
 
 func readWindowsSSHRecord(directory, sid string) (*openSSHInstallRecord, bool, error) {
@@ -454,13 +481,18 @@ func readWindowsSSHRecord(directory, sid string) (*openSSHInstallRecord, bool, e
 	if err != nil || !exists {
 		return nil, exists, err
 	}
+	record, err := parseWindowsSSHRecord(value)
+	return record, err == nil, err
+}
+
+func parseWindowsSSHRecord(value []byte) (*openSSHInstallRecord, error) {
 	var record openSSHInstallRecord
 	decoder := json.NewDecoder(bytes.NewReader(value))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&record); err != nil || decoder.Decode(&struct{}{}) != io.EOF || record.Version != 1 || record.IncludeChunk == "" {
-		return nil, false, ErrOpenSSHConfigConflict
+		return nil, ErrOpenSSHConfigConflict
 	}
-	return &record, true, nil
+	return &record, nil
 }
 
 type windowsSSHTransaction struct {
@@ -552,7 +584,22 @@ func publishWindowsSSHState(directory, sid, main string, mainSet bool, owned str
 	return writeWindowsOwnedSSHFile(directory, ".paperboat-config-install-v1.json", sid, append(value, '\n'))
 }
 func writeWindowsOwnedSSHFile(directory, name, sid string, value []byte) error {
-	return atomicfile.Write(filepath.Join(directory, name), value, atomicfile.Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: managedSSHSDDL(sid)})
+	path := filepath.Join(directory, name)
+	if err := withManagedSSHOwner(sid, func() error {
+		return atomicfile.Write(path, value, atomicfile.Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: managedSSHSDDL(sid)})
+	}); err != nil {
+		return err
+	}
+	opened, exists, err := openPinnedWindowsSSHFile(path, 0)
+	if err != nil || !exists || opened == nil {
+		return errors.Join(ErrOpenSSHConfigConflict, err)
+	}
+	defer opened.Close()
+	userSID, err := windows.StringToSid(sid)
+	if err != nil || userSID == nil || !windowssecurity.HandleOwnerMatchesSID(opened.handle, userSID) || !windowssecurity.ProtectedHandleDACLMatches(opened.handle, managedSSHSDDL(sid)) || !bytes.Equal(opened.value, value) {
+		return ErrOpenSSHConfigConflict
+	}
+	return nil
 }
 func removeWindowsOwnedSSHFile(directory, name, sid string) error {
 	path := filepath.Join(directory, name)
@@ -572,8 +619,14 @@ func writeWindowsUserSSHConfig(directory, sid string, value []byte) error {
 		existed = exists
 	}
 	if !existed {
-		return atomicfile.Write(path, value, atomicfile.Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: managedSSHSDDL(sid)})
+		return writeWindowsOwnedSSHFile(directory, "config", sid, value)
 	}
+	return withManagedSSHOwner(sid, func() error {
+		return replaceWindowsUserSSHFile(directory, path, sid, value)
+	})
+}
+
+func replaceWindowsUserSSHFile(directory, path, sid string, value []byte) error {
 	//paperboat:allow-source-policy atomic-replacement owner=managed-ssh-windows reason=same-directory-acl-protected-config-staging
 	temporary, err := os.CreateTemp(directory, ".paperboat-config-")
 	if err != nil {
@@ -604,7 +657,14 @@ func writeWindowsUserSSHConfig(directory, sid string, value []byte) error {
 	if err != nil {
 		return err
 	}
-	return windows.MoveFileEx(from, to, windows.MOVEFILE_REPLACE_EXISTING|windows.MOVEFILE_WRITE_THROUGH)
+	if err := windows.MoveFileEx(from, to, windows.MOVEFILE_REPLACE_EXISTING|windows.MOVEFILE_WRITE_THROUGH); err != nil {
+		return err
+	}
+	verified, exists, err := readWindowsSSHFile(directory, "config", sid, false)
+	if err != nil || !exists || !bytes.Equal(verified, value) {
+		return errors.Join(ErrOpenSSHConfigConflict, err)
+	}
+	return nil
 }
 func removeWindowsUserSSHConfig(directory, sid string) error {
 	path := filepath.Join(directory, "config")

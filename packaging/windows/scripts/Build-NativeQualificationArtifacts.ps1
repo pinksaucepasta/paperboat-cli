@@ -172,6 +172,11 @@ try {
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $msiCleanupTest -PathType Leaf)) {
         throw 'Native Windows MSI cleanup qualification test failed to compile.'
     }
+    $nativeTest = Join-Path $outputRoot 'paperboat-windows-native-e2e.test.exe'
+    & go test -c -buildvcs=false -trimpath -tags paperboat_native_e2e -o $nativeTest ./packaging/windows/e2e
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $nativeTest -PathType Leaf)) {
+        throw 'Native Windows end-to-end qualification test failed to compile.'
+    }
     $payloads = @(
         (Join-Path $stageRoot 'upgrade\pb.exe'),
         (Join-Path $stageRoot 'upgrade\pb-launcher.exe'),
@@ -182,7 +187,8 @@ try {
         $s4uFixture,
         $s4uTest,
         $hostinstallTest,
-        $msiCleanupTest
+        $msiCleanupTest,
+        $nativeTest
     )
     if ([string]::IsNullOrWhiteSpace($FreshMsiPath)) {
         $payloads = @(
@@ -220,6 +226,7 @@ $manifest = [ordered]@{
     s4u_test_executable = $s4uTest
     hostinstall_test_executable = $hostinstallTest
     msi_cleanup_test_executable = $msiCleanupTest
+    native_test_executable = $nativeTest
     wix_version = '5.0.2'
     authenticode_status = 'not_present'
     signing_required_for_release = $false
@@ -237,6 +244,7 @@ if ($env:GITHUB_ENV) {
         "PAPERBOAT_WINDOWS_E2E_S4U_TEST=$s4uTest",
         "PAPERBOAT_WINDOWS_E2E_HOSTINSTALL_TEST=$hostinstallTest",
         "PAPERBOAT_WINDOWS_E2E_MSI_CLEANUP_TEST=$msiCleanupTest",
+        "PAPERBOAT_WINDOWS_E2E_NATIVE_TEST=$nativeTest",
         "PAPERBOAT_WINDOWS_E2E_OUTPUT=$outputRoot"
     ) | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 }

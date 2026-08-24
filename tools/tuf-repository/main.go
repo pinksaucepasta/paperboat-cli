@@ -28,9 +28,14 @@ import (
 
 const keychainService = "com.pinksaucepasta.paperboat.tuf.production"
 const windowsNativeQualificationSchema = "paperboat.windows-native-qualification/v1"
+const windowsNativeQualificationResultBindingSchema = "paperboat.windows-native-qualification-result-binding/v1"
 
 func windowsNativeQualificationTarget(architecture string) string {
 	return "windows-" + architecture + "-native-qualification.json"
+}
+
+func windowsNativeQualificationReportTarget(architecture string) string {
+	return "windows-" + architecture + "-native-qualification-report.json"
 }
 
 var roles = []string{"root-1", "root-2", "root-3", "targets-1", "targets-2", "snapshot-1", "timestamp-1"}
@@ -45,15 +50,24 @@ type componentTarget struct {
 	BinaryFormat string `json:"binary_format"`
 }
 type windowsNativeQualification struct {
-	Schema         string                           `json:"schema"`
-	ReleaseVersion string                           `json:"release_version"`
-	Platform       string                           `json:"platform"`
-	Architecture   string                           `json:"architecture"`
-	Status         string                           `json:"status"`
-	NativeTested   bool                             `json:"native_tested"`
-	WindowsBuild   string                           `json:"windows_build"`
-	Runner         string                           `json:"runner"`
-	Artifacts      []windowsNativeQualifiedArtifact `json:"artifacts"`
+	Schema              string                                  `json:"schema"`
+	ReleaseVersion      string                                  `json:"release_version"`
+	Platform            string                                  `json:"platform"`
+	Architecture        string                                  `json:"architecture"`
+	Status              string                                  `json:"status"`
+	NativeTested        bool                                    `json:"native_tested"`
+	WindowsBuild        string                                  `json:"windows_build"`
+	Runner              string                                  `json:"runner"`
+	QualificationResult windowsNativeQualificationResultBinding `json:"qualification_result"`
+	Artifacts           []windowsNativeQualifiedArtifact        `json:"artifacts"`
+}
+type windowsNativeQualificationResultBinding struct {
+	Schema           string `json:"schema"`
+	TargetPath       string `json:"target_path"`
+	SHA256           string `json:"sha256"`
+	Length           int64  `json:"length"`
+	NativeTestSHA256 string `json:"native_test_sha256"`
+	NativeTestLength int64  `json:"native_test_length"`
 }
 type windowsNativeQualifiedArtifact struct {
 	Component    string `json:"component"`
@@ -521,6 +535,9 @@ func publish(repo, version, artifacts string, qualificationEvidencePaths map[str
 		if err != nil {
 			return err
 		}
+		if err := validateWindowsNativeQualificationResult(qualification, version, architecture, artifacts); err != nil {
+			return err
+		}
 		qualifications[architecture], qualificationBodies[architecture], qualificationDigests[architecture] = qualification, body, digest
 	}
 	root, targets, snapshot, timestamp, err := loadSet(repo)
@@ -699,6 +716,10 @@ func validateWindowsNativeQualification(qualification windowsNativeQualification
 	if architecture != "amd64" && architecture != "arm64" || qualification.Schema != windowsNativeQualificationSchema || qualification.ReleaseVersion != version || qualification.Platform != "windows" || qualification.Architecture != architecture || qualification.Status != "passed" || !qualification.NativeTested || !safeEvidenceValue(qualification.WindowsBuild) || !safeEvidenceValue(qualification.Runner) {
 		return fmt.Errorf("Windows %s native qualification evidence is incomplete or not passed", architecture)
 	}
+	result := qualification.QualificationResult
+	if result.Schema != windowsNativeQualificationResultBindingSchema || result.TargetPath != windowsNativeQualificationReportTarget(architecture) || !validSHA256(result.SHA256) || result.Length < 1 || result.Length > 4<<20 || !validSHA256(result.NativeTestSHA256) || result.NativeTestLength < 1 {
+		return fmt.Errorf("Windows %s native qualification result binding is invalid", architecture)
+	}
 	if len(components) != 5 || len(qualification.Artifacts) != len(components) {
 		return fmt.Errorf("Windows %s native qualification evidence does not cover every component", architecture)
 	}
@@ -720,6 +741,63 @@ func validateWindowsNativeQualification(qualification windowsNativeQualification
 		return fmt.Errorf("Windows %s native qualification evidence is missing a component", architecture)
 	}
 	return nil
+}
+
+func validateWindowsNativeQualificationResult(qualification windowsNativeQualification, version, architecture, artifacts string) error {
+	if err := validateWindowsNativeQualification(qualification, version, architecture, qualificationArtifactsAsComponents(qualification)); err != nil {
+		return err
+	}
+	result := qualification.QualificationResult
+	path := filepath.Join(artifacts, result.TargetPath)
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() != result.Length {
+		return fmt.Errorf("Windows %s native qualification report is invalid", architecture)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read Windows %s native qualification report: %w", architecture, err)
+	}
+	digest := sha256.Sum256(body)
+	if hex.EncodeToString(digest[:]) != result.SHA256 {
+		return fmt.Errorf("Windows %s native qualification report digest does not match its evidence", architecture)
+	}
+	var report struct {
+		Schema           string            `json:"schema"`
+		Platform         string            `json:"platform"`
+		Architecture     string            `json:"architecture"`
+		Stability        string            `json:"stability"`
+		NativeTested     bool              `json:"native_tested"`
+		Version          string            `json:"version"`
+		Status           string            `json:"status"`
+		WindowsBuild     string            `json:"windows_build"`
+		Runner           string            `json:"runner"`
+		MSISHA256        string            `json:"msi_sha256"`
+		UpgradeMSISHA256 string            `json:"upgrade_msi_sha256"`
+		NativeTestSHA256 string            `json:"native_test_sha256"`
+		NativeTestLength int64             `json:"native_test_length"`
+		Events           []json.RawMessage `json:"events"`
+		Failure          json.RawMessage   `json:"failure"`
+	}
+	if json.Unmarshal(body, &report) != nil || report.Schema != "paperboat.windows-native-qualification-report/v1" || report.Platform != "windows" || report.Architecture != architecture || report.Stability != "stable" || !report.NativeTested || report.Version != version || report.Status != "passed" || report.WindowsBuild != qualification.WindowsBuild || report.Runner != qualification.Runner || !validSHA256(report.MSISHA256) || !validSHA256(report.UpgradeMSISHA256) || report.NativeTestSHA256 != result.NativeTestSHA256 || report.NativeTestLength != result.NativeTestLength || len(report.Events) == 0 || string(report.Failure) != "null" {
+		return fmt.Errorf("Windows %s native qualification report is incomplete or not passed", architecture)
+	}
+	return nil
+}
+
+func qualificationArtifactsAsComponents(qualification windowsNativeQualification) []componentTarget {
+	components := make([]componentTarget, 0, len(qualification.Artifacts))
+	for _, artifact := range qualification.Artifacts {
+		components = append(components, componentTarget{Component: artifact.Component, TargetPath: artifact.TargetPath, SHA256: artifact.SHA256, Length: artifact.Length, Platform: artifact.Platform, Architecture: artifact.Architecture, BinaryFormat: "pe"})
+	}
+	return components
+}
+
+func validSHA256(value string) bool {
+	if len(value) != sha256.Size*2 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil && value == strings.ToLower(value)
 }
 
 func qualificationBinding(qualification windowsNativeQualification, evidenceDigest string, component componentTarget) *windowsNativeQualificationBinding {

@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	hostruntime "github.com/pinksaucepasta/paperboat/internal/hostruntime/runtime"
 	"github.com/pinksaucepasta/paperboat/internal/windowsopenssh"
 	"github.com/spf13/cobra"
 	"golang.org/x/sys/windows"
@@ -66,11 +67,11 @@ type msiWindowsServiceDefinition struct {
 	Account     string            `json:"account"`
 }
 
-type msiPreviewDescriptor struct {
-	Schema            string `json:"schema"`
-	Name              string `json:"name"`
-	ServiceDefinition string `json:"service_definition"`
-}
+// Keep MSI cleanup's strict decoder on the same schema that writes preview
+// descriptors. A reduced duplicate schema rejects valid production fields and
+// can make a legitimate MSI uninstall fail closed before removing its own
+// preview service.
+type msiPreviewDescriptor = hostruntime.PreviewRuntimeDescriptor
 
 // msiCleanupCommand is intentionally hidden. It is called only by the
 // deferred MSI action while pb.exe is still installed and before RemoveFiles.
@@ -633,14 +634,8 @@ func parseOwnedMSIPreviewDescriptor(body []byte, paths msiCleanupPaths) (string,
 	if len(body) > 64<<10 {
 		return "", "", "", errMSIPreviewOwnership
 	}
-	var descriptor msiPreviewDescriptor
-	decoder := json.NewDecoder(strings.NewReader(string(body)))
-	decoder.DisallowUnknownFields()
-	if decoder.Decode(&descriptor) != nil {
-		return "", "", "", errMSIPreviewOwnership
-	}
-	var extra any
-	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) || descriptor.Schema != "paperboat.preview-runtime/v1" || descriptor.Name == "" {
+	descriptor, decodeErr := hostruntime.DecodePreviewRuntimeDescriptor(body)
+	if decodeErr != nil || descriptor.ServiceDefinition == "" || descriptor.BindAddress != "127.0.0.1" || descriptor.ServiceGeneration == 0 {
 		return "", "", "", errMSIPreviewOwnership
 	}
 	definitionName := strings.TrimSuffix(filepath.Base(descriptor.ServiceDefinition), filepath.Ext(descriptor.ServiceDefinition))

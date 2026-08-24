@@ -475,7 +475,8 @@ func TestExchangeTransferKeySelectsDirectionFromHostOwnership(t *testing.T) {
 
 	t.Run("receives when host has no key", func(t *testing.T) {
 		hostVault, _ := transfercrypto.NewKeyVault(&transferKeySecrets{items: make(map[string]string)})
-		service := &Service{config: Config{TransferKeys: hostVault}}
+		acknowledged := make(chan struct{}, 2)
+		service := &Service{config: Config{TransferKeys: hostVault, ObserveTransferKeyAcknowledged: func() { acknowledged <- struct{}{} }}}
 		material, _ := transfercrypto.GenerateKeyMaterial()
 		host, client := net.Pipe()
 		result := make(chan error, 1)
@@ -486,6 +487,11 @@ func TestExchangeTransferKeySelectsDirectionFromHostOwnership(t *testing.T) {
 		_ = client.Close()
 		if err := <-result; err != nil {
 			t.Fatal(err)
+		}
+		select {
+		case <-acknowledged:
+		case <-time.After(time.Second):
+			t.Fatal("successful receiver acknowledgement was not observed")
 		}
 		stored, storedPeer, err := hostVault.LoadBound(binding.TransferID, binding.Generation)
 		if err != nil || stored != material || storedPeer != peer {
@@ -502,6 +508,11 @@ func TestExchangeTransferKeySelectsDirectionFromHostOwnership(t *testing.T) {
 		if err := <-retryResult; err != nil {
 			t.Fatalf("receive retry changed direction: %v", err)
 		}
+		select {
+		case <-acknowledged:
+		case <-time.After(time.Second):
+			t.Fatal("successful retry acknowledgement was not observed")
+		}
 		material.Destroy()
 	})
 
@@ -512,7 +523,8 @@ func TestExchangeTransferKeySelectsDirectionFromHostOwnership(t *testing.T) {
 		if err := hostVault.Save(binding.TransferID, binding.Generation, material, expires); err != nil {
 			t.Fatal(err)
 		}
-		service := &Service{config: Config{TransferKeys: hostVault}}
+		acknowledged := make(chan struct{}, 1)
+		service := &Service{config: Config{TransferKeys: hostVault, ObserveTransferKeyAcknowledged: func() { acknowledged <- struct{}{} }}}
 		host, client := net.Pipe()
 		result := make(chan error, 1)
 		go func() { result <- service.exchangeTransferKey(host, descriptor, authority) }()
@@ -542,6 +554,11 @@ func TestExchangeTransferKeySelectsDirectionFromHostOwnership(t *testing.T) {
 		_ = retryClient.Close()
 		if err := <-retryResult; err != nil {
 			t.Fatalf("delivery retry changed direction: %v", err)
+		}
+		select {
+		case <-acknowledged:
+			t.Fatal("sender-side transfer-key delivery reported a receiver acknowledgement")
+		default:
 		}
 		material.Destroy()
 	})

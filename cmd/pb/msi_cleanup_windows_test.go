@@ -418,7 +418,15 @@ func TestMSIPreviewDescriptorRequiresHashBoundPathAndStrictJSON(t *testing.T) {
 	logicalName := "fixture"
 	serviceName := msiPaperboatServicePrefix + msiPreviewInstance(logicalName)
 	definitionPath := filepath.Join(paths.ServiceRoot, serviceName+".json")
-	valid := msiPreviewDescriptor{Schema: "paperboat.preview-runtime/v1", Name: logicalName, ServiceDefinition: definitionPath}
+	valid := msiPreviewDescriptor{
+		Schema:            "paperboat.preview-runtime/v1",
+		Name:              logicalName,
+		BindAddress:       "127.0.0.1",
+		Port:              38123,
+		ServiceGeneration: 1787503345680,
+		Indefinite:        true,
+		ServiceDefinition: definitionPath,
+	}
 	body, err := json.Marshal(valid)
 	if err != nil {
 		t.Fatal(err)
@@ -441,6 +449,16 @@ func TestMSIPreviewDescriptorRequiresHashBoundPathAndStrictJSON(t *testing.T) {
 	}
 	if exists, err := validateOwnedMSIPreviewDescriptor(validPath, paths); !exists || !errors.Is(err, errMSIPreviewOwnership) {
 		t.Fatalf("unknown descriptor field exists=%t err=%v, want ownership failure", exists, err)
+	}
+	if err := os.WriteFile(validPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	logical, definition, resolved, err := parseOwnedMSIPreviewDescriptor(body, paths)
+	if err != nil {
+		t.Fatalf("parse full production descriptor: %v", err)
+	}
+	if logical != logicalName || definition != serviceName || !sameWindowsPath(resolved, definitionPath) {
+		t.Fatalf("parsed descriptor=(%q,%q,%q), want (%q,%q,%q)", logical, definition, resolved, logicalName, serviceName, definitionPath)
 	}
 }
 

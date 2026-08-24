@@ -92,6 +92,13 @@ func TestClientCoordinatorSupportsStableHostLifecycle(t *testing.T) {
 	if peer.starts != 1 {
 		t.Fatalf("client peer poller starts = %d, want 1", peer.starts)
 	}
+	if host.State() != Running {
+		t.Fatalf("client coordination state = %q, want %q", host.State(), Running)
+	}
+	health := host.health.Snapshot()
+	if capability := health.Capabilities["worker_lifecycle"]; capability.State != "ready" {
+		t.Fatalf("client worker lifecycle health = %#v, want ready", capability)
+	}
 	status := host.WorkloadStatus()
 	if status.Generation == 0 {
 		t.Fatalf("workload status = %#v, want initialized generation", status)

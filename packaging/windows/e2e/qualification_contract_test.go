@@ -92,9 +92,16 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 		"PaperboatUpdated",
 		"PaperboatHostd.json",
 		"PaperboatUpdated.json",
+		"Fixed Paperboat service declaration remains after uninstall",
 		"refusing to overwrite an unmanaged service declaration",
 		"Get-PaperboatPreviewDeclarations",
+		"Paperboat preview declaration is a directory",
+		"Paperboat preview declaration is a reparse point",
+		"Paperboat service declaration root is a reparse point",
+		"Paperboat state root is a reparse point",
 		"Get-CimInstance -ClassName Win32_Service -ErrorAction Stop",
+		"HKLM:\\Software\\Paperboat\\OpenSSH",
+		"stale Paperboat OpenSSH ownership state",
 		"SHA256",
 		"$instance = $nameHash.Substring(0, 16)",
 		"$descriptorRoot = Join-Path $script:stateRoot 'previews\\active'",
@@ -117,7 +124,14 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 		"TestNativePrepareS4UDPAPIQualification",
 		"TestNativeLoggedOutS4UDPAPIQualification",
 		"MsiCleanupTestExecutable",
+		"[Parameter(Mandatory = $true)]\n    [string] $NativeTestExecutable",
+		"$resolvedNativeTestExecutable = [IO.Path]::GetFullPath($NativeTestExecutable)",
 		"runtime-current",
+		"qualification_output_directory_invalid",
+		"$outputDirectoryItem = Get-Item -Force -LiteralPath $resolvedOutputDirectory -ErrorAction Stop",
+		"$outputDirectoryItem.PSIsContainer",
+		"[IO.Directory]::Exists($resolvedOutputDirectory)",
+		"$outputDirectoryItem.Attributes -band [IO.FileAttributes]::ReparsePoint",
 		"Assert-PaperboatSshdAbsent",
 		"Set-QualificationRuntimeCurrentACL",
 		"TestNativeApplyQualificationRuntimeCurrentACL",
@@ -127,6 +141,15 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 		"Stage-PreMsiRuntimeCurrentFixture",
 		"Remove-PreMsiRuntimeCurrentFixture",
 		"Invoke-NativeGoTests",
+		"Invoke-NativeTestPattern",
+		"New-NativeTestExecutionEvidence",
+		"Assert-NativeTestExecutionEvidence",
+		"paperboat.windows-native-test-execution/v1",
+		"machine_readable",
+		"tests_run_count",
+		"matched zero tests",
+		"$reportJSON = $report | ConvertTo-Json -Depth 10",
+		"[IO.File]::WriteAllText($reportPath, $reportJSON + \"`n\", [Text.UTF8Encoding]::new($false))",
 		"native_go_preview_e2e",
 		"^TestNativeDurablePreviewServiceLifecycle$",
 		"Assert-PreMsiRuntimeCurrentFixtureIntegrity",
@@ -179,9 +202,36 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 		"TestNativeLegacyOwnerFullSecurityMigration",
 		"native_legacy_security_migration",
 		"role_artifact_allowlist",
+		"Invoke-NativeCommandCapture",
+		"$previousErrorActionPreference = $ErrorActionPreference",
+		"$ErrorActionPreference = 'Continue'",
+		"$ErrorActionPreference = $previousErrorActionPreference",
+		"$roleProbe = Invoke-NativeCommandCapture -ExecutablePath $rolePath -Arguments $roleArguments",
+		"$nativeResult = Invoke-NativeCommandCapture -ExecutablePath $ExecutablePath -Arguments $Arguments",
 		"Assert-InstalledMachineACL -Path $versionsRoot -Directory $true",
 		"Assert-InstalledMachineACL -Path $immutableReleaseRoot -Directory $true",
 		"Assert-InstalledMachineACL -Path $path -Directory $false",
+		"ConvertTo-PaperboatStateRelativePath",
+		"Get-PaperboatStateSecuritySnapshot",
+		"New-PaperboatStateSnapshotEntry",
+		"Get-PaperboatStateSnapshot",
+		"$script:preexistingPaperboatState = Get-PaperboatStateSnapshot",
+		"preexisting_state_snapshot",
+		"RelativePath",
+		"OwnerSID",
+		"DaclSddl",
+		"SecurityDescriptor",
+		"Assert-PaperboatStateSnapshotEntryUnchanged",
+		"Pre-existing Paperboat state disappeared after uninstall",
+		"Pre-existing Paperboat state SHA256 changed",
+		"Pre-existing Paperboat state length changed",
+		"Pre-existing Paperboat state security descriptor changed",
+		"Paperboat state root presence changed after uninstall",
+		"allowedNewEmptyOwnedDirectories",
+		"Assert-PaperboatStateResidue",
+		"Unknown Paperboat state residue remains after uninstall",
+		"Paperboat state path is a reparse point",
+		"New Paperboat state residue is not an empty owned directory placeholder",
 		"-test.run', '^TestNativeMSIPreview",
 		"runtime-current service/declaration removal and ownership-conflict preservation cases passed",
 	} {
@@ -189,7 +239,14 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 			t.Fatalf("native MSI harness is missing %q", requiredText)
 		}
 	}
-	for _, forbiddenText := range []string{"Start-Process -FilePath $ownerPreparationExecutable", "-Credential $credential", "-LoadUserProfile", "^TestNativeMSIPreviewCleanup$", "Set-Acl -LiteralPath $Path -AclObject $security", "$security.SetOwner($system)"} {
+	previewDeclarations := string(harness)
+	if strings.Contains(previewDeclarations, "Get-ChildItem -Force -File -LiteralPath $definitionRoot") {
+		t.Fatal("preview declaration preflight must inspect directories and reparse entries, not only regular files")
+	}
+	if strings.Contains(string(harness), "$output = @(& $rolePath @roleArguments 2>&1)") {
+		t.Fatal("role-artifact allowlist probes must use the scoped PowerShell 5.1-safe native capture helper")
+	}
+	for _, forbiddenText := range []string{"Start-Process -FilePath $ownerPreparationExecutable", "-Credential $credential", "-LoadUserProfile", "^TestNativeMSIPreviewCleanup$", "Set-Acl -LiteralPath $Path -AclObject $security", "$security.SetOwner($system)", "[string] $NativeTestExecutable = ''", "-ExecutablePath 'go'", "$report | ConvertTo-Json -Depth 10 | Set-Content"} {
 		if strings.Contains(string(harness), forbiddenText) {
 			t.Fatalf("native MSI harness retains Session 0 alternate-credential launch %q", forbiddenText)
 		}
@@ -198,7 +255,7 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, requiredText := range []string{"paperboat-windows-msi-cleanup.test.exe", "msi_cleanup_test_executable", "PAPERBOAT_WINDOWS_E2E_MSI_CLEANUP_TEST", "paperboat-windows-hostinstall.test.exe", "hostinstall_test_executable"} {
+	for _, requiredText := range []string{"paperboat-windows-msi-cleanup.test.exe", "msi_cleanup_test_executable", "PAPERBOAT_WINDOWS_E2E_MSI_CLEANUP_TEST", "paperboat-windows-hostinstall.test.exe", "hostinstall_test_executable", "paperboat-windows-native-e2e.test.exe", "native_test_executable", "PAPERBOAT_WINDOWS_E2E_NATIVE_TEST", "./packaging/windows/e2e"} {
 		if !strings.Contains(string(artifactBuilder), requiredText) {
 			t.Fatalf("native qualification artifact builder is missing %q", requiredText)
 		}
@@ -263,6 +320,31 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 		"platform-qualification",
 		"release-windows",
 		"needs: [release-authority, windows-release-contract, platform-qualification]",
+		"PAPERBOAT_RELEASE_ORIGIN_HOSTS_JSON",
+		"atomic activation requires exactly one authoritative release origin host",
+		"must be a canonical literal IPv4 address",
+		"PAPERBOAT_INSTALL_URL and PAPERBOAT_DEFAULT_RELEASE_URL must use one public release origin",
+		"or '?' in value or '#' in value",
+		"legacy_ipv4_component",
+		"socket.inet_aton(value)",
+		"release endpoint host must use canonical DNS or IP spelling",
+		"release_host: ${{ steps.origin_topology.outputs.release_host }}",
+		"install_url: ${{ steps.origin_topology.outputs.install_url }}",
+		"server_url: ${{ steps.origin_topology.outputs.server_url }}",
+		"release_url: ${{ steps.origin_topology.outputs.release_url }}",
+		"DEFAULT_SERVER_URL: ${{ needs.release-authority.outputs.server_url }}",
+		"DEFAULT_RELEASE_URL: ${{ needs.release-authority.outputs.release_url }}",
+		"PAPERBOAT_DEFAULT_SERVER_URL: ${{ needs.release-authority.outputs.server_url }}",
+		"PAPERBOAT_DEFAULT_RELEASE_URL: ${{ needs.release-authority.outputs.release_url }}",
+		"RELEASE_HOST: ${{ needs.release-authority.outputs.release_host }}",
+		"Verify public server and installer readiness",
+		"${INSTALL_URL}?p=00000000000000000000000000",
+		"${INSTALL_URL%/install}/current.json",
+		"${SERVER_URL%/}/current.json",
+		"${SERVER_URL%/}/healthz",
+		"public server current.json does not match the authoritative release origin",
+		"public current.json is not served by the authoritative release origin",
+		"public TUF root is not served by the authoritative release origin",
 		"windows-winget",
 		"windows-amd64",
 		"windows-arm64",
@@ -277,14 +359,164 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 		"PAPERBOAT_WINDOWS_E2E_S4U_TEST",
 		"PAPERBOAT_WINDOWS_E2E_HOSTINSTALL_TEST",
 		"PAPERBOAT_WINDOWS_E2E_MSI_CLEANUP_TEST",
+		"PAPERBOAT_WINDOWS_E2E_NATIVE_TEST",
 		"-MsiCleanupTestExecutable",
+		"-NativeTestExecutable",
 		"native_legacy_security_migration",
 		"native_s4u_dpapi",
+		"native_runtime_current_fixture",
+		"native_go_preview_e2e",
+		"native_runtime_current_fixture_cleanup",
 		"role_artifact_allowlist",
+		"preexisting_state_snapshot",
+		"msi_payload_assertions",
+		"$report.failure -ne $null",
+		"$report.native_test_sha256 -ne $nativeTestHash",
+		"[int64]$report.native_test_length -ne [int64]$nativeTest.Length",
+		"paperboat.windows-native-qualification-result-binding/v1",
+		"windows-$env:PAPERBOAT_ARCH-native-qualification-report.json",
+		"qualification_result = @{",
+		"$preexistingStateEvents = @(",
+		"$preexistingStateEvents.Count -ne 1",
+		"$preexistingStateDetail -notmatch",
+		"root_present=(true|false)",
+		"entries=\\d+",
+		"security=owner_dacl_descriptor",
+		"reparse=false",
 	} {
 		if !strings.Contains(string(releaseWorkflow), requiredText) {
 			t.Fatalf("release candidate qualification is missing %q", requiredText)
 		}
+	}
+}
+
+func TestQualificationNativeTestPatternUsesScopedStderrCapture(t *testing.T) {
+	root := packagingWindowsRoot(t)
+	harnessBytes, err := os.ReadFile(filepath.Join(root, "scripts", "Invoke-NativeWindowsQualification.ps1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness := string(harnessBytes)
+	start := strings.Index(harness, "function Invoke-NativeTestPattern")
+	if start < 0 {
+		t.Fatal("native test pattern capture seam is missing")
+	}
+	end := strings.Index(harness[start:], "function Assert-QualificationRegularFile")
+	if end < 0 {
+		t.Fatal("native test pattern capture boundary is missing")
+	}
+	body := harness[start : start+end]
+	if !strings.Contains(body, "$nativeResult = Invoke-NativeCommandCapture -ExecutablePath $ExecutablePath -Arguments $Arguments") {
+		t.Fatal("native test patterns do not use the scoped PS5-safe native capture helper")
+	}
+	if strings.Contains(body, "2>&1") || strings.Contains(body, "& $ExecutablePath @Arguments") {
+		t.Fatal("native test patterns still invoke native stderr directly under global ErrorActionPreference Stop")
+	}
+}
+
+func TestQualificationOutputDirectoryIsValidatedAfterCreation(t *testing.T) {
+	root := packagingWindowsRoot(t)
+	harnessBytes, err := os.ReadFile(filepath.Join(root, "scripts", "Invoke-NativeWindowsQualification.ps1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness := string(harnessBytes)
+	resolved := strings.Index(harness, "$resolvedOutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)")
+	created := strings.Index(harness, "$null = New-Item -ItemType Directory -Force -Path $resolvedOutputDirectory -ErrorAction Stop")
+	inspected := strings.Index(harness, "$outputDirectoryItem = Get-Item -Force -LiteralPath $resolvedOutputDirectory -ErrorAction Stop")
+	if resolved < 0 || created < 0 || inspected < 0 || resolved > created || created > inspected {
+		t.Fatalf("output directory is not resolved, created, and inspected in order: resolved=%d created=%d inspected=%d", resolved, created, inspected)
+	}
+	validation := harness[inspected:]
+	for _, required := range []string{
+		"$outputDirectoryItem.PSIsContainer",
+		"[IO.Directory]::Exists($resolvedOutputDirectory)",
+		"[IO.FileAttributes]::ReparsePoint",
+		"qualification_output_directory_invalid",
+	} {
+		if !strings.Contains(validation, required) {
+			t.Fatalf("output directory validation is missing %q", required)
+		}
+	}
+}
+
+func TestQualificationReportGateRequiresExactPreexistingStateEvent(t *testing.T) {
+	root := packagingWindowsRoot(t)
+	workflowBytes, err := os.ReadFile(filepath.Join(root, "..", "..", ".github", "workflows", "release.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := string(workflowBytes)
+	gate := strings.Index(workflow, "Require passed native Windows qualification report")
+	if gate < 0 {
+		t.Fatal("native qualification report gate is missing")
+	}
+	body := workflow[gate:]
+	for _, required := range []string{
+		"$report.failure -ne $null",
+		"$preexistingStateEvents = @(",
+		"$preexistingStateEvents.Count -ne 1",
+		"$preexistingStateDetail -notmatch",
+		"root_present=(true|false)",
+		"entries=\\d+",
+		"security=owner_dacl_descriptor",
+		"reparse=false",
+	} {
+		if !strings.Contains(body, required) {
+			t.Fatalf("native qualification report gate is missing %q", required)
+		}
+	}
+}
+
+func TestQualificationPreexistingStateSnapshotIsBeforeMutationAndExact(t *testing.T) {
+	root := packagingWindowsRoot(t)
+	harnessBytes, err := os.ReadFile(filepath.Join(root, "scripts", "Invoke-NativeWindowsQualification.ps1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness := string(harnessBytes)
+	snapshot := strings.Index(harness, "$script:preexistingPaperboatState = Get-PaperboatStateSnapshot")
+	s4u := strings.Index(harness, "\n    Invoke-S4UDPAPIQualification")
+	uninstall := strings.Index(harness, "function Assert-Uninstalled")
+	if snapshot < 0 || s4u < 0 || snapshot > s4u {
+		t.Fatalf("pre-existing state snapshot is not established before qualification mutation: snapshot=%d s4u=%d", snapshot, s4u)
+	}
+	if uninstall < 0 {
+		t.Fatal("uninstall assertion seam is missing")
+	}
+	if strings.Contains(harness, "Get-ChildItem -Force -LiteralPath $script:stateRoot -Recurse") {
+		t.Fatal("state residue validation must use the non-reparse snapshot traversal, not broad recursive enumeration")
+	}
+	for _, required := range []string{
+		"RootPresent",
+		"RelativePath",
+		"Type",
+		"ReparsePoint",
+		"SHA256",
+		"Length",
+		"OwnerSID",
+		"DaclSddl",
+		"SecurityDescriptor",
+		"Paperboat state root presence changed after uninstall",
+		"allowedNewEmptyOwnedDirectories",
+		"Unknown Paperboat state residue remains after uninstall",
+	} {
+		if !strings.Contains(harness, required) {
+			t.Fatalf("pre-existing state contract is missing %q", required)
+		}
+	}
+}
+
+func TestQualificationStateSnapshotAcceptsRootRelativePath(t *testing.T) {
+	root := packagingWindowsRoot(t)
+	harnessBytes, err := os.ReadFile(filepath.Join(root, "scripts", "Invoke-NativeWindowsQualification.ps1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness := string(harnessBytes)
+	const signature = "[Parameter(Mandatory = $true)][AllowEmptyString()][string] $RelativePath"
+	if !strings.Contains(harness, signature) {
+		t.Fatalf("qualification state snapshot must accept the root entry's empty relative path")
 	}
 }
 

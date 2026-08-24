@@ -2,7 +2,9 @@ package bootstrap
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -44,6 +46,10 @@ type ResumeRecord struct {
 	Material                *Material `json:"material,omitempty"`
 	ClientInstalled         bool      `json:"client_installed,omitempty"`
 	RuntimeEnrolled         bool      `json:"runtime_enrolled,omitempty"`
+	AuthenticatedSetup      bool      `json:"authenticated_setup,omitempty"`
+	SetupOperationID        string    `json:"setup_operation_id,omitempty"`
+	ExpectedUserMachineID   string    `json:"expected_user_machine_id,omitempty"`
+	ExpectedGeneration      int64     `json:"expected_installation_generation,omitempty"`
 }
 
 func ResumePath(stateRoot string) string {
@@ -90,6 +96,84 @@ func LoadResume(stateRoot, serverURL, publicIdentityKey, enrollmentToken, displa
 	if !filepath.IsAbs(stateRoot) || now.IsZero() {
 		return ResumeRecord{}, ErrResumeBinding
 	}
+	record, err := loadResumeDocument(stateRoot)
+	if err != nil {
+		return ResumeRecord{}, err
+	}
+	if strings.TrimRight(strings.TrimSpace(serverURL), "/") != record.ServerURL ||
+		strings.TrimSpace(publicIdentityKey) != record.PublicIdentityKey ||
+		strings.TrimSpace(displayName) != record.DisplayName ||
+		strings.TrimSpace(setupMode) != record.SetupMode {
+		return ResumeRecord{}, ErrResumeBinding
+	}
+	if record.requiresEnrollmentToken() && strings.TrimSpace(enrollmentToken) == "" && !record.PairingStarted {
+		return ResumeRecord{}, ErrResumeTokenRequired
+	}
+	if strings.TrimSpace(enrollmentToken) != "" && enrollmentTokenDigest(enrollmentToken) != record.EnrollmentTokenSHA {
+		return ResumeRecord{}, ErrResumeBinding
+	}
+	if record.Material != nil && !now.UTC().Before(record.Material.ExpiresAt) {
+		return record, ErrResumeExpired
+	}
+	if record.Material == nil && !record.PairingExpiresAt.IsZero() && !now.UTC().Before(record.PairingExpiresAt) {
+		return record, ErrResumeExpired
+	}
+	return record, nil
+}
+
+// PrepareAuthenticatedSetupResume creates or reuses the protected verifier
+// journal for an authenticated Host setup. It replaces an older journal only
+// when every immutable machine binding matches and the journal is expired with
+// no material or locally committed installation progress.
+func PrepareAuthenticatedSetupResume(stateRoot, serverURL, publicIdentityKey, displayName, machineID string, installationGeneration int64, now time.Time) (ResumeRecord, error) {
+	serverURL = strings.TrimRight(strings.TrimSpace(serverURL), "/")
+	publicIdentityKey, displayName, machineID = strings.TrimSpace(publicIdentityKey), strings.TrimSpace(displayName), strings.TrimSpace(machineID)
+	if !filepath.IsAbs(stateRoot) || !validResumeServer(serverURL) || publicIdentityKey == "" || displayName == "" || machineID == "" || installationGeneration < 1 || now.IsZero() {
+		return ResumeRecord{}, ErrResumeBinding
+	}
+	existing, err := loadResumeDocument(stateRoot)
+	if err == nil {
+		exactBase := existing.ServerURL == serverURL && existing.PublicIdentityKey == publicIdentityKey && existing.DisplayName == displayName && existing.SetupMode == "host"
+		exactAuthenticatedBinding := exactBase && existing.ExpectedUserMachineID == machineID && existing.ExpectedGeneration == installationGeneration
+		expired := !now.UTC().Before(existing.PairingExpiresAt)
+		if existing.Material != nil && !now.UTC().Before(existing.Material.ExpiresAt) {
+			expired = true
+		}
+		if existing.AuthenticatedSetup {
+			if exactAuthenticatedBinding && !expired {
+				return existing, nil
+			}
+			if !exactAuthenticatedBinding || !expired || existing.Material != nil || existing.RuntimeEnrolled || existing.ClientInstalled {
+				return ResumeRecord{}, ErrResumeBinding
+			}
+		} else if !exactBase || !existing.PairingStarted || !expired || existing.Material != nil || existing.RuntimeEnrolled || existing.ClientInstalled {
+			return ResumeRecord{}, ErrResumeBinding
+		}
+		if clearErr := ClearResume(stateRoot); clearErr != nil {
+			return ResumeRecord{}, clearErr
+		}
+	} else if !errors.Is(err, ErrResumeNotFound) {
+		return ResumeRecord{}, err
+	}
+	verifierBytes, operationBytes := make([]byte, 32), make([]byte, 16)
+	if _, err := io.ReadFull(rand.Reader, verifierBytes); err != nil {
+		return ResumeRecord{}, err
+	}
+	if _, err := io.ReadFull(rand.Reader, operationBytes); err != nil {
+		return ResumeRecord{}, err
+	}
+	record := NewResumeRecord(serverURL, publicIdentityKey, "", displayName, "host", base64.RawURLEncoding.EncodeToString(verifierBytes), now.UTC().Add(15*time.Minute))
+	record.AuthenticatedSetup = true
+	record.SetupOperationID = "host-setup-" + base64.RawURLEncoding.EncodeToString(operationBytes)
+	record.ExpectedUserMachineID = machineID
+	record.ExpectedGeneration = installationGeneration
+	if err := SaveResume(stateRoot, record); err != nil {
+		return ResumeRecord{}, err
+	}
+	return record, nil
+}
+
+func loadResumeDocument(stateRoot string) (ResumeRecord, error) {
 	path := ResumePath(stateRoot)
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -114,24 +198,6 @@ func LoadResume(stateRoot, serverURL, publicIdentityKey, enrollmentToken, displa
 	}
 	if err := validateResumeRecord(record, true); err != nil {
 		return ResumeRecord{}, err
-	}
-	if strings.TrimRight(strings.TrimSpace(serverURL), "/") != record.ServerURL ||
-		strings.TrimSpace(publicIdentityKey) != record.PublicIdentityKey ||
-		strings.TrimSpace(displayName) != record.DisplayName ||
-		strings.TrimSpace(setupMode) != record.SetupMode {
-		return ResumeRecord{}, ErrResumeBinding
-	}
-	if record.requiresEnrollmentToken() && strings.TrimSpace(enrollmentToken) == "" && !record.PairingStarted {
-		return ResumeRecord{}, ErrResumeTokenRequired
-	}
-	if strings.TrimSpace(enrollmentToken) != "" && enrollmentTokenDigest(enrollmentToken) != record.EnrollmentTokenSHA {
-		return ResumeRecord{}, ErrResumeBinding
-	}
-	if record.Material != nil && !now.UTC().Before(record.Material.ExpiresAt) {
-		return record, ErrResumeExpired
-	}
-	if record.Material == nil && !record.PairingExpiresAt.IsZero() && !now.UTC().Before(record.PairingExpiresAt) {
-		return record, ErrResumeExpired
 	}
 	return record, nil
 }
@@ -167,6 +233,25 @@ func ValidateRecoveredMaterial(previous, recovered Material, runtimeEnrolled boo
 	return nil
 }
 
+// ValidateAuthenticatedSetupMaterial binds authenticated Host material to the
+// exact setup transition and, on recovery, to the artifact that was verified
+// before the one-shot installation authority was issued.
+func ValidateAuthenticatedSetupMaterial(record ResumeRecord, material Material) error {
+	if !record.AuthenticatedSetup || material.UserMachineID != record.ExpectedUserMachineID || material.InstallationGeneration != record.ExpectedGeneration || material.SetupMode != "host" {
+		return ErrResumeBinding
+	}
+	if record.Material == nil {
+		return nil
+	}
+	if err := ValidateRecoveredMaterial(*record.Material, material, record.RuntimeEnrolled); err != nil {
+		return err
+	}
+	if record.Material.Artifact == nil || material.Artifact == nil || *record.Material.Artifact != *material.Artifact {
+		return fmt.Errorf("%w: authenticated Host recovery changed the verified artifact", ErrResumeBinding)
+	}
+	return nil
+}
+
 func enrollmentTokenDigest(value string) string {
 	digest := sha256.Sum256([]byte(strings.TrimSpace(value)))
 	return hex.EncodeToString(digest[:])
@@ -193,6 +278,13 @@ func validateResumeRecord(record ResumeRecord, loaded bool) error {
 		return ErrResumeBinding
 	}
 	if _, err := hex.DecodeString(record.EnrollmentTokenSHA); err != nil {
+		return ErrResumeBinding
+	}
+	if record.AuthenticatedSetup {
+		if record.SetupMode != "host" || record.requiresEnrollmentToken() || len(record.SetupOperationID) < 8 || len(record.SetupOperationID) > 128 || record.ExpectedUserMachineID == "" || record.ExpectedGeneration < 1 {
+			return ErrResumeBinding
+		}
+	} else if record.SetupOperationID != "" || record.ExpectedUserMachineID != "" || record.ExpectedGeneration != 0 {
 		return ErrResumeBinding
 	}
 	if loaded && record.Material == nil && record.ClientInstalled || record.RuntimeEnrolled && record.Material == nil {

@@ -45,10 +45,17 @@ type windowsServiceDefinition struct {
 // owned: callers must surface that residue instead of deleting an ambiguous
 // SCM entry.
 type WindowsPreviewServiceArtifact struct {
-	Name            string
-	HasService      bool
+	Name       string
+	HasService bool
+	// ServiceTerminal is true only when SCM reports durable successful
+	// completion, or when the registration is already marked for deletion.
+	// Callers must not reconcile a descriptor-less service while this is false.
+	ServiceTerminal bool
 	HasDeclaration  bool
 	DeclarationRoot string
+	// DeclarationModifiedAt lets reconciliation preserve a just-created SCM
+	// registration during the descriptor publication/startup window.
+	DeclarationModifiedAt time.Time
 }
 
 func windowsServiceName(kind, instance string) string {
@@ -102,6 +109,8 @@ var windowsServiceProbe = probeWindowsService
 
 var windowsServiceList = listWindowsServices
 
+var windowsPreviewServiceTerminalProbe = probeWindowsPreviewServiceTerminal
+
 func probeWindowsService(name string) (owned bool, resultErr error) {
 	manager, err := mgr.Connect()
 	if err != nil {
@@ -144,6 +153,40 @@ func listWindowsServices() (result []string, resultErr error) {
 	return result, nil
 }
 
+func probeWindowsPreviewServiceTerminal(name string) (exists bool, terminal bool, resultErr error) {
+	manager, err := mgr.Connect()
+	if err != nil {
+		return false, false, err
+	}
+	defer func() { resultErr = errors.Join(resultErr, manager.Disconnect()) }()
+	service, err := manager.OpenService(name)
+	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+		return false, false, nil
+	}
+	if errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
+		return true, true, nil
+	}
+	if err != nil {
+		return false, false, err
+	}
+	defer func() { resultErr = errors.Join(resultErr, service.Close()) }()
+	status, err := service.Query()
+	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+		return false, false, nil
+	}
+	if errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
+		return true, true, nil
+	}
+	if err != nil {
+		return true, false, err
+	}
+	return true, windowsPreviewServiceStatusTerminal(status), nil
+}
+
+func windowsPreviewServiceStatusTerminal(status svc.Status) bool {
+	return status.State == svc.Stopped && status.Win32ExitCode == 0 && status.ServiceSpecificExitCode == 0
+}
+
 func validateWindowsPreviewDeclarationEntry(entry os.DirEntry) error {
 	if !entry.IsDir() {
 		return nil
@@ -165,7 +208,13 @@ func ListWindowsPreviewServiceArtifacts() ([]WindowsPreviewServiceArtifact, erro
 	}
 	byName := make(map[string]WindowsPreviewServiceArtifact, len(serviceNames))
 	for _, name := range serviceNames {
-		byName[name] = WindowsPreviewServiceArtifact{Name: name, HasService: true}
+		exists, terminal, err := windowsPreviewServiceTerminalProbe(name)
+		if err != nil {
+			return nil, fmt.Errorf("query preview service %s status: %w", name, err)
+		}
+		if exists {
+			byName[name] = WindowsPreviewServiceArtifact{Name: name, HasService: true, ServiceTerminal: terminal}
+		}
 	}
 	entries, err := readWindowsServiceDefinitionEntries()
 	if err != nil {
@@ -194,10 +243,15 @@ func ListWindowsPreviewServiceArtifacts() ([]WindowsPreviewServiceArtifact, erro
 		if err := validateWindowsPreviewDefinition(path, name, stateRoot, definition); err != nil {
 			return nil, fmt.Errorf("validate preview declaration %s: %w", entry.Name(), err)
 		}
+		info, err := entry.Info()
+		if err != nil {
+			return nil, fmt.Errorf("stat preview declaration %s: %w", entry.Name(), err)
+		}
 		artifact := byName[name]
 		artifact.Name = name
 		artifact.HasDeclaration = true
 		artifact.DeclarationRoot = stateRoot
+		artifact.DeclarationModifiedAt = info.ModTime().UTC()
 		byName[name] = artifact
 	}
 	result := make([]WindowsPreviewServiceArtifact, 0, len(byName))

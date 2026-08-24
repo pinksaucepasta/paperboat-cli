@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -27,6 +28,18 @@ func (a *fakeApplier) Apply(_ context.Context, mode string) error {
 	return a.err
 }
 func (a *fakeApplier) Close(context.Context) error { return nil }
+
+type blockingApplier struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (a *blockingApplier) Apply(context.Context, string) error {
+	close(a.entered)
+	<-a.release
+	return nil
+}
+func (a *blockingApplier) Close(context.Context) error { return nil }
 
 func TestNewAllowsRootPeerIdentity(t *testing.T) {
 	root := t.TempDir()
@@ -54,22 +67,32 @@ func TestNewRejectsHeartbeatIntervalWithoutCallback(t *testing.T) {
 	}
 }
 
-func TestServeListenerReportsReadyAndHeartbeatsFromAcceptLoop(t *testing.T) {
+func TestServeListenerReportsPeriodicHeartbeatsDuringRequestTraffic(t *testing.T) {
 	root, err := os.MkdirTemp("", "pb-hostservice-")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(root) })
 	ready := make(chan struct{}, 1)
-	heartbeat := make(chan struct{}, 1)
+	heartbeat := make(chan struct{}, 2)
+	ticks := make(chan time.Time, 2)
+	tickerStopped := make(chan struct{})
+	applier := &blockingApplier{entered: make(chan struct{}), release: make(chan struct{})}
+	var heartbeatCount atomic.Int64
 	server, err := New(Config{
 		SocketPath: filepath.Join(root, "host.sock"), StatePath: filepath.Join(root, "policy.json"),
-		UID: os.Getuid(), GID: os.Getgid(), Applier: &fakeApplier{}, Version: "test",
+		UID: os.Getuid(), GID: os.Getgid(), Applier: applier, Version: "test",
 		Ready:     func() error { ready <- struct{}{}; return nil },
-		Heartbeat: func() error { heartbeat <- struct{}{}; return nil }, HeartbeatInterval: 10 * time.Millisecond,
+		Heartbeat: func() error { heartbeatCount.Add(1); heartbeat <- struct{}{}; return nil }, HeartbeatInterval: time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	server.newHeartbeatTicker = func(interval time.Duration) (<-chan time.Time, func()) {
+		if interval != time.Second {
+			t.Errorf("heartbeat interval=%s", interval)
+		}
+		return ticks, func() { close(tickerStopped) }
 	}
 	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: server.config.SocketPath, Net: "unix"})
 	if err != nil {
@@ -84,14 +107,95 @@ func TestServeListenerReportsReadyAndHeartbeatsFromAcceptLoop(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("readiness was not reported")
 	}
+	client, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: server.config.SocketPath, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.NewEncoder(client).Encode(Request{Schema: ProtocolV1, Operation: "apply_availability", Mode: KeepAwake, Version: 1}); err != nil {
+		t.Fatal(err)
+	}
 	select {
-	case <-heartbeat:
+	case <-applier.entered:
 	case <-time.After(time.Second):
-		t.Fatal("accept loop did not report heartbeat")
+		t.Fatal("request did not reach the blocking applier")
+	}
+	for index := 0; index < 2; index++ {
+		ticks <- time.Time{}
+		select {
+		case <-heartbeat:
+		case <-time.After(time.Second):
+			t.Fatalf("request traffic blocked periodic heartbeat %d", index+1)
+		}
+	}
+	if got := heartbeatCount.Load(); got != 2 {
+		t.Fatalf("heartbeat count=%d", got)
+	}
+	close(applier.release)
+	var response Response
+	if err := json.NewDecoder(client).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if response.Status != "applied" || response.ObservedVersion != 1 {
+		t.Fatalf("response=%+v", response)
 	}
 	cancel()
 	if err := <-done; !errors.Is(err, context.Canceled) {
 		t.Fatalf("run error=%v", err)
+	}
+	select {
+	case <-tickerStopped:
+	default:
+		t.Fatal("heartbeat ticker was not stopped")
+	}
+	completedHeartbeats := heartbeatCount.Load()
+	ticks <- time.Time{}
+	if heartbeatCount.Load() != completedHeartbeats {
+		t.Fatal("heartbeat continued after server cancellation")
+	}
+}
+
+func TestServeListenerReturnsPeriodicHeartbeatFailure(t *testing.T) {
+	root, err := os.MkdirTemp("", "pb-hostservice-heartbeat-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	ticks := make(chan time.Time, 1)
+	tickerStopped := make(chan struct{})
+	heartbeatErr := errors.New("notify watchdog")
+	server, err := New(Config{
+		SocketPath: filepath.Join(root, "host.sock"), StatePath: filepath.Join(root, "policy.json"),
+		UID: os.Getuid(), GID: os.Getgid(), Applier: &fakeApplier{}, Version: "test",
+		Heartbeat: func() error { return heartbeatErr }, HeartbeatInterval: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.newHeartbeatTicker = func(time.Duration) (<-chan time.Time, func()) {
+		return ticks, func() { close(tickerStopped) }
+	}
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: server.config.SocketPath, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- server.serveListener(context.Background(), listener) }()
+	ticks <- time.Time{}
+	select {
+	case err := <-done:
+		if !errors.Is(err, heartbeatErr) {
+			t.Fatalf("run error=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("heartbeat failure did not stop the listener")
+	}
+	select {
+	case <-tickerStopped:
+	default:
+		t.Fatal("heartbeat ticker was not stopped after failure")
 	}
 }
 

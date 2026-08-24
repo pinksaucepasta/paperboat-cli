@@ -3,14 +3,12 @@
 package runtime
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/url"
 	"os"
@@ -27,44 +25,6 @@ import (
 	hostservice "github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
 	servepkg "github.com/pinksaucepasta/paperboat/internal/serve"
 )
-
-type ServeRuntimeDescriptor struct {
-	SourcePath     string              `json:"source_path"`
-	SourceKind     servepkg.SourceKind `json:"source_kind"`
-	SourceIdentity string              `json:"source_identity"`
-	SPA            bool                `json:"spa"`
-	OwnerMode      string              `json:"owner_mode"`
-	Visibility     string              `json:"visibility"`
-	ListenPort     uint16              `json:"listen_port,omitempty"`
-}
-
-type PreviewRuntimeDescriptor struct {
-	Schema            string                           `json:"schema"`
-	Name              string                           `json:"name"`
-	BindAddress       string                           `json:"bind_address,omitempty"`
-	Port              uint16                           `json:"port"`
-	ServiceGeneration uint64                           `json:"service_generation,omitempty"`
-	Indefinite        bool                             `json:"indefinite"`
-	ExpiresAt         *time.Time                       `json:"expires_at,omitempty"`
-	ServiceDefinition string                           `json:"service_definition"`
-	Record            *preview.ControlRecord           `json:"record,omitempty"`
-	Failure           *PreviewRuntimeFailure           `json:"failure,omitempty"`
-	Serve             *ServeRuntimeDescriptor          `json:"serve,omitempty"`
-	PrivateRemote     *PrivatePreviewRuntimeDescriptor `json:"private_remote,omitempty"`
-}
-
-type PreviewRuntimeFailure struct {
-	Code string `json:"code"`
-}
-
-type PrivatePreviewRuntimeDescriptor struct {
-	MachineID         string `json:"machine_id"`
-	MachineName       string `json:"machine_name"`
-	EnvironmentID     string `json:"environment_id"`
-	MachineGeneration uint64 `json:"machine_generation"`
-	TargetPort        uint16 `json:"target_port"`
-	ListenPort        uint16 `json:"listen_port,omitempty"`
-}
 
 var ErrPreviewAlreadyActive = errors.New("preview name is already active")
 var ErrPreviewServiceMissing = errors.New("preview service is missing")
@@ -715,30 +675,5 @@ func readPreviewRuntimeDescriptor(path string) (PreviewRuntimeDescriptor, error)
 	if err != nil {
 		return PreviewRuntimeDescriptor{}, err
 	}
-	var descriptor PreviewRuntimeDescriptor
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	if decoder.Decode(&descriptor) != nil || decoder.Decode(&struct{}{}) != io.EOF {
-		return PreviewRuntimeDescriptor{}, ErrProductionInvalid
-	}
-	validPreview := descriptor.Serve == nil && descriptor.PrivateRemote == nil && descriptor.Port != 0
-	validServe := descriptor.PrivateRemote == nil && validServeRuntimeDescriptor(descriptor.Serve) && descriptor.BindAddress == "127.0.0.1" && descriptor.ServiceGeneration > 0
-	validRemote := descriptor.Serve == nil && validPrivatePreviewRuntimeDescriptor(descriptor.PrivateRemote) && descriptor.BindAddress == "127.0.0.1" && descriptor.ServiceGeneration > 0
-	validFailure := descriptor.Failure == nil || descriptor.Record != nil && descriptor.Record.State == "failed" && (descriptor.Failure.Code == "preview_listener_unavailable" || descriptor.Failure.Code == "preview_worker_start_failed")
-	if descriptor.Schema != "paperboat.preview-runtime/v1" || !validPreview && !validServe && !validRemote || descriptor.Name == "" || descriptor.ServiceDefinition != "" && !filepath.IsAbs(descriptor.ServiceDefinition) || descriptor.Indefinite == (descriptor.ExpiresAt != nil) || !validFailure {
-		return PreviewRuntimeDescriptor{}, ErrProductionInvalid
-	}
-	return descriptor, nil
-}
-
-func validPrivatePreviewRuntimeDescriptor(value *PrivatePreviewRuntimeDescriptor) bool {
-	return value != nil && value.MachineID != "" && value.MachineName != "" && value.EnvironmentID != "" && value.MachineGeneration > 0 && value.TargetPort > 0
-}
-
-func validServeRuntimeDescriptor(value *ServeRuntimeDescriptor) bool {
-	return value != nil && filepath.IsAbs(value.SourcePath) && value.SourceIdentity != "" &&
-		(value.SourceKind == servepkg.SourceFile || value.SourceKind == servepkg.SourceDirectory) &&
-		value.OwnerMode == "detached" && (value.Visibility == "private" || value.Visibility == "public") &&
-		(value.Visibility == "private" || value.ListenPort == 0) &&
-		(!value.SPA || value.SourceKind == servepkg.SourceDirectory)
+	return DecodePreviewRuntimeDescriptor(data)
 }

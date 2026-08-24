@@ -253,6 +253,23 @@ func release(version string, body []byte) Release {
 	return Release{Version: version, SHA256: hex.EncodeToString(sum[:]), Length: int64(len(body)), Platform: runtime.GOOS, Architecture: runtime.GOARCH, CLISHA256: hex.EncodeToString(sum[:]), CLILength: int64(len(body)), CLIPlatform: runtime.GOOS, CLIArchitecture: runtime.GOARCH, HostdAPIMin: 1, HostdAPIMax: 2, RuntimeAPIMin: 1, RuntimeAPIMax: 2}
 }
 
+func TestValidWorkerIdentitySupportsExactRootEnrollment(t *testing.T) {
+	for _, test := range []struct {
+		uid, gid int
+		want     bool
+	}{
+		{uid: 1000, gid: 1000, want: true},
+		{uid: 0, gid: 0, want: true},
+		{uid: 0, gid: 1000},
+		{uid: 1000, gid: 0},
+		{uid: -1, gid: -1},
+	} {
+		if got := validWorkerIdentity(test.uid, test.gid); got != test.want {
+			t.Fatalf("validWorkerIdentity(%d, %d)=%v want %v", test.uid, test.gid, got, test.want)
+		}
+	}
+}
+
 type fakeFetcher struct{ body, cliBody []byte }
 
 func (f *fakeFetcher) Fetch(context.Context, Release) (io.ReadCloser, error) {

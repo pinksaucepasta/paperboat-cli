@@ -1,0 +1,2540 @@
+{
+  "schema": "paperboat.codex-path-manifest/v1",
+  "codex_version": "0.149.1",
+  "source_tag": "rust-v0.149.1",
+  "source_commit": "ff29a44391deccde0aba0f8390337d7f3c319ea4",
+  "inputs_sha256": "53badd0b6c55734f1e7ae3f6820125e37401a790457cc594eedde05e77ae23c9",
+  "client_requests": {
+    "account/bedrock/discover": [],
+    "account/bedrock/setup": [],
+    "account/login/cancel": [],
+    "account/login/start": [],
+    "account/logout": [],
+    "account/rateLimitResetCredit/consume": [],
+    "account/rateLimits/read": [],
+    "account/read": [],
+    "account/sendAddCreditsNudgeEmail": [],
+    "account/usage/read": [],
+    "account/workspaceMessages/read": [],
+    "app/installed": [],
+    "app/list": [],
+    "app/read": [],
+    "collaborationMode/list": [],
+    "command/exec": [
+      {
+        "pointer": "/params/cwd",
+        "kind": "native-launch-cwd-alias"
+      },
+      {
+        "pointer": "/params/sandboxPolicy/writableRoots/*",
+        "kind": "absolute",
+        "variant_pointer": "/params/sandboxPolicy/type",
+        "variants": [
+          "workspaceWrite"
+        ]
+      }
+    ],
+    "command/exec/resize": [],
+    "command/exec/terminate": [],
+    "command/exec/write": [],
+    "config/batchWrite": [
+      {
+        "pointer": "/params/edits/*/keyPath",
+        "kind": "project-key-path"
+      },
+      {
+        "pointer": "/params/filePath",
+        "kind": "path"
+      }
+    ],
+    "config/mcpServer/reload": [],
+    "config/read": [
+      {
+        "pointer": "/params/cwd",
+        "kind": "path"
+      }
+    ],
+    "config/value/write": [
+      {
+        "pointer": "/params/filePath",
+        "kind": "path"
+      },
+      {
+        "pointer": "/params/keyPath",
+        "kind": "project-key-path"
+      }
+    ],
+    "configRequirements/read": [],
+    "environment/add": [],
+    "environment/info": [],
+    "environment/status": [],
+    "experimentalFeature/enablement/set": [],
+    "experimentalFeature/list": [],
+    "externalAgentConfig/detect": [
+      {
+        "pointer": "/params/cwds/*",
+        "kind": "path"
+      }
+    ],
+    "externalAgentConfig/import": [
+      {
+        "pointer": "/params/migrationItems/*/cwd",
+        "kind": "path"
+      },
+      {
+        "pointer": "/params/migrationItems/*/details/sessions/*/cwd",
+        "kind": "path"
+      },
+      {
+        "pointer": "/params/migrationItems/*/details/sessions/*/path",
+        "kind": "path"
+      }
+    ],
+    "externalAgentConfig/import/readHistories": [],
+    "externalAgentConfig/import/recordHistory": [
+      {
+        "pointer": "/params/itemTypeResults/*/failures/*/cwd",
+        "kind": "path"
+      },
+      {
+        "pointer": "/params/itemTypeResults/*/successes/*/cwd",
+        "kind": "path"
+      }
+    ],
+    "feedback/upload": [
+      {
+        "pointer": "/params/extraLogFiles/*",
+        "kind": "path"
+      }
+    ],
+    "fs/copy": [
+      {
+        "pointer": "/params/destinationPath",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/params/sourcePath",
+        "kind": "absolute"
+      }
+    ],
+    "fs/createDirectory": [
+      {
+        "pointer": "/params/path",
+        "kind": "absolute"
+      }
+    ],
+    "fs/getMetadata": [
+      {
+        "pointer": "/params/path",
+        "kind": "absolute"
+      }
+    ],
+    "fs/readDirectory": [
+      {
+        "pointer": "/params/path",
+        "kind": "absolute"
+      }
+    ],
+    "fs/readFile": [
+      {
+        "pointer": "/params/path",
+        "kind": "absolute"
+      }
+    ],
+    "fs/remove": [
+      {
+        "pointer": "/params/path",
+        "kind": "absolute"
+      }
+    ],
+    "fs/unwatch": [],
+    "fs/watch": [
+      {
+        "pointer": "/params/path",
+        "kind": "absolute"
+      }
+    ],
+    "fs/writeFile": [
+      {
+        "pointer": "/params/path",
+        "kind": "absolute"
+      }
+    ],
+    "fuzzyFileSearch": [
+      {
+        "pointer": "/params/roots/*",
+        "kind": "path"
+      }
+    ],
+    "fuzzyFileSearch/sessionStart": [
+      {
+        "pointer": "/params/roots/*",
+        "kind": "path"
+      }
+    ],
+    "fuzzyFileSearch/sessionStop": [],
+    "fuzzyFileSearch/sessionUpdate": [],
+    "getAuthStatus": [],
+    "getConversationSummary": [
+      {
+        "pointer": "/params/rolloutPath",
+        "kind": "path"
+      }
+    ],
+    "gitDiffToRemote": [
+      {
+        "pointer": "/params/cwd",
+        "kind": "path"
+      }
+    ],
+    "hooks/list": [
+      {
+        "pointer": "/params/cwds/*",
+        "kind": "hooks-list-cwd-alias"
+      }
+    ],
+    "initialize": [],
+    "marketplace/add": [
+      {
+        "pointer": "/params/sparsePaths/*",
+        "kind": "path"
+      }
+    ],
+    "marketplace/remove": [],
+    "marketplace/upgrade": [],
+    "mcpServer/oauth/login": [],
+    "mcpServer/resource/read": [],
+    "mcpServer/tool/call": [],
+    "mcpServerStatus/list": [],
+    "memory/reset": [],
+    "mock/experimentalMethod": [],
+    "model/list": [],
+    "modelProvider/capabilities/read": [],
+    "permissionProfile/list": [
+      {
+        "pointer": "/params/cwd",
+        "kind": "path"
+      }
+    ],
+    "plugin/install": [
+      {
+        "pointer": "/params/marketplacePath",
+        "kind": "absolute"
+      }
+    ],
+    "plugin/installed": [
+      {
+        "pointer": "/params/cwds/*",
+        "kind": "absolute"
+      }
+    ],
+    "plugin/list": [
+      {
+        "pointer": "/params/cwds/*",
+        "kind": "native-launch-cwd-alias"
+      }
+    ],
+    "plugin/read": [
+      {
+        "pointer": "/params/marketplacePath",
+        "kind": "absolute"
+      }
+    ],
+    "plugin/search": [
+      {
+        "pointer": "/params/cwds/*",
+        "kind": "absolute"
+      }
+    ],
+    "plugin/share/checkout": [],
+    "plugin/share/delete": [],
+    "plugin/share/list": [],
+    "plugin/share/save": [
+      {
+        "pointer": "/params/pluginPath",
+        "kind": "absolute"
+      }
+    ],
+    "plugin/share/updateTargets": [],
+    "plugin/skill/read": [],
+    "plugin/uninstall": [],
+    "process/kill": [],
+    "process/resizePty": [],
+    "process/spawn": [
+      {
+        "pointer": "/params/cwd",
+        "kind": "absolute"
+      }
+    ],
+    "process/writeStdin": [],
+    "project/create": [
+      {
+        "pointer": "/params/roots/*/path",
+        "kind": "absolute"
+      }
+    ],
+    "project/delete": [],
+    "project/import": [
+      {
+        "pointer": "/params/roots/*/path",
+        "kind": "absolute"
+      }
+    ],
+    "project/list": [],
+    "project/move": [],
+    "project/read": [],
+    "project/update": [
+      {
+        "pointer": "/params/roots/*/path",
+        "kind": "absolute"
+      }
+    ],
+    "remoteControl/client/list": [],
+    "remoteControl/client/revoke": [],
+    "remoteControl/disable": [],
+    "remoteControl/enable": [],
+    "remoteControl/pairing/start": [],
+    "remoteControl/pairing/status": [],
+    "remoteControl/status/read": [],
+    "review/start": [],
+    "server/diagnostics": [],
+    "skills/config/write": [
+      {
+        "pointer": "/params/path",
+        "kind": "absolute"
+      }
+    ],
+    "skills/extraRoots/set": [
+      {
+        "pointer": "/params/extraRoots/*",
+        "kind": "absolute"
+      }
+    ],
+    "skills/list": [
+      {
+        "pointer": "/params/cwds/*",
+        "kind": "skills-list-cwd-alias"
+      }
+    ],
+    "thread/approveGuardianDeniedAction": [],
+    "thread/archive": [],
+    "thread/backgroundTerminals/clean": [],
+    "thread/backgroundTerminals/list": [],
+    "thread/backgroundTerminals/terminate": [],
+    "thread/compact/start": [],
+    "thread/decrement_elicitation": [],
+    "thread/delete": [],
+    "thread/fork": [
+      {
+        "pointer": "/params/cwd",
+        "kind": "path"
+      },
+      {
+        "pointer": "/params/path",
+        "kind": "path"
+      },
+      {
+        "pointer": "/params/runtimeWorkspaceRoots/*",
+        "kind": "native-launch-cwd-alias"
+      }
+    ],
+    "thread/goal/clear": [],
+    "thread/goal/get": [],
+    "thread/goal/set": [],
+    "thread/increment_elicitation": [],
+    "thread/inject_items": [],
+    "thread/items/list": [],
+    "thread/list": [
+      {
+        "pointer": "/params/cwd",
+        "kind": "path-or-array"
+      }
+    ],
+    "thread/loaded/list": [],
+    "thread/memoryMode/set": [],
+    "thread/metadata/update": [],
+    "thread/name/set": [],
+    "thread/queue/add": [
+      {
+        "pointer": "/params/input/*/path",
+        "kind": "path",
+        "variant_pointer": "/params/input/*/type",
+        "variants": [
+          "localAudio",
+          "localImage",
+          "skill"
+        ],
+        "ignored_variants": [
+          "mention"
+        ]
+      }
+    ],
+    "thread/queue/delete": [],
+    "thread/queue/list": [],
+    "thread/queue/reorder": [],
+    "thread/queue/start": [],
+    "thread/queue/update": [
+      {
+        "pointer": "/params/input/*/path",
+        "kind": "path",
+        "variant_pointer": "/params/input/*/type",
+        "variants": [
+          "localAudio",
+          "localImage",
+          "skill"
+        ],
+        "ignored_variants": [
+          "mention"
+        ]
+      }
+    ],
+    "thread/read": [],
+    "thread/realtime/appendAudio": [],
+    "thread/realtime/appendSpeech": [],
+    "thread/realtime/appendText": [],
+    "thread/realtime/listVoices": [],
+    "thread/realtime/start": [],
+    "thread/realtime/stop": [],
+    "thread/resume": [
+      {
+        "pointer": "/params/cwd",
+        "kind": "path"
+      },
+      {
+        "pointer": "/params/path",
+        "kind": "path"
+      },
+      {
+        "pointer": "/params/runtimeWorkspaceRoots/*",
+        "kind": "native-launch-cwd-alias"
+      }
+    ],
+    "thread/revert": [],
+    "thread/rollback": [],
+    "thread/search": [],
+    "thread/searchOccurrences": [],
+    "thread/section/move": [],
+    "thread/settings/update": [
+      {
+        "pointer": "/params/cwd",
+        "kind": "path"
+      },
+      {
+        "pointer": "/params/sandboxPolicy/writableRoots/*",
+        "kind": "absolute",
+        "variant_pointer": "/params/sandboxPolicy/type",
+        "variants": [
+          "workspaceWrite"
+        ]
+      }
+    ],
+    "thread/shellCommand": [],
+    "thread/start": [
+      {
+        "pointer": "/params/cwd",
+        "kind": "path"
+      },
+      {
+        "pointer": "/params/runtimeWorkspaceRoots/*",
+        "kind": "thread-start-runtime-root-alias"
+      },
+      {
+        "pointer": "/params/selectedCapabilityRoots/*/location/path",
+        "kind": "path",
+        "variant_pointer": "/params/selectedCapabilityRoots/*/location/type",
+        "variants": [
+          "environment"
+        ]
+      }
+    ],
+    "thread/turns/list": [],
+    "thread/unarchive": [],
+    "thread/unsubscribe": [],
+    "threadSection/create": [],
+    "threadSection/delete": [],
+    "threadSection/list": [],
+    "threadSection/update": [],
+    "turn/interrupt": [],
+    "turn/start": [
+      {
+        "pointer": "/params/cwd",
+        "kind": "path"
+      },
+      {
+        "pointer": "/params/input/*/path",
+        "kind": "path",
+        "variant_pointer": "/params/input/*/type",
+        "variants": [
+          "localAudio",
+          "localImage",
+          "skill"
+        ],
+        "ignored_variants": [
+          "mention"
+        ]
+      },
+      {
+        "pointer": "/params/runtimeWorkspaceRoots/*",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/params/sandboxPolicy/writableRoots/*",
+        "kind": "absolute",
+        "variant_pointer": "/params/sandboxPolicy/type",
+        "variants": [
+          "workspaceWrite"
+        ]
+      }
+    ],
+    "turn/steer": [
+      {
+        "pointer": "/params/input/*/path",
+        "kind": "path",
+        "variant_pointer": "/params/input/*/type",
+        "variants": [
+          "localAudio",
+          "localImage",
+          "skill"
+        ],
+        "ignored_variants": [
+          "mention"
+        ]
+      }
+    ],
+    "windowsSandbox/readiness": [],
+    "windowsSandbox/setupStart": [
+      {
+        "pointer": "/params/cwd",
+        "kind": "absolute"
+      }
+    ]
+  },
+  "client_notifications": {
+    "initialized": []
+  },
+  "client_responses": {
+    "account/bedrock/discover": [],
+    "account/bedrock/setup": [],
+    "account/login/cancel": [],
+    "account/login/start": [],
+    "account/logout": [],
+    "account/rateLimitResetCredit/consume": [],
+    "account/rateLimits/read": [],
+    "account/read": [],
+    "account/sendAddCreditsNudgeEmail": [],
+    "account/usage/read": [],
+    "account/workspaceMessages/read": [],
+    "app/installed": [],
+    "app/list": [],
+    "app/read": [],
+    "collaborationMode/list": [],
+    "command/exec": [],
+    "command/exec/resize": [],
+    "command/exec/terminate": [],
+    "command/exec/write": [],
+    "config/batchWrite": [
+      {
+        "pointer": "/result/filePath",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/overriddenMetadata/overridingLayer/name/dotCodexFolder",
+        "kind": "absolute",
+        "variant_pointer": "/result/overriddenMetadata/overridingLayer/name/type",
+        "variants": [
+          "project"
+        ]
+      },
+      {
+        "pointer": "/result/overriddenMetadata/overridingLayer/name/file",
+        "kind": "absolute",
+        "variant_pointer": "/result/overriddenMetadata/overridingLayer/name/type",
+        "variants": [
+          "legacyManagedConfigTomlFromFile",
+          "packagedDefaults",
+          "system",
+          "user"
+        ]
+      }
+    ],
+    "config/mcpServer/reload": [],
+    "config/read": [
+      {
+        "pointer": "/result/config/projects",
+        "kind": "path-map-keys"
+      },
+      {
+        "pointer": "/result/config/sandbox_workspace_write/writable_roots/*",
+        "kind": "path"
+      },
+      {
+        "pointer": "/result/layers/*/disabledReason",
+        "kind": "project-disabled-reason"
+      },
+      {
+        "pointer": "/result/layers/*/name/dotCodexFolder",
+        "kind": "absolute",
+        "variant_pointer": "/result/layers/*/name/type",
+        "variants": [
+          "project"
+        ]
+      },
+      {
+        "pointer": "/result/layers/*/name/file",
+        "kind": "absolute",
+        "variant_pointer": "/result/layers/*/name/type",
+        "variants": [
+          "legacyManagedConfigTomlFromFile",
+          "packagedDefaults",
+          "system",
+          "user"
+        ]
+      },
+      {
+        "pointer": "/result/origins/*/name/dotCodexFolder",
+        "kind": "absolute",
+        "variant_pointer": "/result/origins/*/name/type",
+        "variants": [
+          "project"
+        ]
+      },
+      {
+        "pointer": "/result/origins/*/name/file",
+        "kind": "absolute",
+        "variant_pointer": "/result/origins/*/name/type",
+        "variants": [
+          "legacyManagedConfigTomlFromFile",
+          "packagedDefaults",
+          "system",
+          "user"
+        ]
+      }
+    ],
+    "config/value/write": [
+      {
+        "pointer": "/result/filePath",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/overriddenMetadata/overridingLayer/name/dotCodexFolder",
+        "kind": "absolute",
+        "variant_pointer": "/result/overriddenMetadata/overridingLayer/name/type",
+        "variants": [
+          "project"
+        ]
+      },
+      {
+        "pointer": "/result/overriddenMetadata/overridingLayer/name/file",
+        "kind": "absolute",
+        "variant_pointer": "/result/overriddenMetadata/overridingLayer/name/type",
+        "variants": [
+          "legacyManagedConfigTomlFromFile",
+          "packagedDefaults",
+          "system",
+          "user"
+        ]
+      }
+    ],
+    "configRequirements/read": [
+      {
+        "pointer": "/result/requirements/hooks/managedDir",
+        "kind": "path"
+      },
+      {
+        "pointer": "/result/requirements/hooks/windowsManagedDir",
+        "kind": "path"
+      }
+    ],
+    "environment/add": [],
+    "environment/info": [
+      {
+        "pointer": "/result/shell/path",
+        "kind": "path"
+      }
+    ],
+    "environment/status": [],
+    "experimentalFeature/enablement/set": [],
+    "experimentalFeature/list": [],
+    "externalAgentConfig/detect": [
+      {
+        "pointer": "/result/items/*/cwd",
+        "kind": "path"
+      },
+      {
+        "pointer": "/result/items/*/details/sessions/*/cwd",
+        "kind": "path"
+      },
+      {
+        "pointer": "/result/items/*/details/sessions/*/path",
+        "kind": "path"
+      }
+    ],
+    "externalAgentConfig/import": [],
+    "externalAgentConfig/import/readHistories": [
+      {
+        "pointer": "/result/data/*/failures/*/cwd",
+        "kind": "path"
+      },
+      {
+        "pointer": "/result/data/*/successes/*/cwd",
+        "kind": "path"
+      }
+    ],
+    "externalAgentConfig/import/recordHistory": [],
+    "feedback/upload": [],
+    "fs/copy": [],
+    "fs/createDirectory": [],
+    "fs/getMetadata": [],
+    "fs/readDirectory": [],
+    "fs/readFile": [],
+    "fs/remove": [],
+    "fs/unwatch": [],
+    "fs/watch": [
+      {
+        "pointer": "/result/path",
+        "kind": "absolute"
+      }
+    ],
+    "fs/writeFile": [],
+    "fuzzyFileSearch": [
+      {
+        "pointer": "/result/files/*/path",
+        "kind": "path"
+      },
+      {
+        "pointer": "/result/files/*/root",
+        "kind": "path"
+      }
+    ],
+    "fuzzyFileSearch/sessionStart": [],
+    "fuzzyFileSearch/sessionStop": [],
+    "fuzzyFileSearch/sessionUpdate": [],
+    "getAuthStatus": [],
+    "getConversationSummary": [
+      {
+        "pointer": "/result/summary/cwd",
+        "kind": "path"
+      },
+      {
+        "pointer": "/result/summary/path",
+        "kind": "path"
+      }
+    ],
+    "gitDiffToRemote": [],
+    "hooks/list": [
+      {
+        "pointer": "/result/data/*/cwd",
+        "kind": "hooks-list-cwd-alias"
+      },
+      {
+        "pointer": "/result/data/*/errors/*/path",
+        "kind": "path"
+      },
+      {
+        "pointer": "/result/data/*/hooks/*/sourcePath",
+        "kind": "absolute"
+      }
+    ],
+    "initialize": [],
+    "marketplace/add": [
+      {
+        "pointer": "/result/installedRoot",
+        "kind": "absolute"
+      }
+    ],
+    "marketplace/remove": [
+      {
+        "pointer": "/result/installedRoot",
+        "kind": "absolute"
+      }
+    ],
+    "marketplace/upgrade": [
+      {
+        "pointer": "/result/upgradedRoots/*",
+        "kind": "absolute"
+      }
+    ],
+    "mcpServer/oauth/login": [],
+    "mcpServer/resource/read": [],
+    "mcpServer/tool/call": [],
+    "mcpServerStatus/list": [],
+    "memory/reset": [],
+    "mock/experimentalMethod": [],
+    "model/list": [],
+    "modelProvider/capabilities/read": [],
+    "permissionProfile/list": [],
+    "plugin/install": [],
+    "plugin/installed": [
+      {
+        "pointer": "/result/marketplaceLoadErrors/*/marketplacePath",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/marketplaces/*/path",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/marketplaces/*/plugins/*/interface/composerIcon",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/marketplaces/*/plugins/*/interface/logo",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/marketplaces/*/plugins/*/interface/logoDark",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/marketplaces/*/plugins/*/interface/screenshots/*",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/marketplaces/*/plugins/*/source/path",
+        "kind": "absolute",
+        "variant_pointer": "/result/marketplaces/*/plugins/*/source/type",
+        "variants": [
+          "local"
+        ],
+        "ignored_variants": [
+          "git"
+        ]
+      }
+    ],
+    "plugin/list": [
+      {
+        "pointer": "/result/marketplaceLoadErrors/*/marketplacePath",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/marketplaces/*/path",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/marketplaces/*/plugins/*/interface/composerIcon",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/marketplaces/*/plugins/*/interface/logo",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/marketplaces/*/plugins/*/interface/logoDark",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/marketplaces/*/plugins/*/interface/screenshots/*",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/marketplaces/*/plugins/*/source/path",
+        "kind": "absolute",
+        "variant_pointer": "/result/marketplaces/*/plugins/*/source/type",
+        "variants": [
+          "local"
+        ],
+        "ignored_variants": [
+          "git"
+        ]
+      }
+    ],
+    "plugin/read": [
+      {
+        "pointer": "/result/plugin/marketplacePath",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/plugin/skills/*/interface/iconLarge",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/plugin/skills/*/interface/iconSmall",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/plugin/skills/*/path",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/plugin/summary/interface/composerIcon",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/plugin/summary/interface/logo",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/plugin/summary/interface/logoDark",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/plugin/summary/interface/screenshots/*",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/plugin/summary/source/path",
+        "kind": "absolute",
+        "variant_pointer": "/result/plugin/summary/source/type",
+        "variants": [
+          "local"
+        ],
+        "ignored_variants": [
+          "git"
+        ]
+      }
+    ],
+    "plugin/search": [
+      {
+        "pointer": "/result/data/*/marketplacePath",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/data/*/plugin/interface/composerIcon",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/data/*/plugin/interface/logo",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/data/*/plugin/interface/logoDark",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/data/*/plugin/interface/screenshots/*",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/data/*/plugin/source/path",
+        "kind": "absolute",
+        "variant_pointer": "/result/data/*/plugin/source/type",
+        "variants": [
+          "local"
+        ],
+        "ignored_variants": [
+          "git"
+        ]
+      }
+    ],
+    "plugin/share/checkout": [
+      {
+        "pointer": "/result/marketplacePath",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/pluginPath",
+        "kind": "absolute"
+      }
+    ],
+    "plugin/share/delete": [],
+    "plugin/share/list": [
+      {
+        "pointer": "/result/data/*/localPluginPath",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/data/*/plugin/interface/composerIcon",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/data/*/plugin/interface/logo",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/data/*/plugin/interface/logoDark",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/data/*/plugin/interface/screenshots/*",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/data/*/plugin/source/path",
+        "kind": "absolute",
+        "variant_pointer": "/result/data/*/plugin/source/type",
+        "variants": [
+          "local"
+        ],
+        "ignored_variants": [
+          "git"
+        ]
+      }
+    ],
+    "plugin/share/save": [],
+    "plugin/share/updateTargets": [],
+    "plugin/skill/read": [],
+    "plugin/uninstall": [],
+    "process/kill": [],
+    "process/resizePty": [],
+    "process/spawn": [],
+    "process/writeStdin": [],
+    "project/create": [
+      {
+        "pointer": "/result/project/roots/*/path",
+        "kind": "absolute"
+      }
+    ],
+    "project/delete": [],
+    "project/import": [
+      {
+        "pointer": "/result/project/roots/*/path",
+        "kind": "absolute"
+      }
+    ],
+    "project/list": [
+      {
+        "pointer": "/result/data/*/roots/*/path",
+        "kind": "absolute"
+      }
+    ],
+    "project/move": [],
+    "project/read": [
+      {
+        "pointer": "/result/project/roots/*/path",
+        "kind": "absolute"
+      }
+    ],
+    "project/update": [
+      {
+        "pointer": "/result/project/roots/*/path",
+        "kind": "absolute"
+      }
+    ],
+    "remoteControl/client/list": [],
+    "remoteControl/client/revoke": [],
+    "remoteControl/disable": [],
+    "remoteControl/enable": [],
+    "remoteControl/pairing/start": [],
+    "remoteControl/pairing/status": [],
+    "remoteControl/status/read": [],
+    "review/start": [
+      {
+        "pointer": "/result/turn/items/*/changes/*/kind/move_path",
+        "kind": "path",
+        "variant_pointer": "/result/turn/items/*/changes/*/kind/type",
+        "variants": [
+          "update"
+        ]
+      },
+      {
+        "pointer": "/result/turn/items/*/changes/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/turn/items/*/type",
+        "variants": [
+          "fileChange"
+        ]
+      },
+      {
+        "pointer": "/result/turn/items/*/content/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/turn/items/*/content/*/type",
+        "variants": [
+          "localAudio",
+          "localImage",
+          "skill"
+        ],
+        "ignored_variants": [
+          "mention"
+        ]
+      },
+      {
+        "pointer": "/result/turn/items/*/memoryCitation/entries/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/turn/items/*/type",
+        "variants": [
+          "agentMessage"
+        ]
+      },
+      {
+        "pointer": "/result/turn/items/*/savedPath",
+        "kind": "absolute",
+        "variant_pointer": "/result/turn/items/*/type",
+        "variants": [
+          "imageGeneration"
+        ]
+      }
+    ],
+    "server/diagnostics": [],
+    "skills/config/write": [],
+    "skills/extraRoots/set": [],
+    "skills/list": [
+      {
+        "pointer": "/result/data/*/cwd",
+        "kind": "path"
+      },
+      {
+        "pointer": "/result/data/*/errors/*/path",
+        "kind": "path"
+      },
+      {
+        "pointer": "/result/data/*/skills/*/interface/iconLarge",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/data/*/skills/*/interface/iconSmall",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/data/*/skills/*/path",
+        "kind": "absolute"
+      }
+    ],
+    "thread/approveGuardianDeniedAction": [],
+    "thread/archive": [],
+    "thread/backgroundTerminals/clean": [],
+    "thread/backgroundTerminals/list": [],
+    "thread/backgroundTerminals/terminate": [],
+    "thread/compact/start": [],
+    "thread/decrement_elicitation": [],
+    "thread/delete": [],
+    "thread/fork": [
+      {
+        "pointer": "/result/cwd",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/runtimeWorkspaceRoots/*",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/sandbox/writableRoots/*",
+        "kind": "absolute",
+        "variant_pointer": "/result/sandbox/type",
+        "variants": [
+          "workspaceWrite"
+        ]
+      },
+      {
+        "pointer": "/result/thread/cwd",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/thread/path",
+        "kind": "path"
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/changes/*/kind/move_path",
+        "kind": "path",
+        "variant_pointer": "/result/thread/turns/*/items/*/changes/*/kind/type",
+        "variants": [
+          "update"
+        ]
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/changes/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/thread/turns/*/items/*/type",
+        "variants": [
+          "fileChange"
+        ]
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/content/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/thread/turns/*/items/*/content/*/type",
+        "variants": [
+          "localAudio",
+          "localImage",
+          "skill"
+        ],
+        "ignored_variants": [
+          "mention"
+        ]
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/memoryCitation/entries/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/thread/turns/*/items/*/type",
+        "variants": [
+          "agentMessage"
+        ]
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/savedPath",
+        "kind": "absolute",
+        "variant_pointer": "/result/thread/turns/*/items/*/type",
+        "variants": [
+          "imageGeneration"
+        ]
+      }
+    ],
+    "thread/goal/clear": [],
+    "thread/goal/get": [],
+    "thread/goal/set": [],
+    "thread/increment_elicitation": [],
+    "thread/inject_items": [],
+    "thread/items/list": [
+      {
+        "pointer": "/result/data/*/item/changes/*/kind/move_path",
+        "kind": "path",
+        "variant_pointer": "/result/data/*/item/changes/*/kind/type",
+        "variants": [
+          "update"
+        ]
+      },
+      {
+        "pointer": "/result/data/*/item/changes/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/data/*/item/type",
+        "variants": [
+          "fileChange"
+        ]
+      },
+      {
+        "pointer": "/result/data/*/item/content/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/data/*/item/content/*/type",
+        "variants": [
+          "localAudio",
+          "localImage",
+          "skill"
+        ],
+        "ignored_variants": [
+          "mention"
+        ]
+      },
+      {
+        "pointer": "/result/data/*/item/memoryCitation/entries/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/data/*/item/type",
+        "variants": [
+          "agentMessage"
+        ]
+      },
+      {
+        "pointer": "/result/data/*/item/savedPath",
+        "kind": "absolute",
+        "variant_pointer": "/result/data/*/item/type",
+        "variants": [
+          "imageGeneration"
+        ]
+      }
+    ],
+    "thread/list": [
+      {
+        "pointer": "/result/data/*/cwd",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/data/*/path",
+        "kind": "path"
+      },
+      {
+        "pointer": "/result/data/*/turns/*/items/*/changes/*/kind/move_path",
+        "kind": "path",
+        "variant_pointer": "/result/data/*/turns/*/items/*/changes/*/kind/type",
+        "variants": [
+          "update"
+        ]
+      },
+      {
+        "pointer": "/result/data/*/turns/*/items/*/changes/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/data/*/turns/*/items/*/type",
+        "variants": [
+          "fileChange"
+        ]
+      },
+      {
+        "pointer": "/result/data/*/turns/*/items/*/content/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/data/*/turns/*/items/*/content/*/type",
+        "variants": [
+          "localAudio",
+          "localImage",
+          "skill"
+        ],
+        "ignored_variants": [
+          "mention"
+        ]
+      },
+      {
+        "pointer": "/result/data/*/turns/*/items/*/memoryCitation/entries/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/data/*/turns/*/items/*/type",
+        "variants": [
+          "agentMessage"
+        ]
+      },
+      {
+        "pointer": "/result/data/*/turns/*/items/*/savedPath",
+        "kind": "absolute",
+        "variant_pointer": "/result/data/*/turns/*/items/*/type",
+        "variants": [
+          "imageGeneration"
+        ]
+      }
+    ],
+    "thread/loaded/list": [],
+    "thread/memoryMode/set": [],
+    "thread/metadata/update": [
+      {
+        "pointer": "/result/thread/cwd",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/thread/path",
+        "kind": "path"
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/changes/*/kind/move_path",
+        "kind": "path",
+        "variant_pointer": "/result/thread/turns/*/items/*/changes/*/kind/type",
+        "variants": [
+          "update"
+        ]
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/changes/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/thread/turns/*/items/*/type",
+        "variants": [
+          "fileChange"
+        ]
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/content/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/thread/turns/*/items/*/content/*/type",
+        "variants": [
+          "localAudio",
+          "localImage",
+          "skill"
+        ],
+        "ignored_variants": [
+          "mention"
+        ]
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/memoryCitation/entries/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/thread/turns/*/items/*/type",
+        "variants": [
+          "agentMessage"
+        ]
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/savedPath",
+        "kind": "absolute",
+        "variant_pointer": "/result/thread/turns/*/items/*/type",
+        "variants": [
+          "imageGeneration"
+        ]
+      }
+    ],
+    "thread/name/set": [],
+    "thread/queue/add": [
+      {
+        "pointer": "/result/queuedSubmission/input/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/queuedSubmission/input/*/type",
+        "variants": [
+          "localAudio",
+          "localImage",
+          "skill"
+        ],
+        "ignored_variants": [
+          "mention"
+        ]
+      }
+    ],
+    "thread/queue/delete": [],
+    "thread/queue/list": [
+      {
+        "pointer": "/result/data/*/input/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/data/*/input/*/type",
+        "variants": [
+          "localAudio",
+          "localImage",
+          "skill"
+        ],
+        "ignored_variants": [
+          "mention"
+        ]
+      }
+    ],
+    "thread/queue/reorder": [],
+    "thread/queue/start": [
+      {
+        "pointer": "/result/turn/items/*/changes/*/kind/move_path",
+        "kind": "path",
+        "variant_pointer": "/result/turn/items/*/changes/*/kind/type",
+        "variants": [
+          "update"
+        ]
+      },
+      {
+        "pointer": "/result/turn/items/*/changes/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/turn/items/*/type",
+        "variants": [
+          "fileChange"
+        ]
+      },
+      {
+        "pointer": "/result/turn/items/*/content/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/turn/items/*/content/*/type",
+        "variants": [
+          "localAudio",
+          "localImage",
+          "skill"
+        ],
+        "ignored_variants": [
+          "mention"
+        ]
+      },
+      {
+        "pointer": "/result/turn/items/*/memoryCitation/entries/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/turn/items/*/type",
+        "variants": [
+          "agentMessage"
+        ]
+      },
+      {
+        "pointer": "/result/turn/items/*/savedPath",
+        "kind": "absolute",
+        "variant_pointer": "/result/turn/items/*/type",
+        "variants": [
+          "imageGeneration"
+        ]
+      }
+    ],
+    "thread/queue/update": [
+      {
+        "pointer": "/result/queuedSubmission/input/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/queuedSubmission/input/*/type",
+        "variants": [
+          "localAudio",
+          "localImage",
+          "skill"
+        ],
+        "ignored_variants": [
+          "mention"
+        ]
+      }
+    ],
+    "thread/read": [
+      {
+        "pointer": "/result/thread/cwd",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/thread/path",
+        "kind": "path"
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/changes/*/kind/move_path",
+        "kind": "path",
+        "variant_pointer": "/result/thread/turns/*/items/*/changes/*/kind/type",
+        "variants": [
+          "update"
+        ]
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/changes/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/thread/turns/*/items/*/type",
+        "variants": [
+          "fileChange"
+        ]
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/content/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/thread/turns/*/items/*/content/*/type",
+        "variants": [
+          "localAudio",
+          "localImage",
+          "skill"
+        ],
+        "ignored_variants": [
+          "mention"
+        ]
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/memoryCitation/entries/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/thread/turns/*/items/*/type",
+        "variants": [
+          "agentMessage"
+        ]
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/savedPath",
+        "kind": "absolute",
+        "variant_pointer": "/result/thread/turns/*/items/*/type",
+        "variants": [
+          "imageGeneration"
+        ]
+      }
+    ],
+    "thread/realtime/appendAudio": [],
+    "thread/realtime/appendSpeech": [],
+    "thread/realtime/appendText": [],
+    "thread/realtime/listVoices": [],
+    "thread/realtime/start": [],
+    "thread/realtime/stop": [],
+    "thread/resume": [
+      {
+        "pointer": "/result/cwd",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/initialTurnsPage/data/*/items/*/changes/*/kind/move_path",
+        "kind": "path",
+        "variant_pointer": "/result/initialTurnsPage/data/*/items/*/changes/*/kind/type",
+        "variants": [
+          "update"
+        ]
+      },
+      {
+        "pointer": "/result/initialTurnsPage/data/*/items/*/changes/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/initialTurnsPage/data/*/items/*/type",
+        "variants": [
+          "fileChange"
+        ]
+      },
+      {
+        "pointer": "/result/initialTurnsPage/data/*/items/*/content/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/initialTurnsPage/data/*/items/*/content/*/type",
+        "variants": [
+          "localAudio",
+          "localImage",
+          "skill"
+        ],
+        "ignored_variants": [
+          "mention"
+        ]
+      },
+      {
+        "pointer": "/result/initialTurnsPage/data/*/items/*/memoryCitation/entries/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/initialTurnsPage/data/*/items/*/type",
+        "variants": [
+          "agentMessage"
+        ]
+      },
+      {
+        "pointer": "/result/initialTurnsPage/data/*/items/*/savedPath",
+        "kind": "absolute",
+        "variant_pointer": "/result/initialTurnsPage/data/*/items/*/type",
+        "variants": [
+          "imageGeneration"
+        ]
+      },
+      {
+        "pointer": "/result/runtimeWorkspaceRoots/*",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/sandbox/writableRoots/*",
+        "kind": "absolute",
+        "variant_pointer": "/result/sandbox/type",
+        "variants": [
+          "workspaceWrite"
+        ]
+      },
+      {
+        "pointer": "/result/thread/cwd",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/thread/path",
+        "kind": "path"
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/changes/*/kind/move_path",
+        "kind": "path",
+        "variant_pointer": "/result/thread/turns/*/items/*/changes/*/kind/type",
+        "variants": [
+          "update"
+        ]
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/changes/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/thread/turns/*/items/*/type",
+        "variants": [
+          "fileChange"
+        ]
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/content/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/thread/turns/*/items/*/content/*/type",
+        "variants": [
+          "localAudio",
+          "localImage",
+          "skill"
+        ],
+        "ignored_variants": [
+          "mention"
+        ]
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/memoryCitation/entries/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/thread/turns/*/items/*/type",
+        "variants": [
+          "agentMessage"
+        ]
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/savedPath",
+        "kind": "absolute",
+        "variant_pointer": "/result/thread/turns/*/items/*/type",
+        "variants": [
+          "imageGeneration"
+        ]
+      }
+    ],
+    "thread/revert": [
+      {
+        "pointer": "/result/thread/cwd",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/thread/path",
+        "kind": "path"
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/changes/*/kind/move_path",
+        "kind": "path",
+        "variant_pointer": "/result/thread/turns/*/items/*/changes/*/kind/type",
+        "variants": [
+          "update"
+        ]
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/changes/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/thread/turns/*/items/*/type",
+        "variants": [
+          "fileChange"
+        ]
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/content/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/thread/turns/*/items/*/content/*/type",
+        "variants": [
+          "localAudio",
+          "localImage",
+          "skill"
+        ],
+        "ignored_variants": [
+          "mention"
+        ]
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/memoryCitation/entries/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/thread/turns/*/items/*/type",
+        "variants": [
+          "agentMessage"
+        ]
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/savedPath",
+        "kind": "absolute",
+        "variant_pointer": "/result/thread/turns/*/items/*/type",
+        "variants": [
+          "imageGeneration"
+        ]
+      }
+    ],
+    "thread/rollback": [
+      {
+        "pointer": "/result/thread/cwd",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/thread/path",
+        "kind": "path"
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/changes/*/kind/move_path",
+        "kind": "path",
+        "variant_pointer": "/result/thread/turns/*/items/*/changes/*/kind/type",
+        "variants": [
+          "update"
+        ]
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/changes/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/thread/turns/*/items/*/type",
+        "variants": [
+          "fileChange"
+        ]
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/content/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/thread/turns/*/items/*/content/*/type",
+        "variants": [
+          "localAudio",
+          "localImage",
+          "skill"
+        ],
+        "ignored_variants": [
+          "mention"
+        ]
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/memoryCitation/entries/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/thread/turns/*/items/*/type",
+        "variants": [
+          "agentMessage"
+        ]
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/savedPath",
+        "kind": "absolute",
+        "variant_pointer": "/result/thread/turns/*/items/*/type",
+        "variants": [
+          "imageGeneration"
+        ]
+      }
+    ],
+    "thread/search": [
+      {
+        "pointer": "/result/data/*/thread/cwd",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/data/*/thread/path",
+        "kind": "path"
+      },
+      {
+        "pointer": "/result/data/*/thread/turns/*/items/*/changes/*/kind/move_path",
+        "kind": "path",
+        "variant_pointer": "/result/data/*/thread/turns/*/items/*/changes/*/kind/type",
+        "variants": [
+          "update"
+        ]
+      },
+      {
+        "pointer": "/result/data/*/thread/turns/*/items/*/changes/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/data/*/thread/turns/*/items/*/type",
+        "variants": [
+          "fileChange"
+        ]
+      },
+      {
+        "pointer": "/result/data/*/thread/turns/*/items/*/content/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/data/*/thread/turns/*/items/*/content/*/type",
+        "variants": [
+          "localAudio",
+          "localImage",
+          "skill"
+        ],
+        "ignored_variants": [
+          "mention"
+        ]
+      },
+      {
+        "pointer": "/result/data/*/thread/turns/*/items/*/memoryCitation/entries/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/data/*/thread/turns/*/items/*/type",
+        "variants": [
+          "agentMessage"
+        ]
+      },
+      {
+        "pointer": "/result/data/*/thread/turns/*/items/*/savedPath",
+        "kind": "absolute",
+        "variant_pointer": "/result/data/*/thread/turns/*/items/*/type",
+        "variants": [
+          "imageGeneration"
+        ]
+      }
+    ],
+    "thread/searchOccurrences": [],
+    "thread/section/move": [],
+    "thread/settings/update": [],
+    "thread/shellCommand": [],
+    "thread/start": [
+      {
+        "pointer": "/result/cwd",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/runtimeWorkspaceRoots/*",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/sandbox/writableRoots/*",
+        "kind": "absolute",
+        "variant_pointer": "/result/sandbox/type",
+        "variants": [
+          "workspaceWrite"
+        ]
+      },
+      {
+        "pointer": "/result/thread/cwd",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/thread/path",
+        "kind": "path"
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/changes/*/kind/move_path",
+        "kind": "path",
+        "variant_pointer": "/result/thread/turns/*/items/*/changes/*/kind/type",
+        "variants": [
+          "update"
+        ]
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/changes/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/thread/turns/*/items/*/type",
+        "variants": [
+          "fileChange"
+        ]
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/content/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/thread/turns/*/items/*/content/*/type",
+        "variants": [
+          "localAudio",
+          "localImage",
+          "skill"
+        ],
+        "ignored_variants": [
+          "mention"
+        ]
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/memoryCitation/entries/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/thread/turns/*/items/*/type",
+        "variants": [
+          "agentMessage"
+        ]
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/savedPath",
+        "kind": "absolute",
+        "variant_pointer": "/result/thread/turns/*/items/*/type",
+        "variants": [
+          "imageGeneration"
+        ]
+      }
+    ],
+    "thread/turns/list": [
+      {
+        "pointer": "/result/data/*/items/*/changes/*/kind/move_path",
+        "kind": "path",
+        "variant_pointer": "/result/data/*/items/*/changes/*/kind/type",
+        "variants": [
+          "update"
+        ]
+      },
+      {
+        "pointer": "/result/data/*/items/*/changes/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/data/*/items/*/type",
+        "variants": [
+          "fileChange"
+        ]
+      },
+      {
+        "pointer": "/result/data/*/items/*/content/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/data/*/items/*/content/*/type",
+        "variants": [
+          "localAudio",
+          "localImage",
+          "skill"
+        ],
+        "ignored_variants": [
+          "mention"
+        ]
+      },
+      {
+        "pointer": "/result/data/*/items/*/memoryCitation/entries/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/data/*/items/*/type",
+        "variants": [
+          "agentMessage"
+        ]
+      },
+      {
+        "pointer": "/result/data/*/items/*/savedPath",
+        "kind": "absolute",
+        "variant_pointer": "/result/data/*/items/*/type",
+        "variants": [
+          "imageGeneration"
+        ]
+      }
+    ],
+    "thread/unarchive": [
+      {
+        "pointer": "/result/thread/cwd",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/result/thread/path",
+        "kind": "path"
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/changes/*/kind/move_path",
+        "kind": "path",
+        "variant_pointer": "/result/thread/turns/*/items/*/changes/*/kind/type",
+        "variants": [
+          "update"
+        ]
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/changes/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/thread/turns/*/items/*/type",
+        "variants": [
+          "fileChange"
+        ]
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/content/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/thread/turns/*/items/*/content/*/type",
+        "variants": [
+          "localAudio",
+          "localImage",
+          "skill"
+        ],
+        "ignored_variants": [
+          "mention"
+        ]
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/memoryCitation/entries/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/thread/turns/*/items/*/type",
+        "variants": [
+          "agentMessage"
+        ]
+      },
+      {
+        "pointer": "/result/thread/turns/*/items/*/savedPath",
+        "kind": "absolute",
+        "variant_pointer": "/result/thread/turns/*/items/*/type",
+        "variants": [
+          "imageGeneration"
+        ]
+      }
+    ],
+    "thread/unsubscribe": [],
+    "threadSection/create": [],
+    "threadSection/delete": [],
+    "threadSection/list": [],
+    "threadSection/update": [],
+    "turn/interrupt": [],
+    "turn/start": [
+      {
+        "pointer": "/result/turn/items/*/changes/*/kind/move_path",
+        "kind": "path",
+        "variant_pointer": "/result/turn/items/*/changes/*/kind/type",
+        "variants": [
+          "update"
+        ]
+      },
+      {
+        "pointer": "/result/turn/items/*/changes/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/turn/items/*/type",
+        "variants": [
+          "fileChange"
+        ]
+      },
+      {
+        "pointer": "/result/turn/items/*/content/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/turn/items/*/content/*/type",
+        "variants": [
+          "localAudio",
+          "localImage",
+          "skill"
+        ],
+        "ignored_variants": [
+          "mention"
+        ]
+      },
+      {
+        "pointer": "/result/turn/items/*/memoryCitation/entries/*/path",
+        "kind": "path",
+        "variant_pointer": "/result/turn/items/*/type",
+        "variants": [
+          "agentMessage"
+        ]
+      },
+      {
+        "pointer": "/result/turn/items/*/savedPath",
+        "kind": "absolute",
+        "variant_pointer": "/result/turn/items/*/type",
+        "variants": [
+          "imageGeneration"
+        ]
+      }
+    ],
+    "turn/steer": [],
+    "windowsSandbox/readiness": [],
+    "windowsSandbox/setupStart": []
+  },
+  "server_requests": {
+    "account/chatgptAuthTokens/refresh": [],
+    "applyPatchApproval": [
+      {
+        "pointer": "/params/fileChanges/*/move_path",
+        "kind": "path",
+        "variant_pointer": "/params/fileChanges/*/type",
+        "variants": [
+          "update"
+        ]
+      },
+      {
+        "pointer": "/params/grantRoot",
+        "kind": "path"
+      }
+    ],
+    "attestation/generate": [],
+    "currentTime/read": [],
+    "execCommandApproval": [
+      {
+        "pointer": "/params/cwd",
+        "kind": "path"
+      },
+      {
+        "pointer": "/params/parsedCmd/*/path",
+        "kind": "path",
+        "variant_pointer": "/params/parsedCmd/*/type",
+        "variants": [
+          "list_files",
+          "read",
+          "search"
+        ]
+      }
+    ],
+    "item/commandExecution/requestApproval": [
+      {
+        "pointer": "/params/additionalPermissions/fileSystem/entries/*/path/value/path",
+        "kind": "path",
+        "variant_pointer": "/params/additionalPermissions/fileSystem/entries/*/path/value/kind",
+        "variants": [
+          "unknown"
+        ]
+      }
+    ],
+    "item/fileChange/requestApproval": [
+      {
+        "pointer": "/params/grantRoot",
+        "kind": "path"
+      }
+    ],
+    "item/permissions/requestApproval": [
+      {
+        "pointer": "/params/cwd",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/params/permissions/fileSystem/entries/*/path/value/path",
+        "kind": "path",
+        "variant_pointer": "/params/permissions/fileSystem/entries/*/path/value/kind",
+        "variants": [
+          "unknown"
+        ]
+      }
+    ],
+    "item/tool/call": [],
+    "item/tool/requestUserInput": [],
+    "mcpServer/elicitation/request": []
+  },
+  "server_notifications": {
+    "account/login/completed": [],
+    "account/rateLimits/updated": [],
+    "account/updated": [],
+    "app/list/updated": [],
+    "autoApprovalReview/strictReviewRequired": [],
+    "command/exec/outputDelta": [],
+    "configWarning": [
+      {
+        "pointer": "/params/path",
+        "kind": "path"
+      }
+    ],
+    "deprecationNotice": [],
+    "error": [],
+    "externalAgentConfig/import/completed": [
+      {
+        "pointer": "/params/itemTypeResults/*/failures/*/cwd",
+        "kind": "path"
+      },
+      {
+        "pointer": "/params/itemTypeResults/*/successes/*/cwd",
+        "kind": "path"
+      }
+    ],
+    "externalAgentConfig/import/progress": [
+      {
+        "pointer": "/params/itemTypeResults/*/failures/*/cwd",
+        "kind": "path"
+      },
+      {
+        "pointer": "/params/itemTypeResults/*/successes/*/cwd",
+        "kind": "path"
+      }
+    ],
+    "fs/changed": [
+      {
+        "pointer": "/params/changedPaths/*",
+        "kind": "absolute"
+      }
+    ],
+    "fuzzyFileSearch/sessionCompleted": [],
+    "fuzzyFileSearch/sessionUpdated": [
+      {
+        "pointer": "/params/files/*/path",
+        "kind": "path"
+      },
+      {
+        "pointer": "/params/files/*/root",
+        "kind": "path"
+      }
+    ],
+    "guardianWarning": [],
+    "hook/completed": [
+      {
+        "pointer": "/params/run/sourcePath",
+        "kind": "absolute"
+      }
+    ],
+    "hook/started": [
+      {
+        "pointer": "/params/run/sourcePath",
+        "kind": "absolute"
+      }
+    ],
+    "item/agentMessage/delta": [],
+    "item/autoApprovalReview/completed": [
+      {
+        "pointer": "/params/action/cwd",
+        "kind": "absolute",
+        "variant_pointer": "/params/action/type",
+        "variants": [
+          "applyPatch",
+          "command",
+          "execve"
+        ]
+      },
+      {
+        "pointer": "/params/action/files/*",
+        "kind": "absolute",
+        "variant_pointer": "/params/action/type",
+        "variants": [
+          "applyPatch"
+        ]
+      },
+      {
+        "pointer": "/params/action/permissions/fileSystem/entries/*/path/value/path",
+        "kind": "path",
+        "variant_pointer": "/params/action/permissions/fileSystem/entries/*/path/value/kind",
+        "variants": [
+          "unknown"
+        ]
+      }
+    ],
+    "item/autoApprovalReview/started": [
+      {
+        "pointer": "/params/action/cwd",
+        "kind": "absolute",
+        "variant_pointer": "/params/action/type",
+        "variants": [
+          "applyPatch",
+          "command",
+          "execve"
+        ]
+      },
+      {
+        "pointer": "/params/action/files/*",
+        "kind": "absolute",
+        "variant_pointer": "/params/action/type",
+        "variants": [
+          "applyPatch"
+        ]
+      },
+      {
+        "pointer": "/params/action/permissions/fileSystem/entries/*/path/value/path",
+        "kind": "path",
+        "variant_pointer": "/params/action/permissions/fileSystem/entries/*/path/value/kind",
+        "variants": [
+          "unknown"
+        ]
+      }
+    ],
+    "item/commandExecution/outputDelta": [],
+    "item/commandExecution/terminalInteraction": [],
+    "item/completed": [
+      {
+        "pointer": "/params/item/changes/*/kind/move_path",
+        "kind": "path",
+        "variant_pointer": "/params/item/changes/*/kind/type",
+        "variants": [
+          "update"
+        ]
+      },
+      {
+        "pointer": "/params/item/changes/*/path",
+        "kind": "path",
+        "variant_pointer": "/params/item/type",
+        "variants": [
+          "fileChange"
+        ]
+      },
+      {
+        "pointer": "/params/item/content/*/path",
+        "kind": "path",
+        "variant_pointer": "/params/item/content/*/type",
+        "variants": [
+          "localAudio",
+          "localImage",
+          "skill"
+        ],
+        "ignored_variants": [
+          "mention"
+        ]
+      },
+      {
+        "pointer": "/params/item/memoryCitation/entries/*/path",
+        "kind": "path",
+        "variant_pointer": "/params/item/type",
+        "variants": [
+          "agentMessage"
+        ]
+      },
+      {
+        "pointer": "/params/item/savedPath",
+        "kind": "absolute",
+        "variant_pointer": "/params/item/type",
+        "variants": [
+          "imageGeneration"
+        ]
+      }
+    ],
+    "item/fileChange/outputDelta": [],
+    "item/fileChange/patchUpdated": [
+      {
+        "pointer": "/params/changes/*/kind/move_path",
+        "kind": "path",
+        "variant_pointer": "/params/changes/*/kind/type",
+        "variants": [
+          "update"
+        ]
+      },
+      {
+        "pointer": "/params/changes/*/path",
+        "kind": "path"
+      }
+    ],
+    "item/mcpToolCall/progress": [],
+    "item/plan/delta": [],
+    "item/reasoning/summaryPartAdded": [],
+    "item/reasoning/summaryTextDelta": [],
+    "item/reasoning/textDelta": [],
+    "item/started": [
+      {
+        "pointer": "/params/item/changes/*/kind/move_path",
+        "kind": "path",
+        "variant_pointer": "/params/item/changes/*/kind/type",
+        "variants": [
+          "update"
+        ]
+      },
+      {
+        "pointer": "/params/item/changes/*/path",
+        "kind": "path",
+        "variant_pointer": "/params/item/type",
+        "variants": [
+          "fileChange"
+        ]
+      },
+      {
+        "pointer": "/params/item/content/*/path",
+        "kind": "path",
+        "variant_pointer": "/params/item/content/*/type",
+        "variants": [
+          "localAudio",
+          "localImage",
+          "skill"
+        ],
+        "ignored_variants": [
+          "mention"
+        ]
+      },
+      {
+        "pointer": "/params/item/memoryCitation/entries/*/path",
+        "kind": "path",
+        "variant_pointer": "/params/item/type",
+        "variants": [
+          "agentMessage"
+        ]
+      },
+      {
+        "pointer": "/params/item/savedPath",
+        "kind": "absolute",
+        "variant_pointer": "/params/item/type",
+        "variants": [
+          "imageGeneration"
+        ]
+      }
+    ],
+    "mcpServer/oauthLogin/completed": [],
+    "mcpServer/startupStatus/updated": [],
+    "model/rerouted": [],
+    "model/safetyBuffering/updated": [],
+    "model/verification": [],
+    "process/exited": [],
+    "process/outputDelta": [],
+    "project/changed": [],
+    "rawResponse/completed": [],
+    "rawResponseItem/completed": [],
+    "remoteControl/status/changed": [],
+    "serverRequest/resolved": [],
+    "skills/changed": [],
+    "thread/archived": [],
+    "thread/closed": [],
+    "thread/compacted": [],
+    "thread/deleted": [],
+    "thread/environment/connected": [],
+    "thread/environment/disconnected": [],
+    "thread/goal/cleared": [],
+    "thread/goal/updated": [],
+    "thread/name/updated": [],
+    "thread/project/updated": [],
+    "thread/queue/changed": [],
+    "thread/realtime/closed": [],
+    "thread/realtime/error": [],
+    "thread/realtime/itemAdded": [],
+    "thread/realtime/outputAudio/delta": [],
+    "thread/realtime/sdp": [],
+    "thread/realtime/started": [],
+    "thread/realtime/transcript/delta": [],
+    "thread/realtime/transcript/done": [],
+    "thread/reverted": [],
+    "thread/settings/updated": [
+      {
+        "pointer": "/params/threadSettings/cwd",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/params/threadSettings/sandboxPolicy/writableRoots/*",
+        "kind": "absolute",
+        "variant_pointer": "/params/threadSettings/sandboxPolicy/type",
+        "variants": [
+          "workspaceWrite"
+        ]
+      }
+    ],
+    "thread/started": [
+      {
+        "pointer": "/params/thread/cwd",
+        "kind": "absolute"
+      },
+      {
+        "pointer": "/params/thread/path",
+        "kind": "path"
+      },
+      {
+        "pointer": "/params/thread/turns/*/items/*/changes/*/kind/move_path",
+        "kind": "path",
+        "variant_pointer": "/params/thread/turns/*/items/*/changes/*/kind/type",
+        "variants": [
+          "update"
+        ]
+      },
+      {
+        "pointer": "/params/thread/turns/*/items/*/changes/*/path",
+        "kind": "path",
+        "variant_pointer": "/params/thread/turns/*/items/*/type",
+        "variants": [
+          "fileChange"
+        ]
+      },
+      {
+        "pointer": "/params/thread/turns/*/items/*/content/*/path",
+        "kind": "path",
+        "variant_pointer": "/params/thread/turns/*/items/*/content/*/type",
+        "variants": [
+          "localAudio",
+          "localImage",
+          "skill"
+        ],
+        "ignored_variants": [
+          "mention"
+        ]
+      },
+      {
+        "pointer": "/params/thread/turns/*/items/*/memoryCitation/entries/*/path",
+        "kind": "path",
+        "variant_pointer": "/params/thread/turns/*/items/*/type",
+        "variants": [
+          "agentMessage"
+        ]
+      },
+      {
+        "pointer": "/params/thread/turns/*/items/*/savedPath",
+        "kind": "absolute",
+        "variant_pointer": "/params/thread/turns/*/items/*/type",
+        "variants": [
+          "imageGeneration"
+        ]
+      }
+    ],
+    "thread/status/changed": [],
+    "thread/tokenUsage/updated": [],
+    "thread/unarchived": [],
+    "turn/completed": [
+      {
+        "pointer": "/params/turn/items/*/changes/*/kind/move_path",
+        "kind": "path",
+        "variant_pointer": "/params/turn/items/*/changes/*/kind/type",
+        "variants": [
+          "update"
+        ]
+      },
+      {
+        "pointer": "/params/turn/items/*/changes/*/path",
+        "kind": "path",
+        "variant_pointer": "/params/turn/items/*/type",
+        "variants": [
+          "fileChange"
+        ]
+      },
+      {
+        "pointer": "/params/turn/items/*/content/*/path",
+        "kind": "path",
+        "variant_pointer": "/params/turn/items/*/content/*/type",
+        "variants": [
+          "localAudio",
+          "localImage",
+          "skill"
+        ],
+        "ignored_variants": [
+          "mention"
+        ]
+      },
+      {
+        "pointer": "/params/turn/items/*/memoryCitation/entries/*/path",
+        "kind": "path",
+        "variant_pointer": "/params/turn/items/*/type",
+        "variants": [
+          "agentMessage"
+        ]
+      },
+      {
+        "pointer": "/params/turn/items/*/savedPath",
+        "kind": "absolute",
+        "variant_pointer": "/params/turn/items/*/type",
+        "variants": [
+          "imageGeneration"
+        ]
+      }
+    ],
+    "turn/diff/updated": [],
+    "turn/moderationMetadata": [],
+    "turn/plan/updated": [],
+    "turn/started": [
+      {
+        "pointer": "/params/turn/items/*/changes/*/kind/move_path",
+        "kind": "path",
+        "variant_pointer": "/params/turn/items/*/changes/*/kind/type",
+        "variants": [
+          "update"
+        ]
+      },
+      {
+        "pointer": "/params/turn/items/*/changes/*/path",
+        "kind": "path",
+        "variant_pointer": "/params/turn/items/*/type",
+        "variants": [
+          "fileChange"
+        ]
+      },
+      {
+        "pointer": "/params/turn/items/*/content/*/path",
+        "kind": "path",
+        "variant_pointer": "/params/turn/items/*/content/*/type",
+        "variants": [
+          "localAudio",
+          "localImage",
+          "skill"
+        ],
+        "ignored_variants": [
+          "mention"
+        ]
+      },
+      {
+        "pointer": "/params/turn/items/*/memoryCitation/entries/*/path",
+        "kind": "path",
+        "variant_pointer": "/params/turn/items/*/type",
+        "variants": [
+          "agentMessage"
+        ]
+      },
+      {
+        "pointer": "/params/turn/items/*/savedPath",
+        "kind": "absolute",
+        "variant_pointer": "/params/turn/items/*/type",
+        "variants": [
+          "imageGeneration"
+        ]
+      }
+    ],
+    "warning": [],
+    "windows/worldWritableWarning": [
+      {
+        "pointer": "/params/samplePaths/*",
+        "kind": "path"
+      }
+    ],
+    "windowsSandbox/setupCompleted": []
+  },
+  "server_responses": {
+    "account/chatgptAuthTokens/refresh": [],
+    "applyPatchApproval": [],
+    "attestation/generate": [],
+    "currentTime/read": [],
+    "execCommandApproval": [],
+    "item/commandExecution/requestApproval": [],
+    "item/fileChange/requestApproval": [],
+    "item/permissions/requestApproval": [
+      {
+        "pointer": "/result/permissions/fileSystem/entries/*/path/value/path",
+        "kind": "path",
+        "variant_pointer": "/result/permissions/fileSystem/entries/*/path/value/kind",
+        "variants": [
+          "unknown"
+        ]
+      }
+    ],
+    "item/tool/call": [],
+    "item/tool/requestUserInput": [],
+    "mcpServer/elicitation/request": []
+  },
+  "preserved_client_response_paths": {
+    "initialize": [
+      "/result/codexHome"
+    ]
+  }
+}

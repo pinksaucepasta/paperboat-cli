@@ -54,6 +54,56 @@ func TestServeRuntimeDescriptorRoundTrip(t *testing.T) {
 	}
 }
 
+func TestWindowsOwnerServiceControlURLFallbackMatchesRegistration(t *testing.T) {
+	t.Setenv(windowsPreviewControlURLEnv, "https://api.example.test/")
+	registration := identity.Registration{ServerURL: "https://api.example.test"}
+	got, err := resolveWindowsOwnerControlURL("", registration, nil)
+	if err != nil || got != registration.ServerURL {
+		t.Fatalf("control URL=%q err=%v, want %q", got, err, registration.ServerURL)
+	}
+}
+
+func TestWindowsOwnerServiceControlURLFallbackRejectsInvalidOrMismatchedOrigin(t *testing.T) {
+	cases := []struct {
+		name            string
+		env             string
+		registration    identity.Registration
+		registrationErr error
+	}{
+		{name: "missing", env: "", registrationErr: errors.New("registration unavailable")},
+		{name: "non HTTPS", env: "http://api.example.test", registrationErr: errors.New("registration unavailable")},
+		{name: "path", env: "https://api.example.test/control", registrationErr: errors.New("registration unavailable")},
+		{name: "mismatch", env: "https://api.example.test", registration: identity.Registration{ServerURL: "https://other.example.test"}},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv(windowsPreviewControlURLEnv, test.env)
+			if _, err := resolveWindowsOwnerControlURL("", test.registration, test.registrationErr); !errors.Is(err, errPreviewControlOrigin) {
+				t.Fatalf("error=%v, want sanitized control-origin error", err)
+			}
+		})
+	}
+}
+
+func TestPersistPreviewWorkerStartupFailurePublishesSanitizedDescriptor(t *testing.T) {
+	root := t.TempDir()
+	descriptorPath, _ := writeTestServeDescriptor(t, root, "docs", time.Now().UTC().Add(time.Hour))
+	descriptor, err := readPreviewRuntimeDescriptor(descriptorPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := persistPreviewWorkerStartupFailure(descriptorPath, descriptor); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := readPreviewRuntimeDescriptor(descriptorPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Record == nil || loaded.Record.State != "failed" || loaded.Failure == nil || loaded.Failure.Code != "preview_worker_start_failed" {
+		t.Fatalf("startup failure descriptor=%#v", loaded)
+	}
+}
+
 func TestServeRuntimeDescriptorRequiresCurrentSchemaFields(t *testing.T) {
 	root := t.TempDir()
 	sourcePath := filepath.Join(root, "site")

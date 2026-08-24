@@ -59,7 +59,7 @@ type controlServer struct {
 }
 
 func (s *controlServer) listen() (*net.UnixListener, error) {
-	if !filepath.IsAbs(s.socketPath) || s.uid <= 0 || s.gid < 0 || s.invoke == nil && s.invokeRequest == nil {
+	if !filepath.IsAbs(s.socketPath) || !validUnixWorkerIdentity(s.uid, s.gid) || s.invoke == nil && s.invokeRequest == nil {
 		return nil, ErrInvalidConfig
 	}
 	directory := filepath.Dir(s.socketPath)

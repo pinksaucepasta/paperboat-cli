@@ -8,6 +8,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +20,8 @@ import (
 	"time"
 
 	"github.com/pinksaucepasta/paperboat/internal/config"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/identity"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/machinecontrol"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
 	"golang.org/x/sys/windows"
 )
@@ -62,13 +65,18 @@ type environment struct {
 // A loaded profile is not evidence that the user's DPAPI master keys can be
 // unlocked, and a local S4U logon is not evidence of credentialed SMB access.
 type limitations struct {
-	SMB            limitation `json:"smb"`
-	DPAPI          limitation `json:"dpapi"`
-	DPAPIMigration limitation `json:"dpapi_credential_manager_migration"`
-	EFS            limitation `json:"efs"`
-	Git            limitation `json:"git"`
-	Network        limitation `json:"network"`
-	Codex          limitation `json:"codex"`
+	SMB                         limitation `json:"smb"`
+	DPAPI                       limitation `json:"dpapi"`
+	DPAPIMigration              limitation `json:"dpapi_credential_manager_migration"`
+	FileSecretStore             limitation `json:"file_secret_store"`
+	EFS                         limitation `json:"efs"`
+	Git                         limitation `json:"git"`
+	Network                     limitation `json:"network"`
+	Codex                       limitation `json:"codex"`
+	PreviewIdentityOpen         limitation `json:"preview_identity_open"`
+	PreviewRegistration         limitation `json:"preview_registration"`
+	PreviewMachineControlSource limitation `json:"preview_machine_control_source"`
+	PreviewMachineControlToken  limitation `json:"preview_machine_control_token"`
 }
 
 type limitation struct {
@@ -93,12 +101,17 @@ func main() {
 		if mode == dpapiServiceMode {
 			child = dpapiChildMode
 		}
+		environment := map[string]string{"PAPERBOAT_S4U_QUALIFICATION": "1"}
+		if mode == dpapiServiceMode {
+			environment["PAPERBOAT_S4U_RUNTIME_STATE_ROOT"] = filepath.Clean(reportPath) + ".preview-state"
+			environment["PAPERBOAT_S4U_CONTROL_URL"] = "https://api.example.test"
+		}
 		err = service.RunWindowsService(service.ServiceEntryConfig{
 			Name:        name,
 			Executable:  executable,
 			Arguments:   []string{child, ownerSIDFlag, ownerSID, reportFlag, reportPath},
 			EnrolledSID: ownerSID,
-			Environment: map[string]string{"PAPERBOAT_S4U_QUALIFICATION": "1"},
+			Environment: environment,
 			LaunchFailure: func(launchErr error) {
 				_ = os.WriteFile(reportPath+".launch-error", []byte(launchErr.Error()), 0o600)
 			},
@@ -206,6 +219,26 @@ func writeChildReport(ownerSID, reportPath string) error {
 	if sessionID != 0 {
 		return fmt.Errorf("S4U child session=%d, want service session 0", sessionID)
 	}
+	previewIdentityOpen := limitation{Status: "fail", Reason: "identity.Open failed in the logged-out S4U child"}
+	previewRegistration := limitation{Status: "fail", Reason: "identity registration read failed in the logged-out S4U child"}
+	previewMachineControlSource := limitation{Status: "fail", Reason: "machine-control source construction failed in the logged-out S4U child"}
+	previewMachineControlToken := limitation{Status: "fail", Reason: "machine-control token read failed in the logged-out S4U child"}
+	stateRoot := strings.TrimSpace(os.Getenv("PAPERBOAT_S4U_RUNTIME_STATE_ROOT"))
+	controlURL := strings.TrimSpace(os.Getenv("PAPERBOAT_S4U_CONTROL_URL"))
+	if filepath.IsAbs(stateRoot) && filepath.Clean(stateRoot) == stateRoot && controlURL == "https://api.example.test" {
+		if store, openErr := identity.Open(identity.Config{StateRoot: stateRoot}); openErr == nil {
+			previewIdentityOpen = limitation{Status: "pass", Reason: "identity.Open succeeded in the logged-out S4U child"}
+			if registration, registrationErr := store.Registration(); registrationErr == nil && registration.ServerURL == controlURL {
+				previewRegistration = limitation{Status: "pass", Reason: "identity registration matched the owner-service control origin"}
+				if source, sourceErr := machinecontrol.NewSource(machinecontrol.Config{ControlURL: controlURL, StateRoot: stateRoot}); sourceErr == nil {
+					previewMachineControlSource = limitation{Status: "pass", Reason: "machine-control source constructed in the logged-out S4U child"}
+					if token, tokenErr := source.Token(context.Background()); tokenErr == nil && len(token) >= 32 {
+						previewMachineControlToken = limitation{Status: "pass", Reason: "machine-control token was read from the owner fixture in the logged-out S4U child"}
+					}
+				}
+			}
+		}
+	}
 	executable, err := os.Executable()
 	if err != nil {
 		return err
@@ -230,6 +263,22 @@ func writeChildReport(ownerSID, reportPath string) error {
 	} else {
 		dpapiMigration = limitation{Status: "pass", Reason: "logged-out S4U read the Credential Manager credential after owner migration to the production LocalAppData DPAPI store"}
 	}
+	fileSecretStore := limitation{Status: "fail", Reason: "logged-out S4U could not write and read a fresh Paperboat FileSecretStore credential"}
+	fileSecretDirectory := reportPath + ".file-secret-store"
+	fileSecrets := config.FileSecretStore{Dir: fileSecretDirectory}
+	const fileSecretRef = "runtime-transfer-key"
+	const fileSecretValue = "paperboat-s4u-file-secret-v2"
+	if writeErr := fileSecrets.Set(fileSecretRef, fileSecretValue); writeErr != nil {
+		fileSecretStore.Reason += ": write: " + writeErr.Error()
+	} else if cleartext, readErr := fileSecrets.Get(fileSecretRef); readErr != nil {
+		fileSecretStore.Reason += ": read: " + readErr.Error()
+	} else if cleartext != fileSecretValue {
+		fileSecretStore.Reason += ": credential value did not match"
+	} else {
+		fileSecretStore = limitation{Status: "pass", Reason: "logged-out S4U wrote and read a fresh machine-scope Paperboat FileSecretStore credential"}
+	}
+	_ = fileSecrets.Delete(fileSecretRef)
+	_ = os.Remove(fileSecretDirectory)
 	efs := limitation{Status: "fail", Reason: "logged-out S4U could not read the owner-encrypted EFS fixture"}
 	if output, encryptErr := exec.Command("cipher.exe", "/E", "/A", reportPath+".efs").CombinedOutput(); encryptErr != nil {
 		efs.Reason += ": encrypt: " + encryptErr.Error() + ": " + strings.TrimSpace(string(output))
@@ -278,13 +327,18 @@ func writeChildReport(ownerSID, reportPath string) error {
 		Environment:        environment{OwnerWorkload: os.Getenv("PAPERBOAT_S4U_QUALIFICATION")},
 		JobCleanupExpected: true,
 		Limitations: limitations{
-			SMB:            limitation{Status: "not_qualified", Reason: "S4U does not retain reusable user network credentials; credentialed SMB requires a separate native qualification."},
-			DPAPI:          dpapi,
-			DPAPIMigration: dpapiMigration,
-			EFS:            efs,
-			Git:            git,
-			Network:        network,
-			Codex:          codex,
+			SMB:                         limitation{Status: "not_qualified", Reason: "S4U does not retain reusable user network credentials; credentialed SMB requires a separate native qualification."},
+			DPAPI:                       dpapi,
+			DPAPIMigration:              dpapiMigration,
+			FileSecretStore:             fileSecretStore,
+			EFS:                         efs,
+			Git:                         git,
+			Network:                     network,
+			Codex:                       codex,
+			PreviewIdentityOpen:         previewIdentityOpen,
+			PreviewRegistration:         previewRegistration,
+			PreviewMachineControlSource: previewMachineControlSource,
+			PreviewMachineControlToken:  previewMachineControlToken,
 		},
 	}
 	if err := writeReport(reportPath, record); err != nil {

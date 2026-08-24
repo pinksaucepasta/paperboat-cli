@@ -3,14 +3,12 @@
 package runtime
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/url"
 	"os"
@@ -29,44 +27,11 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-type ServeRuntimeDescriptor struct {
-	SourcePath     string              `json:"source_path"`
-	SourceKind     servepkg.SourceKind `json:"source_kind"`
-	SourceIdentity string              `json:"source_identity"`
-	SPA            bool                `json:"spa"`
-	OwnerMode      string              `json:"owner_mode"`
-	Visibility     string              `json:"visibility"`
-	ListenPort     uint16              `json:"listen_port,omitempty"`
-}
-type PreviewRuntimeDescriptor struct {
-	Schema            string                           `json:"schema"`
-	Name              string                           `json:"name"`
-	BindAddress       string                           `json:"bind_address,omitempty"`
-	Port              uint16                           `json:"port"`
-	ServiceGeneration uint64                           `json:"service_generation,omitempty"`
-	Indefinite        bool                             `json:"indefinite"`
-	ExpiresAt         *time.Time                       `json:"expires_at,omitempty"`
-	ServiceDefinition string                           `json:"service_definition"`
-	Record            *preview.ControlRecord           `json:"record,omitempty"`
-	Failure           *PreviewRuntimeFailure           `json:"failure,omitempty"`
-	Serve             *ServeRuntimeDescriptor          `json:"serve,omitempty"`
-	PrivateRemote     *PrivatePreviewRuntimeDescriptor `json:"private_remote,omitempty"`
-}
-type PreviewRuntimeFailure struct {
-	Code string `json:"code"`
-}
-type PrivatePreviewRuntimeDescriptor struct {
-	MachineID         string `json:"machine_id"`
-	MachineName       string `json:"machine_name"`
-	EnvironmentID     string `json:"environment_id"`
-	MachineGeneration uint64 `json:"machine_generation"`
-	TargetPort        uint16 `json:"target_port"`
-	ListenPort        uint16 `json:"listen_port,omitempty"`
-}
-
 var ErrPreviewAlreadyActive = errors.New("preview name is already active")
 var ErrPreviewServiceMissing = errors.New("preview service is missing")
 var ErrPreviewServiceFailed = errors.New("preview service failed")
+
+const windowsPreviewStartupReconcileGrace = 2 * time.Minute
 
 type PreviewServiceFailureError struct{ Code string }
 
@@ -589,9 +554,6 @@ func ReconcileExpiredPreviewServices(ctx context.Context, root string, now time.
 	if err != nil {
 		return err
 	}
-	if len(entries) == 0 {
-		return nil
-	}
 	artifacts, err := listWindowsPreviewServiceArtifacts()
 	if err != nil {
 		return err
@@ -601,7 +563,8 @@ func ReconcileExpiredPreviewServices(ctx context.Context, root string, now time.
 		return err
 	}
 	var preflightErr error
-	plans := make([]windowsPreviewCleanupPlan, 0, len(entries))
+	plans := make([]windowsPreviewCleanupPlan, 0, len(entries)+len(artifacts))
+	describedArtifacts := make(map[string]bool, len(entries))
 	for _, entry := range entries {
 		if entry.IsDir() {
 			if strings.EqualFold(filepath.Ext(entry.Name()), ".json") {
@@ -623,6 +586,7 @@ func ReconcileExpiredPreviewServices(ctx context.Context, root string, now time.
 			preflightErr = errors.Join(preflightErr, fmt.Errorf("validate preview service %s: %w", entry.Name(), e))
 			continue
 		}
+		describedArtifacts[strings.ToLower(plan.serviceName)] = true
 		if d.Indefinite || d.ExpiresAt == nil || d.ExpiresAt.After(now) {
 			continue
 		}
@@ -640,6 +604,26 @@ func ReconcileExpiredPreviewServices(ctx context.Context, root string, now time.
 			continue
 		}
 		plans = append(plans, plan)
+	}
+	for _, artifact := range artifacts {
+		if describedArtifacts[strings.ToLower(artifact.Name)] {
+			continue
+		}
+		if artifact.HasDeclaration && (artifact.DeclarationModifiedAt.IsZero() || artifact.DeclarationModifiedAt.Add(windowsPreviewStartupReconcileGrace).After(now) || artifact.HasService && !artifact.ServiceTerminal) {
+			// A preview publishes its descriptor while the service is starting.
+			// Preserve fresh declarations before SCM registration, descriptor-less
+			// Running/Pending registrations, and fresh Stopped registrations so
+			// concurrent reconciliation cannot terminate or delete active startup.
+			continue
+		}
+		plan, e := preflightWindowsPreviewArtifact(ctx, root, artifact)
+		if e != nil {
+			preflightErr = errors.Join(preflightErr, fmt.Errorf("validate orphan preview artifact %s: %w", artifact.Name, e))
+			continue
+		}
+		if plan.serviceName != "" {
+			plans = append(plans, plan)
+		}
 	}
 	if preflightErr != nil {
 		return preflightErr
@@ -790,18 +774,7 @@ func readPreviewRuntimeDescriptor(path string) (PreviewRuntimeDescriptor, error)
 	if err != nil {
 		return PreviewRuntimeDescriptor{}, err
 	}
-	var d PreviewRuntimeDescriptor
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	var extra any
-	if dec.Decode(&d) != nil || dec.Decode(&extra) != io.EOF || d.Schema != "paperboat.preview-runtime/v1" || d.Name == "" || d.Indefinite == (d.ExpiresAt != nil) || d.ServiceDefinition != "" && !filepath.IsAbs(d.ServiceDefinition) {
-		return PreviewRuntimeDescriptor{}, ErrProductionInvalid
-	}
-	valid := d.Port != 0 && d.Serve == nil && d.PrivateRemote == nil || validServeRuntimeDescriptor(d.Serve) && d.BindAddress == "127.0.0.1" && d.ServiceGeneration > 0 || validPrivatePreviewRuntimeDescriptor(d.PrivateRemote) && d.Serve == nil && d.BindAddress == "127.0.0.1" && d.ServiceGeneration > 0
-	if !valid {
-		return PreviewRuntimeDescriptor{}, ErrProductionInvalid
-	}
-	return d, nil
+	return DecodePreviewRuntimeDescriptor(data)
 }
 
 func previewDescriptorSID(path string) (*windows.SID, error) {
@@ -861,10 +834,4 @@ func previewDescriptorDACL(value string) string {
 		return ""
 	}
 	return "D:" + value[index+open:]
-}
-func validPrivatePreviewRuntimeDescriptor(d *PrivatePreviewRuntimeDescriptor) bool {
-	return d != nil && d.MachineID != "" && d.MachineName != "" && d.EnvironmentID != "" && d.MachineGeneration > 0 && d.TargetPort > 0
-}
-func validServeRuntimeDescriptor(d *ServeRuntimeDescriptor) bool {
-	return d != nil && filepath.IsAbs(d.SourcePath) && d.SourceIdentity != "" && (d.SourceKind == servepkg.SourceFile || d.SourceKind == servepkg.SourceDirectory) && d.OwnerMode == "detached" && (d.Visibility == "private" || d.Visibility == "public") && (d.Visibility == "private" || d.ListenPort == 0) && (!d.SPA || d.SourceKind == servepkg.SourceDirectory)
 }

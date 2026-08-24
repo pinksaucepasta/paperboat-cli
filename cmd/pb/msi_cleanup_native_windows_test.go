@@ -60,11 +60,7 @@ func TestNativeMSIPreviewCleanup(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(descriptorPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	descriptorBody, err := json.Marshal(msiPreviewDescriptor{
-		Schema:            "paperboat.preview-runtime/v1",
-		Name:              currentLogicalName,
-		ServiceDefinition: definitionPath,
-	})
+	descriptorBody, err := json.Marshal(nativeMSIPreviewDescriptor(currentLogicalName, definitionPath))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,11 +169,7 @@ func TestNativeMSIPreviewOwnershipConflictPreservesRuntimeState(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(descriptorPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	descriptorBody, err := json.Marshal(msiPreviewDescriptor{
-		Schema:            "paperboat.preview-runtime/v1",
-		Name:              logicalName,
-		ServiceDefinition: definitionPath,
-	})
+	descriptorBody, err := json.Marshal(nativeMSIPreviewDescriptor(logicalName, definitionPath))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,11 +233,7 @@ func TestNativeMSIPreviewDescriptorConflictPreservesOwnedService(t *testing.T) {
 		t.Fatal(err)
 	}
 	foreignDefinition := filepath.Join(paths.ServiceRoot, foreignName+".json")
-	descriptorBody, err := json.Marshal(msiPreviewDescriptor{
-		Schema:            "paperboat.preview-runtime/v1",
-		Name:              foreignLogicalName,
-		ServiceDefinition: foreignDefinition,
-	})
+	descriptorBody, err := json.Marshal(nativeMSIPreviewDescriptor(foreignLogicalName, foreignDefinition))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,6 +261,18 @@ func nativeMSIPreviewLogicalName(index uint64) string {
 
 func nativeMSIPreviewName(index uint64) string {
 	return msiPaperboatServicePrefix + msiPreviewInstance(nativeMSIPreviewLogicalName(index))
+}
+
+func nativeMSIPreviewDescriptor(logicalName, definitionPath string) msiPreviewDescriptor {
+	return msiPreviewDescriptor{
+		Schema:            "paperboat.preview-runtime/v1",
+		Name:              logicalName,
+		BindAddress:       "127.0.0.1",
+		Port:              38123,
+		ServiceGeneration: 1787503345680,
+		Indefinite:        true,
+		ServiceDefinition: definitionPath,
+	}
 }
 
 func nativeMSIPreviewFixture(t *testing.T, manager *mgr.Mgr, paths msiCleanupPaths, name, logicalName, executable string) error {

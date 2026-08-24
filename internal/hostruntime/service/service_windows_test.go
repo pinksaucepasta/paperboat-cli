@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
 )
 
@@ -190,6 +191,28 @@ func TestWindowsPreviewDeclarationOwnershipIsExact(t *testing.T) {
 		if err := validateWindowsPreviewDefinition(definitionPath, serviceName, stateRoot, candidate); !errors.Is(err, ErrInvalidDefinition) {
 			t.Fatalf("foreign preview declaration accepted: definition=%+v error=%v", candidate, err)
 		}
+	}
+}
+
+func TestWindowsPreviewServiceTerminalStatusRequiresSuccessfulStop(t *testing.T) {
+	tests := []struct {
+		name   string
+		status svc.Status
+		want   bool
+	}{
+		{name: "stopped successfully", status: svc.Status{State: svc.Stopped}, want: true},
+		{name: "start pending", status: svc.Status{State: svc.StartPending}},
+		{name: "running", status: svc.Status{State: svc.Running}},
+		{name: "stop pending", status: svc.Status{State: svc.StopPending}},
+		{name: "win32 failure", status: svc.Status{State: svc.Stopped, Win32ExitCode: 1}},
+		{name: "service failure", status: svc.Status{State: svc.Stopped, ServiceSpecificExitCode: 1}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := windowsPreviewServiceStatusTerminal(test.status); got != test.want {
+				t.Fatalf("terminal = %v, want %v for %+v", got, test.want, test.status)
+			}
+		})
 	}
 }
 

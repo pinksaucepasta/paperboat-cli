@@ -18,11 +18,22 @@ The current root-v2 online role aliases are `targets-1`, `targets-2`, `snapshot-
 rotation must update both the protected GitHub Environment secret name and the workflow's
 ephemeral signing-state binding before the next tag is created.
 Every tag or manual release first enters the protected `paperboat-tuf-published` environment,
-validates the install, server, and release HTTPS endpoints, then uses the protected SSH identity
-only for a read-only readiness command proving that one running server container has the exact
-parent bind mount
+strictly parses the install, server, and release HTTPS endpoints and requires the install and
+release URLs to share one public origin. Endpoint hosts must use canonical DNS or IP spelling;
+legacy numeric IPv4 forms are rejected. `PAPERBOAT_RELEASE_ORIGIN_HOSTS_JSON` is the protected
+environment's authoritative JSON inventory of backend publication hosts. Atomic activation
+currently supports exactly one canonical literal IPv4 entry, and `PAPERBOAT_RELEASE_HOST` must
+equal it. DNS names, IPv6 addresses, alternate IPv4 spellings, multiple entries, and mismatches
+are rejected so every SSH and SCP operation addresses the same backend. The validated
+host is passed through a job output so publication cannot re-read a different host later in the
+run. `PAPERBOAT_RELEASE_KNOWN_HOSTS` must pin the SSH host key for that literal IPv4. The gate
+then uses the protected SSH identity only for a read-only readiness command proving
+that one running server container on that exact host has the parent bind mount
 `/opt/paperboat/releases` to `/srv/paperboat-releases` read-only and resolves
-`PAPERBOAT_RELEASE_DIRECTORY=/srv/paperboat-releases/current`. It also validates the release
+`PAPERBOAT_RELEASE_DIRECTORY=/srv/paperboat-releases/current`. Bounded HTTPS probes then require
+the public installer and control-plane health endpoint to respond. Byte-hash comparisons prove that
+the installer-origin and control-plane `current.json` responses match the authoritative host's
+`current.json`, and that the public TUF root comes from that host. It also validates the release
 version, fetches the served root and its numbered chain from the public HTTPS TUF repository,
 verifies that chain from the client-embedded trusted root, and validates all four online secrets
 against the active roles. A cheap Windows amd64 Git-Bash contract job then validates the release
@@ -69,7 +80,9 @@ exists and every downloaded release asset has been byte-verified.
 Root keys are never available to CI.
 `PAPERBOAT_INSTALL_URL` is the exact user-facing HTTPS install endpoint, currently
 `https://get.pprbt.dev/install`. The protected authority gate validates it before allocating
-platform builders. The isolated pre-activation verifier compares both installer sources
+platform builders. `PAPERBOAT_DEFAULT_RELEASE_URL` must use that same public origin at `/tuf`,
+while `PAPERBOAT_DEFAULT_SERVER_URL` must be an HTTPS origin with no path. The isolated
+pre-activation verifier compares both installer sources
 byte-for-byte with the immutable GitHub release assets.
 
 Windows publication is fail-closed for both architectures. `paperboat-tuf publish` requires
@@ -83,6 +96,13 @@ Each evidence file is added as a signed TUF target named
 binding to that evidence target, its evidence digest, release version, Windows build, runner,
 status, and that component's digest and length. Later rollout mutations revalidate those bindings
 and refuse to re-sign a Windows release that lacks valid architecture-matching evidence.
+
+The evidence also contains a SHA-256 and length binding to the exact
+`windows-<arch>-native-qualification-report.json` produced by the native harness, plus the native
+test executable's SHA-256 and length. The report is copied unchanged into the immutable GitHub
+candidate. The TUF signer verifies the report bytes and passed result before signing the evidence;
+the isolated staged-consumer gate verifies the signed evidence, immutable report, and native-test
+binding again before activation.
 
 Create evidence only after the final artifact bytes are available. If optional Authenticode
 signing is used, create evidence after signing and RFC 3161 timestamping. It must use this exact
@@ -99,6 +119,14 @@ schema and cover `cli`, `runtime`, `hostd`,
   "native_tested": true,
   "windows_build": "26100",
   "runner": "windows-2025",
+  "qualification_result": {
+    "schema": "paperboat.windows-native-qualification-result-binding/v1",
+    "target_path": "windows-<arch>-native-qualification-report.json",
+    "sha256": "<lowercase report sha256>",
+    "length": 12345,
+    "native_test_sha256": "<lowercase native test executable sha256>",
+    "native_test_length": 12345
+  },
   "artifacts": [
     {
       "component": "cli",

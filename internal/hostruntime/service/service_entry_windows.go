@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -309,6 +310,15 @@ func enrolledOwnerExists(value string) (bool, error) {
 }
 
 func deleteOwnWindowsService(name string) (resultErr error) {
+	definitionPath := filepath.Join(windowsServiceDefinitionRoot, name+".json")
+	definition, err := readWindowsServiceDefinitionForRemoval(definitionPath)
+	if err != nil {
+		return err
+	}
+	stateRoot, err := validateWindowsOneShotPreviewDefinition(name, definition)
+	if err != nil {
+		return err
+	}
 	manager, err := mgr.Connect()
 	if err != nil {
 		return err
@@ -322,11 +332,39 @@ func deleteOwnWindowsService(name string) (resultErr error) {
 		return err
 	}
 	defer func() { resultErr = errors.Join(resultErr, current.Close()) }()
-	err = current.Delete()
-	if errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
-		return nil
+	serviceConfig, err := current.Config()
+	if err != nil || !windowsServiceConfigurationOwnsDefinition(serviceConfig, definition) {
+		return errors.Join(err, ErrWindowsServiceEntry)
 	}
-	return err
+	if err := current.Delete(); err != nil && !errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
+		return err
+	}
+	currentDefinition, err := readOwnedWindowsPreviewDefinitionForRemoval(definitionPath, name, stateRoot)
+	if err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(currentDefinition, definition) {
+		return ErrWindowsServiceEntry
+	}
+	if err := os.Remove(definitionPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return syncServiceDirectory(windowsServiceDefinitionRoot)
+}
+
+func validateWindowsOneShotPreviewDefinition(name string, definition windowsServiceDefinition) (string, error) {
+	if !isWindowsPreviewServiceName(name) {
+		return "", ErrWindowsServiceEntry
+	}
+	stateRoot, ok := windowsPreviewStateRoot(definition.Arguments)
+	if !ok {
+		return "", ErrWindowsServiceEntry
+	}
+	definitionPath := filepath.Join(windowsServiceDefinitionRoot, name+".json")
+	if err := validateWindowsPreviewDefinition(definitionPath, name, stateRoot, definition); err != nil {
+		return "", err
+	}
+	return stateRoot, nil
 }
 
 func stoppedServiceStatus(code uint32, failed bool) svc.Status {

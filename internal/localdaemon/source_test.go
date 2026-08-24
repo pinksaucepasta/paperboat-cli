@@ -3,6 +3,7 @@ package localdaemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pinksaucepasta/paperboat/internal/api"
 	"github.com/pinksaucepasta/paperboat/internal/config"
 	"github.com/pinksaucepasta/paperboat/internal/localapi"
 )
@@ -53,6 +55,38 @@ func TestAuthenticatedMachineSourceLoadsCredentialForEveryRefresh(t *testing.T) 
 	defer mu.Unlock()
 	if len(authorizations) != 2 || authorizations[0] != "Bearer token-1" || authorizations[1] != "Bearer token-2" {
 		t.Fatalf("authorizations=%v", authorizations)
+	}
+}
+
+func TestAuthenticatedMachineSourceRunsAutomaticPeerApprovalBeforePublishing(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1/machines" {
+			http.NotFound(writer, request)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"data":{"items":[],"pagination":{"limit":200,"offset":0,"total":0,"next_offset":null}}}`))
+	}))
+	defer server.Close()
+
+	wantErr := errors.New("automatic approval failed")
+	calls := 0
+	source := AuthenticatedMachineSource{
+		ServerURL: server.URL,
+		Auth:      &rotatingAuthSource{},
+		AutoApprovePeerEnrollments: func(ctx context.Context, client *api.Client, machines []api.UserMachine) error {
+			calls++
+			if ctx == nil || client == nil || machines == nil || len(machines) != 0 {
+				t.Fatalf("callback context=%v client=%v machines=%v", ctx, client, machines)
+			}
+			return wantErr
+		},
+	}
+	if _, err := source.ListUserMachines(context.Background()); !errors.Is(err, wantErr) {
+		t.Fatalf("automatic approval error = %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("automatic approval calls = %d", calls)
 	}
 }
 

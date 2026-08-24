@@ -21,7 +21,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-const windowsManagedAgentPipe = "\\\\.\\pipe\\Paperboat-SSH-Agent"
+const windowsManagedAgentPipe = managedssh.WindowsInstalledAgentPipe
 
 const (
 	windowsManagedSSHMarker      = "paperboat-managed-ssh-v1"

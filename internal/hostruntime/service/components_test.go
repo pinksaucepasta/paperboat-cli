@@ -187,10 +187,19 @@ func TestSplitServiceDefinitionUpgradeDoesNotRestartStableSupervisor(t *testing.
 	}
 }
 
-func TestHostdInstallerRejectsRootOwnership(t *testing.T) {
-	_, err := NewHostdInstaller(ComponentConfig{Layout: splitLayout(t, "linux"), User: "root", Group: "root", UID: 0, HostdTokenFile: "/tmp/token", Controller: &controller{}})
-	if !errors.Is(err, ErrInvalidDefinition) {
+func TestHostdInstallerAcceptsOnlyExactRootEnrollment(t *testing.T) {
+	if _, err := NewHostdInstaller(ComponentConfig{Layout: splitLayout(t, "linux"), User: "root", Group: "root", UID: 0, GID: 0, HostdTokenFile: "/tmp/token", Controller: &controller{}}); err != nil {
 		t.Fatalf("root hostd err=%v", err)
+	}
+	for _, config := range []ComponentConfig{
+		{Layout: splitLayout(t, "linux"), User: "alice", Group: "users", UID: 0, GID: 0, HostdTokenFile: "/tmp/token", Controller: &controller{}},
+		{Layout: splitLayout(t, "linux"), User: "root", Group: "root", UID: 0, GID: 1000, HostdTokenFile: "/tmp/token", Controller: &controller{}},
+		{Layout: splitLayout(t, "linux"), User: "root", Group: "users", UID: 0, GID: 0, HostdTokenFile: "/tmp/token", Controller: &controller{}},
+		{Layout: splitLayout(t, "linux"), User: "root", Group: "users", UID: 1000, GID: 1000, HostdTokenFile: "/tmp/token", Controller: &controller{}},
+	} {
+		if _, err := NewHostdInstaller(config); !errors.Is(err, ErrInvalidDefinition) {
+			t.Fatalf("invalid identity %+v err=%v", config, err)
+		}
 	}
 }
 

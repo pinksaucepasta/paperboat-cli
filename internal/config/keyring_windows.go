@@ -54,6 +54,17 @@ func windowsCredentialError(operation string, err error) error {
 	return fmt.Errorf("%w: Credential Manager %s: %v", ErrCredentialStoreUnavailable, operation, err)
 }
 
+// A network or S4U logon has no Credential Manager logon session. DPAPI is
+// the authoritative store, so an unavailable legacy migration source is
+// equivalent to no legacy credential. This lets login create a new DPAPI v2
+// credential without weakening reads of an existing DPAPI object.
+func windowsCredentialReadError(err error) error {
+	if errors.Is(err, windows.ERROR_NO_SUCH_LOGON_SESSION) {
+		return ErrSecretNotFound
+	}
+	return windowsCredentialError("read", err)
+}
+
 func windowsUTF16(value string) (*uint16, error) {
 	encoded, err := windows.UTF16FromString(value)
 	if err != nil {
@@ -92,6 +103,12 @@ func (KeyringStore) Get(ref string) (string, error) {
 		_ = deleteLegacyWindowsCredential(ref)
 		return value, nil
 	}
+	// A tombstone is an authoritative absence. Never consult the legacy store:
+	// it may contain a stale value that an earlier S4U/network-logon deletion
+	// could not reach.
+	if errors.Is(dpapiErr, errDPAPISecretDeleted) {
+		return "", ErrSecretNotFound
+	}
 	// Credential Manager is only a migration source for an absent DPAPI
 	// credential. Never let a stale legacy value replace a DPAPI file that is
 	// present but corrupt, unreadable, or has an invalid ACL.
@@ -110,7 +127,7 @@ func (KeyringStore) Get(ref string) (string, error) {
 		uintptr(unsafe.Pointer(&credential)),
 	)
 	if result == 0 {
-		return "", windowsCredentialError("read", callErr)
+		return "", windowsCredentialReadError(callErr)
 	}
 	if credential == nil || credential.CredentialBlobSize > windowsCredentialBlobMaxBytes || (credential.CredentialBlobSize > 0 && credential.CredentialBlob == nil) {
 		if credential != nil {
@@ -159,20 +176,44 @@ func deleteLegacyWindowsCredential(ref string) error {
 	return nil
 }
 
-func (KeyringStore) Delete(ref string) error {
-	target, err := windowsUTF16(windowsCredentialTarget(ref))
-	if err != nil {
-		return err
-	}
+type windowsCredentialDeleteFunc func(*uint16) (uintptr, error)
+
+func callWindowsCredentialDelete(target *uint16) (uintptr, error) {
 	result, _, callErr := procCredDeleteW.Call(
 		uintptr(unsafe.Pointer(target)),
 		windowsCredentialTypeGeneric,
 		0,
 	)
-	if result == 0 && !errors.Is(callErr, windows.ERROR_NOT_FOUND) {
-		// Keep the authoritative DPAPI value when legacy cleanup is uncertain.
-		// A retry can safely complete deletion without resurrecting old state.
-		return windowsCredentialError("delete", callErr)
+	return result, callErr
+}
+
+func deleteWindowsCredential(ref string, deleteLegacy windowsCredentialDeleteFunc) error {
+	if deleteLegacy == nil {
+		return fmt.Errorf("%w: Credential Manager delete is unavailable", ErrCredentialStoreUnavailable)
 	}
-	return deleteDPAPISecret(ref)
+	target, err := windowsUTF16(windowsCredentialTarget(ref))
+	if err != nil {
+		return err
+	}
+	// Commit logical deletion before touching the optional legacy store. The
+	// tombstone contains no secret and prevents stale migration fallback.
+	if err := setDPAPISecretTombstone(ref); err != nil {
+		return err
+	}
+	result, callErr := deleteLegacy(target)
+	if result != 0 || errors.Is(callErr, windows.ERROR_NOT_FOUND) {
+		return deleteDPAPISecretTombstone(ref)
+	}
+	if errors.Is(callErr, windows.ERROR_NO_SUCH_LOGON_SESSION) {
+		// Credential Manager is expected to be unavailable to S4U and network
+		// logons. The tombstone is the durable deletion authority until a later
+		// interactive retry can remove any legacy value.
+		return nil
+	}
+	// Keep the tombstone on uncertain cleanup so Get remains fail closed.
+	return windowsCredentialError("delete", callErr)
+}
+
+func (KeyringStore) Delete(ref string) error {
+	return deleteWindowsCredential(ref, callWindowsCredentialDelete)
 }

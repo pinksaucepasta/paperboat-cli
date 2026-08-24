@@ -800,7 +800,7 @@ func matches(status hostdproto.Status, state hostdproto.State, id string, epoch 
 }
 
 func validateConfig(config Config) error {
-	if config.Fetcher == nil || config.Starter == nil || config.Hostd == nil || config.Health == nil || config.OwnerUID < 0 || config.OwnerGID < 0 || config.WorkerUID <= 0 || config.WorkerGID < 0 || len(config.Capability) != 32 || config.HostdEndpoint == "" || config.MonitorWindow <= 0 || config.HealthInterval <= 0 || config.HealthInterval > config.MonitorWindow || validateRelease(config.Active) != nil {
+	if config.Fetcher == nil || config.Starter == nil || config.Hostd == nil || config.Health == nil || config.OwnerUID < 0 || config.OwnerGID < 0 || !validWorkerIdentity(config.WorkerUID, config.WorkerGID) || len(config.Capability) != 32 || config.HostdEndpoint == "" || config.MonitorWindow <= 0 || config.HealthInterval <= 0 || config.HealthInterval > config.MonitorWindow || validateRelease(config.Active) != nil {
 		return ErrInvalidConfig
 	}
 	for _, path := range []string{config.StatePath, config.RuntimeCurrent, config.RuntimeRollback, config.RuntimeStaged, config.CLICurrent, config.CLIRollback} {

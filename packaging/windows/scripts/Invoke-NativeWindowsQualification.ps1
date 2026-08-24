@@ -33,7 +33,8 @@ param(
     [Parameter(Mandatory = $true)]
     [string] $MsiCleanupTestExecutable,
 
-    [string] $NativeTestExecutable = '',
+    [Parameter(Mandatory = $true)]
+    [string] $NativeTestExecutable,
 
     [Parameter(Mandatory = $true)]
     [string] $OutputDirectory
@@ -43,8 +44,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 $script:events = @()
-$script:installedByHarness = $false
-$script:upgradeInstalled = $false
+$script:preflightPassed = $false
 $script:dynamicPreviewServiceName = $null
 $script:dynamicPreviewDescriptorPath = $null
 $script:runtimeCurrentFixtureCreated = $false
@@ -55,14 +55,37 @@ $script:preMsiRuntimeCurrentReleasesRoot = $null
 $script:preMsiRuntimeCurrentHash = $null
 $script:preMsiRuntimeCurrentStaged = $false
 $script:qualificationSID = $null
+$script:nativeTestEvidenceSequence = 0
+$script:nativeTestSHA256 = $null
+$script:nativeTestLength = $null
+$script:preexistingPaperboatState = $null
+$script:launchedQualificationProcesses = @()
+$script:qualificationProcessIdentityFailures = @()
+$script:qualificationProcessRegistrationFailures = @()
+$script:qualificationProcessContract = 'synchronous_descendants_required'
 $script:msiexec = Join-Path $env:SystemRoot 'System32\msiexec.exe'
+$script:icacls = Join-Path $env:SystemRoot 'System32\icacls.exe'
+$script:serviceControl = Join-Path $env:SystemRoot 'System32\sc.exe'
+$script:msiOperationTimeoutMilliseconds = 5 * 60 * 1000
+$script:msiTerminationGraceMilliseconds = 15 * 1000
+$script:nativeCommandTimeoutMilliseconds = 30 * 1000
+$script:nativeTestTimeoutMilliseconds = 5 * 60 * 1000 + 30 * 1000
+$script:streamDrainTimeoutMilliseconds = 15 * 1000
 $script:installRoot = Join-Path ${env:ProgramFiles} 'Paperboat'
 $script:binaryRoot = Join-Path $script:installRoot 'bin'
 $script:stateRoot = Join-Path ${env:ProgramData} 'Paperboat'
 $script:registryPath = 'HKLM:\Software\Paperboat'
+$script:openSSHRegistryPath = 'HKLM:\Software\Paperboat\OpenSSH'
 
-New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 $resolvedOutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
+$null = New-Item -ItemType Directory -Force -Path $resolvedOutputDirectory -ErrorAction Stop
+$outputDirectoryItem = Get-Item -Force -LiteralPath $resolvedOutputDirectory -ErrorAction Stop
+if (-not $outputDirectoryItem.PSIsContainer -or -not [IO.Directory]::Exists($resolvedOutputDirectory)) {
+    throw "qualification_output_directory_invalid: output path is not a real directory: $resolvedOutputDirectory"
+}
+if (($outputDirectoryItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+    throw "qualification_output_directory_invalid: output path is a reparse point: $resolvedOutputDirectory"
+}
 $resolvedMsiPath = [IO.Path]::GetFullPath($MsiPath)
 $resolvedUpgradeMsiPath = [IO.Path]::GetFullPath($UpgradeMsiPath)
 $resolvedFixturePath = [IO.Path]::GetFullPath($ServiceFixturePath)
@@ -70,6 +93,7 @@ $resolvedS4UFixturePath = [IO.Path]::GetFullPath($S4UFixturePath)
 $resolvedS4UTestExecutable = [IO.Path]::GetFullPath($S4UTestExecutable)
 $resolvedHostinstallTestExecutable = [IO.Path]::GetFullPath($HostinstallTestExecutable)
 $resolvedMsiCleanupTestExecutable = [IO.Path]::GetFullPath($MsiCleanupTestExecutable)
+$resolvedNativeTestExecutable = [IO.Path]::GetFullPath($NativeTestExecutable)
 $reportPath = Join-Path $resolvedOutputDirectory 'native-windows-qualification.json'
 
 function Add-QualificationEvent {
@@ -93,6 +117,109 @@ function Assert-Qualification {
     if (-not $Condition) {
         throw "qualification_assertion_failed: $Message"
     }
+}
+
+function New-NativeTestExecutionEvidence {
+    param(
+        [Parameter(Mandatory = $true)][string] $ExecutablePath,
+        [Parameter(Mandatory = $true)][string[]] $Arguments,
+        [Parameter(Mandatory = $true)][string] $RunPattern,
+        [Parameter(Mandatory = $true)][string] $Description,
+        [Parameter(Mandatory = $true)][string] $EvidenceName,
+        [Parameter(Mandatory = $true)][int] $ExitCode,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]] $Output
+    )
+    $runTests = @()
+    $passedTests = @()
+    $failedTests = @()
+    $skippedTests = @()
+    foreach ($line in @($Output | ForEach-Object { [string]$_ })) {
+        if ($line -match '^\s*=== RUN\s+(.+?)\s*$') {
+            $runTests += $Matches[1]
+            continue
+        }
+        if ($line -match '^\s*---\s+(PASS|FAIL|SKIP):\s+(.+?)(?:\s+\([^)]*\))?\s*$') {
+            switch ($Matches[1]) {
+                'PASS' { $passedTests += $Matches[2] }
+                'FAIL' { $failedTests += $Matches[2] }
+                'SKIP' { $skippedTests += $Matches[2] }
+            }
+        }
+    }
+
+    $script:nativeTestEvidenceSequence++
+    $safeName = [regex]::Replace($EvidenceName, '[^A-Za-z0-9_.-]', '_')
+    $sequence = '{0:D3}' -f $script:nativeTestEvidenceSequence
+    $evidencePath = Join-Path $resolvedOutputDirectory "native-test-$sequence-$safeName.json"
+    $outputPath = Join-Path $resolvedOutputDirectory "native-test-$sequence-$safeName.log"
+    $utf8NoBom = New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $false
+    [IO.File]::WriteAllText($outputPath, ((@($Output | ForEach-Object { [string]$_ }) -join [Environment]::NewLine) + [Environment]::NewLine), $utf8NoBom)
+    $evidence = [ordered]@{
+        schema = 'paperboat.windows-native-test-execution/v1'
+        machine_readable = $true
+        description = $Description
+        executable = $ExecutablePath
+        arguments = @($Arguments)
+        run_pattern = $RunPattern
+        exit_code = $ExitCode
+        tests_run = @($runTests)
+        tests_run_count = @($runTests).Count
+        tests_passed = @($passedTests)
+        tests_passed_count = @($passedTests).Count
+        tests_failed = @($failedTests)
+        tests_failed_count = @($failedTests).Count
+        tests_skipped = @($skippedTests)
+        tests_skipped_count = @($skippedTests).Count
+        output_log = $outputPath
+    }
+    [IO.File]::WriteAllText($evidencePath, ($evidence | ConvertTo-Json -Depth 10), $utf8NoBom)
+    return [pscustomobject]@{
+        EvidencePath = $evidencePath
+        OutputPath = $outputPath
+        ExitCode = $ExitCode
+        TestsRun = @($runTests)
+        TestsRunCount = @($runTests).Count
+        TestsPassed = @($passedTests)
+        TestsPassedCount = @($passedTests).Count
+        TestsFailed = @($failedTests)
+        TestsFailedCount = @($failedTests).Count
+        TestsSkipped = @($skippedTests)
+        TestsSkippedCount = @($skippedTests).Count
+    }
+}
+
+function Assert-NativeTestExecutionEvidence {
+    param(
+        [Parameter(Mandatory = $true)][psobject] $Evidence,
+        [Parameter(Mandatory = $true)][string] $Description
+    )
+    Assert-Qualification ($Evidence.ExitCode -eq 0) "Native Windows qualification test pattern failed for $Description with exit code $($Evidence.ExitCode). Evidence: $($Evidence.EvidencePath)."
+    Assert-Qualification ($Evidence.TestsRunCount -gt 0) "Native Windows qualification matched zero tests for $Description. Pattern execution evidence: $($Evidence.EvidencePath)."
+    Assert-Qualification ($Evidence.TestsPassedCount -gt 0) "Native Windows qualification completed no passing tests for $Description. Pattern execution evidence: $($Evidence.EvidencePath)."
+    Assert-Qualification ($Evidence.TestsFailedCount -eq 0) "Native Windows qualification reported failed tests for $Description. Pattern execution evidence: $($Evidence.EvidencePath)."
+}
+
+function Invoke-NativeTestPattern {
+    param(
+        [Parameter(Mandatory = $true)][string] $ExecutablePath,
+        [Parameter(Mandatory = $true)][string[]] $Arguments,
+        [Parameter(Mandatory = $true)][string] $RunPattern,
+        [Parameter(Mandatory = $true)][string] $Description,
+        [Parameter(Mandatory = $true)][string] $EvidenceName
+    )
+    $output = @()
+    $exitCode = -1
+    try {
+        $nativeResult = Invoke-NativeCommandCapture -ExecutablePath $ExecutablePath -Arguments $Arguments -TimeoutMilliseconds $script:nativeTestTimeoutMilliseconds
+        $output = @($nativeResult.Output)
+        $exitCode = [int]$nativeResult.ExitCode
+    }
+    catch {
+        $output += [string]$_
+    }
+    $evidence = New-NativeTestExecutionEvidence -ExecutablePath $ExecutablePath -Arguments $Arguments -RunPattern $RunPattern -Description $Description -EvidenceName $EvidenceName -ExitCode $exitCode -Output $output
+    Assert-NativeTestExecutionEvidence -Evidence $evidence -Description $Description
+    return $evidence
 }
 
 function Assert-QualificationRegularFile {
@@ -165,9 +292,8 @@ function Set-QualificationRuntimeCurrentACL {
         [Environment]::SetEnvironmentVariable('PAPERBOAT_WINDOWS_E2E_ACL_DIRECTORY', $directoryValue, 'Process')
         [Environment]::SetEnvironmentVariable('PAPERBOAT_WINDOWS_E2E_ACL_SID', $QualificationSID, 'Process')
         $arguments = @('-test.v', '-test.run', '^TestNativeApplyQualificationRuntimeCurrentACL$', '-test.count', '1', '-test.timeout', '1m')
-        & $resolvedHostinstallTestExecutable @arguments
-        $exitCode = $LASTEXITCODE
-        Assert-Qualification ($exitCode -eq 0) "Native runtime-current ACL helper failed with exit code $exitCode."
+        $evidenceName = if ($Directory) { 'runtime-current-acl-directory' } else { 'runtime-current-acl-file' }
+        $null = Invoke-NativeTestPattern -ExecutablePath $resolvedHostinstallTestExecutable -Arguments $arguments -RunPattern '^TestNativeApplyQualificationRuntimeCurrentACL$' -Description 'runtime-current ACL helper' -EvidenceName $evidenceName
     }
     finally {
         foreach ($variableName in $variableNames) {
@@ -326,8 +452,8 @@ function Test-QualificationTrustValidation {
     $reparsePath = Join-Path $fixtureBase 'reparse-owner'
     try {
         New-Item -ItemType Directory -Force -Path $foreignOwnerPath | Out-Null
-        & icacls.exe $foreignOwnerPath /setowner "*$UntrustedSID" | Out-Null
-        Assert-Qualification ($LASTEXITCODE -eq 0) 'Could not create the hostile-owner qualification fixture.'
+        $foreignOwnerResult = Invoke-NativeCommandCapture -ExecutablePath $script:icacls -Arguments @($foreignOwnerPath, '/setowner', "*$UntrustedSID")
+        Assert-Qualification ($foreignOwnerResult.ExitCode -eq 0) "Could not create the hostile-owner qualification fixture: $($foreignOwnerResult.Output -join ' ')"
         $foreignOwnerRejected = $false
         try {
             Assert-QualificationAncestorTrusted $foreignOwnerPath
@@ -349,8 +475,8 @@ function Test-QualificationTrustValidation {
         Assert-Qualification ($foreignOwnerAfter -eq $UntrustedSID) 'Atomic qualification root creation mutated the foreign-owned path.'
 
         New-QualificationTrustedRootAtomic $deleteACEPath
-        & icacls.exe $deleteACEPath /grant "*${UntrustedSID}:D" | Out-Null
-        Assert-Qualification ($LASTEXITCODE -eq 0) 'Could not create the hostile delete-ACE qualification fixture.'
+        $deleteACEResult = Invoke-NativeCommandCapture -ExecutablePath $script:icacls -Arguments @($deleteACEPath, '/grant', "*${UntrustedSID}:D")
+        Assert-Qualification ($deleteACEResult.ExitCode -eq 0) "Could not create the hostile delete-ACE qualification fixture: $($deleteACEResult.Output -join ' ')"
         $deleteACERejected = $false
         try {
             Assert-QualificationAncestorTrusted $deleteACEPath
@@ -426,6 +552,48 @@ function Quote-WindowsArgument {
     return '"' + $Value.Replace('"', '\"') + '"'
 }
 
+function Stop-QualificationProcess {
+    param(
+        [Parameter(Mandatory = $true)][Diagnostics.Process] $Process,
+        [Parameter(Mandatory = $true)][bool] $HandlePinned
+    )
+    # Every caller pins Process.Handle immediately after Start. Never fall back to
+    # raw-PID termination: a reused PID could target an unrelated process.
+    Assert-Qualification $HandlePinned 'Qualification process termination requires a pinned process handle.'
+    try {
+        if ($Process.HasExited) {
+            return
+        }
+    }
+    catch {
+        throw "Could not inspect qualification process before termination: $($_.Exception.Message)"
+    }
+    $targetProcessId = [uint32]$Process.Id
+    try {
+        if (-not $Process.HasExited) {
+            $Process.Kill()
+        }
+    }
+    catch {
+        try {
+            if (-not $Process.HasExited) {
+                throw "Qualification process could not be terminated: $($_.Exception.Message)"
+            }
+        }
+        catch {
+            throw
+        }
+    }
+    try {
+        Assert-Qualification ($Process.WaitForExit($script:msiTerminationGraceMilliseconds)) "Qualification process $targetProcessId did not terminate within the bounded deadline."
+    }
+    catch {
+        if (-not $Process.HasExited) {
+            throw
+        }
+    }
+}
+
 function Invoke-Msi {
     param(
         [Parameter(Mandatory = $true)][string[]] $Arguments,
@@ -435,9 +603,76 @@ function Invoke-Msi {
     $logArgument = Quote-WindowsArgument $LogPath
     $argumentLine = (($Arguments + @('/qn', '/norestart', '/L*v', $logArgument)) -join ' ')
     Add-QualificationEvent -Name "msiexec_$Operation" -Status 'started' -Detail $argumentLine
-    $process = Start-Process -FilePath $script:msiexec -ArgumentList $argumentLine -Wait -PassThru -WindowStyle Hidden
-    Assert-Qualification ($process.ExitCode -eq 0 -or $process.ExitCode -eq 3010) "msiexec $Operation returned exit code $($process.ExitCode). See $LogPath."
-    Add-QualificationEvent -Name "msiexec_$Operation" -Status 'passed' -Detail "exit_code=$($process.ExitCode); log=$LogPath"
+    $process = $null
+    $processRecord = $null
+    $started = $false
+    $handlePinned = $false
+    try {
+        try {
+            $process = Start-Process -FilePath $script:msiexec -ArgumentList $argumentLine -PassThru -WindowStyle Hidden -ErrorAction Stop
+            $started = $true
+            $processHandle = $process.Handle
+            Assert-Qualification ($processHandle -ne [IntPtr]::Zero) 'msiexec returned an invalid process handle.'
+            $handlePinned = $true
+            $processRecord = Register-QualificationProcess -Process $process
+        }
+        catch {
+            Add-QualificationEvent -Name "msiexec_$Operation" -Status 'failed' -Detail "start_failed=true; log=$LogPath"
+            throw
+        }
+        if (-not $process.WaitForExit($script:msiOperationTimeoutMilliseconds)) {
+            $processId = [uint32]$process.Id
+            $terminationFailure = $null
+            try {
+                Assert-Qualification $handlePinned 'msiexec timeout cleanup has no pinned process handle.'
+                if (-not $process.HasExited) {
+                    $process.Kill()
+                }
+            }
+            catch {
+                $terminationFailure = $_.Exception.Message
+            }
+            $terminated = $false
+            try {
+                $terminated = $process.WaitForExit($script:msiTerminationGraceMilliseconds)
+            }
+            catch {
+                if ($null -eq $terminationFailure) {
+                    $terminationFailure = $_.Exception.Message
+                }
+            }
+            $detail = "timeout_ms=$($script:msiOperationTimeoutMilliseconds); process_id=$processId; terminated=$terminated; log=$LogPath"
+            if (-not [string]::IsNullOrWhiteSpace($terminationFailure)) {
+                $detail += '; termination_error=' + $terminationFailure
+            }
+            Add-QualificationEvent -Name "msiexec_$Operation" -Status 'failed' -Detail $detail
+            throw "msiexec $Operation exceeded the bounded timeout. $detail"
+        }
+        $exitCode = [int]$process.ExitCode
+        if ($exitCode -ne 0 -and $exitCode -ne 3010) {
+            Add-QualificationEvent -Name "msiexec_$Operation" -Status 'failed' -Detail "exit_code=$exitCode; log=$LogPath"
+            throw "msiexec $Operation returned exit code $exitCode. See $LogPath."
+        }
+        Add-QualificationEvent -Name "msiexec_$Operation" -Status 'passed' -Detail "exit_code=$exitCode; log=$LogPath"
+    }
+    finally {
+        if ($null -ne $process) {
+            try {
+                if ($started -and (-not $handlePinned -or $null -eq $processRecord)) {
+                    $script:qualificationProcessRegistrationFailures += "kind=msiexec; handle_pinned=$handlePinned; record_present=$($null -ne $processRecord)"
+                }
+                if ($started -and $handlePinned -and $null -eq $processRecord -and -not $process.HasExited) {
+                    Stop-QualificationProcess -Process $process -HandlePinned $handlePinned
+                }
+                if ($null -ne $processRecord) {
+                    Complete-QualificationProcess -Record $processRecord -Process $process
+                }
+            }
+            finally {
+                $process.Dispose()
+            }
+        }
+    }
 }
 
 function Get-PaperboatServices {
@@ -457,7 +692,15 @@ function Get-PaperboatPreviewDeclarations {
     if (-not (Test-Path -LiteralPath $definitionRoot)) {
         return @()
     }
-    return @(Get-ChildItem -Force -File -LiteralPath $definitionRoot -Filter 'PaperboatPreview-*.json' -ErrorAction Stop)
+    $root = Get-Item -Force -LiteralPath $definitionRoot -ErrorAction Stop
+    Assert-Qualification ($root.PSIsContainer) "Paperboat service declaration root is not a directory: $definitionRoot"
+    Assert-Qualification ((($root.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)) "Paperboat service declaration root is a reparse point: $definitionRoot"
+    $declarations = @(Get-ChildItem -Force -LiteralPath $definitionRoot -Filter 'PaperboatPreview-*.json' -ErrorAction Stop)
+    foreach ($declaration in $declarations) {
+        Assert-Qualification (-not $declaration.PSIsContainer) "Paperboat preview declaration is a directory: $($declaration.FullName)"
+        Assert-Qualification ((($declaration.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)) "Paperboat preview declaration is a reparse point: $($declaration.FullName)"
+    }
+    return $declarations
 }
 
 function Get-InstalledPaperboatProducts {
@@ -478,8 +721,357 @@ function Get-InstalledPaperboatProducts {
     return @($entries)
 }
 
+function Get-QualificationProcessCreationKey {
+    param([Parameter(Mandatory = $true)][DateTime] $Timestamp)
+    $utcTicks = $Timestamp.ToUniversalTime().Ticks
+    return [int64]($utcTicks - ($utcTicks % 10))
+}
+
+function Register-QualificationProcess {
+    param([Parameter(Mandatory = $true)][Diagnostics.Process] $Process)
+    $imagePath = [IO.Path]::GetFullPath([string]$Process.StartInfo.FileName)
+    $record = [pscustomobject]@{
+        ProcessId = [uint32]$Process.Id
+        StartUtc = $Process.StartTime.ToUniversalTime()
+        StartCreationKey = Get-QualificationProcessCreationKey $Process.StartTime
+        ImagePath = $imagePath
+        EndUtc = $null
+        EndCreationKey = $null
+    }
+    $script:launchedQualificationProcesses += $record
+    return $record
+}
+
+function Complete-QualificationProcess {
+    param(
+        [Parameter(Mandatory = $true)][psobject] $Record,
+        [Parameter(Mandatory = $true)][Diagnostics.Process] $Process
+    )
+    if ($Process.HasExited) {
+        $Record.EndUtc = $Process.ExitTime.ToUniversalTime()
+        $Record.EndCreationKey = Get-QualificationProcessCreationKey $Process.ExitTime
+    }
+}
+
+function Test-QualificationPathWithinRoot {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][string] $Root
+    )
+    try {
+        $fullPath = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+        $fullRoot = [IO.Path]::GetFullPath($Root).TrimEnd('\')
+    }
+    catch {
+        return $false
+    }
+    return $fullPath.Equals($fullRoot, [StringComparison]::OrdinalIgnoreCase) -or
+        $fullPath.StartsWith($fullRoot + '\', [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-QualificationOwnedProcesses {
+    $qualificationRoot = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)) 'PaperboatQualification'
+    $ownedRoots = @($script:installRoot, $qualificationRoot, $resolvedOutputDirectory)
+    $ownedExecutables = @(
+        $resolvedFixturePath,
+        $resolvedS4UFixturePath,
+        $resolvedS4UTestExecutable,
+        $resolvedHostinstallTestExecutable,
+        $resolvedMsiCleanupTestExecutable,
+        $resolvedNativeTestExecutable
+    )
+    $allProcesses = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop)
+    $ownedProcesses = [Collections.ArrayList]::new()
+    $ownedKeys = @{}
+    $script:qualificationProcessIdentityFailures = @()
+    foreach ($candidate in $allProcesses) {
+        if ([uint32]$candidate.ProcessId -eq [uint32]$PID) {
+            continue
+        }
+        $executablePath = [string]$candidate.ExecutablePath
+        $owned = $false
+        if (-not [string]::IsNullOrWhiteSpace($executablePath)) {
+            foreach ($root in $ownedRoots) {
+                if (Test-QualificationPathWithinRoot -Path $executablePath -Root $root) {
+                    $owned = $true
+                    break
+                }
+            }
+            if (-not $owned) {
+                foreach ($ownedExecutable in $ownedExecutables) {
+                    if ($executablePath.Equals($ownedExecutable, [StringComparison]::OrdinalIgnoreCase)) {
+                        $owned = $true
+                        break
+                    }
+                }
+            }
+        }
+        if ($owned) {
+            $creationUtc = ([DateTime]$candidate.CreationDate).ToUniversalTime()
+            $creationKey = Get-QualificationProcessCreationKey $creationUtc
+            $key = "$([uint32]$candidate.ProcessId):$creationKey"
+            if (-not $ownedKeys.ContainsKey($key)) {
+                $ownedKeys[$key] = $true
+                $null = $ownedProcesses.Add($candidate)
+            }
+        }
+    }
+
+    foreach ($record in $script:launchedQualificationProcesses) {
+        $recordStartUtc = [DateTime]$record.StartUtc
+        $recordStartKey = [int64]$record.StartCreationKey
+        $liveLaunches = @($allProcesses | Where-Object {
+            if ([uint32]$_.ProcessId -ne [uint32]$record.ProcessId) {
+                return $false
+            }
+            $creationUtc = ([DateTime]$_.CreationDate).ToUniversalTime()
+            $creationKey = Get-QualificationProcessCreationKey $creationUtc
+            $imagePath = [string]$_.ExecutablePath
+            return $creationKey -eq $recordStartKey -and
+                -not [string]::IsNullOrWhiteSpace($imagePath) -and
+                ([IO.Path]::GetFullPath($imagePath)).Equals([string]$record.ImagePath, [StringComparison]::OrdinalIgnoreCase)
+        })
+        Assert-Qualification ($liveLaunches.Count -le 1) "Launch identity is ambiguous for PID $($record.ProcessId)."
+        if ($null -eq $record.EndUtc) {
+            if ($liveLaunches.Count -ne 1) {
+                $script:qualificationProcessIdentityFailures += "pid=$($record.ProcessId),start=$($recordStartUtc.ToString('o')),image=$($record.ImagePath),state=nonterminal_identity_missing"
+                continue
+            }
+            $liveLaunch = $liveLaunches[0]
+            $liveCreationUtc = ([DateTime]$liveLaunch.CreationDate).ToUniversalTime()
+            $liveCreationKey = Get-QualificationProcessCreationKey $liveCreationUtc
+            $liveKey = "$([uint32]$liveLaunch.ProcessId):$liveCreationKey"
+            if (-not $ownedKeys.ContainsKey($liveKey)) {
+                $ownedKeys[$liveKey] = $true
+                $null = $ownedProcesses.Add($liveLaunch)
+            }
+        }
+        elseif ($liveLaunches.Count -gt 0) {
+            $script:qualificationProcessIdentityFailures += "pid=$($record.ProcessId),start=$($recordStartUtc.ToString('o')),image=$($record.ImagePath),state=terminal_identity_still_live"
+        }
+        $recordEndKey = if ($null -ne $record.EndCreationKey) { [int64]$record.EndCreationKey } else { Get-QualificationProcessCreationKey ([DateTime]::UtcNow) }
+        foreach ($candidate in $allProcesses) {
+            if ([uint32]$candidate.ProcessId -eq [uint32]$PID -or [uint32]$candidate.ParentProcessId -ne [uint32]$record.ProcessId) {
+                continue
+            }
+            $creationUtc = ([DateTime]$candidate.CreationDate).ToUniversalTime()
+            $creationKey = Get-QualificationProcessCreationKey $creationUtc
+            if ($creationKey -lt $recordStartKey -or $creationKey -gt $recordEndKey) {
+                continue
+            }
+            $key = "$([uint32]$candidate.ProcessId):$creationKey"
+            if (-not $ownedKeys.ContainsKey($key)) {
+                $ownedKeys[$key] = $true
+                $null = $ownedProcesses.Add($candidate)
+            }
+        }
+    }
+    return @($ownedProcesses)
+}
+
+function Assert-NoQualificationProcessResidue {
+    param([Parameter(Mandatory = $true)][string] $Phase)
+    $processes = @(Get-QualificationOwnedProcesses)
+    $detail = @($processes | ForEach-Object {
+        "pid=$($_.ProcessId),name=$($_.Name),path=$([string]$_.ExecutablePath)"
+    }) -join '; '
+    Assert-Qualification ($script:qualificationProcessRegistrationFailures.Count -eq 0) "Qualification launches were not safely registered during $Phase`: $($script:qualificationProcessRegistrationFailures -join '; ')"
+    Assert-Qualification ($script:qualificationProcessIdentityFailures.Count -eq 0) "Qualification process identities could not be resolved during $Phase`: $($script:qualificationProcessIdentityFailures -join '; ')"
+    Assert-Qualification ($processes.Count -eq 0) "Qualification-owned processes remain during $Phase`: $detail"
+    Add-QualificationEvent -Name 'process_residue_audit' -Status 'passed' -Detail "phase=$Phase; owned_processes=0; exact_paths=true; launch_identity=pid_creation_image; direct_children=parent_lifetime; contract=$($script:qualificationProcessContract)"
+}
+
+function Invoke-NativeCommandCapture {
+    param(
+        [Parameter(Mandatory = $true)][string] $ExecutablePath,
+        [Parameter(Mandatory = $true)][string[]] $Arguments,
+        [ValidateRange(1, 600000)][int] $TimeoutMilliseconds = $script:nativeCommandTimeoutMilliseconds
+    )
+    Assert-Qualification (Test-Path -LiteralPath $ExecutablePath -PathType Leaf) "Native qualification executable is missing: $ExecutablePath"
+    $start = [Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = $ExecutablePath
+    $start.Arguments = (($Arguments | ForEach-Object { Quote-WindowsArgument ([string]$_) }) -join ' ')
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $start
+    $previousErrorActionPreference = $ErrorActionPreference
+    $started = $false
+    $handlePinned = $false
+    $processRecord = $null
+    $stdoutTask = $null
+    $stderrTask = $null
+    try {
+        $ErrorActionPreference = 'Continue'
+        Assert-Qualification ($process.Start()) "Could not start native qualification command: $ExecutablePath"
+        $started = $true
+        $processHandle = $process.Handle
+        Assert-Qualification ($processHandle -ne [IntPtr]::Zero) "Native qualification command returned an invalid process handle: $ExecutablePath"
+        $handlePinned = $true
+        $processRecord = Register-QualificationProcess -Process $process
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit($TimeoutMilliseconds)) {
+            $processId = [uint32]$process.Id
+            $terminationError = $null
+            try {
+                $null = Stop-QualificationProcess -Process $process -HandlePinned $handlePinned
+            }
+            catch {
+                $terminationError = $_.Exception.Message
+            }
+            $timeoutTasks = [Threading.Tasks.Task[]]@($stdoutTask, $stderrTask)
+            $streamsDrained = [Threading.Tasks.Task]::WaitAll($timeoutTasks, $script:streamDrainTimeoutMilliseconds)
+            throw "Native qualification command exceeded its bounded timeout: executable=$ExecutablePath timeout_ms=$TimeoutMilliseconds process_id=$processId streams_drained=$streamsDrained termination_error=$terminationError"
+        }
+        $streamTasks = [Threading.Tasks.Task[]]@($stdoutTask, $stderrTask)
+        Assert-Qualification ([Threading.Tasks.Task]::WaitAll($streamTasks, $script:streamDrainTimeoutMilliseconds)) "Native qualification command output did not close within the bounded drain deadline: $ExecutablePath"
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        $output = @($stdout -split "`r?`n") + @($stderr -split "`r?`n")
+        return [pscustomobject]@{
+            Output = @($output | Where-Object { $_ -ne '' })
+            ExitCode = [int]$process.ExitCode
+        }
+    }
+    finally {
+        try {
+            $cleanupTerminationError = $null
+            if ($started) {
+                if (-not $handlePinned -or $null -eq $processRecord) {
+                    $script:qualificationProcessRegistrationFailures += "kind=native; image=$ExecutablePath; handle_pinned=$handlePinned; record_present=$($null -ne $processRecord)"
+                }
+                if ($handlePinned) {
+                    try {
+                        if (-not $process.HasExited) {
+                            $null = Stop-QualificationProcess -Process $process -HandlePinned $handlePinned
+                        }
+                    }
+                    catch {
+                        $cleanupTerminationError = $_.Exception.Message
+                    }
+                }
+            }
+            if ($null -ne $stdoutTask -and $null -ne $stderrTask) {
+                $cleanupTasks = [Threading.Tasks.Task[]]@($stdoutTask, $stderrTask)
+                Assert-Qualification ([Threading.Tasks.Task]::WaitAll($cleanupTasks, $script:streamDrainTimeoutMilliseconds)) "Native qualification command output did not close within the bounded cleanup drain deadline: $ExecutablePath"
+            }
+            Assert-Qualification ([string]::IsNullOrWhiteSpace($cleanupTerminationError)) "Native qualification process cleanup failed: $cleanupTerminationError"
+        }
+        finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+            try {
+                if ($null -ne $processRecord) {
+                    Complete-QualificationProcess -Record $processRecord -Process $process
+                }
+            }
+            finally {
+                $process.Dispose()
+            }
+        }
+    }
+}
+
+function ConvertTo-PaperboatStateRelativePath {
+    param([Parameter(Mandatory = $true)][string] $Path)
+    $rootPath = [IO.Path]::GetFullPath($script:stateRoot).TrimEnd('\')
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    if ($fullPath.Equals($rootPath, [StringComparison]::OrdinalIgnoreCase)) {
+        return ''
+    }
+    $rootPrefix = $rootPath + '\'
+    Assert-Qualification $fullPath.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase) "Paperboat state path escaped the state root: $fullPath"
+    return $fullPath.Substring($rootPrefix.Length).Replace('/', '\')
+}
+
+function Get-PaperboatStateSecuritySnapshot {
+    param([Parameter(Mandatory = $true)][string] $Path)
+    $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+    $securitySections = [Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Group -bor [Security.AccessControl.AccessControlSections]::Access
+    $ownerSID = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    $daclSddl = $acl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access)
+    $securityDescriptor = $acl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]$securitySections)
+    Assert-Qualification (-not [string]::IsNullOrWhiteSpace($ownerSID)) "Paperboat state security owner is unavailable: $Path"
+    Assert-Qualification (-not [string]::IsNullOrWhiteSpace($daclSddl)) "Paperboat state DACL is unavailable: $Path"
+    Assert-Qualification (-not [string]::IsNullOrWhiteSpace($securityDescriptor)) "Paperboat state security descriptor is unavailable: $Path"
+    return [pscustomobject]@{
+        OwnerSID = $ownerSID
+        DaclSddl = $daclSddl
+        SecurityDescriptor = $securityDescriptor
+    }
+}
+
+function New-PaperboatStateSnapshotEntry {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string] $RelativePath
+    )
+    $item = Get-Item -Force -LiteralPath $Path -ErrorAction Stop
+    $reparsePoint = (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+    Assert-Qualification (-not $reparsePoint) "Paperboat state path is a reparse point: $Path"
+    $security = Get-PaperboatStateSecuritySnapshot -Path $Path
+    $type = if ($item.PSIsContainer) { 'directory' } else { 'file' }
+    $sha256 = $null
+    $length = $null
+    if (-not $item.PSIsContainer) {
+        $sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $Path -ErrorAction Stop).Hash.ToUpperInvariant()
+        $length = [int64]$item.Length
+    }
+    return [pscustomobject]@{
+        RelativePath = $RelativePath
+        Type = $type
+        Attributes = [int64]$item.Attributes
+        ReparsePoint = $reparsePoint
+        SHA256 = $sha256
+        Length = $length
+        OwnerSID = $security.OwnerSID
+        DaclSddl = $security.DaclSddl
+        SecurityDescriptor = $security.SecurityDescriptor
+    }
+}
+
+function Get-PaperboatStateSnapshot {
+    $rootPath = [IO.Path]::GetFullPath($script:stateRoot)
+    $rootItem = $null
+    try {
+        $rootItem = Get-Item -Force -LiteralPath $rootPath -ErrorAction Stop
+    }
+    catch [System.Management.Automation.ItemNotFoundException] {
+        return [pscustomobject]@{
+            RootPresent = $false
+            Entries = @()
+        }
+    }
+    Assert-Qualification ($rootItem.PSIsContainer) "Paperboat state root is not a directory: $rootPath"
+    $pending = [System.Collections.Generic.Queue[string]]::new()
+    $pending.Enqueue($rootPath)
+    $entries = @()
+    while ($pending.Count -gt 0) {
+        $currentPath = $pending.Dequeue()
+        $currentItem = Get-Item -Force -LiteralPath $currentPath -ErrorAction Stop
+        $relativePath = ConvertTo-PaperboatStateRelativePath -Path $currentPath
+        $entries += New-PaperboatStateSnapshotEntry -Path $currentPath -RelativePath $relativePath
+        if (-not $currentItem.PSIsContainer) {
+            continue
+        }
+        foreach ($child in @(Get-ChildItem -Force -LiteralPath $currentPath -ErrorAction Stop)) {
+            $childPath = [IO.Path]::GetFullPath($child.FullName)
+            $null = ConvertTo-PaperboatStateRelativePath -Path $childPath
+            $pending.Enqueue($childPath)
+        }
+    }
+    return [pscustomobject]@{
+        RootPresent = $true
+        Entries = @($entries | Sort-Object -Property RelativePath)
+    }
+}
+
 function Assert-Preflight {
     Assert-Qualification (Test-Path -LiteralPath $script:msiexec -PathType Leaf) "msiexec.exe is unavailable at $($script:msiexec)."
+    Assert-Qualification (Test-Path -LiteralPath $script:icacls -PathType Leaf) "icacls.exe is unavailable at $($script:icacls)."
+    Assert-Qualification (Test-Path -LiteralPath $script:serviceControl -PathType Leaf) "sc.exe is unavailable at $($script:serviceControl)."
     Assert-Qualification (Test-Path -LiteralPath $resolvedMsiPath -PathType Leaf) "Fresh MSI is missing: $resolvedMsiPath"
     Assert-Qualification (Test-Path -LiteralPath $resolvedUpgradeMsiPath -PathType Leaf) "Upgrade MSI is missing: $resolvedUpgradeMsiPath"
     Assert-Qualification (Test-Path -LiteralPath $resolvedFixturePath -PathType Leaf) "Windows service fixture is missing: $resolvedFixturePath"
@@ -492,6 +1084,13 @@ function Assert-Preflight {
     Assert-Qualification ([IO.Path]::GetExtension($resolvedHostinstallTestExecutable) -ieq '.exe') "Windows host-install qualification test executable must be an .exe."
     Assert-Qualification (Test-Path -LiteralPath $resolvedMsiCleanupTestExecutable -PathType Leaf) "Windows MSI cleanup qualification test executable is missing: $resolvedMsiCleanupTestExecutable"
     Assert-Qualification ([IO.Path]::GetExtension($resolvedMsiCleanupTestExecutable) -ieq '.exe') "Windows MSI cleanup qualification test executable must be an .exe."
+    Assert-Qualification (Test-Path -LiteralPath $resolvedNativeTestExecutable -PathType Leaf) "Native Windows qualification test executable is missing: $resolvedNativeTestExecutable"
+    Assert-Qualification ([IO.Path]::GetExtension($resolvedNativeTestExecutable) -ieq '.exe') "Native Windows qualification test executable must be an .exe."
+    Assert-QualificationRegularFile -Path $resolvedNativeTestExecutable
+    $nativeTestItem = Get-Item -Force -LiteralPath $resolvedNativeTestExecutable -ErrorAction Stop
+    $script:nativeTestSHA256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $resolvedNativeTestExecutable -ErrorAction Stop).Hash.ToLowerInvariant()
+    $script:nativeTestLength = [int64]$nativeTestItem.Length
+    Assert-Qualification ($script:nativeTestLength -gt 0) 'Native Windows qualification test executable is empty.'
     Assert-Qualification ([Environment]::Is64BitOperatingSystem) 'Qualification requires a 64-bit Windows operating system.'
     $nativeArchitecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
     $expectedArchitecture = if ($Architecture -eq 'amd64') { 'X64' } else { 'Arm64' }
@@ -503,9 +1102,17 @@ function Assert-Preflight {
     Assert-Qualification (-not [string]::IsNullOrWhiteSpace($script:qualificationSID)) 'Qualification identity has no SID for runtime-current ACL validation.'
     Assert-Qualification ($script:qualificationSID -notin @('S-1-5-18', 'S-1-5-32-544')) 'Qualification identity must be a non-trusted user SID for runtime-current ACL validation.'
     Assert-Qualification (@(Get-PaperboatServices).Count -eq 0) 'PaperboatHostd or PaperboatUpdated already exists; refusing to overwrite an unmanaged test state.'
+    Assert-Qualification (@(Get-InstalledPaperboatProducts).Count -eq 0) 'A Paperboat MSI product already exists; refusing to overwrite an unmanaged test state.'
+    Assert-NoQualificationProcessResidue -Phase 'preflight'
     Assert-Qualification (@(Get-PaperboatPreviewServices).Count -eq 0) 'A PaperboatPreview-* service already exists; refusing to overwrite an unmanaged test state.'
+    if (Test-Path -LiteralPath $script:stateRoot) {
+        $stateRootItem = Get-Item -Force -LiteralPath $script:stateRoot -ErrorAction Stop
+        Assert-Qualification ($stateRootItem.PSIsContainer) "Paperboat state root is not a directory: $($script:stateRoot)"
+        Assert-Qualification ((($stateRootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)) "Paperboat state root is a reparse point: $($script:stateRoot)"
+    }
     Assert-Qualification (@(Get-PaperboatPreviewDeclarations).Count -eq 0) 'A PaperboatPreview-* service declaration already exists; refusing to overwrite an unmanaged test state.'
-    Assert-Qualification (-not (Test-Path -LiteralPath $script:registryPath)) 'HKLM:\Software\Paperboat already exists; refusing to overwrite an unmanaged test state.'
+	Assert-Qualification (-not (Test-Path -LiteralPath $script:openSSHRegistryPath)) "$($script:openSSHRegistryPath) already exists; refusing to run MSI qualification against stale Paperboat OpenSSH ownership state."
+	Assert-Qualification (-not (Test-Path -LiteralPath $script:registryPath)) 'HKLM:\Software\Paperboat already exists; refusing to overwrite an unmanaged test state.'
     Assert-Qualification (-not (Test-Path -LiteralPath $script:installRoot)) "$($script:installRoot) already exists; refusing to overwrite an unmanaged test state."
     foreach ($definitionName in @('PaperboatHostd.json', 'PaperboatUpdated.json')) {
         $definitionPath = Join-Path $script:stateRoot "services\$definitionName"
@@ -516,6 +1123,8 @@ function Assert-Preflight {
     # cleanup never mutates an ambiguous owner.
     $paperboatSshd = @(Get-CimInstance -ClassName Win32_Service -ErrorAction Stop | Where-Object { $_.Name -eq 'PaperboatSshd' })
     Assert-Qualification ($paperboatSshd.Count -eq 0) 'PaperboatSshd already exists; refusing to run MSI qualification against an ambiguous service owner.'
+    $script:preexistingPaperboatState = Get-PaperboatStateSnapshot
+    Add-QualificationEvent -Name 'preexisting_state_snapshot' -Status 'passed' -Detail "root_present=$($script:preexistingPaperboatState.RootPresent); entries=$(@($script:preexistingPaperboatState.Entries).Count); security=owner_dacl_descriptor; reparse=false"
     Add-QualificationEvent -Name 'preflight' -Status 'passed' -Detail "native_architecture=$nativeArchitecture; requested_architecture=$Architecture"
 }
 
@@ -566,16 +1175,18 @@ function Assert-InstalledPayload {
     )) {
         $rolePath = Join-Path $immutableReleaseRoot $probe.File
         [string[]] $roleArguments = $probe.Arguments
-        $output = @(& $rolePath @roleArguments 2>&1)
-        $exitCode = $LASTEXITCODE
+        $roleProbe = Invoke-NativeCommandCapture -ExecutablePath $rolePath -Arguments $roleArguments
+        $output = @($roleProbe.Output)
+        $exitCode = $roleProbe.ExitCode
         Assert-Qualification ($exitCode -eq 2) "$($probe.File) accepted forbidden command '$($probe.Arguments -join ' ')' or returned exit code $exitCode instead of 2: $($output -join ' ')"
         Assert-Qualification (($output -join ' ') -match 'service artifact cannot run that command') "$($probe.File) did not report the role allowlist rejection: $($output -join ' ')"
     }
     Add-QualificationEvent -Name 'role_artifact_allowlist' -Status 'passed' -Detail "version=$ExpectedVersion; runtime_cli_rejected=true; hostd_cli_rejected=true; updater_worker_rejected=true"
     $cliTarget = Join-Path $script:installRoot 'releases\cli-current\pb.exe'
     Assert-Qualification (Test-Path -LiteralPath $cliTarget -PathType Leaf) "Stable CLI target is missing $cliTarget."
-    $launcherOutput = @(& (Join-Path $script:binaryRoot 'pb.exe') --version 2>&1)
-    $launcherExitCode = $LASTEXITCODE
+    $launcherResult = Invoke-NativeCommandCapture -ExecutablePath (Join-Path $script:binaryRoot 'pb.exe') -Arguments @('--version')
+    $launcherOutput = @($launcherResult.Output)
+    $launcherExitCode = $launcherResult.ExitCode
     Assert-Qualification ($launcherExitCode -eq 0) "Installed stable launcher failed --version with exit code ${launcherExitCode}: $($launcherOutput -join ' ')."
     $launcherVersion = ($launcherOutput -join ' ').Trim()
     $matchingVersionLines = @($launcherOutput | Where-Object { $_ -match "Version\s+$([regex]::Escape($ExpectedVersion))$" })
@@ -615,7 +1226,10 @@ function Assert-PaperboatSshdAbsent {
     param([Parameter(Mandatory = $true)][string] $Phase)
     $current = @(Get-CimInstance -ClassName Win32_Service -ErrorAction Stop | Where-Object { $_.Name -eq 'PaperboatSshd' })
     Assert-Qualification ($current.Count -eq 0) "PaperboatSshd appeared during MSI $Phase without an explicitly owned qualification fixture."
-    Add-QualificationEvent -Name 'openssh_isolation' -Status 'passed' -Detail "phase=$Phase; service_absent=true"
+    if ($Phase -eq 'uninstall') {
+        Assert-Qualification (-not (Test-Path -LiteralPath $script:openSSHRegistryPath)) "Paperboat OpenSSH ownership marker remains after MSI ${Phase}: $($script:openSSHRegistryPath)"
+    }
+    Add-QualificationEvent -Name 'openssh_isolation' -Status 'passed' -Detail "phase=$Phase; service_absent=true; marker_absent=$(-not (Test-Path -LiteralPath $script:openSSHRegistryPath))"
 }
 
 function New-OwnedPreviewCleanupFixture {
@@ -714,11 +1328,75 @@ function Convert-ToMsiVersion {
     return '{0}.{1}.{2}' -f ([int]$parts[0] % 100), [int]$parts[1], (([int]$parts[2] * 100) + [int]$parts[3])
 }
 
+function Assert-PaperboatStateSnapshotEntryUnchanged {
+    param(
+        [Parameter(Mandatory = $true)][psobject] $Baseline,
+        [Parameter(Mandatory = $true)][psobject] $Current
+    )
+    $path = if ($Baseline.RelativePath -eq '') { $script:stateRoot } else { Join-Path $script:stateRoot $Baseline.RelativePath }
+    Assert-Qualification ($Current.Type -eq $Baseline.Type) "Pre-existing Paperboat state type changed: $path"
+    Assert-Qualification ([int64]$Current.Attributes -eq [int64]$Baseline.Attributes) "Pre-existing Paperboat state attributes changed: $path"
+    Assert-Qualification ($Current.ReparsePoint -eq $Baseline.ReparsePoint -and -not $Current.ReparsePoint) "Pre-existing Paperboat state reparse status changed: $path"
+    Assert-Qualification ($Current.SHA256 -ceq $Baseline.SHA256) "Pre-existing Paperboat state SHA256 changed: $path"
+    Assert-Qualification ($Current.Length -eq $Baseline.Length) "Pre-existing Paperboat state length changed: $path"
+    Assert-Qualification ($Current.OwnerSID -ceq $Baseline.OwnerSID) "Pre-existing Paperboat state owner changed: $path"
+    Assert-Qualification ($Current.DaclSddl -ceq $Baseline.DaclSddl) "Pre-existing Paperboat state DACL changed: $path"
+    Assert-Qualification ($Current.SecurityDescriptor -ceq $Baseline.SecurityDescriptor) "Pre-existing Paperboat state security descriptor changed: $path"
+}
+
+function Assert-PaperboatStateResidue {
+    Assert-Qualification ($null -ne $script:preexistingPaperboatState) 'Pre-existing Paperboat state was not snapshotted before MSI mutation.'
+    $baseline = $script:preexistingPaperboatState
+    $current = Get-PaperboatStateSnapshot
+    Assert-Qualification ($current.RootPresent -eq $baseline.RootPresent) "Paperboat state root presence changed after uninstall: baseline=$($baseline.RootPresent) current=$($current.RootPresent)"
+    $baselineEntries = @($baseline.Entries)
+    $currentEntries = @($current.Entries)
+    $baselineByPath = @{}
+    foreach ($entry in $baselineEntries) {
+        $baselineByPath[$entry.RelativePath] = $entry
+    }
+    $currentByPath = @{}
+    foreach ($entry in $currentEntries) {
+        $currentByPath[$entry.RelativePath] = $entry
+    }
+
+    foreach ($baselineEntry in $baselineEntries) {
+        Assert-Qualification ($currentByPath.ContainsKey($baselineEntry.RelativePath)) "Pre-existing Paperboat state disappeared after uninstall: $($baselineEntry.RelativePath)"
+        Assert-PaperboatStateSnapshotEntryUnchanged -Baseline $baselineEntry -Current $currentByPath[$baselineEntry.RelativePath]
+    }
+
+    # These are the only directories that WiX or this qualification creates as
+    # empty placeholders. Any file or unlisted descendant is new residue.
+    $allowedNewEmptyOwnedDirectories = @(
+        'ssh',
+        'updates',
+        'updates\current',
+        'updates\rollback',
+        'logs',
+        'services',
+        'previews',
+        'previews\active'
+    )
+    foreach ($currentEntry in $currentEntries) {
+        if ($baselineByPath.ContainsKey($currentEntry.RelativePath) -or $currentEntry.RelativePath -eq '') {
+            continue
+        }
+        $relativeLower = $currentEntry.RelativePath.ToLowerInvariant()
+        Assert-Qualification ($relativeLower -in $allowedNewEmptyOwnedDirectories) "Unknown Paperboat state residue remains after uninstall: $($currentEntry.RelativePath)"
+        Assert-Qualification ($currentEntry.Type -eq 'directory') "New Paperboat state residue is not an empty owned directory placeholder: $($currentEntry.RelativePath)"
+        Assert-Qualification (-not $currentEntry.ReparsePoint) "New Paperboat state placeholder is a reparse point: $($currentEntry.RelativePath)"
+    }
+}
+
 function Assert-Uninstalled {
     $services = Get-PaperboatServices
     Assert-Qualification ($services.Count -eq 0) "Paperboat SCM services remain after uninstall: $($services.Name -join ', ')."
     $previewServices = Get-PaperboatPreviewServices
     Assert-Qualification ($previewServices.Count -eq 0) "PaperboatPreview-* services remain after uninstall: $($previewServices.Name -join ', ')."
+	foreach ($definitionName in @('PaperboatHostd.json', 'PaperboatUpdated.json')) {
+		$definitionPath = Join-Path $script:stateRoot "services\$definitionName"
+		Assert-Qualification (-not (Test-Path -LiteralPath $definitionPath)) "Fixed Paperboat service declaration remains after uninstall: $definitionPath"
+	}
 	if (-not [string]::IsNullOrWhiteSpace($script:dynamicPreviewServiceName)) {
 		Assert-Qualification (-not (Test-Path -LiteralPath (Join-Path $script:stateRoot "services\$($script:dynamicPreviewServiceName).json"))) 'The owned preview service declaration remains after uninstall.'
 	}
@@ -730,19 +1408,15 @@ function Assert-Uninstalled {
         $registry = Get-ItemProperty -LiteralPath $script:registryPath -ErrorAction Stop
         Assert-Qualification ($null -eq $registry.ReleaseVersion) 'Paperboat ReleaseVersion remains after uninstall.'
     }
-    if (Test-Path -LiteralPath $script:stateRoot) {
-        $productFiles = @(Get-ChildItem -LiteralPath $script:stateRoot -Recurse -File -ErrorAction Stop | Where-Object {
-            $_.Name -in @('provisioning-hook.json', 'paperboat-runtime.exe', 'paperboat-hostd.exe', 'paperboat-updater.exe')
-        })
-        Assert-Qualification ($productFiles.Count -eq 0) 'Product binaries or provisioning metadata remain in ProgramData after uninstall.'
-    }
+    Assert-PaperboatStateResidue
     Assert-PaperboatSshdAbsent -Phase 'uninstall'
     Assert-Qualification (@(Get-InstalledPaperboatProducts).Count -eq 0) 'An ARP Paperboat product entry remains after uninstall.'
     $machinePathEntries = @(Get-MachinePathEntries)
     $expectedPathEntry = ConvertTo-NormalizedMachinePathEntry $script:binaryRoot
     $paperboatPathEntryCount = @($machinePathEntries | Where-Object { $_ -ieq $expectedPathEntry }).Count
     Assert-Qualification ($paperboatPathEntryCount -eq 0) "Paperboat bin remains in the machine PATH after uninstall; found $paperboatPathEntryCount normalized entries for $expectedPathEntry."
-    Add-QualificationEvent -Name 'msi_uninstall_assertions' -Status 'passed' -Detail 'fixed services, dynamic preview services, PATH ownership, PaperboatSshd preflight absence, binaries, product registry, ARP entry, and provisioning metadata were verified.'
+    Assert-NoQualificationProcessResidue -Phase 'uninstall'
+    Add-QualificationEvent -Name 'msi_uninstall_assertions' -Status 'passed' -Detail 'fixed services, dynamic preview services, process residue, PATH ownership, PaperboatSshd preflight absence, binaries, product registry, ARP entry, and provisioning metadata were verified.'
 }
 
 function Assert-PreMsiRuntimeCurrentFixtureIntegrity {
@@ -830,16 +1504,8 @@ function Invoke-NativeGoTests {
         [Parameter(Mandatory = $true)][string] $Description,
         [Parameter(Mandatory = $true)][string] $Timeout
     )
-    if ($NativeTestExecutable -ne '') {
-        $resolvedNativeTestExecutable = [IO.Path]::GetFullPath($NativeTestExecutable)
-        Assert-Qualification (Test-Path -LiteralPath $resolvedNativeTestExecutable -PathType Leaf) "Native Windows qualification test executable is missing: $resolvedNativeTestExecutable"
-        $nativeTestArguments = @('-test.v', '-test.run', $RunPattern, '-test.count', '1', '-test.timeout', $Timeout)
-        & $resolvedNativeTestExecutable @nativeTestArguments
-    }
-    else {
-        & go test -count=1 -tags paperboat_native_e2e -v -run $RunPattern ./packaging/windows/e2e
-    }
-    Assert-Qualification ($LASTEXITCODE -eq 0) "Native Windows qualification Go tests failed for $Description with exit code $LASTEXITCODE."
+    $nativeTestArguments = @('-test.v', '-test.run', $RunPattern, '-test.count', '1', '-test.timeout', $Timeout)
+    return Invoke-NativeTestPattern -ExecutablePath $resolvedNativeTestExecutable -Arguments $nativeTestArguments -RunPattern $RunPattern -Description $Description -EvidenceName $Description
 }
 
 function Invoke-GoQualification {
@@ -851,15 +1517,15 @@ function Invoke-GoQualification {
         try {
             $preMsiRunPattern = '^(TestNativeSCMHostdAndUpdaterLifecycle|TestNativeConPTYPowerShell51|TestNativeConPTYPowerShell7|TestNativeConPTYCmd|TestNativeLongPathFilesystemLifecycle)$'
             Add-QualificationEvent -Name 'native_go_e2e' -Status 'started' -Detail 'pre-MSI SCM hostd/updater, ConPTY, and long-path tests; durable preview is isolated on RuntimeCurrent'
-            Invoke-NativeGoTests -RunPattern $preMsiRunPattern -Description 'pre-MSI native tests' -Timeout '5m'
-            Add-QualificationEvent -Name 'native_go_e2e' -Status 'passed' -Detail 'pre-MSI SCM hostd/updater, ConPTY, and long-path tests'
+            $preMsiEvidence = Invoke-NativeGoTests -RunPattern $preMsiRunPattern -Description 'pre-MSI native tests' -Timeout '5m'
+            Add-QualificationEvent -Name 'native_go_e2e' -Status 'passed' -Detail "pre-MSI SCM hostd/updater, ConPTY, and long-path tests; tests_run=$($preMsiEvidence.TestsRunCount); evidence=$($preMsiEvidence.EvidencePath)"
 
             try {
                 Stage-PreMsiRuntimeCurrentFixture
                 Assert-PreMsiRuntimeCurrentFixtureIntegrity
                 Add-QualificationEvent -Name 'native_go_preview_e2e' -Status 'started' -Detail 'durable preview service against hash-bound RuntimeCurrent fixture'
-                Invoke-NativeGoTests -RunPattern '^TestNativeDurablePreviewServiceLifecycle$' -Description 'durable preview RuntimeCurrent test' -Timeout '5m'
-                Add-QualificationEvent -Name 'native_go_preview_e2e' -Status 'passed' -Detail 'durable preview service against hash-bound RuntimeCurrent fixture'
+                $previewEvidence = Invoke-NativeGoTests -RunPattern '^TestNativeDurablePreviewServiceLifecycle$' -Description 'durable preview RuntimeCurrent test' -Timeout '5m'
+                Add-QualificationEvent -Name 'native_go_preview_e2e' -Status 'passed' -Detail "durable preview service against hash-bound RuntimeCurrent fixture; tests_run=$($previewEvidence.TestsRunCount); evidence=$($previewEvidence.EvidencePath)"
             }
             finally {
                 Remove-PreMsiRuntimeCurrentFixture
@@ -867,9 +1533,8 @@ function Invoke-GoQualification {
 
             Add-QualificationEvent -Name 'native_msi_cleanup' -Status 'started' -Detail 'runtime-current PaperboatPreview ownership and bounded slot cleanup'
 			$cleanupArguments = @('-test.v', '-test.run', '^TestNativeMSIPreview', '-test.count', '1', '-test.timeout', '2m')
-			& $resolvedMsiCleanupTestExecutable @cleanupArguments
-			Assert-Qualification ($LASTEXITCODE -eq 0) "Native Windows MSI cleanup qualification failed with exit code $LASTEXITCODE."
-			Add-QualificationEvent -Name 'native_msi_cleanup' -Status 'passed' -Detail 'runtime-current service/declaration removal and ownership-conflict preservation cases passed'
+			$cleanupEvidence = Invoke-NativeTestPattern -ExecutablePath $resolvedMsiCleanupTestExecutable -Arguments $cleanupArguments -RunPattern '^TestNativeMSIPreview' -Description 'MSI preview cleanup tests' -EvidenceName 'msi-preview-cleanup'
+			Add-QualificationEvent -Name 'native_msi_cleanup' -Status 'passed' -Detail "runtime-current service/declaration removal and ownership-conflict preservation cases passed; tests_run=$($cleanupEvidence.TestsRunCount); evidence=$($cleanupEvidence.EvidencePath)"
         }
         finally {
             Pop-Location
@@ -883,6 +1548,8 @@ function Invoke-GoQualification {
 function Invoke-OwnerQualificationTest {
     param(
         [Parameter(Mandatory = $true)][string[]] $Arguments,
+        [Parameter(Mandatory = $true)][string] $RunPattern,
+        [Parameter(Mandatory = $true)][string] $EvidenceName,
         [Parameter(Mandatory = $true)][Security.SecureString] $CredentialSecret,
         [Parameter(Mandatory = $true)][string] $OwnerAccount,
         [Parameter(Mandatory = $true)][string] $WorkingDirectory,
@@ -904,9 +1571,17 @@ function Invoke-OwnerQualificationTest {
     $credentialPointer = [IntPtr]::Zero
     $credentialBytes = $null
     $started = $false
+    $handlePinned = $false
+    $processRecord = $null
+    $stdoutTask = $null
+    $stderrTask = $null
     try {
         Assert-Qualification ($process.Start()) 'Could not start the owner-impersonation qualification process.'
         $started = $true
+        $processHandle = $process.Handle
+        Assert-Qualification ($processHandle -ne [IntPtr]::Zero) 'Owner-impersonation qualification returned an invalid process handle.'
+        $handlePinned = $true
+        $processRecord = Register-QualificationProcess -Process $process
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
         $credentialPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($CredentialSecret)
@@ -921,11 +1596,16 @@ function Invoke-OwnerQualificationTest {
         [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($credentialPointer)
         $credentialPointer = [IntPtr]::Zero
         Assert-Qualification ($process.WaitForExit(90000)) 'Owner-impersonation qualification process exceeded its 90 second deadline.'
+        $streamTasks = [Threading.Tasks.Task[]]@($stdoutTask, $stderrTask)
+        Assert-Qualification ([Threading.Tasks.Task]::WaitAll($streamTasks, $script:streamDrainTimeoutMilliseconds)) 'Owner-impersonation qualification output did not close within the bounded drain deadline.'
         $stdout = $stdoutTask.GetAwaiter().GetResult()
         $stderr = $stderrTask.GetAwaiter().GetResult()
         [IO.File]::WriteAllText($StandardOutputPath, $stdout)
         [IO.File]::WriteAllText($StandardErrorPath, $stderr)
-        return [pscustomobject]@{ ExitCode = $process.ExitCode; Output = @($stdout, $stderr) -join "`n" }
+        $ownerOutput = @($stdout -split "`r?`n") + @($stderr -split "`r?`n")
+        $evidence = New-NativeTestExecutionEvidence -ExecutablePath $resolvedS4UTestExecutable -Arguments $Arguments -RunPattern $RunPattern -Description $EvidenceName -EvidenceName $EvidenceName -ExitCode $process.ExitCode -Output $ownerOutput
+        Assert-NativeTestExecutionEvidence -Evidence $evidence -Description $EvidenceName
+        return [pscustomobject]@{ ExitCode = $process.ExitCode; Output = @($stdout, $stderr) -join "`n"; Evidence = $evidence }
     }
     finally {
         if ($null -ne $credentialBytes) {
@@ -934,11 +1614,39 @@ function Invoke-OwnerQualificationTest {
         if ($credentialPointer -ne [IntPtr]::Zero) {
             [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($credentialPointer)
         }
-        if ($started -and -not $process.HasExited) {
-            $process.Kill()
-            $process.WaitForExit()
+        try {
+            $cleanupTerminationError = $null
+            if ($started) {
+                if (-not $handlePinned -or $null -eq $processRecord) {
+                    $script:qualificationProcessRegistrationFailures += "kind=owner; image=$resolvedS4UTestExecutable; handle_pinned=$handlePinned; record_present=$($null -ne $processRecord)"
+                }
+                if ($handlePinned) {
+                    try {
+                        if (-not $process.HasExited) {
+                            $null = Stop-QualificationProcess -Process $process -HandlePinned $handlePinned
+                        }
+                    }
+                    catch {
+                        $cleanupTerminationError = $_.Exception.Message
+                    }
+                }
+            }
+            if ($null -ne $stdoutTask -and $null -ne $stderrTask) {
+                $cleanupTasks = [Threading.Tasks.Task[]]@($stdoutTask, $stderrTask)
+                Assert-Qualification ([Threading.Tasks.Task]::WaitAll($cleanupTasks, $script:streamDrainTimeoutMilliseconds)) 'Owner-impersonation qualification output did not close within the bounded cleanup drain deadline.'
+            }
+            Assert-Qualification ([string]::IsNullOrWhiteSpace($cleanupTerminationError)) "Owner-impersonation process cleanup failed: $cleanupTerminationError"
         }
-        $process.Dispose()
+        finally {
+            try {
+                if ($null -ne $processRecord) {
+                    Complete-QualificationProcess -Record $processRecord -Process $process
+                }
+            }
+            finally {
+                $process.Dispose()
+            }
+        }
     }
 }
 
@@ -1000,17 +1708,17 @@ function Invoke-S4UDPAPIQualification {
         $ownerSID = $owner.SID.Value
         Assert-Qualification (-not [string]::IsNullOrWhiteSpace($ownerSID)) 'Temporary S4U qualification owner has no SID.'
         Test-QualificationTrustValidation -UntrustedSID $ownerSID
-        & icacls.exe $qualificationRoot /inheritance:r /grant:r "*${ownerSID}:(OI)(CI)RX" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
-        Assert-Qualification ($LASTEXITCODE -eq 0) 'Could not protect the S4U qualification root directory.'
-        & icacls.exe $qualificationRoot /setowner '*S-1-5-32-544' | Out-Null
-        Assert-Qualification ($LASTEXITCODE -eq 0) 'Could not set the trusted owner on the S4U qualification root directory.'
+        $qualificationACLResult = Invoke-NativeCommandCapture -ExecutablePath $script:icacls -Arguments @($qualificationRoot, '/inheritance:r', '/grant:r', "*${ownerSID}:(OI)(CI)RX", '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F')
+        Assert-Qualification ($qualificationACLResult.ExitCode -eq 0) "Could not protect the S4U qualification root directory: $($qualificationACLResult.Output -join ' ')"
+        $qualificationOwnerResult = Invoke-NativeCommandCapture -ExecutablePath $script:icacls -Arguments @($qualificationRoot, '/setowner', '*S-1-5-32-544')
+        Assert-Qualification ($qualificationOwnerResult.ExitCode -eq 0) "Could not set the trusted owner on the S4U qualification root directory: $($qualificationOwnerResult.Output -join ' ')"
         Assert-QualificationTransactionDirectory -Path $qualificationRoot -OwnerSID $ownerSID -OwnerWritable $false
         New-Item -ItemType Directory -Force -Path $workRoot | Out-Null
         Assert-Qualification (((Get-Item -Force -LiteralPath $workRoot).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'Owner-writable S4U work directory is a reparse point.'
-        & icacls.exe $workRoot /inheritance:r /grant:r "*${ownerSID}:(OI)(CI)M" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
-        Assert-Qualification ($LASTEXITCODE -eq 0) 'Could not protect the owner-writable S4U work directory.'
-        & icacls.exe $workRoot /setowner '*S-1-5-32-544' | Out-Null
-        Assert-Qualification ($LASTEXITCODE -eq 0) 'Could not set the trusted owner on the owner-writable S4U work directory.'
+        $workACLResult = Invoke-NativeCommandCapture -ExecutablePath $script:icacls -Arguments @($workRoot, '/inheritance:r', '/grant:r', "*${ownerSID}:(OI)(CI)M", '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F')
+        Assert-Qualification ($workACLResult.ExitCode -eq 0) "Could not protect the owner-writable S4U work directory: $($workACLResult.Output -join ' ')"
+        $workOwnerResult = Invoke-NativeCommandCapture -ExecutablePath $script:icacls -Arguments @($workRoot, '/setowner', '*S-1-5-32-544')
+        Assert-Qualification ($workOwnerResult.ExitCode -eq 0) "Could not set the trusted owner on the owner-writable S4U work directory: $($workOwnerResult.Output -join ' ')"
         Assert-QualificationTransactionDirectory -Path $workRoot -OwnerSID $ownerSID -OwnerWritable $true
         Assert-Qualification (((Get-Item -Force -LiteralPath $resolvedS4UTestExecutable).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'S4U test executable source is a reparse point.'
         Assert-Qualification (((Get-Item -Force -LiteralPath $resolvedS4UFixturePath).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'S4U fixture source is a reparse point.'
@@ -1022,7 +1730,7 @@ function Invoke-S4UDPAPIQualification {
         $prepareArguments = @('-test.v', '-test.run', '^TestNativePrepareS4UDPAPIQualification$', '-test.count', '1', '-test.timeout', '1m')
         Assert-Qualification (((Get-Item -Force -LiteralPath $resolvedS4UTestExecutable).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'S4U owner test executable became a reparse point before owner-context preparation.'
         Assert-Qualification ((Get-FileHash -Algorithm SHA256 -LiteralPath $resolvedS4UTestExecutable).Hash.ToLowerInvariant() -eq $sourcePreparationHash) 'S4U owner test executable changed immediately before owner-context preparation.'
-        $prepare = Invoke-OwnerQualificationTest -Arguments $prepareArguments -CredentialSecret $credentialSecret -OwnerAccount "$env:COMPUTERNAME\$ownerName" -WorkingDirectory $workRoot -StandardOutputPath $prepareStdout -StandardErrorPath $prepareStderr
+        $prepare = Invoke-OwnerQualificationTest -Arguments $prepareArguments -RunPattern '^TestNativePrepareS4UDPAPIQualification$' -EvidenceName 's4u-owner-prepare' -CredentialSecret $credentialSecret -OwnerAccount "$env:COMPUTERNAME\$ownerName" -WorkingDirectory $workRoot -StandardOutputPath $prepareStdout -StandardErrorPath $prepareStderr
         Assert-Qualification (Test-Path -LiteralPath $prepareStdout -PathType Leaf) 'Owner preparation stdout redirect was not created in the qualification directory.'
         Assert-Qualification (Test-Path -LiteralPath $prepareStderr -PathType Leaf) 'Owner preparation stderr redirect was not created in the qualification directory.'
         if ($prepare.ExitCode -ne 0) {
@@ -1037,19 +1745,19 @@ function Invoke-S4UDPAPIQualification {
         Assert-QualificationTransactionDirectory -Path $qualificationRoot -OwnerSID $ownerSID -OwnerWritable $false
         Assert-QualificationTransactionDirectory -Path $workRoot -OwnerSID $ownerSID -OwnerWritable $true
         New-Item -ItemType Directory -Force -Path $trustedRoot | Out-Null
-        & icacls.exe $trustedRoot /inheritance:r /grant:r "*${ownerSID}:(OI)(CI)RX" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
-        Assert-Qualification ($LASTEXITCODE -eq 0) 'Could not protect the trusted S4U fixture directory.'
-        & icacls.exe $trustedRoot /setowner '*S-1-5-32-544' | Out-Null
-        Assert-Qualification ($LASTEXITCODE -eq 0) 'Could not set the trusted owner on the trusted S4U fixture directory.'
+        $trustedACLResult = Invoke-NativeCommandCapture -ExecutablePath $script:icacls -Arguments @($trustedRoot, '/inheritance:r', '/grant:r', "*${ownerSID}:(OI)(CI)RX", '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F')
+        Assert-Qualification ($trustedACLResult.ExitCode -eq 0) "Could not protect the trusted S4U fixture directory: $($trustedACLResult.Output -join ' ')"
+        $trustedOwnerResult = Invoke-NativeCommandCapture -ExecutablePath $script:icacls -Arguments @($trustedRoot, '/setowner', '*S-1-5-32-544')
+        Assert-Qualification ($trustedOwnerResult.ExitCode -eq 0) "Could not set the trusted owner on the trusted S4U fixture directory: $($trustedOwnerResult.Output -join ' ')"
         Assert-QualificationTransactionDirectory -Path $trustedRoot -OwnerSID $ownerSID -OwnerWritable $false
         Assert-Qualification (((Get-Item -Force -LiteralPath $trustedRoot).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'Trusted S4U fixture directory is a reparse point.'
         Copy-Item -LiteralPath $resolvedS4UFixturePath -Destination $qualificationFixture -Force
         Assert-Qualification (Test-Path -LiteralPath $qualificationFixture -PathType Leaf) 'S4U fixture executable was not isolated in the trusted directory.'
         Assert-Qualification (((Get-Item -Force -LiteralPath $qualificationFixture).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'S4U fixture executable is a reparse point.'
-        & icacls.exe $qualificationFixture /inheritance:r /grant:r "*${ownerSID}:RX" '*S-1-5-18:F' '*S-1-5-32-544:F' | Out-Null
-        Assert-Qualification ($LASTEXITCODE -eq 0) 'Could not protect the trusted S4U fixture executable.'
-        & icacls.exe $qualificationFixture /setowner '*S-1-5-32-544' | Out-Null
-        Assert-Qualification ($LASTEXITCODE -eq 0) 'Could not set the trusted owner on the S4U fixture executable.'
+        $fixtureACLResult = Invoke-NativeCommandCapture -ExecutablePath $script:icacls -Arguments @($qualificationFixture, '/inheritance:r', '/grant:r', "*${ownerSID}:RX", '*S-1-5-18:F', '*S-1-5-32-544:F')
+        Assert-Qualification ($fixtureACLResult.ExitCode -eq 0) "Could not protect the trusted S4U fixture executable: $($fixtureACLResult.Output -join ' ')"
+        $fixtureOwnerResult = Invoke-NativeCommandCapture -ExecutablePath $script:icacls -Arguments @($qualificationFixture, '/setowner', '*S-1-5-32-544')
+        Assert-Qualification ($fixtureOwnerResult.ExitCode -eq 0) "Could not set the trusted owner on the S4U fixture executable: $($fixtureOwnerResult.Output -join ' ')"
         $trustedFixtureHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $qualificationFixture).Hash.ToLowerInvariant()
         Assert-Qualification ($trustedFixtureHash -eq $sourceFixtureHashBeforePreparation) 'Trusted S4U fixture differs from its source.'
         $env:PAPERBOAT_WINDOWS_E2E_S4U_FIXTURE = $qualificationFixture
@@ -1058,7 +1766,7 @@ function Invoke-S4UDPAPIQualification {
         $mutationArguments = @('-test.v', '-test.run', '^TestNativeOwnerCannotMutateS4UFixture$', '-test.count', '1', '-test.timeout', '1m')
         Assert-Qualification (((Get-Item -Force -LiteralPath $resolvedS4UTestExecutable).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'S4U owner test executable became a reparse point before owner immutability probe.'
         Assert-Qualification ((Get-FileHash -Algorithm SHA256 -LiteralPath $resolvedS4UTestExecutable).Hash.ToLowerInvariant() -eq $sourcePreparationHash) 'S4U owner test executable changed immediately before owner immutability probe.'
-        $mutation = Invoke-OwnerQualificationTest -Arguments $mutationArguments -CredentialSecret $credentialSecret -OwnerAccount "$env:COMPUTERNAME\$ownerName" -WorkingDirectory $workRoot -StandardOutputPath $mutationStdout -StandardErrorPath $mutationStderr
+        $mutation = Invoke-OwnerQualificationTest -Arguments $mutationArguments -RunPattern '^TestNativeOwnerCannotMutateS4UFixture$' -EvidenceName 's4u-owner-mutation' -CredentialSecret $credentialSecret -OwnerAccount "$env:COMPUTERNAME\$ownerName" -WorkingDirectory $workRoot -StandardOutputPath $mutationStdout -StandardErrorPath $mutationStderr
         Assert-Qualification (Test-Path -LiteralPath $mutationStdout -PathType Leaf) 'Owner mutation-probe stdout redirect was not created in the work directory.'
         Assert-Qualification (Test-Path -LiteralPath $mutationStderr -PathType Leaf) 'Owner mutation-probe stderr redirect was not created in the work directory.'
         if ($mutation.ExitCode -ne 0) {
@@ -1078,9 +1786,8 @@ function Invoke-S4UDPAPIQualification {
         Assert-Qualification ((Get-FileHash -Algorithm SHA256 -LiteralPath $resolvedS4UFixturePath).Hash.ToLowerInvariant() -eq $trustedFixtureHash) 'S4U fixture source changed immediately before SCM qualification.'
         Assert-Qualification ((Get-FileHash -Algorithm SHA256 -LiteralPath $qualificationFixture).Hash.ToLowerInvariant() -eq $trustedFixtureHash) 'Trusted S4U fixture changed immediately before SCM qualification.'
         $arguments = @('-test.v', '-test.run', '^TestNativeLoggedOutS4UDPAPIQualification$', '-test.count', '1', '-test.timeout', '2m')
-        & $resolvedS4UTestExecutable @arguments
-        Assert-Qualification ($LASTEXITCODE -eq 0) "Native logged-out S4U DPAPI qualification failed with exit code $LASTEXITCODE."
-        Add-QualificationEvent -Name 'native_s4u_dpapi' -Status 'passed' -Detail "owner_sid=$ownerSID; architecture=$Architecture; dpapi_readable=true; credential_manager_migration=true"
+        $loggedOutEvidence = Invoke-NativeTestPattern -ExecutablePath $resolvedS4UTestExecutable -Arguments $arguments -RunPattern '^TestNativeLoggedOutS4UDPAPIQualification$' -Description 'logged-out S4U DPAPI qualification' -EvidenceName 's4u-logged-out'
+        Add-QualificationEvent -Name 'native_s4u_dpapi' -Status 'passed' -Detail "owner_sid=$ownerSID; architecture=$Architecture; dpapi_readable=true; credential_manager_migration=true; tests_run=$($loggedOutEvidence.TestsRunCount); evidence=$($loggedOutEvidence.EvidencePath); owner_prepare_evidence=$($prepare.Evidence.EvidencePath); owner_mutation_evidence=$($mutation.Evidence.EvidencePath)"
     }
     catch {
         $invocation = $_.InvocationInfo
@@ -1101,9 +1808,9 @@ function Invoke-S4UDPAPIQualification {
                     Stop-Service -Name $serviceName -Force -ErrorAction Stop
                     $qualificationService.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
                 }
-                & sc.exe delete $serviceName | Out-Null
-                if ($LASTEXITCODE -ne 0) {
-                    throw "sc.exe delete returned exit code $LASTEXITCODE"
+                $deleteResult = Invoke-NativeCommandCapture -ExecutablePath $script:serviceControl -Arguments @('delete', $serviceName)
+                if ($deleteResult.ExitCode -ne 0) {
+                    throw "sc.exe delete returned exit code $($deleteResult.ExitCode): $($deleteResult.Output -join ' ')"
                 }
                 for ($attempt = 0; $attempt -lt 20; $attempt++) {
                     if ($null -eq (Get-Service -Name $serviceName -ErrorAction SilentlyContinue)) {
@@ -1213,9 +1920,8 @@ function Invoke-S4UDPAPIQualification {
 function Invoke-LegacySecurityMigrationQualification {
     Add-QualificationEvent -Name 'native_legacy_security_migration' -Status 'started' -Detail 'isolated owner-FULL root/config/token ACL fixture'
     $arguments = @('-test.v', '-test.run', '^TestNativeLegacyOwnerFullSecurityMigration$', '-test.count', '1', '-test.timeout', '2m')
-    & $resolvedHostinstallTestExecutable @arguments
-    Assert-Qualification ($LASTEXITCODE -eq 0) "Native legacy Windows security migration qualification failed with exit code $LASTEXITCODE."
-    Add-QualificationEvent -Name 'native_legacy_security_migration' -Status 'passed' -Detail 'owner_full_rejected_before=true; owner_read_only_after=true; config_unchanged=true'
+    $evidence = Invoke-NativeTestPattern -ExecutablePath $resolvedHostinstallTestExecutable -Arguments $arguments -RunPattern '^TestNativeLegacyOwnerFullSecurityMigration$' -Description 'legacy Windows security migration qualification' -EvidenceName 'legacy-security-migration'
+    Add-QualificationEvent -Name 'native_legacy_security_migration' -Status 'passed' -Detail "owner_full_rejected_before=true; owner_read_only_after=true; config_unchanged=true; tests_run=$($evidence.TestsRunCount); evidence=$($evidence.EvidencePath)"
 }
 
 function Write-QualificationReport {
@@ -1236,10 +1942,13 @@ function Write-QualificationReport {
         upgrade_version = $UpgradeVersion
         msi_sha256 = if (Test-Path -LiteralPath $resolvedMsiPath) { (Get-FileHash -Algorithm SHA256 -LiteralPath $resolvedMsiPath).Hash.ToLowerInvariant() } else { $null }
         upgrade_msi_sha256 = if (Test-Path -LiteralPath $resolvedUpgradeMsiPath) { (Get-FileHash -Algorithm SHA256 -LiteralPath $resolvedUpgradeMsiPath).Hash.ToLowerInvariant() } else { $null }
+        native_test_sha256 = $script:nativeTestSHA256
+        native_test_length = $script:nativeTestLength
         events = $script:events
         failure = if ($Failure -eq '') { $null } else { $Failure }
     }
-    $report | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $reportPath -Encoding UTF8
+    $reportJSON = $report | ConvertTo-Json -Depth 10
+    [IO.File]::WriteAllText($reportPath, $reportJSON + "`n", [Text.UTF8Encoding]::new($false))
     if ($env:GITHUB_STEP_SUMMARY) {
         @(
             "### Native Windows $Architecture qualification",
@@ -1259,6 +1968,7 @@ $bodyFailure = $null
 $cleanupFailure = $null
 try {
     Assert-Preflight
+    $script:preflightPassed = $true
     Invoke-S4UDPAPIQualification
     Invoke-LegacySecurityMigrationQualification
     Invoke-GoQualification
@@ -1266,7 +1976,6 @@ try {
 
     $freshLog = Join-Path $resolvedOutputDirectory 'msi-fresh.log'
     Invoke-Msi -Arguments @('/i', (Quote-WindowsArgument $script:qualifiedFreshMsiPath)) -LogPath $freshLog -Operation 'fresh_install'
-    $script:installedByHarness = $true
     Assert-InstalledPayload -ExpectedVersion $Version
 
     $repairTarget = Join-Path $script:binaryRoot 'pb.exe'
@@ -1282,7 +1991,6 @@ try {
 
     $upgradeLog = Join-Path $resolvedOutputDirectory 'msi-upgrade.log'
     Invoke-Msi -Arguments @('/i', (Quote-WindowsArgument $script:qualifiedUpgradeMsiPath)) -LogPath $upgradeLog -Operation 'upgrade'
-    $script:upgradeInstalled = $true
     Assert-InstalledPayload -ExpectedVersion $UpgradeVersion
     Assert-OwnedPreviewCleanupFixturePresent
     $expectedMsiVersion = Convert-ToMsiVersion -FullVersion $UpgradeVersion
@@ -1295,19 +2003,15 @@ try {
     Assert-Qualification ($productCode -match '^\{[0-9A-Fa-f-]+\}$') "ARP product code is invalid: $productCode"
     $uninstallLog = Join-Path $resolvedOutputDirectory 'msi-uninstall.log'
     Invoke-Msi -Arguments @('/x', $productCode) -LogPath $uninstallLog -Operation 'uninstall'
-    $script:installedByHarness = $false
-    $script:upgradeInstalled = $false
     Assert-Uninstalled
 
     $reinstallLog = Join-Path $resolvedOutputDirectory 'msi-reinstall.log'
     Invoke-Msi -Arguments @('/i', (Quote-WindowsArgument $script:qualifiedFreshMsiPath)) -LogPath $reinstallLog -Operation 'reinstall'
-    $script:installedByHarness = $true
     Assert-InstalledPayload -ExpectedVersion $Version
     $reinstallEntries = @(Get-InstalledPaperboatProducts)
     Assert-Qualification ($reinstallEntries.Count -eq 1) "Expected one ARP entry after reinstall, found $($reinstallEntries.Count)."
     $reinstallUninstallLog = Join-Path $resolvedOutputDirectory 'msi-reinstall-uninstall.log'
     Invoke-Msi -Arguments @('/x', $reinstallEntries[0].PSChildName) -LogPath $reinstallUninstallLog -Operation 'reinstall_uninstall'
-    $script:installedByHarness = $false
     Assert-Uninstalled
     Add-QualificationEvent -Name 'msi_reinstall_assertions' -Status 'passed' -Detail 'clean reinstall and second uninstall passed from a path containing spaces and Unicode'
 }
@@ -1317,14 +2021,16 @@ catch {
     $bodyFailure = $_
 }
 finally {
-    if ($script:installedByHarness -or $script:upgradeInstalled) {
+    if ($script:preflightPassed) {
         try {
             $entries = @(Get-InstalledPaperboatProducts)
             if ($entries.Count -gt 0) {
+                Assert-Qualification ($entries.Count -eq 1) "Failure cleanup found multiple Paperboat MSI products: $($entries.PSChildName -join ', ')."
                 $cleanupCode = $entries[0].PSChildName
                 $cleanupLog = Join-Path $resolvedOutputDirectory 'msi-cleanup.log'
                 Invoke-Msi -Arguments @('/x', $cleanupCode) -LogPath $cleanupLog -Operation 'failure_cleanup'
             }
+            Assert-NoQualificationProcessResidue -Phase 'final_cleanup'
         }
         catch {
             $cleanupFailure = $_

@@ -98,7 +98,7 @@ func fileTransferTestHandler(t *testing.T) (*FileTransferHandler, *store.Store) 
 			return nil, errors.New("invalid")
 		}
 		return authorizerFunc(func(context.Context, protocol.Frame) (Authorization, error) {
-			return Authorization{JournalBinding: "env:1:cli:1", EnvironmentID: "env_1", MachineID: "machine_host", UserID: "user_1", ClientID: "cli_1", SessionID: "ses_1"}, nil
+			return Authorization{JournalBinding: "env:1:cli:1", EnvironmentID: "env_1", MachineID: "machine_host", SourceMachineID: "machine_client", UserID: "user_1", ClientID: "cli_1", SessionID: "ses_1"}, nil
 		}), nil
 	}, AuthorizeCreate: func(authorization Authorization, request CreateFileTransferRequest) bool {
 		return request.DestinationMachineID == authorization.MachineID && request.InitiatingUserID == authorization.UserID
@@ -217,6 +217,44 @@ func TestEncryptedFileTransferPublishesOnlyAfterAuthenticatedManifestChunksAndRe
 	}
 	if _, err := vault.Load(batchID, 1); !errors.Is(err, transfercrypto.ErrKeyUnavailable) {
 		t.Fatalf("completed transfer key still available: %v", err)
+	}
+	request := transferRequest(http.MethodGet, server.URL+"/v1/file-transfers/"+batchID+".0", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var status clienttransfer.Manifest
+	if err := json.Unmarshal(response.Body.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+	if status.TransferID != batchID+".0" || status.BatchID != batchID || status.SourceMachineID != "machine_client" || status.DestinationMachineID != "machine_host" || status.InitiatingUserID != "user_1" || status.SessionID != "ses_1" {
+		t.Fatalf("status identity=%+v", status)
+	}
+	if status.Basename != "private.txt" || status.Size != int64(len(plaintext)) || status.SHA256 != hex.EncodeToString(digest[:]) || status.CommittedOffset != int64(len(plaintext)) || status.CommittedChunk != 1 {
+		t.Fatalf("status content=%+v", status)
+	}
+	if status.State != "published" || status.ResultCode != "published" || status.ReceiptPath != "Paperboat Inbox/"+batchID+".0-private.txt" || status.CreatedAt.IsZero() || status.ExpiresAt.IsZero() {
+		t.Fatalf("status result=%+v", status)
+	}
+
+	// Receipt processing may retire the durable spool object after publication.
+	// Missing optional path enrichment must not hide the durable source status.
+	contentPath := filepath.Join(filepath.Dir(published), batchID+".0.content")
+	if err := os.Remove(contentPath); err != nil {
+		t.Fatal(err)
+	}
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, transferRequest(http.MethodGet, server.URL+"/v1/file-transfers/"+batchID+".0", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status after spool retirement=%d body=%s", response.Code, response.Body.String())
+	}
+	status = clienttransfer.Manifest{}
+	if err := json.Unmarshal(response.Body.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+	if status.TransferID != batchID+".0" || status.State != "published" || status.ResultCode != "published" || status.ReceiptPath != "" || status.CommittedChunk != 1 {
+		t.Fatalf("status after spool retirement=%+v", status)
 	}
 }
 
@@ -418,6 +456,23 @@ func TestEncryptedReversePendingManifestAndChunksAreOpaque(t *testing.T) {
 	}
 	if !strings.Contains(pending, batchID) || !strings.Contains(pending, resourceID) {
 		t.Fatalf("pending omitted opaque identities: %s", pending)
+	}
+
+	request = transferRequest(http.MethodGet, "http://helper.test/v1/file-transfers/"+resourceID, nil)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d %s", response.Code, response.Body.String())
+	}
+	statusBody := response.Body.String()
+	for _, forbidden := range []string{"private-name.txt", transferDigest(plaintext), "machine_host", "machine_client", "user_1", "Paperboat Inbox", `"size"`, `"basename"`, `"sha256"`} {
+		if strings.Contains(statusBody, forbidden) {
+			t.Fatalf("recipient status exposed %q: %s", forbidden, statusBody)
+		}
+	}
+	var opaqueStatus encryptedTransferResource
+	if err := json.Unmarshal(response.Body.Bytes(), &opaqueStatus); err != nil || opaqueStatus.TransferID != resourceID || opaqueStatus.State != "pending" || opaqueStatus.ExpiresAt.IsZero() {
+		t.Fatalf("opaque status=%+v err=%v", opaqueStatus, err)
 	}
 
 	request = transferRequest(http.MethodGet, "http://helper.test/v1/file-transfers/"+resourceID+"/e2ee-manifest", nil)

@@ -873,12 +873,17 @@ func ensureWindowsMachineDirectory(path, ownerSID string) error {
 	}
 	defer windows.CloseHandle(handle)
 	// A pre-existing machine root may be created by MSI under SYSTEM. A process
-	// cut between protected creation and the owner transfer may leave the one
-	// exact Administrators-owned transitional state. Reject every other owner
-	// without rewriting it.
+	// cut between protected creation and the owner transfer may leave the exact
+	// Administrators-owned current-DACL transition. WiX also creates DATAROOT
+	// with an Administrators owner and a protected SYSTEM/Administrators-only
+	// DACL before the enrolled SID is known. Both states exclude the enrolled
+	// user's filtered token and are safe to complete through this held handle.
+	// Reject every other owner or DACL without rewriting it.
 	if !windowssecurity.HandleOwnerMatchesSID(handle, trustedOwner) {
 		administrators, ownerErr := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
-		if ownerErr != nil || !windowssecurity.HandleOwnerMatchesSID(handle, administrators) || !windowssecurity.ProtectedHandleDACLMatches(handle, windowsRuntimeCurrentRootDACL(ownerSID)) {
+		trustedTransition := windowssecurity.ProtectedHandleDACLMatches(handle, windowsRuntimeCurrentRootDACL(ownerSID)) ||
+			windowssecurity.ProtectedHandleDACLMatches(handle, windowsRuntimeMSIBootstrapRootDACL())
+		if ownerErr != nil || !windowssecurity.HandleOwnerMatchesSID(handle, administrators) || !trustedTransition {
 			return fmt.Errorf("validate existing Windows runtime root owner: %w", ErrInvalidRequest)
 		}
 	}
@@ -903,6 +908,10 @@ func windowsRuntimeCurrentFileDACL(ownerSID string) string {
 
 func windowsRuntimeCurrentRootDACL(ownerSID string) string {
 	return "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;" + ownerSID + ")"
+}
+
+func windowsRuntimeMSIBootstrapRootDACL() string {
+	return "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
 }
 
 func windowsRuntimeSecurityMatches(path string, owner *windows.SID, dacl string) bool {

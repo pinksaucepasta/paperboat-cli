@@ -39,7 +39,7 @@ func runUpdated(ctx context.Context, args []string, _ io.Writer, stderr io.Write
 			return errors.New("invalid paperboat-updated environment")
 		}
 	}
-	if repository == "" || machineID == "" || healthURL == "" || uidErr != nil || gidErr != nil || uid <= 0 || gid < 0 {
+	if repository == "" || machineID == "" || healthURL == "" || uidErr != nil || gidErr != nil || !validRuntimeIdentity(uid, gid) {
 		return errors.New("invalid paperboat-updated environment")
 	}
 	token, err := readWorkerToken(tokenPath)
@@ -76,4 +76,8 @@ func runUpdated(ctx context.Context, args []string, _ io.Writer, stderr io.Write
 		return err
 	}
 	return updaterService.Run(ctx)
+}
+
+func validRuntimeIdentity(uid, gid int) bool {
+	return uid > 0 && gid > 0 || uid == 0 && gid == 0
 }

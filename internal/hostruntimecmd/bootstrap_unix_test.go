@@ -166,7 +166,7 @@ func TestPrepareInstallationReusesMatchingPersistedIdentity(t *testing.T) {
 	artifactServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(body) }))
 	defer artifactServer.Close()
 	manifest, _, _ := signedBootstrapArtifacts(t, artifactServer.URL+"/pb", body)
-	material := bootstrap.Material{UserMachineID: "um_reuse", UserMachineEnrollmentID: "ume_reuse", EnvironmentID: "env_reuse", HelperID: "helper_reuse", ReuseIdentity: true, Artifact: &manifest}
+	material := bootstrap.Material{UserMachineID: "machine_env_reuse", UserMachineEnrollmentID: "ume_reuse", EnvironmentID: "env_reuse", HelperID: "helper_reuse", ReuseIdentity: true, Artifact: &manifest}
 	client := &recordingEnrollmentClient{}
 	artifactPath := filepath.Join(stateRoot, "tuf", "targets", "pb")
 	if err := os.MkdirAll(filepath.Dir(artifactPath), 0o700); err != nil {

@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -46,6 +47,105 @@ func TestAPIDescriptorSourceValidatesAndMapsDirectAuthority(t *testing.T) {
 	}
 	if acquired.IntentID != descriptor.IntentID || acquired.AttemptGeneration != descriptor.AttemptGeneration {
 		t.Fatalf("acquisition callback=%+v descriptor=%+v", acquired, descriptor)
+	}
+}
+
+func TestAPIDescriptorSourceRetriesInvalidAdvisoryRelayLatencyOnce(t *testing.T) {
+	now := time.Unix(2000, 0).UTC()
+	document := peerAttemptDocument(t, now)
+	controllingFingerprint, controlledFingerprint := documentFingerprints(t, document)
+	var requests []api.PeerAttemptInput
+	source, err := NewAPIDescriptorSource(APIDescriptorSourceConfig{
+		Client: peerAttemptClientFunc(func(_ context.Context, input api.PeerAttemptInput) (api.PeerAttemptDescriptor, error) {
+			requests = append(requests, input)
+			if len(requests) == 1 {
+				return api.PeerAttemptDescriptor{}, &api.APIError{Status: 400, Code: "invalid_request", Message: "Peer attempt could not be completed."}
+			}
+			return document, nil
+		}),
+		EnvironmentID:                     "env_1",
+		Purpose:                           "interactive",
+		Consumer:                          "terminal",
+		AccountID:                         "account_1",
+		RootPublicKey:                     testDescriptorRoot().Public().(ed25519.PublicKey),
+		ControllingEndpointID:             document.InitiatorEndpointID,
+		ControlledEndpointID:              document.ResponderEndpointID,
+		ControllingCertificateFingerprint: controllingFingerprint,
+		ControlledCertificateFingerprint:  controlledFingerprint,
+		RelayLatency: func() *api.RelayLatencyVector {
+			return &api.RelayLatencyVector{Generation: 7, ObservedAt: now, Samples: []api.RelayLatencySample{{Region: "fsn1", RTTMS: 20}}}
+		},
+		OperationID: func(Generation) string { return document.OperationID },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.Acquire(context.Background(), Generation{Attempt: 2, Network: 4}); err != nil {
+		t.Fatal(err)
+	}
+	if len(requests) != 2 || requests[0].RelayLatency == nil || requests[1].RelayLatency != nil {
+		t.Fatalf("requests=%+v", requests)
+	}
+	if requests[0].OperationID != requests[1].OperationID || requests[0].AttemptGeneration != requests[1].AttemptGeneration || requests[0].NetworkGeneration != requests[1].NetworkGeneration || !slices.Equal(requests[0].AllowedPaths, requests[1].AllowedPaths) {
+		t.Fatalf("retry changed peer authority binding: first=%+v second=%+v", requests[0], requests[1])
+	}
+	first, second := requests[0], requests[1]
+	first.RelayLatency, second.RelayLatency = nil, nil
+	if !reflect.DeepEqual(first, second) {
+		t.Fatalf("retry changed request beyond relay latency: first=%+v second=%+v", requests[0], requests[1])
+	}
+}
+
+func TestAPIDescriptorSourceDoesNotRetryNonLatencyFailure(t *testing.T) {
+	calls := 0
+	source := descriptorSourceForTest(t, func(context.Context, api.PeerAttemptInput) (api.PeerAttemptDescriptor, error) {
+		calls++
+		return api.PeerAttemptDescriptor{}, &api.APIError{Status: 400, Code: "invalid_request"}
+	})
+	if _, err := source.Acquire(context.Background(), Generation{Attempt: 2, Network: 4}); !errors.Is(err, ErrDescriptorInvalid) {
+		t.Fatalf("error=%v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("calls=%d, want 1", calls)
+	}
+}
+
+func TestShouldRetryWithoutRelayLatencyIsNarrow(t *testing.T) {
+	vector := &api.RelayLatencyVector{Generation: 1}
+	for _, test := range []struct {
+		name   string
+		err    error
+		vector *api.RelayLatencyVector
+		want   bool
+	}{
+		{name: "invalid request with vector", err: &api.APIError{Status: 400, Code: "invalid_request"}, vector: vector, want: true},
+		{name: "no vector", err: &api.APIError{Status: 400, Code: "invalid_request"}},
+		{name: "server failure", err: &api.APIError{Status: 503, Code: "invalid_request"}, vector: vector},
+		{name: "different code", err: &api.APIError{Status: 400, Code: "permission_denied"}, vector: vector},
+		{name: "transport failure", err: errors.New("network"), vector: vector},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := shouldRetryWithoutRelayLatency(test.err, test.vector); got != test.want {
+				t.Fatalf("retry=%t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
+func TestAPIDescriptorSourcePreservesSecondRelayFallbackFailure(t *testing.T) {
+	calls := 0
+	source := descriptorSourceWithRelayForTest(t, func(context.Context, api.PeerAttemptInput) (api.PeerAttemptDescriptor, error) {
+		calls++
+		if calls == 1 {
+			return api.PeerAttemptDescriptor{}, &api.APIError{Status: 400, Code: "invalid_request"}
+		}
+		return api.PeerAttemptDescriptor{}, &api.APIError{Status: 503, Code: "route_unavailable"}
+	})
+	if _, err := source.Acquire(context.Background(), Generation{Attempt: 2, Network: 4}); !errors.Is(err, ErrDescriptorUnavailable) {
+		t.Fatalf("error=%v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("calls=%d, want 2", calls)
 	}
 }
 
@@ -132,6 +232,33 @@ func descriptorSourceForTest(t *testing.T, client peerAttemptClientFunc) *APIDes
 	document.OperationID = "peer-operation-0123456789"
 	controllingFingerprint, controlledFingerprint := documentFingerprints(t, document)
 	source, err := NewAPIDescriptorSource(APIDescriptorSourceConfig{Client: client, EnvironmentID: "env_1", Purpose: "interactive", Consumer: "terminal", AccountID: "account_1", RootPublicKey: testDescriptorRoot().Public().(ed25519.PublicKey), ControllingEndpointID: document.InitiatorEndpointID, ControlledEndpointID: document.ResponderEndpointID, ControllingCertificateFingerprint: controllingFingerprint, ControlledCertificateFingerprint: controlledFingerprint, OperationID: func(Generation) string { return "peer-operation-0123456789" }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return source
+}
+
+func descriptorSourceWithRelayForTest(t *testing.T, client peerAttemptClientFunc) *APIDescriptorSource {
+	t.Helper()
+	document := peerAttemptDocument(t, time.Unix(2000, 0).UTC())
+	document.OperationID = "peer-operation-0123456789"
+	controllingFingerprint, controlledFingerprint := documentFingerprints(t, document)
+	source, err := NewAPIDescriptorSource(APIDescriptorSourceConfig{
+		Client:                            client,
+		EnvironmentID:                     "env_1",
+		Purpose:                           "interactive",
+		Consumer:                          "terminal",
+		AccountID:                         "account_1",
+		RootPublicKey:                     testDescriptorRoot().Public().(ed25519.PublicKey),
+		ControllingEndpointID:             document.InitiatorEndpointID,
+		ControlledEndpointID:              document.ResponderEndpointID,
+		ControllingCertificateFingerprint: controllingFingerprint,
+		ControlledCertificateFingerprint:  controlledFingerprint,
+		RelayLatency: func() *api.RelayLatencyVector {
+			return &api.RelayLatencyVector{Generation: 7, ObservedAt: time.Unix(2000, 0).UTC(), Samples: []api.RelayLatencySample{{Region: "fsn1", RTTMS: 20}}}
+		},
+		OperationID: func(Generation) string { return "peer-operation-0123456789" },
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
