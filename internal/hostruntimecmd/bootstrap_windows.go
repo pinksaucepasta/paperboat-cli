@@ -265,7 +265,27 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	if err != nil {
 		return fmt.Errorf("resolve Paperboat executable for administrator approval: %w", err)
 	}
-	if err := elevation.RunRuntimeService(ctx, executable, elevation.ActionInstallCommit, request); err != nil {
+	// The one-shot installer invokes pb from the active installed slot. Windows
+	// keeps that image open, so the elevated commit process must run from a
+	// separate copy before it rotates the active slot.
+	elevated, err := os.CreateTemp(*stateRoot, ".pb-elevated-*.exe")
+	if err != nil {
+		return fmt.Errorf("stage executable for administrator approval: %w", err)
+	}
+	elevatedPath := elevated.Name()
+	defer os.Remove(elevatedPath)
+	source, err := os.Open(executable)
+	if err != nil {
+		elevated.Close()
+		return fmt.Errorf("open executable for administrator approval: %w", err)
+	}
+	_, copyErr := io.Copy(elevated, source)
+	closeSourceErr := source.Close()
+	closeElevatedErr := elevated.Close()
+	if copyErr != nil || closeSourceErr != nil || closeElevatedErr != nil {
+		return fmt.Errorf("copy executable for administrator approval: %w", errors.Join(copyErr, closeSourceErr, closeElevatedErr))
+	}
+	if err := elevation.RunRuntimeService(ctx, elevatedPath, elevation.ActionInstallCommit, request); err != nil {
 		return fmt.Errorf("install Paperboat Windows host runtime: %w", err)
 	}
 	if err := bootstrap.ClearResume(*stateRoot); err != nil {
