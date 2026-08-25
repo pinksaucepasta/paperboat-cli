@@ -508,6 +508,7 @@ jobs:
           chmod 0600 "$HOME/.ssh/paperboat-release" "$HOME/.ssh/known_hosts"
       - name: Fetch and validate production TUF signing state
         env:
+          PAPERBOAT_TUF_CI: '1'
           RELEASE_HOST: ${{ needs.release-authority.outputs.release_host }}
           PAPERBOAT_TUF_KEY_TARGETS_1: ${{ secrets.PAPERBOAT_TUF_KEY_TARGETS_1 }}
           PAPERBOAT_TUF_KEY_TARGETS_2: ${{ secrets.PAPERBOAT_TUF_KEY_TARGETS_2 }}
