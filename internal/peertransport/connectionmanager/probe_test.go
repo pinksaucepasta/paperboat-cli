@@ -396,21 +396,37 @@ func TestProbeSchedulerAttemptExhaustionIsPermanent(t *testing.T) {
 }
 
 func TestProbeSchedulerNetworkGenerationExhaustionInterruptsRun(t *testing.T) {
-	s, _ := NewProbeScheduler(ProbePolicy{InitialBackoff: time.Hour, MaximumBackoff: time.Hour}, probeRunnerFunc(func(context.Context, ProbeAttempt) (ProbeResult, error) {
-		t.Fatal("runner called after network generation exhaustion")
-		return ProbeResult{}, nil
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	calls := 0
+	s, _ := NewProbeScheduler(ProbePolicy{InitialBackoff: time.Hour, MaximumBackoff: time.Hour}, probeRunnerFunc(func(ctx context.Context, _ ProbeAttempt) (ProbeResult, error) {
+		calls++
+		started <- struct{}{}
+		<-ctx.Done()
+		canceled <- struct{}{}
+		return ProbeResult{}, ctx.Err()
 	}), discardProbe)
 	s.networkGeneration = math.MaxUint64
 	done := make(chan error, 1)
 	go func() { done <- s.Run(context.Background()) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("probe did not publish its active cancellation")
+	}
 	s.NetworkChanged()
 	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("network generation exhaustion did not cancel the active probe")
+	}
+	select {
 	case err := <-done:
-		if !errors.Is(err, ErrProbeExhausted) || s.networkGeneration != math.MaxUint64 {
-			t.Fatalf("generation=%d error=%v", s.networkGeneration, err)
+		if !errors.Is(err, ErrProbeExhausted) || s.networkGeneration != math.MaxUint64 || calls != 1 {
+			t.Fatalf("generation=%d calls=%d error=%v", s.networkGeneration, calls, err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("network generation exhaustion did not wake scheduler")
+		t.Fatal("network generation exhaustion did not stop scheduler")
 	}
 }
 
