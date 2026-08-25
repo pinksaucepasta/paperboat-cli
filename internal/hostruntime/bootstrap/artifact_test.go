@@ -58,7 +58,7 @@ func newTestTUFRepository(t *testing.T, body []byte, version string, expires tim
 	digestBytes := sha256.Sum256(body)
 	format := "elf"
 	if runtime.GOOS == "darwin" {
-		format = "pkg"
+		format = "dmg"
 	}
 	repository := "pinksaucepasta/paperboat-cli"
 	index := releaseindex.Index{

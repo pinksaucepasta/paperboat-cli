@@ -263,7 +263,8 @@ jobs:
             runner = if ($env:RUNNER_NAME) { $env:RUNNER_NAME } else { '${{ matrix.runner }}' }
           }
           $qualificationPath = Join-Path $env:RUNNER_TEMP 'windows-${{ matrix.architecture }}-native-qualification.json'
-          $qualification | ConvertTo-Json -Compress | Set-Content -LiteralPath $qualificationPath -Encoding utf8NoBOM
+          $json = $qualification | ConvertTo-Json -Compress
+          [IO.File]::WriteAllText($qualificationPath, $json, (New-Object Text.UTF8Encoding($false)))
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-windows-${{ matrix.architecture }}
@@ -280,7 +281,7 @@ jobs:
           retention-days: 7
 
   release-macos:
-    name: Build macOS arm64 PKG
+    name: Build macOS arm64 DMG
     needs: [release-authority, release-contract]
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
     runs-on: blacksmith-6vcpu-macos-latest
@@ -290,12 +291,6 @@ jobs:
     env:
       DEFAULT_SERVER_URL: ${{ needs.release-authority.outputs.server_url }}
       DEFAULT_RELEASE_URL: ${{ needs.release-authority.outputs.release_url }}
-      APPLE_INSTALLER_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_INSTALLER_CERTIFICATE_P12_BASE64 }}
-      APPLE_INSTALLER_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_INSTALLER_CERTIFICATE_PASSWORD }}
-      APPLE_INSTALLER_SIGNING_IDENTITY: ${{ secrets.APPLE_INSTALLER_SIGNING_IDENTITY }}
-      APPLE_ID: ${{ secrets.APPLE_ID }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -304,25 +299,7 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Import Developer ID Installer certificate
-        shell: bash
-        run: |
-          set -euo pipefail
-          for name in APPLE_INSTALLER_CERTIFICATE_P12_BASE64 APPLE_INSTALLER_CERTIFICATE_PASSWORD APPLE_INSTALLER_SIGNING_IDENTITY APPLE_ID APPLE_TEAM_ID APPLE_APP_PASSWORD; do
-            test -n "${!name}" || { echo "$name is required for a signed, notarized macOS package" >&2; exit 1; }
-          done
-          keychain="$RUNNER_TEMP/paperboat-release.keychain-db"
-          password="$(uuidgen)"
-          certificate="$RUNNER_TEMP/paperboat-installer.p12"
-          printf '%s' "$APPLE_INSTALLER_CERTIFICATE_P12_BASE64" | base64 --decode > "$certificate" 2>/dev/null || printf '%s' "$APPLE_INSTALLER_CERTIFICATE_P12_BASE64" | base64 -D > "$certificate"
-          security create-keychain -p "$password" "$keychain"
-          security set-keychain-settings -lut 21600 "$keychain"
-          security unlock-keychain -p "$password" "$keychain"
-          security import "$certificate" -P "$APPLE_INSTALLER_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain"
-          security list-keychains -d user -s "$keychain" login.keychain-db
-          security default-keychain -s "$keychain"
-      - name: Build and sign one macOS PKG
+      - name: Build one macOS arm64 DMG
         shell: bash
         run: |
           set -euo pipefail
@@ -334,27 +311,14 @@ jobs:
             --server-url "$DEFAULT_SERVER_URL" \
             --release-url "$DEFAULT_RELEASE_URL"
           mkdir -p dist
-          ./tools/build-macos-pkg.sh \
+          ./tools/build-macos-dmg.sh \
             --binary "$RUNNER_TEMP/pb-darwin-arm64" \
-            --output dist/pb-darwin-arm64.pkg \
-            --version "$RELEASE_VERSION" \
-            --signing-identity "$APPLE_INSTALLER_SIGNING_IDENTITY"
-      - name: Notarize and staple macOS PKG
-        shell: bash
-        run: |
-          set -euo pipefail
-          xcrun notarytool submit dist/pb-darwin-arm64.pkg \
-            --apple-id "$APPLE_ID" \
-            --team-id "$APPLE_TEAM_ID" \
-            --password "$APPLE_APP_PASSWORD" \
-            --wait
-          xcrun stapler staple dist/pb-darwin-arm64.pkg
-          xcrun stapler validate dist/pb-darwin-arm64.pkg
-          pkgutil --check-signature dist/pb-darwin-arm64.pkg
+            --output dist/pb-darwin-arm64.dmg \
+            --version "$RELEASE_VERSION"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-darwin-arm64
-          path: dist/pb-darwin-arm64.pkg
+          path: dist/pb-darwin-arm64.dmg
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
@@ -407,7 +371,7 @@ jobs:
               'pb-windows-arm64.exe',
               'pb-linux-amd64',
               'pb-linux-arm64',
-              'pb-darwin-arm64.pkg',
+              'pb-darwin-arm64.dmg',
           }
           root = Path('dist')
           actual = {path.name for path in root.iterdir() if path.is_file() and not path.is_symlink()}
@@ -564,7 +528,7 @@ jobs:
           if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repository):
               raise SystemExit('GitHub repository is invalid')
           expected = {
-              'pb-darwin-arm64.pkg': ('darwin', 'arm64', 'pkg'),
+              'pb-darwin-arm64.dmg': ('darwin', 'arm64', 'dmg'),
               'pb-linux-amd64': ('linux', 'amd64', 'elf'),
               'pb-linux-arm64': ('linux', 'arm64', 'elf'),
               'pb-windows-amd64.exe': ('windows', 'amd64', 'pe'),

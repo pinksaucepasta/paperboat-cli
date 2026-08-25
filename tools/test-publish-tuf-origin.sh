@@ -27,7 +27,7 @@ import sys
 
 version = sys.argv[2]
 assets = {
-    "pb-darwin-arm64.pkg": ("darwin", "arm64", "pkg"),
+    "pb-darwin-arm64.dmg": ("darwin", "arm64", "dmg"),
     "pb-linux-amd64": ("linux", "amd64", "elf"),
     "pb-linux-arm64": ("linux", "arm64", "elf"),
     "pb-windows-amd64.exe": ("windows", "amd64", "pe"),

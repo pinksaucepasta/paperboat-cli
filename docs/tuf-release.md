@@ -6,7 +6,7 @@ Paperboat publishes exactly five native release assets. Every asset is the compl
 - `pb-windows-arm64.exe`
 - `pb-linux-amd64`
 - `pb-linux-arm64`
-- `pb-darwin-arm64.pkg`
+- `pb-darwin-arm64.dmg`
 
 Linux assets are raw ELF executables. Windows assets are PE executables. The macOS asset is a signed and notarized arm64 installer package. The installed executable handles CLI, services, runtime, updates, and background roles through internal arguments.
 

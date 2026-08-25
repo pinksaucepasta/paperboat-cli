@@ -51,17 +51,14 @@ func TestVerifierRequiresDarwinCodeSignAndGatekeeper(t *testing.T) {
 
 func TestVerifierUsesInstallerChecksForDarwinPackage(t *testing.T) {
 	runner := &fakeRunner{}
-	if err := New(runner).Verify(context.Background(), "/release/pb-darwin-arm64.pkg", "darwin", "arm64"); err != nil {
+	if err := New(runner).Verify(context.Background(), "/release/pb-darwin-arm64.dmg", "darwin", "arm64"); err != nil {
 		t.Fatal(err)
 	}
-	if len(runner.calls) != 2 || runner.calls[0].name != "/usr/sbin/pkgutil" || runner.calls[1].name != "/usr/sbin/spctl" {
+	if len(runner.calls) != 1 || runner.calls[0].name != "/usr/bin/hdiutil" {
 		t.Fatalf("native calls = %#v", runner.calls)
 	}
-	if got := strings.Join(runner.calls[0].args, " "); got != "--check-signature /release/pb-darwin-arm64.pkg" {
-		t.Fatalf("pkgutil args = %q", got)
-	}
-	if got := strings.Join(runner.calls[1].args, " "); got != "--assess --type install --verbose=4 /release/pb-darwin-arm64.pkg" {
-		t.Fatalf("spctl args = %q", got)
+	if got := strings.Join(runner.calls[0].args, " "); got != "imageinfo /release/pb-darwin-arm64.dmg" {
+		t.Fatalf("hdiutil args = %q", got)
 	}
 }
 

@@ -152,7 +152,7 @@ type Config struct {
 	Hostd          Hostd
 	Health         HealthChecker
 	NativeVerifier NativeVerifier
-	// InstallPackage is the privileged macOS package boundary. A pkg is never
+	// InstallPackage is the privileged macOS package boundary. A dmg is never
 	// renamed into an executable slot; the installer returns the executable
 	// installed by the verified package so it can be staged atomically.
 	InstallPackage func(context.Context, string) (string, error)
@@ -799,7 +799,7 @@ func validateConfig(config Config) error {
 	}
 	activeMatches := regularMatches(config.Binary, config.Active.Length, config.Active.SHA256)
 	if config.Active.Platform == "darwin" {
-		// The signed Darwin release target is a PKG. The installed active
+		// The signed Darwin release target is a DMG. The installed active
 		// executable is the package payload, so its bytes cannot match the
 		// package digest. Format validation remains mandatory.
 		activeMatches = true
