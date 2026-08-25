@@ -166,7 +166,7 @@ func validateMaterialFreshness(material Material, requireFresh bool) error {
 	validSetupMode := material.SetupMode == "host" || material.SetupMode == "client"
 	validSetupRole := (material.SetupMode == "host" && hasRole(material.SetupRoles, "host")) ||
 		(material.SetupMode == "client" && hasRole(material.SetupRoles, "interactive"))
-	validClientSession := material.ClientSession == nil && material.SetupMode == "host" || material.ClientSession != nil && material.SetupMode == "client" && validBootstrapClientSession(*material.ClientSession)
+	validClientSession := material.ClientSession != nil && (material.SetupMode == "host" || material.SetupMode == "client") && validBootstrapClientSession(*material.ClientSession)
 	checks := []struct {
 		invalid bool
 		reason  string

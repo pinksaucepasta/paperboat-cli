@@ -45,7 +45,7 @@ func TestDashboardTokenPairingAndMaterialExchange(t *testing.T) {
 				return
 			}
 			manifest := descriptor(server.URL, "0.0.0-development")
-			_ = json.NewEncoder(writer).Encode(map[string]any{"data": Material{Schema: "paperboat.byod-installation/v1", UserMachineID: "um_1", UserMachineEnrollmentID: "ume_1", EnvironmentID: "env_1", ControlURL: server.URL, HelperID: "helper_1", EnrollmentID: "enroll_1", EnrollmentCredential: "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOP", ExpiresAt: expires, Artifact: &manifest, HelperListenAddress: "127.0.0.1:38080", InstallationGeneration: 1, SetupRoles: []string{"host"}, SetupMode: "host"}})
+			_ = json.NewEncoder(writer).Encode(map[string]any{"data": Material{Schema: "paperboat.byod-installation/v1", UserMachineID: "um_1", UserMachineEnrollmentID: "ume_1", EnvironmentID: "env_1", ControlURL: server.URL, HelperID: "helper_1", EnrollmentID: "enroll_1", EnrollmentCredential: "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOP", ExpiresAt: expires, Artifact: &manifest, HelperListenAddress: "127.0.0.1:38080", InstallationGeneration: 1, SetupRoles: []string{"host"}, SetupMode: "host", ClientSession: &ClientSession{Schema: "paperboat.cli-session/v1", SessionID: "cls_1", AccessToken: "access-012345678901234567890123456789", RefreshToken: "refresh-012345678901234567890123456789", TokenType: "Bearer", ExpiresIn: 3600}}})
 		default:
 			http.NotFound(writer, request)
 		}
@@ -169,7 +169,7 @@ func TestWaitForMaterialToleratesTransientNetworkErrors(t *testing.T) {
 			panic(http.ErrAbortHandler)
 		default:
 			manifest := descriptor(server.URL, "0.0.0-development")
-			_ = json.NewEncoder(writer).Encode(map[string]any{"data": Material{Schema: "paperboat.byod-installation/v1", UserMachineID: "um_1", UserMachineEnrollmentID: "ume_1", EnvironmentID: "env_1", ControlURL: server.URL, HelperID: "helper_1", EnrollmentID: "enroll_1", EnrollmentCredential: "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOP", ExpiresAt: expires, Artifact: &manifest, HelperListenAddress: "127.0.0.1:38080", InstallationGeneration: 1, SetupRoles: []string{"host"}, SetupMode: "host"}})
+			_ = json.NewEncoder(writer).Encode(map[string]any{"data": Material{Schema: "paperboat.byod-installation/v1", UserMachineID: "um_1", UserMachineEnrollmentID: "ume_1", EnvironmentID: "env_1", ControlURL: server.URL, HelperID: "helper_1", EnrollmentID: "enroll_1", EnrollmentCredential: "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOP", ExpiresAt: expires, Artifact: &manifest, HelperListenAddress: "127.0.0.1:38080", InstallationGeneration: 1, SetupRoles: []string{"host"}, SetupMode: "host", ClientSession: &ClientSession{Schema: "paperboat.cli-session/v1", SessionID: "cls_1", AccessToken: "access-012345678901234567890123456789", RefreshToken: "refresh-012345678901234567890123456789", TokenType: "Bearer", ExpiresIn: 3600}}})
 		}
 	}))
 	defer server.Close()
@@ -222,7 +222,7 @@ func TestRecoverMaterialIgnoresLocalPairingExpiry(t *testing.T) {
 		_ = json.NewEncoder(writer).Encode(map[string]any{"data": Material{
 			Schema: "paperboat.byod-installation/v1", UserMachineID: "um_1", UserMachineEnrollmentID: "ume_1", EnvironmentID: "env_1", ControlURL: server.URL,
 			HelperID: "helper_1", EnrollmentID: "enroll_1", EnrollmentCredential: "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOP", ExpiresAt: materialExpiry,
-			Artifact: &manifest, HelperListenAddress: "127.0.0.1:38080", InstallationGeneration: 1, SetupRoles: []string{"host"}, SetupMode: "host",
+			Artifact: &manifest, HelperListenAddress: "127.0.0.1:38080", InstallationGeneration: 1, SetupRoles: []string{"host"}, SetupMode: "host", ClientSession: &ClientSession{Schema: "paperboat.cli-session/v1", SessionID: "cls_1", AccessToken: "access-012345678901234567890123456789", RefreshToken: "refresh-012345678901234567890123456789", TokenType: "Bearer", ExpiresIn: 3600},
 		}})
 	}))
 	defer server.Close()
