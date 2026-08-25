@@ -348,14 +348,10 @@ func downloadVerifiedGitHubAsset(ctx context.Context, base *http.Client, rawURL,
 			client.Timeout = 5 * time.Minute
 		}
 	}
-	previousRedirect := client.CheckRedirect
 	client.CheckRedirect = func(request *http.Request, via []*http.Request) error {
 		host := strings.ToLower(request.URL.Hostname())
 		if len(via) >= 5 || request.URL.Scheme != "https" || request.URL.User != nil || host != "github.com" && !strings.HasSuffix(host, ".githubusercontent.com") && !strings.HasSuffix(host, ".blob.core.windows.net") {
 			return ErrArtifactTarget
-		}
-		if previousRedirect != nil {
-			return previousRedirect(request, via)
 		}
 		return nil
 	}
