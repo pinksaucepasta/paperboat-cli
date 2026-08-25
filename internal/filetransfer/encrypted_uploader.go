@@ -5,6 +5,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/pinksaucepasta/paperboat/internal/diagnosticlog"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/transfercrypto"
 	"github.com/pinksaucepasta/paperboat/internal/resolver"
 )
@@ -15,6 +16,10 @@ type EncryptedUploader struct {
 	Target     resolver.ConnectInfo
 	Retention  time.Duration
 	Generation uint64
+	// CleanupWarning reports a local sender-key cleanup failure after the host
+	// has durably delivered and acknowledged the batch. The callback must not
+	// reinterpret that irreversible delivery as a failed upload.
+	CleanupWarning func(error)
 }
 
 func (u *EncryptedUploader) SendBatch(ctx context.Context, batchID, sessionID string, sources []Source) (Batch, error) {
@@ -44,7 +49,10 @@ func (u *EncryptedUploader) SendBatch(ctx context.Context, batchID, sessionID st
 		return Batch{}, err
 	}
 	if err := u.Keys.Erase(batchID); err != nil {
-		return Batch{}, err
+		diagnosticlog.TryInfo("delivered file transfer sender-key cleanup failed", "batch_id", batchID, "error", err)
+		if u.CleanupWarning != nil {
+			u.CleanupWarning(err)
+		}
 	}
 	return batch, nil
 }

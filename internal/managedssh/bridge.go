@@ -136,12 +136,13 @@ func BridgeSSH(ctx context.Context, stream io.ReadWriteCloser, target LoopbackTa
 		err = normalizeBridgeError(err)
 		if half, ok := stream.(interface{ CloseWrite() error }); ok {
 			_ = half.CloseWrite()
-		} else {
-			finish()
 		}
-		if err != nil {
-			finish()
-		}
+		// Target EOF is terminal for an SSH connection. Some OpenSSH clients
+		// keep ProxyCommand input open until the proxy exits, so waiting for the
+		// opposite copier here deadlocks after a remote command has completed.
+		// Drain target output, publish its FIN, then close both read sides to
+		// unblock the client-to-target copier.
+		finish()
 		results <- copyResult{direction: "from_sshd", bytes: count, err: err}
 	}()
 	var result BridgeResult

@@ -19,6 +19,7 @@ import (
 
 	"github.com/pinksaucepasta/paperboat/internal/buildinfo"
 	"github.com/pinksaucepasta/paperboat/internal/config"
+	"github.com/pinksaucepasta/paperboat/internal/remotepath"
 )
 
 // ErrUnauthenticated means the server rejected the reused credential. Callers
@@ -362,6 +363,22 @@ type PendingEndpointIdentity struct {
 	SafetyCode     string    `json:"safety_code"`
 }
 
+// EndpointRequestStatus is the account-scoped authoritative state of a
+// one-shot endpoint enrollment request. It contains public keys only.
+type EndpointRequestStatus struct {
+	RequestID      string    `json:"request_id"`
+	AccountID      string    `json:"account_id"`
+	EndpointID     string    `json:"endpoint_id"`
+	Role           string    `json:"role"`
+	Generation     uint64    `json:"generation"`
+	NoisePublicKey string    `json:"noise_public_key"`
+	QUICPublicKey  string    `json:"quic_public_key"`
+	CreatedAt      time.Time `json:"created_at"`
+	ExpiresAt      time.Time `json:"expires_at"`
+	SafetyCode     string    `json:"safety_code"`
+	State          string    `json:"state"`
+}
+
 // CLIEndpointRequestInput contains only public endpoint keys. The request is
 // signed later by an already paired CLI and never carries a root private key.
 type CLIEndpointRequestInput struct {
@@ -398,6 +415,21 @@ func (c *Client) RequestCLIEndpoint(ctx context.Context, input CLIEndpointReques
 	var out PendingEndpointIdentity
 	if err := c.doWithHeaders(ctx, http.MethodPost, "/v1/e2ee/endpoint-requests", input, &out, http.Header{"Idempotency-Key": []string{input.OperationID}}); err != nil {
 		return PendingEndpointIdentity{}, err
+	}
+	return out, nil
+}
+
+// CLIEndpointRequestStatus reads one enrollment request through the
+// authenticated account boundary. The server deliberately returns not found
+// for both a missing request and a request owned by another account.
+func (c *Client) CLIEndpointRequestStatus(ctx context.Context, requestID string) (EndpointRequestStatus, error) {
+	if strings.TrimSpace(requestID) == "" {
+		return EndpointRequestStatus{}, errors.New("CLI endpoint enrollment request identity is invalid")
+	}
+	var out EndpointRequestStatus
+	path := "/v1/e2ee/endpoint-requests/" + url.PathEscape(requestID)
+	if err := c.doStrict(ctx, http.MethodGet, path, nil, &out); err != nil {
+		return EndpointRequestStatus{}, err
 	}
 	return out, nil
 }
@@ -647,6 +679,30 @@ func (c *Client) StartMachineEnrollment(ctx context.Context, idempotencyKey stri
 func (c *Client) SetupMachine(ctx context.Context, input MachineSetupInput) (UserMachine, error) {
 	var out UserMachine
 	err := c.do(ctx, http.MethodPost, "/v1/machines/setup", input, &out)
+	return out, err
+}
+
+type AuthenticatedHostSetupInput struct {
+	Verifier                string          `json:"verifier"`
+	PublicIdentityKey       string          `json:"public_identity_key"`
+	InstallationGeneration  int64           `json:"installation_generation"`
+	SetupMode               string          `json:"setup_mode"`
+	Artifact                MachineArtifact `json:"artifact"`
+	SSHUser                 string          `json:"ssh_user,omitempty"`
+	SSHPort                 uint16          `json:"ssh_port,omitempty"`
+	CanReuseRuntimeIdentity bool            `json:"can_reuse_runtime_identity,omitempty"`
+}
+
+type AuthenticatedHostSetupInstallation struct {
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+func (c *Client) PrepareAuthenticatedHostSetup(ctx context.Context, machineID, operationID string, input AuthenticatedHostSetupInput) (AuthenticatedHostSetupInstallation, error) {
+	if strings.TrimSpace(machineID) == "" || len(strings.TrimSpace(operationID)) < 8 {
+		return AuthenticatedHostSetupInstallation{}, errors.New("authenticated Host setup request is invalid")
+	}
+	var out AuthenticatedHostSetupInstallation
+	err := c.doWithHeaders(ctx, http.MethodPost, "/v1/machines/"+url.PathEscape(machineID)+"/host-setup-installations", input, &out, http.Header{"Idempotency-Key": []string{operationID}})
 	return out, err
 }
 
@@ -1537,33 +1593,13 @@ func (c *Client) MachineSSHDescriptor(ctx context.Context, machineID, operationI
 func validateOperationDescriptor(out ExecDescriptor, machineID, operationID, expectedScope, operationKind string) error {
 	quic, quicErr := url.Parse(out.Endpoints.QUIC)
 	wss, wssErr := url.Parse(out.Endpoints.WSS)
-	if out.OperationID != operationID || out.Environment == nil || out.Environment.ID == "" || out.Environment.Kind != "byod" || out.Environment.ResourceID != machineID || out.Environment.State != "ready" || !remoteAbsolutePath(out.Environment.Root) ||
+	if out.OperationID != operationID || out.Environment == nil || out.Environment.ID == "" || out.Environment.Kind != "byod" || out.Environment.ResourceID != machineID || out.Environment.State != "ready" || !remotepath.Absolute(out.Environment.Root) ||
 		quicErr != nil || quic.Scheme != "quic" || quic.Hostname() == "" || quic.User != nil || quic.Path != "" || quic.RawQuery != "" || quic.Fragment != "" ||
 		wssErr != nil || wss.Scheme != "wss" || wss.Hostname() == "" || wss.User != nil || wss.Path != "/v1/runtime" || wss.RawQuery != "" || wss.Fragment != "" ||
 		out.Auth.Method != "bearer" || out.Auth.Token == "" || len(out.Auth.Scopes) != 1 || out.Auth.Scopes[0] != expectedScope || out.ExpiresAt.IsZero() || out.Auth.ExpiresAt.IsZero() || !out.ExpiresAt.Equal(out.Auth.ExpiresAt) {
 		return fmt.Errorf("invalid %s descriptor", operationKind)
 	}
 	return nil
-}
-
-// remoteAbsolutePath validates a path described by a remote host. filepath.IsAbs
-// cannot be used here because its result depends on the client's operating
-// system, while a Windows client can consume a Linux descriptor and vice versa.
-func remoteAbsolutePath(value string) bool {
-	if value == "" || strings.ContainsRune(value, 0) {
-		return false
-	}
-	if strings.HasPrefix(value, "/") {
-		return true
-	}
-	if len(value) >= 3 && ((value[0] >= 'A' && value[0] <= 'Z') || (value[0] >= 'a' && value[0] <= 'z')) && value[1] == ':' && (value[2] == '\\' || value[2] == '/') {
-		return true
-	}
-	if strings.HasPrefix(value, `\\`) {
-		parts := strings.Split(strings.TrimPrefix(value, `\\`), `\`)
-		return len(parts) >= 2 && parts[0] != "" && parts[1] != ""
-	}
-	return false
 }
 
 func (c *Client) MachineFileTransferDescriptor(ctx context.Context, destinationMachineID, sourceMachineID, sessionID string) (FileTransfer, error) {

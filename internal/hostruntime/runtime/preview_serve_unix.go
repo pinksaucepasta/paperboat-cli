@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -35,10 +36,76 @@ type ProductionServeWorkerConfig struct {
 	PreviewRunner     servepkg.PreviewRunner
 }
 
+var errPreviewControlOrigin = errors.New("preview control origin unavailable")
+
+const (
+	windowsPreviewOwnerWorkloadEnv = "PAPERBOAT_WINDOWS_PREVIEW_OWNER_WORKLOAD"
+	windowsPreviewServiceScopeEnv  = "PAPERBOAT_RUNTIME_SERVICE_SCOPE"
+	windowsPreviewControlURLEnv    = "PAPERBOAT_CONTROL_URL"
+)
+
+// resolveWindowsOwnerControlURL resolves the control-plane origin passed to a
+// Windows owner workload. The SCM parent injects PAPERBOAT_CONTROL_URL when it
+// launches the enrolled owner through S4U. A readable registration remains an
+// independent check: if it exists, both values must identify the same exact
+// HTTPS origin. Registration read failures are tolerated here because the
+// service environment is the fallback specifically for the S4U boundary.
+func resolveWindowsOwnerControlURL(configured string, registration identity.Registration, registrationErr error) (string, error) {
+	if strings.TrimSpace(configured) != "" {
+		return configured, nil
+	}
+	configuredOrigin, err := exactHTTPSOrigin(os.Getenv(windowsPreviewControlURLEnv))
+	if err != nil {
+		return "", errors.Join(ErrProductionInvalid, errPreviewControlOrigin)
+	}
+	if registrationErr == nil {
+		registrationOrigin, registrationURLerr := exactHTTPSOrigin(registration.ServerURL)
+		if registrationURLerr != nil || registrationOrigin != configuredOrigin {
+			return "", errors.Join(ErrProductionInvalid, errPreviewControlOrigin)
+		}
+		// Keep the registration spelling when it is readable. The downstream
+		// worker compares its configured URL with registration.ServerURL.
+		return registration.ServerURL, nil
+	}
+	return configuredOrigin, nil
+}
+
+func exactHTTPSOrigin(raw string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" || strings.HasSuffix(parsed.Host, ":") || parsed.User != nil || parsed.Opaque != "" || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || parsed.RawFragment != "" || parsed.Path != "" && parsed.Path != "/" || parsed.RawPath != "" && parsed.RawPath != "/" {
+		return "", errPreviewControlOrigin
+	}
+	parsed.Scheme = "https"
+	parsed.Host = strings.ToLower(parsed.Host)
+	parsed.Path = ""
+	parsed.RawPath = ""
+	return parsed.String(), nil
+}
+
+func persistPreviewWorkerStartupFailure(path string, descriptor PreviewRuntimeDescriptor) error {
+	return persistPreviewRuntimeFailure(path, &descriptor, previewFailureWorkerStart)
+}
+
+func persistPreviewRuntimeFailure(path string, descriptor *PreviewRuntimeDescriptor, code string) error {
+	if descriptor == nil || !validPreviewRuntimeFailureCode(code) {
+		return ErrProductionInvalid
+	}
+	descriptor.Port = 0
+	descriptor.Record = &preview.ControlRecord{LogicalName: descriptor.Name, State: "failed", ExpiresAt: descriptor.ExpiresAt}
+	descriptor.Failure = &PreviewRuntimeFailure{Code: code}
+	return writePreviewRuntimeDescriptor(path, *descriptor)
+}
+
 func RunProductionServeWorker(ctx context.Context, config ProductionServeWorkerConfig) error {
 	if ctx == nil || !filepath.IsAbs(config.StateRoot) || config.Name == "" || !filepath.IsAbs(config.DescriptorPath) ||
 		config.ServiceDefinition != "" && !filepath.IsAbs(config.ServiceDefinition) || config.Indefinite == (config.ExpiresAt != nil) {
 		return ErrProductionInvalid
+	}
+	if runtime.GOOS == "windows" {
+		expectedDescriptorPath := filepath.Join(config.StateRoot, "previews", "active", previewServiceInstance(config.Name)+".json")
+		if filepath.Clean(config.DescriptorPath) != config.DescriptorPath || !strings.EqualFold(config.DescriptorPath, expectedDescriptorPath) {
+			return ErrProductionInvalid
+		}
 	}
 	descriptor, err := readPreviewRuntimeDescriptor(config.DescriptorPath)
 	if err != nil || descriptor.Schema != "paperboat.preview-runtime/v1" || descriptor.Name != config.Name ||
@@ -46,10 +113,11 @@ func RunProductionServeWorker(ctx context.Context, config ProductionServeWorkerC
 		!samePreviewExpiry(descriptor.ExpiresAt, config.ExpiresAt) || !validServeRuntimeDescriptor(descriptor.Serve) {
 		return errors.Join(ErrProductionInvalid, err)
 	}
-	registrationStore, err := identity.Open(identity.Config{StateRoot: config.StateRoot})
+	registrationStore, registrationOpenErr := identity.Open(identity.Config{StateRoot: config.StateRoot})
 	var registration identity.Registration
-	if err == nil {
-		registration, _ = registrationStore.Registration()
+	registrationErr := registrationOpenErr
+	if registrationOpenErr == nil {
+		registration, registrationErr = registrationStore.Registration()
 	}
 	logger, err := observability.NewLogger(slog.Default())
 	if err != nil {
@@ -57,6 +125,13 @@ func RunProductionServeWorker(ctx context.Context, config ProductionServeWorkerC
 	}
 	logEvent := func(operation, result string, duration time.Duration) {
 		_ = logger.Log(context.Background(), observability.Event{Component: "serve", Operation: operation, Result: result, Duration: duration, MachineID: registration.MachineID, State: result, Role: "detached", Generation: descriptor.ServiceGeneration})
+	}
+	if descriptor.Serve.Visibility == "public" && strings.TrimSpace(config.ControlURL) == "" && runtime.GOOS == "windows" && os.Getenv(windowsPreviewOwnerWorkloadEnv) == "1" && os.Getenv(windowsPreviewServiceScopeEnv) == "user" {
+		resolvedControlURL, resolveErr := resolveWindowsOwnerControlURL(config.ControlURL, registration, registrationErr)
+		if resolveErr != nil {
+			return errors.Join(resolveErr, persistPreviewRuntimeFailure(config.DescriptorPath, &descriptor, previewFailureControlOrigin))
+		}
+		config.ControlURL = resolvedControlURL
 	}
 	restartStarted := time.Now()
 	source, err := servepkg.ResolvePinnedSource(descriptor.Serve.SourcePath, descriptor.Serve.SourceKind, descriptor.Serve.SourceIdentity)
@@ -75,7 +150,9 @@ func RunProductionServeWorker(ctx context.Context, config ProductionServeWorkerC
 	if config.ExpiresAt != nil {
 		duration = time.Until(config.ExpiresAt.UTC())
 		if duration <= 0 {
-			_ = os.Remove(config.DescriptorPath)
+			if err := os.Remove(config.DescriptorPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
 			return nil
 		}
 	}
@@ -95,6 +172,9 @@ func RunProductionServeWorker(ctx context.Context, config ProductionServeWorkerC
 			return startErr
 		}
 		waitErr := local.Wait()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		cleanupErr := retireCompletedServeService(context.Background(), config.Name, config.DescriptorPath, config.ServiceDefinition, config.ServiceRunner)
 		return errors.Join(waitErr, cleanupErr)
 	}
@@ -123,16 +203,28 @@ func RunProductionServeWorker(ctx context.Context, config ProductionServeWorkerC
 	})
 	if err != nil {
 		if errors.Is(err, context.Canceled) && ctx.Err() != nil {
-			return retireCompletedServeService(context.Background(), config.Name, config.DescriptorPath, config.ServiceDefinition, config.ServiceRunner)
+			// The service supervisor can stop the worker while public preview
+			// readiness is still in progress. Keep the durable descriptor and unit
+			// so the same serve can resume after restart or reboot.
+			return ctx.Err()
 		}
 		return err
 	}
 	waitErr := foreground.Wait()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	cleanupErr := retireCompletedServeService(context.Background(), config.Name, config.DescriptorPath, config.ServiceDefinition, config.ServiceRunner)
 	return errors.Join(waitErr, cleanupErr)
 }
 
 func reconcileInvalidServeSource(ctx context.Context, config ProductionServeWorkerConfig, public bool) error {
+	if runtime.GOOS == "windows" {
+		expectedDescriptorPath := filepath.Join(config.StateRoot, "previews", "active", previewServiceInstance(config.Name)+".json")
+		if filepath.Clean(config.DescriptorPath) != config.DescriptorPath || !strings.EqualFold(config.DescriptorPath, expectedDescriptorPath) {
+			return ErrProductionInvalid
+		}
+	}
 	if public {
 		if err := revokeProductionPreviewByName(ctx, config.ControlURL, config.StateRoot, config.Name, config.Transport); err != nil {
 			return err
@@ -143,7 +235,7 @@ func reconcileInvalidServeSource(ctx context.Context, config ProductionServeWork
 		runner = hostservice.ExecRunner{}
 	}
 	if config.ServiceDefinition != "" {
-		if err := retirePreviewService(ctx, config.Name, config.ServiceDefinition, runner); err != nil {
+		if err := retirePreviewServiceWithRoot(ctx, config.StateRoot, config.Name, config.ServiceDefinition, runner); err != nil {
 			return err
 		}
 	}

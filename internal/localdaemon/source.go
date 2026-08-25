@@ -27,6 +27,9 @@ type AuthenticatedMachineSource struct {
 	// list is loaded. Production wires this to the account-root signer so a
 	// one-shot enrollment never requires a separate trust-approval command.
 	AutoApprovePeerEnrollments func(context.Context, *api.Client, []api.UserMachine) error
+	// ReportPeerApprovalSignerUnavailable observes the one non-fatal approval
+	// condition without making ordinary machine inventory unavailable.
+	ReportPeerApprovalSignerUnavailable func(PeerApprovalSignerUnavailableError)
 }
 
 func (s *AuthenticatedMachineSource) SetManagedSSHReadiness(ready bool, code string) {
@@ -212,7 +215,13 @@ func (s AuthenticatedMachineSource) ListUserMachines(ctx context.Context) ([]api
 	}
 	if s.AutoApprovePeerEnrollments != nil {
 		if err := s.AutoApprovePeerEnrollments(ctx, client, machines); err != nil {
-			return nil, err
+			var unavailable *PeerApprovalSignerUnavailableError
+			if !errors.As(err, &unavailable) {
+				return nil, err
+			}
+			if s.ReportPeerApprovalSignerUnavailable != nil {
+				s.ReportPeerApprovalSignerUnavailable(*unavailable)
+			}
 		}
 	}
 	for index := range machines {
@@ -223,6 +232,34 @@ func (s AuthenticatedMachineSource) ListUserMachines(ctx context.Context) ([]api
 		machines[index].SSHLocalCode = s.SSHLocalCode
 	}
 	return reconcileSSHAuthorities(ctx, client, machines)
+}
+
+// RateLimitedPeerApprovalReporter bounds repeated diagnostics from inventory
+// refreshes. The returned closure is concurrency-safe and reports immediately,
+// then at most once per interval.
+func RateLimitedPeerApprovalReporter(clock func() time.Time, interval time.Duration, report func(PeerApprovalSignerUnavailableError)) func(PeerApprovalSignerUnavailableError) {
+	if clock == nil {
+		clock = time.Now
+	}
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	var mu sync.Mutex
+	var last time.Time
+	return func(issue PeerApprovalSignerUnavailableError) {
+		if report == nil {
+			return
+		}
+		now := clock()
+		mu.Lock()
+		if !last.IsZero() && now.Sub(last) < interval {
+			mu.Unlock()
+			return
+		}
+		last = now
+		mu.Unlock()
+		report(issue)
+	}
 }
 
 func reconcileSSHAuthorities(ctx context.Context, client *api.Client, machines []api.UserMachine) ([]api.UserMachine, error) {

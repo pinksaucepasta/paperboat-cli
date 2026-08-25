@@ -16,6 +16,7 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/api"
 	"github.com/pinksaucepasta/paperboat/internal/diagnosticlog"
 	identitystore "github.com/pinksaucepasta/paperboat/internal/hostruntime/identity"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/server"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/candidatelease"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/connectionmanager"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/directpath"
@@ -510,8 +511,11 @@ func (s *Service) serveDirectTransport(ctx context.Context, document api.PeerAtt
 				_ = stream.Close()
 				return
 			}
+			boundAuthorizer := func(authorizeCtx context.Context, value streamauth.Header) (server.Authorization, error) {
+				return s.authorizeStream(authorizeCtx, document, value)
+			}
 			if header.Resumable {
-				resumeErr := s.config.AuthorizeStream(transportCtx, header)
+				_, resumeErr := boundAuthorizer(transportCtx, header)
 				if resumeErr == nil {
 					resumeErr = s.streams.Attach(authority.PeerEndpointID(), header, connection, s.config.ServeStream, activity)
 				}
@@ -524,7 +528,7 @@ func (s *Service) serveDirectTransport(ctx context.Context, document api.PeerAtt
 				activity.Open()
 				defer activity.Close()
 			}
-			if err := DispatchParsedStream(transportCtx, header, connection, s.config.AuthorizeStream, s.config.ServeStream); err != nil && s.config.ObserveError != nil {
+			if err := DispatchParsedStream(transportCtx, header, connection, boundAuthorizer, s.config.ServeStream); err != nil && s.config.ObserveError != nil {
 				s.config.ObserveError(err)
 			}
 		}()

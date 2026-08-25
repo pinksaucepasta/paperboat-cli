@@ -24,6 +24,7 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/enrollment"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostinstall"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/identity"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/machinecontrol"
 	"github.com/pinksaucepasta/paperboat/internal/httptransport"
 	"github.com/pinksaucepasta/paperboat/internal/machinename"
 	"github.com/pinksaucepasta/paperboat/internal/windows/elevation"
@@ -102,6 +103,9 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	resumeExpired := errors.Is(resumeErr, bootstrap.ErrResumeExpired)
 	if errors.Is(resumeErr, bootstrap.ErrResumeExpired) {
 		if !resume.PairingStarted {
+			if resume.AuthenticatedSetup {
+				return bootstrap.ErrResumeExpired
+			}
 			if err := bootstrap.ClearResume(*stateRoot); err != nil {
 				return fmt.Errorf("clear expired unpaired machine enrollment state: %w", err)
 			}
@@ -122,6 +126,9 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	if errors.Is(resumeErr, bootstrap.ErrResumeNotFound) && tokenFileErr != nil {
 		return errors.New("enrollment token file must be an absolute regular non-reparse file")
 	}
+	// Reusable means the bound identity can prove a renewal, including after
+	// expiry. Reuse material is always passed through the renewing token source
+	// below before it is treated as ready for machine-control bootstrap.
 	_, reusableIdentityErr := enrollment.LoadRuntimeIdentityForRenewal(*stateRoot, time.Now().UTC())
 	sshConfig := windowsopenssh.DefaultConfig(nil)
 	if errors.Is(resumeErr, bootstrap.ErrResumeNotFound) {
@@ -146,12 +153,14 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 		// Poll before creating a pairing whenever a journal exists. This closes
 		// the crash window where CreatePairing committed on the server but the
 		// client lost its response or could not persist the returned Pairing.
-		if resumeExpired {
+		if resume.AuthenticatedSetup {
+			material, err = recoverAuthenticatedSetupMaterial(ctx, config, resume, resumeExpired, defaultOneShotResumeOperations())
+		} else if resumeExpired {
 			material, err = bootstrap.RecoverMaterial(ctx, config, resume.RuntimeEnrolled)
 		} else {
 			material, err = bootstrap.WaitForMaterial(ctx, config, resume.PairingExpiresAt, 2*time.Second)
 		}
-		if errors.Is(err, bootstrap.ErrInstallationUnavailable) {
+		if !resume.AuthenticatedSetup && errors.Is(err, bootstrap.ErrInstallationUnavailable) {
 			if resumeExpired && resume.PairingStarted {
 				// Never replace an expired paired journal with a new enrollment.
 				// Its verifier is the durable recovery binding for the server-issued
@@ -192,6 +201,11 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 				return err
 			}
 		}
+		if resume.AuthenticatedSetup {
+			if err := bootstrap.ValidateAuthenticatedSetupMaterial(resume, material); err != nil {
+				return err
+			}
+		}
 		resume.PairingStarted = true
 		resume.Material = &material
 		if err := bootstrap.SaveResume(*stateRoot, resume); err != nil {
@@ -201,6 +215,11 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	if *tokenFile != "" && tokenFileErr == nil {
 		if err := bootstrap.ConsumeEnrollmentTokenFile(*tokenFile); err != nil {
 			return fmt.Errorf("consume enrollment token file: %w", err)
+		}
+	}
+	if resume.AuthenticatedSetup {
+		if err := bootstrap.ValidateAuthenticatedSetupMaterial(resume, material); err != nil {
+			return err
 		}
 	}
 	if err := saveBootstrapRegistration(identityStore, *serverURL, material, windowsAccountName(account.Username), sshConfig.Port); err != nil {
@@ -218,18 +237,24 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 			return fmt.Errorf("persist CLI enrollment progress: %w", err)
 		}
 	}
-	artifactPath, err := bootstrap.FetchVerifiedArtifact(ctx, *material.Artifact, filepath.Join(*stateRoot, "tuf"), windowsArtifactHTTPClient())
-	if err != nil {
-		return err
-	}
-	if !resume.RuntimeEnrolled {
-		if err := ensureWindowsRuntimeEnrollment(ctx, material, *stateRoot); err != nil {
-			return err
-		}
+	artifactPath, err := prepareWindowsBootstrapRuntime(ctx, material.ReuseIdentity, resume.RuntimeEnrolled, func(ctx context.Context) error {
+		return ensureWindowsRuntimeEnrollment(ctx, material, *stateRoot)
+	}, func() error {
 		resume.RuntimeEnrolled = true
 		if err := bootstrap.SaveResume(*stateRoot, resume); err != nil {
 			return fmt.Errorf("persist runtime enrollment progress: %w", err)
 		}
+		return nil
+	}, func(ctx context.Context) error {
+		if err := ensureWindowsMachineControl(ctx, material, *stateRoot); err != nil {
+			return fmt.Errorf("persist machine control credential: %w", err)
+		}
+		return nil
+	}, func(ctx context.Context) (string, error) {
+		return bootstrap.FetchVerifiedArtifact(ctx, *material.Artifact, filepath.Join(*stateRoot, "tuf"), windowsArtifactHTTPClient())
+	})
+	if err != nil {
+		return err
 	}
 	request := hostinstall.Request{Schema: hostinstall.SchemaV1, Platform: runtime.GOOS, User: windowsAccountName(account.Username), Group: "Paperboat", OwnerSID: sid, Executable: artifactPath, Artifact: *material.Artifact, Home: home, Path: os.Getenv("PATH"), StateRoot: *stateRoot, WorkspaceRoot: home, ControlURL: material.ControlURL, UserMachineID: material.UserMachineID, Shell: filepath.Join(os.Getenv("WINDIR"), "System32", "WindowsPowerShell", "v1.0", "powershell.exe"), HelperListenAddress: material.HelperListenAddress, SetupMode: *setupMode}
 	if err := hostinstall.Validate(request, 0); err != nil {
@@ -251,19 +276,66 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 }
 
 func ensureWindowsRuntimeEnrollment(ctx context.Context, material bootstrap.Material, stateRoot string) error {
-	runtimeIdentity, loadErr := enrollment.LoadRuntimeIdentityForRenewal(stateRoot, time.Now().UTC())
-	required, err := runtimeEnrollmentRequired(runtimeIdentity, loadErr, material)
+	now := time.Now().UTC()
+	runtimeIdentity, loadErr := enrollment.LoadRuntimeIdentity(stateRoot, now)
+	renewableIdentity := runtimeIdentity
+	renewalLoadErr := loadErr
+	if loadErr != nil {
+		renewableIdentity, renewalLoadErr = enrollment.LoadRuntimeIdentityForRenewal(stateRoot, now)
+	}
+	action, err := planRuntimeEnrollment(runtimeIdentity, loadErr, renewableIdentity, renewalLoadErr, material)
 	if err != nil {
 		return err
 	}
-	if !required {
+	switch action {
+	case runtimeEnrollmentReuse:
+		return nil
+	case runtimeEnrollmentRenew:
+		source, sourceErr := enrollment.NewRenewingTokenSource(enrollment.RenewingTokenConfig{
+			ControlURL: material.ControlURL,
+			StateRoot:  stateRoot,
+			Transport:  httptransport.Default(),
+			Timeout:    15 * time.Second,
+			OperationID: func() (string, error) {
+				var value [16]byte
+				if _, err := rand.Read(value[:]); err != nil {
+					return "", err
+				}
+				return "bootstrap-runtime-renew-" + base64.RawURLEncoding.EncodeToString(value[:]), nil
+			},
+		})
+		if sourceErr != nil {
+			return sourceErr
+		}
+		if _, err = source.Token(ctx); err != nil {
+			return err
+		}
+		readyIdentity, readyErr := enrollment.LoadRuntimeIdentity(stateRoot, time.Now().UTC())
+		if readyErr != nil || !runtimeIdentityMatches(readyIdentity, material) {
+			return errors.New("renewed runtime identity is unavailable or mismatched")
+		}
+		return nil
+	case runtimeEnrollmentEnroll:
+		client, clientErr := enrollment.NewClient(nil, 15*time.Second)
+		if clientErr != nil {
+			return clientErr
+		}
+		_, err = client.Enroll(ctx, enrollment.Config{ControlURL: material.ControlURL, StateRoot: stateRoot, EnrollmentCredential: material.EnrollmentCredential})
+		return err
+	default:
+		return errors.New("runtime enrollment action is invalid")
+	}
+}
+
+func ensureWindowsMachineControl(ctx context.Context, material bootstrap.Material, stateRoot string) error {
+	if material.SetupMode != "client" {
 		return nil
 	}
-	client, clientErr := enrollment.NewClient(nil, 15*time.Second)
-	if clientErr != nil {
-		return clientErr
+	source, err := machinecontrol.NewSource(machinecontrol.Config{ControlURL: material.ControlURL, StateRoot: stateRoot, Timeout: 15 * time.Second})
+	if err != nil {
+		return err
 	}
-	_, err = client.Enroll(ctx, enrollment.Config{ControlURL: material.ControlURL, StateRoot: stateRoot, EnrollmentCredential: material.EnrollmentCredential})
+	_, err = source.EnsureInitial(ctx)
 	return err
 }
 

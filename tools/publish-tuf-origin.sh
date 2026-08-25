@@ -105,6 +105,23 @@ transaction=$(mktemp -d "$staging/activation-${version}.XXXXXX")
 next="$transaction/next"
 mkdir "$next"
 tar -xzf "$bundle" -C "$next" --no-same-owner --no-same-permissions
+
+# Keep immutable content-addressed targets referenced by metadata already
+# cached by older clients. New candidate targets win; missing historical
+# blobs are hard-linked from the current tree without network transfer or
+# duplicate disk allocation. Both trees live under the same release root.
+historical_targets="$live/tuf/targets"
+[[ -d "$historical_targets" && ! -L "$historical_targets" ]] || { echo "historical TUF targets are unavailable" >&2; exit 1; }
+[[ -z "$(find "$historical_targets" -mindepth 1 -type d -print -quit)" ]] || { echo "historical TUF targets contain nested paths" >&2; exit 1; }
+[[ -z "$(find "$historical_targets" -mindepth 1 ! -type f -print -quit)" ]] || { echo "historical TUF targets contain a non-regular file" >&2; exit 1; }
+while IFS= read -r -d '' historical; do
+  name=${historical#"$historical_targets/"}
+  destination="$next/tuf/targets/$name"
+  if [[ ! -e "$destination" ]]; then
+    ln "$historical" "$destination"
+  fi
+done < <(find "$historical_targets" -mindepth 1 -maxdepth 1 -type f -print0)
+
 [[ -z "$(find "$next" -type l -print -quit)" ]] || { echo "staged release contains a symlink" >&2; exit 1; }
 
 python3 - "$next/current.json" "$version" <<'PY'

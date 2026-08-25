@@ -60,11 +60,21 @@ func RunProductionPreviewWorker(ctx context.Context, config ProductionPreviewWor
 		}
 		durable = &descriptor
 	}
+	startupFailure := func(code string, cause error) error {
+		if cause == nil || errors.Is(cause, context.Canceled) {
+			return cause
+		}
+		slog.Error("public preview startup failed", "stage", code, "duration_ms", time.Since(startedAt).Milliseconds(), "error", cause)
+		if durable == nil {
+			return cause
+		}
+		return errors.Join(cause, persistPreviewRuntimeFailure(config.DescriptorPath, durable, code))
+	}
 	if config.ServiceDefinition != "" && (durable == nil || durable.Serve == nil) {
 		home, homeErr := os.UserHomeDir()
 		expected, _, pathErr := previewServiceDefinition(home, config.Name, runtime.GOOS)
 		if homeErr != nil || pathErr != nil || config.ServiceDefinition != expected {
-			return errors.Join(ErrProductionInvalid, homeErr, pathErr)
+			return startupFailure(previewFailureServiceDefinition, errors.Join(ErrProductionInvalid, homeErr, pathErr))
 		}
 		runner := config.ServiceRunner
 		if runner == nil {
@@ -89,35 +99,46 @@ func RunProductionPreviewWorker(ctx context.Context, config ProductionPreviewWor
 	}
 	store, err := identity.Open(identity.Config{StateRoot: config.StateRoot})
 	if err != nil {
-		return err
+		return startupFailure(previewFailureIdentityOpen, err)
 	}
+	stage("identity_open")
 	registration, err := store.Registration()
-	if err != nil || registration.ServerURL != controlURL.String() {
-		return ErrProductionInvalid
+	if err != nil {
+		return startupFailure(previewFailureRegistration, err)
 	}
+	if registration.ServerURL != controlURL.String() {
+		return startupFailure(previewFailureRegistration, ErrProductionInvalid)
+	}
+	stage("registration")
 	machines, err := machinecontrol.NewSource(machinecontrol.Config{ControlURL: controlURL.String(), StateRoot: config.StateRoot, Transport: config.Transport})
 	if err != nil {
-		return err
+		return startupFailure(previewFailureMachineControl, err)
 	}
+	stage("machine_control_source")
 	operationID := func() (string, error) { return randomProductionOperationID() }
 	credentials, err := preview.NewCredentialSource(preview.CredentialSourceConfig{Endpoint: controlURL.ResolveReference(&url.URL{Path: "/v1/previews/credentials"}).String(), AllowedHosts: []string{controlURL.Hostname()}, Identities: machines, Proofs: machines, OperationID: operationID, Transport: config.Transport})
 	if err != nil {
-		return err
+		return startupFailure(previewFailureCredentials, err)
 	}
+	stage("credential_source")
 	control, err := preview.NewControlClient(preview.ControlClientConfig{Endpoint: controlURL.ResolveReference(&url.URL{Path: "/v1/previews/operations"}).String(), AllowedHosts: []string{controlURL.Hostname()}, EnvironmentID: registration.EnvironmentID, Tokens: credentials, Identities: machines, Proofs: machines, Transport: config.Transport})
 	if err != nil {
-		return err
+		return startupFailure(previewFailureControlClient, err)
 	}
+	stage("control_client")
 	target := preview.Target{Host: "127.0.0.1", Port: config.Port}
 	var remote preview.ControlRecord
 	items, listErr := control.List(ctx)
 	if listErr == nil {
+		stage("control_list")
 		for _, item := range items {
 			if item.LogicalName == config.Name && item.State != "removed" && item.State != "expired" && (config.Indefinite || item.ExpiresAt != nil && item.ExpiresAt.After(time.Now().UTC())) {
 				remote = item
 				break
 			}
 		}
+	} else {
+		slog.Warn("public preview startup boundary failed", "stage", previewFailureControlList, "duration_ms", time.Since(startedAt).Milliseconds(), "error", listErr)
 	}
 	if remote.PreviewKey == "" || remote.TargetPort != int32(config.Port) {
 		if config.SourceKind == "" && config.OwnerMode == "" {
@@ -126,12 +147,20 @@ func RunProductionPreviewWorker(ctx context.Context, config ProductionPreviewWor
 			remote, err = control.RegisterWithMetadata(ctx, config.Name, target, true, config.Duration, config.Indefinite, config.SourceKind, config.OwnerMode)
 		}
 		if err != nil {
-			return err
+			return startupFailure(previewFailureControlRegister, err)
 		}
+		stage("control_register")
 	}
 	stage("registered")
 	removeRemote := true
 	defer func() {
+		// A durable service can be interrupted at any startup stage, including
+		// after registration but before connector readiness. Preserve the remote
+		// route for every supervisor cancellation, not only cancellation after the
+		// worker reaches its steady-state loop.
+		if durable != nil && ctx.Err() != nil {
+			removeRemote = false
+		}
 		if removeRemote {
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
@@ -142,92 +171,106 @@ func RunProductionPreviewWorker(ctx context.Context, config ProductionPreviewWor
 	}()
 	registry, err := preview.New(preview.Config{Prober: preview.TCPProber{Dialer: net.Dialer{Timeout: 2 * time.Second}}, MaxTargets: 1, MaxConcurrentProbes: 1})
 	if err != nil {
-		return err
+		return startupFailure(previewFailureRegistry, err)
 	}
+	stage("registry")
 	if _, err = registry.RegisterCanonical(remote.PreviewKey, remote.URL, registration.EnvironmentID, config.Name, target); err != nil {
-		return err
+		return startupFailure(previewFailureRegistryRegister, err)
 	}
+	stage("registry_register")
 	sender, err := preview.NewHTTPSender(preview.HTTPSenderConfig{Endpoint: controlURL.ResolveReference(&url.URL{Path: "/v1/previews/observations"}).String(), AllowedHosts: []string{controlURL.Hostname()}, Tokens: credentials, Identities: machines, Proofs: machines, OperationID: operationID, Transport: config.Transport})
 	if err != nil {
-		return err
+		return startupFailure(previewFailureSender, err)
 	}
+	stage("sender")
 	monitor, err := preview.NewMonitor(preview.MonitorConfig{Registry: registry})
 	if err != nil {
-		return err
+		return startupFailure(previewFailureMonitor, err)
 	}
+	stage("monitor")
 	reporter, err := preview.NewReporter(preview.ReporterConfig{Registry: registry, Sender: sender, Interval: 5 * time.Second, Timeout: 10 * time.Second})
 	if err != nil {
-		return err
+		return startupFailure(previewFailureReporter, err)
 	}
+	stage("reporter")
 	fetcher, err := auth.NewHTTPJWKSFetcher(controlURL.ResolveReference(&url.URL{Path: "/.well-known/jwks.json"}).String(), []string{controlURL.Hostname()}, config.Transport)
 	if err != nil {
-		return err
+		return startupFailure(previewFailureJWKSFetcher, err)
 	}
+	stage("jwks_fetcher")
 	keys, err := auth.NewJWKSCache(auth.JWKSConfig{Fetcher: fetcher, Clock: productionClock{}, TTL: 5 * time.Minute, RetainMissing: auth.DefaultRetainMissing, PersistencePath: filepath.Join(config.StateRoot, "authorization", "jwks.json")})
 	if err != nil {
-		return err
+		return startupFailure(previewFailureJWKSCache, err)
 	}
+	stage("jwks_cache")
 	refreshCtx, cancelRefresh := context.WithTimeout(ctx, 10*time.Second)
 	err = keys.Refresh(refreshCtx)
 	cancelRefresh()
 	if err != nil {
-		return err
+		return startupFailure(previewFailureJWKSRefresh, err)
 	}
 	stage("authority_ready")
 	verifier := auth.Verifier{Keys: keys, Clock: productionClock{}, Replays: auth.NewReplayCache(256, productionClock{}), Revocations: auth.NewRevocationCache(), ClockSkew: 30 * time.Second, RefreshTimeout: 2 * time.Second}
 	admissions, err := connector.NewHTTPSAdmissionSource(connector.AdmissionSourceConfig{Endpoint: controlURL.ResolveReference(&url.URL{Path: "/v1/connectors/admission"}).String(), AllowedHosts: []string{controlURL.Hostname()}, Tokens: machines, Proofs: machines, Verifier: verifier, Clock: productionClock{}, Issuer: strings.TrimRight(controlURL.String(), "/"), EnvironmentID: registration.EnvironmentID, MachineID: registration.MachineID, ConnectorID: remote.PreviewKey, EdgePool: "default", OperationID: operationID, Transport: config.Transport})
 	if err != nil {
-		return err
+		return startupFailure(previewFailureAdmission, err)
 	}
+	stage("admission")
 	dialer, err := connector.NewPublicPreviewDialer(connector.PublicPreviewDialerConfig{})
 	if err != nil {
-		return err
+		return startupFailure(previewFailureDialer, err)
 	}
+	stage("dialer")
 	manager, err := connector.New(connector.Config{EnvironmentID: registration.EnvironmentID, MachineID: registration.MachineID, ConnectorID: remote.PreviewKey, EdgePool: "default", Dialer: dialer, DrainTimeout: 10 * time.Second, Transport: connector.QUIC})
 	if err != nil {
-		return err
+		return startupFailure(previewFailureManager, err)
 	}
+	stage("manager")
 	connectorService, err := connector.NewSupervisor(connector.SupervisorConfig{Manager: manager, Admissions: admissions, InitialBackoff: time.Second, MaxBackoff: 30 * time.Second})
 	if err != nil {
-		return err
+		return startupFailure(previewFailureSupervisor, err)
 	}
+	stage("connector_supervisor")
 	if err = monitor.Start(ctx); err != nil {
-		return err
+		return startupFailure(previewFailureMonitorStart, err)
 	}
+	stage("monitor_start")
 	defer shutdownPreviewComponent(monitor.Shutdown)
 	if err = reporter.Start(ctx); err != nil {
-		return err
+		return startupFailure(previewFailureReporterStart, err)
 	}
+	stage("reporter_start")
 	defer shutdownPreviewComponent(reporter.Shutdown)
 	if err = connectorService.Start(ctx); err != nil {
-		return err
+		return startupFailure(previewFailureConnectorStart, err)
 	}
 	stage("connector_started")
 	defer shutdownPreviewComponent(connectorService.Shutdown)
 	if err = monitor.RunOnce(ctx); err != nil {
-		return err
+		return startupFailure(previewFailureTargetProbe, err)
 	}
 	stage("target_probed")
 	if _, err = reporter.DeliverOnce(ctx); err != nil {
-		return err
+		return startupFailure(previewFailureObservation, err)
 	}
 	stage("observation_delivered")
 	if err = waitForPreviewConnector(ctx, manager); err != nil {
-		return err
+		return startupFailure(previewFailureConnectorReady, err)
 	}
 	status := manager.Status()
 	slog.Info("public preview carrier ready", "transport", status.Transport, "generation", status.Generation, "duration_ms", time.Since(startedAt).Milliseconds())
 	remote.State = "ready"
 	if config.Ready != nil {
 		if err = config.Ready(remote); err != nil {
-			return err
+			return startupFailure(previewFailureReady, err)
 		}
 	}
 	if durable != nil {
 		durable.Record = &remote
 		if err = writePreviewRuntimeDescriptor(config.DescriptorPath, *durable); err != nil {
-			return err
+			return startupFailure(previewFailureDescriptorWrite, err)
 		}
+		stage("descriptor_ready")
 	}
 	defer func() {
 		if runErr == nil && durable != nil {
@@ -254,6 +297,14 @@ func RunProductionPreviewWorker(ctx context.Context, config ProductionPreviewWor
 	for {
 		select {
 		case <-ctx.Done():
+			// A durable worker is stopped during service restarts, user logoff,
+			// and operating-system shutdown. Keep its server route so the same
+			// descriptor and URL can reconnect when the service starts again.
+			// Foreground previews still revoke their route when their command is
+			// canceled.
+			if durable != nil {
+				removeRemote = false
+			}
 			return ctx.Err()
 		case <-expiry:
 			_, _ = registry.Expire(remote.PreviewKey)

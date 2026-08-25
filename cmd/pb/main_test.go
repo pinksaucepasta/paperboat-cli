@@ -3,17 +3,22 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -32,7 +37,9 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/config"
 	"github.com/pinksaucepasta/paperboat/internal/diagnostics"
 	doctorpkg "github.com/pinksaucepasta/paperboat/internal/doctor"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/bootstrap"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/identity"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntimecmd"
 	"github.com/pinksaucepasta/paperboat/internal/httptransport"
 	"github.com/pinksaucepasta/paperboat/internal/inbox"
 	"github.com/pinksaucepasta/paperboat/internal/localapi"
@@ -48,6 +55,17 @@ import (
 	"github.com/spf13/cobra"
 )
 
+func TestDeliveredTransferKeyCleanupWarningIsBoundedAndPreservesSuccess(t *testing.T) {
+	var stderr bytes.Buffer
+	writeDeliveredTransferKeyCleanupWarning(&stderr)
+	if got := stderr.String(); got != deliveredTransferKeyCleanupWarning {
+		t.Fatalf("warning=%q", got)
+	}
+	if stderr.Len() > 160 || !strings.Contains(stderr.String(), "File delivery completed") || strings.Contains(strings.ToLower(stderr.String()), "transfer failed") {
+		t.Fatalf("warning does not preserve delivered state: %q", stderr.String())
+	}
+}
+
 func TestOpenSSHArgumentsPlacesRemoteCommandAfterDestination(t *testing.T) {
 	destination := managedssh.Destination{User: "root", Host: "machine.pprbt", Port: 2222}
 	got := openSSHArguments(destination, []string{"printf ssh-ok"}, true)
@@ -61,6 +79,88 @@ func TestOpenSSHArgumentsPlacesRemoteCommandAfterDestination(t *testing.T) {
 	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("openSSHArguments() = %q, want %q", got, want)
+	}
+}
+
+func TestEnsureCLIIdentityForLoginFailsClosedForEstablishedLocalRoot(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/e2ee/root" {
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":{"code":"not_found","message":"root unavailable"}}`))
+	}))
+	defer server.Close()
+	root := t.TempDir()
+	store := config.ProfileStore{Path: root, Secrets: config.FileSecretStore{Dir: filepath.Join(root, "secrets")}}
+	public, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SavePeerAccountRootPublic(server.URL, "account_1", public); err != nil {
+		t.Fatal(err)
+	}
+	flags := flag.NewFlagSet("login", flag.ContinueOnError)
+	flags.String("recovery-key", "", "")
+	ctx := command.NewContext(flags)
+	profile := config.Profile{Issuer: server.URL, Account: config.Account{ID: "account_1"}, CLIClientSessionID: "cli_1"}
+	err = ensureCLIIdentityForLogin(ctx, store, profile, config.Credential{})
+	if !errors.Is(err, identitybootstrap.ErrEstablishedRootUnavailable) {
+		t.Fatalf("login enrollment error = %v", err)
+	}
+}
+
+func TestEnsureCLIIdentityForLoginBootstrapsNewAccount(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/v1/e2ee/root" {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":{"code":"not_found"}}`))
+			return
+		}
+		if r.URL.Path != "/v1/e2ee/bootstrap" {
+			http.NotFound(w, r)
+			return
+		}
+		var input api.E2EEBootstrapInput
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			t.Errorf("decode bootstrap: %v", err)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": input})
+	}))
+	defer server.Close()
+	root := t.TempDir()
+	store := config.ProfileStore{Path: root, Secrets: config.FileSecretStore{Dir: filepath.Join(root, "secrets")}}
+	flags := flag.NewFlagSet("login", flag.ContinueOnError)
+	flags.String("recovery-key", "", "")
+	ctx := command.NewContext(flags)
+	profile := config.Profile{Issuer: server.URL, Account: config.Account{ID: "account_1"}, CLIClientSessionID: "cli_1"}
+	if err := ensureCLIIdentityForLogin(ctx, store, profile, config.Credential{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ExportPeerAccountRootSeed(server.URL, profile.Account.ID); err != nil {
+		t.Fatalf("new root seed was not persisted: %v", err)
+	}
+	if _, err := store.LoadPeerCertificate(server.URL, profile.CLIClientSessionID); err != nil {
+		t.Fatalf("new endpoint certificate was not persisted: %v", err)
+	}
+}
+
+func TestWindowsArtifactCommandAllowlist(t *testing.T) {
+	tests := []struct {
+		role, command string
+		want          bool
+	}{{"cli", "auth", true}, {"cli", "__msi-cleanup", true},
+		{"runtime", "__runtime-worker", true}, {"runtime", "__windows-sshd-service", true}, {"runtime", "__runtime-config", true},
+		{"runtime", "__runtime-preview", true}, {"runtime", "__runtime-private-preview", true}, {"runtime", "__runtime-serve", true},
+		{"runtime", "__runtime-hostd", false}, {"runtime", "__runtime-updated", false}, {"runtime", "auth", false}, {"runtime", "__msi-cleanup", false},
+		{"hostd", "__runtime-hostd", true}, {"hostd", "__runtime-updated", false}, {"updater", "__runtime-updated", true}, {"updater", "__runtime-activate", true}, {"updater", "__runtime-worker", false}, {"unknown", "__runtime-hostd", false}}
+	for _, test := range tests {
+		if got := windowsArtifactCommandAllowed(test.role, []string{test.command}); got != test.want {
+			t.Fatalf("role=%q command=%q got=%v want=%v", test.role, test.command, got, test.want)
+		}
 	}
 }
 
@@ -126,6 +226,30 @@ func TestUpdateCommandContract(t *testing.T) {
 		if childErr != nil || child == nil || child.Flags().Lookup("json") == nil {
 			t.Fatalf("find %v: command=%v error=%v", path, child, childErr)
 		}
+	}
+}
+
+func TestSignedUpdateAvailableNeverOffersDowngrade(t *testing.T) {
+	for _, test := range []struct {
+		installed string
+		latest    string
+		want      bool
+	}{
+		{installed: "2026.08.22.28", latest: "2026.08.22.29", want: true},
+		{installed: "2026.08.22.28", latest: "2026.08.22.28", want: false},
+		{installed: "2026.08.22.28", latest: "2026.08.22.25", want: false},
+		{installed: "2026.08.22.28", latest: "", want: false},
+	} {
+		got, err := signedUpdateAvailable(test.installed, test.latest)
+		if err != nil {
+			t.Fatalf("signedUpdateAvailable(%q, %q): %v", test.installed, test.latest, err)
+		}
+		if got != test.want {
+			t.Fatalf("signedUpdateAvailable(%q, %q) = %t, want %t", test.installed, test.latest, got, test.want)
+		}
+	}
+	if _, err := signedUpdateAvailable("2026.08.22.28", "latest"); err == nil {
+		t.Fatal("malformed signed version was accepted")
 	}
 }
 
@@ -317,6 +441,531 @@ func TestDoctorIndependentPathChecksRequireAuthenticatedSuccess(t *testing.T) {
 	}
 }
 
+func TestDoctorSharedPathReachabilityProbesUseOneConsistentSnapshot(t *testing.T) {
+	if doctorPathReachabilityTimeout >= doctorProbeTimeout {
+		t.Fatalf("shared path timeout=%s, probe timeout=%s", doctorPathReachabilityTimeout, doctorProbeTimeout)
+	}
+	var calls atomic.Int32
+	probes := doctorSharedPathReachabilityProbes(context.Background(), 100*time.Millisecond, func(context.Context) (map[connectionmanager.Path]tunnel.PathReachability, error) {
+		calls.Add(1)
+		return map[connectionmanager.Path]tunnel.PathReachability{
+			connectionmanager.PathDirectQUIC: {Reachable: true, RTT: 8 * time.Millisecond},
+			connectionmanager.PathRelayQUIC:  {Reachable: true, RTT: 12 * time.Millisecond, PTOs: 1, RelayRegion: "mumbai"},
+			connectionmanager.PathWSS:        {Reachable: true, RTT: 24 * time.Millisecond, RelayRegion: "mumbai"},
+		}, nil
+	})
+	now := time.Date(2026, 8, 24, 1, 2, 3, 0, time.UTC)
+	report, err := doctorpkg.Run(context.Background(), doctorpkg.Config{
+		Timeout: time.Second, ProbeTimeout: time.Second, Clock: func() time.Time { return now },
+		Correlation: func() (string, error) { return "pb-doctor-0123456789abcdef", nil },
+	}, nil, probes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("path reachability loads=%d, want 1", calls.Load())
+	}
+	checks := make(map[string]doctorpkg.Check, len(report.Checks))
+	for _, check := range report.Checks {
+		checks[check.Code] = check
+	}
+	for _, code := range []string{"direct_reachability", "relay_reachability", "wss_reachability", "peer_reachability"} {
+		if checks[code].Status != doctorpkg.StatusPass {
+			t.Fatalf("%s=%#v", code, checks[code])
+		}
+	}
+	if report.Overall != "healthy" || checks["peer_reachability"].SelectedPath != "direct" {
+		t.Fatalf("report=%#v", report)
+	}
+}
+
+func TestDoctorSharedPathReachabilityProbesClassifyLoaderFailureConsistently(t *testing.T) {
+	var calls atomic.Int32
+	probes := doctorSharedPathReachabilityProbes(context.Background(), 100*time.Millisecond, func(context.Context) (map[connectionmanager.Path]tunnel.PathReachability, error) {
+		calls.Add(1)
+		return nil, errors.New("path loader failed")
+	})
+	report, err := doctorpkg.Run(context.Background(), doctorpkg.Config{
+		Timeout: time.Second, ProbeTimeout: 500 * time.Millisecond, Clock: time.Now,
+		Correlation: func() (string, error) { return "pb-doctor-0123456789abcdef", nil },
+	}, nil, probes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("path reachability loads=%d, want 1", calls.Load())
+	}
+	var summary, recovery, category string
+	for index, check := range report.Checks {
+		if check.Status != doctorpkg.StatusUnavailable {
+			t.Fatalf("check=%#v", check)
+		}
+		if index == 0 {
+			summary, recovery, category = check.Summary, check.Recovery, check.Category
+			continue
+		}
+		if check.Summary != summary || check.Recovery != recovery || check.Category != category {
+			t.Fatalf("mixed shared failure: first=%q/%q/%q check=%#v", category, summary, recovery, check)
+		}
+	}
+}
+
+func TestDoctorSharedPathReachabilityProbesIgnoreStaggeredProbeCancellation(t *testing.T) {
+	parent, cancelParent := context.WithCancel(context.Background())
+	defer cancelParent()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	probes := doctorSharedPathReachabilityProbes(parent, time.Second, func(ctx context.Context) (map[connectionmanager.Path]tunnel.PathReachability, error) {
+		calls.Add(1)
+		close(started)
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return map[connectionmanager.Path]tunnel.PathReachability{
+			connectionmanager.PathDirectQUIC: {Reachable: true, RTT: 8 * time.Millisecond},
+			connectionmanager.PathRelayQUIC:  {Reachable: true, RTT: 12 * time.Millisecond, RelayRegion: "mumbai"},
+			connectionmanager.PathWSS:        {Reachable: true, RTT: 24 * time.Millisecond, RelayRegion: "mumbai"},
+		}, nil
+	})
+	canceledContext, cancelProbe := context.WithCancel(context.Background())
+	cancelProbe()
+	shortContext, cancelShort := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancelShort()
+	longContext, cancelLong := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancelLong()
+	checks := make(chan doctorpkg.Check, len(probes))
+	go func() { checks <- probes[0].Run(canceledContext) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("shared loader did not start")
+	}
+	for index, probeContext := range []context.Context{shortContext, longContext, context.Background()} {
+		probe := probes[index+1]
+		go func() { checks <- probe.Run(probeContext) }()
+	}
+	<-shortContext.Done()
+	<-longContext.Done()
+	close(release)
+	seen := make(map[string]doctorpkg.Check, len(probes))
+	for range probes {
+		select {
+		case check := <-checks:
+			seen[check.Code] = check
+		case <-time.After(time.Second):
+			t.Fatal("shared probe did not finish")
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("path reachability loads=%d, want 1", calls.Load())
+	}
+	for _, code := range []string{"direct_reachability", "relay_reachability", "wss_reachability", "peer_reachability"} {
+		if seen[code].Status != doctorpkg.StatusPass {
+			t.Fatalf("%s=%#v", code, seen[code])
+		}
+	}
+}
+
+func TestDoctorSharedPathReachabilityProbesPreserveParentCancellation(t *testing.T) {
+	parent, cancelParent := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	var calls atomic.Int32
+	probes := doctorSharedPathReachabilityProbes(parent, time.Second, func(ctx context.Context) (map[connectionmanager.Path]tunnel.PathReachability, error) {
+		calls.Add(1)
+		close(started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	checks := make(chan doctorpkg.Check, len(probes))
+	for _, probe := range probes {
+		probe := probe
+		go func() { checks <- probe.Run(context.Background()) }()
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("shared loader did not start")
+	}
+	cancelParent()
+	var summary, recovery, category string
+	for index := range probes {
+		select {
+		case check := <-checks:
+			if check.Status != doctorpkg.StatusUnavailable {
+				t.Fatalf("check=%#v", check)
+			}
+			if index == 0 {
+				summary, recovery, category = check.Summary, check.Recovery, check.Category
+			} else if check.Summary != summary || check.Recovery != recovery || check.Category != category {
+				t.Fatalf("mixed parent cancellation: first=%q/%q/%q check=%#v", category, summary, recovery, check)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("shared canceled probe did not finish")
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("path reachability loads=%d, want 1", calls.Load())
+	}
+}
+
+func TestDoctorPeerReachabilitySelectsStrongestSharedPath(t *testing.T) {
+	tests := []struct {
+		name         string
+		results      map[connectionmanager.Path]tunnel.PathReachability
+		wantStatus   string
+		wantPath     string
+		wantFallback string
+		wantRegion   string
+		wantRTTMS    float64
+		wantPTOs     uint32
+	}{
+		{
+			name: "direct wins over all reachable fallbacks",
+			results: map[connectionmanager.Path]tunnel.PathReachability{
+				connectionmanager.PathDirectQUIC: {Reachable: true, RTT: 8 * time.Millisecond},
+				connectionmanager.PathRelayQUIC:  {Reachable: true, RTT: 12 * time.Millisecond, PTOs: 1, RelayRegion: "mumbai"},
+				connectionmanager.PathWSS:        {Reachable: true, RTT: 24 * time.Millisecond, RelayRegion: "mumbai"},
+			},
+			wantStatus: doctorpkg.StatusPass, wantPath: "direct", wantFallback: "none", wantRTTMS: 8,
+		},
+		{
+			name: "relay wins over wss",
+			results: map[connectionmanager.Path]tunnel.PathReachability{
+				connectionmanager.PathRelayQUIC: {Reachable: true, RTT: 12 * time.Millisecond, PTOs: 1, RelayRegion: "mumbai"},
+				connectionmanager.PathWSS:       {Reachable: true, RTT: 24 * time.Millisecond, RelayRegion: "mumbai"},
+			},
+			wantStatus: doctorpkg.StatusWarning, wantPath: "relay", wantFallback: "direct_not_selected", wantRegion: "mumbai", wantRTTMS: 12, wantPTOs: 1,
+		},
+		{
+			name: "wss is final reachable fallback",
+			results: map[connectionmanager.Path]tunnel.PathReachability{
+				connectionmanager.PathWSS: {Reachable: true, RTT: 24 * time.Millisecond, PTOs: 2, RelayRegion: "mumbai"},
+			},
+			wantStatus: doctorpkg.StatusWarning, wantPath: "wss", wantFallback: "quic_not_selected", wantRegion: "mumbai", wantRTTMS: 24, wantPTOs: 2,
+		},
+		{name: "all paths unreachable", results: map[connectionmanager.Path]tunnel.PathReachability{}, wantStatus: doctorpkg.StatusFail},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			check := doctorPeerReachabilityCheck(test.results)
+			if check.Status != test.wantStatus || check.SelectedPath != test.wantPath || check.Fallback != test.wantFallback || check.RelayRegion != test.wantRegion || check.RTTMS != test.wantRTTMS || check.PTOs != test.wantPTOs {
+				t.Fatalf("check=%#v", check)
+			}
+			if err := check.Validate(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestSpecTreeRegistersDeclaredFlagTypes(t *testing.T) {
+	called := false
+	source := &command.Spec{Name: "fixture", Subcommands: []*command.Spec{{
+		Name: "inspect", Action: func(ctx *command.Context) error {
+			called = true
+			if ctx.String("recovery-key") != "fixture-key" || !ctx.Bool("json") || ctx.String("hours") != "3.5" {
+				t.Fatalf("action values: recovery-key=%q json=%t hours=%q", ctx.String("recovery-key"), ctx.Bool("json"), ctx.String("hours"))
+			}
+			return nil
+		}, Flags: []command.Flag{
+			&command.StringFlag{Name: "recovery-key", Usage: "key file"},
+			&command.BoolFlag{Name: "json", Usage: "JSON output"},
+			&command.Float64Flag{Name: "hours", Usage: "hours"},
+		},
+	}}}
+	tree := specTree(source, source.Name)
+	entry, _, err := tree.Find([]string{"inspect"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, wantType := range map[string]string{"recovery-key": "string", "json": "bool", "hours": "float64"} {
+		flag := entry.Flags().Lookup(name)
+		if flag == nil || flag.Value.Type() != wantType {
+			t.Fatalf("flag %q=%v, want type %q", name, flag, wantType)
+		}
+	}
+	tree.SetOut(io.Discard)
+	tree.SetErr(io.Discard)
+	tree.SetArgs([]string{"inspect", "--recovery-key", "fixture-key", "--json", "--hours", "3.5"})
+	if err := tree.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("action was not called")
+	}
+}
+
+func TestSpecTreeRegistersEveryDeclaredBoolFlag(t *testing.T) {
+	for _, source := range []*command.Spec{authCommand(), configCommand(), previewCommand(), inboxCommand()} {
+		tree := specTree(source, source.Name)
+		for _, childSpec := range source.Subcommands {
+			entry, _, err := tree.Find([]string{childSpec.Name})
+			if err != nil {
+				t.Fatalf("%s %s: %v", source.Name, childSpec.Name, err)
+			}
+			for _, declared := range childSpec.Flags {
+				boolFlag, ok := declared.(*command.BoolFlag)
+				if !ok {
+					continue
+				}
+				registered := entry.Flags().Lookup(boolFlag.Name)
+				if registered == nil || registered.Value.Type() != "bool" {
+					t.Fatalf("%s %s --%s=%v", source.Name, childSpec.Name, boolFlag.Name, registered)
+				}
+			}
+		}
+	}
+}
+
+func specTreeActionTestCommand(t *testing.T, source *command.Spec, childName string, action command.Action) *cobra.Command {
+	t.Helper()
+	for _, child := range source.Subcommands {
+		if child.Name != childName {
+			continue
+		}
+		childCopy := *child
+		childCopy.Action = action
+		return specTree(&command.Spec{Name: source.Name, Usage: source.Usage, Subcommands: []*command.Spec{&childCopy}}, source.Name)
+	}
+	t.Fatalf("%s subcommand %q not found", source.Name, childName)
+	return nil
+}
+
+func TestSpecTreeExecutesDeclaredFlagsIntoActions(t *testing.T) {
+	tests := []struct {
+		name        string
+		source      func() *command.Spec
+		child       string
+		args        []string
+		wantStrings map[string]string
+		wantBools   map[string]bool
+	}{
+		{name: "auth login recovery key", source: authCommand, child: "login", args: []string{"login", "--recovery-key", "fixture-recovery-key"}, wantStrings: map[string]string{"recovery-key": "fixture-recovery-key"}},
+		{name: "auth switch recovery key", source: authCommand, child: "switch", args: []string{"switch", "--recovery-key", "fixture-switch-key"}, wantStrings: map[string]string{"recovery-key": "fixture-switch-key"}},
+		{name: "auth status json", source: authCommand, child: "status", args: []string{"status", "--json"}, wantBools: map[string]bool{"json": true}},
+		{name: "config show json", source: configCommand, child: "show", args: []string{"show", "--json"}, wantBools: map[string]bool{"json": true}},
+		{name: "preview list json", source: previewCommand, child: "list", args: []string{"list", "--json"}, wantBools: map[string]bool{"json": true}},
+		{name: "preview revoke confirmation and json", source: previewCommand, child: "revoke", args: []string{"revoke", "preview-fixture", "--yes", "--json"}, wantBools: map[string]bool{"yes": true, "json": true}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			called := false
+			tree := specTreeActionTestCommand(t, test.source(), test.child, func(ctx *command.Context) error {
+				called = true
+				for name, want := range test.wantStrings {
+					if got := ctx.String(name); got != want {
+						t.Fatalf("%s=%q, want %q", name, got, want)
+					}
+				}
+				for name, want := range test.wantBools {
+					if got := ctx.Bool(name); got != want {
+						t.Fatalf("%s=%t, want %t", name, got, want)
+					}
+				}
+				return nil
+			})
+			tree.SetOut(io.Discard)
+			tree.SetErr(io.Discard)
+			tree.SetArgs(test.args)
+			if err := tree.ExecuteContext(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if !called {
+				t.Fatal("action was not called")
+			}
+		})
+	}
+}
+
+func TestInboxSpecTreeRegistersJSONForPathSetAndReset(t *testing.T) {
+	tree := specTree(inboxCommand(), "inbox")
+	for _, name := range []string{"path", "set", "reset"} {
+		entry, _, err := tree.Find([]string{name})
+		if err != nil {
+			t.Fatalf("inbox %s: %v", name, err)
+		}
+		flag := entry.Flags().Lookup("json")
+		if flag == nil || flag.Value.Type() != "bool" {
+			t.Fatalf("inbox %s --json=%v", name, flag)
+		}
+	}
+}
+
+func TestInboxSpecTreeEnforcesPositionalArguments(t *testing.T) {
+	const directory = "fixture-inbox-directory"
+	called := false
+	tree := specTreeActionTestCommand(t, inboxCommand(), "set", func(ctx *command.Context) error {
+		called = true
+		if ctx.Args().Len() != 1 || ctx.Args().First() != directory {
+			t.Fatalf("set args len=%d first=%q", ctx.Args().Len(), ctx.Args().First())
+		}
+		return nil
+	})
+	tree.SetOut(io.Discard)
+	tree.SetErr(io.Discard)
+	tree.SetArgs([]string{"set", directory})
+	if err := tree.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("set one directory: %v", err)
+	}
+	if !called {
+		t.Fatal("set action was not called")
+	}
+
+	for _, test := range []struct {
+		name  string
+		child string
+		args  []string
+	}{
+		{name: "set zero", child: "set", args: []string{"set"}},
+		{name: "set two", child: "set", args: []string{"set", directory, "extra"}},
+		{name: "path one", child: "path", args: []string{"path", directory}},
+		{name: "reset one", child: "reset", args: []string{"reset", directory}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			actionCalled := false
+			commandTree := specTreeActionTestCommand(t, inboxCommand(), test.child, func(*command.Context) error {
+				actionCalled = true
+				return nil
+			})
+			commandTree.SetOut(io.Discard)
+			commandTree.SetErr(io.Discard)
+			commandTree.SetArgs(test.args)
+			if err := commandTree.ExecuteContext(context.Background()); err == nil {
+				t.Fatal("invalid arguments succeeded")
+			}
+			if actionCalled {
+				t.Fatal("action was called for invalid arguments")
+			}
+		})
+	}
+}
+
+func TestInboxPathJSONExecutesWithDisposableIdentity(t *testing.T) {
+	rootPath := commandRuntimeTestRoot(t)
+	home := filepath.Join(rootPath, "home")
+	runtimeRoot := filepath.Join(rootPath, "runtime")
+	stateRoot := filepath.Join(rootPath, "identity")
+	inboxPath := filepath.Join(home, "Paperboat Inbox")
+	for _, directory := range []string{home, runtimeRoot, inboxPath} {
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := inbox.EnsurePath(inboxPath); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(rootPath, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(rootPath, "state"))
+	t.Setenv("XDG_RUNTIME_DIR", runtimeRoot)
+	t.Setenv("TMPDIR", runtimeRoot)
+	t.Setenv("PAPERBOAT_RUNTIME_STATE_ROOT", stateRoot)
+	configPath := filepath.Join(rootPath, "config.json")
+	const serverURL = "https://api.paperboat.test"
+	if err := os.WriteFile(configPath, []byte(`{"server_url":"`+serverURL+`"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	identityStore, err := identity.Open(identity.Config{StateRoot: stateRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := identityStore.Current()
+	if err := identityStore.SaveRegistration(identity.Registration{
+		ServerURL: serverURL, MachineID: "machine_inbox_fixture", EnvironmentID: "environment_inbox_fixture",
+		PublicKeyID: key.ID, PublicIdentityKey: base64.RawURLEncoding.EncodeToString(key.Public()), InboxPath: inboxPath,
+		InstallationGeneration: 1, SetupMode: "client", SetupRoles: []string{"interactive"}, UpdatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	root := newRootCommand()
+	var stdout, stderr bytes.Buffer
+	root.SetOut(&stdout)
+	root.SetErr(&stderr)
+	root.SetArgs([]string{"--config", configPath, "inbox", "path", "--json"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("execute: %v stderr=%q", err, stderr.String())
+	}
+	var payload struct {
+		SchemaVersion string `json:"schema_version"`
+		OK            bool   `json:"ok"`
+		Data          struct {
+			Path string `json:"path"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("decode %q: %v", stdout.String(), err)
+	}
+	if payload.SchemaVersion != "1.0" || !payload.OK || payload.Data.Path != inboxPath || stderr.Len() != 0 {
+		t.Fatalf("payload=%#v stderr=%q", payload, stderr.String())
+	}
+}
+
+func TestSpecTreePreservesUndeclaredConfigAndPreviewCreateFlags(t *testing.T) {
+	configTree := specTree(configCommand(), "config")
+	for commandName, flagNames := range map[string][]string{
+		"status":   {"json"},
+		"assign":   {"json", "mode", "yes"},
+		"unassign": {"json", "yes"},
+	} {
+		entry, _, err := configTree.Find([]string{commandName})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, flagName := range flagNames {
+			if entry.Flags().Lookup(flagName) == nil {
+				t.Fatalf("config %s missing --%s", commandName, flagName)
+			}
+		}
+	}
+	previewTree := specTree(previewCommand(), "preview")
+	create, _, err := previewTree.Find([]string{"create"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, flagName := range []string{"name", "port", "machine", "duration", "indefinite", "public", "listen-port", "detach", "json"} {
+		if create.Flags().Lookup(flagName) == nil {
+			t.Fatalf("preview create missing --%s", flagName)
+		}
+	}
+	configCalled := false
+	configAction := specTreeActionTestCommand(t, configCommand(), "assign", func(ctx *command.Context) error {
+		configCalled = true
+		if ctx.String("mode") != "pull-only" || ctx.Bool("json") || ctx.Bool("yes") {
+			t.Fatalf("config assign defaults: mode=%q json=%t yes=%t", ctx.String("mode"), ctx.Bool("json"), ctx.Bool("yes"))
+		}
+		return nil
+	})
+	configAction.SetOut(io.Discard)
+	configAction.SetErr(io.Discard)
+	configAction.SetArgs([]string{"assign", "repository-fixture", "machine-fixture"})
+	if err := configAction.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !configCalled {
+		t.Fatal("config assign action was not called")
+	}
+	previewCalled := false
+	previewAction := specTreeActionTestCommand(t, previewCommand(), "create", func(ctx *command.Context) error {
+		previewCalled = true
+		if ctx.Duration("duration") != 24*time.Hour || ctx.Bool("indefinite") || ctx.Bool("public") || ctx.Bool("detach") || ctx.Bool("json") || ctx.Uint("port") != 0 || ctx.Uint("listen-port") != 0 {
+			t.Fatalf("preview create defaults: duration=%s indefinite=%t public=%t detach=%t json=%t port=%d listen-port=%d", ctx.Duration("duration"), ctx.Bool("indefinite"), ctx.Bool("public"), ctx.Bool("detach"), ctx.Bool("json"), ctx.Uint("port"), ctx.Uint("listen-port"))
+		}
+		return nil
+	})
+	previewAction.SetOut(io.Discard)
+	previewAction.SetErr(io.Discard)
+	previewAction.SetArgs([]string{"create"})
+	if err := previewAction.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !previewCalled {
+		t.Fatal("preview create action was not called")
+	}
+}
+
 func TestShellCompletionIsBoundedSilentAndResourceSpecific(t *testing.T) {
 	rootPath := commandRuntimeTestRoot(t)
 	t.Setenv("HOME", rootPath)
@@ -475,6 +1124,11 @@ func TestUserFacingErrorSanitizesInfrastructureFailures(t *testing.T) {
 			forbid: []string{"GET", "/v1/projects", "api.secret.example"},
 		},
 		{
+			name: "local filesystem failure",
+			err:  &os.PathError{Op: "open", Path: `C:\\Users\\Pujan\\Paperboat\\daemon.lock`, Err: os.ErrPermission},
+			want: "daemon.lock",
+		},
+		{
 			name: "operation deadline",
 			err:  fmt.Errorf("peer stream setup: %w", context.DeadlineExceeded),
 			want: "peer stream setup: context deadline exceeded",
@@ -499,7 +1153,12 @@ func TestUserFacingErrorSanitizesInfrastructureFailures(t *testing.T) {
 		{
 			name: "pairing required",
 			err:  identitybootstrap.ErrPairingRequired,
-			want: "needs the account recovery key",
+			want: "needs approval from a paired device",
+		},
+		{
+			name: "pairing approval expired",
+			err:  identitybootstrap.ErrEnrollmentExpired,
+			want: "Keep a paired device online",
 		},
 		{
 			name:   "uninstall cleanup keeps safe stage",
@@ -584,6 +1243,32 @@ func TestExecConnectInfoPreservesRequestedPath(t *testing.T) {
 	}
 }
 
+func TestRemoteExecAbsolutePathUsesTargetPlatform(t *testing.T) {
+	tests := []struct {
+		name          string
+		platform      string
+		workspaceRoot string
+		cwd           string
+		want          bool
+	}{
+		{name: "Windows client to Linux root", platform: "linux", workspaceRoot: "/root", cwd: "/root", want: true},
+		{name: "Windows client to macOS root", platform: "darwin", workspaceRoot: "/Users/paperboat", cwd: "/tmp", want: true},
+		{name: "Unix client to Windows root", platform: "windows", workspaceRoot: `C:\workspace`, cwd: `C:\workspace`, want: true},
+		{name: "platform inferred from Linux workspace", workspaceRoot: "/root", cwd: "/root/project", want: true},
+		{name: "platform inferred from Windows workspace", workspaceRoot: `C:\workspace`, cwd: `D:\project`, want: true},
+		{name: "Linux rejects Windows cwd", platform: "linux", workspaceRoot: "/root", cwd: `C:\workspace`},
+		{name: "Windows rejects Linux cwd", platform: "windows", workspaceRoot: `C:\workspace`, cwd: "/root"},
+		{name: "relative cwd rejected", platform: "linux", workspaceRoot: "/root", cwd: "project"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := remoteAbsolutePath(test.platform, test.workspaceRoot, test.cwd); got != test.want {
+				t.Fatalf("remoteAbsolutePath(%q, %q, %q) = %v, want %v", test.platform, test.workspaceRoot, test.cwd, got, test.want)
+			}
+		})
+	}
+}
+
 type execInputTestConn struct {
 	mu         sync.Mutex
 	writes     [][]byte
@@ -636,22 +1321,50 @@ func (c *sshProxyCopyFailureConn) Write([]byte) (int, error) {
 func (*sshProxyCopyFailureConn) Close() error      { return nil }
 func (*sshProxyCopyFailureConn) CloseWrite() error { return net.ErrClosed }
 
+type sshProxyTrackedReader struct {
+	io.Reader
+	done chan struct{}
+	once sync.Once
+}
+
+func (r *sshProxyTrackedReader) Read(value []byte) (int, error) {
+	count, err := r.Reader.Read(value)
+	if err != nil {
+		r.once.Do(func() { close(r.done) })
+	}
+	return count, err
+}
+
 func TestCopySSHProxyRemoteEOFTerminatesWithOpenInput(t *testing.T) {
 	proxy, remote := net.Pipe()
 	inputReader, inputWriter := io.Pipe()
-	defer inputWriter.Close()
 	defer inputReader.Close()
 	connection := &sshProxyTestConn{Conn: proxy, closeWrite: func() error { return nil }}
+	trackedInput := &sshProxyTrackedReader{Reader: inputReader, done: make(chan struct{})}
+	var output bytes.Buffer
 	done := make(chan error, 1)
-	go func() { done <- copySSHProxy(connection, connection, inputReader, io.Discard) }()
+	go func() { done <- copySSHProxy(connection, connection, trackedInput, &output) }()
+	const response = "command-output-before-close"
+	if _, err := remote.Write([]byte(response)); err != nil {
+		t.Fatal(err)
+	}
 	_ = remote.Close()
 	select {
 	case err := <-done:
 		if err != nil {
 			t.Fatal(err)
 		}
+		if output.String() != response {
+			t.Fatalf("output=%q, want %q", output.String(), response)
+		}
 	case <-time.After(time.Second):
 		t.Fatal("SSH proxy waited for input after remote EOF")
+	}
+	_ = inputWriter.Close()
+	select {
+	case <-trackedInput.done:
+	case <-time.After(time.Second):
+		t.Fatal("SSH proxy input copier leaked after input close")
 	}
 }
 
@@ -1714,6 +2427,57 @@ func TestPreviewsListsAndPurgesOnlySelectedEnvironment(t *testing.T) {
 	}
 }
 
+func TestPreviewListContinuesWhenLocalCleanupFails(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	stateRoot := filepath.Join(dir, "stale-runtime")
+	if err := os.MkdirAll(filepath.Join(stateRoot, "previews", "active"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PAPERBOAT_RUNTIME_STATE_ROOT", stateRoot)
+
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/previews" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		writeAPIData(t, w, []map[string]any{{
+			"id": "prv_1", "environment_id": "env_1", "project_id": "prj_1", "resource_id": "um_1", "user_id": "usr_1",
+			"logical_name": "web", "environment_name": "studio", "environment_kind": "byod", "owner_email": "owner@example.test",
+			"url": "https://preview.example.test", "state": "ready", "target_port": 3000,
+		}})
+	}))
+	defer server.Close()
+	writeTestProfile(t, dir, configPath, server.URL)
+
+	previousReconciler := reconcileExpiredPreviewServicesForList
+	reconcileExpiredPreviewServicesForList = func(context.Context, string, time.Time) error {
+		return errors.New("Windows preview mutation does not match the enrolled runtime")
+	}
+	t.Cleanup(func() { reconcileExpiredPreviewServicesForList = previousReconciler })
+
+	var stdout, stderr bytes.Buffer
+	if code := run(context.Background(), []string{"--config", configPath, "preview", "list", "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("server requests=%d, want 1", requests.Load())
+	}
+	var output struct {
+		OK   bool `json:"ok"`
+		Data struct {
+			Previews []api.Preview `json:"previews"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &output); err != nil || !output.OK || len(output.Data.Previews) != 1 || output.Data.Previews[0].ID != "prv_1" {
+		t.Fatalf("stdout=%q output=%+v err=%v", stdout.String(), output, err)
+	}
+	if got := stderr.String(); got != previewListCleanupWarning || strings.Contains(got, "Windows preview mutation") {
+		t.Fatalf("stderr=%q", got)
+	}
+}
+
 func TestSessionListAcceptsDefaultEnvironment(t *testing.T) {
 	root := newRootCommand()
 	command, remaining, err := root.Find([]string{"session", "list"})
@@ -1886,8 +2650,90 @@ func TestSetupRollbackContextSurvivesCanceledCommand(t *testing.T) {
 	if got := rollback.Value(contextKey("operation")); got != "setup" {
 		t.Fatalf("rollback context value=%v", got)
 	}
-	if deadline, ok := rollback.Deadline(); !ok || time.Until(deadline) <= 0 || time.Until(deadline) > 15*time.Second {
+	if deadline, ok := rollback.Deadline(); !ok || time.Until(deadline) <= 0 || time.Until(deadline) > 2*time.Minute {
 		t.Fatalf("rollback deadline=(%v,%t)", deadline, ok)
+	}
+}
+
+func TestAuthenticatedHostFailureRestoresPreviousClientRegistrationControlAndService(t *testing.T) {
+	stateRoot := t.TempDir()
+	identityStore, err := identity.Open(identity.Config{StateRoot: stateRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicIdentityKey := base64.RawURLEncoding.EncodeToString(identityStore.Current().Public())
+	inboxPath := filepath.Join(stateRoot, "Paperboat Inbox")
+	if err := os.MkdirAll(inboxPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var setupCalls, controlCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/machines/setup":
+			setupCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": api.UserMachine{
+				ID: "mch_rollback", EnvironmentID: "env_rollback", DisplayName: "Victus",
+				Platform: runtime.GOOS, Architecture: runtime.GOARCH, WorkspaceRoot: filepath.Dir(stateRoot),
+				SetupMode: "client", SetupRoles: []string{"interactive"}, PublicIdentityKey: publicIdentityKey,
+				InstallationGeneration: 5,
+				Installation: &api.ClientInstallation{ControlURL: "https://api.example.test", HelperListenAddress: "127.0.0.1:38080", Artifact: api.MachineArtifact{
+					Schema: bootstrap.ArtifactTargetSchemaV1, Kind: bootstrap.ArtifactKindPB, Version: "2026.08.24.1",
+					Platform: runtime.GOOS, Architecture: runtime.GOARCH, RepositoryURL: "https://updates.example.test", TargetPath: "pb-" + runtime.GOOS + "-" + runtime.GOARCH,
+				}},
+			}})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/machines/mch_rollback/control-credentials":
+			controlCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": api.MachineControlCredential{Credential: strings.Repeat("c", 48), ExpiresAt: time.Now().UTC().Add(time.Hour)}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	previous := identity.Registration{
+		ServerURL: server.URL, MachineID: "mch_rollback", EnvironmentID: "env_rollback",
+		PublicKeyID: identityStore.Current().ID, PublicIdentityKey: publicIdentityKey, InboxPath: inboxPath,
+		InstallationGeneration: 3, SetupMode: "client", SetupRoles: []string{"interactive"}, UpdatedAt: time.Now().UTC(),
+	}
+	if err := identityStore.SaveRegistration(previous); err != nil {
+		t.Fatal(err)
+	}
+	resume := bootstrap.NewResumeRecord("https://api.example.test", publicIdentityKey, "", "Victus", "host", "authenticated-verifier-012345678901234", time.Now().UTC().Add(time.Minute))
+	resume.AuthenticatedSetup = true
+	resume.SetupOperationID = "host-setup-operation"
+	resume.ExpectedUserMachineID = "mch_rollback"
+	resume.ExpectedGeneration = 4
+	resume.PairingStarted = true
+	if err := bootstrap.SaveResume(stateRoot, resume); err != nil {
+		t.Fatal(err)
+	}
+	previousInstaller := installSetupClientService
+	var installed hostruntimecmd.ClientInstallConfig
+	installSetupClientService = func(_ context.Context, config hostruntimecmd.ClientInstallConfig, _ io.Reader, _, _ io.Writer) error {
+		installed = config
+		return nil
+	}
+	t.Cleanup(func() { installSetupClientService = previousInstaller })
+	client := api.New(server.URL, config.Credential{AccessToken: strings.Repeat("a", 40)}, nil)
+	if err := rollbackAuthenticatedHostSetup(context.Background(), client, identityStore, previous, true, server.URL, stateRoot, filepath.Dir(stateRoot), inboxPath, "Victus", publicIdentityKey, strings.NewReader(""), io.Discard, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	registration, err := identityStore.Registration()
+	if err != nil || registration.SetupMode != "client" || registration.InstallationGeneration != 5 || registration.SSHUser != "" || registration.SSHPort != 0 {
+		t.Fatalf("restored registration=%+v err=%v", registration, err)
+	}
+	control, err := identityStore.MachineControl(time.Now().UTC(), 0)
+	if err != nil || control.InstallationGeneration != 5 {
+		t.Fatalf("restored control=%+v err=%v", control, err)
+	}
+	if installed.MachineID != "mch_rollback" || installed.StateRoot != stateRoot || installed.Artifact.Version != "2026.08.24.1" {
+		t.Fatalf("restored Client install=%+v", installed)
+	}
+	if _, err := os.Stat(bootstrap.ResumePath(stateRoot)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Host resume was not cleared: %v", err)
+	}
+	if setupCalls.Load() != 1 || controlCalls.Load() != 1 {
+		t.Fatalf("setup calls=%d control calls=%d", setupCalls.Load(), controlCalls.Load())
 	}
 }
 
@@ -2368,6 +3214,222 @@ func TestFileCredentialFallbackPersistsSelection(t *testing.T) {
 	}
 }
 
+func writeAuthLoginTestProfile(t *testing.T, root, configPath, issuer string) config.ProfileStore {
+	t.Helper()
+	isolateCommandCredentialLocation(t, root)
+	profileDir := filepath.Join(root, "credentials")
+	configJSON := `{"server_url":` + quote(issuer) + `,"auth":{"allow_file_fallback":true,"profile_dir":` + quote(profileDir) + `}}`
+	if err := os.WriteFile(configPath, []byte(configJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := config.ProfileStore{Path: profileDir, Secrets: config.FileSecretStore{Dir: filepath.Join(profileDir, "secrets")}}
+	expires := time.Now().UTC().Add(time.Hour)
+	profile := config.Profile{Issuer: issuer, Account: config.Account{ID: "account_1", Email: "old@example.test"}, CLIClientSessionID: "cls_old", AccessExpiresAt: expires}
+	credential := config.Credential{AccessToken: "access-old", RefreshToken: "refresh-old", TokenType: "Bearer", ExpiresAt: expires}
+	if err := store.Save(profile, credential); err != nil {
+		t.Fatal(err)
+	}
+	return store
+}
+
+func TestAuthLoginRepairsReadableServerRejectedProfile(t *testing.T) {
+	var rejectedRootCalls atomic.Int32
+	var authorizeCalls atomic.Int32
+	var bootstrapCalls atomic.Int32
+	var revokeCalls atomic.Int32
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/e2ee/root":
+			w.Header().Set("Content-Type", "application/json")
+			switch r.Header.Get("Authorization") {
+			case "Bearer access-old":
+				rejectedRootCalls.Add(1)
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = io.WriteString(w, `{"error":{"code":"unauthenticated","message":"session rejected"}}`)
+			case "Bearer access-new":
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = io.WriteString(w, `{"error":{"code":"not_found","message":"root unavailable"}}`)
+			default:
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = io.WriteString(w, `{"error":{"code":"unauthenticated"}}`)
+			}
+		case "/v1/auth/device/authorize":
+			authorizeCalls.Add(1)
+			writeAPIData(t, w, map[string]any{"device_code": "device_repair_1", "user_code": "REPAIR-1", "verification_uri": server.URL + "/verify", "verification_uri_complete": server.URL + "/verify?code=REPAIR-1", "expires_in": 10, "interval": 1})
+		case "/v1/auth/device/token":
+			writeAPIData(t, w, map[string]any{"access_token": "access-new", "refresh_token": "refresh-new", "token_type": "Bearer", "expires_in": 3600, "scope": "account:read", "cli_client_session_id": "cls_new"})
+		case "/v1/me":
+			if r.Header.Get("Authorization") != "Bearer access-new" {
+				t.Errorf("me authorization=%q", r.Header.Get("Authorization"))
+			}
+			writeAPIData(t, w, map[string]any{"id": "account_1", "email": "new@example.test", "display_name": "New User"})
+		case "/v1/e2ee/bootstrap":
+			if r.Header.Get("Authorization") != "Bearer access-new" {
+				t.Errorf("bootstrap authorization=%q", r.Header.Get("Authorization"))
+			}
+			bootstrapCalls.Add(1)
+			var input api.E2EEBootstrapInput
+			if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+				t.Errorf("decode bootstrap: %v", err)
+				return
+			}
+			writeAPIData(t, w, input)
+		case "/v1/auth/token/revoke":
+			if r.Header.Get("Authorization") != "Bearer refresh-old" {
+				t.Errorf("revoke authorization=%q", r.Header.Get("Authorization"))
+			}
+			revokeCalls.Add(1)
+			writeAPIData(t, w, map[string]any{})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.json")
+	store := writeAuthLoginTestProfile(t, root, configPath, server.URL)
+	previousInstaller := installLocalDaemonService
+	installLocalDaemonService = func(context.Context, string, string, string) error { return nil }
+	t.Cleanup(func() { installLocalDaemonService = previousInstaller })
+	previousBrowser := openBrowser
+	openBrowser = func(string) error { return nil }
+	t.Cleanup(func() { openBrowser = previousBrowser })
+
+	if err := newApp().Run([]string{"pb", "--config", configPath, "auth", "login"}); err != nil {
+		t.Fatalf("auth login: %v", err)
+	}
+	active, err := store.Load(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := store.CredentialFor(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active.CLIClientSessionID != "cls_new" || active.Account.Email != "new@example.test" || credential.AccessToken != "access-new" || credential.RefreshToken != "refresh-new" {
+		t.Fatalf("active=%#v credential=%#v", active, credential)
+	}
+	pending, err := store.PendingRevocations(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rejectedRootCalls.Load() != 1 || authorizeCalls.Load() != 1 || bootstrapCalls.Load() != 1 || revokeCalls.Load() != 1 || len(pending) != 0 {
+		t.Fatalf("rejected=%d authorize=%d bootstrap=%d revoke=%d pending=%d", rejectedRootCalls.Load(), authorizeCalls.Load(), bootstrapCalls.Load(), revokeCalls.Load(), len(pending))
+	}
+}
+
+func TestAuthLoginDoesNotReplaceReadableProfileOnNonAuthenticationFailure(t *testing.T) {
+	var authorizeCalls atomic.Int32
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/e2ee/root":
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, `{"error":{"code":"unavailable","message":"try again"}}`)
+		case "/v1/auth/device/authorize":
+			authorizeCalls.Add(1)
+			writeAPIData(t, w, map[string]any{"device_code": "unexpected", "user_code": "UNEXPECTED", "verification_uri": server.URL, "expires_in": 10, "interval": 1})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.json")
+	store := writeAuthLoginTestProfile(t, root, configPath, server.URL)
+	if err := newApp().Run([]string{"pb", "--config", configPath, "auth", "login"}); err == nil {
+		t.Fatal("auth login unexpectedly replaced a profile after a non-authentication failure")
+	}
+	active, err := store.Load(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := store.CredentialFor(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if authorizeCalls.Load() != 0 || active.CLIClientSessionID != "cls_old" || credential.AccessToken != "access-old" || credential.RefreshToken != "refresh-old" {
+		t.Fatalf("authorize=%d active=%#v credential=%#v", authorizeCalls.Load(), active, credential)
+	}
+}
+
+type authLoginFaultSecretStore struct {
+	values        map[string]string
+	failDeleteRef string
+}
+
+func (s *authLoginFaultSecretStore) Set(ref, value string) error {
+	s.values[ref] = value
+	return nil
+}
+
+func (s *authLoginFaultSecretStore) Get(ref string) (string, error) {
+	value, ok := s.values[ref]
+	if !ok {
+		return "", os.ErrNotExist
+	}
+	return value, nil
+}
+
+func (s *authLoginFaultSecretStore) Delete(ref string) error {
+	if ref == s.failDeleteRef {
+		return errors.New("injected old-secret deletion failure")
+	}
+	delete(s.values, ref)
+	return nil
+}
+
+func TestAuthLoginPersistenceDoesNotRejectCommittedSwitchOnOldSecretCleanupFailure(t *testing.T) {
+	dir := t.TempDir()
+	secrets := &authLoginFaultSecretStore{values: map[string]string{}}
+	store := config.ProfileStore{Path: dir, Secrets: secrets}
+	issuer := "https://api.example.com"
+	old := config.Profile{Issuer: issuer, CLIClientSessionID: "cls_old"}
+	if err := store.Save(old, config.Credential{AccessToken: "access-old", RefreshToken: "refresh-old"}); err != nil {
+		t.Fatal(err)
+	}
+	previous, err := store.Load(issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secrets.failDeleteRef = previous.AccessSecretRef
+	next := config.Profile{Issuer: issuer, CLIClientSessionID: "cls_new"}
+	if err := persistAuthorizedProfile(store, &previous, next, config.Credential{AccessToken: "access-new", RefreshToken: "refresh-new"}); err != nil {
+		t.Fatalf("auth login treated committed switch as failed: %v", err)
+	}
+	active, err := store.Load(issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := store.CredentialFor(issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active.CLIClientSessionID != "cls_new" || credential.AccessToken != "access-new" || credential.RefreshToken != "refresh-new" {
+		t.Fatalf("active = %#v, credential = %#v", active, credential)
+	}
+}
+
+func TestAuthLoginPersistenceReconcilesCommittedMutationError(t *testing.T) {
+	dir := t.TempDir()
+	store := config.ProfileStore{Path: dir, Secrets: config.FileSecretStore{Dir: filepath.Join(dir, "secrets")}}
+	profile := config.Profile{Issuer: "https://api.example.com", CLIClientSessionID: "cls_new"}
+	credential := config.Credential{AccessToken: "access-new", RefreshToken: "refresh-new"}
+	if err := store.Save(profile, credential); err != nil {
+		t.Fatal(err)
+	}
+	if err := committedProfileMutation(store, profile, credential, errors.New("injected post-commit lock failure")); err != nil {
+		t.Fatalf("committed mutation was treated as failed: %v", err)
+	}
+	if err := committedProfileMutation(store, profile, config.Credential{AccessToken: "different", RefreshToken: "refresh-new"}, errors.New("real failure")); err == nil {
+		t.Fatal("mismatched committed credential suppressed a real mutation failure")
+	}
+}
+
 func TestSessionNameReservesOnlyAutomaticShellNames(t *testing.T) {
 	if err := validateSessionName("shell-tools"); err != nil {
 		t.Fatalf("shell-tools should be valid: %v", err)
@@ -2394,6 +3456,40 @@ func writeTestProfile(t *testing.T, dir, configPath, serverURL string) {
 	err := store.Save(config.Profile{Issuer: serverURL, CLIClientSessionID: "cls_test", AccessExpiresAt: expires}, config.Credential{AccessToken: "token", RefreshToken: "refresh", ExpiresAt: expires})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestAuthStatusRejectsProfileWithMissingSecret(t *testing.T) {
+	for _, missing := range []string{"access", "refresh"} {
+		t.Run(missing, func(t *testing.T) {
+			dir := t.TempDir()
+			configPath := filepath.Join(dir, "config.json")
+			serverURL := "https://api.example.test"
+			writeTestProfile(t, dir, configPath, serverURL)
+			cfg, err := config.Load(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			store, err := config.ProfileStoreFor(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			profile, err := store.Load(serverURL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ref := profile.AccessSecretRef
+			if missing == "refresh" {
+				ref = profile.RefreshSecretRef
+			}
+			if err := store.Secrets.Delete(ref); err != nil {
+				t.Fatal(err)
+			}
+			err = newApp().Run([]string{"pb", "--config", configPath, "auth", "status", "--json"})
+			if !errors.Is(err, config.ErrSecretNotFound) || !strings.Contains(err.Error(), "pb auth login") {
+				t.Fatalf("auth status error = %v", err)
+			}
+		})
 	}
 }
 
@@ -3120,15 +4216,73 @@ func TestCommandUsesTestSafeLocalDaemonInstaller(t *testing.T) {
 	}
 }
 
-func TestEnsureLocalDaemonServiceUsesInstallerBoundary(t *testing.T) {
-	configPath := filepath.Join(t.TempDir(), "config.json")
-	if err := os.WriteFile(configPath, []byte(`{"server_url":"https://api.paperboat.test"}`), 0o600); err != nil {
+func localDaemonReadinessTestConfig(t *testing.T, registered bool) (*config.Config, string) {
+	t.Helper()
+	root := commandRuntimeTestRoot(t)
+	home, runtimeRoot := filepath.Join(root, "home"), filepath.Join(root, "runtime")
+	for _, directory := range []string{home, runtimeRoot} {
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "xdg-state"))
+	t.Setenv("XDG_RUNTIME_DIR", runtimeRoot)
+	t.Setenv("TMPDIR", runtimeRoot)
+	stateRoot := filepath.Join(root, "identity")
+	t.Setenv("PAPERBOAT_RUNTIME_STATE_ROOT", stateRoot)
+	configPath := filepath.Join(root, "config.json")
+	const serverURL = "https://api.paperboat.test"
+	if err := os.WriteFile(configPath, []byte(`{"server_url":"`+serverURL+`"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !registered {
+		return cfg, configPath
+	}
+	identityStore, err := identity.Open(identity.Config{StateRoot: stateRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inboxPath := filepath.Join(home, "Paperboat Inbox")
+	if err := os.MkdirAll(inboxPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	key := identityStore.Current()
+	if err := identityStore.SaveRegistration(identity.Registration{
+		ServerURL: serverURL, MachineID: "machine_local", EnvironmentID: "environment_local",
+		PublicKeyID: key.ID, PublicIdentityKey: base64.RawURLEncoding.EncodeToString(key.Public()),
+		InboxPath: inboxPath, InstallationGeneration: 1, SetupMode: "client", SetupRoles: []string{"interactive"}, UpdatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return cfg, configPath
+}
+
+func TestEnsureLocalDaemonServiceDefersUntilMachineRegistration(t *testing.T) {
+	cfg, _ := localDaemonReadinessTestConfig(t, false)
+	previous := installLocalDaemonService
+	calls := 0
+	installLocalDaemonService = func(context.Context, string, string, string) error {
+		calls++
+		return nil
+	}
+	t.Cleanup(func() { installLocalDaemonService = previous })
+
+	if err := ensureLocalDaemonService(context.Background(), cfg); err != nil {
+		t.Fatalf("clean auth readiness error=%v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("clean auth launched an unregistered daemon %d times", calls)
+	}
+}
+
+func TestEnsureLocalDaemonServiceUsesInstallerAfterRegistration(t *testing.T) {
+	cfg, configPath := localDaemonReadinessTestConfig(t, true)
 	previous := installLocalDaemonService
 	calls := 0
 	sentinel := errors.New("test installer sentinel")
@@ -3143,11 +4297,156 @@ func TestEnsureLocalDaemonServiceUsesInstallerBoundary(t *testing.T) {
 		return sentinel
 	}
 	t.Cleanup(func() { installLocalDaemonService = previous })
+
 	if err := ensureLocalDaemonService(context.Background(), cfg); !errors.Is(err, sentinel) {
 		t.Fatalf("ensure error=%v", err)
 	}
 	if calls != 1 {
 		t.Fatalf("installer calls=%d, want 1", calls)
+	}
+}
+
+func TestRequireLocalDaemonServiceRejectsMissingRegistrationWithoutLaunching(t *testing.T) {
+	cfg, _ := localDaemonReadinessTestConfig(t, false)
+	previous := installLocalDaemonService
+	installLocalDaemonService = func(context.Context, string, string, string) error {
+		t.Fatal("unregistered peer command launched the local daemon")
+		return nil
+	}
+	t.Cleanup(func() { installLocalDaemonService = previous })
+
+	err := requireLocalDaemonService(context.Background(), cfg)
+	if err == nil || !strings.Contains(err.Error(), "pb setup --mode client") {
+		t.Fatalf("missing registration error=%v", err)
+	}
+}
+
+func TestRequireLocalDaemonServiceBoundsMissingReadiness(t *testing.T) {
+	cfg, _ := localDaemonReadinessTestConfig(t, true)
+	previous := installLocalDaemonService
+	calls := 0
+	installLocalDaemonService = func(context.Context, string, string, string) error {
+		calls++
+		return nil
+	}
+	t.Cleanup(func() { installLocalDaemonService = previous })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	err := requireLocalDaemonService(ctx, cfg)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("missing readiness error=%v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("installer calls=%d, want 1", calls)
+	}
+}
+
+func TestRebindLocalDaemonStopsStartsAndWaitsForReadySnapshot(t *testing.T) {
+	cfg, configPath := localDaemonReadinessTestConfig(t, true)
+	paths, err := currentLocalDaemonPaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	snapshot := localapi.Snapshot{Schema: localapi.SnapshotSchemaV1, Generation: 1, ObservedAt: now, DaemonState: "ready", Machines: []localapi.MachineStatus{}}
+	store, err := localapi.NewSnapshotStore(&snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverConfig, err := commandLocalAPIServerConfig(paths.SocketPath, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localServer, err := localapi.NewServer(serverConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverCtx, cancelServer := context.WithCancel(context.Background())
+	defer cancelServer()
+	done := make(chan error, 1)
+
+	previousInstall, previousRemove := installLocalDaemonService, removeLocalDaemonService
+	var lifecycle []string
+	removeLocalDaemonService = func(_ context.Context, executable string) error {
+		if !strings.HasSuffix(strings.ToLower(executable), ".test") && !strings.HasSuffix(strings.ToLower(executable), ".test.exe") {
+			t.Fatalf("expected test executable, got %q", executable)
+		}
+		lifecycle = append(lifecycle, "stop")
+		return nil
+	}
+	installLocalDaemonService = func(_ context.Context, _ string, gotConfigPath, server string) error {
+		if gotConfigPath != configPath || server != "https://api.paperboat.test" {
+			t.Fatalf("config=%q server=%q", gotConfigPath, server)
+		}
+		lifecycle = append(lifecycle, "start")
+		go func() { done <- localServer.Run(serverCtx) }()
+		return nil
+	}
+	t.Cleanup(func() {
+		installLocalDaemonService, removeLocalDaemonService = previousInstall, previousRemove
+	})
+
+	if err := rebindLocalDaemonService(context.Background(), cfg); err != nil {
+		t.Fatalf("rebind error=%v", err)
+	}
+	if !slices.Equal(lifecycle, []string{"stop", "start"}) {
+		t.Fatalf("daemon lifecycle=%v", lifecycle)
+	}
+	if err := ensureLocalDaemonService(context.Background(), cfg); err != nil {
+		t.Fatalf("ready daemon check=%v", err)
+	}
+	if !slices.Equal(lifecycle, []string{"stop", "start"}) {
+		t.Fatalf("ready daemon was reinstalled: %v", lifecycle)
+	}
+	cancelServer()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("server err=%v", err)
+	}
+}
+
+func TestClientSetupAndPeerCommandsWireBoundedLocalDaemonReadiness(t *testing.T) {
+	_, testFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("resolve test source path")
+	}
+	mainPath := filepath.Join(filepath.Dir(testFile), "main.go")
+	parsed, err := parser.ParseFile(token.NewFileSet(), mainPath, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"setupCommand":     "rebindLocalDaemonService",
+		"sendCommand":      "requireLocalDaemonService",
+		"actionPing":       "requireLocalDaemonService",
+		"actionRemoteExec": "requireLocalDaemonService",
+	}
+	found := make(map[string]int, len(want))
+	for _, declaration := range parsed.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok {
+			continue
+		}
+		callee, tracked := want[function.Name.Name]
+		if !tracked {
+			continue
+		}
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			identifier, ok := call.Fun.(*ast.Ident)
+			if ok && identifier.Name == callee {
+				found[function.Name.Name]++
+			}
+			return true
+		})
+	}
+	for function, callee := range want {
+		if found[function] != 1 {
+			t.Fatalf("%s calls %s %d times, want 1", function, callee, found[function])
+		}
 	}
 }
 

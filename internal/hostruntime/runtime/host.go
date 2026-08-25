@@ -155,6 +155,13 @@ func NewClientCoordinator(ctx context.Context, config HostConfig, dependencies H
 	if err != nil {
 		return nil, err
 	}
+	var nativePeerService Service
+	if dependencies.NativePeerFactory != nil {
+		nativePeerService, err = dependencies.NativePeerFactory(func(net.Conn) error { return ErrHostInvalid }, transferHandler, nil)
+		if err != nil || nativePeerService == nil {
+			return nil, errors.Join(ErrHostInvalid, err)
+		}
+	}
 	mux := http.NewServeMux()
 	if dependencies.ServeLeases != nil && dependencies.LocalControlToken != "" {
 		mux.Handle("/v1/serve-leases", servelease.Handler{Manager: dependencies.ServeLeases, Token: dependencies.LocalControlToken})
@@ -189,30 +196,52 @@ func NewClientCoordinator(ctx context.Context, config HostConfig, dependencies H
 	if err != nil {
 		return nil, err
 	}
-	components := []Component{
-		{Capability: "storage", Required: true, Service: shutdownService{shutdown: func(context.Context) error { return durable.Close() }}},
-		{Capability: "file_transfer_cleanup", Required: true, Service: &filetransfer.CleanupWorker{Service: transferService}},
+	components := []stablehostd.Component{
+		{Name: "storage", Required: true, Service: shutdownService{shutdown: func(context.Context) error { return durable.Close() }}},
+		{Name: "file_transfer_cleanup", Required: true, Service: &filetransfer.CleanupWorker{Service: transferService}},
 	}
 	if dependencies.AuthorizationService != nil {
-		components = append(components, Component{Capability: "authorization", Required: false, Service: dependencies.AuthorizationService})
+		components = append(components, stablehostd.Component{Name: "authorization", Required: false, Service: dependencies.AuthorizationService})
 	}
 	if dependencies.PreviewRecovery != nil {
-		components = append(components, Component{Capability: "preview_recovery", Required: false, Service: dependencies.PreviewRecovery})
+		components = append(components, stablehostd.Component{Name: "preview_recovery", Required: false, Service: dependencies.PreviewRecovery})
 	}
 	if dependencies.ServeLeases != nil {
-		components = append(components, Component{Capability: "serve_lease", Required: false, Service: dependencies.ServeLeases})
+		components = append(components, stablehostd.Component{Name: "serve_lease", Required: false, Service: dependencies.ServeLeases})
+	}
+	if nativePeerService != nil {
+		components = append(components, stablehostd.Component{Name: "peer_transport", Required: true, Service: nativePeerService})
 	}
 	components = append(components,
-		Component{Capability: "runtime_observation", Required: true, Service: dependencies.RuntimeObservationService},
-		Component{Capability: "edge", Required: true, Service: dependencies.Connector},
-		Component{Capability: "control_plane", Required: true, Service: httpService},
+		stablehostd.Component{Name: "runtime_observation", Required: true, Service: dependencies.RuntimeObservationService},
+		stablehostd.Component{Name: "edge", Required: true, Service: dependencies.Connector},
+		stablehostd.Component{Name: "control_plane", Required: true, Service: httpService},
 	)
-	runtime, err := NewRuntime(Config{Version: config.Runtime.Version, Components: components, ShutdownTimeout: config.ShutdownTimeout})
+	// Client mode still participates in the same stable-hostd update fence as
+	// host mode. Transfers, previews, connector state, and the local control
+	// plane belong to the stable daemon; the replaceable worker is only the
+	// versioned coordination lifecycle. Without this composition, the Windows
+	// SCM owner calls StartStable on a coordinator with no stable daemon and
+	// fails every Client installation with ErrHostInvalid.
+	daemon, err := stablehostd.New(stablehostd.Config{
+		Workloads:       stablehostd.Workloads{Transfers: transferService, ServeLeases: dependencies.ServeLeases},
+		Components:      components,
+		ShutdownTimeout: config.ShutdownTimeout,
+	})
+	if err != nil {
+		return nil, errors.Join(ErrHostInvalid, err)
+	}
+	workerComponents := []Component{{Capability: "worker_lifecycle", Required: true, Service: workerLifecycleService{}}}
+	runtime, err := NewRuntime(Config{Version: config.Runtime.Version, Components: workerComponents, ShutdownTimeout: config.ShutdownTimeout})
 	if err != nil {
 		return nil, err
 	}
-	healthSource.set(runtime, components)
-	return &Host{runtime: runtime, http: httpService, handler: mux, cleanupUnstarted: durable.Close}, nil
+	workers, err := stablehostd.NewWorkerController(daemon)
+	if err != nil {
+		return nil, errors.Join(ErrHostInvalid, err)
+	}
+	healthSource.set(runtime, workerComponents)
+	return &Host{runtime: runtime, hostd: daemon, workers: workers, http: httpService, handler: mux, health: healthSource, transferRoot: filepath.Join(config.Runtime.StateRoot, "file-transfers"), cleanupUnstarted: durable.Close}, nil
 }
 
 func transferWorkloadCount(root string) uint64 {
@@ -671,14 +700,12 @@ func (h *Host) Start(ctx context.Context) error {
 	return nil
 }
 
-// StartStable starts only hostd-owned workloads and ingress. It deliberately
-// does not start the in-process Runtime worker: production hostd uses this
-// entry point and launches the active runtime as a separately fenced process.
+// StartStable starts hostd-owned workloads and the coordination services whose
+// health is exposed by the stable control plane. The separately fenced worker
+// proves the selected runtime artifact and owns its lifecycle lease; it must
+// not leave the actual authorization and observation services in New state.
 func (h *Host) StartStable(ctx context.Context) error {
-	if h.hostd == nil {
-		return ErrHostInvalid
-	}
-	return h.hostd.Start(ctx)
+	return h.Start(ctx)
 }
 
 // ReplaceWorker swaps coordination only. Hostd-owned workload managers,
@@ -718,12 +745,9 @@ func (h *Host) Shutdown(ctx context.Context) error {
 }
 
 // ShutdownStable is used by the stable hostd process after its external worker
-// has been stopped. It is reserved for actual supervisor shutdown.
+// has been stopped. It drains coordination before durable hostd workloads.
 func (h *Host) ShutdownStable(ctx context.Context) error {
-	if h.hostd == nil {
-		return ErrHostInvalid
-	}
-	return h.hostd.Shutdown(ctx)
+	return h.Shutdown(ctx)
 }
 func (h *Host) State() State {
 	h.workerMu.RLock()

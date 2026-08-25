@@ -26,27 +26,32 @@
     {
       "id": "cli",
       "file": "pb.exe",
-      "role": "client"
+      "role": "client",
+      "update_policy": "in_process"
     },
     {
       "id": "launcher",
       "file": "pb-launcher.exe",
-      "role": "client_launcher"
+      "role": "client_launcher",
+      "update_policy": "msi_only_stable_abi_v1"
     },
     {
       "id": "runtime",
       "file": "paperboat-runtime.exe",
-      "role": "runtime"
+      "role": "runtime",
+      "update_policy": "in_process"
     },
     {
       "id": "host_supervisor",
       "file": "paperboat-hostd.exe",
-      "role": "host_supervisor"
+      "role": "host_supervisor",
+      "update_policy": "in_process"
     },
     {
       "id": "updater",
       "file": "paperboat-updater.exe",
-      "role": "updater"
+      "role": "updater",
+      "update_policy": "in_process"
     }
   ],
   "services": [

@@ -41,6 +41,9 @@
         <Directory Id="BINDIR" Name="bin" />
         <Directory Id="RELEASES" Name="releases">
           <Directory Id="CLICURRENTSLOT" Name="cli-current" />
+          <Directory Id="VERSIONS" Name="versions">
+            <Directory Id="ACTIVERELEASE" Name="$(var.PaperboatVersion)" />
+          </Directory>
         </Directory>
       </Directory>
     </StandardDirectory>
@@ -75,7 +78,7 @@
     -->
     <CustomAction
         Id="CleanupPaperboatDynamicServices"
-        FileRef="RuntimeBinary"
+        FileRef="CLICurrentSeedBinary"
         ExeCommand="__msi-cleanup --full-uninstall"
         Execute="deferred"
         Impersonate="no"
@@ -106,13 +109,14 @@
         <!-- pb.exe is the stable public launcher. It selects the protected,
              rollback-capable CLI slot instead of becoming stale after a
              one-shot Client renewal. -->
-        <File Id="CliBinary" Source="$(var.StagingDir)\pb-launcher.exe" Name="pb.exe" KeyPath="yes" Vital="yes" />
+        <File Id="CliBinary" Source="$(var.StagingDir)\pb-launcher.exe" Name="pb.exe" KeyPath="yes" Vital="yes">
+          <PermissionEx Sddl="O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)" />
+        </File>
       </Component>
       <Component Id="LauncherComponent" Guid="{F3E5F8E2-BD39-4CC4-BD4C-6FD34E5C8F02}">
-        <File Id="LauncherBinary" Source="$(var.StagingDir)\pb-launcher.exe" KeyPath="yes" Vital="yes" />
-      </Component>
-      <Component Id="RuntimeComponent" Guid="{F3E5F8E2-BD39-4CC4-BD4C-6FD34E5C8F03}">
-        <File Id="RuntimeBinary" Source="$(var.StagingDir)\paperboat-runtime.exe" KeyPath="yes" Vital="yes" />
+        <File Id="LauncherBinary" Source="$(var.StagingDir)\pb-launcher.exe" KeyPath="yes" Vital="yes">
+          <PermissionEx Sddl="O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)" />
+        </File>
       </Component>
       <Component Id="CliPathComponent" Guid="{F3E5F8E2-BD39-4CC4-BD4C-6FD34E5C8F0B}">
         <Environment
@@ -123,14 +127,35 @@
             Part="last"
             System="yes"
             Permanent="no" />
+        <!-- Remove only the empty MSI-owned install root. Windows Installer
+             leaves non-empty directories untouched, so unknown residue stays
+             visible to qualification. -->
+        <RemoveFolder Id="RemoveEmptyInstallRoot" Directory="INSTALLFOLDER" On="uninstall" />
       </Component>
     </ComponentGroup>
   </Fragment>
 
   <Fragment>
-    <ComponentGroup Id="ServiceComponents" Directory="BINDIR">
-      <Component Id="HostSupervisorServiceComponent" Guid="{F3E5F8E2-BD39-4CC4-BD4C-6FD34E5C8F04}">
-        <File Id="HostSupervisorBinary" Source="$(var.StagingDir)\paperboat-hostd.exe" KeyPath="yes" Vital="yes" />
+    <ComponentGroup Id="ServiceComponents" Directory="ACTIVERELEASE">
+      <Component Id="ReleaseVersionsSecurityComponent" Directory="VERSIONS" Guid="{5F72FCD4-1D71-44D3-8D42-0D19CD0F44A4}">
+        <CreateFolder>
+          <PermissionEx Sddl="O:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)" />
+        </CreateFolder>
+      </Component>
+      <Component Id="ActiveReleaseSecurityComponent" Guid="{5F72FCD4-1D71-44D3-8D42-0D19CD0F44A5}">
+        <CreateFolder>
+          <PermissionEx Sddl="O:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)" />
+        </CreateFolder>
+      </Component>
+      <Component Id="RuntimeComponent" Guid="{5F72FCD4-1D71-44D3-8D42-0D19CD0F44A1}">
+        <File Id="RuntimeBinary" Source="$(var.StagingDir)\paperboat-runtime.exe" KeyPath="yes" Vital="yes">
+          <PermissionEx Sddl="O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)" />
+        </File>
+      </Component>
+      <Component Id="HostSupervisorServiceComponent" Guid="{614E6D9D-4014-44DA-B6FD-3D1CC018E6A2}">
+        <File Id="HostSupervisorBinary" Source="$(var.StagingDir)\paperboat-hostd.exe" KeyPath="yes" Vital="yes">
+          <PermissionEx Sddl="O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)" />
+        </File>
         <ServiceInstall
             Id="HostSupervisorServiceInstall"
             Name="PaperboatHostd"
@@ -148,8 +173,10 @@
             Remove="uninstall"
             Wait="yes" />
       </Component>
-      <Component Id="UpdaterServiceComponent" Guid="{F3E5F8E2-BD39-4CC4-BD4C-6FD34E5C8F05}">
-        <File Id="UpdaterBinary" Source="$(var.StagingDir)\paperboat-updater.exe" KeyPath="yes" Vital="yes" />
+      <Component Id="UpdaterServiceComponent" Guid="{A781783F-740B-45B9-AEC9-281BF52ABF39}">
+        <File Id="UpdaterBinary" Source="$(var.StagingDir)\paperboat-updater.exe" KeyPath="yes" Vital="yes">
+          <PermissionEx Sddl="O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)" />
+        </File>
         <ServiceInstall
             Id="UpdaterServiceInstall"
             Name="PaperboatUpdated"
@@ -208,17 +235,17 @@
     <ComponentGroup Id="CLIReleaseComponents" Directory="CLICURRENTSLOT">
       <Component Id="CLIReleaseRootComponent" Directory="RELEASES" Guid="{F3E5F8E2-BD39-4CC4-BD4C-6FD34E5C8F0D}">
         <CreateFolder>
-          <PermissionEx Sddl="D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)" />
+          <PermissionEx Sddl="O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)" />
         </CreateFolder>
       </Component>
       <Component Id="CLICurrentSeedComponent" Guid="{F3E5F8E2-BD39-4CC4-BD4C-6FD34E5C8F0C}">
         <CreateFolder>
-          <PermissionEx Sddl="D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)" />
+          <PermissionEx Sddl="O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)" />
         </CreateFolder>
         <!-- Seed the immutable current CLI slot. bin\pb.exe is only the
              launcher and must have a verified target on a plain MSI install. -->
         <File Id="CLICurrentSeedBinary" Source="$(var.StagingDir)\pb.exe" Name="pb.exe" KeyPath="yes" Vital="yes">
-          <PermissionEx Sddl="D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)" />
+          <PermissionEx Sddl="O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)" />
         </File>
       </Component>
     </ComponentGroup>

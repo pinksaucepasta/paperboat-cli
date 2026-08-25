@@ -9,15 +9,18 @@ package hostinstall
 import (
 	"context"
 	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
+	"unsafe"
 
 	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/binarytarget"
@@ -25,6 +28,7 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/nativesignature"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
 	"github.com/pinksaucepasta/paperboat/internal/windowsopenssh"
+	"github.com/pinksaucepasta/paperboat/internal/windowssecurity"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
@@ -66,18 +70,19 @@ type Request struct {
 // WindowsRuntimeConfig is the protected input consumed by Paperboat SCM
 // entries. It contains no command line and cannot redirect an SCM service.
 type WindowsRuntimeConfig struct {
-	Schema      string                   `json:"schema"`
-	OwnerSID    string                   `json:"owner_sid"`
-	User        string                   `json:"user"`
-	StateRoot   string                   `json:"state_root"`
-	Workspace   string                   `json:"workspace_root"`
-	ControlURL  string                   `json:"control_url"`
-	MachineID   string                   `json:"machine_id"`
-	SetupMode   string                   `json:"setup_mode"`
-	TokenFile   string                   `json:"token_file"`
-	InstalledAt time.Time                `json:"installed_at"`
-	Committed   bool                     `json:"committed"`
-	Artifact    bootstrap.ArtifactTarget `json:"artifact"`
+	Schema        string                   `json:"schema"`
+	OwnerSID      string                   `json:"owner_sid"`
+	User          string                   `json:"user"`
+	StateRoot     string                   `json:"state_root"`
+	Workspace     string                   `json:"workspace_root"`
+	ControlURL    string                   `json:"control_url"`
+	ListenAddress string                   `json:"listen_address"`
+	MachineID     string                   `json:"machine_id"`
+	SetupMode     string                   `json:"setup_mode"`
+	TokenFile     string                   `json:"token_file"`
+	InstalledAt   time.Time                `json:"installed_at"`
+	Committed     bool                     `json:"committed"`
+	Artifact      bootstrap.ArtifactTarget `json:"artifact"`
 }
 
 const windowsConfigSchema = "paperboat.windows-runtime-install/v1"
@@ -96,13 +101,45 @@ func Decode(reader io.Reader) (Request, error) {
 	return request, nil
 }
 
-func WindowsProgramDataRoot() string { return `C:\ProgramData\Paperboat` }
+var windowsProgramDataRoot = `C:\ProgramData\Paperboat`
+
+func WindowsProgramDataRoot() string { return windowsProgramDataRoot }
 func WindowsInstallConfigPath() string {
 	return filepath.Join(WindowsProgramDataRoot(), "runtime-install.json")
 }
 func WindowsHostdTokenPath() string { return filepath.Join(WindowsProgramDataRoot(), "hostd.token") }
 
 func LoadWindowsRuntimeConfig() (WindowsRuntimeConfig, error) {
+	config, err := readWindowsRuntimeConfig()
+	if err != nil {
+		return WindowsRuntimeConfig{}, err
+	}
+	trustedOwner, err := windowsRuntimeTrustedOwner()
+	if err != nil {
+		return WindowsRuntimeConfig{}, fmt.Errorf("resolve trusted Windows runtime owner: %w", err)
+	}
+	fileDACL := windowsRuntimeCurrentFileDACL(config.OwnerSID)
+	rootDACL := windowsRuntimeCurrentRootDACL(config.OwnerSID)
+	if err := validateWindowsRuntimeSecurity(WindowsProgramDataRoot(), trustedOwner, rootDACL, "root"); err != nil {
+		return WindowsRuntimeConfig{}, err
+	}
+	if err := validateWindowsRuntimeSecurity(WindowsInstallConfigPath(), trustedOwner, fileDACL, "config"); err != nil {
+		return WindowsRuntimeConfig{}, err
+	}
+	if err := secureWindowsFile(WindowsHostdTokenPath(), ""); err != nil {
+		return WindowsRuntimeConfig{}, fmt.Errorf("validate Windows runtime token file: %w", err)
+	}
+	tokenInfo, err := os.Stat(WindowsHostdTokenPath())
+	if err != nil || tokenInfo.Size() != 32 {
+		return WindowsRuntimeConfig{}, fmt.Errorf("validate Windows runtime token size: %w", ErrInvalidRequest)
+	}
+	if err := validateWindowsRuntimeSecurity(WindowsHostdTokenPath(), trustedOwner, fileDACL, "token"); err != nil {
+		return WindowsRuntimeConfig{}, err
+	}
+	return config, nil
+}
+
+func readWindowsRuntimeConfig() (WindowsRuntimeConfig, error) {
 	path := WindowsInstallConfigPath()
 	if err := secureWindowsFile(path, ""); err != nil {
 		return WindowsRuntimeConfig{}, err
@@ -111,6 +148,10 @@ func LoadWindowsRuntimeConfig() (WindowsRuntimeConfig, error) {
 	if err != nil || len(body) == 0 || len(body) > 128<<10 {
 		return WindowsRuntimeConfig{}, ErrInvalidRequest
 	}
+	return decodeWindowsRuntimeConfig(body)
+}
+
+func decodeWindowsRuntimeConfig(body []byte) (WindowsRuntimeConfig, error) {
 	var config WindowsRuntimeConfig
 	decoder := json.NewDecoder(strings.NewReader(string(body)))
 	decoder.DisallowUnknownFields()
@@ -124,8 +165,100 @@ func LoadWindowsRuntimeConfig() (WindowsRuntimeConfig, error) {
 	if config.SetupMode == "" {
 		config.SetupMode = "host"
 	}
+	if config.ListenAddress == "" {
+		// Older Windows installs used the runtime's fixed loopback default.
+		config.ListenAddress = "127.0.0.1:8080"
+	}
 	if !validWindowsConfig(config) {
 		return WindowsRuntimeConfig{}, ErrInvalidRequest
+	}
+	return config, nil
+}
+
+func migrateLegacyWindowsRuntimeSecurity() (WindowsRuntimeConfig, error) {
+	if !isAdministrator() {
+		return WindowsRuntimeConfig{}, ErrNotPrivileged
+	}
+	rootHandle, _, err := openWindowsRuntimeObject(WindowsProgramDataRoot(), true)
+	if err != nil {
+		return WindowsRuntimeConfig{}, fmt.Errorf("open legacy Windows runtime root: %w", err)
+	}
+	defer windows.CloseHandle(rootHandle)
+	configHandle, configInfo, err := openWindowsRuntimeObject(WindowsInstallConfigPath(), false)
+	if err != nil {
+		return WindowsRuntimeConfig{}, fmt.Errorf("open legacy Windows runtime config: %w", err)
+	}
+	defer windows.CloseHandle(configHandle)
+	tokenHandle, tokenInfo, err := openWindowsRuntimeObject(WindowsHostdTokenPath(), false)
+	if err != nil {
+		return WindowsRuntimeConfig{}, fmt.Errorf("open legacy Windows runtime token: %w", err)
+	}
+	defer windows.CloseHandle(tokenHandle)
+	if uint64(configInfo.FileSizeHigh)<<32|uint64(configInfo.FileSizeLow) == 0 || uint64(configInfo.FileSizeHigh)<<32|uint64(configInfo.FileSizeLow) > 128<<10 {
+		return WindowsRuntimeConfig{}, fmt.Errorf("read legacy Windows runtime config: %w", ErrInvalidRequest)
+	}
+	configBody := make([]byte, uint64(configInfo.FileSizeHigh)<<32|uint64(configInfo.FileSizeLow))
+	for offset := 0; offset < len(configBody); {
+		var configRead uint32
+		if err := windows.ReadFile(configHandle, configBody[offset:], &configRead, nil); err != nil || configRead == 0 {
+			return WindowsRuntimeConfig{}, fmt.Errorf("read legacy Windows runtime config: %w", ErrInvalidRequest)
+		}
+		offset += int(configRead)
+	}
+	config, err := decodeWindowsRuntimeConfig(configBody)
+	if err != nil {
+		return WindowsRuntimeConfig{}, fmt.Errorf("read legacy Windows runtime config: %w", err)
+	}
+	caller, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil || caller == nil || caller.User.Sid == nil || !strings.EqualFold(caller.User.Sid.String(), config.OwnerSID) {
+		// The legacy file granted its enrolled owner WRITE_DAC and WRITE_DATA.
+		// Bind migration to the elevated identity that explicitly requested the
+		// repair so rewritten legacy bytes cannot select another Windows account.
+		return WindowsRuntimeConfig{}, fmt.Errorf("validate legacy Windows runtime repair caller: %w", ErrInvalidRequest)
+	}
+	trustedOwner, err := windowsRuntimeTrustedOwner()
+	if err != nil {
+		return WindowsRuntimeConfig{}, fmt.Errorf("resolve trusted Windows runtime owner: %w", err)
+	}
+	legacyOwner := caller.User.Sid
+	legacyFileDACL := windowsRuntimeLegacyFileDACL(config.OwnerSID)
+	legacyRootDACL := windowsRuntimeLegacyRootDACL(config.OwnerSID)
+	currentFileDACL := windowsRuntimeCurrentFileDACL(config.OwnerSID)
+	currentRootDACL := windowsRuntimeCurrentRootDACL(config.OwnerSID)
+	if !windowsRuntimeMigrationHandleSecurityMatches(rootHandle, legacyOwner, trustedOwner, legacyRootDACL, currentRootDACL) {
+		return WindowsRuntimeConfig{}, fmt.Errorf("validate legacy Windows runtime root security: %w", ErrInvalidRequest)
+	}
+	if !windowsRuntimeMigrationHandleSecurityMatches(configHandle, legacyOwner, trustedOwner, legacyFileDACL, currentFileDACL) {
+		return WindowsRuntimeConfig{}, fmt.Errorf("validate legacy Windows runtime config security: %w", ErrInvalidRequest)
+	}
+	if uint64(tokenInfo.FileSizeHigh)<<32|uint64(tokenInfo.FileSizeLow) != 32 {
+		return WindowsRuntimeConfig{}, fmt.Errorf("validate legacy Windows runtime token file: %w", ErrInvalidRequest)
+	}
+	if !windowsRuntimeMigrationHandleSecurityMatches(tokenHandle, legacyOwner, trustedOwner, legacyFileDACL, currentFileDACL) {
+		return WindowsRuntimeConfig{}, fmt.Errorf("validate legacy Windows runtime token security: %w", ErrInvalidRequest)
+	}
+	allCurrent := windowsRuntimeHandleSecurityMatches(rootHandle, trustedOwner, currentRootDACL) &&
+		windowsRuntimeHandleSecurityMatches(configHandle, trustedOwner, currentFileDACL) &&
+		windowsRuntimeHandleSecurityMatches(tokenHandle, trustedOwner, currentFileDACL)
+	if allCurrent {
+		return WindowsRuntimeConfig{}, fmt.Errorf("validate legacy Windows runtime transition: %w", ErrInvalidRequest)
+	}
+	// Validate every object before the first mutation. A foreign owner must fail
+	// without allowing a partially trusted tree to be adopted. Each subsequent
+	// owner+DACL replacement is idempotent, so an interrupted migration can
+	// resume from any mixture of the two explicitly supported states.
+	for _, item := range []struct {
+		handle windows.Handle
+		dacl   string
+		stage  string
+	}{
+		{tokenHandle, currentFileDACL, "token"},
+		{configHandle, currentFileDACL, "config"},
+		{rootHandle, currentRootDACL, "root"},
+	} {
+		if err := applyWindowsHandleOwnedDACL(item.handle, trustedOwner, item.dacl); err != nil {
+			return WindowsRuntimeConfig{}, fmt.Errorf("migrate Windows runtime %s security: %w", item.stage, err)
+		}
 	}
 	return config, nil
 }
@@ -141,7 +274,7 @@ func Install(ctx context.Context, request Request) error {
 	if err != nil {
 		return err
 	}
-	if err := runWindowsInstallPhase(ctx, "prepare Paperboat machine state", func() error { return ensureWindowsDirectory(WindowsProgramDataRoot(), request.OwnerSID) }); err != nil {
+	if err := runWindowsInstallPhase(ctx, "prepare Paperboat machine state", func() error { return ensureWindowsMachineDirectory(WindowsProgramDataRoot(), request.OwnerSID) }); err != nil {
 		return err
 	}
 	if err := runWindowsInstallPhase(ctx, "prepare Paperboat release slots", func() error { return ensureWindowsDirectory(layout.ReleasesRoot, request.OwnerSID) }); err != nil {
@@ -175,6 +308,15 @@ func Install(ctx context.Context, request Request) error {
 	}); err != nil {
 		return err
 	}
+	immutableRelease, err := layout.WindowsRelease(request.Artifact.Version)
+	if err != nil {
+		return err
+	}
+	if err := runWindowsInstallPhase(ctx, "seed immutable Paperboat Windows release", func() error {
+		return seedWindowsImmutableRelease(ctx, request, layout, immutableRelease)
+	}); err != nil {
+		return err
+	}
 	if err := runWindowsInstallPhase(ctx, "protect Paperboat CLI release slots", func() error { return protectWindowsCLISlots(layout) }); err != nil {
 		return err
 	}
@@ -184,7 +326,7 @@ func Install(ctx context.Context, request Request) error {
 	if err := runWindowsInstallPhase(ctx, "prepare Paperboat host token", func() error { return ensureWindowsToken(request.OwnerSID) }); err != nil {
 		return err
 	}
-	config := WindowsRuntimeConfig{Schema: windowsConfigSchema, OwnerSID: request.OwnerSID, User: request.User, StateRoot: request.StateRoot, Workspace: request.WorkspaceRoot, ControlURL: request.ControlURL, MachineID: request.UserMachineID, SetupMode: request.SetupMode, TokenFile: WindowsHostdTokenPath(), InstalledAt: time.Now().UTC(), Artifact: request.Artifact}
+	config := WindowsRuntimeConfig{Schema: windowsConfigSchema, OwnerSID: request.OwnerSID, User: request.User, StateRoot: request.StateRoot, Workspace: request.WorkspaceRoot, ControlURL: request.ControlURL, ListenAddress: request.HelperListenAddress, MachineID: request.UserMachineID, SetupMode: request.SetupMode, TokenFile: WindowsHostdTokenPath(), InstalledAt: time.Now().UTC(), Artifact: request.Artifact}
 	if err := runWindowsInstallPhase(ctx, "write Paperboat runtime configuration", func() error { return writeWindowsConfig(config) }); err != nil {
 		return err
 	}
@@ -192,7 +334,9 @@ func Install(ctx context.Context, request Request) error {
 	// slot. Re-apply their SCM definitions so the newly staged image is started;
 	// UpgradeReload would treat existing declarations as stable and leave the
 	// services stopped.
-	if err := runWindowsInstallPhase(ctx, "install Paperboat Windows services", func() error { return installWindowsServices(ctx, layout, "") }); err != nil {
+	if err := runWindowsInstallPhase(ctx, "install Paperboat Windows services", func() error {
+		return installWindowsServices(ctx, layout, "", immutableRelease.Hostd, immutableRelease.Updater)
+	}); err != nil {
 		return err
 	}
 	if err := runWindowsInstallPhase(ctx, "finalize Paperboat OpenSSH role", func() error { return installWindowsSSHAfterActivation(ctx, request, layout) }); err != nil {
@@ -227,6 +371,13 @@ func windowsOpenSSHConfig(layout service.Layout, ownerSID string) windowsopenssh
 	config := windowsopenssh.DefaultConfig(nil)
 	config.OwnerSID = ownerSID
 	config.ServiceExecutable = layout.RuntimeCurrent
+	if installed, err := LoadWindowsRuntimeConfig(); err == nil {
+		if release, releaseErr := layout.WindowsRelease(installed.Artifact.Version); releaseErr == nil {
+			if _, statErr := os.Lstat(release.Runtime); statErr == nil {
+				config.ServiceExecutable = release.Runtime
+			}
+		}
+	}
 	return config
 }
 
@@ -371,9 +522,16 @@ func Repair(ctx context.Context) error {
 		if errors.Is(err, os.ErrNotExist) && !windowsRuntimeServiceExists() {
 			return ErrNotInstalled
 		}
-		return err
+		config, err = migrateLegacyWindowsRuntimeSecurity()
+		if err != nil {
+			return err
+		}
 	}
 	layout, err := service.DefaultLayout("windows")
+	if err != nil {
+		return err
+	}
+	config, err = reconcileWindowsRepairVersion(ctx, config, layout)
 	if err != nil {
 		return err
 	}
@@ -384,7 +542,7 @@ func Repair(ctx context.Context) error {
 	if err := repairWindowsRuntimeBinary(ctx, config, layout); err != nil {
 		return err
 	}
-	if err := ensureWindowsDirectory(WindowsProgramDataRoot(), config.OwnerSID); err != nil {
+	if err := ensureWindowsMachineDirectory(WindowsProgramDataRoot(), config.OwnerSID); err != nil {
 		return err
 	}
 	if err := ensureWindowsDirectory(config.StateRoot, config.OwnerSID); err != nil {
@@ -396,13 +554,63 @@ func Repair(ctx context.Context) error {
 	if err := ensureWindowsToken(config.OwnerSID); err != nil {
 		return err
 	}
-	if err := applyWindowsACL(WindowsInstallConfigPath(), config.OwnerSID, false); err != nil {
+	if err := writeWindowsConfig(config); err != nil {
 		return err
 	}
-	if err := installWindowsServices(ctx, layout, ""); err != nil {
+	immutableRelease, err := layout.WindowsRelease(config.Artifact.Version)
+	if err != nil {
+		return err
+	}
+	seedRequest := Request{Executable: layout.RuntimeCurrent, OwnerSID: config.OwnerSID, Artifact: config.Artifact}
+	if err := seedWindowsImmutableRelease(ctx, seedRequest, layout, immutableRelease); err != nil {
+		return err
+	}
+	if err := installWindowsServices(ctx, layout, "", immutableRelease.Hostd, immutableRelease.Updater); err != nil {
 		return err
 	}
 	return installWindowsSSHAfterActivation(ctx, request, layout)
+}
+
+func reconcileWindowsRepairVersion(ctx context.Context, config WindowsRuntimeConfig, layout service.Layout) (WindowsRuntimeConfig, error) {
+	manager, err := mgr.Connect()
+	if err != nil {
+		return config, err
+	}
+	defer manager.Disconnect()
+	versions := make([]string, 0, 2)
+	for _, item := range []struct{ name, argument string }{{"PaperboatHostd", "__runtime-hostd"}, {"PaperboatUpdated", "__runtime-updated"}} {
+		registered, err := manager.OpenService(item.name)
+		if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+			return config, nil
+		}
+		if err != nil {
+			return config, err
+		}
+		definition, configErr := registered.Config()
+		closeErr := registered.Close()
+		if configErr != nil || closeErr != nil {
+			return config, errors.Join(configErr, closeErr)
+		}
+		arguments, err := windows.DecomposeCommandLine(definition.BinaryPathName)
+		if err != nil || len(arguments) != 2 || arguments[1] != item.argument {
+			return config, ErrInvalidRequest
+		}
+		version, err := layout.WindowsVersionForExecutable(arguments[0])
+		if err != nil {
+			return config, nil
+		}
+		if err := verifyWindowsInstalledBinary(ctx, arguments[0], config.Artifact.Architecture); err != nil {
+			return config, err
+		}
+		versions = append(versions, version)
+	}
+	if len(versions) != 2 || versions[0] != versions[1] {
+		return config, ErrInvalidRequest
+	}
+	if versions[0] != config.Artifact.Version {
+		config.Artifact.Version = versions[0]
+	}
+	return config, nil
 }
 
 // Purge removes only Paperboat-owned service declarations, slots, tokens, and
@@ -460,12 +668,16 @@ func uninstallWindows(ctx context.Context, purge bool) error {
 	return result
 }
 
-func installWindowsServices(ctx context.Context, layout service.Layout, upgradeMode string) error {
+func installWindowsServices(ctx context.Context, layout service.Layout, upgradeMode string, immutableTargets ...string) error {
+	hostdExecutable, updaterExecutable := layout.RuntimeCurrent, layout.RuntimeCurrent
+	if len(immutableTargets) == 2 {
+		hostdExecutable, updaterExecutable = immutableTargets[0], immutableTargets[1]
+	}
 	for _, item := range []struct {
-		kind string
-		args []string
-	}{{service.HostdKind, []string{"__runtime-hostd"}}, {service.UpdaterKind, []string{"__runtime-updated"}}} {
-		installer, err := service.New(service.Config{Platform: "windows", Kind: item.kind, ConfigRoot: WindowsProgramDataRoot(), Executable: layout.RuntimeCurrent, User: "Paperboat", Group: "Paperboat", Arguments: item.args, Controller: service.WindowsController{}, UpgradeMode: upgradeMode})
+		kind, executable string
+		args             []string
+	}{{service.HostdKind, hostdExecutable, []string{"__runtime-hostd"}}, {service.UpdaterKind, updaterExecutable, []string{"__runtime-updated"}}} {
+		installer, err := service.New(service.Config{Platform: "windows", Kind: item.kind, ConfigRoot: WindowsProgramDataRoot(), Executable: item.executable, User: "Paperboat", Group: "Paperboat", Arguments: item.args, Controller: service.WindowsController{}, UpgradeMode: upgradeMode})
 		if err != nil {
 			return err
 		}
@@ -474,6 +686,49 @@ func installWindowsServices(ctx context.Context, layout service.Layout, upgradeM
 		}
 	}
 	return nil
+}
+
+func seedWindowsImmutableRelease(ctx context.Context, request Request, layout service.Layout, release service.WindowsReleasePaths) error {
+	if err := ensureWindowsImmutableDirectory(filepath.Dir(release.Root)); err != nil {
+		return err
+	}
+	if err := ensureWindowsImmutableDirectory(release.Root); err != nil {
+		return err
+	}
+	// MSI owns the stable launcher and the initial role-stamped artifacts.
+	// Never manufacture a missing hostd/updater by copying the general CLI or
+	// runtime binary: that would erase the build-time command allowlist.
+	for _, destination := range []string{release.Runtime, release.Hostd, release.Updater} {
+		if err := verifyWindowsInstalledBinary(ctx, destination, request.Artifact.Architecture); err != nil {
+			return err
+		}
+		trustedOwner, ownerErr := windowsRuntimeTrustedOwner()
+		if ownerErr != nil {
+			return ownerErr
+		}
+		if err := applyWindowsOwnedDACL(destination, trustedOwner, "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func ensureWindowsImmutableDirectory(path string) error {
+	if !safeAbsolute(path) {
+		return ErrInvalidRequest
+	}
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return err
+	}
+	attributes, err := windows.GetFileAttributes(windows.StringToUTF16Ptr(path))
+	if err != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return ErrInvalidRequest
+	}
+	trustedOwner, err := windowsRuntimeTrustedOwner()
+	if err != nil {
+		return err
+	}
+	return applyWindowsOwnedDACL(path, trustedOwner, "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)")
 }
 
 func Validate(request Request, _ int) error {
@@ -494,6 +749,10 @@ func Validate(request Request, _ int) error {
 	}
 	if request.SetupMode != "host" && request.SetupMode != "client" {
 		return fmt.Errorf("%w: setup mode", ErrInvalidRequest)
+	}
+	listenHost, listenPort, listenErr := net.SplitHostPort(request.HelperListenAddress)
+	if listenErr != nil || listenPort == "" || net.ParseIP(listenHost) == nil || !net.ParseIP(listenHost).IsLoopback() {
+		return fmt.Errorf("%w: helper listen address", ErrInvalidRequest)
 	}
 	if err := bootstrap.VerifyArtifactTarget(request.Artifact); err != nil || request.Artifact.Platform != "windows" {
 		return fmt.Errorf("%w: artifact descriptor", ErrInvalidRequest)
@@ -517,17 +776,25 @@ func writeWindowsConfig(config WindowsRuntimeConfig) error {
 	if err != nil {
 		return err
 	}
-	if err := ensureWindowsDirectory(WindowsProgramDataRoot(), config.OwnerSID); err != nil {
+	if err := ensureWindowsMachineDirectory(WindowsProgramDataRoot(), config.OwnerSID); err != nil {
 		return err
 	}
-	if err := atomicfile.Write(WindowsInstallConfigPath(), body, atomicfile.Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1}); err != nil {
+	fileDACL := windowsRuntimeCurrentFileDACL(config.OwnerSID)
+	if err := windowssecurity.WithRestorePrivilege(func() error {
+		return atomicfile.Write(WindowsInstallConfigPath(), body, atomicfile.Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: "O:SY" + fileDACL})
+	}); err != nil {
 		return err
 	}
-	return applyWindowsACL(WindowsInstallConfigPath(), config.OwnerSID, false)
+	trustedOwner, err := windowsRuntimeTrustedOwner()
+	if err != nil {
+		return err
+	}
+	return applyWindowsOwnedDACL(WindowsInstallConfigPath(), trustedOwner, fileDACL)
 }
 
 func validWindowsConfig(config WindowsRuntimeConfig) bool {
-	return config.Schema == windowsConfigSchema && validSID(config.OwnerSID) && config.User != "" && safeAbsolute(config.StateRoot) && safeAbsolute(config.Workspace) && safeAbsolute(config.TokenFile) && config.MachineID != "" && (config.SetupMode == "host" || config.SetupMode == "client") && config.Artifact.Platform == "windows"
+	host, port, listenErr := net.SplitHostPort(config.ListenAddress)
+	return config.Schema == windowsConfigSchema && validSID(config.OwnerSID) && config.User != "" && safeAbsolute(config.StateRoot) && safeAbsolute(config.Workspace) && config.TokenFile == WindowsHostdTokenPath() && config.MachineID != "" && (config.SetupMode == "host" || config.SetupMode == "client") && bootstrap.VerifyArtifactTarget(config.Artifact) == nil && config.Artifact.Platform == "windows" && config.Artifact.Architecture == runtime.GOARCH && listenErr == nil && port != "" && net.ParseIP(host) != nil && net.ParseIP(host).IsLoopback()
 }
 func safeAbsolute(path string) bool {
 	return filepath.IsAbs(path) && filepath.Clean(path) == path && !strings.ContainsAny(path, "\x00\r\n")
@@ -539,7 +806,18 @@ func validSID(value string) bool {
 
 func ensureWindowsToken(ownerSID string) error {
 	path := WindowsHostdTokenPath()
-	if err := secureWindowsFile(path, ownerSID); err == nil {
+	if err := secureWindowsFile(path, ""); err == nil {
+		info, statErr := os.Stat(path)
+		if statErr != nil || info.Size() != 32 {
+			return ErrInvalidRequest
+		}
+		trustedOwner, ownerErr := windowsRuntimeTrustedOwner()
+		if ownerErr != nil {
+			return ownerErr
+		}
+		if !windowsRuntimeSecurityMatches(path, trustedOwner, windowsRuntimeCurrentFileDACL(ownerSID)) {
+			return fmt.Errorf("validate existing Windows runtime token security: %w", ErrInvalidRequest)
+		}
 		return nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
@@ -548,17 +826,354 @@ func ensureWindowsToken(ownerSID string) error {
 	if _, err := rand.Read(token); err != nil {
 		return err
 	}
-	if err := os.WriteFile(path, token, 0o600); err != nil {
+	if err := windowssecurity.WithRestorePrivilege(func() error {
+		return atomicfile.Write(path, token, atomicfile.Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: "O:SY" + windowsRuntimeCurrentFileDACL(ownerSID)})
+	}); err != nil {
 		return err
 	}
-	return applyWindowsACL(path, ownerSID, false)
+	trustedOwner, err := windowsRuntimeTrustedOwner()
+	if err != nil {
+		return err
+	}
+	return applyWindowsOwnedDACL(path, trustedOwner, windowsRuntimeCurrentFileDACL(ownerSID))
+}
+
+func ensureWindowsMachineDirectory(path, ownerSID string) error {
+	if !safeAbsolute(path) || !validSID(ownerSID) {
+		return ErrInvalidRequest
+	}
+	trustedOwner, err := windowsRuntimeTrustedOwner()
+	if err != nil {
+		return err
+	}
+	_, statErr := os.Lstat(path)
+	if errors.Is(statErr, os.ErrNotExist) {
+		if err := createWindowsRuntimeRoot(path, trustedOwner, windowsRuntimeCurrentRootDACL(ownerSID)); err == nil {
+			// Creation and the BA-to-SYSTEM owner transition were verified through
+			// one nonshared, non-reparse handle. Do not weaken that proof by
+			// resolving the path again after the trusted handle is closed.
+			return nil
+		} else if err != windows.ERROR_ALREADY_EXISTS {
+			return err
+		}
+	} else if statErr != nil {
+		return statErr
+	}
+	info, err := os.Lstat(path)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return ErrInvalidRequest
+	}
+	attributes, err := windows.GetFileAttributes(windows.StringToUTF16Ptr(path))
+	if err != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return ErrInvalidRequest
+	}
+	handle, _, err := openWindowsRuntimeObject(path, true)
+	if err != nil {
+		return err
+	}
+	defer windows.CloseHandle(handle)
+	// A pre-existing machine root may be created by MSI under SYSTEM. A process
+	// cut between protected creation and the owner transfer may leave the exact
+	// Administrators-owned current-DACL transition. WiX also creates DATAROOT
+	// with an Administrators owner and a protected SYSTEM/Administrators-only
+	// DACL before the enrolled SID is known. Both states exclude the enrolled
+	// user's filtered token and are safe to complete through this held handle.
+	// Reject every other owner or DACL without rewriting it.
+	if !windowssecurity.HandleOwnerMatchesSID(handle, trustedOwner) {
+		administrators, ownerErr := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
+		trustedTransition := windowssecurity.ProtectedHandleDACLMatches(handle, windowsRuntimeCurrentRootDACL(ownerSID)) ||
+			windowssecurity.ProtectedHandleDACLMatches(handle, windowsRuntimeMSIBootstrapRootDACL())
+		if ownerErr != nil || !windowssecurity.HandleOwnerMatchesSID(handle, administrators) || !trustedTransition {
+			return fmt.Errorf("validate existing Windows runtime root owner: %w", ErrInvalidRequest)
+		}
+	}
+	return applyWindowsHandleOwnedDACL(handle, trustedOwner, windowsRuntimeCurrentRootDACL(ownerSID))
+}
+
+func windowsRuntimeTrustedOwner() (*windows.SID, error) {
+	return windows.CreateWellKnownSid(windows.WinLocalSystemSid)
+}
+
+func windowsRuntimeLegacyFileDACL(ownerSID string) string {
+	return "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + ownerSID + ")"
+}
+
+func windowsRuntimeLegacyRootDACL(ownerSID string) string {
+	return "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;" + ownerSID + ")"
+}
+
+func windowsRuntimeCurrentFileDACL(ownerSID string) string {
+	return "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;" + ownerSID + ")"
+}
+
+func windowsRuntimeCurrentRootDACL(ownerSID string) string {
+	return "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;" + ownerSID + ")"
+}
+
+func windowsRuntimeMSIBootstrapRootDACL() string {
+	return "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
+}
+
+func windowsRuntimeSecurityMatches(path string, owner *windows.SID, dacl string) bool {
+	handle, err := openWindowsRuntimeSecurityObject(path)
+	if err != nil {
+		return false
+	}
+	defer windows.CloseHandle(handle)
+	return windowsRuntimeHandleSecurityMatches(handle, owner, dacl)
+}
+
+func validateWindowsRuntimeSecurity(path string, owner *windows.SID, dacl, stage string) error {
+	handle, err := openWindowsRuntimeSecurityObject(path)
+	if err != nil {
+		return fmt.Errorf("open Windows runtime %s security: %w", stage, err)
+	}
+	defer windows.CloseHandle(handle)
+	if !windowssecurity.HandleOwnerMatchesSID(handle, owner) {
+		return fmt.Errorf("validate Windows runtime %s filesystem owner: %w", stage, ErrInvalidRequest)
+	}
+	if !windowssecurity.ProtectedHandleDACLMatches(handle, dacl) {
+		actual := "unavailable"
+		if current, queryErr := windows.GetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION); queryErr == nil && current != nil {
+			actual = current.String()
+		}
+		return fmt.Errorf("validate Windows runtime %s protected DACL (got %s want %s): %w", stage, actual, dacl, ErrInvalidRequest)
+	}
+	return nil
+}
+
+func openWindowsRuntimeSecurityObject(path string) (windows.Handle, error) {
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || (!info.IsDir() && !info.Mode().IsRegular()) {
+		if err == nil {
+			err = ErrInvalidRequest
+		}
+		return 0, err
+	}
+	pathUTF16, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return 0, err
+	}
+	flags := uint32(windows.FILE_FLAG_OPEN_REPARSE_POINT)
+	if info.IsDir() {
+		flags |= windows.FILE_FLAG_BACKUP_SEMANTICS
+	}
+	handle, err := windows.CreateFile(pathUTF16, windows.GENERIC_READ|windows.READ_CONTROL, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil, windows.OPEN_EXISTING, flags, 0)
+	if err != nil {
+		return 0, err
+	}
+	var information windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(handle, &information); err != nil {
+		windows.CloseHandle(handle)
+		return 0, err
+	}
+	isDirectory := information.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0
+	if information.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 || isDirectory != info.IsDir() {
+		windows.CloseHandle(handle)
+		return 0, ErrInvalidRequest
+	}
+	return handle, nil
+}
+
+func windowsRuntimeMigrationSecurityMatches(path string, legacyOwner, trustedOwner *windows.SID, legacyDACL, currentDACL string) bool {
+	return windowsRuntimeSecurityMatches(path, legacyOwner, legacyDACL) || windowsRuntimeSecurityMatches(path, trustedOwner, currentDACL)
+}
+
+func windowsRuntimeHandleSecurityMatches(handle windows.Handle, owner *windows.SID, dacl string) bool {
+	return windowssecurity.HandleOwnerMatchesSID(handle, owner) && windowssecurity.ProtectedHandleDACLMatches(handle, dacl)
+}
+
+func windowsRuntimeMigrationHandleSecurityMatches(handle windows.Handle, legacyOwner, trustedOwner *windows.SID, legacyDACL, currentDACL string) bool {
+	return windowsRuntimeHandleSecurityMatches(handle, legacyOwner, legacyDACL) || windowsRuntimeHandleSecurityMatches(handle, trustedOwner, currentDACL)
+}
+
+func openWindowsRuntimeObject(path string, directory bool) (windows.Handle, windows.ByHandleFileInformation, error) {
+	pathUTF16, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return 0, windows.ByHandleFileInformation{}, err
+	}
+	flags := uint32(windows.FILE_FLAG_OPEN_REPARSE_POINT)
+	if directory {
+		flags |= windows.FILE_FLAG_BACKUP_SEMANTICS
+	}
+	handle, err := windows.CreateFile(pathUTF16, windows.GENERIC_READ|windows.READ_CONTROL|windows.WRITE_DAC|windows.WRITE_OWNER, 0, nil, windows.OPEN_EXISTING, flags, 0)
+	if err != nil {
+		return 0, windows.ByHandleFileInformation{}, err
+	}
+	var information windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(handle, &information); err != nil {
+		windows.CloseHandle(handle)
+		return 0, windows.ByHandleFileInformation{}, err
+	}
+	isDirectory := information.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0
+	if information.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 || isDirectory != directory {
+		windows.CloseHandle(handle)
+		return 0, windows.ByHandleFileInformation{}, ErrInvalidRequest
+	}
+	return handle, information, nil
+}
+
+func applyWindowsHandleOwnedDACL(handle windows.Handle, owner *windows.SID, access string) error {
+	if owner == nil || !owner.IsValid() {
+		return ErrInvalidRequest
+	}
+	descriptor, err := windows.SecurityDescriptorFromString(access)
+	if err != nil {
+		return err
+	}
+	absoluteDescriptor, err := descriptor.ToAbsolute()
+	if err != nil {
+		return err
+	}
+	dacl, _, err := absoluteDescriptor.DACL()
+	if err != nil {
+		return err
+	}
+	if err := windowssecurity.WithRestorePrivilege(func() error {
+		if setErr := windows.SetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil); setErr != nil {
+			return setErr
+		}
+		runtime.KeepAlive(absoluteDescriptor)
+		if !windowssecurity.ProtectedHandleDACLMatches(handle, access) {
+			return fmt.Errorf("validate rewritten object protected DACL: %w", ErrInvalidRequest)
+		}
+		return windows.SetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION, owner, nil, nil, nil)
+	}); err != nil {
+		return err
+	}
+	runtime.KeepAlive(absoluteDescriptor)
+	if !windowsRuntimeHandleSecurityMatches(handle, owner, access) {
+		return ErrInvalidRequest
+	}
+	return nil
+}
+
+func applyWindowsOwnedDACL(path string, owner *windows.SID, access string) error {
+	if owner == nil || !owner.IsValid() {
+		return ErrInvalidRequest
+	}
+	descriptor, err := windows.SecurityDescriptorFromString(access)
+	if err != nil {
+		return err
+	}
+	absoluteDescriptor, err := descriptor.ToAbsolute()
+	if err != nil {
+		return err
+	}
+	dacl, _, err := absoluteDescriptor.DACL()
+	if err != nil {
+		return err
+	}
+	if err := windowssecurity.WithRestorePrivilege(func() error {
+		if setErr := windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil); setErr != nil {
+			return setErr
+		}
+		runtime.KeepAlive(absoluteDescriptor)
+		if !windowssecurity.ProtectedDACLMatches(path, access) {
+			return fmt.Errorf("validate rewritten object protected DACL: %w", ErrInvalidRequest)
+		}
+		return windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION, owner, nil, nil, nil)
+	}); err != nil {
+		return err
+	}
+	runtime.KeepAlive(absoluteDescriptor)
+	if err := validateWindowsRuntimeSecurity(path, owner, access, "rewritten object"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func createWindowsRuntimeRoot(path string, owner *windows.SID, dacl string) error {
+	// Administrators is a trusted creation owner in an elevated token. The
+	// final protected DACL gives the enrolled user read/execute only, so the
+	// object is safe while its owner is transferred to SYSTEM.
+	descriptor, err := windows.SecurityDescriptorFromString(dacl)
+	if err != nil {
+		return err
+	}
+	attributes := windows.SecurityAttributes{
+		Length:             uint32(unsafe.Sizeof(windows.SecurityAttributes{})),
+		SecurityDescriptor: descriptor,
+	}
+	pathUTF16, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return err
+	}
+	administrators, err := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
+	if err != nil {
+		return err
+	}
+	created := false
+	err = windowssecurity.WithRestorePrivilegeAndOwner(administrators, func() error {
+		if err := windows.CreateDirectory(pathUTF16, &attributes); err != nil {
+			return err
+		}
+		created = true
+		handle, openErr := windows.CreateFile(pathUTF16, windows.READ_CONTROL|windows.WRITE_DAC|windows.WRITE_OWNER, 0, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+		if openErr != nil {
+			return openErr
+		}
+		defer windows.CloseHandle(handle)
+		var information windows.ByHandleFileInformation
+		if infoErr := windows.GetFileInformationByHandle(handle, &information); infoErr != nil {
+			return infoErr
+		}
+		if information.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 || information.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+			return ErrInvalidRequest
+		}
+		if !windowssecurity.HandleOwnerMatchesSID(handle, administrators) || !windowssecurity.ProtectedHandleDACLMatches(handle, dacl) {
+			return windows.ERROR_INVALID_SECURITY_DESCR
+		}
+		finalDescriptor, descriptorErr := windows.SecurityDescriptorFromString(dacl)
+		if descriptorErr != nil {
+			return descriptorErr
+		}
+		absoluteDescriptor, descriptorErr := finalDescriptor.ToAbsolute()
+		if descriptorErr != nil {
+			return descriptorErr
+		}
+		finalDACL, _, descriptorErr := absoluteDescriptor.DACL()
+		if descriptorErr != nil {
+			return descriptorErr
+		}
+		descriptorErr = windows.SetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, finalDACL, nil)
+		runtime.KeepAlive(absoluteDescriptor)
+		if descriptorErr != nil {
+			return descriptorErr
+		}
+		if !windowssecurity.ProtectedHandleDACLMatches(handle, dacl) {
+			return fmt.Errorf("validate created Windows runtime root protected DACL: %w", ErrInvalidRequest)
+		}
+		if descriptorErr = windows.SetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION, owner, nil, nil, nil); descriptorErr != nil {
+			return descriptorErr
+		}
+		if !windowssecurity.HandleOwnerMatchesSID(handle, owner) || !windowssecurity.ProtectedHandleDACLMatches(handle, dacl) {
+			return windows.ERROR_INVALID_SECURITY_DESCR
+		}
+		return nil
+	})
+	runtime.KeepAlive(descriptor)
+	if err != nil {
+		removeErr := error(nil)
+		if created {
+			removeErr = os.Remove(path)
+			if errors.Is(removeErr, os.ErrNotExist) {
+				removeErr = nil
+			}
+		}
+		if removeErr != nil {
+			return errors.Join(err, removeErr)
+		}
+		return err
+	}
+	return nil
 }
 
 func stageWindowsBinary(ctx context.Context, source, current, rollback string, artifact bootstrap.ArtifactTarget, ownerSID string) error {
-	if err := ensureWindowsDirectory(filepath.Dir(current), ownerSID); err != nil {
+	if err := ensureWindowsExecutableDirectory(filepath.Dir(current), ownerSID); err != nil {
 		return fmt.Errorf("prepare runtime slot: %w", err)
 	}
-	if err := ensureWindowsDirectory(filepath.Dir(rollback), ownerSID); err != nil {
+	if err := ensureWindowsExecutableDirectory(filepath.Dir(rollback), ownerSID); err != nil {
 		return fmt.Errorf("prepare runtime rollback slot: %w", err)
 	}
 	if err := secureWindowsFile(source, ""); err != nil {
@@ -569,22 +1184,25 @@ func stageWindowsBinary(ctx context.Context, source, current, rollback string, a
 	if err := nativesignature.New(nil).Verify(sourceVerifyCtx, source, "windows", artifact.Architecture); err != nil {
 		return fmt.Errorf("%w: downloaded runtime Authenticode: %v", ErrInvalidRequest, err)
 	}
-	input, err := os.Open(source)
-	if err != nil {
+	body, err := os.ReadFile(source)
+	if err != nil || len(body) < 1 || len(body) > 256<<20 {
+		return fmt.Errorf("%w: read staged runtime", ErrInvalidRequest)
+	}
+	var suffix [16]byte
+	if _, err := rand.Read(suffix[:]); err != nil {
 		return err
 	}
-	defer input.Close()
 	//paperboat:allow-source-policy atomic-replacement owner=windows-host-install reason=same-directory-verified-runtime-staging
-	temporary, err := os.CreateTemp(filepath.Dir(current), ".paperboat-runtime-*.exe")
-	if err != nil {
-		return err
-	}
-	temporaryPath := temporary.Name()
+	temporaryPath := filepath.Join(filepath.Dir(current), ".paperboat-runtime-"+hex.EncodeToString(suffix[:])+".exe")
 	defer os.Remove(temporaryPath)
-	written, copyErr := io.Copy(temporary, io.LimitReader(input, 256<<20+1))
-	closeErr := temporary.Close()
-	if copyErr != nil || closeErr != nil || written < 1 || written > 256<<20 {
-		return fmt.Errorf("%w: copy staged runtime", ErrInvalidRequest)
+	publicDACL := "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)"
+	if ownerSID != "" {
+		publicDACL = "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;" + ownerSID + ")"
+	}
+	if err := windowssecurity.WithRestorePrivilege(func() error {
+		return atomicfile.Write(temporaryPath, body, atomicfile.Options{Mode: 0o755, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: "O:SY" + publicDACL})
+	}); err != nil {
+		return err
 	}
 	if err := binarytarget.Validate(temporaryPath, "windows", artifact.Architecture); err != nil {
 		return fmt.Errorf("%w: staged runtime executable format", ErrInvalidRequest)
@@ -594,7 +1212,11 @@ func stageWindowsBinary(ctx context.Context, source, current, rollback string, a
 	if err := nativesignature.New(nil).Verify(verifyCtx, temporaryPath, "windows", artifact.Architecture); err != nil {
 		return fmt.Errorf("%w: staged runtime Authenticode: %v", ErrInvalidRequest, err)
 	}
-	if err := applyWindowsACL(temporaryPath, ownerSID, false); err != nil {
+	trustedOwner, err := windowsRuntimeTrustedOwner()
+	if err != nil {
+		return err
+	}
+	if err := validateWindowsRuntimeSecurity(temporaryPath, trustedOwner, publicDACL, "staged executable"); err != nil {
 		return err
 	}
 	if err := os.Remove(rollback); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -617,9 +1239,37 @@ func stageWindowsBinary(ctx context.Context, source, current, rollback string, a
 	return nil
 }
 
+func ensureWindowsExecutableDirectory(path, readerSID string) error {
+	if !safeAbsolute(path) {
+		return ErrInvalidRequest
+	}
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return ErrInvalidRequest
+	}
+	attributes, err := windows.GetFileAttributes(windows.StringToUTF16Ptr(path))
+	if err != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return ErrInvalidRequest
+	}
+	if readerSID == "" {
+		readerSID = "BU"
+	} else if !validSID(readerSID) {
+		return ErrInvalidRequest
+	}
+	dacl := "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;" + readerSID + ")"
+	trustedOwner, err := windowsRuntimeTrustedOwner()
+	if err != nil {
+		return err
+	}
+	return applyWindowsOwnedDACL(path, trustedOwner, dacl)
+}
+
 // Built-in Users may read and execute the public CLI, but only SYSTEM and
 // Administrators may replace its launcher or its active release slot.
-const windowsCLIEntrypointDACL = "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)"
+const windowsCLIEntrypointDACL = "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)"
 
 // windowsCLIEntrypointPaths returns the stable launcher installed by the MSI
 // and the public command path. The latter must always be a launcher: the CLI
@@ -634,6 +1284,13 @@ func installWindowsCLIEntrypoint(ctx context.Context, layout service.Layout, arc
 	if err := verifyWindowsInstalledBinary(ctx, launcher, architecture); err != nil {
 		return fmt.Errorf("verify installed stable launcher: %w", err)
 	}
+	trustedOwner, err := windowsRuntimeTrustedOwner()
+	if err != nil {
+		return err
+	}
+	if err := validateWindowsRuntimeSecurity(launcher, trustedOwner, windowsCLIEntrypointDACL, "stable launcher"); err != nil {
+		return err
+	}
 	return replaceWindowsCLIEntrypoint(entrypoint, launcher)
 }
 
@@ -644,7 +1301,11 @@ func protectWindowsCLISlots(layout service.Layout) error {
 		} else if err != nil {
 			return err
 		}
-		if err := applyWindowsDACL(path, windowsCLIEntrypointDACL); err != nil {
+		trustedOwner, ownerErr := windowsRuntimeTrustedOwner()
+		if ownerErr != nil {
+			return ownerErr
+		}
+		if err := applyWindowsOwnedDACL(path, trustedOwner, windowsCLIEntrypointDACL); err != nil {
 			return err
 		}
 	}
@@ -663,7 +1324,9 @@ func replaceWindowsCLIEntrypoint(entrypoint, launcher string) error {
 	if err != nil || len(body) == 0 || len(body) > 256<<20 {
 		return ErrInvalidRequest
 	}
-	return atomicfile.Write(entrypoint, body, atomicfile.Options{Mode: 0o755, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: windowsCLIEntrypointDACL})
+	return windowssecurity.WithRestorePrivilege(func() error {
+		return atomicfile.Write(entrypoint, body, atomicfile.Options{Mode: 0o755, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: "O:SY" + windowsCLIEntrypointDACL})
+	})
 }
 
 func repairWindowsRuntimeBinary(ctx context.Context, config WindowsRuntimeConfig, layout service.Layout) error {
@@ -774,15 +1437,54 @@ func applyWindowsACL(path, ownerSID string, directory bool) error {
 }
 
 func applyWindowsDACL(path, access string) error {
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || (!info.IsDir() && !info.Mode().IsRegular()) {
+		if err == nil {
+			err = ErrInvalidRequest
+		}
+		return err
+	}
+	pathUTF16, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return err
+	}
+	flags := uint32(windows.FILE_FLAG_OPEN_REPARSE_POINT)
+	if info.IsDir() {
+		flags |= windows.FILE_FLAG_BACKUP_SEMANTICS
+	}
+	handle, err := windows.CreateFile(pathUTF16, windows.READ_CONTROL|windows.WRITE_DAC, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, flags, 0)
+	if err != nil {
+		return err
+	}
+	defer windows.CloseHandle(handle)
+	var information windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(handle, &information); err != nil {
+		return err
+	}
+	isDirectory := information.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0
+	if information.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 || isDirectory != info.IsDir() {
+		return ErrInvalidRequest
+	}
 	descriptor, err := windows.SecurityDescriptorFromString(access)
 	if err != nil {
 		return err
 	}
-	dacl, _, err := descriptor.DACL()
+	absoluteDescriptor, err := descriptor.ToAbsolute()
 	if err != nil {
 		return err
 	}
-	return windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil)
+	dacl, _, err := absoluteDescriptor.DACL()
+	if err != nil {
+		return err
+	}
+	if err := windows.SetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil); err != nil {
+		return err
+	}
+	runtime.KeepAlive(absoluteDescriptor)
+	if !windowssecurity.ProtectedHandleDACLMatches(handle, access) {
+		return fmt.Errorf("validate rewritten Windows object protected DACL: %w", ErrInvalidRequest)
+	}
+	return nil
 }
 
 func repairWindowsTreeACL(root, ownerSID string) error {

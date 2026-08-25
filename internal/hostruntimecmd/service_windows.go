@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostinstall"
-	"github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntimeentry"
 	"github.com/pinksaucepasta/paperboat/internal/windows/elevation"
 	"github.com/pinksaucepasta/paperboat/internal/windowsopenssh"
@@ -155,19 +154,15 @@ func dispatchElevatedOperation(ctx context.Context, request elevation.Request) e
 }
 
 func repairWindowsInstallation(ctx context.Context) error {
-	runtimeErr := hostinstall.Repair(ctx)
-	if errors.Is(runtimeErr, hostinstall.ErrNotInstalled) {
-		runtimeErr = nil
+	err := hostinstall.Repair(ctx)
+	if errors.Is(err, hostinstall.ErrNotInstalled) {
+		return nil
 	}
-	sshConfig := windowsopenssh.DefaultConfig(nil)
-	if installed, err := hostinstall.LoadWindowsRuntimeConfig(); err == nil {
-		sshConfig.OwnerSID = installed.OwnerSID
-	}
-	if layout, err := service.DefaultLayout("windows"); err == nil {
-		sshConfig.ServiceExecutable = layout.RuntimeCurrent
-	}
-	_, sshErr := windowsopenssh.Repair(ctx, sshConfig)
-	return errors.Join(runtimeErr, sshErr)
+	// hostinstall.Repair owns the complete role-scoped service contract. In
+	// particular, Client repair removes PaperboatSshd while Host repair restores
+	// it. A second unconditional OpenSSH repair here used to recreate the SSH
+	// service on Client installations and contradicted that persisted role.
+	return err
 }
 
 func uninstallPersistedWindowsRuntime(ctx context.Context) error {

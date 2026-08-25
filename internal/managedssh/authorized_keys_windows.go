@@ -13,7 +13,6 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/sys/windows"
 )
@@ -43,7 +42,7 @@ func ReconcileAuthorizedKeys(home string, _ uint32, publicKeys []string) (Author
 		return AuthorizedKeysResult{}, err
 	}
 	home = filepath.Clean(home)
-	if err := verifyCurrentUserOwnedPath(home, sid, true); err != nil {
+	if err := verifyCurrentUserProfileRoot(home, sid); err != nil {
 		return AuthorizedKeysResult{}, ErrAuthorizedKeysConflict
 	}
 	directory := filepath.Join(home, ".ssh")
@@ -147,8 +146,14 @@ func writeWindowsAuthorizedKeys(directory, sid string, value []byte) error {
 		return err
 	}
 	if !exists {
-		return atomicfile.Write(path, value, atomicfile.Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: managedSSHSDDL(sid)})
+		return writeWindowsOwnedSSHFile(directory, "authorized_keys", sid, value)
 	}
+	return withManagedSSHOwner(sid, func() error {
+		return replaceWindowsAuthorizedKeys(directory, path, sid, value)
+	})
+}
+
+func replaceWindowsAuthorizedKeys(directory, path, sid string, value []byte) error {
 	//paperboat:allow-source-policy atomic-replacement owner=managed-ssh-windows reason=same-directory-acl-protected-authority-staging
 	temporary, err := os.CreateTemp(directory, ".paperboat-authorized-keys-")
 	if err != nil {
@@ -179,7 +184,14 @@ func writeWindowsAuthorizedKeys(directory, sid string, value []byte) error {
 	if err != nil {
 		return err
 	}
-	return windows.MoveFileEx(from, to, windows.MOVEFILE_REPLACE_EXISTING|windows.MOVEFILE_WRITE_THROUGH)
+	if err := windows.MoveFileEx(from, to, windows.MOVEFILE_REPLACE_EXISTING|windows.MOVEFILE_WRITE_THROUGH); err != nil {
+		return err
+	}
+	verified, exists, err := readWindowsSSHFile(directory, "authorized_keys", sid, false)
+	if err != nil || !exists || !bytes.Equal(verified, value) {
+		return errors.Join(ErrAuthorizedKeysConflict, err)
+	}
+	return nil
 }
 
 // Keep io imported in this Windows implementation's API surface checks. The

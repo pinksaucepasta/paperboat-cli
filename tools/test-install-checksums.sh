@@ -60,10 +60,25 @@ required = (
     "function Get-ReleaseChecksum([string]$Path, [string]$Asset)",
     "'^(?<hash>[0-9A-Fa-f]{64})[ \\t]+\\*?(?<name>(?:\\./)?[^ \\t]+)$'",
     "$expected = Get-ReleaseChecksum $sums $asset",
+    '$asset = "paperboat_${version}_windows_${arch}.msi"',
+    "[Environment]::GetFolderPath([Environment+SpecialFolder]::System)",
+    "'msiexec.exe'",
+    "'/i'", "'/qn'", "'/norestart'", "'/L*v'",
+    "WaitForExit(1200000)",
+    "function Assert-InstalledVersion",
+    "-Verb RunAs",
+    r"'Paperboat\bin\pb.exe'",
+    '& $installedPb pair --server $server --enrollment-token $token --name $name "--setup-mode=$setupMode"',
 )
 for value in required:
     if value not in source:
         raise SystemExit(f"installer checksum test: Windows parser contract is missing {value!r}")
+if "pb-windows-$arch.exe" in source:
+    raise SystemExit("installer checksum test: Windows installer must not bootstrap pairing through a downloaded direct executable")
+if r"\\bVersion\\s+" in source or r"\\s*$" in source:
+    raise SystemExit("installer checksum test: Windows version regex contains doubled escapes")
+if r"(?m)^.*\bVersion\s+" not in source:
+    raise SystemExit("installer checksum test: Windows version assertion regex is missing")
 
 pattern = re.compile(r"^(?P<hash>[0-9A-Fa-f]{64})[ \t]+\*?(?P<name>(?:\./)?[^ \t]+)$")
 for manifest in map(pathlib.Path, sys.argv[2:]):

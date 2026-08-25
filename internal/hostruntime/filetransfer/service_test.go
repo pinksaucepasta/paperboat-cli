@@ -174,12 +174,24 @@ func TestPublishedPathUsesInboxAndResolvesCollisionsIdempotently(t *testing.T) {
 	if repeated, err := service.PublishedPath(context.Background(), created[0].ID); err != nil || repeated != path {
 		t.Fatalf("repeated path=%q err=%v", repeated, err)
 	}
+	if existing, err := service.ExistingPublishedPath(context.Background(), created[0].ID); err != nil || existing != path {
+		t.Fatalf("existing path=%q err=%v", existing, err)
+	}
 	manifest, err := durable.FileTransfer(context.Background(), created[0].ID)
 	if err != nil || manifest.State != "published" {
 		t.Fatalf("manifest=%+v err=%v", manifest, err)
 	}
 	if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, data) {
 		t.Fatalf("published=%q err=%v", got, err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.ExistingPublishedPath(context.Background(), created[0].ID); !hasCode(err, InvalidPath) {
+		t.Fatalf("missing existing path err=%v", err)
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("read-only lookup recreated path: %v", err)
 	}
 }
 

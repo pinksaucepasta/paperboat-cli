@@ -66,6 +66,58 @@ type productionClock struct{}
 
 func (productionClock) Now() time.Time { return time.Now().UTC() }
 
+type productionClientPeerDependencies struct {
+	attempts            peerrelay.Source
+	networkChanges      *networkChangeService
+	signalingSubstrate  *signaling.SubstrateManager
+	stateRoot           string
+	transport           http.RoundTripper
+	authorizer          server.AuthorizerFactory
+	transferKeys        *transfercrypto.KeyVault
+	observeRelaySuccess func(string)
+	directNetwork       *directNetworkProxy
+	build               func(peerrelay.Config) (*peerrelay.Service, error)
+}
+
+func newProductionClientPeerService(dependencies productionClientPeerDependencies, serve func(net.Conn) error, transferHandler http.Handler) (Service, error) {
+	previewDialer := &net.Dialer{Timeout: 10 * time.Second}
+	service, err := dependencies.build(peerrelay.Config{
+		Source:             dependencies.attempts,
+		Fingerprints:       dependencies.networkChanges,
+		SocketMapping:      dependencies.networkChanges,
+		SignalingSubstrate: dependencies.signalingSubstrate,
+		StateRoot:          dependencies.stateRoot,
+		TLS:                &tls.Config{MinVersion: tls.VersionTLS13},
+		HTTPClient:         &http.Client{Transport: dependencies.transport},
+		Serve:              serve,
+		ServePreview: func(ctx context.Context, stream net.Conn) error {
+			return peerpreview.Serve(ctx, stream, previewDialer.DialContext)
+		},
+		ServeTransfer: func(ctx context.Context, stream net.Conn) error {
+			return server.ServeHTTPConnection(ctx, stream, transferHandler)
+		},
+		AuthorizeStream: peerrelay.CredentialStreamAuthorizer(dependencies.authorizer),
+		ServeStream: func(ctx context.Context, header streamauth.Header, stream net.Conn) error {
+			if header.Consumer != "private_preview" {
+				return peerrelay.ErrInvalid
+			}
+			return peerpreview.Serve(ctx, stream, previewDialer.DialContext)
+		},
+		TransferKeys:        dependencies.transferKeys,
+		ObserveRelaySuccess: dependencies.observeRelaySuccess,
+		ObserveTransferKeyAcknowledged: func() {
+			recordProductionPeerOutcome(dependencies.stateRoot, "transfer_key_ack_written")
+		},
+		ObserveError: func(err error) {
+			observeProductionPeerError(dependencies.stateRoot, err)
+		},
+	})
+	if err == nil {
+		dependencies.directNetwork.Set(service)
+	}
+	return service, err
+}
+
 type regionalMonitorService struct {
 	monitor *networkcheck.RegionalMonitor
 	mu      sync.Mutex
@@ -601,8 +653,10 @@ func NewProductionHost(ctx context.Context, version string, environ func(string)
 				default:
 					return peerrelay.ErrInvalid
 				}
-			}, TransferKeys: transferKeys, ObserveRelaySuccess: relayRegion.Observe, ObserveError: func(err error) {
-				slog.Error("peer transport attempt failed", "error", err)
+			}, TransferKeys: transferKeys, ObserveRelaySuccess: relayRegion.Observe, ObserveTransferKeyAcknowledged: func() {
+				recordProductionPeerOutcome(runtimeConfig.StateRoot, "transfer_key_ack_written")
+			}, ObserveError: func(err error) {
+				observeProductionPeerError(runtimeConfig.StateRoot, err)
 			}})
 			if serviceErr == nil {
 				directNetwork.Set(service)
@@ -834,17 +888,31 @@ func newProductionClientCoordinator(ctx context.Context, version string, environ
 	if err != nil {
 		return nil, err
 	}
-	networkHandler, err := newNetworkChangeHandler(supervisor, nil, metrics)
+	directNetwork := &directNetworkProxy{}
+	networkHandler, err := newNetworkChangeHandler(supervisor, directNetwork, metrics)
 	if err != nil {
 		return nil, err
 	}
-	networkChanges, err := newNetworkChangeService(networkHandler.Handle)
+	identityStore, err := runtimeidentity.Open(runtimeidentity.Config{StateRoot: runtimeConfig.StateRoot})
 	if err != nil {
+		return nil, err
+	}
+	networkFingerprintSecret, err := identityStore.NetworkFingerprintSecret()
+	if err != nil {
+		return nil, err
+	}
+	defer clear(networkFingerprintSecret)
+	networkChanges, err := newFingerprintingNetworkChangeService(networkFingerprintSecret, networkHandler.Handle)
+	if err != nil {
+		return nil, err
+	}
+	if err := networkChanges.ConfigurePortMapping(networkcheck.MappingVerifier{Resolver: net.DefaultResolver, Timeout: 500 * time.Millisecond}); err != nil {
 		return nil, err
 	}
 	connectorService := &connectorReadinessService{supervisor: supervisor, manager: manager, networkChanges: networkChanges}
 	relayRegion := &currentRelayRegion{}
-	regionalMonitor, regionalCache, err := newProductionRegionalMonitor(controlURL, transport, relayRegion.Current, nil, nil, nil)
+	signalingSubstrate := &signaling.SubstrateManager{}
+	regionalMonitor, regionalCache, err := newProductionRegionalMonitor(controlURL, transport, relayRegion.Current, signalingSubstrate, &tls.Config{MinVersion: tls.VersionTLS13}, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -873,7 +941,30 @@ func newProductionClientCoordinator(ctx context.Context, version string, environ
 	if err != nil {
 		return nil, err
 	}
-	return NewClientCoordinator(ctx, HostConfig{Runtime: runtimeConfig, ListenAddress: listen, WorkspaceRoot: registration.InboxPath, EnvironmentID: registration.EnvironmentID, MachineID: registration.MachineID, InboxPath: registration.InboxPath, ShutdownTimeout: 30 * time.Second, RecoveryExitSignal: recoveryExitSignal, FileTransferPolicy: transferPolicy}, HostDependencies{Authorizer: authorizer, AuthorizationService: authorizationRefresh, Connector: connectorService, PreviewLauncher: previewManager, PreviewRecovery: previewManager, RuntimeObservationService: serviceGroup{regionalMonitor, observation}, Metrics: metrics, ServeLeases: serveLeases, LocalControlToken: localControlToken})
+	transferKeys, err := transfercrypto.NewKeyVault(clientconfig.FileSecretStore{Dir: filepath.Join(runtimeConfig.StateRoot, "transfer-keys")})
+	if err != nil {
+		return nil, err
+	}
+	attempts, err := peerattempt.New(peerattempt.Config{ControlURL: controlURL.String(), StateRoot: runtimeConfig.StateRoot, Transport: transport, Timeout: 15 * time.Second}, control)
+	if err != nil {
+		return nil, err
+	}
+	peerDependencies := productionClientPeerDependencies{
+		attempts:            attempts,
+		networkChanges:      networkChanges,
+		signalingSubstrate:  signalingSubstrate,
+		stateRoot:           runtimeConfig.StateRoot,
+		transport:           transport,
+		authorizer:          authorizer,
+		transferKeys:        transferKeys,
+		observeRelaySuccess: relayRegion.Observe,
+		directNetwork:       directNetwork,
+		build:               peerrelay.New,
+	}
+	nativePeerFactory := func(serve func(net.Conn) error, transferHandler, _ http.Handler) (Service, error) {
+		return newProductionClientPeerService(peerDependencies, serve, transferHandler)
+	}
+	return NewClientCoordinator(ctx, HostConfig{Runtime: runtimeConfig, ListenAddress: listen, WorkspaceRoot: registration.InboxPath, EnvironmentID: registration.EnvironmentID, MachineID: registration.MachineID, InboxPath: registration.InboxPath, ShutdownTimeout: 30 * time.Second, RecoveryExitSignal: recoveryExitSignal, FileTransferPolicy: transferPolicy}, HostDependencies{Authorizer: authorizer, AuthorizationService: authorizationRefresh, Connector: connectorService, PreviewLauncher: previewManager, PreviewRecovery: previewManager, RuntimeObservationService: serviceGroup{regionalMonitor, observation}, Metrics: metrics, ServeLeases: serveLeases, LocalControlToken: localControlToken, TransferKeys: transferKeys, NativePeerFactory: nativePeerFactory})
 }
 
 type peerEnrollmentEnsurer interface {

@@ -3,13 +3,16 @@
 package runtime
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -21,14 +24,26 @@ import (
 	"time"
 
 	clientapi "github.com/pinksaucepasta/paperboat/internal/api"
+	clientconfig "github.com/pinksaucepasta/paperboat/internal/config"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/connector"
 	runtimeidentity "github.com/pinksaucepasta/paperboat/internal/hostruntime/identity"
 	peeridentityenrollment "github.com/pinksaucepasta/paperboat/internal/hostruntime/peeridentity"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/peerrelay"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/server"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/networkcheck"
+	"github.com/pinksaucepasta/paperboat/internal/peertransport/signaling"
+	"github.com/pinksaucepasta/paperboat/internal/peertransport/streamauth"
+	"github.com/pinksaucepasta/paperboat/internal/peertransport/transfercrypto"
 	"golang.org/x/crypto/ssh"
 )
 
 type testTokenSource struct{}
+
+type clientPeerAttemptSource struct{}
+
+func (*clientPeerAttemptSource) Next(context.Context) (clientapi.PeerAttemptDescriptor, error) {
+	return clientapi.PeerAttemptDescriptor{}, context.Canceled
+}
 
 type runtimeObservationConnector struct{}
 
@@ -52,6 +67,98 @@ func (runtimeObservationConnector) Status() connector.Status {
 }
 
 func (testTokenSource) Token(context.Context) (string, error) { return "helper-identity", nil }
+
+func TestProductionClientPeerServiceBindsCompleteClientTransport(t *testing.T) {
+	root := t.TempDir()
+	attempts := &clientPeerAttemptSource{}
+	networkChanges := &networkChangeService{}
+	signalingSubstrate := &signaling.SubstrateManager{}
+	transferKeys, err := transfercrypto.NewKeyVault(clientconfig.FileSecretStore{Dir: filepath.Join(root, "transfer-keys")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	directNetwork := &directNetworkProxy{}
+	transport := http.DefaultTransport
+	var captured peerrelay.Config
+	var observedRegion string
+	service, err := newProductionClientPeerService(productionClientPeerDependencies{
+		attempts:            attempts,
+		networkChanges:      networkChanges,
+		signalingSubstrate:  signalingSubstrate,
+		stateRoot:           root,
+		transport:           transport,
+		authorizer:          func(string) (server.Authorizer, error) { return hostAuthorizer{}, nil },
+		transferKeys:        transferKeys,
+		observeRelaySuccess: func(region string) { observedRegion = region },
+		directNetwork:       directNetwork,
+		build: func(config peerrelay.Config) (*peerrelay.Service, error) {
+			captured = config
+			return peerrelay.New(config)
+		},
+	}, func(net.Conn) error { return nil }, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if captured.Source != attempts || captured.Fingerprints != networkChanges || captured.SocketMapping != networkChanges {
+		t.Fatal("production Client peer service did not bind attempts and network-change authorities")
+	}
+	if captured.SignalingSubstrate != signalingSubstrate || captured.TransferKeys != transferKeys {
+		t.Fatal("production Client peer service did not bind signaling and transfer-key authorities")
+	}
+	if captured.HTTPClient == nil || captured.HTTPClient.Transport != transport || captured.TLS == nil || captured.TLS.MinVersion != tls.VersionTLS13 {
+		t.Fatal("production Client peer service did not bind its authenticated transport contract")
+	}
+	if captured.Serve == nil || captured.ServePreview == nil || captured.ServeTransfer == nil || captured.AuthorizeStream == nil || captured.ServeStream == nil {
+		t.Fatal("production Client peer service omitted a required serving contract")
+	}
+	captured.ObserveRelaySuccess("bom")
+	if observedRegion != "bom" {
+		t.Fatalf("observed relay region = %q, want bom", observedRegion)
+	}
+	if err := captured.ServeStream(t.Context(), streamauth.Header{Consumer: "terminal"}, nil); !errors.Is(err, peerrelay.ErrInvalid) {
+		t.Fatalf("non-preview stream error = %v, want peerrelay.ErrInvalid", err)
+	}
+	previewServer, previewClient := net.Pipe()
+	_ = previewClient.Close()
+	if err := captured.ServeStream(t.Context(), streamauth.Header{Consumer: "private_preview"}, previewServer); errors.Is(err, peerrelay.ErrInvalid) {
+		t.Fatalf("private preview was rejected by Client dispatch: %v", err)
+	}
+
+	serverConn, clientConn := net.Pipe()
+	done := make(chan error, 1)
+	go func() { done <- captured.ServeTransfer(t.Context(), serverConn) }()
+	request, err := http.NewRequest(http.MethodGet, "http://machine/v1/file-transfers/id", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := request.Write(clientConn); err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.ReadResponse(bufio.NewReader(clientConn), request)
+	if err != nil || response.StatusCode != http.StatusNoContent {
+		t.Fatalf("transfer response=%v error=%v", response, err)
+	}
+	_ = response.Body.Close()
+	_ = clientConn.Close()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Client transfer server did not stop after stream close")
+	}
+
+	directNetwork.mu.RLock()
+	target := directNetwork.target
+	directNetwork.mu.RUnlock()
+	peerService, ok := service.(*peerrelay.Service)
+	if !ok || target != peerService {
+		t.Fatal("production Client peer service was not installed as direct-network recovery target")
+	}
+}
 
 type testProofSource struct{ body []byte }
 

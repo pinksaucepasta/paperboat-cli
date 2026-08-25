@@ -135,9 +135,13 @@ func validWindowsHostdTokenACLForSID(path, enrolledSID string) bool {
 	if sid, err := windows.StringToSid(enrolledSID); err != nil || sid == nil || !sid.IsValid() {
 		return false
 	}
+	system, err := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
+	if err != nil || !windowssecurity.OwnerMatchesSID(path, system) {
+		return false
+	}
 	want := "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
 	if enrolledSID != "S-1-5-18" {
-		want += "(A;;FA;;;" + enrolledSID + ")"
+		want += "(A;;FR;;;" + enrolledSID + ")"
 	}
 	return windowssecurity.ProtectedDACLMatches(path, want)
 }

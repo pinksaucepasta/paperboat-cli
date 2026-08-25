@@ -83,15 +83,25 @@ type Error struct {
 	Code       string `json:"code"`
 	Message    string `json:"message"`
 	StatusCode int    `json:"-"`
-	RequestID  string `json:"request_id,omitempty"`
+	RequestID  string `json:"requestId,omitempty"`
 	Retryable  bool   `json:"retryable"`
 }
 
 func (e *Error) Error() string {
-	if e.Message != "" {
-		return fmt.Sprintf("file transfer failed (%s): %s", e.Code, e.Message)
+	code := e.Code
+	if !validResultCode(code) {
+		code = "http_error"
 	}
-	return "file transfer failed: " + e.Code
+	if e.StatusCode != 0 {
+		if status := http.StatusText(e.StatusCode); status != "" {
+			return fmt.Sprintf("file transfer failed: %s (HTTP %d %s)", code, e.StatusCode, status)
+		}
+		return fmt.Sprintf("file transfer failed: %s (HTTP %d)", code, e.StatusCode)
+	}
+	if e.Message != "" {
+		return fmt.Sprintf("file transfer failed (%s): %s", code, e.Message)
+	}
+	return "file transfer failed: " + code
 }
 
 type Client struct {
@@ -100,6 +110,7 @@ type Client struct {
 	RefreshAuth     func(context.Context) (Auth, error)
 	MaxConcurrent   int
 	DeliveryTimeout time.Duration
+	retryWait       func(context.Context, int) error
 	authMu          sync.RWMutex
 	refreshMu       sync.Mutex
 	auth            Auth
@@ -110,7 +121,7 @@ func NewClient(endpoint string, auth Auth, binding Binding, client *http.Client)
 	if client == nil {
 		client = &http.Client{Transport: httptransport.Default(), Timeout: 5 * time.Minute}
 	}
-	return &Client{Endpoint: strings.TrimRight(endpoint, "/"), HTTPClient: client, MaxConcurrent: 2, DeliveryTimeout: 10 * time.Minute, auth: auth, binding: binding}
+	return &Client{Endpoint: strings.TrimRight(endpoint, "/"), HTTPClient: client, MaxConcurrent: 2, DeliveryTimeout: 10 * time.Minute, retryWait: waitOperationRetry, auth: auth, binding: binding}
 }
 
 func (c *Client) UpdateAuth(auth Auth) { c.setAuth(auth) }
@@ -123,6 +134,7 @@ func (c *Client) WithTransport(transport http.RoundTripper) *Client {
 	clone.RefreshAuth = c.RefreshAuth
 	clone.MaxConcurrent = c.MaxConcurrent
 	clone.DeliveryTimeout = c.DeliveryTimeout
+	clone.retryWait = c.retryWait
 	return clone
 }
 
@@ -498,15 +510,28 @@ func (c *Client) retryJSONRequest(ctx context.Context, method, url, operation, m
 			return nil
 		}
 		var responseErr *Error
-		if errors.As(err, &responseErr) {
+		if errors.As(err, &responseErr) && !transientHTTPStatus(responseErr.StatusCode) {
 			return err
 		}
-		if waitErr := waitOperationRetry(retryCtx, attempt); waitErr != nil {
+		wait := c.retryWait
+		if wait == nil {
+			wait = waitOperationRetry
+		}
+		if waitErr := wait(retryCtx, attempt); waitErr != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
 			return err
 		}
+	}
+}
+
+func transientHTTPStatus(status int) bool {
+	switch status {
+	case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -618,15 +643,40 @@ func (c *Client) refreshIfExpiring(ctx context.Context) error {
 	c.setAuth(fresh)
 	return nil
 }
+
 func decodeError(response *http.Response) error {
 	defer response.Body.Close()
 	failure := &Error{Code: "http_error", StatusCode: response.StatusCode}
-	_ = json.NewDecoder(io.LimitReader(response.Body, 64<<10)).Decode(failure)
-	if failure.Code == "" {
-		failure.Code = "http_error"
+	var envelope struct {
+		Code      string `json:"code"`
+		RequestID string `json:"requestId"`
+		Retryable bool   `json:"retryable"`
+	}
+	if json.NewDecoder(io.LimitReader(response.Body, 64<<10)).Decode(&envelope) == nil {
+		if validResultCode(envelope.Code) {
+			failure.Code = envelope.Code
+		}
+		if len(envelope.RequestID) <= 128 {
+			failure.RequestID = envelope.RequestID
+		}
+		failure.Retryable = envelope.Retryable
 	}
 	return failure
 }
+
+func validResultCode(code string) bool {
+	if len(code) < 3 || len(code) > 64 || code[0] < 'a' || code[0] > 'z' {
+		return false
+	}
+	for _, character := range code[1:] {
+		if character >= 'a' && character <= 'z' || character >= '0' && character <= '9' || character == '_' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
 func (c *Client) currentAuth() Auth { c.authMu.RLock(); defer c.authMu.RUnlock(); return c.auth }
 func (c *Client) setAuth(auth Auth) { c.authMu.Lock(); c.auth = auth; c.authMu.Unlock() }
 func operationID(kind, value string) string {

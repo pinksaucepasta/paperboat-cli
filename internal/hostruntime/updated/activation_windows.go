@@ -1,0 +1,949 @@
+//go:build windows
+
+package updated
+
+import (
+	"bufio"
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/binarytarget"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostdproto"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/nativesignature"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/workerupdate"
+	"github.com/pinksaucepasta/paperboat/internal/windowssecurity"
+	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/svc"
+	"golang.org/x/sys/windows/svc/mgr"
+)
+
+const (
+	windowsActivatorService = "PaperboatUpdateActivator"
+	windowsHostdService     = "PaperboatHostd"
+	windowsUpdaterService   = "PaperboatUpdated"
+	windowsSSHService       = "PaperboatSshd"
+)
+
+func windowsActivationJournalPath(stateRoot string) string {
+	return filepath.Join(stateRoot, "activation", "journal.json")
+}
+
+func stageWindowsActivation(ctx context.Context, config WindowsConfig, release workerupdate.Release) (windowsActivationJournal, error) {
+	if !exactReleasePattern.MatchString(release.Version) || release.Platform != "windows" || release.Architecture != config.Architecture {
+		return windowsActivationJournal{}, workerupdate.ErrInvalidRelease
+	}
+	layout, err := service.DefaultLayout("windows")
+	if err != nil {
+		return windowsActivationJournal{}, err
+	}
+	paths, err := layout.WindowsRelease(release.Version)
+	if err != nil {
+		return windowsActivationJournal{}, err
+	}
+	if _, err := os.Lstat(filepath.Join(paths.Root, ".quarantined")); err == nil {
+		return windowsActivationJournal{}, workerupdate.ErrQuarantined
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return windowsActivationJournal{}, err
+	}
+	// Resolve and validate every mutable SCM dependency before downloading any
+	// release bytes. An inconsistent installation fails cheaply and unchanged.
+	oldHostd, err := queryWindowsServiceTarget(windowsHostdService, "__runtime-hostd")
+	if err != nil {
+		return windowsActivationJournal{}, err
+	}
+	oldUpdater, err := queryWindowsServiceTarget(windowsUpdaterService, "__runtime-updated")
+	if err != nil {
+		return windowsActivationJournal{}, err
+	}
+	oldSSH := windowsServiceTarget{}
+	if config.SetupMode == "host" {
+		oldSSH, err = queryOptionalWindowsServiceTarget(windowsSSHService)
+		if err != nil {
+			return windowsActivationJournal{}, err
+		}
+		if !validWindowsSSHRoleTarget(config.SetupMode, oldSSH) {
+			return windowsActivationJournal{}, errInvalidWindowsActivation
+		}
+		if !validWindowsSSHArguments(oldSSH.Arguments) {
+			return windowsActivationJournal{}, errInvalidWindowsActivation
+		}
+	} else {
+		unexpectedSSH, queryErr := queryOptionalWindowsServiceTarget(windowsSSHService)
+		if queryErr != nil {
+			return windowsActivationJournal{}, queryErr
+		}
+		if !validWindowsSSHRoleTarget(config.SetupMode, unexpectedSSH) {
+			return windowsActivationJournal{}, errInvalidWindowsActivation
+		}
+	}
+	if !activeWindowsServiceTargetsMatch(layout, config.ActiveVersion, oldHostd, oldUpdater, oldSSH) {
+		return windowsActivationJournal{}, errInvalidWindowsActivation
+	}
+	if err := secureWindowsTransactionDirectory(filepath.Dir(windowsActivationJournalPath(config.StateRoot))); err != nil {
+		return windowsActivationJournal{}, err
+	}
+	if err := secureWindowsReleaseDirectory(filepath.Dir(paths.Root)); err != nil {
+		return windowsActivationJournal{}, err
+	}
+	if err := secureWindowsReleaseDirectory(paths.Root); err != nil {
+		return windowsActivationJournal{}, err
+	}
+	source := workerupdate.TUFSource{RepositoryURL: config.RepositoryURL, StateRoot: filepath.Join(config.StateRoot, "tuf"), MachineID: config.MachineID}
+	components := []struct {
+		name, path string
+		target     workerupdate.ComponentTarget
+	}{
+		{"runtime", paths.Runtime, workerupdate.ComponentTarget{SHA256: release.SHA256, Length: release.Length, Platform: release.Platform, Architecture: release.Architecture}},
+		{"cli", paths.CLI, workerupdate.ComponentTarget{SHA256: release.CLISHA256, Length: release.CLILength, Platform: release.CLIPlatform, Architecture: release.CLIArchitecture}},
+		{"hostd", paths.Hostd, release.Hostd}, {"updater", paths.Updater, release.Updater},
+	}
+	staged := make(map[string]windowsActivationComponent, len(components))
+	for _, component := range components {
+		if component.target.Platform != "windows" || component.target.Architecture != config.Architecture || component.target.Length <= 0 || component.target.Length > maxWindowsComponentSize || len(component.target.SHA256) != 64 || !lowerHex(component.target.SHA256) {
+			return windowsActivationJournal{}, workerupdate.ErrInvalidRelease
+		}
+		if err := stageWindowsComponent(ctx, source, release, component.name, component.path, component.target, config.OwnerSID); err != nil {
+			return windowsActivationJournal{}, err
+		}
+		staged[component.name] = windowsActivationComponent{Path: component.path, SHA256: component.target.SHA256, Length: component.target.Length}
+	}
+	newSSH := windowsServiceTarget{}
+	if oldSSH.Executable != "" {
+		newSSH = windowsServiceTarget{Executable: paths.Runtime, Arguments: append([]string(nil), oldSSH.Arguments...), WasRunning: oldSSH.WasRunning}
+	}
+	oldRecord, err := readOptionalWindowsCLIRecord(paths.ActiveCLIRecord)
+	if err != nil {
+		return windowsActivationJournal{}, err
+	}
+	var transaction [16]byte
+	if _, err := rand.Read(transaction[:]); err != nil {
+		return windowsActivationJournal{}, err
+	}
+	cliSlot := "pb.slot-" + strings.ReplaceAll(release.Version, ".", "-") + ".exe"
+	journal := windowsActivationJournal{
+		Schema: windowsActivationJournalSchema, TransactionID: hex.EncodeToString(transaction[:]), PreviousVersion: config.ActiveVersion, Version: release.Version, Architecture: config.Architecture, Stage: windowsActivationStaged,
+		Runtime: staged["runtime"], CLI: staged["cli"], Hostd: staged["hostd"], Updater: staged["updater"],
+		OldHostd: oldHostd, OldUpdater: oldUpdater, OldSSH: oldSSH, NewSSH: newSSH,
+		NewHostd:          windowsServiceTarget{Executable: paths.Hostd, Arguments: []string{"__runtime-hostd"}, WasRunning: true},
+		NewUpdater:        windowsServiceTarget{Executable: paths.Updater, Arguments: []string{"__runtime-updated"}, WasRunning: true},
+		PreviousCLIRecord: oldRecord, NewCLIRecord: cliSlot + "\n",
+	}
+	backend := newWindowsSCMActivationBackend(config)
+	if err := backend.WriteJournal(journal); err != nil {
+		return windowsActivationJournal{}, err
+	}
+	if err := installWindowsActivatorService(paths.Updater); err != nil {
+		return windowsActivationJournal{}, err
+	}
+	return journal, nil
+}
+
+func activeWindowsServiceTargetsMatch(layout service.Layout, version string, hostd, updater, ssh windowsServiceTarget) bool {
+	paths, err := layout.WindowsRelease(version)
+	if err != nil || !strings.EqualFold(hostd.Executable, paths.Hostd) || !strings.EqualFold(updater.Executable, paths.Updater) {
+		return false
+	}
+	return ssh.Executable == "" || strings.EqualFold(ssh.Executable, paths.Runtime)
+}
+
+func stageWindowsComponent(ctx context.Context, source workerupdate.TUFSource, release workerupdate.Release, name, destination string, target workerupdate.ComponentTarget, ownerSID string) error {
+	if matchesWindowsComponent(destination, target) {
+		if err := secureWindowsReleaseFile(destination); err != nil {
+			return err
+		}
+		verifyCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		return nativesignature.New(nil).Verify(verifyCtx, destination, "windows", target.Architecture)
+	}
+	if _, err := os.Lstat(destination); err == nil {
+		return errInvalidWindowsActivation
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	stream, err := source.FetchComponent(ctx, release, name)
+	if err != nil {
+		return err
+	}
+	defer stream.Close()
+	temporary := destination + ".staged"
+	_ = os.Remove(temporary)
+	file, err := os.OpenFile(temporary, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o700)
+	if err != nil {
+		return err
+	}
+	hash := sha256.New()
+	written, copyErr := io.Copy(io.MultiWriter(file, hash), io.LimitReader(stream, target.Length+1))
+	syncErr, closeErr := file.Sync(), file.Close()
+	if err := errors.Join(copyErr, syncErr, closeErr); err != nil {
+		_ = os.Remove(temporary)
+		return err
+	}
+	if written != target.Length || !strings.EqualFold(hex.EncodeToString(hash.Sum(nil)), target.SHA256) {
+		_ = os.Remove(temporary)
+		return workerupdate.ErrInvalidRelease
+	}
+	if err := binarytarget.Validate(temporary, "windows", target.Architecture); err != nil {
+		_ = os.Remove(temporary)
+		return err
+	}
+	verifyCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := nativesignature.New(nil).Verify(verifyCtx, temporary, "windows", target.Architecture); err != nil {
+		_ = os.Remove(temporary)
+		return err
+	}
+	if err := secureWindowsReleaseFile(temporary); err != nil {
+		_ = os.Remove(temporary)
+		return err
+	}
+	// Destination cannot exist: immutable version paths are never overwritten.
+	//paperboat:allow-source-policy atomic-replacement owner=windows-updater reason=verified-immutable-component-publication
+	if err := os.Rename(temporary, destination); err != nil {
+		_ = os.Remove(temporary)
+		return err
+	}
+	return nil
+}
+
+func secureWindowsReleaseDirectory(path string) error {
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return err
+	}
+	attributes, err := windows.GetFileAttributes(windows.StringToUTF16Ptr(path))
+	if err != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return errInvalidWindowsActivation
+	}
+	return applyWindowsReleaseACL(path, "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)")
+}
+
+func secureWindowsTransactionDirectory(path string) error {
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return err
+	}
+	attributes, err := windows.GetFileAttributes(windows.StringToUTF16Ptr(path))
+	if err != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return errInvalidWindowsActivation
+	}
+	return applyWindowsReleaseACL(path, "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")
+}
+
+func secureWindowsReleaseFile(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return errInvalidWindowsActivation
+	}
+	attributes, err := windows.GetFileAttributes(windows.StringToUTF16Ptr(path))
+	if err != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return errInvalidWindowsActivation
+	}
+	return applyWindowsReleaseACL(path, "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)")
+}
+
+func applyWindowsReleaseACL(path, sddl string) error {
+	descriptor, err := windows.SecurityDescriptorFromString(sddl)
+	if err != nil {
+		return err
+	}
+	dacl, _, err := descriptor.DACL()
+	if err != nil {
+		return err
+	}
+	system, err := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
+	if err != nil {
+		return err
+	}
+	if err := windowssecurity.WithRestorePrivilege(func() error {
+		return windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, system, nil, dacl, nil)
+	}); err != nil {
+		return err
+	}
+	if !windowssecurity.OwnerMatchesSID(path, system) || !windowssecurity.ProtectedDACLMatches(path, sddl) {
+		return errInvalidWindowsActivation
+	}
+	return nil
+}
+
+func matchesWindowsComponent(path string, target workerupdate.ComponentTarget) bool {
+	file, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() != target.Length {
+		return false
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, file); err != nil {
+		return false
+	}
+	return strings.EqualFold(hex.EncodeToString(h.Sum(nil)), target.SHA256) && binarytarget.Validate(path, "windows", target.Architecture) == nil
+}
+
+func readOptionalWindowsCLIRecord(path string) (string, error) {
+	if _, err := os.Lstat(path); err == nil {
+		if !windowsMachineFileSecurityMatches(path, "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)") {
+			return "", errInvalidWindowsActivation
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	body, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil || len(body) > 256 || strings.Count(string(body), "\n") != 1 {
+		return "", errInvalidWindowsActivation
+	}
+	return string(body), nil
+}
+
+func windowsMachineFileSecurityMatches(path, dacl string) bool {
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return false
+	}
+	attributes, err := windows.GetFileAttributes(windows.StringToUTF16Ptr(path))
+	if err != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return false
+	}
+	system, err := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
+	return err == nil && windowssecurity.OwnerMatchesSID(path, system) && windowssecurity.ProtectedDACLMatches(path, dacl)
+}
+
+func queryWindowsServiceTarget(name, expectedArgument string) (windowsServiceTarget, error) {
+	manager, err := mgr.Connect()
+	if err != nil {
+		return windowsServiceTarget{}, err
+	}
+	defer manager.Disconnect()
+	item, err := manager.OpenService(name)
+	if err != nil {
+		return windowsServiceTarget{}, err
+	}
+	defer item.Close()
+	config, err := item.Config()
+	if err != nil {
+		return windowsServiceTarget{}, err
+	}
+	args, err := windows.DecomposeCommandLine(config.BinaryPathName)
+	if err != nil || len(args) != 2 || args[1] != expectedArgument || !filepath.IsAbs(args[0]) || !validPrivilegedWindowsServiceConfig(config, mgr.StartAutomatic, mgr.ErrorNormal) {
+		return windowsServiceTarget{}, errInvalidWindowsActivation
+	}
+	if err := validateWindowsRecovery(item); err != nil {
+		return windowsServiceTarget{}, err
+	}
+	status, err := item.Query()
+	if err != nil {
+		return windowsServiceTarget{}, err
+	}
+	return windowsServiceTarget{Executable: filepath.Clean(args[0]), Arguments: []string{expectedArgument}, WasRunning: status.State != svc.Stopped}, nil
+}
+
+func queryOptionalWindowsServiceTarget(name string) (windowsServiceTarget, error) {
+	manager, err := mgr.Connect()
+	if err != nil {
+		return windowsServiceTarget{}, err
+	}
+	defer manager.Disconnect()
+	item, err := manager.OpenService(name)
+	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+		return windowsServiceTarget{}, nil
+	}
+	if err != nil {
+		return windowsServiceTarget{}, err
+	}
+	defer item.Close()
+	config, err := item.Config()
+	if err != nil {
+		return windowsServiceTarget{}, err
+	}
+	args, err := windows.DecomposeCommandLine(config.BinaryPathName)
+	if err != nil || len(args) < 2 || !filepath.IsAbs(args[0]) || !validPrivilegedWindowsServiceConfig(config, mgr.StartAutomatic, mgr.ErrorNormal) {
+		return windowsServiceTarget{}, errInvalidWindowsActivation
+	}
+	status, err := item.Query()
+	if err != nil {
+		return windowsServiceTarget{}, err
+	}
+	return windowsServiceTarget{Executable: filepath.Clean(args[0]), Arguments: append([]string(nil), args[1:]...), WasRunning: status.State != svc.Stopped}, nil
+}
+
+func validPrivilegedWindowsServiceConfig(config mgr.Config, startType, errorControl uint32) bool {
+	return strings.EqualFold(config.ServiceStartName, "LocalSystem") && config.StartType == startType && config.ErrorControl == errorControl && config.SidType == windows.SERVICE_SID_TYPE_UNRESTRICTED && !config.DelayedAutoStart
+}
+
+func installWindowsActivatorService(executable string) error {
+	manager, err := mgr.Connect()
+	if err != nil {
+		return err
+	}
+	defer manager.Disconnect()
+	if current, openErr := manager.OpenService(windowsActivatorService); openErr == nil {
+		defer current.Close()
+		config, e := current.Config()
+		if e != nil {
+			return e
+		}
+		config.BinaryPathName = windows.ComposeCommandLine([]string{executable, "__runtime-activate"})
+		config.StartType = mgr.StartAutomatic
+		config.ErrorControl = mgr.ErrorSevere
+		config.ServiceStartName = "LocalSystem"
+		config.SidType = windows.SERVICE_SID_TYPE_UNRESTRICTED
+		config.DelayedAutoStart = false
+		if err := current.UpdateConfig(config); err != nil {
+			return err
+		}
+		if err := configureWindowsRecovery(current); err != nil {
+			return err
+		}
+		updated, err := current.Config()
+		if err != nil || !strings.EqualFold(updated.BinaryPathName, config.BinaryPathName) || !validPrivilegedWindowsServiceConfig(updated, mgr.StartAutomatic, mgr.ErrorSevere) {
+			return errors.Join(errInvalidWindowsActivation, err)
+		}
+		return validateWindowsRecovery(current)
+	} else if !errors.Is(openErr, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+		return openErr
+	}
+	item, err := manager.CreateService(windowsActivatorService, executable, mgr.Config{DisplayName: "Paperboat Update Activator", Description: "Paperboat one-shot verified update activation", StartType: mgr.StartAutomatic, ErrorControl: mgr.ErrorSevere, ServiceStartName: "LocalSystem", SidType: windows.SERVICE_SID_TYPE_UNRESTRICTED}, "__runtime-activate")
+	if err != nil {
+		return err
+	}
+	defer item.Close()
+	if err := configureWindowsRecovery(item); err != nil {
+		return err
+	}
+	return validateWindowsRecovery(item)
+}
+
+func configureWindowsRecovery(item *mgr.Service) error {
+	if err := item.SetRecoveryActions([]mgr.RecoveryAction{{Type: mgr.ServiceRestart, Delay: 5 * time.Second}, {Type: mgr.ServiceRestart, Delay: 15 * time.Second}, {Type: mgr.ServiceRestart, Delay: time.Minute}}, 24*60*60); err != nil {
+		return err
+	}
+	return item.SetRecoveryActionsOnNonCrashFailures(true)
+}
+
+func validateWindowsRecovery(item *mgr.Service) error {
+	actions, err := item.RecoveryActions()
+	if err != nil || len(actions) != 3 || actions[0].Type != mgr.ServiceRestart || actions[0].Delay != 5*time.Second || actions[1].Type != mgr.ServiceRestart || actions[1].Delay != 15*time.Second || actions[2].Type != mgr.ServiceRestart || actions[2].Delay != time.Minute {
+		return errors.Join(errInvalidWindowsActivation, err)
+	}
+	nonCrash, err := item.RecoveryActionsOnNonCrashFailures()
+	if err != nil || !nonCrash {
+		return errors.Join(errInvalidWindowsActivation, err)
+	}
+	return nil
+}
+
+func startWindowsActivatorService() error {
+	manager, err := mgr.Connect()
+	if err != nil {
+		return err
+	}
+	defer manager.Disconnect()
+	item, err := manager.OpenService(windowsActivatorService)
+	if err != nil {
+		return err
+	}
+	defer item.Close()
+	return item.Start()
+}
+
+type windowsSCMActivationBackend struct{ config WindowsConfig }
+
+func newWindowsSCMActivationBackend(config WindowsConfig) *windowsSCMActivationBackend {
+	return &windowsSCMActivationBackend{config: config}
+}
+
+func (b *windowsSCMActivationBackend) WriteJournal(j windowsActivationJournal) error {
+	body, err := json.Marshal(j)
+	if err != nil {
+		return err
+	}
+	path := windowsActivationJournalPath(b.config.StateRoot)
+	if err := atomicfile.Write(path, body, atomicfile.Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1}); err != nil {
+		return err
+	}
+	return applyWindowsReleaseACL(path, "D:P(A;;FA;;;SY)(A;;FA;;;BA)")
+}
+func (b *windowsSCMActivationBackend) StopServices(ctx context.Context) error {
+	return stopNamedWindowsServices(ctx, windowsActivationServiceNames(b.config.SetupMode)...)
+}
+
+func (b *windowsSCMActivationBackend) SetServiceTargets(_ context.Context, hostd, updater, ssh windowsServiceTarget) error {
+	if err := setWindowsServiceTarget(windowsHostdService, hostd); err != nil {
+		return err
+	}
+	if err := setWindowsServiceTarget(windowsUpdaterService, updater); err != nil {
+		return err
+	}
+	if b.config.SetupMode == "host" && ssh.Executable != "" {
+		return setWindowsServiceTarget(windowsSSHService, ssh)
+	}
+	return nil
+}
+func (b *windowsSCMActivationBackend) StartServices(ctx context.Context, hostd, updater, ssh bool) error {
+	if hostd {
+		if err := startNamedWindowsService(ctx, windowsHostdService); err != nil {
+			return err
+		}
+	}
+	if updater {
+		if err := startNamedWindowsService(ctx, windowsUpdaterService); err != nil {
+			return err
+		}
+	}
+	if b.config.SetupMode == "host" && ssh {
+		return startNamedWindowsService(ctx, windowsSSHService)
+	}
+	return nil
+}
+func (b *windowsSCMActivationBackend) VerifyHealth(ctx context.Context, journal windowsActivationJournal) error {
+	if err := requireNamedWindowsServicesRunning(windowsHostdService, windowsUpdaterService); err != nil {
+		return err
+	}
+	token, err := os.ReadFile(b.config.TokenFile)
+	if err != nil {
+		return err
+	}
+	hostd, err := hostdproto.NewClient(b.config.HostdSocket, token, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	deadline := time.Now().Add(90 * time.Second)
+	for {
+		status, activeErr := hostd.Active(ctx)
+		if activeErr == nil && status.State == hostdproto.StateActive && status.WorkerID != "" && status.Epoch != 0 && status.LastHeartbeatUnixMilli > 0 && time.Since(time.UnixMilli(status.LastHeartbeatUnixMilli)) <= 15*time.Second {
+			break
+		}
+		if time.Now().After(deadline) {
+			return errors.Join(errInvalidWindowsActivation, activeErr)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+	if b.config.HealthURL == "" {
+		return errInvalidWindowsActivation
+	}
+	request, _ := http.NewRequestWithContext(ctx, http.MethodGet, b.config.HealthURL, nil)
+	response, err := (&http.Client{Timeout: 5 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}).Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	var health struct {
+		Live bool `json:"live"`
+	}
+	if response.StatusCode != http.StatusOK || json.NewDecoder(io.LimitReader(response.Body, 8<<10)).Decode(&health) != nil || !health.Live {
+		return fmt.Errorf("runtime health returned HTTP %d", response.StatusCode)
+	}
+	client, err := NewClient(b.config.ControlSocket, 10*time.Second)
+	if err != nil {
+		return err
+	}
+	updaterStatus, err := client.Status(ctx)
+	if err != nil || updaterStatus.Version != journal.Version {
+		return errors.Join(errInvalidWindowsActivation, err)
+	}
+	if !matchesWindowsComponent(journal.CLI.Path, workerupdate.ComponentTarget{SHA256: journal.CLI.SHA256, Length: journal.CLI.Length, Platform: "windows", Architecture: journal.Architecture}) {
+		return errInvalidWindowsActivation
+	}
+	if journal.NewSSH.WasRunning {
+		if err := requireNamedWindowsServicesRunning(windowsSSHService); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func requireNamedWindowsServicesRunning(names ...string) error {
+	manager, err := mgr.Connect()
+	if err != nil {
+		return err
+	}
+	defer manager.Disconnect()
+	for _, name := range names {
+		item, err := manager.OpenService(name)
+		if err != nil {
+			return err
+		}
+		status, queryErr := item.Query()
+		closeErr := item.Close()
+		if queryErr != nil || closeErr != nil || status.State != svc.Running {
+			return errors.Join(errInvalidWindowsActivation, queryErr, closeErr)
+		}
+	}
+	return nil
+}
+func (b *windowsSCMActivationBackend) CommitCLI(ctx context.Context, journal windowsActivationJournal) error {
+	if exactReleasePattern.MatchString(journal.Version) {
+		if err := commitWindowsInstallVersion(b.config, journal.Version); err != nil {
+			return err
+		}
+	}
+	recordPath := filepath.Join(filepath.Dir(b.config.CLICurrent), "pb.active")
+	if journal.NewCLIRecord == "" {
+		if err := os.Remove(recordPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return nil
+	}
+	name := strings.TrimSuffix(journal.NewCLIRecord, "\n")
+	if strings.ContainsAny(name, `/\:*?"<>|`) || !strings.HasPrefix(name, "pb.slot-") || !strings.HasSuffix(name, ".exe") {
+		return errInvalidWindowsActivation
+	}
+	destination := filepath.Join(filepath.Dir(b.config.CLICurrent), name)
+	if journal.CLI.Path != "" && !matchesWindowsComponent(destination, workerupdate.ComponentTarget{SHA256: journal.CLI.SHA256, Length: journal.CLI.Length, Platform: "windows", Architecture: journal.Architecture}) {
+		body, err := os.ReadFile(journal.CLI.Path)
+		if err != nil {
+			return err
+		}
+		if err := windowssecurity.WithRestorePrivilege(func() error {
+			return atomicfile.Write(destination, body, atomicfile.Options{Mode: 0o755, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: "O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)"})
+		}); err != nil {
+			return err
+		}
+	}
+	if !windowsMachineFileSecurityMatches(destination, "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)") {
+		return errInvalidWindowsActivation
+	}
+	if journal.CLI.Path != "" {
+		target := workerupdate.ComponentTarget{SHA256: journal.CLI.SHA256, Length: journal.CLI.Length, Platform: "windows", Architecture: journal.Architecture}
+		if !matchesWindowsComponent(destination, target) {
+			return errInvalidWindowsActivation
+		}
+		verifyCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		if err := nativesignature.New(nil).Verify(verifyCtx, destination, "windows", journal.Architecture); err != nil {
+			return err
+		}
+	} else if journal.NewCLIRecord != "" {
+		if err := binarytarget.Validate(destination, "windows", b.config.Architecture); err != nil {
+			return err
+		}
+		verifyCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		if err := nativesignature.New(nil).Verify(verifyCtx, destination, "windows", b.config.Architecture); err != nil {
+			return err
+		}
+	}
+	return windowssecurity.WithRestorePrivilege(func() error {
+		return atomicfile.Write(recordPath, []byte(journal.NewCLIRecord), atomicfile.Options{Mode: 0o644, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: "O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)"})
+	})
+}
+
+func commitWindowsInstallVersion(config WindowsConfig, version string) error {
+	body, err := os.ReadFile(config.InstallState)
+	if err != nil || len(body) == 0 || len(body) > 128<<10 {
+		return errInvalidWindowsActivation
+	}
+	var document map[string]any
+	decoder := json.NewDecoder(strings.NewReader(string(body)))
+	decoder.UseNumber()
+	if err := decoder.Decode(&document); err != nil {
+		return err
+	}
+	artifact, ok := document["artifact"].(map[string]any)
+	if !ok {
+		return errInvalidWindowsActivation
+	}
+	artifact["version"] = version
+	updated, err := json.Marshal(document)
+	if err != nil {
+		return err
+	}
+	if err := windowssecurity.WithRestorePrivilege(func() error {
+		return atomicfile.Write(config.InstallState, updated, atomicfile.Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: "O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;" + config.OwnerSID + ")"})
+	}); err != nil {
+		return err
+	}
+	return applyWindowsReleaseACL(config.InstallState, "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;"+config.OwnerSID+")")
+}
+
+func reconcileWindowsInstallVersion(ctx context.Context, config WindowsConfig) error {
+	body, err := os.ReadFile(config.InstallState)
+	if err != nil || len(body) == 0 || len(body) > 128<<10 {
+		return errInvalidWindowsActivation
+	}
+	var document struct {
+		Artifact struct {
+			Version string `json:"version"`
+		} `json:"artifact"`
+	}
+	if json.Unmarshal(body, &document) != nil || !exactReleasePattern.MatchString(document.Artifact.Version) {
+		return errInvalidWindowsActivation
+	}
+	if document.Artifact.Version == config.ActiveVersion {
+		return nil
+	}
+	if journal, journalErr := loadWindowsActivationJournal(config); journalErr == nil && journal.Stage != windowsActivationCommitted && journal.Stage != windowsActivationRolledBack {
+		if document.Artifact.Version != journal.PreviousVersion && document.Artifact.Version != journal.Version || config.ActiveVersion != journal.PreviousVersion && config.ActiveVersion != journal.Version {
+			return errInvalidWindowsActivation
+		}
+		return nil
+	} else if journalErr != nil && !errors.Is(journalErr, os.ErrNotExist) {
+		return journalErr
+	}
+	source := workerupdate.TUFSource{RepositoryURL: config.RepositoryURL, StateRoot: filepath.Join(config.StateRoot, "tuf"), MachineID: config.MachineID}
+	release, err := source.Active(ctx, config.ActiveVersion)
+	if err != nil {
+		return err
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	target := workerupdate.ComponentTarget{SHA256: release.Updater.SHA256, Length: release.Updater.Length, Platform: release.Updater.Platform, Architecture: release.Updater.Architecture}
+	if !matchesWindowsComponent(executable, target) {
+		return errInvalidWindowsActivation
+	}
+	verifyCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := nativesignature.New(nil).Verify(verifyCtx, executable, "windows", config.Architecture); err != nil {
+		return err
+	}
+	return commitWindowsInstallVersion(config, config.ActiveVersion)
+}
+func (b *windowsSCMActivationBackend) Quarantine(_ context.Context, journal windowsActivationJournal) error {
+	path := filepath.Join(filepath.Dir(journal.Runtime.Path), ".quarantined")
+	if err := atomicfile.Write(path, []byte(boundedWindowsActivationFailure(errors.New(journal.Failure))+"\n"), atomicfile.Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1}); err != nil {
+		return err
+	}
+	return applyWindowsReleaseACL(path, "D:P(A;;FA;;;SY)(A;;FA;;;BA)")
+}
+
+func setWindowsServiceTarget(name string, target windowsServiceTarget) error {
+	if !filepath.IsAbs(target.Executable) || len(target.Arguments) == 0 || len(target.Arguments) > 16 {
+		return errInvalidWindowsActivation
+	}
+	if name == windowsHostdService && (len(target.Arguments) != 1 || target.Arguments[0] != "__runtime-hostd") || name == windowsUpdaterService && (len(target.Arguments) != 1 || target.Arguments[0] != "__runtime-updated") {
+		return errInvalidWindowsActivation
+	}
+	if name == windowsSSHService && !validWindowsSSHArguments(target.Arguments) {
+		return errInvalidWindowsActivation
+	}
+	manager, err := mgr.Connect()
+	if err != nil {
+		return err
+	}
+	defer manager.Disconnect()
+	item, err := manager.OpenService(name)
+	if err != nil {
+		return err
+	}
+	defer item.Close()
+	config, err := item.Config()
+	if err != nil {
+		return err
+	}
+	config.BinaryPathName = windows.ComposeCommandLine(append([]string{target.Executable}, target.Arguments...))
+	config.StartType = mgr.StartAutomatic
+	config.ErrorControl = mgr.ErrorNormal
+	config.ServiceStartName = "LocalSystem"
+	config.SidType = windows.SERVICE_SID_TYPE_UNRESTRICTED
+	config.DelayedAutoStart = false
+	if err := item.UpdateConfig(config); err != nil {
+		return err
+	}
+	updated, err := item.Config()
+	if err != nil || !strings.EqualFold(updated.BinaryPathName, config.BinaryPathName) || !validPrivilegedWindowsServiceConfig(updated, mgr.StartAutomatic, mgr.ErrorNormal) {
+		return errors.Join(errInvalidWindowsActivation, err)
+	}
+	return validateWindowsRecovery(item)
+}
+func stopNamedWindowsServices(ctx context.Context, names ...string) error {
+	manager, err := mgr.Connect()
+	if err != nil {
+		return err
+	}
+	defer manager.Disconnect()
+	for _, name := range names {
+		item, err := manager.OpenService(name)
+		if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		_, controlErr := item.Control(svc.Stop)
+		if controlErr != nil && !errors.Is(controlErr, windows.ERROR_SERVICE_NOT_ACTIVE) {
+			item.Close()
+			return controlErr
+		}
+		for {
+			status, queryErr := item.Query()
+			if queryErr != nil {
+				item.Close()
+				return queryErr
+			}
+			if status.State == svc.Stopped {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				item.Close()
+				return ctx.Err()
+			case <-time.After(250 * time.Millisecond):
+			}
+		}
+		item.Close()
+	}
+	return nil
+}
+func startNamedWindowsService(ctx context.Context, name string) error {
+	manager, err := mgr.Connect()
+	if err != nil {
+		return err
+	}
+	defer manager.Disconnect()
+	item, err := manager.OpenService(name)
+	if err != nil {
+		return err
+	}
+	defer item.Close()
+	if err := item.Start(); err != nil && !errors.Is(err, windows.ERROR_SERVICE_ALREADY_RUNNING) {
+		return err
+	}
+	for {
+		status, err := item.Query()
+		if err != nil {
+			return err
+		}
+		if status.State == svc.Running {
+			return nil
+		}
+		if status.State == svc.Stopped {
+			return errInvalidWindowsActivation
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+}
+
+func loadWindowsActivationJournal(config WindowsConfig) (windowsActivationJournal, error) {
+	file, err := os.Open(windowsActivationJournalPath(config.StateRoot))
+	if err != nil {
+		return windowsActivationJournal{}, err
+	}
+	defer file.Close()
+	decoder := json.NewDecoder(bufio.NewReader(io.LimitReader(file, 128<<10)))
+	decoder.DisallowUnknownFields()
+	var journal windowsActivationJournal
+	var extra any
+	if decoder.Decode(&journal) != nil || decoder.Decode(&extra) != io.EOF || !validWindowsActivationJournal(journal) || !validWindowsActivationPaths(config, journal) {
+		return windowsActivationJournal{}, errInvalidWindowsActivation
+	}
+	return journal, nil
+}
+
+func resumeWindowsActivation(ctx context.Context, config WindowsConfig) (bool, error) {
+	journal, err := loadWindowsActivationJournal(config)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if journal.Stage == windowsActivationCommitted || journal.Stage == windowsActivationRolledBack {
+		return false, nil
+	}
+	if config.ActiveVersion == journal.Version {
+		return false, nil
+	}
+	target := workerupdate.ComponentTarget{SHA256: journal.Updater.SHA256, Length: journal.Updater.Length, Platform: "windows", Architecture: journal.Architecture}
+	if !matchesWindowsComponent(journal.Updater.Path, target) {
+		return false, errInvalidWindowsActivation
+	}
+	verifyCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := nativesignature.New(nil).Verify(verifyCtx, journal.Updater.Path, "windows", journal.Architecture); err != nil {
+		return false, err
+	}
+	if err := installWindowsActivatorService(journal.Updater.Path); err != nil {
+		return false, err
+	}
+	if err := startWindowsActivatorService(); err != nil && !errors.Is(err, windows.ERROR_SERVICE_ALREADY_RUNNING) {
+		return false, err
+	}
+	return true, nil
+}
+
+func validWindowsActivationPaths(config WindowsConfig, journal windowsActivationJournal) bool {
+	if config.SetupMode == "client" && (journal.OldSSH.Executable != "" || journal.NewSSH.Executable != "") {
+		return false
+	}
+	layout, err := service.DefaultLayout("windows")
+	if err != nil {
+		return false
+	}
+	paths, err := layout.WindowsRelease(journal.Version)
+	if err != nil || !strings.EqualFold(journal.Runtime.Path, paths.Runtime) || !strings.EqualFold(journal.CLI.Path, paths.CLI) || !strings.EqualFold(journal.Hostd.Path, paths.Hostd) || !strings.EqualFold(journal.Updater.Path, paths.Updater) {
+		return false
+	}
+	if !strings.EqualFold(journal.NewHostd.Executable, paths.Hostd) || !strings.EqualFold(journal.NewUpdater.Executable, paths.Updater) || journal.NewSSH.Executable != "" && !strings.EqualFold(journal.NewSSH.Executable, paths.Runtime) {
+		return false
+	}
+	previous, err := layout.WindowsRelease(journal.PreviousVersion)
+	if err != nil || !strings.EqualFold(journal.OldHostd.Executable, previous.Hostd) || !strings.EqualFold(journal.OldUpdater.Executable, previous.Updater) || journal.OldSSH.Executable != "" && !strings.EqualFold(journal.OldSSH.Executable, previous.Runtime) {
+		return false
+	}
+	for _, target := range []windowsServiceTarget{journal.OldHostd, journal.OldUpdater, journal.OldSSH} {
+		if target.Executable == "" {
+			continue
+		}
+		if !filepath.IsAbs(target.Executable) || filepath.Clean(target.Executable) != target.Executable || len(target.Arguments) == 0 || len(target.Arguments) > 16 {
+			return false
+		}
+		for _, argument := range target.Arguments {
+			if strings.ContainsAny(argument, "\x00\r\n") || len(argument) > 4096 {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// RunWindowsActivator is the fixed one-shot SCM entry. Its only input is the
+// protected journal created by the signed updater.
+func RunWindowsActivator(ctx context.Context, config WindowsConfig) error {
+	journal, err := loadWindowsActivationJournal(config)
+	if err != nil {
+		return err
+	}
+	result, activationErr := executeWindowsActivation(ctx, newWindowsSCMActivationBackend(config), journal)
+	var connectErr error
+	if result.Stage == windowsActivationCommitted || result.Stage == windowsActivationRolledBack {
+		var manager *mgr.Mgr
+		manager, connectErr = mgr.Connect()
+		if connectErr == nil {
+			if item, openErr := manager.OpenService(windowsActivatorService); openErr == nil {
+				_ = item.Delete()
+				_ = item.Close()
+			}
+			_ = manager.Disconnect()
+		}
+	}
+	if result.Stage == windowsActivationRolledBack {
+		activationErr = nil
+	}
+	return errors.Join(activationErr, connectErr)
+}

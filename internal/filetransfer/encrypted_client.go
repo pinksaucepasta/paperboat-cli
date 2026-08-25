@@ -172,9 +172,11 @@ func (c *Client) uploadEncrypted(ctx context.Context, resource encryptedResource
 }
 
 func (c *Client) encryptedStatus(ctx context.Context, id string) (encryptedResource, error) {
-	var resource encryptedResource
-	err := c.retryJSONRequest(ctx, http.MethodGet, c.Endpoint+"/"+id, operationID("status", id), "", 0, nil, &resource)
-	return resource, err
+	manifest, err := c.Status(ctx, id)
+	if err != nil {
+		return encryptedResource{}, err
+	}
+	return encryptedResource{TransferID: manifest.TransferID, CommittedChunk: manifest.CommittedChunk, State: manifest.State, ExpiresAt: manifest.ExpiresAt}, nil
 }
 
 func (c *Client) cancelEncryptedBatch(resources []encryptedResource) {

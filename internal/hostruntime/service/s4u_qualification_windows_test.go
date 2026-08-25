@@ -3,8 +3,12 @@
 package service
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"net"
 	"os"
@@ -15,12 +19,444 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
+	"github.com/pinksaucepasta/paperboat/internal/config"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/identity"
+	"github.com/pinksaucepasta/paperboat/internal/windowssecurity"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
 )
 
 const s4uFixturePathEnvironment = "PAPERBOAT_WINDOWS_E2E_S4U_FIXTURE"
+const s4uFixtureSHA256Environment = "PAPERBOAT_WINDOWS_E2E_S4U_FIXTURE_SHA256"
+const s4uReportPathEnvironment = "PAPERBOAT_WINDOWS_E2E_S4U_REPORT_PATH"
+const s4uServiceNameEnvironment = "PAPERBOAT_WINDOWS_E2E_S4U_SERVICE_NAME"
+const s4uQualificationActionStagePrefix = "paperboat-s4u-action-stage:"
+
+var qualificationCredWrite = windows.NewLazySystemDLL("advapi32.dll").NewProc("CredWriteW")
+
+var (
+	qualificationOwnerSIDFlag      = flag.String("paperboat-owner-sid", "", "native qualification owner SID")
+	qualificationReportPathFlag    = flag.String("paperboat-report-path", "", "native qualification report path")
+	qualificationFixturePathFlag   = flag.String("paperboat-fixture-path", "", "native qualification fixture path")
+	qualificationFixtureSHA256Flag = flag.String("paperboat-fixture-sha256", "", "native qualification fixture SHA256")
+)
+
+type qualificationWindowsCredential struct {
+	Flags              uint32
+	Type               uint32
+	TargetName         *uint16
+	Comment            *uint16
+	LastWritten        windows.Filetime
+	CredentialBlobSize uint32
+	CredentialBlob     *byte
+	Persist            uint32
+	AttributeCount     uint32
+	Attributes         unsafe.Pointer
+	TargetAlias        *uint16
+	UserName           *uint16
+}
+
+func reportS4UQualificationActionStage(stage string) {
+	fmt.Printf("%s%s\n", s4uQualificationActionStagePrefix, stage)
+}
+
+func writeLegacyCredentialManagerFixture(t *testing.T, ref, value string) {
+	t.Helper()
+	reportS4UQualificationActionStage("credential-manager-write")
+	target, err := windows.UTF16PtrFromString("paperboat:" + ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	username, err := windows.UTF16PtrFromString("paperboat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob := []byte(value)
+	defer clear(blob)
+	credential := qualificationWindowsCredential{Type: 1, TargetName: target, CredentialBlobSize: uint32(len(blob)), Persist: 2, UserName: username}
+	if len(blob) > 0 {
+		credential.CredentialBlob = &blob[0]
+	}
+	if result, _, callErr := qualificationCredWrite.Call(uintptr(unsafe.Pointer(&credential)), 0); result == 0 {
+		t.Fatalf("write legacy Credential Manager fixture: %v", callErr)
+	}
+}
+
+func prepareProductionKeyringFixtures(t *testing.T, reportPath string, cleanup bool) {
+	t.Helper()
+	reportS4UQualificationActionStage("keyring-write")
+	keyring := config.KeyringStore{}
+	if err := keyring.Set(reportPath, "paperboat-s4u-dpapi-v1"); err != nil {
+		t.Fatalf("create owner Paperboat KeyringStore fixture: %v", err)
+	}
+	migratedRef := reportPath + "-migrated"
+	writeLegacyCredentialManagerFixture(t, migratedRef, "paperboat-s4u-migrated-v1")
+	reportS4UQualificationActionStage("credential-manager-migrate")
+	if value, err := keyring.Get(migratedRef); err != nil || value != "paperboat-s4u-migrated-v1" {
+		t.Fatalf("migrate owner Credential Manager fixture into Paperboat KeyringStore: value=%q err=%v", value, err)
+	}
+	if cleanup {
+		t.Cleanup(func() {
+			_ = keyring.Delete(reportPath)
+			_ = keyring.Delete(migratedRef)
+		})
+	}
+}
+
+const s4uPreviewControlURL = "https://api.example.test"
+
+func prepareS4UPreviewIdentityFixture(t *testing.T, reportPath string) string {
+	t.Helper()
+	reportS4UQualificationActionStage("identity-create")
+	stateRoot := reportPath + ".preview-state"
+	store, err := identity.Open(identity.Config{StateRoot: stateRoot})
+	if err != nil {
+		t.Fatalf("create S4U preview identity store: %v", err)
+	}
+	key := store.Current()
+	registration := identity.Registration{
+		ServerURL:              s4uPreviewControlURL,
+		MachineID:              "machine_s4u_preview",
+		EnvironmentID:          "environment_s4u_preview",
+		PublicKeyID:            key.ID,
+		PublicIdentityKey:      base64.RawURLEncoding.EncodeToString(key.Public()),
+		InboxPath:              filepath.Join(stateRoot, "inbox"),
+		InstallationGeneration: 1,
+		SetupRoles:             []string{"host"},
+		UpdatedAt:              time.Now().UTC(),
+	}
+	if err := store.SaveRegistration(registration); err != nil {
+		t.Fatalf("save S4U preview registration: %v", err)
+	}
+	reportS4UQualificationActionStage("identity-control")
+	if err := store.SaveMachineControl(identity.MachineControl{
+		MachineID:              registration.MachineID,
+		EnvironmentID:          registration.EnvironmentID,
+		InstallationGeneration: registration.InstallationGeneration,
+		Credential:             strings.Repeat("m", 40),
+		ExpiresAt:              time.Now().UTC().Add(2 * time.Hour),
+		KeyID:                  key.ID,
+	}); err != nil {
+		t.Fatalf("save S4U preview machine-control fixture: %v", err)
+	}
+	reportS4UQualificationActionStage("identity-open")
+	reopened, err := identity.Open(identity.Config{StateRoot: stateRoot})
+	if err != nil {
+		t.Fatalf("reopen S4U preview identity store as effective owner: %v", err)
+	}
+	reportS4UQualificationActionStage("identity-registration-read")
+	if _, err := reopened.Registration(); err != nil {
+		t.Fatalf("reopen S4U preview registration as effective owner: %v", err)
+	}
+	reportS4UQualificationActionStage("identity-control-read")
+	if _, err := reopened.MachineControl(time.Now().UTC(), 0); err != nil {
+		t.Fatalf("reopen S4U preview machine-control as effective owner: %v", err)
+	}
+	return stateRoot
+}
+
+func assertQualificationIdentityOwner(t *testing.T, stateRoot, ownerSID string) {
+	t.Helper()
+	sid, err := windows.StringToSid(ownerSID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"machine-identity.json", "machine-registration.json", "machine-control.json"} {
+		path := filepath.Join(stateRoot, name)
+		if !windowssecurity.OwnerMatchesSID(path, sid) {
+			t.Fatalf("qualification identity file %s is not owned by owner process %s", name, ownerSID)
+		}
+		descriptor := "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + ownerSID + ")"
+		if !windowssecurity.ProtectedDACLMatches(path, descriptor) {
+			t.Fatalf("qualification identity file %s does not have the effective owner's protected DACL", name)
+		}
+	}
+}
+
+func withQualificationOwner(t *testing.T, action func(windows.Token)) {
+	t.Helper()
+	ownerSID := requiredS4UOwnerSID(t)
+	processToken := windows.GetCurrentProcessToken()
+	reportS4UQualificationActionStage("owner-process-validate")
+	if err := validateOwnerToken(processToken, ownerSID); err != nil {
+		t.Fatalf("qualification process does not run as owner %s: %v", ownerSID, err)
+	}
+	reportS4UQualificationActionStage("thread-token-absent")
+	var threadToken windows.Token
+	if err := windows.OpenThreadToken(windows.CurrentThread(), windows.TOKEN_QUERY, true, &threadToken); err == nil {
+		_ = threadToken.Close()
+		t.Fatal("owner qualification process unexpectedly has a thread impersonation token")
+	} else if !errors.Is(err, windows.ERROR_NO_TOKEN) {
+		t.Fatalf("check owner qualification thread token: %v", err)
+	}
+	reportS4UQualificationActionStage("effective-owner")
+	effectiveSID, err := windowssecurity.CurrentEffectiveUserSID()
+	if err != nil || effectiveSID.String() != ownerSID {
+		t.Fatalf("effective qualification owner SID = %v, want %s: %v", effectiveSID, ownerSID, err)
+	}
+	reportS4UQualificationActionStage("profile-ready")
+	for _, name := range []string{"USERPROFILE", "APPDATA", "LOCALAPPDATA"} {
+		value := os.Getenv(name)
+		info, statErr := os.Stat(value)
+		if value == "" || !filepath.IsAbs(value) || filepath.Clean(value) != value || statErr != nil || !info.IsDir() {
+			t.Fatalf("owner qualification profile is not loaded: variable=%s path=%q stat=%v", name, value, statErr)
+		}
+	}
+	action(processToken)
+}
+
+func assertQualificationKeyringOwner(t *testing.T, localAppData, ref, ownerSID string) {
+	t.Helper()
+	digest := sha256.Sum256([]byte(ref))
+	path := filepath.Join(localAppData, "Paperboat", "credentials", hex.EncodeToString(digest[:])+".dpapi")
+	sid, err := windows.StringToSid(ownerSID)
+	if err != nil || !windowssecurity.OwnerMatchesSID(path, sid) {
+		t.Fatalf("qualification keyring file is not owned by owner process %s: %v", ownerSID, err)
+	}
+}
+
+// TestNativePrepareS4UDPAPIQualification runs in a dedicated process created
+// with the enrolled owner's credentials and profile. Credential Manager rejects
+// service, network, and S4U-only logons with ERROR_NO_SUCH_LOGON_SESSION, so the
+// harness must use a real owner logon rather than thread impersonation.
+func TestNativePrepareS4UDPAPIQualification(t *testing.T) {
+	withQualificationOwner(t, func(token windows.Token) {
+		ownerSID := requiredS4UOwnerSID(t)
+		reportS4UQualificationActionStage("local-app-data")
+		localAppData := os.Getenv("LOCALAPPDATA")
+		reportS4UQualificationActionStage("working-directory")
+		reportPath := requiredS4UReportPath(t)
+		workingDirectory, err := os.Getwd()
+		if err != nil || !strings.EqualFold(filepath.Clean(workingDirectory), filepath.Dir(reportPath)) {
+			t.Fatalf("owner preparation working directory = %q, want %q: %v", workingDirectory, filepath.Dir(reportPath), err)
+		}
+		reportS4UQualificationActionStage("owner-access")
+		probePath := reportPath + ".owner-access"
+		if err := os.WriteFile(probePath, []byte("owner-access-v1"), 0o600); err != nil {
+			t.Fatalf("write owner qualification access probe: %v", err)
+		}
+		if err := os.Remove(probePath); err != nil {
+			t.Fatalf("remove owner qualification access probe: %v", err)
+		}
+		reportS4UQualificationActionStage("atomic-file")
+		atomicProbePath := reportPath + ".atomic-owner"
+		for _, value := range []string{"effective-owner-v1", "effective-owner-v2"} {
+			if err := atomicfile.Write(atomicProbePath, []byte(value), atomicfile.CurrentOwnerOptions(0o600)); err != nil {
+				t.Fatalf("write effective-owner atomic fixture: %v", err)
+			}
+		}
+		if body, err := os.ReadFile(atomicProbePath); err != nil || string(body) != "effective-owner-v2" {
+			t.Fatalf("reopen effective-owner atomic fixture: body=%q err=%v", body, err)
+		}
+		owner, err := windows.StringToSid(ownerSID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ownerDescriptor := "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + ownerSID + ")"
+		if !windowssecurity.OwnerMatchesSID(atomicProbePath, owner) || !windowssecurity.ProtectedDACLMatches(atomicProbePath, ownerDescriptor) {
+			t.Fatal("effective-owner atomic replacement did not preserve the owner and protected DACL")
+		}
+		if err := os.Remove(atomicProbePath); err != nil {
+			t.Fatalf("remove effective-owner atomic fixture: %v", err)
+		}
+		reportS4UQualificationActionStage("file-secret-store")
+		fileSecretDirectory := reportPath + ".file-secret-owner"
+		fileSecrets := config.FileSecretStore{Dir: fileSecretDirectory}
+		const fileSecretRef = "runtime-transfer-key"
+		const fileSecretValue = "paperboat-s4u-owner-file-secret-v2"
+		if err := fileSecrets.Set(fileSecretRef, fileSecretValue); err != nil {
+			t.Fatalf("write effective-owner FileSecretStore fixture: %v", err)
+		}
+		if value, err := fileSecrets.Get(fileSecretRef); err != nil || value != fileSecretValue {
+			t.Fatalf("reopen effective-owner FileSecretStore fixture: value=%q err=%v", value, err)
+		}
+		if err := fileSecrets.Delete(fileSecretRef); err != nil {
+			t.Fatalf("delete effective-owner FileSecretStore fixture: %v", err)
+		}
+		if err := os.Remove(fileSecretDirectory); err != nil {
+			t.Fatalf("remove effective-owner FileSecretStore directory: %v", err)
+		}
+		prepareProductionKeyringFixtures(t, reportPath, false)
+		previewStateRoot := prepareS4UPreviewIdentityFixture(t, reportPath)
+		reportS4UQualificationActionStage("security-assertions")
+		assertQualificationKeyringOwner(t, localAppData, reportPath, ownerSID)
+		assertQualificationKeyringOwner(t, localAppData, reportPath+"-migrated", ownerSID)
+		assertQualificationIdentityOwner(t, previewStateRoot, ownerSID)
+		reportS4UQualificationActionStage("body-complete")
+	})
+}
+
+// TestNativeOwnerCannotMutateS4UFixture runs as the enrolled owner after the
+// privileged harness publishes the future LocalSystem executable. The owner
+// may read and execute it, but cannot write, replace, rename, delete, or create
+// a sibling in its trusted directory.
+func TestNativeOwnerCannotMutateS4UFixture(t *testing.T) {
+	withQualificationOwner(t, func(windows.Token) {
+		fixture := requiredS4UFixture(t)
+		if handle, err := os.OpenFile(fixture, os.O_WRONLY|os.O_TRUNC, 0); err == nil {
+			handle.Close()
+			t.Fatal("enrolled owner could truncate the future LocalSystem fixture")
+		}
+		replacement := fixture + ".owner-replacement"
+		if err := os.WriteFile(replacement, []byte("replacement"), 0o600); err == nil {
+			t.Fatal("enrolled owner could create a sibling in the trusted fixture directory")
+		}
+		if err := os.Rename(fixture, replacement); err == nil {
+			t.Fatal("enrolled owner could rename the future LocalSystem fixture")
+		}
+		if err := os.Remove(fixture); err == nil {
+			t.Fatal("enrolled owner could delete the future LocalSystem fixture")
+		}
+		_ = requiredS4UFixture(t)
+	})
+}
+
+// TestNativeLoggedOutS4UDPAPIQualification is the release gate for the exact
+// cross-logon credential contract Paperboat relies on. An earlier real owner
+// logon prepares machine-scope v2 DPAPI values behind the owner's strict ACL.
+// This phase proves no interactive owner token is selectable and requires the
+// actual LocalSystem -> enrolled-owner S4U child to decrypt them. It deliberately
+// has no Git, Codex, EFS, or network dependency.
+func TestNativeLoggedOutS4UDPAPIQualification(t *testing.T) {
+	fixture := requiredS4UFixture(t)
+	ownerSID := requiredS4UOwnerSID(t)
+	if hasSelectableOwnerWTSToken(t, ownerSID) {
+		t.Fatalf("owner %s has a selectable WTS token; logged-out DPAPI qualification did not run", ownerSID)
+	}
+
+	name := requiredS4UServiceName(t)
+	reportPath := requiredS4UReportPath(t)
+	manager, err := mgr.Connect()
+	if err != nil {
+		t.Fatalf("connect SCM: %v", err)
+	}
+	defer manager.Disconnect()
+	serviceHandle, err := manager.CreateService(name, fixture, mgr.Config{
+		DisplayName:      name,
+		Description:      "Paperboat native logged-out S4U DPAPI qualification fixture",
+		StartType:        mgr.StartManual,
+		ServiceStartName: "LocalSystem",
+	}, "--paperboat-s4u-dpapi-service", "--service-name", name, "--owner-sid", ownerSID, "--report", reportPath)
+	if err != nil {
+		t.Fatalf("create S4U DPAPI qualification service: %v", err)
+	}
+	defer func() { _ = stopAndDeleteS4UService(serviceHandle) }()
+	if err := serviceHandle.Start(); err != nil {
+		t.Fatalf("start S4U DPAPI qualification service: %v", err)
+	}
+	if err := waitS4UServiceState(serviceHandle, svc.Running, 30*time.Second); err != nil {
+		body, _ := os.ReadFile(reportPath + ".launch-error")
+		t.Fatalf("%v: %s", err, strings.TrimSpace(string(body)))
+	}
+	record := waitS4UReport(t, reportPath, 30*time.Second)
+	assertS4UDPAPIReport(t, record, ownerSID)
+
+	if _, err := serviceHandle.Control(svc.Stop); err != nil && !errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE) {
+		t.Fatalf("stop S4U DPAPI qualification service: %v", err)
+	}
+	if err := waitS4UServiceState(serviceHandle, svc.Stopped, 30*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	for _, pid := range []uint32{record.ChildPID, record.DescendantPID} {
+		if err := waitS4UProcessExit(pid, 15*time.Second); err != nil {
+			t.Fatalf("S4U Job Object cleanup for pid %d: %v", pid, err)
+		}
+	}
+}
+
+// TestNativeLoggedOutS4UFileSecretQualification is the focused regression for
+// runtime-owned transfer keys. Unlike the owner-prepared KeyringStore gate, it
+// requires the logged-out S4U child itself to create and reopen a fresh
+// FileSecretStore value, matching the file-transfer receiver path.
+func TestNativeLoggedOutS4UFileSecretQualification(t *testing.T) {
+	fixture := requiredS4UFixture(t)
+	ownerSID := requiredS4UOwnerSID(t)
+	if hasSelectableOwnerWTSToken(t, ownerSID) {
+		t.Fatalf("owner %s has a selectable WTS token; logged-out FileSecretStore qualification did not run", ownerSID)
+	}
+
+	name := fmt.Sprintf("PaperboatS4UFileSecret%d", os.Getpid())
+	reportPath := filepath.Join(t.TempDir(), "s4u-file-secret-report.json")
+	manager, err := mgr.Connect()
+	if err != nil {
+		t.Fatalf("connect SCM: %v", err)
+	}
+	defer manager.Disconnect()
+	serviceHandle, err := manager.CreateService(name, fixture, mgr.Config{
+		DisplayName:      name,
+		Description:      "Paperboat native logged-out S4U FileSecretStore qualification fixture",
+		StartType:        mgr.StartManual,
+		ServiceStartName: "LocalSystem",
+	}, "--paperboat-s4u-dpapi-service", "--service-name", name, "--owner-sid", ownerSID, "--report", reportPath)
+	if err != nil {
+		t.Fatalf("create S4U FileSecretStore qualification service: %v", err)
+	}
+	defer func() { _ = stopAndDeleteS4UService(serviceHandle) }()
+	if err := serviceHandle.Start(); err != nil {
+		t.Fatalf("start S4U FileSecretStore qualification service: %v", err)
+	}
+	if err := waitS4UServiceState(serviceHandle, svc.Running, 30*time.Second); err != nil {
+		body, _ := os.ReadFile(reportPath + ".launch-error")
+		t.Fatalf("%v: %s", err, strings.TrimSpace(string(body)))
+	}
+	record := waitS4UReport(t, reportPath, 30*time.Second)
+	if record.OwnerSID != ownerSID || record.SessionID != 0 || !record.JobCleanupExpected {
+		t.Fatalf("invalid logged-out S4U FileSecretStore report: %+v", record)
+	}
+	if record.Limitations.FileSecretStore.Status != "pass" || strings.TrimSpace(record.Limitations.FileSecretStore.Reason) == "" {
+		t.Fatalf("logged-out S4U must write and read a fresh FileSecretStore credential: %+v", record.Limitations.FileSecretStore)
+	}
+
+	if _, err := serviceHandle.Control(svc.Stop); err != nil && !errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE) {
+		t.Fatalf("stop S4U FileSecretStore qualification service: %v", err)
+	}
+	if err := waitS4UServiceState(serviceHandle, svc.Stopped, 30*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	for _, pid := range []uint32{record.ChildPID, record.DescendantPID} {
+		if err := waitS4UProcessExit(pid, 15*time.Second); err != nil {
+			t.Fatalf("S4U Job Object cleanup for pid %d: %v", pid, err)
+		}
+	}
+}
+
+func assertS4UDPAPIReport(t *testing.T, record s4uQualificationReport, ownerSID string) {
+	t.Helper()
+	if record.Schema != "paperboat.windows-s4u-qualification/v1" || record.OwnerSID != ownerSID || record.ChildPID == 0 || record.DescendantPID == 0 || record.ChildPID == record.DescendantPID || record.SessionID != 0 {
+		t.Fatalf("invalid logged-out S4U DPAPI report: %+v", record)
+	}
+	if !record.Profile.Exists || !filepath.IsAbs(record.Profile.Home) || !strings.EqualFold(record.Profile.Home, record.Profile.UserProfile) || record.Environment.OwnerWorkload != "1" {
+		t.Fatalf("S4U owner profile was not loaded correctly: %+v", record)
+	}
+	if !record.JobCleanupExpected {
+		t.Fatal("S4U DPAPI fixture did not declare kill-on-close Job Object ownership")
+	}
+	if record.Limitations.DPAPI.Status != "pass" || strings.TrimSpace(record.Limitations.DPAPI.Reason) == "" {
+		t.Fatalf("logged-out S4U must decrypt the owner DPAPI credential: %+v", record.Limitations.DPAPI)
+	}
+	if record.Limitations.DPAPIMigration.Status != "pass" || strings.TrimSpace(record.Limitations.DPAPIMigration.Reason) == "" {
+		t.Fatalf("logged-out S4U must read the owner-migrated Credential Manager credential through KeyringStore: %+v", record.Limitations.DPAPIMigration)
+	}
+	if record.Limitations.FileSecretStore.Status != "pass" || strings.TrimSpace(record.Limitations.FileSecretStore.Reason) == "" {
+		t.Fatalf("logged-out S4U must write and read a fresh FileSecretStore credential: %+v", record.Limitations.FileSecretStore)
+	}
+	for _, result := range []struct {
+		name   string
+		status string
+		reason string
+	}{
+		{name: "identity_open", status: record.Limitations.PreviewIdentityOpen.Status, reason: record.Limitations.PreviewIdentityOpen.Reason},
+		{name: "registration", status: record.Limitations.PreviewRegistration.Status, reason: record.Limitations.PreviewRegistration.Reason},
+		{name: "machine_control_source", status: record.Limitations.PreviewMachineControlSource.Status, reason: record.Limitations.PreviewMachineControlSource.Reason},
+		{name: "machine_control_token", status: record.Limitations.PreviewMachineControlToken.Status, reason: record.Limitations.PreviewMachineControlToken.Reason},
+	} {
+		if result.status != "pass" || strings.TrimSpace(result.reason) == "" {
+			t.Fatalf("logged-out S4U preview stage %s did not pass: status=%q reason=%q", result.name, result.status, result.reason)
+		}
+	}
+}
 
 type s4uQualificationReport struct {
 	Schema        string `json:"schema"`
@@ -48,6 +484,14 @@ type s4uQualificationReport struct {
 			Status string `json:"status"`
 			Reason string `json:"reason"`
 		} `json:"dpapi"`
+		DPAPIMigration struct {
+			Status string `json:"status"`
+			Reason string `json:"reason"`
+		} `json:"dpapi_credential_manager_migration"`
+		FileSecretStore struct {
+			Status string `json:"status"`
+			Reason string `json:"reason"`
+		} `json:"file_secret_store"`
 		EFS struct {
 			Status string `json:"status"`
 			Reason string `json:"reason"`
@@ -64,6 +508,22 @@ type s4uQualificationReport struct {
 			Status string `json:"status"`
 			Reason string `json:"reason"`
 		} `json:"codex"`
+		PreviewIdentityOpen struct {
+			Status string `json:"status"`
+			Reason string `json:"reason"`
+		} `json:"preview_identity_open"`
+		PreviewRegistration struct {
+			Status string `json:"status"`
+			Reason string `json:"reason"`
+		} `json:"preview_registration"`
+		PreviewMachineControlSource struct {
+			Status string `json:"status"`
+			Reason string `json:"reason"`
+		} `json:"preview_machine_control_source"`
+		PreviewMachineControlToken struct {
+			Status string `json:"status"`
+			Reason string `json:"reason"`
+		} `json:"preview_machine_control_token"`
 	} `json:"limitations"`
 }
 
@@ -86,13 +546,7 @@ func TestNativeLoggedOutS4UQualification(t *testing.T) {
 
 	name := fmt.Sprintf("PaperboatS4UQualification%d", os.Getpid())
 	reportPath := filepath.Join(t.TempDir(), "s4u-report.json")
-	protected, err := transformQualificationDPAPI([]byte("paperboat-s4u-dpapi-v1"), true)
-	if err != nil {
-		t.Fatalf("create logged-in owner DPAPI fixture: %v", err)
-	}
-	if err := os.WriteFile(reportPath+".dpapi", protected, 0o600); err != nil {
-		t.Fatalf("write owner DPAPI fixture: %v", err)
-	}
+	prepareProductionKeyringFixtures(t, reportPath, true)
 	if err := os.WriteFile(reportPath+".efs", []byte("paperboat-s4u-efs-v1"), 0o600); err != nil {
 		t.Fatalf("write owner EFS fixture: %v", err)
 	}
@@ -181,7 +635,7 @@ func TestNativeLoggedOutS4UQualification(t *testing.T) {
 
 func requiredS4UFixture(t *testing.T) string {
 	t.Helper()
-	path := os.Getenv(s4uFixturePathEnvironment)
+	path := qualificationFlagOrEnvironment(*qualificationFixturePathFlag, s4uFixturePathEnvironment)
 	if path == "" {
 		t.Fatalf("%s is required", s4uFixturePathEnvironment)
 	}
@@ -189,21 +643,64 @@ func requiredS4UFixture(t *testing.T) string {
 	if err != nil || !strings.EqualFold(filepath.Ext(absolute), ".exe") {
 		t.Fatalf("S4U fixture must be an absolute .exe: %q", path)
 	}
-	info, err := os.Stat(absolute)
-	if err != nil || !info.Mode().IsRegular() {
+	info, err := os.Lstat(absolute)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 		t.Fatalf("S4U fixture is not a regular file: %q: %v", absolute, err)
+	}
+	attributes, err := windows.GetFileAttributes(windows.StringToUTF16Ptr(absolute))
+	if err != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		t.Fatalf("S4U fixture is a reparse point: %q: %v", absolute, err)
+	}
+	body, err := os.ReadFile(absolute)
+	if err != nil {
+		t.Fatalf("read S4U fixture: %v", err)
+	}
+	digest := fmt.Sprintf("%x", sha256.Sum256(body))
+	expectedDigest := strings.ToLower(qualificationFlagOrEnvironment(*qualificationFixtureSHA256Flag, s4uFixtureSHA256Environment))
+	if len(expectedDigest) != sha256.Size*2 || digest != expectedDigest {
+		t.Fatalf("S4U fixture SHA256 = %q, want %q", digest, expectedDigest)
 	}
 	return absolute
 }
 
 func requiredS4UOwnerSID(t *testing.T) string {
 	t.Helper()
-	value := os.Getenv("PAPERBOAT_WINDOWS_E2E_S4U_OWNER_SID")
+	value := qualificationFlagOrEnvironment(*qualificationOwnerSIDFlag, "PAPERBOAT_WINDOWS_E2E_S4U_OWNER_SID")
 	sid, err := windows.StringToSid(value)
 	if value == "" || err != nil || sid == nil || sid.String() != value {
 		t.Fatalf("PAPERBOAT_WINDOWS_E2E_S4U_OWNER_SID must be an enrolled Windows SID")
 	}
 	return value
+}
+
+func requiredS4UReportPath(t *testing.T) string {
+	t.Helper()
+	path := qualificationFlagOrEnvironment(*qualificationReportPathFlag, s4uReportPathEnvironment)
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path || strings.ContainsAny(path, "\x00\r\n") {
+		t.Fatalf("%s must be an absolute clean path", s4uReportPathEnvironment)
+	}
+	return path
+}
+
+func requiredS4UServiceName(t *testing.T) string {
+	t.Helper()
+	name := os.Getenv(s4uServiceNameEnvironment)
+	if len(name) < len("PaperboatS4UDPAPI-")+8 || len(name) > 80 || !strings.HasPrefix(name, "PaperboatS4UDPAPI-") {
+		t.Fatalf("%s must be a bounded Paperboat qualification service name", s4uServiceNameEnvironment)
+	}
+	for _, r := range name {
+		if r != '-' && (r < '0' || r > '9') && (r < 'A' || r > 'Z') && (r < 'a' || r > 'z') {
+			t.Fatalf("%s contains an invalid character", s4uServiceNameEnvironment)
+		}
+	}
+	return name
+}
+
+func qualificationFlagOrEnvironment(flagValue, environmentName string) string {
+	if value := strings.TrimSpace(flagValue); value != "" {
+		return value
+	}
+	return strings.TrimSpace(os.Getenv(environmentName))
 }
 
 func hasSelectableOwnerWTSToken(t *testing.T, ownerSID string) bool {
@@ -267,8 +764,14 @@ func assertS4UReport(t *testing.T, record s4uQualificationReport, ownerSID strin
 	if record.Limitations.SMB.Status != "not_qualified" || strings.TrimSpace(record.Limitations.SMB.Reason) == "" {
 		t.Fatalf("SMB limitation is not reported honestly: %+v", record.Limitations.SMB)
 	}
-	if record.Limitations.DPAPI.Status != "pass" && record.Limitations.DPAPI.Status != "fail" || strings.TrimSpace(record.Limitations.DPAPI.Reason) == "" {
-		t.Fatalf("DPAPI qualification result is invalid: %+v", record.Limitations.DPAPI)
+	if record.Limitations.DPAPI.Status != "pass" || strings.TrimSpace(record.Limitations.DPAPI.Reason) == "" {
+		t.Fatalf("logged-out S4U must decrypt the owner DPAPI credential: %+v", record.Limitations.DPAPI)
+	}
+	if record.Limitations.DPAPIMigration.Status != "pass" || strings.TrimSpace(record.Limitations.DPAPIMigration.Reason) == "" {
+		t.Fatalf("logged-out S4U must read the owner-migrated Credential Manager credential through KeyringStore: %+v", record.Limitations.DPAPIMigration)
+	}
+	if record.Limitations.FileSecretStore.Status != "pass" || strings.TrimSpace(record.Limitations.FileSecretStore.Reason) == "" {
+		t.Fatalf("logged-out S4U must write and read a fresh FileSecretStore credential: %+v", record.Limitations.FileSecretStore)
 	}
 	for name, result := range map[string]struct{ Status, Reason string }{"EFS": {record.Limitations.EFS.Status, record.Limitations.EFS.Reason}, "Git": {record.Limitations.Git.Status, record.Limitations.Git.Reason}, "network": {record.Limitations.Network.Status, record.Limitations.Network.Reason}, "Codex": {record.Limitations.Codex.Status, record.Limitations.Codex.Reason}} {
 		if result.Status != "pass" {
@@ -278,30 +781,6 @@ func assertS4UReport(t *testing.T, record s4uQualificationReport, ownerSID strin
 		}
 	}
 	t.Logf("logged-out S4U DPAPI result: %s: %s", record.Limitations.DPAPI.Status, record.Limitations.DPAPI.Reason)
-}
-
-func transformQualificationDPAPI(value []byte, protect bool) ([]byte, error) {
-	input := windows.DataBlob{Size: uint32(len(value))}
-	if len(value) > 0 {
-		input.Data = &value[0]
-	}
-	entropyBytes := []byte("paperboat/windows-s4u-qualification/v1")
-	entropy := windows.DataBlob{Size: uint32(len(entropyBytes)), Data: &entropyBytes[0]}
-	var output windows.DataBlob
-	var err error
-	if protect {
-		err = windows.CryptProtectData(&input, nil, &entropy, 0, nil, 0x1, &output)
-	} else {
-		err = windows.CryptUnprotectData(&input, nil, &entropy, 0, nil, 0x1, &output)
-	}
-	if err != nil {
-		return nil, err
-	}
-	defer windows.LocalFree(windows.Handle(uintptr(unsafe.Pointer(output.Data))))
-	if output.Size > 1<<20 || output.Size > 0 && output.Data == nil {
-		return nil, errors.New("invalid DPAPI output")
-	}
-	return append([]byte(nil), unsafe.Slice(output.Data, int(output.Size))...), nil
 }
 
 func waitS4UServiceState(serviceHandle *mgr.Service, want svc.State, timeout time.Duration) error {

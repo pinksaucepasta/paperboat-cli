@@ -20,6 +20,7 @@ type bootstrapCLIClient interface {
 	E2EERoot(context.Context) (api.E2EERoot, error)
 	BootstrapE2EE(context.Context, string, api.E2EEBootstrapInput) (api.E2EEBootstrapResult, error)
 	RequestCLIEndpoint(context.Context, api.CLIEndpointRequestInput) (api.PendingEndpointIdentity, error)
+	CLIEndpointRequestStatus(context.Context, string) (api.EndpointRequestStatus, error)
 	EndpointCertificate(context.Context, string, uint64) (api.EndpointCertificateDocument, error)
 }
 
@@ -65,6 +66,9 @@ func installBootstrapCLIWith(ctx context.Context, session *bootstrap.ClientSessi
 		return errors.New("server returned an invalid CLI account")
 	}
 	profile := config.Profile{Issuer: issuer, Account: config.Account{ID: me.ID, Email: me.Email, DisplayName: me.DisplayName}, CLIClientSessionID: session.SessionID, AccessExpiresAt: cred.ExpiresAt}
+	if err := store.Recover(issuer); err != nil {
+		return fmt.Errorf("recover interrupted CLI profile installation: %w", err)
+	}
 	if err := saveBootstrapCLIProfile(store, profile, cred); err != nil {
 		return err
 	}
@@ -83,7 +87,7 @@ func saveBootstrapCLIProfile(store config.ProfileStore, profile config.Profile, 
 	for attempt := 0; attempt < 2; attempt++ {
 		existing, err := store.Load(profile.Issuer)
 		if errors.Is(err, config.ErrNoCredentials) {
-			if err := store.Save(profile, cred); errors.Is(err, config.ErrProfileExists) && attempt == 0 {
+			if err := reconcileBootstrapProfileMutation(store, profile, cred, store.Save(profile, cred)); errors.Is(err, config.ErrProfileExists) && attempt == 0 {
 				continue
 			} else if err != nil {
 				return err
@@ -96,7 +100,7 @@ func saveBootstrapCLIProfile(store config.ProfileStore, profile config.Profile, 
 		if existing.Account.ID == "" || existing.Account.ID != profile.Account.ID {
 			return errors.New("existing Paperboat profile belongs to another account")
 		}
-		if err := store.Switch(existing.CLIClientSessionID, profile, cred); errors.Is(err, config.ErrProfileChanged) && attempt == 0 {
+		if err := reconcileBootstrapProfileMutation(store, profile, cred, store.Switch(existing.CLIClientSessionID, profile, cred)); errors.Is(err, config.ErrProfileChanged) && attempt == 0 {
 			continue
 		} else if err != nil {
 			return err
@@ -106,20 +110,26 @@ func saveBootstrapCLIProfile(store config.ProfileStore, profile config.Profile, 
 	return errors.New("Paperboat profile changed while completing bootstrap")
 }
 
-func enrollBootstrapCLIIdentity(ctx context.Context, store config.ProfileStore, client bootstrapCLIClient, issuer string, me api.Me, sessionID string) error {
-	if _, rootErr := client.E2EERoot(ctx); rootErr == nil {
-		if _, err := identitybootstrap.EnrollExistingRoot(ctx, identitybootstrap.ExistingRootRequest{Store: store, Client: client, Issuer: issuer, AccountID: me.ID, CLIClientSessionID: sessionID}); err != nil {
-			return fmt.Errorf("enroll CLI peer identity with paired device: %w", err)
-		}
+func reconcileBootstrapProfileMutation(store config.ProfileStore, profile config.Profile, credential config.Credential, mutationErr error) error {
+	if mutationErr == nil {
 		return nil
-	} else if api.IsNotFound(rootErr) {
-		if _, err := identitybootstrap.Bootstrap(ctx, identitybootstrap.Request{Store: store, Client: client, Issuer: issuer, AccountID: me.ID, CLIClientSessionID: sessionID}); err != nil {
-			return fmt.Errorf("bootstrap CLI peer identity: %w", err)
-		}
-		return nil
-	} else {
-		return fmt.Errorf("read account E2EE root: %w", rootErr)
 	}
+	active, err := store.Load(profile.Issuer)
+	if err != nil || active.CLIClientSessionID != profile.CLIClientSessionID {
+		return mutationErr
+	}
+	activeCredential, err := store.CredentialFor(profile.Issuer)
+	if err != nil || activeCredential.AccessToken != credential.AccessToken || activeCredential.RefreshToken != credential.RefreshToken {
+		return mutationErr
+	}
+	return nil
+}
+
+func enrollBootstrapCLIIdentity(ctx context.Context, store config.ProfileStore, client bootstrapCLIClient, issuer string, me api.Me, sessionID string) error {
+	if _, err := identitybootstrap.EnrollCLI(ctx, identitybootstrap.CLIRequest{Store: store, Client: client, Issuer: issuer, AccountID: me.ID, CLIClientSessionID: sessionID}); err != nil {
+		return fmt.Errorf("enroll CLI peer identity: %w", err)
+	}
+	return nil
 }
 
 func shouldInstallBootstrapCLI(material bootstrap.Material) bool {

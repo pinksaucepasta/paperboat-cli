@@ -39,13 +39,15 @@ type ControlRequest struct {
 }
 
 type ControlResponse struct {
-	Schema      string                  `json:"schema"`
-	Status      string                  `json:"status"`
-	Version     string                  `json:"version,omitempty"`
-	Updated     bool                    `json:"updated"`
-	Observation autoupdate.Observation  `json:"observation"`
-	ErrorCode   string                  `json:"error_code,omitempty"`
-	Supervisor  supervisorupdate.Result `json:"supervisor,omitempty"`
+	Schema            string                  `json:"schema"`
+	Status            string                  `json:"status"`
+	Version           string                  `json:"version,omitempty"`
+	Updated           bool                    `json:"updated"`
+	Pending           bool                    `json:"pending,omitempty"`
+	ActivationFailure string                  `json:"activation_failure,omitempty"`
+	Observation       autoupdate.Observation  `json:"observation"`
+	ErrorCode         string                  `json:"error_code,omitempty"`
+	Supervisor        supervisorupdate.Result `json:"supervisor,omitempty"`
 }
 
 type controlServer struct {
@@ -57,7 +59,7 @@ type controlServer struct {
 }
 
 func (s *controlServer) listen() (*net.UnixListener, error) {
-	if !filepath.IsAbs(s.socketPath) || s.uid <= 0 || s.gid < 0 || s.invoke == nil && s.invokeRequest == nil {
+	if !filepath.IsAbs(s.socketPath) || !validUnixWorkerIdentity(s.uid, s.gid) || s.invoke == nil && s.invokeRequest == nil {
 		return nil, ErrInvalidConfig
 	}
 	directory := filepath.Dir(s.socketPath)

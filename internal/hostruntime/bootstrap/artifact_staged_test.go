@@ -75,7 +75,7 @@ func TestStagedTUFRepository(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			githubBootstrap := readStagedRegularFile(t, filepath.Join(githubRoot, bootstrap.TargetPath))
+			githubBootstrap := readStagedRegularFile(t, filepath.Join(githubRoot, stagedBootstrapAssetName(target.platform, bootstrap.TargetPath)))
 			if !bytes.Equal(bootstrapBody, githubBootstrap) {
 				t.Fatal("staged bootstrap target differs from the immutable GitHub asset")
 			}
@@ -115,9 +115,27 @@ func TestStagedTUFRepository(t *testing.T) {
 			}
 			if target.platform == "windows" {
 				evidence := "windows-" + target.architecture + "-native-qualification.json"
-				assertSignedTargetMatchesFile(t, filepath.Join(repositoryRoot, "metadata", "targets.json"), evidence, filepath.Join(githubRoot, evidence))
+				evidencePath := filepath.Join(githubRoot, evidence)
+				assertSignedTargetMatchesFile(t, filepath.Join(repositoryRoot, "metadata", "targets.json"), evidence, evidencePath)
+				assertWindowsQualificationResultBinding(t, evidencePath, githubRoot, version, target.architecture)
 			}
 		})
+	}
+}
+
+func stagedBootstrapAssetName(platform, targetPath string) string {
+	if platform == "windows" {
+		return targetPath + ".exe"
+	}
+	return targetPath
+}
+
+func TestStagedBootstrapAssetNameUsesWindowsExecutableSuffix(t *testing.T) {
+	if got := stagedBootstrapAssetName("windows", "pb-windows-amd64"); got != "pb-windows-amd64.exe" {
+		t.Fatalf("Windows bootstrap asset = %q", got)
+	}
+	if got := stagedBootstrapAssetName("linux", "pb-linux-amd64"); got != "pb-linux-amd64" {
+		t.Fatalf("Linux bootstrap asset = %q", got)
 	}
 }
 
@@ -191,6 +209,69 @@ func assertSignedTargetMatchesFile(t *testing.T, targetsPath, name, immutable st
 	digest := sha256.Sum256(body)
 	if descriptor.Length != int64(len(body)) || descriptor.Hashes["sha256"] != hex.EncodeToString(digest[:]) {
 		t.Fatalf("signed TUF target %s differs from the immutable GitHub asset", name)
+	}
+}
+
+func assertWindowsQualificationResultBinding(t *testing.T, evidencePath, githubRoot, version, architecture string) {
+	t.Helper()
+	var evidence struct {
+		Schema              string `json:"schema"`
+		ReleaseVersion      string `json:"release_version"`
+		Platform            string `json:"platform"`
+		Architecture        string `json:"architecture"`
+		Status              string `json:"status"`
+		NativeTested        bool   `json:"native_tested"`
+		WindowsBuild        string `json:"windows_build"`
+		Runner              string `json:"runner"`
+		QualificationResult struct {
+			Schema           string `json:"schema"`
+			TargetPath       string `json:"target_path"`
+			SHA256           string `json:"sha256"`
+			Length           int64  `json:"length"`
+			NativeTestSHA256 string `json:"native_test_sha256"`
+			NativeTestLength int64  `json:"native_test_length"`
+		} `json:"qualification_result"`
+		Artifacts []json.RawMessage `json:"artifacts"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(readStagedRegularFile(t, evidencePath)))
+	decoder.DisallowUnknownFields()
+	var extra any
+	if decoder.Decode(&evidence) != nil || decoder.Decode(&extra) != io.EOF || evidence.Schema != "paperboat.windows-native-qualification/v1" || evidence.ReleaseVersion != version || evidence.Platform != "windows" || evidence.Architecture != architecture || evidence.Status != "passed" || !evidence.NativeTested || evidence.WindowsBuild == "" || evidence.Runner == "" {
+		t.Fatal("signed Windows native qualification evidence is incomplete or not passed")
+	}
+	result := evidence.QualificationResult
+	expectedReport := "windows-" + architecture + "-native-qualification-report.json"
+	if result.Schema != "paperboat.windows-native-qualification-result-binding/v1" || result.TargetPath != expectedReport || len(result.SHA256) != sha256.Size*2 || len(result.NativeTestSHA256) != sha256.Size*2 || result.Length < 1 || result.NativeTestLength < 1 {
+		t.Fatal("signed Windows native qualification result binding is incomplete")
+	}
+	reportBody := readStagedRegularFile(t, filepath.Join(githubRoot, result.TargetPath))
+	reportDigest := sha256.Sum256(reportBody)
+	if result.Length != int64(len(reportBody)) || result.SHA256 != hex.EncodeToString(reportDigest[:]) {
+		t.Fatal("signed Windows native qualification result binding differs from its immutable report")
+	}
+	var report struct {
+		Schema           string            `json:"schema"`
+		Platform         string            `json:"platform"`
+		Architecture     string            `json:"architecture"`
+		Stability        string            `json:"stability"`
+		NativeTested     bool              `json:"native_tested"`
+		Version          string            `json:"version"`
+		Status           string            `json:"status"`
+		WindowsBuild     string            `json:"windows_build"`
+		Runner           string            `json:"runner"`
+		UpgradeVersion   string            `json:"upgrade_version"`
+		MSISHA256        string            `json:"msi_sha256"`
+		UpgradeMSISHA256 string            `json:"upgrade_msi_sha256"`
+		NativeTestSHA256 string            `json:"native_test_sha256"`
+		NativeTestLength int64             `json:"native_test_length"`
+		Events           []json.RawMessage `json:"events"`
+		Failure          json.RawMessage   `json:"failure"`
+	}
+	decoder = json.NewDecoder(bytes.NewReader(reportBody))
+	decoder.DisallowUnknownFields()
+	extra = nil
+	if decoder.Decode(&report) != nil || decoder.Decode(&extra) != io.EOF || report.Schema != "paperboat.windows-native-qualification-report/v1" || report.Platform != "windows" || report.Architecture != architecture || report.Stability != "stable" || !report.NativeTested || report.Version != version || report.Status != "passed" || report.WindowsBuild != evidence.WindowsBuild || report.Runner != evidence.Runner || report.NativeTestSHA256 != result.NativeTestSHA256 || report.NativeTestLength != result.NativeTestLength || len(report.Events) == 0 || string(report.Failure) != "null" {
+		t.Fatal("immutable Windows native qualification report does not match its signed binding")
 	}
 }
 

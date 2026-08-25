@@ -47,7 +47,7 @@ func TestApproveMachineRequiresExactSafetyCodeAndSignsPublishedKeys(t *testing.T
 	noise := sha256.Sum256([]byte("machine-noise"))
 	quicPublic, _, _ := ed25519.GenerateKey(nil)
 	code := machineSafetyCode("machine_1", 2, noise, quicPublic)
-	client := &approvalClient{root: api.E2EERoot{Version: 1, PublicKey: base64.RawURLEncoding.EncodeToString(rootPublic), Fingerprint: hex.EncodeToString(rootFingerprint[:]), Generation: 1}, pending: []api.PendingEndpointIdentity{{RequestID: "per_0123456789abcdef", EndpointID: "machine_1", Generation: 2, NoisePublicKey: base64.RawURLEncoding.EncodeToString(noise[:]), QUICPublicKey: base64.RawURLEncoding.EncodeToString(quicPublic), CreatedAt: now.Add(-time.Minute), ExpiresAt: now.Add(4 * time.Minute), SafetyCode: code}}}
+	client := &approvalClient{root: api.E2EERoot{Version: 1, PublicKey: base64.RawURLEncoding.EncodeToString(rootPublic), Fingerprint: hex.EncodeToString(rootFingerprint[:]), Generation: 1}, pending: []api.PendingEndpointIdentity{{RequestID: "per_0123456789abcdef", EndpointID: "machine_1", State: "pending", Generation: 2, NoisePublicKey: base64.RawURLEncoding.EncodeToString(noise[:]), QUICPublicKey: base64.RawURLEncoding.EncodeToString(quicPublic), CreatedAt: now.Add(-time.Minute), ExpiresAt: now.Add(4 * time.Minute), SafetyCode: code}}}
 	request := ApprovalRequest{Store: store, Client: client, Issuer: "https://api.example.test", AccountID: "account_1", CLIClientSessionID: "cli_1", RequestID: "per_0123456789abcdef", SafetyCode: code, Now: func() time.Time { return now }}
 	result, err := ApproveMachine(context.Background(), request)
 	if err != nil {
@@ -78,7 +78,7 @@ func TestApproveCLIRequiresCLIRoleAndSignsNewSessionKeys(t *testing.T) {
 	noise := sha256.Sum256([]byte("cli-noise"))
 	quicPublic, _, _ := ed25519.GenerateKey(nil)
 	code := machineSafetyCode("cli_new", 1, noise, quicPublic)
-	client := &approvalClient{root: api.E2EERoot{Version: 1, PublicKey: base64.RawURLEncoding.EncodeToString(rootPublic), Fingerprint: hex.EncodeToString(rootFingerprint[:]), Generation: 1}, pending: []api.PendingEndpointIdentity{{RequestID: "per_0123456789abcdef", EndpointID: "cli_new", Role: "cli", Generation: 1, NoisePublicKey: base64.RawURLEncoding.EncodeToString(noise[:]), QUICPublicKey: base64.RawURLEncoding.EncodeToString(quicPublic), CreatedAt: now.Add(-time.Minute), ExpiresAt: now.Add(4 * time.Minute), SafetyCode: code}}}
+	client := &approvalClient{root: api.E2EERoot{Version: 1, PublicKey: base64.RawURLEncoding.EncodeToString(rootPublic), Fingerprint: hex.EncodeToString(rootFingerprint[:]), Generation: 1}, pending: []api.PendingEndpointIdentity{{RequestID: "per_0123456789abcdef", EndpointID: "cli_new", Role: "cli", State: "pending", Generation: 1, NoisePublicKey: base64.RawURLEncoding.EncodeToString(noise[:]), QUICPublicKey: base64.RawURLEncoding.EncodeToString(quicPublic), CreatedAt: now.Add(-time.Minute), ExpiresAt: now.Add(4 * time.Minute), SafetyCode: code}}}
 	result, err := ApproveCLI(context.Background(), ApprovalRequest{Store: store, Client: client, Issuer: "https://api.example.test", AccountID: "account_1", CLIClientSessionID: "cli_existing", RequestID: "per_0123456789abcdef", SafetyCode: code, Now: func() time.Time { return now }})
 	if err != nil {
 		t.Fatal(err)

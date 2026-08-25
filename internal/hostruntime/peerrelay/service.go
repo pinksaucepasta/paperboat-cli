@@ -16,6 +16,7 @@ import (
 
 	"github.com/pinksaucepasta/paperboat/internal/api"
 	identitystore "github.com/pinksaucepasta/paperboat/internal/hostruntime/identity"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/server"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/candidatelease"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/directpath"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/endpointidentity"
@@ -49,30 +50,31 @@ type FingerprintSource interface {
 }
 
 type Config struct {
-	Source              Source
-	Fingerprints        FingerprintSource
-	StateRoot           string
-	TLS                 *tls.Config
-	HTTPClient          *http.Client
-	Serve               func(net.Conn) error
-	ServePreview        func(context.Context, net.Conn) error
-	ServeCodex          func(context.Context, net.Conn) error
-	ServeSSH            func(context.Context, net.Conn) error
-	ServeTransfer       func(context.Context, net.Conn) error
-	AuthorizeStream     StreamAuthorizer
-	ServeStream         StreamHandler
-	PollInterval        time.Duration
-	AttemptLimit        int
-	Carrier             relaycarrier.Config
-	MaximumDeadline     time.Duration
-	Clock               func() time.Time
-	Dial                func(context.Context, relaycarrier.WSSDialConfig) (*relaycarrier.Connection, error)
-	DialQUIC            func(context.Context, relaycarrier.QUICDialConfig) (*relaycarrier.Connection, error)
-	TransferKeys        *transfercrypto.KeyVault
-	SocketMapping       directpath.SocketMappingSource
-	SignalingSubstrate  *signaling.SubstrateManager
-	ObserveError        func(error)
-	ObserveRelaySuccess func(string)
+	Source                         Source
+	Fingerprints                   FingerprintSource
+	StateRoot                      string
+	TLS                            *tls.Config
+	HTTPClient                     *http.Client
+	Serve                          func(net.Conn) error
+	ServePreview                   func(context.Context, net.Conn) error
+	ServeCodex                     func(context.Context, net.Conn) error
+	ServeSSH                       func(context.Context, net.Conn) error
+	ServeTransfer                  func(context.Context, net.Conn) error
+	AuthorizeStream                StreamAuthorizer
+	ServeStream                    StreamHandler
+	PollInterval                   time.Duration
+	AttemptLimit                   int
+	Carrier                        relaycarrier.Config
+	MaximumDeadline                time.Duration
+	Clock                          func() time.Time
+	Dial                           func(context.Context, relaycarrier.WSSDialConfig) (*relaycarrier.Connection, error)
+	DialQUIC                       func(context.Context, relaycarrier.QUICDialConfig) (*relaycarrier.Connection, error)
+	TransferKeys                   *transfercrypto.KeyVault
+	SocketMapping                  directpath.SocketMappingSource
+	SignalingSubstrate             *signaling.SubstrateManager
+	ObserveError                   func(error)
+	ObserveRelaySuccess            func(string)
+	ObserveTransferKeyAcknowledged func()
 }
 
 type Service struct {
@@ -875,6 +877,10 @@ func (s *Service) serveRelay(setupCtx, lifetime context.Context, connection *rel
 		if !claimRelay() {
 			return false, context.Canceled
 		}
+		// Relay carriers deliberately end after the E2EE key exchange. File bytes
+		// then use the qualified H3/H2 origin path; only direct QUIC retains this
+		// peer session as an HTTP data transport. Keeping that distinction avoids
+		// silently exposing an unbounded relay stream as a transfer transport.
 		return true, s.exchangeTransferKey(stream, descriptor, authority)
 	}
 	if authority.Context.Consumer == "private_preview" {
@@ -1008,7 +1014,7 @@ func (s *Service) serveRelayTransport(ctx context.Context, responder nativepeer.
 			if !containsConsumer(descriptor.StreamPolicy.AllowedConsumers, parsed.Consumer) {
 				return ErrStreamDispatch
 			}
-			authorizeErr := s.config.AuthorizeStream(authorizeCtx, parsed)
+			_, authorizeErr := s.authorizeStream(authorizeCtx, descriptor, parsed)
 			slog.Info("peer authorized stream authorized", "consumer", parsed.Consumer, "operation_id", parsed.OperationID, "stream_id", parsed.StreamID, "error", authorizeErr)
 			return authorizeErr
 		})
@@ -1053,6 +1059,17 @@ func (s *Service) serveRelayTransport(ctx context.Context, responder nativepeer.
 	}
 }
 
+func (s *Service) authorizeStream(ctx context.Context, descriptor api.PeerAttemptDescriptor, header streamauth.Header) (server.Authorization, error) {
+	authorization, err := s.config.AuthorizeStream(ctx, header)
+	if err != nil {
+		return server.Authorization{}, err
+	}
+	if authorization.ClientID != descriptor.InitiatorEndpointID || authorization.UserID != descriptor.AccountID || authorization.MachineID != descriptor.ResponderEndpointID {
+		return server.Authorization{}, ErrStreamDispatch
+	}
+	return authorization, nil
+}
+
 func containsConsumer(values []string, value string) bool {
 	for _, item := range values {
 		if item == value {
@@ -1079,7 +1096,11 @@ func (s *Service) exchangeTransferKey(stream net.Conn, descriptor api.PeerAttemp
 	if !errors.Is(err, transfercrypto.ErrKeyUnavailable) {
 		return err
 	}
-	return transfercrypto.ReceiveKey(stream, binding, authority.Context, s.config.TransferKeys)
+	err = transfercrypto.ReceiveKey(stream, binding, authority.Context, s.config.TransferKeys)
+	if err == nil && s.config.ObserveTransferKeyAcknowledged != nil {
+		s.config.ObserveTransferKeyAcknowledged()
+	}
+	return err
 }
 
 func descriptorCertificate(descriptor api.PeerAttemptDescriptor, endpointID string, rootPublic ed25519.PublicKey, now time.Time) (endpointidentity.Certificate, error) {

@@ -94,27 +94,9 @@ type tufWindowsNativeQualificationTargetCustom struct {
 	Status       string `json:"status"`
 }
 
-type tufWindowsNativeQualification struct {
-	Schema         string                              `json:"schema"`
-	ReleaseVersion string                              `json:"release_version"`
-	Platform       string                              `json:"platform"`
-	Architecture   string                              `json:"architecture"`
-	Status         string                              `json:"status"`
-	NativeTested   bool                                `json:"native_tested"`
-	WindowsBuild   string                              `json:"windows_build"`
-	Runner         string                              `json:"runner"`
-	Artifacts      []tufWindowsNativeQualifiedArtifact `json:"artifacts"`
-}
-
-type tufWindowsNativeQualifiedArtifact struct {
-	Component    string `json:"component"`
-	TargetPath   string `json:"target_path"`
-	SHA256       string `json:"sha256"`
-	Length       int64  `json:"length"`
-	Platform     string `json:"platform"`
-	Architecture string `json:"architecture"`
-	Status       string `json:"status"`
-}
+type tufWindowsNativeQualification = releaseindex.WindowsNativeQualification
+type tufWindowsNativeQualificationResultBinding = releaseindex.WindowsNativeQualificationResultBinding
+type tufWindowsNativeQualifiedArtifact = releaseindex.WindowsNativeQualifiedArtifact
 
 // FetchVerifiedReleaseIndex fetches the fixed stable selector through TUF.
 // Unsigned discovery data cannot influence the selected target name.
@@ -357,7 +339,7 @@ func validWindowsNativeQualificationEvidence(raw []byte, binding *tufWindowsNati
 	decoder.DisallowUnknownFields()
 	var extra any
 	if decoder.Decode(&qualification) != nil || decoder.Decode(&extra) != io.EOF || binding == nil ||
-		qualification.Schema != "paperboat.windows-native-qualification/v1" ||
+		qualification.Schema != releaseindex.WindowsNativeQualificationSchemaV1 ||
 		qualification.ReleaseVersion != index.Version ||
 		qualification.Platform != "windows" ||
 		qualification.Architecture != index.Architecture ||
@@ -366,6 +348,13 @@ func validWindowsNativeQualificationEvidence(raw []byte, binding *tufWindowsNati
 		!safeQualificationValue(qualification.WindowsBuild) || !safeQualificationValue(qualification.Runner) ||
 		index.Stability != "stable" || !index.NativeTested || len(index.TestedWindowsBuilds) != 1 ||
 		qualification.WindowsBuild != index.TestedWindowsBuilds[0] || len(qualification.Artifacts) != len(index.Targets) {
+		return false
+	}
+	result := qualification.QualificationResult
+	if result.Schema != releaseindex.WindowsNativeQualificationResultBindingSchemaV1 ||
+		result.TargetPath != "windows-"+index.Architecture+"-native-qualification-report.json" ||
+		!lowerHex(result.SHA256) || result.Length < 1 || result.Length > 4<<20 ||
+		!lowerHex(result.NativeTestSHA256) || result.NativeTestLength < 1 {
 		return false
 	}
 	expected := make(map[string]releaseindex.Target, len(index.Targets))

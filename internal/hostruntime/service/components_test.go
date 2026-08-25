@@ -80,6 +80,28 @@ func TestDefaultWindowsLayoutUsesCanonicalSeparators(t *testing.T) {
 	}
 }
 
+func TestWindowsImmutableReleasePathsRejectTraversal(t *testing.T) {
+	layout, err := DefaultLayout("windows")
+	if err != nil {
+		t.Fatal(err)
+	}
+	release, err := layout.WindowsRelease("2026.08.23.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if release.Hostd != `C:\Program Files\Paperboat\releases\versions\2026.08.23.1\paperboat-hostd.exe` || release.Updater != `C:\Program Files\Paperboat\releases\versions\2026.08.23.1\paperboat-updater.exe` {
+		t.Fatalf("release=%+v", release)
+	}
+	if version, err := layout.WindowsVersionForExecutable(release.Updater); err != nil || version != "2026.08.23.1" {
+		t.Fatalf("version=%q err=%v", version, err)
+	}
+	for _, version := range []string{"../2026.08.23.1", "2026.8.23.1", "2026.08.23.01", "2026.08.23.1\\escape"} {
+		if _, err := layout.WindowsRelease(version); !errors.Is(err, ErrInvalidDefinition) {
+			t.Fatalf("version %q err=%v", version, err)
+		}
+	}
+}
+
 func TestSplitLayoutRejectsEscapingComponents(t *testing.T) {
 	layout := splitLayout(t, "linux")
 	layout.UpdaterBinary = "/tmp/paperboat-updated"
@@ -165,10 +187,19 @@ func TestSplitServiceDefinitionUpgradeDoesNotRestartStableSupervisor(t *testing.
 	}
 }
 
-func TestHostdInstallerRejectsRootOwnership(t *testing.T) {
-	_, err := NewHostdInstaller(ComponentConfig{Layout: splitLayout(t, "linux"), User: "root", Group: "root", UID: 0, HostdTokenFile: "/tmp/token", Controller: &controller{}})
-	if !errors.Is(err, ErrInvalidDefinition) {
+func TestHostdInstallerAcceptsOnlyExactRootEnrollment(t *testing.T) {
+	if _, err := NewHostdInstaller(ComponentConfig{Layout: splitLayout(t, "linux"), User: "root", Group: "root", UID: 0, GID: 0, HostdTokenFile: "/tmp/token", Controller: &controller{}}); err != nil {
 		t.Fatalf("root hostd err=%v", err)
+	}
+	for _, config := range []ComponentConfig{
+		{Layout: splitLayout(t, "linux"), User: "alice", Group: "users", UID: 0, GID: 0, HostdTokenFile: "/tmp/token", Controller: &controller{}},
+		{Layout: splitLayout(t, "linux"), User: "root", Group: "root", UID: 0, GID: 1000, HostdTokenFile: "/tmp/token", Controller: &controller{}},
+		{Layout: splitLayout(t, "linux"), User: "root", Group: "users", UID: 0, GID: 0, HostdTokenFile: "/tmp/token", Controller: &controller{}},
+		{Layout: splitLayout(t, "linux"), User: "root", Group: "users", UID: 1000, GID: 1000, HostdTokenFile: "/tmp/token", Controller: &controller{}},
+	} {
+		if _, err := NewHostdInstaller(config); !errors.Is(err, ErrInvalidDefinition) {
+			t.Fatalf("invalid identity %+v err=%v", config, err)
+		}
 	}
 }
 

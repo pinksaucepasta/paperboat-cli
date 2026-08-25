@@ -378,6 +378,7 @@ type peerTransferKeyDelivery struct {
 	binding  transfercrypto.KeyControlBinding
 	material transfercrypto.KeyMaterial
 	vault    *transfercrypto.KeyVault
+	mu       sync.Mutex
 	context  peercontext.Context
 }
 
@@ -385,6 +386,8 @@ func (d *peerTransferKeyDelivery) exchange(stream io.ReadWriter, context peercon
 	if d == nil || context.OperationID == "" || context.Consumer != "file_transfer_key" {
 		return ErrPeerTerminalInvalid
 	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	binding := d.binding
 	// The file transfer binding identifies the encrypted transfer, while the
 	// peer descriptor has a fresh idempotency operation for each attempt. The
@@ -392,10 +395,32 @@ func (d *peerTransferKeyDelivery) exchange(stream io.ReadWriter, context peercon
 	// reusing the transfer operation ID would make fallback attempts conflict
 	// at the server.
 	binding.OperationID = context.OperationID
+	var err error
 	if d.vault != nil {
-		return transfercrypto.ReceiveKey(stream, binding, context, d.vault)
+		err = transfercrypto.ReceiveKey(stream, binding, context, d.vault)
+	} else {
+		err = transfercrypto.DeliverKey(stream, binding, d.material)
 	}
-	return transfercrypto.DeliverKey(stream, binding, d.material)
+	if err != nil {
+		return err
+	}
+	// Path-scoped candidates have distinct authenticated contexts. Bind the
+	// manifest to the candidate that actually completed the key exchange, not
+	// whichever descriptor happened to finish acquisition last.
+	d.context = context
+	return nil
+}
+
+func (d *peerTransferKeyDelivery) exchangedContext() (peercontext.Context, error) {
+	if d == nil {
+		return peercontext.Context{}, ErrPeerTerminalInvalid
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if _, err := d.context.MarshalBinary(); err != nil {
+		return peercontext.Context{}, ErrPeerTerminalInvalid
+	}
+	return d.context, nil
 }
 
 type completedPeerConn struct{}
@@ -430,6 +455,10 @@ func (t *PeerTerminalTunnel) PrepareReceiveTransferKey(ctx context.Context, info
 	if err != nil {
 		return peercontext.Context{}, nil, err
 	}
+	peerContext, err := delivery.exchangedContext()
+	if err != nil {
+		return peercontext.Context{}, nil, errors.Join(err, connection.Close())
+	}
 	owned, ownedOK := connection.(*ownedPeerTerminalConn)
 	direct, directOK := func() (*directTransferPeerConn, bool) {
 		if !ownedOK {
@@ -442,13 +471,15 @@ func (t *PeerTerminalTunnel) PrepareReceiveTransferKey(ctx context.Context, info
 		if err := connection.Close(); err != nil {
 			return peercontext.Context{}, nil, err
 		}
-		return delivery.context, nil, nil
+		// Relay QUIC/WSS authenticates and delivers the E2EE key only. A nil
+		// transport explicitly selects the qualified H3/H2 origin data path.
+		return peerContext, nil, nil
 	}
 	transport, err := newDirectTransferRoundTripper(owned, direct)
 	if err != nil {
 		return peercontext.Context{}, nil, errors.Join(err, connection.Close())
 	}
-	return delivery.context, transport, nil
+	return peerContext, transport, nil
 }
 
 func (t *PeerTerminalTunnel) PrepareTransferKey(ctx context.Context, info resolver.ConnectInfo, binding transfercrypto.KeyControlBinding, material transfercrypto.KeyMaterial) (peercontext.Context, http.RoundTripper, error) {
@@ -457,6 +488,10 @@ func (t *PeerTerminalTunnel) PrepareTransferKey(ctx context.Context, info resolv
 	if err != nil {
 		return peercontext.Context{}, nil, err
 	}
+	peerContext, err := delivery.exchangedContext()
+	if err != nil {
+		return peercontext.Context{}, nil, errors.Join(err, connection.Close())
+	}
 	owned, ownedOK := connection.(*ownedPeerTerminalConn)
 	direct, directOK := func() (*directTransferPeerConn, bool) {
 		if !ownedOK {
@@ -469,13 +504,15 @@ func (t *PeerTerminalTunnel) PrepareTransferKey(ctx context.Context, info resolv
 		if err := connection.Close(); err != nil {
 			return peercontext.Context{}, nil, err
 		}
-		return delivery.context, nil, nil
+		// Relay QUIC/WSS authenticates and delivers the E2EE key only. A nil
+		// transport explicitly selects the qualified H3/H2 origin data path.
+		return peerContext, nil, nil
 	}
 	transport, err := newDirectTransferRoundTripper(owned, direct)
 	if err != nil {
 		return peercontext.Context{}, nil, errors.Join(err, connection.Close())
 	}
-	return delivery.context, transport, nil
+	return peerContext, transport, nil
 }
 
 type directTransferPeerConn struct{ group *peerQUICNativeStreamGroup }
@@ -2898,6 +2935,19 @@ func newTerminalDescriptorKey(generation uint64, path connectionmanager.Path, pa
 	return key, nil
 }
 
+func (c *terminalRaceConnector) descriptorSource(path connectionmanager.Path, oneShot bool) (*directpath.APIDescriptorSource, bool) {
+	if c == nil {
+		return nil, false
+	}
+	// Multi-path one-shot races need a separate server operation and allowed
+	// path policy per candidate. Explicit single-path modes already constrain
+	// the shared source to that one path, so no path-scoped map is allocated.
+	if oneShot && c.oneShotDescriptors != nil {
+		return c.oneShotDescriptors[path], true
+	}
+	return c.descriptors, false
+}
+
 func (c *terminalRaceConnector) descriptor(ctx context.Context, generation uint64, path connectionmanager.Path) (directpath.AttemptDescriptor, peersession.Authority, error) {
 	if c == nil || ctx == nil || generation == 0 || c.descriptors == nil || c.owner == nil || c.clientAuthority == nil {
 		return directpath.AttemptDescriptor{}, peersession.Authority{}, ErrPeerTerminalInvalid
@@ -2908,16 +2958,13 @@ func (c *terminalRaceConnector) descriptor(ctx context.Context, generation uint6
 	// policy. The encrypted transfer binding remains separate and is rebound to
 	// the authenticated descriptor context during key exchange.
 	oneShot := oneShotPeerOperation(c.application, c.keyDelivery)
-	key, err := newTerminalDescriptorKey(generation, path, oneShot)
+	source, pathScoped := c.descriptorSource(path, oneShot)
+	key, err := newTerminalDescriptorKey(generation, path, pathScoped)
 	if err != nil {
 		return directpath.AttemptDescriptor{}, peersession.Authority{}, err
 	}
-	source := c.descriptors
-	if oneShot {
-		source = c.oneShotDescriptors[path]
-		if source == nil {
-			return directpath.AttemptDescriptor{}, peersession.Authority{}, ErrPeerTerminalInvalid
-		}
+	if source == nil {
+		return directpath.AttemptDescriptor{}, peersession.Authority{}, ErrPeerTerminalInvalid
 	}
 	c.descriptorMu.Lock()
 	if call := c.descriptorCalls[key]; call != nil {
@@ -2940,9 +2987,6 @@ func (c *terminalRaceConnector) descriptor(ctx context.Context, generation uint6
 		call.descriptor, call.err = source.Acquire(ctx, directpath.Generation{Attempt: attempt, Network: network})
 		if call.err == nil {
 			call.authority, call.err = peersession.New(peersession.Config{Descriptor: call.descriptor.Document, LocalCertificate: c.clientAuthority.LocalCertificate, PeerCertificate: c.clientAuthority.MachineCertificate, LocalNoisePrivate: c.clientAuthority.LocalKeys.NoisePrivate, Consumer: call.descriptor.Document.Consumer})
-			if call.err == nil && c.keyDelivery != nil {
-				c.keyDelivery.context = call.authority.Context
-			}
 		}
 		if call.err == nil {
 			call.err = c.health.observe(generation, c.networkGeneration.Load(), call.descriptor)

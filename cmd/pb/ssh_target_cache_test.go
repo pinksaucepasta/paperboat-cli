@@ -1,6 +1,9 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -13,13 +16,25 @@ func testSSHTargetCacheMachine() api.UserMachine {
 }
 
 func TestSSHTargetCacheRoundTrip(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	configRoot := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", configRoot)
+	cacheDirectory := filepath.Join(configRoot, "paperboat")
+	if runtime.GOOS == "windows" {
+		if _, err := os.Stat(cacheDirectory); !os.IsNotExist(err) {
+			t.Fatalf("cache directory unexpectedly exists before first write: %v", err)
+		}
+	}
 	cfg := &config.Config{ServerURL: "https://api.paperboat.test"}
 	machine := testSSHTargetCacheMachine()
 	now := time.Unix(1_800_000_000, 0)
 	target := api.ManagedSSHTarget{MachineID: machine.ID, MachineGeneration: 4, OSUser: "root", Port: 2222}
 	if err := sshTargetCacheStore(cfg, machine, target, now); err != nil {
 		t.Fatalf("store: %v", err)
+	}
+	if runtime.GOOS == "windows" {
+		if info, err := os.Stat(cacheDirectory); err != nil || !info.IsDir() {
+			t.Fatalf("cache directory was not created: info=%v err=%v", info, err)
+		}
 	}
 	got, ok := sshTargetCacheLookup(cfg, machine, now.Add(2*time.Minute))
 	if !ok || got.OSUser != "root" || got.Port != 2222 {

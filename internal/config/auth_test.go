@@ -166,6 +166,213 @@ func TestInitialSaveMetadataFailureRemovesStoredSecrets(t *testing.T) {
 	}
 }
 
+func TestInitialSaveRejectsEmptyCredentialWithoutMutation(t *testing.T) {
+	for name, credential := range map[string]Credential{
+		"access":  {RefreshToken: "refresh"},
+		"refresh": {AccessToken: "access"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			secrets := &faultSecretStore{values: map[string]string{}}
+			store := ProfileStore{Path: dir, Secrets: secrets}
+			err := store.Save(Profile{Issuer: "https://api.example.com", CLIClientSessionID: "cls_1"}, credential)
+			if err == nil {
+				t.Fatal("expected incomplete credential rejection")
+			}
+			if len(secrets.values) != 0 {
+				t.Fatalf("stored secrets = %#v", secrets.values)
+			}
+			if _, statErr := os.Stat(store.profilePath("https://api.example.com")); !os.IsNotExist(statErr) {
+				t.Fatalf("profile metadata exists after rejection: %v", statErr)
+			}
+		})
+	}
+}
+
+func TestCredentialForRejectsPersistedEmptyToken(t *testing.T) {
+	dir := t.TempDir()
+	secrets := &faultSecretStore{values: map[string]string{}}
+	store := ProfileStore{Path: dir, Secrets: secrets}
+	issuer := "https://api.example.com"
+	if err := store.Save(Profile{Issuer: issuer, CLIClientSessionID: "cls_1"}, Credential{AccessToken: "access", RefreshToken: "refresh"}); err != nil {
+		t.Fatal(err)
+	}
+	profile, err := store.Load(issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secrets.values[profile.RefreshSecretRef] = ""
+	if _, err := store.CredentialFor(issuer); err == nil {
+		t.Fatal("expected persisted empty token rejection")
+	}
+}
+
+func TestRepairMissingAccessPreservesActiveUntilCommitAndQueuesOldRefresh(t *testing.T) {
+	dir := t.TempDir()
+	secrets := &faultSecretStore{values: map[string]string{}}
+	store := ProfileStore{Path: dir, Secrets: secrets}
+	issuer := "https://api.example.com"
+	old := Profile{Issuer: issuer, CLIClientSessionID: "cls_old", Account: Account{ID: "acct_old"}}
+	if err := store.Save(old, Credential{AccessToken: "access-old", RefreshToken: "refresh-old"}); err != nil {
+		t.Fatal(err)
+	}
+	previous, err := store.Load(issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := secrets.Delete(previous.AccessSecretRef); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Repair(previous.CLIClientSessionID, Profile{Issuer: issuer, CLIClientSessionID: "cls_new", Account: Account{ID: "acct_new"}}, Credential{AccessToken: "access-new", RefreshToken: "refresh-new"}); err != nil {
+		t.Fatal(err)
+	}
+	active, err := store.Load(issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active.CLIClientSessionID != "cls_new" || active.Account.ID != "acct_new" {
+		t.Fatalf("active profile = %#v", active)
+	}
+	credential, err := store.CredentialFor(issuer)
+	if err != nil || credential.AccessToken != "access-new" || credential.RefreshToken != "refresh-new" {
+		t.Fatalf("credential = %#v, err = %v", credential, err)
+	}
+	records, err := store.PendingRevocations(issuer)
+	if err != nil || len(records) != 1 {
+		t.Fatalf("pending revocations = %#v, err = %v", records, err)
+	}
+	if records[0].CLIClientSessionID != "cls_old" {
+		t.Fatalf("record = %#v", records[0])
+	}
+}
+
+func TestRepairMissingOrEmptyRefreshDoesNotInventRevocation(t *testing.T) {
+	for _, value := range []string{"missing", "empty"} {
+		t.Run(value, func(t *testing.T) {
+			dir := t.TempDir()
+			secrets := &faultSecretStore{values: map[string]string{}}
+			store := ProfileStore{Path: dir, Secrets: secrets}
+			issuer := "https://api.example.com"
+			if err := store.Save(Profile{Issuer: issuer, CLIClientSessionID: "cls_old"}, Credential{AccessToken: "access-old", RefreshToken: "refresh-old"}); err != nil {
+				t.Fatal(err)
+			}
+			previous, err := store.Load(issuer)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if value == "missing" {
+				if err := secrets.Delete(previous.RefreshSecretRef); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				secrets.values[previous.RefreshSecretRef] = ""
+			}
+			if err := store.Repair(previous.CLIClientSessionID, Profile{Issuer: issuer, CLIClientSessionID: "cls_new"}, Credential{AccessToken: "access-new", RefreshToken: "refresh-new"}); err != nil {
+				t.Fatal(err)
+			}
+			active, err := store.Load(issuer)
+			if err != nil || active.CLIClientSessionID != "cls_new" {
+				t.Fatalf("active = %#v, err = %v", active, err)
+			}
+			records, err := store.PendingRevocations(issuer)
+			if err != nil || len(records) != 0 {
+				t.Fatalf("pending revocations = %#v, err = %v", records, err)
+			}
+		})
+	}
+}
+
+func TestRepairCommitFailureLeavesCorruptActiveProfileUntouched(t *testing.T) {
+	dir := t.TempDir()
+	secrets := &faultSecretStore{values: map[string]string{}}
+	store := ProfileStore{Path: dir, Secrets: secrets}
+	issuer := "https://api.example.com"
+	if err := store.Save(Profile{Issuer: issuer, CLIClientSessionID: "cls_old"}, Credential{AccessToken: "access-old", RefreshToken: "refresh-old"}); err != nil {
+		t.Fatal(err)
+	}
+	previous, err := store.Load(issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := secrets.Delete(previous.AccessSecretRef); err != nil {
+		t.Fatal(err)
+	}
+	store.write = func(string, []byte, os.FileMode) error { return errors.New("injected repair commit failure") }
+	if err := store.Repair(previous.CLIClientSessionID, Profile{Issuer: issuer, CLIClientSessionID: "cls_new"}, Credential{AccessToken: "access-new", RefreshToken: "refresh-new"}); err == nil {
+		t.Fatal("expected repair commit failure")
+	}
+	active, err := store.Load(issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active.CLIClientSessionID != previous.CLIClientSessionID || active.AccessSecretRef != previous.AccessSecretRef || active.RefreshSecretRef != previous.RefreshSecretRef {
+		t.Fatalf("active profile changed after failed repair: %#v", active)
+	}
+	if _, err := store.CredentialFor(issuer); !errors.Is(err, ErrSecretNotFound) && !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("credential error = %v, want missing active access secret", err)
+	}
+	if records, err := store.PendingRevocations(issuer); err != nil || len(records) != 1 || records[0].CLIClientSessionID != "cls_new" {
+		t.Fatalf("pending revocations = %#v, err = %v", records, err)
+	}
+	if _, err := os.Stat(store.authTransactionPath(issuer)); !os.IsNotExist(err) {
+		t.Fatalf("transaction remains after handled failure: %v", err)
+	}
+}
+
+func TestRecoverInterruptedTransactionQueuesAbandonedNewSession(t *testing.T) {
+	dir := t.TempDir()
+	secrets := &faultSecretStore{values: map[string]string{}}
+	store := ProfileStore{Path: dir, Secrets: secrets}
+	issuer := "https://api.example.com"
+	if err := store.Save(Profile{Issuer: issuer, CLIClientSessionID: "cls_old"}, Credential{AccessToken: "access-old", RefreshToken: "refresh-old"}); err != nil {
+		t.Fatal(err)
+	}
+	previous, err := store.Load(issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accessRef, refreshRef, err := newSecretRefs(issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := Profile{Version: ProfileVersion, Issuer: issuer, CLIClientSessionID: "cls_new", AccessSecretRef: accessRef, RefreshSecretRef: refreshRef}
+	tx := AuthTransaction{Version: authTransactionVersion, Operation: "switch", Issuer: issuer, Previous: previous, Next: next, State: authTransactionPrepared, CreatedAt: time.Now().UTC()}
+	if err := store.writeAuthTransaction(tx); err != nil {
+		t.Fatal(err)
+	}
+	if err := secrets.Set(accessRef, "access-new"); err != nil {
+		t.Fatal(err)
+	}
+	if err := secrets.Set(refreshRef, "refresh-new"); err != nil {
+		t.Fatal(err)
+	}
+	restarted := ProfileStore{Path: dir, Secrets: secrets}
+	if err := restarted.Recover(issuer); err != nil {
+		t.Fatal(err)
+	}
+	active, err := restarted.Load(issuer)
+	if err != nil || active.CLIClientSessionID != "cls_old" {
+		t.Fatalf("active = %#v, err = %v", active, err)
+	}
+	if _, err := secrets.Get(accessRef); !errors.Is(err, ErrSecretNotFound) && !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staged access secret remains: %v", err)
+	}
+	if _, err := secrets.Get(refreshRef); !errors.Is(err, ErrSecretNotFound) && !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staged refresh secret remains: %v", err)
+	}
+	records, err := restarted.PendingRevocations(issuer)
+	if err != nil || len(records) != 1 {
+		t.Fatalf("pending revocations = %#v, err = %v", records, err)
+	}
+	recovered, err := restarted.PendingRevocationCredential(records[0])
+	if err != nil || recovered.RefreshToken != "refresh-new" {
+		t.Fatalf("recovered = %#v, err = %v", recovered, err)
+	}
+	if _, err := os.Stat(restarted.authTransactionPath(issuer)); !os.IsNotExist(err) {
+		t.Fatalf("transaction remains after recovery: %v", err)
+	}
+}
+
 func TestFileSecretStoreRejectsLoosePermissions(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.Chmod(dir, 0o700); err != nil {
@@ -277,6 +484,38 @@ func TestRefreshWriteFailurePreservesRotatedRefreshToken(t *testing.T) {
 	}
 }
 
+func TestRefreshProfileCommitFailureKeepsNewTokensAndExpiredMetadata(t *testing.T) {
+	dir := t.TempDir()
+	secrets := &faultSecretStore{values: map[string]string{}}
+	store := ProfileStore{Path: dir, Secrets: secrets}
+	expired := time.Now().Add(-time.Minute).UTC()
+	issuer := "https://api.example.com"
+	if err := store.Save(Profile{Issuer: issuer, CLIClientSessionID: "cls_1", AccessExpiresAt: expired}, Credential{AccessToken: "access-old", RefreshToken: "refresh-old", ExpiresAt: expired}); err != nil {
+		t.Fatal(err)
+	}
+	store.write = func(string, []byte, os.FileMode) error { return errors.New("injected profile commit failure") }
+	_, err := store.CredentialWithRefresh(issuer, time.Minute, func(Credential) (Credential, string, error) {
+		return Credential{AccessToken: "access-new", RefreshToken: "refresh-new", ExpiresAt: time.Now().Add(time.Hour)}, "cls_1", nil
+	})
+	if err == nil {
+		t.Fatal("expected profile commit failure")
+	}
+	profile, loadErr := store.Load(issuer)
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	credential, credentialErr := store.CredentialFor(issuer)
+	if credentialErr != nil {
+		t.Fatal(credentialErr)
+	}
+	if credential.AccessToken != "access-new" || credential.RefreshToken != "refresh-new" {
+		t.Fatalf("credential = %#v", credential)
+	}
+	if !profile.AccessExpiresAt.Equal(expired) {
+		t.Fatalf("profile expiry = %s, want retry-forcing %s", profile.AccessExpiresAt, expired)
+	}
+}
+
 func TestRefreshSessionMismatchQuarantinesRotatedCredential(t *testing.T) {
 	dir := t.TempDir()
 	secrets := &faultSecretStore{values: map[string]string{}}
@@ -336,6 +575,38 @@ func TestReplaceWriteFailureRestoresPreviousCredentials(t *testing.T) {
 	}
 }
 
+func TestReplaceProfileCommitFailureKeepsPreviousCredentialPair(t *testing.T) {
+	dir := t.TempDir()
+	secrets := &faultSecretStore{values: map[string]string{}}
+	store := ProfileStore{Path: dir, Secrets: secrets}
+	issuer := "https://api.example.com"
+	if err := store.Save(Profile{Issuer: issuer, CLIClientSessionID: "cls_old"}, Credential{AccessToken: "access-old", RefreshToken: "refresh-old"}); err != nil {
+		t.Fatal(err)
+	}
+	previous, err := store.Load(issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.write = func(string, []byte, os.FileMode) error { return errors.New("injected profile commit failure") }
+	if err := store.Replace(Profile{Issuer: issuer, CLIClientSessionID: "cls_new"}, Credential{AccessToken: "access-new", RefreshToken: "refresh-new"}); err == nil {
+		t.Fatal("expected replacement profile commit failure")
+	}
+	active, err := store.Load(issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := store.CredentialFor(issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active.CLIClientSessionID != "cls_old" || active.AccessSecretRef != previous.AccessSecretRef || active.RefreshSecretRef != previous.RefreshSecretRef || credential.AccessToken != "access-old" || credential.RefreshToken != "refresh-old" {
+		t.Fatalf("active = %#v, credential = %#v", active, credential)
+	}
+	if len(secrets.values) != 2 {
+		t.Fatalf("replacement secrets were not rolled back: %#v", secrets.values)
+	}
+}
+
 func TestSwitchRejectsChangedExpectedSessionWithoutQueueing(t *testing.T) {
 	dir := t.TempDir()
 	secrets := &faultSecretStore{values: map[string]string{}}
@@ -358,6 +629,156 @@ func TestSwitchRejectsChangedExpectedSessionWithoutQueueing(t *testing.T) {
 	records, err := store.PendingRevocations(issuer)
 	if err != nil || len(records) != 0 {
 		t.Fatalf("records = %#v, err = %v", records, err)
+	}
+}
+
+func TestSwitchProfileCommitFailureKeepsPreviousCredentialAndRevocationState(t *testing.T) {
+	dir := t.TempDir()
+	secrets := &faultSecretStore{values: map[string]string{}}
+	store := ProfileStore{Path: dir, Secrets: secrets}
+	issuer := "https://api.example.com"
+	if err := store.Save(Profile{Issuer: issuer, CLIClientSessionID: "cls_old"}, Credential{AccessToken: "access-old", RefreshToken: "refresh-old"}); err != nil {
+		t.Fatal(err)
+	}
+	previous, err := store.Load(issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.write = func(string, []byte, os.FileMode) error { return errors.New("injected profile commit failure") }
+	if err := store.Switch("cls_old", Profile{Issuer: issuer, CLIClientSessionID: "cls_new"}, Credential{AccessToken: "access-new", RefreshToken: "refresh-new"}); err == nil {
+		t.Fatal("expected switch profile commit failure")
+	}
+	active, err := store.Load(issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := store.CredentialFor(issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active.CLIClientSessionID != "cls_old" || active.AccessSecretRef != previous.AccessSecretRef || active.RefreshSecretRef != previous.RefreshSecretRef || credential.AccessToken != "access-old" || credential.RefreshToken != "refresh-old" {
+		t.Fatalf("active = %#v, credential = %#v", active, credential)
+	}
+	records, err := store.PendingRevocations(issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("rolled-back switch retained revocation records: %#v", records)
+	}
+	if len(secrets.values) != 2 {
+		t.Fatalf("switch secrets were not rolled back: %#v", secrets.values)
+	}
+}
+
+func TestPendingRevocationForActiveSessionRemainsStagedUntilSwitchCommit(t *testing.T) {
+	dir := t.TempDir()
+	secrets := &faultSecretStore{values: map[string]string{}}
+	store := ProfileStore{Path: dir, Secrets: secrets}
+	issuer := "https://api.example.com"
+	if err := store.Save(Profile{Issuer: issuer, CLIClientSessionID: "cls_old"}, Credential{AccessToken: "access-old", RefreshToken: "refresh-old"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.QueueRevocation(issuer, "cls_old", "refresh-old"); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a process restart after QueueRevocation and before the profile
+	// commit. The staged record must not be exposed to a remote drain.
+	restarted := ProfileStore{Path: dir, Secrets: secrets}
+	records, err := restarted.PendingRevocations(issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("active-session revocation became drainable: %#v", records)
+	}
+	if _, err := os.Stat(store.pendingRevocationPath(issuer, "cls_old")); err != nil {
+		t.Fatalf("staged revocation is not durable: %v", err)
+	}
+	if err := restarted.Switch("cls_old", Profile{Issuer: issuer, CLIClientSessionID: "cls_new"}, Credential{AccessToken: "access-new", RefreshToken: "refresh-new"}); err != nil {
+		t.Fatal(err)
+	}
+	records, err = restarted.PendingRevocations(issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || records[0].CLIClientSessionID != "cls_old" {
+		t.Fatalf("committed switch revocations = %#v", records)
+	}
+}
+
+func TestSwitchDefersOldSecretDeletionFailureWithoutFailingCommittedLogin(t *testing.T) {
+	dir := t.TempDir()
+	secrets := &faultSecretStore{values: map[string]string{}}
+	store := ProfileStore{Path: dir, Secrets: secrets}
+	issuer := "https://api.example.com"
+	if err := store.Save(Profile{Issuer: issuer, CLIClientSessionID: "cls_old"}, Credential{AccessToken: "access-old", RefreshToken: "refresh-old"}); err != nil {
+		t.Fatal(err)
+	}
+	old, err := store.Load(issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secrets.failDeleteRef = old.AccessSecretRef
+	if err := store.Switch("cls_old", Profile{Issuer: issuer, CLIClientSessionID: "cls_new"}, Credential{AccessToken: "access-new", RefreshToken: "refresh-new"}); err != nil {
+		t.Fatalf("committed switch reported cleanup failure: %v", err)
+	}
+	active, err := store.Load(issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := store.CredentialFor(issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active.CLIClientSessionID != "cls_new" || credential.AccessToken != "access-new" || credential.RefreshToken != "refresh-new" {
+		t.Fatalf("active = %#v, credential = %#v", active, credential)
+	}
+	if len(active.ObsoleteSecretRefs) != 1 || active.ObsoleteSecretRefs[0] != old.AccessSecretRef {
+		t.Fatalf("deferred cleanup refs = %#v", active.ObsoleteSecretRefs)
+	}
+	secrets.failDeleteRef = ""
+	if err := store.Switch("cls_new", Profile{Issuer: issuer, CLIClientSessionID: "cls_new"}, Credential{AccessToken: "access-newer", RefreshToken: "refresh-newer"}); err != nil {
+		t.Fatal(err)
+	}
+	active, err = store.Load(issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active.ObsoleteSecretRefs) != 0 {
+		t.Fatalf("deferred cleanup was not retried: %#v", active.ObsoleteSecretRefs)
+	}
+}
+
+func TestReplaceDefersOldSecretDeletionFailureAfterProfileCommit(t *testing.T) {
+	dir := t.TempDir()
+	secrets := &faultSecretStore{values: map[string]string{}}
+	store := ProfileStore{Path: dir, Secrets: secrets}
+	issuer := "https://api.example.com"
+	if err := store.Save(Profile{Issuer: issuer, CLIClientSessionID: "cls_old"}, Credential{AccessToken: "access-old", RefreshToken: "refresh-old"}); err != nil {
+		t.Fatal(err)
+	}
+	old, err := store.Load(issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secrets.failDeleteRef = old.RefreshSecretRef
+	if err := store.Replace(Profile{Issuer: issuer, CLIClientSessionID: "cls_new"}, Credential{AccessToken: "access-new", RefreshToken: "refresh-new"}); err != nil {
+		t.Fatalf("committed replace reported cleanup failure: %v", err)
+	}
+	active, err := store.Load(issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := store.CredentialFor(issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active.CLIClientSessionID != "cls_new" || credential.AccessToken != "access-new" || credential.RefreshToken != "refresh-new" {
+		t.Fatalf("active = %#v, credential = %#v", active, credential)
+	}
+	if len(active.ObsoleteSecretRefs) != 1 || active.ObsoleteSecretRefs[0] != old.RefreshSecretRef {
+		t.Fatalf("deferred cleanup refs = %#v", active.ObsoleteSecretRefs)
 	}
 }
 
@@ -566,7 +987,7 @@ func TestSharedLockSerializesAndRecoversDeadOwner(t *testing.T) {
 	}
 
 	dead := newSharedLock(path)
-	if err := os.MkdirAll(dead.path, 0o700); err != nil {
+	if err := createSharedLockDirectory(dead.path); err != nil {
 		t.Fatal(err)
 	}
 	hostname, _ := os.Hostname()

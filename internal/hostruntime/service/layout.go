@@ -30,6 +30,68 @@ type Layout struct {
 	HostdSocket     string
 }
 
+// WindowsReleasePaths is one immutable, signed Windows release. SCM services
+// point directly at Hostd and Updater in this directory. The stable CLI
+// launcher selects CLI through ActiveCLIRecord only after service health has
+// been proven.
+type WindowsReleasePaths struct {
+	Root, Runtime, CLI, Hostd, Updater, Launcher, ActiveCLIRecord string
+}
+
+// WindowsRelease returns fixed paths for an exact release version. It accepts
+// no arbitrary directory or filename, keeping updater writes inside the
+// protected Paperboat release root.
+func (l Layout) WindowsRelease(version string) (WindowsReleasePaths, error) {
+	if l.Platform != "windows" || !exactLayoutReleaseVersion(version) {
+		return WindowsReleasePaths{}, ErrInvalidDefinition
+	}
+	root := windowsPathJoin(l.ReleasesRoot, "versions", version)
+	paths := WindowsReleasePaths{
+		Root:            root,
+		Runtime:         windowsPathJoin(root, "paperboat-runtime.exe"),
+		CLI:             windowsPathJoin(root, "pb.exe"),
+		Hostd:           windowsPathJoin(root, "paperboat-hostd.exe"),
+		Updater:         windowsPathJoin(root, "paperboat-updater.exe"),
+		Launcher:        windowsPathJoin(root, "pb-launcher.exe"),
+		ActiveCLIRecord: windowsPathJoin(filepath.Dir(l.CLICurrent), "pb.active"),
+	}
+	for _, value := range []string{paths.Root, paths.Runtime, paths.CLI, paths.Hostd, paths.Updater, paths.Launcher} {
+		if !withinForPlatform("windows", l.ReleasesRoot, value) {
+			return WindowsReleasePaths{}, ErrInvalidDefinition
+		}
+	}
+	return paths, nil
+}
+
+// WindowsVersionForExecutable returns the immutable release version owning a
+// Windows component executable. Mutable bin and legacy slot paths are rejected.
+func (l Layout) WindowsVersionForExecutable(executable string) (string, error) {
+	if l.Platform != "windows" || !withinForPlatform("windows", windowsPathJoin(l.ReleasesRoot, "versions"), executable) {
+		return "", ErrInvalidDefinition
+	}
+	relative := strings.TrimPrefix(strings.TrimPrefix(strings.ToLower(filepath.Clean(executable)), strings.ToLower(windowsPathJoin(l.ReleasesRoot, "versions"))), `\`)
+	parts := strings.Split(relative, `\`)
+	if len(parts) != 2 || !exactLayoutReleaseVersion(parts[0]) {
+		return "", ErrInvalidDefinition
+	}
+	return parts[0], nil
+}
+
+func exactLayoutReleaseVersion(value string) bool {
+	parts := strings.Split(value, ".")
+	if len(parts) != 4 || len(parts[0]) != 4 || len(parts[1]) != 2 || len(parts[2]) != 2 || len(parts[3]) == 0 || len(parts[3]) > 4 || len(parts[3]) > 1 && parts[3][0] == '0' {
+		return false
+	}
+	for _, part := range parts {
+		for _, character := range part {
+			if character < '0' || character > '9' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // DefaultLayout returns the fixed, supported native host layout. Windows uses
 // a named pipe rather than pretending a filesystem socket is secure there.
 func DefaultLayout(platform string) (Layout, error) {

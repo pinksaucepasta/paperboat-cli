@@ -4,13 +4,16 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/charmbracelet/x/ansi"
+	"github.com/pinksaucepasta/paperboat/internal/api"
 )
 
 func TestPeerHTTPClientCarriesRequestOnlyThroughInjectedConnection(t *testing.T) {
@@ -57,6 +60,56 @@ func TestValidateArgsRejectsPaperboatOwnedFlags(t *testing.T) {
 	if err := ValidateForwardedArgs([]string{"--model", "gpt-5"}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestCodexCodecRejectionStillStopsRuntimeAndDeletesSession(t *testing.T) {
+	backend := &cleanupRecordingBackend{}
+	stopped := false
+	runtimeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete || r.Header.Get("Authorization") != "Bearer manage-secret" {
+			t.Errorf("cleanup request = %s auth=%q", r.Method, r.Header.Get("Authorization"))
+			http.Error(w, "bad cleanup", http.StatusBadRequest)
+			return
+		}
+		stopped = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer runtimeServer.Close()
+
+	config := mustTestCodexPathCodecConfig(t)
+	func() {
+		defer cleanupCodexSession(Options{Backend: backend, Stderr: &bytes.Buffer{}}, api.CodexDescriptor{
+			ManagementURL:    runtimeServer.URL + "/runtime",
+			ManageCredential: "manage-secret",
+		}, runtimeServer.Client(), "cdx_cleanup")
+		if _, err := config.newCodec().clientToServer([]byte(`{"id":1,"method":"future/method","params":{}}`)); err == nil {
+			t.Fatal("codec rejection was not triggered")
+		}
+	}()
+	if !stopped || len(backend.deleted) != 1 || backend.deleted[0] != "cdx_cleanup" {
+		t.Fatalf("cleanup stopped=%t deleted=%v", stopped, backend.deleted)
+	}
+}
+
+type cleanupRecordingBackend struct {
+	deleted []string
+}
+
+func (*cleanupRecordingBackend) CreateCodexSession(context.Context, string, string) (api.CodexSession, error) {
+	return api.CodexSession{}, errors.New("unexpected CreateCodexSession")
+}
+
+func (*cleanupRecordingBackend) CodexSessionDescriptor(context.Context, string) (api.CodexDescriptor, error) {
+	return api.CodexDescriptor{}, errors.New("unexpected CodexSessionDescriptor")
+}
+
+func (*cleanupRecordingBackend) RenewCodexSession(context.Context, string) (api.CodexSession, error) {
+	return api.CodexSession{}, errors.New("unexpected RenewCodexSession")
+}
+
+func (b *cleanupRecordingBackend) DeleteCodexSession(_ context.Context, id string) error {
+	b.deleted = append(b.deleted, id)
+	return nil
 }
 
 func TestDirectoryPickerNavigationAndSelection(t *testing.T) {
@@ -130,6 +183,9 @@ func TestCompatibleVersions(t *testing.T) {
 	if err := compatible("0.146.0", "0.146.1", &warning); err != nil {
 		t.Fatal(err)
 	}
+	if err := compatible("0.148.0-alpha.21", "0.148.0", &warning); err != nil {
+		t.Fatalf("Codex prerelease version was rejected: %v", err)
+	}
 	if !strings.Contains(warning.String(), "patch version") {
 		t.Fatalf("warning = %q", warning.String())
 	}
@@ -138,5 +194,8 @@ func TestCompatibleVersions(t *testing.T) {
 	}
 	if err := compatible("not-a-version", "0.146.0", &warning); err == nil {
 		t.Fatal("malformed version accepted")
+	}
+	if err := compatible("0.148.0.1", "0.148.0", &warning); err == nil {
+		t.Fatal("extra numeric version component accepted")
 	}
 }

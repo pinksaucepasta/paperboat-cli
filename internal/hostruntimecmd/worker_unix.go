@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	gort "runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/pinksaucepasta/paperboat/internal/buildinfo"
@@ -58,7 +59,7 @@ func runHostd(ctx context.Context, output io.Writer) error {
 	serverCtx, stopServer := context.WithCancel(ctx)
 	serverDone := make(chan error, 1)
 	go func() { serverDone <- server.Run(serverCtx) }()
-	if err := waitForHostdSocket(ctx, socket, serverDone); err != nil {
+	if err := waitForHostdSocket(ctx, socket, token, serverDone); err != nil {
 		stopServer()
 		shutdownStableHost(host)
 		return err
@@ -82,31 +83,67 @@ func runHostd(ctx context.Context, output io.Writer) error {
 		return err
 	}
 	fmt.Fprintln(output, "pb hostd ready")
-	<-ctx.Done()
+	watchdogInterval := notifier.WatchdogInterval()
+	var watchdog <-chan time.Time
+	var watchdogTicker *time.Ticker
+	if watchdogInterval > 0 {
+		watchdogTicker = time.NewTicker(watchdogInterval)
+		defer watchdogTicker.Stop()
+		watchdog = watchdogTicker.C
+	}
+	var runErr error
+run:
+	for {
+		select {
+		case <-ctx.Done():
+			runErr = notifier.Draining()
+			break run
+		case <-watchdog:
+			if err := notifier.Watchdog(); err != nil {
+				runErr = errors.Join(err, notifier.Degraded("watchdog notification failed"))
+				break run
+			}
+		}
+	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	stopErr := worker.Stop(shutdownCtx)
 	stopServer()
 	serverErr := <-serverDone
-	return errors.Join(notifier.Draining(), stopErr, serverErr, notifier.Stopping(), host.ShutdownStable(shutdownCtx))
+	return errors.Join(runErr, stopErr, serverErr, notifier.Stopping(), host.ShutdownStable(shutdownCtx))
 }
 
-func waitForHostdSocket(ctx context.Context, socket string, done <-chan error) error {
+func waitForHostdSocket(ctx context.Context, socket string, token []byte, done <-chan error) error {
 	deadline := time.NewTimer(15 * time.Second)
 	defer deadline.Stop()
 	tick := time.NewTicker(10 * time.Millisecond)
 	defer tick.Stop()
+	client, err := hostdproto.NewClient(socket, token, 250*time.Millisecond)
+	if err != nil {
+		return err
+	}
+	var lastErr error
 	for {
-		if info, err := os.Lstat(socket); err == nil && info.Mode()&os.ModeSocket != 0 {
+		attemptCtx, cancelAttempt := context.WithTimeout(ctx, 250*time.Millisecond)
+		_, activeErr := client.Active(attemptCtx)
+		cancelAttempt()
+		if activeErr == nil {
 			return nil
 		}
+		if !errors.Is(activeErr, os.ErrNotExist) && !errors.Is(activeErr, syscall.ECONNREFUSED) {
+			return activeErr
+		}
+		lastErr = activeErr
 		select {
 		case err := <-done:
+			if err == nil {
+				return errors.New("hostd lifecycle server exited before readiness")
+			}
 			return err
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-deadline.C:
-			return errors.New("hostd lifecycle socket did not become ready")
+			return errors.Join(errors.New("hostd lifecycle socket did not become ready"), lastErr)
 		case <-tick.C:
 		}
 	}

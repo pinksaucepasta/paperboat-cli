@@ -10,6 +10,11 @@ on:
         description: Immutable candidate version (YYYY.MM.DD.N)
         required: true
         type: string
+      windows_qualification_only:
+        description: Run both Windows package and native MSI qualification jobs without candidate assembly or publication
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   # One release may own the GitHub latest selector and origin transaction at a
@@ -37,6 +42,11 @@ jobs:
     runs-on: blacksmith-2vcpu-ubuntu-2404-arm
     timeout-minutes: 5
     environment: paperboat-tuf-published
+    outputs:
+      release_host: ${{ steps.origin_topology.outputs.release_host }}
+      install_url: ${{ steps.origin_topology.outputs.install_url }}
+      server_url: ${{ steps.origin_topology.outputs.server_url }}
+      release_url: ${{ steps.origin_topology.outputs.release_url }}
     permissions:
       contents: read
     steps:
@@ -47,19 +57,112 @@ jobs:
         shell: bash
         run: ./tools/release-version.sh validate "${RELEASE_VERSION}"
       - name: Validate release endpoints
+        id: origin_topology
         env:
           INSTALL_URL: ${{ vars.PAPERBOAT_INSTALL_URL }}
           SERVER_URL: ${{ vars.PAPERBOAT_DEFAULT_SERVER_URL }}
           RELEASE_URL: ${{ vars.PAPERBOAT_DEFAULT_RELEASE_URL }}
+          RELEASE_HOST: ${{ vars.PAPERBOAT_RELEASE_HOST }}
+          RELEASE_ORIGIN_HOSTS_JSON: ${{ vars.PAPERBOAT_RELEASE_ORIGIN_HOSTS_JSON }}
         shell: bash
         run: |
           set -euo pipefail
-          test -n "$INSTALL_URL" || { echo 'PAPERBOAT_INSTALL_URL is required' >&2; exit 1; }
-          case "$INSTALL_URL" in https://*) ;; *) echo 'PAPERBOAT_INSTALL_URL must use https' >&2; exit 1 ;; esac
-          test -n "$SERVER_URL" || { echo 'PAPERBOAT_DEFAULT_SERVER_URL is required' >&2; exit 1; }
-          case "$SERVER_URL" in https://*) ;; *) echo 'PAPERBOAT_DEFAULT_SERVER_URL must use https' >&2; exit 1 ;; esac
-          test -n "$RELEASE_URL" || { echo 'PAPERBOAT_DEFAULT_RELEASE_URL is required' >&2; exit 1; }
-          case "$RELEASE_URL" in https://*) ;; *) echo 'PAPERBOAT_DEFAULT_RELEASE_URL must use https' >&2; exit 1 ;; esac
+          validated_endpoints=$(python3 - <<'PY'
+          import ipaddress
+          import json
+          import os
+          import re
+          import socket
+          from urllib.parse import urlsplit
+
+          def canonical_host(value):
+              if not value or value != value.strip() or any(character.isspace() for character in value):
+                  raise SystemExit('release endpoint host must use canonical DNS or IP spelling')
+              try:
+                  return str(ipaddress.ip_address(value))
+              except ValueError:
+                  pass
+              legacy_ipv4_component = r'(?:0[xX][0-9a-fA-F]+|[0-9]+)'
+              if re.fullmatch(rf'{legacy_ipv4_component}(?:\.{legacy_ipv4_component}){{0,3}}', value):
+                  raise SystemExit('release endpoint host must use canonical DNS or IP spelling')
+              try:
+                  socket.inet_aton(value)
+              except OSError:
+                  pass
+              else:
+                  raise SystemExit('release endpoint host must use canonical DNS or IP spelling')
+              value = value.lower()
+              if len(value) > 253 or not re.fullmatch(r'[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?', value) or any(not label or len(label) > 63 or label.startswith('-') or label.endswith('-') for label in value.split('.')):
+                  raise SystemExit('release endpoint host must use canonical DNS or IP spelling')
+              return value
+
+          def canonical_release_host(name, value):
+              if not value or value != value.strip() or any(character.isspace() for character in value):
+                  raise SystemExit(f'{name} must be a canonical literal IPv4 address')
+              try:
+                  address = ipaddress.ip_address(value)
+              except ValueError as error:
+                  raise SystemExit(f'{name} must be a canonical literal IPv4 address') from error
+              if address.version != 4 or value != str(address):
+                  raise SystemExit(f'{name} must be a canonical literal IPv4 address')
+              return str(address)
+
+          def endpoint(name, value, required_path=None):
+              if not value or value != value.strip() or any(character.isspace() for character in value):
+                  raise SystemExit(f'{name} is required and must not contain whitespace')
+              try:
+                  parsed = urlsplit(value)
+                  port = parsed.port
+              except ValueError as error:
+                  raise SystemExit(f'{name} is invalid: {error}') from error
+              if parsed.scheme != 'https' or not parsed.hostname or parsed.username is not None or parsed.password is not None:
+                  raise SystemExit(f'{name} must use https with no credentials')
+              if port not in (None, 443) or parsed.query or parsed.fragment or '?' in value or '#' in value:
+                  raise SystemExit(f'{name} must use the default HTTPS port with no query or fragment')
+              if required_path is not None and parsed.path != required_path:
+                  raise SystemExit(f'{name} must use the exact {required_path} path')
+              return canonical_host(parsed.hostname), port or 443
+
+          def canonical_url(origin, path):
+              host, _ = origin
+              authority = f'[{host}]' if ':' in host else host
+              return f'https://{authority}{path}'
+
+          install_origin = endpoint('PAPERBOAT_INSTALL_URL', os.environ.get('INSTALL_URL', ''), '/install')
+          server_url = os.environ.get('SERVER_URL', '')
+          server_origin = endpoint('PAPERBOAT_DEFAULT_SERVER_URL', server_url)
+          if urlsplit(server_url).path not in ('', '/'):
+              raise SystemExit('PAPERBOAT_DEFAULT_SERVER_URL must be an HTTPS origin with no path')
+          release_origin = endpoint('PAPERBOAT_DEFAULT_RELEASE_URL', os.environ.get('RELEASE_URL', ''), '/tuf')
+          if install_origin != release_origin:
+              raise SystemExit('PAPERBOAT_INSTALL_URL and PAPERBOAT_DEFAULT_RELEASE_URL must use one public release origin')
+
+          raw_hosts = os.environ.get('RELEASE_ORIGIN_HOSTS_JSON', '')
+          try:
+              origin_hosts = json.loads(raw_hosts)
+          except json.JSONDecodeError as error:
+              raise SystemExit('PAPERBOAT_RELEASE_ORIGIN_HOSTS_JSON must be a JSON array') from error
+          if not isinstance(origin_hosts, list) or len(origin_hosts) != 1 or not isinstance(origin_hosts[0], str):
+              raise SystemExit('atomic activation requires exactly one authoritative release origin host')
+
+          release_host = canonical_release_host('PAPERBOAT_RELEASE_HOST', os.environ.get('RELEASE_HOST', ''))
+          authoritative_host = canonical_release_host('PAPERBOAT_RELEASE_ORIGIN_HOSTS_JSON entry', origin_hosts[0])
+          if release_host != authoritative_host:
+              raise SystemExit('PAPERBOAT_RELEASE_HOST must equal the sole authoritative origin host')
+          print(release_host)
+          print(canonical_url(install_origin, '/install'))
+          print(canonical_url(server_origin, ''))
+          print(canonical_url(release_origin, '/tuf'))
+          PY
+          )
+          mapfile -t endpoint_values <<< "$validated_endpoints"
+          test "${#endpoint_values[@]}" -eq 4 || { echo 'validated release endpoint output is incomplete' >&2; exit 1; }
+          {
+            printf 'release_host=%s\n' "${endpoint_values[0]}"
+            printf 'install_url=%s\n' "${endpoint_values[1]}"
+            printf 'server_url=%s\n' "${endpoint_values[2]}"
+            printf 'release_url=%s\n' "${endpoint_values[3]}"
+          } >> "$GITHUB_OUTPUT"
       - name: Configure protected release origin read-only identity
         env:
           PAPERBOAT_RELEASE_SSH_KEY: ${{ secrets.PAPERBOAT_RELEASE_SSH_KEY }}
@@ -76,7 +179,7 @@ jobs:
           chmod 0600 "$HOME/.ssh/known_hosts"
       - name: Verify read-only publication origin readiness
         env:
-          RELEASE_HOST: ${{ vars.PAPERBOAT_RELEASE_HOST }}
+          RELEASE_HOST: ${{ steps.origin_topology.outputs.release_host }}
         shell: bash
         run: |
           set -euo pipefail
@@ -127,9 +230,48 @@ jobs:
               raise SystemExit("no single running container exposes the read-only releases parent mount and current runtime directory")
           PY
           REMOTE
+      - name: Verify public server and installer readiness
+        env:
+          INSTALL_URL: ${{ steps.origin_topology.outputs.install_url }}
+          SERVER_URL: ${{ steps.origin_topology.outputs.server_url }}
+          RELEASE_HOST: ${{ steps.origin_topology.outputs.release_host }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          response="$RUNNER_TEMP/paperboat-install-readiness"
+          current="$RUNNER_TEMP/paperboat-current-readiness.json"
+          server_current="$RUNNER_TEMP/paperboat-server-current-readiness.json"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --connect-timeout 5 --max-time 15 --max-filesize 1048576 --retry 2 --retry-all-errors \
+            --output "$response" "${INSTALL_URL}?p=00000000000000000000000000"
+          test -s "$response" || { echo 'public Paperboat installer is empty' >&2; exit 1; }
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --connect-timeout 5 --max-time 15 --max-filesize 1048576 --retry 2 --retry-all-errors \
+            --output "$current" "${INSTALL_URL%/install}/current.json"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --connect-timeout 5 --max-time 15 --max-filesize 1048576 --retry 2 --retry-all-errors \
+            --output "$server_current" "${SERVER_URL%/}/current.json"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --connect-timeout 5 --max-time 15 --max-filesize 1048576 --retry 2 --retry-all-errors \
+            --output /dev/null "${SERVER_URL%/}/healthz"
+          python3 - "$current" <<'PY'
+          import json
+          import re
+          import sys
+          value = json.load(open(sys.argv[1], encoding='utf-8'))
+          if set(value) != {'schema', 'version'} or value['schema'] != 'paperboat.release-current/v1' or not re.fullmatch(r'20[0-9]{2}\.[0-9]{2}\.[0-9]{2}\.(0|[1-9][0-9]*)', value['version']):
+              raise SystemExit('public current.json is invalid')
+          PY
+          remote_current_hash=$(ssh -i "$HOME/.ssh/paperboat-release" -o BatchMode=yes -o StrictHostKeyChecking=yes "root@$RELEASE_HOST" \
+            "sha256sum /opt/paperboat/releases/current/current.json | awk '{print \$1}'")
+          public_current_hash=$(sha256sum "$current" | awk '{print $1}')
+          server_current_hash=$(sha256sum "$server_current" | awk '{print $1}')
+          test "$remote_current_hash" = "$public_current_hash" || { echo 'public current.json is not served by the authoritative release origin' >&2; exit 1; }
+          test "$server_current_hash" = "$public_current_hash" || { echo 'public server current.json does not match the authoritative release origin' >&2; exit 1; }
       - name: Fetch public current root chain
         env:
-          RELEASE_URL: ${{ vars.PAPERBOAT_DEFAULT_RELEASE_URL }}
+          RELEASE_URL: ${{ steps.origin_topology.outputs.release_url }}
+          RELEASE_HOST: ${{ steps.origin_topology.outputs.release_host }}
         shell: bash
         run: |
           set -euo pipefail
@@ -145,6 +287,10 @@ jobs:
               --output "$2" "$base/$1"
           }
           curl_root root.json "$metadata/root.json"
+          remote_root_hash=$(ssh -i "$HOME/.ssh/paperboat-release" -o BatchMode=yes -o StrictHostKeyChecking=yes "root@$RELEASE_HOST" \
+            "sha256sum /opt/paperboat/releases/current/tuf/metadata/root.json | awk '{print \$1}'")
+          public_root_hash=$(sha256sum "$metadata/root.json" | awk '{print $1}')
+          test "$remote_root_hash" = "$public_root_hash" || { echo 'public TUF root is not served by the authoritative release origin' >&2; exit 1; }
           root_version=$(python3 - "$metadata/root.json" <<'PY'
           import json, sys
           value = json.load(open(sys.argv[1], encoding='utf-8')).get('signed', {}).get('version')
@@ -182,6 +328,7 @@ jobs:
   platform-qualification:
     name: Native platform qualification
     needs: [release-authority, windows-release-contract]
+    if: ${{ !inputs.windows_qualification_only }}
     uses: ./.github/workflows/platform-qualification.yml
 
   windows-release-contract:
@@ -215,7 +362,7 @@ jobs:
   release-linux:
     name: Build Linux ${{ matrix.architecture }} release assets
     needs: [release-authority, windows-release-contract, platform-qualification]
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    if: (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')) && !inputs.windows_qualification_only
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     permissions:
@@ -243,8 +390,8 @@ jobs:
       - name: Build Unix archives only
         env:
           VERSION: ${{ env.RELEASE_VERSION }}
-          DEFAULT_SERVER_URL: ${{ vars.PAPERBOAT_DEFAULT_SERVER_URL }}
-          DEFAULT_RELEASE_URL: ${{ vars.PAPERBOAT_DEFAULT_RELEASE_URL }}
+          DEFAULT_SERVER_URL: ${{ needs.release-authority.outputs.server_url }}
+          DEFAULT_RELEASE_URL: ${{ needs.release-authority.outputs.release_url }}
         shell: bash
         run: |
           set -euo pipefail
@@ -282,7 +429,7 @@ jobs:
   release-macos:
     name: Build macOS release assets
     needs: [release-authority, windows-release-contract, platform-qualification]
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    if: (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')) && !inputs.windows_qualification_only
     runs-on: blacksmith-6vcpu-macos-latest
     timeout-minutes: 30
     permissions:
@@ -298,8 +445,8 @@ jobs:
       - name: Build macOS arm64 archive
         env:
           VERSION: ${{ env.RELEASE_VERSION }}
-          DEFAULT_SERVER_URL: ${{ vars.PAPERBOAT_DEFAULT_SERVER_URL }}
-          DEFAULT_RELEASE_URL: ${{ vars.PAPERBOAT_DEFAULT_RELEASE_URL }}
+          DEFAULT_SERVER_URL: ${{ needs.release-authority.outputs.server_url }}
+          DEFAULT_RELEASE_URL: ${{ needs.release-authority.outputs.release_url }}
         shell: bash
         run: |
           set -euo pipefail
@@ -328,7 +475,12 @@ jobs:
   release-windows:
     name: Windows ${{ matrix.architecture }} (${{ matrix.channel }}) package
     needs: [release-authority, windows-release-contract, platform-qualification]
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    if: >-
+      always() &&
+      (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')) &&
+      needs.release-authority.result == 'success' &&
+      needs.windows-release-contract.result == 'success' &&
+      (needs.platform-qualification.result == 'success' || inputs.windows_qualification_only)
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     permissions:
@@ -346,8 +498,8 @@ jobs:
     env:
       PAPERBOAT_ARCH: ${{ matrix.architecture }}
       PAPERBOAT_CHANNEL: ${{ matrix.channel }}
-      PAPERBOAT_DEFAULT_SERVER_URL: ${{ vars.PAPERBOAT_DEFAULT_SERVER_URL }}
-      PAPERBOAT_DEFAULT_RELEASE_URL: ${{ vars.PAPERBOAT_DEFAULT_RELEASE_URL }}
+      PAPERBOAT_DEFAULT_SERVER_URL: ${{ needs.release-authority.outputs.server_url }}
+      PAPERBOAT_DEFAULT_RELEASE_URL: ${{ needs.release-authority.outputs.release_url }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -408,8 +560,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Windows amd64/arm64 CLI build failed.' }
           & go build -buildvcs=false -trimpath -ldflags $ldflags -o (Join-Path $stage 'pb-launcher.exe') ./cmd/pb-launcher
           if ($LASTEXITCODE -ne 0) { throw 'Windows launcher build failed.' }
-          foreach ($role in @('paperboat-runtime.exe', 'paperboat-hostd.exe', 'paperboat-updater.exe')) {
-            Copy-Item -LiteralPath (Join-Path $stage 'pb.exe') -Destination (Join-Path $stage $role)
+          foreach ($role in @(
+            @{ File = 'paperboat-runtime.exe'; Value = 'runtime' },
+            @{ File = 'paperboat-hostd.exe'; Value = 'hostd' },
+            @{ File = 'paperboat-updater.exe'; Value = 'updater' }
+          )) {
+            & go build -buildvcs=false -trimpath -ldflags "$ldflags -X github.com/pinksaucepasta/paperboat/internal/buildinfo.WindowsArtifactRole=$($role.Value)" -o (Join-Path $stage $role.File) ./cmd/pb
+            if ($LASTEXITCODE -ne 0) { throw "Windows $($role.Value) role build failed." }
           }
           "PAPERBOAT_WINDOWS_STAGE=$stage" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding UTF8
           "PAPERBOAT_WINDOWS_DIST=$dist" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding UTF8
@@ -488,8 +645,13 @@ jobs:
             -UpgradeVersion $env:PAPERBOAT_WINDOWS_UPGRADE_VERSION `
             -Architecture $env:PAPERBOAT_ARCH `
             -ServiceFixturePath $env:PAPERBOAT_WINDOWS_E2E_SERVICE_FIXTURE `
+            -S4UFixturePath $env:PAPERBOAT_WINDOWS_E2E_S4U_FIXTURE `
+            -S4UTestExecutable $env:PAPERBOAT_WINDOWS_E2E_S4U_TEST `
+            -HostinstallTestExecutable $env:PAPERBOAT_WINDOWS_E2E_HOSTINSTALL_TEST `
+            -MsiCleanupTestExecutable $env:PAPERBOAT_WINDOWS_E2E_MSI_CLEANUP_TEST `
+            -NativeTestExecutable $env:PAPERBOAT_WINDOWS_E2E_NATIVE_TEST `
             -OutputDirectory $env:PAPERBOAT_WINDOWS_E2E_OUTPUT
-          if ($LASTEXITCODE -ne 0) { throw 'Full native Windows MSI qualification failed.' }
+          if (-not $?) { throw 'Full native Windows MSI qualification failed.' }
       - name: Require passed native Windows qualification report
         shell: powershell
         run: |
@@ -500,6 +662,11 @@ jobs:
           $msi = Join-Path $env:PAPERBOAT_WINDOWS_DIST ("paperboat_{0}_windows_{1}.msi" -f $env:RELEASE_VERSION, $env:PAPERBOAT_ARCH)
           $msiHash = (Get-FileHash -LiteralPath $msi -Algorithm SHA256).Hash.ToLowerInvariant()
           $upgradeHash = (Get-FileHash -LiteralPath $env:PAPERBOAT_WINDOWS_E2E_UPGRADE_MSI -Algorithm SHA256).Hash.ToLowerInvariant()
+          $nativeTest = Get-Item -Force -LiteralPath $env:PAPERBOAT_WINDOWS_E2E_NATIVE_TEST -ErrorAction Stop
+          if ($nativeTest.PSIsContainer -or (($nativeTest.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+            throw 'Native Windows qualification test executable is not a regular non-reparse file.'
+          }
+          $nativeTestHash = (Get-FileHash -LiteralPath $nativeTest.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
           $releaseParts = $env:RELEASE_VERSION.Split('.')
           $upgradeParts = $env:PAPERBOAT_WINDOWS_UPGRADE_VERSION.Split('.')
           $releaseDate = [DateTime]::new([int]$releaseParts[0], [int]$releaseParts[1], [int]$releaseParts[2])
@@ -507,7 +674,7 @@ jobs:
           if ($upgradeDate -lt $releaseDate -or ($upgradeDate -eq $releaseDate -and [int]$upgradeParts[3] -le [int]$releaseParts[3])) {
             throw "Upgrade fixture version $env:PAPERBOAT_WINDOWS_UPGRADE_VERSION is not greater than release $env:RELEASE_VERSION."
           }
-          $requiredEvents = @('preflight', 'native_go_e2e', 'msi_path_fixtures', 'msiexec_fresh_install', 'msi_repair_assertions', 'dynamic_preview_cleanup_fixture', 'msiexec_upgrade', 'msi_upgrade_assertions', 'msiexec_uninstall', 'msi_uninstall_assertions', 'msiexec_reinstall', 'msi_reinstall_assertions', 'msiexec_reinstall_uninstall')
+          $requiredEvents = @('preflight', 'preexisting_state_snapshot', 'native_s4u_dpapi', 'native_legacy_security_migration', 'native_go_e2e', 'native_runtime_current_fixture', 'native_go_preview_e2e', 'native_runtime_current_fixture_cleanup', 'native_msi_cleanup', 'openssh_isolation', 'msi_path_fixtures', 'role_artifact_allowlist', 'msiexec_fresh_install', 'msi_payload_assertions', 'msi_repair_assertions', 'dynamic_preview_cleanup_fixture', 'msiexec_upgrade', 'msi_upgrade_assertions', 'msiexec_uninstall', 'msi_uninstall_assertions', 'msiexec_reinstall', 'msi_reinstall_assertions', 'msiexec_reinstall_uninstall')
           if ($report.schema -ne 'paperboat.windows-native-qualification-report/v1' -or
               $report.platform -ne 'windows' -or
               $report.architecture -ne $env:PAPERBOAT_ARCH -or
@@ -515,15 +682,26 @@ jobs:
               $report.version -ne $env:RELEASE_VERSION -or
               $report.upgrade_version -ne $env:PAPERBOAT_WINDOWS_UPGRADE_VERSION -or
               $report.status -ne 'passed' -or
+              $report.failure -ne $null -or
               $report.native_tested -ne $true -or
               [string]::IsNullOrWhiteSpace([string]$report.windows_build) -or
               [string]::IsNullOrWhiteSpace([string]$report.runner) -or
               $report.msi_sha256 -ne $msiHash -or
-              $report.upgrade_msi_sha256 -ne $upgradeHash) {
+              $report.upgrade_msi_sha256 -ne $upgradeHash -or
+              $report.native_test_sha256 -ne $nativeTestHash -or
+              [int64]$report.native_test_length -ne [int64]$nativeTest.Length) {
             throw 'Native qualification report does not describe the passed final and upgrade MSI bytes.'
           }
           $failedEvents = @($report.events | Where-Object { $_.status -in @('failed', 'blocked') })
           if ($failedEvents.Count -ne 0) { throw 'Native qualification report contains failed or blocked events.' }
+          $preexistingStateEvents = @($report.events | Where-Object { $_.name -eq 'preexisting_state_snapshot' -and $_.status -eq 'passed' })
+          if ($preexistingStateEvents.Count -ne 1) {
+            throw "Native qualification report must contain exactly one passed preexisting_state_snapshot event; found $($preexistingStateEvents.Count)."
+          }
+          $preexistingStateDetail = [string]$preexistingStateEvents[0].detail
+          if ($preexistingStateDetail -notmatch '(?i)^\s*root_present=(true|false);\s*entries=\d+;\s*security=owner_dacl_descriptor;\s*reparse=false\s*$') {
+            throw 'Native qualification report preexisting_state_snapshot detail is incomplete.'
+          }
           foreach ($eventName in $requiredEvents) {
             if (@($report.events | Where-Object { $_.name -eq $eventName -and $_.status -eq 'passed' }).Count -eq 0) {
               throw "Native qualification report is missing passed event $eventName."
@@ -584,7 +762,16 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          $report = Get-Content -LiteralPath $env:PAPERBOAT_WINDOWS_NATIVE_REPORT -Raw | ConvertFrom-Json
+          $reportSource = Get-Item -Force -LiteralPath $env:PAPERBOAT_WINDOWS_NATIVE_REPORT -ErrorAction Stop
+          if ($reportSource.PSIsContainer -or (($reportSource.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+            throw 'Native Windows qualification report is not a regular non-reparse file.'
+          }
+          $report = Get-Content -LiteralPath $reportSource.FullName -Raw | ConvertFrom-Json
+          $reportName = "windows-$env:PAPERBOAT_ARCH-native-qualification-report.json"
+          $reportPath = Join-Path $env:PAPERBOAT_WINDOWS_DIST $reportName
+          Copy-Item -LiteralPath $reportSource.FullName -Destination $reportPath
+          $reportAsset = Get-Item -Force -LiteralPath $reportPath -ErrorAction Stop
+          $reportHash = (Get-FileHash -LiteralPath $reportAsset.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
           $components = @('cli', 'runtime', 'hostd', 'updater', 'launcher')
           $artifacts = foreach ($component in $components) {
             $name = "$component-windows-$env:PAPERBOAT_ARCH"
@@ -609,8 +796,16 @@ jobs:
             native_tested = $true
             windows_build = [string]$report.windows_build
             runner = [string]$report.runner
+            qualification_result = @{
+              schema = 'paperboat.windows-native-qualification-result-binding/v1'
+              target_path = $reportName
+              sha256 = $reportHash
+              length = [int64]$reportAsset.Length
+              native_test_sha256 = [string]$report.native_test_sha256
+              native_test_length = [int64]$report.native_test_length
+            }
             artifacts = @($artifacts)
-          } | ConvertTo-Json -Depth 5
+          } | ConvertTo-Json -Depth 6
           $path = Join-Path $env:PAPERBOAT_WINDOWS_DIST ("windows-{0}-native-qualification.json" -f $env:PAPERBOAT_ARCH)
           [IO.File]::WriteAllText($path, $evidence + "`n", [Text.UTF8Encoding]::new($false))
       - name: Generate signing manifest, checksums, SBOM, and provenance handoff
@@ -656,7 +851,7 @@ jobs:
   windows-winget:
     name: Render final-hash WinGet manifests
     needs: release-windows
-    if: (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')) && needs.release-windows.result == 'success'
+    if: (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')) && !inputs.windows_qualification_only && needs.release-windows.result == 'success'
     runs-on: blacksmith-2vcpu-windows-2025
     timeout-minutes: 15
     permissions:
@@ -714,6 +909,7 @@ jobs:
     name: Assemble immutable qualified candidate
     if: >-
       (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')) &&
+      !inputs.windows_qualification_only &&
       needs.release-authority.result == 'success' &&
       needs.platform-qualification.result == 'success' &&
       needs.release-linux.result == 'success' &&
@@ -829,6 +1025,8 @@ jobs:
             dist/*.spdx.json
             dist/windows-signing-manifest*.json
             dist/windows-provenance-*.json
+            dist/windows-*-native-qualification.json
+            dist/windows-*-native-qualification-report.json
             dist/Pinksaucepasta.Paperboat*.yaml
             dist/windows-openssh-compatibility.json
       - name: Write immutable candidate manifest
@@ -868,8 +1066,8 @@ jobs:
 
   release-publication:
     name: Publish qualified release to production
-    needs: candidate-assembly
-    if: needs.candidate-assembly.result == 'success'
+    needs: [release-authority, candidate-assembly]
+    if: needs.release-authority.result == 'success' && needs.candidate-assembly.result == 'success'
     permissions:
       contents: write
       packages: write
@@ -975,15 +1173,15 @@ jobs:
           chmod 0600 "$HOME/.ssh/known_hosts"
       - name: Fetch current production TUF repository
         env:
-          RELEASE_HOST: ${{ vars.PAPERBOAT_RELEASE_HOST }}
+          RELEASE_HOST: ${{ needs.release-authority.outputs.release_host }}
         shell: bash
         run: |
           set -euo pipefail
           test -n "$RELEASE_HOST" || { echo 'PAPERBOAT_RELEASE_HOST is required' >&2; exit 1; }
           repository="$RUNNER_TEMP/tuf-production"
-          mkdir -p "$repository"
+          mkdir -p "$repository/targets"
           ssh -i "$HOME/.ssh/paperboat-release" -o BatchMode=yes -o StrictHostKeyChecking=yes "root@$RELEASE_HOST" \
-            'tar -C /opt/paperboat/releases/current/tuf -cf - metadata targets' | tar -C "$repository" -xf -
+            'tar -C /opt/paperboat/releases/current/tuf -cf - metadata' | tar -C "$repository" -xf -
           install -m 0600 tools/tuf-repository/active-signing-state.json "$repository/.signing-state.json"
           echo "PAPERBOAT_TUF_REPOSITORY=$repository" >> "$GITHUB_ENV"
       - name: Sign and verify production TUF release
@@ -1046,7 +1244,7 @@ jobs:
           go test ./internal/hostruntime/bootstrap -run '^TestStagedTUFRepository$' -count=1
       - name: Activate verified release atomically on Hetzner
         env:
-          RELEASE_HOST: ${{ vars.PAPERBOAT_RELEASE_HOST }}
+          RELEASE_HOST: ${{ needs.release-authority.outputs.release_host }}
         shell: bash
         run: |
           set -euo pipefail

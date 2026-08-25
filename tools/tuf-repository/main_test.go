@@ -78,7 +78,8 @@ func TestCISigningPublishesCompleteSupportedRelease(t *testing.T) {
 	}
 	evidencePaths := make(map[string]string, 2)
 	for _, architecture := range []string{"amd64", "arm64"} {
-		evidence, err := json.Marshal(windowsNativeQualification{Schema: windowsNativeQualificationSchema, ReleaseVersion: version, Platform: "windows", Architecture: architecture, Status: "passed", NativeTested: true, WindowsBuild: "26100", Runner: "windows-" + architecture + "-test", Artifacts: qualified[architecture]})
+		result := writeWindowsQualificationReport(t, artifacts, version, architecture)
+		evidence, err := json.Marshal(windowsNativeQualification{Schema: windowsNativeQualificationSchema, ReleaseVersion: version, Platform: "windows", Architecture: architecture, Status: "passed", NativeTested: true, WindowsBuild: "26100", Runner: "windows-" + architecture + "-test", QualificationResult: result, Artifacts: qualified[architecture]})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -371,6 +372,7 @@ func TestWindowsNativeQualificationRequiresExplicitPassedArtifactEvidence(t *tes
 			for name, mutate := range map[string]func(*windowsNativeQualification){
 				"native-tested-false": func(q *windowsNativeQualification) { q.NativeTested = false },
 				"not-passed":          func(q *windowsNativeQualification) { q.Status = "skipped" },
+				"invalid-result-hash": func(q *windowsNativeQualification) { q.QualificationResult.SHA256 = "invalid" },
 				"wrong-architecture": func(q *windowsNativeQualification) {
 					q.Architecture = map[string]string{"amd64": "arm64", "arm64": "amd64"}[architecture]
 				},
@@ -387,6 +389,25 @@ func TestWindowsNativeQualificationRequiresExplicitPassedArtifactEvidence(t *tes
 				})
 			}
 		})
+	}
+}
+
+func TestWindowsNativeQualificationBindsExactPassedResult(t *testing.T) {
+	architecture := "amd64"
+	version := "2026.08.18.9"
+	components := windowsComponents(architecture)
+	qualification := validWindowsQualification(architecture, components)
+	artifacts := t.TempDir()
+	qualification.QualificationResult = writeWindowsQualificationReport(t, artifacts, version, architecture)
+	if err := validateWindowsNativeQualificationResult(qualification, version, architecture, artifacts); err != nil {
+		t.Fatalf("valid native qualification result rejected: %v", err)
+	}
+	reportPath := filepath.Join(artifacts, qualification.QualificationResult.TargetPath)
+	if err := os.WriteFile(reportPath, []byte(`{"schema":"paperboat.windows-native-qualification-report/v1","status":"failed"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateWindowsNativeQualificationResult(qualification, version, architecture, artifacts); err == nil {
+		t.Fatal("changed native qualification result unexpectedly accepted")
 	}
 }
 
@@ -506,7 +527,39 @@ func validWindowsQualification(architecture string, components []componentTarget
 	for _, component := range components {
 		artifacts = append(artifacts, windowsNativeQualifiedArtifact{Component: component.Component, TargetPath: component.TargetPath, SHA256: component.SHA256, Length: component.Length, Platform: "windows", Architecture: architecture, Status: "passed"})
 	}
-	return windowsNativeQualification{Schema: windowsNativeQualificationSchema, ReleaseVersion: "2026.08.18.9", Platform: "windows", Architecture: architecture, Status: "passed", NativeTested: true, WindowsBuild: "26100", Runner: "windows-11-" + architecture, Artifacts: artifacts}
+	result := windowsNativeQualificationResultBinding{Schema: windowsNativeQualificationResultBindingSchema, TargetPath: windowsNativeQualificationReportTarget(architecture), SHA256: strings.Repeat("a", 64), Length: 100, NativeTestSHA256: strings.Repeat("c", 64), NativeTestLength: 200}
+	return windowsNativeQualification{Schema: windowsNativeQualificationSchema, ReleaseVersion: "2026.08.18.9", Platform: "windows", Architecture: architecture, Status: "passed", NativeTested: true, WindowsBuild: "26100", Runner: "windows-" + architecture + "-test", QualificationResult: result, Artifacts: artifacts}
+}
+
+func writeWindowsQualificationReport(t *testing.T, artifacts, version, architecture string) windowsNativeQualificationResultBinding {
+	t.Helper()
+	nativeTestSHA256 := strings.Repeat("c", 64)
+	body, err := json.Marshal(map[string]any{
+		"schema":             "paperboat.windows-native-qualification-report/v1",
+		"platform":           "windows",
+		"architecture":       architecture,
+		"stability":          "stable",
+		"native_tested":      true,
+		"version":            version,
+		"status":             "passed",
+		"windows_build":      "26100",
+		"runner":             "windows-" + architecture + "-test",
+		"msi_sha256":         strings.Repeat("d", 64),
+		"upgrade_msi_sha256": strings.Repeat("e", 64),
+		"native_test_sha256": nativeTestSHA256,
+		"native_test_length": int64(200),
+		"events":             []map[string]string{{"name": "native_go_e2e", "status": "passed"}},
+		"failure":            nil,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetPath := windowsNativeQualificationReportTarget(architecture)
+	if err := os.WriteFile(filepath.Join(artifacts, targetPath), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(body)
+	return windowsNativeQualificationResultBinding{Schema: windowsNativeQualificationResultBindingSchema, TargetPath: targetPath, SHA256: hex.EncodeToString(digest[:]), Length: int64(len(body)), NativeTestSHA256: nativeTestSHA256, NativeTestLength: 200}
 }
 
 func writeTargetForTest(t *testing.T, repo, name string, info *metadata.TargetFiles, body []byte) {

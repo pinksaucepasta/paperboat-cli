@@ -100,8 +100,14 @@ while ([DateTimeOffset]::UtcNow -lt $deadline -and @(Get-Process msiexec -ErrorA
     Start-Sleep -Seconds 1
 }
 
-$files = @('pb.exe', 'pb-launcher.exe', 'paperboat-runtime.exe', 'paperboat-hostd.exe', 'paperboat-updater.exe')
-$presentFiles = @($files | Where-Object { Test-Path (Join-Path $installRoot "bin\$_") })
+$files = @(
+    (Join-Path $installRoot 'bin\pb.exe'),
+    (Join-Path $installRoot 'bin\pb-launcher.exe'),
+    (Join-Path $installRoot "releases\versions\$Version\paperboat-runtime.exe"),
+    (Join-Path $installRoot "releases\versions\$Version\paperboat-hostd.exe"),
+    (Join-Path $installRoot "releases\versions\$Version\paperboat-updater.exe")
+)
+$presentFiles = @($files | Where-Object { Test-Path $_ })
 $services = @(Get-Service PaperboatHostd, PaperboatUpdated -ErrorAction SilentlyContinue)
 $products = @(Get-PaperboatProducts)
 $registryPresent = Test-Path $registryPath

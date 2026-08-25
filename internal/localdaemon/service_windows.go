@@ -17,6 +17,7 @@ import (
 	"time"
 	"unsafe"
 
+	hostruntimeservice "github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
 	"golang.org/x/sys/windows"
 )
 
@@ -56,6 +57,7 @@ type windowsDaemonProcess interface {
 }
 
 func installWindowsCurrentUserService(ctx context.Context, executable, configPath, serverURL string) error {
+	executable = resolveWindowsDaemonExecutable(executable)
 	if ctx == nil || !validWindowsExecutable(executable) || configPath != "" && !validWindowsConfigPath(configPath) || !validTaskText(serverURL) {
 		return ErrInvalidInventoryConfig
 	}
@@ -89,10 +91,34 @@ func installWindowsCurrentUserService(ctx context.Context, executable, configPat
 	return nil
 }
 
+// resolveWindowsDaemonExecutable binds the persistent task to the stable MSI
+// launcher instead of the mutable cli-current payload. Major upgrades and
+// updater slot rotation may replace the payload, but the launcher path remains
+// the public command contract. Development and test binaries outside the
+// managed CLI slot are left unchanged.
+func resolveWindowsDaemonExecutable(executable string) string {
+	layout, err := hostruntimeservice.DefaultLayout("windows")
+	if err != nil {
+		return executable
+	}
+	return resolveManagedWindowsDaemonExecutable(executable, layout, validWindowsExecutable)
+}
+
+func resolveManagedWindowsDaemonExecutable(executable string, layout hostruntimeservice.Layout, valid func(string) bool) string {
+	if valid == nil || !strings.EqualFold(filepath.Dir(filepath.Clean(executable)), filepath.Dir(layout.CLICurrent)) {
+		return executable
+	}
+	launcher := filepath.Join(layout.InstallRoot, "bin", "pb.exe")
+	if valid(launcher) {
+		return launcher
+	}
+	return executable
+}
+
 func defaultStartWindowsDetachedDaemon(executable string, arguments []string) error {
 	command := exec.Command(executable, arguments...)
 	command.SysProcAttr = &windows.SysProcAttr{
-		CreationFlags: windows.DETACHED_PROCESS | windows.CREATE_NEW_PROCESS_GROUP,
+		CreationFlags: windows.DETACHED_PROCESS | windows.CREATE_NEW_PROCESS_GROUP | windows.CREATE_BREAKAWAY_FROM_JOB,
 		HideWindow:    true,
 	}
 	if err := command.Start(); err != nil {

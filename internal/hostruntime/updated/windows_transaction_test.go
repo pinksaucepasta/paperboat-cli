@@ -1,0 +1,161 @@
+package updated
+
+import (
+	"context"
+	"errors"
+	"reflect"
+	"slices"
+	"strings"
+	"testing"
+)
+
+type recordingWindowsActivationBackend struct {
+	events []string
+	fail   string
+}
+
+func (b *recordingWindowsActivationBackend) event(name string) error {
+	b.events = append(b.events, name)
+	if b.fail == name {
+		return errors.New("injected " + name)
+	}
+	return nil
+}
+func (b *recordingWindowsActivationBackend) WriteJournal(j windowsActivationJournal) error {
+	return b.event("journal:" + string(j.Stage))
+}
+func (b *recordingWindowsActivationBackend) StopServices(context.Context) error {
+	return b.event("stop")
+}
+func (b *recordingWindowsActivationBackend) SetServiceTargets(_ context.Context, h, _, _ windowsServiceTarget) error {
+	return b.event("targets:" + h.Executable)
+}
+func (b *recordingWindowsActivationBackend) StartServices(_ context.Context, h, u, ssh bool) error {
+	return b.event("start")
+}
+func (b *recordingWindowsActivationBackend) VerifyHealth(context.Context, windowsActivationJournal) error {
+	return b.event("health")
+}
+func (b *recordingWindowsActivationBackend) CommitCLI(_ context.Context, j windowsActivationJournal) error {
+	return b.event("cli:" + j.NewCLIRecord)
+}
+func (b *recordingWindowsActivationBackend) Quarantine(context.Context, windowsActivationJournal) error {
+	return b.event("quarantine")
+}
+
+func testWindowsActivationJournal() windowsActivationJournal {
+	c := windowsActivationComponent{Path: `C:\Paperboat\candidate.exe`, SHA256: strings.Repeat("a", 64), Length: 1}
+	return windowsActivationJournal{Schema: windowsActivationJournalSchema, TransactionID: strings.Repeat("1", 32), PreviousVersion: "2026.08.22.1", Version: "2026.08.23.1", Architecture: "amd64", Stage: windowsActivationStaged, Runtime: c, CLI: c, Hostd: c, Updater: c, OldHostd: windowsServiceTarget{Executable: "old-hostd", Arguments: []string{"__runtime-hostd"}, WasRunning: true}, NewHostd: windowsServiceTarget{Executable: "new-hostd", Arguments: []string{"__runtime-hostd"}}, OldUpdater: windowsServiceTarget{Executable: "old-updater", Arguments: []string{"__runtime-updated"}, WasRunning: true}, NewUpdater: windowsServiceTarget{Executable: "new-updater", Arguments: []string{"__runtime-updated"}}, PreviousCLIRecord: "old.exe\n", NewCLIRecord: "new.exe\n"}
+}
+
+func TestWindowsActivationCommitsCLIOnlyAfterHealth(t *testing.T) {
+	b := &recordingWindowsActivationBackend{}
+	result, err := executeWindowsActivation(context.Background(), b, testWindowsActivationJournal())
+	if err != nil || result.Stage != windowsActivationCommitted {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	want := []string{"journal:switching", "stop", "targets:new-hostd", "start", "journal:services_live", "health", "cli:new.exe\n", "journal:committed"}
+	if !reflect.DeepEqual(b.events, want) {
+		t.Fatalf("events=%q want=%q", b.events, want)
+	}
+}
+
+func TestWindowsActivationHealthFailureRestoresExactOldTargetsAndCLI(t *testing.T) {
+	b := &recordingWindowsActivationBackend{fail: "health"}
+	result, err := executeWindowsActivation(context.Background(), b, testWindowsActivationJournal())
+	if err == nil || result.Stage != windowsActivationRolledBack {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	wantTail := []string{"journal:rolling_back", "stop", "targets:old-hostd", "cli:old.exe\n", "quarantine", "journal:rollback_ready", "start", "journal:rolled_back"}
+	if !reflect.DeepEqual(b.events[len(b.events)-len(wantTail):], wantTail) {
+		t.Fatalf("events=%q", b.events)
+	}
+}
+
+func TestWindowsActivationRollbackReadyResumeOnlyStartsOldServices(t *testing.T) {
+	journal := testWindowsActivationJournal()
+	journal.Stage = windowsActivationRollbackReady
+	b := &recordingWindowsActivationBackend{}
+	result, err := executeWindowsActivation(context.Background(), b, journal)
+	if err == nil || result.Stage != windowsActivationRolledBack {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	want := []string{"start", "journal:rolled_back"}
+	if !reflect.DeepEqual(b.events, want) {
+		t.Fatalf("events=%q want=%q", b.events, want)
+	}
+}
+
+func TestWindowsActivationDoesNotStartOldUpdaterBeforeRollbackReadyIsDurable(t *testing.T) {
+	b := &recordingWindowsActivationBackend{fail: "journal:rollback_ready"}
+	result, err := rollbackWindowsActivation(context.Background(), b, testWindowsActivationJournal(), errors.New("candidate failed"))
+	if err == nil || result.Stage != windowsActivationRollbackReady || slices.Contains(b.events, "start") {
+		t.Fatalf("result=%+v events=%q err=%v", result, b.events, err)
+	}
+}
+
+func TestWindowsActivationFailureIsBoundedAndSingleLine(t *testing.T) {
+	message := boundedWindowsActivationFailure(errors.New(strings.Repeat("x", 3000) + "\r\nsecret"))
+	if len(message) != 2048 || strings.ContainsAny(message, "\r\n\x00") {
+		t.Fatalf("failure length=%d value=%q", len(message), message)
+	}
+}
+
+func TestWindowsActivationRecoveryNeverContinuesAmbiguousCutover(t *testing.T) {
+	j := testWindowsActivationJournal()
+	j.Stage = windowsActivationServicesLive
+	b := &recordingWindowsActivationBackend{}
+	result, err := executeWindowsActivation(context.Background(), b, j)
+	if err == nil || result.Stage != windowsActivationRolledBack || b.events[0] != "journal:rolling_back" {
+		t.Fatalf("result=%+v events=%q err=%v", result, b.events, err)
+	}
+}
+
+func TestWindowsActivationRollbackNeverRestartsAfterTargetFailure(t *testing.T) {
+	b := &recordingWindowsActivationBackend{fail: "targets:old-hostd"}
+	result, err := rollbackWindowsActivation(context.Background(), b, testWindowsActivationJournal(), errors.New("candidate failed"))
+	if err == nil || result.Stage != windowsActivationRollingBack {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if slices.Contains(b.events, "start") {
+		t.Fatalf("unsafe restart after target failure: %q", b.events)
+	}
+}
+
+func TestWindowsActivationServiceSetIsRoleScoped(t *testing.T) {
+	if got, want := windowsActivationServiceNames("client"), []string{"PaperboatHostd", "PaperboatUpdated"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("client=%q want=%q", got, want)
+	}
+	if got, want := windowsActivationServiceNames("host"), []string{"PaperboatSshd", "PaperboatHostd", "PaperboatUpdated"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("host=%q want=%q", got, want)
+	}
+	sshArguments := []string{"__windows-sshd-service", "--sshd", `C:\Program Files\OpenSSH\sshd.exe`, "--config", `C:\ProgramData\Paperboat\ssh\sshd_config`}
+	target := windowsServiceTarget{Executable: "sshd", Arguments: sshArguments}
+	if !validWindowsSSHRoleTarget("host", target) || validWindowsSSHRoleTarget("host", windowsServiceTarget{}) || validWindowsSSHRoleTarget("client", target) || !validWindowsSSHRoleTarget("client", windowsServiceTarget{}) {
+		t.Fatal("PaperboatSshd role invariant is not exact")
+	}
+	journal := testWindowsActivationJournal()
+	journal.OldSSH, journal.NewSSH = target, target
+	if !validWindowsActivationJournal(journal) {
+		t.Fatal("exact PaperboatSshd journal rejected")
+	}
+	journal.NewSSH.Arguments = append([]string(nil), sshArguments...)
+	journal.NewSSH.Arguments[2] = `C:\Temp\sshd.exe`
+	if validWindowsActivationJournal(journal) {
+		t.Fatal("malformed PaperboatSshd journal accepted")
+	}
+}
+
+func TestWindowsActivationBlocksBothSidesUntilTerminalJournal(t *testing.T) {
+	journal := testWindowsActivationJournal()
+	for _, stage := range []windowsActivationStage{windowsActivationStaged, windowsActivationSwitching, windowsActivationServicesLive, windowsActivationRollingBack} {
+		journal.Stage = stage
+		if !windowsActivationBlocksVersion(journal, journal.Version) || !windowsActivationBlocksVersion(journal, journal.PreviousVersion) {
+			t.Fatalf("stage %q did not fence both updater versions", stage)
+		}
+	}
+	journal.Stage = windowsActivationCommitted
+	if windowsActivationBlocksVersion(journal, journal.Version) {
+		t.Fatal("committed activation remains fenced")
+	}
+}

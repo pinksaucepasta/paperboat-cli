@@ -55,8 +55,14 @@ func TestNativeSCMHostdAndUpdaterLifecycle(t *testing.T) {
 			installed := true
 			t.Cleanup(func() {
 				if installed {
-					_ = installer.Uninstall(context.Background())
-					_ = waitServiceAbsent(test.name, 15*time.Second)
+					cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+					defer cleanupCancel()
+					if err := installer.Uninstall(cleanupCtx); err != nil {
+						t.Errorf("cleanup uninstall %s: %v", test.name, err)
+					}
+					if err := waitServiceAbsent(test.name, 15*time.Second); err != nil {
+						t.Errorf("cleanup wait for %s: %v", test.name, err)
+					}
 				}
 			})
 
@@ -130,7 +136,13 @@ func assertServiceArguments(t *testing.T, name string, want ...string) {
 
 func TestNativeDurablePreviewServiceLifecycle(t *testing.T) {
 	t.Setenv("PAPERBOAT_WINDOWS_PREVIEW_OWNER_WORKLOAD", "")
-	fixture := requiredFixture(t)
+	layout, err := service.DefaultLayout("windows")
+	if err != nil {
+		t.Fatalf("resolve installed runtime layout: %v", err)
+	}
+	if info, statErr := os.Stat(layout.RuntimeCurrent); statErr != nil || !info.Mode().IsRegular() {
+		t.Fatalf("installed runtime-current is unavailable: %s: %v", layout.RuntimeCurrent, statErr)
+	}
 	root := t.TempDir()
 	// Include the process identity and timestamp so a terminated qualification
 	// process can never collide with a stale service from an earlier run.
@@ -141,19 +153,27 @@ func TestNativeDurablePreviewServiceLifecycle(t *testing.T) {
 	expires := time.Now().UTC().Add(5 * time.Second)
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
-	descriptor, err := hostruntime.InstallPreviewService(ctx, fixture, root, name, 32123, &expires, false)
+	descriptor, err := hostruntime.InstallPreviewService(ctx, layout.RuntimeCurrent, root, name, 32123, &expires, false)
 	if err != nil {
 		t.Fatalf("install durable preview service: %v", err)
 	}
 	t.Cleanup(func() {
-		_ = hostruntime.RemovePreviewService(context.Background(), root, name)
-		_ = removeServiceIfPresent(serviceName)
-		_ = waitServiceAbsent(serviceName, 15*time.Second)
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		if err := hostruntime.RemovePreviewService(cleanupCtx, root, name); err != nil {
+			t.Errorf("cleanup preview runtime %s: %v", serviceName, err)
+		}
+		if err := removeServiceIfPresent(serviceName); err != nil {
+			t.Errorf("cleanup preview service %s: %v", serviceName, err)
+		}
+		if err := waitServiceAbsent(serviceName, 15*time.Second); err != nil {
+			t.Errorf("cleanup wait for preview service %s: %v", serviceName, err)
+		}
 	})
 	if descriptor.Schema != "paperboat.preview-runtime/v1" || descriptor.Name != name || descriptor.Port != 32123 || descriptor.Indefinite || descriptor.ExpiresAt == nil || descriptor.ServiceDefinition == "" {
 		t.Fatalf("unexpected preview descriptor: %+v", descriptor)
 	}
-	assertServiceConfiguration(t, serviceName, fixture, mgr.StartAutomatic)
+	assertServiceConfiguration(t, serviceName, layout.RuntimeCurrent, mgr.StartAutomatic)
 	assertServiceRunning(t, serviceName)
 
 	// Reconciliation before expiry must be a no-op.
@@ -183,15 +203,6 @@ func TestNativeDurablePreviewServiceLifecycle(t *testing.T) {
 		}
 		if cleanupErr := waitServiceAbsent(serviceName, 30*time.Second); cleanupErr != nil {
 			t.Fatalf("expired service remained after explicit cleanup: %v", cleanupErr)
-		}
-	}
-	// The temporary fixture root is intentionally outside the installed state
-	// root, so the production descriptor validator rejects it after the SYSTEM
-	// service transition. The service is already absent; remove only this
-	// test-owned fixture file before asserting final cleanup.
-	if _, statErr := os.Stat(previewDescriptorPath(root, name)); statErr == nil {
-		if err := os.Remove(previewDescriptorPath(root, name)); err != nil {
-			t.Fatalf("remove expired preview fixture descriptor: %v", err)
 		}
 	}
 	if _, err := os.Stat(previewDescriptorPath(root, name)); !errors.Is(err, os.ErrNotExist) {

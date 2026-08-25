@@ -51,7 +51,10 @@ type Workloads struct {
 }
 
 func (w Workloads) valid() bool {
-	return w.Sessions != nil && w.Executions != nil && w.Transfers != nil
+	// Host mode owns sessions and executions as a pair. Client mode owns no
+	// command workloads, but it still needs the stable transfer manager so file
+	// receipt survives coordination-worker replacement.
+	return w.Transfers != nil && (w.Sessions == nil) == (w.Executions == nil)
 }
 
 type Config struct {

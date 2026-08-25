@@ -36,56 +36,65 @@ func TestRuntimeWorkerEntryActivatesFencedHostdLease(t *testing.T) {
 	serverDone := make(chan error, 1)
 	go func() { serverDone <- server.Run(serverCtx) }()
 	t.Cleanup(func() { stopServer(); <-serverDone })
-	deadline := time.Now().Add(time.Second)
-	for {
-		if _, err := os.Stat(filepath.Join(root, "socket", "hostd.sock")); err == nil {
-			break
-		}
-		select {
-		case err := <-serverDone:
-			t.Fatalf("hostd socket failed to start: %v", err)
-		default:
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("hostd socket did not start")
-		}
-		time.Sleep(time.Millisecond)
+	if err := waitForHostdSocket(context.Background(), filepath.Join(root, "socket", "hostd.sock"), token, serverDone); err != nil {
+		t.Fatalf("hostd socket failed to start: %v", err)
 	}
 
 	workerCtx, stopWorker := context.WithCancel(context.Background())
+	defer stopWorker()
 	done := make(chan error, 1)
-	output := &lockedBuffer{}
+	output := newLockedBuffer()
 	go func() {
 		done <- runWorker(workerCtx, []string{
 			"--socket", filepath.Join(root, "socket", "hostd.sock"), "--token-file", tokenPath,
 			"--worker-id", "runtime-test", "--version", "test", "--heartbeat", "1s",
 		}, bytes.NewReader(nil), output, &bytes.Buffer{})
 	}()
-	deadline = time.Now().Add(time.Second)
-	for server.Status().State != hostdproto.StateActive || output.String() != "ready 1 1\nactive 1 1\n" {
-		if time.Now().After(deadline) {
-			t.Fatalf("worker did not activate: status=%+v output=%q", server.Status(), output.String())
+	const expectedOutput = "ready 1 1\nactive 1 1\n"
+	activationCtx, cancelActivation := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelActivation()
+	for output.String() != expectedOutput {
+		select {
+		case err := <-done:
+			t.Fatalf("worker exited before activation: status=%+v output=%q err=%v", server.Status(), output.String(), err)
+		case <-output.changed:
+		case <-activationCtx.Done():
+			t.Fatalf("worker did not activate before deadline: status=%+v output=%q", server.Status(), output.String())
 		}
-		time.Sleep(time.Millisecond)
+	}
+	if status := server.Status(); status.State != hostdproto.StateActive {
+		t.Fatalf("worker reported activation without active fence: status=%+v output=%q", status, output.String())
 	}
 	stopWorker()
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	if output.String() != "ready 1 1\nactive 1 1\n" {
+	if output.String() != expectedOutput {
 		t.Fatalf("output=%q", output.String())
 	}
 }
 
 type lockedBuffer struct {
-	mu sync.Mutex
-	b  bytes.Buffer
+	mu      sync.Mutex
+	b       bytes.Buffer
+	changed chan struct{}
+}
+
+func newLockedBuffer() *lockedBuffer {
+	return &lockedBuffer{changed: make(chan struct{}, 1)}
 }
 
 func (b *lockedBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.b.Write(p)
+	n, err := b.b.Write(p)
+	b.mu.Unlock()
+	if n > 0 {
+		select {
+		case b.changed <- struct{}{}:
+		default:
+		}
+	}
+	return n, err
 }
 
 func (b *lockedBuffer) String() string {

@@ -7,11 +7,13 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/pinksaucepasta/paperboat/internal/api"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/endpointidentity"
@@ -58,7 +60,16 @@ func (s *APIDescriptorSource) Acquire(ctx context.Context, generation Generation
 		return AttemptDescriptor{}, ErrFactoryInvalid
 	}
 	allowedPaths := requestedAllowedPaths(s.config.Purpose, s.config.AllowedPaths)
-	document, err := s.config.Client.CreatePeerAttempt(ctx, api.PeerAttemptInput{OperationID: operationID, EnvironmentID: s.config.EnvironmentID, Purpose: s.config.Purpose, Consumer: s.config.Consumer, ControllingCertificateFingerprint: s.config.ControllingCertificateFingerprint, ControlledCertificateFingerprint: s.config.ControlledCertificateFingerprint, AttemptGeneration: generation.Attempt, NetworkGeneration: generation.Network, AllowedPaths: allowedPaths, Transfer: s.config.Transfer, RelayLatency: relayLatencyVector(s.config.RelayLatency)})
+	input := api.PeerAttemptInput{OperationID: operationID, EnvironmentID: s.config.EnvironmentID, Purpose: s.config.Purpose, Consumer: s.config.Consumer, ControllingCertificateFingerprint: s.config.ControllingCertificateFingerprint, ControlledCertificateFingerprint: s.config.ControlledCertificateFingerprint, AttemptGeneration: generation.Attempt, NetworkGeneration: generation.Network, AllowedPaths: allowedPaths, Transfer: s.config.Transfer, RelayLatency: relayLatencyVector(s.config.RelayLatency)}
+	document, err := s.config.Client.CreatePeerAttempt(ctx, input)
+	if shouldRetryWithoutRelayLatency(err, input.RelayLatency) {
+		// Relay selection is advisory. Older control planes can reject a fresh
+		// vector when their persisted peer-selection state is unusable. Retry the
+		// same idempotent operation once without the vector so that route tuning
+		// can never block authenticated peer authority.
+		input.RelayLatency = nil
+		document, err = s.config.Client.CreatePeerAttempt(ctx, input)
+	}
 	if err != nil {
 		return AttemptDescriptor{}, classifyDescriptorAPIError(err)
 	}
@@ -74,6 +85,14 @@ func (s *APIDescriptorSource) Acquire(ctx context.Context, generation Generation
 	return result, nil
 }
 
+func shouldRetryWithoutRelayLatency(err error, vector *api.RelayLatencyVector) bool {
+	if err == nil || vector == nil {
+		return false
+	}
+	var apiErr *api.APIError
+	return errors.As(err, &apiErr) && apiErr.Status == http.StatusBadRequest && apiErr.Code == "invalid_request"
+}
+
 func relayLatencyVector(source func() *api.RelayLatencyVector) *api.RelayLatencyVector {
 	if source == nil {
 		return nil
@@ -83,12 +102,12 @@ func relayLatencyVector(source func() *api.RelayLatencyVector) *api.RelayLatency
 
 func validateAPIDescriptor(value api.PeerAttemptDescriptor, config APIDescriptorSourceConfig, operationID string, generation Generation) (map[string][]byte, error) {
 	allowedPaths := requestedAllowedPaths(config.Purpose, config.AllowedPaths)
-	if value.Version != 1 || value.AccountID != config.AccountID || value.DeviceID != config.ControllingEndpointID || value.OperationID != operationID || value.EnvironmentID != config.EnvironmentID || value.Purpose != config.Purpose || value.Consumer != config.Consumer || !validAPIDescriptorStreamPolicy(config.Purpose, value.StreamPolicy) || !equalDescriptorTransfer(value.Transfer, config.Transfer) || value.Role != string(signaling.RoleControlling) || value.AttemptGeneration != generation.Attempt || value.NetworkGeneration != generation.Network || value.HostGeneration == 0 || value.AuthorizationGeneration == 0 || value.InitiatorEndpointID != config.ControllingEndpointID || value.ResponderEndpointID != config.ControlledEndpointID || value.Signaling.Subprotocol != "paperboat.peer-signaling.v1" || len(value.EndpointCertificates) != 2 || len(value.Relays) != 1 || !slices.Equal(value.Policy.AllowedPaths, allowedPaths) || value.Policy.RelayDeadlineMS < 100 || value.Policy.RelayDeadlineMS > 60000 || value.Policy.HealthIntervalMS < 1000 || value.Policy.HealthIntervalMS > 300000 || value.Policy.MaxCandidates < 1 || value.Policy.MaxCandidates > 64 {
-		return nil, ErrDescriptorInvalid
+	if reason := invalidAPIDescriptorDocumentReason(value, config, operationID, generation, allowedPaths); reason != "" {
+		return nil, fmt.Errorf("%w: %s", ErrDescriptorInvalid, reason)
 	}
 	relay := value.Relays[0]
-	if !boundedDescriptorValue(relay.Region, 1, 128) || relay.RouteGeneration == 0 || !exactHTTPSURL(relay.QUICURL, "/v1/peer-relay") || !exactWSSURL(relay.WSSURL, "/v1/peer-relay") || !compactToken(relay.RouteToken) || !compactToken(relay.PMTUToken) || !exactUDPURL(relay.PMTUURL) || !relay.ExpiresAt.Equal(value.ExpiresAt) {
-		return nil, ErrDescriptorInvalid
+	if reason := invalidAPIDescriptorRelayReason(relay, value.ExpiresAt); reason != "" {
+		return nil, fmt.Errorf("%w: %s", ErrDescriptorInvalid, reason)
 	}
 	wantRoles := map[string]endpointidentity.Role{value.InitiatorEndpointID: endpointidentity.RoleCLI, value.ResponderEndpointID: endpointidentity.RoleMachine}
 	wantFingerprints := map[string]string{value.InitiatorEndpointID: config.ControllingCertificateFingerprint, value.ResponderEndpointID: config.ControlledCertificateFingerprint}
@@ -96,16 +115,16 @@ func validateAPIDescriptor(value api.PeerAttemptDescriptor, config APIDescriptor
 	certificates := make(map[string][]byte, 2)
 	for _, document := range value.EndpointCertificates {
 		if seen[document.EndpointID] || wantRoles[document.EndpointID] == 0 {
-			return nil, ErrDescriptorInvalid
+			return nil, fmt.Errorf("%w: endpoint certificate identity", ErrDescriptorInvalid)
 		}
 		raw, err := base64.RawURLEncoding.Strict().DecodeString(document.Certificate)
 		if err != nil || base64.RawURLEncoding.EncodeToString(raw) != document.Certificate {
-			return nil, ErrDescriptorInvalid
+			return nil, fmt.Errorf("%w: endpoint certificate encoding", ErrDescriptorInvalid)
 		}
 		certificate, err := endpointidentity.Verify(raw, config.RootPublicKey, endpointidentity.Expected{AccountID: config.AccountID, Role: wantRoles[document.EndpointID], EndpointID: document.EndpointID}, value.IssuedAt)
 		fingerprint := sha256.Sum256(raw)
 		if err != nil || certificate.Claims.EndpointID != document.EndpointID || certificate.Claims.Role != wantRoles[document.EndpointID] || certificate.Claims.ExpiresAt.Before(value.ExpiresAt) || hex.EncodeToString(fingerprint[:]) != wantFingerprints[document.EndpointID] {
-			return nil, ErrDescriptorInvalid
+			return nil, fmt.Errorf("%w: endpoint certificate authority", ErrDescriptorInvalid)
 		}
 		seen[document.EndpointID] = true
 		certificates[document.EndpointID] = append([]byte(nil), raw...)
@@ -113,13 +132,89 @@ func validateAPIDescriptor(value api.PeerAttemptDescriptor, config APIDescriptor
 	if machineRaw := certificates[value.ResponderEndpointID]; len(machineRaw) > 0 {
 		machine, err := endpointidentity.Parse(machineRaw)
 		if err != nil || machine.Claims.Generation != value.HostGeneration {
-			return nil, ErrDescriptorInvalid
+			return nil, fmt.Errorf("%w: machine certificate generation", ErrDescriptorInvalid)
 		}
 	}
 	if len(seen) != 2 {
-		return nil, ErrDescriptorInvalid
+		return nil, fmt.Errorf("%w: endpoint certificate count", ErrDescriptorInvalid)
 	}
 	return certificates, nil
+}
+
+func invalidAPIDescriptorDocumentReason(value api.PeerAttemptDescriptor, config APIDescriptorSourceConfig, operationID string, generation Generation, allowedPaths []string) string {
+	switch {
+	case value.Version != 1:
+		return "version"
+	case value.AccountID != config.AccountID:
+		return "account binding"
+	case value.DeviceID != config.ControllingEndpointID:
+		return "device binding"
+	case value.OperationID != operationID:
+		return "operation binding"
+	case value.EnvironmentID != config.EnvironmentID:
+		return "environment binding"
+	case value.Purpose != config.Purpose:
+		return "purpose binding"
+	case value.Consumer != config.Consumer:
+		return "consumer binding"
+	case !validAPIDescriptorStreamPolicy(config.Purpose, value.StreamPolicy):
+		return "stream policy"
+	case !equalDescriptorTransfer(value.Transfer, config.Transfer):
+		return "transfer binding"
+	case value.Role != string(signaling.RoleControlling):
+		return "signaling role"
+	case value.AttemptGeneration != generation.Attempt:
+		return "attempt generation"
+	case value.NetworkGeneration != generation.Network:
+		return "network generation"
+	case value.HostGeneration == 0:
+		return "host generation"
+	case value.AuthorizationGeneration == 0:
+		return "authorization generation"
+	case value.InitiatorEndpointID != config.ControllingEndpointID:
+		return "initiator binding"
+	case value.ResponderEndpointID != config.ControlledEndpointID:
+		return "responder binding"
+	case value.Signaling.Subprotocol != "paperboat.peer-signaling.v1":
+		return "signaling subprotocol"
+	case len(value.EndpointCertificates) != 2:
+		return "endpoint certificate count"
+	case len(value.Relays) != 1:
+		return "relay count"
+	case !slices.Equal(value.Policy.AllowedPaths, allowedPaths):
+		return "allowed paths"
+	case value.Policy.RelayDeadlineMS < 100 || value.Policy.RelayDeadlineMS > 60000:
+		return "relay deadline"
+	case value.Policy.HealthIntervalMS < 1000 || value.Policy.HealthIntervalMS > 300000:
+		return "health interval"
+	case value.Policy.MaxCandidates < 1 || value.Policy.MaxCandidates > 64:
+		return "candidate limit"
+	default:
+		return ""
+	}
+}
+
+func invalidAPIDescriptorRelayReason(relay api.PeerAttemptRelay, expiresAt time.Time) string {
+	switch {
+	case !boundedDescriptorValue(relay.Region, 1, 128):
+		return "relay region"
+	case relay.RouteGeneration == 0:
+		return "relay generation"
+	case !exactHTTPSURL(relay.QUICURL, "/v1/peer-relay"):
+		return "relay QUIC URL"
+	case !exactWSSURL(relay.WSSURL, "/v1/peer-relay"):
+		return "relay WSS URL"
+	case !compactToken(relay.RouteToken):
+		return "relay route credential"
+	case !compactToken(relay.PMTUToken):
+		return "relay PMTU credential"
+	case !exactUDPURL(relay.PMTUURL):
+		return "relay PMTU URL"
+	case !relay.ExpiresAt.Equal(expiresAt):
+		return "relay expiry"
+	default:
+		return ""
+	}
 }
 
 func requestedAllowedPaths(purpose string, configured []string) []string {
@@ -228,7 +323,7 @@ func classifyDescriptorAPIError(err error) error {
 		if apiErr.Status >= http.StatusInternalServerError {
 			return errors.Join(ErrDescriptorUnavailable, err)
 		}
-		return errors.Join(ErrDescriptorInvalid, err)
+		return errors.Join(fmt.Errorf("%w: peer API status %d code %s", ErrDescriptorInvalid, apiErr.Status, apiErr.Code), err)
 	}
 }
 

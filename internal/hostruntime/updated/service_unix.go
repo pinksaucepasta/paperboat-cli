@@ -61,7 +61,7 @@ type Service struct {
 }
 
 func New(config Config) (*Service, error) {
-	if !filepath.IsAbs(config.StateRoot) || !filepath.IsAbs(config.ControlSocket) || config.WorkerUID <= 0 || config.WorkerGID < 0 || len(config.Token) != 32 || config.SocketPath == "" || config.RepositoryURL == "" || config.MachineID == "" || config.Health == nil {
+	if !filepath.IsAbs(config.StateRoot) || !filepath.IsAbs(config.ControlSocket) || !validUnixWorkerIdentity(config.WorkerUID, config.WorkerGID) || len(config.Token) != 32 || config.SocketPath == "" || config.RepositoryURL == "" || config.MachineID == "" || config.Health == nil {
 		return nil, ErrInvalidConfig
 	}
 	if err := secureRoot(config.StateRoot); err != nil {
@@ -98,6 +98,10 @@ func New(config Config) (*Service, error) {
 	service := &Service{manager: manager, supervisor: supervisor, source: source, scheduler: scheduler}
 	service.control = controlServer{socketPath: config.ControlSocket, uid: config.WorkerUID, gid: config.WorkerGID, invokeRequest: service.controlRequestWithRequest}
 	return service, nil
+}
+
+func validUnixWorkerIdentity(uid, gid int) bool {
+	return uid > 0 && gid > 0 || uid == 0 && gid == 0
 }
 
 func (s *Service) Run(ctx context.Context) error {

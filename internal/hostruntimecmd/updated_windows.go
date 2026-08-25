@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"path/filepath"
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostinstall"
@@ -19,16 +20,42 @@ func runUpdated(ctx context.Context, args []string, _ io.Writer, _ io.Writer) er
 	if len(args) != 0 {
 		return errors.New("updated does not accept arguments")
 	}
-	config, err := windowsRuntimeInstallConfig()
+	workerConfig, err := windowsUpdatedConfig()
 	if err != nil {
 		return err
 	}
-	layout, err := service.DefaultLayout("windows")
-	if err != nil {
-		return err
-	}
-	workerConfig := updated.WindowsConfig{StateRoot: layout.UpdateStateRoot, RuntimeCurrent: layout.RuntimeCurrent, RuntimeRollback: layout.RuntimeRollback, RuntimeStaged: layout.RuntimeStaged, CLICurrent: layout.CLICurrent, CLIRollback: layout.CLIRollback, OwnerSID: config.OwnerSID, MachineID: config.MachineID, RepositoryURL: config.ControlURL, TokenFile: config.TokenFile, InstallState: filepath.Join(hostinstall.WindowsProgramDataRoot(), "runtime-install.json"), Architecture: config.Artifact.Architecture}
 	return service.RunWindowsSystemService("PaperboatUpdated", func(serviceCtx context.Context) error {
 		return updated.RunWindows(serviceCtx, workerConfig)
 	})
+}
+
+func runActivator(_ context.Context, args []string, _ io.Writer, _ io.Writer) error {
+	if len(args) != 0 {
+		return errors.New("activator does not accept arguments")
+	}
+	config, err := windowsUpdatedConfig()
+	if err != nil {
+		return err
+	}
+	return service.RunWindowsSystemService("PaperboatUpdateActivator", func(serviceCtx context.Context) error {
+		return updated.RunWindowsActivator(serviceCtx, config)
+	})
+}
+
+func windowsUpdatedConfig() (updated.WindowsConfig, error) {
+	config, err := windowsRuntimeInstallConfig()
+	if err != nil {
+		return updated.WindowsConfig{}, err
+	}
+	layout, err := service.DefaultLayout("windows")
+	if err != nil {
+		return updated.WindowsConfig{}, err
+	}
+	activeVersion := config.Artifact.Version
+	if executable, executableErr := os.Executable(); executableErr == nil {
+		if immutableVersion, versionErr := layout.WindowsVersionForExecutable(executable); versionErr == nil {
+			activeVersion = immutableVersion
+		}
+	}
+	return updated.WindowsConfig{StateRoot: layout.UpdateStateRoot, RuntimeCurrent: layout.RuntimeCurrent, RuntimeRollback: layout.RuntimeRollback, RuntimeStaged: layout.RuntimeStaged, CLICurrent: layout.CLICurrent, CLIRollback: layout.CLIRollback, OwnerSID: config.OwnerSID, MachineID: config.MachineID, RepositoryURL: config.Artifact.RepositoryURL, TokenFile: config.TokenFile, InstallState: filepath.Join(hostinstall.WindowsProgramDataRoot(), "runtime-install.json"), ControlSocket: `\\.\pipe\PaperboatUpdatedControl`, HostdSocket: layout.HostdSocket, HealthURL: "http://" + config.ListenAddress + "/healthz", ActiveVersion: activeVersion, Architecture: config.Artifact.Architecture, AutomaticActivation: true, SetupMode: config.SetupMode}, nil
 }

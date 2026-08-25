@@ -53,8 +53,10 @@ import (
 	filetransfer "github.com/pinksaucepasta/paperboat/internal/filetransfer"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/bootstrap"
 	helperconfig "github.com/pinksaucepasta/paperboat/internal/hostruntime/config"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/enrollment"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/identity"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/preview"
+	hostruntime "github.com/pinksaucepasta/paperboat/internal/hostruntime/runtime"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/servelease"
 	service "github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/updated"
@@ -77,8 +79,10 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/privatepreviewproxy"
 	"github.com/pinksaucepasta/paperboat/internal/processlifetime"
 	"github.com/pinksaucepasta/paperboat/internal/prompt"
+	"github.com/pinksaucepasta/paperboat/internal/remotepath"
 	"github.com/pinksaucepasta/paperboat/internal/resolver"
 	"github.com/pinksaucepasta/paperboat/internal/selector"
+	"github.com/pinksaucepasta/paperboat/internal/selfupdate"
 	servepkg "github.com/pinksaucepasta/paperboat/internal/serve"
 	"github.com/pinksaucepasta/paperboat/internal/session"
 	"github.com/pinksaucepasta/paperboat/internal/statusbar"
@@ -107,6 +111,14 @@ var currentLocalDaemonPaths = localdaemon.CurrentUserPaths
 // the local daemon. Command tests replace it with an in-process sentinel: a
 // Go test executable must never be registered as a detached daemon service.
 var installLocalDaemonService localDaemonServiceInstaller = localdaemon.InstallCurrentUserService
+
+// removeLocalDaemonService is the matching ownership boundary used when setup
+// changes the machine identity that the daemon must present. Rebinding stops
+// the exact owner process before installing the replacement service.
+var removeLocalDaemonService localDaemonServiceRemover = localdaemon.RemoveCurrentUserService
+
+var installSetupClientService = hostruntimecmd.InstallClient
+var verifySetupHostArtifact = hostruntimecmd.VerifyHostArtifact
 
 type exitCodeError struct{ code int }
 
@@ -188,6 +200,10 @@ func terminalArgs(minimum int) cobra.PositionalArgs {
 }
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	if !windowsArtifactCommandAllowed(buildinfo.WindowsArtifactRole, args) {
+		fmt.Fprintln(stderr, "pb: This service artifact cannot run that command.")
+		return 2
+	}
 	root := newRootCommand()
 	root.SetOut(stdout)
 	root.SetErr(stderr)
@@ -218,6 +234,30 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	return 1
 }
 
+func windowsArtifactCommandAllowed(role string, args []string) bool {
+	if role == "" || role == "cli" {
+		return true
+	}
+	if len(args) == 0 {
+		return false
+	}
+	switch role {
+	case "runtime":
+		switch args[0] {
+		case "__runtime-worker", "__windows-sshd-service", "__runtime-config", "__runtime-preview", "__runtime-private-preview", "__runtime-serve":
+			return true
+		default:
+			return false
+		}
+	case "hostd":
+		return args[0] == "__runtime-hostd"
+	case "updater":
+		return args[0] == "__runtime-updated" || args[0] == "__runtime-activate"
+	default:
+		return false
+	}
+}
+
 func userFacingError(err error) string {
 	if err == nil {
 		return ""
@@ -239,10 +279,13 @@ func userFacingError(err error) string {
 		return "Your Paperboat session is no longer valid. Run `pb auth login`, then retry."
 	}
 	if errors.Is(err, config.ErrSecretNotFound) {
-		return "This CLI is signed in but not paired for private transport. Run `pb auth login --recovery-key /absolute/recovery-key-file`."
+		return "This CLI is signed in but not paired for private transport. Run `pb auth login` and approve it from a paired device."
 	}
 	if errors.Is(err, identitybootstrap.ErrPairingRequired) {
-		return "This CLI needs the account recovery key before private transport can be enabled. Rerun `pb auth login --recovery-key /absolute/recovery-key-file`."
+		return "This CLI needs approval from a paired device before private transport can be enabled. Rerun `pb auth login`."
+	}
+	if errors.Is(err, identitybootstrap.ErrEnrollmentExpired) {
+		return "Private transport approval expired. Keep a paired device online and rerun `pb auth login`."
 	}
 	var uninstallErr uninstallCleanupError
 	if errors.As(err, &uninstallErr) {
@@ -258,6 +301,12 @@ func userFacingError(err error) string {
 			message += " Request ID: " + apiErr.RequestID + "."
 		}
 		return message
+	}
+	// os.PathError satisfies net.Error on some platforms. Do not misreport a
+	// local filesystem or named-pipe failure as an Internet outage.
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) {
+		return err.Error()
 	}
 	var netErr net.Error
 	if errors.As(err, &netErr) {
@@ -374,6 +423,16 @@ func updatedRuntimeCommand() *cobra.Command {
 	}, SilenceUsage: true, SilenceErrors: true}
 }
 
+func activatorRuntimeCommand() *cobra.Command {
+	return &cobra.Command{Use: "__runtime-activate", Hidden: true, DisableFlagParsing: true, RunE: func(command *cobra.Command, args []string) error {
+		code := hostruntimecmd.Execute(command.Context(), append([]string{"activate"}, args...), command.InOrStdin(), command.OutOrStdout(), command.ErrOrStderr())
+		if code != 0 {
+			return exitCodeError{code: code}
+		}
+		return nil
+	}, SilenceUsage: true, SilenceErrors: true}
+}
+
 func windowsSSHDServiceCommand() *cobra.Command {
 	command := &cobra.Command{
 		Use:    "__windows-sshd-service",
@@ -427,6 +486,9 @@ func localDaemonCommand() *cobra.Command {
 				return err
 			}
 			source := &localdaemon.AuthenticatedMachineSource{ServerURL: cfg.ServerURL, Auth: authSource}
+			source.ReportPeerApprovalSignerUnavailable = localdaemon.RateLimitedPeerApprovalReporter(time.Now, time.Minute, func(issue localdaemon.PeerApprovalSignerUnavailableError) {
+				diagnosticlog.TryInfo("peer enrollment signer unavailable", "reason", "verifier_only", "pending_requests", issue.PendingRequests)
+			})
 			source.SourceMachineID, err = configuredMachineID()
 			if err != nil {
 				return err
@@ -563,6 +625,12 @@ func transportConsumerSummary(consumers []localapi.TransportConsumer) string {
 	return strings.Join(parts, ", ")
 }
 
+const (
+	doctorRunTimeout              = 20 * time.Second
+	doctorProbeTimeout            = 10 * time.Second
+	doctorPathReachabilityTimeout = 8 * time.Second
+)
+
 func doctorCommandV1() *cobra.Command {
 	command := &cobra.Command{
 		Use:   "doctor [machine]",
@@ -603,7 +671,7 @@ func doctorCommandV1() *cobra.Command {
 				reportMachine = &doctorpkg.Machine{ID: selected.ID, Alias: selected.Alias}
 			}
 			report, err := doctorpkg.Run(command.Context(), doctorpkg.Config{
-				Timeout: 20 * time.Second, ProbeTimeout: 10 * time.Second, Clock: time.Now,
+				Timeout: doctorRunTimeout, ProbeTimeout: doctorProbeTimeout, Clock: time.Now,
 				Correlation: newDoctorCorrelationID,
 			}, reportMachine, doctorProbes(command, snapshot, machine))
 			if err != nil {
@@ -661,34 +729,90 @@ func doctorProbes(command *cobra.Command, snapshot localapi.Snapshot, machine *l
 	if machine != nil {
 		probes = append(probes, doctorMachineProbes(*machine)...)
 		probes = append(probes, doctorPathReachabilityProbes(command, machine.ID)...)
-		probes = append(probes, doctorpkg.Probe{Code: "peer_reachability", Run: func(ctx context.Context) doctorpkg.Check {
-			return probeDoctorPeer(ctx, command, machine.ID)
-		}})
 	}
 	return probes
 }
 
 func doctorPathReachabilityProbes(command *cobra.Command, machineID string) []doctorpkg.Probe {
-	var once sync.Once
-	results := make(map[connectionmanager.Path]tunnel.PathReachability, 3)
-	load := func(ctx context.Context) {
+	return doctorSharedPathReachabilityProbes(command.Context(), doctorPathReachabilityTimeout, func(ctx context.Context) (map[connectionmanager.Path]tunnel.PathReachability, error) {
 		commandContext := actionContext(command, []string{machineID})
 		commandContext.Context = ctx
 		dependencies, err := buildDeps(commandContext)
-		if err != nil || dependencies.peerTunnel == nil {
-			return
+		if err != nil {
+			return nil, err
+		}
+		if dependencies.peerTunnel == nil {
+			return nil, errors.New("peer tunnel is unavailable")
 		}
 		client, err := backendClient(commandContext)
 		if err != nil {
-			return
+			return nil, err
 		}
 		machine, err := resolveUserMachine(ctx, client, machineID)
-		if err != nil || !machine.Online {
-			return
+		if err != nil {
+			return nil, err
+		}
+		if !machine.Online {
+			return nil, errors.New("selected machine is offline")
 		}
 		target := resolver.ConnectInfo{TargetKind: "machine", ProjectID: machine.ID, Project: machine.DisplayName, MachineGeneration: uint64(machine.InstallationGeneration), Terminal: &resolver.TerminalTarget{Protocol: "paperboat.health-probe.v1", EnvironmentID: machine.EnvironmentID}}
-		results = dependencies.peerTunnel.ProbePathReachability(ctx, target)
+		return dependencies.peerTunnel.ProbePathReachability(ctx, target), nil
+	})
+}
+
+type doctorPathReachabilityOutcomeState uint8
+
+const (
+	doctorPathReachabilityOutcomeUnset doctorPathReachabilityOutcomeState = iota
+	doctorPathReachabilityOutcomeReady
+	doctorPathReachabilityOutcomeFailed
+	doctorPathReachabilityOutcomeCanceled
+)
+
+type doctorPathReachabilityOutcome struct {
+	state   doctorPathReachabilityOutcomeState
+	results map[connectionmanager.Path]tunnel.PathReachability
+	err     error
+}
+
+type doctorPathReachabilityLoader func(context.Context) (map[connectionmanager.Path]tunnel.PathReachability, error)
+
+func loadDoctorPathReachability(parent context.Context, timeout time.Duration, loader doctorPathReachabilityLoader) doctorPathReachabilityOutcome {
+	outcome := doctorPathReachabilityOutcome{state: doctorPathReachabilityOutcomeFailed, results: make(map[connectionmanager.Path]tunnel.PathReachability, 3)}
+	if parent == nil {
+		outcome.err = errors.New("doctor path reachability parent context is unavailable")
+		return outcome
 	}
+	if timeout <= 0 || loader == nil {
+		outcome.err = errors.New("doctor path reachability loader is unavailable")
+		return outcome
+	}
+	loadContext, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	loaded, err := loader(loadContext)
+	if contextErr := loadContext.Err(); contextErr != nil {
+		outcome.state = doctorPathReachabilityOutcomeCanceled
+		outcome.err = contextErr
+		return outcome
+	}
+	if err != nil {
+		outcome.err = err
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			outcome.state = doctorPathReachabilityOutcomeCanceled
+		}
+		return outcome
+	}
+	for _, path := range []connectionmanager.Path{connectionmanager.PathDirectQUIC, connectionmanager.PathRelayQUIC, connectionmanager.PathWSS} {
+		outcome.results[path] = loaded[path]
+	}
+	outcome.state = doctorPathReachabilityOutcomeReady
+	return outcome
+}
+
+func doctorSharedPathReachabilityProbes(parent context.Context, timeout time.Duration, loader doctorPathReachabilityLoader) []doctorpkg.Probe {
+	var once sync.Once
+	var outcome doctorPathReachabilityOutcome
+	loadOnce := func() { outcome = loadDoctorPathReachability(parent, timeout, loader) }
 	definitions := []struct {
 		code string
 		name string
@@ -698,15 +822,36 @@ func doctorPathReachabilityProbes(command *cobra.Command, machineID string) []do
 		{"relay_reachability", "Relay QUIC", connectionmanager.PathRelayQUIC},
 		{"wss_reachability", "WebSocket fallback", connectionmanager.PathWSS},
 	}
-	probes := make([]doctorpkg.Probe, 0, len(definitions))
+	probes := make([]doctorpkg.Probe, 0, len(definitions)+1)
 	for _, definition := range definitions {
 		definition := definition
-		probes = append(probes, doctorpkg.Probe{Code: definition.code, Run: func(ctx context.Context) doctorpkg.Check {
-			once.Do(func() { load(ctx) })
-			return doctorPathReachabilityCheck(definition.code, definition.name, results[definition.path])
+		probes = append(probes, doctorpkg.Probe{Code: definition.code, Run: func(context.Context) doctorpkg.Check {
+			once.Do(loadOnce)
+			if check, unavailable := doctorPathReachabilityOutcomeCheck(definition.code, outcome); unavailable {
+				return check
+			}
+			return doctorPathReachabilityCheck(definition.code, definition.name, outcome.results[definition.path])
 		}})
 	}
+	probes = append(probes, doctorpkg.Probe{Code: "peer_reachability", Run: func(context.Context) doctorpkg.Check {
+		once.Do(loadOnce)
+		if check, unavailable := doctorPathReachabilityOutcomeCheck("peer_reachability", outcome); unavailable {
+			return check
+		}
+		return doctorPeerReachabilityCheck(outcome.results)
+	}})
 	return probes
+}
+
+func doctorPathReachabilityOutcomeCheck(code string, outcome doctorPathReachabilityOutcome) (doctorpkg.Check, bool) {
+	switch outcome.state {
+	case doctorPathReachabilityOutcomeReady:
+		return doctorpkg.Check{}, false
+	case doctorPathReachabilityOutcomeCanceled:
+		return doctorpkg.Check{Category: "transport", Code: code, Status: doctorpkg.StatusUnavailable, Summary: "The shared path reachability check was canceled before it completed.", Recovery: "Run pb doctor again when the selected machine and network are available."}, true
+	default:
+		return doctorpkg.Check{Category: "transport", Code: code, Status: doctorpkg.StatusUnavailable, Summary: "The shared path reachability check could not be completed.", Recovery: "Check the local Paperboat service and run pb doctor again."}, true
+	}
 }
 
 func doctorPathReachabilityCheck(code, name string, result tunnel.PathReachability) doctorpkg.Check {
@@ -716,28 +861,16 @@ func doctorPathReachabilityCheck(code, name string, result tunnel.PathReachabili
 	return doctorpkg.Check{Category: "transport", Code: code, Status: doctorpkg.StatusWarning, Summary: name + " did not reach the selected machine.", Recovery: "Check network and firewall policy; Paperboat will continue using any reachable fallback path."}
 }
 
-func probeDoctorPeer(ctx context.Context, command *cobra.Command, machineID string) doctorpkg.Check {
+func doctorPeerReachabilityCheck(results map[connectionmanager.Path]tunnel.PathReachability) doctorpkg.Check {
 	failure := doctorpkg.Check{Category: "transport", Code: "peer_reachability", Status: doctorpkg.StatusFail, Summary: "No authenticated Paperboat path reached the selected machine.", Recovery: "Check the Paperboat service on the selected machine and local network access, then run pb doctor again."}
-	commandContext := actionContext(command, []string{machineID})
-	commandContext.Context = ctx
-	dependencies, err := buildDeps(commandContext)
-	if err != nil || dependencies.peerTunnel == nil {
-		return failure
+	for _, path := range []connectionmanager.Path{connectionmanager.PathDirectQUIC, connectionmanager.PathRelayQUIC, connectionmanager.PathWSS} {
+		result := results[path]
+		if !result.Reachable {
+			continue
+		}
+		return doctorPeerCheck(tunnel.PingResult{Path: path, RelayRegion: result.RelayRegion, RTT: result.RTT, PTOs: result.PTOs})
 	}
-	client, err := backendClient(commandContext)
-	if err != nil {
-		return failure
-	}
-	machine, err := resolveUserMachine(ctx, client, machineID)
-	if err != nil || !machine.Online {
-		return failure
-	}
-	target := resolver.ConnectInfo{TargetKind: "machine", ProjectID: machine.ID, Project: machine.DisplayName, MachineGeneration: uint64(machine.InstallationGeneration), Terminal: &resolver.TerminalTarget{Protocol: "paperboat.health-probe.v1", EnvironmentID: machine.EnvironmentID}}
-	result, err := dependencies.peerTunnel.PingOnce(ctx, target)
-	if err != nil {
-		return failure
-	}
-	return doctorPeerCheck(result)
+	return failure
 }
 
 func doctorPeerCheck(result tunnel.PingResult) doctorpkg.Check {
@@ -1249,6 +1382,249 @@ func waitForAuthenticatedTransport(ctx context.Context, command *cobra.Command, 
 }
 
 type localDaemonServiceInstaller func(context.Context, string, string, string) error
+type localDaemonServiceRemover func(context.Context, string) error
+type localDaemonSnapshotClient interface {
+	Snapshot(context.Context) (localapi.Snapshot, error)
+}
+type localDaemonSnapshotLauncher func(context.Context) error
+
+const (
+	localDaemonReadyTimeout      = 30 * time.Second
+	localDaemonReadyPollInterval = 50 * time.Millisecond
+)
+
+var localDaemonLaunchGate = make(chan struct{}, 1)
+
+// localDaemonRegistrationMatches reports whether this device has a machine
+// registration for the active server. A clean sign-in intentionally has no
+// registration yet: auth must not launch a daemon that can only exit with a
+// setup-required error.
+func localDaemonRegistrationMatches(cfg *config.Config) (bool, error) {
+	if cfg == nil || strings.TrimSpace(cfg.ServerURL) == "" {
+		return false, localdaemon.ErrInvalidInventoryConfig
+	}
+	store, err := runtimeIdentityStore()
+	if err != nil {
+		return false, err
+	}
+	registration, err := store.Registration()
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	configuredServer, err := config.NormalizeServerURL(cfg.ServerURL)
+	if err != nil {
+		return false, err
+	}
+	registeredServer, err := config.NormalizeServerURL(registration.ServerURL)
+	if err != nil {
+		return false, err
+	}
+	return registration.MachineID != "" && registeredServer == configuredServer, nil
+}
+
+func localDaemonLaunchValues(cfg *config.Config) (string, string, string, error) {
+	if cfg == nil || strings.TrimSpace(cfg.ServerURL) == "" {
+		return "", "", "", localdaemon.ErrInvalidInventoryConfig
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return "", "", "", err
+	}
+	configPath := cfg.Path()
+	if configPath != "" {
+		configPath, err = filepath.Abs(configPath)
+		if err != nil {
+			return "", "", "", err
+		}
+	}
+	return executable, configPath, cfg.ServerURL, nil
+}
+
+func waitForLocalDaemonSnapshot(ctx context.Context, client localDaemonSnapshotClient, socketPath string, lastSocketErr error) (localapi.Snapshot, error) {
+	if ctx == nil || client == nil || strings.TrimSpace(socketPath) == "" {
+		return localapi.Snapshot{}, localdaemon.ErrInvalidInventoryConfig
+	}
+	ticker := time.NewTicker(localDaemonReadyPollInterval)
+	defer ticker.Stop()
+	for {
+		snapshot, err := client.Snapshot(ctx)
+		if err == nil {
+			return snapshot, nil
+		}
+		if contextErr := ctx.Err(); contextErr != nil {
+			if lastSocketErr == nil && localDaemonSocketUnavailable(err) {
+				lastSocketErr = fmt.Errorf("connect local daemon at %s: %w", socketPath, err)
+			}
+			if lastSocketErr != nil {
+				return localapi.Snapshot{}, errors.Join(lastSocketErr, contextErr)
+			}
+			return localapi.Snapshot{}, errors.Join(err, contextErr)
+		}
+		if !localDaemonSocketUnavailable(err) {
+			return localapi.Snapshot{}, err
+		}
+		lastSocketErr = fmt.Errorf("connect local daemon at %s: %w", socketPath, err)
+		select {
+		case <-ctx.Done():
+			return localapi.Snapshot{}, errors.Join(lastSocketErr, ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func acquireLocalDaemonLaunch(ctx context.Context) (func(), error) {
+	select {
+	case localDaemonLaunchGate <- struct{}{}:
+		return func() { <-localDaemonLaunchGate }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func recoverLocalDaemonSnapshot(ctx context.Context, client localDaemonSnapshotClient, socketPath string, launch localDaemonSnapshotLauncher) (localapi.Snapshot, error) {
+	if ctx == nil || client == nil || launch == nil || strings.TrimSpace(socketPath) == "" {
+		return localapi.Snapshot{}, localdaemon.ErrInvalidInventoryConfig
+	}
+	snapshot, err := client.Snapshot(ctx)
+	if err == nil {
+		return snapshot, nil
+	}
+	if contextErr := ctx.Err(); contextErr != nil {
+		if localDaemonSocketUnavailable(err) {
+			err = fmt.Errorf("connect local daemon at %s: %w", socketPath, err)
+		}
+		return localapi.Snapshot{}, errors.Join(err, contextErr)
+	}
+	if !localDaemonSocketUnavailable(err) {
+		return localapi.Snapshot{}, err
+	}
+	lastSocketErr := fmt.Errorf("connect local daemon at %s: %w", socketPath, err)
+	release, err := acquireLocalDaemonLaunch(ctx)
+	if err != nil {
+		return localapi.Snapshot{}, errors.Join(lastSocketErr, err)
+	}
+	defer release()
+
+	snapshot, err = client.Snapshot(ctx)
+	if err == nil {
+		return snapshot, nil
+	}
+	if contextErr := ctx.Err(); contextErr != nil {
+		return localapi.Snapshot{}, errors.Join(lastSocketErr, contextErr)
+	}
+	if !localDaemonSocketUnavailable(err) {
+		return localapi.Snapshot{}, err
+	}
+	lastSocketErr = fmt.Errorf("connect local daemon at %s: %w", socketPath, err)
+	if err := launch(ctx); err != nil {
+		return localapi.Snapshot{}, errors.Join(lastSocketErr, err)
+	}
+	if contextErr := ctx.Err(); contextErr != nil {
+		return localapi.Snapshot{}, errors.Join(lastSocketErr, contextErr)
+	}
+	return waitForLocalDaemonSnapshot(ctx, client, socketPath, lastSocketErr)
+}
+
+// startLocalDaemonAndWait first accepts an already-ready owner daemon. When
+// the local endpoint is absent it installs the service and waits for one valid
+// snapshot, so process creation cannot be mistaken for readiness.
+func startLocalDaemonAndWait(ctx context.Context, cfg *config.Config, install localDaemonServiceInstaller) (*localapi.Client, localapi.Snapshot, error) {
+	return startLocalDaemonAndWaitWithin(ctx, cfg, install, localDaemonReadyTimeout)
+}
+
+func startLocalDaemonAndWaitWithin(ctx context.Context, cfg *config.Config, install localDaemonServiceInstaller, timeout time.Duration) (*localapi.Client, localapi.Snapshot, error) {
+	if install == nil {
+		return nil, localapi.Snapshot{}, localdaemon.ErrInvalidInventoryConfig
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if timeout <= 0 {
+		return nil, localapi.Snapshot{}, localdaemon.ErrInvalidInventoryConfig
+	}
+	operationCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	paths, err := currentLocalDaemonPaths()
+	if err != nil {
+		return nil, localapi.Snapshot{}, err
+	}
+	client, err := localapi.NewClient(paths.SocketPath, 2*time.Second)
+	if err != nil {
+		return nil, localapi.Snapshot{}, err
+	}
+	snapshot, err := recoverLocalDaemonSnapshot(operationCtx, client, paths.SocketPath, func(launchCtx context.Context) error {
+		executable, configPath, server, launchErr := localDaemonLaunchValues(cfg)
+		if launchErr != nil {
+			return launchErr
+		}
+		return install(launchCtx, executable, configPath, server)
+	})
+	if err != nil {
+		return nil, localapi.Snapshot{}, err
+	}
+	return client, snapshot, nil
+}
+
+// ensureLocalDaemonService is used by auth. Before the first setup it is a
+// deliberate no-op; setup owns the first machine-bound daemon launch.
+func ensureLocalDaemonService(ctx context.Context, cfg *config.Config) error {
+	matches, err := localDaemonRegistrationMatches(cfg)
+	if err != nil || !matches {
+		return err
+	}
+	_, _, err = startLocalDaemonAndWait(ctx, cfg, installLocalDaemonService)
+	return err
+}
+
+// requireLocalDaemonService is the bounded recovery path for peer commands.
+// It covers reboot followed only by a non-interactive Windows OpenSSH logon,
+// where an ONLOGON task cannot start the per-user daemon.
+func requireLocalDaemonService(ctx context.Context, cfg *config.Config) error {
+	matches, err := localDaemonRegistrationMatches(cfg)
+	if err != nil {
+		return err
+	}
+	if !matches {
+		return errors.New("this device is not set up for the active Paperboat server; run `pb setup --mode client`")
+	}
+	_, _, err = startLocalDaemonAndWait(ctx, cfg, installLocalDaemonService)
+	return err
+}
+
+func requireCodexLocalDaemonForPlatform(ctx context.Context, cfg *config.Config, platform string, require func(context.Context, *config.Config) error) error {
+	if platform != "windows" {
+		return nil
+	}
+	if require == nil {
+		return localdaemon.ErrInvalidInventoryConfig
+	}
+	return require(ctx, cfg)
+}
+
+// rebindLocalDaemonService restarts the owner daemon only after setup has
+// committed the new machine registration. This prevents a still-running
+// daemon from retaining a previous machine or server identity.
+func rebindLocalDaemonService(ctx context.Context, cfg *config.Config) error {
+	matches, err := localDaemonRegistrationMatches(cfg)
+	if err != nil {
+		return err
+	}
+	if !matches {
+		return errors.New("Client machine registration is unavailable for the active Paperboat server")
+	}
+	executable, _, _, err := localDaemonLaunchValues(cfg)
+	if err != nil {
+		return err
+	}
+	if err := removeLocalDaemonService(ctx, executable); err != nil {
+		return fmt.Errorf("stop previous local daemon: %w", err)
+	}
+	_, _, err = startLocalDaemonAndWait(ctx, cfg, installLocalDaemonService)
+	return err
+}
 
 func localDaemonSnapshot(command *cobra.Command, install localDaemonServiceInstaller) (*localapi.Client, localapi.Snapshot, error) {
 	if command == nil || install == nil {
@@ -1266,55 +1642,35 @@ func localDaemonSnapshot(command *cobra.Command, install localDaemonServiceInsta
 	if commandCtx == nil {
 		commandCtx = context.Background()
 	}
-	snapshot, err := client.Snapshot(commandCtx)
-	if err == nil {
-		return client, snapshot, nil
-	}
-	if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ECONNREFUSED) {
+	operationCtx, cancel := context.WithTimeout(commandCtx, localDaemonReadyTimeout)
+	defer cancel()
+	snapshot, err := recoverLocalDaemonSnapshot(operationCtx, client, paths.SocketPath, func(launchCtx context.Context) error {
+		executable, executableErr := os.Executable()
+		if executableErr != nil {
+			return executableErr
+		}
+		configPath := configPathFlag(command)
+		effectiveConfig, configErr := config.Load(configPath)
+		if configErr != nil {
+			return configErr
+		}
+		configPath = effectiveConfig.Path()
+		if configPath != "" {
+			configPath, executableErr = filepath.Abs(configPath)
+			if executableErr != nil {
+				return executableErr
+			}
+		}
+		server, _ := command.Flags().GetString("server")
+		if strings.TrimSpace(server) == "" {
+			server = effectiveConfig.ServerURL
+		}
+		return install(launchCtx, executable, configPath, server)
+	})
+	if err != nil {
 		return nil, localapi.Snapshot{}, err
 	}
-	executable, executableErr := os.Executable()
-	if executableErr != nil {
-		return nil, localapi.Snapshot{}, executableErr
-	}
-	configPath := configPathFlag(command)
-	effectiveConfig, configErr := config.Load(configPath)
-	if configErr != nil {
-		return nil, localapi.Snapshot{}, configErr
-	}
-	configPath = effectiveConfig.Path()
-	if configPath != "" {
-		configPath, executableErr = filepath.Abs(configPath)
-		if executableErr != nil {
-			return nil, localapi.Snapshot{}, executableErr
-		}
-	}
-	server, _ := command.Flags().GetString("server")
-	if strings.TrimSpace(server) == "" {
-		server = effectiveConfig.ServerURL
-	}
-	initialSocketErr := fmt.Errorf("connect local daemon at %s: %w", paths.SocketPath, err)
-	if err := install(commandCtx, executable, configPath, server); err != nil {
-		return nil, localapi.Snapshot{}, errors.Join(initialSocketErr, err)
-	}
-	readyCtx, cancel := context.WithTimeout(commandCtx, 5*time.Second)
-	defer cancel()
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		snapshot, err = client.Snapshot(readyCtx)
-		if err == nil {
-			return client, snapshot, nil
-		}
-		if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ECONNREFUSED) {
-			return nil, localapi.Snapshot{}, err
-		}
-		select {
-		case <-readyCtx.Done():
-			return nil, localapi.Snapshot{}, errors.Join(err, readyCtx.Err())
-		case <-ticker.C:
-		}
-	}
+	return client, snapshot, nil
 }
 
 func writeWaitResult(stdout, stderr io.Writer, result localwait.Result) {
@@ -1694,11 +2050,6 @@ func pairCommand() *cobra.Command {
 				if strings.TrimSpace(token) == "" && strings.TrimSpace(tokenFile) == "" {
 					return errors.New("fresh pairing requires --enrollment-token or --enrollment-token-file")
 				}
-				if runtime.GOOS == "windows" {
-					if _, err := setupPlatformHostPrerequisites(command.Context()); err != nil {
-						return fmt.Errorf("prepare Windows OpenSSH: %w", err)
-					}
-				}
 			}
 			publicIdentityKey := base64.RawURLEncoding.EncodeToString(identityStore.Current().Public())
 			if !fresh && registration.PublicIdentityKey != publicIdentityKey {
@@ -1816,13 +2167,19 @@ func setupCommand() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("resolve Paperboat Inbox: %w", err)
 			}
+			previousRegistration, previousRegistrationErr := identityStore.Registration()
+			hadPreviousRegistration := previousRegistrationErr == nil
 			previousMode := ""
-			if existing, registrationErr := identityStore.Registration(); registrationErr == nil {
-				inboxPath = existing.InboxPath
-				previousMode = existing.SetupMode
+			if hadPreviousRegistration {
+				inboxPath = previousRegistration.InboxPath
+				previousMode = previousRegistration.SetupMode
 			}
 			if err := inbox.EnsurePath(inboxPath); err != nil {
 				return fmt.Errorf("prepare Paperboat Inbox: %w", err)
+			}
+			d, err := buildDeps(ctx)
+			if err != nil {
+				return err
 			}
 			setupAPIMode := mode
 			machine, err := client.SetupMachine(command.Context(), api.MachineSetupInput{
@@ -1837,14 +2194,51 @@ func setupCommand() *cobra.Command {
 				}
 				return err
 			}
-			if mode == "host" {
-				if _, err := client.RegisterManagedSSHTarget(command.Context(), machine.ID, uint64(machine.InstallationGeneration), account.Username, uint16(sshPortValue), "managed-ssh-target-"+strings.TrimPrefix(newIdempotencyKey(), "pb-")); err != nil {
-					return fmt.Errorf("register SSH target: %w", err)
+			rollbackHostFailure := func(cause error) error {
+				if mode != "host" || previousMode == "host" {
+					return cause
 				}
+				rollbackCtx, cancelRollback := setupRollbackContext(command.Context())
+				defer cancelRollback()
+				rollbackErr := rollbackAuthenticatedHostSetup(rollbackCtx, client, identityStore, previousRegistration, hadPreviousRegistration, d.cfg.ServerURL, stateRoot, workspaceRoot, inboxPath, strings.TrimSpace(name), publicIdentityKey, command.InOrStdin(), command.OutOrStdout(), command.ErrOrStderr())
+				return errors.Join(cause, rollbackErr)
 			}
-			d, err := buildDeps(ctx)
-			if err != nil {
-				return err
+			if machine.Installation == nil {
+				return rollbackHostFailure(errors.New("server did not return TUF installation material"))
+			}
+			artifact := bootstrap.ArtifactTarget{
+				Schema: machine.Installation.Artifact.Schema, Kind: machine.Installation.Artifact.Kind,
+				Version: machine.Installation.Artifact.Version, Platform: machine.Installation.Artifact.Platform,
+				Architecture: machine.Installation.Artifact.Architecture, RepositoryURL: machine.Installation.Artifact.RepositoryURL,
+				TargetPath: machine.Installation.Artifact.TargetPath,
+			}
+			if mode == "host" {
+				if err := verifySetupHostArtifact(command.Context(), stateRoot, artifact); err != nil {
+					return rollbackHostFailure(fmt.Errorf("verify Host installation artifact: %w", err))
+				}
+				if _, err := client.RegisterManagedSSHTarget(command.Context(), machine.ID, uint64(machine.InstallationGeneration), account.Username, uint16(sshPortValue), "managed-ssh-target-"+strings.TrimPrefix(newIdempotencyKey(), "pb-")); err != nil {
+					return rollbackHostFailure(fmt.Errorf("register SSH target: %w", err))
+				}
+				resume, err := bootstrap.PrepareAuthenticatedSetupResume(stateRoot, d.cfg.ServerURL, publicIdentityKey, strings.TrimSpace(name), machine.ID, machine.InstallationGeneration, time.Now().UTC())
+				if err != nil {
+					return rollbackHostFailure(fmt.Errorf("prepare authenticated Host setup recovery: %w", err))
+				}
+				_, reusableIdentityErr := enrollment.LoadRuntimeIdentityForRenewal(stateRoot, time.Now().UTC())
+				prepared, err := client.PrepareAuthenticatedHostSetup(command.Context(), machine.ID, resume.SetupOperationID, api.AuthenticatedHostSetupInput{
+					Verifier: resume.Verifier, PublicIdentityKey: publicIdentityKey,
+					InstallationGeneration: machine.InstallationGeneration, SetupMode: "host",
+					Artifact: machine.Installation.Artifact,
+					SSHUser:  account.Username, SSHPort: uint16(sshPortValue),
+					CanReuseRuntimeIdentity: reusableIdentityErr == nil,
+				})
+				if err != nil {
+					return rollbackHostFailure(fmt.Errorf("prepare authenticated Host installation: %w", err))
+				}
+				resume.PairingStarted = true
+				resume.PairingExpiresAt = prepared.ExpiresAt
+				if err := bootstrap.SaveResume(stateRoot, resume); err != nil {
+					return rollbackHostFailure(fmt.Errorf("persist authenticated Host installation: %w", err))
+				}
 			}
 			registration := identity.Registration{
 				ServerURL: d.cfg.ServerURL, MachineID: machine.ID, EnvironmentID: machine.EnvironmentID,
@@ -1858,42 +2252,13 @@ func setupCommand() *cobra.Command {
 				registration.SSHUser, registration.SSHPort = account.Username, uint16(sshPortValue)
 			}
 			if err := identityStore.SaveRegistration(registration); err != nil {
-				return fmt.Errorf("save machine registration: %w", err)
+				return rollbackHostFailure(fmt.Errorf("save machine registration: %w", err))
 			}
-			operationID := "machine-control-" + strings.TrimPrefix(newIdempotencyKey(), "pb-")
-			controlBody, err := json.Marshal(struct {
-				OperationID string `json:"operation_id"`
-			}{operationID})
-			if err != nil {
-				return err
-			}
-			controlPath := "/v1/machines/" + machine.ID + "/control-credentials"
-			proof, err := identityStore.MachineProof(operationID, http.MethodPost, controlPath, controlBody, time.Now().UTC())
-			if err != nil {
-				return fmt.Errorf("prove machine identity: %w", err)
-			}
-			controlCredential, err := client.IssueMachineControlCredential(command.Context(), machine.ID, operationID, proof)
-			if err != nil {
-				return fmt.Errorf("issue machine control credential: %w", err)
-			}
-			if err := identityStore.SaveMachineControl(identity.MachineControl{
-				MachineID: machine.ID, EnvironmentID: machine.EnvironmentID,
-				InstallationGeneration: machine.InstallationGeneration, Credential: controlCredential.Credential,
-				ExpiresAt: controlCredential.ExpiresAt, KeyID: key.ID,
-			}); err != nil {
-				return fmt.Errorf("save machine control credential: %w", err)
+			if err := saveSetupMachineControl(command.Context(), client, identityStore, machine, key.ID); err != nil {
+				return rollbackHostFailure(err)
 			}
 			if mode == "client" {
-				if machine.Installation == nil {
-					return errors.New("server did not return TUF client installation material")
-				}
-				artifact := bootstrap.ArtifactTarget{
-					Schema: machine.Installation.Artifact.Schema, Kind: machine.Installation.Artifact.Kind,
-					Version: machine.Installation.Artifact.Version, Platform: machine.Installation.Artifact.Platform,
-					Architecture: machine.Installation.Artifact.Architecture, RepositoryURL: machine.Installation.Artifact.RepositoryURL,
-					TargetPath: machine.Installation.Artifact.TargetPath,
-				}
-				installErr := hostruntimecmd.InstallClient(command.Context(), hostruntimecmd.ClientInstallConfig{
+				installErr := installSetupClientService(command.Context(), hostruntimecmd.ClientInstallConfig{
 					StateRoot: stateRoot, WorkspaceRoot: workspaceRoot, ControlURL: machine.Installation.ControlURL,
 					MachineID: machine.ID, ListenAddress: machine.Installation.HelperListenAddress,
 					Artifact: artifact,
@@ -1901,35 +2266,18 @@ func setupCommand() *cobra.Command {
 				if installErr != nil {
 					return fmt.Errorf("install client service: %w; retry `pb setup --mode client`", installErr)
 				}
+				if err := rebindLocalDaemonService(command.Context(), d.cfg); err != nil {
+					return fmt.Errorf("start Client local daemon: %w; retry `pb setup --mode client`", err)
+				}
 			}
 			if mode == "host" {
 				arguments := []string{"bootstrap", "--server", d.cfg.ServerURL, "--state-root", stateRoot, "--name", strings.TrimSpace(name)}
 				if code := hostruntimecmd.Execute(command.Context(), arguments, command.InOrStdin(), command.OutOrStdout(), command.ErrOrStderr()); code != 0 {
-					bootstrapErr := error(exitCodeError{code: code})
-					if previousMode != "client" && previousMode != "host" {
-						rollbackCtx, cancelRollback := setupRollbackContext(command.Context())
-						defer cancelRollback()
-						rolledBack, rollbackErr := client.SetupMachine(rollbackCtx, api.MachineSetupInput{
-							SetupMode: "client", DisplayName: strings.TrimSpace(name), Platform: runtime.GOOS, Architecture: runtime.GOARCH,
-							WorkspaceRoot: workspaceRoot, PublicIdentityKey: publicIdentityKey, RuntimeVersions: map[string]string{"pb": buildinfo.Version},
-						})
-						if rollbackErr == nil {
-							registration, loadErr := identityStore.Registration()
-							if loadErr == nil {
-								registration.SetupMode, registration.SetupRoles = "client", append([]string(nil), rolledBack.SetupRoles...)
-								registration.InstallationGeneration, registration.UpdatedAt = rolledBack.InstallationGeneration, time.Now().UTC()
-								rollbackErr = identityStore.SaveRegistration(registration)
-							} else {
-								rollbackErr = loadErr
-							}
-						}
-						bootstrapErr = errors.Join(bootstrapErr, rollbackErr)
-					}
-					return bootstrapErr
+					return rollbackHostFailure(exitCodeError{code: code})
 				}
 				machine, err = doctorUserMachine(command.Context(), client, machine.ID)
 				if err != nil {
-					return fmt.Errorf("verify host readiness: %w", err)
+					return rollbackHostFailure(fmt.Errorf("verify host readiness: %w", err))
 				}
 				registration, err := identityStore.Registration()
 				if err != nil {
@@ -1980,7 +2328,88 @@ func resolveSetupMode(value string, interactive bool, output io.Writer) (string,
 }
 
 func setupRollbackContext(parent context.Context) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.WithoutCancel(parent), 15*time.Second)
+	return context.WithTimeout(context.WithoutCancel(parent), 2*time.Minute)
+}
+
+func saveSetupMachineControl(ctx context.Context, client *api.Client, identityStore *identity.Store, machine api.UserMachine, keyID string) error {
+	operationID := "machine-control-" + strings.TrimPrefix(newIdempotencyKey(), "pb-")
+	controlBody, err := json.Marshal(struct {
+		OperationID string `json:"operation_id"`
+	}{operationID})
+	if err != nil {
+		return err
+	}
+	controlPath := "/v1/machines/" + machine.ID + "/control-credentials"
+	proof, err := identityStore.MachineProof(operationID, http.MethodPost, controlPath, controlBody, time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("prove machine identity: %w", err)
+	}
+	controlCredential, err := client.IssueMachineControlCredential(ctx, machine.ID, operationID, proof)
+	if err != nil {
+		return fmt.Errorf("issue machine control credential: %w", err)
+	}
+	if err := identityStore.SaveMachineControl(identity.MachineControl{
+		MachineID: machine.ID, EnvironmentID: machine.EnvironmentID,
+		InstallationGeneration: machine.InstallationGeneration, Credential: controlCredential.Credential,
+		ExpiresAt: controlCredential.ExpiresAt, KeyID: keyID,
+	}); err != nil {
+		return fmt.Errorf("save machine control credential: %w", err)
+	}
+	return nil
+}
+
+func rollbackAuthenticatedHostSetup(ctx context.Context, client *api.Client, identityStore *identity.Store, previous identity.Registration, hadPrevious bool, serverURL, stateRoot, workspaceRoot, inboxPath, displayName, publicIdentityKey string, stdin io.Reader, stdout, stderr io.Writer) error {
+	rolledBack, err := client.SetupMachine(ctx, api.MachineSetupInput{
+		SetupMode: "client", DisplayName: displayName, Platform: runtime.GOOS, Architecture: runtime.GOARCH,
+		WorkspaceRoot: workspaceRoot, PublicIdentityKey: publicIdentityKey,
+		RuntimeVersions: map[string]string{"pb": buildinfo.Version},
+	})
+	if err != nil {
+		return fmt.Errorf("restore previous Client server state: %w", err)
+	}
+	if rolledBack.SetupMode != "client" || rolledBack.ID == "" || rolledBack.EnvironmentID == "" || rolledBack.PublicIdentityKey != publicIdentityKey || rolledBack.InstallationGeneration < 1 {
+		return errors.New("restore previous Client server state: server returned mismatched machine state")
+	}
+	registration := previous
+	if !hadPrevious {
+		registration = identity.Registration{ServerURL: serverURL, PublicKeyID: identityStore.Current().ID, PublicIdentityKey: publicIdentityKey, InboxPath: inboxPath}
+	}
+	registration.ServerURL = serverURL
+	registration.MachineID = rolledBack.ID
+	registration.EnvironmentID = rolledBack.EnvironmentID
+	registration.PublicKeyID = identityStore.Current().ID
+	registration.PublicIdentityKey = publicIdentityKey
+	registration.InboxPath = inboxPath
+	registration.InstallationGeneration = rolledBack.InstallationGeneration
+	registration.SetupMode = "client"
+	registration.SetupRoles = append([]string(nil), rolledBack.SetupRoles...)
+	registration.SSHUser, registration.SSHPort = "", 0
+	registration.UpdatedAt = time.Now().UTC()
+	if err := identityStore.SaveRegistration(registration); err != nil {
+		return fmt.Errorf("restore previous Client registration: %w", err)
+	}
+	if err := saveSetupMachineControl(ctx, client, identityStore, rolledBack, identityStore.Current().ID); err != nil {
+		return fmt.Errorf("restore previous Client control credential: %w", err)
+	}
+	if rolledBack.Installation == nil {
+		return errors.New("restore previous Client service: server did not return installation material")
+	}
+	artifact := bootstrap.ArtifactTarget{
+		Schema: rolledBack.Installation.Artifact.Schema, Kind: rolledBack.Installation.Artifact.Kind,
+		Version: rolledBack.Installation.Artifact.Version, Platform: rolledBack.Installation.Artifact.Platform,
+		Architecture: rolledBack.Installation.Artifact.Architecture, RepositoryURL: rolledBack.Installation.Artifact.RepositoryURL,
+		TargetPath: rolledBack.Installation.Artifact.TargetPath,
+	}
+	if err := installSetupClientService(ctx, hostruntimecmd.ClientInstallConfig{
+		StateRoot: stateRoot, WorkspaceRoot: workspaceRoot, ControlURL: rolledBack.Installation.ControlURL,
+		MachineID: rolledBack.ID, ListenAddress: rolledBack.Installation.HelperListenAddress, Artifact: artifact,
+	}, stdin, stdout, stderr); err != nil {
+		return fmt.Errorf("restore previous Client service: %w", err)
+	}
+	if err := bootstrap.ClearResume(stateRoot); err != nil {
+		return fmt.Errorf("clear failed Host setup recovery state: %w", err)
+	}
+	return nil
 }
 
 func unpairCommand() *cobra.Command {
@@ -2609,6 +3038,7 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(hostdRuntimeCommand())
 	root.AddCommand(runtimeWorkerCommand())
 	root.AddCommand(updatedRuntimeCommand())
+	root.AddCommand(activatorRuntimeCommand())
 	root.AddCommand(windowsSSHDServiceCommand())
 	root.AddCommand(localDaemonCommand())
 	root.AddCommand(statusCommand())
@@ -2667,7 +3097,11 @@ func actionUpdateCheck(command *cobra.Command, _ []string) error {
 	if err != nil {
 		return fmt.Errorf("check with paperboat-updated: %w", err)
 	}
-	result := updateCheckResult{InstalledVersion: buildinfo.Version, LatestVersion: response.Version, UpdateAvailable: response.Version != "" && response.Version != buildinfo.Version, Verified: true}
+	available, err := signedUpdateAvailable(buildinfo.Version, response.Version)
+	if err != nil {
+		return fmt.Errorf("validate signed update version: %w", err)
+	}
+	result := updateCheckResult{InstalledVersion: buildinfo.Version, LatestVersion: response.Version, UpdateAvailable: available, Verified: true}
 	jsonOutput, _ := command.Flags().GetBool("json")
 	if jsonOutput {
 		return json.NewEncoder(command.OutOrStdout()).Encode(map[string]any{"schema_version": "1.0", "ok": true, "data": result})
@@ -2678,6 +3112,17 @@ func actionUpdateCheck(command *cobra.Command, _ []string) error {
 		fmt.Fprintf(command.OutOrStdout(), "pb %s is up to date.\n", buildinfo.Version)
 	}
 	return nil
+}
+
+func signedUpdateAvailable(installed, latest string) (bool, error) {
+	if latest == "" {
+		return false, nil
+	}
+	comparison, err := selfupdate.CompareVersions(latest, installed)
+	if err != nil {
+		return false, err
+	}
+	return comparison > 0, nil
 }
 
 type updateStatusResult struct {
@@ -2735,6 +3180,12 @@ func actionUpdate(command *cobra.Command, _ []string) error {
 	if err != nil {
 		return fmt.Errorf("update with paperboat-updated: %w", err)
 	}
+	if runtime.GOOS == "windows" && response.Pending {
+		response, err = waitForWindowsUpdateActivation(ctx, response.Version)
+		if err != nil {
+			return fmt.Errorf("wait for Paperboat Windows activation: %w", err)
+		}
+	}
 	result := updateResult{PreviousVersion: buildinfo.Version, Version: response.Version, CLIUpdated: response.Updated, RuntimeUpdated: response.Updated, SupervisorUpdated: response.Supervisor.Applied}
 	jsonOutput, _ := command.Flags().GetBool("json")
 	if jsonOutput {
@@ -2746,6 +3197,31 @@ func actionUpdate(command *cobra.Command, _ []string) error {
 	}
 	fmt.Fprintf(command.OutOrStdout(), "Updated Paperboat runtime to %s.\n", result.Version)
 	return nil
+}
+
+func waitForWindowsUpdateActivation(ctx context.Context, version string) (updated.ControlResponse, error) {
+	if version == "" {
+		return updated.ControlResponse{}, errors.New("updater returned an empty pending version")
+	}
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		client, err := updated.NewClient(updatedControlSocket(), 10*time.Second)
+		if err == nil {
+			status, statusErr := client.Status(ctx)
+			if statusErr == nil && status.ActivationFailure != "" {
+				return updated.ControlResponse{}, errors.New(status.ActivationFailure)
+			}
+			if statusErr == nil && status.Version == version && !status.Pending && status.Updated {
+				return status, nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return updated.ControlResponse{}, ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 func actionApproveMaintenance(command *cobra.Command, _ []string) error {
@@ -2762,6 +3238,13 @@ func actionApproveMaintenance(command *cobra.Command, _ []string) error {
 	response, err := client.ApproveMaintenance(ctx, release)
 	if err != nil {
 		return fmt.Errorf("approve supervisor maintenance: %w", err)
+	}
+	if runtime.GOOS == "windows" && response.Pending {
+		activated, waitErr := waitForWindowsUpdateActivation(ctx, response.Version)
+		if waitErr != nil {
+			return fmt.Errorf("wait for Paperboat Windows maintenance activation: %w", waitErr)
+		}
+		response.Version, response.Supervisor.Version, response.Supervisor.Applied, response.Supervisor.MaintenanceRequired = activated.Version, activated.Version, true, false
 	}
 	jsonOutput, _ := command.Flags().GetBool("json")
 	if jsonOutput {
@@ -4270,6 +4753,14 @@ func executeInteractiveCommand(parent *cobra.Command, args []string) error {
 	return command.ExecuteContext(parent.Context())
 }
 
+const deliveredTransferKeyCleanupWarning = "Warning: File delivery completed, but local encryption-key cleanup could not be completed.\n"
+
+func writeDeliveredTransferKeyCleanupWarning(writer io.Writer) {
+	if writer != nil {
+		_, _ = io.WriteString(writer, deliveredTransferKeyCleanupWarning)
+	}
+}
+
 func sendCommand() *cobra.Command {
 	command := &cobra.Command{
 		Use:   "send <path>... --to <machine>",
@@ -4294,6 +4785,9 @@ func sendCommand() *cobra.Command {
 			sourceMachineID, err := configuredMachineID()
 			if err != nil {
 				return err
+			}
+			if err := requireLocalDaemonService(ctx.Context, dependencies.cfg); err != nil {
+				return fmt.Errorf("prepare local peer transport: %w", err)
 			}
 			var destination api.UserMachine
 			if strings.TrimSpace(destinationRef) != "" {
@@ -4419,21 +4913,12 @@ func sendCommand() *cobra.Command {
 				if coordinatorErr != nil {
 					return coordinatorErr
 				}
-				keyBinding := transfercrypto.KeyControlBinding{OperationID: filetransfer.KeyOperationID(batchID), TransferID: batchID, Generation: 1, ExpiresAt: expiresAt}
 				peerTarget := resolver.ConnectInfo{TargetKind: "machine", ProjectID: destination.ID, MachineGeneration: uint64(destination.InstallationGeneration), Transport: string(tunnel.TerminalTransportAuto), Terminal: &resolver.TerminalTarget{EnvironmentID: destination.EnvironmentID}}
-				preparedKey, prepareErr := keyCoordinator.Prepare(ctx.Context, peerTarget, keyBinding)
-				if prepareErr != nil {
-					return prepareErr
+				uploader := &filetransfer.EncryptedUploader{
+					Client: transferClient, Keys: keyCoordinator, Target: peerTarget, Retention: retention, Generation: 1,
+					CleanupWarning: func(error) { writeDeliveredTransferKeyCleanupWarning(cobraCommand.ErrOrStderr()) },
 				}
-				defer preparedKey.Close()
-				defer preparedKey.Material.Destroy()
-				batch, err = transferClient.SendEncryptedBatch(ctx.Context, batchID, sessionID, prepared.Sources, keyBinding.Generation, preparedKey)
-				if err != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
-					_ = keyCoordinator.Erase(batchID)
-				}
-				if err == nil {
-					err = keyCoordinator.Erase(batchID)
-				}
+				batch, err = uploader.SendBatch(ctx.Context, batchID, sessionID, prepared.Sources)
 			}
 			if err != nil {
 				return err
@@ -4628,7 +5113,7 @@ func transferClientForCommand(cobraCommand *cobra.Command, args []string) (*file
 		return nil, api.UserMachine{}, friendlyCommandError(err)
 	}
 	target := &resolver.FileTransferTarget{Endpoint: descriptor.Endpoint, SourceMachineID: descriptor.SourceMachineID, DestinationMachineID: descriptor.DestinationMachineID, InitiatingUserID: descriptor.InitiatingUserID, Auth: resolver.AuthTarget{Method: descriptor.Auth.Method, Token: descriptor.Auth.Token, ExpiresAt: descriptor.Auth.ExpiresAt.UTC().Format(time.RFC3339Nano)}, Policy: descriptor.Policy}
-	client := fileTransferClientForTarget(target)
+	client := newTransferClient(target)
 	if client == nil {
 		return nil, api.UserMachine{}, errors.New("server returned an invalid file transfer descriptor")
 	}
@@ -4689,12 +5174,14 @@ func specTree(source *command.Spec, use string) *cobra.Command {
 		}
 		entry := &cobra.Command{Use: childUse, Short: child.Usage, Args: commandArgs(specCommandArgs(use, child.Name)), RunE: actionRun(child.Action)}
 		for _, configuredFlag := range child.Flags {
-			if stringFlag, ok := configuredFlag.(*command.StringFlag); ok {
-				entry.Flags().String(stringFlag.Name, "", stringFlag.Usage)
+			switch configuredFlag := configuredFlag.(type) {
+			case *command.StringFlag:
+				entry.Flags().String(configuredFlag.Name, "", configuredFlag.Usage)
+			case *command.BoolFlag:
+				entry.Flags().Bool(configuredFlag.Name, false, configuredFlag.Usage)
+			case *command.Float64Flag:
+				entry.Flags().Float64(configuredFlag.Name, 0, configuredFlag.Usage)
 			}
-		}
-		if (use == "auth" && child.Name == "status") || (use == "config" && child.Name == "show") {
-			entry.Flags().Bool("json", false, "print JSON")
 		}
 		if use == "config" && child.Name == "status" {
 			entry.Flags().Bool("json", false, "print JSON")
@@ -4710,9 +5197,6 @@ func specTree(source *command.Spec, use string) *cobra.Command {
 			entry.Flags().Bool("yes", false, "confirm removal")
 		}
 		if use == "preview" {
-			if child.Name == "list" {
-				entry.Flags().Bool("json", false, "print JSON")
-			}
 			if child.Name == "create" {
 				entry.Flags().String("name", "", "stable preview name")
 				entry.Flags().Uint("port", 0, "local target port")
@@ -4724,10 +5208,6 @@ func specTree(source *command.Spec, use string) *cobra.Command {
 				entry.Flags().Bool("detach", false, "continue after this command exits")
 				entry.Flags().Bool("json", false, "print JSON")
 			}
-			if child.Name == "revoke" {
-				entry.Flags().Bool("yes", false, "confirm removal")
-				entry.Flags().Bool("json", false, "print JSON")
-			}
 		}
 		root.AddCommand(entry)
 	}
@@ -4735,6 +5215,14 @@ func specTree(source *command.Spec, use string) *cobra.Command {
 }
 
 func specCommandArgs(parent, name string) cobra.PositionalArgs {
+	if parent == "inbox" {
+		switch name {
+		case "set":
+			return cobra.ExactArgs(1)
+		case "path", "reset":
+			return cobra.NoArgs
+		}
+	}
 	if parent == "config" {
 		switch name {
 		case "set":
@@ -5244,24 +5732,38 @@ func authLoginMode(c *command.Context, replace bool) error {
 	if err != nil {
 		return err
 	}
+	if err := store.Recover(cfg.ServerURL); err != nil {
+		return fmt.Errorf("recover interrupted Paperboat sign-in: %w", err)
+	}
 	if err := drainPendingRevocations(c.Context, cfg.ServerURL, store); err != nil {
 		fmt.Fprintln(os.Stderr, "Warning: an earlier session is still being revoked. Paperboat will retry automatically.")
 	}
 	var previous *config.Profile
+	repairProfile := false
 	if existingProfile, existingErr := store.Load(cfg.ServerURL); existingErr == nil {
 		if !replace {
 			credential, credentialErr := store.CredentialFor(cfg.ServerURL)
-			if credentialErr != nil {
-				return credentialErr
+			if credentialErr == nil {
+				identityErr := ensureCLIIdentityForLogin(c, store, existingProfile, credential)
+				if identityErr == nil {
+					if err := ensureLocalDaemonService(c.Context, cfg); err != nil {
+						return fmt.Errorf("repair local SSH integration: %w", err)
+					}
+					fmt.Fprintf(os.Stdout, "Signed in as %s\n", firstNonEmpty(existingProfile.Account.Email, existingProfile.Account.DisplayName, existingProfile.Account.ID))
+					return nil
+				}
+				if !errors.Is(identityErr, api.ErrUnauthenticated) {
+					return identityErr
+				}
+				// The local pair is readable but the server rejected it. Keep the
+				// previous profile authoritative until device authorization commits;
+				// the normal Switch path atomically replaces readable credentials.
+			} else {
+				// A profile whose credential pair is missing, corrupt, or unreadable
+				// cannot repair itself. Keep it authoritative until the replacement
+				// device authorization is fully persisted, then atomically replace it.
+				repairProfile = true
 			}
-			if err := ensureCLIIdentityForLogin(c, store, existingProfile, credential); err != nil {
-				return err
-			}
-			if err := ensureLocalDaemonService(c.Context, cfg); err != nil {
-				return fmt.Errorf("repair local SSH integration: %w", err)
-			}
-			fmt.Fprintf(os.Stdout, "Signed in as %s\n", firstNonEmpty(existingProfile.Account.Email, existingProfile.Account.DisplayName, existingProfile.Account.ID))
-			return nil
 		}
 		previous = &existingProfile
 	} else if !errors.Is(existingErr, config.ErrNoCredentials) {
@@ -5333,10 +5835,10 @@ func authLoginMode(c *command.Context, replace bool) error {
 		}
 		p := config.Profile{Issuer: cfg.ServerURL, CLIClientSessionID: tokens.CLIClientSessionID, AccessExpiresAt: expires, Account: config.Account{ID: me.ID, Email: me.Email, DisplayName: me.DisplayName}}
 		var saveErr error
-		if previous != nil {
-			saveErr = store.Switch(previous.CLIClientSessionID, p, cred)
+		if repairProfile {
+			saveErr = committedProfileMutation(store, p, cred, store.Repair(previous.CLIClientSessionID, p, cred))
 		} else {
-			saveErr = store.Save(p, cred)
+			saveErr = persistAuthorizedProfile(store, previous, p, cred)
 		}
 		if errors.Is(saveErr, config.ErrCredentialStoreUnavailable) && previous == nil && !cfg.Auth.AllowFileFallback {
 			fallbackStore, fallbackErr := fileCredentialFallback(cfg)
@@ -5366,36 +5868,17 @@ func authLoginMode(c *command.Context, replace bool) error {
 	}
 }
 
-func ensureLocalDaemonService(ctx context.Context, cfg *config.Config) error {
-	if ctx == nil || cfg == nil || strings.TrimSpace(cfg.ServerURL) == "" {
-		return localdaemon.ErrInvalidInventoryConfig
-	}
-	executable, err := os.Executable()
-	if err != nil {
-		return err
-	}
-	configPath := cfg.Path()
-	if configPath != "" {
-		configPath, err = filepath.Abs(configPath)
-		if err != nil {
-			return err
-		}
-	}
-	return installLocalDaemonService(ctx, executable, configPath, cfg.ServerURL)
-}
-
-func ensureCLIIdentity(ctx context.Context, store config.ProfileStore, profile config.Profile, credential config.Credential) error {
-	_, err := identitybootstrap.Bootstrap(ctx, identitybootstrap.Request{Store: store, Client: api.New(profile.Issuer, credential, nil), Issuer: profile.Issuer, AccountID: profile.Account.ID, CLIClientSessionID: profile.CLIClientSessionID})
-	return err
-}
-
 func ensureCLIIdentityForLogin(c *command.Context, store config.ProfileStore, profile config.Profile, credential config.Credential) error {
 	if input := strings.TrimSpace(c.String("recovery-key")); input != "" {
 		if err := importRecoveryKey(store, profile, input); err != nil {
 			return err
 		}
+		_, err := identitybootstrap.Bootstrap(c.Context, identitybootstrap.Request{Store: store, Client: api.New(profile.Issuer, credential, nil), Issuer: profile.Issuer, AccountID: profile.Account.ID, CLIClientSessionID: profile.CLIClientSessionID})
+		return err
 	}
-	return ensureCLIIdentity(c.Context, store, profile, credential)
+	client := api.New(profile.Issuer, credential, nil)
+	_, err := identitybootstrap.EnrollCLI(c.Context, identitybootstrap.CLIRequest{Store: store, Client: client, Issuer: profile.Issuer, AccountID: profile.Account.ID, CLIClientSessionID: profile.CLIClientSessionID})
+	return err
 }
 
 func importRecoveryKey(store config.ProfileStore, profile config.Profile, input string) error {
@@ -5511,10 +5994,41 @@ func cleanupIssuedSession(issuer, cliClientSessionID, refreshToken string, store
 	return nil
 }
 
+func persistAuthorizedProfile(store config.ProfileStore, previous *config.Profile, profile config.Profile, credential config.Credential) error {
+	var err error
+	if previous != nil {
+		err = store.Switch(previous.CLIClientSessionID, profile, credential)
+	} else {
+		err = store.Save(profile, credential)
+	}
+	return committedProfileMutation(store, profile, credential, err)
+}
+
+// A lock-release or post-commit cleanup failure must not make authLogin revoke
+// a newly active session. Reconcile the authoritative profile and both secret
+// values before deciding that a mutation failed.
+func committedProfileMutation(store config.ProfileStore, profile config.Profile, credential config.Credential, mutationErr error) error {
+	if mutationErr == nil {
+		return nil
+	}
+	active, err := store.Load(profile.Issuer)
+	if err != nil || active.CLIClientSessionID != profile.CLIClientSessionID {
+		return mutationErr
+	}
+	activeCredential, err := store.CredentialFor(profile.Issuer)
+	if err != nil || activeCredential.AccessToken != credential.AccessToken || activeCredential.RefreshToken != credential.RefreshToken {
+		return mutationErr
+	}
+	return nil
+}
+
 func authStatus(c *command.Context) error {
 	cfg, store, err := requireAuthConfig(c)
 	if err != nil {
 		return err
+	}
+	if err := store.Recover(cfg.ServerURL); err != nil {
+		return fmt.Errorf("recover interrupted Paperboat sign-in: %w", err)
 	}
 	p, err := store.Load(cfg.ServerURL)
 	if errors.Is(err, config.ErrNoCredentials) {
@@ -5526,6 +6040,9 @@ func authStatus(c *command.Context) error {
 	}
 	if err != nil {
 		return err
+	}
+	if _, err := store.CredentialFor(cfg.ServerURL); err != nil {
+		return fmt.Errorf("Paperboat sign-in credentials are unavailable; run `pb auth login` to repair them: %w", err)
 	}
 	if c.Bool("json") {
 		return json.NewEncoder(os.Stdout).Encode(map[string]any{"signed_in": true, "issuer": p.Issuer, "cli_client_session_id": p.CLIClientSessionID, "access_expires_at": p.AccessExpiresAt, "account": p.Account})
@@ -5539,27 +6056,18 @@ func authLogout(c *command.Context) error {
 	if err != nil {
 		return err
 	}
-	var refreshTokens []string
-	if credential, credentialErr := store.CredentialFor(cfg.ServerURL); credentialErr == nil && strings.TrimSpace(credential.RefreshToken) != "" {
-		refreshTokens = append(refreshTokens, credential.RefreshToken)
+	if err := store.Recover(cfg.ServerURL); err != nil {
+		return fmt.Errorf("recover interrupted Paperboat sign-in: %w", err)
 	}
-	if records, recordsErr := store.PendingRevocations(cfg.ServerURL); recordsErr == nil {
-		for _, record := range records {
-			credential, credentialErr := store.PendingRevocationCredential(record)
-			if credentialErr == nil && strings.TrimSpace(credential.RefreshToken) != "" {
-				refreshTokens = append(refreshTokens, credential.RefreshToken)
-			}
+	logoutCredentials, err := store.TakeLogoutCredentials(cfg.ServerURL)
+	if err != nil {
+		return fmt.Errorf("remove local Paperboat sessions: %w", err)
+	}
+	refreshTokens := make([]string, 0, len(logoutCredentials))
+	for _, credential := range logoutCredentials {
+		if strings.TrimSpace(credential.RefreshToken) != "" {
+			refreshTokens = append(refreshTokens, credential.RefreshToken)
 		}
-	}
-	if _, removeErr := store.Remove(cfg.ServerURL); removeErr != nil && !errors.Is(removeErr, config.ErrNoCredentials) {
-		// Remove may report an unreadable credential after successfully deleting
-		// the profile. Only fail when local profile metadata still exists.
-		if _, remainingErr := store.Load(cfg.ServerURL); !errors.Is(remainingErr, config.ErrNoCredentials) {
-			return fmt.Errorf("remove local Paperboat session: %w", removeErr)
-		}
-	}
-	if err := store.DiscardPendingRevocations(cfg.ServerURL); err != nil {
-		return fmt.Errorf("clear local pending revocations: %w", err)
 	}
 	if len(refreshTokens) > 0 {
 		revokeCtx, cancel := context.WithTimeout(c.Context, 2*time.Second)
@@ -6066,6 +6574,9 @@ func actionPing(command *cobra.Command, args []string) error {
 	}
 	if !machine.Online {
 		return &api.APIError{Code: "machine_offline", Message: "This machine is offline."}
+	}
+	if err := requireLocalDaemonService(command.Context(), dependencies.cfg); err != nil {
+		return fmt.Errorf("prepare local peer transport: %w", err)
 	}
 	target := resolver.ConnectInfo{TargetKind: "machine", ProjectID: machine.ID, Project: machine.DisplayName, MachineGeneration: uint64(machine.InstallationGeneration), Terminal: &resolver.TerminalTarget{Protocol: "paperboat.health-probe.v1", EnvironmentID: machine.EnvironmentID}}
 	report := pingReport{Schema: "paperboat.ping/v1", MachineID: machine.ID, MachineName: machine.DisplayName, Sent: count, Samples: make([]pingSample, 0, count)}
@@ -7153,10 +7664,14 @@ func setInboxPath(c *command.Context, path string) error {
 	return nil
 }
 
+var reconcileExpiredPreviewServicesForList = hostruntimeentry.ReconcileExpiredPreviewServices
+
+const previewListCleanupWarning = "Warning: local preview cleanup could not run; server previews are still listed, but local entries may include expired services.\n"
+
 func previewListCommand(c *command.Context) error {
 	if stateRoot := previewRuntimeStateRoot(); stateRoot != "" {
-		if err := hostruntimeentry.ReconcileExpiredPreviewServices(c.Context, stateRoot, time.Now().UTC()); err != nil {
-			return friendlyCommandError(err)
+		if err := reconcileExpiredPreviewServicesForList(c.Context, stateRoot, time.Now().UTC()); err != nil && c.ErrWriter != nil {
+			_, _ = io.WriteString(c.ErrWriter, previewListCleanupWarning)
 		}
 	}
 	privateItems := listLocalPrivateServes()
@@ -7233,52 +7748,13 @@ func listLocalPrivateServes() []localPrivateServe {
 		if err != nil {
 			continue
 		}
-		var descriptor struct {
-			Schema            string     `json:"schema"`
-			Name              string     `json:"name"`
-			BindAddress       string     `json:"bind_address"`
-			Port              uint16     `json:"port"`
-			ServiceGeneration uint64     `json:"service_generation"`
-			Indefinite        bool       `json:"indefinite"`
-			ExpiresAt         *time.Time `json:"expires_at"`
-			ServiceDefinition string     `json:"service_definition"`
-			Record            *struct {
-				OperationID   string     `json:"operation_id"`
-				ID            string     `json:"id"`
-				EnvironmentID string     `json:"environment_id"`
-				LogicalName   string     `json:"logical_name"`
-				PreviewKey    string     `json:"preview_key"`
-				URL           string     `json:"url"`
-				TargetPort    int32      `json:"target_port"`
-				State         string     `json:"state"`
-				ExpiresAt     *time.Time `json:"expires_at"`
-			} `json:"record"`
-			Serve *struct {
-				SourcePath     string `json:"source_path"`
-				SourceKind     string `json:"source_kind"`
-				SourceIdentity string `json:"source_identity"`
-				SPA            bool   `json:"spa"`
-				OwnerMode      string `json:"owner_mode"`
-				Visibility     string `json:"visibility"`
-				ListenPort     uint16 `json:"listen_port"`
-			} `json:"serve"`
-			PrivateRemote *struct {
-				MachineID         string `json:"machine_id"`
-				MachineName       string `json:"machine_name"`
-				EnvironmentID     string `json:"environment_id"`
-				MachineGeneration uint64 `json:"machine_generation"`
-				TargetPort        uint16 `json:"target_port"`
-				ListenPort        uint16 `json:"listen_port"`
-			} `json:"private_remote"`
-		}
-		decoder := json.NewDecoder(bytes.NewReader(data))
-		decoder.DisallowUnknownFields()
-		if decoder.Decode(&descriptor) != nil || decoder.Decode(&struct{}{}) != io.EOF || descriptor.Schema != "paperboat.preview-runtime/v1" || descriptor.Name == "" || descriptor.BindAddress != "127.0.0.1" || descriptor.ServiceGeneration == 0 || descriptor.Record == nil || !strings.HasPrefix(descriptor.Record.URL, "http://127.0.0.1:") {
+		descriptor, decodeErr := hostruntime.DecodePreviewRuntimeDescriptor(data)
+		if decodeErr != nil || descriptor.BindAddress != "127.0.0.1" || descriptor.ServiceGeneration == 0 || descriptor.Record == nil || !strings.HasPrefix(descriptor.Record.URL, "http://127.0.0.1:") {
 			continue
 		}
 		item := localPrivateServe{Name: descriptor.Name, URL: descriptor.Record.URL, State: descriptor.Record.State, ExpiresAt: descriptor.ExpiresAt}
 		if descriptor.Serve != nil && descriptor.PrivateRemote == nil && descriptor.Serve.Visibility == "private" && descriptor.Serve.OwnerMode == "detached" && filepath.IsAbs(descriptor.Serve.SourcePath) {
-			item.SourcePath, item.SourceKind = descriptor.Serve.SourcePath, descriptor.Serve.SourceKind
+			item.SourcePath, item.SourceKind = descriptor.Serve.SourcePath, string(descriptor.Serve.SourceKind)
 		} else if descriptor.PrivateRemote != nil && descriptor.Serve == nil && descriptor.PrivateRemote.MachineID != "" && descriptor.PrivateRemote.MachineName != "" && descriptor.PrivateRemote.EnvironmentID != "" && descriptor.PrivateRemote.MachineGeneration > 0 && descriptor.PrivateRemote.TargetPort > 0 {
 			item.SourcePath, item.SourceKind, item.Machine = fmt.Sprintf("127.0.0.1:%d", descriptor.PrivateRemote.TargetPort), "remote-port", descriptor.PrivateRemote.MachineName
 		} else {
@@ -8016,12 +8492,11 @@ func actionSSH(command *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	arguments := openSSHArguments(destination, args[1:], dash == 1)
 	environment := os.Environ()
 	if transport, _ := command.Flags().GetString("transport"); transport != "" {
 		environment = append(environment, "PAPERBOAT_TRANSPORT="+transport)
 	}
-	return (managedssh.OpenSSHExecutor{}).Execute("ssh", arguments, environment)
+	return executeManagedSSH(command, ctx, machine, destination, args[1:], dash == 1, environment)
 }
 
 func resolveSSHRequestedUser(targetUser, flagUser string) (string, error) {
@@ -8040,13 +8515,7 @@ func resolveSSHRequestedUser(targetUser, flagUser string) (string, error) {
 }
 
 func openSSHArguments(destination managedssh.Destination, passthrough []string, includePassthrough bool) []string {
-	arguments := []string{
-		"-o", "BatchMode=yes",
-		"-o", "IdentitiesOnly=yes",
-		"-o", "PreferredAuthentications=publickey",
-		"-o", "PasswordAuthentication=no",
-		"-o", "KbdInteractiveAuthentication=no",
-	}
+	arguments := openSSHSecurityArguments()
 	if destination.Port != 22 {
 		arguments = append(arguments, "-p", strconv.Itoa(int(destination.Port)))
 	}
@@ -8055,6 +8524,16 @@ func openSSHArguments(destination managedssh.Destination, passthrough []string, 
 		arguments = append(arguments, passthrough...)
 	}
 	return arguments
+}
+
+func openSSHSecurityArguments() []string {
+	return []string{
+		"-o", "BatchMode=yes",
+		"-o", "IdentitiesOnly=yes",
+		"-o", "PreferredAuthentications=publickey",
+		"-o", "PasswordAuthentication=no",
+		"-o", "KbdInteractiveAuthentication=no",
+	}
 }
 
 func actionSSHProxy(command *cobra.Command, _ []string) error {
@@ -8257,7 +8736,7 @@ func actionSSHDoctor(command *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	agentSocket := filepath.Join(paths.RuntimeRoot, "paperboat-ssh-agent.sock")
+	agentSocket := managedssh.InstalledAgentSocket(paths.RuntimeRoot)
 	if err := managedssh.ValidateInstalledOpenSSHConfig(home, uint32(os.Geteuid()), managedssh.AliasSuffix, agentSocket); err != nil {
 		return fmt.Errorf("managed OpenSSH configuration is not ready; rerun `pb auth login`: %w", err)
 	}
@@ -8493,6 +8972,9 @@ func actionRemoteExec(c *command.Context, requested string, request tunnel.ExecR
 	sourceMachineID, err := configuredMachineID()
 	if err != nil {
 		return fail(255, "source_identity_unavailable", false, false, err)
+	}
+	if err := requireLocalDaemonService(c.Context, d.cfg); err != nil {
+		return fail(255, "local_transport_unavailable", false, false, fmt.Errorf("prepare local peer transport: %w", err))
 	}
 	client.SetSourceMachineID(sourceMachineID)
 	machine, warm := resolveWarmUserMachine(c.Context, requested)
@@ -8795,26 +9277,7 @@ func actionRemoteExec(c *command.Context, requested string, request tunnel.ExecR
 }
 
 func remoteAbsolutePath(platform, workspaceRoot, path string) bool {
-	windowsTarget := strings.EqualFold(strings.TrimSpace(platform), "windows") || strings.TrimSpace(platform) == "" && windowsAbsolutePath(workspaceRoot)
-	if !windowsTarget {
-		return filepath.IsAbs(path)
-	}
-	return windowsAbsolutePath(path)
-}
-
-func windowsAbsolutePath(path string) bool {
-	if strings.ContainsAny(path, "\x00\r\n") || path == "" || strings.TrimSpace(path) != path {
-		return false
-	}
-	path = strings.ReplaceAll(path, "/", `\`)
-	if len(path) >= 3 && ((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) && path[1] == ':' && path[2] == '\\' {
-		return true
-	}
-	if strings.HasPrefix(path, `\\`) {
-		parts := strings.Split(path[2:], `\`)
-		return len(parts) >= 2 && parts[0] != "" && parts[1] != ""
-	}
-	return false
+	return remotepath.AbsoluteForTarget(platform, workspaceRoot, path)
 }
 
 func finishExecResult(stdout, stderr io.Writer, operationID string, jsonOutput, sawTerminalEvent bool, code int, err error) error {
@@ -9078,6 +9541,9 @@ func actionCodex(c *command.Context) error {
 	}
 	if err != nil {
 		return err
+	}
+	if err := requireCodexLocalDaemonForPlatform(c.Context, d.cfg, runtime.GOOS, requireLocalDaemonService); err != nil {
+		return fmt.Errorf("prepare local peer transport: %w", err)
 	}
 	backend := api.New(d.cfg.ServerURL, credential, nil)
 	requested := c.Args().First()
@@ -9898,6 +10364,8 @@ func fileTransferClientForTarget(target *resolver.FileTransferTarget) *filetrans
 	}
 	return transferClient
 }
+
+var newTransferClient = fileTransferClientForTarget
 
 func localFileTransferSenderFromEnvironment() (*filetransfer.LocalSender, error) {
 	endpoint := strings.TrimSpace(os.Getenv("PAPERBOAT_FILE_TRANSFER_STAGING_ENDPOINT"))
@@ -11047,44 +11515,13 @@ func inspectLocalPreviewDescriptors(report *localDoctorReport, directory string,
 			report.InvalidPreviews++
 			continue
 		}
-		var descriptor struct {
-			Schema            string          `json:"schema"`
-			Name              string          `json:"name"`
-			BindAddress       string          `json:"bind_address"`
-			Port              uint16          `json:"port"`
-			ServiceGeneration uint64          `json:"service_generation"`
-			Indefinite        bool            `json:"indefinite"`
-			ExpiresAt         *time.Time      `json:"expires_at"`
-			ServiceDefinition string          `json:"service_definition"`
-			Record            json.RawMessage `json:"record"`
-			PrivateRemote     *struct {
-				MachineID         string `json:"machine_id"`
-				MachineName       string `json:"machine_name"`
-				EnvironmentID     string `json:"environment_id"`
-				MachineGeneration uint64 `json:"machine_generation"`
-				TargetPort        uint16 `json:"target_port"`
-				ListenPort        uint16 `json:"listen_port,omitempty"`
-			} `json:"private_remote"`
-			Serve *struct {
-				SourcePath     string              `json:"source_path"`
-				SourceKind     servepkg.SourceKind `json:"source_kind"`
-				SourceIdentity string              `json:"source_identity"`
-				SPA            bool                `json:"spa"`
-				OwnerMode      string              `json:"owner_mode"`
-				Visibility     string              `json:"visibility"`
-			} `json:"serve"`
-		}
-		decoder := json.NewDecoder(io.LimitReader(file, 64<<10))
-		decoder.DisallowUnknownFields()
-		decodeErr := decoder.Decode(&descriptor)
-		var extra any
-		extraErr := decoder.Decode(&extra)
-		file.Close()
+		data, readErr := io.ReadAll(io.LimitReader(file, (64<<10)+1))
+		closeErr := file.Close()
+		descriptor, decodeErr := hostruntime.DecodePreviewRuntimeDescriptor(data)
 		validPreview := descriptor.Serve == nil && descriptor.PrivateRemote == nil && descriptor.Port != 0
-		validRemote := descriptor.Serve == nil && descriptor.PrivateRemote != nil && descriptor.BindAddress == "127.0.0.1" && descriptor.ServiceGeneration > 0 && descriptor.PrivateRemote.MachineID != "" && descriptor.PrivateRemote.MachineName != "" && descriptor.PrivateRemote.EnvironmentID != "" && descriptor.PrivateRemote.MachineGeneration > 0 && descriptor.PrivateRemote.TargetPort != 0
-		validServe := descriptor.BindAddress == "127.0.0.1" && descriptor.ServiceGeneration > 0 && descriptor.Serve != nil && filepath.IsAbs(descriptor.Serve.SourcePath) && descriptor.Serve.SourceIdentity != "" && descriptor.Serve.OwnerMode == "detached" && (descriptor.Serve.Visibility == "private" || descriptor.Serve.Visibility == "public") &&
-			(descriptor.Serve.SourceKind == servepkg.SourceFile || descriptor.Serve.SourceKind == servepkg.SourceDirectory) && (!descriptor.Serve.SPA || descriptor.Serve.SourceKind == servepkg.SourceDirectory)
-		if decodeErr != nil || extraErr != io.EOF || descriptor.Schema != "paperboat.preview-runtime/v1" || !validPreview && !validServe && !validRemote || descriptor.Name == "" || descriptor.Indefinite == (descriptor.ExpiresAt != nil) {
+		validRemote := descriptor.Serve == nil && descriptor.PrivateRemote != nil
+		validServe := descriptor.Serve != nil
+		if readErr != nil || closeErr != nil || len(data) > 64<<10 || decodeErr != nil || !validPreview && !validServe && !validRemote {
 			report.InvalidPreviews++
 			continue
 		}

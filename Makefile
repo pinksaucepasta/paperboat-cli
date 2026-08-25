@@ -15,10 +15,11 @@ GOFMT       := $(GO_ROOT)/bin/gofmt
 GO_FILES    := $(shell find . -path ./.git -prune -o -name '*.go' -print)
 LDFLAGS     := -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Version=$(VERSION) -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Commit=$(COMMIT) -X github.com/pinksaucepasta/paperboat/internal/buildinfo.ProtocolVersion=$(PROTOCOL_VERSION) -X github.com/pinksaucepasta/paperboat/internal/buildinfo.DefaultReleaseURL=$(DEFAULT_RELEASE_URL)
 
-.PHONY: binary-size-check build check clean complete container-compose-check contracts cross-build dependencies fmt fmt-check fuzz generate generate-check hosted-image-check install license-check lint metrics-check metrics-generate preflight race release-metadata reproducible-builds source-policy static-analysis test tidy tidy-check uninstall verification verify-toolchain vet vulnerability-check
+.PHONY: binary-size-check build check clean codex-manifest-check codex-manifest-generate complete container-compose-check contracts cross-build dependencies fmt fmt-check fuzz generate generate-check hosted-image-check install license-check lint metrics-check metrics-generate preflight race release-metadata reproducible-builds source-policy static-analysis test tidy tidy-check uninstall verification verify-toolchain vet vulnerability-check
 
 contracts:
 	@./testdata/contracts/validate.sh
+	@./tools/test-release-version.sh
 
 dependencies:
 	@./tools/verify-peer-dependencies.sh
@@ -108,10 +109,27 @@ fmt-check:
 
 generate:
 	$(GO) run github.com/sqlc-dev/sqlc/cmd/sqlc@$(SQLC_VERSION) generate
-	$(GO) generate ./...
+
+codex-manifest-generate:
+	@test -n "$(CODEX_SOURCE)" || { echo 'CODEX_SOURCE must point to the pinned official openai/codex checkout' >&2; exit 1; }
+	$(GO) run ./tools/codex-path-manifest -source "$(CODEX_SOURCE)" -output internal/codexsession/codex_path_manifest_0_149_1.json
+
+codex-manifest-check:
+	@test -n "$(CODEX_SOURCE)" || { echo 'CODEX_SOURCE must point to the pinned official openai/codex checkout' >&2; exit 1; }
+	@temporary="$$(mktemp "$${TMPDIR:-/tmp}/paperboat-codex-manifest.XXXXXX")"; \
+		trap 'rm -f "$$temporary"' EXIT; \
+		$(GO) run ./tools/codex-path-manifest -source "$(CODEX_SOURCE)" -output "$$temporary"; \
+		cmp -s "$$temporary" internal/codexsession/codex_path_manifest_0_149_1.json || { \
+			echo 'Codex path manifest is stale; run make codex-manifest-generate CODEX_SOURCE=/path/to/openai/codex' >&2; \
+			diff -u internal/codexsession/codex_path_manifest_0_149_1.json "$$temporary"; \
+			exit 1; \
+		}
 
 generate-check:
-	@before="$$(git diff -- internal/hostruntime/store/storesqlc)"; $(MAKE) generate >/dev/null; test "$$(git diff -- internal/hostruntime/store/storesqlc)" = "$$before" || { echo "generated sqlc output is stale; run make generate" >&2; git diff -- internal/hostruntime/store/storesqlc; exit 1; }
+	@before="$$(git diff -- internal/hostruntime/store/storesqlc)"; \
+		$(MAKE) generate >/dev/null || exit $$?; \
+		test "$$(git diff -- internal/hostruntime/store/storesqlc)" = "$$before" || { echo "generated sqlc output is stale; run make generate" >&2; git diff -- internal/hostruntime/store/storesqlc; exit 1; }
+	@$(GO) test ./internal/codexsession -run '^TestCodexPathManifestHasPinnedCompleteCoverage$$' -count=1
 
 lint: fmt-check vet
 
@@ -132,6 +150,7 @@ verification: complete fuzz reproducible-builds static-analysis vulnerability-ch
 # remain separate workflow/integration gates.
 preflight:
 	@$(MAKE) check
+	@$(MAKE) codex-manifest-check
 	@$(MAKE) race
 	@$(MAKE) cross-build
 	@./packaging/windows/scripts/validate-release-pipeline.sh

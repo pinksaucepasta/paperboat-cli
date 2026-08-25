@@ -610,6 +610,60 @@ func (s *Service) PublishedPath(ctx context.Context, id string) (string, error) 
 	return path, nil
 }
 
+// ExistingPublishedPath resolves the already-published destination without
+// creating or repairing any filesystem entry. Status requests use this path so
+// a read-only inspection can report the exact collision-resolved Inbox name.
+func (s *Service) ExistingPublishedPath(ctx context.Context, id string) (string, error) {
+	transfer, err := s.config.Store.FileTransfer(ctx, id)
+	if err != nil {
+		return "", &Error{Code: InvalidPath, Cause: err}
+	}
+	if transfer.DestinationMachineID != s.config.LocalMachineID || transfer.State != "published" {
+		return "", &Error{Code: InvalidPath}
+	}
+	contentInfo, err := os.Stat(s.contentPath(id))
+	if err != nil {
+		return "", &Error{Code: StorageUnavailable, Cause: err}
+	}
+	if s.config.PublishRoot == "" {
+		path := s.publishedPath(transfer)
+		matches, matchErr := publishedFileMatches(contentInfo, path)
+		if matchErr != nil {
+			return "", &Error{Code: StorageUnavailable, Cause: matchErr}
+		}
+		if !matches {
+			return "", &Error{Code: InvalidPath}
+		}
+		return path, nil
+	}
+	root := filepath.Clean(s.config.PublishRoot)
+	if !filepath.IsAbs(root) || root != s.config.PublishRoot {
+		return "", &Error{Code: StorageUnavailable, Cause: errors.New("publish root is invalid")}
+	}
+	for index := 1; index <= 10000; index++ {
+		path := filepath.Join(root, publishedName(transfer.Basename, index))
+		matches, matchErr := publishedFileMatches(contentInfo, path)
+		if matchErr != nil {
+			return "", &Error{Code: StorageUnavailable, Cause: matchErr}
+		}
+		if matches {
+			return path, nil
+		}
+	}
+	return "", &Error{Code: InvalidPath}
+}
+
+func publishedFileMatches(contentInfo os.FileInfo, path string) (bool, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 && os.SameFile(contentInfo, info), nil
+}
+
 func (s *Service) publishToRoot(contentPath string, transfer store.FileTransfer) (string, error) {
 	root := filepath.Clean(s.config.PublishRoot)
 	if !filepath.IsAbs(root) || root != s.config.PublishRoot {
@@ -625,14 +679,8 @@ func (s *Service) publishToRoot(contentPath string, transfer store.FileTransfer)
 	if err != nil {
 		return "", &Error{Code: StorageUnavailable, Cause: err}
 	}
-	extension := filepath.Ext(transfer.Basename)
-	stem := strings.TrimSuffix(transfer.Basename, extension)
 	for index := 1; index <= 10000; index++ {
-		name := transfer.Basename
-		if index > 1 {
-			name = fmt.Sprintf("%s (%d)%s", stem, index, extension)
-		}
-		path := filepath.Join(root, name)
+		path := filepath.Join(root, publishedName(transfer.Basename, index))
 		info, statErr := os.Lstat(path)
 		if statErr == nil {
 			if info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 && os.SameFile(contentInfo, info) {
@@ -655,6 +703,15 @@ func (s *Service) publishToRoot(contentPath string, transfer store.FileTransfer)
 		return path, nil
 	}
 	return "", &Error{Code: StorageUnavailable, Cause: errors.New("inbox name collision limit reached")}
+}
+
+func publishedName(basename string, index int) string {
+	if index <= 1 {
+		return basename
+	}
+	extension := filepath.Ext(basename)
+	stem := strings.TrimSuffix(basename, extension)
+	return fmt.Sprintf("%s (%d)%s", stem, index, extension)
 }
 func (s *Service) Cancel(ctx context.Context, id string) error {
 	transfer, err := s.config.Store.FileTransfer(ctx, id)

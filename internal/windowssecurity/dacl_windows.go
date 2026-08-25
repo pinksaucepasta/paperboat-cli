@@ -18,27 +18,71 @@ func ProtectedDACLMatches(path, expected string) bool {
 	if err != nil || got == nil {
 		return false
 	}
+	return protectedDACLMatches(got, expected)
+}
+
+// ProtectedHandleDACLMatches performs the same exact DACL check through an
+// already trusted open handle, so callers do not re-resolve an attacker-
+// replaceable path while establishing an object's security.
+func ProtectedHandleDACLMatches(handle windows.Handle, expected string) bool {
+	got, err := windows.GetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+	if err != nil || got == nil {
+		return false
+	}
+	return protectedDACLMatches(got, expected)
+}
+
+func protectedDACLMatches(got *windows.SECURITY_DESCRIPTOR, expected string) bool {
 	control, _, err := got.Control()
 	if err != nil || control&windows.SE_DACL_PROTECTED == 0 {
 		return false
 	}
 	actual := dacl(got.String())
-	if actual == dacl(expected) {
+	expectedDACL := dacl(expected)
+	if actual == expectedDACL {
 		return true
 	}
-	token, err := windows.OpenCurrentProcessToken()
+	userSID, err := CurrentEffectiveUserSID()
 	if err != nil {
 		return false
 	}
-	defer token.Close()
-	user, err := token.GetTokenUser()
-	if err != nil || user == nil || user.User.Sid == nil {
+	return daclMatchesLocalAdministratorAlias(actual, expectedDACL, userSID.String())
+}
+
+func daclMatchesLocalAdministratorAlias(actual, expected, userSID string) bool {
+	if !strings.HasSuffix(userSID, "-500") {
 		return false
 	}
-	if !strings.HasSuffix(user.User.Sid.String(), "-500") {
+	return actual == strings.ReplaceAll(expected, userSID, "LA")
+}
+
+// OwnerMatchesSID rejects attacker-owned filesystem objects even when their
+// current DACL text matches the expected protected ACL. A Windows owner can
+// restore WRITE_DAC and replace a machine-scope DPAPI credential later.
+func OwnerMatchesSID(path string, expected *windows.SID) bool {
+	if expected == nil || !expected.IsValid() {
 		return false
 	}
-	return actual == dacl(strings.Replace(expected, user.User.Sid.String(), "LA", 1))
+	descriptor, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION)
+	if err != nil || descriptor == nil {
+		return false
+	}
+	owner, _, err := descriptor.Owner()
+	return err == nil && owner != nil && owner.Equals(expected)
+}
+
+// HandleOwnerMatchesSID validates ownership without resolving a filesystem
+// path after the object has been opened.
+func HandleOwnerMatchesSID(handle windows.Handle, expected *windows.SID) bool {
+	if expected == nil || !expected.IsValid() {
+		return false
+	}
+	descriptor, err := windows.GetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION)
+	if err != nil || descriptor == nil {
+		return false
+	}
+	owner, _, err := descriptor.Owner()
+	return err == nil && owner != nil && owner.Equals(expected)
 }
 
 func dacl(value string) string {

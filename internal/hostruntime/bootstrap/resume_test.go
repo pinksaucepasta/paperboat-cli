@@ -173,3 +173,81 @@ func TestRecoveredMaterialCannotChangeBoundMachine(t *testing.T) {
 		t.Fatalf("changed machine error=%v", err)
 	}
 }
+
+func TestAuthenticatedHostSetupResumeReusesLiveAndReplacesOnlyExactExpiredEmptyJournal(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	server := "https://api.example.test"
+	publicKey := base64.RawURLEncoding.EncodeToString(make([]byte, 32))
+	first, err := PrepareAuthenticatedSetupResume(root, server, publicKey, "Victus", "mch_1", 7, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := PrepareAuthenticatedSetupResume(root, server, publicKey, "Victus", "mch_1", 7, now.Add(time.Minute))
+	if err != nil || second.Verifier != first.Verifier || second.SetupOperationID != first.SetupOperationID {
+		t.Fatalf("live authenticated resume=%+v err=%v, first=%+v", second, err, first)
+	}
+	if err := ClearResume(root); err != nil {
+		t.Fatal(err)
+	}
+	legacy := NewResumeRecord(server, publicKey, "", "Victus", "host", "legacy-verifier-01234567890123456789", now.Add(-time.Minute))
+	legacy.PairingStarted = true
+	if err := SaveResume(root, legacy); err != nil {
+		t.Fatal(err)
+	}
+	replaced, err := PrepareAuthenticatedSetupResume(root, server, publicKey, "Victus", "mch_1", 7, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !replaced.AuthenticatedSetup || replaced.Verifier == legacy.Verifier || replaced.ExpectedUserMachineID != "mch_1" || replaced.ExpectedGeneration != 7 {
+		t.Fatalf("replacement=%+v", replaced)
+	}
+	if err := ClearResume(root); err != nil {
+		t.Fatal(err)
+	}
+	legacy.DisplayName = "Other"
+	if err := SaveResume(root, legacy); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PrepareAuthenticatedSetupResume(root, server, publicKey, "Victus", "mch_1", 7, now); !errors.Is(err, ErrResumeBinding) {
+		t.Fatalf("mismatched stale journal error=%v", err)
+	}
+	loaded, err := loadResumeDocument(root)
+	if err != nil || loaded.Verifier != legacy.Verifier {
+		t.Fatalf("mismatched journal was changed: %+v err=%v", loaded, err)
+	}
+	if err := ClearResume(root); err != nil {
+		t.Fatal(err)
+	}
+	first.PairingExpiresAt = now.Add(-time.Minute)
+	if err := SaveResume(root, first); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PrepareAuthenticatedSetupResume(root, server, publicKey, "Victus", "mch_2", 8, now); !errors.Is(err, ErrResumeBinding) {
+		t.Fatalf("mismatched authenticated journal error=%v", err)
+	}
+	loaded, err = loadResumeDocument(root)
+	if err != nil || loaded.Verifier != first.Verifier || loaded.ExpectedUserMachineID != "mch_1" || loaded.ExpectedGeneration != 7 {
+		t.Fatalf("mismatched authenticated journal was changed: %+v err=%v", loaded, err)
+	}
+}
+
+func TestAuthenticatedHostSetupMaterialCannotChangeMachineGenerationOrVerifiedArtifact(t *testing.T) {
+	record := ResumeRecord{AuthenticatedSetup: true, ExpectedUserMachineID: "mch_1", ExpectedGeneration: 7}
+	artifact := &ArtifactTarget{Schema: ArtifactTargetSchemaV1, Kind: ArtifactKindPB, Version: "2026.08.24.1", Platform: "windows", Architecture: "amd64", RepositoryURL: "https://updates.example.test/paperboat", TargetPath: "pb-windows-amd64"}
+	material := Material{UserMachineID: "mch_1", UserMachineEnrollmentID: "ump_1", EnvironmentID: "env_1", ControlURL: "https://api.example.test", HelperID: "helper_1", InstallationGeneration: 7, SetupMode: "host", Artifact: artifact}
+	if err := ValidateAuthenticatedSetupMaterial(record, material); err != nil {
+		t.Fatal(err)
+	}
+	record.Material = &material
+	changed := material
+	changed.Artifact = &ArtifactTarget{Schema: artifact.Schema, Kind: artifact.Kind, Version: "2026.08.24.2", Platform: artifact.Platform, Architecture: artifact.Architecture, RepositoryURL: artifact.RepositoryURL, TargetPath: artifact.TargetPath}
+	if err := ValidateAuthenticatedSetupMaterial(record, changed); !errors.Is(err, ErrResumeBinding) {
+		t.Fatalf("changed artifact error=%v", err)
+	}
+	changed = material
+	changed.InstallationGeneration++
+	if err := ValidateAuthenticatedSetupMaterial(record, changed); !errors.Is(err, ErrResumeBinding) {
+		t.Fatalf("changed generation error=%v", err)
+	}
+}

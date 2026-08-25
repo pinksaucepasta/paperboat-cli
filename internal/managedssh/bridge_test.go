@@ -206,6 +206,57 @@ func TestBridgeSSHPreservesBinaryBytesAndHalfClose(t *testing.T) {
 	}
 }
 
+func TestBridgeSSHRemoteCloseTerminatesWithClientInputOpen(t *testing.T) {
+	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	response := []byte("command-output-before-close")
+	serverDone := make(chan error, 1)
+	go func() {
+		connection, acceptErr := listener.AcceptTCP()
+		if acceptErr != nil {
+			serverDone <- acceptErr
+			return
+		}
+		_, writeErr := connection.Write(response)
+		serverDone <- errors.Join(writeErr, connection.Close())
+	}()
+
+	bridgeSide, clientSide := tcpPair(t)
+	defer clientSide.Close()
+	bridgeDone := make(chan struct {
+		result BridgeResult
+		err    error
+	}, 1)
+	go func() {
+		result, bridgeErr := BridgeSSH(t.Context(), bridgeSide, LoopbackTarget{Host: "127.0.0.1", Port: uint16(listener.Addr().(*net.TCPAddr).Port)}, time.Second)
+		bridgeDone <- struct {
+			result BridgeResult
+			err    error
+		}{result, bridgeErr}
+	}()
+	if err := clientSide.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	output, err := io.ReadAll(clientSide)
+	if err != nil || !bytes.Equal(output, response) {
+		t.Fatalf("output=%q error=%v", output, err)
+	}
+	select {
+	case bridged := <-bridgeDone:
+		if bridged.err != nil || bridged.result.ToSSHD != 0 || bridged.result.FromSSHD != int64(len(response)) {
+			t.Fatalf("bridge=%+v error=%v", bridged.result, bridged.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("bridge waited for client input after target EOF")
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestBridgeSSHBackpressurePreservesOrder(t *testing.T) {
 	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.ParseIP("127.0.0.1")})
 	if err != nil {

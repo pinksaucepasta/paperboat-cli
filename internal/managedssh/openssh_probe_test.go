@@ -48,6 +48,9 @@ func TestIsolatedOpenSSHProbeEnvironmentDoesNotInheritUserState(t *testing.T) {
 		if !ok {
 			t.Fatalf("invalid environment entry %q", value)
 		}
+		if runtime.GOOS == "windows" {
+			name = strings.ToUpper(name)
+		}
 		values[name] = content
 	}
 	if values["HOME"] == "/real/home" || values["USERPROFILE"] == `C:\\Users\\real` {

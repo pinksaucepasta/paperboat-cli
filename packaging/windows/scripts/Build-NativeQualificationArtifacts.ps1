@@ -93,8 +93,12 @@ function Build-Payload {
     $launcher = Join-Path $PayloadDirectory 'pb-launcher.exe'
     Invoke-GoBuild -Output $cli -Package './cmd/pb' -LdFlags $ldflags
     Invoke-GoBuild -Output $launcher -Package './cmd/pb-launcher' -LdFlags $ldflags
-    foreach ($role in @('paperboat-runtime.exe', 'paperboat-hostd.exe', 'paperboat-updater.exe')) {
-        Copy-Item -LiteralPath $cli -Destination (Join-Path $PayloadDirectory $role)
+    foreach ($role in @(
+        @{ File = 'paperboat-runtime.exe'; Value = 'runtime' },
+        @{ File = 'paperboat-hostd.exe'; Value = 'hostd' },
+        @{ File = 'paperboat-updater.exe'; Value = 'updater' }
+    )) {
+        Invoke-GoBuild -Output (Join-Path $PayloadDirectory $role.File) -Package './cmd/pb' -LdFlags "$ldflags -X github.com/pinksaucepasta/paperboat/internal/buildinfo.WindowsArtifactRole=$($role.Value)"
     }
 }
 
@@ -151,13 +155,40 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Upgrade qualification MSI build failed.' }
     $fixture = Join-Path $outputRoot 'paperboat-windows-service-fixture.exe'
     Invoke-GoBuild -Output $fixture -Package './packaging/windows/e2e/service-fixture'
+    $s4uFixture = Join-Path $outputRoot 'paperboat-windows-s4u-fixture.exe'
+    Invoke-GoBuild -Output $s4uFixture -Package './internal/hostruntime/service/testdata/s4u-fixture'
+    $s4uTest = Join-Path $outputRoot 'paperboat-windows-s4u.test.exe'
+    & go test -c -buildvcs=false -trimpath -tags paperboat_native_e2e -o $s4uTest ./internal/hostruntime/service
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $s4uTest -PathType Leaf)) {
+        throw 'Native Windows S4U qualification test failed to compile.'
+    }
+    $hostinstallTest = Join-Path $outputRoot 'paperboat-windows-hostinstall.test.exe'
+    & go test -c -buildvcs=false -trimpath -tags paperboat_native_e2e -o $hostinstallTest ./internal/hostruntime/hostinstall
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $hostinstallTest -PathType Leaf)) {
+        throw 'Native Windows host-install qualification test failed to compile.'
+    }
+    $msiCleanupTest = Join-Path $outputRoot 'paperboat-windows-msi-cleanup.test.exe'
+    & go test -c -buildvcs=false -trimpath -tags paperboat_native_e2e -o $msiCleanupTest ./cmd/pb
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $msiCleanupTest -PathType Leaf)) {
+        throw 'Native Windows MSI cleanup qualification test failed to compile.'
+    }
+    $nativeTest = Join-Path $outputRoot 'paperboat-windows-native-e2e.test.exe'
+    & go test -c -buildvcs=false -trimpath -tags paperboat_native_e2e -o $nativeTest ./packaging/windows/e2e
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $nativeTest -PathType Leaf)) {
+        throw 'Native Windows end-to-end qualification test failed to compile.'
+    }
     $payloads = @(
         (Join-Path $stageRoot 'upgrade\pb.exe'),
         (Join-Path $stageRoot 'upgrade\pb-launcher.exe'),
         (Join-Path $stageRoot 'upgrade\paperboat-runtime.exe'),
         (Join-Path $stageRoot 'upgrade\paperboat-hostd.exe'),
         (Join-Path $stageRoot 'upgrade\paperboat-updater.exe'),
-        $fixture
+        $fixture,
+        $s4uFixture,
+        $s4uTest,
+        $hostinstallTest,
+        $msiCleanupTest,
+        $nativeTest
     )
     if ([string]::IsNullOrWhiteSpace($FreshMsiPath)) {
         $payloads = @(
@@ -191,6 +222,11 @@ $manifest = [ordered]@{
     fresh_msi = $freshMsi
     upgrade_msi = $upgradeMsi
     service_fixture = (Join-Path $outputRoot 'paperboat-windows-service-fixture.exe')
+    s4u_fixture = $s4uFixture
+    s4u_test_executable = $s4uTest
+    hostinstall_test_executable = $hostinstallTest
+    msi_cleanup_test_executable = $msiCleanupTest
+    native_test_executable = $nativeTest
     wix_version = '5.0.2'
     authenticode_status = 'not_present'
     signing_required_for_release = $false
@@ -204,6 +240,11 @@ if ($env:GITHUB_ENV) {
         "PAPERBOAT_WINDOWS_E2E_MSI=$freshMsi",
         "PAPERBOAT_WINDOWS_E2E_UPGRADE_MSI=$upgradeMsi",
         "PAPERBOAT_WINDOWS_E2E_SERVICE_FIXTURE=$(Join-Path $outputRoot 'paperboat-windows-service-fixture.exe')",
+        "PAPERBOAT_WINDOWS_E2E_S4U_FIXTURE=$s4uFixture",
+        "PAPERBOAT_WINDOWS_E2E_S4U_TEST=$s4uTest",
+        "PAPERBOAT_WINDOWS_E2E_HOSTINSTALL_TEST=$hostinstallTest",
+        "PAPERBOAT_WINDOWS_E2E_MSI_CLEANUP_TEST=$msiCleanupTest",
+        "PAPERBOAT_WINDOWS_E2E_NATIVE_TEST=$nativeTest",
         "PAPERBOAT_WINDOWS_E2E_OUTPUT=$outputRoot"
     ) | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 }

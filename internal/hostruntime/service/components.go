@@ -57,12 +57,12 @@ func ComponentController(platform, kind string, enrolledUID int, runner Runner) 
 	return nil, ErrInvalidDefinition
 }
 
-// NewHostdInstaller defines the durable, unprivileged host supervisor. It is
-// intentionally a system service on Linux and a LaunchDaemon that drops to the
-// enrolled account on macOS: it must outlive individual terminal clients, but
-// must never run live user workloads as root.
+// NewHostdInstaller defines the durable host supervisor. It is intentionally a
+// system service on Linux and a LaunchDaemon that drops to the enrolled account
+// on macOS. Explicit root enrollments remain root for compatibility; an
+// ordinary enrolled account can never be widened to root here.
 func NewHostdInstaller(config ComponentConfig) (*Installer, error) {
-	if err := config.Layout.Validate(); err != nil || config.User == "root" || config.UID <= 0 || !filepath.IsAbs(config.HostdTokenFile) {
+	if err := config.Layout.Validate(); err != nil || !validEnrolledIdentity(config.User, config.Group, config.UID, config.GID) || !filepath.IsAbs(config.HostdTokenFile) {
 		return nil, ErrInvalidDefinition
 	}
 	environment := copyEnvironment(config.Environment)
@@ -81,7 +81,7 @@ func NewHostdInstaller(config ComponentConfig) (*Installer, error) {
 // stage and activate signed artifacts. It never receives a shell command or
 // arbitrary path from a caller.
 func NewUpdaterInstaller(config ComponentConfig) (*Installer, error) {
-	if err := config.Layout.Validate(); err != nil || config.UID <= 0 || config.GID < 0 || !filepath.IsAbs(config.HostdTokenFile) || strings.TrimSpace(config.ReleaseRepository) == "" || strings.TrimSpace(config.MachineID) == "" || strings.TrimSpace(config.HealthURL) == "" {
+	if err := config.Layout.Validate(); err != nil || !validEnrolledIdentity(config.User, config.Group, config.UID, config.GID) || !filepath.IsAbs(config.HostdTokenFile) || strings.TrimSpace(config.ReleaseRepository) == "" || strings.TrimSpace(config.MachineID) == "" || strings.TrimSpace(config.HealthURL) == "" {
 		return nil, ErrInvalidDefinition
 	}
 	group := "root"
@@ -112,6 +112,13 @@ func NewUpdaterInstaller(config ComponentConfig) (*Installer, error) {
 		User: "root", Group: group, Arguments: []string{"serve"}, Environment: environment,
 		UpgradeMode: UpgradeReload, Controller: config.Controller,
 	})
+}
+
+func validEnrolledIdentity(user, group string, uid, gid int) bool {
+	if uid == 0 || gid == 0 {
+		return user == "root" && (group == "root" || group == "wheel") && uid == 0 && gid == 0
+	}
+	return user != "" && user != "root" && group != "" && group != "root" && group != "wheel" && uid > 0 && gid > 0
 }
 
 func updaterControlSocket(platform string) string {

@@ -48,9 +48,10 @@ type machineInstall struct {
 }
 
 type component struct {
-	ID   string `json:"id"`
-	File string `json:"file"`
-	Role string `json:"role"`
+	ID           string `json:"id"`
+	File         string `json:"file"`
+	Role         string `json:"role"`
+	UpdatePolicy string `json:"update_policy"`
 }
 
 type service struct {
@@ -164,11 +165,11 @@ func validatePolicy(policy metadata) error {
 		return fmt.Errorf("user state, IPC, or firewall contract is incorrect")
 	}
 	wantComponents := []component{
-		{ID: "cli", File: "pb.exe", Role: "client"},
-		{ID: "launcher", File: "pb-launcher.exe", Role: "client_launcher"},
-		{ID: "runtime", File: "paperboat-runtime.exe", Role: "runtime"},
-		{ID: "host_supervisor", File: "paperboat-hostd.exe", Role: "host_supervisor"},
-		{ID: "updater", File: "paperboat-updater.exe", Role: "updater"},
+		{ID: "cli", File: "pb.exe", Role: "client", UpdatePolicy: "in_process"},
+		{ID: "launcher", File: "pb-launcher.exe", Role: "client_launcher", UpdatePolicy: "msi_only_stable_abi_v1"},
+		{ID: "runtime", File: "paperboat-runtime.exe", Role: "runtime", UpdatePolicy: "in_process"},
+		{ID: "host_supervisor", File: "paperboat-hostd.exe", Role: "host_supervisor", UpdatePolicy: "in_process"},
+		{ID: "updater", File: "paperboat-updater.exe", Role: "updater", UpdatePolicy: "in_process"},
 	}
 	if !sameComponents(policy.Components, wantComponents) {
 		return fmt.Errorf("component contract is incorrect")
@@ -222,17 +223,42 @@ func validateWix(root string, policy metadata) error {
 		`Name="PaperboatUpdated"`,
 		`<ComponentGroup Id="CLIReleaseComponents" Directory="CLICURRENTSLOT">`,
 		`<Directory Id="CLICURRENTSLOT" Name="cli-current" />`,
+		`<Directory Id="ACTIVERELEASE" Name="$(var.PaperboatVersion)" />`,
+		`<ComponentGroup Id="ServiceComponents" Directory="ACTIVERELEASE">`,
+		`FileRef="CLICurrentSeedBinary"`,
 		`Source="$(var.StagingDir)\pb.exe" Name="pb.exe"`,
-		`D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)`,
+		`O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)`,
 		`Value="PaperboatSshd"`,
 		`Microsoft.OpenSSH.Preview`,
 		`Value="none"`,
 		`CapabilityInstallation`,
 		`ExistingSystemSshd`,
+		`<RemoveFolder Id="RemoveEmptyInstallRoot" Directory="INSTALLFOLDER" On="uninstall" />`,
 	} {
 		if !strings.Contains(string(source), required) {
 			return fmt.Errorf("wix/Paperboat.wxs is missing %q", required)
 		}
+	}
+	directoryACL := `O:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)`
+	fileACL := `O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)`
+	for _, contract := range []struct {
+		kind, id, acl string
+	}{
+		{kind: "Component", id: "ReleaseVersionsSecurityComponent", acl: directoryACL},
+		{kind: "Component", id: "ActiveReleaseSecurityComponent", acl: directoryACL},
+		{kind: "File", id: "RuntimeBinary", acl: fileACL},
+		{kind: "File", id: "HostSupervisorBinary", acl: fileACL},
+		{kind: "File", id: "UpdaterBinary", acl: fileACL},
+	} {
+		elementPattern := `(?s)<` + contract.kind + `\b[^>]*\bId="` + regexp.QuoteMeta(contract.id) + `"[^>]*>.*?</` + contract.kind + `>`
+		element := regexp.MustCompile(elementPattern).Find(source)
+		permission := `<PermissionEx Sddl="` + contract.acl + `" />`
+		if element == nil || !strings.Contains(string(element), permission) {
+			return fmt.Errorf("wix/Paperboat.wxs does not bind ACL %q to %s %s", contract.acl, contract.kind, contract.id)
+		}
+	}
+	if strings.Contains(string(source), `FileRef="RuntimeBinary"`) {
+		return fmt.Errorf("WiX uninstall cleanup must not invoke the runtime-role artifact")
 	}
 	componentGUID := regexp.MustCompile(`Guid="([^"]+)"`)
 	seenGUIDs := make(map[string]struct{})

@@ -52,6 +52,8 @@ func InstallService(ctx context.Context, serviceExecutable, sshdPath, configPath
 		restartRequired = !sameServiceCommand(current.BinaryPathName, serviceExecutable, sshdPath, configPath)
 		current.BinaryPathName = expectedCommand
 		current.StartType = mgr.StartAutomatic
+		current.ErrorControl = mgr.ErrorNormal
+		current.ServiceStartName = "LocalSystem"
 		current.SidType = windows.SERVICE_SID_TYPE_UNRESTRICTED
 		err = service.UpdateConfig(current)
 	}
@@ -64,6 +66,10 @@ func InstallService(ctx context.Context, serviceExecutable, sshdPath, configPath
 	}
 	if err := service.SetRecoveryActionsOnNonCrashFailures(true); err != nil {
 		return err
+	}
+	installed, err := service.Config()
+	if err != nil || !sameServiceCommand(installed.BinaryPathName, serviceExecutable, sshdPath, configPath) || !strings.EqualFold(installed.ServiceStartName, "LocalSystem") || installed.StartType != mgr.StartAutomatic || installed.ErrorControl != mgr.ErrorNormal || installed.SidType != windows.SERVICE_SID_TYPE_UNRESTRICTED {
+		return errors.Join(ErrServiceOwnership, err)
 	}
 	if restartRequired {
 		if status, queryErr := service.Query(); queryErr == nil && status.State != svc.Stopped {

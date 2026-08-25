@@ -23,3 +23,8 @@ var DefaultServerURL = "https://api.pprbt.dev"
 // DefaultReleaseURL is the HTTPS origin serving the signed TUF repository.
 // Release builds replace it with the production release origin.
 var DefaultReleaseURL = ""
+
+// WindowsArtifactRole is stamped into each privileged Windows service
+// artifact. It prevents a service binary from acting as the general CLI or a
+// different privileged role even if its command line is changed.
+var WindowsArtifactRole = ""

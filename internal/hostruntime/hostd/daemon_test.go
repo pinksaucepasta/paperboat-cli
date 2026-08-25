@@ -111,3 +111,26 @@ func TestWorkerReplacementDoesNotTerminateHostdOwnedPTY(t *testing.T) {
 		t.Fatal("hostd shutdown did not terminate owned PTY")
 	}
 }
+
+func TestClientWorkloadsAllowTransfersWithoutCommandExecution(t *testing.T) {
+	d, err := New(Config{
+		Workloads:  Workloads{Transfers: &filetransfer.Service{}},
+		Components: []Component{{Name: "ingress", Required: true, Service: &testService{}}},
+	})
+	if err != nil {
+		t.Fatalf("new Client hostd: %v", err)
+	}
+	if d.Workloads().Sessions != nil || d.Workloads().Executions != nil || d.Workloads().Transfers == nil {
+		t.Fatalf("Client workloads = %#v", d.Workloads())
+	}
+}
+
+func TestHostWorkloadsRejectPartialCommandOwnership(t *testing.T) {
+	_, err := New(Config{
+		Workloads:  Workloads{Sessions: &session.Manager{}, Transfers: &filetransfer.Service{}},
+		Components: []Component{{Name: "ingress", Required: true, Service: &testService{}}},
+	})
+	if err != ErrInvalidConfig {
+		t.Fatalf("error = %v, want %v", err, ErrInvalidConfig)
+	}
+}

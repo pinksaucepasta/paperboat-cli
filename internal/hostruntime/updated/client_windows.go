@@ -29,13 +29,15 @@ type ControlRequest struct {
 	Release   string `json:"release,omitempty"`
 }
 type ControlResponse struct {
-	Schema      string                  `json:"schema"`
-	Status      string                  `json:"status"`
-	Version     string                  `json:"version,omitempty"`
-	Updated     bool                    `json:"updated"`
-	Observation autoupdate.Observation  `json:"observation"`
-	ErrorCode   string                  `json:"error_code,omitempty"`
-	Supervisor  supervisorupdate.Result `json:"supervisor,omitempty"`
+	Schema            string                  `json:"schema"`
+	Status            string                  `json:"status"`
+	Version           string                  `json:"version,omitempty"`
+	Updated           bool                    `json:"updated"`
+	Pending           bool                    `json:"pending,omitempty"`
+	ActivationFailure string                  `json:"activation_failure,omitempty"`
+	Observation       autoupdate.Observation  `json:"observation"`
+	ErrorCode         string                  `json:"error_code,omitempty"`
+	Supervisor        supervisorupdate.Result `json:"supervisor,omitempty"`
 }
 
 type Client struct {

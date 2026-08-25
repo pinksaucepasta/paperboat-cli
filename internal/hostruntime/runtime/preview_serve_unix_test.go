@@ -54,6 +54,56 @@ func TestServeRuntimeDescriptorRoundTrip(t *testing.T) {
 	}
 }
 
+func TestWindowsOwnerServiceControlURLFallbackMatchesRegistration(t *testing.T) {
+	t.Setenv(windowsPreviewControlURLEnv, "https://api.example.test/")
+	registration := identity.Registration{ServerURL: "https://api.example.test"}
+	got, err := resolveWindowsOwnerControlURL("", registration, nil)
+	if err != nil || got != registration.ServerURL {
+		t.Fatalf("control URL=%q err=%v, want %q", got, err, registration.ServerURL)
+	}
+}
+
+func TestWindowsOwnerServiceControlURLFallbackRejectsInvalidOrMismatchedOrigin(t *testing.T) {
+	cases := []struct {
+		name            string
+		env             string
+		registration    identity.Registration
+		registrationErr error
+	}{
+		{name: "missing", env: "", registrationErr: errors.New("registration unavailable")},
+		{name: "non HTTPS", env: "http://api.example.test", registrationErr: errors.New("registration unavailable")},
+		{name: "path", env: "https://api.example.test/control", registrationErr: errors.New("registration unavailable")},
+		{name: "mismatch", env: "https://api.example.test", registration: identity.Registration{ServerURL: "https://other.example.test"}},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv(windowsPreviewControlURLEnv, test.env)
+			if _, err := resolveWindowsOwnerControlURL("", test.registration, test.registrationErr); !errors.Is(err, errPreviewControlOrigin) {
+				t.Fatalf("error=%v, want sanitized control-origin error", err)
+			}
+		})
+	}
+}
+
+func TestPersistPreviewWorkerStartupFailurePublishesSanitizedDescriptor(t *testing.T) {
+	root := t.TempDir()
+	descriptorPath, _ := writeTestServeDescriptor(t, root, "docs", time.Now().UTC().Add(time.Hour))
+	descriptor, err := readPreviewRuntimeDescriptor(descriptorPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := persistPreviewWorkerStartupFailure(descriptorPath, descriptor); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := readPreviewRuntimeDescriptor(descriptorPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Record == nil || loaded.Record.State != "failed" || loaded.Failure == nil || loaded.Failure.Code != "preview_worker_start_failed" {
+		t.Fatalf("startup failure descriptor=%#v", loaded)
+	}
+}
+
 func TestServeRuntimeDescriptorRequiresCurrentSchemaFields(t *testing.T) {
 	root := t.TempDir()
 	sourcePath := filepath.Join(root, "site")
@@ -83,7 +133,7 @@ func TestServeRuntimeDescriptorRequiresCurrentSchemaFields(t *testing.T) {
 	}
 }
 
-func TestDetachedServeShutdownStopsListenerAndRemovesDescriptor(t *testing.T) {
+func TestDetachedServeSupervisorShutdownStopsListenerAndPreservesDescriptor(t *testing.T) {
 	root := t.TempDir()
 	descriptorPath, expires := writeTestServeDescriptor(t, root, "docs", time.Now().UTC().Add(time.Hour))
 	ctx, cancel := context.WithCancel(context.Background())
@@ -104,14 +154,32 @@ func TestDetachedServeShutdownStopsListenerAndRemovesDescriptor(t *testing.T) {
 	}()
 	listenerPort := <-port
 	cancel()
-	if err := <-done; err != nil {
-		t.Fatal(err)
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("shutdown error = %v, want context canceled", err)
 	}
 	if _, err := net.DialTimeout("tcp4", net.JoinHostPort("127.0.0.1", fmt.Sprint(listenerPort)), 100*time.Millisecond); err == nil {
 		t.Fatal("listener remains after shutdown")
 	}
-	if _, err := os.Stat(descriptorPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("descriptor remains after shutdown: %v", err)
+	if _, err := os.Stat(descriptorPath); err != nil {
+		t.Fatalf("durable descriptor was removed during supervisor shutdown: %v", err)
+	}
+}
+
+func TestDetachedPublicServeStartupCancellationPreservesDescriptor(t *testing.T) {
+	root := t.TempDir()
+	descriptorPath, expires := writeTestServeDescriptor(t, root, "docs", time.Now().UTC().Add(time.Hour))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := RunProductionServeWorker(ctx, ProductionServeWorkerConfig{
+		ControlURL: "https://api.paperboat.test", StateRoot: root, Name: "docs", ExpiresAt: &expires,
+		DescriptorPath: descriptorPath,
+		PreviewRunner:  func(context.Context, servepkg.PreviewRunConfig) error { return context.Canceled },
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("startup cancellation error = %v, want context canceled", err)
+	}
+	if _, err := os.Stat(descriptorPath); err != nil {
+		t.Fatalf("durable descriptor was removed during startup cancellation: %v", err)
 	}
 }
 
@@ -155,11 +223,11 @@ func TestDetachedPrivateServePublishesOnlyLoopbackURL(t *testing.T) {
 	}
 	response.Body.Close()
 	cancel()
-	if err := <-done; err != nil {
-		t.Fatal(err)
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("shutdown error = %v, want context canceled", err)
 	}
-	if _, err := os.Stat(descriptorPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("descriptor remains after shutdown: %v", err)
+	if _, err := os.Stat(descriptorPath); err != nil {
+		t.Fatalf("durable descriptor was removed during supervisor shutdown: %v", err)
 	}
 }
 

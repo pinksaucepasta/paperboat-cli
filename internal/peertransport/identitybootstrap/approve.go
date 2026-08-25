@@ -80,7 +80,7 @@ func approveEndpoint(ctx context.Context, request ApprovalRequest, wantRole endp
 			selected = &pending[index]
 		}
 	}
-	if selected == nil || selected.SafetyCode != request.SafetyCode || !selected.ExpiresAt.After(now) || selected.CreatedAt.After(now.Add(time.Minute)) || selected.Generation == 0 || !boundedID(selected.EndpointID) {
+	if selected == nil || selected.State != "pending" || selected.SafetyCode != request.SafetyCode || !selected.ExpiresAt.After(now) || selected.CreatedAt.After(now.Add(time.Minute)) || selected.Generation == 0 || !boundedID(selected.EndpointID) {
 		return Result{}, ErrInvalid
 	}
 	selectedRole := endpointidentity.RoleMachine
