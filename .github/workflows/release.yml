@@ -336,13 +336,18 @@ jobs:
             --server-url "$DEFAULT_SERVER_URL" \
             --release-url "$DEFAULT_RELEASE_URL"
           mkdir -p dist
-          arguments=()
-          if [ -n "$APPLE_INSTALLER_SIGNING_IDENTITY" ]; then arguments=(--signing-identity "$APPLE_INSTALLER_SIGNING_IDENTITY"); fi
-          ./tools/build-macos-pkg.sh \
-            --binary "$RUNNER_TEMP/pb-darwin-arm64" \
-            --output dist/pb-darwin-arm64.pkg \
-            --version "$RELEASE_VERSION" \
-            "${arguments[@]}"
+          if [ -n "$APPLE_INSTALLER_SIGNING_IDENTITY" ]; then
+            ./tools/build-macos-pkg.sh \
+              --binary "$RUNNER_TEMP/pb-darwin-arm64" \
+              --output dist/pb-darwin-arm64.pkg \
+              --version "$RELEASE_VERSION" \
+              --signing-identity "$APPLE_INSTALLER_SIGNING_IDENTITY"
+          else
+            ./tools/build-macos-pkg.sh \
+              --binary "$RUNNER_TEMP/pb-darwin-arm64" \
+              --output dist/pb-darwin-arm64.pkg \
+              --version "$RELEASE_VERSION"
+          fi
       - name: Notarize and staple macOS PKG
         if: env.APPLE_ID != '' && env.APPLE_TEAM_ID != '' && env.APPLE_APP_PASSWORD != '' && env.APPLE_INSTALLER_SIGNING_IDENTITY != ''
         shell: bash
