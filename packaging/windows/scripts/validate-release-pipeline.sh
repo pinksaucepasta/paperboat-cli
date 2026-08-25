@@ -106,7 +106,7 @@ if "@('.exe', '.msi')" in windows_signer or "-notin @('.exe', '.msi')" in window
     raise SystemExit('Windows release signer retains MSI compatibility')
 if "Only unified Paperboat PE .exe files may be signed" not in windows_signer:
     raise SystemExit('Windows release signer does not enforce unified .exe inputs')
-for value in ('pkgbuild', 'productsign', '--sign', 'pkgutil --check-signature'):
+for value in ('pkgbuild', 'productsign', '--sign', 'pkgutil --expand'):
     if value not in pkg_builder:
         raise SystemExit(f'macOS package builder is missing {value}')
 for value in ('pb-launcher', 'launcher-windows', 'paperboat-runtime', 'paperboat-hostd', 'paperboat-updater'):

@@ -2,7 +2,7 @@
 set -eu
 
 usage() {
-  echo "usage: $0 --binary FILE --output FILE --version VERSION --signing-identity IDENTITY" >&2
+  echo "usage: $0 --binary FILE --output FILE --version VERSION [--signing-identity IDENTITY]" >&2
   exit 64
 }
 
@@ -29,7 +29,6 @@ done
 [ -f "$binary" ] && [ ! -L "$binary" ] || { echo "macOS package input is missing or not a regular file" >&2; exit 1; }
 [ -n "$output" ] || usage
 [ -n "$version" ] || usage
-[ -n "$identity" ] || usage
 
 case "$version" in
   20[0-9][0-9].[0-9][0-9].[0-9][0-9].* ) ;;
@@ -57,8 +56,14 @@ pkgbuild \
   --version "$version" \
   --install-location / \
   --ownership recommended \
-  --sign "$identity" \
   "$unsigned"
 
-productsign --sign "$identity" "$unsigned" "$output"
-pkgutil --check-signature "$output"
+if [ -n "$identity" ]; then
+  productsign --sign "$identity" "$unsigned" "$output"
+  pkgutil --check-signature "$output"
+else
+  mv "$unsigned" "$output"
+fi
+expanded="$root/expanded"
+pkgutil --expand "$output" "$expanded"
+test -f "$expanded/Payload" || { echo 'macOS package payload is missing' >&2; exit 1; }

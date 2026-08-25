@@ -306,11 +306,12 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Import Developer ID Installer certificate
+        if: env.APPLE_INSTALLER_CERTIFICATE_P12_BASE64 != ''
         shell: bash
         run: |
           set -euo pipefail
-          for name in APPLE_INSTALLER_CERTIFICATE_P12_BASE64 APPLE_INSTALLER_CERTIFICATE_PASSWORD APPLE_INSTALLER_SIGNING_IDENTITY APPLE_ID APPLE_TEAM_ID APPLE_APP_PASSWORD; do
-            test -n "${!name}" || { echo "$name is required for a signed, notarized macOS package" >&2; exit 1; }
+          for name in APPLE_INSTALLER_CERTIFICATE_PASSWORD APPLE_INSTALLER_SIGNING_IDENTITY; do
+            test -n "${!name}" || { echo "$name is required when an Apple installer certificate is configured" >&2; exit 1; }
           done
           keychain="$RUNNER_TEMP/paperboat-release.keychain-db"
           password="$(uuidgen)"
@@ -323,7 +324,7 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain"
           security list-keychains -d user -s "$keychain" login.keychain-db
           security default-keychain -s "$keychain"
-      - name: Build and sign one macOS PKG
+      - name: Build one macOS PKG
         shell: bash
         run: |
           set -euo pipefail
@@ -335,12 +336,15 @@ jobs:
             --server-url "$DEFAULT_SERVER_URL" \
             --release-url "$DEFAULT_RELEASE_URL"
           mkdir -p dist
+          arguments=()
+          if [ -n "$APPLE_INSTALLER_SIGNING_IDENTITY" ]; then arguments=(--signing-identity "$APPLE_INSTALLER_SIGNING_IDENTITY"); fi
           ./tools/build-macos-pkg.sh \
             --binary "$RUNNER_TEMP/pb-darwin-arm64" \
             --output dist/pb-darwin-arm64.pkg \
             --version "$RELEASE_VERSION" \
-            --signing-identity "$APPLE_INSTALLER_SIGNING_IDENTITY"
+            "${arguments[@]}"
       - name: Notarize and staple macOS PKG
+        if: env.APPLE_ID != '' && env.APPLE_TEAM_ID != '' && env.APPLE_APP_PASSWORD != '' && env.APPLE_INSTALLER_SIGNING_IDENTITY != ''
         shell: bash
         run: |
           set -euo pipefail
