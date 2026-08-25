@@ -65,8 +65,39 @@ Assert-Rejected 'modified pre-existing file' { Assert-PaperboatStateResidue }
 		t.Fatal(err)
 	}
 	command := exec.Command("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", scriptPath)
-	command.Env = append(os.Environ(), "PAPERBOAT_STATE_TEST_ROOT="+root)
+	command.Env = append(withoutEnvironmentVariable(os.Environ(), "PSModulePath"), "PAPERBOAT_STATE_TEST_ROOT="+root)
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("PowerShell state residue self-test failed: %v: %s", err, output)
 	}
+}
+
+func TestWithoutEnvironmentVariableIsCaseInsensitive(t *testing.T) {
+	environment := []string{
+		`Path=C:\\Windows`,
+		`PSModulePath=C:\\Program Files\\PowerShell\\Modules`,
+		`psmodulepath=C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\Modules`,
+		`=C:=C:\\runner`,
+	}
+	got := withoutEnvironmentVariable(environment, "PSModulePath")
+	want := []string{`Path=C:\\Windows`, `=C:=C:\\runner`}
+	if len(got) != len(want) {
+		t.Fatalf("filtered environment length = %d, want %d: %q", len(got), len(want), got)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("filtered environment[%d] = %q, want %q", index, got[index], want[index])
+		}
+	}
+}
+
+func withoutEnvironmentVariable(environment []string, name string) []string {
+	filtered := make([]string, 0, len(environment))
+	for _, entry := range environment {
+		key, _, found := strings.Cut(entry, "=")
+		if found && strings.EqualFold(key, name) {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return filtered
 }
