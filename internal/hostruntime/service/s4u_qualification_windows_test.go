@@ -35,6 +35,9 @@ const s4uFixtureSHA256Environment = "PAPERBOAT_WINDOWS_E2E_S4U_FIXTURE_SHA256"
 const s4uReportPathEnvironment = "PAPERBOAT_WINDOWS_E2E_S4U_REPORT_PATH"
 const s4uServiceNameEnvironment = "PAPERBOAT_WINDOWS_E2E_S4U_SERVICE_NAME"
 const s4uOwnerAccountEnvironment = "PAPERBOAT_WINDOWS_E2E_S4U_OWNER_ACCOUNT"
+const s4uQualificationActionStagePrefix = "paperboat-s4u-action-stage:"
+const s4uQualificationCleanupStagePrefix = "paperboat-s4u-cleanup-stage:"
+const s4uQualificationCleanupFailurePrefix = "paperboat-s4u-cleanup-failure:"
 
 var (
 	qualificationCredWrite = windows.NewLazySystemDLL("advapi32.dll").NewProc("CredWriteW")
@@ -62,8 +65,21 @@ type qualificationWindowsCredential struct {
 	UserName           *uint16
 }
 
+func reportS4UQualificationActionStage(stage string) {
+	fmt.Printf("%s%s\n", s4uQualificationActionStagePrefix, stage)
+}
+
+func reportS4UQualificationCleanupStage(stage string) {
+	fmt.Printf("%s%s\n", s4uQualificationCleanupStagePrefix, stage)
+}
+
+func reportS4UQualificationCleanupFailure(stage string) {
+	fmt.Printf("%s%s\n", s4uQualificationCleanupFailurePrefix, stage)
+}
+
 func writeLegacyCredentialManagerFixture(t *testing.T, ref, value string) {
 	t.Helper()
+	reportS4UQualificationActionStage("credential-manager-write")
 	target, err := windows.UTF16PtrFromString("paperboat:" + ref)
 	if err != nil {
 		t.Fatal(err)
@@ -85,12 +101,14 @@ func writeLegacyCredentialManagerFixture(t *testing.T, ref, value string) {
 
 func prepareProductionKeyringFixtures(t *testing.T, reportPath string, cleanup bool) {
 	t.Helper()
+	reportS4UQualificationActionStage("keyring-write")
 	keyring := config.KeyringStore{}
 	if err := keyring.Set(reportPath, "paperboat-s4u-dpapi-v1"); err != nil {
 		t.Fatalf("create owner Paperboat KeyringStore fixture: %v", err)
 	}
 	migratedRef := reportPath + "-migrated"
 	writeLegacyCredentialManagerFixture(t, migratedRef, "paperboat-s4u-migrated-v1")
+	reportS4UQualificationActionStage("credential-manager-migrate")
 	if value, err := keyring.Get(migratedRef); err != nil || value != "paperboat-s4u-migrated-v1" {
 		t.Fatalf("migrate owner Credential Manager fixture into Paperboat KeyringStore: value=%q err=%v", value, err)
 	}
@@ -106,6 +124,7 @@ const s4uPreviewControlURL = "https://api.example.test"
 
 func prepareS4UPreviewIdentityFixture(t *testing.T, reportPath string) string {
 	t.Helper()
+	reportS4UQualificationActionStage("identity-create")
 	stateRoot := reportPath + ".preview-state"
 	store, err := identity.Open(identity.Config{StateRoot: stateRoot})
 	if err != nil {
@@ -126,6 +145,7 @@ func prepareS4UPreviewIdentityFixture(t *testing.T, reportPath string) string {
 	if err := store.SaveRegistration(registration); err != nil {
 		t.Fatalf("save S4U preview registration: %v", err)
 	}
+	reportS4UQualificationActionStage("identity-control")
 	if err := store.SaveMachineControl(identity.MachineControl{
 		MachineID:              registration.MachineID,
 		EnvironmentID:          registration.EnvironmentID,
@@ -136,13 +156,16 @@ func prepareS4UPreviewIdentityFixture(t *testing.T, reportPath string) string {
 	}); err != nil {
 		t.Fatalf("save S4U preview machine-control fixture: %v", err)
 	}
+	reportS4UQualificationActionStage("identity-open")
 	reopened, err := identity.Open(identity.Config{StateRoot: stateRoot})
 	if err != nil {
 		t.Fatalf("reopen S4U preview identity store as effective owner: %v", err)
 	}
+	reportS4UQualificationActionStage("identity-registration-read")
 	if _, err := reopened.Registration(); err != nil {
 		t.Fatalf("reopen S4U preview registration as effective owner: %v", err)
 	}
+	reportS4UQualificationActionStage("identity-control-read")
 	if _, err := reopened.MachineControl(time.Now().UTC(), 0); err != nil {
 		t.Fatalf("reopen S4U preview machine-control as effective owner: %v", err)
 	}
@@ -293,19 +316,30 @@ func qualificationInteractiveToken(accountName string, password []uint16) (windo
 
 func withQualificationOwner(t *testing.T, action func(windows.Token)) {
 	t.Helper()
+	reportS4UQualificationActionStage("credential-input")
 	password, err := readQualificationPassword()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer clear(password)
 	accountName := strings.TrimSpace(os.Getenv(s4uOwnerAccountEnvironment))
+	reportS4UQualificationActionStage("interactive-logon")
 	token, account, domain, err := qualificationInteractiveToken(accountName, password)
 	clear(password)
 	if err != nil {
 		t.Fatalf("create interactive qualification owner token: %v", err)
 	}
-	defer token.Close()
+	defer func() {
+		reportS4UQualificationCleanupStage("interactive-token-close")
+		if err := token.Close(); err != nil {
+			reportS4UQualificationCleanupFailure("interactive-token-close")
+			t.Errorf("close interactive qualification owner token: %v", err)
+			return
+		}
+		reportS4UQualificationCleanupStage("interactive-token-closed")
+	}()
 	ownerSID := requiredS4UOwnerSID(t)
+	reportS4UQualificationActionStage("owner-token-validate")
 	if err := validateOwnerToken(token, ownerSID); err != nil {
 		t.Fatalf("interactive qualification token does not match owner %s: %v", ownerSID, err)
 	}
@@ -313,45 +347,73 @@ func withQualificationOwner(t *testing.T, action func(windows.Token)) {
 	if err != nil || processUser == nil || processUser.User.Sid == nil || processUser.User.Sid.String() == ownerSID {
 		t.Fatalf("qualification process identity must differ from impersonated owner %s: %v", ownerSID, err)
 	}
+	reportS4UQualificationActionStage("profile-privileges")
 	stopPrivileges, err := qualificationProfilePrivilegeScope()
 	if err != nil {
 		t.Fatalf("enable owner profile-load privileges: %v", err)
 	}
+	reportS4UQualificationActionStage("profile-load")
 	profile, loadErr := loadOwnerProfile(token, account, domain)
 	privilegeErr := stopPrivileges()
 	if loadErr != nil || privilegeErr != nil {
+		reportS4UQualificationCleanupStage("profile-load-cleanup")
 		cleanupErr := closeQualificationProfile(profile)
+		if cleanupErr == nil {
+			reportS4UQualificationCleanupStage("profile-load-cleaned")
+		} else {
+			reportS4UQualificationCleanupFailure("profile-load-cleanup")
+		}
 		t.Fatalf("load interactive qualification owner profile: %v", errors.Join(loadErr, privilegeErr, cleanupErr))
 	}
+	reportS4UQualificationActionStage("profile-loaded")
 	impersonationReverted := true
 	defer func() {
 		if !impersonationReverted {
+			reportS4UQualificationCleanupFailure("profile-unload-blocked")
 			t.Error("owner profile could not be unloaded after impersonation reversion failed")
 			return
 		}
+		reportS4UQualificationCleanupStage("profile-unload")
 		if err := closeQualificationProfile(profile); err != nil {
+			reportS4UQualificationCleanupFailure("profile-unload")
 			t.Errorf("unload interactive qualification owner profile: %v", err)
+			return
 		}
+		reportS4UQualificationCleanupStage("profile-unloaded")
 	}()
 	var impersonationToken windows.Token
+	reportS4UQualificationActionStage("impersonation-token")
 	if err := windows.DuplicateTokenEx(token, windows.TOKEN_QUERY|windows.TOKEN_IMPERSONATE, nil, windows.SecurityImpersonation, windows.TokenImpersonation, &impersonationToken); err != nil {
 		t.Fatalf("duplicate qualification impersonation token: %v", err)
 	}
-	defer impersonationToken.Close()
+	defer func() {
+		reportS4UQualificationCleanupStage("impersonation-token-close")
+		if err := impersonationToken.Close(); err != nil {
+			reportS4UQualificationCleanupFailure("impersonation-token-close")
+			t.Errorf("close qualification impersonation token: %v", err)
+			return
+		}
+		reportS4UQualificationCleanupStage("impersonation-token-closed")
+	}()
 	runtime.LockOSThread()
+	reportS4UQualificationActionStage("impersonation-start")
 	if err := windows.SetThreadToken(nil, impersonationToken); err != nil {
 		runtime.UnlockOSThread()
 		t.Fatalf("impersonate qualification owner: %v", err)
 	}
 	impersonationReverted = false
 	defer func() {
+		reportS4UQualificationCleanupStage("impersonation-revert")
 		if err := windows.RevertToSelf(); err != nil {
+			reportS4UQualificationCleanupFailure("impersonation-revert")
 			t.Errorf("revert qualification owner impersonation: %v", err)
 			return
 		}
 		impersonationReverted = true
 		runtime.UnlockOSThread()
+		reportS4UQualificationCleanupStage("impersonation-reverted")
 	}()
+	reportS4UQualificationActionStage("impersonated")
 	action(token)
 }
 
@@ -373,11 +435,13 @@ func assertQualificationKeyringOwner(t *testing.T, localAppData, ref, ownerSID s
 func TestNativePrepareS4UDPAPIQualification(t *testing.T) {
 	withQualificationOwner(t, func(token windows.Token) {
 		ownerSID := requiredS4UOwnerSID(t)
+		reportS4UQualificationActionStage("effective-owner")
 		effectiveSID, err := windowssecurity.CurrentEffectiveUserSID()
 		if err != nil || effectiveSID.String() != ownerSID {
 			t.Fatalf("effective qualification owner SID = %v, want %s: %v", effectiveSID, ownerSID, err)
 		}
 		var effectiveToken windows.Token
+		reportS4UQualificationActionStage("effective-token")
 		if err := windows.OpenThreadToken(windows.CurrentThread(), windows.TOKEN_QUERY, true, &effectiveToken); err != nil {
 			t.Fatalf("open effective owner token: %v", err)
 		}
@@ -386,6 +450,7 @@ func TestNativePrepareS4UDPAPIQualification(t *testing.T) {
 		if effectiveErr != nil || effectiveUser == nil || effectiveUser.User.Sid == nil || effectiveUser.User.Sid.String() != ownerSID {
 			t.Fatalf("fixture preparation is not impersonating enrolled owner %s: %v", ownerSID, effectiveErr)
 		}
+		reportS4UQualificationActionStage("local-app-data")
 		localAppData, err := token.KnownFolderPath(windows.FOLDERID_LocalAppData, windows.KF_FLAG_DEFAULT)
 		if err != nil || !filepath.IsAbs(localAppData) {
 			t.Fatalf("resolve enrolled owner LocalAppData: %v", err)
@@ -401,11 +466,13 @@ func TestNativePrepareS4UDPAPIQualification(t *testing.T) {
 				_ = os.Unsetenv("LOCALAPPDATA")
 			}
 		}()
+		reportS4UQualificationActionStage("working-directory")
 		reportPath := requiredS4UReportPath(t)
 		workingDirectory, err := os.Getwd()
 		if err != nil || !strings.EqualFold(filepath.Clean(workingDirectory), filepath.Dir(reportPath)) {
 			t.Fatalf("owner preparation working directory = %q, want %q: %v", workingDirectory, filepath.Dir(reportPath), err)
 		}
+		reportS4UQualificationActionStage("owner-access")
 		probePath := reportPath + ".owner-access"
 		if err := os.WriteFile(probePath, []byte("owner-access-v1"), 0o600); err != nil {
 			t.Fatalf("write owner qualification access probe: %v", err)
@@ -413,6 +480,7 @@ func TestNativePrepareS4UDPAPIQualification(t *testing.T) {
 		if err := os.Remove(probePath); err != nil {
 			t.Fatalf("remove owner qualification access probe: %v", err)
 		}
+		reportS4UQualificationActionStage("atomic-file")
 		atomicProbePath := reportPath + ".atomic-owner"
 		for _, value := range []string{"effective-owner-v1", "effective-owner-v2"} {
 			if err := atomicfile.Write(atomicProbePath, []byte(value), atomicfile.CurrentOwnerOptions(0o600)); err != nil {
@@ -433,6 +501,7 @@ func TestNativePrepareS4UDPAPIQualification(t *testing.T) {
 		if err := os.Remove(atomicProbePath); err != nil {
 			t.Fatalf("remove effective-owner atomic fixture: %v", err)
 		}
+		reportS4UQualificationActionStage("file-secret-store")
 		fileSecretDirectory := reportPath + ".file-secret-owner"
 		fileSecrets := config.FileSecretStore{Dir: fileSecretDirectory}
 		const fileSecretRef = "runtime-transfer-key"
@@ -451,9 +520,11 @@ func TestNativePrepareS4UDPAPIQualification(t *testing.T) {
 		}
 		prepareProductionKeyringFixtures(t, reportPath, false)
 		previewStateRoot := prepareS4UPreviewIdentityFixture(t, reportPath)
+		reportS4UQualificationActionStage("security-assertions")
 		assertQualificationKeyringOwner(t, localAppData, reportPath, ownerSID)
 		assertQualificationKeyringOwner(t, localAppData, reportPath+"-migrated", ownerSID)
 		assertQualificationIdentityOwner(t, previewStateRoot, ownerSID)
+		reportS4UQualificationActionStage("body-complete")
 	})
 }
 

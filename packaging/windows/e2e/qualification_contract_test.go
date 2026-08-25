@@ -162,6 +162,17 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 		"exact_file=true; empty_directories=true; install_root_absent=true",
 		"New-LocalUser",
 		"Invoke-OwnerQualificationTest",
+		"Get-OwnerQualificationStages",
+		"paperboat-s4u-action-stage:",
+		"paperboat-s4u-cleanup-stage:",
+		"paperboat-s4u-cleanup-failure:",
+		"action_stage=$ownerActionStage",
+		"cleanup_stage=$ownerCleanupStage",
+		"cleanup_failure=$ownerCleanupFailure",
+		"$actionStage = 'unreported'",
+		"$cleanupStage = 'not-started'",
+		"$allowedActionStages -contains $Matches[1]",
+		"$allowedCleanupStages -contains $Matches[1]",
 		"[Diagnostics.ProcessStartInfo]::new()",
 		"$start.CreateNoWindow = $true",
 		"$start.RedirectStandardInput = $true",
@@ -387,6 +398,119 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 	} {
 		if !strings.Contains(string(releaseWorkflow), requiredText) {
 			t.Fatalf("release candidate qualification is missing %q", requiredText)
+		}
+	}
+}
+
+func TestS4UOwnerQualificationStagesAreBoundedLiterals(t *testing.T) {
+	repositoryRoot := filepath.Clean(filepath.Join(packagingWindowsRoot(t), "..", ".."))
+	testBody, err := os.ReadFile(filepath.Join(repositoryRoot, "internal", "hostruntime", "service", "s4u_qualification_windows_test.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	harnessBody, err := os.ReadFile(filepath.Join(packagingWindowsRoot(t), "scripts", "Invoke-NativeWindowsQualification.ps1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	testText := string(testBody)
+	harnessText := normalizeQualificationText(string(harnessBody))
+	stages := []string{
+		"credential-input", "interactive-logon", "owner-token-validate",
+		"profile-privileges", "profile-load", "profile-loaded",
+		"impersonation-token", "impersonation-start", "impersonated",
+		"effective-owner", "effective-token", "local-app-data",
+		"working-directory", "owner-access", "atomic-file",
+		"file-secret-store", "keyring-write", "credential-manager-write",
+		"credential-manager-migrate", "identity-create", "identity-control",
+		"identity-open", "identity-registration-read", "identity-control-read",
+		"security-assertions", "body-complete",
+	}
+	for _, stage := range stages {
+		if !strings.Contains(testText, `reportS4UQualificationActionStage("`+stage+`")`) {
+			t.Fatalf("S4U owner test is missing literal stage %q", stage)
+		}
+		if !strings.Contains(harnessText, "'"+stage+"'") {
+			t.Fatalf("qualification harness does not allow literal stage %q", stage)
+		}
+	}
+	if got, want := strings.Count(testText, "reportS4UQualificationActionStage("), len(stages)+1; got != want {
+		t.Fatalf("S4U stage reporter has %d call sites, want exactly %d fixed literal calls plus its declaration", got, want)
+	}
+	cleanupStages := []string{
+		"profile-load-cleanup", "profile-load-cleaned",
+		"impersonation-revert", "impersonation-reverted",
+		"impersonation-token-close", "impersonation-token-closed",
+		"profile-unload", "profile-unloaded",
+		"interactive-token-close", "interactive-token-closed",
+	}
+	for _, stage := range cleanupStages {
+		if !strings.Contains(testText, `reportS4UQualificationCleanupStage("`+stage+`")`) {
+			t.Fatalf("S4U owner test is missing literal cleanup stage %q", stage)
+		}
+		if !strings.Contains(harnessText, "'"+stage+"'") {
+			t.Fatalf("qualification harness does not allow literal cleanup stage %q", stage)
+		}
+	}
+	if got, want := strings.Count(testText, "reportS4UQualificationCleanupStage("), len(cleanupStages)+1; got != want {
+		t.Fatalf("S4U cleanup reporter has %d call sites, want exactly %d fixed literal calls plus its declaration", got, want)
+	}
+	cleanupFailures := []string{
+		"profile-load-cleanup", "profile-unload-blocked",
+		"impersonation-revert", "impersonation-token-close",
+		"profile-unload", "interactive-token-close",
+	}
+	for _, stage := range cleanupFailures {
+		if !strings.Contains(testText, `reportS4UQualificationCleanupFailure("`+stage+`")`) {
+			t.Fatalf("S4U owner test is missing literal cleanup failure %q", stage)
+		}
+		if !strings.Contains(harnessText, "'"+stage+"'") {
+			t.Fatalf("qualification harness does not allow literal cleanup failure %q", stage)
+		}
+	}
+	if got, want := strings.Count(testText, "reportS4UQualificationCleanupFailure("), len(cleanupFailures)+1; got != want {
+		t.Fatalf("S4U cleanup failure reporter has %d call sites, want exactly %d fixed literal calls plus its declaration", got, want)
+	}
+	if !strings.Contains(harnessText, "^paperboat-s4u-action-stage:([a-z0-9-]+)$") ||
+		!strings.Contains(harnessText, "^paperboat-s4u-cleanup-stage:([a-z0-9-]+)$") ||
+		!strings.Contains(harnessText, "^paperboat-s4u-cleanup-failure:([a-z0-9-]+)$") ||
+		!strings.Contains(harnessText, "$allowedActionStages -contains $Matches[1]") ||
+		!strings.Contains(harnessText, "$allowedCleanupStages -contains $Matches[1]") ||
+		!strings.Contains(harnessText, "$allowedCleanupFailures -contains $Matches[1]") ||
+		!strings.Contains(harnessText, "$Output.Length -gt 8192") {
+		t.Fatal("qualification harness must accept only a bounded allowlisted stage marker")
+	}
+}
+
+func TestOwnerQualificationCleanupCannotMaskPrimaryFailure(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join(packagingWindowsRoot(t), "scripts", "Invoke-NativeWindowsQualification.ps1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := normalizeQualificationText(string(body))
+	start := strings.Index(text, "function Invoke-OwnerQualificationTest {")
+	end := strings.Index(text, "\nfunction Invoke-S4UDPAPIQualification {")
+	if start < 0 || end <= start {
+		t.Fatal("could not isolate owner qualification function")
+	}
+	owner := text[start:end]
+	catchIndex := strings.Index(owner, "$primaryException = $_")
+	cleanupIndex := strings.Index(owner, "\n    finally {")
+	rethrowIndex := strings.LastIndex(owner, "if ($null -ne $primaryException) {")
+	if catchIndex < 0 || cleanupIndex <= catchIndex || rethrowIndex <= cleanupIndex {
+		t.Fatal("owner qualification must retain the first body exception across cleanup and rethrow it afterward")
+	}
+	cleanupBody := owner[cleanupIndex:rethrowIndex]
+	if strings.Contains(cleanupBody, "Assert-Qualification") {
+		t.Fatal("owner qualification cleanup must record failures without throwing over the primary error")
+	}
+	for _, required := range []string{
+		"$cleanupFailureKinds += 'completion'",
+		"$cleanupFailureKinds += 'stream-drain'",
+		"$cleanupFailureKinds += 'termination'",
+		"throw $primaryException",
+	} {
+		if !strings.Contains(owner, required) {
+			t.Fatalf("owner qualification failure preservation is missing %q", required)
 		}
 	}
 }

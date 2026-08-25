@@ -199,6 +199,49 @@ function Assert-NativeTestExecutionEvidence {
     Assert-Qualification ($Evidence.TestsFailedCount -eq 0) "Native Windows qualification reported failed tests for $Description. Pattern execution evidence: $($Evidence.EvidencePath)."
 }
 
+function Get-OwnerQualificationStages {
+    param([Parameter(Mandatory = $true)][string] $Output)
+    $allowedActionStages = @(
+        'credential-input', 'interactive-logon', 'owner-token-validate',
+        'profile-privileges', 'profile-load', 'profile-loaded',
+        'impersonation-token', 'impersonation-start', 'impersonated',
+        'effective-owner', 'effective-token', 'local-app-data',
+        'working-directory', 'owner-access', 'atomic-file',
+        'file-secret-store', 'keyring-write', 'credential-manager-write',
+        'credential-manager-migrate', 'identity-create', 'identity-control',
+        'identity-open', 'identity-registration-read', 'identity-control-read',
+        'security-assertions', 'body-complete'
+    )
+    $allowedCleanupStages = @(
+        'profile-load-cleanup', 'profile-load-cleaned',
+        'impersonation-revert', 'impersonation-reverted',
+        'impersonation-token-close', 'impersonation-token-closed',
+        'profile-unload', 'profile-unloaded',
+        'interactive-token-close', 'interactive-token-closed'
+    )
+    $allowedCleanupFailures = @(
+        'profile-load-cleanup', 'profile-unload-blocked',
+        'impersonation-revert', 'impersonation-token-close',
+        'profile-unload', 'interactive-token-close'
+    )
+    $actionStage = 'unreported'
+    $cleanupStage = 'not-started'
+    $cleanupFailure = 'none'
+    $boundedTail = if ($Output.Length -gt 8192) { $Output.Substring($Output.Length - 8192) } else { $Output }
+    foreach ($line in @($boundedTail -split "`r?`n")) {
+        if ($line -match '^paperboat-s4u-action-stage:([a-z0-9-]+)$' -and $allowedActionStages -contains $Matches[1]) {
+            $actionStage = $Matches[1]
+        }
+        if ($line -match '^paperboat-s4u-cleanup-stage:([a-z0-9-]+)$' -and $allowedCleanupStages -contains $Matches[1]) {
+            $cleanupStage = $Matches[1]
+        }
+        if ($cleanupFailure -eq 'none' -and $line -match '^paperboat-s4u-cleanup-failure:([a-z0-9-]+)$' -and $allowedCleanupFailures -contains $Matches[1]) {
+            $cleanupFailure = $Matches[1]
+        }
+    }
+    return [pscustomobject]@{ ActionStage = $actionStage; CleanupStage = $cleanupStage; CleanupFailure = $cleanupFailure }
+}
+
 function Invoke-NativeTestPattern {
     param(
         [Parameter(Mandatory = $true)][string] $ExecutablePath,
@@ -1575,6 +1618,12 @@ function Invoke-OwnerQualificationTest {
     $processRecord = $null
     $stdoutTask = $null
     $stderrTask = $null
+    $ownerActionStage = 'unreported'
+    $ownerCleanupStage = 'not-started'
+    $ownerCleanupFailure = 'none'
+    $primaryException = $null
+    $cleanupFailureKinds = @()
+    $result = $null
     try {
         Assert-Qualification ($process.Start()) 'Could not start the owner-impersonation qualification process.'
         $started = $true
@@ -1595,30 +1644,73 @@ function Invoke-OwnerQualificationTest {
         [Array]::Clear($credentialBytes, 0, $credentialBytes.Length)
         [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($credentialPointer)
         $credentialPointer = [IntPtr]::Zero
-        Assert-Qualification ($process.WaitForExit(90000)) 'Owner-impersonation qualification process exceeded its 90 second deadline.'
+        $exited = $process.WaitForExit(90000)
+        if (-not $exited) {
+            $stopSucceeded = $true
+            if ($handlePinned) {
+                try {
+                    $null = Stop-QualificationProcess -Process $process -HandlePinned $handlePinned
+                }
+                catch {
+                    $stopSucceeded = $false
+                }
+            }
+            $stdoutDrained = $false
+            $stderrDrained = $false
+            try { $stdoutDrained = $stdoutTask.Wait($script:streamDrainTimeoutMilliseconds) } catch { $stdoutDrained = $false }
+            try { $stderrDrained = $stderrTask.Wait($script:streamDrainTimeoutMilliseconds) } catch { $stderrDrained = $false }
+            if ($stdoutDrained) {
+                $timeoutStages = Get-OwnerQualificationStages -Output $stdoutTask.GetAwaiter().GetResult()
+                $ownerActionStage = $timeoutStages.ActionStage
+                $ownerCleanupStage = $timeoutStages.CleanupStage
+                $ownerCleanupFailure = $timeoutStages.CleanupFailure
+            }
+            Assert-Qualification $false "Owner-impersonation qualification process exceeded its 90 second deadline; action_stage=$ownerActionStage; cleanup_stage=$ownerCleanupStage; cleanup_failure=$ownerCleanupFailure; stop_succeeded=$stopSucceeded; stdout_drained=$stdoutDrained; stderr_drained=$stderrDrained."
+        }
         $streamTasks = [Threading.Tasks.Task[]]@($stdoutTask, $stderrTask)
         Assert-Qualification ([Threading.Tasks.Task]::WaitAll($streamTasks, $script:streamDrainTimeoutMilliseconds)) 'Owner-impersonation qualification output did not close within the bounded drain deadline.'
         $stdout = $stdoutTask.GetAwaiter().GetResult()
         $stderr = $stderrTask.GetAwaiter().GetResult()
+        $ownerStages = Get-OwnerQualificationStages -Output $stdout
+        $ownerActionStage = $ownerStages.ActionStage
+        $ownerCleanupStage = $ownerStages.CleanupStage
+        $ownerCleanupFailure = $ownerStages.CleanupFailure
         [IO.File]::WriteAllText($StandardOutputPath, $stdout)
         [IO.File]::WriteAllText($StandardErrorPath, $stderr)
         $ownerOutput = @($stdout -split "`r?`n") + @($stderr -split "`r?`n")
         $evidence = New-NativeTestExecutionEvidence -ExecutablePath $resolvedS4UTestExecutable -Arguments $Arguments -RunPattern $RunPattern -Description $EvidenceName -EvidenceName $EvidenceName -ExitCode $process.ExitCode -Output $ownerOutput
+        if ($process.ExitCode -ne 0) {
+            Assert-Qualification $false "Native Windows qualification test pattern failed for $EvidenceName with exit code $($process.ExitCode); action_stage=$ownerActionStage; cleanup_stage=$ownerCleanupStage; cleanup_failure=$ownerCleanupFailure. Evidence: $($evidence.EvidencePath)."
+        }
         Assert-NativeTestExecutionEvidence -Evidence $evidence -Description $EvidenceName
-        return [pscustomobject]@{ ExitCode = $process.ExitCode; Output = @($stdout, $stderr) -join "`n"; Evidence = $evidence }
+        $result = [pscustomobject]@{ ExitCode = $process.ExitCode; Output = @($stdout, $stderr) -join "`n"; Evidence = $evidence }
+    }
+    catch {
+        $primaryException = $_
     }
     finally {
         if ($null -ne $credentialBytes) {
-            [Array]::Clear($credentialBytes, 0, $credentialBytes.Length)
+            try {
+                [Array]::Clear($credentialBytes, 0, $credentialBytes.Length)
+            }
+            catch {
+                $cleanupFailureKinds += 'credential-bytes-clear'
+            }
         }
         if ($credentialPointer -ne [IntPtr]::Zero) {
-            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($credentialPointer)
+            try {
+                [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($credentialPointer)
+            }
+            catch {
+                $cleanupFailureKinds += 'credential-pointer-clear'
+            }
         }
         try {
             $cleanupTerminationError = $null
             if ($started) {
                 if (-not $handlePinned -or $null -eq $processRecord) {
                     $script:qualificationProcessRegistrationFailures += "kind=owner; image=$resolvedS4UTestExecutable; handle_pinned=$handlePinned; record_present=$($null -ne $processRecord)"
+                    $cleanupFailureKinds += 'registration'
                 }
                 if ($handlePinned) {
                     try {
@@ -1628,26 +1720,60 @@ function Invoke-OwnerQualificationTest {
                     }
                     catch {
                         $cleanupTerminationError = $_.Exception.Message
+                        $cleanupFailureKinds += 'termination'
                     }
                 }
             }
             if ($null -ne $stdoutTask -and $null -ne $stderrTask) {
                 $cleanupTasks = [Threading.Tasks.Task[]]@($stdoutTask, $stderrTask)
-                Assert-Qualification ([Threading.Tasks.Task]::WaitAll($cleanupTasks, $script:streamDrainTimeoutMilliseconds)) 'Owner-impersonation qualification output did not close within the bounded cleanup drain deadline.'
+                $cleanupDrained = $false
+                try {
+                    $cleanupDrained = [Threading.Tasks.Task]::WaitAll($cleanupTasks, $script:streamDrainTimeoutMilliseconds)
+                }
+                catch {
+                    $cleanupDrained = $false
+                }
+                if (-not $cleanupDrained) {
+                    $script:qualificationProcessRegistrationFailures += "kind=owner; cleanup_drain=false; action_stage=$ownerActionStage; cleanup_stage=$ownerCleanupStage"
+                    $cleanupFailureKinds += 'stream-drain'
+                }
             }
-            Assert-Qualification ([string]::IsNullOrWhiteSpace($cleanupTerminationError)) "Owner-impersonation process cleanup failed: $cleanupTerminationError"
+            if (-not [string]::IsNullOrWhiteSpace($cleanupTerminationError)) {
+                $script:qualificationProcessRegistrationFailures += "kind=owner; cleanup_termination=false; action_stage=$ownerActionStage; cleanup_stage=$ownerCleanupStage"
+            }
+        }
+        catch {
+            $cleanupFailureKinds += 'cleanup-unexpected'
+            $script:qualificationProcessRegistrationFailures += "kind=owner; cleanup_unexpected=false; action_stage=$ownerActionStage; cleanup_stage=$ownerCleanupStage"
         }
         finally {
             try {
                 if ($null -ne $processRecord) {
-                    Complete-QualificationProcess -Record $processRecord -Process $process
+                    try {
+                        Complete-QualificationProcess -Record $processRecord -Process $process
+                    }
+                    catch {
+                        $cleanupFailureKinds += 'completion'
+                        $script:qualificationProcessRegistrationFailures += "kind=owner; completion=false; action_stage=$ownerActionStage; cleanup_stage=$ownerCleanupStage"
+                    }
                 }
             }
             finally {
-                $process.Dispose()
+                try {
+                    $process.Dispose()
+                }
+                catch {
+                    $cleanupFailureKinds += 'dispose'
+                    $script:qualificationProcessRegistrationFailures += "kind=owner; dispose=false; action_stage=$ownerActionStage; cleanup_stage=$ownerCleanupStage"
+                }
             }
         }
     }
+    if ($null -ne $primaryException) {
+        throw $primaryException
+    }
+    Assert-Qualification ($cleanupFailureKinds.Count -eq 0) "Owner-impersonation process cleanup failed; kinds=$($cleanupFailureKinds -join ','); action_stage=$ownerActionStage; cleanup_stage=$ownerCleanupStage; cleanup_failure=$ownerCleanupFailure."
+    return $result
 }
 
 function Invoke-S4UDPAPIQualification {
