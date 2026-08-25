@@ -135,6 +135,16 @@ func ensureDPAPIDirectoryWithCreate(path, sddl string, create dpapiDirectoryCrea
 			// Administrators group as owner for an administrator account.
 			if mkdirErr := os.Mkdir(path, 0o700); mkdirErr == nil {
 				createdBelowTrustedParent = true
+			} else if errors.Is(mkdirErr, os.ErrNotExist) {
+				// Profile namespaces may be created before their credential root.
+				// Secure the parent chain first, then retry the final component.
+				if parentErr := ensureDPAPIDirectory(filepath.Dir(path), sddl); parentErr != nil {
+					return parentErr
+				}
+				if retryErr := os.Mkdir(path, 0o700); retryErr != nil && !errors.Is(retryErr, os.ErrExist) {
+					return retryErr
+				}
+				createdBelowTrustedParent = true
 			} else if !errors.Is(mkdirErr, os.ErrExist) {
 				return mkdirErr
 			}
