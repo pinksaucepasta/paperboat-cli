@@ -435,7 +435,7 @@ jobs:
         run: |
           set -euo pipefail
           if ! gh release view "$RELEASE_VERSION" >/dev/null 2>&1; then
-            gh release create "$RELEASE_VERSION" --target "$GITHUB_SHA" --title "Paperboat $RELEASE_VERSION" --notes "Paperboat $RELEASE_VERSION" --draft --latest=false
+            gh release create "$RELEASE_VERSION" --verify-tag --title "Paperboat $RELEASE_VERSION" --notes "Paperboat $RELEASE_VERSION" --draft --latest=false
           fi
       - name: Upload only the five binaries/packages through the GitHub API
         env:
