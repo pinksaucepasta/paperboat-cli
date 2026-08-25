@@ -11,6 +11,7 @@ import (
 	"time"
 	"unsafe"
 
+	winenv "github.com/pinksaucepasta/paperboat/internal/windowsenvironment"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
 )
@@ -36,6 +37,13 @@ func (h *sshdServiceHandler) Execute(_ []string, requests <-chan svc.ChangeReque
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	command := exec.CommandContext(ctx, h.sshdPath, "-D", "-e", "-f", h.configPath)
+	// services.exe may retain the pre-install environment until reboot. The
+	// Paperboat command directory is part of the managed installation contract,
+	// so carry it into sshd explicitly; OpenSSH copies this environment to every
+	// authenticated command shell.
+	if executable, executableErr := os.Executable(); executableErr == nil {
+		command.Env = winenv.WithCommandDirectory(os.Environ(), filepath.Dir(executable))
+	}
 	command.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NEW_PROCESS_GROUP}
 	job, err := windows.CreateJobObject(nil, nil)
 	if err != nil {

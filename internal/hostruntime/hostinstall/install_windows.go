@@ -29,6 +29,7 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/nativesignature"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/releaseindex"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
+	winenv "github.com/pinksaucepasta/paperboat/internal/windowsenvironment"
 	"github.com/pinksaucepasta/paperboat/internal/windowsopenssh"
 	"github.com/pinksaucepasta/paperboat/internal/windowssecurity"
 	"golang.org/x/sys/windows"
@@ -128,6 +129,9 @@ func InstallStandaloneBinary(ctx context.Context, source, version string) error 
 		if err := ensureWindowsDirectory(directory, ""); err != nil {
 			return err
 		}
+	}
+	if err := winenv.EnsureMachinePath(filepath.Dir(layout.Binary)); err != nil {
+		return fmt.Errorf("register Paperboat command path: %w", err)
 	}
 	artifact := bootstrap.ArtifactTarget{
 		Schema: bootstrap.ArtifactTargetSchemaV1, Kind: bootstrap.ArtifactKindPB, Version: version,
@@ -304,6 +308,9 @@ func Install(ctx context.Context, request Request) error {
 		return err
 	}
 	if err := runWindowsInstallPhase(ctx, "prepare Paperboat machine state", func() error { return ensureWindowsMachineDirectory(WindowsProgramDataRoot(), request.OwnerSID) }); err != nil {
+		return err
+	}
+	if err := runWindowsInstallPhase(ctx, "register Paperboat command path", func() error { return winenv.EnsureMachinePath(filepath.Dir(layout.Binary)) }); err != nil {
 		return err
 	}
 	if err := runWindowsInstallPhase(ctx, "prepare Paperboat release slots", func() error { return ensureWindowsDirectory(layout.ReleasesRoot, request.OwnerSID) }); err != nil {
@@ -546,6 +553,9 @@ func Repair(ctx context.Context) error {
 	if err := ensureWindowsMachineDirectory(WindowsProgramDataRoot(), config.OwnerSID); err != nil {
 		return err
 	}
+	if err := winenv.EnsureMachinePath(filepath.Dir(layout.Binary)); err != nil {
+		return err
+	}
 	if err := ensureWindowsDirectory(config.StateRoot, config.OwnerSID); err != nil {
 		return err
 	}
@@ -624,6 +634,7 @@ func uninstallWindows(ctx context.Context, purge bool) error {
 		return err
 	}
 	var result error
+	result = errors.Join(result, winenv.RemoveMachinePath(filepath.Dir(layout.Binary)))
 	runtimeCurrent, _, _ := windowsRuntimePaths(layout)
 	for _, item := range []struct {
 		kind       string
