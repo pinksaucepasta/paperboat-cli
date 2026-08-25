@@ -1129,6 +1129,14 @@ func stageWindowsBinary(ctx context.Context, source, current, rollback string, a
 	if err := nativesignature.New(nil).Verify(sourceVerifyCtx, source, "windows", artifact.Architecture); err != nil {
 		return fmt.Errorf("%w: downloaded runtime Authenticode: %v", ErrInvalidRequest, err)
 	}
+	// The dashboard bootstrap may execute the verified binary directly from the
+	// installed active slot. That process necessarily keeps the image open on
+	// Windows, so rotating the slot would fail with a sharing violation. The
+	// image has already passed every integrity and signature check above; leave
+	// it in place and let service installation bind to the same executable.
+	if filepath.Clean(source) == filepath.Clean(current) {
+		return nil
+	}
 	body, err := os.ReadFile(source)
 	if err != nil || len(body) < 1 || len(body) > 256<<20 {
 		return fmt.Errorf("%w: read staged runtime", ErrInvalidRequest)
