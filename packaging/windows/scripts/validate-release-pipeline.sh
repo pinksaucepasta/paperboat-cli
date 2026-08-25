@@ -6,7 +6,7 @@ repository_root=$(CDPATH='' cd -- "$(dirname -- "$0")/../../.." && pwd)
 python3 - \
   "$repository_root/.github/workflows/release.yml" \
   "$repository_root/tools/build-release-asset.sh" \
-  "$repository_root/tools/build-macos-dmg.sh" \
+  "$repository_root/tools/build-macos-pkg.sh" \
   "$repository_root/Makefile" \
   "$repository_root/tools/tuf-repository/main.go" \
   "$repository_root/packaging/windows/scripts/sign-and-verify.ps1" <<'PY'
@@ -14,10 +14,10 @@ import pathlib
 import re
 import sys
 
-workflow_path, release_builder_path, dmg_builder_path, makefile_path, tuf_path, windows_signer_path = map(pathlib.Path, sys.argv[1:])
+workflow_path, release_builder_path, pkg_builder_path, makefile_path, tuf_path, windows_signer_path = map(pathlib.Path, sys.argv[1:])
 workflow = workflow_path.read_text(encoding='utf-8')
 release_builder = release_builder_path.read_text(encoding='utf-8')
-dmg_builder = dmg_builder_path.read_text(encoding='utf-8')
+pkg_builder = pkg_builder_path.read_text(encoding='utf-8')
 makefile = makefile_path.read_text(encoding='utf-8')
 tuf_repository = tuf_path.read_text(encoding='utf-8')
 windows_signer = windows_signer_path.read_text(encoding='utf-8')
@@ -51,6 +51,9 @@ required = {
     'gh release edit "$RELEASE_VERSION" --draft=false --target "$GITHUB_SHA"',
     'Publish release assets without changing Latest',
     'Mark the verified GitHub release latest',
+    'APPLE_INSTALLER_SIGNING_IDENTITY',
+    'xcrun notarytool submit',
+    'xcrun stapler staple',
 }
 missing = sorted(value for value in required if value not in workflow)
 if missing:
@@ -61,9 +64,9 @@ expected_assets = {
     'pb-windows-arm64.exe',
     'pb-linux-amd64',
     'pb-linux-arm64',
-    'pb-darwin-arm64.dmg',
+    'pb-darwin-arm64.pkg',
 }
-asset_literals = set(re.findall(r"['\"](pb-(?:windows|linux|darwin)-[a-z0-9-]+(?:\.exe|\.dmg)?)['\"]", workflow))
+asset_literals = set(re.findall(r"['\"](pb-(?:windows|linux|darwin)-[a-z0-9-]+(?:\.exe|\.pkg)?)['\"]", workflow))
 if not expected_assets.issubset(asset_literals):
     raise SystemExit(f'release workflow does not name all five assets: {sorted(asset_literals)}')
 
@@ -103,9 +106,9 @@ if "@('.exe', '.msi')" in windows_signer or "-notin @('.exe', '.msi')" in window
     raise SystemExit('Windows release signer retains MSI compatibility')
 if "Only unified Paperboat PE .exe files may be signed" not in windows_signer:
     raise SystemExit('Windows release signer does not enforce unified .exe inputs')
-for value in ('hdiutil create', '-format UDZO', 'install -m 0755'):
-    if value not in dmg_builder:
-        raise SystemExit(f'macOS DMG builder is missing {value}')
+for value in ('pkgbuild', 'productsign', '--sign', 'pkgutil --check-signature'):
+    if value not in pkg_builder:
+        raise SystemExit(f'macOS package builder is missing {value}')
 for value in ('pb-launcher', 'launcher-windows', 'paperboat-runtime', 'paperboat-hostd', 'paperboat-updater'):
     if value in makefile:
         raise SystemExit(f'Makefile retains retired role artifact {value}')

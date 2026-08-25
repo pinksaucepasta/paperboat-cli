@@ -16,7 +16,7 @@ GOFMT       := $(GO_ROOT)/bin/gofmt
 GO_FILES    := $(shell find . -path ./.git -prune -o -name '*.go' -print)
 LDFLAGS     := -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Version=$(VERSION) -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Commit=$(COMMIT) -X github.com/pinksaucepasta/paperboat/internal/buildinfo.ProtocolVersion=$(PROTOCOL_VERSION) -X github.com/pinksaucepasta/paperboat/internal/buildinfo.DefaultServerURL=$(DEFAULT_SERVER_URL) -X github.com/pinksaucepasta/paperboat/internal/buildinfo.DefaultReleaseURL=$(DEFAULT_RELEASE_URL)
 
-.PHONY: binary-size-check build check clean codex-path-manifest complete container-compose-check contracts cross-build dependencies fmt fmt-check fuzz generate generate-check hosted-image-check install license-check lint metrics-check metrics-generate preflight race release-assets release-binaries release-macos-dmg reproducible-builds source-policy static-analysis test tidy tidy-check uninstall verification verify-toolchain vet vulnerability-check
+.PHONY: binary-size-check build check clean codex-path-manifest complete container-compose-check contracts cross-build dependencies fmt fmt-check fuzz generate generate-check hosted-image-check install license-check lint metrics-check metrics-generate preflight race release-assets release-binaries release-macos-pkg reproducible-builds source-policy static-analysis test tidy tidy-check uninstall verification verify-toolchain vet vulnerability-check
 
 contracts:
 	@./testdata/contracts/validate.sh
@@ -62,16 +62,17 @@ release-binaries: verify-toolchain
 	@./tools/build-release-asset.sh --platform windows --architecture amd64 --output dist/pb-windows-amd64.exe --version "$(VERSION)" --server-url "$(DEFAULT_SERVER_URL)" --release-url "$(DEFAULT_RELEASE_URL)"
 	@./tools/build-release-asset.sh --platform windows --architecture arm64 --output dist/pb-windows-arm64.exe --version "$(VERSION)" --server-url "$(DEFAULT_SERVER_URL)" --release-url "$(DEFAULT_RELEASE_URL)"
 
-release-macos-dmg: verify-toolchain
-	@test "$$(uname -s)" = Darwin || { echo 'release-macos-dmg requires macOS' >&2; exit 1; }
-	@test "$$(uname -m)" = arm64 || { echo 'release-macos-dmg requires an Apple Silicon runner' >&2; exit 1; }
+release-macos-pkg: verify-toolchain
+	@test "$$(uname -s)" = Darwin || { echo 'release-macos-pkg requires macOS' >&2; exit 1; }
+	@test "$$(uname -m)" = arm64 || { echo 'release-macos-pkg requires an Apple Silicon runner' >&2; exit 1; }
 	@mkdir -p dist
-	@rm -f dist/pb-darwin-arm64.stage dist/pb-darwin-arm64.dmg
+	@rm -f dist/pb-darwin-arm64.stage dist/pb-darwin-arm64.pkg
 	@./tools/build-release-asset.sh --platform darwin --architecture arm64 --output dist/pb-darwin-arm64.stage --version "$(VERSION)" --server-url "$(DEFAULT_SERVER_URL)" --release-url "$(DEFAULT_RELEASE_URL)"
-	@./tools/build-macos-dmg.sh --binary dist/pb-darwin-arm64.stage --output dist/pb-darwin-arm64.dmg --version "$(VERSION)"
+	@test -n "$(MACOS_INSTALLER_SIGNING_IDENTITY)" || { echo 'MACOS_INSTALLER_SIGNING_IDENTITY is required' >&2; exit 1; }
+	@./tools/build-macos-pkg.sh --binary dist/pb-darwin-arm64.stage --output dist/pb-darwin-arm64.pkg --version "$(VERSION)" --signing-identity "$(MACOS_INSTALLER_SIGNING_IDENTITY)"
 	@rm -f dist/pb-darwin-arm64.stage
 
-release-assets: release-binaries release-macos-dmg
+release-assets: release-binaries release-macos-pkg
 
 install: build
 	install -d $(BINDIR)

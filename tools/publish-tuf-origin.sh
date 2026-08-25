@@ -119,7 +119,7 @@ if not isinstance(repository, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z
     raise SystemExit("current.json has an invalid GitHub repository")
 assets = value.get("assets")
 expected = {
-    "pb-darwin-arm64.dmg": ("darwin", "arm64", "dmg"),
+    "pb-darwin-arm64.pkg": ("darwin", "arm64", "pkg"),
     "pb-linux-amd64": ("linux", "amd64", "elf"),
     "pb-linux-arm64": ("linux", "arm64", "elf"),
     "pb-windows-amd64.exe": ("windows", "amd64", "pe"),

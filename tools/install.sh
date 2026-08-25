@@ -135,9 +135,9 @@ command -v curl >/dev/null 2>&1 || { echo "pb installer: curl is required" >&2; 
 
 asset="pb-${os}-${arch}"
 [ "$os" != windows ] || asset="$asset.exe"
-[ "$os" != darwin ] || asset="$asset.dmg"
+[ "$os" != darwin ] || asset="$asset.pkg"
 format=elf
-[ "$os" != darwin ] || format=dmg
+[ "$os" != darwin ] || format=pkg
 
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/paperboat-install.XXXXXX")
 trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
@@ -194,14 +194,13 @@ fi
 [ "$actual" = "$expected" ] || { echo "pb installer: release asset digest verification failed" >&2; exit 1; }
 
 if [ "$os" = darwin ]; then
-  command -v hdiutil >/dev/null 2>&1 || { echo "pb installer: hdiutil is required" >&2; exit 1; }
-  mkdir -p "$install_dir"
-  mountpoint="$tmp_dir/mount"; mkdir -p "$mountpoint"
-  hdiutil attach -nobrowse -readonly -mountpoint "$mountpoint" "$download" >/dev/null
-  trap 'hdiutil detach "$mountpoint" -quiet >/dev/null 2>&1 || true; rm -rf "$tmp_dir"' EXIT HUP INT TERM
-  [ -f "$mountpoint/pb" ] || { echo "pb installer: DMG does not contain pb" >&2; exit 1; }
-  target="$install_dir/pb"; staged="$install_dir/.pb.installing.$$"
-  cp "$mountpoint/pb" "$staged"; chmod 0755 "$staged"; mv -f "$staged" "$target"
+  command -v installer >/dev/null 2>&1 || { echo "pb installer: macOS installer is required" >&2; exit 1; }
+  if [ "$install_dir_requested" = true ] || [ -n "${PAPERBOAT_INSTALL_DIR:-}" ]; then
+    echo "pb installer: --install-dir is not supported for the macOS PKG; it installs /usr/local/bin/pb" >&2
+    exit 2
+  fi
+  sudo installer -pkg "$download" -target /
+  target=/usr/local/bin/pb
 else
   mkdir -p "$install_dir"
   target="$install_dir/pb"

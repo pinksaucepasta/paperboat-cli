@@ -90,10 +90,10 @@ func TestCISigningPublishesCompleteSupportedRelease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, exists := targets.Signed.Targets["pb-darwin-amd64.dmg"]; exists {
+	if _, exists := targets.Signed.Targets["pb-darwin-amd64.pkg"]; exists {
 		t.Fatal("unsupported macOS amd64 target was published")
 	}
-	if _, exists := targets.Signed.Targets["pb-darwin-arm64.dmg"]; !exists {
+	if _, exists := targets.Signed.Targets["pb-darwin-arm64.pkg"]; !exists {
 		t.Fatal("macOS arm64 target was not published")
 	}
 	wantNames := map[string]bool{}
