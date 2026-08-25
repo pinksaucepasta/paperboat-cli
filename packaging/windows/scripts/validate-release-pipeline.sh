@@ -46,7 +46,7 @@ required = {
     "'assets': assets",
     'publish-tuf-origin.sh',
     'PAPERBOAT_RELEASE_BUNDLE_SHA256',
-    'gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_VERSION"',
+    'gh release view "$RELEASE_VERSION" --json tagName,assets',
     'GitHub API did not return a digest',
     'gh release edit "$RELEASE_VERSION" --draft=false --target "$GITHUB_SHA"',
     'Publish release assets without changing Latest',
