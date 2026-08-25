@@ -526,7 +526,7 @@ func Validate(request Request, sudoUID int) error {
 	if err := bootstrap.VerifyArtifactTarget(request.Artifact); err != nil || request.Artifact.Platform != request.Platform {
 		return fmt.Errorf("%w: TUF target descriptor", ErrInvalidRequest)
 	}
-	if err := verifyArtifact(request.Executable, request.UID); err != nil {
+	if err := verifyArtifact(request.Executable, request.UID, request.Platform); err != nil {
 		return fmt.Errorf("%w: TUF target file", ErrInvalidRequest)
 	}
 	if err := binarytarget.Validate(request.Executable, request.Platform, request.Artifact.Architecture); err != nil {
@@ -577,12 +577,13 @@ func invokingUID() int {
 	return uid
 }
 
-func verifyArtifact(path string, uid int) error {
+func verifyArtifact(path string, uid int, platform string) error {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return ErrInvalidRequest
 	}
 	lstat, err := os.Lstat(path)
-	if err != nil || !lstat.Mode().IsRegular() || lstat.Mode()&os.ModeSymlink != 0 || lstat.Mode().Perm()&0o022 != 0 || ownerUID(lstat) != uid {
+	rootOwnedDarwinPackageBinary := platform == "darwin" && filepath.Clean(path) == "/usr/local/bin/pb" && ownerUID(lstat) == 0
+	if err != nil || !lstat.Mode().IsRegular() || lstat.Mode()&os.ModeSymlink != 0 || lstat.Mode().Perm()&0o022 != 0 || (ownerUID(lstat) != uid && !rootOwnedDarwinPackageBinary) {
 		return ErrInvalidRequest
 	}
 	file, err := os.Open(path)
@@ -591,7 +592,7 @@ func verifyArtifact(path string, uid int) error {
 	}
 	defer file.Close()
 	info, err := file.Stat()
-	if err != nil || !info.Mode().IsRegular() || info.Size() < 1 || info.Size() > 256<<20 || ownerUID(info) != uid {
+	if err != nil || !info.Mode().IsRegular() || info.Size() < 1 || info.Size() > 256<<20 || (ownerUID(info) != uid && !rootOwnedDarwinPackageBinary) {
 		return ErrInvalidRequest
 	}
 	return nil
