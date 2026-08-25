@@ -456,7 +456,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_VERSION" > "$RUNNER_TEMP/release.json"
+          gh release view "$RELEASE_VERSION" --json tagName,assets > "$RUNNER_TEMP/release.json"
           python3 - "$RUNNER_TEMP/release.json" dist <<'PY'
           import hashlib
           import json
