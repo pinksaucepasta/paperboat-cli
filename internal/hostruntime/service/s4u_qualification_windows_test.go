@@ -8,15 +8,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 	"unsafe"
@@ -34,20 +32,15 @@ const s4uFixturePathEnvironment = "PAPERBOAT_WINDOWS_E2E_S4U_FIXTURE"
 const s4uFixtureSHA256Environment = "PAPERBOAT_WINDOWS_E2E_S4U_FIXTURE_SHA256"
 const s4uReportPathEnvironment = "PAPERBOAT_WINDOWS_E2E_S4U_REPORT_PATH"
 const s4uServiceNameEnvironment = "PAPERBOAT_WINDOWS_E2E_S4U_SERVICE_NAME"
-const s4uOwnerAccountEnvironment = "PAPERBOAT_WINDOWS_E2E_S4U_OWNER_ACCOUNT"
 const s4uQualificationActionStagePrefix = "paperboat-s4u-action-stage:"
-const s4uQualificationCleanupStagePrefix = "paperboat-s4u-cleanup-stage:"
-const s4uQualificationCleanupFailurePrefix = "paperboat-s4u-cleanup-failure:"
+
+var qualificationCredWrite = windows.NewLazySystemDLL("advapi32.dll").NewProc("CredWriteW")
 
 var (
-	qualificationCredWrite = windows.NewLazySystemDLL("advapi32.dll").NewProc("CredWriteW")
-	qualificationLogonUser = windows.NewLazySystemDLL("advapi32.dll").NewProc("LogonUserW")
-)
-
-const (
-	qualificationLogonInteractive     = uint32(2)
-	qualificationLogonProviderDefault = uint32(0)
-	qualificationPasswordLimit        = int64(512)
+	qualificationOwnerSIDFlag      = flag.String("paperboat-owner-sid", "", "native qualification owner SID")
+	qualificationReportPathFlag    = flag.String("paperboat-report-path", "", "native qualification report path")
+	qualificationFixturePathFlag   = flag.String("paperboat-fixture-path", "", "native qualification fixture path")
+	qualificationFixtureSHA256Flag = flag.String("paperboat-fixture-sha256", "", "native qualification fixture SHA256")
 )
 
 type qualificationWindowsCredential struct {
@@ -67,14 +60,6 @@ type qualificationWindowsCredential struct {
 
 func reportS4UQualificationActionStage(stage string) {
 	fmt.Printf("%s%s\n", s4uQualificationActionStagePrefix, stage)
-}
-
-func reportS4UQualificationCleanupStage(stage string) {
-	fmt.Printf("%s%s\n", s4uQualificationCleanupStagePrefix, stage)
-}
-
-func reportS4UQualificationCleanupFailure(stage string) {
-	fmt.Printf("%s%s\n", s4uQualificationCleanupFailurePrefix, stage)
 }
 
 func writeLegacyCredentialManagerFixture(t *testing.T, ref, value string) {
@@ -181,7 +166,7 @@ func assertQualificationIdentityOwner(t *testing.T, stateRoot, ownerSID string) 
 	for _, name := range []string{"machine-identity.json", "machine-registration.json", "machine-control.json"} {
 		path := filepath.Join(stateRoot, name)
 		if !windowssecurity.OwnerMatchesSID(path, sid) {
-			t.Fatalf("qualification identity file %s is not owned by impersonated owner %s", name, ownerSID)
+			t.Fatalf("qualification identity file %s is not owned by owner process %s", name, ownerSID)
 		}
 		descriptor := "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + ownerSID + ")"
 		if !windowssecurity.ProtectedDACLMatches(path, descriptor) {
@@ -190,231 +175,36 @@ func assertQualificationIdentityOwner(t *testing.T, stateRoot, ownerSID string) 
 	}
 }
 
-func qualificationProfilePrivilegeScope() (func() error, error) {
-	runtime.LockOSThread()
-	abort := func(err error, token windows.Token) (func() error, error) {
-		if token != 0 {
-			err = errors.Join(err, token.Close())
-		}
-		revertErr := windows.RevertToSelf()
-		err = errors.Join(err, revertErr)
-		if revertErr == nil {
-			runtime.UnlockOSThread()
-		}
-		return nil, err
-	}
-	if err := windows.ImpersonateSelf(windows.SecurityImpersonation); err != nil {
-		runtime.UnlockOSThread()
-		return nil, err
-	}
-	var token windows.Token
-	if err := windows.OpenThreadToken(windows.CurrentThread(), windows.TOKEN_QUERY|windows.TOKEN_ADJUST_PRIVILEGES, false, &token); err != nil {
-		return abort(err, 0)
-	}
-	names := []string{"SeBackupPrivilege", "SeRestorePrivilege"}
-	stateBytes := make([]byte, unsafe.Sizeof(windows.Tokenprivileges{})+uintptr(len(names)-1)*unsafe.Sizeof(windows.LUIDAndAttributes{}))
-	state := (*windows.Tokenprivileges)(unsafe.Pointer(&stateBytes[0]))
-	state.PrivilegeCount = uint32(len(names))
-	for index, value := range names {
-		name, err := windows.UTF16PtrFromString(value)
-		if err != nil {
-			return abort(err, token)
-		}
-		if err := windows.LookupPrivilegeValue(nil, name, &state.AllPrivileges()[index].Luid); err != nil {
-			return abort(err, token)
-		}
-		state.AllPrivileges()[index].Attributes = windows.SE_PRIVILEGE_ENABLED
-	}
-	previousBytes := make([]byte, len(stateBytes))
-	previous := (*windows.Tokenprivileges)(unsafe.Pointer(&previousBytes[0]))
-	var previousLength uint32
-	result, _, callErr := syscall.SyscallN(procAdjustTokenPrivileges.Addr(), uintptr(token), 0, uintptr(unsafe.Pointer(state)), uintptr(len(previousBytes)), uintptr(unsafe.Pointer(previous)), uintptr(unsafe.Pointer(&previousLength)))
-	if result == 0 || callErr == windows.ERROR_NOT_ALL_ASSIGNED {
-		if callErr != syscall.Errno(0) {
-			return abort(callErr, token)
-		}
-		return abort(windows.ERROR_GEN_FAILURE, token)
-	}
-	return func() error {
-		var restoreErr error
-		if previousLength > 0 {
-			result, _, callErr := syscall.SyscallN(procAdjustTokenPrivileges.Addr(), uintptr(token), 0, uintptr(unsafe.Pointer(previous)), 0, 0, 0)
-			if result == 0 {
-				restoreErr = callErr
-			}
-		}
-		revertErr := windows.RevertToSelf()
-		restoreErr = errors.Join(restoreErr, token.Close(), revertErr)
-		if revertErr == nil {
-			runtime.UnlockOSThread()
-		}
-		runtime.KeepAlive(stateBytes)
-		runtime.KeepAlive(previousBytes)
-		return restoreErr
-	}, nil
-}
-
-func closeQualificationProfile(profile *loadedOwnerProfile) error {
-	if profile == nil {
-		return nil
-	}
-	stopPrivileges, privilegeErr := qualificationProfilePrivilegeScope()
-	if privilegeErr != nil {
-		return errors.Join(privilegeErr, profile.Close())
-	}
-	closeErr := profile.Close()
-	return errors.Join(closeErr, stopPrivileges())
-}
-
-func readQualificationPassword() ([]uint16, error) {
-	raw, err := io.ReadAll(io.LimitReader(os.Stdin, qualificationPasswordLimit+2))
-	if err != nil {
-		return nil, err
-	}
-	defer clear(raw)
-	if len(raw) == 0 || int64(len(raw)) > qualificationPasswordLimit || len(raw)%2 != 0 {
-		return nil, errors.New("invalid bounded UTF-16 qualification credential")
-	}
-	password := make([]uint16, len(raw)/2+1)
-	for index := 0; index < len(raw); index += 2 {
-		value := uint16(raw[index]) | uint16(raw[index+1])<<8
-		if value == 0 {
-			clear(password)
-			return nil, errors.New("qualification credential contains an embedded NUL")
-		}
-		password[index/2] = value
-	}
-	return password, nil
-}
-
-func qualificationInteractiveToken(accountName string, password []uint16) (windows.Token, string, string, error) {
-	account, domain, found := strings.Cut(accountName, `\`)
-	if !found || account == "" || domain == "" {
-		return 0, "", "", errors.New("qualification owner account must be DOMAIN\\user")
-	}
-	// strings.Cut returns the domain before the separator.
-	domain, account = account, domain
-	accountPointer, err := windows.UTF16PtrFromString(account)
-	if err != nil {
-		return 0, "", "", err
-	}
-	domainPointer, err := windows.UTF16PtrFromString(domain)
-	if err != nil {
-		return 0, "", "", err
-	}
-	var token windows.Token
-	result, _, callErr := qualificationLogonUser.Call(uintptr(unsafe.Pointer(accountPointer)), uintptr(unsafe.Pointer(domainPointer)), uintptr(unsafe.Pointer(&password[0])), uintptr(qualificationLogonInteractive), uintptr(qualificationLogonProviderDefault), uintptr(unsafe.Pointer(&token)))
-	runtime.KeepAlive(password)
-	if result == 0 {
-		if callErr != syscall.Errno(0) {
-			return 0, "", "", callErr
-		}
-		return 0, "", "", windows.ERROR_LOGON_FAILURE
-	}
-	return token, account, domain, nil
-}
-
 func withQualificationOwner(t *testing.T, action func(windows.Token)) {
 	t.Helper()
-	reportS4UQualificationActionStage("credential-input")
-	password, err := readQualificationPassword()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer clear(password)
-	accountName := strings.TrimSpace(os.Getenv(s4uOwnerAccountEnvironment))
-	reportS4UQualificationActionStage("interactive-logon")
-	token, account, domain, err := qualificationInteractiveToken(accountName, password)
-	clear(password)
-	if err != nil {
-		t.Fatalf("create interactive qualification owner token: %v", err)
-	}
-	defer func() {
-		reportS4UQualificationCleanupStage("interactive-token-close")
-		if err := token.Close(); err != nil {
-			reportS4UQualificationCleanupFailure("interactive-token-close")
-			t.Errorf("close interactive qualification owner token: %v", err)
-			return
-		}
-		reportS4UQualificationCleanupStage("interactive-token-closed")
-	}()
 	ownerSID := requiredS4UOwnerSID(t)
-	reportS4UQualificationActionStage("owner-token-validate")
-	if err := validateOwnerToken(token, ownerSID); err != nil {
-		t.Fatalf("interactive qualification token does not match owner %s: %v", ownerSID, err)
+	processToken := windows.GetCurrentProcessToken()
+	reportS4UQualificationActionStage("owner-process-validate")
+	if err := validateOwnerToken(processToken, ownerSID); err != nil {
+		t.Fatalf("qualification process does not run as owner %s: %v", ownerSID, err)
 	}
-	processUser, err := windows.GetCurrentProcessToken().GetTokenUser()
-	if err != nil || processUser == nil || processUser.User.Sid == nil || processUser.User.Sid.String() == ownerSID {
-		t.Fatalf("qualification process identity must differ from impersonated owner %s: %v", ownerSID, err)
+	reportS4UQualificationActionStage("thread-token-absent")
+	var threadToken windows.Token
+	if err := windows.OpenThreadToken(windows.CurrentThread(), windows.TOKEN_QUERY, true, &threadToken); err == nil {
+		_ = threadToken.Close()
+		t.Fatal("owner qualification process unexpectedly has a thread impersonation token")
+	} else if !errors.Is(err, windows.ERROR_NO_TOKEN) {
+		t.Fatalf("check owner qualification thread token: %v", err)
 	}
-	reportS4UQualificationActionStage("profile-privileges")
-	stopPrivileges, err := qualificationProfilePrivilegeScope()
-	if err != nil {
-		t.Fatalf("enable owner profile-load privileges: %v", err)
+	reportS4UQualificationActionStage("effective-owner")
+	effectiveSID, err := windowssecurity.CurrentEffectiveUserSID()
+	if err != nil || effectiveSID.String() != ownerSID {
+		t.Fatalf("effective qualification owner SID = %v, want %s: %v", effectiveSID, ownerSID, err)
 	}
-	reportS4UQualificationActionStage("profile-load")
-	profile, loadErr := loadOwnerProfile(token, account, domain)
-	privilegeErr := stopPrivileges()
-	if loadErr != nil || privilegeErr != nil {
-		reportS4UQualificationCleanupStage("profile-load-cleanup")
-		cleanupErr := closeQualificationProfile(profile)
-		if cleanupErr == nil {
-			reportS4UQualificationCleanupStage("profile-load-cleaned")
-		} else {
-			reportS4UQualificationCleanupFailure("profile-load-cleanup")
+	reportS4UQualificationActionStage("profile-ready")
+	for _, name := range []string{"USERPROFILE", "APPDATA", "LOCALAPPDATA"} {
+		value := os.Getenv(name)
+		info, statErr := os.Stat(value)
+		if value == "" || !filepath.IsAbs(value) || filepath.Clean(value) != value || statErr != nil || !info.IsDir() {
+			t.Fatalf("owner qualification profile is not loaded: variable=%s path=%q stat=%v", name, value, statErr)
 		}
-		t.Fatalf("load interactive qualification owner profile: %v", errors.Join(loadErr, privilegeErr, cleanupErr))
 	}
-	reportS4UQualificationActionStage("profile-loaded")
-	impersonationReverted := true
-	defer func() {
-		if !impersonationReverted {
-			reportS4UQualificationCleanupFailure("profile-unload-blocked")
-			t.Error("owner profile could not be unloaded after impersonation reversion failed")
-			return
-		}
-		reportS4UQualificationCleanupStage("profile-unload")
-		if err := closeQualificationProfile(profile); err != nil {
-			reportS4UQualificationCleanupFailure("profile-unload")
-			t.Errorf("unload interactive qualification owner profile: %v", err)
-			return
-		}
-		reportS4UQualificationCleanupStage("profile-unloaded")
-	}()
-	var impersonationToken windows.Token
-	reportS4UQualificationActionStage("impersonation-token")
-	if err := windows.DuplicateTokenEx(token, windows.TOKEN_QUERY|windows.TOKEN_IMPERSONATE, nil, windows.SecurityImpersonation, windows.TokenImpersonation, &impersonationToken); err != nil {
-		t.Fatalf("duplicate qualification impersonation token: %v", err)
-	}
-	defer func() {
-		reportS4UQualificationCleanupStage("impersonation-token-close")
-		if err := impersonationToken.Close(); err != nil {
-			reportS4UQualificationCleanupFailure("impersonation-token-close")
-			t.Errorf("close qualification impersonation token: %v", err)
-			return
-		}
-		reportS4UQualificationCleanupStage("impersonation-token-closed")
-	}()
-	runtime.LockOSThread()
-	reportS4UQualificationActionStage("impersonation-start")
-	if err := windows.SetThreadToken(nil, impersonationToken); err != nil {
-		runtime.UnlockOSThread()
-		t.Fatalf("impersonate qualification owner: %v", err)
-	}
-	impersonationReverted = false
-	defer func() {
-		reportS4UQualificationCleanupStage("impersonation-revert")
-		if err := windows.RevertToSelf(); err != nil {
-			reportS4UQualificationCleanupFailure("impersonation-revert")
-			t.Errorf("revert qualification owner impersonation: %v", err)
-			return
-		}
-		impersonationReverted = true
-		runtime.UnlockOSThread()
-		reportS4UQualificationCleanupStage("impersonation-reverted")
-	}()
-	reportS4UQualificationActionStage("impersonated")
-	action(token)
+	action(processToken)
 }
 
 func assertQualificationKeyringOwner(t *testing.T, localAppData, ref, ownerSID string) {
@@ -423,49 +213,19 @@ func assertQualificationKeyringOwner(t *testing.T, localAppData, ref, ownerSID s
 	path := filepath.Join(localAppData, "Paperboat", "credentials", hex.EncodeToString(digest[:])+".dpapi")
 	sid, err := windows.StringToSid(ownerSID)
 	if err != nil || !windowssecurity.OwnerMatchesSID(path, sid) {
-		t.Fatalf("qualification keyring file is not owned by impersonated owner %s: %v", ownerSID, err)
+		t.Fatalf("qualification keyring file is not owned by owner process %s: %v", ownerSID, err)
 	}
 }
 
-// TestNativePrepareS4UDPAPIQualification uses a real interactive logon token
-// for the enrolled owner on a locked thread. Credential Manager rejects
-// service, network, and S4U-only logons with ERROR_NO_SUCH_LOGON_SESSION. The
-// harness process stays on the Session 0 runner identity so this phase has no
-// inherited desktop or window-station dependency.
+// TestNativePrepareS4UDPAPIQualification runs in a dedicated process created
+// with the enrolled owner's credentials and profile. Credential Manager rejects
+// service, network, and S4U-only logons with ERROR_NO_SUCH_LOGON_SESSION, so the
+// harness must use a real owner logon rather than thread impersonation.
 func TestNativePrepareS4UDPAPIQualification(t *testing.T) {
 	withQualificationOwner(t, func(token windows.Token) {
 		ownerSID := requiredS4UOwnerSID(t)
-		reportS4UQualificationActionStage("effective-owner")
-		effectiveSID, err := windowssecurity.CurrentEffectiveUserSID()
-		if err != nil || effectiveSID.String() != ownerSID {
-			t.Fatalf("effective qualification owner SID = %v, want %s: %v", effectiveSID, ownerSID, err)
-		}
-		var effectiveToken windows.Token
-		reportS4UQualificationActionStage("effective-token")
-		if err := windows.OpenThreadToken(windows.CurrentThread(), windows.TOKEN_QUERY, true, &effectiveToken); err != nil {
-			t.Fatalf("open effective owner token: %v", err)
-		}
-		effectiveUser, effectiveErr := effectiveToken.GetTokenUser()
-		effectiveToken.Close()
-		if effectiveErr != nil || effectiveUser == nil || effectiveUser.User.Sid == nil || effectiveUser.User.Sid.String() != ownerSID {
-			t.Fatalf("fixture preparation is not impersonating enrolled owner %s: %v", ownerSID, effectiveErr)
-		}
 		reportS4UQualificationActionStage("local-app-data")
-		localAppData, err := token.KnownFolderPath(windows.FOLDERID_LocalAppData, windows.KF_FLAG_DEFAULT)
-		if err != nil || !filepath.IsAbs(localAppData) {
-			t.Fatalf("resolve enrolled owner LocalAppData: %v", err)
-		}
-		previousLocalAppData, hadLocalAppData := os.LookupEnv("LOCALAPPDATA")
-		if err := os.Setenv("LOCALAPPDATA", filepath.Clean(localAppData)); err != nil {
-			t.Fatal(err)
-		}
-		defer func() {
-			if hadLocalAppData {
-				_ = os.Setenv("LOCALAPPDATA", previousLocalAppData)
-			} else {
-				_ = os.Unsetenv("LOCALAPPDATA")
-			}
-		}()
+		localAppData := os.Getenv("LOCALAPPDATA")
 		reportS4UQualificationActionStage("working-directory")
 		reportPath := requiredS4UReportPath(t)
 		workingDirectory, err := os.Getwd()
@@ -875,7 +635,7 @@ func TestNativeLoggedOutS4UQualification(t *testing.T) {
 
 func requiredS4UFixture(t *testing.T) string {
 	t.Helper()
-	path := os.Getenv(s4uFixturePathEnvironment)
+	path := qualificationFlagOrEnvironment(*qualificationFixturePathFlag, s4uFixturePathEnvironment)
 	if path == "" {
 		t.Fatalf("%s is required", s4uFixturePathEnvironment)
 	}
@@ -896,7 +656,7 @@ func requiredS4UFixture(t *testing.T) string {
 		t.Fatalf("read S4U fixture: %v", err)
 	}
 	digest := fmt.Sprintf("%x", sha256.Sum256(body))
-	expectedDigest := strings.ToLower(strings.TrimSpace(os.Getenv(s4uFixtureSHA256Environment)))
+	expectedDigest := strings.ToLower(qualificationFlagOrEnvironment(*qualificationFixtureSHA256Flag, s4uFixtureSHA256Environment))
 	if len(expectedDigest) != sha256.Size*2 || digest != expectedDigest {
 		t.Fatalf("S4U fixture SHA256 = %q, want %q", digest, expectedDigest)
 	}
@@ -905,7 +665,7 @@ func requiredS4UFixture(t *testing.T) string {
 
 func requiredS4UOwnerSID(t *testing.T) string {
 	t.Helper()
-	value := os.Getenv("PAPERBOAT_WINDOWS_E2E_S4U_OWNER_SID")
+	value := qualificationFlagOrEnvironment(*qualificationOwnerSIDFlag, "PAPERBOAT_WINDOWS_E2E_S4U_OWNER_SID")
 	sid, err := windows.StringToSid(value)
 	if value == "" || err != nil || sid == nil || sid.String() != value {
 		t.Fatalf("PAPERBOAT_WINDOWS_E2E_S4U_OWNER_SID must be an enrolled Windows SID")
@@ -915,7 +675,7 @@ func requiredS4UOwnerSID(t *testing.T) string {
 
 func requiredS4UReportPath(t *testing.T) string {
 	t.Helper()
-	path := os.Getenv(s4uReportPathEnvironment)
+	path := qualificationFlagOrEnvironment(*qualificationReportPathFlag, s4uReportPathEnvironment)
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path || strings.ContainsAny(path, "\x00\r\n") {
 		t.Fatalf("%s must be an absolute clean path", s4uReportPathEnvironment)
 	}
@@ -934,6 +694,13 @@ func requiredS4UServiceName(t *testing.T) string {
 		}
 	}
 	return name
+}
+
+func qualificationFlagOrEnvironment(flagValue, environmentName string) string {
+	if value := strings.TrimSpace(flagValue); value != "" {
+		return value
+	}
+	return strings.TrimSpace(os.Getenv(environmentName))
 }
 
 func hasSelectableOwnerWTSToken(t *testing.T, ownerSID string) bool {

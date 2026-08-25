@@ -200,44 +200,42 @@ function Assert-NativeTestExecutionEvidence {
 }
 
 function Get-OwnerQualificationStages {
-    param([Parameter(Mandatory = $true)][string] $Output)
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string] $Output)
     $allowedActionStages = @(
-        'credential-input', 'interactive-logon', 'owner-token-validate',
-        'profile-privileges', 'profile-load', 'profile-loaded',
-        'impersonation-token', 'impersonation-start', 'impersonated',
-        'effective-owner', 'effective-token', 'local-app-data',
+        'owner-process-validate', 'thread-token-absent', 'effective-owner',
+        'profile-ready', 'local-app-data',
         'working-directory', 'owner-access', 'atomic-file',
         'file-secret-store', 'keyring-write', 'credential-manager-write',
         'credential-manager-migrate', 'identity-create', 'identity-control',
         'identity-open', 'identity-registration-read', 'identity-control-read',
         'security-assertions', 'body-complete'
     )
-    $allowedCleanupStages = @(
-        'profile-load-cleanup', 'profile-load-cleaned',
-        'impersonation-revert', 'impersonation-reverted',
-        'impersonation-token-close', 'impersonation-token-closed',
-        'profile-unload', 'profile-unloaded',
-        'interactive-token-close', 'interactive-token-closed'
-    )
-    $allowedCleanupFailures = @(
-        'profile-load-cleanup', 'profile-unload-blocked',
-        'impersonation-revert', 'impersonation-token-close',
-        'profile-unload', 'interactive-token-close'
-    )
+	$allowedCleanupStages = @(
+		'profile-load-cleanup', 'profile-load-cleaned',
+		'impersonation-revert', 'impersonation-reverted',
+		'impersonation-token-close', 'impersonation-token-closed',
+		'profile-unload', 'profile-unloaded',
+		'interactive-token-close', 'interactive-token-closed'
+	)
+	$allowedCleanupFailures = @(
+		'profile-load-cleanup', 'profile-unload-blocked',
+		'impersonation-revert', 'impersonation-token-close',
+		'profile-unload', 'interactive-token-close'
+	)
     $actionStage = 'unreported'
-    $cleanupStage = 'not-started'
-    $cleanupFailure = 'none'
+	$cleanupStage = 'not-started'
+	$cleanupFailure = 'none'
     $boundedTail = if ($Output.Length -gt 8192) { $Output.Substring($Output.Length - 8192) } else { $Output }
     foreach ($line in @($boundedTail -split "`r?`n")) {
         if ($line -match '^paperboat-s4u-action-stage:([a-z0-9-]+)$' -and $allowedActionStages -contains $Matches[1]) {
             $actionStage = $Matches[1]
         }
-        if ($line -match '^paperboat-s4u-cleanup-stage:([a-z0-9-]+)$' -and $allowedCleanupStages -contains $Matches[1]) {
-            $cleanupStage = $Matches[1]
-        }
-        if ($cleanupFailure -eq 'none' -and $line -match '^paperboat-s4u-cleanup-failure:([a-z0-9-]+)$' -and $allowedCleanupFailures -contains $Matches[1]) {
-            $cleanupFailure = $Matches[1]
-        }
+		if ($line -match '^paperboat-s4u-cleanup-stage:([a-z0-9-]+)$' -and $allowedCleanupStages -contains $Matches[1]) {
+			$cleanupStage = $Matches[1]
+		}
+		if ($cleanupFailure -eq 'none' -and $line -match '^paperboat-s4u-cleanup-failure:([a-z0-9-]+)$' -and $allowedCleanupFailures -contains $Matches[1]) {
+			$cleanupFailure = $Matches[1]
+		}
     }
     return [pscustomobject]@{ ActionStage = $actionStage; CleanupStage = $cleanupStage; CleanupFailure = $cleanupFailure }
 }
@@ -1590,6 +1588,7 @@ function Invoke-GoQualification {
 
 function Invoke-OwnerQualificationTest {
     param(
+        [Parameter(Mandatory = $true)][string] $ExecutablePath,
         [Parameter(Mandatory = $true)][string[]] $Arguments,
         [Parameter(Mandatory = $true)][string] $RunPattern,
         [Parameter(Mandatory = $true)][string] $EvidenceName,
@@ -1600,19 +1599,23 @@ function Invoke-OwnerQualificationTest {
         [Parameter(Mandatory = $true)][string] $StandardErrorPath
     )
     $start = [Diagnostics.ProcessStartInfo]::new()
-    $start.FileName = $resolvedS4UTestExecutable
+    $start.FileName = $ExecutablePath
     $start.WorkingDirectory = $WorkingDirectory
-    $start.Arguments = $Arguments -join ' '
+    $start.Arguments = (($Arguments | ForEach-Object { Quote-WindowsArgument ([string]$_) }) -join ' ')
     $start.UseShellExecute = $false
     $start.CreateNoWindow = $true
-    $start.RedirectStandardInput = $true
+    $start.RedirectStandardInput = $false
     $start.RedirectStandardOutput = $true
     $start.RedirectStandardError = $true
-    $start.EnvironmentVariables['PAPERBOAT_WINDOWS_E2E_S4U_OWNER_ACCOUNT'] = $OwnerAccount
+    $accountSeparator = $OwnerAccount.IndexOf('\')
+    Assert-Qualification ($accountSeparator -gt 0 -and $accountSeparator -lt ($OwnerAccount.Length - 1)) 'Qualification owner account must be DOMAIN\user.'
+    $start.Domain = $OwnerAccount.Substring(0, $accountSeparator)
+    $start.UserName = $OwnerAccount.Substring($accountSeparator + 1)
+    $passwordProperty = 'Pass' + 'word'
+    $start.$passwordProperty = $CredentialSecret
+    $start.LoadUserProfile = $true
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $start
-    $credentialPointer = [IntPtr]::Zero
-    $credentialBytes = $null
     $started = $false
     $handlePinned = $false
     $processRecord = $null
@@ -1625,25 +1628,14 @@ function Invoke-OwnerQualificationTest {
     $cleanupFailureKinds = @()
     $result = $null
     try {
-        Assert-Qualification ($process.Start()) 'Could not start the owner-impersonation qualification process.'
+        Assert-Qualification ($process.Start()) 'Could not start the owner-account qualification process.'
         $started = $true
         $processHandle = $process.Handle
-        Assert-Qualification ($processHandle -ne [IntPtr]::Zero) 'Owner-impersonation qualification returned an invalid process handle.'
+        Assert-Qualification ($processHandle -ne [IntPtr]::Zero) 'Owner-account qualification returned an invalid process handle.'
         $handlePinned = $true
         $processRecord = Register-QualificationProcess -Process $process
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
-        $credentialPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($CredentialSecret)
-        $credentialByteLength = [Runtime.InteropServices.Marshal]::ReadInt32($credentialPointer, -4)
-        Assert-Qualification ($credentialByteLength -gt 0 -and $credentialByteLength -le 512 -and $credentialByteLength % 2 -eq 0) 'Generated qualification credential has an invalid encoded length.'
-        $credentialBytes = [byte[]]::new($credentialByteLength)
-        [Runtime.InteropServices.Marshal]::Copy($credentialPointer, $credentialBytes, 0, $credentialByteLength)
-        $process.StandardInput.BaseStream.Write($credentialBytes, 0, $credentialBytes.Length)
-        $process.StandardInput.BaseStream.Flush()
-        $process.StandardInput.Close()
-        [Array]::Clear($credentialBytes, 0, $credentialBytes.Length)
-        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($credentialPointer)
-        $credentialPointer = [IntPtr]::Zero
         $exited = $process.WaitForExit(90000)
         if (-not $exited) {
             $stopSucceeded = $true
@@ -1665,10 +1657,10 @@ function Invoke-OwnerQualificationTest {
                 $ownerCleanupStage = $timeoutStages.CleanupStage
                 $ownerCleanupFailure = $timeoutStages.CleanupFailure
             }
-            Assert-Qualification $false "Owner-impersonation qualification process exceeded its 90 second deadline; action_stage=$ownerActionStage; cleanup_stage=$ownerCleanupStage; cleanup_failure=$ownerCleanupFailure; stop_succeeded=$stopSucceeded; stdout_drained=$stdoutDrained; stderr_drained=$stderrDrained."
+            Assert-Qualification $false "Owner-account qualification process exceeded its 90 second deadline; action_stage=$ownerActionStage; cleanup_stage=$ownerCleanupStage; cleanup_failure=$ownerCleanupFailure; stop_succeeded=$stopSucceeded; stdout_drained=$stdoutDrained; stderr_drained=$stderrDrained."
         }
         $streamTasks = [Threading.Tasks.Task[]]@($stdoutTask, $stderrTask)
-        Assert-Qualification ([Threading.Tasks.Task]::WaitAll($streamTasks, $script:streamDrainTimeoutMilliseconds)) 'Owner-impersonation qualification output did not close within the bounded drain deadline.'
+        Assert-Qualification ([Threading.Tasks.Task]::WaitAll($streamTasks, $script:streamDrainTimeoutMilliseconds)) 'Owner-account qualification output did not close within the bounded drain deadline.'
         $stdout = $stdoutTask.GetAwaiter().GetResult()
         $stderr = $stderrTask.GetAwaiter().GetResult()
         $ownerStages = Get-OwnerQualificationStages -Output $stdout
@@ -1678,7 +1670,7 @@ function Invoke-OwnerQualificationTest {
         [IO.File]::WriteAllText($StandardOutputPath, $stdout)
         [IO.File]::WriteAllText($StandardErrorPath, $stderr)
         $ownerOutput = @($stdout -split "`r?`n") + @($stderr -split "`r?`n")
-        $evidence = New-NativeTestExecutionEvidence -ExecutablePath $resolvedS4UTestExecutable -Arguments $Arguments -RunPattern $RunPattern -Description $EvidenceName -EvidenceName $EvidenceName -ExitCode $process.ExitCode -Output $ownerOutput
+        $evidence = New-NativeTestExecutionEvidence -ExecutablePath $ExecutablePath -Arguments $Arguments -RunPattern $RunPattern -Description $EvidenceName -EvidenceName $EvidenceName -ExitCode $process.ExitCode -Output $ownerOutput
         if ($process.ExitCode -ne 0) {
             Assert-Qualification $false "Native Windows qualification test pattern failed for $EvidenceName with exit code $($process.ExitCode); action_stage=$ownerActionStage; cleanup_stage=$ownerCleanupStage; cleanup_failure=$ownerCleanupFailure. Evidence: $($evidence.EvidencePath)."
         }
@@ -1689,27 +1681,11 @@ function Invoke-OwnerQualificationTest {
         $primaryException = $_
     }
     finally {
-        if ($null -ne $credentialBytes) {
-            try {
-                [Array]::Clear($credentialBytes, 0, $credentialBytes.Length)
-            }
-            catch {
-                $cleanupFailureKinds += 'credential-bytes-clear'
-            }
-        }
-        if ($credentialPointer -ne [IntPtr]::Zero) {
-            try {
-                [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($credentialPointer)
-            }
-            catch {
-                $cleanupFailureKinds += 'credential-pointer-clear'
-            }
-        }
         try {
             $cleanupTerminationError = $null
             if ($started) {
                 if (-not $handlePinned -or $null -eq $processRecord) {
-                    $script:qualificationProcessRegistrationFailures += "kind=owner; image=$resolvedS4UTestExecutable; handle_pinned=$handlePinned; record_present=$($null -ne $processRecord)"
+                    $script:qualificationProcessRegistrationFailures += "kind=owner; image=$ExecutablePath; handle_pinned=$handlePinned; record_present=$($null -ne $processRecord)"
                     $cleanupFailureKinds += 'registration'
                 }
                 if ($handlePinned) {
@@ -1772,7 +1748,7 @@ function Invoke-OwnerQualificationTest {
     if ($null -ne $primaryException) {
         throw $primaryException
     }
-    Assert-Qualification ($cleanupFailureKinds.Count -eq 0) "Owner-impersonation process cleanup failed; kinds=$($cleanupFailureKinds -join ','); action_stage=$ownerActionStage; cleanup_stage=$ownerCleanupStage; cleanup_failure=$ownerCleanupFailure."
+    Assert-Qualification ($cleanupFailureKinds.Count -eq 0) "Owner-account process cleanup failed; kinds=$($cleanupFailureKinds -join ','); action_stage=$ownerActionStage; cleanup_stage=$ownerCleanupStage; cleanup_failure=$ownerCleanupFailure."
     return $result
 }
 
@@ -1793,6 +1769,7 @@ function Invoke-S4UDPAPIQualification {
     $qualificationRoot = Join-Path $qualificationParent $ownerName
     $workRoot = Join-Path $qualificationRoot 'work'
     $trustedRoot = Join-Path $qualificationRoot 'trusted'
+    $qualificationOwnerTest = Join-Path $qualificationRoot 'paperboat-windows-s4u-owner.test.exe'
     $qualificationFixture = Join-Path $trustedRoot 's4u-fixture.exe'
     $reportPath = Join-Path $workRoot 's4u-dpapi-report.json'
     $prepareStdout = Join-Path $workRoot 'owner-prepare.stdout.log'
@@ -1839,6 +1816,15 @@ function Invoke-S4UDPAPIQualification {
         $qualificationOwnerResult = Invoke-NativeCommandCapture -ExecutablePath $script:icacls -Arguments @($qualificationRoot, '/setowner', '*S-1-5-32-544')
         Assert-Qualification ($qualificationOwnerResult.ExitCode -eq 0) "Could not set the trusted owner on the S4U qualification root directory: $($qualificationOwnerResult.Output -join ' ')"
         Assert-QualificationTransactionDirectory -Path $qualificationRoot -OwnerSID $ownerSID -OwnerWritable $false
+        Copy-Item -LiteralPath $resolvedS4UTestExecutable -Destination $qualificationOwnerTest -Force
+        Assert-Qualification (Test-Path -LiteralPath $qualificationOwnerTest -PathType Leaf) 'S4U owner test executable was not isolated in the qualification root.'
+        Assert-Qualification (((Get-Item -Force -LiteralPath $qualificationOwnerTest).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'S4U owner test executable is a reparse point.'
+        $ownerTestACLResult = Invoke-NativeCommandCapture -ExecutablePath $script:icacls -Arguments @($qualificationOwnerTest, '/inheritance:r', '/grant:r', "*${ownerSID}:RX", '*S-1-5-18:F', '*S-1-5-32-544:F')
+        Assert-Qualification ($ownerTestACLResult.ExitCode -eq 0) "Could not protect the S4U owner test executable: $($ownerTestACLResult.Output -join ' ')"
+        $ownerTestOwnerResult = Invoke-NativeCommandCapture -ExecutablePath $script:icacls -Arguments @($qualificationOwnerTest, '/setowner', '*S-1-5-32-544')
+        Assert-Qualification ($ownerTestOwnerResult.ExitCode -eq 0) "Could not set the trusted owner on the S4U owner test executable: $($ownerTestOwnerResult.Output -join ' ')"
+        $ownerTestHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $qualificationOwnerTest).Hash.ToLowerInvariant()
+        Assert-Qualification ($ownerTestHash -eq (Get-FileHash -Algorithm SHA256 -LiteralPath $resolvedS4UTestExecutable).Hash.ToLowerInvariant()) 'Isolated S4U owner test executable differs from its source.'
         New-Item -ItemType Directory -Force -Path $workRoot | Out-Null
         Assert-Qualification (((Get-Item -Force -LiteralPath $workRoot).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'Owner-writable S4U work directory is a reparse point.'
         $workACLResult = Invoke-NativeCommandCapture -ExecutablePath $script:icacls -Arguments @($workRoot, '/inheritance:r', '/grant:r', "*${ownerSID}:(OI)(CI)M", '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F')
@@ -1853,10 +1839,10 @@ function Invoke-S4UDPAPIQualification {
         $env:PAPERBOAT_WINDOWS_E2E_S4U_OWNER_SID = $ownerSID
         $env:PAPERBOAT_WINDOWS_E2E_S4U_REPORT_PATH = $reportPath
         $env:PAPERBOAT_WINDOWS_E2E_S4U_SERVICE_NAME = $serviceName
-        $prepareArguments = @('-test.v', '-test.run', '^TestNativePrepareS4UDPAPIQualification$', '-test.count', '1', '-test.timeout', '1m')
+        $prepareArguments = @('-test.v', '-test.run', '^TestNativePrepareS4UDPAPIQualification$', '-test.count', '1', '-test.timeout', '1m', '-paperboat-owner-sid', $ownerSID, '-paperboat-report-path', $reportPath)
         Assert-Qualification (((Get-Item -Force -LiteralPath $resolvedS4UTestExecutable).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'S4U owner test executable became a reparse point before owner-context preparation.'
         Assert-Qualification ((Get-FileHash -Algorithm SHA256 -LiteralPath $resolvedS4UTestExecutable).Hash.ToLowerInvariant() -eq $sourcePreparationHash) 'S4U owner test executable changed immediately before owner-context preparation.'
-        $prepare = Invoke-OwnerQualificationTest -Arguments $prepareArguments -RunPattern '^TestNativePrepareS4UDPAPIQualification$' -EvidenceName 's4u-owner-prepare' -CredentialSecret $credentialSecret -OwnerAccount "$env:COMPUTERNAME\$ownerName" -WorkingDirectory $workRoot -StandardOutputPath $prepareStdout -StandardErrorPath $prepareStderr
+        $prepare = Invoke-OwnerQualificationTest -ExecutablePath $qualificationOwnerTest -Arguments $prepareArguments -RunPattern '^TestNativePrepareS4UDPAPIQualification$' -EvidenceName 's4u-owner-prepare' -CredentialSecret $credentialSecret -OwnerAccount "$env:COMPUTERNAME\$ownerName" -WorkingDirectory $workRoot -StandardOutputPath $prepareStdout -StandardErrorPath $prepareStderr
         Assert-Qualification (Test-Path -LiteralPath $prepareStdout -PathType Leaf) 'Owner preparation stdout redirect was not created in the qualification directory.'
         Assert-Qualification (Test-Path -LiteralPath $prepareStderr -PathType Leaf) 'Owner preparation stderr redirect was not created in the qualification directory.'
         if ($prepare.ExitCode -ne 0) {
@@ -1865,6 +1851,7 @@ function Invoke-S4UDPAPIQualification {
 
         Assert-Qualification (((Get-Item -Force -LiteralPath $resolvedS4UTestExecutable).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'S4U owner test executable became a reparse point during owner-context preparation.'
         Assert-Qualification ((Get-FileHash -Algorithm SHA256 -LiteralPath $resolvedS4UTestExecutable).Hash.ToLowerInvariant() -eq $sourcePreparationHash) 'S4U owner test executable changed during owner-context preparation.'
+        Assert-Qualification ((Get-FileHash -Algorithm SHA256 -LiteralPath $qualificationOwnerTest).Hash.ToLowerInvariant() -eq $ownerTestHash) 'Isolated S4U owner test executable changed during owner-context preparation.'
         Assert-Qualification ((Get-FileHash -Algorithm SHA256 -LiteralPath $resolvedS4UFixturePath).Hash.ToLowerInvariant() -eq $sourceFixtureHashBeforePreparation) 'S4U fixture source changed during owner-context preparation.'
         Assert-QualificationAncestorTrusted $programDataRoot
         Assert-QualificationAncestorTrusted $qualificationParent
@@ -1889,10 +1876,10 @@ function Invoke-S4UDPAPIQualification {
         $env:PAPERBOAT_WINDOWS_E2E_S4U_FIXTURE = $qualificationFixture
         $env:PAPERBOAT_WINDOWS_E2E_S4U_FIXTURE_SHA256 = $trustedFixtureHash
 
-        $mutationArguments = @('-test.v', '-test.run', '^TestNativeOwnerCannotMutateS4UFixture$', '-test.count', '1', '-test.timeout', '1m')
+        $mutationArguments = @('-test.v', '-test.run', '^TestNativeOwnerCannotMutateS4UFixture$', '-test.count', '1', '-test.timeout', '1m', '-paperboat-owner-sid', $ownerSID, '-paperboat-fixture-path', $qualificationFixture, '-paperboat-fixture-sha256', $trustedFixtureHash)
         Assert-Qualification (((Get-Item -Force -LiteralPath $resolvedS4UTestExecutable).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'S4U owner test executable became a reparse point before owner immutability probe.'
         Assert-Qualification ((Get-FileHash -Algorithm SHA256 -LiteralPath $resolvedS4UTestExecutable).Hash.ToLowerInvariant() -eq $sourcePreparationHash) 'S4U owner test executable changed immediately before owner immutability probe.'
-        $mutation = Invoke-OwnerQualificationTest -Arguments $mutationArguments -RunPattern '^TestNativeOwnerCannotMutateS4UFixture$' -EvidenceName 's4u-owner-mutation' -CredentialSecret $credentialSecret -OwnerAccount "$env:COMPUTERNAME\$ownerName" -WorkingDirectory $workRoot -StandardOutputPath $mutationStdout -StandardErrorPath $mutationStderr
+        $mutation = Invoke-OwnerQualificationTest -ExecutablePath $qualificationOwnerTest -Arguments $mutationArguments -RunPattern '^TestNativeOwnerCannotMutateS4UFixture$' -EvidenceName 's4u-owner-mutation' -CredentialSecret $credentialSecret -OwnerAccount "$env:COMPUTERNAME\$ownerName" -WorkingDirectory $workRoot -StandardOutputPath $mutationStdout -StandardErrorPath $mutationStderr
         Assert-Qualification (Test-Path -LiteralPath $mutationStdout -PathType Leaf) 'Owner mutation-probe stdout redirect was not created in the work directory.'
         Assert-Qualification (Test-Path -LiteralPath $mutationStderr -PathType Leaf) 'Owner mutation-probe stderr redirect was not created in the work directory.'
         if ($mutation.ExitCode -ne 0) {
@@ -1900,6 +1887,7 @@ function Invoke-S4UDPAPIQualification {
         }
         Assert-Qualification (((Get-Item -Force -LiteralPath $resolvedS4UTestExecutable).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'S4U owner test executable became a reparse point during owner immutability probe.'
         Assert-Qualification ((Get-FileHash -Algorithm SHA256 -LiteralPath $resolvedS4UTestExecutable).Hash.ToLowerInvariant() -eq $sourcePreparationHash) 'S4U owner test executable changed during owner immutability probe.'
+        Assert-Qualification ((Get-FileHash -Algorithm SHA256 -LiteralPath $qualificationOwnerTest).Hash.ToLowerInvariant() -eq $ownerTestHash) 'Isolated S4U owner test executable changed during owner immutability probe.'
         Assert-Qualification ((Get-FileHash -Algorithm SHA256 -LiteralPath $qualificationFixture).Hash.ToLowerInvariant() -eq $trustedFixtureHash) 'Trusted S4U fixture changed during owner immutability probe.'
 
         Add-QualificationEvent -Name 'native_s4u_dpapi' -Status 'started' -Detail "owner_sid=$ownerSID; architecture=$Architecture; owner_migration_prepared=true"

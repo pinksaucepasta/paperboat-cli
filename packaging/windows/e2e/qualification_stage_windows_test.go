@@ -36,8 +36,9 @@ Assert-Stages 'cleanup-failure-preserved' ([string]::Join([Environment]::NewLine
 Assert-Stages 'first-cleanup-failure' ([string]::Join([Environment]::NewLine, @('paperboat-s4u-cleanup-failure:profile-unload', 'paperboat-s4u-cleanup-failure:interactive-token-close'))) 'unreported' 'not-started' 'profile-unload'
 Assert-Stages 'last-per-channel' ([string]::Join([Environment]::NewLine, @('paperboat-s4u-action-stage:owner-access', 'paperboat-s4u-action-stage:identity-open', 'paperboat-s4u-cleanup-stage:profile-unload', 'paperboat-s4u-cleanup-stage:profile-unloaded'))) 'identity-open' 'profile-unloaded' 'none'
 Assert-Stages 'unknown' ([string]::Join([Environment]::NewLine, @('paperboat-s4u-action-stage:secret-value', 'paperboat-s4u-cleanup-stage:unknown', 'paperboat-s4u-cleanup-failure:secret-value'))) 'unreported' 'not-started' 'none'
+Assert-Stages 'empty' '' 'unreported' 'not-started' 'none'
 $longPrefix = 'x' * 9000
-Assert-Stages 'bounded-tail' ([string]::Join([Environment]::NewLine, @($longPrefix, 'paperboat-s4u-action-stage:profile-load', 'paperboat-s4u-cleanup-stage:profile-load-cleaned'))) 'profile-load' 'profile-load-cleaned' 'none'
+Assert-Stages 'bounded-tail' ([string]::Join([Environment]::NewLine, @($longPrefix, 'paperboat-s4u-action-stage:profile-ready', 'paperboat-s4u-cleanup-stage:profile-load-cleaned'))) 'profile-ready' 'profile-load-cleaned' 'none'
 `
 	scriptPath := filepath.Join(t.TempDir(), "qualification-stage-parser.ps1")
 	if err := os.WriteFile(scriptPath, []byte(selfTest), 0o600); err != nil {

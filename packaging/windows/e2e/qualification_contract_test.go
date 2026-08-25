@@ -163,6 +163,7 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 		"New-LocalUser",
 		"Invoke-OwnerQualificationTest",
 		"Get-OwnerQualificationStages",
+		"[Parameter(Mandatory = $true)][AllowEmptyString()][string] $Output",
 		"paperboat-s4u-action-stage:",
 		"paperboat-s4u-cleanup-stage:",
 		"paperboat-s4u-cleanup-failure:",
@@ -175,15 +176,21 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 		"$allowedCleanupStages -contains $Matches[1]",
 		"[Diagnostics.ProcessStartInfo]::new()",
 		"$start.CreateNoWindow = $true",
-		"$start.RedirectStandardInput = $true",
-		"$process.StandardInput.BaseStream.Write",
-		"[Runtime.InteropServices.Marshal]::SecureStringToBSTR",
-		"[Runtime.InteropServices.Marshal]::ReadInt32($credentialPointer, -4)",
-		"[Runtime.InteropServices.Marshal]::Copy",
-		"[Runtime.InteropServices.Marshal]::ZeroFreeBSTR",
-		"[Array]::Clear($credentialBytes",
+		"$start.RedirectStandardInput = $false",
+		"$start.FileName = $ExecutablePath",
+		"Quote-WindowsArgument ([string]$_)",
+		"$start.Domain = $OwnerAccount.Substring(0, $accountSeparator)",
+		"$start.UserName = $OwnerAccount.Substring($accountSeparator + 1)",
+		"$passwordProperty = 'Pass' + 'word'",
+		"$start.$passwordProperty = $CredentialSecret",
+		"$start.LoadUserProfile = $true",
+		"$qualificationOwnerTest",
+		"Copy-Item -LiteralPath $resolvedS4UTestExecutable -Destination $qualificationOwnerTest -Force",
+		"-paperboat-owner-sid",
+		"-paperboat-report-path",
+		"-paperboat-fixture-path",
+		"-paperboat-fixture-sha256",
 		"$process.WaitForExit(90000)",
-		"PAPERBOAT_WINDOWS_E2E_S4U_OWNER_ACCOUNT",
 		"-WorkingDirectory $workRoot",
 		"Copy-Item -LiteralPath $resolvedS4UFixturePath",
 		"TestNativeOwnerCannotMutateS4UFixture",
@@ -415,10 +422,8 @@ func TestS4UOwnerQualificationStagesAreBoundedLiterals(t *testing.T) {
 	testText := string(testBody)
 	harnessText := normalizeQualificationText(string(harnessBody))
 	stages := []string{
-		"credential-input", "interactive-logon", "owner-token-validate",
-		"profile-privileges", "profile-load", "profile-loaded",
-		"impersonation-token", "impersonation-start", "impersonated",
-		"effective-owner", "effective-token", "local-app-data",
+		"owner-process-validate", "thread-token-absent", "effective-owner",
+		"profile-ready", "local-app-data",
 		"working-directory", "owner-access", "atomic-file",
 		"file-secret-store", "keyring-write", "credential-manager-write",
 		"credential-manager-migrate", "identity-create", "identity-control",
@@ -436,48 +441,34 @@ func TestS4UOwnerQualificationStagesAreBoundedLiterals(t *testing.T) {
 	if got, want := strings.Count(testText, "reportS4UQualificationActionStage("), len(stages)+1; got != want {
 		t.Fatalf("S4U stage reporter has %d call sites, want exactly %d fixed literal calls plus its declaration", got, want)
 	}
-	cleanupStages := []string{
-		"profile-load-cleanup", "profile-load-cleaned",
-		"impersonation-revert", "impersonation-reverted",
-		"impersonation-token-close", "impersonation-token-closed",
-		"profile-unload", "profile-unloaded",
-		"interactive-token-close", "interactive-token-closed",
-	}
-	for _, stage := range cleanupStages {
-		if !strings.Contains(testText, `reportS4UQualificationCleanupStage("`+stage+`")`) {
-			t.Fatalf("S4U owner test is missing literal cleanup stage %q", stage)
-		}
-		if !strings.Contains(harnessText, "'"+stage+"'") {
-			t.Fatalf("qualification harness does not allow literal cleanup stage %q", stage)
-		}
-	}
-	if got, want := strings.Count(testText, "reportS4UQualificationCleanupStage("), len(cleanupStages)+1; got != want {
-		t.Fatalf("S4U cleanup reporter has %d call sites, want exactly %d fixed literal calls plus its declaration", got, want)
-	}
-	cleanupFailures := []string{
-		"profile-load-cleanup", "profile-unload-blocked",
-		"impersonation-revert", "impersonation-token-close",
-		"profile-unload", "interactive-token-close",
-	}
-	for _, stage := range cleanupFailures {
-		if !strings.Contains(testText, `reportS4UQualificationCleanupFailure("`+stage+`")`) {
-			t.Fatalf("S4U owner test is missing literal cleanup failure %q", stage)
-		}
-		if !strings.Contains(harnessText, "'"+stage+"'") {
-			t.Fatalf("qualification harness does not allow literal cleanup failure %q", stage)
-		}
-	}
-	if got, want := strings.Count(testText, "reportS4UQualificationCleanupFailure("), len(cleanupFailures)+1; got != want {
-		t.Fatalf("S4U cleanup failure reporter has %d call sites, want exactly %d fixed literal calls plus its declaration", got, want)
-	}
 	if !strings.Contains(harnessText, "^paperboat-s4u-action-stage:([a-z0-9-]+)$") ||
-		!strings.Contains(harnessText, "^paperboat-s4u-cleanup-stage:([a-z0-9-]+)$") ||
-		!strings.Contains(harnessText, "^paperboat-s4u-cleanup-failure:([a-z0-9-]+)$") ||
 		!strings.Contains(harnessText, "$allowedActionStages -contains $Matches[1]") ||
-		!strings.Contains(harnessText, "$allowedCleanupStages -contains $Matches[1]") ||
-		!strings.Contains(harnessText, "$allowedCleanupFailures -contains $Matches[1]") ||
 		!strings.Contains(harnessText, "$Output.Length -gt 8192") {
 		t.Fatal("qualification harness must accept only a bounded allowlisted stage marker")
+	}
+	for _, forbidden := range []string{
+		"qualificationLogonUser", "qualificationProfilePrivilegeScope", "loadOwnerProfile(",
+		"windows.SetThreadToken", "windows.ImpersonateSelf", "readQualificationPassword",
+		"KnownFolderPath(",
+	} {
+		if strings.Contains(testText, forbidden) {
+			t.Fatalf("owner preparation retains fixture-only bootstrap %q", forbidden)
+		}
+	}
+	ownerStart := strings.Index(harnessText, "function Invoke-OwnerQualificationTest {")
+	ownerEnd := strings.Index(harnessText, "\nfunction Invoke-S4UDPAPIQualification {")
+	if ownerStart < 0 || ownerEnd <= ownerStart {
+		t.Fatal("could not isolate owner-account qualification function")
+	}
+	ownerHarness := harnessText[ownerStart:ownerEnd]
+	for _, forbidden := range []string{
+		"RedirectStandardInput = $true", "$process.StandardInput", "StandardInput.BaseStream", "SecureStringToBSTR",
+		"PtrToString", "Marshal]::Copy", "ZeroFreeBSTR", "credentialBytes",
+		"EnvironmentVariables",
+	} {
+		if strings.Contains(ownerHarness, forbidden) {
+			t.Fatalf("owner-account launcher exposes a forbidden credential path %q", forbidden)
+		}
 	}
 }
 
