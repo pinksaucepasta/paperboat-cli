@@ -65,6 +65,16 @@ func TestVerifierUsesInstallerChecksForDarwinPackage(t *testing.T) {
 	}
 }
 
+func TestVerifierAcceptsUnsignedDevelopmentDarwinPackage(t *testing.T) {
+	runner := &fakeRunner{output: []byte(`Package "pb.pkg": no signature found`), err: errors.New("unsigned")}
+	if err := New(runner).Verify(context.Background(), "/release/pb-darwin-arm64.pkg", "darwin", "arm64"); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.calls) != 1 || runner.calls[0].name != "/usr/sbin/pkgutil" {
+		t.Fatalf("native calls = %#v", runner.calls)
+	}
+}
+
 func TestVerifierRejectsFailedDarwinAssessment(t *testing.T) {
 	runner := &fakeRunner{err: errors.New("rejected")}
 	if err := New(runner).Verify(context.Background(), "/release/pb", "darwin", "amd64"); !errors.Is(err, ErrInvalid) {

@@ -125,6 +125,13 @@ func runWindowsDaemon(ctx context.Context, config DaemonConfig) error {
 			if transportInvalidator != nil {
 				transportInvalidator.Observe(machines)
 			}
+			if managedSSHRuntime != nil {
+				sshCtx, cancelSSH := context.WithTimeout(refreshCtx, 15*time.Second)
+				if refreshErr := managedSSHRuntime.Refresh(sshCtx); refreshErr != nil {
+					_ = recorder.Record("ssh", "managed_refresh", "warning", map[string]string{"outcome": "degraded", "reason": ManagedSSHHealthCode(refreshErr)})
+				}
+				cancelSSH()
+			}
 			if config.WarmPeerMetadata == nil {
 				return
 			}

@@ -96,6 +96,13 @@ func Run(ctx context.Context, config DaemonConfig) error {
 	diagnosticAPI := &diagnosticService{recorder: recorder, store: store, stateRoot: config.Paths.StateRoot, ownerUID: config.OwnerUID, clock: diagnosticClock}
 	inventory, err := NewInventory(InventoryConfig{Source: config.Source, Store: store, RefreshInterval: config.RefreshInterval, RequestTimeout: config.RequestTimeout, Clock: config.Clock, OnMachines: func(refreshCtx context.Context, machines []api.UserMachine) {
 		transportInvalidator.Observe(machines)
+		if managedSSHRuntime != nil {
+			sshCtx, cancelSSH := context.WithTimeout(refreshCtx, 15*time.Second)
+			if refreshErr := managedSSHRuntime.Refresh(sshCtx); refreshErr != nil {
+				_ = recorder.Record("ssh", "managed_refresh", "warning", map[string]string{"outcome": "degraded", "reason": ManagedSSHHealthCode(refreshErr)})
+			}
+			cancelSSH()
+		}
 		if config.WarmPeerMetadata != nil {
 			warmTimeout := config.RequestTimeout
 			if warmTimeout <= 0 {

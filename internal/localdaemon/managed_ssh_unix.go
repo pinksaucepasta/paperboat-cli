@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pinksaucepasta/paperboat/internal/api"
@@ -29,7 +30,9 @@ type ManagedSSHConfig struct {
 }
 
 type ManagedSSHRuntime struct {
-	agent *managedssh.AgentService
+	agent   *managedssh.AgentService
+	mu      sync.Mutex
+	refresh func(context.Context) error
 }
 
 func StartManagedSSH(ctx context.Context, cfg ManagedSSHConfig) (*ManagedSSHRuntime, error) {
@@ -64,24 +67,36 @@ func StartManagedSSH(ctx context.Context, cfg ManagedSSHConfig) (*ManagedSSHRunt
 		return nil, err
 	}
 	command := strconv.Quote(cfg.Executable)
-	targets, err := managedSSHAliasTargets(ctx, client)
+	install := func(refreshCtx context.Context) error {
+		targets, err := managedSSHAliasTargets(refreshCtx, client)
+		if err != nil {
+			return err
+		}
+		_, err = managedssh.InstallOpenSSHConfig(managedssh.OpenSSHConfig{
+			Home: cfg.Home, OwnerUID: cfg.OwnerUID, AliasSuffix: managedssh.AliasSuffix,
+			ProxyCommand:      command + " __ssh-proxy --host %h --port %p --user %r",
+			KnownHostsCommand: command + " __ssh-known-hosts --host %h --port %p",
+			AgentSocket:       agent.Socket(),
+			IdentityFile:      managedssh.ManagedIdentityPublicKeyPath(cfg.Home),
+			Targets:           targets,
+		})
+		return err
+	}
+	err = install(ctx)
 	if err != nil {
 		_ = agent.Close()
 		return nil, err
 	}
-	_, err = managedssh.InstallOpenSSHConfig(managedssh.OpenSSHConfig{
-		Home: cfg.Home, OwnerUID: cfg.OwnerUID, AliasSuffix: managedssh.AliasSuffix,
-		ProxyCommand:      command + " __ssh-proxy --host %h --port %p --user %r",
-		KnownHostsCommand: command + " __ssh-known-hosts --host %h --port %p",
-		AgentSocket:       agent.Socket(),
-		IdentityFile:      managedssh.ManagedIdentityPublicKeyPath(cfg.Home),
-		Targets:           targets,
-	})
-	if err != nil {
-		_ = agent.Close()
-		return nil, err
+	return &ManagedSSHRuntime{agent: agent, refresh: install}, nil
+}
+
+func (r *ManagedSSHRuntime) Refresh(ctx context.Context) error {
+	if r == nil || r.refresh == nil {
+		return nil
 	}
-	return &ManagedSSHRuntime{agent: agent}, nil
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.refresh(ctx)
 }
 
 func (r *ManagedSSHRuntime) Close() error {

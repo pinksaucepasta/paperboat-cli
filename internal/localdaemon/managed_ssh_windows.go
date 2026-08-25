@@ -32,6 +32,8 @@ const (
 
 type ManagedSSHRuntime struct {
 	closeFn func() error
+	refresh func(context.Context) error
+	mu      sync.Mutex
 	once    sync.Once
 	err     error
 }
@@ -63,16 +65,27 @@ func StartManagedSSH(ctx context.Context, cfg ManagedSSHConfig) (*ManagedSSHRunt
 	if err != nil {
 		return nil, err
 	}
-	targets, err := managedSSHAliasTargets(ctx, client)
-	if err != nil {
+	install := func(refreshCtx context.Context) error {
+		targets, err := managedSSHAliasTargets(refreshCtx, client)
+		if err != nil {
+			return err
+		}
+		return installWindowsOpenSSHConfig(cfg, agentRuntime.socket, identity.PublicKey, targets)
+	}
+	if err := install(ctx); err != nil {
 		_ = agentRuntime.Close()
 		return nil, err
 	}
-	if err := installWindowsOpenSSHConfig(cfg, agentRuntime.socket, identity.PublicKey, targets); err != nil {
-		_ = agentRuntime.Close()
-		return nil, err
+	return &ManagedSSHRuntime{closeFn: agentRuntime.Close, refresh: install}, nil
+}
+
+func (r *ManagedSSHRuntime) Refresh(ctx context.Context) error {
+	if r == nil || r.refresh == nil {
+		return nil
 	}
-	return &ManagedSSHRuntime{closeFn: agentRuntime.Close}, nil
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.refresh(ctx)
 }
 
 func (r *ManagedSSHRuntime) Close() error {

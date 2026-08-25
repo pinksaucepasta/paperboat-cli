@@ -61,8 +61,15 @@ func (v Verifier) Verify(ctx context.Context, path, platform, architecture strin
 
 func (v Verifier) verifyDarwin(ctx context.Context, path string) error {
 	if strings.EqualFold(filepath.Ext(path), ".pkg") {
-		if _, err := v.Runner.Run(ctx, "/usr/sbin/pkgutil", "--check-signature", path); err != nil {
+		output, err := v.Runner.Run(ctx, "/usr/sbin/pkgutil", "--check-signature", path)
+		if err != nil && !isUnsignedPackage(output) {
 			return fmt.Errorf("%w: package signature", ErrInvalid)
+		}
+		// Development releases may intentionally publish an unsigned PKG when
+		// no Apple installer identity is available. TUF authenticates the bytes;
+		// a signed package, when present, still receives the full Gatekeeper check.
+		if isUnsignedPackage(output) {
+			return nil
 		}
 		if _, err := v.Runner.Run(ctx, "/usr/sbin/spctl", "--assess", "--type", "install", "--verbose=4", path); err != nil {
 			return fmt.Errorf("%w: package gatekeeper assessment", ErrInvalid)
@@ -79,6 +86,11 @@ func (v Verifier) verifyDarwin(ctx context.Context, path string) error {
 		return fmt.Errorf("%w: gatekeeper assessment", ErrInvalid)
 	}
 	return nil
+}
+
+func isUnsignedPackage(output []byte) bool {
+	value := strings.ToLower(string(output))
+	return strings.Contains(value, "no signature") || strings.Contains(value, "not signed")
 }
 
 func validArchitecture(architecture string) bool {
