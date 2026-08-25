@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -252,6 +253,11 @@ func TestWindowsReleaseComponentQualificationBindsEvidence(t *testing.T) {
 	if !validWindowsNativeQualificationEvidence(evidenceRaw, binding, index) {
 		t.Fatal("matching Windows qualification evidence was rejected")
 	}
+	withoutResult := evidence
+	withoutResult.QualificationResult = tufWindowsNativeQualificationResultBinding{}
+	if validWindowsNativeQualificationEvidence(marshalJSON(t, withoutResult), binding, index) {
+		t.Fatal("Windows qualification evidence without its result binding was accepted")
+	}
 
 	binding.ArtifactSHA256 = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
 	if validWindowsNativeQualificationBinding(binding, index, target) {
@@ -305,7 +311,12 @@ func testWindowsQualificationEvidence(index releaseindex.Index, binding *tufWind
 	}
 	return tufWindowsNativeQualification{
 		Schema: "paperboat.windows-native-qualification/v1", ReleaseVersion: index.Version, Platform: "windows", Architecture: "amd64",
-		Status: "passed", NativeTested: true, WindowsBuild: binding.WindowsBuild, Runner: binding.Runner, Artifacts: artifacts,
+		Status: "passed", NativeTested: true, WindowsBuild: binding.WindowsBuild, Runner: binding.Runner,
+		QualificationResult: tufWindowsNativeQualificationResultBinding{
+			Schema: "paperboat.windows-native-qualification-result-binding/v1", TargetPath: "windows-amd64-native-qualification-report.json",
+			SHA256: strings.Repeat("b", 64), Length: 100, NativeTestSHA256: strings.Repeat("c", 64), NativeTestLength: 200,
+		},
+		Artifacts: artifacts,
 	}
 }
 

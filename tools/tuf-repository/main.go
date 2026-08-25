@@ -22,13 +22,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/releaseindex"
 	"github.com/sigstore/sigstore/pkg/signature"
 	"github.com/theupdateframework/go-tuf/v2/metadata"
 )
 
 const keychainService = "com.pinksaucepasta.paperboat.tuf.production"
-const windowsNativeQualificationSchema = "paperboat.windows-native-qualification/v1"
-const windowsNativeQualificationResultBindingSchema = "paperboat.windows-native-qualification-result-binding/v1"
+const windowsNativeQualificationSchema = releaseindex.WindowsNativeQualificationSchemaV1
+const windowsNativeQualificationResultBindingSchema = releaseindex.WindowsNativeQualificationResultBindingSchemaV1
 
 func windowsNativeQualificationTarget(architecture string) string {
 	return "windows-" + architecture + "-native-qualification.json"
@@ -49,35 +50,9 @@ type componentTarget struct {
 	Architecture string `json:"architecture"`
 	BinaryFormat string `json:"binary_format"`
 }
-type windowsNativeQualification struct {
-	Schema              string                                  `json:"schema"`
-	ReleaseVersion      string                                  `json:"release_version"`
-	Platform            string                                  `json:"platform"`
-	Architecture        string                                  `json:"architecture"`
-	Status              string                                  `json:"status"`
-	NativeTested        bool                                    `json:"native_tested"`
-	WindowsBuild        string                                  `json:"windows_build"`
-	Runner              string                                  `json:"runner"`
-	QualificationResult windowsNativeQualificationResultBinding `json:"qualification_result"`
-	Artifacts           []windowsNativeQualifiedArtifact        `json:"artifacts"`
-}
-type windowsNativeQualificationResultBinding struct {
-	Schema           string `json:"schema"`
-	TargetPath       string `json:"target_path"`
-	SHA256           string `json:"sha256"`
-	Length           int64  `json:"length"`
-	NativeTestSHA256 string `json:"native_test_sha256"`
-	NativeTestLength int64  `json:"native_test_length"`
-}
-type windowsNativeQualifiedArtifact struct {
-	Component    string `json:"component"`
-	TargetPath   string `json:"target_path"`
-	SHA256       string `json:"sha256"`
-	Length       int64  `json:"length"`
-	Platform     string `json:"platform"`
-	Architecture string `json:"architecture"`
-	Status       string `json:"status"`
-}
+type windowsNativeQualification = releaseindex.WindowsNativeQualification
+type windowsNativeQualificationResultBinding = releaseindex.WindowsNativeQualificationResultBinding
+type windowsNativeQualifiedArtifact = releaseindex.WindowsNativeQualifiedArtifact
 type windowsNativeQualificationBinding struct {
 	Schema         string `json:"schema"`
 	EvidenceTarget string `json:"evidence_target"`
