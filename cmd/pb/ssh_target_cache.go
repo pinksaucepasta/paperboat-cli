@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"time"
@@ -89,6 +90,9 @@ func storeSSHTargetCache(serverURL, alias string, target api.ManagedSSHTarget, m
 	path, err := sshTargetCacheFilePath()
 	if err != nil {
 		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("create SSH target cache directory: %w", err)
 	}
 	cache := sshTargetCache{Version: sshTargetCacheVersion, Entries: map[string]sshTargetCacheEntry{}}
 	if data, readErr := os.ReadFile(path); readErr == nil {
