@@ -11,6 +11,7 @@ on:
         options:
           - all
           - windows-arm64
+          - macos-arm64
   workflow_call:
     inputs:
       target:
@@ -41,6 +42,8 @@ jobs:
           ${{ fromJSON(
             inputs.target == 'windows-arm64' &&
             '[{"os":"windows","architecture":"arm64","runner":"windows-11-arm"}]' ||
+            inputs.target == 'macos-arm64' &&
+            '[{"os":"macos","architecture":"arm64","runner":"blacksmith-6vcpu-macos-latest"}]' ||
             '[{"os":"linux","architecture":"amd64","runner":"blacksmith-2vcpu-ubuntu-2404"},{"os":"linux","architecture":"arm64","runner":"blacksmith-2vcpu-ubuntu-2404-arm"},{"os":"macos","architecture":"arm64","runner":"blacksmith-6vcpu-macos-latest"},{"os":"windows","architecture":"amd64","runner":"blacksmith-2vcpu-windows-2025"},{"os":"windows","architecture":"arm64","runner":"windows-11-arm"}]'
           ) }}
     steps:

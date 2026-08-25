@@ -36,20 +36,8 @@ func TestRuntimeWorkerEntryActivatesFencedHostdLease(t *testing.T) {
 	serverDone := make(chan error, 1)
 	go func() { serverDone <- server.Run(serverCtx) }()
 	t.Cleanup(func() { stopServer(); <-serverDone })
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		if _, err := os.Stat(filepath.Join(root, "socket", "hostd.sock")); err == nil {
-			break
-		}
-		select {
-		case err := <-serverDone:
-			t.Fatalf("hostd socket failed to start: %v", err)
-		default:
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("hostd socket did not start")
-		}
-		time.Sleep(time.Millisecond)
+	if err := waitForHostdSocket(context.Background(), filepath.Join(root, "socket", "hostd.sock"), token, serverDone); err != nil {
+		t.Fatalf("hostd socket failed to start: %v", err)
 	}
 
 	workerCtx, stopWorker := context.WithCancel(context.Background())

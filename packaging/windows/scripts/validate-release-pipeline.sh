@@ -93,14 +93,15 @@ for required in (
 for required in (
     "workflow_call:", "platform-contract:",
     "description: Native platform qualification target", "type: choice", "type: string",
-    "default: all", "options:", "- all", "- windows-arm64",
-    "include: >-", "${{ fromJSON(", "inputs.target == 'windows-arm64'",
+    "default: all", "options:", "- all", "- windows-arm64", "- macos-arm64",
+    "include: >-", "${{ fromJSON(", "inputs.target == 'windows-arm64'", "inputs.target == 'macos-arm64'",
     "timeout-minutes: 30",
     '"runner":"blacksmith-2vcpu-ubuntu-2404"',
     '"runner":"blacksmith-2vcpu-ubuntu-2404-arm"',
     '"runner":"blacksmith-6vcpu-macos-latest"',
     '"runner":"blacksmith-2vcpu-windows-2025"', '"runner":"windows-11-arm"',
     '"architecture":"amd64"', '"architecture":"arm64"',
+    "'[{\"os\":\"macos\",\"architecture\":\"arm64\",\"runner\":\"blacksmith-6vcpu-macos-latest\"}]'",
     'actual="$(go env GOOS)/$(go env GOARCH)"',
 ):
     if required not in qualification:
