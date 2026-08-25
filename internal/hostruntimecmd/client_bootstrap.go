@@ -132,5 +132,7 @@ func enrollBootstrapCLIIdentity(ctx context.Context, store config.ProfileStore, 
 }
 
 func shouldInstallBootstrapCLI(material bootstrap.Material) bool {
-	return material.ClientSession != nil && material.SetupMode != "host"
+	// Host is the superset of client capabilities. The server supplies a CLI
+	// session for both modes; host additionally installs the managed runtime.
+	return material.ClientSession != nil && (material.SetupMode == "host" || material.SetupMode == "client")
 }
