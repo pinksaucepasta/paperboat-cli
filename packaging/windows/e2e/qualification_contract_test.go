@@ -245,7 +245,7 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 		"Pre-existing Paperboat state SHA256 changed",
 		"Pre-existing Paperboat state length changed",
 		"Pre-existing Paperboat state security descriptor changed",
-		"Paperboat state root presence changed after uninstall",
+		"Pre-existing Paperboat state root disappeared after uninstall",
 		"allowedNewEmptyOwnedDirectories",
 		"Assert-PaperboatStateResidue",
 		"Unknown Paperboat state residue remains after uninstall",
@@ -366,6 +366,10 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 	for _, requiredText := range []string{
 		"platform-qualification",
 		"release-windows",
+		"windows_qualification_only:",
+		"Run both Windows package and native MSI qualification jobs without candidate assembly or publication",
+		"(needs.platform-qualification.result == 'success' || inputs.windows_qualification_only)",
+		"!inputs.windows_qualification_only && needs.release-windows.result == 'success'",
 		"needs: [release-authority, windows-release-contract, platform-qualification]",
 		"PAPERBOAT_RELEASE_ORIGIN_HOSTS_JSON",
 		"atomic activation requires exactly one authoritative release origin host",
@@ -661,13 +665,16 @@ func TestQualificationPreexistingStateSnapshotIsBeforeMutationAndExact(t *testin
 		"OwnerSID",
 		"DaclSddl",
 		"SecurityDescriptor",
-		"Paperboat state root presence changed after uninstall",
+		"Pre-existing Paperboat state root disappeared after uninstall",
 		"allowedNewEmptyOwnedDirectories",
 		"Unknown Paperboat state residue remains after uninstall",
 	} {
 		if !strings.Contains(harness, required) {
 			t.Fatalf("pre-existing state contract is missing %q", required)
 		}
+	}
+	if strings.Contains(harness, "Paperboat state root presence changed after uninstall") {
+		t.Fatal("qualification must allow an absent baseline to become only the explicitly validated empty owned directory skeleton")
 	}
 }
 

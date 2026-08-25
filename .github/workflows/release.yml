@@ -10,6 +10,11 @@ on:
         description: Immutable candidate version (YYYY.MM.DD.N)
         required: true
         type: string
+      windows_qualification_only:
+        description: Run both Windows package and native MSI qualification jobs without candidate assembly or publication
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   # One release may own the GitHub latest selector and origin transaction at a
@@ -323,6 +328,7 @@ jobs:
   platform-qualification:
     name: Native platform qualification
     needs: [release-authority, windows-release-contract]
+    if: ${{ !inputs.windows_qualification_only }}
     uses: ./.github/workflows/platform-qualification.yml
 
   windows-release-contract:
@@ -356,7 +362,7 @@ jobs:
   release-linux:
     name: Build Linux ${{ matrix.architecture }} release assets
     needs: [release-authority, windows-release-contract, platform-qualification]
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    if: (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')) && !inputs.windows_qualification_only
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     permissions:
@@ -423,7 +429,7 @@ jobs:
   release-macos:
     name: Build macOS release assets
     needs: [release-authority, windows-release-contract, platform-qualification]
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    if: (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')) && !inputs.windows_qualification_only
     runs-on: blacksmith-6vcpu-macos-latest
     timeout-minutes: 30
     permissions:
@@ -469,7 +475,12 @@ jobs:
   release-windows:
     name: Windows ${{ matrix.architecture }} (${{ matrix.channel }}) package
     needs: [release-authority, windows-release-contract, platform-qualification]
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    if: >-
+      always() &&
+      (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')) &&
+      needs.release-authority.result == 'success' &&
+      needs.windows-release-contract.result == 'success' &&
+      (needs.platform-qualification.result == 'success' || inputs.windows_qualification_only)
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     permissions:
@@ -840,7 +851,7 @@ jobs:
   windows-winget:
     name: Render final-hash WinGet manifests
     needs: release-windows
-    if: (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')) && needs.release-windows.result == 'success'
+    if: (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')) && !inputs.windows_qualification_only && needs.release-windows.result == 'success'
     runs-on: blacksmith-2vcpu-windows-2025
     timeout-minutes: 15
     permissions:
@@ -898,6 +909,7 @@ jobs:
     name: Assemble immutable qualified candidate
     if: >-
       (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')) &&
+      !inputs.windows_qualification_only &&
       needs.release-authority.result == 'success' &&
       needs.platform-qualification.result == 'success' &&
       needs.release-linux.result == 'success' &&

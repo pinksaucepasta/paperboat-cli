@@ -1389,7 +1389,7 @@ function Assert-PaperboatStateResidue {
     Assert-Qualification ($null -ne $script:preexistingPaperboatState) 'Pre-existing Paperboat state was not snapshotted before MSI mutation.'
     $baseline = $script:preexistingPaperboatState
     $current = Get-PaperboatStateSnapshot
-    Assert-Qualification ($current.RootPresent -eq $baseline.RootPresent) "Paperboat state root presence changed after uninstall: baseline=$($baseline.RootPresent) current=$($current.RootPresent)"
+    Assert-Qualification (-not $baseline.RootPresent -or $current.RootPresent) 'Pre-existing Paperboat state root disappeared after uninstall.'
     $baselineEntries = @($baseline.Entries)
     $currentEntries = @($current.Entries)
     $baselineByPath = @{}
