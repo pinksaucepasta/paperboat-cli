@@ -59,7 +59,7 @@ func (l *sharedLock) Lock() error {
 			l.local.Unlock()
 		}
 	}()
-	if err := os.MkdirAll(filepath.Dir(l.path), 0o700); err != nil {
+	if err := prepareSharedLockParent(filepath.Dir(l.path)); err != nil {
 		return err
 	}
 	hostname, _ := os.Hostname()
@@ -71,9 +71,9 @@ func (l *sharedLock) Lock() error {
 	}
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		if err := os.Mkdir(l.path, 0o700); err == nil {
-			if err := os.WriteFile(filepath.Join(l.path, "owner.json"), append(encoded, '\n'), 0o600); err != nil {
-				_ = os.RemoveAll(l.path)
+		if err := createSharedLockDirectory(l.path); err == nil {
+			if err := writeSharedLockOwner(filepath.Join(l.path, "owner.json"), append(encoded, '\n')); err != nil {
+				_ = cleanupNewSharedLock(l.path)
 				return err
 			}
 			locked = true
@@ -81,12 +81,14 @@ func (l *sharedLock) Lock() error {
 		} else if !os.IsExist(err) {
 			return err
 		}
+		if err := validateSharedLockDirectory(l.path); err != nil {
+			return err
+		}
 		stale, err := sharedLockIsStale(l.path, hostname)
 		if err == nil && stale {
 			stalePath := l.path + ".stale-" + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatInt(time.Now().UnixNano(), 10)
 			//paperboat:allow-source-policy atomic-replacement owner=runtime-auth reason=stale-lock-quarantine
-			if os.Rename(l.path, stalePath) == nil {
-				_ = os.RemoveAll(stalePath)
+			if quarantineSharedLock(l.path, stalePath) == nil {
 				continue
 			}
 		}
@@ -121,6 +123,12 @@ func (l *sharedLock) Unlock() error {
 			l.local.Unlock()
 		}
 	}()
+	if err := validateSharedLockDirectory(l.path); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
 	b, err := os.ReadFile(filepath.Join(l.path, "owner.json"))
 	if os.IsNotExist(err) {
 		return nil
@@ -825,6 +833,9 @@ func (s ProfileStore) CompleteRevocation(record PendingRevocation) (resultErr er
 	}
 	defer func() { resultErr = errors.Join(resultErr, profileLock.Unlock()) }()
 	path := s.existingPendingRevocationPath(record.Issuer, record.CLIClientSessionID)
+	if err := ensureProfileDirectory(filepath.Dir(path)); err != nil {
+		return err
+	}
 	lock := newSharedLock(path + ".lock")
 	if err := lock.Lock(); err != nil {
 		return err
@@ -867,6 +878,9 @@ func (s ProfileStore) DiscardRevocation(issuer, cliClientSessionID string) (resu
 		return err
 	}
 	path := s.existingPendingRevocationPath(issuer, cliClientSessionID)
+	if err := ensureProfileDirectory(filepath.Dir(path)); err != nil {
+		return err
+	}
 	lock := newSharedLock(path + ".lock")
 	if err := lock.Lock(); err != nil {
 		return err
@@ -917,6 +931,9 @@ func (s ProfileStore) DiscardPendingRevocations(issuer string) (resultErr error)
 	if err != nil {
 		return err
 	}
+	if err := ensureProfileDirectory(dir); err != nil {
+		return err
+	}
 	prefix := profileKey(issuer) + "-"
 	var errs []error
 	for _, entry := range entries {
@@ -955,6 +972,9 @@ func (s ProfileStore) DiscardPendingRevocations(issuer string) (resultErr error)
 
 func (s ProfileStore) MarkRevocationSucceeded(record PendingRevocation) (result PendingRevocation, resultErr error) {
 	path := s.existingPendingRevocationPath(record.Issuer, record.CLIClientSessionID)
+	if err := ensureProfileDirectory(filepath.Dir(path)); err != nil {
+		return PendingRevocation{}, err
+	}
 	lock := newSharedLock(path + ".lock")
 	if err := lock.Lock(); err != nil {
 		return PendingRevocation{}, err

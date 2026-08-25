@@ -105,8 +105,11 @@ func newProductionClientPeerService(dependencies productionClientPeerDependencie
 		},
 		TransferKeys:        dependencies.transferKeys,
 		ObserveRelaySuccess: dependencies.observeRelaySuccess,
+		ObserveTransferKeyAcknowledged: func() {
+			recordProductionPeerOutcome(dependencies.stateRoot, "transfer_key_ack_written")
+		},
 		ObserveError: func(err error) {
-			slog.Error("peer transport attempt failed", "error", err)
+			observeProductionPeerError(dependencies.stateRoot, err)
 		},
 	})
 	if err == nil {
@@ -650,8 +653,10 @@ func NewProductionHost(ctx context.Context, version string, environ func(string)
 				default:
 					return peerrelay.ErrInvalid
 				}
-			}, TransferKeys: transferKeys, ObserveRelaySuccess: relayRegion.Observe, ObserveError: func(err error) {
-				slog.Error("peer transport attempt failed", "error", err)
+			}, TransferKeys: transferKeys, ObserveRelaySuccess: relayRegion.Observe, ObserveTransferKeyAcknowledged: func() {
+				recordProductionPeerOutcome(runtimeConfig.StateRoot, "transfer_key_ack_written")
+			}, ObserveError: func(err error) {
+				observeProductionPeerError(runtimeConfig.StateRoot, err)
 			}})
 			if serviceErr == nil {
 				directNetwork.Set(service)

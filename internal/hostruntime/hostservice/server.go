@@ -85,9 +85,10 @@ type Config struct {
 }
 
 type Server struct {
-	config Config
-	mu     sync.Mutex
-	state  State
+	config             Config
+	mu                 sync.Mutex
+	state              State
+	newHeartbeatTicker func(time.Duration) (<-chan time.Time, func())
 }
 
 func New(config Config) (*Server, error) {
@@ -98,7 +99,14 @@ func New(config Config) (*Server, error) {
 	if config.Now == nil {
 		config.Now = time.Now
 	}
-	server := &Server{config: config, state: State{Schema: ProtocolV1, DesiredMode: KeepAwake, Status: "pending"}}
+	server := &Server{
+		config: config,
+		state:  State{Schema: ProtocolV1, DesiredMode: KeepAwake, Status: "pending"},
+		newHeartbeatTicker: func(interval time.Duration) (<-chan time.Time, func()) {
+			ticker := time.NewTicker(interval)
+			return ticker.C, ticker.Stop
+		},
+	}
 	if err := server.load(); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
@@ -134,30 +142,56 @@ func (s *Server) serveListener(ctx context.Context, listener *net.UnixListener) 
 			return err
 		}
 	}
+	// A busy control socket must not starve the systemd watchdog. Drive its
+	// heartbeat from an independent periodic source instead of accept deadlines.
+	heartbeats := (<-chan time.Time)(nil)
+	stopHeartbeatTicker := func() {}
+	if s.config.HeartbeatInterval > 0 {
+		heartbeats, stopHeartbeatTicker = s.newHeartbeatTicker(s.config.HeartbeatInterval)
+		if heartbeats == nil || stopHeartbeatTicker == nil {
+			return ErrInvalidConfig
+		}
+	}
+	controlCtx, stopControl := context.WithCancel(ctx)
+	controlErr := make(chan error, 1)
+	controlDone := make(chan struct{})
 	go func() {
-		<-ctx.Done()
-		listener.Close()
-	}()
-	for {
-		if s.config.HeartbeatInterval > 0 {
-			if err := listener.SetDeadline(s.config.Now().Add(s.config.HeartbeatInterval)); err != nil {
-				if ctx.Err() != nil {
-					return errors.Join(ctx.Err(), s.config.Applier.Close(context.Background()))
+		defer close(controlDone)
+		for {
+			select {
+			case <-controlCtx.Done():
+				_ = listener.Close()
+				return
+			case _, open := <-heartbeats:
+				if !open {
+					controlErr <- ErrInvalidConfig
+					_ = listener.Close()
+					return
 				}
-				return err
+				if err := s.config.Heartbeat(); err != nil {
+					controlErr <- err
+					_ = listener.Close()
+					return
+				}
 			}
 		}
+	}()
+	defer func() {
+		stopControl()
+		stopHeartbeatTicker()
+		_ = listener.Close()
+		<-controlDone
+	}()
+	for {
 		connection, err := listener.AcceptUnix()
 		if err != nil {
+			select {
+			case err := <-controlErr:
+				return err
+			default:
+			}
 			if ctx.Err() != nil {
 				return errors.Join(ctx.Err(), s.config.Applier.Close(context.Background()))
-			}
-			var networkErr net.Error
-			if errors.As(err, &networkErr) && networkErr.Timeout() && s.config.HeartbeatInterval > 0 {
-				if err := s.config.Heartbeat(); err != nil {
-					return err
-				}
-				continue
 			}
 			return err
 		}

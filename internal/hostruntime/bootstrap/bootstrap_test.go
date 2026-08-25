@@ -13,6 +13,8 @@ import (
 	"runtime"
 	"testing"
 	"time"
+
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/releaseindex"
 )
 
 var testPublicIdentityKey = base64.RawURLEncoding.EncodeToString(make([]byte, ed25519.PublicKeySize))
@@ -250,7 +252,7 @@ func TestValidateMaterialAcceptsClientCLISetup(t *testing.T) {
 		Schema: "paperboat.byod-installation/v1", UserMachineID: "um_1", UserMachineEnrollmentID: "ume_1",
 		EnvironmentID: "env_1", ControlURL: "https://example.test", HelperID: "helper_1", EnrollmentID: "enroll_1",
 		EnrollmentCredential: "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOP", ExpiresAt: time.Now().UTC().Add(time.Minute),
-		Artifact:            &ArtifactTarget{Schema: ArtifactTargetSchemaV1, Kind: ArtifactKindPB, Version: "1.0.0", Platform: runtime.GOOS, Architecture: runtime.GOARCH, RepositoryURL: "https://example.test/tuf", TargetPath: "pb-" + runtime.GOOS + "-" + runtime.GOARCH},
+		Artifact:            &ArtifactTarget{Schema: ArtifactTargetSchemaV1, Kind: ArtifactKindPB, Version: "2026.01.01.0", Platform: runtime.GOOS, Architecture: runtime.GOARCH, RepositoryURL: "https://example.test/tuf", TargetPath: releaseindex.AssetName(runtime.GOOS, runtime.GOARCH)},
 		HelperListenAddress: "127.0.0.1:38080", InstallationGeneration: 1, SetupMode: "client", SetupRoles: []string{"interactive"},
 		ClientSession: &ClientSession{Schema: "paperboat.cli-session/v1", SessionID: "cls_1", AccessToken: "access-012345678901234567890123456789", RefreshToken: "refresh-012345678901234567890123456789", TokenType: "Bearer", ExpiresIn: 3600},
 	}

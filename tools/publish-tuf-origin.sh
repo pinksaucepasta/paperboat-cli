@@ -106,30 +106,39 @@ next="$transaction/next"
 mkdir "$next"
 tar -xzf "$bundle" -C "$next" --no-same-owner --no-same-permissions
 
-# Keep immutable content-addressed targets referenced by metadata already
-# cached by older clients. New candidate targets win; missing historical
-# blobs are hard-linked from the current tree without network transfer or
-# duplicate disk allocation. Both trees live under the same release root.
-historical_targets="$live/tuf/targets"
-[[ -d "$historical_targets" && ! -L "$historical_targets" ]] || { echo "historical TUF targets are unavailable" >&2; exit 1; }
-[[ -z "$(find "$historical_targets" -mindepth 1 -type d -print -quit)" ]] || { echo "historical TUF targets contain nested paths" >&2; exit 1; }
-[[ -z "$(find "$historical_targets" -mindepth 1 ! -type f -print -quit)" ]] || { echo "historical TUF targets contain a non-regular file" >&2; exit 1; }
-while IFS= read -r -d '' historical; do
-  name=${historical#"$historical_targets/"}
-  destination="$next/tuf/targets/$name"
-  if [[ ! -e "$destination" ]]; then
-    ln "$historical" "$destination"
-  fi
-done < <(find "$historical_targets" -mindepth 1 -maxdepth 1 -type f -print0)
-
 [[ -z "$(find "$next" -type l -print -quit)" ]] || { echo "staged release contains a symlink" >&2; exit 1; }
 
 python3 - "$next/current.json" "$version" <<'PY'
-import json, pathlib, sys
+import json, pathlib, re, sys
 path = pathlib.Path(sys.argv[1])
 value = json.loads(path.read_text())
-if value != {"schema": "paperboat.release-current/v1", "version": sys.argv[2]}:
+if value.get("schema") != "paperboat.release-current/v1" or value.get("version") != sys.argv[2]:
     raise SystemExit("current.json does not match the release")
+repository = value.get("repository")
+if not isinstance(repository, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
+    raise SystemExit("current.json has an invalid GitHub repository")
+assets = value.get("assets")
+expected = {
+    "pb-darwin-arm64.pkg": ("darwin", "arm64", "pkg"),
+    "pb-linux-amd64": ("linux", "amd64", "elf"),
+    "pb-linux-arm64": ("linux", "arm64", "elf"),
+    "pb-windows-amd64.exe": ("windows", "amd64", "pe"),
+    "pb-windows-arm64.exe": ("windows", "arm64", "pe"),
+}
+if not isinstance(assets, dict) or set(assets) != set(expected):
+    raise SystemExit("current.json does not contain the exact release asset set")
+for name, (platform, architecture, format_) in expected.items():
+    asset = assets[name]
+    if not isinstance(asset, dict) or set(asset) != {"platform", "architecture", "format", "url", "sha256", "length"}:
+        raise SystemExit(f"current.json asset metadata is invalid for {name}")
+    if asset["platform"] != platform or asset["architecture"] != architecture or asset["format"] != format_:
+        raise SystemExit(f"current.json asset identity is invalid for {name}")
+    if asset["url"] != f"https://github.com/{repository}/releases/download/{sys.argv[2]}/{name}":
+        raise SystemExit(f"current.json asset URL is invalid for {name}")
+    if not isinstance(asset["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", asset["sha256"]):
+        raise SystemExit(f"current.json asset digest is invalid for {name}")
+    if isinstance(asset["length"], bool) or not isinstance(asset["length"], int) or asset["length"] < 1:
+        raise SystemExit(f"current.json asset length is invalid for {name}")
 PY
 
 for required in install windows tuf/metadata/root.json tuf/metadata/targets.json tuf/metadata/snapshot.json tuf/metadata/timestamp.json; do
@@ -140,6 +149,7 @@ for directory in "$next/tuf/metadata" "$next/tuf/targets"; do
   [[ -z "$(find "$directory" -mindepth 1 -type d -print -quit)" ]] || { echo "release bundle contains nested TUF paths" >&2; exit 1; }
   [[ -z "$(find "$directory" -mindepth 1 ! -type f -print -quit)" ]] || { echo "release bundle contains a non-regular TUF file" >&2; exit 1; }
 done
+[[ -z "$(find "$next/tuf/targets" -mindepth 1 -print -quit)" ]] || { echo "release bundle must not contain TUF target blobs" >&2; exit 1; }
 
 chown -R 501:root "$next"
 chmod 0700 "$next"

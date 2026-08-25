@@ -1346,6 +1346,25 @@ func TestOneShotDescriptorKeySeparatesFallbackPaths(t *testing.T) {
 	}
 }
 
+func TestOneShotDescriptorSourceUsesSharedSourceForExplicitPathMode(t *testing.T) {
+	shared := new(directpath.APIDescriptorSource)
+	pathScoped := new(directpath.APIDescriptorSource)
+	connector := &terminalRaceConnector{descriptors: shared}
+
+	source, scoped := connector.descriptorSource(connectionmanager.PathRelayQUIC, true)
+	if source != shared || scoped {
+		t.Fatalf("explicit path source=%p scoped=%t, want shared source", source, scoped)
+	}
+
+	connector.oneShotDescriptors = map[connectionmanager.Path]*directpath.APIDescriptorSource{
+		connectionmanager.PathRelayQUIC: pathScoped,
+	}
+	source, scoped = connector.descriptorSource(connectionmanager.PathRelayQUIC, true)
+	if source != pathScoped || !scoped {
+		t.Fatalf("multi-path source=%p scoped=%t, want path-scoped source", source, scoped)
+	}
+}
+
 func TestRelayFirstOneShotDescriptorRequestsOnlyRelayQUIC(t *testing.T) {
 	paths := oneShotDescriptorPaths(connectionmanager.ModeAuto)
 	if len(paths) != 3 || paths[0] != connectionmanager.PathRelayQUIC {

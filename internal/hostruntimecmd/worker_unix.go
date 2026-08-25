@@ -82,13 +82,34 @@ func runHostd(ctx context.Context, output io.Writer) error {
 		return err
 	}
 	fmt.Fprintln(output, "pb hostd ready")
-	<-ctx.Done()
+	watchdogInterval := notifier.WatchdogInterval()
+	var watchdog <-chan time.Time
+	var watchdogTicker *time.Ticker
+	if watchdogInterval > 0 {
+		watchdogTicker = time.NewTicker(watchdogInterval)
+		defer watchdogTicker.Stop()
+		watchdog = watchdogTicker.C
+	}
+	var runErr error
+run:
+	for {
+		select {
+		case <-ctx.Done():
+			runErr = notifier.Draining()
+			break run
+		case <-watchdog:
+			if err := notifier.Watchdog(); err != nil {
+				runErr = errors.Join(err, notifier.Degraded("watchdog notification failed"))
+				break run
+			}
+		}
+	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	stopErr := worker.Stop(shutdownCtx)
 	stopServer()
 	serverErr := <-serverDone
-	return errors.Join(notifier.Draining(), stopErr, serverErr, notifier.Stopping(), host.ShutdownStable(shutdownCtx))
+	return errors.Join(runErr, stopErr, serverErr, notifier.Stopping(), host.ShutdownStable(shutdownCtx))
 }
 
 func waitForHostdSocket(ctx context.Context, socket string, done <-chan error) error {

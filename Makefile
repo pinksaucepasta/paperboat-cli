@@ -5,7 +5,8 @@ BINDIR      := $(PREFIX)/bin
 VERSION     ?= $(shell ./tools/release-version.sh current)
 COMMIT      ?= $(shell git rev-parse --verify HEAD 2>/dev/null || echo unknown)
 PROTOCOL_VERSION ?= 1
-DEFAULT_RELEASE_URL ?=
+DEFAULT_SERVER_URL ?= https://api.pprbt.dev
+DEFAULT_RELEASE_URL ?= https://get.pprbt.dev/tuf
 GO_VERSION  := 1.26.6
 SQLC_VERSION := v1.30.0
 GO_ROOT     := $(shell GOTOOLCHAIN=go$(GO_VERSION) go env GOROOT)
@@ -13,9 +14,9 @@ export PATH := $(GO_ROOT)/bin:$(PATH)
 GO          := GOTOOLCHAIN=local go
 GOFMT       := $(GO_ROOT)/bin/gofmt
 GO_FILES    := $(shell find . -path ./.git -prune -o -name '*.go' -print)
-LDFLAGS     := -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Version=$(VERSION) -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Commit=$(COMMIT) -X github.com/pinksaucepasta/paperboat/internal/buildinfo.ProtocolVersion=$(PROTOCOL_VERSION) -X github.com/pinksaucepasta/paperboat/internal/buildinfo.DefaultReleaseURL=$(DEFAULT_RELEASE_URL)
+LDFLAGS     := -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Version=$(VERSION) -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Commit=$(COMMIT) -X github.com/pinksaucepasta/paperboat/internal/buildinfo.ProtocolVersion=$(PROTOCOL_VERSION) -X github.com/pinksaucepasta/paperboat/internal/buildinfo.DefaultServerURL=$(DEFAULT_SERVER_URL) -X github.com/pinksaucepasta/paperboat/internal/buildinfo.DefaultReleaseURL=$(DEFAULT_RELEASE_URL)
 
-.PHONY: binary-size-check build check clean complete container-compose-check contracts cross-build dependencies fmt fmt-check fuzz generate generate-check hosted-image-check install license-check lint metrics-check metrics-generate preflight race release-metadata reproducible-builds source-policy static-analysis test tidy tidy-check uninstall verification verify-toolchain vet vulnerability-check
+.PHONY: binary-size-check build check clean codex-path-manifest complete container-compose-check contracts cross-build dependencies fmt fmt-check fuzz generate generate-check hosted-image-check install license-check lint metrics-check metrics-generate preflight race release-assets release-binaries release-macos-pkg reproducible-builds source-policy static-analysis test tidy tidy-check uninstall verification verify-toolchain vet vulnerability-check
 
 contracts:
 	@./testdata/contracts/validate.sh
@@ -46,25 +47,32 @@ build:
 
 cross-build: verify-toolchain
 	@mkdir -p dist
-	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o dist/$(BINARY)-darwin-arm64 $(PKG)
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o dist/$(BINARY)-linux-amd64 $(PKG)
-	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o dist/$(BINARY)-linux-arm64 $(PKG)
-	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o dist/$(BINARY)-windows-amd64.exe $(PKG)
-	CGO_ENABLED=0 GOOS=windows GOARCH=arm64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o dist/$(BINARY)-windows-arm64.exe $(PKG)
-	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o dist/$(BINARY)-launcher-windows-amd64.exe ./cmd/pb-launcher
-	CGO_ENABLED=0 GOOS=windows GOARCH=arm64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o dist/$(BINARY)-launcher-windows-arm64.exe ./cmd/pb-launcher
+	@rm -f dist/pb-darwin-arm64 dist/pb-linux-amd64 dist/pb-linux-arm64 dist/pb-windows-amd64.exe dist/pb-windows-arm64.exe
+	VERSION="$(VERSION)" DEFAULT_SERVER_URL="$(DEFAULT_SERVER_URL)" DEFAULT_RELEASE_URL="$(DEFAULT_RELEASE_URL)" ./tools/build-release-asset.sh --platform darwin --architecture arm64 --output dist/pb-darwin-arm64 --version "$(VERSION)" --server-url "$(DEFAULT_SERVER_URL)" --release-url "$(DEFAULT_RELEASE_URL)"
+	VERSION="$(VERSION)" DEFAULT_SERVER_URL="$(DEFAULT_SERVER_URL)" DEFAULT_RELEASE_URL="$(DEFAULT_RELEASE_URL)" ./tools/build-release-asset.sh --platform linux --architecture amd64 --output dist/pb-linux-amd64 --version "$(VERSION)" --server-url "$(DEFAULT_SERVER_URL)" --release-url "$(DEFAULT_RELEASE_URL)"
+	VERSION="$(VERSION)" DEFAULT_SERVER_URL="$(DEFAULT_SERVER_URL)" DEFAULT_RELEASE_URL="$(DEFAULT_RELEASE_URL)" ./tools/build-release-asset.sh --platform linux --architecture arm64 --output dist/pb-linux-arm64 --version "$(VERSION)" --server-url "$(DEFAULT_SERVER_URL)" --release-url "$(DEFAULT_RELEASE_URL)"
+	VERSION="$(VERSION)" DEFAULT_SERVER_URL="$(DEFAULT_SERVER_URL)" DEFAULT_RELEASE_URL="$(DEFAULT_RELEASE_URL)" ./tools/build-release-asset.sh --platform windows --architecture amd64 --output dist/pb-windows-amd64.exe --version "$(VERSION)" --server-url "$(DEFAULT_SERVER_URL)" --release-url "$(DEFAULT_RELEASE_URL)"
+	VERSION="$(VERSION)" DEFAULT_SERVER_URL="$(DEFAULT_SERVER_URL)" DEFAULT_RELEASE_URL="$(DEFAULT_RELEASE_URL)" ./tools/build-release-asset.sh --platform windows --architecture arm64 --output dist/pb-windows-arm64.exe --version "$(VERSION)" --server-url "$(DEFAULT_SERVER_URL)" --release-url "$(DEFAULT_RELEASE_URL)"
 
-# Produce reviewable integrity metadata alongside a release binary. Signing,
-# SBOM generation, and publishing are performed by the release pipeline.
-release-metadata: build
+release-binaries: verify-toolchain
 	@mkdir -p dist
-	@cp bin/$(BINARY) dist/$(BINARY)-$(VERSION)
-	@shasum -a 256 dist/$(BINARY)-$(VERSION) > dist/$(BINARY)-$(VERSION).sha256
-	@{ \
-		printf '{"name":"paperboat","version":"%s","protocol_version":"%s","commit":"%s","go_version":"%s"}\n' \
-		"$(VERSION)" "$(PROTOCOL_VERSION)" \
-		"$(COMMIT)" "$(shell go version | awk '{print $$3}')"; \
-	} > dist/$(BINARY)-$(VERSION).provenance.json
+	@rm -f dist/pb-linux-amd64 dist/pb-linux-arm64 dist/pb-windows-amd64.exe dist/pb-windows-arm64.exe
+	@./tools/build-release-asset.sh --platform linux --architecture amd64 --output dist/pb-linux-amd64 --version "$(VERSION)" --server-url "$(DEFAULT_SERVER_URL)" --release-url "$(DEFAULT_RELEASE_URL)"
+	@./tools/build-release-asset.sh --platform linux --architecture arm64 --output dist/pb-linux-arm64 --version "$(VERSION)" --server-url "$(DEFAULT_SERVER_URL)" --release-url "$(DEFAULT_RELEASE_URL)"
+	@./tools/build-release-asset.sh --platform windows --architecture amd64 --output dist/pb-windows-amd64.exe --version "$(VERSION)" --server-url "$(DEFAULT_SERVER_URL)" --release-url "$(DEFAULT_RELEASE_URL)"
+	@./tools/build-release-asset.sh --platform windows --architecture arm64 --output dist/pb-windows-arm64.exe --version "$(VERSION)" --server-url "$(DEFAULT_SERVER_URL)" --release-url "$(DEFAULT_RELEASE_URL)"
+
+release-macos-pkg: verify-toolchain
+	@test "$$(uname -s)" = Darwin || { echo 'release-macos-pkg requires macOS' >&2; exit 1; }
+	@test "$$(uname -m)" = arm64 || { echo 'release-macos-pkg requires an Apple Silicon runner' >&2; exit 1; }
+	@mkdir -p dist
+	@rm -f dist/pb-darwin-arm64.stage dist/pb-darwin-arm64.pkg
+	@./tools/build-release-asset.sh --platform darwin --architecture arm64 --output dist/pb-darwin-arm64.stage --version "$(VERSION)" --server-url "$(DEFAULT_SERVER_URL)" --release-url "$(DEFAULT_RELEASE_URL)"
+	@test -n "$(MACOS_INSTALLER_SIGNING_IDENTITY)" || { echo 'MACOS_INSTALLER_SIGNING_IDENTITY is required' >&2; exit 1; }
+	@./tools/build-macos-pkg.sh --binary dist/pb-darwin-arm64.stage --output dist/pb-darwin-arm64.pkg --version "$(VERSION)" --signing-identity "$(MACOS_INSTALLER_SIGNING_IDENTITY)"
+	@rm -f dist/pb-darwin-arm64.stage
+
+release-assets: release-binaries release-macos-pkg
 
 install: build
 	install -d $(BINDIR)
@@ -109,6 +117,13 @@ fmt-check:
 generate:
 	$(GO) run github.com/sqlc-dev/sqlc/cmd/sqlc@$(SQLC_VERSION) generate
 	$(GO) generate ./...
+
+# This manifest is pinned to an official OpenAI Codex checkout and is not part
+# of routine repository generation. Regenerate it only when intentionally
+# updating the pinned Codex protocol version.
+codex-path-manifest:
+	@test -n "$(CODEX_SOURCE)" || { echo 'CODEX_SOURCE must point to the pinned official openai/codex checkout' >&2; exit 2; }
+	$(GO) run ./tools/codex-path-manifest -source "$(CODEX_SOURCE)" -output internal/codexsession/codex_path_manifest_0_149_1.json
 
 generate-check:
 	@before="$$(git diff -- internal/hostruntime/store/storesqlc)"; $(MAKE) generate >/dev/null; test "$$(git diff -- internal/hostruntime/store/storesqlc)" = "$$before" || { echo "generated sqlc output is stale; run make generate" >&2; git diff -- internal/hostruntime/store/storesqlc; exit 1; }

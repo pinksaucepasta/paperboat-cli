@@ -26,7 +26,7 @@ import (
 type ExecStarter struct{}
 
 func (ExecStarter) Start(ctx context.Context, request StartRequest) (Worker, error) {
-	if request.Executable == "" || request.WorkerID == "" || request.UID <= 0 || request.GID < 0 || request.HostdEndpoint == "" || len(request.Capability) != 32 || !request.MutationsDisabled {
+	if request.Executable == "" || request.WorkerID == "" || !validWorkerIdentity(request.UID, request.GID) || request.HostdEndpoint == "" || len(request.Capability) != 32 || !request.MutationsDisabled {
 		return nil, ErrInvalidConfig
 	}
 	if os.Geteuid() != 0 && request.UID != os.Geteuid() {

@@ -90,7 +90,7 @@ for import in $(rg -o --no-filename --glob '*.go' 'tailscale\.com/[^"[:space:]]+
   esac
 done
 
-unexpected_winutil=$(rg -n --glob '*.go' 'tailscale\.com/util/winutil' . | grep -Ev '^\./packaging/windows/e2e/conpty_windows_test\.go:[0-9]+:' || true)
+unexpected_winutil=$(rg -n --glob '*.go' 'tailscale\.com/util/winutil' . || true)
 if [ -n "$unexpected_winutil" ]; then
   echo "owned source imports Tailscale winutil outside the Windows ConPTY parity test:" >&2
   printf '%s\n' "$unexpected_winutil" >&2

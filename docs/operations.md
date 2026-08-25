@@ -46,16 +46,11 @@ Threat-model sign-off, cross-service metrics and audit events, artifact signing,
 SBOM/provenance, and revocation propagation evidence remain release work in the
 owning repositories.
 
-`make release-metadata` emits a versioned binary, SHA-256 checksum, and
-provenance JSON containing the version, protocol, commit, and Go toolchain. The
-release pipeline must sign these files and attach an SBOM before publishing.
-
-Pushing a validated `YYYY.MM.DD.X` tag runs `.github/workflows/release.yml`. It cross-builds
-Darwin, Linux, and Windows amd64/arm64 candidates, creates checksums and an SPDX JSON SBOM,
-and stops before any attestation, container publication, or GitHub release publication unless
-the protected TUF publication handoff verifies every Windows artifact. Verify an installed
-published archive with `gh attestation verify <archive> --repo <owner>/<repo>` and its adjacent
-checksum before installation. Authenticode is optional and is not a release gate.
+Pushing a validated `YYYY.MM.DD.X` tag runs `.github/workflows/release.yml`. It builds the
+five native assets, verifies their GitHub API-reported size and digest, signs the five TUF
+asset targets, and atomically publishes `current.json`, installers, and TUF metadata. The
+server publishes metadata only; installers and runtime updates download executable bytes from
+the immutable GitHub release URLs recorded in the signed metadata.
 
 Incident procedures are maintained in [runbooks.md](runbooks.md).
 

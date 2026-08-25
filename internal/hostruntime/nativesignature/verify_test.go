@@ -49,6 +49,22 @@ func TestVerifierRequiresDarwinCodeSignAndGatekeeper(t *testing.T) {
 	}
 }
 
+func TestVerifierUsesInstallerChecksForDarwinPackage(t *testing.T) {
+	runner := &fakeRunner{}
+	if err := New(runner).Verify(context.Background(), "/release/pb-darwin-arm64.pkg", "darwin", "arm64"); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.calls) != 2 || runner.calls[0].name != "/usr/sbin/pkgutil" || runner.calls[1].name != "/usr/sbin/spctl" {
+		t.Fatalf("native calls = %#v", runner.calls)
+	}
+	if got := strings.Join(runner.calls[0].args, " "); got != "--check-signature /release/pb-darwin-arm64.pkg" {
+		t.Fatalf("pkgutil args = %q", got)
+	}
+	if got := strings.Join(runner.calls[1].args, " "); got != "--assess --type install --verbose=4 /release/pb-darwin-arm64.pkg" {
+		t.Fatalf("spctl args = %q", got)
+	}
+}
+
 func TestVerifierRejectsFailedDarwinAssessment(t *testing.T) {
 	runner := &fakeRunner{err: errors.New("rejected")}
 	if err := New(runner).Verify(context.Background(), "/release/pb", "darwin", "amd64"); !errors.Is(err, ErrInvalid) {

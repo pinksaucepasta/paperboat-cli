@@ -1,11 +1,13 @@
 package clientauthority
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -66,5 +68,118 @@ func TestResolveBindsLocalCustodyAndRemoteCertificateToOneRoot(t *testing.T) {
 	document.CertificateFingerprint = hex.EncodeToString(make([]byte, 32))
 	if _, err := Resolve(context.Background(), Request{Store: store, Client: certificateClientFunc(func(context.Context, string, uint64) (api.EndpointCertificateDocument, error) { return document, nil }), Issuer: issuer, AccountID: accountID, CLIClientSessionID: cliID, MachineID: machineID, MachineGeneration: 3, Now: now}); err == nil {
 		t.Fatal("metadata substitution was accepted")
+	}
+}
+
+func TestResolveUsesVerifierOnlyRootWithoutCreatingPrivateCustody(t *testing.T) {
+	root := t.TempDir()
+	store := config.ProfileStore{Path: root, Secrets: config.FileSecretStore{Dir: filepath.Join(root, "secrets")}}
+	issuer, accountID, cliID, machineID := "https://api.example.test", "account_01", "cli_verifier", "machine_01"
+	rootPublic, rootPrivate, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SavePeerAccountRootPublic(issuer, accountID, rootPublic); err != nil {
+		t.Fatal(err)
+	}
+	keys, err := store.PeerEndpointKeys(issuer, accountID, cliID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys.RootPrivate) != 0 {
+		t.Fatal("endpoint-only key creation loaded account root private custody")
+	}
+
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	local, err := endpointidentity.Sign(rootPrivate, endpointidentity.Claims{
+		AccountID: accountID, Role: endpointidentity.RoleCLI, EndpointID: cliID,
+		NoisePublicKey: keys.NoisePublic, QUICPublicKey: keys.QUICPrivate.Public().(ed25519.PublicKey),
+		Generation: 1, Serial: 1, IssuedAt: now.Add(-time.Minute), ExpiresAt: now.Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	localRaw, err := local.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SavePeerCertificate(issuer, cliID, localRaw); err != nil {
+		t.Fatal(err)
+	}
+
+	machinePublic, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var machineNoise [32]byte
+	machineNoise[0] = 1
+	machine, err := endpointidentity.Sign(rootPrivate, endpointidentity.Claims{
+		AccountID: accountID, Role: endpointidentity.RoleMachine, EndpointID: machineID,
+		NoisePublicKey: machineNoise, QUICPublicKey: machinePublic,
+		Generation: 3, Serial: 2, IssuedAt: now.Add(-time.Minute), ExpiresAt: now.Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	machineRaw, err := machine.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	machineFingerprint := sha256.Sum256(machineRaw)
+	rootFingerprint := sha256.Sum256(rootPublic)
+	document := api.EndpointCertificateDocument{
+		Version: 1, AccountID: accountID, RootFingerprint: hex.EncodeToString(rootFingerprint[:]),
+		EndpointID: machineID, Role: "machine", Generation: 3, Serial: 2,
+		IssuedAt: machine.Claims.IssuedAt.Format(time.RFC3339), ExpiresAt: machine.Claims.ExpiresAt.Format(time.RFC3339),
+		Certificate: base64.RawURLEncoding.EncodeToString(machineRaw), CertificateFingerprint: hex.EncodeToString(machineFingerprint[:]),
+	}
+	request := Request{
+		Store: store, Client: certificateClientFunc(func(_ context.Context, endpoint string, generation uint64) (api.EndpointCertificateDocument, error) {
+			if endpoint != machineID || generation != 3 {
+				t.Fatalf("endpoint=%q generation=%d", endpoint, generation)
+			}
+			return document, nil
+		}),
+		Issuer: issuer, AccountID: accountID, CLIClientSessionID: cliID,
+		MachineID: machineID, MachineGeneration: 3, Now: now,
+	}
+	authority, err := Resolve(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(authority.RootPublic, rootPublic) || len(authority.LocalKeys.RootPrivate) != 0 ||
+		authority.LocalKeys.NoisePublic != keys.NoisePublic ||
+		!bytes.Equal(authority.LocalKeys.QUICPrivate, keys.QUICPrivate) ||
+		authority.LocalCertificate.Claims.EndpointID != cliID || authority.MachineCertificate.Claims.EndpointID != machineID {
+		t.Fatal("resolved verifier-only authority did not preserve the expected public root and endpoint custody")
+	}
+	if _, err := store.ExportPeerAccountRootSeed(issuer, accountID); !errors.Is(err, config.ErrSecretNotFound) {
+		t.Fatalf("verifier-only resolution created root private custody: %v", err)
+	}
+	authority.Clear()
+
+	otherPublic, otherPrivate, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	substituted, err := endpointidentity.Sign(otherPrivate, endpointidentity.Claims{
+		AccountID: accountID, Role: endpointidentity.RoleMachine, EndpointID: machineID,
+		NoisePublicKey: machineNoise, QUICPublicKey: machinePublic,
+		Generation: 3, Serial: 2, IssuedAt: now.Add(-time.Minute), ExpiresAt: now.Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	substitutedRaw, err := substituted.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	substitutedFingerprint := sha256.Sum256(substitutedRaw)
+	otherRootFingerprint := sha256.Sum256(otherPublic)
+	document.RootFingerprint = hex.EncodeToString(otherRootFingerprint[:])
+	document.Certificate = base64.RawURLEncoding.EncodeToString(substitutedRaw)
+	document.CertificateFingerprint = hex.EncodeToString(substitutedFingerprint[:])
+	if _, err := Resolve(context.Background(), request); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("substituted verifier root error = %v", err)
 	}
 }

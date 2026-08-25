@@ -36,7 +36,7 @@ type windowsServiceTarget struct {
 type windowsActivationJournal struct {
 	Schema, TransactionID, PreviousVersion, Version, Architecture string
 	Stage                                                         windowsActivationStage
-	Runtime, CLI, Hostd, Updater                                  windowsActivationComponent
+	Runtime, CLI, Hostd, Updater, PreviousBinary                  windowsActivationComponent
 	OldHostd, NewHostd, OldUpdater, NewUpdater, OldSSH, NewSSH    windowsServiceTarget
 	PreviousCLIRecord, NewCLIRecord                               string
 	Failure                                                       string
@@ -49,6 +49,8 @@ var errInvalidWindowsActivation = errors.New("invalid Windows activation transac
 type windowsActivationBackend interface {
 	WriteJournal(windowsActivationJournal) error
 	StopServices(context.Context) error
+	ActivateBinary(context.Context, windowsActivationJournal) error
+	RestoreBinary(context.Context, windowsActivationJournal) error
 	SetServiceTargets(context.Context, windowsServiceTarget, windowsServiceTarget, windowsServiceTarget) error
 	StartServices(context.Context, bool, bool, bool) error
 	VerifyHealth(context.Context, windowsActivationJournal) error
@@ -77,6 +79,9 @@ func executeWindowsActivation(ctx context.Context, backend windowsActivationBack
 		return journal, err
 	}
 	if err = backend.StopServices(ctx); err != nil {
+		return rollbackWindowsActivation(ctx, backend, journal, err)
+	}
+	if err = backend.ActivateBinary(ctx, journal); err != nil {
 		return rollbackWindowsActivation(ctx, backend, journal, err)
 	}
 	if err = backend.SetServiceTargets(ctx, journal.NewHostd, journal.NewUpdater, journal.NewSSH); err != nil {
@@ -111,7 +116,11 @@ func rollbackWindowsActivation(ctx context.Context, backend windowsActivationBac
 	journalErr := backend.WriteJournal(journal)
 	stopErr := backend.StopServices(ctx)
 	var targetErr error
+	var binaryErr error
 	if stopErr == nil {
+		binaryErr = backend.RestoreBinary(ctx, journal)
+	}
+	if stopErr == nil && binaryErr == nil {
 		targetErr = backend.SetServiceTargets(ctx, journal.OldHostd, journal.OldUpdater, journal.OldSSH)
 	}
 	// Restore the durable version and CLI pointer before restarting the old
@@ -119,7 +128,7 @@ func rollbackWindowsActivation(ctx context.Context, backend windowsActivationBac
 	// this rollback.
 	cliErr := backend.CommitCLI(ctx, windowsActivationJournal{Version: journal.PreviousVersion, PreviousCLIRecord: journal.NewCLIRecord, NewCLIRecord: journal.PreviousCLIRecord})
 	quarantineErr := backend.Quarantine(ctx, journal)
-	rollbackErr := errors.Join(journalErr, stopErr, targetErr, cliErr, quarantineErr)
+	rollbackErr := errors.Join(journalErr, stopErr, binaryErr, targetErr, cliErr, quarantineErr)
 	if rollbackErr != nil {
 		return journal, errors.Join(cause, rollbackErr)
 	}
@@ -152,7 +161,7 @@ func validWindowsActivationJournal(j windowsActivationJournal) bool {
 	if j.Schema != windowsActivationJournalSchema || len(j.TransactionID) != 32 || !lowerHex(j.TransactionID) || !exactReleasePattern.MatchString(j.Version) || !exactReleasePattern.MatchString(j.PreviousVersion) || !validWindowsActivationStage(j.Stage) || j.Architecture != "amd64" && j.Architecture != "arm64" || len(j.Failure) > 4096 {
 		return false
 	}
-	for _, component := range []windowsActivationComponent{j.Runtime, j.CLI, j.Hostd, j.Updater} {
+	for _, component := range []windowsActivationComponent{j.Runtime, j.CLI, j.Hostd, j.Updater, j.PreviousBinary} {
 		if component.Path == "" || len(component.SHA256) != 64 || !lowerHex(component.SHA256) || component.Length <= 0 || component.Length > maxWindowsComponentSize {
 			return false
 		}
@@ -170,7 +179,10 @@ func validWindowsActivationJournal(j windowsActivationJournal) bool {
 	if (j.OldSSH.Executable == "") != (j.NewSSH.Executable == "") || j.OldSSH.Executable != "" && (!validWindowsSSHArguments(j.OldSSH.Arguments) || !validWindowsSSHArguments(j.NewSSH.Arguments)) {
 		return false
 	}
-	return j.NewCLIRecord != ""
+	// The stable layout.Binary path is the sole CLI/runtime entry point. These
+	// fields remain in the journal for decoding old schema-shaped records, but a
+	// new transaction must never create or consume a pb.active pointer.
+	return j.PreviousCLIRecord == "" && j.NewCLIRecord == ""
 }
 
 func validWindowsSSHArguments(arguments []string) bool {

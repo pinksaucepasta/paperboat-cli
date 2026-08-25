@@ -10,6 +10,8 @@ import (
 	"runtime"
 	"testing"
 	"time"
+
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/releaseindex"
 )
 
 func TestProductionTUFRepository(t *testing.T) {
@@ -26,7 +28,7 @@ func TestProductionTUFRepository(t *testing.T) {
 	target := ArtifactTarget{
 		Schema: ArtifactTargetSchemaV1, Kind: ArtifactKindPB, Version: version,
 		Platform: runtime.GOOS, Architecture: runtime.GOARCH, RepositoryURL: repositoryURL,
-		TargetPath: "pb-" + runtime.GOOS + "-" + runtime.GOARCH,
+		TargetPath: releaseindex.AssetName(runtime.GOOS, runtime.GOARCH),
 	}
 	root := t.TempDir()
 	path, err := FetchVerifiedArtifact(ctx, target, filepath.Join(root, "legacy"), nil)
@@ -50,20 +52,20 @@ func TestProductionTUFRepository(t *testing.T) {
 	if index.Version != version {
 		t.Fatalf("signed release index version=%q, want %q", index.Version, version)
 	}
-	cliTarget, ok := index.Component("cli")
+	pbTarget, ok := index.Component("pb")
 	if !ok {
-		t.Fatal("signed release index has no CLI component")
+		t.Fatal("signed release index has no pb component")
 	}
-	cliPath, err := FetchVerifiedReleaseComponent(ctx, repositoryURL, filepath.Join(root, "component"), index, "cli", nil, time.Now().UTC())
+	pbPath, err := FetchVerifiedReleaseComponent(ctx, repositoryURL, filepath.Join(root, "component"), index, "pb", nil, time.Now().UTC())
 	if err != nil {
 		t.Fatal(err)
 	}
-	cliBody, err := os.ReadFile(cliPath)
+	pbBody, err := os.ReadFile(pbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	digest := sha256.Sum256(cliBody)
-	if cliTarget.SHA256 != hex.EncodeToString(digest[:]) || cliTarget.Length != int64(len(cliBody)) || !bytes.Equal(legacyBody, cliBody) {
-		t.Fatal("legacy bootstrap target and signed CLI component are not identical")
+	digest := sha256.Sum256(pbBody)
+	if pbTarget.SHA256 != hex.EncodeToString(digest[:]) || pbTarget.Length != int64(len(pbBody)) || !bytes.Equal(legacyBody, pbBody) {
+		t.Fatal("legacy bootstrap target and signed pb component are not identical")
 	}
 }

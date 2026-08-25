@@ -19,80 +19,6 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/localdaemon"
 )
 
-func TestRemovePlatformProductInstallationHandsOffEveryRegisteredMSI(t *testing.T) {
-	previousEnumerate := enumeratePaperboatMSIProducts
-	previousRun := runPaperboatMSIUninstall
-	t.Cleanup(func() {
-		enumeratePaperboatMSIProducts = previousEnumerate
-		runPaperboatMSIUninstall = previousRun
-	})
-	first := "{11111111-1111-1111-1111-111111111111}"
-	second := "{22222222-2222-2222-2222-222222222222}"
-	enumeratePaperboatMSIProducts = func() ([]string, error) { return []string{first, second}, nil }
-	var calls []string
-	runPaperboatMSIUninstall = func(_ context.Context, productCode string) error {
-		calls = append(calls, productCode)
-		if productCode == first {
-			return errors.New("first MSI failed")
-		}
-		return nil
-	}
-	err := removeRegisteredPaperboatMSIProducts(context.Background())
-	if got, want := strings.Join(calls, ","), first+","+second; got != want {
-		t.Fatalf("MSI uninstall calls = %q, want %q", got, want)
-	}
-	if err == nil || !strings.Contains(err.Error(), "first MSI failed") {
-		t.Fatalf("MSI uninstall error = %v", err)
-	}
-}
-
-func TestWindowsRegisteredCleanupUninstallsMSIBeforeRuntimePurge(t *testing.T) {
-	previousEnumerate := enumeratePaperboatMSIProducts
-	previousRun := runPaperboatMSIUninstall
-	previousGlobal := runWindowsGlobalCleanup
-	previousPurge := purgeWindowsHostRuntime
-	t.Cleanup(func() {
-		enumeratePaperboatMSIProducts = previousEnumerate
-		runPaperboatMSIUninstall = previousRun
-		runWindowsGlobalCleanup = previousGlobal
-		purgeWindowsHostRuntime = previousPurge
-	})
-	product := "{11111111-1111-1111-1111-111111111111}"
-	enumeratePaperboatMSIProducts = func() ([]string, error) { return []string{product}, nil }
-	var calls []string
-	globalFailure := errors.New("global cleanup failed")
-	runWindowsGlobalCleanup = func(context.Context) error {
-		calls = append(calls, "global")
-		return globalFailure
-	}
-	runPaperboatMSIUninstall = func(context.Context, string) error {
-		calls = append(calls, "msi")
-		return nil
-	}
-	purgeWindowsHostRuntime = func(context.Context) error {
-		calls = append(calls, "runtime")
-		return nil
-	}
-	if err := performWindowsRegisteredCleanup(context.Background()); !errors.Is(err, globalFailure) {
-		t.Fatalf("registered cleanup error = %v", err)
-	}
-	if got := strings.Join(calls, ","); got != "global,msi,runtime" {
-		t.Fatalf("registered cleanup order = %q, want global,msi,runtime", got)
-	}
-	calls = nil
-	runWindowsGlobalCleanup = func(context.Context) error {
-		calls = append(calls, "global")
-		return nil
-	}
-	enumeratePaperboatMSIProducts = func() ([]string, error) { return nil, nil }
-	if err := performWindowsRegisteredCleanup(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if got := strings.Join(calls, ","); got != "global,runtime" {
-		t.Fatalf("standalone cleanup order = %q, want global,runtime", got)
-	}
-}
-
 func TestWindowsUninstallPlanIsProtectedBoundedAndHelperIsNonRecursive(t *testing.T) {
 	directory := t.TempDir()
 	previousExecutable := windowsUninstallExecutable
@@ -222,17 +148,6 @@ func TestRemovePathPreservingIsCaseInsensitiveOnWindows(t *testing.T) {
 func TestFilesystemRootRejectsWindowsDriveAndUNCShare(t *testing.T) {
 	if !filesystemRoot(`C:\`) || !filesystemRoot(`\\server\share\`) || filesystemRoot(`C:\Paperboat`) {
 		t.Fatal("Windows filesystem-root detection accepted a destructive cleanup target")
-	}
-}
-
-type fakeMSIExitError struct{ code int }
-
-func (e fakeMSIExitError) Error() string { return "MSI exit " + strconv.Itoa(e.code) }
-func (e fakeMSIExitError) ExitCode() int { return e.code }
-
-func TestMSIUninstallExitContractAcceptsOnlySuccessAndRebootRequired(t *testing.T) {
-	if !successfulMSIUninstallExit(nil) || !successfulMSIUninstallExit(fakeMSIExitError{code: 3010}) || successfulMSIUninstallExit(fakeMSIExitError{code: 1603}) {
-		t.Fatal("MSI uninstall exit contract did not distinguish success, reboot-required, and failure")
 	}
 }
 

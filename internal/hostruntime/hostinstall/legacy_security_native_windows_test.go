@@ -69,18 +69,34 @@ func TestNativeLegacyOwnerFullSecurityMigration(t *testing.T) {
 	if err := os.Mkdir(WindowsProgramDataRoot(), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	hostileTransitionDACL := "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
+	msiBootstrapDACL := windowsRuntimeMSIBootstrapRootDACL()
+	if err := applyWindowsOwnedDACL(WindowsProgramDataRoot(), administrators, msiBootstrapDACL); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureWindowsMachineDirectory(WindowsProgramDataRoot(), ownerSID); err != nil {
+		t.Fatalf("complete exact WiX machine-root bootstrap state: %v", err)
+	}
+	if !windowsRuntimeSecurityMatches(WindowsProgramDataRoot(), trustedOwner, currentRootDACL) {
+		t.Fatal("WiX machine-root bootstrap state did not reach its final SYSTEM-owned state")
+	}
+	if err := os.Remove(WindowsProgramDataRoot()); err != nil {
+		t.Fatalf("reset atomic machine-root fixture: %v", err)
+	}
+	if err := os.Mkdir(WindowsProgramDataRoot(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	hostileTransitionDACL := "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;BU)"
 	if err := applyWindowsOwnedDACL(WindowsProgramDataRoot(), administrators, hostileTransitionDACL); err != nil {
 		t.Fatal(err)
 	}
 	if err := ensureWindowsMachineDirectory(WindowsProgramDataRoot(), ownerSID); err == nil {
-		t.Fatal("Administrators-owned root with a noncanonical DACL was accepted as a resumable transition")
+		t.Fatal("Administrators-owned root with an extra principal was accepted as a resumable transition")
 	}
 	if !windowssecurity.OwnerMatchesSID(WindowsProgramDataRoot(), administrators) || !windowssecurity.ProtectedDACLMatches(WindowsProgramDataRoot(), hostileTransitionDACL) {
 		t.Fatal("rejected machine-root transition was mutated")
 	}
 	if err := os.Remove(WindowsProgramDataRoot()); err != nil {
-		t.Fatalf("reset atomic machine-root fixture: %v", err)
+		t.Fatalf("reset hostile machine-root transition fixture: %v", err)
 	}
 	if err := os.MkdirAll(WindowsProgramDataRoot(), 0o700); err != nil {
 		t.Fatal(err)

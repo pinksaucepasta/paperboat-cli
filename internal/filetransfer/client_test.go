@@ -175,6 +175,34 @@ func TestSendBatchWaitsForPendingDeliveryReceipt(t *testing.T) {
 	}
 }
 
+func TestStatusAndEncryptedResumeDecodeFullSourceVisibleManifest(t *testing.T) {
+	createdAt := time.Date(2026, 8, 24, 0, 0, 0, 0, time.UTC)
+	expiresAt := createdAt.Add(7 * 24 * time.Hour)
+	want := Manifest{
+		TransferID: "fb_status.0", BatchID: "fb_status", SourceMachineID: "machine_source", DestinationMachineID: "machine_destination", InitiatingUserID: "user_1", SessionID: "session_1",
+		Basename: "payload.txt", Size: 17, SHA256: strings.Repeat("a", 64), CommittedOffset: 17, CommittedChunk: 1, State: "published", ResultCode: "published", ReceiptPath: "Paperboat Inbox/payload (2).txt", CreatedAt: createdAt, ExpiresAt: expiresAt,
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet || request.URL.Path != "/v1/file-transfers/"+want.TransferID {
+			t.Errorf("unexpected %s %s", request.Method, request.URL.Path)
+			writer.WriteHeader(http.StatusNotFound)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(writer).Encode(want)
+	}))
+	defer server.Close()
+	client := NewClient(server.URL+"/v1/file-transfers", Auth{Token: "token"}, testBinding(), server.Client())
+	got, err := client.Status(context.Background(), want.TransferID)
+	if err != nil || got != want {
+		t.Fatalf("status=%+v err=%v", got, err)
+	}
+	resource, err := client.encryptedStatus(context.Background(), want.TransferID)
+	if err != nil || resource.TransferID != want.TransferID || resource.CommittedChunk != want.CommittedChunk || resource.State != want.State || !resource.ExpiresAt.Equal(want.ExpiresAt) {
+		t.Fatalf("encrypted status=%+v err=%v", resource, err)
+	}
+}
+
 func TestProactiveRefreshAppliesToBodyAndHeaderOnlyOperations(t *testing.T) {
 	policy := Policy{Revision: "file-transfer-v1", MaxFileBytes: 50 << 20, MaxBatchFiles: 10, MaxBatchBytes: 500 << 20, MaxConcurrentTransfers: 2, RetentionSeconds: 604800, DeliveryTimeoutSeconds: 600, MaxPendingSpoolBytes: 1 << 30}
 	var requests int

@@ -105,7 +105,7 @@ func resolveWindowsDaemonExecutable(executable string) string {
 }
 
 func resolveManagedWindowsDaemonExecutable(executable string, layout hostruntimeservice.Layout, valid func(string) bool) string {
-	if valid == nil || !strings.EqualFold(filepath.Dir(filepath.Clean(executable)), filepath.Dir(layout.CLICurrent)) {
+	if valid == nil || !strings.EqualFold(filepath.Dir(filepath.Clean(executable)), filepath.Dir(layout.Binary)) {
 		return executable
 	}
 	launcher := filepath.Join(layout.InstallRoot, "bin", "pb.exe")

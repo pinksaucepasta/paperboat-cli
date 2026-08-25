@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
 )
 
@@ -81,7 +82,7 @@ func TestWindowsPreviewDeclarationDirectoryFailsClosed(t *testing.T) {
 	}
 }
 
-func TestWindowsRemovalAcceptsMissingRuntimeCurrentFromRealDeclaration(t *testing.T) {
+func TestWindowsRemovalAcceptsMissingBinaryFromRealDeclaration(t *testing.T) {
 	root := t.TempDir()
 	const name = "PaperboatPreview-0123456789abcdef"
 	executable := filepath.Join(root, "releases", "runtime-current", "paperboat-runtime.exe")
@@ -169,7 +170,7 @@ func TestWindowsPreviewDeclarationOwnershipIsExact(t *testing.T) {
 		t.Fatal(err)
 	}
 	definition := windowsServiceDefinition{
-		Schema: "paperboat.windows-service/v1", Name: serviceName, Executable: layout.RuntimeCurrent,
+		Schema: "paperboat.windows-service/v1", Name: serviceName, Executable: layout.Binary,
 		Arguments: args, Account: "SYSTEM",
 	}
 	if err := validateWindowsPreviewDefinition(definitionPath, serviceName, stateRoot, definition); err != nil {
@@ -177,7 +178,7 @@ func TestWindowsPreviewDeclarationOwnershipIsExact(t *testing.T) {
 	}
 	for _, mutate := range []func(*windowsServiceDefinition){
 		func(d *windowsServiceDefinition) { d.Account = "Administrator" },
-		func(d *windowsServiceDefinition) { d.Executable = layout.RuntimeRollback },
+		func(d *windowsServiceDefinition) { d.Executable = layout.BinaryRollback },
 		func(d *windowsServiceDefinition) { d.Arguments = append([]string{}, args[:len(args)-1]...) },
 		func(d *windowsServiceDefinition) {
 			d.Arguments = append([]string{}, args...)
@@ -190,6 +191,28 @@ func TestWindowsPreviewDeclarationOwnershipIsExact(t *testing.T) {
 		if err := validateWindowsPreviewDefinition(definitionPath, serviceName, stateRoot, candidate); !errors.Is(err, ErrInvalidDefinition) {
 			t.Fatalf("foreign preview declaration accepted: definition=%+v error=%v", candidate, err)
 		}
+	}
+}
+
+func TestWindowsPreviewServiceTerminalStatusRequiresSuccessfulStop(t *testing.T) {
+	tests := []struct {
+		name   string
+		status svc.Status
+		want   bool
+	}{
+		{name: "stopped successfully", status: svc.Status{State: svc.Stopped}, want: true},
+		{name: "start pending", status: svc.Status{State: svc.StartPending}},
+		{name: "running", status: svc.Status{State: svc.Running}},
+		{name: "stop pending", status: svc.Status{State: svc.StopPending}},
+		{name: "win32 failure", status: svc.Status{State: svc.Stopped, Win32ExitCode: 1}},
+		{name: "service failure", status: svc.Status{State: svc.Stopped, ServiceSpecificExitCode: 1}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := windowsPreviewServiceStatusTerminal(test.status); got != test.want {
+				t.Fatalf("terminal = %v, want %v for %+v", got, test.want, test.status)
+			}
+		})
 	}
 }
 

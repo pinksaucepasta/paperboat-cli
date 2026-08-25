@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"os"
 	"path/filepath"
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostinstall"
@@ -51,11 +50,5 @@ func windowsUpdatedConfig() (updated.WindowsConfig, error) {
 	if err != nil {
 		return updated.WindowsConfig{}, err
 	}
-	activeVersion := config.Artifact.Version
-	if executable, executableErr := os.Executable(); executableErr == nil {
-		if immutableVersion, versionErr := layout.WindowsVersionForExecutable(executable); versionErr == nil {
-			activeVersion = immutableVersion
-		}
-	}
-	return updated.WindowsConfig{StateRoot: layout.UpdateStateRoot, RuntimeCurrent: layout.RuntimeCurrent, RuntimeRollback: layout.RuntimeRollback, RuntimeStaged: layout.RuntimeStaged, CLICurrent: layout.CLICurrent, CLIRollback: layout.CLIRollback, OwnerSID: config.OwnerSID, MachineID: config.MachineID, RepositoryURL: config.Artifact.RepositoryURL, TokenFile: config.TokenFile, InstallState: filepath.Join(hostinstall.WindowsProgramDataRoot(), "runtime-install.json"), ControlSocket: `\\.\pipe\PaperboatUpdatedControl`, HostdSocket: layout.HostdSocket, HealthURL: "http://" + config.ListenAddress + "/healthz", ActiveVersion: activeVersion, Architecture: config.Artifact.Architecture, AutomaticActivation: true, SetupMode: config.SetupMode}, nil
+	return updated.WindowsConfig{StateRoot: layout.UpdateStateRoot, Binary: layout.Binary, BinaryRollback: layout.BinaryRollback, BinaryStaged: layout.BinaryStaged, OwnerSID: config.OwnerSID, MachineID: config.MachineID, RepositoryURL: config.Artifact.RepositoryURL, TokenFile: config.TokenFile, InstallState: filepath.Join(hostinstall.WindowsProgramDataRoot(), "runtime-install.json"), ControlSocket: `\\.\pipe\PaperboatUpdatedControl`, HostdSocket: layout.HostdSocket, HealthURL: "http://" + config.ListenAddress + "/healthz", ActiveVersion: config.Artifact.Version, Architecture: config.Artifact.Architecture, AutomaticActivation: true, SetupMode: config.SetupMode}, nil
 }

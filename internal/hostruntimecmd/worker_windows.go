@@ -80,14 +80,7 @@ func runWindowsHostdService(install hostinstall.WindowsRuntimeConfig) error {
 	if err != nil {
 		return err
 	}
-	hostdExecutable, runtimeExecutable := layout.RuntimeCurrent, layout.RuntimeCurrent
-	if executable, executableErr := os.Executable(); executableErr == nil {
-		if version, versionErr := layout.WindowsVersionForExecutable(executable); versionErr == nil {
-			if release, releaseErr := layout.WindowsRelease(version); releaseErr == nil {
-				hostdExecutable, runtimeExecutable = executable, release.Runtime
-			}
-		}
-	}
+	hostdExecutable, runtimeExecutable := layout.Binary, layout.Binary
 	environment := windowsHostdWorkerEnvironment(install, layout, runtimeExecutable)
 	token, err := readWindowsHostdTokenForSID(install.TokenFile, install.OwnerSID)
 	if err != nil {
@@ -189,7 +182,7 @@ func runOwnerHostd(ctx context.Context, output io.Writer, install hostinstall.Wi
 		if layoutErr != nil {
 			return layoutErr
 		}
-		executable = layout.RuntimeCurrent
+		executable = layout.Binary
 	}
 	if !validWindowsPipe(socket) {
 		return errors.New("hostd worker named-pipe configuration is invalid")

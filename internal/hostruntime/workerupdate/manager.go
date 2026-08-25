@@ -25,7 +25,7 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/updateflow"
 )
 
-const maxRuntimeBytes int64 = 256 << 20
+const maxRuntimeBytes int64 = 512 << 20
 
 var (
 	ErrInvalidConfig  = errors.New("invalid worker update configuration")
@@ -136,27 +136,29 @@ type NativeVerifier interface {
 }
 
 type Config struct {
-	StatePath       string
-	RuntimeCurrent  string
-	RuntimeRollback string
-	RuntimeStaged   string
-	CLICurrent      string
-	CLIRollback     string
-	Active          Release
-	OwnerUID        int
-	OwnerGID        int
-	WorkerUID       int
-	WorkerGID       int
-	HostdEndpoint   string
-	Capability      []byte
-	Fetcher         Fetcher
-	Starter         Starter
-	Hostd           Hostd
-	Health          HealthChecker
-	NativeVerifier  NativeVerifier
-	MonitorWindow   time.Duration
-	HealthInterval  time.Duration
-	Now             func() time.Time
+	StatePath      string
+	Binary         string
+	BinaryRollback string
+	BinaryStaged   string
+	Active         Release
+	OwnerUID       int
+	OwnerGID       int
+	WorkerUID      int
+	WorkerGID      int
+	HostdEndpoint  string
+	Capability     []byte
+	Fetcher        Fetcher
+	Starter        Starter
+	Hostd          Hostd
+	Health         HealthChecker
+	NativeVerifier NativeVerifier
+	// InstallPackage is the privileged macOS package boundary. A pkg is never
+	// renamed into an executable slot; the installer returns the executable
+	// installed by the verified package so it can be staged atomically.
+	InstallPackage func(context.Context, string) (string, error)
+	MonitorWindow  time.Duration
+	HealthInterval time.Duration
+	Now            func() time.Time
 }
 
 // Manager permits exactly one transaction. It retains at most runtime-current,
@@ -186,6 +188,9 @@ func New(config Config) (*Manager, error) {
 	}
 	if config.NativeVerifier == nil {
 		config.NativeVerifier = nativesignature.New(nil)
+	}
+	if config.InstallPackage == nil && runtime.GOOS == "darwin" {
+		config.InstallPackage = installDarwinPackage
 	}
 	if err := validateConfig(config); err != nil {
 		return nil, err
@@ -251,7 +256,7 @@ func (m *Manager) Activate(ctx context.Context, release Release) (Result, error)
 		_ = m.write(journal)
 		return Result{Version: m.active.Version}, err
 	}
-	journal = withRelease(journal, release, m.config.RuntimeStaged)
+	journal = withRelease(journal, release, m.config.BinaryStaged)
 	if journal, err = m.transition(journal, updateflow.StageStaged); err != nil {
 		return Result{Version: m.active.Version}, err
 	}
@@ -259,7 +264,7 @@ func (m *Manager) Activate(ctx context.Context, release Release) (Result, error)
 		return Result{Version: m.active.Version}, err
 	}
 
-	request := m.startRequest(release, m.config.RuntimeStaged)
+	request := m.startRequest(release, m.config.BinaryStaged)
 	if journal, err = m.transition(journal, updateflow.StageCandidateStarted); err != nil {
 		return Result{Version: m.active.Version}, err
 	}
@@ -296,7 +301,7 @@ func (m *Manager) Activate(ctx context.Context, release Release) (Result, error)
 	if err = m.promoteStorage(); err != nil {
 		return Result{Version: m.active.Version}, m.rollbackPreActivation(journal, worker, err)
 	}
-	journal.StagedPath = m.config.RuntimeCurrent
+	journal.StagedPath = m.config.Binary
 	if err = m.write(journal); err != nil {
 		return Result{Version: m.active.Version}, err
 	}
@@ -325,9 +330,6 @@ func (m *Manager) Activate(ctx context.Context, release Release) (Result, error)
 		return Result{Version: m.active.Version}, err
 	}
 	m.active = release
-	if err := m.installCLI(ctx, release); err != nil {
-		return Result{Version: release.Version, Updated: true}, err
-	}
 	return Result{Version: release.Version, Updated: true}, m.finishCommitted(journal)
 }
 
@@ -368,7 +370,7 @@ func (m *Manager) recoverLocked(ctx context.Context) error {
 			if err := m.ensurePromoted(journal); err != nil {
 				return err
 			}
-			journal.StagedPath = m.config.RuntimeCurrent
+			journal.StagedPath = m.config.Binary
 			next, transitionErr := m.transition(journal, updateflow.StageMonitoring)
 			if transitionErr != nil {
 				return transitionErr
@@ -389,9 +391,6 @@ func (m *Manager) recoverLocked(ctx context.Context) error {
 		return m.monitorAndCommitRecovered(ctx, journal)
 	case updateflow.RecoveryFinalizeCleanup:
 		m.active = releaseFromJournal(journal)
-		if err := m.installCLI(ctx, m.active); err != nil {
-			return err
-		}
 		return m.finishCommitted(journal)
 	case updateflow.RecoveryPerformRollback:
 		return ErrBlocked
@@ -415,9 +414,6 @@ func (m *Manager) monitorAndCommitRecovered(ctx context.Context, journal updatef
 		return err
 	}
 	m.active = release
-	if err := m.installCLI(ctx, release); err != nil {
-		return err
-	}
 	return m.finishCommitted(next)
 }
 
@@ -466,7 +462,7 @@ func (m *Manager) rollbackActive(ctx context.Context, journal updateflow.Journal
 		return err
 	}
 	previous := m.active
-	rollbackRequest := m.startRequest(previous, m.config.RuntimeRollback)
+	rollbackRequest := m.startRequest(previous, m.config.BinaryRollback)
 	rollbackWorker, startErr := m.config.Starter.Start(ctx, rollbackRequest)
 	if startErr == nil {
 		ready, readyErr := rollbackWorker.Ready(ctx)
@@ -544,7 +540,7 @@ func (m *Manager) stage(ctx context.Context, release Release) error {
 		return err
 	}
 	defer stream.Close()
-	directory := filepath.Dir(m.config.RuntimeStaged)
+	directory := filepath.Dir(m.config.BinaryStaged)
 	//paperboat:allow-source-policy atomic-replacement owner=worker-update reason=same-directory-verified-runtime-download-staging
 	pending, err := os.CreateTemp(directory, ".paperboat-runtime-")
 	if err != nil {
@@ -573,6 +569,28 @@ func (m *Manager) stage(ctx context.Context, release Release) error {
 	if err := pending.Close(); err != nil {
 		return err
 	}
+	if release.Platform == "darwin" {
+		if m.config.InstallPackage == nil {
+			return ErrInvalidConfig
+		}
+		if err := m.config.NativeVerifier.Verify(ctx, pendingPath, release.Platform, release.Architecture); err != nil {
+			return ErrInvalidRelease
+		}
+		installedPath, err := m.config.InstallPackage(ctx, pendingPath)
+		if err != nil {
+			return ErrInvalidRelease
+		}
+		if err := stageInstalledDarwinExecutable(installedPath, m.config.BinaryStaged, m.config.OwnerUID, m.config.OwnerGID); err != nil {
+			return ErrInvalidRelease
+		}
+		if err := binarytarget.Validate(m.config.BinaryStaged, release.Platform, release.Architecture); err != nil {
+			return ErrInvalidRelease
+		}
+		if err := m.config.NativeVerifier.Verify(ctx, m.config.BinaryStaged, release.Platform, release.Architecture); err != nil {
+			return ErrInvalidRelease
+		}
+		return syncDirectories(directory, filepath.Dir(m.config.BinaryStaged))
+	}
 	if err := binarytarget.Validate(pendingPath, release.Platform, release.Architecture); err != nil {
 		return ErrInvalidRelease
 	}
@@ -580,131 +598,92 @@ func (m *Manager) stage(ctx context.Context, release Release) error {
 		return ErrInvalidRelease
 	}
 	//paperboat:allow-source-policy atomic-replacement owner=worker-update reason=verified-runtime-download-publication
-	if err := os.Rename(pendingPath, m.config.RuntimeStaged); err != nil {
+	if err := os.Rename(pendingPath, m.config.BinaryStaged); err != nil {
 		return err
 	}
 	return syncDirectories(directory)
 }
 
-// installCLI runs only after the runtime worker has survived its monitoring
-// hold and the runtime transaction committed. The stable launcher continues
-// to use the old CLI for this invocation; later invocations select current.
-// A private temporary file is the only transient third CLI artifact.
-func (m *Manager) installCLI(ctx context.Context, release Release) error {
-	fetcher, ok := m.config.Fetcher.(ComponentFetcher)
-	if !ok {
-		return ErrInvalidConfig
+func stageInstalledDarwinExecutable(source, destination string, ownerUID, ownerGID int) error {
+	if source == "" || !filepath.IsAbs(source) || filepath.Clean(source) != source || !filepath.IsAbs(destination) || filepath.Clean(destination) != destination {
+		return ErrInvalidRelease
 	}
-	directory := filepath.Dir(m.config.CLICurrent)
-	staged := m.config.CLICurrent + ".staged"
-	if regularMatches(m.config.CLICurrent, release.CLILength, release.CLISHA256) {
-		return removeRuntimeFile(staged, m.config.OwnerUID)
+	info, err := os.Lstat(source)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() < 1 || info.Size() > maxRuntimeBytes {
+		return ErrInvalidRelease
 	}
-	if !regularMatches(staged, release.CLILength, release.CLISHA256) {
-		if err := removeRuntimeFile(staged, m.config.OwnerUID); err != nil {
-			return err
-		}
-		stream, err := fetcher.FetchComponent(ctx, release, "cli")
-		if err != nil {
-			return err
-		}
-		defer stream.Close()
-		//paperboat:allow-source-policy atomic-replacement owner=worker-update reason=same-directory-verified-cli-download-staging
-		pending, err := os.CreateTemp(directory, ".paperboat-cli-")
-		if err != nil {
-			return err
-		}
-		pendingPath := pending.Name()
-		defer os.Remove(pendingPath)
-		if err := pending.Chmod(0o700); err != nil {
-			_ = pending.Close()
-			return err
-		}
-		if err := pending.Chown(m.config.OwnerUID, m.config.OwnerGID); err != nil {
-			_ = pending.Close()
-			return err
-		}
-		hash := sha256.New()
-		written, copyErr := io.Copy(io.MultiWriter(pending, hash), io.LimitReader(stream, release.CLILength+1))
-		if copyErr != nil || written != release.CLILength || !strings.EqualFold(hex.EncodeToString(hash.Sum(nil)), release.CLISHA256) {
-			_ = pending.Close()
-			return ErrInvalidRelease
-		}
-		if err := pending.Sync(); err != nil {
-			_ = pending.Close()
-			return err
-		}
-		if err := pending.Close(); err != nil {
-			return err
-		}
-		if err := binarytarget.Validate(pendingPath, release.CLIPlatform, release.CLIArchitecture); err != nil {
-			return ErrInvalidRelease
-		}
-		if err := m.config.NativeVerifier.Verify(ctx, pendingPath, release.CLIPlatform, release.CLIArchitecture); err != nil {
-			return ErrInvalidRelease
-		}
-		//paperboat:allow-source-policy atomic-replacement owner=worker-update reason=verified-cli-download-publication
-		if err := os.Rename(pendingPath, staged); err != nil {
-			return err
-		}
-		if err := syncDirectories(directory); err != nil {
-			return err
-		}
-	}
-	if _, err := os.Lstat(m.config.CLICurrent); errors.Is(err, os.ErrNotExist) {
-		if err := safeRuntimeFile(m.config.CLIRollback, m.config.OwnerUID, true); err != nil {
-			return err
-		}
-		//paperboat:allow-source-policy atomic-replacement owner=worker-update reason=initial-verified-cli-slot-activation
-		if err := os.Rename(staged, m.config.CLICurrent); err != nil {
-			return err
-		}
-		return syncDirectories(directory, filepath.Dir(m.config.CLIRollback))
-	} else if err != nil {
+	directory := filepath.Dir(destination)
+	//paperboat:allow-source-policy atomic-replacement owner=worker-update reason=same-directory-verified-darwin-executable-staging
+	pending, err := os.CreateTemp(directory, ".paperboat-darwin-executable-")
+	if err != nil {
 		return err
 	}
-	if err := safeRuntimeFile(m.config.CLICurrent, m.config.OwnerUID, true); err != nil {
+	pendingPath := pending.Name()
+	defer os.Remove(pendingPath)
+	if err := pending.Chmod(0o700); err != nil {
+		_ = pending.Close()
 		return err
 	}
-	if err := removeRuntimeFile(m.config.CLIRollback, m.config.OwnerUID); err != nil {
+	if err := pending.Chown(ownerUID, ownerGID); err != nil {
+		_ = pending.Close()
 		return err
 	}
-	//paperboat:allow-source-policy atomic-replacement owner=worker-update reason=current-cli-to-rollback-slot-transition
-	if err := os.Rename(m.config.CLICurrent, m.config.CLIRollback); err != nil {
+	input, err := os.Open(source)
+	if err != nil {
+		_ = pending.Close()
 		return err
 	}
-	//paperboat:allow-source-policy atomic-replacement owner=worker-update reason=verified-staged-cli-slot-activation
-	if err := os.Rename(staged, m.config.CLICurrent); err != nil {
+	written, copyErr := io.Copy(pending, io.LimitReader(input, maxRuntimeBytes+1))
+	closeErr := input.Close()
+	if copyErr != nil || closeErr != nil || written != info.Size() {
+		_ = pending.Close()
+		return ErrInvalidRelease
+	}
+	if err := pending.Sync(); err != nil {
+		_ = pending.Close()
 		return err
 	}
-	return syncDirectories(directory, filepath.Dir(m.config.CLIRollback))
+	if err := pending.Close(); err != nil {
+		return err
+	}
+	//paperboat:allow-source-policy atomic-replacement owner=worker-update reason=verified-darwin-package-executable-staging
+	if err := os.Rename(pendingPath, destination); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (m *Manager) promoteStorage() error {
-	if err := safeRuntimeFile(m.config.RuntimeCurrent, m.config.OwnerUID, true); err != nil {
+	if err := safeRuntimeFile(m.config.Binary, m.config.OwnerUID, true); err != nil {
 		return err
 	}
-	if err := safeRuntimeFile(m.config.RuntimeStaged, m.config.OwnerUID, true); err != nil {
+	if err := safeRuntimeFile(m.config.BinaryStaged, m.config.OwnerUID, true); err != nil {
 		return err
 	}
-	if err := removeRuntimeFile(m.config.RuntimeRollback, m.config.OwnerUID); err != nil {
+	if err := removeRuntimeFile(m.config.BinaryRollback, m.config.OwnerUID); err != nil {
 		return err
 	}
 	//paperboat:allow-source-policy atomic-replacement owner=worker-update reason=current-runtime-to-rollback-slot-transition
-	if err := os.Rename(m.config.RuntimeCurrent, m.config.RuntimeRollback); err != nil {
+	if err := os.Rename(m.config.Binary, m.config.BinaryRollback); err != nil {
 		return err
 	}
 	//paperboat:allow-source-policy atomic-replacement owner=worker-update reason=verified-staged-runtime-slot-activation
-	if err := os.Rename(m.config.RuntimeStaged, m.config.RuntimeCurrent); err != nil {
+	if err := os.Rename(m.config.BinaryStaged, m.config.Binary); err != nil {
 		//paperboat:allow-source-policy atomic-replacement owner=worker-update reason=restore-runtime-rollback-after-activation-failure
-		_ = os.Rename(m.config.RuntimeRollback, m.config.RuntimeCurrent)
+		_ = os.Rename(m.config.BinaryRollback, m.config.Binary)
 		return err
 	}
-	return syncDirectories(filepath.Dir(m.config.RuntimeCurrent), filepath.Dir(m.config.RuntimeRollback), filepath.Dir(m.config.RuntimeStaged))
+	return syncDirectories(filepath.Dir(m.config.Binary), filepath.Dir(m.config.BinaryRollback), filepath.Dir(m.config.BinaryStaged))
 }
 
 func (m *Manager) ensurePromoted(journal updateflow.Journal) error {
-	if regularMatches(m.config.RuntimeCurrent, journal.CandidateLength, journal.CandidateDigest) {
+	if m.active.Platform == "darwin" || runtime.GOOS == "darwin" {
+		if err := binarytarget.Validate(m.config.Binary, "darwin", "arm64"); err != nil {
+			return err
+		}
+		return nil
+	}
+	if regularMatches(m.config.Binary, journal.CandidateLength, journal.CandidateDigest) {
 		return nil
 	}
 	return m.promoteStorage()
@@ -714,32 +693,32 @@ func (m *Manager) restoreStorage() error {
 	// Before activation, current is old and staged is candidate, so there is
 	// nothing to restore. After promotion, current is candidate and rollback is
 	// old; move only the verified candidate into the quarantined staged slot.
-	if _, err := os.Lstat(m.config.RuntimeStaged); err == nil {
+	if _, err := os.Lstat(m.config.BinaryStaged); err == nil {
 		return nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if err := safeRuntimeFile(m.config.RuntimeCurrent, m.config.OwnerUID, true); err != nil {
+	if err := safeRuntimeFile(m.config.Binary, m.config.OwnerUID, true); err != nil {
 		return err
 	}
-	if err := safeRuntimeFile(m.config.RuntimeRollback, m.config.OwnerUID, true); err != nil {
+	if err := safeRuntimeFile(m.config.BinaryRollback, m.config.OwnerUID, true); err != nil {
 		return err
 	}
 	//paperboat:allow-source-policy atomic-replacement owner=worker-update reason=quarantine-current-runtime-before-rollback
-	if err := os.Rename(m.config.RuntimeCurrent, m.config.RuntimeStaged); err != nil {
+	if err := os.Rename(m.config.Binary, m.config.BinaryStaged); err != nil {
 		return err
 	}
 	//paperboat:allow-source-policy atomic-replacement owner=worker-update reason=verified-runtime-rollback-slot-activation
-	if err := os.Rename(m.config.RuntimeRollback, m.config.RuntimeCurrent); err != nil {
+	if err := os.Rename(m.config.BinaryRollback, m.config.Binary); err != nil {
 		//paperboat:allow-source-policy atomic-replacement owner=worker-update reason=restore-current-runtime-after-rollback-failure
-		_ = os.Rename(m.config.RuntimeStaged, m.config.RuntimeCurrent)
+		_ = os.Rename(m.config.BinaryStaged, m.config.Binary)
 		return err
 	}
-	return syncDirectories(filepath.Dir(m.config.RuntimeCurrent), filepath.Dir(m.config.RuntimeRollback), filepath.Dir(m.config.RuntimeStaged))
+	return syncDirectories(filepath.Dir(m.config.Binary), filepath.Dir(m.config.BinaryRollback), filepath.Dir(m.config.BinaryStaged))
 }
 
 func (m *Manager) removeStaged() error {
-	return removeRuntimeFile(m.config.RuntimeStaged, m.config.OwnerUID)
+	return removeRuntimeFile(m.config.BinaryStaged, m.config.OwnerUID)
 }
 
 func (m *Manager) newJournal() updateflow.Journal {
@@ -751,7 +730,7 @@ func (m *Manager) idleJournal(from updateflow.Journal, failure updateflow.Failur
 	journal := updateflow.Journal{Schema: updateflow.SchemaV1, TransactionID: from.TransactionID, Stage: updateflow.StageIdle,
 		ActiveVersion: m.active.Version, BootID: from.BootID, StageUpdatedAt: m.now(), RollbackCount: from.RollbackCount, LastFailure: failure}
 	if quarantine != "" {
-		journal = withRelease(journal, Release{Version: quarantine, SHA256: from.CandidateDigest, Length: from.CandidateLength, Platform: runtime.GOOS, Architecture: runtime.GOARCH, CLISHA256: from.CandidateCLIDigest, CLILength: from.CandidateCLILength, CLIPlatform: runtime.GOOS, CLIArchitecture: runtime.GOARCH, HostdAPIMin: from.HostdAPIMin, HostdAPIMax: from.HostdAPIMax, RuntimeAPIMin: from.RuntimeAPIMin, RuntimeAPIMax: from.RuntimeAPIMax}, m.config.RuntimeStaged)
+		journal = withRelease(journal, Release{Version: quarantine, SHA256: from.CandidateDigest, Length: from.CandidateLength, Platform: runtime.GOOS, Architecture: runtime.GOARCH, HostdAPIMin: from.HostdAPIMin, HostdAPIMax: from.HostdAPIMax, RuntimeAPIMin: from.RuntimeAPIMin, RuntimeAPIMax: from.RuntimeAPIMax}, m.config.BinaryStaged)
 	}
 	return journal
 }
@@ -787,12 +766,12 @@ func (m *Manager) startRequest(release Release, executable string) StartRequest 
 }
 
 func withRelease(journal updateflow.Journal, release Release, path string) updateflow.Journal {
-	journal.CandidateVersion, journal.CandidateDigest, journal.CandidateLength, journal.CandidateCLIDigest, journal.CandidateCLILength, journal.StagedPath = release.Version, release.SHA256, release.Length, release.CLISHA256, release.CLILength, path
+	journal.CandidateVersion, journal.CandidateDigest, journal.CandidateLength, journal.StagedPath = release.Version, release.SHA256, release.Length, path
 	journal.HostdAPIMin, journal.HostdAPIMax, journal.RuntimeAPIMin, journal.RuntimeAPIMax = release.HostdAPIMin, release.HostdAPIMax, release.RuntimeAPIMin, release.RuntimeAPIMax
 	return journal
 }
 func releaseFromJournal(j updateflow.Journal) Release {
-	return Release{Version: j.CandidateVersion, SHA256: j.CandidateDigest, Length: j.CandidateLength, Platform: runtime.GOOS, Architecture: runtime.GOARCH, CLISHA256: j.CandidateCLIDigest, CLILength: j.CandidateCLILength, CLIPlatform: runtime.GOOS, CLIArchitecture: runtime.GOARCH, HostdAPIMin: j.HostdAPIMin, HostdAPIMax: j.HostdAPIMax, RuntimeAPIMin: j.RuntimeAPIMin, RuntimeAPIMax: j.RuntimeAPIMax}
+	return Release{Version: j.CandidateVersion, SHA256: j.CandidateDigest, Length: j.CandidateLength, Platform: runtime.GOOS, Architecture: runtime.GOARCH, HostdAPIMin: j.HostdAPIMin, HostdAPIMax: j.HostdAPIMax, RuntimeAPIMin: j.RuntimeAPIMin, RuntimeAPIMax: j.RuntimeAPIMax}
 }
 func workerID(version string) string { return "runtime-" + version }
 func matches(status hostdproto.Status, state hostdproto.State, id string, epoch uint64) bool {
@@ -800,10 +779,11 @@ func matches(status hostdproto.Status, state hostdproto.State, id string, epoch 
 }
 
 func validateConfig(config Config) error {
-	if config.Fetcher == nil || config.Starter == nil || config.Hostd == nil || config.Health == nil || config.OwnerUID < 0 || config.OwnerGID < 0 || config.WorkerUID <= 0 || config.WorkerGID < 0 || len(config.Capability) != 32 || config.HostdEndpoint == "" || config.MonitorWindow <= 0 || config.HealthInterval <= 0 || config.HealthInterval > config.MonitorWindow || validateRelease(config.Active) != nil {
+	if config.Fetcher == nil || config.Starter == nil || config.Hostd == nil || config.Health == nil || config.OwnerUID < 0 || config.OwnerGID < 0 || !validWorkerIdentity(config.WorkerUID, config.WorkerGID) || len(config.Capability) != 32 || config.HostdEndpoint == "" || config.MonitorWindow <= 0 || config.HealthInterval <= 0 || config.HealthInterval > config.MonitorWindow || validateRelease(config.Active) != nil {
 		return ErrInvalidConfig
 	}
-	for _, path := range []string{config.StatePath, config.RuntimeCurrent, config.RuntimeRollback, config.RuntimeStaged, config.CLICurrent, config.CLIRollback} {
+	paths := []string{config.StatePath, config.Binary, config.BinaryRollback, config.BinaryStaged}
+	for _, path := range paths {
 		if !filepath.IsAbs(path) || filepath.Clean(path) != path || filepath.Base(path) == "." || filepath.Base(path) == string(filepath.Separator) {
 			return ErrInvalidConfig
 		}
@@ -811,27 +791,35 @@ func validateConfig(config Config) error {
 			return err
 		}
 	}
-	if config.RuntimeCurrent == config.RuntimeRollback || config.RuntimeCurrent == config.RuntimeStaged || config.RuntimeRollback == config.RuntimeStaged || config.CLICurrent == config.CLIRollback {
+	if config.Binary == config.BinaryRollback || config.Binary == config.BinaryStaged || config.BinaryRollback == config.BinaryStaged {
 		return ErrInvalidConfig
 	}
-	if err := safeRuntimeFile(config.RuntimeCurrent, config.OwnerUID, true); err != nil {
+	if err := safeRuntimeFile(config.Binary, config.OwnerUID, true); err != nil {
 		return err
 	}
-	if !regularMatches(config.RuntimeCurrent, config.Active.Length, config.Active.SHA256) || binarytarget.Validate(config.RuntimeCurrent, config.Active.Platform, config.Active.Architecture) != nil {
+	activeMatches := regularMatches(config.Binary, config.Active.Length, config.Active.SHA256)
+	if config.Active.Platform == "darwin" {
+		// The signed Darwin release target is a PKG. The installed active
+		// executable is the package payload, so its bytes cannot match the
+		// package digest. Format validation remains mandatory.
+		activeMatches = true
+	}
+	if !activeMatches || binarytarget.Validate(config.Binary, config.Active.Platform, config.Active.Architecture) != nil {
 		return ErrUnsafeStorage
 	}
-	if _, ok := config.Fetcher.(ComponentFetcher); !ok || safeRuntimeFile(config.CLICurrent, config.OwnerUID, true) != nil || binarytarget.Validate(config.CLICurrent, config.Active.CLIPlatform, config.Active.CLIArchitecture) != nil {
+	if config.Active.Platform == "darwin" && config.InstallPackage == nil {
 		return ErrUnsafeStorage
 	}
 	return nil
 }
 
 func validateRelease(release Release) error {
-	if !validVersion(release.Version) || len(release.SHA256) != 64 || release.Length < 1 || release.Length > maxRuntimeBytes || release.Platform != runtime.GOOS || release.Architecture != runtime.GOARCH || !hexDigest(release.SHA256) || len(release.CLISHA256) != 64 || release.CLILength < 1 || release.CLILength > maxRuntimeBytes || release.CLIPlatform != runtime.GOOS || release.CLIArchitecture != runtime.GOARCH || !hexDigest(release.CLISHA256) || invalidRequiredAPIRange(release.HostdAPIMin, release.HostdAPIMax) || invalidRequiredAPIRange(release.RuntimeAPIMin, release.RuntimeAPIMax) {
+	if !validVersion(release.Version) || len(release.SHA256) != 64 || release.Length < 1 || release.Length > maxRuntimeBytes || release.Platform != runtime.GOOS || release.Architecture != runtime.GOARCH || !hexDigest(release.SHA256) || invalidRequiredAPIRange(release.HostdAPIMin, release.HostdAPIMax) || invalidRequiredAPIRange(release.RuntimeAPIMin, release.RuntimeAPIMax) {
 		return ErrInvalidRelease
 	}
 	return nil
 }
+
 func invalidAPIRange(minimum, maximum uint16) bool { return minimum > maximum || maximum > 1024 }
 func invalidRequiredAPIRange(minimum, maximum uint16) bool {
 	return minimum == 0 || invalidAPIRange(minimum, maximum)

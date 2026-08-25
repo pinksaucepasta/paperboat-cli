@@ -4,6 +4,7 @@ package service
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -21,6 +22,7 @@ import (
 	"unsafe"
 
 	"github.com/pinksaucepasta/paperboat/internal/config"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/identity"
 	"github.com/pinksaucepasta/paperboat/internal/windowssecurity"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
@@ -97,6 +99,43 @@ func prepareProductionKeyringFixtures(t *testing.T, reportPath string, cleanup b
 			_ = keyring.Delete(migratedRef)
 		})
 	}
+}
+
+const s4uPreviewControlURL = "https://api.example.test"
+
+func prepareS4UPreviewIdentityFixture(t *testing.T, reportPath string) string {
+	t.Helper()
+	stateRoot := reportPath + ".preview-state"
+	store, err := identity.Open(identity.Config{StateRoot: stateRoot})
+	if err != nil {
+		t.Fatalf("create S4U preview identity store: %v", err)
+	}
+	key := store.Current()
+	registration := identity.Registration{
+		ServerURL:              s4uPreviewControlURL,
+		MachineID:              "machine_s4u_preview",
+		EnvironmentID:          "environment_s4u_preview",
+		PublicKeyID:            key.ID,
+		PublicIdentityKey:      base64.RawURLEncoding.EncodeToString(key.Public()),
+		InboxPath:              filepath.Join(stateRoot, "inbox"),
+		InstallationGeneration: 1,
+		SetupRoles:             []string{"host"},
+		UpdatedAt:              time.Now().UTC(),
+	}
+	if err := store.SaveRegistration(registration); err != nil {
+		t.Fatalf("save S4U preview registration: %v", err)
+	}
+	if err := store.SaveMachineControl(identity.MachineControl{
+		MachineID:              registration.MachineID,
+		EnvironmentID:          registration.EnvironmentID,
+		InstallationGeneration: registration.InstallationGeneration,
+		Credential:             strings.Repeat("m", 40),
+		ExpiresAt:              time.Now().UTC().Add(2 * time.Hour),
+		KeyID:                  key.ID,
+	}); err != nil {
+		t.Fatalf("save S4U preview machine-control fixture: %v", err)
+	}
+	return stateRoot
 }
 
 func qualificationProfilePrivilegeScope() (func() error, error) {
@@ -342,6 +381,7 @@ func TestNativePrepareS4UDPAPIQualification(t *testing.T) {
 			t.Fatalf("remove owner qualification access probe: %v", err)
 		}
 		prepareProductionKeyringFixtures(t, reportPath, false)
+		prepareS4UPreviewIdentityFixture(t, reportPath)
 		assertQualificationKeyringOwner(t, localAppData, reportPath, ownerSID)
 		assertQualificationKeyringOwner(t, localAppData, reportPath+"-migrated", ownerSID)
 	})
@@ -425,6 +465,62 @@ func TestNativeLoggedOutS4UDPAPIQualification(t *testing.T) {
 	}
 }
 
+// TestNativeLoggedOutS4UFileSecretQualification is the focused regression for
+// runtime-owned transfer keys. Unlike the owner-prepared KeyringStore gate, it
+// requires the logged-out S4U child itself to create and reopen a fresh
+// FileSecretStore value, matching the file-transfer receiver path.
+func TestNativeLoggedOutS4UFileSecretQualification(t *testing.T) {
+	fixture := requiredS4UFixture(t)
+	ownerSID := requiredS4UOwnerSID(t)
+	if hasSelectableOwnerWTSToken(t, ownerSID) {
+		t.Fatalf("owner %s has a selectable WTS token; logged-out FileSecretStore qualification did not run", ownerSID)
+	}
+
+	name := fmt.Sprintf("PaperboatS4UFileSecret%d", os.Getpid())
+	reportPath := filepath.Join(t.TempDir(), "s4u-file-secret-report.json")
+	manager, err := mgr.Connect()
+	if err != nil {
+		t.Fatalf("connect SCM: %v", err)
+	}
+	defer manager.Disconnect()
+	serviceHandle, err := manager.CreateService(name, fixture, mgr.Config{
+		DisplayName:      name,
+		Description:      "Paperboat native logged-out S4U FileSecretStore qualification fixture",
+		StartType:        mgr.StartManual,
+		ServiceStartName: "LocalSystem",
+	}, "--paperboat-s4u-dpapi-service", "--service-name", name, "--owner-sid", ownerSID, "--report", reportPath)
+	if err != nil {
+		t.Fatalf("create S4U FileSecretStore qualification service: %v", err)
+	}
+	defer func() { _ = stopAndDeleteS4UService(serviceHandle) }()
+	if err := serviceHandle.Start(); err != nil {
+		t.Fatalf("start S4U FileSecretStore qualification service: %v", err)
+	}
+	if err := waitS4UServiceState(serviceHandle, svc.Running, 30*time.Second); err != nil {
+		body, _ := os.ReadFile(reportPath + ".launch-error")
+		t.Fatalf("%v: %s", err, strings.TrimSpace(string(body)))
+	}
+	record := waitS4UReport(t, reportPath, 30*time.Second)
+	if record.OwnerSID != ownerSID || record.SessionID != 0 || !record.JobCleanupExpected {
+		t.Fatalf("invalid logged-out S4U FileSecretStore report: %+v", record)
+	}
+	if record.Limitations.FileSecretStore.Status != "pass" || strings.TrimSpace(record.Limitations.FileSecretStore.Reason) == "" {
+		t.Fatalf("logged-out S4U must write and read a fresh FileSecretStore credential: %+v", record.Limitations.FileSecretStore)
+	}
+
+	if _, err := serviceHandle.Control(svc.Stop); err != nil && !errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE) {
+		t.Fatalf("stop S4U FileSecretStore qualification service: %v", err)
+	}
+	if err := waitS4UServiceState(serviceHandle, svc.Stopped, 30*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	for _, pid := range []uint32{record.ChildPID, record.DescendantPID} {
+		if err := waitS4UProcessExit(pid, 15*time.Second); err != nil {
+			t.Fatalf("S4U Job Object cleanup for pid %d: %v", pid, err)
+		}
+	}
+}
+
 func assertS4UDPAPIReport(t *testing.T, record s4uQualificationReport, ownerSID string) {
 	t.Helper()
 	if record.Schema != "paperboat.windows-s4u-qualification/v1" || record.OwnerSID != ownerSID || record.ChildPID == 0 || record.DescendantPID == 0 || record.ChildPID == record.DescendantPID || record.SessionID != 0 {
@@ -441,6 +537,23 @@ func assertS4UDPAPIReport(t *testing.T, record s4uQualificationReport, ownerSID 
 	}
 	if record.Limitations.DPAPIMigration.Status != "pass" || strings.TrimSpace(record.Limitations.DPAPIMigration.Reason) == "" {
 		t.Fatalf("logged-out S4U must read the owner-migrated Credential Manager credential through KeyringStore: %+v", record.Limitations.DPAPIMigration)
+	}
+	if record.Limitations.FileSecretStore.Status != "pass" || strings.TrimSpace(record.Limitations.FileSecretStore.Reason) == "" {
+		t.Fatalf("logged-out S4U must write and read a fresh FileSecretStore credential: %+v", record.Limitations.FileSecretStore)
+	}
+	for _, result := range []struct {
+		name   string
+		status string
+		reason string
+	}{
+		{name: "identity_open", status: record.Limitations.PreviewIdentityOpen.Status, reason: record.Limitations.PreviewIdentityOpen.Reason},
+		{name: "registration", status: record.Limitations.PreviewRegistration.Status, reason: record.Limitations.PreviewRegistration.Reason},
+		{name: "machine_control_source", status: record.Limitations.PreviewMachineControlSource.Status, reason: record.Limitations.PreviewMachineControlSource.Reason},
+		{name: "machine_control_token", status: record.Limitations.PreviewMachineControlToken.Status, reason: record.Limitations.PreviewMachineControlToken.Reason},
+	} {
+		if result.status != "pass" || strings.TrimSpace(result.reason) == "" {
+			t.Fatalf("logged-out S4U preview stage %s did not pass: status=%q reason=%q", result.name, result.status, result.reason)
+		}
 	}
 }
 
@@ -474,6 +587,10 @@ type s4uQualificationReport struct {
 			Status string `json:"status"`
 			Reason string `json:"reason"`
 		} `json:"dpapi_credential_manager_migration"`
+		FileSecretStore struct {
+			Status string `json:"status"`
+			Reason string `json:"reason"`
+		} `json:"file_secret_store"`
 		EFS struct {
 			Status string `json:"status"`
 			Reason string `json:"reason"`
@@ -490,6 +607,22 @@ type s4uQualificationReport struct {
 			Status string `json:"status"`
 			Reason string `json:"reason"`
 		} `json:"codex"`
+		PreviewIdentityOpen struct {
+			Status string `json:"status"`
+			Reason string `json:"reason"`
+		} `json:"preview_identity_open"`
+		PreviewRegistration struct {
+			Status string `json:"status"`
+			Reason string `json:"reason"`
+		} `json:"preview_registration"`
+		PreviewMachineControlSource struct {
+			Status string `json:"status"`
+			Reason string `json:"reason"`
+		} `json:"preview_machine_control_source"`
+		PreviewMachineControlToken struct {
+			Status string `json:"status"`
+			Reason string `json:"reason"`
+		} `json:"preview_machine_control_token"`
 	} `json:"limitations"`
 }
 
@@ -728,6 +861,9 @@ func assertS4UReport(t *testing.T, record s4uQualificationReport, ownerSID strin
 	}
 	if record.Limitations.DPAPIMigration.Status != "pass" || strings.TrimSpace(record.Limitations.DPAPIMigration.Reason) == "" {
 		t.Fatalf("logged-out S4U must read the owner-migrated Credential Manager credential through KeyringStore: %+v", record.Limitations.DPAPIMigration)
+	}
+	if record.Limitations.FileSecretStore.Status != "pass" || strings.TrimSpace(record.Limitations.FileSecretStore.Reason) == "" {
+		t.Fatalf("logged-out S4U must write and read a fresh FileSecretStore credential: %+v", record.Limitations.FileSecretStore)
 	}
 	for name, result := range map[string]struct{ Status, Reason string }{"EFS": {record.Limitations.EFS.Status, record.Limitations.EFS.Reason}, "Git": {record.Limitations.Git.Status, record.Limitations.Git.Reason}, "network": {record.Limitations.Network.Status, record.Limitations.Network.Reason}, "Codex": {record.Limitations.Codex.Status, record.Limitations.Codex.Reason}} {
 		if result.Status != "pass" {

@@ -1,6 +1,9 @@
 #!/bin/sh
 set -eu
 
+# Paperboat has one executable per native platform. This bootstrap script is
+# intentionally small: the release origin supplies only current.json and TUF
+# metadata; the immutable bytes always come from the GitHub release asset.
 repository=${PAPERBOAT_GITHUB_REPOSITORY:-pinksaucepasta/paperboat-cli}
 version=${PAPERBOAT_VERSION:-latest}
 release_metadata_url=${PAPERBOAT_RELEASE_METADATA_URL:-https://api.pprbt.dev/current.json}
@@ -13,28 +16,10 @@ enrollment_token_file=
 machine_name=
 ssh_port=
 recovery_output=
+install_dir_requested=false
+
 if [ -n "${PAPERBOAT_ENROLLMENT_TOKEN:-}" ]; then enrollment_token=$PAPERBOAT_ENROLLMENT_TOKEN; pair=true; fi
 if [ -n "${PAPERBOAT_MACHINE_NAME:-}" ]; then machine_name=$PAPERBOAT_MACHINE_NAME; fi
-
-release_checksum() {
-  checksum_file=$1
-  asset_name=$2
-  awk -v asset="$asset_name" '
-    function valid_sha256(value) {
-      return length(value) == 64 && value ~ /^[0-9A-Fa-f]+$/
-    }
-    {
-      digest = $1
-      path = $2
-      if (!valid_sha256(digest)) next
-      sub(/^\*/, "", path)
-      if (path == asset || path == "./" asset) {
-        print tolower(digest)
-        exit
-      }
-    }
-  ' "$checksum_file"
-}
 
 usage() {
   cat <<'EOF'
@@ -44,23 +29,22 @@ Usage:
   install.sh [options]
 
 Options:
-  --version VERSION          Install a specific release (default: current)
-  --install-dir DIRECTORY    Install pb here (default: ~/.local/bin)
-  --setup MODE               Run setup after install: client or host
-  --pair                     Pair this machine as a host after install
-  --enrollment-token TOKEN   Use a dashboard-issued single-use pairing token
+  --version VERSION             Install the version named by current.json
+  --install-dir DIRECTORY       Install Linux pb here (default: ~/.local/bin)
+  --setup MODE                  Run setup after install: client or host
+  --pair                        Pair this machine after install
+  --enrollment-token TOKEN      Use a dashboard-issued single-use pairing token
   --enrollment-token-file FILE  Read the token from an absolute owner-only file
-  --setup-mode MODE          Pair as host or client (default: host)
-  --name NAME                Set the machine name
-  --ssh-port PORT            Existing SSH port; valid only with --setup host
-  --recovery-output FILE     Save the account recovery key during setup
-  --no-setup                 Install only (the default)
-  -h, --help                 Show this help
+  --setup-mode MODE             Pair as host or client (default: host)
+  --name NAME                   Set the machine name
+  --ssh-port PORT               Existing SSH port; valid only with --setup host
+  --recovery-output FILE        Save the account recovery key during setup
+  --no-setup                    Install only (the default)
+  -h, --help                    Show this help
 
 Examples:
-  curl -fsSL https://get.pprbt.dev/install | bash
-  curl -fsSL https://get.pprbt.dev/install | bash -s -- --pair --enrollment-token TOKEN
-  curl -fsSL https://get.pprbt.dev/install | bash -s -- --setup client
+  curl -fsSL https://get.pprbt.dev/install | sh
+  curl -fsSL https://get.pprbt.dev/install | sh -s -- --pair --enrollment-token TOKEN
 EOF
 }
 
@@ -70,7 +54,7 @@ while [ "$#" -gt 0 ]; do
       [ "$#" -ge 2 ] || { echo "pb installer: $1 requires a value" >&2; exit 2; }
       case "$1" in
         --version) version=$2 ;;
-        --install-dir) install_dir=$2 ;;
+        --install-dir) install_dir=$2; install_dir_requested=true ;;
         --setup) setup_mode=$2 ;;
         --setup-mode) pair_mode=$2 ;;
         --enrollment-token) enrollment_token=$2 ;;
@@ -132,71 +116,120 @@ case $(uname -m) in
   *) echo "pb installer: unsupported architecture: $(uname -m)" >&2; exit 1 ;;
 esac
 
-if ! command -v curl >/dev/null 2>&1; then
-  echo "pb installer: curl is required" >&2
-  exit 1
-fi
+case "$repository" in
+  */*)
+    repository_owner=${repository%%/*}
+    repository_name=${repository#*/}
+    case "$repository_owner$repository_name" in
+      ""|*[!A-Za-z0-9_.-]*) echo "pb installer: invalid GitHub repository" >&2; exit 1 ;;
+    esac
+    [ "$repository" = "$repository_owner/$repository_name" ] || { echo "pb installer: invalid GitHub repository" >&2; exit 1; }
+    ;;
+  *) echo "pb installer: invalid GitHub repository" >&2; exit 1 ;;
+esac
+case "$release_metadata_url" in
+  https://*) ;;
+  *) echo "pb installer: release metadata URL must use HTTPS" >&2; exit 1 ;;
+esac
+command -v curl >/dev/null 2>&1 || { echo "pb installer: curl is required" >&2; exit 1; }
 
 asset="pb-${os}-${arch}"
-if [ "$version" = latest ]; then
-  case "$release_metadata_url" in
-    https://*) ;;
-    *) echo "pb installer: release metadata URL must use HTTPS" >&2; exit 1 ;;
-  esac
-  current=$(curl -fLsS --proto '=https' --tlsv1.2 "$release_metadata_url")
-  version=$(printf '%s' "$current" | tr -d '\r\n\t ' | sed -n 's|^{"schema":"paperboat.release-current/v1","version":"\([0-9A-Za-z._-]*\)"}$|\1|p')
-  [ -n "$version" ] || { echo "pb installer: release metadata is invalid" >&2; exit 1; }
-fi
-case "$version" in
-  ""|*/*|*[!0-9A-Za-z._-]*) echo "pb installer: invalid release version" >&2; exit 1 ;;
-esac
-release_base="https://github.com/${repository}/releases/download/${version}"
+[ "$os" != windows ] || asset="$asset.exe"
+[ "$os" != darwin ] || asset="$asset.pkg"
+format=elf
+[ "$os" != darwin ] || format=pkg
+
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/paperboat-install.XXXXXX")
 trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
+current_file="$tmp_dir/current.json"
+curl -fLsS --proto '=https' --tlsv1.2 "$release_metadata_url" -o "$current_file"
 
-echo "Downloading Paperboat for ${os}/${arch}..." >&2
-curl -fL --proto '=https' --tlsv1.2 "$release_base/$asset" -o "$tmp_dir/$asset"
-curl -fL --proto '=https' --tlsv1.2 "$release_base/SHA256SUMS" -o "$tmp_dir/SHA256SUMS"
-expected=$(release_checksum "$tmp_dir/SHA256SUMS" "$asset")
-[ -n "$expected" ] || { echo "pb installer: checksum for $asset is missing" >&2; exit 1; }
-if command -v shasum >/dev/null 2>&1; then
-  actual=$(shasum -a 256 "$tmp_dir/$asset" | awk '{print $1}')
-elif command -v sha256sum >/dev/null 2>&1; then
-  actual=$(sha256sum "$tmp_dir/$asset" | awk '{print $1}')
-else
-  echo "pb installer: shasum or sha256sum is required" >&2
+# The release publisher writes compact JSON with stable struct field order.
+# Keep the parser dependency-free so a clean macOS install does not require
+# Python, jq, or a package manager. Values are validated again below before
+# they are used as URLs or paths.
+compact=$(tr -d '\r\n\t ' < "$current_file")
+metadata_version=$(printf '%s' "$compact" | sed -n 's|.*"schema":"paperboat.release-current/v1","version":"\([^"]*\)".*|\1|p')
+metadata_repository=$(printf '%s' "$compact" | sed -n 's|.*"repository":"\([^"]*\)".*|\1|p')
+[ -n "$metadata_version" ] && [ -n "$metadata_repository" ] || { echo "pb installer: current.json is invalid" >&2; exit 1; }
+case "$metadata_version" in
+  *[!0-9A-Za-z._-]*|/*|"") echo "pb installer: current.json contains an invalid version" >&2; exit 1 ;;
+esac
+[ "$metadata_repository" = "$repository" ] || { echo "pb installer: current.json repository does not match the configured release repository" >&2; exit 1; }
+if [ "$version" = latest ]; then
+  version=$metadata_version
+elif [ "$version" != "$metadata_version" ]; then
+  echo "pb installer: requested version is not the current signed release" >&2
   exit 1
 fi
-[ "$actual" = "$expected" ] || { echo "pb installer: checksum verification failed" >&2; exit 1; }
 
-mkdir -p "$install_dir"
-target="$install_dir/pb"
-staged="$install_dir/.pb.installing.$$"
-cp "$tmp_dir/$asset" "$staged"
-chmod 0755 "$staged"
-mv -f "$staged" "$target"
+asset_metadata=$(printf '%s' "$compact" | sed -n 's|.*"'"$asset"'":{"platform":"\([^"]*\)","architecture":"\([^"]*\)","format":"\([^"]*\)","url":"\([^"]*\)","sha256":"\([0-9a-f]\{64\}\)","length":\([0-9][0-9]*\)}.*|\1 \2 \3 \4 \5 \6|p')
+set -- $asset_metadata
+[ "$#" -eq 6 ] || { echo "pb installer: current.json has no metadata for $asset" >&2; exit 1; }
+asset_platform=$1
+asset_architecture=$2
+asset_format=$3
+asset_url=$4
+expected=$5
+expected_length=$6
+[ "$asset_platform" = "$os" ] && [ "$asset_architecture" = "$arch" ] && [ "$asset_format" = "$format" ] || { echo "pb installer: current.json asset metadata does not match this host" >&2; exit 1; }
+expected_url="https://github.com/${repository}/releases/download/${version}/${asset}"
+[ "$asset_url" = "$expected_url" ] || { echo "pb installer: release asset URL is not an immutable GitHub release URL" >&2; exit 1; }
+
+download="$tmp_dir/$asset"
+echo "Downloading Paperboat for ${os}/${arch}..." >&2
+curl -fL --proto '=https' --tlsv1.2 "$asset_url" -o "$download"
+actual_length=$(wc -c < "$download" | tr -d ' ')
+[ "$actual_length" = "$expected_length" ] || { echo "pb installer: release asset length verification failed" >&2; exit 1; }
+if command -v shasum >/dev/null 2>&1; then
+  actual=$(shasum -a 256 "$download" | awk '{print $1}')
+elif command -v sha256sum >/dev/null 2>&1; then
+  actual=$(sha256sum "$download" | awk '{print $1}')
+elif command -v openssl >/dev/null 2>&1; then
+  actual=$(openssl dgst -sha256 "$download" | awk '{print $NF}')
+else
+  echo "pb installer: shasum, sha256sum, or openssl is required" >&2
+  exit 1
+fi
+[ "$actual" = "$expected" ] || { echo "pb installer: release asset digest verification failed" >&2; exit 1; }
+
+if [ "$os" = darwin ]; then
+  command -v installer >/dev/null 2>&1 || { echo "pb installer: macOS installer is required" >&2; exit 1; }
+  if [ "$install_dir_requested" = true ] || [ -n "${PAPERBOAT_INSTALL_DIR:-}" ]; then
+    echo "pb installer: --install-dir is not supported for the macOS PKG; it installs /usr/local/bin/pb" >&2
+    exit 2
+  fi
+  sudo installer -pkg "$download" -target /
+  target=/usr/local/bin/pb
+else
+  mkdir -p "$install_dir"
+  target="$install_dir/pb"
+  staged="$install_dir/.pb.installing.$$"
+  cp "$download" "$staged"
+  chmod 0755 "$staged"
+  mv -f "$staged" "$target"
+fi
 echo "Installed pb to $target" >&2
 
 case ":${PATH}:" in
   *":${install_dir}:"*) ;;
-  *) echo "Add ${install_dir} to PATH to run pb from a new shell." >&2 ;;
+  *) [ "$os" = darwin ] || echo "Add ${install_dir} to PATH to run pb from a new shell." >&2 ;;
 esac
 
 set --
 if [ -n "$machine_name" ]; then set -- "$@" --name "$machine_name"; fi
 if [ "$pair" = true ]; then
-	first=${enrollment_token%${enrollment_token#?}}
-	second=${enrollment_token#?}; second=${second%${second#?}}
-	case "$first" in 0|2|4|6|8|B|D|F|H|J|L|N|P|R|T|V|X|Z) pair_mode=host ;; *) pair_mode=client ;; esac
-	set -- "$@" --setup-mode "$pair_mode"
-  if [ -n "$enrollment_token" ]; then set -- "$@" --enrollment-token "$enrollment_token"; fi
-  if [ -n "$enrollment_token_file" ]; then set -- "$@" --enrollment-token-file "$enrollment_token_file"; fi
+  first=${enrollment_token%${enrollment_token#?}}
+  case "$first" in 0|2|4|6|8|B|D|F|H|J|L|N|P|R|T|V|X|Z) pair_mode=host ;; *) pair_mode=client ;; esac
+  set -- "$@" --setup-mode "$pair_mode"
+  [ -z "$enrollment_token" ] || set -- "$@" --enrollment-token "$enrollment_token"
+  [ -z "$enrollment_token_file" ] || set -- "$@" --enrollment-token-file "$enrollment_token_file"
   exec "$target" pair "$@"
 fi
 if [ -n "$setup_mode" ]; then
   set -- "$@" --mode "$setup_mode"
-  if [ -n "$ssh_port" ]; then set -- "$@" --ssh-port "$ssh_port"; fi
-  if [ -n "$recovery_output" ]; then set -- "$@" --recovery-output "$recovery_output"; fi
+  [ -z "$ssh_port" ] || set -- "$@" --ssh-port "$ssh_port"
+  [ -z "$recovery_output" ] || set -- "$@" --recovery-output "$recovery_output"
   exec "$target" setup "$@"
 fi
 

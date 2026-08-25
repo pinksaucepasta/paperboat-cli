@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"path/filepath"
+	"strings"
 )
 
 var ErrInvalid = errors.New("native executable signature verification failed")
@@ -58,6 +60,15 @@ func (v Verifier) Verify(ctx context.Context, path, platform, architecture strin
 }
 
 func (v Verifier) verifyDarwin(ctx context.Context, path string) error {
+	if strings.EqualFold(filepath.Ext(path), ".pkg") {
+		if _, err := v.Runner.Run(ctx, "/usr/sbin/pkgutil", "--check-signature", path); err != nil {
+			return fmt.Errorf("%w: package signature", ErrInvalid)
+		}
+		if _, err := v.Runner.Run(ctx, "/usr/sbin/spctl", "--assess", "--type", "install", "--verbose=4", path); err != nil {
+			return fmt.Errorf("%w: package gatekeeper assessment", ErrInvalid)
+		}
+		return nil
+	}
 	// codesign validates the embedded signature and designated requirements.
 	// spctl performs Gatekeeper assessment, which rejects code that is not
 	// accepted for execution, including an unnotarized distribution.

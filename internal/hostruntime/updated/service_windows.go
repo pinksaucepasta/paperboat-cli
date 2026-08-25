@@ -26,15 +26,15 @@ import (
 // WindowsConfig contains only fixed paths supplied by the SCM installation.
 // Release metadata is never accepted over the local service command channel.
 type WindowsConfig struct {
-	StateRoot, RuntimeCurrent, RuntimeRollback, RuntimeStaged, CLICurrent, CLIRollback string
-	OwnerSID, MachineID, RepositoryURL, TokenFile, InstallState, ControlSocket         string
-	ActiveVersion                                                                      string
-	Architecture                                                                       string
-	HostdSocket, HealthURL                                                             string
-	AutomaticActivation                                                                bool
-	SetupMode                                                                          string
-	VerifyExecutable                                                                   func(context.Context, string, string) error
-	ResolveRelease                                                                     workerupdate.Resolver
+	StateRoot, Binary, BinaryRollback, BinaryStaged                            string
+	OwnerSID, MachineID, RepositoryURL, TokenFile, InstallState, ControlSocket string
+	ActiveVersion                                                              string
+	Architecture                                                               string
+	HostdSocket, HealthURL                                                     string
+	AutomaticActivation                                                        bool
+	SetupMode                                                                  string
+	VerifyExecutable                                                           func(context.Context, string, string) error
+	ResolveRelease                                                             workerupdate.Resolver
 }
 
 func validLoopbackHealthURL(value string) bool {
@@ -97,14 +97,15 @@ func RunWindows(ctx context.Context, config WindowsConfig) error {
 }
 
 func validWindowsConfig(config WindowsConfig) bool {
-	for _, value := range []string{config.StateRoot, config.RuntimeCurrent, config.RuntimeRollback, config.RuntimeStaged, config.CLICurrent, config.CLIRollback, config.TokenFile, config.InstallState} {
+	paths := []string{config.StateRoot, config.Binary, config.BinaryRollback, config.BinaryStaged, config.TokenFile, config.InstallState}
+	for _, value := range paths {
 		if !filepath.IsAbs(value) || filepath.Clean(value) != value || strings.ContainsAny(value, "\x00\r\n") {
 			return false
 		}
 	}
 	layout, layoutErr := service.DefaultLayout("windows")
 	sid, err := windows.StringToSid(config.OwnerSID)
-	return layoutErr == nil && err == nil && sid != nil && sid.IsValid() && config.MachineID != "" && config.RepositoryURL != "" && config.StateRoot == layout.UpdateStateRoot && config.RuntimeCurrent == layout.RuntimeCurrent && config.RuntimeRollback == layout.RuntimeRollback && config.RuntimeStaged == layout.RuntimeStaged && config.CLICurrent == layout.CLICurrent && config.CLIRollback == layout.CLIRollback && config.TokenFile == hostinstall.WindowsHostdTokenPath() && config.InstallState == hostinstall.WindowsInstallConfigPath() && config.ControlSocket == `\\.\pipe\PaperboatUpdatedControl` && config.HostdSocket == layout.HostdSocket && validLoopbackHealthURL(config.HealthURL) && exactReleasePattern.MatchString(config.ActiveVersion) && (config.Architecture == "amd64" || config.Architecture == "arm64") && (config.SetupMode == "host" || config.SetupMode == "client")
+	return layoutErr == nil && err == nil && sid != nil && sid.IsValid() && config.MachineID != "" && config.RepositoryURL != "" && config.StateRoot == layout.UpdateStateRoot && config.Binary == layout.Binary && config.BinaryRollback == layout.BinaryRollback && config.BinaryStaged == layout.BinaryStaged && config.TokenFile == hostinstall.WindowsHostdTokenPath() && config.InstallState == hostinstall.WindowsInstallConfigPath() && config.ControlSocket == `\\.\pipe\PaperboatUpdatedControl` && config.HostdSocket == layout.HostdSocket && validLoopbackHealthURL(config.HealthURL) && exactReleasePattern.MatchString(config.ActiveVersion) && (config.Architecture == "amd64" || config.Architecture == "arm64") && (config.SetupMode == "host" || config.SetupMode == "client")
 }
 
 func validateWindowsPrivilegedInstallConfig(config WindowsConfig) error {
@@ -185,32 +186,20 @@ func recoverWindowsSlots(ctx context.Context, config WindowsConfig) error {
 	if verify == nil {
 		verify = verifyWindowsRecoveryExecutable
 	}
-	runtimeRestore, runtimeErr := validateWindowsSlot(ctx, config.RuntimeCurrent, config.RuntimeRollback, config.Architecture, verify)
-	cliRestore, cliErr := validateWindowsSlot(ctx, config.CLICurrent, config.CLIRollback, config.Architecture, verify)
+	runtimeRestore, runtimeErr := validateWindowsSlot(ctx, config.Binary, config.BinaryRollback, config.Architecture, verify)
 	// A staged file without a committed transaction is deliberately discarded.
 	// This is the safe reboot recovery point: never activate unknown bytes.
-	stagedErr := os.Remove(config.RuntimeStaged)
+	stagedErr := os.Remove(config.BinaryStaged)
 	if errors.Is(stagedErr, os.ErrNotExist) {
 		stagedErr = nil
 	}
-	if err := errors.Join(runtimeErr, cliErr, stagedErr); err != nil {
+	if err := errors.Join(runtimeErr, stagedErr); err != nil {
 		return err
 	}
 	if runtimeRestore {
 		//paperboat:allow-source-policy atomic-replacement owner=windows-updater reason=verified-runtime-rollback-slot-activation
-		if err := os.Rename(config.RuntimeRollback, config.RuntimeCurrent); err != nil {
+		if err := os.Rename(config.BinaryRollback, config.Binary); err != nil {
 			return err
-		}
-	}
-	if cliRestore {
-		//paperboat:allow-source-policy atomic-replacement owner=windows-updater reason=verified-cli-rollback-slot-activation
-		if err := os.Rename(config.CLIRollback, config.CLICurrent); err != nil {
-			var rollbackErr error
-			if runtimeRestore {
-				//paperboat:allow-source-policy atomic-replacement owner=windows-updater reason=restore-runtime-slot-after-cli-rollback-failure
-				rollbackErr = os.Rename(config.RuntimeCurrent, config.RuntimeRollback)
-			}
-			return errors.Join(err, rollbackErr)
 		}
 	}
 	return nil

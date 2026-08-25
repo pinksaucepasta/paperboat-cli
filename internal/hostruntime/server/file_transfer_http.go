@@ -68,6 +68,11 @@ type encryptedTransferResource struct {
 	ExpiresAt      time.Time `json:"expires_at"`
 }
 
+type sourceEncryptedTransferStatus struct {
+	store.FileTransfer
+	CommittedChunk uint64 `json:"committed_chunk"`
+}
+
 type encryptedCreateResponse struct {
 	BatchID   string                      `json:"batch_id"`
 	Resources []encryptedTransferResource `json:"resources"`
@@ -416,11 +421,21 @@ func (h *FileTransferHandler) serveManifest(writer http.ResponseWriter, request 
 	}
 	switch request.Method {
 	case http.MethodGet:
-		if transfer.E2EETransferID != "" {
+		if transfer.E2EETransferID != "" && transfer.SourceMachineID != authorization.SourceMachineID {
 			writeJSON(writer, http.StatusOK, encryptedBatchResponse(transfer.BatchID, []store.FileTransfer{transfer}).Resources[0])
-		} else {
-			writeJSON(writer, http.StatusOK, transfer)
+			return
 		}
+		if transfer.E2EETransferID != "" {
+			if transfer.State == "published" && transfer.ReceiptPath == "" {
+				published, err := h.config.Service.ExistingPublishedPath(request.Context(), transfer.ID)
+				if err == nil {
+					transfer.ReceiptPath = "Paperboat Inbox/" + filepath.Base(published)
+				}
+			}
+			writeJSON(writer, http.StatusOK, sourceEncryptedTransferStatus{FileTransfer: transfer, CommittedChunk: transfer.CommittedChunks})
+			return
+		}
+		writeJSON(writer, http.StatusOK, transfer)
 	case http.MethodDelete:
 		if err := h.config.Service.Cancel(request.Context(), id); err != nil {
 			writeFileTransferError(writer, requestID, err)

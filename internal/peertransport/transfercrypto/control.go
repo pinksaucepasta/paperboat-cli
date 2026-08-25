@@ -17,7 +17,13 @@ const (
 	controlVersion    = 1
 )
 
-var ErrControlRejected = errors.New("transfer key control rejected")
+var (
+	ErrControlContext  = errors.New("transfer key control context rejected")
+	ErrControlRejected = errors.New("transfer key control binding rejected")
+	ErrControlRead     = errors.New("transfer key control read failed")
+	ErrControlStore    = errors.New("transfer key control storage failed")
+	ErrControlAck      = errors.New("transfer key control acknowledgement failed")
+)
 
 type KeyControlBinding struct {
 	OperationID string
@@ -50,22 +56,22 @@ func DeliverKey(writer io.ReadWriter, binding KeyControlBinding, material KeyMat
 
 func ReceiveKey(writer io.ReadWriter, expected KeyControlBinding, context peercontext.Context, vault *KeyVault) error {
 	if writer == nil || vault == nil || validateControlBinding(expected) != nil || context.OperationID != expected.OperationID || context.Consumer != "file_transfer_key" {
-		return ErrInvalid
+		return fmt.Errorf("%w: %w", ErrControlContext, ErrInvalid)
 	}
 	payload, err := readControlFrame(writer)
 	if err != nil {
-		return fmt.Errorf("read transfer key: %w", err)
+		return fmt.Errorf("%w: %w", ErrControlRead, err)
 	}
 	binding, material, err := parseKeyControl(payload)
 	if err != nil || binding.OperationID != expected.OperationID || binding.TransferID != expected.TransferID || binding.Generation != expected.Generation || !binding.ExpiresAt.Equal(expected.ExpiresAt.UTC().Truncate(time.Second)) {
 		return ErrControlRejected
 	}
 	if err := vault.SaveBound(binding.TransferID, binding.Generation, material, binding.ExpiresAt, context); err != nil {
-		return fmt.Errorf("store transfer key: %w", err)
+		return fmt.Errorf("%w: %w", ErrControlStore, err)
 	}
 	ack := controlAcknowledgement(payload)
 	if err := writeAll(writer, ack[:]); err != nil {
-		return fmt.Errorf("acknowledge transfer key: %w", err)
+		return fmt.Errorf("%w: %w", ErrControlAck, err)
 	}
 	return nil
 }

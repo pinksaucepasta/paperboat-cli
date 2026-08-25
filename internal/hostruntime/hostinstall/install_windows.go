@@ -17,6 +17,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -26,6 +27,7 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/binarytarget"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/bootstrap"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/nativesignature"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/releaseindex"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
 	"github.com/pinksaucepasta/paperboat/internal/windowsopenssh"
 	"github.com/pinksaucepasta/paperboat/internal/windowssecurity"
@@ -45,6 +47,8 @@ var (
 	removePaperboatSSHState   = windowsopenssh.RemovePaperboatState
 	installPaperboatSSH       = windowsopenssh.InstallService
 )
+
+var standaloneVersionPattern = regexp.MustCompile(`^[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]+$`)
 
 type Request struct {
 	Schema              string                   `json:"schema"`
@@ -108,6 +112,31 @@ func WindowsInstallConfigPath() string {
 	return filepath.Join(WindowsProgramDataRoot(), "runtime-install.json")
 }
 func WindowsHostdTokenPath() string { return filepath.Join(WindowsProgramDataRoot(), "hostd.token") }
+
+// InstallStandaloneBinary is the single Windows bootstrap elevation path.
+// The downloaded pb.exe invokes this command itself, so no launcher or
+// updater executable is fetched or installed separately.
+func InstallStandaloneBinary(ctx context.Context, source, version string) error {
+	if !isAdministrator() || ctx == nil || !safeAbsolute(source) || !standaloneVersionPattern.MatchString(version) {
+		return ErrInvalidRequest
+	}
+	layout, err := service.DefaultLayout("windows")
+	if err != nil || layout.Binary == "" {
+		return ErrInvalidRequest
+	}
+	for _, directory := range []string{layout.InstallRoot, layout.ReleasesRoot, filepath.Dir(layout.Binary), filepath.Dir(filepath.Join(layout.ReleasesRoot, "pb.rollback"))} {
+		if err := ensureWindowsDirectory(directory, ""); err != nil {
+			return err
+		}
+	}
+	artifact := bootstrap.ArtifactTarget{
+		Schema: bootstrap.ArtifactTargetSchemaV1, Kind: bootstrap.ArtifactKindPB, Version: version,
+		Platform: "windows", Architecture: runtime.GOARCH, RepositoryURL: "https://get.pprbt.dev/tuf",
+		TargetPath: releaseindex.AssetName("windows", runtime.GOARCH),
+	}
+	rollback := filepath.Join(layout.ReleasesRoot, "pb.rollback")
+	return stageWindowsBinary(ctx, source, layout.Binary, rollback, artifact, "")
+}
 
 func LoadWindowsRuntimeConfig() (WindowsRuntimeConfig, error) {
 	config, err := readWindowsRuntimeConfig()
@@ -295,32 +324,10 @@ func Install(ctx context.Context, request Request) error {
 	if err := runWindowsInstallPhase(ctx, "release Paperboat OpenSSH service for activation", func() error { return removeWindowsSSHBeforeActivation(ctx, request, layout) }); err != nil {
 		return err
 	}
+	runtimeCurrent, runtimeRollback, _ := windowsRuntimePaths(layout)
 	if err := runWindowsInstallPhase(ctx, "stage verified Paperboat runtime", func() error {
-		return stageWindowsBinary(ctx, request.Executable, layout.RuntimeCurrent, layout.RuntimeRollback, request.Artifact, request.OwnerSID)
+		return stageWindowsBinary(ctx, request.Executable, runtimeCurrent, runtimeRollback, request.Artifact, request.OwnerSID)
 	}); err != nil {
-		return err
-	}
-	// The bootstrap artifact is also the signed CLI target. Seed the stable
-	// CLI slot during every install/renewal instead of leaving the MSI's old
-	// pb.exe as the command users execute.
-	if err := runWindowsInstallPhase(ctx, "stage verified Paperboat CLI", func() error {
-		return stageWindowsBinary(ctx, request.Executable, layout.CLICurrent, layout.CLIRollback, request.Artifact, "")
-	}); err != nil {
-		return err
-	}
-	immutableRelease, err := layout.WindowsRelease(request.Artifact.Version)
-	if err != nil {
-		return err
-	}
-	if err := runWindowsInstallPhase(ctx, "seed immutable Paperboat Windows release", func() error {
-		return seedWindowsImmutableRelease(ctx, request, layout, immutableRelease)
-	}); err != nil {
-		return err
-	}
-	if err := runWindowsInstallPhase(ctx, "protect Paperboat CLI release slots", func() error { return protectWindowsCLISlots(layout) }); err != nil {
-		return err
-	}
-	if err := runWindowsInstallPhase(ctx, "activate stable Paperboat CLI launcher", func() error { return installWindowsCLIEntrypoint(ctx, layout, request.Artifact.Architecture) }); err != nil {
 		return err
 	}
 	if err := runWindowsInstallPhase(ctx, "prepare Paperboat host token", func() error { return ensureWindowsToken(request.OwnerSID) }); err != nil {
@@ -335,7 +342,7 @@ func Install(ctx context.Context, request Request) error {
 	// UpgradeReload would treat existing declarations as stable and leave the
 	// services stopped.
 	if err := runWindowsInstallPhase(ctx, "install Paperboat Windows services", func() error {
-		return installWindowsServices(ctx, layout, "", immutableRelease.Hostd, immutableRelease.Updater)
+		return installWindowsServices(ctx, layout, "")
 	}); err != nil {
 		return err
 	}
@@ -370,14 +377,7 @@ func runWindowsInstallPhase(ctx context.Context, phase string, operation func() 
 func windowsOpenSSHConfig(layout service.Layout, ownerSID string) windowsopenssh.Config {
 	config := windowsopenssh.DefaultConfig(nil)
 	config.OwnerSID = ownerSID
-	config.ServiceExecutable = layout.RuntimeCurrent
-	if installed, err := LoadWindowsRuntimeConfig(); err == nil {
-		if release, releaseErr := layout.WindowsRelease(installed.Artifact.Version); releaseErr == nil {
-			if _, statErr := os.Lstat(release.Runtime); statErr == nil {
-				config.ServiceExecutable = release.Runtime
-			}
-		}
-	}
+	config.ServiceExecutable, _, _ = windowsRuntimePaths(layout)
 	return config
 }
 
@@ -397,7 +397,8 @@ func installWindowsSSHAfterActivation(ctx context.Context, request Request, layo
 		return removePaperboatSSHState(ctx, windowsOpenSSHConfig(layout, request.OwnerSID))
 	}
 	config := windowsOpenSSHConfig(layout, request.OwnerSID)
-	return installPaperboatSSH(ctx, layout.RuntimeCurrent, filepath.Join(config.InstallRoot, "sshd.exe"), filepath.Join(config.StateRoot, "sshd_config"))
+	runtimeCurrent, _, _ := windowsRuntimePaths(layout)
+	return installPaperboatSSH(ctx, runtimeCurrent, filepath.Join(config.InstallRoot, "sshd.exe"), filepath.Join(config.StateRoot, "sshd_config"))
 }
 
 func Commit(request Request) error {
@@ -557,15 +558,7 @@ func Repair(ctx context.Context) error {
 	if err := writeWindowsConfig(config); err != nil {
 		return err
 	}
-	immutableRelease, err := layout.WindowsRelease(config.Artifact.Version)
-	if err != nil {
-		return err
-	}
-	seedRequest := Request{Executable: layout.RuntimeCurrent, OwnerSID: config.OwnerSID, Artifact: config.Artifact}
-	if err := seedWindowsImmutableRelease(ctx, seedRequest, layout, immutableRelease); err != nil {
-		return err
-	}
-	if err := installWindowsServices(ctx, layout, "", immutableRelease.Hostd, immutableRelease.Updater); err != nil {
+	if err := installWindowsServices(ctx, layout, ""); err != nil {
 		return err
 	}
 	return installWindowsSSHAfterActivation(ctx, request, layout)
@@ -577,7 +570,6 @@ func reconcileWindowsRepairVersion(ctx context.Context, config WindowsRuntimeCon
 		return config, err
 	}
 	defer manager.Disconnect()
-	versions := make([]string, 0, 2)
 	for _, item := range []struct{ name, argument string }{{"PaperboatHostd", "__runtime-hostd"}, {"PaperboatUpdated", "__runtime-updated"}} {
 		registered, err := manager.OpenService(item.name)
 		if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
@@ -595,20 +587,12 @@ func reconcileWindowsRepairVersion(ctx context.Context, config WindowsRuntimeCon
 		if err != nil || len(arguments) != 2 || arguments[1] != item.argument {
 			return config, ErrInvalidRequest
 		}
-		version, err := layout.WindowsVersionForExecutable(arguments[0])
-		if err != nil {
-			return config, nil
+		if !strings.EqualFold(filepath.Clean(arguments[0]), filepath.Clean(layout.Binary)) {
+			return config, ErrInvalidRequest
 		}
-		if err := verifyWindowsInstalledBinary(ctx, arguments[0], config.Artifact.Architecture); err != nil {
+		if err := verifyWindowsInstalledBinary(ctx, layout.Binary, config.Artifact.Architecture); err != nil {
 			return config, err
 		}
-		versions = append(versions, version)
-	}
-	if len(versions) != 2 || versions[0] != versions[1] {
-		return config, ErrInvalidRequest
-	}
-	if versions[0] != config.Artifact.Version {
-		config.Artifact.Version = versions[0]
 	}
 	return config, nil
 }
@@ -640,13 +624,14 @@ func uninstallWindows(ctx context.Context, purge bool) error {
 		return err
 	}
 	var result error
+	runtimeCurrent, _, _ := windowsRuntimePaths(layout)
 	for _, item := range []struct {
 		kind       string
 		executable string
 		args       []string
 	}{
-		{service.HostdKind, layout.RuntimeCurrent, []string{"__runtime-hostd"}},
-		{service.UpdaterKind, layout.RuntimeCurrent, []string{"__runtime-updated"}},
+		{service.HostdKind, runtimeCurrent, []string{"__runtime-hostd"}},
+		{service.UpdaterKind, runtimeCurrent, []string{"__runtime-updated"}},
 	} {
 		installer, makeErr := service.New(service.Config{Platform: "windows", Kind: item.kind, ConfigRoot: WindowsProgramDataRoot(), Executable: item.executable, User: "Paperboat", Group: "Paperboat", Arguments: item.args, Controller: service.WindowsController{}})
 		if makeErr == nil {
@@ -668,11 +653,8 @@ func uninstallWindows(ctx context.Context, purge bool) error {
 	return result
 }
 
-func installWindowsServices(ctx context.Context, layout service.Layout, upgradeMode string, immutableTargets ...string) error {
-	hostdExecutable, updaterExecutable := layout.RuntimeCurrent, layout.RuntimeCurrent
-	if len(immutableTargets) == 2 {
-		hostdExecutable, updaterExecutable = immutableTargets[0], immutableTargets[1]
-	}
+func installWindowsServices(ctx context.Context, layout service.Layout, upgradeMode string) error {
+	hostdExecutable, updaterExecutable, _ := windowsRuntimePaths(layout)
 	for _, item := range []struct {
 		kind, executable string
 		args             []string
@@ -686,49 +668,6 @@ func installWindowsServices(ctx context.Context, layout service.Layout, upgradeM
 		}
 	}
 	return nil
-}
-
-func seedWindowsImmutableRelease(ctx context.Context, request Request, layout service.Layout, release service.WindowsReleasePaths) error {
-	if err := ensureWindowsImmutableDirectory(filepath.Dir(release.Root)); err != nil {
-		return err
-	}
-	if err := ensureWindowsImmutableDirectory(release.Root); err != nil {
-		return err
-	}
-	// MSI owns the stable launcher and the initial role-stamped artifacts.
-	// Never manufacture a missing hostd/updater by copying the general CLI or
-	// runtime binary: that would erase the build-time command allowlist.
-	for _, destination := range []string{release.Runtime, release.Hostd, release.Updater} {
-		if err := verifyWindowsInstalledBinary(ctx, destination, request.Artifact.Architecture); err != nil {
-			return err
-		}
-		trustedOwner, ownerErr := windowsRuntimeTrustedOwner()
-		if ownerErr != nil {
-			return ownerErr
-		}
-		if err := applyWindowsOwnedDACL(destination, trustedOwner, "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)"); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func ensureWindowsImmutableDirectory(path string) error {
-	if !safeAbsolute(path) {
-		return ErrInvalidRequest
-	}
-	if err := os.MkdirAll(path, 0o700); err != nil {
-		return err
-	}
-	attributes, err := windows.GetFileAttributes(windows.StringToUTF16Ptr(path))
-	if err != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-		return ErrInvalidRequest
-	}
-	trustedOwner, err := windowsRuntimeTrustedOwner()
-	if err != nil {
-		return err
-	}
-	return applyWindowsOwnedDACL(path, trustedOwner, "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)")
 }
 
 func Validate(request Request, _ int) error {
@@ -873,12 +812,17 @@ func ensureWindowsMachineDirectory(path, ownerSID string) error {
 	}
 	defer windows.CloseHandle(handle)
 	// A pre-existing machine root may be created by MSI under SYSTEM. A process
-	// cut between protected creation and the owner transfer may leave the one
-	// exact Administrators-owned transitional state. Reject every other owner
-	// without rewriting it.
+	// cut between protected creation and the owner transfer may leave the exact
+	// Administrators-owned current-DACL transition. WiX also creates DATAROOT
+	// with an Administrators owner and a protected SYSTEM/Administrators-only
+	// DACL before the enrolled SID is known. Both states exclude the enrolled
+	// user's filtered token and are safe to complete through this held handle.
+	// Reject every other owner or DACL without rewriting it.
 	if !windowssecurity.HandleOwnerMatchesSID(handle, trustedOwner) {
 		administrators, ownerErr := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
-		if ownerErr != nil || !windowssecurity.HandleOwnerMatchesSID(handle, administrators) || !windowssecurity.ProtectedHandleDACLMatches(handle, windowsRuntimeCurrentRootDACL(ownerSID)) {
+		trustedTransition := windowssecurity.ProtectedHandleDACLMatches(handle, windowsRuntimeCurrentRootDACL(ownerSID)) ||
+			windowssecurity.ProtectedHandleDACLMatches(handle, windowsRuntimeMSIBootstrapRootDACL())
+		if ownerErr != nil || !windowssecurity.HandleOwnerMatchesSID(handle, administrators) || !trustedTransition {
 			return fmt.Errorf("validate existing Windows runtime root owner: %w", ErrInvalidRequest)
 		}
 	}
@@ -903,6 +847,10 @@ func windowsRuntimeCurrentFileDACL(ownerSID string) string {
 
 func windowsRuntimeCurrentRootDACL(ownerSID string) string {
 	return "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;" + ownerSID + ")"
+}
+
+func windowsRuntimeMSIBootstrapRootDACL() string {
+	return "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
 }
 
 func windowsRuntimeSecurityMatches(path string, owner *windows.SID, dacl string) bool {
@@ -1160,6 +1108,12 @@ func createWindowsRuntimeRoot(path string, owner *windows.SID, dacl string) erro
 	return nil
 }
 
+// windowsRuntimePaths returns the only active executable and its two protected
+// transaction slots.
+func windowsRuntimePaths(layout service.Layout) (current, rollback, staged string) {
+	return layout.Binary, layout.BinaryRollback, layout.BinaryStaged
+}
+
 func stageWindowsBinary(ctx context.Context, source, current, rollback string, artifact bootstrap.ArtifactTarget, ownerSID string) error {
 	if err := ensureWindowsExecutableDirectory(filepath.Dir(current), ownerSID); err != nil {
 		return fmt.Errorf("prepare runtime slot: %w", err)
@@ -1258,87 +1212,26 @@ func ensureWindowsExecutableDirectory(path, readerSID string) error {
 	return applyWindowsOwnedDACL(path, trustedOwner, dacl)
 }
 
-// Built-in Users may read and execute the public CLI, but only SYSTEM and
-// Administrators may replace its launcher or its active release slot.
-const windowsCLIEntrypointDACL = "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)"
-
-// windowsCLIEntrypointPaths returns the stable launcher installed by the MSI
-// and the public command path. The latter must always be a launcher: the CLI
-// bytes themselves live in the protected, rollback-capable release slot.
-func windowsCLIEntrypointPaths(layout service.Layout) (launcher, entrypoint string) {
-	binaryRoot := filepath.Join(layout.InstallRoot, "bin")
-	return filepath.Join(binaryRoot, "pb-launcher.exe"), filepath.Join(binaryRoot, "pb.exe")
-}
-
-func installWindowsCLIEntrypoint(ctx context.Context, layout service.Layout, architecture string) error {
-	launcher, entrypoint := windowsCLIEntrypointPaths(layout)
-	if err := verifyWindowsInstalledBinary(ctx, launcher, architecture); err != nil {
-		return fmt.Errorf("verify installed stable launcher: %w", err)
-	}
-	trustedOwner, err := windowsRuntimeTrustedOwner()
-	if err != nil {
-		return err
-	}
-	if err := validateWindowsRuntimeSecurity(launcher, trustedOwner, windowsCLIEntrypointDACL, "stable launcher"); err != nil {
-		return err
-	}
-	return replaceWindowsCLIEntrypoint(entrypoint, launcher)
-}
-
-func protectWindowsCLISlots(layout service.Layout) error {
-	for _, path := range []string{layout.CLICurrent, layout.CLIRollback} {
-		if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
-			continue
-		} else if err != nil {
-			return err
-		}
-		trustedOwner, ownerErr := windowsRuntimeTrustedOwner()
-		if ownerErr != nil {
-			return ownerErr
-		}
-		if err := applyWindowsOwnedDACL(path, trustedOwner, windowsCLIEntrypointDACL); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// replaceWindowsCLIEntrypoint publishes the already validated launcher with a
-// same-directory atomic replacement. A Client renewal therefore replaces a
-// stale full CLI in bin\\pb.exe without modifying either CLI release slot or
-// its rollback sibling.
-func replaceWindowsCLIEntrypoint(entrypoint, launcher string) error {
-	if !safeAbsolute(entrypoint) || !safeAbsolute(launcher) || filepath.Dir(entrypoint) != filepath.Dir(launcher) || strings.EqualFold(entrypoint, launcher) {
-		return ErrInvalidRequest
-	}
-	body, err := os.ReadFile(launcher)
-	if err != nil || len(body) == 0 || len(body) > 256<<20 {
-		return ErrInvalidRequest
-	}
-	return windowssecurity.WithRestorePrivilege(func() error {
-		return atomicfile.Write(entrypoint, body, atomicfile.Options{Mode: 0o755, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: "O:SY" + windowsCLIEntrypointDACL})
-	})
-}
-
 func repairWindowsRuntimeBinary(ctx context.Context, config WindowsRuntimeConfig, layout service.Layout) error {
-	quarantine := layout.RuntimeCurrent + ".repair-quarantine"
-	if verifyWindowsInstalledBinary(ctx, layout.RuntimeCurrent, config.Artifact.Architecture) == nil {
+	current, rollback, _ := windowsRuntimePaths(layout)
+	quarantine := current + ".repair-quarantine"
+	if verifyWindowsInstalledBinary(ctx, current, config.Artifact.Architecture) == nil {
 		_ = os.Remove(quarantine)
-		return applyWindowsACL(layout.RuntimeCurrent, config.OwnerSID, false)
+		return applyWindowsACL(current, config.OwnerSID, false)
 	}
-	if _, err := os.Stat(layout.RuntimeCurrent); errors.Is(err, os.ErrNotExist) && verifyWindowsInstalledBinary(ctx, quarantine, config.Artifact.Architecture) == nil {
+	if _, err := os.Stat(current); errors.Is(err, os.ErrNotExist) && verifyWindowsInstalledBinary(ctx, quarantine, config.Artifact.Architecture) == nil {
 		//paperboat:allow-source-policy atomic-replacement owner=windows-host-repair reason=verified-quarantine-runtime-restoration
-		if err := os.Rename(quarantine, layout.RuntimeCurrent); err != nil {
+		if err := os.Rename(quarantine, current); err != nil {
 			return err
 		}
-		return applyWindowsACL(layout.RuntimeCurrent, config.OwnerSID, false)
+		return applyWindowsACL(current, config.OwnerSID, false)
 	}
 	_ = os.Remove(quarantine)
 	currentExists := false
-	if _, err := os.Stat(layout.RuntimeCurrent); err == nil {
+	if _, err := os.Stat(current); err == nil {
 		currentExists = true
 		//paperboat:allow-source-policy atomic-replacement owner=windows-host-repair reason=current-runtime-quarantine-before-verification
-		if err := os.Rename(layout.RuntimeCurrent, quarantine); err != nil {
+		if err := os.Rename(current, quarantine); err != nil {
 			return err
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -1347,17 +1240,17 @@ func repairWindowsRuntimeBinary(ctx context.Context, config WindowsRuntimeConfig
 	restoreCurrent := func() {
 		if currentExists {
 			//paperboat:allow-source-policy atomic-replacement owner=windows-host-repair reason=restore-quarantined-current-runtime
-			_ = os.Rename(quarantine, layout.RuntimeCurrent)
+			_ = os.Rename(quarantine, current)
 		}
 	}
-	if verifyWindowsInstalledBinary(ctx, layout.RuntimeRollback, config.Artifact.Architecture) == nil {
+	if verifyWindowsInstalledBinary(ctx, rollback, config.Artifact.Architecture) == nil {
 		//paperboat:allow-source-policy atomic-replacement owner=windows-host-repair reason=verified-rollback-runtime-activation
-		if err := os.Rename(layout.RuntimeRollback, layout.RuntimeCurrent); err != nil {
+		if err := os.Rename(rollback, current); err != nil {
 			restoreCurrent()
 			return err
 		}
 		_ = os.Remove(quarantine)
-		return applyWindowsACL(layout.RuntimeCurrent, config.OwnerSID, false)
+		return applyWindowsACL(current, config.OwnerSID, false)
 	}
 	repairState := filepath.Join(layout.UpdateStateRoot, "repair-tuf")
 	artifactPath, err := bootstrap.FetchVerifiedArtifact(ctx, config.Artifact, repairState, nil)
@@ -1365,7 +1258,7 @@ func repairWindowsRuntimeBinary(ctx context.Context, config WindowsRuntimeConfig
 		restoreCurrent()
 		return err
 	}
-	if err := stageWindowsBinary(ctx, artifactPath, layout.RuntimeCurrent, layout.RuntimeRollback, config.Artifact, config.OwnerSID); err != nil {
+	if err := stageWindowsBinary(ctx, artifactPath, current, rollback, config.Artifact, config.OwnerSID); err != nil {
 		restoreCurrent()
 		return err
 	}

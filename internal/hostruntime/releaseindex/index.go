@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -20,6 +21,7 @@ var ErrInvalid = errors.New("signed release index is invalid")
 var versionPattern = regexp.MustCompile(`^[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]+$`)
 var dependencyVersionPattern = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$`)
 var valuePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:+/-]{0,127}$`)
+var repositoryPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
 
 type Index struct {
 	Schema                 string    `json:"schema"`
@@ -52,6 +54,9 @@ type Index struct {
 type Target struct {
 	Component    string `json:"component"`
 	TargetPath   string `json:"target_path"`
+	AssetName    string `json:"asset_name"`
+	Repository   string `json:"repository"`
+	DownloadURL  string `json:"download_url"`
 	SHA256       string `json:"sha256"`
 	Length       int64  `json:"length"`
 	Platform     string `json:"platform"`
@@ -115,15 +120,13 @@ func (i Index) Validate(now time.Time) error {
 		}
 		revoked[version] = true
 	}
-	required := map[string]bool{"cli": false, "runtime": false, "hostd": false, "updater": false, "launcher": false}
-	if len(i.Targets) != len(required) {
+	if len(i.Targets) != 1 {
 		return ErrInvalid
 	}
-	for _, target := range i.Targets {
-		if _, ok := required[target.Component]; !ok || required[target.Component] || target.TargetPath != target.Component+"-"+i.Platform+"-"+i.Architecture || target.Platform != i.Platform || target.Architecture != i.Architecture || target.BinaryFormat != i.BinaryFormat || target.Length < 1 || target.Length > 512<<20 || len(target.SHA256) != sha256.Size*2 || !lowerHex(target.SHA256) {
-			return ErrInvalid
-		}
-		required[target.Component] = true
+	target := i.Targets[0]
+	assetName := AssetName(i.Platform, i.Architecture)
+	if target.Component != "pb" || target.TargetPath != assetName || target.AssetName != assetName || !validRepository(target.Repository) || target.Platform != i.Platform || target.Architecture != i.Architecture || target.BinaryFormat != i.BinaryFormat || target.Length < 1 || target.Length > 512<<20 || len(target.SHA256) != sha256.Size*2 || !lowerHex(target.SHA256) || !ValidDownloadURL(target.DownloadURL, target.Repository, i.Version, assetName) {
+		return ErrInvalid
 	}
 	if i.Rollout.Schema != RolloutSchemaV1 || len(i.Rollout.CohortSeed) < 1 || len(i.Rollout.CohortSeed) > 128 || strings.ContainsAny(i.Rollout.CohortSeed, "\x00\r\n") || i.Rollout.Percentage > 100 {
 		return ErrInvalid
@@ -165,7 +168,31 @@ func validPlatform(platform, arch, format string) bool {
 	if arch != "amd64" && arch != "arm64" {
 		return false
 	}
-	return platform == "linux" && format == "elf" || platform == "darwin" && format == "mach-o" || platform == "windows" && format == "pe"
+	return platform == "linux" && format == "elf" || platform == "darwin" && format == "pkg" || platform == "windows" && format == "pe"
+}
+
+// AssetName is the only public release asset naming rule. A platform has one
+// immutable artifact and the installed pb executable contains every role.
+func AssetName(platform, architecture string) string {
+	name := "pb-" + platform + "-" + architecture
+	if platform == "windows" {
+		name += ".exe"
+	}
+	if platform == "darwin" {
+		name += ".pkg"
+	}
+	return name
+}
+
+// ValidDownloadURL binds a signed target to an immutable GitHub release asset.
+// No server-hosted target or mutable latest/download endpoint is accepted.
+func ValidDownloadURL(raw, repository, version, assetName string) bool {
+	parsed, err := url.Parse(raw)
+	return err == nil && validRepository(repository) && parsed.Scheme == "https" && parsed.Hostname() == "github.com" && parsed.User == nil && parsed.RawQuery == "" && parsed.Fragment == "" && parsed.Path == "/"+repository+"/releases/download/"+version+"/"+assetName
+}
+
+func validRepository(value string) bool {
+	return repositoryPattern.MatchString(value)
 }
 func lowerHex(value string) bool {
 	_, err := hex.DecodeString(value)

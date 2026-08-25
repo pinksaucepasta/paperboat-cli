@@ -6,7 +6,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -45,18 +44,25 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	name := flags.String("name", "", "User machine name")
 	shell := flags.String("shell", "", "Absolute login shell (default: auto-detect)")
 	stateRoot := flags.String("state-root", "", "Paperboat runtime state directory")
+	setupMode := flags.String("setup-mode", "host", "enrollment role: host or client")
 	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
 		return errors.New("bootstrap accepts flags only")
+	}
+	if *setupMode != "host" && *setupMode != "client" {
+		return errors.New("setup-mode must be host or client")
 	}
 	if *legacyToken != "" && *tokenFile != "" {
 		return errors.New("use only one enrollment token source")
 	}
 	token := strings.TrimSpace(*legacyToken)
+	var tokenFileErr error
 	if *tokenFile != "" {
-		var tokenErr error
-		token, tokenErr = bootstrap.ReadEnrollmentTokenFile(*tokenFile)
-		if tokenErr != nil {
-			return errors.New("enrollment token file must be an absolute regular owner-only file")
+		token, tokenFileErr = bootstrap.ReadEnrollmentTokenFile(*tokenFile)
+		if tokenFileErr != nil {
+			// The first process removes the token after the server accepts the
+			// pairing. Check the protected resume journal before rejecting a
+			// missing file so a later process can continue by verifier.
+			token = ""
 		}
 	}
 	reader := bufio.NewReader(stdin)
@@ -106,32 +112,46 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	if err != nil {
 		return err
 	}
-	verifierBytes := make([]byte, 32)
-	if _, err := rand.Read(verifierBytes); err != nil {
-		return err
+	publicIdentityKey := base64.RawURLEncoding.EncodeToString(identityStore.Current().Public())
+	resume, resumeErr := bootstrap.LoadResume(*stateRoot, *serverURL, publicIdentityKey, token, *name, *setupMode, time.Now().UTC())
+	authenticatedResume := resume.AuthenticatedSetup && (resumeErr == nil || errors.Is(resumeErr, bootstrap.ErrResumeExpired) && resume.PairingStarted)
+	if resume.AuthenticatedSetup && !authenticatedResume {
+		return bootstrap.ErrResumeExpired
 	}
-	config := bootstrap.Config{ServerURL: *serverURL, EnrollmentToken: token, DisplayName: *name, WorkspaceRoot: workspace, Verifier: base64.RawURLEncoding.EncodeToString(verifierBytes), PublicIdentityKey: base64.RawURLEncoding.EncodeToString(identityStore.Current().Public()), RuntimeVersions: map[string]string{"pb": buildinfo.Version}}
-	pairing, err := bootstrap.CreatePairing(ctx, config)
-	if err != nil {
-		return err
-	}
-	if *tokenFile != "" {
-		if err := bootstrap.ConsumeEnrollmentTokenFile(*tokenFile); err != nil {
-			return fmt.Errorf("consume enrollment token file: %w", err)
+	var material bootstrap.Material
+	if authenticatedResume {
+		config := bootstrap.Config{ServerURL: *serverURL, DisplayName: *name, WorkspaceRoot: workspace, Verifier: resume.Verifier, PublicIdentityKey: publicIdentityKey, RuntimeVersions: map[string]string{"pb": buildinfo.Version}}
+		fmt.Fprintln(stderr, "Completing authenticated Host setup...")
+		material, err = bootstrap.RecoverMaterial(ctx, config, resume.RuntimeEnrolled)
+		if err == nil {
+			err = bootstrap.ValidateAuthenticatedSetupMaterial(resume, material)
 		}
-	}
-	fmt.Fprintln(stderr, "Completing one-shot machine enrollment...")
-	material, err := bootstrap.WaitForMaterial(ctx, config, pairing.ExpiresAt, 2*time.Second)
-	if err != nil {
-		return err
+		if err != nil {
+			return err
+		}
+		resume.PairingStarted = true
+		resume.Material = &material
+		if err := bootstrap.SaveResume(*stateRoot, resume); err != nil {
+			return fmt.Errorf("persist authenticated Host setup material: %w", err)
+		}
+	} else {
+		material, resume, err = resumeOneShotEnrollment(ctx, oneShotResumeInput{
+			StateRoot: *stateRoot, SetupMode: *setupMode, TokenFile: *tokenFile, TokenFileErr: tokenFileErr,
+			Config: bootstrap.Config{ServerURL: *serverURL, EnrollmentToken: token, DisplayName: *name, WorkspaceRoot: workspace, PublicIdentityKey: publicIdentityKey, RuntimeVersions: map[string]string{"pb": buildinfo.Version}},
+			Resume: resume, ResumeErr: resumeErr, Status: stderr,
+		}, defaultOneShotResumeOperations())
+		if err != nil {
+			return err
+		}
 	}
 	// Host-only enrollment does not promise a local CLI profile. Keep the
 	// machine enrollment one-shot even when the account already has an E2E
 	// root; CLI identity bootstrap is required only for client setup.
-	if shouldInstallBootstrapCLI(material) {
-		if err := installBootstrapCLI(ctx, material.ClientSession, *serverURL); err != nil {
+	if err := completeBootstrapCLIResume(ctx, *stateRoot, *serverURL, material, &resume, installBootstrapCLI, bootstrap.SaveResume); err != nil {
+		if shouldInstallBootstrapCLI(material) {
 			return fmt.Errorf("initialize Paperboat CLI session: %w", err)
 		}
+		return err
 	}
 	if err := saveBootstrapRegistration(identityStore, *serverURL, material, "", 0); err != nil {
 		return fmt.Errorf("save machine registration: %w", err)
@@ -139,13 +159,20 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	fmt.Fprintln(stderr, "Enrollment accepted. Setting up the managed host service...")
 	client, err := enrollment.NewClient(nil, 15*time.Second)
 	if err != nil {
-		return errors.Join(err, reportInstallationFailureWithEnrollmentCredential(ctx, material, "artifact_verification"))
+		return failBootstrapBeforeRuntime(ctx, err, material, *stateRoot, "artifact_verification")
 	}
 	artifactHTTP := artifactHTTPClient()
-	artifactPath, err := prepareInstallation(ctx, &material, *stateRoot, artifactHTTP, client)
+	artifactPath, err := prepareUnixBootstrapRuntime(ctx, &material, *stateRoot, artifactHTTP, client, resume.RuntimeEnrolled, func() error {
+		resume.RuntimeEnrolled = true
+		return bootstrap.SaveResume(*stateRoot, resume)
+	})
 	if err != nil {
+		var checkpointErr *runtimeEnrollmentCheckpointError
+		if errors.As(err, &checkpointErr) {
+			return err
+		}
 		if !material.ReuseIdentity {
-			return errors.Join(err, reportInstallationFailureWithEnrollmentCredential(ctx, material, "artifact_verification"))
+			return failBootstrapBeforeRuntime(ctx, err, material, *stateRoot, "artifact_verification")
 		}
 		return failBootstrapInstallation(ctx, err, material, *stateRoot, "artifact_verification")
 	}
@@ -164,7 +191,7 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 		Executable: executable, Artifact: *material.Artifact,
 		Home: home, Path: servicePath, StateRoot: *stateRoot, WorkspaceRoot: workspace, ControlURL: material.ControlURL,
 		UserMachineID: material.UserMachineID, Shell: resolvedShell, HelperListenAddress: material.HelperListenAddress,
-		SetupMode: "host",
+		SetupMode: material.SetupMode,
 	}
 	previousGeneration := workerGeneration(*stateRoot)
 	fmt.Fprintln(stderr, "Paperboat must run before login and while this account is logged out.")
@@ -173,7 +200,10 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	installCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
 	if err := authorizeServiceInstall(installCtx, executable, installRequest, stdin, stdout, stderr); err != nil {
-		return failBootstrapInstallation(ctx, err, material, *stateRoot, "service_install")
+		// Missing or delayed administrator approval is locally retryable. The
+		// protected journal and runtime identity must survive so the next run
+		// does not need the already-consumed one-shot token.
+		return &installationStageError{Stage: "service_install", Cause: err}
 	}
 	workerCommand, err := installWorkerCommand(commandDirectory, systemWorkerExecutable())
 	if err != nil {
@@ -193,6 +223,9 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 			}
 			if err := workerCommand.Commit(); err != nil {
 				return &installationStageError{Stage: "service_install", Cause: fmt.Errorf("remove previous pb command backup: %w", err)}
+			}
+			if err := bootstrap.ClearResume(*stateRoot); err != nil {
+				return fmt.Errorf("clear completed machine enrollment resume state: %w", err)
 			}
 			fmt.Fprintln(stdout, "Paperboat host runtime is ready.")
 			return nil
@@ -273,7 +306,23 @@ func failBootstrapInstallation(ctx context.Context, cause error, material bootst
 	if !material.ReuseIdentity {
 		cleanupErr = removeNewEnrollmentCredentials(stateRoot)
 	}
-	return &installationStageError{Stage: stage, Cause: errors.Join(cause, reportErr, cleanupErr)}
+	var clearErr error
+	if reportErr == nil {
+		// The server has moved this enrollment to retryable failure and will
+		// require a new dashboard token. Remove the old verifier binding so
+		// that replacement enrollment is not rejected as a token mismatch.
+		clearErr = bootstrap.ClearResume(stateRoot)
+	}
+	return &installationStageError{Stage: stage, Cause: errors.Join(cause, reportErr, cleanupErr, clearErr)}
+}
+
+func failBootstrapBeforeRuntime(ctx context.Context, cause error, material bootstrap.Material, stateRoot, stage string) error {
+	reportErr := reportInstallationFailureWithEnrollmentCredential(ctx, material, stage)
+	var clearErr error
+	if reportErr == nil {
+		clearErr = bootstrap.ClearResume(stateRoot)
+	}
+	return &installationStageError{Stage: stage, Cause: errors.Join(cause, reportErr, clearErr)}
 }
 
 func removeNewEnrollmentCredentials(stateRoot string) error {
@@ -611,25 +660,7 @@ func installService(ctx context.Context, installer serviceInstaller, attempts in
 }
 
 func prepareInstallation(ctx context.Context, material *bootstrap.Material, stateRoot string, artifactHTTP *http.Client, client enrollmentClient) (string, error) {
-	if material.ReuseIdentity {
-		identity, err := enrollment.LoadRuntimeIdentityForRenewal(stateRoot, time.Now().UTC())
-		if err != nil || identity.HelperID != material.HelperID || identity.EnvironmentID != material.EnvironmentID {
-			return "", bootstrap.ErrInvalid
-		}
-	}
-	artifactPath, err := fetchBootstrapArtifact(ctx, *material.Artifact, filepath.Join(stateRoot, "tuf"), artifactHTTP)
-	if err != nil {
-		return "", err
-	}
-	if material.ReuseIdentity {
-		return artifactPath, nil
-	}
-	if _, err := client.Enroll(ctx, enrollment.Config{ControlURL: material.ControlURL, StateRoot: stateRoot, EnrollmentCredential: material.EnrollmentCredential}); err != nil {
-		_ = os.Remove(artifactPath)
-		return "", err
-	}
-	material.EnrollmentCredential = ""
-	return artifactPath, nil
+	return prepareUnixBootstrapRuntime(ctx, material, stateRoot, artifactHTTP, client, false, func() error { return nil })
 }
 
 func confirmRootBootstrap(reader *bufio.Reader, output io.Writer) error {

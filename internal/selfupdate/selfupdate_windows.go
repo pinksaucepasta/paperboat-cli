@@ -4,8 +4,6 @@ package selfupdate
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,13 +15,14 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/binarytarget"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/bootstrap"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/nativesignature"
 	"github.com/pinksaucepasta/paperboat/internal/windowssecurity"
-	"time"
+	"golang.org/x/sys/windows"
 )
 
 const currentSchemaV1 = "paperboat.release-current/v1"
@@ -66,10 +65,11 @@ func Resolve(ctx context.Context, releaseURL string, client *http.Client) (boots
 	return bootstrap.ArtifactTarget{Schema: bootstrap.ArtifactTargetSchemaV1, Kind: bootstrap.ArtifactKindPB, Version: current.Version, Platform: runtime.GOOS, Architecture: runtime.GOARCH, RepositoryURL: base.String() + "/tuf", TargetPath: "pb-" + runtime.GOOS + "-" + runtime.GOARCH}, nil
 }
 
-// InstallCLI uses a side-by-side slot on Windows. A running PE image cannot
-// be renamed safely, so the old image remains valid while the launcher reads
-// the atomically replaced active-slot record for subsequent invocations.
-func InstallCLI(currentExecutable, verifiedArtifact string) error {
+// InstallBinary replaces the one installed Paperboat executable. Windows
+// keeps a running image open, so callers that are themselves the active pb
+// process must invoke this through a short-lived copy of the same executable
+// after the service processes have been stopped.
+func InstallBinary(currentExecutable, verifiedArtifact string) error {
 	currentExecutable, err := filepath.Abs(currentExecutable)
 	if err != nil || !filepath.IsAbs(verifiedArtifact) || !strings.EqualFold(filepath.Ext(currentExecutable), ".exe") {
 		return ErrInvalidRelease
@@ -94,25 +94,34 @@ func InstallCLI(currentExecutable, verifiedArtifact string) error {
 	if err != nil || len(body) == 0 || len(body) > 256<<20 {
 		return ErrInvalidRelease
 	}
-	var suffix [8]byte
-	if _, err := rand.Read(suffix[:]); err != nil {
-		return err
-	}
-	slotName := strings.TrimSuffix(filepath.Base(currentExecutable), filepath.Ext(currentExecutable)) + ".slot-" + hex.EncodeToString(suffix[:]) + ".exe"
-	slotPath := filepath.Join(filepath.Dir(currentExecutable), slotName)
+	temporaryPath := currentExecutable + ".new"
+	_ = os.Remove(temporaryPath)
 	if err := windowssecurity.WithRestorePrivilege(func() error {
-		return atomicfile.Write(slotPath, body, atomicfile.Options{Mode: 0o755, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: "O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)"})
+		return atomicfile.Write(temporaryPath, body, atomicfile.Options{Mode: 0o755, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: "O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)"})
 	}); err != nil {
 		return err
 	}
-	activePath := filepath.Join(filepath.Dir(currentExecutable), strings.TrimSuffix(filepath.Base(currentExecutable), filepath.Ext(currentExecutable))+".active")
+	defer os.Remove(temporaryPath)
 	if err := windowssecurity.WithRestorePrivilege(func() error {
-		return atomicfile.Write(activePath, []byte(slotName+"\n"), atomicfile.Options{Mode: 0o644, OwnerUID: -1, OwnerGID: -1, SecurityDescriptor: "O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)"})
+		from, err := windows.UTF16PtrFromString(temporaryPath)
+		if err != nil {
+			return err
+		}
+		to, err := windows.UTF16PtrFromString(currentExecutable)
+		if err != nil {
+			return err
+		}
+		return windows.MoveFileEx(from, to, windows.MOVEFILE_REPLACE_EXISTING|windows.MOVEFILE_WRITE_THROUGH)
 	}); err != nil {
-		_ = os.Remove(slotPath)
 		return err
 	}
 	return nil
+}
+
+// InstallCLI is retained as a source-compatible name for older callers. CLI
+// and runtime now share the same signed executable and stable path.
+func InstallCLI(currentExecutable, verifiedArtifact string) error {
+	return InstallBinary(currentExecutable, verifiedArtifact)
 }
 
 func safeRegular(path string) error {

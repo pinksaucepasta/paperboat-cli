@@ -15,6 +15,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/releaseindex"
 )
 
 // TestStagedTUFRepository runs the same signed bootstrap, release-index, and
@@ -65,7 +67,7 @@ func TestStagedTUFRepository(t *testing.T) {
 			bootstrap := ArtifactTarget{
 				Schema: ArtifactTargetSchemaV1, Kind: ArtifactKindPB, Version: version,
 				Platform: target.platform, Architecture: target.architecture, RepositoryURL: server.URL,
-				TargetPath: "pb-" + target.platform + "-" + target.architecture,
+				TargetPath: releaseindex.AssetName(target.platform, target.architecture),
 			}
 			bootstrapPath, err := fetchVerifiedArtifact(ctx, bootstrap, filepath.Join(stateRoot, "bootstrap"), client, trustedRoot, target.platform, target.architecture)
 			if err != nil {
@@ -88,48 +90,39 @@ func TestStagedTUFRepository(t *testing.T) {
 			if index.Version != version {
 				t.Fatalf("staged release index version=%q, want %q", index.Version, version)
 			}
-			for _, component := range []string{"cli", "runtime", "hostd", "updater", "launcher"} {
-				targetInfo, ok := index.Component(component)
-				if !ok {
-					t.Fatalf("staged release index has no %s component", component)
-				}
-				path, err := fetchVerifiedReleaseComponent(ctx, server.URL, filepath.Join(stateRoot, component), index, component, client, now, target.platform, target.architecture)
-				if err != nil {
-					t.Fatalf("component %s: %v", component, err)
-				}
-				body, err := os.ReadFile(path)
-				if err != nil {
-					t.Fatal(err)
-				}
-				digest := sha256.Sum256(body)
-				if targetInfo.Length != int64(len(body)) || targetInfo.SHA256 != hex.EncodeToString(digest[:]) {
-					t.Fatalf("component %s does not match its signed target", component)
-				}
-				githubComponent := readStagedRegularFile(t, filepath.Join(githubRoot, targetInfo.TargetPath))
-				if !bytes.Equal(body, githubComponent) {
-					t.Fatalf("component %s differs from the immutable GitHub asset", component)
-				}
-				if component == "cli" && !bytes.Equal(bootstrapBody, body) {
-					t.Fatal("staged bootstrap alias and signed CLI component are not identical")
-				}
+			targetInfo, ok := index.Component("pb")
+			if !ok {
+				t.Fatal("staged release index has no pb component")
 			}
-			if target.platform == "windows" {
-				evidence := "windows-" + target.architecture + "-native-qualification.json"
-				assertSignedTargetMatchesFile(t, filepath.Join(repositoryRoot, "metadata", "targets.json"), evidence, filepath.Join(githubRoot, evidence))
+			path, err := fetchVerifiedReleaseComponent(ctx, server.URL, filepath.Join(stateRoot, "pb"), index, "pb", client, now, target.platform, target.architecture)
+			if err != nil {
+				t.Fatalf("pb component: %v", err)
+			}
+			body, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			digest := sha256.Sum256(body)
+			if targetInfo.Length != int64(len(body)) || targetInfo.SHA256 != hex.EncodeToString(digest[:]) {
+				t.Fatal("pb component does not match its signed target")
+			}
+			githubComponent := readStagedRegularFile(t, filepath.Join(githubRoot, targetInfo.TargetPath))
+			if !bytes.Equal(body, githubComponent) {
+				t.Fatal("pb component differs from the immutable GitHub asset")
+			}
+			if !bytes.Equal(bootstrapBody, body) {
+				t.Fatal("staged bootstrap target and signed pb component are not identical")
 			}
 		})
 	}
 }
 
-func stagedBootstrapAssetName(platform, targetPath string) string {
-	if platform == "windows" {
-		return targetPath + ".exe"
-	}
+func stagedBootstrapAssetName(_ string, targetPath string) string {
 	return targetPath
 }
 
 func TestStagedBootstrapAssetNameUsesWindowsExecutableSuffix(t *testing.T) {
-	if got := stagedBootstrapAssetName("windows", "pb-windows-amd64"); got != "pb-windows-amd64.exe" {
+	if got := stagedBootstrapAssetName("windows", "pb-windows-amd64.exe"); got != "pb-windows-amd64.exe" {
 		t.Fatalf("Windows bootstrap asset = %q", got)
 	}
 	if got := stagedBootstrapAssetName("linux", "pb-linux-amd64"); got != "pb-linux-amd64" {
@@ -183,30 +176,6 @@ func assertStagedFileEquals(t *testing.T, staged, immutable string) {
 	t.Helper()
 	if !bytes.Equal(readStagedRegularFile(t, staged), readStagedRegularFile(t, immutable)) {
 		t.Fatalf("staged %s differs from immutable GitHub asset %s", filepath.Base(staged), filepath.Base(immutable))
-	}
-}
-
-func assertSignedTargetMatchesFile(t *testing.T, targetsPath, name, immutable string) {
-	t.Helper()
-	var envelope struct {
-		Signed struct {
-			Targets map[string]struct {
-				Length int64             `json:"length"`
-				Hashes map[string]string `json:"hashes"`
-			} `json:"targets"`
-		} `json:"signed"`
-	}
-	if err := json.Unmarshal(readStagedRegularFile(t, targetsPath), &envelope); err != nil {
-		t.Fatal(err)
-	}
-	descriptor, ok := envelope.Signed.Targets[name]
-	if !ok {
-		t.Fatalf("signed TUF targets metadata has no %s", name)
-	}
-	body := readStagedRegularFile(t, immutable)
-	digest := sha256.Sum256(body)
-	if descriptor.Length != int64(len(body)) || descriptor.Hashes["sha256"] != hex.EncodeToString(digest[:]) {
-		t.Fatalf("signed TUF target %s differs from the immutable GitHub asset", name)
 	}
 }
 

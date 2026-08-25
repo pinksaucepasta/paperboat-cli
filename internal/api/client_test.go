@@ -68,6 +68,29 @@ func TestMachineExecDescriptorBindsSourceAndOperation(t *testing.T) {
 	}
 }
 
+func TestPrepareAuthenticatedHostSetupBindsMachineOperationAndGeneration(t *testing.T) {
+	expiresAt := time.Now().UTC().Add(10 * time.Minute)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/machines/mch_1/host-setup-installations" || r.Header.Get("Authorization") != "Bearer token" || r.Header.Get("Idempotency-Key") != "host-setup-operation-1" {
+			t.Fatalf("request=%s %s headers=%v", r.Method, r.URL.Path, r.Header)
+		}
+		var input AuthenticatedHostSetupInput
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil || input.SetupMode != "host" || input.InstallationGeneration != 7 || input.PublicIdentityKey != "public-key" || input.Verifier != "verifier-012345678901234567890123" || input.Artifact.Version != "2026.08.24.1" || input.Artifact.TargetPath != "pb-windows-amd64" || input.SSHUser != "pujan" || input.SSHPort != 22 || !input.CanReuseRuntimeIdentity {
+			t.Fatalf("input=%+v err=%v", input, err)
+		}
+		writeData(w, http.StatusCreated, AuthenticatedHostSetupInstallation{ExpiresAt: expiresAt})
+	}))
+	defer server.Close()
+	result, err := New(server.URL, config.Credential{AccessToken: "token"}, server.Client()).PrepareAuthenticatedHostSetup(context.Background(), "mch_1", "host-setup-operation-1", AuthenticatedHostSetupInput{
+		Verifier: "verifier-012345678901234567890123", PublicIdentityKey: "public-key",
+		InstallationGeneration: 7, SetupMode: "host", SSHUser: "pujan", SSHPort: 22, CanReuseRuntimeIdentity: true,
+		Artifact: MachineArtifact{Schema: "paperboat.tuf-target/v1", Kind: "pb", Version: "2026.08.24.1", Platform: "windows", Architecture: "amd64", RepositoryURL: "https://updates.example.test/paperboat", TargetPath: "pb-windows-amd64"},
+	})
+	if err != nil || !result.ExpiresAt.Equal(expiresAt) {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+}
+
 func TestMachineSSHDescriptorRequiresExactScope(t *testing.T) {
 	for _, scope := range []string{"ssh:operate", "exec:operate"} {
 		t.Run(scope, func(t *testing.T) {
@@ -184,6 +207,69 @@ func TestEndpointCertificateUsesExactEscapedIdentity(t *testing.T) {
 	}
 	if _, err := New(server.URL, config.Credential{}, server.Client()).EndpointCertificate(context.Background(), "", 3); err == nil {
 		t.Fatal("empty endpoint identity was accepted")
+	}
+}
+
+func TestRequestCLIEndpointUsesBoundHTTPContract(t *testing.T) {
+	input := CLIEndpointRequestInput{
+		OperationID: "operation_cli_0123456789", EndpointID: "cli_session_01", Generation: 1,
+		NoisePublicKey: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+		QUICPublicKey:  "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI",
+	}
+	expected := PendingEndpointIdentity{
+		RequestID: "per_0123456789abcdef", EndpointID: input.EndpointID, Role: "cli", State: "pending", Generation: 1,
+		NoisePublicKey: input.NoisePublicKey, QUICPublicKey: input.QUICPublicKey,
+		CreatedAt: time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC), ExpiresAt: time.Date(2026, 8, 3, 12, 5, 0, 0, time.UTC),
+		SafetyCode: "abcde-fghij",
+	}
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/e2ee/endpoint-requests" ||
+			r.Header.Get("Authorization") != "Bearer token" || r.Header.Get("Idempotency-Key") != input.OperationID ||
+			r.Header.Get("Content-Type") != "application/json" || r.Header.Get("Accept") != "application/json" {
+			t.Fatalf("request=%s %s headers=%v", r.Method, r.URL.Path, r.Header)
+		}
+		var body map[string]json.RawMessage
+		decoder := json.NewDecoder(r.Body)
+		if err := decoder.Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if len(body) != 5 {
+			t.Fatalf("request body fields=%v", body)
+		}
+		var got CLIEndpointRequestInput
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(encoded, &got); err != nil || got != input {
+			t.Fatalf("request body=%s decoded=%+v err=%v", encoded, got, err)
+		}
+		writeData(w, http.StatusCreated, expected)
+	}))
+	defer server.Close()
+
+	got, err := New(server.URL, config.Credential{AccessToken: "token"}, server.Client()).RequestCLIEndpoint(context.Background(), input)
+	if err != nil || got != expected || requests != 1 {
+		t.Fatalf("response=%+v requests=%d err=%v", got, requests, err)
+	}
+
+	for name, invalid := range map[string]CLIEndpointRequestInput{
+		"operation":  {EndpointID: input.EndpointID, Generation: 1, NoisePublicKey: input.NoisePublicKey, QUICPublicKey: input.QUICPublicKey},
+		"endpoint":   {OperationID: input.OperationID, Generation: 1, NoisePublicKey: input.NoisePublicKey, QUICPublicKey: input.QUICPublicKey},
+		"generation": {OperationID: input.OperationID, EndpointID: input.EndpointID, NoisePublicKey: input.NoisePublicKey, QUICPublicKey: input.QUICPublicKey},
+		"noise key":  {OperationID: input.OperationID, EndpointID: input.EndpointID, Generation: 1, QUICPublicKey: input.QUICPublicKey},
+		"QUIC key":   {OperationID: input.OperationID, EndpointID: input.EndpointID, Generation: 1, NoisePublicKey: input.NoisePublicKey},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := New(server.URL, config.Credential{AccessToken: "token"}, server.Client()).RequestCLIEndpoint(context.Background(), invalid); err == nil {
+				t.Fatal("invalid CLI endpoint request was sent")
+			}
+		})
+	}
+	if requests != 1 {
+		t.Fatalf("invalid inputs reached server: requests=%d", requests)
 	}
 }
 

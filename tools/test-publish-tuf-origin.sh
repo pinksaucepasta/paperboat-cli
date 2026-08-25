@@ -9,8 +9,6 @@ release_root="$temporary/releases"
 mkdir -p "$release_root/current/tuf/metadata" "$release_root/current/tuf/targets" "$release_root/staging"
 printf 'previous current\n' > "$release_root/current/current.json"
 printf 'previous timestamp\n' > "$release_root/current/tuf/metadata/timestamp.json"
-printf 'historical target bytes\n' > "$release_root/current/tuf/targets/historical-only"
-printf 'superseded target bytes\n' > "$release_root/current/tuf/targets/shared-target"
 
 # The production script deliberately pins its release root. Substitute only
 # that guard for this local failure-atomicity test; no activation is attempted.
@@ -18,6 +16,42 @@ test_publisher="$temporary/publish-tuf-origin.sh"
 sed "s|/opt/paperboat/releases|$release_root|g" "$publisher" > "$test_publisher"
 chmod 0700 "$test_publisher"
 test "$(awk 'NF { line=$0 } END { print line }' "$publisher")" = 'atomic_exchange "$live" "$next"'
+
+write_current_manifest() {
+  local path=$1
+  local version=$2
+  python3 - "$path" "$version" <<'PY'
+import json
+import pathlib
+import sys
+
+version = sys.argv[2]
+assets = {
+    "pb-darwin-arm64.pkg": ("darwin", "arm64", "pkg"),
+    "pb-linux-amd64": ("linux", "amd64", "elf"),
+    "pb-linux-arm64": ("linux", "arm64", "elf"),
+    "pb-windows-amd64.exe": ("windows", "amd64", "pe"),
+    "pb-windows-arm64.exe": ("windows", "arm64", "pe"),
+}
+body = {
+    "schema": "paperboat.release-current/v1",
+    "version": version,
+    "repository": "pinksaucepasta/paperboat-cli",
+    "assets": {
+        name: {
+            "platform": platform,
+            "architecture": architecture,
+            "format": format_,
+            "url": f"https://github.com/pinksaucepasta/paperboat-cli/releases/download/{version}/{name}",
+            "sha256": "0" * 64,
+            "length": 1,
+        }
+        for name, (platform, architecture, format_) in assets.items()
+    },
+}
+pathlib.Path(sys.argv[1]).write_text(json.dumps(body, separators=(",", ":")) + "\n")
+PY
+}
 
 select_checksum_backend() {
   if command -v sha256sum >/dev/null 2>&1; then
@@ -208,7 +242,7 @@ test "$before" = "$(snapshot)"
 
 candidate="$temporary/candidate"
 mkdir -p "$candidate/tuf/metadata" "$candidate/tuf/targets"
-printf '{"schema":"paperboat.release-current/v1","version":"wrong"}\n' > "$candidate/current.json"
+write_current_manifest "$candidate/current.json" wrong
 printf x > "$candidate/install"
 printf x > "$candidate/windows"
 for name in root targets snapshot timestamp; do printf x > "$candidate/tuf/metadata/$name.json"; done
@@ -261,14 +295,11 @@ EOF
   chmod 0700 "$temporary/bin/docker" "$temporary/bin/chown"
 
   candidate_version=2026.08.22.23
-  printf '{"schema":"paperboat.release-current/v1","version":"%s"}\n' "$candidate_version" > "$candidate/current.json"
-  printf 'new target bytes\n' > "$candidate/tuf/targets/new-only"
-  printf 'replacement target bytes\n' > "$candidate/tuf/targets/shared-target"
+  write_current_manifest "$candidate/current.json" "$candidate_version"
   tar -C "$candidate" -czf "$bundle" current.json install windows tuf
   digest=$(run_checksum "$checksum_backend" "$bundle" | awk '{print $1}')
   expected="$temporary/expected"
   cp -R "$candidate" "$expected"
-  cp "$release_root/current/tuf/targets/historical-only" "$expected/tuf/targets/historical-only"
   expected_candidate=$(snapshot_directory "$expected")
   PATH="$temporary/bin:$PATH" PAPERBOAT_TEST_DOCKER_MODE=good PAPERBOAT_TEST_RELEASE_ROOT="$release_root" run_test_publisher "$bundle" "$release_root" "$candidate_version" "$digest"
   set -- "$release_root"/staging/activation-*
@@ -276,13 +307,10 @@ EOF
   transaction=$1
   test "$expected_candidate" = "$(snapshot)"
   test "$before" = "$(snapshot_directory "$transaction/next")"
-  test "$(cat "$release_root/current/tuf/targets/shared-target")" = 'replacement target bytes'
-  test "$(cat "$release_root/current/tuf/targets/historical-only")" = 'historical target bytes'
-  test "$(stat -c %i "$release_root/current/tuf/targets/historical-only")" = "$(stat -c %i "$transaction/next/tuf/targets/historical-only")"
 
   next="$temporary/next"
   mkdir -p "$next/tuf/metadata" "$next/tuf/targets"
-  printf '{"schema":"paperboat.release-current/v1","version":"2026.08.22.24"}\n' > "$next/current.json"
+  write_current_manifest "$next/current.json" 2026.08.22.24
   printf x > "$next/install"
   printf x > "$next/windows"
   for name in root targets snapshot timestamp; do printf x > "$next/tuf/metadata/$name.json"; done

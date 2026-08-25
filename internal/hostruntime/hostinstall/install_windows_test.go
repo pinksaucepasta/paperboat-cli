@@ -5,43 +5,11 @@ package hostinstall
 import (
 	"context"
 	"errors"
-	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
 	"github.com/pinksaucepasta/paperboat/internal/windowsopenssh"
 )
-
-func TestWindowsCLIEntrypointUsesStableLauncherAtPublicPBPath(t *testing.T) {
-	layout, err := service.DefaultLayout("windows")
-	if err != nil {
-		t.Fatal(err)
-	}
-	launcher, entrypoint := windowsCLIEntrypointPaths(layout)
-	if launcher != `C:\Program Files\Paperboat\bin\pb-launcher.exe` || entrypoint != `C:\Program Files\Paperboat\bin\pb.exe` {
-		t.Fatalf("launcher=%q entrypoint=%q", launcher, entrypoint)
-	}
-}
-
-func TestReplaceWindowsCLIEntrypointReplacesStaleClientBinary(t *testing.T) {
-	directory := t.TempDir()
-	launcher := filepath.Join(directory, "pb-launcher.exe")
-	entrypoint := filepath.Join(directory, "pb.exe")
-	if err := os.WriteFile(launcher, []byte("stable launcher bytes"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(entrypoint, []byte("stale full CLI bytes"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := replaceWindowsCLIEntrypoint(entrypoint, launcher); err != nil {
-		t.Fatal(err)
-	}
-	got, err := os.ReadFile(entrypoint)
-	if err != nil || string(got) != "stable launcher bytes" {
-		t.Fatalf("entrypoint=%q err=%v", got, err)
-	}
-}
 
 func TestWindowsSSHServiceSetFollowsHostClientTransition(t *testing.T) {
 	layout, err := service.DefaultLayout("windows")
@@ -86,14 +54,14 @@ func TestWindowsSSHServiceSetFollowsHostClientTransition(t *testing.T) {
 		t.Fatalf("host/client SSH operations: remove service=%d remove state=%d install=%d", len(removedService), len(removedState), len(installs))
 	}
 	for _, config := range removedService {
-		if config.ServiceExecutable != layout.RuntimeCurrent {
-			t.Fatalf("SSH ownership executable: service=%q want=%q", config.ServiceExecutable, layout.RuntimeCurrent)
+		if config.ServiceExecutable != layout.Binary {
+			t.Fatalf("SSH ownership executable: service=%q want=%q", config.ServiceExecutable, layout.Binary)
 		}
 	}
-	if removedState[0].ServiceExecutable != layout.RuntimeCurrent {
-		t.Fatalf("SSH state ownership executable=%q want=%q", removedState[0].ServiceExecutable, layout.RuntimeCurrent)
+	if removedState[0].ServiceExecutable != layout.Binary {
+		t.Fatalf("SSH state ownership executable=%q want=%q", removedState[0].ServiceExecutable, layout.Binary)
 	}
-	if installs[0].executable != layout.RuntimeCurrent || installs[0].sshd != `C:\Program Files\OpenSSH\sshd.exe` || installs[0].config != `C:\ProgramData\Paperboat\ssh\sshd_config` {
+	if installs[0].executable != layout.Binary || installs[0].sshd != `C:\Program Files\OpenSSH\sshd.exe` || installs[0].config != `C:\ProgramData\Paperboat\ssh\sshd_config` {
 		t.Fatalf("host SSH install=%+v", installs[0])
 	}
 }

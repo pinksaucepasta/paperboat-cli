@@ -9,9 +9,8 @@ import (
 
 func fixture() Index {
 	i := Index{Schema: SchemaV1, ReleaseID: "rel_1", Version: "2026.08.18.7", Channel: "stable", Severity: "routine", CreatedAt: time.Now().UTC(), Platform: "linux", Architecture: "amd64", BinaryFormat: "elf", HostdAPIMin: 1, HostdAPIMax: 2, RuntimeAPIMin: 1, RuntimeAPIMax: 2, RolloutPolicyRevision: 1, Rollout: Rollout{Schema: RolloutSchemaV1, CohortSeed: "seed", Percentage: 100}}
-	for _, component := range []string{"cli", "runtime", "hostd", "updater", "launcher"} {
-		i.Targets = append(i.Targets, Target{Component: component, TargetPath: component + "-linux-amd64", SHA256: strings.Repeat("a", 64), Length: 100, Platform: "linux", Architecture: "amd64", BinaryFormat: "elf"})
-	}
+	name := AssetName("linux", "amd64")
+	i.Targets = []Target{{Component: "pb", TargetPath: name, AssetName: name, Repository: "example/paperboat-cli", DownloadURL: "https://github.com/example/paperboat-cli/releases/download/2026.08.18.7/" + name, SHA256: strings.Repeat("a", 64), Length: 100, Platform: "linux", Architecture: "amd64", BinaryFormat: "elf"}}
 	return i
 }
 
@@ -22,20 +21,20 @@ func TestDecodeAndEligibility(t *testing.T) {
 	if err != nil || !got.Eligible("machine", time.Now(), false) {
 		t.Fatalf("got=%+v err=%v", got, err)
 	}
-	if target, ok := got.Component("runtime"); !ok || target.Component != "runtime" {
-		t.Fatal("runtime target missing")
+	if target, ok := got.Component("pb"); !ok || target.Component != "pb" {
+		t.Fatal("pb target missing")
 	}
 }
 func TestRejectsMissingDuplicateAndUnknown(t *testing.T) {
 	i := fixture()
-	i.Targets = i.Targets[:4]
+	i.Targets = nil
 	if i.Validate(time.Now()) == nil {
 		t.Fatal("missing accepted")
 	}
 	i = fixture()
-	i.Targets[4] = i.Targets[0]
+	i.Targets = append(i.Targets, i.Targets[0])
 	if i.Validate(time.Now()) == nil {
-		t.Fatal("duplicate accepted")
+		t.Fatal("duplicate target accepted")
 	}
 	body, _ := json.Marshal(fixture())
 	body = append(body[:len(body)-1], []byte(`,"unknown":true}`)...)
@@ -52,5 +51,16 @@ func TestManualBypassDoesNotBypassSafety(t *testing.T) {
 	i.Revoked = true
 	if i.Eligible("machine", time.Now(), true) {
 		t.Fatal("revoked release accepted")
+	}
+}
+
+func TestRejectsNonCanonicalGitHubRepository(t *testing.T) {
+	for _, repository := range []string{"example owner/paperboat", "example/paper boat", "example//paperboat", "example/paperboat/extra", " example/paperboat"} {
+		i := fixture()
+		i.Targets[0].Repository = repository
+		i.Targets[0].DownloadURL = "https://github.com/" + repository + "/releases/download/" + i.Version + "/" + i.Targets[0].AssetName
+		if i.Validate(time.Now()) == nil {
+			t.Fatalf("repository %q was accepted", repository)
+		}
 	}
 }

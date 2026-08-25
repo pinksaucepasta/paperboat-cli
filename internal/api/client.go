@@ -651,6 +651,30 @@ func (c *Client) SetupMachine(ctx context.Context, input MachineSetupInput) (Use
 	return out, err
 }
 
+type AuthenticatedHostSetupInput struct {
+	Verifier                string          `json:"verifier"`
+	PublicIdentityKey       string          `json:"public_identity_key"`
+	InstallationGeneration  int64           `json:"installation_generation"`
+	SetupMode               string          `json:"setup_mode"`
+	Artifact                MachineArtifact `json:"artifact"`
+	SSHUser                 string          `json:"ssh_user,omitempty"`
+	SSHPort                 uint16          `json:"ssh_port,omitempty"`
+	CanReuseRuntimeIdentity bool            `json:"can_reuse_runtime_identity,omitempty"`
+}
+
+type AuthenticatedHostSetupInstallation struct {
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+func (c *Client) PrepareAuthenticatedHostSetup(ctx context.Context, machineID, operationID string, input AuthenticatedHostSetupInput) (AuthenticatedHostSetupInstallation, error) {
+	if strings.TrimSpace(machineID) == "" || len(strings.TrimSpace(operationID)) < 8 {
+		return AuthenticatedHostSetupInstallation{}, errors.New("authenticated Host setup request is invalid")
+	}
+	var out AuthenticatedHostSetupInstallation
+	err := c.doWithHeaders(ctx, http.MethodPost, "/v1/machines/"+url.PathEscape(machineID)+"/host-setup-installations", input, &out, http.Header{"Idempotency-Key": []string{operationID}})
+	return out, err
+}
+
 type MachineControlCredential struct {
 	Credential string    `json:"credential"`
 	ExpiresAt  time.Time `json:"expires_at"`

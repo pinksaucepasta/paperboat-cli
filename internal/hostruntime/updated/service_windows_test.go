@@ -17,7 +17,7 @@ func testWindowsUpdaterConfig(t *testing.T) WindowsConfig {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return WindowsConfig{StateRoot: layout.UpdateStateRoot, RuntimeCurrent: layout.RuntimeCurrent, RuntimeRollback: layout.RuntimeRollback, RuntimeStaged: layout.RuntimeStaged, CLICurrent: layout.CLICurrent, CLIRollback: layout.CLIRollback, OwnerSID: "S-1-5-21-1-2-3-1001", MachineID: "machine", RepositoryURL: "https://get.pprbt.dev", TokenFile: hostinstall.WindowsHostdTokenPath(), InstallState: hostinstall.WindowsInstallConfigPath(), ControlSocket: `\\.\pipe\PaperboatUpdatedControl`, HostdSocket: layout.HostdSocket, HealthURL: "http://127.0.0.1:8080/healthz", ActiveVersion: "2026.08.23.1", Architecture: "amd64", SetupMode: "client"}
+	return WindowsConfig{StateRoot: layout.UpdateStateRoot, Binary: layout.Binary, BinaryRollback: layout.BinaryRollback, BinaryStaged: layout.BinaryStaged, OwnerSID: "S-1-5-21-1-2-3-1001", MachineID: "machine", RepositoryURL: "https://get.pprbt.dev", TokenFile: hostinstall.WindowsHostdTokenPath(), InstallState: hostinstall.WindowsInstallConfigPath(), ControlSocket: `\\.\pipe\PaperboatUpdatedControl`, HostdSocket: layout.HostdSocket, HealthURL: "http://127.0.0.1:8080/healthz", ActiveVersion: "2026.08.23.1", Architecture: "amd64", SetupMode: "client"}
 }
 
 func TestWindowsUpdaterRejectsMutableTrustAndPathInputs(t *testing.T) {
@@ -71,22 +71,18 @@ func TestWindowsSSHCommandContractIsExact(t *testing.T) {
 	}
 }
 
-func TestWindowsActiveServiceTargetsAreExactRoleArtifacts(t *testing.T) {
+func TestWindowsActiveServiceTargetsUseCanonicalBinary(t *testing.T) {
 	layout, err := service.DefaultLayout("windows")
 	if err != nil {
 		t.Fatal(err)
 	}
-	paths, err := layout.WindowsRelease("2026.08.23.1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	hostd := windowsServiceTarget{Executable: paths.Hostd}
-	updater := windowsServiceTarget{Executable: paths.Updater}
-	ssh := windowsServiceTarget{Executable: paths.Runtime}
+	hostd := windowsServiceTarget{Executable: layout.Binary}
+	updater := windowsServiceTarget{Executable: layout.Binary}
+	ssh := windowsServiceTarget{Executable: layout.Binary}
 	if !activeWindowsServiceTargetsMatch(layout, "2026.08.23.1", hostd, updater, ssh) {
 		t.Fatal("exact role targets rejected")
 	}
-	hostd.Executable = paths.Runtime
+	hostd.Executable = layout.BinaryRollback
 	if activeWindowsServiceTargetsMatch(layout, "2026.08.23.1", hostd, updater, ssh) {
 		t.Fatal("runtime artifact accepted as hostd")
 	}

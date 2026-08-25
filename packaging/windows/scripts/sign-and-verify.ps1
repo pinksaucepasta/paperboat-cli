@@ -88,8 +88,8 @@ try {
             throw "Signing input is missing: $resolved"
         }
         $extension = [IO.Path]::GetExtension($resolved).ToLowerInvariant()
-        if ($extension -notin @('.exe', '.msi')) {
-            throw "Only PE .exe and MSI files may be signed: $resolved"
+        if ($extension -ne '.exe') {
+            throw "Only unified Paperboat PE .exe files may be signed: $resolved"
         }
         if ($extension -eq '.exe' -and (Get-PeMachine -FilePath $resolved) -ne $Architecture) {
             throw "PE architecture mismatch for $([IO.Path]::GetFileName($resolved))."

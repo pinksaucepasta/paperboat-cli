@@ -24,9 +24,7 @@ type ComponentConfig struct {
 }
 
 // ComponentController returns the one service-manager controller permitted for
-// a split component. Keeping the unit and launchd label here prevents callers
-// from accidentally registering hostd or the updater under a legacy runtime
-// service name.
+// a service role. Both roles invoke the same installed pb executable.
 func ComponentController(platform, kind string, enrolledUID int, runner Runner) (Controller, error) {
 	if runner == nil || enrolledUID < 0 {
 		return nil, ErrInvalidDefinition
@@ -57,22 +55,24 @@ func ComponentController(platform, kind string, enrolledUID int, runner Runner) 
 	return nil, ErrInvalidDefinition
 }
 
-// NewHostdInstaller defines the durable, unprivileged host supervisor. It is
-// intentionally a system service on Linux and a LaunchDaemon that drops to the
-// enrolled account on macOS: it must outlive individual terminal clients, but
-// must never run live user workloads as root.
+// NewHostdInstaller defines the durable host supervisor. It is intentionally a
+// system service on Linux and a LaunchDaemon that drops to the enrolled account
+// on macOS. Explicit root enrollments remain root for compatibility; an
+// ordinary enrolled account can never be widened to root here.
 func NewHostdInstaller(config ComponentConfig) (*Installer, error) {
-	if err := config.Layout.Validate(); err != nil || config.User == "root" || config.UID <= 0 || !filepath.IsAbs(config.HostdTokenFile) {
+	if err := config.Layout.Validate(); err != nil || !validEnrolledIdentity(config.User, config.Group, config.UID, config.GID) || !filepath.IsAbs(config.HostdTokenFile) {
 		return nil, ErrInvalidDefinition
 	}
 	environment := copyEnvironment(config.Environment)
+	binary := config.Layout.Binary
+	environment["PAPERBOAT_BINARY"] = binary
+	environment["PAPERBOAT_BINARY_ROLLBACK"] = config.Layout.BinaryRollback
+	environment["PAPERBOAT_BINARY_STAGED"] = config.Layout.BinaryStaged
 	environment["PAPERBOAT_HOSTD_SOCKET"] = config.Layout.HostdSocket
-	environment["PAPERBOAT_RUNTIME_CURRENT"] = config.Layout.RuntimeCurrent
-	environment["PAPERBOAT_RUNTIME_ROLLBACK"] = config.Layout.RuntimeRollback
 	environment["PAPERBOAT_HOSTD_TOKEN_FILE"] = config.HostdTokenFile
 	return New(Config{
-		Platform: config.Layout.Platform, Kind: HostdKind, ConfigRoot: "/", Executable: config.Layout.HostdBinary,
-		User: config.User, Group: config.Group, Arguments: []string{"serve"}, Environment: environment,
+		Platform: config.Layout.Platform, Kind: HostdKind, ConfigRoot: "/", Executable: binary,
+		User: config.User, Group: config.Group, Arguments: []string{"__runtime-hostd"}, Environment: environment,
 		UpgradeMode: UpgradeReload, Controller: config.Controller,
 	})
 }
@@ -81,7 +81,7 @@ func NewHostdInstaller(config ComponentConfig) (*Installer, error) {
 // stage and activate signed artifacts. It never receives a shell command or
 // arbitrary path from a caller.
 func NewUpdaterInstaller(config ComponentConfig) (*Installer, error) {
-	if err := config.Layout.Validate(); err != nil || config.UID <= 0 || config.GID < 0 || !filepath.IsAbs(config.HostdTokenFile) || strings.TrimSpace(config.ReleaseRepository) == "" || strings.TrimSpace(config.MachineID) == "" || strings.TrimSpace(config.HealthURL) == "" {
+	if err := config.Layout.Validate(); err != nil || !validEnrolledIdentity(config.User, config.Group, config.UID, config.GID) || !filepath.IsAbs(config.HostdTokenFile) || strings.TrimSpace(config.ReleaseRepository) == "" || strings.TrimSpace(config.MachineID) == "" || strings.TrimSpace(config.HealthURL) == "" {
 		return nil, ErrInvalidDefinition
 	}
 	group := "root"
@@ -89,16 +89,12 @@ func NewUpdaterInstaller(config ComponentConfig) (*Installer, error) {
 		group = "wheel"
 	}
 	environment := copyEnvironment(config.Environment)
+	binary := config.Layout.Binary
+	environment["PAPERBOAT_BINARY"] = binary
+	environment["PAPERBOAT_BINARY_ROLLBACK"] = config.Layout.BinaryRollback
+	environment["PAPERBOAT_BINARY_STAGED"] = config.Layout.BinaryStaged
 	environment["PAPERBOAT_UPDATE_STATE_ROOT"] = config.Layout.UpdateStateRoot
 	environment["PAPERBOAT_RELEASE_ROOT"] = config.Layout.ReleasesRoot
-	environment["PAPERBOAT_HOSTD_BINARY"] = config.Layout.HostdBinary
-	environment["PAPERBOAT_UPDATER_BINARY"] = config.Layout.UpdaterBinary
-	environment["PAPERBOAT_LAUNCHER_BINARY"] = config.Layout.Launcher
-	environment["PAPERBOAT_RUNTIME_CURRENT"] = config.Layout.RuntimeCurrent
-	environment["PAPERBOAT_RUNTIME_ROLLBACK"] = config.Layout.RuntimeRollback
-	environment["PAPERBOAT_RUNTIME_STAGED"] = config.Layout.RuntimeStaged
-	environment["PAPERBOAT_CLI_CURRENT"] = config.Layout.CLICurrent
-	environment["PAPERBOAT_CLI_ROLLBACK"] = config.Layout.CLIRollback
 	environment["PAPERBOAT_HOSTD_SOCKET"] = config.Layout.HostdSocket
 	environment["PAPERBOAT_HOSTD_TOKEN_FILE"] = config.HostdTokenFile
 	environment["PAPERBOAT_RELEASE_REPOSITORY"] = config.ReleaseRepository
@@ -108,10 +104,17 @@ func NewUpdaterInstaller(config ComponentConfig) (*Installer, error) {
 	environment["PAPERBOAT_ENROLLED_GID"] = strconv.Itoa(config.GID)
 	environment["PAPERBOAT_UPDATED_SOCKET"] = updaterControlSocket(config.Layout.Platform)
 	return New(Config{
-		Platform: config.Layout.Platform, Kind: UpdaterKind, ConfigRoot: "/", Executable: config.Layout.UpdaterBinary,
-		User: "root", Group: group, Arguments: []string{"serve"}, Environment: environment,
+		Platform: config.Layout.Platform, Kind: UpdaterKind, ConfigRoot: "/", Executable: binary,
+		User: "root", Group: group, Arguments: []string{"__runtime-updated"}, Environment: environment,
 		UpgradeMode: UpgradeReload, Controller: config.Controller,
 	})
+}
+
+func validEnrolledIdentity(user, group string, uid, gid int) bool {
+	if uid == 0 || gid == 0 {
+		return user == "root" && (group == "root" || group == "wheel") && uid == 0 && gid == 0
+	}
+	return user != "" && user != "root" && group != "" && group != "root" && group != "wheel" && uid > 0 && gid > 0
 }
 
 func updaterControlSocket(platform string) string {

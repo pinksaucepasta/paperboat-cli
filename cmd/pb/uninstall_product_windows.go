@@ -13,12 +13,9 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
-	"unsafe"
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostinstall"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
@@ -28,22 +25,14 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-const paperboatMSIUpgradeCode = "{6B5F6B0A-40B2-4B9E-9E2A-7CF2F6C2D3D4}"
-
 const (
 	windowsUninstallPlanSchema   = "paperboat.windows-uninstall-plan/v1"
 	windowsUninstallStatusSchema = "paperboat.windows-uninstall-status/v1"
 )
 
 var (
-	paperboatMSIProductCodePattern = regexp.MustCompile(`^\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}$`)
-	msiDLL                         = windows.NewLazySystemDLL("msi.dll")
-	msiEnumRelatedProducts         = msiDLL.NewProc("MsiEnumRelatedProductsW")
-	enumeratePaperboatMSIProducts  = defaultEnumeratePaperboatMSIProducts
-	runPaperboatMSIUninstall       = defaultRunPaperboatMSIUninstall
-	runWindowsGlobalCleanup        = func(ctx context.Context) error { return runMSIFullUninstallCleanup(ctx, io.Discard) }
-	purgeWindowsHostRuntime        = hostinstall.Purge
-	windowsUninstallExecutable     = os.Executable
+	purgeWindowsHostRuntime    = hostinstall.Purge
+	windowsUninstallExecutable = os.Executable
 )
 
 type windowsUninstallPlan struct {
@@ -64,8 +53,9 @@ type windowsUninstallStatus struct {
 }
 
 // removePlatformProductInstallation hands cleanup to a protected helper before
-// the calling executable or its user state can be removed. The MSI custom
-// action invokes only __msi-cleanup, so this cannot recurse into pb uninstall.
+// the calling executable or its user state can be removed. The helper runs the
+// same unified pb executable with an internal completion argument, so it never
+// depends on a separate installer or cleanup binary.
 func removePlatformProductInstallation(ctx context.Context, inboxPaths []string, output io.Writer) error {
 	if ctx == nil || output == nil {
 		return errors.New("invalid Windows uninstall handoff")
@@ -76,22 +66,6 @@ func removePlatformProductInstallation(ctx context.Context, inboxPaths []string,
 	}
 	_, _ = fmt.Fprintf(output, "Windows uninstall is continuing in the elevated cleanup helper. Completion status: %s\n", statusPath)
 	return nil
-}
-
-func removeRegisteredPaperboatMSIProducts(ctx context.Context) error {
-	products, err := enumeratePaperboatMSIProducts()
-	if err != nil {
-		return err
-	}
-	var result error
-	for _, productCode := range products {
-		if !paperboatMSIProductCodePattern.MatchString(productCode) {
-			result = errors.Join(result, errors.New("Windows Installer returned an invalid Paperboat product code"))
-			continue
-		}
-		result = errors.Join(result, runPaperboatMSIUninstall(ctx, productCode))
-	}
-	return result
 }
 
 func purgePlatformRuntime(*cobra.Command) error { return nil }
@@ -262,15 +236,10 @@ func performWindowsSystemUninstall(ctx context.Context, inboxPaths []string) err
 }
 
 func performWindowsRegisteredCleanup(ctx context.Context) error {
-	var result error
-	// Global cleanup owns Paperboat preview services and OpenSSH state even
-	// when no MSI registration exists. Run it while installed paths remain.
-	result = errors.Join(result, runWindowsGlobalCleanup(ctx))
-	// Run Windows Installer while its registered custom-action binary still
-	// exists. The custom action uses only __msi-cleanup and cannot recurse.
-	result = errors.Join(result, removeRegisteredPaperboatMSIProducts(ctx))
-	result = errors.Join(result, purgeWindowsHostRuntime(ctx))
-	return result
+	// The installed unified executable owns the host runtime directly. Purge
+	// that runtime before removing the installation root; no split cleanup
+	// action is needed.
+	return purgeWindowsHostRuntime(ctx)
 }
 
 func readWindowsUninstallPlan(planPath string) (windowsUninstallPlan, error) {
@@ -519,70 +488,4 @@ func retryWindowsRemoval(ctx context.Context, path string, preserved []string) e
 		case <-time.After(250 * time.Millisecond):
 		}
 	}
-}
-
-func defaultEnumeratePaperboatMSIProducts() ([]string, error) {
-	upgradeCode, err := windows.UTF16PtrFromString(paperboatMSIUpgradeCode)
-	if err != nil {
-		return nil, err
-	}
-	var products []string
-	for index := uint32(0); ; index++ {
-		buffer := make([]uint16, 39)
-		result, _, _ := msiEnumRelatedProducts.Call(
-			uintptr(unsafe.Pointer(upgradeCode)), 0, uintptr(index), uintptr(unsafe.Pointer(&buffer[0])),
-		)
-		switch windows.Errno(result) {
-		case windows.ERROR_SUCCESS:
-			productCode := windows.UTF16ToString(buffer)
-			if !paperboatMSIProductCodePattern.MatchString(productCode) {
-				return nil, errors.New("Windows Installer returned an invalid Paperboat product code")
-			}
-			products = append(products, productCode)
-		case windows.ERROR_NO_MORE_ITEMS:
-			return products, nil
-		default:
-			return nil, fmt.Errorf("enumerate registered Paperboat MSI products: %w", windows.Errno(result))
-		}
-	}
-}
-
-func defaultRunPaperboatMSIUninstall(ctx context.Context, productCode string) error {
-	if ctx == nil || !paperboatMSIProductCodePattern.MatchString(productCode) {
-		return errors.New("invalid Paperboat MSI uninstall request")
-	}
-	systemDirectory, err := windows.GetSystemDirectory()
-	if err != nil {
-		return err
-	}
-	msiexec := filepath.Join(systemDirectory, "msiexec.exe")
-	info, err := os.Lstat(msiexec)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-		return errors.New("trusted Windows Installer executable is unavailable")
-	}
-	attributes, err := windows.GetFileAttributes(windows.StringToUTF16Ptr(msiexec))
-	if err != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-		return errors.New("trusted Windows Installer executable is unavailable")
-	}
-	command := exec.CommandContext(ctx, msiexec, "/x", productCode, "/qn", "/norestart")
-	output, err := command.CombinedOutput()
-	if successfulMSIUninstallExit(err) {
-		return nil
-	}
-	detail := strings.TrimSpace(string(output))
-	if len(detail) > 1024 {
-		detail = detail[:1024]
-	}
-	if detail == "" {
-		return fmt.Errorf("uninstall Paperboat MSI %s: %w", productCode, err)
-	}
-	return fmt.Errorf("uninstall Paperboat MSI %s: %w: %s", productCode, err, detail)
-}
-
-func successfulMSIUninstallExit(err error) bool {
-	if err == nil {
-		return true
-	}
-	var exit interface{ ExitCode() int }
-	return errors.As(err, &exit) && exit.ExitCode() == 3010
 }

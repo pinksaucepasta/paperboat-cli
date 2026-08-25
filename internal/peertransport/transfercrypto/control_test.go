@@ -69,8 +69,8 @@ func TestKeyControlDoesNotAcknowledgeFailedPersistence(t *testing.T) {
 	_ = writeControlFrame(&wire, payload)
 	vault, _ := NewKeyVault(failingSecrets{})
 	vault.now = func() time.Time { return now }
-	if err := ReceiveKey(&wire, binding, keyPeerContext(binding.OperationID), vault); err == nil {
-		t.Fatal("persistence failure accepted")
+	if err := ReceiveKey(&wire, binding, keyPeerContext(binding.OperationID), vault); !errors.Is(err, ErrControlStore) || !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("persistence error = %v, want typed store and underlying errors", err)
 	}
 	if wire.Len() != 0 {
 		t.Fatal("persistence failure produced acknowledgement")

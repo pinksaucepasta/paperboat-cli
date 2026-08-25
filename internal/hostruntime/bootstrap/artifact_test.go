@@ -5,15 +5,18 @@ import (
 	"crypto"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -46,13 +49,26 @@ func newTestTUFRepository(t *testing.T, body []byte, version string, expires tim
 			t.Fatal(err)
 		}
 	}
-	targetPath := "pb-" + runtime.GOOS + "-" + runtime.GOARCH
+	targetPath := releaseindex.AssetName(runtime.GOOS, runtime.GOARCH)
 	targets := metadata.Targets(time.Now().UTC().Add(24 * time.Hour))
 	info, err := metadata.TargetFile().FromBytes(targetPath, body, "sha256")
 	if err != nil {
 		t.Fatal(err)
 	}
-	custom, _ := json.Marshal(tufTargetCustom{ArtifactTargetSchemaV1, ArtifactKindPB, version, runtime.GOOS, runtime.GOARCH})
+	digestBytes := sha256.Sum256(body)
+	format := "elf"
+	if runtime.GOOS == "darwin" {
+		format = "pkg"
+	}
+	repository := "pinksaucepasta/paperboat-cli"
+	index := releaseindex.Index{
+		Schema: releaseindex.SchemaV1, ReleaseID: "rel_" + version, Version: version, Channel: "stable", Severity: "routine",
+		CreatedAt: time.Now().UTC(), Platform: runtime.GOOS, Architecture: runtime.GOARCH, BinaryFormat: format,
+		Targets:     []releaseindex.Target{{Component: "pb", TargetPath: targetPath, AssetName: targetPath, Repository: repository, DownloadURL: "https://github.com/" + repository + "/releases/download/" + version + "/" + targetPath, SHA256: hex.EncodeToString(digestBytes[:]), Length: int64(len(body)), Platform: runtime.GOOS, Architecture: runtime.GOARCH, BinaryFormat: format}},
+		HostdAPIMin: 1, HostdAPIMax: 2, RuntimeAPIMin: 1, RuntimeAPIMax: 2, RolloutPolicyRevision: 1,
+		Rollout: releaseindex.Rollout{Schema: releaseindex.RolloutSchemaV1, CohortSeed: "release-" + version, Percentage: 100},
+	}
+	custom, _ := json.Marshal(tufAssetCustom{Schema: "paperboat.tuf-asset/v1", Kind: "github-release-asset", Version: version, Platform: runtime.GOOS, Architecture: runtime.GOARCH, Format: format, AssetName: targetPath, Repository: repository, URL: index.Targets[0].DownloadURL, SHA256: hex.EncodeToString(digestBytes[:]), Length: int64(len(body)), ReleaseIndex: index})
 	raw := json.RawMessage(custom)
 	info.Custom, info.Path = &raw, targetPath
 	targets.Signed.Targets[targetPath] = info
@@ -80,18 +96,25 @@ func newTestTUFRepository(t *testing.T, body []byte, version string, expires tim
 	targetsBytes, _ := targets.ToBytes(false)
 	snapshotBytes, _ := snapshot.ToBytes(false)
 	timestampBytes, _ := timestamp.ToBytes(false)
-	digest := hex.EncodeToString(info.Hashes["sha256"])
+	targetDigest := hex.EncodeToString(info.Hashes["sha256"])
 	return testTUFRepository{root: rootBytes, files: map[string][]byte{
-		"/metadata/timestamp.json":              timestampBytes,
-		"/metadata/1.snapshot.json":             snapshotBytes,
-		"/metadata/1.targets.json":              targetsBytes,
-		"/targets/" + digest + "." + targetPath: body,
+		"/metadata/timestamp.json":                                            timestampBytes,
+		"/metadata/1.snapshot.json":                                           snapshotBytes,
+		"/metadata/1.targets.json":                                            targetsBytes,
+		"/targets/" + targetDigest + "." + targetPath:                         body,
+		"/" + repository + "/releases/download/" + version + "/" + targetPath: body,
 	}}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (function roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return function(request)
 }
 
 func (r testTUFRepository) server(t *testing.T) *httptest.Server {
 	t.Helper()
-	return httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		body, ok := r.files[request.URL.Path]
 		if !ok {
 			http.NotFound(writer, request)
@@ -100,18 +123,35 @@ func (r testTUFRepository) server(t *testing.T) *httptest.Server {
 		writer.Header().Set("Content-Length", fmt.Sprint(len(body)))
 		_, _ = writer.Write(body)
 	}))
+	target, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := server.Client()
+	transport := client.Transport
+	client.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Hostname() == "github.com" {
+			clone := request.Clone(request.Context())
+			clonedURL := *request.URL
+			clonedURL.Scheme, clonedURL.Host = target.Scheme, target.Host
+			clone.URL = &clonedURL
+			request = clone
+		}
+		return transport.RoundTrip(request)
+	})
+	return server
 }
 
 func descriptor(repositoryURL, version string) ArtifactTarget {
-	return ArtifactTarget{Schema: ArtifactTargetSchemaV1, Kind: ArtifactKindPB, Version: version, Platform: runtime.GOOS, Architecture: runtime.GOARCH, RepositoryURL: repositoryURL, TargetPath: "pb-" + runtime.GOOS + "-" + runtime.GOARCH}
+	return ArtifactTarget{Schema: ArtifactTargetSchemaV1, Kind: ArtifactKindPB, Version: version, Platform: runtime.GOOS, Architecture: runtime.GOARCH, RepositoryURL: repositoryURL, TargetPath: releaseindex.AssetName(runtime.GOOS, runtime.GOARCH)}
 }
 
 func TestFetchVerifiedArtifactThroughTUF(t *testing.T) {
 	body := []byte("verified pb binary")
-	repository := newTestTUFRepository(t, body, "2026.08.07", time.Now().UTC().Add(time.Hour))
+	repository := newTestTUFRepository(t, body, "2026.08.07.1", time.Now().UTC().Add(time.Hour))
 	server := repository.server(t)
 	defer server.Close()
-	path, err := fetchVerifiedArtifact(context.Background(), descriptor(server.URL, "2026.08.07"), filepath.Join(t.TempDir(), "tuf"), server.Client(), repository.root, runtime.GOOS, runtime.GOARCH)
+	path, err := fetchVerifiedArtifact(context.Background(), descriptor(server.URL, "2026.08.07.1"), filepath.Join(t.TempDir(), "tuf"), server.Client(), repository.root, runtime.GOOS, runtime.GOARCH)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,36 +165,36 @@ func TestFetchVerifiedArtifactThroughTUF(t *testing.T) {
 }
 
 func TestFetchVerifiedArtifactRejectsTargetMismatch(t *testing.T) {
-	repository := newTestTUFRepository(t, []byte("expected"), "2026.08.07", time.Now().UTC().Add(time.Hour))
+	repository := newTestTUFRepository(t, []byte("expected"), "2026.08.07.1", time.Now().UTC().Add(time.Hour))
 	for path := range repository.files {
-		if len(path) > len("/targets/") && path[:len("/targets/")] == "/targets/" {
+		if strings.Contains(path, "/releases/download/") {
 			repository.files[path] = []byte("tampered")
 		}
 	}
 	server := repository.server(t)
 	defer server.Close()
-	if _, err := fetchVerifiedArtifact(context.Background(), descriptor(server.URL, "2026.08.07"), filepath.Join(t.TempDir(), "tuf"), server.Client(), repository.root, runtime.GOOS, runtime.GOARCH); err == nil {
+	if _, err := fetchVerifiedArtifact(context.Background(), descriptor(server.URL, "2026.08.07.1"), filepath.Join(t.TempDir(), "tuf"), server.Client(), repository.root, runtime.GOOS, runtime.GOARCH); err == nil {
 		t.Fatal("tampered target was accepted")
 	}
 }
 
 func TestFetchVerifiedArtifactRejectsExpiredTimestampAndWrongVersion(t *testing.T) {
-	repository := newTestTUFRepository(t, []byte("pb"), "2026.08.07", time.Now().UTC().Add(-time.Minute))
+	repository := newTestTUFRepository(t, []byte("pb"), "2026.08.07.1", time.Now().UTC().Add(-time.Minute))
 	server := repository.server(t)
 	defer server.Close()
-	if _, err := fetchVerifiedArtifact(context.Background(), descriptor(server.URL, "2026.08.07"), filepath.Join(t.TempDir(), "expired-tuf"), server.Client(), repository.root, runtime.GOOS, runtime.GOARCH); err == nil {
+	if _, err := fetchVerifiedArtifact(context.Background(), descriptor(server.URL, "2026.08.07.1"), filepath.Join(t.TempDir(), "expired-tuf"), server.Client(), repository.root, runtime.GOOS, runtime.GOARCH); err == nil {
 		t.Fatal("expired timestamp was accepted")
 	}
-	repository = newTestTUFRepository(t, []byte("pb"), "2026.08.07", time.Now().UTC().Add(time.Hour))
+	repository = newTestTUFRepository(t, []byte("pb"), "2026.08.07.1", time.Now().UTC().Add(time.Hour))
 	server = repository.server(t)
 	defer server.Close()
-	if _, err := fetchVerifiedArtifact(context.Background(), descriptor(server.URL, "2026.08.08"), filepath.Join(t.TempDir(), "wrong-version-tuf"), server.Client(), repository.root, runtime.GOOS, runtime.GOARCH); !errors.Is(err, ErrArtifactMismatch) {
+	if _, err := fetchVerifiedArtifact(context.Background(), descriptor(server.URL, "2026.08.08.1"), filepath.Join(t.TempDir(), "wrong-version-tuf"), server.Client(), repository.root, runtime.GOOS, runtime.GOARCH); !errors.Is(err, ErrArtifactMismatch) {
 		t.Fatalf("wrong version error=%v", err)
 	}
 }
 
 func TestVerifyArtifactTargetRejectsWrongPlatformAndOrigin(t *testing.T) {
-	target := descriptor("https://updates.example.test/paperboat", "2026.08.07")
+	target := descriptor("https://updates.example.test/paperboat", "2026.08.07.1")
 	target.Platform = "unsupported"
 	if err := VerifyArtifactTarget(target); !errors.Is(err, ErrArtifactTarget) {
 		t.Fatalf("platform err=%v", err)
@@ -184,128 +224,8 @@ func TestFetchVerifiedReleaseComponentRejectsMissingTargetMetadata(t *testing.T)
 
 	now := time.Now().UTC()
 	index := testLinuxReleaseIndex()
-	if _, err := fetchVerifiedReleaseComponentWithRoot(context.Background(), server.URL, filepath.Join(t.TempDir(), "tuf"), index, "cli", server.Client(), now, repository.root, "linux", "amd64"); !errors.Is(err, ErrArtifactMismatch) {
+	if _, err := fetchVerifiedReleaseComponentWithRoot(context.Background(), server.URL, filepath.Join(t.TempDir(), "tuf"), index, "pb", server.Client(), now, repository.root, "linux", "amd64"); !errors.Is(err, ErrArtifactMismatch) {
 		t.Fatalf("missing signed target metadata error=%v", err)
-	}
-}
-
-func TestReleaseComponentCustomValidatesPlatformSchemas(t *testing.T) {
-	for _, fixture := range []struct {
-		platform, architecture, format string
-	}{
-		{"linux", "arm64", "elf"},
-		{"darwin", "arm64", "mach-o"},
-	} {
-		t.Run(fixture.platform, func(t *testing.T) {
-			index := releaseindex.Index{Version: "2026.08.22.22"}
-			target := releaseindex.Target{Component: "cli", Platform: fixture.platform, Architecture: fixture.architecture, BinaryFormat: fixture.format}
-			custom := testReleaseComponentCustom(index, target, nil)
-			raw := marshalJSON(t, custom)
-			decoded, ok := decodeReleaseComponentCustom(raw)
-			if !ok || !validReleaseComponentCustom(decoded, index, target, "cli") {
-				t.Fatal("matching published component schema was rejected")
-			}
-
-			custom.BinaryFormat = "unknown"
-			decoded, ok = decodeReleaseComponentCustom(marshalJSON(t, custom))
-			if !ok || validReleaseComponentCustom(decoded, index, target, "cli") {
-				t.Fatal("unknown binary_format was accepted")
-			}
-			custom = testReleaseComponentCustom(index, target, &tufWindowsNativeQualificationBinding{})
-			decoded, ok = decodeReleaseComponentCustom(marshalJSON(t, custom))
-			if !ok || validReleaseComponentCustom(decoded, index, target, "cli") {
-				t.Fatal("native qualification was accepted on a non-Windows component")
-			}
-			unknownField := append(append([]byte{}, raw[:len(raw)-1]...), []byte(`,"unexpected_binary_format":"elf"}`)...)
-			if _, ok := decodeReleaseComponentCustom(unknownField); ok {
-				t.Fatal("unknown component custom field was accepted")
-			}
-		})
-	}
-}
-
-func TestWindowsReleaseComponentQualificationBindsEvidence(t *testing.T) {
-	index := testWindowsReleaseIndex()
-	target, _ := index.Component("cli")
-	binding := testWindowsQualificationBinding(index, target)
-	custom := testReleaseComponentCustom(index, target, binding)
-	decoded, ok := decodeReleaseComponentCustom(marshalJSON(t, custom))
-	if !ok || !validReleaseComponentCustom(decoded, index, target, "cli") || !validWindowsNativeQualificationBinding(decoded.NativeQualification, index, target) {
-		t.Fatal("matching published Windows component schema was rejected")
-	}
-	custom.NativeQualification = nil
-	if validReleaseComponentCustom(custom, index, target, "cli") {
-		t.Fatal("Windows component without native qualification was accepted")
-	}
-	custom = testReleaseComponentCustom(index, target, binding)
-	custom.BinaryFormat = "elf"
-	if validReleaseComponentCustom(custom, index, target, "cli") {
-		t.Fatal("Windows component with a mismatched binary_format was accepted")
-	}
-	if !validWindowsNativeQualificationTargetCustom(marshalJSON(t, tufWindowsNativeQualificationTargetCustom{
-		Schema: "paperboat.windows-native-qualification/v1", Kind: "windows-native-qualification", Platform: "windows", Architecture: "amd64", Status: "passed",
-	}), target.Architecture) {
-		t.Fatal("matching Windows qualification target custom metadata was rejected")
-	}
-	evidence := testWindowsQualificationEvidence(index, binding)
-	evidenceRaw := marshalJSON(t, evidence)
-	if !validWindowsNativeQualificationEvidence(evidenceRaw, binding, index) {
-		t.Fatal("matching Windows qualification evidence was rejected")
-	}
-
-	binding.ArtifactSHA256 = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-	if validWindowsNativeQualificationBinding(binding, index, target) {
-		t.Fatal("qualification binding with a mismatched component digest was accepted")
-	}
-	binding = testWindowsQualificationBinding(index, target)
-	unknownField := append(append([]byte{}, evidenceRaw[:len(evidenceRaw)-1]...), []byte(`,"unexpected_evidence_field":true}`)...)
-	if validWindowsNativeQualificationEvidence(unknownField, binding, index) {
-		t.Fatal("qualification evidence with an unknown field was accepted")
-	}
-}
-
-func testReleaseComponentCustom(index releaseindex.Index, target releaseindex.Target, qualification *tufWindowsNativeQualificationBinding) tufReleaseComponentCustom {
-	return tufReleaseComponentCustom{
-		Schema: "paperboat.tuf-component/v1", Kind: "component", Component: target.Component, Version: index.Version,
-		Platform: target.Platform, Architecture: target.Architecture, BinaryFormat: target.BinaryFormat, NativeQualification: qualification,
-	}
-}
-
-func testWindowsReleaseIndex() releaseindex.Index {
-	components := []string{"cli", "runtime", "hostd", "updater", "launcher"}
-	targets := make([]releaseindex.Target, 0, len(components))
-	for number, component := range components {
-		targets = append(targets, releaseindex.Target{
-			Component: component, TargetPath: component + "-windows-amd64", SHA256: fmt.Sprintf("%064x", number+1), Length: int64(number + 1),
-			Platform: "windows", Architecture: "amd64", BinaryFormat: "pe",
-		})
-	}
-	return releaseindex.Index{
-		Version: "2026.08.22.22", Platform: "windows", Architecture: "amd64", BinaryFormat: "pe", Targets: targets,
-		Stability: "stable", NativeTested: true, TestedWindowsBuilds: []string{"26100"},
-	}
-}
-
-func testWindowsQualificationBinding(index releaseindex.Index, target releaseindex.Target) *tufWindowsNativeQualificationBinding {
-	return &tufWindowsNativeQualificationBinding{
-		Schema: "paperboat.windows-native-qualification/v1", EvidenceTarget: "windows-amd64-native-qualification.json",
-		EvidenceSHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ReleaseVersion: index.Version,
-		Platform: "windows", Architecture: "amd64", Status: "passed", NativeTested: true, WindowsBuild: "26100", Runner: "windows-2025",
-		ArtifactSHA256: target.SHA256, ArtifactLength: target.Length,
-	}
-}
-
-func testWindowsQualificationEvidence(index releaseindex.Index, binding *tufWindowsNativeQualificationBinding) tufWindowsNativeQualification {
-	artifacts := make([]tufWindowsNativeQualifiedArtifact, 0, len(index.Targets))
-	for _, target := range index.Targets {
-		artifacts = append(artifacts, tufWindowsNativeQualifiedArtifact{
-			Component: target.Component, TargetPath: target.TargetPath, SHA256: target.SHA256, Length: target.Length,
-			Platform: "windows", Architecture: "amd64", Status: "passed",
-		})
-	}
-	return tufWindowsNativeQualification{
-		Schema: "paperboat.windows-native-qualification/v1", ReleaseVersion: index.Version, Platform: "windows", Architecture: "amd64",
-		Status: "passed", NativeTested: true, WindowsBuild: binding.WindowsBuild, Runner: binding.Runner, Artifacts: artifacts,
 	}
 }
 
@@ -382,14 +302,8 @@ func newTestReleaseComponentRepositoryWithoutTargets(t *testing.T) testTUFReposi
 }
 
 func testLinuxReleaseIndex() releaseindex.Index {
-	components := []string{"cli", "runtime", "hostd", "updater", "launcher"}
-	targets := make([]releaseindex.Target, 0, len(components))
-	for number, component := range components {
-		targets = append(targets, releaseindex.Target{
-			Component: component, TargetPath: component + "-linux-amd64", SHA256: fmt.Sprintf("%064x", number+1), Length: int64(number + 1),
-			Platform: "linux", Architecture: "amd64", BinaryFormat: "elf",
-		})
-	}
+	name := releaseindex.AssetName("linux", "amd64")
+	targets := []releaseindex.Target{{Component: "pb", TargetPath: name, AssetName: name, Repository: "pinksaucepasta/paperboat-cli", DownloadURL: "https://github.com/pinksaucepasta/paperboat-cli/releases/download/2026.08.22.22/" + name, SHA256: fmt.Sprintf("%064x", 1), Length: 1, Platform: "linux", Architecture: "amd64", BinaryFormat: "elf"}}
 	return releaseindex.Index{
 		Schema: releaseindex.SchemaV1, ReleaseID: "rel_2026.08.22.22", Version: "2026.08.22.22", Channel: "stable", Severity: "routine",
 		CreatedAt: time.Now().UTC(), Platform: "linux", Architecture: "amd64", BinaryFormat: "elf", Targets: targets,

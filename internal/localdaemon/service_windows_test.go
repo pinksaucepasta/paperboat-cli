@@ -76,24 +76,23 @@ func TestInstallWindowsCurrentUserServiceStartsDetachedUserDaemon(t *testing.T) 
 	}
 }
 
-func TestResolveManagedWindowsDaemonExecutableUsesStableLauncherForReleaseSlot(t *testing.T) {
+func TestResolveManagedWindowsDaemonExecutableUsesStableBinary(t *testing.T) {
 	root := t.TempDir()
 	layout := hostruntimeservice.Layout{
 		InstallRoot: root,
-		CLICurrent:  filepath.Join(root, "releases", "cli-current", "pb.exe"),
+		Binary:      filepath.Join(root, "bin", "pb.exe"),
 	}
-	launcher := filepath.Join(root, "bin", "pb.exe")
-	activeSlot := filepath.Join(filepath.Dir(layout.CLICurrent), "pb.slot-next.exe")
-	valid := func(path string) bool { return strings.EqualFold(path, launcher) }
-	if got := resolveManagedWindowsDaemonExecutable(activeSlot, layout, valid); !strings.EqualFold(got, launcher) {
-		t.Fatalf("managed daemon executable = %q, want stable launcher %q", got, launcher)
+	stable := layout.Binary
+	valid := func(path string) bool { return strings.EqualFold(path, stable) }
+	if got := resolveManagedWindowsDaemonExecutable(stable, layout, valid); !strings.EqualFold(got, stable) {
+		t.Fatalf("managed daemon executable = %q, want stable binary %q", got, stable)
 	}
 	outside := filepath.Join(root, "fixture", "pb.exe")
 	if got := resolveManagedWindowsDaemonExecutable(outside, layout, valid); got != outside {
 		t.Fatalf("development executable = %q, want %q", got, outside)
 	}
-	if got := resolveManagedWindowsDaemonExecutable(activeSlot, layout, func(string) bool { return false }); got != activeSlot {
-		t.Fatalf("missing launcher fallback = %q, want %q", got, activeSlot)
+	if got := resolveManagedWindowsDaemonExecutable(stable, layout, func(string) bool { return false }); got != stable {
+		t.Fatalf("missing stable binary fallback = %q, want %q", got, stable)
 	}
 }
 

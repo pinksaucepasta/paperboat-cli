@@ -27,6 +27,12 @@ func (b *recordingWindowsActivationBackend) WriteJournal(j windowsActivationJour
 func (b *recordingWindowsActivationBackend) StopServices(context.Context) error {
 	return b.event("stop")
 }
+func (b *recordingWindowsActivationBackend) ActivateBinary(_ context.Context, _ windowsActivationJournal) error {
+	return b.event("activate")
+}
+func (b *recordingWindowsActivationBackend) RestoreBinary(_ context.Context, _ windowsActivationJournal) error {
+	return b.event("restore")
+}
 func (b *recordingWindowsActivationBackend) SetServiceTargets(_ context.Context, h, _, _ windowsServiceTarget) error {
 	return b.event("targets:" + h.Executable)
 }
@@ -45,7 +51,9 @@ func (b *recordingWindowsActivationBackend) Quarantine(context.Context, windowsA
 
 func testWindowsActivationJournal() windowsActivationJournal {
 	c := windowsActivationComponent{Path: `C:\Paperboat\candidate.exe`, SHA256: strings.Repeat("a", 64), Length: 1}
-	return windowsActivationJournal{Schema: windowsActivationJournalSchema, TransactionID: strings.Repeat("1", 32), PreviousVersion: "2026.08.22.1", Version: "2026.08.23.1", Architecture: "amd64", Stage: windowsActivationStaged, Runtime: c, CLI: c, Hostd: c, Updater: c, OldHostd: windowsServiceTarget{Executable: "old-hostd", Arguments: []string{"__runtime-hostd"}, WasRunning: true}, NewHostd: windowsServiceTarget{Executable: "new-hostd", Arguments: []string{"__runtime-hostd"}}, OldUpdater: windowsServiceTarget{Executable: "old-updater", Arguments: []string{"__runtime-updated"}, WasRunning: true}, NewUpdater: windowsServiceTarget{Executable: "new-updater", Arguments: []string{"__runtime-updated"}}, PreviousCLIRecord: "old.exe\n", NewCLIRecord: "new.exe\n"}
+	previous := c
+	previous.Path = `C:\Program Files\Paperboat\bin\pb.exe`
+	return windowsActivationJournal{Schema: windowsActivationJournalSchema, TransactionID: strings.Repeat("1", 32), PreviousVersion: "2026.08.22.1", Version: "2026.08.23.1", Architecture: "amd64", Stage: windowsActivationStaged, Runtime: c, CLI: c, Hostd: c, Updater: c, PreviousBinary: previous, OldHostd: windowsServiceTarget{Executable: `C:\Program Files\Paperboat\bin\pb.exe`, Arguments: []string{"__runtime-hostd"}, WasRunning: true}, NewHostd: windowsServiceTarget{Executable: `C:\Program Files\Paperboat\bin\pb.exe`, Arguments: []string{"__runtime-hostd"}}, OldUpdater: windowsServiceTarget{Executable: `C:\Program Files\Paperboat\bin\pb.exe`, Arguments: []string{"__runtime-updated"}, WasRunning: true}, NewUpdater: windowsServiceTarget{Executable: `C:\Program Files\Paperboat\bin\pb.exe`, Arguments: []string{"__runtime-updated"}}}
 }
 
 func TestWindowsActivationCommitsCLIOnlyAfterHealth(t *testing.T) {
@@ -54,7 +62,7 @@ func TestWindowsActivationCommitsCLIOnlyAfterHealth(t *testing.T) {
 	if err != nil || result.Stage != windowsActivationCommitted {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
-	want := []string{"journal:switching", "stop", "targets:new-hostd", "start", "journal:services_live", "health", "cli:new.exe\n", "journal:committed"}
+	want := []string{"journal:switching", "stop", "activate", "targets:C:\\Program Files\\Paperboat\\bin\\pb.exe", "start", "journal:services_live", "health", "cli:", "journal:committed"}
 	if !reflect.DeepEqual(b.events, want) {
 		t.Fatalf("events=%q want=%q", b.events, want)
 	}
@@ -66,7 +74,7 @@ func TestWindowsActivationHealthFailureRestoresExactOldTargetsAndCLI(t *testing.
 	if err == nil || result.Stage != windowsActivationRolledBack {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
-	wantTail := []string{"journal:rolling_back", "stop", "targets:old-hostd", "cli:old.exe\n", "quarantine", "journal:rollback_ready", "start", "journal:rolled_back"}
+	wantTail := []string{"journal:rolling_back", "stop", "restore", "targets:C:\\Program Files\\Paperboat\\bin\\pb.exe", "cli:", "quarantine", "journal:rollback_ready", "start", "journal:rolled_back"}
 	if !reflect.DeepEqual(b.events[len(b.events)-len(wantTail):], wantTail) {
 		t.Fatalf("events=%q", b.events)
 	}
@@ -112,7 +120,7 @@ func TestWindowsActivationRecoveryNeverContinuesAmbiguousCutover(t *testing.T) {
 }
 
 func TestWindowsActivationRollbackNeverRestartsAfterTargetFailure(t *testing.T) {
-	b := &recordingWindowsActivationBackend{fail: "targets:old-hostd"}
+	b := &recordingWindowsActivationBackend{fail: `targets:C:\Program Files\Paperboat\bin\pb.exe`}
 	result, err := rollbackWindowsActivation(context.Background(), b, testWindowsActivationJournal(), errors.New("candidate failed"))
 	if err == nil || result.Stage != windowsActivationRollingBack {
 		t.Fatalf("result=%+v err=%v", result, err)

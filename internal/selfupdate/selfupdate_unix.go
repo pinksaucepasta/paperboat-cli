@@ -60,7 +60,10 @@ func Resolve(ctx context.Context, releaseURL string, client *http.Client) (boots
 	return bootstrap.ArtifactTarget{Schema: bootstrap.ArtifactTargetSchemaV1, Kind: bootstrap.ArtifactKindPB, Version: current.Version, Platform: runtime.GOOS, Architecture: runtime.GOARCH, RepositoryURL: base.String() + "/tuf", TargetPath: "pb-" + runtime.GOOS + "-" + runtime.GOARCH}, nil
 }
 
-func InstallCLI(currentExecutable, verifiedArtifact string) error {
+// InstallBinary atomically replaces the one installed Paperboat executable
+// with a previously TUF-verified artifact. The caller may invoke this from a
+// temporary copy of pb when the current process cannot replace its own file.
+func InstallBinary(currentExecutable, verifiedArtifact string) error {
 	currentExecutable, err := filepath.Abs(currentExecutable)
 	if err != nil || !filepath.IsAbs(verifiedArtifact) {
 		return ErrInvalidRelease
@@ -125,6 +128,13 @@ func InstallCLI(currentExecutable, verifiedArtifact string) error {
 		return err
 	}
 	return nil
+}
+
+// InstallCLI is retained as a source-compatible name for older callers. CLI
+// and runtime are now the same signed executable, so it follows the unified
+// binary path exactly.
+func InstallCLI(currentExecutable, verifiedArtifact string) error {
+	return InstallBinary(currentExecutable, verifiedArtifact)
 }
 
 func validVersion(value string) bool {

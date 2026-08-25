@@ -20,6 +20,7 @@ import (
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/bootstrap"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/enrollment"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/releaseindex"
 )
 
 func TestConfirmRootBootstrapRequiresExplicitYes(t *testing.T) {
@@ -166,7 +167,7 @@ func TestPrepareInstallationReusesMatchingPersistedIdentity(t *testing.T) {
 	artifactServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(body) }))
 	defer artifactServer.Close()
 	manifest, _, _ := signedBootstrapArtifacts(t, artifactServer.URL+"/pb", body)
-	material := bootstrap.Material{UserMachineID: "um_reuse", UserMachineEnrollmentID: "ume_reuse", EnvironmentID: "env_reuse", HelperID: "helper_reuse", ReuseIdentity: true, Artifact: &manifest}
+	material := bootstrap.Material{UserMachineID: "machine_env_reuse", UserMachineEnrollmentID: "ume_reuse", EnvironmentID: "env_reuse", HelperID: "helper_reuse", ReuseIdentity: true, Artifact: &manifest}
 	client := &recordingEnrollmentClient{}
 	artifactPath := filepath.Join(stateRoot, "tuf", "targets", "pb")
 	if err := os.MkdirAll(filepath.Dir(artifactPath), 0o700); err != nil {
@@ -176,10 +177,15 @@ func TestPrepareInstallationReusesMatchingPersistedIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	previousFetcher := fetchBootstrapArtifact
+	previousMaterializer := materializeBootstrapArtifact
 	fetchBootstrapArtifact = func(context.Context, bootstrap.ArtifactTarget, string, *http.Client) (string, error) {
 		return artifactPath, nil
 	}
-	defer func() { fetchBootstrapArtifact = previousFetcher }()
+	materializeBootstrapArtifact = func(_ context.Context, path string) (string, error) { return path, nil }
+	defer func() {
+		fetchBootstrapArtifact = previousFetcher
+		materializeBootstrapArtifact = previousMaterializer
+	}()
 	path, err := prepareInstallation(context.Background(), &material, stateRoot, artifactServer.Client(), client)
 	if err != nil {
 		t.Fatal(err)
@@ -301,7 +307,7 @@ func signedBootstrapArtifacts(t *testing.T, artifactURL string, body []byte) (bo
 	t.Helper()
 	_ = artifactURL
 	_ = body
-	target := bootstrap.ArtifactTarget{Schema: bootstrap.ArtifactTargetSchemaV1, Kind: bootstrap.ArtifactKindPB, Version: "test", Platform: runtime.GOOS, Architecture: runtime.GOARCH, RepositoryURL: "https://updates.example.test/paperboat", TargetPath: "pb-" + runtime.GOOS + "-" + runtime.GOARCH}
+	target := bootstrap.ArtifactTarget{Schema: bootstrap.ArtifactTargetSchemaV1, Kind: bootstrap.ArtifactKindPB, Version: "2026.01.01.0", Platform: runtime.GOOS, Architecture: runtime.GOARCH, RepositoryURL: "https://updates.example.test/paperboat", TargetPath: releaseindex.AssetName(runtime.GOOS, runtime.GOARCH)}
 	return target, target, ""
 }
 

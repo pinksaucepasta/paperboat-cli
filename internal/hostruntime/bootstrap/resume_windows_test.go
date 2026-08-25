@@ -7,6 +7,8 @@ import (
 	"runtime"
 	"testing"
 	"time"
+
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/releaseindex"
 )
 
 func TestSaveResumeAcceptsRealShapedWindowsClientMaterial(t *testing.T) {
@@ -26,7 +28,7 @@ func TestSaveResumeAcceptsRealShapedWindowsClientMaterial(t *testing.T) {
 		EnrollmentID:            "henr_716e2e",
 		EnrollmentCredential:    "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOP",
 		ExpiresAt:               now.Add(10 * time.Minute),
-		Artifact:                &ArtifactTarget{Schema: ArtifactTargetSchemaV1, Kind: ArtifactKindPB, Version: "2026.08.22.23", Platform: "windows", Architecture: runtime.GOARCH, RepositoryURL: "https://get.pprbt.dev/tuf", TargetPath: "pb-windows-" + runtime.GOARCH},
+		Artifact:                &ArtifactTarget{Schema: ArtifactTargetSchemaV1, Kind: ArtifactKindPB, Version: "2026.08.22.23", Platform: "windows", Architecture: runtime.GOARCH, RepositoryURL: "https://get.pprbt.dev/tuf", TargetPath: releaseindex.AssetName("windows", runtime.GOARCH)},
 		HelperListenAddress:     "127.0.0.1:38080",
 		InstallationGeneration:  8,
 		SetupRoles:              []string{"interactive"},

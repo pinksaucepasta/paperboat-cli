@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/bootstrap"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/releaseindex"
 )
 
 func TestDecodeRejectsUnknownAndTrailingFields(t *testing.T) {
@@ -179,7 +180,7 @@ func validRequest(t *testing.T) Request {
 	if err := os.WriteFile(executable, body, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	manifest := bootstrap.ArtifactTarget{Schema: bootstrap.ArtifactTargetSchemaV1, Kind: bootstrap.ArtifactKindPB, Version: "test", Platform: runtime.GOOS, Architecture: runtime.GOARCH, RepositoryURL: "https://updates.example.test/paperboat", TargetPath: "pb-" + runtime.GOOS + "-" + runtime.GOARCH}
+	manifest := bootstrap.ArtifactTarget{Schema: bootstrap.ArtifactTargetSchemaV1, Kind: bootstrap.ArtifactKindPB, Version: "test", Platform: runtime.GOOS, Architecture: runtime.GOARCH, RepositoryURL: "https://updates.example.test/paperboat", TargetPath: releaseindex.AssetName(runtime.GOOS, runtime.GOARCH)}
 	state := t.TempDir()
 	state, err = filepath.EvalSymlinks(state)
 	if err != nil {

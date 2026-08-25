@@ -157,23 +157,21 @@ truncated at `observability.max_event_log_bytes` rather than growing without lim
 
 ```sh
 make build      # -> bin/pb
-make release-metadata # binary checksum + provenance metadata in dist/
+make release-assets   # the five native release assets in dist/
 make install    # install pb
 make test       # unit tests (paste parser + file-transfer pipeline)
 ```
 
-`YYYY.MM.DD.X` tags prepare provenance-attested archives for the supported Darwin, Linux,
-and Windows architectures, plus checksums and an SPDX SBOM. Windows artifacts are not
-described or published as signed unless an optional protected signing gate has verified
-Authenticode signatures, publisher identity, RFC 3161 timestamps, and post-signing checksums.
-Use `tools/release-version.sh next` to generate the next tag; tags have no `v` prefix.
-Android archives target API 24 and link against Bionic so Termux uses Android's native DNS resolver.
+`YYYY.MM.DD.X` tags build and publish the five native assets after their platform checks and
+GitHub API digest verification. Use `tools/release-version.sh next` to generate the next tag;
+tags have no `v` prefix.
 
-Native Windows MSI, portable ZIP, and WinGet packaging sources live in
-[`packaging/windows`](packaging/windows). The MSI builder runs only with an installed WiX
-Toolset on Windows and emits unsigned output. Authenticode signing and RFC 3161 timestamping
-are optional release-authority enhancements. Windows amd64 and arm64 are stable targets after
-their native release qualification passes.
+Releases contain one complete `pb` asset per supported platform and architecture:
+Windows amd64/arm64 PE executables, Linux amd64/arm64 raw ELF executables, and one signed
+and notarized macOS arm64 installer package. Users install through
+[`https://get.pprbt.dev/install`](https://get.pprbt.dev/install); the installer verifies
+`current.json`, downloads the selected bytes from the immutable GitHub release URL, and
+checks the declared length and SHA-256 before installation.
 
 ## Stack
 

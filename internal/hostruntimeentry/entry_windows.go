@@ -168,7 +168,7 @@ func ApplyWindowsPreviewMutation(ctx context.Context, request WindowsPreviewMuta
 		if layoutErr != nil {
 			return layoutErr
 		}
-		executable, err = evalWindowsPreviewExecutable(layout.RuntimeCurrent)
+		executable, err = evalWindowsPreviewExecutable(layout.Binary)
 		if err != nil {
 			return err
 		}
@@ -178,7 +178,7 @@ func ApplyWindowsPreviewMutation(ctx context.Context, request WindowsPreviewMuta
 		if layoutErr != nil {
 			return layoutErr
 		}
-		executable, err = evalWindowsPreviewExecutable(layout.RuntimeCurrent)
+		executable, err = evalWindowsPreviewExecutable(layout.Binary)
 		if err != nil {
 			return err
 		}
@@ -188,7 +188,7 @@ func ApplyWindowsPreviewMutation(ctx context.Context, request WindowsPreviewMuta
 		if layoutErr != nil {
 			return layoutErr
 		}
-		executable, err = evalWindowsPreviewExecutable(layout.RuntimeCurrent)
+		executable, err = evalWindowsPreviewExecutable(layout.Binary)
 		if err != nil {
 			return err
 		}

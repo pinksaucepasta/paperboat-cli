@@ -82,7 +82,7 @@ func (s TUFSource) resolveSupervisor(ctx context.Context, bypassCohort bool) (Re
 		return Release{}, false, nil
 	}
 	release, ok := releaseFromIndex(index)
-	if !ok || release.Hostd.SHA256 == "" || release.Updater.SHA256 == "" || release.Launcher.SHA256 == "" {
+	if !ok {
 		return Release{}, false, ErrInvalidRelease
 	}
 	return release, true, nil
@@ -105,11 +105,18 @@ func (s TUFSource) Active(ctx context.Context, version string) (Release, error) 
 }
 
 func (s TUFSource) Fetch(ctx context.Context, release Release) (io.ReadCloser, error) {
-	return s.FetchComponent(ctx, release, "runtime")
+	return s.FetchComponent(ctx, release, "pb")
 }
 
 func (s TUFSource) FetchComponent(ctx context.Context, release Release, component string) (io.ReadCloser, error) {
-	if component != "runtime" && component != "cli" && component != "hostd" && component != "updater" && component != "launcher" {
+	// Windows' SCM activation keeps role-labelled journal entries for
+	// compatibility, but every role is now the same signed pb artifact. Keep
+	// that translation here so callers cannot accidentally fetch a legacy
+	// component target that no longer exists in the signed index.
+	switch component {
+	case "pb", "runtime", "cli", "hostd", "updater", "launcher":
+		component = "pb"
+	default:
 		return nil, ErrInvalidRelease
 	}
 	now := s.now()
@@ -136,29 +143,23 @@ func (s TUFSource) now() time.Time {
 }
 
 func releaseFromIndex(index releaseindex.Index) (Release, bool) {
-	runtimeTarget, runtimeOK := index.Component("runtime")
-	cliTarget, cliOK := index.Component("cli")
-	hostdTarget, hostdOK := index.Component("hostd")
-	updaterTarget, updaterOK := index.Component("updater")
-	launcherTarget, launcherOK := index.Component("launcher")
-	if !runtimeOK || !cliOK || !hostdOK || !updaterOK || !launcherOK {
+	target, ok := index.Component("pb")
+	if !ok {
 		return Release{}, false
 	}
+	component := ComponentTarget{SHA256: target.SHA256, Length: target.Length, Platform: target.Platform, Architecture: target.Architecture}
 	return Release{
-		Version: index.Version, SHA256: runtimeTarget.SHA256, Length: runtimeTarget.Length, Platform: runtimeTarget.Platform, Architecture: runtimeTarget.Architecture,
-		CLISHA256: cliTarget.SHA256, CLILength: cliTarget.Length, CLIPlatform: cliTarget.Platform, CLIArchitecture: cliTarget.Architecture,
+		Version: index.Version, SHA256: target.SHA256, Length: target.Length, Platform: target.Platform, Architecture: target.Architecture,
+		CLISHA256: target.SHA256, CLILength: target.Length, CLIPlatform: target.Platform, CLIArchitecture: target.Architecture,
+		Hostd: component, Updater: component, Launcher: component,
 		HostdAPIMin: index.HostdAPIMin, HostdAPIMax: index.HostdAPIMax, RuntimeAPIMin: index.RuntimeAPIMin, RuntimeAPIMax: index.RuntimeAPIMax,
-		Hostd:                 ComponentTarget{SHA256: hostdTarget.SHA256, Length: hostdTarget.Length, Platform: hostdTarget.Platform, Architecture: hostdTarget.Architecture},
-		Updater:               ComponentTarget{SHA256: updaterTarget.SHA256, Length: updaterTarget.Length, Platform: updaterTarget.Platform, Architecture: updaterTarget.Architecture},
-		Launcher:              ComponentTarget{SHA256: launcherTarget.SHA256, Length: launcherTarget.Length, Platform: launcherTarget.Platform, Architecture: launcherTarget.Architecture},
 		SupervisorMaintenance: index.SupervisorMaintenance,
 	}, true
 }
 
 func sameReleaseTargets(a, b Release) bool {
 	return a.Version == b.Version && a.SHA256 == b.SHA256 && a.Length == b.Length && a.Platform == b.Platform && a.Architecture == b.Architecture &&
-		a.CLISHA256 == b.CLISHA256 && a.CLILength == b.CLILength && a.CLIPlatform == b.CLIPlatform && a.CLIArchitecture == b.CLIArchitecture &&
-		a.Hostd == b.Hostd && a.Updater == b.Updater && a.Launcher == b.Launcher && a.HostdAPIMin == b.HostdAPIMin && a.HostdAPIMax == b.HostdAPIMax && a.RuntimeAPIMin == b.RuntimeAPIMin && a.RuntimeAPIMax == b.RuntimeAPIMax && a.SupervisorMaintenance == b.SupervisorMaintenance
+		a.HostdAPIMin == b.HostdAPIMin && a.HostdAPIMax == b.HostdAPIMax && a.RuntimeAPIMin == b.RuntimeAPIMin && a.RuntimeAPIMax == b.RuntimeAPIMax && a.SupervisorMaintenance == b.SupervisorMaintenance
 }
 
 func openReadOnly(path string) (io.ReadCloser, error) { return os.Open(path) }

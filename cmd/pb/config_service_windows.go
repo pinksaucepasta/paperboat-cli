@@ -34,7 +34,7 @@ func windowsConfigServiceDefinition(stateRoot string) (service.Config, bool, err
 	}
 	return service.Config{
 		Platform: "windows", Kind: service.ConfigKind, ConfigRoot: hostinstall.WindowsProgramDataRoot(),
-		Executable: layout.RuntimeCurrent, User: "Paperboat", Group: "Paperboat",
+		Executable: layout.Binary, User: "Paperboat", Group: "Paperboat",
 		Arguments:  []string{"__runtime-config", "--state-root", install.StateRoot},
 		Controller: service.WindowsController{},
 	}, true, nil
@@ -63,7 +63,7 @@ func enterWindowsConfigService(stateRoot string) (bool, error) {
 	}
 	err = service.RunWindowsService(service.ServiceEntryConfig{
 		Name:        "PaperboatRuntimeConfig",
-		Executable:  layout.RuntimeCurrent,
+		Executable:  layout.Binary,
 		Arguments:   []string{"__runtime-config", "--state-root", install.StateRoot},
 		EnrolledSID: install.OwnerSID,
 		Environment: map[string]string{

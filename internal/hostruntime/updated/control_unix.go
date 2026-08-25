@@ -59,7 +59,7 @@ type controlServer struct {
 }
 
 func (s *controlServer) listen() (*net.UnixListener, error) {
-	if !filepath.IsAbs(s.socketPath) || s.uid <= 0 || s.gid < 0 || s.invoke == nil && s.invokeRequest == nil {
+	if !filepath.IsAbs(s.socketPath) || !validUnixWorkerIdentity(s.uid, s.gid) || s.invoke == nil && s.invokeRequest == nil {
 		return nil, ErrInvalidConfig
 	}
 	directory := filepath.Dir(s.socketPath)
@@ -194,26 +194,20 @@ func (s *Service) controlRequestWithRequest(ctx context.Context, request Control
 	case "status":
 		response := ControlResponse{Schema: ControlProtocolV1, Status: "ok", Observation: s.Snapshot()}
 		response.Version = s.manager.ActiveVersion()
-		response.Supervisor = s.supervisor.Status()
 		return response, nil
 	case "check":
 		response := ControlResponse{Schema: ControlProtocolV1, Status: "ok", Observation: s.Snapshot()}
 		result, err := s.Check(ctx)
 		response.Version, response.Updated = result.Version, result.Updated
-		response.Supervisor = s.supervisor.Status()
 		return response, err
 	case "update":
 		response := ControlResponse{Schema: ControlProtocolV1, Status: "ok", Observation: s.Snapshot()}
 		result, err := s.UpdateNow(ctx)
 		response.Version, response.Updated = result.Version, result.Updated
 		response.Observation = s.Snapshot()
-		response.Supervisor = s.supervisor.Status()
 		return response, err
 	case "approve-maintenance":
-		response := ControlResponse{Schema: ControlProtocolV1, Status: "ok", Observation: s.Snapshot()}
-		result, err := s.ApproveMaintenance(ctx, request.Release)
-		response.Version, response.Updated, response.Supervisor = result.Version, result.Applied, result
-		return response, err
+		return ControlResponse{Schema: ControlProtocolV1, Status: "error"}, ErrInvalidControl
 	default:
 		return ControlResponse{}, ErrInvalidControl
 	}
