@@ -263,7 +263,8 @@ jobs:
             runner = if ($env:RUNNER_NAME) { $env:RUNNER_NAME } else { '${{ matrix.runner }}' }
           }
           $qualificationPath = Join-Path $env:RUNNER_TEMP 'windows-${{ matrix.architecture }}-native-qualification.json'
-          $qualification | ConvertTo-Json -Compress | Set-Content -LiteralPath $qualificationPath -Encoding utf8NoBOM
+          $json = $qualification | ConvertTo-Json -Compress
+          [IO.File]::WriteAllText($qualificationPath, $json, (New-Object Text.UTF8Encoding($false)))
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-windows-${{ matrix.architecture }}
