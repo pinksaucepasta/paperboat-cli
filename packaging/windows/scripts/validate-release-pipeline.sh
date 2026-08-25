@@ -92,12 +92,15 @@ for required in (
 
 for required in (
     "workflow_call:", "platform-contract:",
+    "description: Native platform qualification target", "type: choice", "type: string",
+    "default: all", "options:", "- all", "- windows-arm64",
+    "include: >-", "${{ fromJSON(", "inputs.target == 'windows-arm64'",
     "timeout-minutes: 30",
-    "runner: blacksmith-2vcpu-ubuntu-2404",
-    "runner: blacksmith-2vcpu-ubuntu-2404-arm",
-    "runner: blacksmith-6vcpu-macos-latest",
-    "runner: blacksmith-2vcpu-windows-2025", "runner: windows-11-arm",
-    "architecture: amd64", "architecture: arm64",
+    '"runner":"blacksmith-2vcpu-ubuntu-2404"',
+    '"runner":"blacksmith-2vcpu-ubuntu-2404-arm"',
+    '"runner":"blacksmith-6vcpu-macos-latest"',
+    '"runner":"blacksmith-2vcpu-windows-2025"', '"runner":"windows-11-arm"',
+    '"architecture":"amd64"', '"architecture":"arm64"',
     'actual="$(go env GOOS)/$(go env GOARCH)"',
 ):
     if required not in qualification:
@@ -268,6 +271,10 @@ if active_state != expected_active_state:
     raise SystemExit("active TUF signing state does not match the current root-v2 role aliases")
 if "needs: [release-authority, windows-release-contract]" not in qualification_job:
     raise SystemExit("platform qualification must wait for protected release authority and the Windows contract gate")
+if "uses: ./.github/workflows/platform-qualification.yml" not in qualification_job:
+    raise SystemExit("release must call the platform qualification reusable workflow")
+if "with:" in qualification_job:
+    raise SystemExit("release must leave the platform qualification target at its all-platform default")
 for name, job in (("Linux release", linux_job), ("macOS release", macos_job), ("Windows release", windows_job)):
     if "needs: [release-authority, windows-release-contract, platform-qualification]" not in job:
         raise SystemExit(f"{name} must wait for protected authority, the Windows contract gate, and native platform qualification")

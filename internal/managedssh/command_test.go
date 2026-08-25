@@ -103,7 +103,13 @@ func completeSSHCommand(channel ssh.Channel, stdout, stderr string, status uint3
 	if _, err := io.WriteString(channel.Stderr(), stderr); err != nil {
 		return err
 	}
-	_, err := channel.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{status}))
+	if _, err := channel.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{status})); err != nil {
+		return err
+	}
+	// The server closes the channel as soon as this helper returns. Wait for
+	// the client's session request loop to consume the exit status first so a
+	// fast teardown cannot turn a real status into ssh.ExitMissingError.
+	_, err := channel.SendRequest("paperboat-test-exit-status-barrier", true, nil)
 	return err
 }
 

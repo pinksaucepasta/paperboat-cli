@@ -321,10 +321,22 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, requiredText := range []string{
+		"description: Native platform qualification target",
+		"type: choice",
+		"type: string",
+		"default: all",
+		"options:",
+		"- all",
+		"- windows-arm64",
+		"include: >-",
+		"${{ fromJSON(",
+		"inputs.target == 'windows-arm64'",
+		`'[{"os":"windows","architecture":"arm64","runner":"windows-11-arm"}]'`,
+		`'[{"os":"linux","architecture":"amd64","runner":"blacksmith-2vcpu-ubuntu-2404"}`,
 		"windows-2025",
 		"windows-11-arm",
-		"architecture: amd64",
-		"architecture: arm64",
+		`"architecture":"amd64"`,
+		`"architecture":"arm64"`,
 		"blacksmith-2vcpu-ubuntu-2404-arm",
 	} {
 		if !strings.Contains(string(workflow), requiredText) {
@@ -334,6 +346,19 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 	releaseWorkflow, err := os.ReadFile(filepath.Join(root, "..", "..", ".github", "workflows", "release.yml"))
 	if err != nil {
 		t.Fatal(err)
+	}
+	releaseText := string(releaseWorkflow)
+	releaseQualificationStart := strings.Index(releaseText, "  platform-qualification:")
+	releaseQualificationEnd := strings.Index(releaseText, "  windows-release-contract:")
+	if releaseQualificationStart < 0 || releaseQualificationEnd <= releaseQualificationStart {
+		t.Fatal("release workflow platform qualification call is missing")
+	}
+	releaseQualification := releaseText[releaseQualificationStart:releaseQualificationEnd]
+	if !strings.Contains(releaseQualification, "uses: ./.github/workflows/platform-qualification.yml") {
+		t.Fatal("release workflow must call the platform qualification reusable workflow")
+	}
+	if strings.Contains(releaseQualification, "with:") {
+		t.Fatal("release workflow must leave the platform qualification target at its all-platform default")
 	}
 	for _, requiredText := range []string{
 		"platform-qualification",
