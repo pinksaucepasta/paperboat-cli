@@ -651,7 +651,7 @@ jobs:
             -MsiCleanupTestExecutable $env:PAPERBOAT_WINDOWS_E2E_MSI_CLEANUP_TEST `
             -NativeTestExecutable $env:PAPERBOAT_WINDOWS_E2E_NATIVE_TEST `
             -OutputDirectory $env:PAPERBOAT_WINDOWS_E2E_OUTPUT
-          if ($LASTEXITCODE -ne 0) { throw 'Full native Windows MSI qualification failed.' }
+          if (-not $?) { throw 'Full native Windows MSI qualification failed.' }
       - name: Require passed native Windows qualification report
         shell: powershell
         run: |

@@ -636,6 +636,27 @@ func TestQualificationReportGateRequiresExactPreexistingStateEvent(t *testing.T)
 	}
 }
 
+func TestReleaseWorkflowUsesPowerShellStatusForQualificationScript(t *testing.T) {
+	root := packagingWindowsRoot(t)
+	workflowBytes, err := os.ReadFile(filepath.Join(root, "..", "..", ".github", "workflows", "release.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := string(workflowBytes)
+	start := strings.Index(workflow, "      - name: Execute full native Windows MSI qualification")
+	end := strings.Index(workflow, "      - name: Require passed native Windows qualification report")
+	if start < 0 || end <= start {
+		t.Fatal("native Windows qualification workflow step is missing")
+	}
+	step := workflow[start:end]
+	if !strings.Contains(step, "if (-not $?) { throw 'Full native Windows MSI qualification failed.' }") {
+		t.Fatal("PowerShell qualification script invocation must use its PowerShell success status")
+	}
+	if strings.Contains(step, "$LASTEXITCODE") {
+		t.Fatal("PowerShell qualification script invocation must not use stale native-process LASTEXITCODE")
+	}
+}
+
 func TestQualificationPreexistingStateSnapshotIsBeforeMutationAndExact(t *testing.T) {
 	root := packagingWindowsRoot(t)
 	harnessBytes, err := os.ReadFile(filepath.Join(root, "scripts", "Invoke-NativeWindowsQualification.ps1"))
