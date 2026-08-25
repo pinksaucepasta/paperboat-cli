@@ -233,6 +233,7 @@ func validateWix(root string, policy metadata) error {
 		`Value="none"`,
 		`CapabilityInstallation`,
 		`ExistingSystemSshd`,
+		`<RemoveFolder Id="RemoveEmptyInstallRoot" Directory="INSTALLFOLDER" On="uninstall" />`,
 	} {
 		if !strings.Contains(string(source), required) {
 			return fmt.Errorf("wix/Paperboat.wxs is missing %q", required)

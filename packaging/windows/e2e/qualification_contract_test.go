@@ -307,6 +307,7 @@ func TestQualificationHarnessFilesAndLifecycleContract(t *testing.T) {
 		"pb doctor --repair",
 		"QualificationInjectedRollback",
 		"PAPERBOAT_QUALIFY_ROLLBACK = 1",
+		"<RemoveFolder Id=\"RemoveEmptyInstallRoot\" Directory=\"INSTALLFOLDER\" On=\"uninstall\" />",
 	} {
 		if !strings.Contains(string(wixSource), requiredText) {
 			t.Fatalf("WiX uninstall cleanup contract is missing %q", requiredText)

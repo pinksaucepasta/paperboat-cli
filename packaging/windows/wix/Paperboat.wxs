@@ -127,6 +127,10 @@
             Part="last"
             System="yes"
             Permanent="no" />
+        <!-- Remove only the empty MSI-owned install root. Windows Installer
+             leaves non-empty directories untouched, so unknown residue stays
+             visible to qualification. -->
+        <RemoveFolder Id="RemoveEmptyInstallRoot" Directory="INSTALLFOLDER" On="uninstall" />
       </Component>
     </ComponentGroup>
   </Fragment>
