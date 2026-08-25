@@ -126,8 +126,18 @@ func ensureDPAPIDirectoryWithCreate(path, sddl string, create dpapiDirectoryCrea
 			} else if !dpapiObjectAlreadyExists(err) {
 				return err
 			}
-		} else if err := os.MkdirAll(path, 0o700); err != nil {
-			return err
+		} else {
+			// The Paperboat credential root's parent already exists. Create only
+			// the final component so success proves this process created the
+			// directory; MkdirAll cannot distinguish that from an attacker winning
+			// the stat/create race. The pinned handle below is then safe to assign
+			// to the current user even when Windows initially chooses the
+			// Administrators group as owner for an administrator account.
+			if mkdirErr := os.Mkdir(path, 0o700); mkdirErr == nil {
+				createdBelowTrustedParent = true
+			} else if !errors.Is(mkdirErr, os.ErrExist) {
+				return mkdirErr
+			}
 		}
 	}
 
