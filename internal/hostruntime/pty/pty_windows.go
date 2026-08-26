@@ -147,13 +147,11 @@ func (a *Adapter) Start(command Command) (*Process, error) {
 	}
 	startup := windows.StartupInfoEx{}
 	startup.Cb = uint32(unsafe.Sizeof(startup))
-	// Explicit null standard handles prevent the parent's console handles from
-	// interfering with ConPTY input/output. Windows Terminal and Tailscale use
-	// the same STARTF_USESTDHANDLES contract for pseudoconsole children.
-	startup.Flags = windows.STARTF_USESTDHANDLES
-	startup.StdInput = 0
-	startup.StdOutput = 0
-	startup.StdErr = 0
+	// Do not set STARTF_USESTDHANDLES here. ConPTY owns the child console
+	// streams through PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE; advertising null
+	// standard handles makes CreateProcess reject the launch with
+	// ERROR_INVALID_HANDLE, which is especially visible when hostd runs as a
+	// Windows service without inherited console handles.
 	startup.ProcThreadAttributeList = attributes.List()
 	var processInfo windows.ProcessInformation
 	// CREATE_NEW_PROCESS_GROUP disables Ctrl+C handling for the new process.
