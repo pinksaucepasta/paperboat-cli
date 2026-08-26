@@ -339,7 +339,7 @@ func hostRuntimeCommand() *cobra.Command {
 		Args:   commandArgs(cobra.NoArgs),
 		RunE: func(command *cobra.Command, _ []string) error {
 			code := hostruntimecmd.Execute(
-				command.Context(), []string{"hostd"}, command.InOrStdin(), command.OutOrStdout(), command.ErrOrStderr(),
+				command.Context(), []string{"run"}, command.InOrStdin(), command.OutOrStdout(), command.ErrOrStderr(),
 			)
 			if code != 0 {
 				return exitCodeError{code: code}
