@@ -146,6 +146,17 @@ type LaunchdController struct {
 	UserDomain bool
 }
 
+func launchdServiceAbsent(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "no such process") ||
+		strings.Contains(message, "could not find service") ||
+		strings.Contains(message, "service not found") ||
+		strings.Contains(message, "does not exist")
+}
+
 func (c LaunchdController) label() string {
 	if c.Label != "" {
 		return c.Label
@@ -163,7 +174,7 @@ func (c LaunchdController) Apply(ctx context.Context, path string, upgrading boo
 	}
 	service := domain + "/" + c.label()
 	if upgrading {
-		if err := c.Runner.Run(ctx, "launchctl", "bootout", service); err != nil && !strings.Contains(err.Error(), "No such process") {
+		if err := c.Runner.Run(ctx, "launchctl", "bootout", service); err != nil && !launchdServiceAbsent(err) {
 			return err
 		}
 	}
@@ -200,7 +211,7 @@ func (c LaunchdController) Remove(ctx context.Context, _ string) error {
 		domain = fmt.Sprintf("gui/%d", c.UID)
 	}
 	err := c.Runner.Run(ctx, "launchctl", "bootout", domain+"/"+c.label())
-	if err != nil && strings.Contains(err.Error(), "No such process") {
+	if err != nil && launchdServiceAbsent(err) {
 		return nil
 	}
 	return err

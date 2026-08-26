@@ -50,6 +50,9 @@ case "$release_url" in
   https://*) ;;
   *) echo "release metadata URL must use HTTPS" >&2; exit 1 ;;
 esac
+# Keep the control plane and update origin as one endpoint. The legacy flag is
+# accepted so older workflow invocations remain parse-compatible.
+release_url="$server_url"
 
 output_dir=$(dirname -- "$output")
 mkdir -p "$output_dir"

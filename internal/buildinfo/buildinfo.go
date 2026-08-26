@@ -20,6 +20,6 @@ var ProtocolVersion = "1"
 // may replace it with -ldflags, but official binaries work without setup.
 var DefaultServerURL = "https://api.pprbt.dev"
 
-// DefaultReleaseURL is the HTTPS origin serving the signed TUF repository.
-// Release builds replace it with the production release origin.
-var DefaultReleaseURL = ""
+// DefaultReleaseURL is retained for source compatibility. Release builds set
+// it to DefaultServerURL; the control plane is the sole update origin.
+var DefaultReleaseURL = DefaultServerURL
