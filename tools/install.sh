@@ -164,7 +164,14 @@ cleanup_existing() {
   rm -rf "$HOME/Library/Application Support/paperboat" "$HOME/.paperboat/runtime" "$HOME/.paperboat/state" "$HOME/.config/paperboat" "$HOME/.local/share/paperboat" "$HOME/.local/state/paperboat"
   # Remove the managed SSH include and selector key so a reinstall cannot
   # retain stale aliases, ports, or an agent socket from an older enrollment.
-  rm -f "$HOME/.ssh/paperboat_config" "$HOME/.ssh/paperboat-managed-ssh.pub"
+  if [ -f "$HOME/.ssh/config" ]; then
+    ssh_config_tmp=$(mktemp "${TMPDIR:-/tmp}/paperboat-ssh-config.XXXXXX")
+    awk '!index($0, "# paperboat-managed-ssh-include-v1")' "$HOME/.ssh/config" > "$ssh_config_tmp"
+    chmod 600 "$ssh_config_tmp"
+    mv -f "$ssh_config_tmp" "$HOME/.ssh/config"
+  fi
+  rm -f "$HOME/.ssh/paperboat_config" "$HOME/.ssh/paperboat-managed-ssh.pub" \
+    "$HOME/.ssh/.paperboat-config-install-v1.json" "$HOME/.ssh/.paperboat-config-transaction-v1.json"
   if [ "$os" = darwin ]; then
     sudo -n rm -f /usr/local/libexec/paperboat/pb 2>/dev/null || true
   else
