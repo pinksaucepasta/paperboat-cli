@@ -72,7 +72,14 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 		// name was supplied so a non-interactive curl|bash command never blocks
 		// or fails on an empty stdin stream.
 		if detected, detectErr := os.Hostname(); detectErr == nil {
-			*name = strings.TrimSpace(detected)
+			detected = strings.TrimSpace(detected)
+			// macOS commonly reports a fully-qualified local hostname (for
+			// example, apple.lan), while machine names are single DNS labels.
+			// Keep the stable first label as the dashboard display name.
+			if dot := strings.IndexByte(detected, '.'); dot > 0 {
+				detected = detected[:dot]
+			}
+			*name = detected
 		}
 	}
 	*name = strings.TrimSpace(*name)
