@@ -89,11 +89,9 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	if err != nil || gid < 0 {
 		return errors.New("could not resolve enrolled gid")
 	}
-	if uid == 0 {
-		if err := confirmRootBootstrap(reader, stderr); err != nil {
-			return err
-		}
-	}
+	// Root is a supported enrollment account. Dashboard-issued one-shot
+	// commands are intentionally non-interactive, so do not require a
+	// confirmation prompt that would fail when stdin is piped from curl.
 	resolvedShell, err := resolveUserShell(*shell, os.Getenv)
 	if err != nil {
 		return err
