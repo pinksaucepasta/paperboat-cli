@@ -267,7 +267,11 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	// The one-shot installer invokes pb from the active installed slot. Windows
 	// keeps that image open, so the elevated commit process must run from a
 	// separate copy before it rotates the active slot.
-	elevated, err := os.CreateTemp(*stateRoot, ".pb-elevated-*.exe")
+	// The runtime state root is protected for credential custody and may be
+	// unreadable to an elevated administrator token. Stage the elevation copy
+	// in the user's temporary directory instead; it is still removed before
+	// bootstrap returns and never becomes an installed runtime artifact.
+	elevated, err := os.CreateTemp("", ".pb-elevated-*.exe")
 	if err != nil {
 		return fmt.Errorf("stage executable for administrator approval: %w", err)
 	}
