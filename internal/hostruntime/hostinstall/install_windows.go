@@ -16,6 +16,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -644,7 +645,28 @@ func Purge(ctx context.Context) error {
 	} else {
 		result = errors.Join(result, removePaperboatSSHState(ctx, windowsOpenSSHConfig(layout, "")))
 	}
-	return errors.Join(result, uninstallWindows(ctx, true))
+	// A service can have been removed already while its old pb.exe process is
+	// still alive. Terminate only the fixed Paperboat executable before deleting
+	// the release slots, otherwise pb.rollback.exe remains locked and a fresh
+	// dashboard install fails halfway through cleanup.
+	result = errors.Join(result, terminatePaperboatProcesses(ctx))
+	result = errors.Join(result, uninstallWindows(ctx, true))
+	return result
+}
+
+func terminatePaperboatProcesses(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	command := exec.CommandContext(ctx, "taskkill.exe", "/F", "/T", "/IM", "pb.exe")
+	if err := command.Run(); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 128 {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func uninstallWindows(ctx context.Context, purge bool) error {

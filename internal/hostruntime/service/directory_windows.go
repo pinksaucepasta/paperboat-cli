@@ -3,6 +3,7 @@
 package service
 
 import (
+	"errors"
 	"os"
 
 	"golang.org/x/sys/windows"
@@ -35,5 +36,9 @@ func prepareAtomicDirectory(directory string) error {
 // with os.Open and calling Sync returns access denied, so there is no second
 // POSIX-style directory fsync to perform after declaration removal.
 func syncServiceDirectory(path string) error {
-	return validateWindowsDirectoryNoReparse(path)
+	err := validateWindowsDirectoryNoReparse(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
 }
