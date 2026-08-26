@@ -3,7 +3,10 @@
 package pty
 
 import (
+	"slices"
+	"strings"
 	"testing"
+	"unicode/utf16"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -48,5 +51,33 @@ func TestAnonymousPipeKeepsOnlyConPTYEndpointInheritable(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestEnvironmentBlockUsesEmbeddedUTF16Terminators(t *testing.T) {
+	block, err := environmentBlock([]string{"TERM=xterm", "PATH=C:\\Windows\\System32"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if block == nil {
+		t.Fatal("environment block is nil")
+	}
+	// Bound the read to the exact number of UTF-16 code units required by the
+	// test environment. This avoids scanning past the allocated environment
+	// block while still checking both trailing terminators.
+	values := unsafe.Slice(block, len("PATH=C:\\Windows\\System32")+1+len("TERM=xterm")+2)
+	end := -1
+	for index := 0; index+1 < len(values); index++ {
+		if values[index] == 0 && values[index+1] == 0 {
+			end = index + 2
+			break
+		}
+	}
+	if end < 0 {
+		t.Fatal("environment block is not double-NUL terminated")
+	}
+	decoded := strings.TrimRight(string(utf16.Decode(values[:end])), "\x00")
+	if got, want := strings.Split(decoded, "\x00"), []string{"PATH=C:\\Windows\\System32", "TERM=xterm"}; !slices.Equal(got, want) {
+		t.Fatalf("environment block=%q want=%q", got, want)
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf16"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -415,7 +416,11 @@ func environmentBlock(environment []string) (*uint16, error) {
 	copyEnvironment := append([]string(nil), environment...)
 	// CreateProcess requires a sorted, double-NUL-terminated UTF-16 block.
 	sortStrings(copyEnvironment)
-	return windows.UTF16PtrFromString(strings.Join(copyEnvironment, "\x00") + "\x00")
+	// UTF16PtrFromString rejects embedded NULs, but the NUL separators are
+	// required by the CreateProcess environment-block contract. Encode the
+	// complete block directly and retain both terminators after the last entry.
+	block := utf16.Encode([]rune(strings.Join(copyEnvironment, "\x00") + "\x00\x00"))
+	return &block[0], nil
 }
 func sortStrings(values []string) {
 	for index := 1; index < len(values); index++ {
