@@ -20,7 +20,6 @@ install_dir_requested=false
 
 if [ -n "${PAPERBOAT_ENROLLMENT_TOKEN:-}" ]; then enrollment_token=$PAPERBOAT_ENROLLMENT_TOKEN; pair=true; fi
 if [ -n "${PAPERBOAT_MACHINE_NAME:-}" ]; then machine_name=$PAPERBOAT_MACHINE_NAME; fi
-if [ -n "${PAPERBOAT_SETUP_MODE:-}" ]; then pair_mode=$PAPERBOAT_SETUP_MODE; fi
 
 usage() {
   cat <<'EOF'
@@ -259,10 +258,8 @@ esac
 set --
 if [ -n "$machine_name" ]; then set -- "$@" --name "$machine_name"; fi
 if [ "$pair" = true ]; then
-  if [ -z "${PAPERBOAT_SETUP_MODE:-}" ]; then
-    first=${enrollment_token%${enrollment_token#?}}
-    case "$first" in 0|2|4|6|8|B|D|F|H|J|L|N|P|R|T|V|X|Z) pair_mode=host ;; *) pair_mode=client ;; esac
-  fi
+  first=${enrollment_token%${enrollment_token#?}}
+  case "$first" in 0|2|4|6|8|B|D|F|H|J|L|N|P|R|T|V|X|Z) pair_mode=host ;; *) pair_mode=client ;; esac
   set -- "$@" --setup-mode "$pair_mode"
   [ -z "$enrollment_token" ] || set -- "$@" --enrollment-token "$enrollment_token"
   [ -z "$enrollment_token_file" ] || set -- "$@" --enrollment-token-file "$enrollment_token_file"
