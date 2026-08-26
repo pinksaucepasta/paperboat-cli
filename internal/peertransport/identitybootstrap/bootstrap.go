@@ -87,10 +87,10 @@ type CLIRequest struct {
 	Fresh              bool
 }
 
-// EnrollCLI selects the only valid enrollment ceremony for the account. An
-// established root is never recreated or imported implicitly: the new CLI
-// generates endpoint-only keys and waits for a paired verifier to approve
-// them. Only an account with no root may execute the first-root bootstrap.
+// EnrollCLI selects the enrollment ceremony for the account. A dashboard
+// enrollment is a deliberate fresh install: it replaces any local identity
+// and uses the one-shot authorization to bootstrap a new account root without
+// requiring another endpoint to approve the machine.
 func EnrollCLI(ctx context.Context, request CLIRequest) (Result, error) {
 	existing := ExistingRootRequest{
 		Store: request.Store, Client: request.Client, Issuer: request.Issuer,
@@ -98,11 +98,7 @@ func EnrollCLI(ctx context.Context, request CLIRequest) (Result, error) {
 		Now: request.Now, PollInterval: request.PollInterval, Timeout: request.Timeout,
 	}
 	if request.Fresh {
-		if _, rootErr := request.Client.E2EERoot(ctx); api.IsNotFound(rootErr) {
-			return Bootstrap(ctx, Request{Store: request.Store, Client: request.Client, Issuer: request.Issuer, AccountID: request.AccountID, CLIClientSessionID: request.CLIClientSessionID, Now: request.Now, AllowRootReplacement: true})
-		} else if rootErr != nil {
-			return Result{}, rootErr
-		}
+		return Bootstrap(ctx, Request{Store: request.Store, Client: request.Client, Issuer: request.Issuer, AccountID: request.AccountID, CLIClientSessionID: request.CLIClientSessionID, Now: request.Now, AllowRootReplacement: true})
 	}
 	result, err := EnrollExistingRoot(ctx, existing)
 	if err == nil || !api.IsNotFound(err) {
