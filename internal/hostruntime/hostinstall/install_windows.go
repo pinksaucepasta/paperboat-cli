@@ -46,7 +46,7 @@ var (
 
 	removePaperboatSSHService = windowsopenssh.RemoveServiceOwned
 	removePaperboatSSHState   = windowsopenssh.RemovePaperboatState
-	installPaperboatSSH       = windowsopenssh.InstallService
+	setupPaperboatSSH         = windowsopenssh.Setup
 )
 
 var standaloneVersionPattern = regexp.MustCompile(`^[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]+$`)
@@ -405,7 +405,9 @@ func installWindowsSSHAfterActivation(ctx context.Context, request Request, layo
 	}
 	config := windowsOpenSSHConfig(layout, request.OwnerSID)
 	runtimeCurrent, _, _ := windowsRuntimePaths(layout)
-	return installPaperboatSSH(ctx, runtimeCurrent, filepath.Join(config.InstallRoot, "sshd.exe"), filepath.Join(config.StateRoot, "sshd_config"))
+	config.ServiceExecutable = runtimeCurrent
+	_, err := setupPaperboatSSH(ctx, config)
+	return err
 }
 
 func Commit(request Request) error {

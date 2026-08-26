@@ -16,14 +16,14 @@ func TestWindowsSSHServiceSetFollowsHostClientTransition(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	previousRemoveService, previousRemoveState, previousInstall := removePaperboatSSHService, removePaperboatSSHState, installPaperboatSSH
+	previousRemoveService, previousRemoveState, previousSetup := removePaperboatSSHService, removePaperboatSSHState, setupPaperboatSSH
 	t.Cleanup(func() {
 		removePaperboatSSHService = previousRemoveService
 		removePaperboatSSHState = previousRemoveState
-		installPaperboatSSH = previousInstall
+		setupPaperboatSSH = previousSetup
 	})
 	var removedService, removedState []windowsopenssh.Config
-	var installs []struct{ executable, sshd, config string }
+	var installs []windowsopenssh.Config
 	removePaperboatSSHService = func(_ context.Context, config windowsopenssh.Config) error {
 		removedService = append(removedService, config)
 		return nil
@@ -32,9 +32,9 @@ func TestWindowsSSHServiceSetFollowsHostClientTransition(t *testing.T) {
 		removedState = append(removedState, config)
 		return nil
 	}
-	installPaperboatSSH = func(_ context.Context, executable, sshd, config string) error {
-		installs = append(installs, struct{ executable, sshd, config string }{executable, sshd, config})
-		return nil
+	setupPaperboatSSH = func(_ context.Context, config windowsopenssh.Config) (windowsopenssh.SetupResult, error) {
+		installs = append(installs, config)
+		return windowsopenssh.SetupResult{}, nil
 	}
 	host := Request{SetupMode: "host", OwnerSID: "S-1-5-21-1-2-3-4"}
 	if err := removeWindowsSSHBeforeActivation(context.Background(), host, layout); err != nil {
@@ -61,7 +61,7 @@ func TestWindowsSSHServiceSetFollowsHostClientTransition(t *testing.T) {
 	if removedState[0].ServiceExecutable != layout.Binary {
 		t.Fatalf("SSH state ownership executable=%q want=%q", removedState[0].ServiceExecutable, layout.Binary)
 	}
-	if installs[0].executable != layout.Binary || installs[0].sshd != `C:\Program Files\OpenSSH\sshd.exe` || installs[0].config != `C:\ProgramData\Paperboat\ssh\sshd_config` {
+	if installs[0].ServiceExecutable != layout.Binary || installs[0].InstallRoot != `C:\Program Files\OpenSSH` || installs[0].StateRoot != `C:\ProgramData\Paperboat\ssh` {
 		t.Fatalf("host SSH install=%+v", installs[0])
 	}
 }

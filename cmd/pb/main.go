@@ -2017,15 +2017,6 @@ func pairCommand() *cobra.Command {
 			if !fresh {
 				serverURL = registration.ServerURL
 			}
-			setupMode, err := command.Flags().GetString("setup-mode")
-			if err != nil {
-				return err
-			}
-			if setupMode == "host" && runtime.GOOS == "windows" {
-				if _, err := setupPlatformHostPrerequisites(command.Context()); err != nil {
-					return fmt.Errorf("prepare Windows OpenSSH: %w", err)
-				}
-			}
 			arguments := []string{"bootstrap", "--server", serverURL}
 			for _, name := range []string{"enrollment-token", "enrollment-token-file", "name", "shell", "state-root", "setup-mode"} {
 				value, err := command.Flags().GetString(name)
