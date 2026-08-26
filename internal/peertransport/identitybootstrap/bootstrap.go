@@ -343,7 +343,7 @@ func Bootstrap(ctx context.Context, request Request) (Result, error) {
 	}
 	var keys config.PeerIdentityKeys
 	var err error
-	if rootExists {
+	if rootExists && !request.AllowRootReplacement {
 		keys, err = request.Store.PeerIdentityKeysForExistingRoot(request.Issuer, request.AccountID, request.CLIClientSessionID)
 		if errors.Is(err, config.ErrSecretNotFound) {
 			return Result{}, ErrPairingRequired
@@ -359,7 +359,7 @@ func Bootstrap(ctx context.Context, request Request) (Result, error) {
 	if !ok || len(rootPublic) != ed25519.PublicKeySize {
 		return Result{}, ErrInvalid
 	}
-	if rootExists {
+	if rootExists && !request.AllowRootReplacement {
 		remotePublic, decodeErr := base64.RawURLEncoding.Strict().DecodeString(remoteRoot.PublicKey)
 		remoteFingerprint := sha256.Sum256(rootPublic)
 		if decodeErr != nil || len(remotePublic) != ed25519.PublicKeySize || !bytes.Equal(remotePublic, rootPublic) || remoteRoot.Version != 1 || remoteRoot.Generation != 1 || remoteRoot.Fingerprint != hex.EncodeToString(remoteFingerprint[:]) {
