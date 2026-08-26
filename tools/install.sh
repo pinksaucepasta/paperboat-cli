@@ -162,6 +162,9 @@ cleanup_existing() {
   # Cover both the packaged macOS layout and the development layout used by
   # deploy-mac.sh. These are Paperboat-owned paths only.
   rm -rf "$HOME/Library/Application Support/paperboat" "$HOME/.paperboat/runtime" "$HOME/.paperboat/state" "$HOME/.config/paperboat" "$HOME/.local/share/paperboat" "$HOME/.local/state/paperboat"
+  # Remove the managed SSH include and selector key so a reinstall cannot
+  # retain stale aliases, ports, or an agent socket from an older enrollment.
+  rm -f "$HOME/.ssh/paperboat_config" "$HOME/.ssh/paperboat-managed-ssh.pub"
   if [ "$os" = darwin ]; then
     sudo -n rm -f /usr/local/libexec/paperboat/pb 2>/dev/null || true
   else
