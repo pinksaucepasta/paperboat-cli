@@ -98,7 +98,11 @@ func EnrollCLI(ctx context.Context, request CLIRequest) (Result, error) {
 		Now: request.Now, PollInterval: request.PollInterval, Timeout: request.Timeout,
 	}
 	if request.Fresh {
-		return Bootstrap(ctx, Request{Store: request.Store, Client: request.Client, Issuer: request.Issuer, AccountID: request.AccountID, CLIClientSessionID: request.CLIClientSessionID, Now: request.Now, AllowRootReplacement: true})
+		if _, rootErr := request.Client.E2EERoot(ctx); api.IsNotFound(rootErr) {
+			return Bootstrap(ctx, Request{Store: request.Store, Client: request.Client, Issuer: request.Issuer, AccountID: request.AccountID, CLIClientSessionID: request.CLIClientSessionID, Now: request.Now, AllowRootReplacement: true})
+		} else if rootErr != nil {
+			return Result{}, rootErr
+		}
 	}
 	result, err := EnrollExistingRoot(ctx, existing)
 	if err == nil || !api.IsNotFound(err) {
