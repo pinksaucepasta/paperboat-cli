@@ -123,7 +123,7 @@ func TestEnsureInitialUsesHelperIdentityAndRetriesWithStableOperation(t *testing
 		t.Fatal(err)
 	}
 	key := store.Current()
-	if err := store.SaveRegistration(identity.Registration{ServerURL: server.URL, MachineID: "mch_1", EnvironmentID: "env_1", PublicKeyID: key.ID, PublicIdentityKey: base64.RawURLEncoding.EncodeToString(key.Public()), InboxPath: filepath.Join(root, "inbox"), InstallationGeneration: 1, SetupMode: "client", SetupRoles: []string{"interactive"}, UpdatedAt: now}); err != nil {
+	if err := store.SaveRegistration(identity.Registration{ServerURL: server.URL, MachineID: "mch_1", EnvironmentID: "env_1", PublicKeyID: key.ID, PublicIdentityKey: base64.RawURLEncoding.EncodeToString(key.Public()), InboxPath: filepath.Join(root, "inbox"), InstallationGeneration: 1, SetupMode: "host", SetupRoles: []string{"host"}, UpdatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
 	source, err := NewSource(Config{ControlURL: server.URL, StateRoot: root, Transport: server.Client().Transport, Clock: func() time.Time { return now }})

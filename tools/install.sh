@@ -159,7 +159,14 @@ cleanup_existing() {
     rm -f "$HOME/.config/systemd/user/paperboat-local-daemon.service"
     rm -f "$HOME/.local/bin/pb"
   fi
-  rm -rf "$HOME/Library/Application Support/paperboat/runtime" "$HOME/Library/Application Support/paperboat/state" "$HOME/.config/paperboat" "$HOME/.local/share/paperboat"
+  # Cover both the packaged macOS layout and the development layout used by
+  # deploy-mac.sh. These are Paperboat-owned paths only.
+  rm -rf "$HOME/Library/Application Support/paperboat" "$HOME/.paperboat/runtime" "$HOME/.paperboat/state" "$HOME/.config/paperboat" "$HOME/.local/share/paperboat" "$HOME/.local/state/paperboat"
+  if [ "$os" = darwin ]; then
+    sudo -n rm -f /usr/local/libexec/paperboat/pb 2>/dev/null || true
+  else
+    rm -f /usr/local/libexec/paperboat/pb
+  fi
 }
 
 asset="pb-${os}-${arch}"

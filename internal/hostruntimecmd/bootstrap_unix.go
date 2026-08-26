@@ -156,6 +156,12 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	if err := saveBootstrapRegistration(identityStore, *serverURL, material, "", 0); err != nil {
 		return fmt.Errorf("save machine registration: %w", err)
 	}
+	// Client enrollments do not run the managed host runtime or mint a
+	// machine-control credential. Those are host-only responsibilities.
+	if material.SetupMode == "client" {
+		fmt.Fprintln(stderr, "Enrollment accepted. Client setup complete.")
+		return nil
+	}
 	fmt.Fprintln(stderr, "Enrollment accepted. Setting up the managed host service...")
 	client, err := enrollment.NewClient(nil, 15*time.Second)
 	if err != nil {

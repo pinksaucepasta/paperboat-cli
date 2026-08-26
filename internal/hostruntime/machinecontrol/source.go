@@ -144,7 +144,7 @@ func (s *Source) EnsureInitial(ctx context.Context) (string, error) {
 		return current.Credential, nil
 	}
 	registration, err := store.Registration()
-	if err != nil || registration.SetupMode != "client" {
+	if err != nil || registration.SetupMode != "host" {
 		return "", ErrInvalid
 	}
 	operationID := initialOperationID(registration, store.Current().ID)

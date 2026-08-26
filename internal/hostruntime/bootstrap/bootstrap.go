@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -28,6 +29,15 @@ var (
 	ErrPairingDenied           = errors.New("BYOD pairing was denied")
 	ErrPairingExpired          = errors.New("BYOD pairing expired")
 	ErrInstallationUnavailable = errors.New("BYOD installation material is unavailable")
+)
+
+const (
+	// maxBootstrapResponseBody bounds bytes retained from a server response.
+	// The request path already limits response reads to this size; keep the
+	// same bound on diagnostics so a malformed server cannot fill the terminal
+	// or an error log with unbounded data.
+	maxBootstrapResponseBody = 64 << 10
+	maxBootstrapErrorBody    = 8 << 10
 )
 
 type Config struct {
@@ -291,30 +301,29 @@ func request(ctx context.Context, client *http.Client, method, target string, bo
 		return err
 	}
 	defer response.Body.Close()
-	encoded, err := io.ReadAll(io.LimitReader(response.Body, 64<<10+1))
-	if err != nil || len(encoded) > 64<<10 {
+	encoded, err := io.ReadAll(io.LimitReader(response.Body, maxBootstrapResponseBody+1))
+	if err != nil || len(encoded) > maxBootstrapResponseBody {
 		return ErrInvalid
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		var envelope struct {
 			Error struct {
-				Code string `json:"code"`
+				Code    string `json:"code"`
+				Message string `json:"message"`
 			} `json:"error"`
 		}
-		if json.Unmarshal(encoded, &envelope) != nil {
-			return fmt.Errorf("%w: server status %d", ErrInvalid, response.StatusCode)
-		}
+		_ = json.Unmarshal(encoded, &envelope)
 		switch envelope.Error.Code {
 		case "machine_approval_pending", "user_machine_approval_pending":
-			return ErrApprovalPending
+			return bootstrapServerError(ErrApprovalPending, response.StatusCode, envelope.Error.Code, envelope.Error.Message, encoded)
 		case "machine_pairing_denied", "user_machine_pairing_denied":
-			return ErrPairingDenied
+			return bootstrapServerError(ErrPairingDenied, response.StatusCode, envelope.Error.Code, envelope.Error.Message, encoded)
 		case "machine_pairing_expired", "user_machine_pairing_expired":
-			return ErrPairingExpired
+			return bootstrapServerError(ErrPairingExpired, response.StatusCode, envelope.Error.Code, envelope.Error.Message, encoded)
 		case "machine_installation_unavailable", "user_machine_installation_unavailable":
-			return ErrInstallationUnavailable
+			return bootstrapServerError(ErrInstallationUnavailable, response.StatusCode, envelope.Error.Code, envelope.Error.Message, encoded)
 		default:
-			return fmt.Errorf("%w: server status %d", ErrInvalid, response.StatusCode)
+			return bootstrapServerError(ErrInvalid, response.StatusCode, envelope.Error.Code, envelope.Error.Message, encoded)
 		}
 	}
 	var envelope struct {
@@ -324,4 +333,39 @@ func request(ctx context.Context, client *http.Client, method, target string, bo
 		return ErrInvalid
 	}
 	return nil
+}
+
+func bootstrapServerError(kind error, status int, code, message string, body []byte) error {
+	// Keep the exact bounded response available in the diagnostic. Quoting it
+	// prevents server-controlled newlines or control bytes from forging output
+	// while retaining enough information to copy and inspect the body.
+	truncated := false
+	if len(body) > maxBootstrapErrorBody {
+		body = body[:maxBootstrapErrorBody]
+		truncated = true
+	}
+	bodyText := string(body)
+	parts := []string{fmt.Sprintf("server status %d", status)}
+	if code != "" {
+		parts = append(parts, "code "+quoteBootstrapDiagnostic(code, 256))
+	}
+	if message != "" {
+		parts = append(parts, "message "+quoteBootstrapDiagnostic(message, 2048))
+	}
+	if strings.TrimSpace(bodyText) != "" {
+		bodyDiagnostic := strconv.Quote(bodyText)
+		if truncated {
+			bodyDiagnostic += "...<truncated>"
+		}
+		parts = append(parts, "body "+bodyDiagnostic)
+	}
+	return fmt.Errorf("%w: %s", kind, strings.Join(parts, "; "))
+}
+
+func quoteBootstrapDiagnostic(value string, limit int) string {
+	value = strings.TrimSpace(value)
+	if len(value) > limit {
+		return strconv.Quote(value[:limit]) + "...<truncated>"
+	}
+	return strconv.Quote(value)
 }

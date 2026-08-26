@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -106,6 +108,58 @@ func TestDashboardEnrollmentTokenLengthContract(t *testing.T) {
 	config := Config{ServerURL: server.URL, EnrollmentToken: "8GXDIGUWR4E6YIGL0D6X0H3FNA", DisplayName: "Studio", WorkspaceRoot: workspace, Verifier: "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOP", PublicIdentityKey: testPublicIdentityKey, HTTP: server.Client()}
 	if _, err := CreatePairing(context.Background(), config); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestCreatePairingSurfacesServerErrorBody(t *testing.T) {
+	workspace, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverBody := `{"error":{"code":"invalid_user_machine_pairing","message":"Pairing details are invalid or unsupported.","request_id":"req_bootstrap_123","details":{"reason":"artifact unavailable"}}}`
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1/machines/pairings" {
+			http.NotFound(writer, request)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusBadRequest)
+		_, _ = writer.Write([]byte(serverBody))
+	}))
+	defer server.Close()
+
+	config := Config{ServerURL: server.URL, EnrollmentToken: "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOP", DisplayName: "Studio", WorkspaceRoot: workspace, Verifier: "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOP", PublicIdentityKey: testPublicIdentityKey, HTTP: server.Client()}
+	_, err = CreatePairing(context.Background(), config)
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("error = %v, want ErrInvalid", err)
+	}
+	if !strings.Contains(err.Error(), "invalid_user_machine_pairing") || !strings.Contains(err.Error(), "Pairing details are invalid or unsupported.") || !strings.Contains(err.Error(), strconv.Quote(serverBody)) {
+		t.Fatalf("error = %v, want server code, message, and exact bounded body", err)
+	}
+}
+
+func TestBootstrapServerErrorDiagnosticIsBounded(t *testing.T) {
+	workspace, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusBadRequest)
+		_, _ = writer.Write([]byte(`{"error":{"code":"invalid_user_machine_pairing","message":"` + strings.Repeat("m", maxBootstrapErrorBody) + `"}}`))
+	}))
+	defer server.Close()
+
+	config := Config{ServerURL: server.URL, EnrollmentToken: "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOP", DisplayName: "Studio", WorkspaceRoot: workspace, Verifier: "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOP", PublicIdentityKey: testPublicIdentityKey, HTTP: server.Client()}
+	_, err = CreatePairing(context.Background(), config)
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("error = %v, want ErrInvalid", err)
+	}
+	if !strings.Contains(err.Error(), "<truncated>") {
+		t.Fatalf("error = %v, want truncation marker", err)
+	}
+	if len(err.Error()) > maxBootstrapResponseBody {
+		t.Fatalf("error length = %d, want <= %d", len(err.Error()), maxBootstrapResponseBody)
 	}
 }
 
