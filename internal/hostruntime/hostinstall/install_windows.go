@@ -117,9 +117,18 @@ func WindowsHostdTokenPath() string { return filepath.Join(WindowsProgramDataRoo
 // InstallStandaloneBinary is the single Windows bootstrap elevation path.
 // The downloaded pb.exe invokes this command itself, so no launcher or
 // updater executable is fetched or installed separately.
-func InstallStandaloneBinary(ctx context.Context, source, version string) error {
+func InstallStandaloneBinary(ctx context.Context, source, version string, fresh bool) error {
 	if !isAdministrator() || ctx == nil || !safeAbsolute(source) || !standaloneVersionPattern.MatchString(version) {
 		return ErrInvalidRequest
+	}
+	if fresh {
+		// Dashboard enrollment is a replacement boundary. Remove the old
+		// services, credentials, managed SSH host keys, and machine-wide state
+		// before staging the verified runtime so a new machine identity cannot
+		// inherit authority from an earlier enrollment.
+		if err := Purge(ctx); err != nil {
+			return fmt.Errorf("purge previous Paperboat enrollment: %w", err)
+		}
 	}
 	layout, err := service.DefaultLayout("windows")
 	if err != nil || layout.Binary == "" {

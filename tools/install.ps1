@@ -9,12 +9,13 @@ $server = if ($env:PAPERBOAT_SERVER) { [string]$env:PAPERBOAT_SERVER } else { 'h
 $metadataUrl = if ($env:PAPERBOAT_RELEASE_METADATA_URL) { [string]$env:PAPERBOAT_RELEASE_METADATA_URL } else { "$server/current.json" }
 $token = [string]$env:PAPERBOAT_ENROLLMENT_TOKEN
 $name = [string]$env:PAPERBOAT_MACHINE_NAME
+$freshEnrollment = -not [string]::IsNullOrWhiteSpace($token)
 $requestedVersion = if ($env:PAPERBOAT_VERSION) { [string]$env:PAPERBOAT_VERSION } else { 'latest' }
 $repo = if ($env:PAPERBOAT_GITHUB_REPOSITORY) { [string]$env:PAPERBOAT_GITHUB_REPOSITORY } else { 'pinksaucepasta/paperboat-cli' }
 
 if ($metadataUrl -notmatch '^https://') { throw 'Paperboat release metadata URL must use HTTPS.' }
 if ($repo -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw 'Paperboat release repository is invalid.' }
-if (-not [string]::IsNullOrWhiteSpace($token) -and $token -notmatch '^[0-9A-Z]{26}$') { throw 'Paperboat enrollment token is invalid.' }
+if ($freshEnrollment -and $token -notmatch '^[0-9A-Z]{26}$') { throw 'Paperboat enrollment token is invalid.' }
 
 $arch = if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq 'Arm64') { 'arm64' } else { 'amd64' }
 $asset = "pb-windows-$arch.exe"
@@ -67,18 +68,21 @@ if ([int64]$file.Length -ne [int64]$assetMetadata.length) { throw "Paperboat rel
 $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $download).Hash.ToLowerInvariant()
 if ($actual -ne [string]$assetMetadata.sha256) { throw "Paperboat release asset digest verification failed for $asset." }
 
-if (-not [string]::IsNullOrWhiteSpace($token)) {
+if ($freshEnrollment) {
   # Stop managed services before replacing pb.exe. Windows keeps executable
   # handles open while services run, which otherwise makes a dashboard-issued
   # fresh install fail during self-upgrade.
   foreach ($serviceName in @('PaperboatHostd', 'PaperboatSshd', 'PaperboatUpdated')) {
     Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
   }
+
+  # A dashboard command is a replacement boundary, not an upgrade resume.
+  # Remove all per-user PB state. The next pair must generate a new
+  # machine identity and must never inherit another dashboard account's
+  # credentials or E2EE identity.
   foreach ($statePath in @(
-    (Join-Path $env:LOCALAPPDATA 'Paperboat\runtime'),
-    (Join-Path $env:LOCALAPPDATA 'Paperboat\state'),
-    (Join-Path $env:PROGRAMDATA 'Paperboat\runtime'),
-    (Join-Path $env:PROGRAMDATA 'Paperboat\state')
+    (Join-Path $env:LOCALAPPDATA 'Paperboat'),
+    (Join-Path $env:APPDATA 'Paperboat')
   )) {
     Remove-Item -LiteralPath $statePath -Recurse -Force -ErrorAction SilentlyContinue
   }
@@ -91,10 +95,11 @@ function Assert-InstalledVersion([string]$Path, [string]$ExpectedVersion) {
   return $output -match ("(?m)^.*\bVersion\s+" + [regex]::Escape($ExpectedVersion) + "\s*$")
 }
 
-if (-not (Assert-InstalledVersion $installedPb $version) -or (Get-FileHash -Algorithm SHA256 -LiteralPath $installedPb -ErrorAction SilentlyContinue).Hash.ToLowerInvariant() -ne $actual) {
+if ($freshEnrollment -or -not (Assert-InstalledVersion $installedPb $version) -or (Get-FileHash -Algorithm SHA256 -LiteralPath $installedPb -ErrorAction SilentlyContinue).Hash.ToLowerInvariant() -ne $actual) {
   # __install is implemented by the downloaded pb.exe itself. This is the
   # only elevation boundary and avoids downloading another executable.
   $arguments = @('__install', '--source', $download, '--version', $version)
+  if ($freshEnrollment) { $arguments += '--fresh' }
   $process = Start-Process -FilePath $download -ArgumentList $arguments -Verb RunAs -PassThru -WindowStyle Hidden
   if (-not $process.WaitForExit(1200000)) {
     try { $process.Kill() } finally { $process.WaitForExit() }
@@ -104,7 +109,7 @@ if (-not (Assert-InstalledVersion $installedPb $version) -or (Get-FileHash -Algo
 }
 if (-not (Assert-InstalledVersion $installedPb $version)) { throw "Installed Paperboat does not report release $version." }
 
-if (-not [string]::IsNullOrWhiteSpace($token)) {
+if ($freshEnrollment) {
   $first = $token.Substring(0, 1)
   $setupMode = if ('02468BDFHJLNPRTVXZ'.Contains($first)) { 'host' } else { 'client' }
   Remove-Item Env:PAPERBOAT_ENROLLMENT_TOKEN -ErrorAction SilentlyContinue

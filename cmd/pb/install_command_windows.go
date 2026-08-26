@@ -24,11 +24,16 @@ func platformInstallCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return hostinstall.InstallStandaloneBinary(command.Context(), source, version)
+			fresh, err := command.Flags().GetBool("fresh")
+			if err != nil {
+				return err
+			}
+			return hostinstall.InstallStandaloneBinary(command.Context(), source, version, fresh)
 		},
 	}
 	command.Flags().String("source", "", "verified downloaded pb.exe")
 	command.Flags().String("version", "", "release version")
+	command.Flags().Bool("fresh", false, "remove an older Paperboat enrollment before installation")
 	_ = command.MarkFlagRequired("source")
 	_ = command.MarkFlagRequired("version")
 	return command
