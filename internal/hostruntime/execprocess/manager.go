@@ -50,9 +50,10 @@ type Request struct {
 }
 
 type Result struct {
-	Code     int       `json:"code"`
-	Signal   string    `json:"signal,omitempty"`
-	ExitedAt time.Time `json:"exited_at"`
+	Code       int       `json:"code"`
+	Signal     string    `json:"signal,omitempty"`
+	ExitedAt   time.Time `json:"exited_at"`
+	StartError string    `json:"start_error,omitempty"`
 }
 
 type Snapshot struct {
@@ -497,7 +498,7 @@ func (e *Execution) run(parent context.Context) {
 	}
 	process, err := newProcess(processConfig{Request: e.request, WorkspaceRoot: e.manager.config.WorkspaceRoot, BaseEnvironment: e.manager.config.BaseEnvironment, ChunkBytes: e.manager.config.ChunkBytes, Output: e.output})
 	if err != nil {
-		e.finish(StateFailed, Result{ExitedAt: e.manager.config.Clock()}, "exec_start_failed")
+		e.finish(StateFailed, Result{ExitedAt: e.manager.config.Clock(), StartError: err.Error()}, "exec_start_failed")
 		return
 	}
 	if e.canceled() || ctx.Err() != nil {
@@ -505,7 +506,7 @@ func (e *Execution) run(parent context.Context) {
 		return
 	}
 	if err := process.Start(ctx); err != nil {
-		e.finish(StateFailed, Result{ExitedAt: e.manager.config.Clock()}, "exec_start_failed")
+		e.finish(StateFailed, Result{ExitedAt: e.manager.config.Clock(), StartError: err.Error()}, "exec_start_failed")
 		return
 	}
 	e.mu.Lock()
