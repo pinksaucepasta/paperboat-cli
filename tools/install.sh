@@ -133,11 +133,42 @@ case "$release_metadata_url" in
 esac
 command -v curl >/dev/null 2>&1 || { echo "pb installer: curl is required" >&2; exit 1; }
 
+# Always start from a clean local state.  Dashboard commands are one-shot
+# enrollment commands, so a stale daemon/config must never survive into the
+# new installation.  Cleanup is deliberately best-effort for paths that do
+# not exist and never touches user files outside Paperboat's own locations.
+cleanup_existing() {
+  old=/usr/local/bin/pb
+  if [ "$(id -u)" -eq 0 ]; then
+    launchctl bootout system/com.pinksaucepasta.paperboat.runtime-host 2>/dev/null || true
+    rm -f /Library/LaunchDaemons/com.pinksaucepasta.paperboat.runtime-host.plist
+    rm -rf "/Library/PrivilegedHelperTools/Paperboat" "/Library/Application Support/Paperboat"
+    rm -f "$old"
+  elif [ "$os" = darwin ]; then
+    sudo -n launchctl bootout system/com.pinksaucepasta.paperboat.runtime-host 2>/dev/null || true
+    sudo -n rm -f /Library/LaunchDaemons/com.pinksaucepasta.paperboat.runtime-host.plist "$old" 2>/dev/null || true
+    sudo -n rm -rf "/Library/PrivilegedHelperTools/Paperboat" "/Library/Application Support/Paperboat" 2>/dev/null || true
+  fi
+  if [ "$os" = darwin ]; then
+    launchctl bootout "gui/$(id -u)/com.pinksaucepasta.paperboat.local-daemon" 2>/dev/null || true
+    rm -f "$HOME/Library/LaunchAgents/com.pinksaucepasta.paperboat.local-daemon.plist"
+  else
+    systemctl --user disable --now paperboat-local-daemon.service 2>/dev/null || true
+    sudo -n systemctl disable --now paperboat-runtime-host.service 2>/dev/null || true
+    sudo -n rm -f /etc/systemd/system/paperboat-runtime-host.service 2>/dev/null || true
+    rm -f "$HOME/.config/systemd/user/paperboat-local-daemon.service"
+    rm -f "$HOME/.local/bin/pb"
+  fi
+  rm -rf "$HOME/Library/Application Support/paperboat/runtime" "$HOME/Library/Application Support/paperboat/state" "$HOME/.config/paperboat" "$HOME/.local/share/paperboat"
+}
+
 asset="pb-${os}-${arch}"
 [ "$os" != windows ] || asset="$asset.exe"
 [ "$os" != darwin ] || asset="$asset.pkg"
 format=elf
 [ "$os" != darwin ] || format=pkg
+
+cleanup_existing
 
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/paperboat-install.XXXXXX")
 trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
