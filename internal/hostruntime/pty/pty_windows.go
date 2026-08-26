@@ -379,7 +379,13 @@ func (p *Process) wait() {
 // subsequent ConPTY child launch fail from a service process.
 func anonymousPipe(inheritRead bool) (windows.Handle, windows.Handle, error) {
 	var read, write windows.Handle
-	if err := windows.CreatePipe(&read, &write, nil, 0); err != nil {
+	// CreatePseudoConsole requires the console-side endpoint to be inheritable.
+	// CreatePipe does not make handles inheritable when its security attributes
+	// argument is nil, even though the subsequent child launch uses the
+	// pseudoconsole attribute. Keep the host-side endpoint private immediately
+	// after creating the pair.
+	security := windows.SecurityAttributes{Length: uint32(unsafe.Sizeof(windows.SecurityAttributes{})), InheritHandle: 1}
+	if err := windows.CreatePipe(&read, &write, &security, 0); err != nil {
 		return 0, 0, err
 	}
 	private := read
