@@ -351,7 +351,10 @@ func ensureWindowsRuntimeEnrollment(ctx context.Context, material bootstrap.Mate
 }
 
 func ensureWindowsMachineControl(ctx context.Context, material bootstrap.Material, stateRoot string) error {
-	if material.SetupMode != "client" {
+	// Machine-control credentials are host-only. Client enrollments must not
+	// mint one, while Windows hosts need the same initial credential bootstrap
+	// as Unix hosts before their managed service starts.
+	if material.SetupMode != "host" {
 		return nil
 	}
 	source, err := machinecontrol.NewSource(machinecontrol.Config{ControlURL: material.ControlURL, StateRoot: stateRoot, Timeout: 15 * time.Second})
