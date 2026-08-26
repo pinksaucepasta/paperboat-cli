@@ -29,6 +29,7 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/health"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostinstall"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/identity"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/machinecontrol"
 	"github.com/pinksaucepasta/paperboat/internal/httptransport"
 	"github.com/pinksaucepasta/paperboat/internal/machinename"
 )
@@ -154,6 +155,13 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	}
 	if err := saveBootstrapRegistration(identityStore, *serverURL, material, "", 0); err != nil {
 		return fmt.Errorf("save machine registration: %w", err)
+	}
+	controlSource, err := machinecontrol.NewSource(machinecontrol.Config{ControlURL: material.ControlURL, StateRoot: *stateRoot, Timeout: 15 * time.Second})
+	if err != nil {
+		return fmt.Errorf("initialize machine control credential source: %w", err)
+	}
+	if _, err := controlSource.EnsureInitial(ctx); err != nil {
+		return fmt.Errorf("persist machine control credential: %w", err)
 	}
 	fmt.Fprintln(stderr, "Enrollment accepted. Setting up the managed host service...")
 	client, err := enrollment.NewClient(nil, 15*time.Second)
