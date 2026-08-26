@@ -66,10 +66,16 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 			token = ""
 		}
 	}
-	reader := bufio.NewReader(stdin)
-	if err := promptBootstrapValue(reader, stderr, "User machine name", name); err != nil {
-		return err
+	if strings.TrimSpace(*name) == "" {
+		// Dashboard one-shot commands intentionally contain only the opaque
+		// enrollment token. Use the operating-system hostname when no explicit
+		// name was supplied so a non-interactive curl|bash command never blocks
+		// or fails on an empty stdin stream.
+		if detected, detectErr := os.Hostname(); detectErr == nil {
+			*name = strings.TrimSpace(detected)
+		}
 	}
+	*name = strings.TrimSpace(*name)
 	if err := machinename.Validate(strings.TrimSpace(*name)); err != nil {
 		return fmt.Errorf("invalid machine name: %w", err)
 	}
