@@ -71,11 +71,11 @@ func (a *Adapter) Start(command Command) (*Process, error) {
 	if !validDimensions(command.Dimensions) {
 		return nil, ErrInvalidCommand
 	}
-	inputRead, inputWrite, err := anonymousPipe()
+	inputRead, inputWrite, err := anonymousPipe(true)
 	if err != nil {
 		return nil, fmt.Errorf("create ConPTY input pipe: %w", err)
 	}
-	outputRead, outputWrite, err := anonymousPipe()
+	outputRead, outputWrite, err := anonymousPipe(false)
 	if err != nil {
 		closeHandles(inputRead, inputWrite)
 		return nil, fmt.Errorf("create ConPTY output pipe: %w", err)
@@ -365,17 +365,20 @@ func (p *Process) wait() {
 	p.closeConsole()
 }
 
-func anonymousPipe() (windows.Handle, windows.Handle, error) {
+// anonymousPipe creates the pipe pair used by ConPTY. The pseudoconsole API
+// expects the console-side endpoint to remain inheritable while the host-side
+// endpoint stays private. Clearing inheritance on both ends makes the
+// subsequent ConPTY child launch fail from a service process.
+func anonymousPipe(inheritRead bool) (windows.Handle, windows.Handle, error) {
 	var read, write windows.Handle
 	if err := windows.CreatePipe(&read, &write, nil, 0); err != nil {
 		return 0, 0, err
 	}
-	if err := windows.SetHandleInformation(read, windows.HANDLE_FLAG_INHERIT, 0); err != nil {
-		windows.Close(read)
-		windows.Close(write)
-		return 0, 0, err
+	private := read
+	if inheritRead {
+		private = write
 	}
-	if err := windows.SetHandleInformation(write, windows.HANDLE_FLAG_INHERIT, 0); err != nil {
+	if err := windows.SetHandleInformation(private, windows.HANDLE_FLAG_INHERIT, 0); err != nil {
 		windows.Close(read)
 		windows.Close(write)
 		return 0, 0, err
