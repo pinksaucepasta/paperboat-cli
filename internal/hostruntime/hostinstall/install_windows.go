@@ -628,6 +628,11 @@ func Purge(ctx context.Context) error {
 	if !isAdministrator() {
 		return ErrNotPrivileged
 	}
+	if _, err := os.Stat(WindowsProgramDataRoot()); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
 	// Windows OpenSSH is a shared WinGet dependency. Purge only removes the
 	// dedicated PaperboatSshd service, Paperboat SSH keys/configuration, and
 	// firewall deltas that Paperboat recorded as its own. This must happen
