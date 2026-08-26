@@ -1185,7 +1185,7 @@ func stageWindowsBinary(ctx context.Context, source, current, rollback string, a
 	if err := validateWindowsRuntimeSecurity(temporaryPath, trustedOwner, publicDACL, "staged executable"); err != nil {
 		return err
 	}
-	if err := os.Remove(rollback); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := removeWindowsFileWithRetry(ctx, rollback); err != nil {
 		return err
 	}
 	if _, err := os.Stat(current); err == nil {
@@ -1203,6 +1203,23 @@ func stageWindowsBinary(ctx context.Context, source, current, rollback string, a
 		return err
 	}
 	return nil
+}
+
+func removeWindowsFileWithRetry(ctx context.Context, path string) error {
+	var last error
+	for attempt := 0; attempt < 10; attempt++ {
+		err := os.Remove(path)
+		if err == nil || errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		last = err
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+	return last
 }
 
 func ensureWindowsExecutableDirectory(path, readerSID string) error {
