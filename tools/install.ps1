@@ -67,6 +67,23 @@ if ([int64]$file.Length -ne [int64]$assetMetadata.length) { throw "Paperboat rel
 $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $download).Hash.ToLowerInvariant()
 if ($actual -ne [string]$assetMetadata.sha256) { throw "Paperboat release asset digest verification failed for $asset." }
 
+if (-not [string]::IsNullOrWhiteSpace($token)) {
+  # Stop managed services before replacing pb.exe. Windows keeps executable
+  # handles open while services run, which otherwise makes a dashboard-issued
+  # fresh install fail during self-upgrade.
+  foreach ($serviceName in @('PaperboatHostd', 'PaperboatSshd', 'PaperboatUpdated')) {
+    Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
+  }
+  foreach ($statePath in @(
+    (Join-Path $env:LOCALAPPDATA 'Paperboat\runtime'),
+    (Join-Path $env:LOCALAPPDATA 'Paperboat\state'),
+    (Join-Path $env:PROGRAMDATA 'Paperboat\runtime'),
+    (Join-Path $env:PROGRAMDATA 'Paperboat\state')
+  )) {
+    Remove-Item -LiteralPath $statePath -Recurse -Force -ErrorAction SilentlyContinue
+  }
+}
+
 function Assert-InstalledVersion([string]$Path, [string]$ExpectedVersion) {
   if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
   $output = (& $Path --version 2>&1 | Out-String)
@@ -88,20 +105,6 @@ if (-not (Assert-InstalledVersion $installedPb $version) -or (Get-FileHash -Algo
 if (-not (Assert-InstalledVersion $installedPb $version)) { throw "Installed Paperboat does not report release $version." }
 
 if (-not [string]::IsNullOrWhiteSpace($token)) {
-  # A dashboard command is a fresh installation contract. Remove stale
-  # machine bootstrap/runtime state before pairing so a new single-use token
-  # can never be rejected because of an abandoned previous enrollment.
-  foreach ($serviceName in @('PaperboatHostd', 'PaperboatSshd', 'PaperboatUpdated')) {
-    Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
-  }
-  foreach ($statePath in @(
-    (Join-Path $env:LOCALAPPDATA 'Paperboat\runtime'),
-    (Join-Path $env:LOCALAPPDATA 'Paperboat\state'),
-    (Join-Path $env:PROGRAMDATA 'Paperboat\runtime'),
-    (Join-Path $env:PROGRAMDATA 'Paperboat\state')
-  )) {
-    Remove-Item -LiteralPath $statePath -Recurse -Force -ErrorAction SilentlyContinue
-  }
   $first = $token.Substring(0, 1)
   $setupMode = if ('02468BDFHJLNPRTVXZ'.Contains($first)) { 'host' } else { 'client' }
   Remove-Item Env:PAPERBOAT_ENROLLMENT_TOKEN -ErrorAction SilentlyContinue
