@@ -78,7 +78,7 @@ func InstallClient(ctx context.Context, config ClientInstallConfig, stdin io.Rea
 	for {
 		requestHTTP, _ := http.NewRequestWithContext(readyCtx, http.MethodGet, "http://"+config.ListenAddress+"/healthz", nil)
 		response, requestErr := client.Do(requestHTTP)
-		if requestErr == nil && bootstrapWorkerReady(readyCtx, response, config.StateRoot, config.Artifact.Version, previousGeneration) {
+		if requestErr == nil && bootstrapWorkerReady(readyCtx, response, config.StateRoot, config.Artifact.Version, previousGeneration, false) {
 			if err := authorizeServiceOperation(ctx, artifactPath, "commit", request, stdout, stderr); err != nil {
 				return errors.Join(err, authorizeServiceOperation(ctx, artifactPath, "uninstall", request, stdout, stderr), workerCommand.Rollback())
 			}

@@ -215,7 +215,7 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	for {
 		request, _ := http.NewRequestWithContext(readyCtx, http.MethodGet, "http://"+material.HelperListenAddress+"/healthz", nil)
 		response, requestErr := healthClient.Do(request)
-		if requestErr == nil && bootstrapWorkerReady(readyCtx, response, *stateRoot, material.Artifact.Version, previousGeneration) {
+		if requestErr == nil && bootstrapWorkerReady(readyCtx, response, *stateRoot, material.Artifact.Version, previousGeneration, material.SetupMode == "host") {
 			if err := authorizeServiceOperation(ctx, executable, "commit", installRequest, stdout, stderr); err != nil {
 				failureErr := errors.Join(err, authorizeServiceOperation(ctx, executable, "uninstall", installRequest, stdout, stderr), workerCommand.Rollback())
 				return failBootstrapInstallation(ctx, failureErr, material, *stateRoot, "service_readiness")
@@ -226,7 +226,11 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 			if err := bootstrap.ClearResume(*stateRoot); err != nil {
 				return fmt.Errorf("clear completed machine enrollment resume state: %w", err)
 			}
-			fmt.Fprintln(stdout, "Paperboat host runtime is ready.")
+			if material.SetupMode == "client" {
+				fmt.Fprintln(stdout, "Paperboat client runtime is ready.")
+			} else {
+				fmt.Fprintln(stdout, "Paperboat host runtime is ready.")
+			}
 			return nil
 		}
 		if response != nil && response.Body != nil {
@@ -241,13 +245,16 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	}
 }
 
-func bootstrapWorkerReady(ctx context.Context, response *http.Response, stateRoot, expectedVersion string, previousGeneration uint64) bool {
+func bootstrapWorkerReady(ctx context.Context, response *http.Response, stateRoot, expectedVersion string, previousGeneration uint64, requireSystemService bool) bool {
 	if response == nil || response.Body == nil {
 		return false
 	}
 	defer response.Body.Close()
 	if !bootstrapHealthMatches(response, expectedVersion) || workerGeneration(stateRoot) <= previousGeneration || !serverHeartbeatReady(stateRoot, expectedVersion, previousGeneration) {
 		return false
+	}
+	if !requireSystemService {
+		return true
 	}
 	_, err := systemServiceScope(ctx)
 	return err == nil
