@@ -443,12 +443,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          existing=$(gh release view "$RELEASE_VERSION" --json assets --jq '.assets[].name')
+          upload_asset() {
+            local file="$1"
+            local attempt
+            for attempt in 1 2 3; do
+              if timeout --signal=TERM 300 gh release upload "$RELEASE_VERSION" "$file" --clobber; then
+                return 0
+              fi
+              if [ "$attempt" -lt 3 ]; then
+                sleep $((attempt * 10))
+              fi
+            done
+            echo "Timed out or failed uploading $(basename "$file") after 3 attempts." >&2
+            return 1
+          }
           while IFS= read -r file; do
-            name=$(basename "$file")
-            if ! printf '%s\n' "$existing" | grep -Fxq "$name"; then
-              gh release upload "$RELEASE_VERSION" "$file"
-            fi
+            upload_asset "$file"
           done < <(find dist -maxdepth 1 -type f -print | sort)
       - name: Verify GitHub asset bytes and exact asset set without re-downloading
         env:
