@@ -129,6 +129,9 @@ func InstallStandaloneBinary(ctx context.Context, source, version string, fresh 
 		if err := Purge(ctx); err != nil {
 			return fmt.Errorf("purge previous Paperboat enrollment: %w", err)
 		}
+		if err := os.RemoveAll(WindowsProgramDataRoot()); err != nil {
+			return fmt.Errorf("remove previous Paperboat machine state: %w", err)
+		}
 	}
 	layout, err := service.DefaultLayout("windows")
 	if err != nil || layout.Binary == "" {
