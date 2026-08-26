@@ -425,8 +425,23 @@ func (c *Client) EndpointCertificate(ctx context.Context, endpointID string, gen
 }
 
 func (c *Client) BootstrapE2EE(ctx context.Context, operationID string, input E2EEBootstrapInput) (E2EEBootstrapResult, error) {
+	return c.bootstrapE2EE(ctx, operationID, input, false)
+}
+
+// BootstrapE2EEFresh authorizes the one-shot dashboard enrollment ceremony to
+// establish a new account root on this freshly wiped machine. The server
+// accepts this only for the short-lived enrollment CLI session it issued.
+func (c *Client) BootstrapE2EEFresh(ctx context.Context, operationID string, input E2EEBootstrapInput) (E2EEBootstrapResult, error) {
+	return c.bootstrapE2EE(ctx, operationID, input, true)
+}
+
+func (c *Client) bootstrapE2EE(ctx context.Context, operationID string, input E2EEBootstrapInput, fresh bool) (E2EEBootstrapResult, error) {
 	var out E2EEBootstrapResult
-	if err := c.doWithHeaders(ctx, http.MethodPost, "/v1/e2ee/bootstrap", input, &out, http.Header{"Idempotency-Key": []string{operationID}}); err != nil {
+	headers := http.Header{"Idempotency-Key": []string{operationID}}
+	if fresh {
+		headers.Set("X-Paperboat-Fresh-Enrollment", "1")
+	}
+	if err := c.doWithHeaders(ctx, http.MethodPost, "/v1/e2ee/bootstrap", input, &out, headers); err != nil {
 		return E2EEBootstrapResult{}, err
 	}
 	return out, nil

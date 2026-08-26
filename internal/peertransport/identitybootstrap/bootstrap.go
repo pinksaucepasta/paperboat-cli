@@ -28,6 +28,10 @@ type Client interface {
 	BootstrapE2EE(context.Context, string, api.E2EEBootstrapInput) (api.E2EEBootstrapResult, error)
 }
 
+type FreshClient interface {
+	BootstrapE2EEFresh(context.Context, string, api.E2EEBootstrapInput) (api.E2EEBootstrapResult, error)
+}
+
 // ExistingRootClient is the small control-plane surface needed to enroll a
 // new CLI endpoint without ever possessing the account root private key.
 type ExistingRootClient interface {
@@ -45,12 +49,13 @@ type CLIClient interface {
 }
 
 type Request struct {
-	Store              config.ProfileStore
-	Client             Client
-	Issuer             string
-	AccountID          string
-	CLIClientSessionID string
-	Now                func() time.Time
+	Store                config.ProfileStore
+	Client               Client
+	Issuer               string
+	AccountID            string
+	CLIClientSessionID   string
+	Now                  func() time.Time
+	AllowRootReplacement bool
 }
 
 type Result struct {
@@ -79,6 +84,7 @@ type CLIRequest struct {
 	Now                func() time.Time
 	PollInterval       time.Duration
 	Timeout            time.Duration
+	Fresh              bool
 }
 
 // EnrollCLI selects the only valid enrollment ceremony for the account. An
@@ -90,6 +96,9 @@ func EnrollCLI(ctx context.Context, request CLIRequest) (Result, error) {
 		Store: request.Store, Client: request.Client, Issuer: request.Issuer,
 		AccountID: request.AccountID, CLIClientSessionID: request.CLIClientSessionID,
 		Now: request.Now, PollInterval: request.PollInterval, Timeout: request.Timeout,
+	}
+	if request.Fresh {
+		return Bootstrap(ctx, Request{Store: request.Store, Client: request.Client, Issuer: request.Issuer, AccountID: request.AccountID, CLIClientSessionID: request.CLIClientSessionID, Now: request.Now, AllowRootReplacement: true})
 	}
 	result, err := EnrollExistingRoot(ctx, existing)
 	if err == nil || !api.IsNotFound(err) {
@@ -367,7 +376,17 @@ func Bootstrap(ctx context.Context, request Request) (Result, error) {
 	certificateFingerprint := sha256.Sum256(raw)
 	operationID := "op_peer_bootstrap_" + hex.EncodeToString(certificateFingerprint[:16])
 	document := api.EndpointCertificateDocument{Version: 1, AccountID: request.AccountID, RootFingerprint: hex.EncodeToString(rootFingerprint[:]), EndpointID: request.CLIClientSessionID, Role: "cli", Generation: certificate.Claims.Generation, Serial: certificate.Claims.Serial, IssuedAt: certificate.Claims.IssuedAt.Format(time.RFC3339), ExpiresAt: certificate.Claims.ExpiresAt.Format(time.RFC3339), Certificate: base64.RawURLEncoding.EncodeToString(raw), CertificateFingerprint: hex.EncodeToString(certificateFingerprint[:])}
-	response, err := request.Client.BootstrapE2EE(ctx, operationID, api.E2EEBootstrapInput{RootPublicKey: base64.RawURLEncoding.EncodeToString(rootPublic), Certificate: document})
+	input := api.E2EEBootstrapInput{RootPublicKey: base64.RawURLEncoding.EncodeToString(rootPublic), Certificate: document}
+	var response api.E2EEBootstrapResult
+	if request.AllowRootReplacement {
+		fresh, ok := request.Client.(FreshClient)
+		if !ok {
+			return Result{}, ErrInvalid
+		}
+		response, err = fresh.BootstrapE2EEFresh(ctx, operationID, input)
+	} else {
+		response, err = request.Client.BootstrapE2EE(ctx, operationID, input)
+	}
 	if err != nil {
 		return Result{}, err
 	}

@@ -125,7 +125,7 @@ func reconcileBootstrapProfileMutation(store config.ProfileStore, profile config
 }
 
 func enrollBootstrapCLIIdentity(ctx context.Context, store config.ProfileStore, client bootstrapCLIClient, issuer string, me api.Me, sessionID string) error {
-	if _, err := identitybootstrap.EnrollCLI(ctx, identitybootstrap.CLIRequest{Store: store, Client: client, Issuer: issuer, AccountID: me.ID, CLIClientSessionID: sessionID}); err != nil {
+	if _, err := identitybootstrap.EnrollCLI(ctx, identitybootstrap.CLIRequest{Store: store, Client: client, Issuer: issuer, AccountID: me.ID, CLIClientSessionID: sessionID, Fresh: true}); err != nil {
 		return fmt.Errorf("enroll CLI peer identity: %w", err)
 	}
 	return nil
