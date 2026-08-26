@@ -175,8 +175,6 @@ asset="pb-${os}-${arch}"
 format=elf
 [ "$os" != darwin ] || format=pkg
 
-cleanup_existing
-
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/paperboat-install.XXXXXX")
 trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
 current_file="$tmp_dir/current.json"
@@ -216,7 +214,7 @@ expected_url="https://github.com/${repository}/releases/download/${version}/${as
 
 download="$tmp_dir/$asset"
 echo "Downloading Paperboat for ${os}/${arch}..." >&2
-curl -fL --proto '=https' --tlsv1.2 "$asset_url" -o "$download"
+curl --fail --location --show-error --silent --retry 5 --retry-delay 2 --connect-timeout 15 --max-time 900 --proto '=https' --tlsv1.2 "$asset_url" -o "$download"
 actual_length=$(wc -c < "$download" | tr -d ' ')
 [ "$actual_length" = "$expected_length" ] || { echo "pb installer: release asset length verification failed" >&2; exit 1; }
 if command -v shasum >/dev/null 2>&1; then
@@ -230,6 +228,9 @@ else
   exit 1
 fi
 [ "$actual" = "$expected" ] || { echo "pb installer: release asset digest verification failed" >&2; exit 1; }
+
+# Preserve the existing installation if download or verification fails.
+cleanup_existing
 
 if [ "$os" = darwin ]; then
   command -v installer >/dev/null 2>&1 || { echo "pb installer: macOS installer is required" >&2; exit 1; }
