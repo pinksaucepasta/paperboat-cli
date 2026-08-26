@@ -59,15 +59,7 @@ func NewAdapter(root string) (*Adapter, error) {
 	return &Adapter{root: resolved}, nil
 }
 
-func (a *Adapter) Start(command Command) (process *Process, retErr error) {
-	defer func() {
-		if retErr != nil {
-			// Native Windows PTY failures happen inside a service session, where
-			// the normal CLI diagnostics stream is not available. Keep one bounded
-			// local diagnostic so service-level failures can be repaired from logs.
-			_ = os.WriteFile(`C:\Windows\Temp\paperboat-pty-error.txt`, []byte(retErr.Error()), 0o600)
-		}
-	}()
+func (a *Adapter) Start(command Command) (*Process, error) {
 	path, err := ValidateProcessPolicy(command.Path, command.Args, command.Env)
 	if err != nil {
 		return nil, err
@@ -191,7 +183,7 @@ func (a *Adapter) Start(command Command) (process *Process, retErr error) {
 		return nil, fmt.Errorf("resume ConPTY process: %w", err)
 	}
 	windows.Close(processInfo.Thread)
-	process = &Process{
+	process := &Process{
 		input:   os.NewFile(uintptr(inputWrite), "paperboat-conpty-input"),
 		output:  os.NewFile(uintptr(outputRead), "paperboat-conpty-output"),
 		console: console, process: processInfo.Process, processID: processInfo.ProcessId, job: job, done: make(chan struct{}),
