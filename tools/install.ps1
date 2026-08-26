@@ -88,6 +88,20 @@ if (-not (Assert-InstalledVersion $installedPb $version) -or (Get-FileHash -Algo
 if (-not (Assert-InstalledVersion $installedPb $version)) { throw "Installed Paperboat does not report release $version." }
 
 if (-not [string]::IsNullOrWhiteSpace($token)) {
+  # A dashboard command is a fresh installation contract. Remove stale
+  # machine bootstrap/runtime state before pairing so a new single-use token
+  # can never be rejected because of an abandoned previous enrollment.
+  foreach ($serviceName in @('PaperboatHostd', 'PaperboatSshd', 'PaperboatUpdated')) {
+    Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
+  }
+  foreach ($statePath in @(
+    (Join-Path $env:LOCALAPPDATA 'Paperboat\runtime'),
+    (Join-Path $env:LOCALAPPDATA 'Paperboat\state'),
+    (Join-Path $env:PROGRAMDATA 'Paperboat\runtime'),
+    (Join-Path $env:PROGRAMDATA 'Paperboat\state')
+  )) {
+    Remove-Item -LiteralPath $statePath -Recurse -Force -ErrorAction SilentlyContinue
+  }
   $first = $token.Substring(0, 1)
   $setupMode = if ('02468BDFHJLNPRTVXZ'.Contains($first)) { 'host' } else { 'client' }
   Remove-Item Env:PAPERBOAT_ENROLLMENT_TOKEN -ErrorAction SilentlyContinue
