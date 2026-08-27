@@ -323,7 +323,35 @@ func TestWindowsUpdateReturnsStagedResultSoCanonicalCallerCanExit(t *testing.T) 
 	if err := writeUpdateResult(command, result, response.Version); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(output.String(), "staged") || !strings.Contains(output.String(), "pb update status") {
+	if !strings.Contains(output.String(), "staged") || !strings.Contains(output.String(), "Wait a few seconds") || !strings.Contains(output.String(), "pb update status") {
+		t.Fatalf("output = %q", output.String())
+	}
+}
+
+func TestUpdateStatusPreservesWindowsActivationState(t *testing.T) {
+	response := updated.ControlResponse{Version: "2026.08.27.50", Pending: true, ActivationFailure: "activation_failed"}
+	result := updateStatusCommandResult("2026.08.27.46", response)
+	if !result.ActivationPending || result.ActivationFailure != "activation_failed" {
+		t.Fatalf("result = %+v", result)
+	}
+	command, _, err := newRootCommand().Find([]string{"update", "status"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	command.SetOut(&output)
+	if err := writeUpdateStatusResult(command, result, false, ""); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "Activation: pending") {
+		t.Fatalf("output = %q", output.String())
+	}
+	result.ActivationPending = false
+	output.Reset()
+	if err := writeUpdateStatusResult(command, result, false, ""); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "Activation: failed (activation_failed)") {
 		t.Fatalf("output = %q", output.String())
 	}
 }

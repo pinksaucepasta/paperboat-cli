@@ -3107,13 +3107,15 @@ func signedUpdateAvailable(installed, latest string) (bool, error) {
 }
 
 type updateStatusResult struct {
-	CLIVersion       string    `json:"cli_version"`
-	RuntimeVersion   string    `json:"runtime_version"`
-	RuntimeAvailable bool      `json:"runtime_available"`
-	LastCheck        time.Time `json:"last_check,omitempty"`
-	NextCheck        time.Time `json:"next_check,omitempty"`
-	LastFailure      string    `json:"last_failure,omitempty"`
-	Supervisor       any       `json:"supervisor,omitempty"`
+	CLIVersion        string    `json:"cli_version"`
+	RuntimeVersion    string    `json:"runtime_version"`
+	RuntimeAvailable  bool      `json:"runtime_available"`
+	ActivationPending bool      `json:"activation_pending"`
+	ActivationFailure string    `json:"activation_failure,omitempty"`
+	LastCheck         time.Time `json:"last_check,omitempty"`
+	NextCheck         time.Time `json:"next_check,omitempty"`
+	LastFailure       string    `json:"last_failure,omitempty"`
+	Supervisor        any       `json:"supervisor,omitempty"`
 }
 
 func actionUpdateStatus(command *cobra.Command, _ []string) error {
@@ -3125,10 +3127,14 @@ func actionUpdateStatus(command *cobra.Command, _ []string) error {
 	}
 	response, err := client.Status(ctx)
 	if err == nil {
-		result := updateStatusResult{CLIVersion: buildinfo.Version, RuntimeVersion: response.Version, RuntimeAvailable: response.Version != "", LastCheck: response.Observation.CheckedAt, NextCheck: response.Observation.NextCheckAt, LastFailure: response.Observation.Failure, Supervisor: response.Supervisor}
+		result := updateStatusCommandResult(buildinfo.Version, response)
 		return writeUpdateStatusResult(command, result, response.Supervisor.MaintenanceRequired, response.Supervisor.StagedVersion)
 	}
 	return fmt.Errorf("read paperboat-updated status: %w", err)
+}
+
+func updateStatusCommandResult(cliVersion string, response updated.ControlResponse) updateStatusResult {
+	return updateStatusResult{CLIVersion: cliVersion, RuntimeVersion: response.Version, RuntimeAvailable: response.Version != "", ActivationPending: response.Pending, ActivationFailure: response.ActivationFailure, LastCheck: response.Observation.CheckedAt, NextCheck: response.Observation.NextCheckAt, LastFailure: response.Observation.Failure, Supervisor: response.Supervisor}
 }
 
 func writeUpdateStatusResult(command *cobra.Command, result updateStatusResult, maintenanceRequired bool, stagedVersion string) error {
@@ -3141,6 +3147,13 @@ func writeUpdateStatusResult(command *cobra.Command, result updateStatusResult, 
 		fmt.Fprintf(command.OutOrStdout(), "Runtime: %s\n", result.RuntimeVersion)
 	} else {
 		fmt.Fprintln(command.OutOrStdout(), "Runtime: unavailable")
+	}
+	if result.ActivationPending {
+		fmt.Fprintln(command.OutOrStdout(), "Activation: pending")
+	} else if result.ActivationFailure != "" {
+		fmt.Fprintf(command.OutOrStdout(), "Activation: failed (%s)\n", result.ActivationFailure)
+	} else {
+		fmt.Fprintln(command.OutOrStdout(), "Activation: complete")
 	}
 	if !result.NextCheck.IsZero() {
 		fmt.Fprintf(command.OutOrStdout(), "Next automatic check: %s\n", result.NextCheck.Local().Format(time.RFC3339))
@@ -3224,7 +3237,7 @@ func writeUpdateResult(command *cobra.Command, result updateResult, version stri
 		return json.NewEncoder(command.OutOrStdout()).Encode(map[string]any{"schema_version": "1.0", "ok": true, "data": result})
 	}
 	if result.ActivationPending {
-		fmt.Fprintf(command.OutOrStdout(), "Paperboat %s is staged. Windows will activate it in the background; run `pb update status` to confirm.\n", version)
+		fmt.Fprintf(command.OutOrStdout(), "Paperboat %s is staged. Windows will activate it in the background. Wait a few seconds, then run `pb update status` to confirm.\n", version)
 		return nil
 	}
 	if !result.CLIUpdated && !result.RuntimeUpdated && !result.SupervisorUpdated {
