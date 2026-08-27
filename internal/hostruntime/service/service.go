@@ -349,9 +349,15 @@ func renderSystemd(config Config) ([]byte, error) {
 	}
 	if systemService {
 		directory := systemDirectoryName(config.Kind)
+		runtimeDirectoryMode := "0755"
+		if config.Kind == HostdKind {
+			// hostdproto requires its socket directory to be private to the
+			// enrolled account. systemd must not pre-create it world-readable.
+			runtimeDirectoryMode = "0700"
+		}
 		options = append(options,
 			unit.NewUnitOption("Service", "RuntimeDirectory", directory),
-			unit.NewUnitOption("Service", "RuntimeDirectoryMode", "0755"),
+			unit.NewUnitOption("Service", "RuntimeDirectoryMode", runtimeDirectoryMode),
 			unit.NewUnitOption("Service", "StateDirectory", directory),
 			unit.NewUnitOption("Service", "StateDirectoryMode", "0700"),
 			unit.NewUnitOption("Service", "CacheDirectory", directory),
