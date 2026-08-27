@@ -4,7 +4,7 @@
   "title": "Paperboat peer attempt descriptor v1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["version", "account_id", "device_id", "operation_id", "intent_id", "environment_id", "purpose", "consumer", "initiator_endpoint_id", "responder_endpoint_id", "role", "attempt_generation", "network_generation", "host_generation", "authorization_generation", "issued_at", "expires_at", "endpoint_certificates", "direct", "signaling", "relays", "policy"],
+  "required": ["version", "account_id", "device_id", "operation_id", "intent_id", "environment_id", "purpose", "consumer", "initiator_endpoint_id", "responder_endpoint_id", "role", "attempt_generation", "network_generation", "host_generation", "authorization_generation", "issued_at", "expires_at", "endpoint_certificates", "trusted_keys", "direct", "signaling", "relays", "policy"],
   "properties": {
     "version": { "const": 1 },
     "account_id": { "$ref": "#/$defs/id" },
@@ -27,12 +27,17 @@
       "type": "array", "minItems": 2, "maxItems": 2,
       "items": {
         "type": "object", "additionalProperties": false,
-        "required": ["endpoint_id", "certificate"],
+        "required": ["endpoint_id", "key_id", "certificate"],
         "properties": {
           "endpoint_id": { "$ref": "#/$defs/id" },
+          "key_id": { "$ref": "#/$defs/key_id" },
           "certificate": { "type": "string", "pattern": "^[A-Za-z0-9_-]{230,568}$" }
         }
       }
+    },
+    "trusted_keys": {
+      "type": "array", "minItems": 1, "maxItems": 64, "uniqueItems": true,
+      "items": { "$ref": "#/$defs/trusted_key" }
     },
     "direct": {
       "type": "object", "additionalProperties": false,
@@ -96,8 +101,19 @@
   ],
   "$defs": {
     "id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$" },
+    "key_id": { "type": "string", "pattern": "^aek_[a-f0-9]{64}$" },
     "generation": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
     "time": { "type": "string", "format": "date-time", "pattern": "Z$" },
+    "trusted_key": {
+      "type": "object", "additionalProperties": false,
+      "required": ["key_id", "public_key", "fingerprint", "generation"],
+      "properties": {
+        "key_id": { "$ref": "#/$defs/key_id" },
+        "public_key": { "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$" },
+        "fingerprint": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "generation": { "$ref": "#/$defs/generation" }
+      }
+    },
     "token": { "type": "string", "pattern": "^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$", "maxLength": 8192 },
     "wss": {
       "type": "object", "additionalProperties": false,

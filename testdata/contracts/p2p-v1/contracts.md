@@ -8,7 +8,8 @@ expired authority, and generation rollback are terminal protocol failures.
 
 ## Endpoint certificates
 
-An account root is Ed25519. Canonical certificate bytes are the existing `PBEC` binary
+An account has one or more active Ed25519 trusted signing keys, one per enrolled CLI
+endpoint. Canonical certificate bytes are the existing `PBEC` binary
 encoding: ASCII `PBEC`, version byte `1`, big-endian uint16 account-ID length and bytes,
 one role byte (`1` CLI, `2` machine), big-endian uint16 endpoint-ID length and bytes,
 32-byte X25519 Noise key, 32-byte Ed25519 QUIC key, then big-endian uint64 generation,
@@ -16,20 +17,21 @@ serial, issued Unix second, and expiry Unix second. The final 64 bytes are the E
 signature over every preceding byte. Generation and serial are positive and at most
 `9007199254740991`, IDs match
 `^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`, keys are non-zero, and expiry is after issuance.
-The HTTP document contains canonical unpadded-base64url certificate bytes plus indexed
-metadata; metadata must exactly equal the parsed bytes. Certificates are immutable and
-identified by `(account_id, endpoint_id, generation, serial)`. A generation may have one
-active certificate. Supersession and revocation are server-side state and do not alter
-certificate bytes. Verification checks the root fingerprint, signature, role, validity,
-generation, serial, endpoint binding, supersession, and revocation.
+The HTTP document contains the signing `key_id`, canonical unpadded-base64url certificate
+bytes, and indexed metadata; metadata must exactly equal the parsed bytes. Certificates
+are immutable and identified by `(account_id, endpoint_id, generation, serial)`. A
+generation may have one active certificate. Supersession and revocation are server-side
+state and do not alter certificate bytes. Verification selects the active trusted key by
+`key_id`, checks its fingerprint and signature, then checks role, validity, generation,
+serial, endpoint binding, supersession, and revocation.
 
-`GET /v1/e2ee/root` returns only the authenticated account's active public root. The first
-CLI uses idempotent `POST /v1/e2ee/bootstrap` to create that immutable root and its
-root-signed generation-1 certificate in one transaction. The CLI endpoint ID must equal the
-authenticated CLI session ID. Exact replay returns the same authority; a different root is
-an identity conflict. If a public root already exists, a client may continue only when its
-local root custody matches it or after the explicit pairing/recovery flow; ordinary server
-responses never create or replace local root authority.
+`GET /v1/e2ee/root` returns the authenticated account's complete active trusted-key set.
+The first CLI uses idempotent `POST /v1/e2ee/bootstrap` to create its trusted key and its
+key-signed generation-1 certificate in one transaction. A fresh CLI bootstrap adds one new
+trusted key and certificate without revoking other active endpoints. The CLI endpoint ID
+must equal the authenticated CLI session ID. Exact replay returns the same authority; a
+different key is an identity conflict. Every trusted-key entry includes its `key_id`,
+public key, fingerprint, and generation.
 
 Each machine installation generates and durably retains its own X25519 Noise private key
 and Ed25519 QUIC private key. It publishes only the corresponding public keys through
@@ -41,12 +43,14 @@ big_endian_generation || noise_public_key || quic_public_key)`, rendered `xxxxx-
 The CLI lists pending requests through `GET /v1/e2ee/pending-endpoints` but signs one only
 after the user supplies the exact compared code. Certificate registration must match the
 pending endpoint, generation, and both public keys and fulfills that request atomically.
-The machine retrieves only the public root and its approved certificate through a fresh
-machine-proof-authenticated `POST /v1/machine-peer-identity/status`, then verifies the root
-signature and exact local public-key binding before persistence. Request/status replay is
+The machine retrieves only the active trusted-key set and its approved certificate through a fresh
+machine-proof-authenticated `POST /v1/machine-peer-identity/status`, then verifies the
+certificate with its identified trusted key and checks the exact local public-key binding
+before persistence. Request/status replay is
 deterministic. A missing, expired, mismatched, conflicting, or revoked authority fails
-closed. The account root private key never enters the machine runtime or server, and no
-endpoint private key enters any control-plane request, response, database, log, or audit.
+closed. Trusted signing-key private material never enters the machine runtime or server,
+and no endpoint private key enters any control-plane request, response, database, log, or
+audit.
 
 Registration uses `PUT /v1/endpoints/{endpoint_id}/certificates/{generation}` with the
 certificate document and an operation ID. Identical replay succeeds; conflicting replay is
@@ -59,7 +63,9 @@ with `If-Match` set to the quoted serial and is idempotent.
 descriptor for an exact intent, endpoint pair, role, attempt generation, and network
 generation. Both role views include the account ID, initiating CLI device ID, original
 operation ID, current machine installation generation, and current runtime-connector
-authorization generation. They also include one exact server-authorized consumer;
+authorization generation. They include the complete active `trusted_keys` set, and each
+entry in `endpoint_certificates` includes the signing `key_id` alongside the certificate.
+They also include one exact server-authorized consumer;
 interactive authority permits only `terminal`, `exec`, or `ssh`, while every private/probe
 purpose permits only its canonical consumer. Both endpoints bind that field into the E2EE
 transcript. The server resolves the machine's current admitted runtime connector and a fresh
@@ -78,7 +84,7 @@ controlled view through machine-proof-authenticated
 empty queue returns no descriptor. Both views contain identical immutable intent,
 generation, certificate, ICE, relay, expiry, and policy authority and differ only in role
 and the role-scoped signaling credential. Exact polling replay returns the same active
-authority. A stale connector, machine generation, certificate, node, root, client session,
+authority. A stale connector, machine generation, certificate, node, trusted key, client session,
 or revoked/expired intent returns no usable descriptor and never downgrades.
 
 Availability, timeout, UDP-blocked, and verified reachability errors are fallback-safe.

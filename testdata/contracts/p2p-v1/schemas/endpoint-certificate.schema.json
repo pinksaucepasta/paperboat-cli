@@ -4,11 +4,11 @@
   "title": "Paperboat endpoint certificate HTTP document v1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["version", "account_id", "root_fingerprint", "endpoint_id", "role", "generation", "serial", "issued_at", "expires_at", "certificate", "certificate_fingerprint"],
+  "required": ["version", "account_id", "key_id", "endpoint_id", "role", "generation", "serial", "issued_at", "expires_at", "certificate", "certificate_fingerprint"],
   "properties": {
     "version": { "const": 1 },
     "account_id": { "$ref": "#/$defs/id" },
-    "root_fingerprint": { "$ref": "#/$defs/fingerprint" },
+    "key_id": { "$ref": "#/$defs/key_id" },
     "endpoint_id": { "$ref": "#/$defs/id" },
     "role": { "enum": ["cli", "machine"] },
     "generation": { "$ref": "#/$defs/generation" },
@@ -20,6 +20,7 @@
   },
   "$defs": {
     "id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$" },
+    "key_id": { "type": "string", "pattern": "^aek_[a-f0-9]{64}$" },
     "fingerprint": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
     "generation": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
     "time": { "type": "string", "format": "date-time", "pattern": "Z$" }

@@ -1,6 +1,6 @@
 {
   "root_public_key": "ebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ",
-  "root_fingerprint": "65b60673d6ed884bf01c2c222d82ada0740f29ac3355d6a925c81f17f47a27b8",
+  "key_id": "aek_65b60673d6ed884bf01c2c222d82ada0740f29ac3355d6a925c81f17f47a27b8",
   "certificate": "UEJFQwEACmFjY291bnRfMDEBAAZjbGlfMDHIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t_g4eLj5OXm5wu8NGpXZnw4ASC9nH_X5R0sX9_qN80vW_QFssa_by14AAAAAAAAAAIAAAAAAAAABwAAAABqcILAAAAAAGpwkND8bhSHyNEvAYJx_8tEbrZ-SVfu07z2CuMYko7rtOdylgAF8nhvqTk1HYji_MDN08XbT5f5XF2z1qeliFm7QVID",
   "certificate_fingerprint": "9b8553888fb56747190f6ef1b86aec19ed889a5f1f9ffb49499c628469a30954",
   "now": "2026-08-03T12:30:00Z"
