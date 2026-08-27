@@ -68,26 +68,6 @@ if ([int64]$file.Length -ne [int64]$assetMetadata.length) { throw "Paperboat rel
 $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $download).Hash.ToLowerInvariant()
 if ($actual -ne [string]$assetMetadata.sha256) { throw "Paperboat release asset digest verification failed for $asset." }
 
-if ($freshEnrollment) {
-  # Stop managed services before replacing pb.exe. Windows keeps executable
-  # handles open while services run, which otherwise makes a dashboard-issued
-  # fresh install fail during self-upgrade.
-  foreach ($serviceName in @('PaperboatHostd', 'PaperboatSshd', 'PaperboatUpdated')) {
-    Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
-  }
-
-  # A dashboard command is a replacement boundary, not an upgrade resume.
-  # Remove all per-user PB state. The next pair must generate a new
-  # machine identity and must never inherit another dashboard account's
-  # credentials or E2EE identity.
-  foreach ($statePath in @(
-    (Join-Path $env:LOCALAPPDATA 'Paperboat'),
-    (Join-Path $env:APPDATA 'Paperboat')
-  )) {
-    Remove-Item -LiteralPath $statePath -Recurse -Force -ErrorAction SilentlyContinue
-  }
-}
-
 function Assert-InstalledVersion([string]$Path, [string]$ExpectedVersion) {
   if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
   $output = (& $Path --version 2>&1 | Out-String)
@@ -95,12 +75,27 @@ function Assert-InstalledVersion([string]$Path, [string]$ExpectedVersion) {
   return $output -match ("(?m)^.*\bVersion\s+" + [regex]::Escape($ExpectedVersion) + "\s*$")
 }
 
+function Test-Administrator {
+  $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+  $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+  return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
 if ($freshEnrollment -or -not (Assert-InstalledVersion $installedPb $version) -or (Get-FileHash -Algorithm SHA256 -LiteralPath $installedPb -ErrorAction SilentlyContinue).Hash.ToLowerInvariant() -ne $actual) {
   # __install is implemented by the downloaded pb.exe itself. This is the
   # only elevation boundary and avoids downloading another executable.
   $arguments = @('__install', '--source', $download, '--version', $version)
   if ($freshEnrollment) { $arguments += '--fresh' }
-  $process = Start-Process -FilePath $download -ArgumentList $arguments -Verb RunAs -PassThru -WindowStyle Hidden
+  # An already-elevated SSH or deployment session has no interactive desktop
+  # on which Windows can show another UAC prompt. Starting it with RunAs in
+  # that environment returns Access is denied even though the caller already
+  # has a full administrator token. Execute directly in that case; ordinary
+  # desktop terminals still use RunAs and show the normal UAC prompt.
+  if (Test-Administrator) {
+    $process = Start-Process -FilePath $download -ArgumentList $arguments -PassThru -WindowStyle Hidden
+  } else {
+    $process = Start-Process -FilePath $download -ArgumentList $arguments -Verb RunAs -PassThru -WindowStyle Hidden
+  }
   if (-not $process.WaitForExit(1200000)) {
     try { $process.Kill() } finally { $process.WaitForExit() }
     throw 'Paperboat installation exceeded the 20 minute limit.'
@@ -110,6 +105,16 @@ if ($freshEnrollment -or -not (Assert-InstalledVersion $installedPb $version) -o
 if (-not (Assert-InstalledVersion $installedPb $version)) { throw "Installed Paperboat does not report release $version." }
 
 if ($freshEnrollment) {
+  # Only cross the replacement boundary after the verified elevated install
+  # has succeeded. If UAC is denied or the elevated session cannot start,
+  # the existing enrollment remains intact and the token can be retried.
+  # __install --fresh already removes machine-wide services and state.
+  foreach ($statePath in @(
+    (Join-Path $env:LOCALAPPDATA 'Paperboat'),
+    (Join-Path $env:APPDATA 'Paperboat')
+  )) {
+    Remove-Item -LiteralPath $statePath -Recurse -Force -ErrorAction SilentlyContinue
+  }
   $first = $token.Substring(0, 1)
   $setupMode = if ('02468BDFHJLNPRTVXZ'.Contains($first)) { 'host' } else { 'client' }
   Remove-Item Env:PAPERBOAT_ENROLLMENT_TOKEN -ErrorAction SilentlyContinue
