@@ -3166,7 +3166,13 @@ func actionUpdate(command *cobra.Command, _ []string) error {
 			if !updateJSON(command) {
 				fmt.Fprintln(command.ErrOrStderr(), "Update staged; waiting for Windows services to activate it...")
 			}
-			response, err = waitForWindowsUpdateActivation(ctx, response.Version)
+			var report func(time.Duration)
+			if !updateJSON(command) {
+				report = func(elapsed time.Duration) {
+					fmt.Fprintf(command.ErrOrStderr(), "Windows service activation is still in progress (%s)...\n", elapsed.Round(time.Second))
+				}
+			}
+			response, err = waitForWindowsUpdateActivationWithProgress(ctx, response.Version, report)
 			if err != nil {
 				return fmt.Errorf("wait for Paperboat Windows activation: %w", err)
 			}
@@ -3240,11 +3246,21 @@ func writeUpdateResult(command *cobra.Command, result updateResult, version stri
 }
 
 func waitForWindowsUpdateActivation(ctx context.Context, version string) (updated.ControlResponse, error) {
+	return waitForWindowsUpdateActivationWithProgress(ctx, version, nil)
+}
+
+func waitForWindowsUpdateActivationWithProgress(ctx context.Context, version string, report func(time.Duration)) (updated.ControlResponse, error) {
 	if version == "" {
 		return updated.ControlResponse{}, errors.New("updater returned an empty pending version")
 	}
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+	started := time.Now()
+	lastReport := started
+	interval := updateProgressInterval
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
 	for {
 		client, err := updated.NewClient(updateControlSocketForCommand(), 10*time.Second)
 		if err == nil {
@@ -3260,6 +3276,11 @@ func waitForWindowsUpdateActivation(ctx context.Context, version string) (update
 		case <-ctx.Done():
 			return updated.ControlResponse{}, ctx.Err()
 		case <-ticker.C:
+			if report != nil && time.Since(lastReport) >= interval {
+				elapsed := time.Since(started)
+				report(elapsed)
+				lastReport = time.Now()
+			}
 		}
 	}
 }
