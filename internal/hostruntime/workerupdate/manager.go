@@ -542,7 +542,7 @@ func (m *Manager) stage(ctx context.Context, release Release) error {
 	defer stream.Close()
 	directory := filepath.Dir(m.config.BinaryStaged)
 	//paperboat:allow-source-policy atomic-replacement owner=worker-update reason=same-directory-verified-runtime-download-staging
-	pending, err := os.CreateTemp(directory, ".paperboat-runtime-")
+	pending, err := os.CreateTemp(directory, runtimeStagingPattern(release.Platform))
 	if err != nil {
 		return err
 	}
@@ -602,6 +602,18 @@ func (m *Manager) stage(ctx context.Context, release Release) error {
 		return err
 	}
 	return syncDirectories(directory)
+}
+
+// runtimeStagingPattern preserves native package extensions while a verified
+// artifact is held in the private staging directory. macOS signature
+// validation distinguishes a signed installer package (.pkg) from an
+// executable, so the temporary package must retain that suffix until
+// installer(8) consumes it.
+func runtimeStagingPattern(platform string) string {
+	if platform == "darwin" {
+		return ".paperboat-runtime-*.pkg"
+	}
+	return ".paperboat-runtime-*"
 }
 
 func stageInstalledDarwinExecutable(source, destination string, ownerUID, ownerGID int) error {

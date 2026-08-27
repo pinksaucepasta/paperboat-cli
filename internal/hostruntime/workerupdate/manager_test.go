@@ -47,6 +47,15 @@ func TestWorkerUpdateCutsOverWithoutRestartingHostd(t *testing.T) {
 	}
 }
 
+func TestRuntimeStagingPatternPreservesDarwinPackageSuffix(t *testing.T) {
+	if got := runtimeStagingPattern("darwin"); got != ".paperboat-runtime-*.pkg" {
+		t.Fatalf("darwin staging pattern = %q", got)
+	}
+	if got := runtimeStagingPattern("linux"); got != ".paperboat-runtime-*" {
+		t.Fatalf("linux staging pattern = %q", got)
+	}
+}
+
 func TestOneHundredWorkerUpdatesKeepOneHostdAndBoundedRetention(t *testing.T) {
 	fixture := newFixture(t)
 	hostd := fixture.hostd
