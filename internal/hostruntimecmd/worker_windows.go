@@ -34,7 +34,7 @@ const windowsOwnerWorkloadEnvironment = "PAPERBOAT_WINDOWS_OWNER_WORKLOAD"
 // replaceable worker only through the authenticated named-pipe fence.
 func runHostd(ctx context.Context, output io.Writer) (err error) {
 	defer func() {
-		if err != nil && os.Getenv(windowsOwnerWorkloadEnvironment) == "1" {
+		if err != nil {
 			recordWindowsServiceLaunchFailure("PaperboatHostd-worker", err)
 		}
 	}()
