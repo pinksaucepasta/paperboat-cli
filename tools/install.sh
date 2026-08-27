@@ -164,6 +164,12 @@ prepare_privileges() {
     needs_sudo=true
   elif [ "$setup_mode" = host ] || { [ "$pair" = true ] && [ "$pair_mode" = host ]; }; then
     needs_sudo=true
+  elif [ -e /usr/local/bin/pb ] || [ -L /usr/local/bin/pb ] || \
+       [ -e /usr/local/libexec/paperboat/pb ] || [ -L /usr/local/libexec/paperboat/pb ] || \
+       [ -e /etc/systemd/system/paperboat-runtime-host.service ] || [ -L /etc/systemd/system/paperboat-runtime-host.service ]; then
+    # A fresh Linux Client setup may replace an earlier Host setup. Elevate
+    # only when privileged Paperboat leftovers actually need to be removed.
+    needs_sudo=true
   fi
   [ "$needs_sudo" = true ] || return 0
   command -v sudo >/dev/null 2>&1 || { echo "pb installer: sudo is required for this setup" >&2; exit 1; }
