@@ -18,6 +18,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net"
 	"net/http"
@@ -95,9 +96,23 @@ import (
 )
 
 func main() {
+	configureProcessLogging(os.Args[1:])
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	os.Exit(run(ctx, os.Args[1:], os.Stdout, os.Stderr))
+}
+
+var quietProcessLogger = slog.New(slog.NewTextHandler(io.Discard, nil))
+
+// configureProcessLogging keeps transport implementation details out of
+// normal CLI output. Internal runtime/service entry points retain the default
+// logger because their stderr is owned by the service manager and is part of
+// runtime diagnostics, not an interactive terminal.
+func configureProcessLogging(args []string) {
+	if len(args) > 0 && strings.HasPrefix(args[0], "__") {
+		return
+	}
+	slog.SetDefault(quietProcessLogger)
 }
 
 var errUsage = errors.New("command usage error")
