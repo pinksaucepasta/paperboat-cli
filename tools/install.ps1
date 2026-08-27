@@ -109,8 +109,13 @@ if ($freshEnrollment -or -not (Assert-InstalledVersion $installedPb $version) -o
     # configurations reject direct execution from the temporary download
     # path; retry through CreateProcess in that case while retaining the
     # already-elevated token.
-    & $download @arguments
-    $directExitCode = $LASTEXITCODE
+    $directExitCode = 1
+    try {
+      & $download @arguments
+      $directExitCode = $LASTEXITCODE
+    } catch {
+      $directExitCode = 1
+    }
     if ($directExitCode -ne 0) {
       $process = Start-Process -FilePath $download -ArgumentList $arguments -PassThru -Wait -WindowStyle Hidden
       if ($process.ExitCode -ne 0) { throw "Paperboat self-install failed with exit code $($process.ExitCode)." }
