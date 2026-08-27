@@ -921,7 +921,7 @@ func newProductionClientCoordinator(ctx context.Context, version string, environ
 	if scope != "system" && scope != "user" {
 		scope = "unknown"
 	}
-	sender := &runtimeObservationSender{endpoint: controlURL.ResolveReference(&url.URL{Path: "/v1/runtime-observations"}).String(), tokens: control, proofs: control, operationID: operationID, environmentID: registration.EnvironmentID, machineID: registration.MachineID, reporterVersion: version, client: &http.Client{Transport: transport, Timeout: 10 * time.Second}, receiptPath: filepath.Join(runtimeConfig.StateRoot, "runtime", "server-heartbeat.json"), workerGeneration: bootState.Generation, osBootID: bootState.OSBootID, serviceScope: scope, connector: manager, capabilities: []string{"file_receive", "preview_launch"}, relayLatency: regionalCache, relaySuccess: relayRegion}
+	sender := &runtimeObservationSender{endpoint: controlURL.ResolveReference(&url.URL{Path: "/v1/runtime-observations"}).String(), tokens: control, proofs: control, operationID: operationID, environmentID: registration.EnvironmentID, machineID: registration.MachineID, reporterVersion: version, client: &http.Client{Transport: transport, Timeout: 10 * time.Second}, receiptPath: filepath.Join(runtimeConfig.StateRoot, "runtime", "server-heartbeat.json"), installationGeneration: uint64(registration.InstallationGeneration), workerGeneration: bootState.Generation, osBootID: bootState.OSBootID, serviceScope: scope, connector: manager, capabilities: []string{"file_receive", "preview_launch"}, relayLatency: regionalCache, relaySuccess: relayRegion}
 	observation := &runtimeObservationService{sender: sender, interval: runtimeConfig.Limits.HeartbeatInterval, timeout: 10 * time.Second}
 	listen := valueOrRuntime(environ("PAPERBOAT_RUNTIME_LISTEN_ADDRESS"), "127.0.0.1:8080")
 	localControlToken, err := writeLocalControlToken(runtimeConfig.StateRoot)
@@ -1368,12 +1368,19 @@ type runtimeUpdateObservation struct {
 }
 
 func (s *runtimeObservationSender) updateObservation(now time.Time, availabilityState *availability.Observation) *runtimeUpdateObservation {
-	if availabilityState == nil || availabilityState.UpdateHealth == "unknown" || s.reporterVersion == "" || s.installationGeneration == 0 || s.workerGeneration == 0 || s.osBootID == "" {
+	if s.reporterVersion == "" || s.installationGeneration == 0 || s.workerGeneration == 0 || s.osBootID == "" {
 		return nil
 	}
 	state, target, errorCode := "healthy", "", ""
-	if availabilityState.UpdateHealth == "recovery_required" {
-		state, target, errorCode = "failed", s.reporterVersion, "recovery_required"
+	var rollbackCount uint64
+	if availabilityState != nil {
+		if availabilityState.UpdateHealth == "unknown" {
+			return nil
+		}
+		rollbackCount = availabilityState.UpdateRollbacks
+		if availabilityState.UpdateHealth == "recovery_required" {
+			state, target, errorCode = "failed", s.reporterVersion, "recovery_required"
+		}
 	}
 	channel := "stable"
 	return &runtimeUpdateObservation{
@@ -1386,7 +1393,7 @@ func (s *runtimeObservationSender) updateObservation(now time.Time, availability
 		InstallationGeneration: s.installationGeneration,
 		WorkerGeneration:       s.workerGeneration,
 		OSBootID:               s.osBootID,
-		RollbackCount:          availabilityState.UpdateRollbacks,
+		RollbackCount:          rollbackCount,
 		ErrorCode:              errorCode,
 		ObservedAt:             now,
 	}

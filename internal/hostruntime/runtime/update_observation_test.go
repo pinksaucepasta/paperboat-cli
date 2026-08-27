@@ -28,3 +28,20 @@ func TestRuntimeUpdateObservationUsesPlatformChannelAndFences(t *testing.T) {
 		t.Fatalf("unknown updater emitted observation=%+v", got)
 	}
 }
+
+func TestRuntimeUpdateObservationReportsWithoutAvailabilityService(t *testing.T) {
+	now := time.Now().UTC()
+	sender := &runtimeObservationSender{
+		reporterVersion:        "2026.08.20.12",
+		installationGeneration: 4,
+		workerGeneration:       9,
+		osBootID:               "boot-1",
+	}
+	observation := sender.updateObservation(now, nil)
+	if observation == nil {
+		t.Fatal("client observation is nil without an availability service")
+	}
+	if observation.State != "healthy" || observation.RollbackCount != 0 || observation.CurrentVersion != sender.reporterVersion {
+		t.Fatalf("client observation=%+v", observation)
+	}
+}
