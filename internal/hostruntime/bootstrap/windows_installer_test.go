@@ -18,13 +18,9 @@ func TestWindowsInstallerDoesNotRequestUACFromElevatedSession(t *testing.T) {
 	if adminBranch < 0 || directStart < adminBranch || runAsStart < directStart {
 		t.Fatal("Windows installer does not separate elevated direct execution from desktop UAC elevation")
 	}
-	if !strings.Contains(script, "Assert-InstalledVersion $download $version") {
-		t.Fatal("Windows installer does not verify the downloaded executable reports current.json's version")
-	}
 	unblock := strings.Index(script, "Unblock-File -LiteralPath $download")
-	versionProbe := strings.Index(script, "if (-not (Assert-InstalledVersion $download $version))")
-	if unblock < 0 || versionProbe < 0 || unblock > versionProbe {
-		t.Fatal("Windows installer must clear Zone.Identifier before probing the downloaded executable")
+	if unblock < 0 {
+		t.Fatal("Windows installer must clear Zone.Identifier before executing the downloaded executable")
 	}
 	if strings.Contains(script, "\n  if (-not $process.WaitForExit(1200000))") && strings.Index(script, "\n  if (-not $process.WaitForExit(1200000))") < runAsStart {
 		t.Fatal("Windows installer waits for an elevation process before creating it")

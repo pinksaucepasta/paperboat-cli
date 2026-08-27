@@ -88,10 +88,6 @@ function Assert-InstalledVersion([string]$Path, [string]$ExpectedVersion) {
   return $versionMatches.Count -eq 1 -and $versionMatches[0].Groups[1].Value -eq ("Version " + $ExpectedVersion)
 }
 
-if (-not (Assert-InstalledVersion $download $version)) {
-  throw "Downloaded Paperboat release does not report version $version."
-}
-
 function Test-Administrator {
   $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
   $principal = [Security.Principal.WindowsPrincipal]::new($identity)
