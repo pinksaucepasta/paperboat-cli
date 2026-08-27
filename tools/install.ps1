@@ -79,9 +79,6 @@ function Assert-InstalledVersion([string]$Path, [string]$ExpectedVersion) {
   return $versionMatches.Count -eq 1 -and $versionMatches[0].Groups[1].Value -eq ("Version " + $ExpectedVersion)
 }
 
-if (-not (Assert-InstalledVersion $download $version)) {
-  throw "Downloaded Paperboat release does not report version $version."
-}
 function Test-Administrator {
   $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
   $principal = [Security.Principal.WindowsPrincipal]::new($identity)
@@ -98,8 +95,8 @@ if ($freshEnrollment -or -not (Assert-InstalledVersion $installedPb $version) -o
   # case; ordinary desktop terminals still use RunAs and show the normal UAC
   # prompt.
   if (Test-Administrator) {
-    & $download @arguments
-    if ($LASTEXITCODE -ne 0) { throw "Paperboat self-install failed with exit code $LASTEXITCODE." }
+    $process = Start-Process -FilePath $download -ArgumentList $arguments -PassThru -Wait -WindowStyle Hidden
+    if ($process.ExitCode -ne 0) { throw "Paperboat self-install failed with exit code $($process.ExitCode)." }
   } else {
     $process = Start-Process -FilePath $download -ArgumentList $arguments -Verb RunAs -PassThru -WindowStyle Hidden
     if (-not $process.WaitForExit(1200000)) {
