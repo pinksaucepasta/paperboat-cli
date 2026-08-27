@@ -13,7 +13,7 @@ func TestWindowsInstallerDoesNotRequestUACFromElevatedSession(t *testing.T) {
 	}
 	script := string(body)
 	adminBranch := strings.Index(script, "if (Test-Administrator) {")
-	directStart := strings.Index(script, "$process = Start-Process -FilePath $download -ArgumentList $arguments -PassThru")
+	directStart := strings.Index(script, "& $download @arguments")
 	runAsStart := strings.Index(script, "$process = Start-Process -FilePath $download -ArgumentList $arguments -Verb RunAs -PassThru")
 	if adminBranch < 0 || directStart < adminBranch || runAsStart < directStart {
 		t.Fatal("Windows installer does not separate elevated direct execution from desktop UAC elevation")
