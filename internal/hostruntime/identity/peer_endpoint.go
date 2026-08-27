@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"crypto/ecdh"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -22,6 +24,7 @@ type PeerEndpoint struct {
 	NoisePrivateKey [32]byte
 	QUICPrivateKey  ed25519.PrivateKey
 	RootPublicKey   ed25519.PublicKey
+	RootKeyID       string
 	Certificate     []byte
 }
 
@@ -41,6 +44,7 @@ type peerEndpointDocument struct {
 	QUICSeed        string `json:"quic_seed_base64url"`
 	Certificate     string `json:"certificate_base64url,omitempty"`
 	RootPublicKey   string `json:"root_public_key_base64url,omitempty"`
+	RootKeyID       string `json:"root_key_id,omitempty"`
 }
 
 func (s *Store) PeerEndpoint() (PeerEndpoint, error) {
@@ -99,6 +103,8 @@ func (s *Store) SavePeerEndpointCertificate(rootPublic ed25519.PublicKey, raw []
 	}
 	value.Certificate = append([]byte(nil), raw...)
 	value.RootPublicKey = append(ed25519.PublicKey(nil), rootPublic...)
+	fingerprint := sha256.Sum256(rootPublic)
+	value.RootKeyID = "aek_" + hex.EncodeToString(fingerprint[:])
 	return s.writePeerEndpoint(value)
 }
 
@@ -143,7 +149,9 @@ func (s *Store) loadPeerEndpoint(generation uint64, machineID string) (PeerEndpo
 	seed, seedErr := base64.RawURLEncoding.Strict().DecodeString(document.QUICSeed)
 	certificate, certificateErr := base64.RawURLEncoding.Strict().DecodeString(document.Certificate)
 	rootPublic, rootErr := base64.RawURLEncoding.Strict().DecodeString(document.RootPublicKey)
-	if noiseErr != nil || seedErr != nil || len(noise) != 32 || len(seed) != ed25519.SeedSize || document.NoisePrivateKey != base64.RawURLEncoding.EncodeToString(noise) || document.QUICSeed != base64.RawURLEncoding.EncodeToString(seed) || document.Certificate != "" && (certificateErr != nil || rootErr != nil || len(rootPublic) != ed25519.PublicKeySize) || document.Certificate == "" && document.RootPublicKey != "" {
+	rootFingerprint := sha256.Sum256(rootPublic)
+	expectedRootKeyID := "aek_" + hex.EncodeToString(rootFingerprint[:])
+	if noiseErr != nil || seedErr != nil || len(noise) != 32 || len(seed) != ed25519.SeedSize || document.NoisePrivateKey != base64.RawURLEncoding.EncodeToString(noise) || document.QUICSeed != base64.RawURLEncoding.EncodeToString(seed) || document.Certificate != "" && (certificateErr != nil || rootErr != nil || len(rootPublic) != ed25519.PublicKeySize || document.RootKeyID != expectedRootKeyID) || document.Certificate == "" && (document.RootPublicKey != "" || document.RootKeyID != "") {
 		return PeerEndpoint{}, ErrInvalidStore
 	}
 	var noisePrivate [32]byte
@@ -151,7 +159,7 @@ func (s *Store) loadPeerEndpoint(generation uint64, machineID string) (PeerEndpo
 	clear(noise)
 	private := ed25519.NewKeyFromSeed(seed)
 	clear(seed)
-	value := PeerEndpoint{Generation: generation, NoisePrivateKey: noisePrivate, QUICPrivateKey: private, RootPublicKey: ed25519.PublicKey(rootPublic), Certificate: certificate}
+	value := PeerEndpoint{Generation: generation, NoisePrivateKey: noisePrivate, QUICPrivateKey: private, RootPublicKey: ed25519.PublicKey(rootPublic), RootKeyID: document.RootKeyID, Certificate: certificate}
 	if len(certificate) > 0 {
 		verified, err := endpointidentity.Verify(certificate, value.RootPublicKey, endpointidentity.Expected{Role: endpointidentity.RoleMachine, EndpointID: machineID, Generation: generation}, s.config.Clock.Now().UTC())
 		noisePublic := value.NoisePublicKey()
@@ -171,8 +179,14 @@ func (s *Store) writePeerEndpoint(value PeerEndpoint) error {
 		if len(value.RootPublicKey) != ed25519.PublicKeySize {
 			return ErrInvalidStore
 		}
+		fingerprint := sha256.Sum256(value.RootPublicKey)
+		expectedRootKeyID := "aek_" + hex.EncodeToString(fingerprint[:])
+		if value.RootKeyID != expectedRootKeyID {
+			return ErrInvalidStore
+		}
 		document.Certificate = base64.RawURLEncoding.EncodeToString(value.Certificate)
 		document.RootPublicKey = base64.RawURLEncoding.EncodeToString(value.RootPublicKey)
+		document.RootKeyID = value.RootKeyID
 	}
 	encoded, err := json.Marshal(document)
 	if err != nil {

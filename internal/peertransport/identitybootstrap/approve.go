@@ -1,7 +1,6 @@
 package identitybootstrap
 
 import (
-	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
@@ -12,6 +11,7 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/api"
 	"github.com/pinksaucepasta/paperboat/internal/config"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/endpointidentity"
+	"github.com/pinksaucepasta/paperboat/internal/peertransport/trustedkeys"
 )
 
 type ApprovalClient interface {
@@ -59,14 +59,19 @@ func approveEndpoint(ctx context.Context, request ApprovalRequest, wantRole endp
 		return Result{}, err
 	}
 	defer clearKeys(&keys)
-	rootPublic := keys.RootPrivate.Public().(ed25519.PublicKey)
-	rootFingerprint := sha256.Sum256(rootPublic)
-	decodedRoot, decodeErr := base64.RawURLEncoding.Strict().DecodeString(root.PublicKey)
-	if decodeErr != nil || root.Version != 1 || root.Generation != 1 || root.Fingerprint != hex.EncodeToString(rootFingerprint[:]) || !bytes.Equal(decodedRoot, rootPublic) {
-		clear(decodedRoot)
+	rootKeys, rootErr := trustedkeys.Root(root)
+	if rootErr != nil {
 		return Result{}, ErrInvalid
 	}
-	clear(decodedRoot)
+	defer trustedkeys.Clear(rootKeys)
+	rootPublic, ok := keys.RootPrivate.Public().(ed25519.PublicKey)
+	if !ok {
+		return Result{}, ErrInvalid
+	}
+	trustedRoot, ok := trustedkeys.ByPublic(rootKeys, rootPublic)
+	if !ok {
+		return Result{}, ErrInvalid
+	}
 	pending, err := request.Client.PendingE2EEEndpoints(ctx)
 	if err != nil {
 		return Result{}, err
@@ -117,7 +122,7 @@ func approveEndpoint(ctx context.Context, request ApprovalRequest, wantRole endp
 		roleName, operationPrefix = "cli", "op_peer_cli_cert_"
 	}
 	operationID := operationPrefix + hex.EncodeToString(fingerprint[:16])
-	document := api.EndpointCertificateDocument{Version: 1, AccountID: request.AccountID, RootFingerprint: hex.EncodeToString(rootFingerprint[:]), EndpointID: selected.EndpointID, Role: roleName, Generation: selected.Generation, Serial: 1, IssuedAt: now.Format(time.RFC3339), ExpiresAt: now.Add(CertificateLifetime).Format(time.RFC3339), Certificate: base64.RawURLEncoding.EncodeToString(raw), CertificateFingerprint: hex.EncodeToString(fingerprint[:])}
+	document := api.EndpointCertificateDocument{Version: 1, AccountID: request.AccountID, KeyID: trustedRoot.KeyID, EndpointID: selected.EndpointID, Role: roleName, Generation: selected.Generation, Serial: 1, IssuedAt: now.Format(time.RFC3339), ExpiresAt: now.Add(CertificateLifetime).Format(time.RFC3339), Certificate: base64.RawURLEncoding.EncodeToString(raw), CertificateFingerprint: hex.EncodeToString(fingerprint[:])}
 	response, err := request.Client.RegisterEndpointCertificate(ctx, operationID, document)
 	if err != nil {
 		return Result{}, err
@@ -125,7 +130,7 @@ func approveEndpoint(ctx context.Context, request ApprovalRequest, wantRole endp
 	if response != document {
 		return Result{}, ErrInvalid
 	}
-	return Result{RootFingerprint: document.RootFingerprint, CertificateFingerprint: document.CertificateFingerprint, Certificate: certificate}, nil
+	return Result{RootFingerprint: trustedkeys.FingerprintString(trustedRoot), CertificateFingerprint: document.CertificateFingerprint, Certificate: certificate}, nil
 }
 
 func allZero(value []byte) bool {

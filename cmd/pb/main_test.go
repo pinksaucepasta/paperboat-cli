@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -128,7 +130,22 @@ func TestEnsureCLIIdentityForLoginBootstrapsNewAccount(t *testing.T) {
 			t.Errorf("decode bootstrap: %v", err)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"data": input})
+		public, err := base64.RawURLEncoding.Strict().DecodeString(input.RootPublicKey)
+		if err != nil || len(public) != ed25519.PublicKeySize {
+			t.Errorf("decode bootstrap root: %v", err)
+			return
+		}
+		fingerprint := sha256.Sum256(public)
+		keyID := "aek_" + hex.EncodeToString(fingerprint[:])
+		result := api.E2EEBootstrapResult{
+			KeyID: keyID,
+			TrustedKeys: []api.E2EEKey{{
+				KeyID: keyID, PublicKey: input.RootPublicKey,
+				Fingerprint: hex.EncodeToString(fingerprint[:]), Generation: 1,
+			}},
+			Certificate: input.Certificate,
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": result})
 	}))
 	defer server.Close()
 	root := t.TempDir()
@@ -3263,7 +3280,21 @@ func TestAuthLoginRepairsReadableServerRejectedProfile(t *testing.T) {
 				t.Errorf("decode bootstrap: %v", err)
 				return
 			}
-			writeAPIData(t, w, input)
+			public, err := base64.RawURLEncoding.Strict().DecodeString(input.RootPublicKey)
+			if err != nil || len(public) != ed25519.PublicKeySize {
+				t.Errorf("decode bootstrap root: %v", err)
+				return
+			}
+			fingerprint := sha256.Sum256(public)
+			keyID := "aek_" + hex.EncodeToString(fingerprint[:])
+			writeAPIData(t, w, api.E2EEBootstrapResult{
+				KeyID: keyID,
+				TrustedKeys: []api.E2EEKey{{
+					KeyID: keyID, PublicKey: input.RootPublicKey,
+					Fingerprint: hex.EncodeToString(fingerprint[:]), Generation: 1,
+				}},
+				Certificate: input.Certificate,
+			})
 		case "/v1/auth/token/revoke":
 			if r.Header.Get("Authorization") != "Bearer refresh-old" {
 				t.Errorf("revoke authorization=%q", r.Header.Get("Authorization"))

@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"testing"
 	"time"
 )
@@ -152,6 +154,59 @@ func TestTLSVerifierRejectsEndpointSubstitutionAndLeafMutation(t *testing.T) {
 	state.PeerCertificates = []*x509.Certificate{&mutated}
 	if err := config.VerifyConnection(state); err == nil {
 		t.Fatal("mutated leaf signature accepted")
+	}
+}
+
+func TestTLSVerifierSelectsPeerCertificateFromTrustedKeyID(t *testing.T) {
+	localRoot, localRootPrivate, _ := ed25519.GenerateKey(rand.Reader)
+	peerRoot, peerRootPrivate, _ := ed25519.GenerateKey(rand.Reader)
+	peerQUIC, peerQUICPrivate, _ := ed25519.GenerateKey(rand.Reader)
+	now := time.Unix(1_800_000_000, 0).UTC()
+	local, err := Sign(localRootPrivate, Claims{AccountID: "account_01", Role: RoleCLI, EndpointID: "cli_01", NoisePublicKey: noiseKey(9), QUICPublicKey: localRoot, Generation: 1, Serial: 1, IssuedAt: now.Add(-time.Minute), ExpiresAt: now.Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The local endpoint's QUIC key must be distinct from its signing key.
+	localQUIC, localQUICPrivate, _ := ed25519.GenerateKey(rand.Reader)
+	local.Claims.QUICPublicKey = localQUIC
+	local, err = Sign(localRootPrivate, local.Claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localLeaf, err := NewTLSCertificate(local, localRoot, localQUICPrivate, now, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer, err := Sign(peerRootPrivate, Claims{AccountID: "account_01", Role: RoleMachine, EndpointID: "machine_01", NoisePublicKey: noiseKey(10), QUICPublicKey: peerQUIC, Generation: 2, Serial: 2, IssuedAt: now.Add(-time.Minute), ExpiresAt: now.Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerRaw, err := peer.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyID := func(public ed25519.PublicKey) string {
+		fingerprint := sha256.Sum256(public)
+		return "aek_" + hex.EncodeToString(fingerprint[:])
+	}
+	key := func(public ed25519.PublicKey) TrustedKey {
+		return TrustedKey{KeyID: keyID(public), PublicKey: public, Fingerprint: sha256.Sum256(public), Generation: 1}
+	}
+	trusted := []TrustedKey{key(localRoot), key(peerRoot)}
+	config, err := ClientTLS(localLeaf, PeerExpectation{RootPublic: localRoot, TrustedKeys: trusted, CertificateKeyID: keyID(peerRoot), Certificate: peerRaw, Expected: Expected{AccountID: "account_01", Role: RoleMachine, EndpointID: "machine_01", Generation: 2}}, "paperboat-test-v1", func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerLeaf, err := NewTLSCertificate(peer, peerRoot, peerQUICPrivate, now, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := tls.ConnectionState{PeerCertificates: []*x509.Certificate{peerLeaf.Leaf}, NegotiatedProtocol: "paperboat-test-v1"}
+	if err := config.VerifyConnection(state); err != nil {
+		t.Fatalf("valid mixed-key peer rejected: %v", err)
+	}
+	if _, err := ClientTLS(localLeaf, PeerExpectation{RootPublic: localRoot, TrustedKeys: trusted, CertificateKeyID: keyID(localRoot), Certificate: peerRaw, Expected: Expected{AccountID: "account_01", Role: RoleMachine, EndpointID: "machine_01", Generation: 2}}, "paperboat-test-v1", func() time.Time { return now }); err == nil {
+		t.Fatal("peer certificate accepted with the wrong trusted key ID")
 	}
 }
 

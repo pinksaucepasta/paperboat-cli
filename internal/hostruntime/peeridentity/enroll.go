@@ -3,7 +3,6 @@ package peeridentity
 import (
 	"bytes"
 	"context"
-	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
@@ -17,7 +16,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pinksaucepasta/paperboat/internal/api"
 	identitystore "github.com/pinksaucepasta/paperboat/internal/hostruntime/identity"
+	"github.com/pinksaucepasta/paperboat/internal/peertransport/endpointidentity"
+	"github.com/pinksaucepasta/paperboat/internal/peertransport/trustedkeys"
 	"golang.org/x/crypto/blake2s"
 )
 
@@ -120,11 +122,9 @@ func (c *Client) Ensure(ctx context.Context) error {
 		Generation  uint64 `json:"generation"`
 	}{statusOperation, endpoint.Generation})
 	var approved struct {
-		State         string `json:"state"`
-		RootPublicKey string `json:"root_public_key"`
-		Certificate   struct {
-			Certificate string `json:"certificate"`
-		} `json:"certificate"`
+		State       string                          `json:"state"`
+		TrustedKeys []api.E2EEKey                   `json:"trusted_keys"`
+		Certificate api.EndpointCertificateDocument `json:"certificate"`
 	}
 	status, err = c.post(ctx, "/v1/machine-peer-identity/status", statusOperation, statusBody, &approved)
 	if err != nil {
@@ -136,12 +136,40 @@ func (c *Client) Ensure(ctx context.Context) error {
 		}
 		return &PendingError{RequestID: pending.RequestID, SafetyCode: pending.SafetyCode, ExpiresAt: pending.ExpiresAt}
 	}
-	root, rootErr := base64.RawURLEncoding.Strict().DecodeString(approved.RootPublicKey)
-	certificate, certificateErr := base64.RawURLEncoding.Strict().DecodeString(approved.Certificate.Certificate)
-	if status != http.StatusOK || approved.State != "approved" || rootErr != nil || len(root) != 32 || certificateErr != nil || len(certificate) == 0 {
+	trusted, trustedErr := trustedkeys.FromAPI(approved.TrustedKeys)
+	if trustedErr != nil {
 		return ErrInvalid
 	}
-	return store.SavePeerEndpointCertificate(ed25519.PublicKey(root), certificate, c.config.Clock().UTC())
+	defer trustedkeys.Clear(trusted)
+	key, keyOK := endpointidentity.TrustedKeyFor(trusted, approved.Certificate.KeyID)
+	certificate, certificateErr := base64.RawURLEncoding.Strict().DecodeString(approved.Certificate.Certificate)
+	issuedAt, issuedErr := parseCanonicalTime(approved.Certificate.IssuedAt)
+	expiresAt, expiresErr := parseCanonicalTime(approved.Certificate.ExpiresAt)
+	certificateFingerprint, fingerprintErr := decodeFingerprint(approved.Certificate.CertificateFingerprint)
+	verified, verifyErr := endpointidentity.VerifyWithTrustedKey(certificate, approved.Certificate.KeyID, trusted, endpointidentity.Expected{Role: endpointidentity.RoleMachine, EndpointID: registration.MachineID, Generation: endpoint.Generation}, c.config.Clock().UTC())
+	if status != http.StatusOK || approved.State != "approved" || !keyOK || certificateErr != nil || len(certificate) == 0 || base64.RawURLEncoding.EncodeToString(certificate) != approved.Certificate.Certificate || issuedErr != nil || expiresErr != nil || fingerprintErr != nil || certificateFingerprint != sha256.Sum256(certificate) || verifyErr != nil || approved.Certificate.Version != 1 || approved.Certificate.AccountID != verified.Claims.AccountID || approved.Certificate.KeyID != key.KeyID || approved.Certificate.EndpointID != verified.Claims.EndpointID || approved.Certificate.Role != "machine" || approved.Certificate.Generation != verified.Claims.Generation || approved.Certificate.Serial != verified.Claims.Serial || issuedAt != verified.Claims.IssuedAt || expiresAt != verified.Claims.ExpiresAt {
+		clear(certificate)
+		return ErrInvalid
+	}
+	return store.SavePeerEndpointCertificate(key.PublicKey, certificate, c.config.Clock().UTC())
+}
+
+func parseCanonicalTime(value string) (time.Time, error) {
+	parsed, err := time.Parse(time.RFC3339, value)
+	if err != nil || parsed.Nanosecond() != 0 || parsed.UTC().Format(time.RFC3339) != value {
+		return time.Time{}, ErrInvalid
+	}
+	return parsed, nil
+}
+
+func decodeFingerprint(value string) ([sha256.Size]byte, error) {
+	var result [sha256.Size]byte
+	decoded, err := hex.DecodeString(value)
+	if err != nil || len(decoded) != len(result) || hex.EncodeToString(decoded) != value {
+		return result, ErrInvalid
+	}
+	copy(result[:], decoded)
+	return result, nil
 }
 
 func (c *Client) post(ctx context.Context, path, operationID string, body []byte, out any) (int, error) {

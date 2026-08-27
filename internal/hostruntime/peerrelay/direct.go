@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"net"
@@ -28,6 +30,7 @@ import (
 	peerpreview "github.com/pinksaucepasta/paperboat/internal/peertransport/privatepreview"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/signaling"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/streamauth"
+	"github.com/pinksaucepasta/paperboat/internal/peertransport/trustedkeys"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/udpsocket"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
@@ -89,7 +92,17 @@ func (s *Service) serveDirect(setupCtx, lifetime context.Context, document api.P
 		delete(s.directAttempts, owner)
 		s.directMu.Unlock()
 	}()
-	descriptor := controlledAttemptDescriptor(document, local.RootPublicKey)
+	trusted, err := trustedkeys.FromAPI(document.TrustedKeys)
+	if err != nil && len(document.TrustedKeys) == 0 && len(local.RootPublicKey) == ed25519.PublicKeySize {
+		fingerprint := sha256.Sum256(local.RootPublicKey)
+		trusted = []endpointidentity.TrustedKey{{KeyID: "aek_" + hex.EncodeToString(fingerprint[:]), PublicKey: append(ed25519.PublicKey(nil), local.RootPublicKey...), Fingerprint: fingerprint, Generation: 1}}
+		err = nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer trustedkeys.Clear(trusted)
+	descriptor := controlledAttemptDescriptor(document, trusted)
 	pmtuKey := authority.PMTUKey()
 	mappingSource := s.config.SocketMapping
 	class := peerquic.ClassInteractive
@@ -124,7 +137,7 @@ func (s *Service) serveDirect(setupCtx, lifetime context.Context, document api.P
 	if err != nil {
 		return false, errors.Join(err, assembly.Close())
 	}
-	serverTLS, err := endpointidentity.ServerTLS(localLeaf, endpointidentity.PeerExpectation{RootPublic: local.RootPublicKey, Certificate: peerRaw, Expected: endpointidentity.Expected{AccountID: document.AccountID, Role: endpointidentity.RoleCLI, EndpointID: document.InitiatorEndpointID, Generation: peerCertificate.Claims.Generation}}, peerquic.ALPN, s.config.Clock)
+	serverTLS, err := endpointidentity.ServerTLS(localLeaf, endpointidentity.PeerExpectation{RootPublic: local.RootPublicKey, TrustedKeys: trusted, CertificateKeyID: endpointCertificateKeyID(document, document.InitiatorEndpointID, trusted), Certificate: peerRaw, Expected: endpointidentity.Expected{AccountID: document.AccountID, Role: endpointidentity.RoleCLI, EndpointID: document.InitiatorEndpointID, Generation: peerCertificate.Claims.Generation}}, peerquic.ALPN, s.config.Clock)
 	if err != nil {
 		return false, errors.Join(err, assembly.Close())
 	}
@@ -564,8 +577,25 @@ func newAuthorizedResponderConn(ctx context.Context, stream interface {
 	return header, &boundResponderConn{stream: stream, reader: bytes.NewReader(nil), local: peerAddr(authority.LocalEndpointID()), remote: peerAddr(authority.PeerEndpointID())}, nil
 }
 
-func controlledAttemptDescriptor(value api.PeerAttemptDescriptor, root ed25519.PublicKey) directpath.AttemptDescriptor {
-	return directpath.AttemptDescriptor{Document: value, IntentID: value.IntentID, AttemptGeneration: value.AttemptGeneration, NetworkGeneration: value.NetworkGeneration, Role: signaling.RoleControlled, InitiatorEndpointID: value.InitiatorEndpointID, ResponderEndpointID: value.ResponderEndpointID, RootPublicKey: append(ed25519.PublicKey(nil), root...), SignalingURL: value.Signaling.URL, SignalingCredential: value.Signaling.Credential, RelayRegion: value.Relays[0].Region, RelayQUICURL: value.Relays[0].QUICURL, RelayWSSURL: value.Relays[0].WSSURL, RelayCredential: value.Relays[0].RouteToken, RelayPMTUCredential: value.Relays[0].PMTUToken, RelayPMTUURL: value.Relays[0].PMTUURL, RouteGeneration: value.Relays[0].RouteGeneration, STUNURLs: append([]string(nil), value.Direct.STUNURLs...), LocalUfrag: value.Direct.ICEUfrag, LocalPassword: value.Direct.ICEPassword, IssuedAt: value.IssuedAt, ExpiresAt: value.ExpiresAt}
+func controlledAttemptDescriptor(value api.PeerAttemptDescriptor, trusted []endpointidentity.TrustedKey) directpath.AttemptDescriptor {
+	keys := make([]endpointidentity.TrustedKey, len(trusted))
+	for index, key := range trusted {
+		keys[index] = key
+		keys[index].PublicKey = append([]byte(nil), key.PublicKey...)
+	}
+	return directpath.AttemptDescriptor{Document: value, IntentID: value.IntentID, AttemptGeneration: value.AttemptGeneration, NetworkGeneration: value.NetworkGeneration, Role: signaling.RoleControlled, InitiatorEndpointID: value.InitiatorEndpointID, ResponderEndpointID: value.ResponderEndpointID, TrustedKeys: keys, SignalingURL: value.Signaling.URL, SignalingCredential: value.Signaling.Credential, RelayRegion: value.Relays[0].Region, RelayQUICURL: value.Relays[0].QUICURL, RelayWSSURL: value.Relays[0].WSSURL, RelayCredential: value.Relays[0].RouteToken, RelayPMTUCredential: value.Relays[0].PMTUToken, RelayPMTUURL: value.Relays[0].PMTUURL, RouteGeneration: value.Relays[0].RouteGeneration, STUNURLs: append([]string(nil), value.Direct.STUNURLs...), LocalUfrag: value.Direct.ICEUfrag, LocalPassword: value.Direct.ICEPassword, IssuedAt: value.IssuedAt, ExpiresAt: value.ExpiresAt}
+}
+
+func endpointCertificateKeyID(value api.PeerAttemptDescriptor, endpointID string, trusted []endpointidentity.TrustedKey) string {
+	for _, certificate := range value.EndpointCertificates {
+		if certificate.EndpointID == endpointID && certificate.KeyID != "" {
+			return certificate.KeyID
+		}
+	}
+	if len(trusted) == 1 {
+		return trusted[0].KeyID
+	}
+	return ""
 }
 
 type boundResponderConn struct {

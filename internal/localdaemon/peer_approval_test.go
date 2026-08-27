@@ -35,8 +35,8 @@ func TestApproveOwnedPeerEnrollmentsAutomaticCLIApproval(t *testing.T) {
 		{name: "wrong account", mutate: func(r *api.E2EERoot, _ *api.PendingEndpointIdentity) {
 			public, _, _ := ed25519.GenerateKey(nil)
 			sum := sha256.Sum256(public)
-			r.PublicKey = base64.RawURLEncoding.EncodeToString(public)
-			r.Fingerprint = hex.EncodeToString(sum[:])
+			keyID := "aek_" + hex.EncodeToString(sum[:])
+			r.TrustedKeys[0] = api.E2EEKey{KeyID: keyID, PublicKey: base64.RawURLEncoding.EncodeToString(public), Fingerprint: hex.EncodeToString(sum[:]), Generation: 1}
 		}, wantErr: true},
 		{name: "retry", mutate: func(_ *api.E2EERoot, _ *api.PendingEndpointIdentity) {}, wantErr: true, wantAttempts: 2},
 		{name: "response fingerprint mismatch", mutateResult: func(document *api.EndpointCertificateDocument) {
@@ -63,7 +63,8 @@ func TestApproveOwnedPeerEnrollmentsAutomaticCLIApproval(t *testing.T) {
 			pending := api.PendingEndpointIdentity{RequestID: "per_0123456789abcdef", EndpointID: endpointID, Role: "cli", State: "pending", Generation: 1, NoisePublicKey: base64.RawURLEncoding.EncodeToString(pendingKeys.NoisePublic[:]), QUICPublicKey: base64.RawURLEncoding.EncodeToString(quic), CreatedAt: serverNow.Add(-time.Minute), ExpiresAt: serverNow.Add(4 * time.Minute), SafetyCode: "abcde-fghij"}
 			rootPublic := keys.RootPrivate.Public().(ed25519.PublicKey)
 			rootSum := sha256.Sum256(rootPublic)
-			root := api.E2EERoot{Version: 1, PublicKey: base64.RawURLEncoding.EncodeToString(rootPublic), Fingerprint: hex.EncodeToString(rootSum[:]), Generation: 1}
+			rootKeyID := "aek_" + hex.EncodeToString(rootSum[:])
+			root := api.E2EERoot{Version: 1, TrustedKeys: []api.E2EEKey{{KeyID: rootKeyID, PublicKey: base64.RawURLEncoding.EncodeToString(rootPublic), Fingerprint: hex.EncodeToString(rootSum[:]), Generation: 1}}}
 			if tc.mutate != nil {
 				tc.mutate(&root, &pending)
 			}

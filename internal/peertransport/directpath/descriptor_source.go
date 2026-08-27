@@ -30,7 +30,8 @@ type APIDescriptorSourceConfig struct {
 	Purpose                           string
 	Consumer                          string
 	AccountID                         string
-	RootPublicKey                     ed25519.PublicKey
+	TrustedKeys                       []endpointidentity.TrustedKey
+	RootPublicKey                     ed25519.PublicKey // internal adapter for existing callers
 	ControllingEndpointID             string
 	ControlledEndpointID              string
 	ControllingCertificateFingerprint string
@@ -44,10 +45,28 @@ type APIDescriptorSourceConfig struct {
 
 type APIDescriptorSource struct{ config APIDescriptorSourceConfig }
 
+func cloneTrustedKeys(values []endpointidentity.TrustedKey) []endpointidentity.TrustedKey {
+	result := make([]endpointidentity.TrustedKey, len(values))
+	for index, value := range values {
+		result[index] = value
+		result[index].PublicKey = append([]byte(nil), value.PublicKey...)
+	}
+	return result
+}
+
 func NewAPIDescriptorSource(config APIDescriptorSourceConfig) (*APIDescriptorSource, error) {
-	if nilInterface(config.Client) || !boundedDescriptorValue(config.EnvironmentID, 1, 128) || config.Purpose != "peer_transport" && config.Purpose != "interactive" && config.Purpose != "private_preview" && config.Purpose != "codex" && config.Purpose != "health_probe" && config.Purpose != "direct_probe" && config.Purpose != "file_transfer_key" || !validPurposeConsumer(config.Purpose, config.Consumer) || !validDescriptorTransfer(config.Purpose, config.Transfer) || !boundedDescriptorValue(config.AccountID, 1, 128) || len(config.RootPublicKey) != ed25519.PublicKeySize || !boundedDescriptorValue(config.ControllingEndpointID, 1, 128) || !boundedDescriptorValue(config.ControlledEndpointID, 1, 128) || config.ControllingEndpointID == config.ControlledEndpointID || !canonicalHexFingerprint(config.ControllingCertificateFingerprint) || !canonicalHexFingerprint(config.ControlledCertificateFingerprint) || config.OperationID == nil {
+	if nilInterface(config.Client) || !boundedDescriptorValue(config.EnvironmentID, 1, 128) || config.Purpose != "peer_transport" && config.Purpose != "interactive" && config.Purpose != "private_preview" && config.Purpose != "codex" && config.Purpose != "health_probe" && config.Purpose != "direct_probe" && config.Purpose != "file_transfer_key" || !validPurposeConsumer(config.Purpose, config.Consumer) || !validDescriptorTransfer(config.Purpose, config.Transfer) || !boundedDescriptorValue(config.AccountID, 1, 128) || !boundedDescriptorValue(config.ControllingEndpointID, 1, 128) || !boundedDescriptorValue(config.ControlledEndpointID, 1, 128) || config.ControllingEndpointID == config.ControlledEndpointID || !canonicalHexFingerprint(config.ControllingCertificateFingerprint) || !canonicalHexFingerprint(config.ControlledCertificateFingerprint) || config.OperationID == nil {
 		return nil, ErrFactoryInvalid
 	}
+	if len(config.TrustedKeys) == 0 && len(config.RootPublicKey) == ed25519.PublicKeySize {
+		fingerprint := sha256.Sum256(config.RootPublicKey)
+		config.TrustedKeys = []endpointidentity.TrustedKey{{KeyID: "aek_" + hex.EncodeToString(fingerprint[:]), PublicKey: append(ed25519.PublicKey(nil), config.RootPublicKey...), Fingerprint: fingerprint, Generation: 1}}
+	}
+	trusted, err := endpointidentity.ValidateTrustedKeySet(config.TrustedKeys)
+	if err != nil {
+		return nil, ErrFactoryInvalid
+	}
+	config.TrustedKeys = trusted
 	return &APIDescriptorSource{config: config}, nil
 }
 
@@ -78,7 +97,7 @@ func (s *APIDescriptorSource) Acquire(ctx context.Context, generation Generation
 		return AttemptDescriptor{}, err
 	}
 	relay := document.Relays[0]
-	result := AttemptDescriptor{Document: document, IntentID: document.IntentID, AttemptGeneration: document.AttemptGeneration, NetworkGeneration: document.NetworkGeneration, Role: signaling.Role(document.Role), InitiatorEndpointID: document.InitiatorEndpointID, ResponderEndpointID: document.ResponderEndpointID, InitiatorCertificate: certificates[document.InitiatorEndpointID], ResponderCertificate: certificates[document.ResponderEndpointID], RootPublicKey: append(ed25519.PublicKey(nil), s.config.RootPublicKey...), SignalingURL: document.Signaling.URL, SignalingCredential: document.Signaling.Credential, RelayRegion: relay.Region, RelayQUICURL: relay.QUICURL, RelayWSSURL: relay.WSSURL, RelayCredential: relay.RouteToken, RelayPMTUCredential: relay.PMTUToken, RelayPMTUURL: relay.PMTUURL, RouteGeneration: relay.RouteGeneration, STUNURLs: append([]string(nil), document.Direct.STUNURLs...), LocalUfrag: document.Direct.ICEUfrag, LocalPassword: document.Direct.ICEPassword, IssuedAt: document.IssuedAt, ExpiresAt: document.ExpiresAt}
+	result := AttemptDescriptor{Document: document, IntentID: document.IntentID, AttemptGeneration: document.AttemptGeneration, NetworkGeneration: document.NetworkGeneration, Role: signaling.Role(document.Role), InitiatorEndpointID: document.InitiatorEndpointID, ResponderEndpointID: document.ResponderEndpointID, InitiatorCertificate: certificates[document.InitiatorEndpointID], ResponderCertificate: certificates[document.ResponderEndpointID], TrustedKeys: cloneTrustedKeys(s.config.TrustedKeys), RootPublicKey: append(ed25519.PublicKey(nil), s.config.RootPublicKey...), SignalingURL: document.Signaling.URL, SignalingCredential: document.Signaling.Credential, RelayRegion: relay.Region, RelayQUICURL: relay.QUICURL, RelayWSSURL: relay.WSSURL, RelayCredential: relay.RouteToken, RelayPMTUCredential: relay.PMTUToken, RelayPMTUURL: relay.PMTUURL, RouteGeneration: relay.RouteGeneration, STUNURLs: append([]string(nil), document.Direct.STUNURLs...), LocalUfrag: document.Direct.ICEUfrag, LocalPassword: document.Direct.ICEPassword, IssuedAt: document.IssuedAt, ExpiresAt: document.ExpiresAt}
 	if s.config.OnAcquire != nil {
 		s.config.OnAcquire(result)
 	}
@@ -121,7 +140,11 @@ func validateAPIDescriptor(value api.PeerAttemptDescriptor, config APIDescriptor
 		if err != nil || base64.RawURLEncoding.EncodeToString(raw) != document.Certificate {
 			return nil, fmt.Errorf("%w: endpoint certificate encoding", ErrDescriptorInvalid)
 		}
-		certificate, err := endpointidentity.Verify(raw, config.RootPublicKey, endpointidentity.Expected{AccountID: config.AccountID, Role: wantRoles[document.EndpointID], EndpointID: document.EndpointID}, value.IssuedAt)
+		keyID := document.KeyID
+		if keyID == "" && len(config.TrustedKeys) == 1 {
+			keyID = config.TrustedKeys[0].KeyID
+		}
+		certificate, err := endpointidentity.VerifyWithTrustedKey(raw, keyID, config.TrustedKeys, endpointidentity.Expected{AccountID: config.AccountID, Role: wantRoles[document.EndpointID], EndpointID: document.EndpointID}, value.IssuedAt)
 		fingerprint := sha256.Sum256(raw)
 		if err != nil || certificate.Claims.EndpointID != document.EndpointID || certificate.Claims.Role != wantRoles[document.EndpointID] || certificate.Claims.ExpiresAt.Before(value.ExpiresAt) || hex.EncodeToString(fingerprint[:]) != wantFingerprints[document.EndpointID] {
 			return nil, fmt.Errorf("%w: endpoint certificate authority", ErrDescriptorInvalid)

@@ -237,6 +237,13 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 			return fmt.Errorf("persist CLI enrollment progress: %w", err)
 		}
 	}
+	if !shouldInstallBootstrapHostRuntime(material) {
+		if err := bootstrap.ClearResume(*stateRoot); err != nil {
+			return fmt.Errorf("clear completed client enrollment resume state: %w", err)
+		}
+		fmt.Fprintln(stdout, "Paperboat client setup complete.")
+		return nil
+	}
 	artifactPath, err := prepareWindowsBootstrapRuntime(ctx, material.ReuseIdentity, resume.RuntimeEnrolled, func(ctx context.Context) error {
 		return ensureWindowsRuntimeEnrollment(ctx, material, *stateRoot)
 	}, func() error {

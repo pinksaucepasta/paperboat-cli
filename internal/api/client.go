@@ -328,6 +328,7 @@ type EndpointCertificateDocument struct {
 	Version                int    `json:"version"`
 	AccountID              string `json:"account_id"`
 	KeyID                  string `json:"key_id"`
+	RootFingerprint        string `json:"-"`
 	EndpointID             string `json:"endpoint_id"`
 	Role                   string `json:"role"`
 	Generation             uint64 `json:"generation"`
@@ -365,6 +366,9 @@ type E2EEKey struct {
 type E2EERoot struct {
 	Version     int       `json:"version"`
 	TrustedKeys []E2EEKey `json:"trusted_keys"`
+	PublicKey   string    `json:"-"`
+	Fingerprint string    `json:"-"`
+	Generation  uint64    `json:"-"`
 }
 
 type PendingEndpointIdentity struct {

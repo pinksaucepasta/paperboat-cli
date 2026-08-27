@@ -12,6 +12,7 @@ import (
 
 	"github.com/pinksaucepasta/paperboat/internal/api"
 	"github.com/pinksaucepasta/paperboat/internal/diagnosticlog"
+	"github.com/pinksaucepasta/paperboat/internal/peertransport/endpointidentity"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/iceagent"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/networkcheck"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/portmapping"
@@ -36,7 +37,8 @@ type AttemptDescriptor struct {
 	ResponderEndpointID  string
 	InitiatorCertificate []byte
 	ResponderCertificate []byte
-	RootPublicKey        ed25519.PublicKey
+	TrustedKeys          []endpointidentity.TrustedKey
+	RootPublicKey        ed25519.PublicKey // internal single-key test/legacy adapter
 	SignalingURL         string
 	SignalingCredential  string
 	RelayRegion          string

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/pinksaucepasta/paperboat/internal/config"
+	"github.com/pinksaucepasta/paperboat/internal/peertransport/endpointidentity"
 )
 
 type cacheKey struct {
@@ -78,13 +79,24 @@ func (c *Cache) Close() {
 
 func cloneAuthority(value Authority) Authority {
 	return Authority{
-		RootPublic:            append(ed25519.PublicKey(nil), value.RootPublic...),
-		LocalKeys:             cloneKeys(value.LocalKeys),
-		LocalCertificate:      value.LocalCertificate,
-		LocalCertificateRaw:   append([]byte(nil), value.LocalCertificateRaw...),
-		MachineCertificate:    value.MachineCertificate,
-		MachineCertificateRaw: append([]byte(nil), value.MachineCertificateRaw...),
+		RootPublic:              append(ed25519.PublicKey(nil), value.RootPublic...),
+		TrustedKeys:             cloneTrustedKeys(value.TrustedKeys),
+		LocalKeys:               cloneKeys(value.LocalKeys),
+		LocalCertificate:        value.LocalCertificate,
+		LocalCertificateRaw:     append([]byte(nil), value.LocalCertificateRaw...),
+		MachineCertificate:      value.MachineCertificate,
+		MachineCertificateKeyID: value.MachineCertificateKeyID,
+		MachineCertificateRaw:   append([]byte(nil), value.MachineCertificateRaw...),
 	}
+}
+
+func cloneTrustedKeys(values []endpointidentity.TrustedKey) []endpointidentity.TrustedKey {
+	result := make([]endpointidentity.TrustedKey, len(values))
+	for i, value := range values {
+		result[i] = value
+		result[i].PublicKey = append([]byte(nil), value.PublicKey...)
+	}
+	return result
 }
 
 func cloneKeys(value config.PeerIdentityKeys) config.PeerIdentityKeys {

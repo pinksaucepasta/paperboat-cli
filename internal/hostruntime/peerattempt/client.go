@@ -21,6 +21,7 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/api"
 	identitystore "github.com/pinksaucepasta/paperboat/internal/hostruntime/identity"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/endpointidentity"
+	"github.com/pinksaucepasta/paperboat/internal/peertransport/trustedkeys"
 )
 
 var (
@@ -174,6 +175,16 @@ func validate(value api.PeerAttemptDescriptor, machineID string, local identitys
 	if err != nil || value.Version != 1 || value.AccountID != localCertificate.Claims.AccountID || value.DeviceID != value.InitiatorEndpointID || value.OperationID == "" || value.IntentID == "" || value.EnvironmentID == "" || value.Purpose != "peer_transport" && value.Purpose != "interactive" && value.Purpose != "private_preview" && value.Purpose != "codex" && value.Purpose != "health_probe" && value.Purpose != "direct_probe" && value.Purpose != "file_transfer_key" || value.Purpose == "peer_transport" && value.Consumer != "peer_transport" || !validStreamPolicy(value.Purpose, value.StreamPolicy) || !validTransfer(value.Purpose, value.Transfer, now) || !validAllowedPaths(value.Purpose, value.Policy.AllowedPaths) || value.InitiatorEndpointID == "" || value.ResponderEndpointID != machineID || value.Role != "controlled" || value.AttemptGeneration == 0 || value.NetworkGeneration == 0 || value.HostGeneration != local.Generation || value.AuthorizationGeneration == 0 || value.IssuedAt.After(now.Add(30*time.Second)) || !value.ExpiresAt.After(now) || value.ExpiresAt.Sub(value.IssuedAt) > 5*time.Minute || len(value.EndpointCertificates) != 2 || len(value.Relays) != 1 || value.Signaling.Subprotocol != "paperboat.peer-signaling.v1" || !exactWSS(value.Signaling.URL, "/v1/peer-signaling") || !token(value.Signaling.Credential) {
 		return ErrInvalid
 	}
+	trusted, err := trustedkeys.FromAPI(value.TrustedKeys)
+	if err != nil && len(value.TrustedKeys) == 0 && len(local.RootPublicKey) == 32 {
+		fingerprint := sha256.Sum256(local.RootPublicKey)
+		trusted = []endpointidentity.TrustedKey{{KeyID: "aek_" + hex.EncodeToString(fingerprint[:]), PublicKey: append([]byte(nil), local.RootPublicKey...), Fingerprint: fingerprint, Generation: 1}}
+		err = nil
+	}
+	if err != nil {
+		return ErrInvalid
+	}
+	defer trustedkeys.Clear(trusted)
 	seen := map[string]bool{}
 	for _, document := range value.EndpointCertificates {
 		raw, decodeErr := base64.RawURLEncoding.Strict().DecodeString(document.Certificate)
@@ -181,7 +192,11 @@ func validate(value api.PeerAttemptDescriptor, machineID string, local identitys
 		if document.EndpointID == machineID {
 			role = endpointidentity.RoleMachine
 		}
-		certificate, verifyErr := endpointidentity.Verify(raw, local.RootPublicKey, endpointidentity.Expected{AccountID: value.AccountID, Role: role, EndpointID: document.EndpointID}, value.IssuedAt)
+		keyID := document.KeyID
+		if keyID == "" && len(trusted) == 1 {
+			keyID = trusted[0].KeyID
+		}
+		certificate, verifyErr := endpointidentity.VerifyWithTrustedKey(raw, keyID, trusted, endpointidentity.Expected{AccountID: value.AccountID, Role: role, EndpointID: document.EndpointID}, value.IssuedAt)
 		if decodeErr != nil || base64.RawURLEncoding.EncodeToString(raw) != document.Certificate || verifyErr != nil || certificate.Claims.ExpiresAt.Before(value.ExpiresAt) || seen[document.EndpointID] || document.EndpointID != value.InitiatorEndpointID && document.EndpointID != machineID || document.EndpointID == machineID && !bytes.Equal(raw, local.Certificate) {
 			return ErrInvalid
 		}

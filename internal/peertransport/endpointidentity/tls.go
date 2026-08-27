@@ -16,9 +16,13 @@ import (
 const maximumLeafLifetime = 24 * time.Hour
 
 type PeerExpectation struct {
-	RootPublic  ed25519.PublicKey
-	Certificate []byte
-	Expected    Expected
+	// RootPublic is retained for the single-key local adapter. New peer
+	// verification uses TrustedKeys and the certificate's explicit key ID.
+	RootPublic       ed25519.PublicKey
+	TrustedKeys      []TrustedKey
+	CertificateKeyID string
+	Certificate      []byte
+	Expected         Expected
 }
 
 func NewTLSCertificate(certificate Certificate, rootPublic ed25519.PublicKey, private ed25519.PrivateKey, now time.Time, lifetime time.Duration) (tls.Certificate, error) {
@@ -80,11 +84,11 @@ func tlsConfig(local tls.Certificate, peer PeerExpectation, alpn string, now fun
 	if len(local.Certificate) != 1 || local.PrivateKey == nil || alpn == "" || now == nil {
 		return nil, errors.New("invalid endpoint TLS configuration")
 	}
-	if _, err := Verify(peer.Certificate, peer.RootPublic, peer.Expected, now()); err != nil {
+	if _, err := verifyPeerCertificate(peer, now()); err != nil {
 		return nil, fmt.Errorf("verify expected peer: %w", err)
 	}
 	verify := func(state tls.ConnectionState) error {
-		expected, err := Verify(peer.Certificate, peer.RootPublic, peer.Expected, now())
+		expected, err := verifyPeerCertificate(peer, now())
 		if err != nil {
 			return fmt.Errorf("revalidate expected peer: %w", err)
 		}
@@ -121,4 +125,23 @@ func tlsConfig(local tls.Certificate, peer PeerExpectation, alpn string, now fun
 		config.ClientAuth = tls.RequireAnyClientCert
 	}
 	return config, nil
+}
+
+func verifyPeerCertificate(peer PeerExpectation, now time.Time) (Certificate, error) {
+	if len(peer.TrustedKeys) > 0 {
+		keyID := peer.CertificateKeyID
+		if keyID == "" && len(peer.TrustedKeys) == 1 {
+			// Keep the internal one-key fixture adapter useful while all
+			// production descriptors carry the server-issued key ID.
+			keyID = peer.TrustedKeys[0].KeyID
+		}
+		if keyID == "" {
+			return Certificate{}, ErrTrustedKeySet
+		}
+		return VerifyWithTrustedKey(peer.Certificate, keyID, peer.TrustedKeys, peer.Expected, now)
+	}
+	if len(peer.RootPublic) != ed25519.PublicKeySize {
+		return Certificate{}, ErrTrustedKeySet
+	}
+	return Verify(peer.Certificate, peer.RootPublic, peer.Expected, now)
 }

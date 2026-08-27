@@ -26,6 +26,15 @@ func TestShouldInstallBootstrapCLI(t *testing.T) {
 	}
 }
 
+func TestShouldInstallBootstrapHostRuntime(t *testing.T) {
+	if !shouldInstallBootstrapHostRuntime(bootstrap.Material{SetupMode: "host"}) {
+		t.Fatal("host enrollment must install the host runtime")
+	}
+	if shouldInstallBootstrapHostRuntime(bootstrap.Material{SetupMode: "client"}) {
+		t.Fatal("client enrollment must stop after shared CLI setup")
+	}
+}
+
 func TestBootstrapCLIHostEnrollmentInstallsClientProfileAndDaemon(t *testing.T) {
 	store := testBootstrapProfileStore(t)
 	issuer := "https://api.example.test"

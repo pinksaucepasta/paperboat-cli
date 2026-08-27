@@ -170,7 +170,7 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	}
 	// Client enrollments stop after the shared CLI setup. Host enrollments also
 	// mint machine-control authority and install the managed host runtime.
-	if material.SetupMode == "client" {
+	if !shouldInstallBootstrapHostRuntime(material) {
 		fmt.Fprintln(stderr, "Enrollment accepted. Client setup complete.")
 		return nil
 	}

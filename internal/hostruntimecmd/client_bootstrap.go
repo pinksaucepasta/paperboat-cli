@@ -135,3 +135,7 @@ func enrollBootstrapCLIIdentity(ctx context.Context, store config.ProfileStore, 
 func shouldInstallBootstrapCLI(material bootstrap.Material) bool {
 	return material.ClientSession != nil && (material.SetupMode == "client" || material.SetupMode == "host")
 }
+
+func shouldInstallBootstrapHostRuntime(material bootstrap.Material) bool {
+	return material.SetupMode == "host"
+}

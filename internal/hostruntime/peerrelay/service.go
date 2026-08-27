@@ -3,8 +3,10 @@ package peerrelay
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -30,6 +32,7 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/streamauth"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/transfercrypto"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/transportstage"
+	"github.com/pinksaucepasta/paperboat/internal/peertransport/trustedkeys"
 )
 
 var ErrInvalid = errors.New("invalid peer relay service configuration")
@@ -349,11 +352,21 @@ func (s *Service) serveAttempt(parent context.Context, descriptor api.PeerAttemp
 	if err != nil {
 		return err
 	}
+	peerKeys, err := trustedkeys.FromAPI(descriptor.TrustedKeys)
+	if err != nil && len(descriptor.TrustedKeys) == 0 && len(local.RootPublicKey) == ed25519.PublicKeySize {
+		fingerprint := sha256.Sum256(local.RootPublicKey)
+		peerKeys = []endpointidentity.TrustedKey{{KeyID: "aek_" + hex.EncodeToString(fingerprint[:]), PublicKey: append(ed25519.PublicKey(nil), local.RootPublicKey...), Fingerprint: fingerprint, Generation: 1}}
+		err = nil
+	}
+	if err != nil {
+		return err
+	}
+	defer trustedkeys.Clear(peerKeys)
 	localCertificate, err := endpointidentity.Verify(local.Certificate, local.RootPublicKey, endpointidentity.Expected{AccountID: descriptor.AccountID, Role: endpointidentity.RoleMachine, EndpointID: descriptor.ResponderEndpointID, Generation: descriptor.HostGeneration}, now)
 	if err != nil {
 		return err
 	}
-	peerCertificate, err := descriptorCertificate(descriptor, descriptor.InitiatorEndpointID, local.RootPublicKey, now)
+	peerCertificate, err := descriptorCertificate(descriptor, descriptor.InitiatorEndpointID, peerKeys, now)
 	if err != nil {
 		return err
 	}
@@ -1103,7 +1116,7 @@ func (s *Service) exchangeTransferKey(stream net.Conn, descriptor api.PeerAttemp
 	return err
 }
 
-func descriptorCertificate(descriptor api.PeerAttemptDescriptor, endpointID string, rootPublic ed25519.PublicKey, now time.Time) (endpointidentity.Certificate, error) {
+func descriptorCertificate(descriptor api.PeerAttemptDescriptor, endpointID string, trusted []endpointidentity.TrustedKey, now time.Time) (endpointidentity.Certificate, error) {
 	for _, document := range descriptor.EndpointCertificates {
 		if document.EndpointID != endpointID {
 			continue
@@ -1112,7 +1125,11 @@ func descriptorCertificate(descriptor api.PeerAttemptDescriptor, endpointID stri
 		if err != nil || base64.RawURLEncoding.EncodeToString(raw) != document.Certificate {
 			return endpointidentity.Certificate{}, ErrInvalid
 		}
-		return endpointidentity.Verify(raw, rootPublic, endpointidentity.Expected{AccountID: descriptor.AccountID, Role: endpointidentity.RoleCLI, EndpointID: endpointID}, now)
+		keyID := document.KeyID
+		if keyID == "" && len(trusted) == 1 {
+			keyID = trusted[0].KeyID
+		}
+		return endpointidentity.VerifyWithTrustedKey(raw, keyID, trusted, endpointidentity.Expected{AccountID: descriptor.AccountID, Role: endpointidentity.RoleCLI, EndpointID: endpointID}, now)
 	}
 	return endpointidentity.Certificate{}, ErrInvalid
 }

@@ -51,7 +51,7 @@ func TestResolveBindsLocalCustodyAndRemoteCertificateToOneRoot(t *testing.T) {
 	machineFingerprint := sha256.Sum256(machineRaw)
 	rootPublic := keys.RootPrivate.Public().(ed25519.PublicKey)
 	rootFingerprint := sha256.Sum256(rootPublic)
-	document := api.EndpointCertificateDocument{Version: 1, AccountID: accountID, RootFingerprint: hex.EncodeToString(rootFingerprint[:]), EndpointID: machineID, Role: "machine", Generation: 3, Serial: 2, IssuedAt: machine.Claims.IssuedAt.Format(time.RFC3339), ExpiresAt: machine.Claims.ExpiresAt.Format(time.RFC3339), Certificate: base64.RawURLEncoding.EncodeToString(machineRaw), CertificateFingerprint: hex.EncodeToString(machineFingerprint[:])}
+	document := api.EndpointCertificateDocument{Version: 1, AccountID: accountID, KeyID: "aek_" + hex.EncodeToString(rootFingerprint[:]), EndpointID: machineID, Role: "machine", Generation: 3, Serial: 2, IssuedAt: machine.Claims.IssuedAt.Format(time.RFC3339), ExpiresAt: machine.Claims.ExpiresAt.Format(time.RFC3339), Certificate: base64.RawURLEncoding.EncodeToString(machineRaw), CertificateFingerprint: hex.EncodeToString(machineFingerprint[:])}
 	authority, err := Resolve(context.Background(), Request{Store: store, Client: certificateClientFunc(func(_ context.Context, endpoint string, generation uint64) (api.EndpointCertificateDocument, error) {
 		if endpoint != machineID || generation != 3 {
 			t.Fatalf("endpoint=%s generation=%d", endpoint, generation)
@@ -128,7 +128,7 @@ func TestResolveUsesVerifierOnlyRootWithoutCreatingPrivateCustody(t *testing.T) 
 	machineFingerprint := sha256.Sum256(machineRaw)
 	rootFingerprint := sha256.Sum256(rootPublic)
 	document := api.EndpointCertificateDocument{
-		Version: 1, AccountID: accountID, RootFingerprint: hex.EncodeToString(rootFingerprint[:]),
+		Version: 1, AccountID: accountID, KeyID: "aek_" + hex.EncodeToString(rootFingerprint[:]),
 		EndpointID: machineID, Role: "machine", Generation: 3, Serial: 2,
 		IssuedAt: machine.Claims.IssuedAt.Format(time.RFC3339), ExpiresAt: machine.Claims.ExpiresAt.Format(time.RFC3339),
 		Certificate: base64.RawURLEncoding.EncodeToString(machineRaw), CertificateFingerprint: hex.EncodeToString(machineFingerprint[:]),
@@ -176,7 +176,7 @@ func TestResolveUsesVerifierOnlyRootWithoutCreatingPrivateCustody(t *testing.T) 
 	}
 	substitutedFingerprint := sha256.Sum256(substitutedRaw)
 	otherRootFingerprint := sha256.Sum256(otherPublic)
-	document.RootFingerprint = hex.EncodeToString(otherRootFingerprint[:])
+	document.KeyID = "aek_" + hex.EncodeToString(otherRootFingerprint[:])
 	document.Certificate = base64.RawURLEncoding.EncodeToString(substitutedRaw)
 	document.CertificateFingerprint = hex.EncodeToString(substitutedFingerprint[:])
 	if _, err := Resolve(context.Background(), request); !errors.Is(err, ErrInvalid) {

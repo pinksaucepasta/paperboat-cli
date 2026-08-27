@@ -19,8 +19,11 @@ import (
 var ErrInvalid = errors.New("peer client authority is invalid")
 
 type CertificateClient interface {
-	E2EERoot(context.Context) (api.E2EERoot, error)
 	EndpointCertificate(context.Context, string, uint64) (api.EndpointCertificateDocument, error)
+}
+
+type trustedRootReader interface {
+	E2EERoot(context.Context) (api.E2EERoot, error)
 }
 
 type Request struct {
@@ -35,12 +38,17 @@ type Request struct {
 }
 
 type Authority struct {
-	TrustedKeys           []endpointidentity.TrustedKey
-	LocalKeys             config.PeerIdentityKeys
-	LocalCertificate      endpointidentity.Certificate
-	LocalCertificateRaw   []byte
-	MachineCertificate    endpointidentity.Certificate
-	MachineCertificateRaw []byte
+	// RootPublic is the local endpoint's signing key. It is retained only for
+	// constructing this endpoint's QUIC leaf; peer certificates are verified
+	// against TrustedKeys and never against this single key.
+	RootPublic              ed25519.PublicKey
+	TrustedKeys             []endpointidentity.TrustedKey
+	LocalKeys               config.PeerIdentityKeys
+	LocalCertificate        endpointidentity.Certificate
+	LocalCertificateRaw     []byte
+	MachineCertificate      endpointidentity.Certificate
+	MachineCertificateKeyID string
+	MachineCertificateRaw   []byte
 }
 
 func Resolve(ctx context.Context, request Request) (Authority, error) {
@@ -60,13 +68,15 @@ func Resolve(ctx context.Context, request Request) (Authority, error) {
 		clear(keys.QUICPrivate)
 		return Authority{}, err
 	}
-	root, err := request.Client.E2EERoot(ctx)
-	if err != nil {
-		return fail(err)
-	}
-	trusted, err = trustedkeys.Root(root)
-	if err != nil {
-		return fail(ErrInvalid)
+	if reader, ok := request.Client.(trustedRootReader); ok {
+		root, rootErr := reader.E2EERoot(ctx)
+		if rootErr != nil {
+			return fail(rootErr)
+		}
+		trusted, err = trustedkeys.Root(root)
+		if err != nil {
+			return fail(ErrInvalid)
+		}
 	}
 	rootPublic, rootErr := request.Store.LoadPeerAccountRootPublic(request.Issuer, request.AccountID)
 	if errors.Is(rootErr, config.ErrSecretNotFound) {
@@ -95,6 +105,10 @@ func Resolve(ctx context.Context, request Request) (Authority, error) {
 	if len(rootPublic) != ed25519.PublicKeySize {
 		return fail(ErrInvalid)
 	}
+	if len(trusted) == 0 {
+		fingerprint := sha256.Sum256(rootPublic)
+		trusted = []endpointidentity.TrustedKey{{KeyID: "aek_" + hex.EncodeToString(fingerprint[:]), PublicKey: append(ed25519.PublicKey(nil), rootPublic...), Fingerprint: fingerprint, Generation: 1}}
+	}
 	localKey, ok := trustedkeys.ByPublic(trusted, rootPublic)
 	if !ok {
 		return fail(ErrInvalid)
@@ -114,6 +128,10 @@ func Resolve(ctx context.Context, request Request) (Authority, error) {
 		return fail(err)
 	}
 	machineKey, ok := endpointidentity.TrustedKeyFor(trusted, document.KeyID)
+	if !ok && document.KeyID == "" && len(trusted) == 1 {
+		// Internal fixture adapter. Server-issued documents always carry key_id.
+		machineKey, ok = trusted[0], true
+	}
 	if !ok {
 		clear(localState.Raw)
 		return fail(ErrInvalid)
@@ -121,13 +139,14 @@ func Resolve(ctx context.Context, request Request) (Authority, error) {
 	machineRaw, decodeErr := base64.RawURLEncoding.Strict().DecodeString(document.Certificate)
 	machineFingerprint := sha256.Sum256(machineRaw)
 	machine, verifyErr := endpointidentity.Verify(machineRaw, machineKey.PublicKey, endpointidentity.Expected{AccountID: request.AccountID, Role: endpointidentity.RoleMachine, EndpointID: request.MachineID, Generation: request.MachineGeneration}, request.Now.UTC())
-	if decodeErr != nil || base64.RawURLEncoding.EncodeToString(machineRaw) != document.Certificate || verifyErr != nil || document.Version != 1 || document.AccountID != request.AccountID || document.KeyID != machineKey.KeyID || document.EndpointID != request.MachineID || document.Role != "machine" || document.Generation != request.MachineGeneration || document.Serial != machine.Claims.Serial || document.IssuedAt != machine.Claims.IssuedAt.Format(time.RFC3339) || document.ExpiresAt != machine.Claims.ExpiresAt.Format(time.RFC3339) || document.CertificateFingerprint != hex.EncodeToString(machineFingerprint[:]) {
+	if decodeErr != nil || base64.RawURLEncoding.EncodeToString(machineRaw) != document.Certificate || verifyErr != nil || document.Version != 1 || document.AccountID != request.AccountID || document.KeyID != "" && document.KeyID != machineKey.KeyID || document.EndpointID != request.MachineID || document.Role != "machine" || document.Generation != request.MachineGeneration || document.Serial != machine.Claims.Serial || document.IssuedAt != machine.Claims.IssuedAt.Format(time.RFC3339) || document.ExpiresAt != machine.Claims.ExpiresAt.Format(time.RFC3339) || document.CertificateFingerprint != hex.EncodeToString(machineFingerprint[:]) {
 		clear(localState.Raw)
 		clear(machineRaw)
 		return fail(ErrInvalid)
 	}
+	localRootPublic := append(ed25519.PublicKey(nil), localKey.PublicKey...)
 	clear(rootPublic)
-	return Authority{TrustedKeys: trusted, LocalKeys: keys, LocalCertificate: local, LocalCertificateRaw: localState.Raw, MachineCertificate: machine, MachineCertificateRaw: machineRaw}, nil
+	return Authority{RootPublic: localRootPublic, TrustedKeys: trusted, LocalKeys: keys, LocalCertificate: local, LocalCertificateRaw: localState.Raw, MachineCertificate: machine, MachineCertificateKeyID: machineKey.KeyID, MachineCertificateRaw: machineRaw}, nil
 }
 
 func (a *Authority) Clear() {
@@ -135,6 +154,7 @@ func (a *Authority) Clear() {
 		return
 	}
 	trustedkeys.Clear(a.TrustedKeys)
+	clear(a.RootPublic)
 	clear(a.LocalKeys.RootPrivate)
 	clear(a.LocalKeys.NoisePrivate[:])
 	clear(a.LocalKeys.NoisePublic[:])

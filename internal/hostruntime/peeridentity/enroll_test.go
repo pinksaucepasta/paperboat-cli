@@ -3,7 +3,9 @@ package peeridentity
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -14,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pinksaucepasta/paperboat/internal/api"
 	identitystore "github.com/pinksaucepasta/paperboat/internal/hostruntime/identity"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/endpointidentity"
 )
@@ -79,7 +82,10 @@ func TestEnsureResumesPendingEnrollmentAndPersistsApprovedCertificate(t *testing
 				t.Fatal(err)
 			}
 			raw, _ := certificate.MarshalBinary()
-			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"state": "approved", "root_public_key": base64.RawURLEncoding.EncodeToString(rootPublic), "certificate": map[string]any{"certificate": base64.RawURLEncoding.EncodeToString(raw)}}})
+			rootFingerprint := sha256.Sum256(rootPublic)
+			certificateFingerprint := sha256.Sum256(raw)
+			certificateDocument := api.EndpointCertificateDocument{Version: 1, AccountID: "account_01", KeyID: "aek_" + hex.EncodeToString(rootFingerprint[:]), EndpointID: "machine_01", Role: "machine", Generation: 3, Serial: 1, IssuedAt: now.Add(-time.Minute).Format(time.RFC3339), ExpiresAt: now.Add(time.Hour).Format(time.RFC3339), Certificate: base64.RawURLEncoding.EncodeToString(raw), CertificateFingerprint: hex.EncodeToString(certificateFingerprint[:])}
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"state": "approved", "trusted_keys": []api.E2EEKey{{KeyID: certificateDocument.KeyID, PublicKey: base64.RawURLEncoding.EncodeToString(rootPublic), Fingerprint: hex.EncodeToString(rootFingerprint[:]), Generation: 1}}, "certificate": certificateDocument}})
 		default:
 			http.NotFound(w, r)
 		}

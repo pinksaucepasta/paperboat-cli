@@ -947,7 +947,7 @@ func (t *PeerTerminalTunnel) dial(ctx context.Context, info resolver.ConnectInfo
 	if keyDelivery != nil {
 		transfer = &api.PeerAttemptTransfer{TransferID: keyDelivery.binding.TransferID, Generation: keyDelivery.binding.Generation, ExpiresAt: keyDelivery.binding.ExpiresAt}
 	}
-	sourceConfig := directpath.APIDescriptorSourceConfig{Client: client, EnvironmentID: info.Terminal.EnvironmentID, Purpose: purpose, Consumer: descriptorConsumer, Transfer: transfer, AccountID: profile.Account.ID, RootPublicKey: authority.RootPublic, ControllingEndpointID: profile.CLIClientSessionID, ControlledEndpointID: info.ProjectID, ControllingCertificateFingerprint: hex.EncodeToString(localFingerprint[:]), ControlledCertificateFingerprint: hex.EncodeToString(peerFingerprint[:]), OperationID: func(generation directpath.Generation) string {
+	sourceConfig := directpath.APIDescriptorSourceConfig{Client: client, EnvironmentID: info.Terminal.EnvironmentID, Purpose: purpose, Consumer: descriptorConsumer, Transfer: transfer, AccountID: profile.Account.ID, TrustedKeys: authority.TrustedKeys, ControllingEndpointID: profile.CLIClientSessionID, ControlledEndpointID: info.ProjectID, ControllingCertificateFingerprint: hex.EncodeToString(localFingerprint[:]), ControlledCertificateFingerprint: hex.EncodeToString(peerFingerprint[:]), OperationID: func(generation directpath.Generation) string {
 		return peerOperationID(profile.CLIClientSessionID, info.ProjectID, purpose, t.operationSeed, operationScope, generation)
 	}}
 	sourceConfig.AllowedPaths = peerAllowedPaths(mode)
@@ -1717,7 +1717,7 @@ func (t *PeerTerminalTunnel) dialDirect(ctx, lifetime context.Context, target *r
 		return nil, errors.Join(err, assembly.Close())
 	}
 	mark("local_certificate_ready")
-	clientTLS, err := endpointidentity.ClientTLS(localLeaf, endpointidentity.PeerExpectation{RootPublic: authority.RootPublic, Certificate: authority.MachineCertificateRaw, Expected: endpointidentity.Expected{AccountID: descriptor.Document.AccountID, Role: endpointidentity.RoleMachine, EndpointID: descriptor.ResponderEndpointID, Generation: descriptor.Document.HostGeneration}}, peerquic.ALPN, t.config.Now)
+	clientTLS, err := endpointidentity.ClientTLS(localLeaf, endpointidentity.PeerExpectation{RootPublic: authority.RootPublic, TrustedKeys: authority.TrustedKeys, CertificateKeyID: authority.MachineCertificateKeyID, Certificate: authority.MachineCertificateRaw, Expected: endpointidentity.Expected{AccountID: descriptor.Document.AccountID, Role: endpointidentity.RoleMachine, EndpointID: descriptor.ResponderEndpointID, Generation: descriptor.Document.HostGeneration}}, peerquic.ALPN, t.config.Now)
 	if err != nil {
 		return nil, errors.Join(err, assembly.Close())
 	}

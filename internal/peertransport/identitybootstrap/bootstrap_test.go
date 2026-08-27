@@ -46,7 +46,7 @@ type newRootReplayClient struct {
 
 func (c *newRootReplayClient) E2EERoot(context.Context) (api.E2EERoot, error) {
 	c.rootCalls++
-	if c.root.PublicKey == "" {
+	if len(c.root.TrustedKeys) == 0 {
 		return api.E2EERoot{}, &api.APIError{Status: http.StatusNotFound, Code: "not_found"}
 	}
 	return c.root, nil
@@ -56,11 +56,10 @@ func (c *newRootReplayClient) BootstrapE2EE(ctx context.Context, operation strin
 	result, err := c.bootstrap(ctx, operation, input)
 	if err == nil {
 		public, decodeErr := base64.RawURLEncoding.Strict().DecodeString(input.RootPublicKey)
-		fingerprint := sha256.Sum256(public)
 		if decodeErr != nil {
 			return api.E2EEBootstrapResult{}, decodeErr
 		}
-		c.root = api.E2EERoot{Version: 1, PublicKey: input.RootPublicKey, Fingerprint: hex.EncodeToString(fingerprint[:]), Generation: 1}
+		c.root = rootDocument(ed25519.PublicKey(public))
 	}
 	return result, err
 }
@@ -106,8 +105,7 @@ func (c *existingEnrollmentClient) EndpointCertificate(context.Context, string, 
 func TestEnrollCLIExistingRootStoresVerifierOnlyIdentityAndIsIdempotent(t *testing.T) {
 	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
 	rootPublic, rootPrivate, _ := ed25519.GenerateKey(nil)
-	rootFingerprint := sha256.Sum256(rootPublic)
-	root := api.E2EERoot{Version: 1, PublicKey: base64.RawURLEncoding.EncodeToString(rootPublic), Fingerprint: hex.EncodeToString(rootFingerprint[:]), Generation: 1}
+	root := rootDocument(rootPublic)
 	rootDir := t.TempDir()
 	store := config.ProfileStore{Path: rootDir, Secrets: config.FileSecretStore{Dir: filepath.Join(rootDir, "secrets")}}
 	keys, err := store.PeerEndpointKeys("https://api.example.test", "account_1", "cli_1")
@@ -121,7 +119,7 @@ func TestEnrollCLIExistingRootStoresVerifierOnlyIdentityAndIsIdempotent(t *testi
 	}
 	raw, _ := certificate.MarshalBinary()
 	certificateFingerprint := sha256.Sum256(raw)
-	client := &existingEnrollmentClient{root: root, pending: api.PendingEndpointIdentity{RequestID: "per_0123456789abcdef", EndpointID: "cli_1", Role: "cli", State: "pending", Generation: 1, NoisePublicKey: base64.RawURLEncoding.EncodeToString(keys.NoisePublic[:]), QUICPublicKey: base64.RawURLEncoding.EncodeToString(quicPublic), CreatedAt: now.Add(-time.Minute), ExpiresAt: now.Add(4 * time.Minute), SafetyCode: "abcde-fghij"}, certificate: api.EndpointCertificateDocument{Version: 1, AccountID: "account_1", RootFingerprint: hex.EncodeToString(rootFingerprint[:]), EndpointID: "cli_1", Role: "cli", Generation: 1, Serial: 1, IssuedAt: certificate.Claims.IssuedAt.Format(time.RFC3339), ExpiresAt: certificate.Claims.ExpiresAt.Format(time.RFC3339), Certificate: base64.RawURLEncoding.EncodeToString(raw), CertificateFingerprint: hex.EncodeToString(certificateFingerprint[:])}}
+	client := &existingEnrollmentClient{root: root, pending: api.PendingEndpointIdentity{RequestID: "per_0123456789abcdef", EndpointID: "cli_1", Role: "cli", State: "pending", Generation: 1, NoisePublicKey: base64.RawURLEncoding.EncodeToString(keys.NoisePublic[:]), QUICPublicKey: base64.RawURLEncoding.EncodeToString(quicPublic), CreatedAt: now.Add(-time.Minute), ExpiresAt: now.Add(4 * time.Minute), SafetyCode: "abcde-fghij"}, certificate: api.EndpointCertificateDocument{Version: 1, AccountID: "account_1", KeyID: rootKeyID(rootPublic), EndpointID: "cli_1", Role: "cli", Generation: 1, Serial: 1, IssuedAt: certificate.Claims.IssuedAt.Format(time.RFC3339), ExpiresAt: certificate.Claims.ExpiresAt.Format(time.RFC3339), Certificate: base64.RawURLEncoding.EncodeToString(raw), CertificateFingerprint: hex.EncodeToString(certificateFingerprint[:])}}
 	request := CLIRequest{Store: store, Client: client, Issuer: "https://api.example.test", AccountID: "account_1", CLIClientSessionID: "cli_1", Now: func() time.Time { return now }, PollInterval: time.Millisecond, Timeout: time.Second}
 	first, err := EnrollCLI(context.Background(), request)
 	if err != nil {
@@ -147,7 +145,6 @@ func TestEnrollCLIExistingRootStoresVerifierOnlyIdentityAndIsIdempotent(t *testi
 func TestEnrollExistingRootRecoversAlreadyFulfilledEnrollmentAfterLocalPersistenceFailure(t *testing.T) {
 	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
 	rootPublic, rootPrivate, _ := ed25519.GenerateKey(nil)
-	rootFingerprint := sha256.Sum256(rootPublic)
 	rootDir := t.TempDir()
 	store := config.ProfileStore{Path: rootDir, Secrets: config.FileSecretStore{Dir: filepath.Join(rootDir, "secrets")}}
 	keys, err := store.PeerEndpointKeys("https://api.example.test", "account_1", "cli_1")
@@ -165,9 +162,9 @@ func TestEnrollExistingRootRecoversAlreadyFulfilledEnrollmentAfterLocalPersisten
 	}
 	certificateFingerprint := sha256.Sum256(raw)
 	client := &existingEnrollmentClient{
-		root:        api.E2EERoot{Version: 1, PublicKey: base64.RawURLEncoding.EncodeToString(rootPublic), Fingerprint: hex.EncodeToString(rootFingerprint[:]), Generation: 1},
+		root:        rootDocument(rootPublic),
 		pending:     api.PendingEndpointIdentity{RequestID: "per_0123456789abcdef", EndpointID: "cli_1", Role: "cli", State: "fulfilled", Generation: 1, NoisePublicKey: base64.RawURLEncoding.EncodeToString(keys.NoisePublic[:]), QUICPublicKey: base64.RawURLEncoding.EncodeToString(quicPublic), CreatedAt: now.Add(-10 * time.Minute), ExpiresAt: now.Add(-5 * time.Minute), SafetyCode: "abcde-fghij"},
-		certificate: api.EndpointCertificateDocument{Version: 1, AccountID: "account_1", RootFingerprint: hex.EncodeToString(rootFingerprint[:]), EndpointID: "cli_1", Role: "cli", Generation: 1, Serial: 1, IssuedAt: certificate.Claims.IssuedAt.Format(time.RFC3339), ExpiresAt: certificate.Claims.ExpiresAt.Format(time.RFC3339), Certificate: base64.RawURLEncoding.EncodeToString(raw), CertificateFingerprint: hex.EncodeToString(certificateFingerprint[:])},
+		certificate: api.EndpointCertificateDocument{Version: 1, AccountID: "account_1", KeyID: rootKeyID(rootPublic), EndpointID: "cli_1", Role: "cli", Generation: 1, Serial: 1, IssuedAt: certificate.Claims.IssuedAt.Format(time.RFC3339), ExpiresAt: certificate.Claims.ExpiresAt.Format(time.RFC3339), Certificate: base64.RawURLEncoding.EncodeToString(raw), CertificateFingerprint: hex.EncodeToString(certificateFingerprint[:])},
 	}
 	result, err := EnrollExistingRoot(context.Background(), ExistingRootRequest{Store: store, Client: client, Issuer: "https://api.example.test", AccountID: "account_1", CLIClientSessionID: "cli_1", Now: func() time.Time { return now }, PollInterval: time.Millisecond, Timeout: time.Second})
 	if err != nil || result.CertificateFingerprint != hex.EncodeToString(certificateFingerprint[:]) || client.certReads != 1 {
@@ -181,7 +178,6 @@ func TestEnrollExistingRootRecoversAlreadyFulfilledEnrollmentAfterLocalPersisten
 func TestEnrollExistingRootExpiresWhileApprovalIsPending(t *testing.T) {
 	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
 	rootPublic, _, _ := ed25519.GenerateKey(nil)
-	rootFingerprint := sha256.Sum256(rootPublic)
 	rootDir := t.TempDir()
 	store := config.ProfileStore{Path: rootDir, Secrets: config.FileSecretStore{Dir: filepath.Join(rootDir, "secrets")}}
 	keys, err := store.PeerEndpointKeys("https://api.example.test", "account_1", "cli_1")
@@ -189,7 +185,7 @@ func TestEnrollExistingRootExpiresWhileApprovalIsPending(t *testing.T) {
 		t.Fatal(err)
 	}
 	quicPublic := keys.QUICPrivate.Public().(ed25519.PublicKey)
-	client := &existingEnrollmentClient{root: api.E2EERoot{Version: 1, PublicKey: base64.RawURLEncoding.EncodeToString(rootPublic), Fingerprint: hex.EncodeToString(rootFingerprint[:]), Generation: 1}, pending: api.PendingEndpointIdentity{RequestID: "per_0123456789abcdef", EndpointID: "cli_1", Role: "cli", State: "pending", Generation: 1, NoisePublicKey: base64.RawURLEncoding.EncodeToString(keys.NoisePublic[:]), QUICPublicKey: base64.RawURLEncoding.EncodeToString(quicPublic), CreatedAt: now, ExpiresAt: now.Add(time.Minute), SafetyCode: "abcde-fghij"}}
+	client := &existingEnrollmentClient{root: rootDocument(rootPublic), pending: api.PendingEndpointIdentity{RequestID: "per_0123456789abcdef", EndpointID: "cli_1", Role: "cli", State: "pending", Generation: 1, NoisePublicKey: base64.RawURLEncoding.EncodeToString(keys.NoisePublic[:]), QUICPublicKey: base64.RawURLEncoding.EncodeToString(quicPublic), CreatedAt: now, ExpiresAt: now.Add(time.Minute), SafetyCode: "abcde-fghij"}}
 	err = nil
 	_, err = EnrollExistingRoot(context.Background(), ExistingRootRequest{Store: store, Client: client, Issuer: "https://api.example.test", AccountID: "account_1", CLIClientSessionID: "cli_1", Now: func() time.Time { return now }, PollInterval: time.Millisecond, Timeout: 10 * time.Millisecond})
 	if !errors.Is(err, ErrEnrollmentExpired) {
@@ -222,7 +218,7 @@ func TestEnrollCLINewRootCreatesPersistsAndExactlyReplaysIdentity(t *testing.T) 
 		if err != nil || certificate.Claims.Serial != 1 {
 			t.Fatalf("certificate=%+v err=%v", certificate, err)
 		}
-		return api.E2EEBootstrapResult(input), nil
+		return bootstrapResult(input), nil
 	})}
 	request := CLIRequest{Store: store, Client: client, Issuer: "https://api.example.test", AccountID: "account_1", CLIClientSessionID: "cli_1", Now: func() time.Time { return now }, PollInterval: time.Millisecond, Timeout: time.Second}
 	first, err := EnrollCLI(context.Background(), request)
@@ -283,7 +279,7 @@ func TestBootstrapRejectsServerSubstitution(t *testing.T) {
 	store := config.ProfileStore{Path: root, Secrets: config.FileSecretStore{Dir: filepath.Join(root, "secrets")}}
 	client := bootstrapClientFunc(func(_ context.Context, _ string, input api.E2EEBootstrapInput) (api.E2EEBootstrapResult, error) {
 		input.Certificate.EndpointID = "other_cli"
-		return api.E2EEBootstrapResult(input), nil
+		return bootstrapResult(input), nil
 	})
 	_, err := Bootstrap(context.Background(), Request{Store: store, Client: client, Issuer: "https://api.example.test", AccountID: "account_1", CLIClientSessionID: "cli_1", Now: func() time.Time { return time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC) }})
 	if !errors.Is(err, ErrInvalid) {
@@ -294,7 +290,8 @@ func TestBootstrapRejectsServerSubstitution(t *testing.T) {
 func TestBootstrapRequiresPairingWhenRemoteRootExistsWithoutLocalCustody(t *testing.T) {
 	root := t.TempDir()
 	store := config.ProfileStore{Path: root, Secrets: config.FileSecretStore{Dir: filepath.Join(root, "secrets")}}
-	_, err := Bootstrap(context.Background(), Request{Store: store, Client: existingRootClient{root: api.E2EERoot{Version: 1, PublicKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", Fingerprint: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Generation: 1}}, Issuer: "https://api.example.test", AccountID: "account_1", CLIClientSessionID: "cli_1"})
+	remotePublic, _, _ := ed25519.GenerateKey(nil)
+	_, err := Bootstrap(context.Background(), Request{Store: store, Client: existingRootClient{root: rootDocument(remotePublic)}, Issuer: "https://api.example.test", AccountID: "account_1", CLIClientSessionID: "cli_1"})
 	if !errors.Is(err, ErrPairingRequired) {
 		t.Fatalf("err=%v", err)
 	}
@@ -309,23 +306,42 @@ func TestValidateRemoteRootRejectsFingerprintAndCanonicalEncodingSubstitution(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	fingerprint := sha256.Sum256(public)
-	valid := api.E2EERoot{Version: 1, PublicKey: base64.RawURLEncoding.EncodeToString(public), Fingerprint: hex.EncodeToString(fingerprint[:]), Generation: 1}
-	if got, _, err := validateRemoteRoot(valid); err != nil || !bytes.Equal(got, public) {
+	valid := rootDocument(public)
+	if got, err := validateRemoteRoot(valid); err != nil || len(got) != 1 || !bytes.Equal(got[0].PublicKey, public) {
 		t.Fatalf("valid root rejected: %v", err)
 	}
 	cases := []api.E2EERoot{
 		func() api.E2EERoot {
 			v := valid
-			v.Fingerprint = hex.EncodeToString(bytes.Repeat([]byte{0}, sha256.Size))
+			v.TrustedKeys[0].Fingerprint = hex.EncodeToString(bytes.Repeat([]byte{0}, sha256.Size))
 			return v
 		}(),
-		func() api.E2EERoot { v := valid; v.PublicKey = base64.URLEncoding.EncodeToString(public); return v }(),
-		func() api.E2EERoot { v := valid; v.Generation = 2; return v }(),
+		func() api.E2EERoot {
+			v := valid
+			v.TrustedKeys[0].PublicKey = base64.URLEncoding.EncodeToString(public)
+			return v
+		}(),
+		func() api.E2EERoot { v := valid; v.TrustedKeys[0].Generation = 0; return v }(),
 	}
 	for index, candidate := range cases {
-		if _, _, err := validateRemoteRoot(candidate); !errors.Is(err, ErrInvalid) {
+		if _, err := validateRemoteRoot(candidate); !errors.Is(err, ErrInvalid) {
 			t.Errorf("case %d accepted substituted root: %v", index, err)
 		}
 	}
+}
+
+func rootKeyID(public ed25519.PublicKey) string {
+	fingerprint := sha256.Sum256(public)
+	return "aek_" + hex.EncodeToString(fingerprint[:])
+}
+
+func rootDocument(public ed25519.PublicKey) api.E2EERoot {
+	fingerprint := sha256.Sum256(public)
+	return api.E2EERoot{Version: 1, TrustedKeys: []api.E2EEKey{{KeyID: rootKeyID(public), PublicKey: base64.RawURLEncoding.EncodeToString(public), Fingerprint: hex.EncodeToString(fingerprint[:]), Generation: 1}}}
+}
+
+func bootstrapResult(input api.E2EEBootstrapInput) api.E2EEBootstrapResult {
+	public, _ := base64.RawURLEncoding.DecodeString(input.RootPublicKey)
+	root := rootDocument(ed25519.PublicKey(public))
+	return api.E2EEBootstrapResult{KeyID: rootKeyID(ed25519.PublicKey(public)), TrustedKeys: root.TrustedKeys, Certificate: input.Certificate}
 }

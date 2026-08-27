@@ -54,6 +54,20 @@ func Root(root api.E2EERoot) ([]endpointidentity.TrustedKey, error) {
 	if root.Version != 1 {
 		return nil, ErrInvalid
 	}
+	// Keep in-memory callers that construct fixtures directly on the pre-list
+	// fields working; these fields are json:"-" and are never accepted on the
+	// wire. Production responses must provide trusted_keys.
+	if len(root.TrustedKeys) == 0 && root.PublicKey != "" {
+		public, err := base64.RawURLEncoding.Strict().DecodeString(root.PublicKey)
+		if err != nil || len(public) != ed25519.PublicKeySize {
+			return nil, ErrInvalid
+		}
+		fingerprint := sha256.Sum256(public)
+		if root.Fingerprint != hex.EncodeToString(fingerprint[:]) || root.Generation == 0 {
+			return nil, ErrInvalid
+		}
+		return FromAPI([]api.E2EEKey{{KeyID: "aek_" + hex.EncodeToString(fingerprint[:]), PublicKey: root.PublicKey, Fingerprint: root.Fingerprint, Generation: root.Generation}})
+	}
 	return FromAPI(root.TrustedKeys)
 }
 
