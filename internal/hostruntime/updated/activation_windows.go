@@ -1143,7 +1143,12 @@ func validWindowsActivationPaths(config WindowsConfig, journal windowsActivation
 	if !strings.EqualFold(journal.PreviousBinary.Path, layout.Binary) || !strings.EqualFold(journal.NewHostd.Executable, layout.Binary) || !strings.EqualFold(journal.NewUpdater.Executable, layout.Binary) || journal.NewSSH.Executable != "" && !strings.EqualFold(journal.NewSSH.Executable, layout.Binary) {
 		return false
 	}
-	if !exactReleasePattern.MatchString(journal.PreviousVersion) || !strings.EqualFold(journal.OldHostd.Executable, layout.Binary) || !strings.EqualFold(journal.OldUpdater.Executable, layout.Binary) || journal.OldSSH.Executable != "" && !strings.EqualFold(journal.OldSSH.Executable, layout.Binary) {
+	// The updater may deliberately be fenced on the rollback slot while a
+	// previous activation is being recovered.  Hostd and SSH always remain on
+	// the canonical binary, but accepting only layout.Binary here rejects a
+	// valid staged journal before the activator can run, leaving the updater
+	// service stopped and the transaction permanently staged.
+	if !exactReleasePattern.MatchString(journal.PreviousVersion) || !strings.EqualFold(journal.OldHostd.Executable, layout.Binary) || !windowsUpdaterExecutableMatches(layout, journal.OldUpdater.Executable) || journal.OldSSH.Executable != "" && !strings.EqualFold(journal.OldSSH.Executable, layout.Binary) {
 		return false
 	}
 	for _, target := range []windowsServiceTarget{journal.OldHostd, journal.OldUpdater, journal.OldSSH} {

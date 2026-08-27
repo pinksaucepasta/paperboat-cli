@@ -96,3 +96,33 @@ func TestWindowsActiveServiceTargetsUseCanonicalBinary(t *testing.T) {
 		t.Fatal("mutable updater artifact accepted")
 	}
 }
+
+func TestWindowsActivationPathsAcceptRollbackUpdaterDuringRecovery(t *testing.T) {
+	config := testWindowsUpdaterConfig(t)
+	layout, err := service.DefaultLayout("windows")
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths, err := canonicalWindowsRelease(layout, "2026.08.24.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	component := windowsActivationComponent{Path: paths.Runtime, SHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Length: 1}
+	journal := windowsActivationJournal{
+		Schema: windowsActivationJournalSchema, TransactionID: "0123456789abcdef0123456789abcdef",
+		PreviousVersion: config.ActiveVersion, Version: "2026.08.24.1", Architecture: config.Architecture,
+		Stage: windowsActivationStaged, Runtime: component, CLI: component, Hostd: component, Updater: component,
+		PreviousBinary: windowsActivationComponent{Path: layout.Binary, SHA256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Length: 1},
+		OldHostd:       windowsServiceTarget{Executable: layout.Binary, Arguments: []string{"__runtime-hostd"}},
+		NewHostd:       windowsServiceTarget{Executable: layout.Binary, Arguments: []string{"__runtime-hostd"}},
+		OldUpdater:     windowsServiceTarget{Executable: layout.BinaryRollback, Arguments: []string{"__runtime-updated"}},
+		NewUpdater:     windowsServiceTarget{Executable: layout.Binary, Arguments: []string{"__runtime-updated"}},
+	}
+	if !validWindowsActivationPaths(config, journal) {
+		t.Fatal("staged journal with rollback updater was rejected")
+	}
+	journal.OldUpdater.Executable = `C:\Temp\pb.exe`
+	if validWindowsActivationPaths(config, journal) {
+		t.Fatal("mutable updater executable was accepted")
+	}
+}
