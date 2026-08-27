@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"path/filepath"
@@ -43,7 +44,7 @@ func (c *Client) callRequest(ctx context.Context, request ControlRequest) (Contr
 	}
 	connection, err := (&net.Dialer{Timeout: c.timeout}).DialContext(ctx, "unix", c.socketPath)
 	if err != nil {
-		return ControlResponse{}, err
+		return ControlResponse{}, fmt.Errorf("%w: %w", ErrUnavailable, err)
 	}
 	defer connection.Close()
 	deadline := time.Now().Add(c.timeout)

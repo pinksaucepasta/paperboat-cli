@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"regexp"
 	"time"
@@ -71,7 +72,7 @@ func (c *Client) callRequest(ctx context.Context, request ControlRequest) (Contr
 	defer cancel()
 	connection, err := winio.DialPipeContext(dialCtx, c.socketPath)
 	if err != nil {
-		return ControlResponse{}, err
+		return ControlResponse{}, fmt.Errorf("%w: %w", ErrUnavailable, err)
 	}
 	defer connection.Close()
 	deadline := time.Now().Add(c.timeout)

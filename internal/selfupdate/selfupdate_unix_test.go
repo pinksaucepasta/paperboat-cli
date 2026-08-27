@@ -4,6 +4,7 @@ package selfupdate
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,19 +14,38 @@ import (
 )
 
 func TestResolveBuildsPlatformDescriptor(t *testing.T) {
+	assetName := "pb-" + runtime.GOOS + "-" + runtime.GOARCH
+	if runtime.GOOS == "darwin" {
+		assetName += ".pkg"
+	}
+	format := "elf"
+	if runtime.GOOS == "darwin" {
+		format = "pkg"
+	}
+	manifest, err := json.Marshal(Current{
+		Schema: currentSchemaV1, Version: "2026.08.18.1", Repository: "example/paperboat-cli",
+		Assets: map[string]CurrentAsset{assetName: {Platform: runtime.GOOS, Architecture: runtime.GOARCH, Format: format, URL: "https://github.com/example/paperboat-cli/releases/download/2026.08.18.1/" + assetName, SHA256: "0000000000000000000000000000000000000000000000000000000000000000", Length: 1}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/current.json" {
 			http.NotFound(w, r)
 			return
 		}
-		_, _ = w.Write([]byte(`{"schema":"paperboat.release-current/v1","version":"2026.08.18.1"}`))
+		_, _ = w.Write(manifest)
 	}))
 	defer server.Close()
 	target, err := Resolve(context.Background(), server.URL, server.Client())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if target.Version != "2026.08.18.1" || target.Platform != runtime.GOOS || target.Architecture != runtime.GOARCH || target.RepositoryURL != server.URL+"/tuf" || target.TargetPath != "pb-"+runtime.GOOS+"-"+runtime.GOARCH {
+	wantTarget := "pb-" + runtime.GOOS + "-" + runtime.GOARCH
+	if runtime.GOOS == "darwin" {
+		wantTarget += ".pkg"
+	}
+	if target.Version != "2026.08.18.1" || target.Platform != runtime.GOOS || target.Architecture != runtime.GOARCH || target.RepositoryURL != server.URL+"/tuf" || target.TargetPath != wantTarget {
 		t.Fatalf("target=%+v", target)
 	}
 }

@@ -4,11 +4,23 @@ package updated
 
 import (
 	"context"
+	"errors"
 	"net"
 	"os"
 	"testing"
 	"time"
 )
+
+func TestControlClientMarksMissingUpdaterAsUnavailable(t *testing.T) {
+	client, err := NewClient("/tmp/paperboat-updated-does-not-exist.sock", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Check(context.Background())
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("missing updater error = %v, want ErrUnavailable", err)
+	}
+}
 
 func TestControlClientUsesOnlyFixedOperations(t *testing.T) {
 	path := testSocketPath(t)

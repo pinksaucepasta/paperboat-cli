@@ -18,6 +18,7 @@ import (
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/binarytarget"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/bootstrap"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/releaseindex"
 )
 
 const currentSchemaV1 = "paperboat.release-current/v1"
@@ -25,8 +26,19 @@ const currentSchemaV1 = "paperboat.release-current/v1"
 var ErrInvalidRelease = errors.New("signed release is invalid")
 
 type Current struct {
-	Schema  string `json:"schema"`
-	Version string `json:"version"`
+	Schema     string                  `json:"schema"`
+	Version    string                  `json:"version"`
+	Repository string                  `json:"repository"`
+	Assets     map[string]CurrentAsset `json:"assets"`
+}
+
+type CurrentAsset struct {
+	Platform     string `json:"platform"`
+	Architecture string `json:"architecture"`
+	Format       string `json:"format"`
+	URL          string `json:"url"`
+	SHA256       string `json:"sha256"`
+	Length       int64  `json:"length"`
 }
 
 func Resolve(ctx context.Context, releaseURL string, client *http.Client) (bootstrap.ArtifactTarget, error) {
@@ -50,14 +62,22 @@ func Resolve(ctx context.Context, releaseURL string, client *http.Client) (boots
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
 		return bootstrap.ArtifactTarget{}, fmt.Errorf("%w: release origin returned HTTP %d", ErrInvalidRelease, response.StatusCode)
 	}
-	decoder := json.NewDecoder(io.LimitReader(response.Body, 4097))
-	decoder.DisallowUnknownFields()
+	decoder := json.NewDecoder(io.LimitReader(response.Body, 64<<10+1))
 	var current Current
 	var extra any
-	if decoder.Decode(&current) != nil || decoder.Decode(&extra) != io.EOF || current.Schema != currentSchemaV1 || !validVersion(current.Version) {
+	if decoder.Decode(&current) != nil || decoder.Decode(&extra) != io.EOF || current.Schema != currentSchemaV1 || !validVersion(current.Version) || !validCurrentAsset(current) {
 		return bootstrap.ArtifactTarget{}, ErrInvalidRelease
 	}
-	return bootstrap.ArtifactTarget{Schema: bootstrap.ArtifactTargetSchemaV1, Kind: bootstrap.ArtifactKindPB, Version: current.Version, Platform: runtime.GOOS, Architecture: runtime.GOARCH, RepositoryURL: base.String() + "/tuf", TargetPath: "pb-" + runtime.GOOS + "-" + runtime.GOARCH}, nil
+	return bootstrap.ArtifactTarget{Schema: bootstrap.ArtifactTargetSchemaV1, Kind: bootstrap.ArtifactKindPB, Version: current.Version, Platform: runtime.GOOS, Architecture: runtime.GOARCH, RepositoryURL: base.String() + "/tuf", TargetPath: releaseindex.AssetName(runtime.GOOS, runtime.GOARCH)}, nil
+}
+
+func validCurrentAsset(current Current) bool {
+	assetName := releaseindex.AssetName(runtime.GOOS, runtime.GOARCH)
+	asset, ok := current.Assets[assetName]
+	if !ok || current.Repository == "" || asset.Platform != runtime.GOOS || asset.Architecture != runtime.GOARCH || asset.Format == "" || asset.URL == "" || asset.SHA256 == "" || asset.Length < 1 {
+		return false
+	}
+	return true
 }
 
 // InstallBinary atomically replaces the one installed Paperboat executable
@@ -134,6 +154,9 @@ func InstallBinary(currentExecutable, verifiedArtifact string) error {
 // and runtime are now the same signed executable, so it follows the unified
 // binary path exactly.
 func InstallCLI(currentExecutable, verifiedArtifact string) error {
+	if runtime.GOOS == "darwin" && filepath.Ext(verifiedArtifact) == ".pkg" {
+		return installDarwinPackage(verifiedArtifact)
+	}
 	return InstallBinary(currentExecutable, verifiedArtifact)
 }
 
