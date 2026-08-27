@@ -67,6 +67,9 @@ $file = Get-Item -LiteralPath $download
 if ([int64]$file.Length -ne [int64]$assetMetadata.length) { throw "Paperboat release asset length verification failed for $asset." }
 $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $download).Hash.ToLowerInvariant()
 if ($actual -ne [string]$assetMetadata.sha256) { throw "Paperboat release asset digest verification failed for $asset." }
+# Clear the download's Zone.Identifier before the first execution. Windows
+# PowerShell can otherwise reject the version probe itself with Access denied.
+Unblock-File -LiteralPath $download -ErrorAction SilentlyContinue
 
 function Assert-InstalledVersion([string]$Path, [string]$ExpectedVersion) {
   if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
@@ -79,11 +82,6 @@ function Assert-InstalledVersion([string]$Path, [string]$ExpectedVersion) {
 if (-not (Assert-InstalledVersion $download $version)) {
   throw "Downloaded Paperboat release does not report version $version."
 }
-# Invoke-WebRequest may attach a Zone.Identifier stream to executable downloads.
-# Clear that mark before invoking the verified file, including from elevated SSH
-# sessions where SmartScreen cannot display an interactive approval dialog.
-Unblock-File -LiteralPath $download -ErrorAction SilentlyContinue
-
 function Test-Administrator {
   $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
   $principal = [Security.Principal.WindowsPrincipal]::new($identity)

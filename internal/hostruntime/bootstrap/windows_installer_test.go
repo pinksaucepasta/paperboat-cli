@@ -21,6 +21,14 @@ func TestWindowsInstallerDoesNotRequestUACFromElevatedSession(t *testing.T) {
 	if !strings.Contains(script, "Assert-InstalledVersion $download $version") {
 		t.Fatal("Windows installer does not verify the downloaded executable reports current.json's version")
 	}
+	unblock := strings.Index(script, "Unblock-File -LiteralPath $download")
+	versionProbe := strings.Index(script, "if (-not (Assert-InstalledVersion $download $version))")
+	if unblock < 0 || versionProbe < 0 || unblock > versionProbe {
+		t.Fatal("Windows installer must clear Zone.Identifier before probing the downloaded executable")
+	}
+	if strings.Contains(script, "\n  if (-not $process.WaitForExit(1200000))") && strings.Index(script, "\n  if (-not $process.WaitForExit(1200000))") < runAsStart {
+		t.Fatal("Windows installer waits for an elevation process before creating it")
+	}
 	if !strings.Contains(script, "$name = [string]$env:COMPUTERNAME") || !strings.Contains(script, "$name = $name.Trim().ToLowerInvariant()") {
 		t.Fatal("Windows installer does not normalize the default machine name")
 	}
