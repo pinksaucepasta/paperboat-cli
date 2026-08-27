@@ -30,6 +30,9 @@ func TestWindowsInstallerDoesNotRequestUACFromElevatedSession(t *testing.T) {
 	if !strings.Contains(script, "New-Item -ItemType File -Path $probe -Force") || !strings.Contains(script, "catch { $installerExecutable = $null }") || !strings.Contains(script, "-FilePath $runAsPath -ArgumentList $arguments -Verb RunAs") {
 		t.Fatal("Windows installer must verify effective staging privileges and fall back through RunAs without leaking Access Denied")
 	}
+	if !strings.Contains(script, "$arguments[2] = $installerExecutable") {
+		t.Fatal("Windows installer must pass the trusted staged source path to the elevated child")
+	}
 	if strings.Contains(script, "\n  if (-not $process.WaitForExit(1200000))") && strings.Index(script, "\n  if (-not $process.WaitForExit(1200000))") < runAsStart {
 		t.Fatal("Windows installer waits for an elevation process before creating it")
 	}

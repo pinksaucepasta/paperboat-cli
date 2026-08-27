@@ -140,6 +140,12 @@ if ($freshEnrollment -or -not (Assert-InstalledVersion $installedPb $version) -o
     # performs its own administrator check, and direct invocation from an SSH
     # session can retain a filtered token even when this shell can write the
     # staging directory.
+    if ($null -ne $installerExecutable) {
+      # The elevated child must read the verified source through a path it can
+      # access. User TEMP ACLs can deny a full administrator token, while the
+      # staged Program Files copy is already trusted and readable.
+      $arguments[2] = $installerExecutable
+    }
     $runAsPath = if ($null -ne $installerExecutable) { $installerExecutable } else { $download }
     try {
       $process = Start-Process -FilePath $runAsPath -ArgumentList $arguments -Verb RunAs -PassThru -Wait -WindowStyle Hidden
