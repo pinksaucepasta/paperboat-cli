@@ -343,7 +343,7 @@ func Install(ctx context.Context, request Request) error {
 	// runtime listen port occupied, causing the fresh owner workload to exit.
 	// The elevated activation process is staged under a temporary executable,
 	// so terminating the fixed pb.exe image cannot terminate this installer.
-	if err := runWindowsInstallPhase(ctx, "terminate stale Paperboat runtime processes", func() error { return terminatePaperboatProcesses(ctx) }); err != nil {
+	if err := runWindowsInstallPhase(ctx, "terminate stale Paperboat runtime processes", func() error { return terminateStaleWindowsRuntimeProcesses(ctx) }); err != nil {
 		return err
 	}
 	// Client has no SSH capability, but PaperboatSshd can hold the current
@@ -673,6 +673,28 @@ func terminatePaperboatProcesses(ctx context.Context) error {
 			return nil
 		}
 		return err
+	}
+	return nil
+}
+
+func terminateStaleWindowsRuntimeProcesses(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// Match only durable runtime entry points. The dashboard installer itself
+	// is a pb.exe bootstrap process and must remain alive while the elevated
+	// commit rotates the installed slot.
+	const script = `$ErrorActionPreference = 'Stop'; Get-CimInstance Win32_Process -Filter "Name = 'pb.exe'" | Where-Object { $_.CommandLine -match '__(runtime-(hostd|worker|updated)|windows-sshd-service)' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop }`
+	command := exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script)
+	if output, err := command.CombinedOutput(); err != nil {
+		message := strings.TrimSpace(string(output))
+		if len(message) > 2048 {
+			message = message[:2048]
+		}
+		if message != "" {
+			return fmt.Errorf("terminate stale Paperboat runtime processes: %w: %s", err, message)
+		}
+		return fmt.Errorf("terminate stale Paperboat runtime processes: %w", err)
 	}
 	return nil
 }
