@@ -137,6 +137,22 @@ command -v curl >/dev/null 2>&1 || { echo "pb installer: curl is required" >&2; 
 # enrollment commands, so a stale daemon/config must never survive into the
 # new installation.  Cleanup is deliberately best-effort for paths that do
 # not exist and never touches user files outside Paperboat's own locations.
+remove_privileged_file() {
+  cleanup_path=$1
+  if [ "$(id -u)" -eq 0 ]; then
+    rm -f "$cleanup_path" 2>/dev/null || true
+  elif command -v sudo >/dev/null 2>&1; then
+    if ! sudo -n rm -f "$cleanup_path" 2>/dev/null; then
+      rm -f "$cleanup_path" 2>/dev/null || true
+    fi
+  else
+    rm -f "$cleanup_path" 2>/dev/null || true
+  fi
+  if [ -e "$cleanup_path" ] || [ -L "$cleanup_path" ]; then
+    echo "pb installer: warning: could not remove privileged path $cleanup_path; continuing" >&2
+  fi
+}
+
 cleanup_existing() {
   old=/usr/local/bin/pb
   if [ "$(id -u)" -eq 0 ]; then
@@ -173,12 +189,13 @@ cleanup_existing() {
   rm -f "$HOME/.ssh/paperboat_config" "$HOME/.ssh/paperboat-managed-ssh.pub" \
     "$HOME/.ssh/.paperboat-config-install-v1.json" "$HOME/.ssh/.paperboat-config-transaction-v1.json"
   if [ "$os" = darwin ]; then
-    sudo -n rm -f /usr/local/libexec/paperboat/pb 2>/dev/null || true
+    remove_privileged_file /usr/local/libexec/paperboat/pb
   else
     # The packaged runtime may be owned by root even when the dashboard
     # command is run as an unprivileged user. Best-effort removal must never
     # abort the installer before the user-owned replacement is installed.
-    sudo -n rm -f /usr/local/libexec/paperboat/pb 2>/dev/null || rm -f /usr/local/libexec/paperboat/pb 2>/dev/null || true
+    remove_privileged_file "$old"
+    remove_privileged_file /usr/local/libexec/paperboat/pb
   fi
 }
 

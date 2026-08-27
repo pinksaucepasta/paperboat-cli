@@ -5,7 +5,7 @@ repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 installer="$repository_root/tools/install.sh"
 temporary=$(mktemp -d "${TMPDIR:-/tmp}/paperboat-install-current.XXXXXX")
 trap 'rm -rf "$temporary"' EXIT HUP INT TERM
-mkdir -p "$temporary/bin"
+mkdir -p "$temporary/bin" "$temporary/home"
 
 cat > "$temporary/bin/uname" <<'EOF'
 #!/bin/sh
@@ -43,12 +43,40 @@ else
   printf '%s\n' "$body"
 fi
 EOF
-chmod 0700 "$temporary/bin/uname" "$temporary/bin/curl"
+cat > "$temporary/bin/id" <<'EOF'
+#!/bin/sh
+case "${1:-}" in
+  -u) echo 1000 ;;
+  *) exec /usr/bin/id "$@" ;;
+esac
+EOF
+cat > "$temporary/bin/sudo" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "$PAPERBOAT_TEST_SUDO_LOG"
+exit 1
+EOF
+cat > "$temporary/bin/rm" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "$PAPERBOAT_TEST_RM_LOG"
+for argument do
+  case "$argument" in
+    /usr/local/bin/pb|/usr/local/libexec/paperboat/pb)
+      echo "rm: cannot remove $argument: Permission denied" >&2
+      exit 1
+      ;;
+  esac
+done
+exec /bin/rm "$@"
+EOF
+chmod 0700 "$temporary/bin/uname" "$temporary/bin/curl" "$temporary/bin/id" "$temporary/bin/sudo" "$temporary/bin/rm"
 
 PAPERBOAT_TEST_CURL_LOG="$temporary/curl.log" \
+PAPERBOAT_TEST_RM_LOG="$temporary/rm.log" \
+PAPERBOAT_TEST_SUDO_LOG="$temporary/sudo.log" \
 PAPERBOAT_RELEASE_METADATA_URL=https://release.example/current.json \
 PAPERBOAT_GITHUB_REPOSITORY=example/paperboat-cli \
 PAPERBOAT_INSTALL_DIR="$temporary/install" \
+HOME="$temporary/home" \
 PATH="$temporary/bin:/usr/bin:/bin" \
 "$installer" >"$temporary/output" 2>"$temporary/error"
 
@@ -59,6 +87,8 @@ if grep -q '/releases/latest' "$temporary/curl.log"; then
   exit 1
 fi
 grep -qx 'paperboat-test' "$temporary/output"
+grep -q '/usr/local/libexec/paperboat/pb' "$temporary/sudo.log"
+grep -q '/usr/local/libexec/paperboat/pb' "$temporary/rm.log"
 
 if PAPERBOAT_RELEASE_METADATA_URL=http://release.example/current.json PATH="$temporary/bin:/usr/bin:/bin" "$installer" >/dev/null 2>"$temporary/insecure-error"; then
   echo 'installer accepted an insecure release metadata URL' >&2
