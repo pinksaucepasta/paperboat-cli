@@ -291,6 +291,23 @@ func TestUpdateWithProgressDoesNotWriteJSONStdout(t *testing.T) {
 	}
 }
 
+func TestUpdateWithProgressHonorsCancellation(t *testing.T) {
+	command, _, err := newRootCommand().Find([]string{"update"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	command.SetContext(ctx)
+	_, err = updateWithProgress(command, ctx, func(ctx context.Context) (updated.ControlResponse, error) {
+		<-ctx.Done()
+		return updated.ControlResponse{}, ctx.Err()
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+}
+
 func TestSignedUpdateAvailableNeverOffersDowngrade(t *testing.T) {
 	for _, test := range []struct {
 		installed string
