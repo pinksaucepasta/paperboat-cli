@@ -564,7 +564,9 @@ jobs:
           expected_prefix = f'https://github.com/{repository}/releases/download/{version}/'
           for asset in release.get('assets', []):
               expected = expected_prefix + asset['name']
-              if asset.get('browserDownloadUrl') != expected:
+              # `gh release view --json assets` exposes the public download
+              # URL as `url` once the draft has been published.
+              if asset.get('url') != expected:
                   raise SystemExit(f'published GitHub asset URL mismatch: {asset["name"]}')
           PY
       - name: Configure protected release origin identity
