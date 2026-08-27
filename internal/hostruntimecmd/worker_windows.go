@@ -185,7 +185,7 @@ func runOwnerHostd(ctx context.Context, output io.Writer, install hostinstall.Wi
 		executable = layout.Binary
 	}
 	if !validWindowsPipe(socket) {
-		return errors.New("hostd worker named-pipe configuration is invalid")
+		return fmt.Errorf("hostd worker named-pipe configuration is invalid: %q", socket)
 	}
 	if !filepath.IsAbs(tokenPath) || filepath.Clean(tokenPath) != tokenPath {
 		return errors.New("hostd worker token-file configuration is invalid")

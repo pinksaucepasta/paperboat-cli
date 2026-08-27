@@ -338,6 +338,14 @@ func Install(ctx context.Context, request Request) error {
 	if err := runWindowsInstallPhase(ctx, "stop Paperboat Windows services for activation", func() error { return stopWindowsRuntimeServices(ctx) }); err != nil {
 		return err
 	}
+	// Service stop only waits for SCM-owned parents. A previous hostd worker
+	// can outlive its parent after an interrupted activation and keep the
+	// runtime listen port occupied, causing the fresh owner workload to exit.
+	// The elevated activation process is staged under a temporary executable,
+	// so terminating the fixed pb.exe image cannot terminate this installer.
+	if err := runWindowsInstallPhase(ctx, "terminate stale Paperboat runtime processes", func() error { return terminatePaperboatProcesses(ctx) }); err != nil {
+		return err
+	}
 	// Client has no SSH capability, but PaperboatSshd can hold the current
 	// runtime open. Release that service before slot rotation; defer its slower
 	// firewall/state cleanup until the new runtime services are running.
