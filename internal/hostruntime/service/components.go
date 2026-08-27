@@ -66,6 +66,10 @@ func NewHostdInstaller(config ComponentConfig) (*Installer, error) {
 	environment := copyEnvironment(config.Environment)
 	binary := config.Layout.Binary
 	environment["PAPERBOAT_BINARY"] = binary
+	// hostd starts the fenced runtime worker from the active slot. Keep this
+	// explicit in the service definition so the supervisor never falls back to
+	// an ambient or caller-controlled executable path.
+	environment["PAPERBOAT_RUNTIME_CURRENT"] = binary
 	environment["PAPERBOAT_BINARY_ROLLBACK"] = config.Layout.BinaryRollback
 	environment["PAPERBOAT_BINARY_STAGED"] = config.Layout.BinaryStaged
 	environment["PAPERBOAT_HOSTD_SOCKET"] = config.Layout.HostdSocket
