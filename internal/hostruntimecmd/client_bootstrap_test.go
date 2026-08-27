@@ -30,8 +30,8 @@ func TestShouldInstallBootstrapHostRuntime(t *testing.T) {
 	if !shouldInstallBootstrapHostRuntime(bootstrap.Material{SetupMode: "host"}) {
 		t.Fatal("host enrollment must install the host runtime")
 	}
-	if shouldInstallBootstrapHostRuntime(bootstrap.Material{SetupMode: "client"}) {
-		t.Fatal("client enrollment must not use host-only runtime path")
+	if !shouldInstallBootstrapHostRuntime(bootstrap.Material{SetupMode: "client"}) {
+		t.Fatal("client enrollment must install the shared managed runtime")
 	}
 	if shouldInstallBootstrapHostRuntime(bootstrap.Material{SetupMode: ""}) {
 		t.Fatal("invalid enrollment setup mode must not install a runtime")

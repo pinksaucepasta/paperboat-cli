@@ -147,5 +147,8 @@ func shouldInstallBootstrapCLI(material bootstrap.Material) bool {
 }
 
 func shouldInstallBootstrapHostRuntime(material bootstrap.Material) bool {
-	return material.SetupMode == "host"
+	// Host mode is a superset of client mode. Both roles install the durable
+	// hostd and updater services; host mode additionally enables machine-only
+	// control and availability components in the platform installer.
+	return material.SetupMode == "host" || material.SetupMode == "client"
 }
