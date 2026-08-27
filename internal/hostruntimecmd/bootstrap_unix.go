@@ -30,6 +30,7 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostinstall"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/identity"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/machinecontrol"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/updated"
 	"github.com/pinksaucepasta/paperboat/internal/httptransport"
 	"github.com/pinksaucepasta/paperboat/internal/machinename"
 )
@@ -168,11 +169,29 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	if err := saveBootstrapRegistration(identityStore, *serverURL, material, "", 0); err != nil {
 		return fmt.Errorf("save machine registration: %w", err)
 	}
-	// Client enrollments stop after the shared CLI setup. Host enrollments also
-	// mint machine-control authority and install the managed host runtime.
-	if !shouldInstallBootstrapHostRuntime(material) {
-		fmt.Fprintln(stderr, "Enrollment accepted. Client setup complete.")
+	// Client mode installs the same managed hostd and updater services, but does
+	// not mint host-only machine-control authority or enable the availability
+	// sidecar.
+	if material.SetupMode == "client" {
+		if material.Artifact == nil {
+			return errors.New("client enrollment did not return a verified artifact")
+		}
+		fmt.Fprintln(stderr, "Enrollment accepted. Setting up the managed client service...")
+		if err := InstallClient(ctx, ClientInstallConfig{
+			StateRoot: *stateRoot, WorkspaceRoot: workspace, ControlURL: material.ControlURL,
+			MachineID: material.UserMachineID, ListenAddress: material.HelperListenAddress,
+			Artifact: *material.Artifact,
+		}, stdin, stdout, stderr); err != nil {
+			return fmt.Errorf("install managed client service: %w", err)
+		}
+		if err := bootstrap.ClearResume(*stateRoot); err != nil {
+			return fmt.Errorf("clear completed client enrollment resume state: %w", err)
+		}
+		fmt.Fprintln(stderr, "Client setup complete.")
 		return nil
+	}
+	if !shouldInstallBootstrapHostRuntime(material) {
+		return errors.New("enrollment setup mode does not install a managed runtime")
 	}
 	fmt.Fprintln(stderr, "Enrollment accepted. Setting up the managed host service...")
 	client, err := enrollment.NewClient(nil, 15*time.Second)
@@ -241,7 +260,8 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	for {
 		request, _ := http.NewRequestWithContext(readyCtx, http.MethodGet, "http://"+material.HelperListenAddress+"/healthz", nil)
 		response, requestErr := healthClient.Do(request)
-		if requestErr == nil && bootstrapWorkerReady(readyCtx, response, *stateRoot, material.Artifact.Version, previousGeneration, material.SetupMode == "host") {
+		if requestErr == nil && bootstrapWorkerReady(readyCtx, response, *stateRoot, material.Artifact.Version, previousGeneration, material.SetupMode == "host") &&
+			(material.SetupMode != "client" || bootstrapUpdaterReady(readyCtx, material.Artifact.Version)) {
 			if err := authorizeServiceOperation(ctx, executable, "commit", installRequest, stdout, stderr); err != nil {
 				failureErr := errors.Join(err, authorizeServiceOperation(ctx, executable, "uninstall", installRequest, stdout, stderr), workerCommand.Rollback())
 				return failBootstrapInstallation(ctx, failureErr, material, *stateRoot, "service_readiness")
@@ -269,6 +289,23 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 		case <-time.After(time.Second):
 		}
 	}
+}
+
+// bootstrapUpdaterReady verifies that the newly installed managed updater is
+// actually serving its authenticated control socket before enrollment is
+// reported complete. A client runtime must not return with pb update/check
+// pointing at a service that has not started yet.
+func bootstrapUpdaterReady(ctx context.Context, expectedVersion string) bool {
+	socket := "/run/paperboat-updated/control.sock"
+	if runtime.GOOS == "darwin" {
+		socket = "/var/run/paperboat-updated/control.sock"
+	}
+	client, err := updated.NewClient(socket, 2*time.Second)
+	if err != nil {
+		return false
+	}
+	response, err := client.Status(ctx)
+	return err == nil && response.Status == "ok" && response.Version == expectedVersion
 }
 
 func bootstrapWorkerReady(ctx context.Context, response *http.Response, stateRoot, expectedVersion string, previousGeneration uint64, requireSystemService bool) bool {
