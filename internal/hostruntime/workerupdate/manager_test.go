@@ -41,6 +41,9 @@ func TestWorkerUpdateCutsOverWithoutRestartingHostd(t *testing.T) {
 	if !regularMatches(fixture.paths.current, fixture.candidate.Length, fixture.candidate.SHA256) || !regularMatches(fixture.paths.rollback, fixture.active.Length, fixture.active.SHA256) {
 		t.Fatal("active/rollback runtime retention is incorrect")
 	}
+	if info, err := os.Stat(fixture.paths.current); err != nil || info.Mode().Perm()&0o111 == 0 {
+		t.Fatalf("active runtime is not executable: info=%v err=%v", info, err)
+	}
 	journal, err := updateflow.Load(fixture.paths.journal)
 	if err != nil || journal.Stage != updateflow.StageIdle || journal.ActiveVersion != fixture.candidate.Version {
 		t.Fatalf("journal=%+v err=%v", journal, err)
@@ -53,6 +56,28 @@ func TestRuntimeStagingPatternPreservesDarwinPackageSuffix(t *testing.T) {
 	}
 	if got := runtimeStagingPattern("linux"); got != ".paperboat-runtime-*" {
 		t.Fatalf("linux staging pattern = %q", got)
+	}
+}
+
+func TestDarwinInstalledExecutableIsRunnableByWorker(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "installed-pb")
+	destination := filepath.Join(root, "releases", "pb.staged")
+	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(source, []byte("signed executable"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := stageInstalledDarwinExecutable(source, destination, os.Geteuid(), os.Getegid()); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm()&0o111 == 0 {
+		t.Fatalf("staged Darwin executable mode=%#o, want executable", info.Mode().Perm())
 	}
 }
 

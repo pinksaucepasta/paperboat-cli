@@ -548,7 +548,14 @@ func (m *Manager) stage(ctx context.Context, release Release) error {
 	}
 	pendingPath := pending.Name()
 	defer os.Remove(pendingPath)
-	if err := pending.Chmod(0o700); err != nil {
+	// The downloaded Darwin package stays private until installer(8) consumes
+	// it. Native executable targets must be traversable by the enrolled worker
+	// UID when hostd launches the candidate.
+	stagingMode := os.FileMode(0o755)
+	if release.Platform == "darwin" {
+		stagingMode = 0o600
+	}
+	if err := pending.Chmod(stagingMode); err != nil {
 		pending.Close()
 		return err
 	}
@@ -632,7 +639,7 @@ func stageInstalledDarwinExecutable(source, destination string, ownerUID, ownerG
 	}
 	pendingPath := pending.Name()
 	defer os.Remove(pendingPath)
-	if err := pending.Chmod(0o700); err != nil {
+	if err := pending.Chmod(0o755); err != nil {
 		_ = pending.Close()
 		return err
 	}
