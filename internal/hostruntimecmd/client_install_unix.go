@@ -49,6 +49,14 @@ func InstallClient(ctx context.Context, config ClientInstallConfig, stdin io.Rea
 	if err != nil {
 		return err
 	}
+	// Darwin release artifacts are signed PKGs, not executable runtime images.
+	// Materialize them through installer(8) before handing the executable path
+	// to the privileged service installer. Linux artifacts are already native
+	// executables and pass through unchanged.
+	artifactPath, err = materializeBootstrapArtifact(ctx, artifactPath)
+	if err != nil {
+		return err
+	}
 	servicePath := os.Getenv("PATH")
 	commandDirectory := filepath.Join(account.HomeDir, ".local", "bin")
 	if !pathListContains(servicePath, commandDirectory) {
