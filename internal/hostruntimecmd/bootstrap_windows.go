@@ -279,6 +279,7 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	// unreadable to an elevated administrator token. Stage the elevation copy
 	// in the user's temporary directory instead; it is still removed before
 	// bootstrap returns and never becomes an installed runtime artifact.
+	//paperboat:allow-source-policy atomic-replacement owner=windows-host-bootstrap reason=isolated-elevation-copy
 	elevated, err := os.CreateTemp("", ".pb-elevated-*.exe")
 	if err != nil {
 		return fmt.Errorf("stage executable for administrator approval: %w", err)
