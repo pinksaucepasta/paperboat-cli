@@ -523,12 +523,6 @@ jobs:
           for name, path in expected.items():
               asset = assets[name]
               digest = asset.get('digest')
-              expected_url = f'https://github.com/{repository}/releases/download/{release_version}/{name}'
-              # The API `url` is the REST asset endpoint.  The immutable
-              # public download URL is exposed as `browser_download_url` and
-              # is the URL written into current.json/TUF targets.
-              if asset.get('browserDownloadUrl') != expected_url:
-                  raise SystemExit(f'GitHub asset URL mismatch: {name}')
               if asset.get('size') != path.stat().st_size:
                   raise SystemExit(f'GitHub asset size mismatch: {name}')
               if not digest:
@@ -550,6 +544,29 @@ jobs:
           # --latest flag is omitted. Explicitly passing make_latest=false
           # would unset an already-latest release during a retry.
           gh release edit "$RELEASE_VERSION" --draft=false --target "$GITHUB_SHA"
+      - name: Verify published GitHub download URLs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release view "$RELEASE_VERSION" --json tagName,assets > "$RUNNER_TEMP/published-release.json"
+          python3 - "$RUNNER_TEMP/published-release.json" <<'PY'
+          import json
+          import os
+          import pathlib
+
+          release = json.loads(pathlib.Path(__import__('sys').argv[1]).read_text())
+          version = os.environ['RELEASE_VERSION']
+          repository = os.environ['GITHUB_REPOSITORY']
+          if release.get('tagName') != version:
+              raise SystemExit('published release tag mismatch')
+          expected_prefix = f'https://github.com/{repository}/releases/download/{version}/'
+          for asset in release.get('assets', []):
+              expected = expected_prefix + asset['name']
+              if asset.get('browserDownloadUrl') != expected:
+                  raise SystemExit(f'published GitHub asset URL mismatch: {asset["name"]}')
+          PY
       - name: Configure protected release origin identity
         env:
           PAPERBOAT_RELEASE_SSH_KEY: ${{ secrets.PAPERBOAT_RELEASE_SSH_KEY }}
