@@ -443,7 +443,7 @@ func secureManagedUserDirectory(path string, mode os.FileMode, uid, gid int) err
 }
 
 func writeInstallMetadata(path string, request Request) error {
-	if err := secureRootDirectory(filepath.Dir(path), 0o700); err != nil {
+	if err := secureRootDirectory(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
 	body, err := json.Marshal(request)
@@ -590,7 +590,7 @@ func recoverInterrupted(ctx context.Context, request Request, paths installPaths
 }
 
 func writeJournal(path string, journal installJournal) error {
-	if err := secureRootDirectory(filepath.Dir(path), 0o700); err != nil {
+	if err := secureRootDirectory(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
 	body, err := json.Marshal(journal)
