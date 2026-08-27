@@ -136,29 +136,25 @@ if ($freshEnrollment -or -not (Assert-InstalledVersion $installedPb $version) -o
   if (Test-Administrator) {
     $installerExecutable = $null
     try { $installerExecutable = Stage-TrustedBootstrap $download } catch { $installerExecutable = $null }
-    # Keep the elevated path in-process so an administrator SSH session does
-    # not depend on an interactive desktop UAC broker. Some Windows policy
-    # configurations reject direct execution from the temporary download
-    # path; retry through CreateProcess in that case while retaining the
-    # already-elevated token.
-    $directExitCode = 1
-    if ($null -ne $installerExecutable) {
-      try {
-        & $installerExecutable @arguments
-        $directExitCode = $LASTEXITCODE
-      } catch {
-        $directExitCode = 1
-      }
-    }
-    if ($directExitCode -ne 0) {
-      $runAsPath = if ($null -ne $installerExecutable) { $installerExecutable } else { $download }
-      try {
-        $process = Start-Process -FilePath $runAsPath -ArgumentList $arguments -Verb RunAs -PassThru -Wait -WindowStyle Hidden
-      } catch {
+    # Always launch through ShellExecute's RunAs verb. The bootstrap process
+    # performs its own administrator check, and direct invocation from an SSH
+    # session can retain a filtered token even when this shell can write the
+    # staging directory.
+    $runAsPath = if ($null -ne $installerExecutable) { $installerExecutable } else { $download }
+    try {
+      $process = Start-Process -FilePath $runAsPath -ArgumentList $arguments -Verb RunAs -PassThru -Wait -WindowStyle Hidden
+    } catch {
+      if ($runAsPath -ne $download) {
+        try {
+          $process = Start-Process -FilePath $download -ArgumentList $arguments -Verb RunAs -PassThru -Wait -WindowStyle Hidden
+        } catch {
+          throw "Paperboat self-install could not start with administrator privileges: $($_.Exception.Message)"
+        }
+      } else {
         throw "Paperboat self-install could not start with administrator privileges: $($_.Exception.Message)"
       }
-      if ($process.ExitCode -ne 0) { throw "Paperboat self-install failed with exit code $($process.ExitCode)." }
     }
+    if ($process.ExitCode -ne 0) { throw "Paperboat self-install failed with exit code $($process.ExitCode)." }
   } else {
     $process = Start-Process -FilePath $download -ArgumentList $arguments -Verb RunAs -PassThru -WindowStyle Hidden
     if (-not $process.WaitForExit(1200000)) {

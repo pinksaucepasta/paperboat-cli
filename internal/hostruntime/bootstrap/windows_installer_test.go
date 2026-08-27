@@ -13,10 +13,12 @@ func TestWindowsInstallerDoesNotRequestUACFromElevatedSession(t *testing.T) {
 	}
 	script := string(body)
 	adminBranch := strings.Index(script, "if (Test-Administrator) {")
-	directStart := strings.Index(script, "& $installerExecutable @arguments")
-	runAsStart := strings.Index(script, "$process = Start-Process -FilePath $download -ArgumentList $arguments -Verb RunAs -PassThru")
-	if adminBranch < 0 || directStart < adminBranch || runAsStart < directStart {
-		t.Fatal("Windows installer does not separate elevated direct execution from desktop UAC elevation")
+	runAsStart := strings.Index(script, "$process = Start-Process -FilePath $runAsPath -ArgumentList $arguments -Verb RunAs -PassThru")
+	if adminBranch < 0 || runAsStart < adminBranch {
+		t.Fatal("Windows installer must launch the bootstrap through RunAs even from an SSH session")
+	}
+	if strings.Contains(script, "& $installerExecutable @arguments") {
+		t.Fatal("Windows installer must not invoke the bootstrap directly with a potentially filtered token")
 	}
 	unblock := strings.Index(script, "Unblock-File -LiteralPath $download")
 	if unblock < 0 {
