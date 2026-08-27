@@ -73,10 +73,23 @@ Unblock-File -LiteralPath $download -ErrorAction SilentlyContinue
 
 function Assert-InstalledVersion([string]$Path, [string]$ExpectedVersion) {
   if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
-  $output = (& $Path --version 2>&1 | Out-String)
-  if ($LASTEXITCODE -ne 0) { return $false }
+  $capture = [IO.Path]::GetTempFileName()
+  $captureError = "$capture.err"
+  try {
+    $probe = Start-Process -FilePath $Path -ArgumentList '--version' -Wait -PassThru -WindowStyle Hidden -RedirectStandardOutput $capture -RedirectStandardError $captureError
+    if ($probe.ExitCode -ne 0) { return $false }
+    $output = ((Get-Content -LiteralPath $capture -Raw -ErrorAction SilentlyContinue) + (Get-Content -LiteralPath $captureError -Raw -ErrorAction SilentlyContinue))
+  } catch {
+    return $false
+  } finally {
+    Remove-Item -LiteralPath $capture,$captureError -Force -ErrorAction SilentlyContinue
+  }
   $versionMatches = [regex]::Matches($output, '(Version[\t ]+[0-9A-Za-z._-]+)')
   return $versionMatches.Count -eq 1 -and $versionMatches[0].Groups[1].Value -eq ("Version " + $ExpectedVersion)
+}
+
+if (-not (Assert-InstalledVersion $download $version)) {
+  throw "Downloaded Paperboat release does not report version $version."
 }
 
 function Test-Administrator {
@@ -95,8 +108,17 @@ if ($freshEnrollment -or -not (Assert-InstalledVersion $installedPb $version) -o
   # case; ordinary desktop terminals still use RunAs and show the normal UAC
   # prompt.
   if (Test-Administrator) {
-    $process = Start-Process -FilePath $download -ArgumentList $arguments -PassThru -Wait -WindowStyle Hidden
-    if ($process.ExitCode -ne 0) { throw "Paperboat self-install failed with exit code $($process.ExitCode)." }
+    # Keep the elevated path in-process so an administrator SSH session does
+    # not depend on an interactive desktop UAC broker. Some Windows policy
+    # configurations reject direct execution from the temporary download
+    # path; retry through CreateProcess in that case while retaining the
+    # already-elevated token.
+    & $download @arguments
+    $directExitCode = $LASTEXITCODE
+    if ($directExitCode -ne 0) {
+      $process = Start-Process -FilePath $download -ArgumentList $arguments -PassThru -Wait -WindowStyle Hidden
+      if ($process.ExitCode -ne 0) { throw "Paperboat self-install failed with exit code $($process.ExitCode)." }
+    }
   } else {
     $process = Start-Process -FilePath $download -ArgumentList $arguments -Verb RunAs -PassThru -WindowStyle Hidden
     if (-not $process.WaitForExit(1200000)) {
