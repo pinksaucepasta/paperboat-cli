@@ -3003,8 +3003,16 @@ func TestMachineAddPrintsOneShotEnrollmentCommands(t *testing.T) {
 	if code := run(context.Background(), []string{"--config", configPath, "machine", "add", "--role", "client", "--name", "Victus"}, &output, &output); code != 0 {
 		t.Fatalf("exit=%d output=%q", code, output.String())
 	}
-	if !strings.Contains(output.String(), "Victus-one-shot-token") || !strings.Contains(output.String(), "get.pprbt.dev/install?p=") || !strings.Contains(output.String(), "PowerShell or Command Prompt") || !strings.Contains(output.String(), `iwr '`) || !strings.Contains(output.String(), `-OutFile "$env:TEMP\pb.ps1"; & "$env:TEMP\pb.ps1"`) || strings.Contains(output.String(), "iex") || strings.Contains(output.String(), "powershell -NoLogo") || strings.Contains(output.String(), "--setup-mode") || strings.Contains(output.String(), "PAPERBOAT_SERVER") {
+	if !strings.Contains(output.String(), "Victus-one-shot-token") || !strings.Contains(output.String(), "get.pprbt.dev/install?p=") || !strings.Contains(output.String(), "PowerShell or Command Prompt") || !strings.Contains(output.String(), `powershell -c "irm '`) || !strings.Contains(output.String(), `| iex"`) || strings.Contains(output.String(), "iwr '") || strings.Contains(output.String(), "-OutFile") || strings.Contains(output.String(), "powershell -NoLogo") || strings.Contains(output.String(), "--setup-mode") || strings.Contains(output.String(), "PAPERBOAT_SERVER") {
 		t.Fatalf("output=%q", output.String())
+	}
+}
+
+func TestWindowsEnrollmentCommandRunsFromCommandPrompt(t *testing.T) {
+	const installerURL = "https://get.pprbt.dev/install?p=rpi-0123456789ABCDEFGHIJKLMNOP"
+	want := `powershell -c "irm 'https://get.pprbt.dev/install?p=rpi-0123456789ABCDEFGHIJKLMNOP' | iex"`
+	if got := windowsEnrollmentCommand(installerURL); got != want {
+		t.Fatalf("windows enrollment command=%q, want %q", got, want)
 	}
 }
 

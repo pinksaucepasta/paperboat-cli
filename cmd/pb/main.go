@@ -5537,8 +5537,7 @@ func userMachineCobraCommand() *cobra.Command {
 }
 
 func windowsEnrollmentCommand(installerURL string) string {
-	path := `"$env:TEMP\pb.ps1"`
-	return "iwr '" + installerURL + "' -OutFile " + path + "; & " + path
+	return "powershell -c \"irm '" + installerURL + "' | iex\""
 }
 
 func waitForAvailabilityObservation(ctx context.Context, client *api.Client, machineID string, current api.AvailabilityPolicy, timeout time.Duration) api.AvailabilityPolicy {
