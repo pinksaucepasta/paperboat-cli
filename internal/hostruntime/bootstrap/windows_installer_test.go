@@ -13,12 +13,12 @@ func TestWindowsInstallerDoesNotRequestUACFromElevatedSession(t *testing.T) {
 	}
 	script := string(body)
 	adminBranch := strings.Index(script, "if (Test-Administrator) {")
-	runAsStart := strings.Index(script, "$process = Start-Process -FilePath $runAsPath -ArgumentList $arguments -Verb RunAs -PassThru")
-	if adminBranch < 0 || runAsStart < adminBranch {
-		t.Fatal("Windows installer must launch the bootstrap through RunAs even from an SSH session")
+	runAsStart := strings.Index(script, "Start-Process -FilePath $runAsPath -ArgumentList $elevatedArguments -Verb RunAs")
+	if adminBranch < 0 || runAsStart < 0 {
+		t.Fatal("Windows installer must handle both elevated and UAC sessions")
 	}
-	if strings.Contains(script, "& $installerExecutable @arguments") {
-		t.Fatal("Windows installer must not invoke the bootstrap directly with a potentially filtered token")
+	if !strings.Contains(script, "& $runAsPath @arguments") {
+		t.Fatal("Windows installer must invoke the bootstrap directly from a verified elevated session")
 	}
 	unblock := strings.Index(script, "Unblock-File -LiteralPath $download")
 	if unblock < 0 {
@@ -27,7 +27,7 @@ func TestWindowsInstallerDoesNotRequestUACFromElevatedSession(t *testing.T) {
 	if !strings.Contains(script, "$trustedBootstrapDirectory = Join-Path ${env:ProgramFiles} 'Paperboat\\bootstrap'") || !strings.Contains(script, "pb-' + [guid]::NewGuid().ToString('N') + '.exe'") || !strings.Contains(script, "Stage-TrustedBootstrap $download") {
 		t.Fatal("Windows installer must stage the verified bootstrap in a trusted administrator-owned path")
 	}
-	if !strings.Contains(script, "New-Item -ItemType File -Path $probe -Force") || !strings.Contains(script, "catch { $installerExecutable = $null }") || !strings.Contains(script, "-FilePath $runAsPath -ArgumentList $arguments -Verb RunAs") {
+	if !strings.Contains(script, "New-Item -ItemType File -Path $probe -Force") || !strings.Contains(script, "catch { $installerExecutable = $null }") || !strings.Contains(script, "-FilePath $runAsPath -ArgumentList $elevatedArguments -Verb RunAs") {
 		t.Fatal("Windows installer must verify effective staging privileges and fall back through RunAs without leaking Access Denied")
 	}
 	if !strings.Contains(script, "$arguments[2] = $installerExecutable") {

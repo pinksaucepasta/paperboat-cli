@@ -133,40 +133,19 @@ if ($freshEnrollment -or -not (Assert-InstalledVersion $installedPb $version) -o
   # on which Windows can show another UAC prompt. Invoke directly in that
   # case; ordinary desktop terminals still use RunAs and show the normal UAC
   # prompt.
+  $installerExecutable = $null
+  try { $installerExecutable = Stage-TrustedBootstrap $download } catch { $installerExecutable = $null }
+  if ($null -ne $installerExecutable) {
+    $arguments[2] = $installerExecutable
+  }
+  $runAsPath = if ($null -ne $installerExecutable) { $installerExecutable } else { $download }
   if (Test-Administrator) {
-    $installerExecutable = $null
-    try { $installerExecutable = Stage-TrustedBootstrap $download } catch { $installerExecutable = $null }
-    # Always launch through ShellExecute's RunAs verb. The bootstrap process
-    # performs its own administrator check, and direct invocation from an SSH
-    # session can retain a filtered token even when this shell can write the
-    # staging directory.
-    if ($null -ne $installerExecutable) {
-      # The elevated child must read the verified source through a path it can
-      # access. User TEMP ACLs can deny a full administrator token, while the
-      # staged Program Files copy is already trusted and readable.
-      $arguments[2] = $installerExecutable
-    }
-    $runAsPath = if ($null -ne $installerExecutable) { $installerExecutable } else { $download }
-    try {
-      $process = Start-Process -FilePath $runAsPath -ArgumentList $arguments -Verb RunAs -PassThru -Wait -WindowStyle Hidden
-    } catch {
-      if ($runAsPath -ne $download) {
-        try {
-          $process = Start-Process -FilePath $download -ArgumentList $arguments -Verb RunAs -PassThru -Wait -WindowStyle Hidden
-        } catch {
-          throw "Paperboat self-install could not start with administrator privileges: $($_.Exception.Message)"
-        }
-      } else {
-        throw "Paperboat self-install could not start with administrator privileges: $($_.Exception.Message)"
-      }
-    }
-    if ($process.ExitCode -ne 0) { throw "Paperboat self-install failed with exit code $($process.ExitCode)." }
+    & $runAsPath @arguments
+    if ($LASTEXITCODE -ne 0) { throw "Paperboat self-install failed with exit code $LASTEXITCODE." }
   } else {
-    $process = Start-Process -FilePath $download -ArgumentList $arguments -Verb RunAs -PassThru -WindowStyle Hidden
-    if (-not $process.WaitForExit(1200000)) {
-      try { $process.Kill() } finally { $process.WaitForExit() }
-      throw 'Paperboat installation exceeded the 20 minute limit.'
-    }
+    $elevatedArguments = @($arguments)
+    if ($runAsPath.Contains(' ')) { $elevatedArguments[2] = '"' + $arguments[2] + '"' }
+    $process = Start-Process -FilePath $runAsPath -ArgumentList $elevatedArguments -Verb RunAs -PassThru -Wait -WindowStyle Hidden
     if ($process.ExitCode -ne 0) { throw "Paperboat self-install failed with exit code $($process.ExitCode)." }
   }
 }
@@ -192,13 +171,10 @@ if ($freshEnrollment) {
   Remove-Item Env:PAPERBOAT_ENROLLMENT_TOKEN -ErrorAction SilentlyContinue
   $pairArguments = @('pair', '--server', $server, '--enrollment-token', $token, '--name', $name, "--setup-mode=$setupMode")
   if (Test-Administrator) {
-    # The pair command installs the managed runtime after CLI enrollment. Run
-    # it with the same full token as __install so its Windows elevation bridge
-    # can register services from an OpenSSH session without Access Denied.
-    $pairProcess = Start-Process -FilePath $installedPb -ArgumentList $pairArguments -Verb RunAs -PassThru -Wait
-    if ($pairProcess.ExitCode -ne 0) { exit $pairProcess.ExitCode }
-  } else {
     & $installedPb @pairArguments
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  } else {
+    $pairProcess = Start-Process -FilePath $installedPb -ArgumentList $pairArguments -Verb RunAs -PassThru -Wait
+    if ($pairProcess.ExitCode -ne 0) { exit $pairProcess.ExitCode }
   }
 }
