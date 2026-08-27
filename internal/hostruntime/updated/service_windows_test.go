@@ -97,6 +97,23 @@ func TestWindowsActiveServiceTargetsUseCanonicalBinary(t *testing.T) {
 	}
 }
 
+func TestNormalizeWindowsRollbackTargetsRestartsUpdaterFromCanonicalPath(t *testing.T) {
+	layout, err := service.DefaultLayout("windows")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostd := windowsServiceTarget{Executable: layout.Binary, Arguments: []string{"__runtime-hostd"}}
+	updater := windowsServiceTarget{Executable: layout.BinaryRollback, Arguments: []string{"__runtime-updated"}, WasRunning: true}
+	ssh := windowsServiceTarget{}
+	_, normalized, _, err := normalizeWindowsRollbackTargets(hostd, updater, ssh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if normalized.Executable != layout.Binary || !normalized.WasRunning {
+		t.Fatalf("normalized updater=%+v want canonical executable %q", normalized, layout.Binary)
+	}
+}
+
 func TestWindowsActivationPathsAcceptRollbackUpdaterDuringRecovery(t *testing.T) {
 	config := testWindowsUpdaterConfig(t)
 	layout, err := service.DefaultLayout("windows")

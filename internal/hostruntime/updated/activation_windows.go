@@ -736,6 +736,22 @@ func (b *windowsSCMActivationBackend) SetServiceTargets(_ context.Context, hostd
 	}
 	return nil
 }
+
+// normalizeWindowsRollbackTargets returns service targets that are valid after
+// the rollback slot has been moved back into the canonical binary location.
+// A previous interrupted activation may have recorded PaperboatUpdated on the
+// rollback path. Once RestoreBinary succeeds that path no longer exists, so
+// restarting it verbatim leaves every service stopped and strands recovery.
+func normalizeWindowsRollbackTargets(hostd, updater, ssh windowsServiceTarget) (windowsServiceTarget, windowsServiceTarget, windowsServiceTarget, error) {
+	layout, err := service.DefaultLayout("windows")
+	if err != nil {
+		return windowsServiceTarget{}, windowsServiceTarget{}, windowsServiceTarget{}, err
+	}
+	if strings.EqualFold(updater.Executable, layout.BinaryRollback) {
+		updater.Executable = layout.Binary
+	}
+	return hostd, updater, ssh, nil
+}
 func (b *windowsSCMActivationBackend) StartServices(ctx context.Context, hostd, updater, ssh bool) error {
 	if hostd {
 		if err := startNamedWindowsService(ctx, windowsHostdService); err != nil {

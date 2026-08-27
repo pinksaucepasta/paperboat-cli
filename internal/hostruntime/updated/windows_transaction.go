@@ -121,7 +121,17 @@ func rollbackWindowsActivation(ctx context.Context, backend windowsActivationBac
 		binaryErr = backend.RestoreBinary(ctx, journal)
 	}
 	if stopErr == nil && binaryErr == nil {
-		targetErr = backend.SetServiceTargets(ctx, journal.OldHostd, journal.OldUpdater, journal.OldSSH)
+		// RestoreBinary moves the previous executable out of the rollback slot
+		// and back into the canonical path. If an interrupted transaction had
+		// recorded PaperboatUpdated on that rollback slot, restart it from the
+		// canonical path now; the slot is intentionally no longer present.
+		hostd, updater, ssh, normalizeErr := normalizeWindowsRollbackTargets(journal.OldHostd, journal.OldUpdater, journal.OldSSH)
+		if normalizeErr != nil {
+			targetErr = normalizeErr
+		} else {
+			journal.OldUpdater = updater
+			targetErr = backend.SetServiceTargets(ctx, hostd, updater, ssh)
+		}
 	}
 	// Restore the durable version and CLI pointer before restarting the old
 	// updater. Otherwise the old updater can observe candidate state and race
