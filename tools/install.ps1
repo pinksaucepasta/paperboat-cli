@@ -190,6 +190,15 @@ if ($freshEnrollment) {
   $first = $token.Substring(0, 1)
   $setupMode = if ('02468BDFHJLNPRTVXZ'.Contains($first)) { 'host' } else { 'client' }
   Remove-Item Env:PAPERBOAT_ENROLLMENT_TOKEN -ErrorAction SilentlyContinue
-  & $installedPb pair --server $server --enrollment-token $token --name $name "--setup-mode=$setupMode"
-  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  $pairArguments = @('pair', '--server', $server, '--enrollment-token', $token, '--name', $name, "--setup-mode=$setupMode")
+  if (Test-Administrator) {
+    # The pair command installs the managed runtime after CLI enrollment. Run
+    # it with the same full token as __install so its Windows elevation bridge
+    # can register services from an OpenSSH session without Access Denied.
+    $pairProcess = Start-Process -FilePath $installedPb -ArgumentList $pairArguments -Verb RunAs -PassThru -Wait
+    if ($pairProcess.ExitCode -ne 0) { exit $pairProcess.ExitCode }
+  } else {
+    & $installedPb @pairArguments
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  }
 }
