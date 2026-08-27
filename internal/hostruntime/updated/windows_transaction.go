@@ -138,17 +138,28 @@ func rollbackWindowsActivation(ctx context.Context, backend windowsActivationBac
 	// this rollback.
 	cliErr := backend.CommitCLI(ctx, windowsActivationJournal{Version: journal.PreviousVersion, PreviousCLIRecord: journal.NewCLIRecord, NewCLIRecord: journal.PreviousCLIRecord})
 	quarantineErr := backend.Quarantine(ctx, journal)
-	rollbackErr := errors.Join(journalErr, stopErr, binaryErr, targetErr, cliErr, quarantineErr)
-	if rollbackErr != nil {
-		return journal, errors.Join(cause, rollbackErr)
+	// The binary and SCM target restoration are the safety boundary. Cleanup
+	// of the durable CLI record or quarantining the candidate is best effort at
+	// this point: a locked candidate (often the activator's own image) must not
+	// leave Hostd, SSH, and the updater all stopped. Preserve cleanup errors in
+	// the journal/result, but continue to the rollback-ready cut point whenever
+	// the machine can safely run the previous binary again.
+	criticalErr := errors.Join(journalErr, stopErr, binaryErr, targetErr)
+	cleanupErr := errors.Join(cliErr, quarantineErr)
+	if criticalErr != nil {
+		return journal, errors.Join(cause, criticalErr, cleanupErr)
 	}
 	// Persist that every mutable pointer is old before starting the old updater.
 	// Recovery from this cut point may only finish rollback.
 	journal.Stage = windowsActivationRollbackReady
-	if err := backend.WriteJournal(journal); err != nil {
-		return journal, errors.Join(cause, err)
+	if cleanupErr != nil {
+		journal.Failure = boundedWindowsActivationFailure(cleanupErr)
 	}
-	return completeWindowsRollback(ctx, backend, journal, cause)
+	if err := backend.WriteJournal(journal); err != nil {
+		return journal, errors.Join(cause, cleanupErr, err)
+	}
+	result, startErr := completeWindowsRollback(ctx, backend, journal, cause)
+	return result, errors.Join(startErr, cleanupErr)
 }
 
 func completeWindowsRollback(_ context.Context, backend windowsActivationBackend, journal windowsActivationJournal, cause error) (windowsActivationJournal, error) {

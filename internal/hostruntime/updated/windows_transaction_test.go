@@ -102,6 +102,17 @@ func TestWindowsActivationDoesNotStartOldUpdaterBeforeRollbackReadyIsDurable(t *
 	}
 }
 
+func TestWindowsActivationRollbackStartsServicesWhenCleanupFails(t *testing.T) {
+	b := &recordingWindowsActivationBackend{fail: "quarantine"}
+	result, err := rollbackWindowsActivation(context.Background(), b, testWindowsActivationJournal(), errors.New("candidate failed"))
+	if err == nil || result.Stage != windowsActivationRolledBack {
+		t.Fatalf("result=%+v events=%q err=%v", result, b.events, err)
+	}
+	if !slices.Contains(b.events, "start") {
+		t.Fatalf("services were not restarted after non-critical cleanup failure: %q", b.events)
+	}
+}
+
 func TestWindowsActivationFailureIsBoundedAndSingleLine(t *testing.T) {
 	message := boundedWindowsActivationFailure(errors.New(strings.Repeat("x", 3000) + "\r\nsecret"))
 	if len(message) != 2048 || strings.ContainsAny(message, "\r\n\x00") {
