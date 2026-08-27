@@ -169,31 +169,14 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	if err := saveBootstrapRegistration(identityStore, *serverURL, material, "", 0); err != nil {
 		return fmt.Errorf("save machine registration: %w", err)
 	}
-	// Client mode installs the same managed hostd and updater services, but does
-	// not mint host-only machine-control authority or enable the availability
-	// sidecar.
-	if material.SetupMode == "client" {
-		if material.Artifact == nil {
-			return errors.New("client enrollment did not return a verified artifact")
-		}
-		fmt.Fprintln(stderr, "Enrollment accepted. Setting up the managed client service...")
-		if err := InstallClient(ctx, ClientInstallConfig{
-			StateRoot: *stateRoot, WorkspaceRoot: workspace, ControlURL: material.ControlURL,
-			MachineID: material.UserMachineID, ListenAddress: material.HelperListenAddress,
-			Artifact: *material.Artifact,
-		}, stdin, stdout, stderr); err != nil {
-			return fmt.Errorf("install managed client service: %w", err)
-		}
-		if err := bootstrap.ClearResume(*stateRoot); err != nil {
-			return fmt.Errorf("clear completed client enrollment resume state: %w", err)
-		}
-		fmt.Fprintln(stderr, "Client setup complete.")
-		return nil
-	}
 	if !shouldInstallBootstrapHostRuntime(material) {
 		return errors.New("enrollment setup mode does not install a managed runtime")
 	}
-	fmt.Fprintln(stderr, "Enrollment accepted. Setting up the managed host service...")
+	if material.SetupMode == "client" {
+		fmt.Fprintln(stderr, "Enrollment accepted. Setting up the managed client service...")
+	} else {
+		fmt.Fprintln(stderr, "Enrollment accepted. Setting up the managed host service...")
+	}
 	client, err := enrollment.NewClient(nil, 15*time.Second)
 	if err != nil {
 		return failBootstrapBeforeRuntime(ctx, err, material, *stateRoot, "artifact_verification")
@@ -213,12 +196,14 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 		}
 		return failBootstrapInstallation(ctx, err, material, *stateRoot, "artifact_verification")
 	}
-	controlSource, err := machinecontrol.NewSource(machinecontrol.Config{ControlURL: material.ControlURL, StateRoot: *stateRoot, Timeout: 15 * time.Second})
-	if err != nil {
-		return fmt.Errorf("initialize machine control credential source: %w", err)
-	}
-	if _, err := controlSource.EnsureInitial(ctx); err != nil {
-		return fmt.Errorf("persist machine control credential: %w", err)
+	if material.SetupMode == "host" {
+		controlSource, err := machinecontrol.NewSource(machinecontrol.Config{ControlURL: material.ControlURL, StateRoot: *stateRoot, Timeout: 15 * time.Second})
+		if err != nil {
+			return fmt.Errorf("initialize machine control credential source: %w", err)
+		}
+		if _, err := controlSource.EnsureInitial(ctx); err != nil {
+			return fmt.Errorf("persist machine control credential: %w", err)
+		}
 	}
 	executable := artifactPath
 	home, err := os.UserHomeDir()
