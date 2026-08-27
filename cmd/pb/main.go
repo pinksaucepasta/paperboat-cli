@@ -5404,7 +5404,7 @@ func userMachineCobraCommand() *cobra.Command {
 		if name != "" {
 			parameter = name + "-" + parameter
 		}
-		windowsURL := "https://get.pprbt.dev/install?p=" + parameter + "&shell=powershell"
+		windowsURL := "https://get.pprbt.dev/install?p=" + parameter
 		fmt.Fprintf(command.OutOrStdout(), "Linux/macOS:\ncurl -fsSL 'https://get.pprbt.dev/install?p=%s' | bash\n\nWindows (PowerShell or Command Prompt):\n%s\n", parameter, windowsEnrollmentCommand(windowsURL))
 		return nil
 	}}
