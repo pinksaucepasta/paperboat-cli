@@ -26,7 +26,6 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntimeentry"
 	"github.com/pinksaucepasta/paperboat/internal/windows/previewbroker"
 	"golang.org/x/sys/windows"
-	"golang.org/x/sys/windows/svc"
 )
 
 const windowsOwnerWorkloadEnvironment = "PAPERBOAT_WINDOWS_OWNER_WORKLOAD"
@@ -54,21 +53,13 @@ func runHostdInner(ctx context.Context, output io.Writer) error {
 	// context as the authoritative boundary, while retaining the marker for
 	// explicit diagnostics and older service environments.
 	if os.Getenv(windowsOwnerWorkloadEnvironment) != "1" {
-		isService, serviceErr := svc.IsWindowsService()
-		if serviceErr == nil && !isService {
-			if sid, sidErr := currentWindowsSID(); sidErr != nil || sid != install.OwnerSID {
-				return errors.New("Paperboat Windows hostd workload is not running as the enrolled owner")
-			}
+		// CreateProcessAsUser intentionally launches the owner workload without
+		// the SCM dispatcher. On Windows, svc.IsWindowsService can still report
+		// true for that detached process because it has no console, so the SID is
+		// the authoritative boundary. LocalSystem, which owns the SCM parent,
+		// cannot match the enrolled owner SID and continues into the dispatcher.
+		if sid, sidErr := currentWindowsSID(); sidErr == nil && sid == install.OwnerSID {
 			return runOwnerHostd(ctx, output, install)
-		}
-		// If the service-context probe is unavailable, an enrolled-owner SID is
-		// still sufficient to distinguish the CreateProcessAsUser workload from
-		// the LocalSystem SCM parent. Never infer owner execution for any other
-		// account; that process must enter the SCM dispatcher instead.
-		if serviceErr != nil {
-			if sid, sidErr := currentWindowsSID(); sidErr == nil && sid == install.OwnerSID {
-				return runOwnerHostd(ctx, output, install)
-			}
 		}
 		return runWindowsHostdService(install)
 	}
