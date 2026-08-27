@@ -1,7 +1,11 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -207,6 +211,67 @@ func TestEndpointCertificateUsesExactEscapedIdentity(t *testing.T) {
 	}
 	if _, err := New(server.URL, config.Credential{}, server.Client()).EndpointCertificate(context.Background(), "", 3); err == nil {
 		t.Fatal("empty endpoint identity was accepted")
+	}
+}
+
+func TestE2EERootAcceptsCanonicalTrustedKeysAndLegacyRootResponse(t *testing.T) {
+	public := bytes.Repeat([]byte{7}, 32)
+	fingerprint := sha256.Sum256(public)
+	keyID := "aek_" + hex.EncodeToString(fingerprint[:])
+	canonical := map[string]any{
+		"version": 1,
+		"trusted_keys": []E2EEKey{{
+			KeyID: keyID, PublicKey: base64.RawURLEncoding.EncodeToString(public),
+			Fingerprint: hex.EncodeToString(fingerprint[:]), Generation: 1,
+		}},
+	}
+	legacy := map[string]any{
+		"version":     1,
+		"public_key":  base64.RawURLEncoding.EncodeToString(public),
+		"fingerprint": hex.EncodeToString(fingerprint[:]),
+		"generation":  uint64(1),
+	}
+	for name, data := range map[string]any{"canonical": canonical, "legacy": legacy} {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet || r.URL.Path != "/v1/e2ee/root" {
+					t.Fatalf("request=%s %s", r.Method, r.URL.Path)
+				}
+				writeData(w, http.StatusOK, data)
+			}))
+			defer server.Close()
+
+			root, err := New(server.URL, config.Credential{AccessToken: "token"}, server.Client()).E2EERoot(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if root.Version != 1 {
+				t.Fatalf("root=%+v", root)
+			}
+			if name == "canonical" && (len(root.TrustedKeys) != 1 || root.TrustedKeys[0].KeyID != keyID) {
+				t.Fatalf("canonical root=%+v", root)
+			}
+			if name == "legacy" && (root.PublicKey == "" || root.Fingerprint == "" || root.Generation != 1) {
+				t.Fatalf("legacy root=%+v", root)
+			}
+		})
+	}
+}
+
+func TestE2EERootRejectsMixedOrUnknownResponseFields(t *testing.T) {
+	for name, data := range map[string]map[string]any{
+		"unknown": {"version": 1, "trusted_keys": []E2EEKey{}, "unexpected": true},
+		"mixed":   {"version": 1, "trusted_keys": []E2EEKey{{}}, "public_key": "legacy", "fingerprint": "legacy", "generation": 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				writeData(w, http.StatusOK, data)
+			}))
+			defer server.Close()
+			if _, err := New(server.URL, config.Credential{AccessToken: "token"}, server.Client()).E2EERoot(context.Background()); err == nil {
+				t.Fatal("invalid E2EE root response was accepted")
+			}
+		})
 	}
 }
 

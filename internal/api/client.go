@@ -371,6 +371,40 @@ type E2EERoot struct {
 	Generation  uint64    `json:"-"`
 }
 
+// UnmarshalJSON keeps the response boundary compatible with servers that
+// still expose the pre-multi-key root document. The canonical v1 wire shape is
+// trusted_keys; legacy fields are normalized into the in-memory fields used by
+// trustedkeys.Root and are never emitted by MarshalJSON.
+func (root *E2EERoot) UnmarshalJSON(encoded []byte) error {
+	type rootDocument struct {
+		Version     int       `json:"version"`
+		TrustedKeys []E2EEKey `json:"trusted_keys"`
+		PublicKey   *string   `json:"public_key"`
+		Fingerprint *string   `json:"fingerprint"`
+		Generation  *uint64   `json:"generation"`
+	}
+	var document rootDocument
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&document); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return errors.New("trailing JSON")
+	}
+	legacy := document.PublicKey != nil || document.Fingerprint != nil || document.Generation != nil
+	if legacy && (document.PublicKey == nil || document.Fingerprint == nil || document.Generation == nil || len(document.TrustedKeys) != 0) {
+		return errors.New("invalid E2EE root document")
+	}
+	*root = E2EERoot{Version: document.Version, TrustedKeys: document.TrustedKeys}
+	if legacy {
+		root.PublicKey = *document.PublicKey
+		root.Fingerprint = *document.Fingerprint
+		root.Generation = *document.Generation
+	}
+	return nil
+}
+
 type PendingEndpointIdentity struct {
 	RequestID      string    `json:"request_id"`
 	EndpointID     string    `json:"endpoint_id"`
