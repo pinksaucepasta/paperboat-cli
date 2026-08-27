@@ -25,9 +25,10 @@ type bootstrapCLIClient interface {
 
 type bootstrapCLIIdentityInstaller func(context.Context, config.ProfileStore, bootstrapCLIClient, string, api.Me, string) error
 
-// installBootstrapCLI completes the user side of a Client enrollment. Host
-// installs must not replace the account CLI E2EE root, because doing so would
-// revoke an already enrolled client and break its SSH authority.
+// installBootstrapCLI completes the user side of an enrollment. Host setup is
+// a superset of Client setup, so both modes receive the local CLI profile,
+// endpoint identity, and daemon. The host runtime is installed separately by
+// the mode-specific bootstrap path.
 func installBootstrapCLI(ctx context.Context, session *bootstrap.ClientSession, serverURL string) error {
 	if session == nil || session.Schema != "paperboat.cli-session/v1" || session.SessionID == "" || session.AccessToken == "" || session.RefreshToken == "" || session.ExpiresIn <= 0 {
 		return errors.New("server returned invalid CLI session")
@@ -132,5 +133,5 @@ func enrollBootstrapCLIIdentity(ctx context.Context, store config.ProfileStore, 
 }
 
 func shouldInstallBootstrapCLI(material bootstrap.Material) bool {
-	return material.ClientSession != nil && material.SetupMode == "client"
+	return material.ClientSession != nil && (material.SetupMode == "client" || material.SetupMode == "host")
 }

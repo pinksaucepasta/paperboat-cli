@@ -14,6 +14,7 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/api"
 	"github.com/pinksaucepasta/paperboat/internal/config"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/endpointidentity"
+	"github.com/pinksaucepasta/paperboat/internal/peertransport/trustedkeys"
 )
 
 const CertificateLifetime = 90 * 24 * time.Hour
@@ -155,18 +156,17 @@ func EnrollExistingRoot(ctx context.Context, request ExistingRootRequest) (Resul
 	if err != nil {
 		return Result{}, err
 	}
-	rootPublic, rootFingerprint, err := validateRemoteRoot(root)
+	trusted, err := validateRemoteRoot(root)
 	if err != nil {
 		return Result{}, err
 	}
-	defer clear(rootPublic)
+	defer trustedkeys.Clear(trusted)
 	storedRoot, storedErr := request.Store.LoadPeerAccountRootPublic(request.Issuer, request.AccountID)
 	if storedErr == nil {
-		if !bytes.Equal(storedRoot, rootPublic) {
+		if _, ok := trustedkeys.ByPublic(trusted, storedRoot); !ok {
 			clear(storedRoot)
 			return Result{}, ErrInvalid
 		}
-		clear(storedRoot)
 	} else if !errors.Is(storedErr, config.ErrSecretNotFound) {
 		return Result{}, storedErr
 	}
@@ -179,20 +179,35 @@ func EnrollExistingRoot(ctx context.Context, request ExistingRootRequest) (Resul
 	if !ok || len(quicPublic) != ed25519.PublicKeySize || keys.NoisePublic == [32]byte{} {
 		return Result{}, ErrInvalid
 	}
+	localKey, ok := trustedkeys.ByPublic(trusted, storedRoot)
+	if storedErr != nil {
+		if len(keys.RootPrivate) != ed25519.PrivateKeySize {
+			return Result{}, ErrInvalid
+		}
+		localPublic, publicOK := keys.RootPrivate.Public().(ed25519.PublicKey)
+		if !publicOK {
+			return Result{}, ErrInvalid
+		}
+		localKey, ok = trustedkeys.ByPublic(trusted, localPublic)
+	}
+	clear(storedRoot)
+	if !ok {
+		return Result{}, ErrInvalid
+	}
 	// A valid locally persisted certificate is the completed enrollment. In
 	// particular, the first call may have bootstrapped the account root; a
 	// later auth/login replay must not switch ceremonies and ask the server to
 	// issue a second certificate for the same endpoint.
 	local, localErr := request.Store.LoadPeerCertificate(request.Issuer, request.CLIClientSessionID)
 	if localErr == nil {
-		certificate, verifyErr := endpointidentity.Verify(local.Raw, rootPublic, endpointidentity.Expected{AccountID: request.AccountID, Role: endpointidentity.RoleCLI, EndpointID: request.CLIClientSessionID, Generation: 1}, now)
+		certificate, verifyErr := endpointidentity.Verify(local.Raw, localKey.PublicKey, endpointidentity.Expected{AccountID: request.AccountID, Role: endpointidentity.RoleCLI, EndpointID: request.CLIClientSessionID, Generation: 1}, now)
 		certificateFingerprint := sha256.Sum256(local.Raw)
 		matchesKeys := verifyErr == nil && certificate.Claims.NoisePublicKey == keys.NoisePublic && bytes.Equal(certificate.Claims.QUICPublicKey, quicPublic)
 		clear(local.Raw)
 		if !matchesKeys {
 			return Result{}, ErrInvalid
 		}
-		return Result{RootFingerprint: hex.EncodeToString(rootFingerprint[:]), CertificateFingerprint: hex.EncodeToString(certificateFingerprint[:]), Certificate: certificate}, nil
+		return Result{RootFingerprint: trustedkeys.FingerprintString(localKey), CertificateFingerprint: hex.EncodeToString(certificateFingerprint[:]), Certificate: certificate}, nil
 	}
 	if !errors.Is(localErr, config.ErrSecretNotFound) {
 		return Result{}, localErr
@@ -229,11 +244,17 @@ func EnrollExistingRoot(ctx context.Context, request ExistingRootRequest) (Resul
 			if rootErr != nil {
 				return Result{}, rootErr
 			}
-			verified, err := verifyEnrolledCLI(document, remoteRoot, rootPublic, rootFingerprint, request.AccountID, request.CLIClientSessionID, keys, current)
+			remoteTrusted, err := validateRemoteRoot(remoteRoot)
+			if err != nil || !equalTrustedKeys(trusted, remoteTrusted) {
+				trustedkeys.Clear(remoteTrusted)
+				return Result{}, ErrInvalid
+			}
+			trustedkeys.Clear(remoteTrusted)
+			verified, err := verifyEnrolledCLI(document, trusted, request.AccountID, request.CLIClientSessionID, keys, current)
 			if err != nil {
 				return Result{}, err
 			}
-			if err := request.Store.SavePeerAccountRootPublic(request.Issuer, request.AccountID, rootPublic); err != nil {
+			if err := request.Store.SavePeerAccountRootPublic(request.Issuer, request.AccountID, localKey.PublicKey); err != nil {
 				return Result{}, err
 			}
 			if _, err := request.Store.SavePeerCertificate(request.Issuer, request.CLIClientSessionID, verified.raw); err != nil {
@@ -241,7 +262,7 @@ func EnrollExistingRoot(ctx context.Context, request ExistingRootRequest) (Resul
 				return Result{}, err
 			}
 			clear(verified.raw)
-			return Result{RootFingerprint: verified.rootFingerprint, CertificateFingerprint: verified.certificateFingerprint, Certificate: verified.certificate}, nil
+			return Result{RootFingerprint: verified.keyFingerprint, CertificateFingerprint: verified.certificateFingerprint, Certificate: verified.certificate}, nil
 		}
 		if !api.IsNotFound(certErr) {
 			return Result{}, certErr
@@ -260,18 +281,29 @@ func EnrollExistingRoot(ctx context.Context, request ExistingRootRequest) (Resul
 type verifiedEnrollment struct {
 	certificate            endpointidentity.Certificate
 	raw                    []byte
-	rootFingerprint        string
+	keyFingerprint         string
 	certificateFingerprint string
 }
 
-func validateRemoteRoot(root api.E2EERoot) (ed25519.PublicKey, [sha256.Size]byte, error) {
-	public, err := base64.RawURLEncoding.Strict().DecodeString(root.PublicKey)
-	fingerprint := sha256.Sum256(public)
-	if err != nil || len(public) != ed25519.PublicKeySize || base64.RawURLEncoding.EncodeToString(public) != root.PublicKey || root.Version != 1 || root.Generation != 1 || root.Fingerprint != hex.EncodeToString(fingerprint[:]) {
-		clear(public)
-		return nil, [sha256.Size]byte{}, ErrInvalid
+func validateRemoteRoot(root api.E2EERoot) ([]endpointidentity.TrustedKey, error) {
+	keys, err := trustedkeys.Root(root)
+	if err != nil {
+		return nil, ErrInvalid
 	}
-	return ed25519.PublicKey(public), fingerprint, nil
+	return keys, nil
+}
+
+func equalTrustedKeys(left, right []endpointidentity.TrustedKey) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for _, key := range left {
+		other, ok := endpointidentity.TrustedKeyFor(right, key.KeyID)
+		if !ok || key.Generation != other.Generation || key.Fingerprint != other.Fingerprint || !bytes.Equal(key.PublicKey, other.PublicKey) {
+			return false
+		}
+	}
+	return true
 }
 
 func validatePendingCLIEnrollment(pending api.PendingEndpointIdentity, endpointID string, noise [32]byte, quic ed25519.PublicKey, now time.Time) error {
@@ -293,13 +325,11 @@ func validatePendingCLIEnrollment(pending api.PendingEndpointIdentity, endpointI
 	return nil
 }
 
-func verifyEnrolledCLI(document api.EndpointCertificateDocument, remoteRoot api.E2EERoot, rootPublic ed25519.PublicKey, rootFingerprint [sha256.Size]byte, accountID, endpointID string, keys config.PeerIdentityKeys, now time.Time) (verifiedEnrollment, error) {
-	remotePublic, remoteFingerprint, err := validateRemoteRoot(remoteRoot)
-	if err != nil || !bytes.Equal(remotePublic, rootPublic) || remoteFingerprint != rootFingerprint {
-		clear(remotePublic)
+func verifyEnrolledCLI(document api.EndpointCertificateDocument, trusted []endpointidentity.TrustedKey, accountID, endpointID string, keys config.PeerIdentityKeys, now time.Time) (verifiedEnrollment, error) {
+	key, ok := endpointidentity.TrustedKeyFor(trusted, document.KeyID)
+	if !ok {
 		return verifiedEnrollment{}, ErrInvalid
 	}
-	clear(remotePublic)
 	raw, err := base64.RawURLEncoding.Strict().DecodeString(document.Certificate)
 	certificateFingerprint := sha256.Sum256(raw)
 	quicPublic, ok := keys.QUICPrivate.Public().(ed25519.PublicKey)
@@ -307,12 +337,12 @@ func verifyEnrolledCLI(document api.EndpointCertificateDocument, remoteRoot api.
 		clear(raw)
 		return verifiedEnrollment{}, ErrInvalid
 	}
-	certificate, verifyErr := endpointidentity.Verify(raw, rootPublic, endpointidentity.Expected{AccountID: accountID, Role: endpointidentity.RoleCLI, EndpointID: endpointID, Generation: 1}, now)
-	if err != nil || len(raw) == 0 || base64.RawURLEncoding.EncodeToString(raw) != document.Certificate || verifyErr != nil || document.Version != 1 || document.AccountID != accountID || document.RootFingerprint != hex.EncodeToString(rootFingerprint[:]) || document.EndpointID != endpointID || document.Role != "cli" || document.Generation != 1 || document.Serial != certificate.Claims.Serial || document.IssuedAt != certificate.Claims.IssuedAt.Format(time.RFC3339) || document.ExpiresAt != certificate.Claims.ExpiresAt.Format(time.RFC3339) || document.CertificateFingerprint != hex.EncodeToString(certificateFingerprint[:]) || certificate.Claims.NoisePublicKey != keys.NoisePublic || !bytes.Equal(certificate.Claims.QUICPublicKey, quicPublic) {
+	certificate, verifyErr := endpointidentity.Verify(raw, key.PublicKey, endpointidentity.Expected{AccountID: accountID, Role: endpointidentity.RoleCLI, EndpointID: endpointID, Generation: 1}, now)
+	if err != nil || len(raw) == 0 || base64.RawURLEncoding.EncodeToString(raw) != document.Certificate || verifyErr != nil || document.Version != 1 || document.AccountID != accountID || document.KeyID != key.KeyID || document.EndpointID != endpointID || document.Role != "cli" || document.Generation != 1 || document.Serial != certificate.Claims.Serial || document.IssuedAt != certificate.Claims.IssuedAt.Format(time.RFC3339) || document.ExpiresAt != certificate.Claims.ExpiresAt.Format(time.RFC3339) || document.CertificateFingerprint != hex.EncodeToString(certificateFingerprint[:]) || certificate.Claims.NoisePublicKey != keys.NoisePublic || !bytes.Equal(certificate.Claims.QUICPublicKey, quicPublic) {
 		clear(raw)
 		return verifiedEnrollment{}, ErrInvalid
 	}
-	return verifiedEnrollment{certificate: certificate, raw: raw, rootFingerprint: document.RootFingerprint, certificateFingerprint: document.CertificateFingerprint}, nil
+	return verifiedEnrollment{certificate: certificate, raw: raw, keyFingerprint: trustedkeys.FingerprintString(key), certificateFingerprint: document.CertificateFingerprint}, nil
 }
 
 func existingEnrollmentOperationID(accountID, endpointID string, noise [32]byte, quic ed25519.PublicKey) string {
@@ -359,14 +389,18 @@ func Bootstrap(ctx context.Context, request Request) (Result, error) {
 	if !ok || len(rootPublic) != ed25519.PublicKeySize {
 		return Result{}, ErrInvalid
 	}
+	keyFingerprint := sha256.Sum256(rootPublic)
+	keyID := "aek_" + hex.EncodeToString(keyFingerprint[:])
 	if rootExists && !request.AllowRootReplacement {
-		remotePublic, decodeErr := base64.RawURLEncoding.Strict().DecodeString(remoteRoot.PublicKey)
-		remoteFingerprint := sha256.Sum256(rootPublic)
-		if decodeErr != nil || len(remotePublic) != ed25519.PublicKeySize || !bytes.Equal(remotePublic, rootPublic) || remoteRoot.Version != 1 || remoteRoot.Generation != 1 || remoteRoot.Fingerprint != hex.EncodeToString(remoteFingerprint[:]) {
-			clear(remotePublic)
+		trusted, trustedErr := validateRemoteRoot(remoteRoot)
+		if trustedErr != nil {
 			return Result{}, ErrInvalid
 		}
-		clear(remotePublic)
+		_, trustedOK := trustedkeys.ByPublic(trusted, rootPublic)
+		trustedkeys.Clear(trusted)
+		if !trustedOK {
+			return Result{}, ErrInvalid
+		}
 	}
 	certificate, raw, err := loadOrCreateCertificate(request, keys, rootPublic, now)
 	if err != nil {
@@ -375,7 +409,7 @@ func Bootstrap(ctx context.Context, request Request) (Result, error) {
 	rootFingerprint := sha256.Sum256(rootPublic)
 	certificateFingerprint := sha256.Sum256(raw)
 	operationID := "op_peer_bootstrap_" + hex.EncodeToString(certificateFingerprint[:16])
-	document := api.EndpointCertificateDocument{Version: 1, AccountID: request.AccountID, RootFingerprint: hex.EncodeToString(rootFingerprint[:]), EndpointID: request.CLIClientSessionID, Role: "cli", Generation: certificate.Claims.Generation, Serial: certificate.Claims.Serial, IssuedAt: certificate.Claims.IssuedAt.Format(time.RFC3339), ExpiresAt: certificate.Claims.ExpiresAt.Format(time.RFC3339), Certificate: base64.RawURLEncoding.EncodeToString(raw), CertificateFingerprint: hex.EncodeToString(certificateFingerprint[:])}
+	document := api.EndpointCertificateDocument{Version: 1, AccountID: request.AccountID, KeyID: keyID, EndpointID: request.CLIClientSessionID, Role: "cli", Generation: certificate.Claims.Generation, Serial: certificate.Claims.Serial, IssuedAt: certificate.Claims.IssuedAt.Format(time.RFC3339), ExpiresAt: certificate.Claims.ExpiresAt.Format(time.RFC3339), Certificate: base64.RawURLEncoding.EncodeToString(raw), CertificateFingerprint: hex.EncodeToString(certificateFingerprint[:])}
 	input := api.E2EEBootstrapInput{RootPublicKey: base64.RawURLEncoding.EncodeToString(rootPublic), Certificate: document}
 	var response api.E2EEBootstrapResult
 	if request.AllowRootReplacement {
@@ -390,10 +424,18 @@ func Bootstrap(ctx context.Context, request Request) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	if response.RootPublicKey != base64.RawURLEncoding.EncodeToString(rootPublic) || response.Certificate != document {
+	trusted, trustedErr := trustedkeys.Bootstrap(response)
+	if trustedErr != nil || response.KeyID != keyID || response.Certificate != document {
 		return Result{}, ErrInvalid
 	}
-	return Result{RootFingerprint: document.RootFingerprint, CertificateFingerprint: document.CertificateFingerprint, Certificate: certificate}, nil
+	defer trustedkeys.Clear(trusted)
+	if _, ok := trustedkeys.ByPublic(trusted, rootPublic); !ok {
+		return Result{}, ErrInvalid
+	}
+	if _, err := verifyEnrolledCLI(response.Certificate, trusted, request.AccountID, request.CLIClientSessionID, keys, now); err != nil {
+		return Result{}, err
+	}
+	return Result{RootFingerprint: hex.EncodeToString(keyFingerprint[:]), CertificateFingerprint: document.CertificateFingerprint, Certificate: certificate}, nil
 }
 
 func loadOrCreateCertificate(request Request, keys config.PeerIdentityKeys, rootPublic ed25519.PublicKey, now time.Time) (endpointidentity.Certificate, []byte, error) {

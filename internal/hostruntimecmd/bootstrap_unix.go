@@ -156,8 +156,9 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 			return err
 		}
 	}
-	// Client mode receives the local CLI profile. Host mode installs only the
-	// managed runtime so it cannot revoke another client's E2EE authority.
+	// Both modes receive the local CLI profile and daemon. Host mode then adds
+	// the managed runtime below; the server-issued CLI session is bound to this
+	// enrollment's independent endpoint identity.
 	if err := completeBootstrapCLIResume(ctx, *stateRoot, *serverURL, material, &resume, installBootstrapCLI, bootstrap.SaveResume); err != nil {
 		if shouldInstallBootstrapCLI(material) {
 			return fmt.Errorf("initialize Paperboat CLI session: %w", err)
@@ -167,8 +168,8 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	if err := saveBootstrapRegistration(identityStore, *serverURL, material, "", 0); err != nil {
 		return fmt.Errorf("save machine registration: %w", err)
 	}
-	// Client enrollments do not run the managed host runtime or mint a
-	// machine-control credential. Those are host-only responsibilities.
+	// Client enrollments stop after the shared CLI setup. Host enrollments also
+	// mint machine-control authority and install the managed host runtime.
 	if material.SetupMode == "client" {
 		fmt.Fprintln(stderr, "Enrollment accepted. Client setup complete.")
 		return nil

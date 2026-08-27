@@ -262,6 +262,7 @@ type PeerAttemptTransfer struct {
 
 type PeerAttemptCertificate struct {
 	EndpointID  string `json:"endpoint_id"`
+	KeyID       string `json:"key_id"`
 	Certificate string `json:"certificate"`
 }
 
@@ -281,6 +282,7 @@ type PeerAttemptDescriptor struct {
 	NetworkGeneration       uint64                   `json:"network_generation"`
 	HostGeneration          uint64                   `json:"host_generation"`
 	AuthorizationGeneration uint64                   `json:"authorization_generation"`
+	TrustedKeys             []E2EEKey                `json:"trusted_keys"`
 	IssuedAt                time.Time                `json:"issued_at"`
 	ExpiresAt               time.Time                `json:"expires_at"`
 	EndpointCertificates    []PeerAttemptCertificate `json:"endpoint_certificates"`
@@ -325,7 +327,7 @@ type PeerAttemptRelay struct {
 type EndpointCertificateDocument struct {
 	Version                int    `json:"version"`
 	AccountID              string `json:"account_id"`
-	RootFingerprint        string `json:"root_fingerprint"`
+	KeyID                  string `json:"key_id"`
 	EndpointID             string `json:"endpoint_id"`
 	Role                   string `json:"role"`
 	Generation             uint64 `json:"generation"`
@@ -341,13 +343,28 @@ type E2EEBootstrapInput struct {
 	Certificate   EndpointCertificateDocument `json:"certificate"`
 }
 
-type E2EEBootstrapResult = E2EEBootstrapInput
+// E2EEBootstrapResult is the result of adding one trusted endpoint signing
+// key. The server returns the complete active trust set so every endpoint can
+// verify certificates issued by any enrolled device.
+type E2EEBootstrapResult struct {
+	KeyID       string                      `json:"key_id"`
+	TrustedKeys []E2EEKey                   `json:"trusted_keys"`
+	Certificate EndpointCertificateDocument `json:"certificate"`
+}
 
-type E2EERoot struct {
-	Version     int    `json:"version"`
+// E2EEKey is public trust metadata for one independently enrolled endpoint.
+// PublicKey and Fingerprint are canonical base64url and lowercase hex strings
+// respectively; private key material never crosses the API boundary.
+type E2EEKey struct {
+	KeyID       string `json:"key_id"`
 	PublicKey   string `json:"public_key"`
 	Fingerprint string `json:"fingerprint"`
 	Generation  uint64 `json:"generation"`
+}
+
+type E2EERoot struct {
+	Version     int       `json:"version"`
+	TrustedKeys []E2EEKey `json:"trusted_keys"`
 }
 
 type PendingEndpointIdentity struct {

@@ -3,6 +3,7 @@ package hostruntimecmd
 import (
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -14,14 +15,37 @@ import (
 
 func TestShouldInstallBootstrapCLI(t *testing.T) {
 	session := &bootstrap.ClientSession{Schema: "paperboat.cli-session/v1"}
-	if shouldInstallBootstrapCLI(bootstrap.Material{SetupMode: "host", ClientSession: session}) {
-		t.Fatal("host enrollment must not replace the account CLI identity")
+	if !shouldInstallBootstrapCLI(bootstrap.Material{SetupMode: "host", ClientSession: session}) {
+		t.Fatal("host enrollment must bootstrap the local CLI identity")
 	}
 	if !shouldInstallBootstrapCLI(bootstrap.Material{SetupMode: "client", ClientSession: session}) {
 		t.Fatal("client enrollment must bootstrap the local CLI identity")
 	}
 	if shouldInstallBootstrapCLI(bootstrap.Material{SetupMode: "client"}) {
 		t.Fatal("enrollment without a CLI session must not bootstrap one")
+	}
+}
+
+func TestBootstrapCLIHostEnrollmentInstallsClientProfileAndDaemon(t *testing.T) {
+	store := testBootstrapProfileStore(t)
+	issuer := "https://api.example.test"
+	resume := bootstrap.NewResumeRecord(issuer, "public-key", "token", "Victus", "host", "verifier-012345678901234567890123456789", time.Now().UTC().Add(time.Hour))
+	material := bootstrap.Material{SetupMode: "host", ClientSession: testBootstrapSession("cli_host")}
+	installCalls := 0
+	if err := completeBootstrapCLIResume(context.Background(), store.Path, issuer, material, &resume, func(_ context.Context, session *bootstrap.ClientSession, serverURL string) error {
+		installCalls++
+		if session == nil || session.SessionID != "cli_host" || serverURL != issuer {
+			t.Fatalf("client bootstrap args = session=%#v server=%q", session, serverURL)
+		}
+		return nil
+	}, bootstrap.SaveResume); err != nil {
+		t.Fatal(err)
+	}
+	if installCalls != 1 || !resume.ClientInstalled {
+		t.Fatalf("installCalls=%d clientInstalled=%t", installCalls, resume.ClientInstalled)
+	}
+	if _, err := os.Stat(bootstrap.ResumePath(store.Path)); err != nil {
+		t.Fatalf("host resume checkpoint was not persisted: %v", err)
 	}
 }
 
