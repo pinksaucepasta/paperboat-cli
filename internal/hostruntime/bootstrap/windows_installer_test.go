@@ -22,7 +22,7 @@ func TestWindowsInstallerDoesNotRequestUACFromElevatedSession(t *testing.T) {
 	if unblock < 0 {
 		t.Fatal("Windows installer must clear Zone.Identifier before executing the downloaded executable")
 	}
-	if !strings.Contains(script, "$trustedBootstrap = Join-Path ${env:ProgramFiles} 'Paperboat\\bootstrap\\pb.exe'") || !strings.Contains(script, "Stage-TrustedBootstrap $download") {
+	if !strings.Contains(script, "$trustedBootstrapDirectory = Join-Path ${env:ProgramFiles} 'Paperboat\\bootstrap'") || !strings.Contains(script, "pb-' + [guid]::NewGuid().ToString('N') + '.exe'") || !strings.Contains(script, "Stage-TrustedBootstrap $download") {
 		t.Fatal("Windows installer must stage the verified bootstrap in a trusted administrator-owned path")
 	}
 	if strings.Contains(script, "\n  if (-not $process.WaitForExit(1200000))") && strings.Index(script, "\n  if (-not $process.WaitForExit(1200000))") < runAsStart {
