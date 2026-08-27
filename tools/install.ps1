@@ -104,12 +104,12 @@ if ($freshEnrollment -or -not (Assert-InstalledVersion $installedPb $version) -o
     if ($LASTEXITCODE -ne 0) { throw "Paperboat self-install failed with exit code $LASTEXITCODE." }
   } else {
     $process = Start-Process -FilePath $download -ArgumentList $arguments -Verb RunAs -PassThru -WindowStyle Hidden
+    if (-not $process.WaitForExit(1200000)) {
+      try { $process.Kill() } finally { $process.WaitForExit() }
+      throw 'Paperboat installation exceeded the 20 minute limit.'
+    }
+    if ($process.ExitCode -ne 0) { throw "Paperboat self-install failed with exit code $($process.ExitCode)." }
   }
-  if (-not $process.WaitForExit(1200000)) {
-    try { $process.Kill() } finally { $process.WaitForExit() }
-    throw 'Paperboat installation exceeded the 20 minute limit.'
-  }
-  if ($process.ExitCode -ne 0) { throw "Paperboat self-install failed with exit code $($process.ExitCode)." }
 }
 if (-not (Assert-InstalledVersion $installedPb $version)) { throw "Installed Paperboat does not report release $version." }
 

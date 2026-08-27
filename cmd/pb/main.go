@@ -5569,7 +5569,7 @@ func userMachineCobraCommand() *cobra.Command {
 }
 
 func windowsEnrollmentCommand(installerURL string) string {
-	return "powershell -c \"irm '" + installerURL + "' | iex\""
+	return "powershell -c \"iex (irm '" + installerURL + "')\""
 }
 
 func waitForAvailabilityObservation(ctx context.Context, client *api.Client, machineID string, current api.AvailabilityPolicy, timeout time.Duration) api.AvailabilityPolicy {
