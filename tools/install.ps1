@@ -92,12 +92,12 @@ if ($freshEnrollment -or -not (Assert-InstalledVersion $installedPb $version) -o
   $arguments = @('__install', '--source', $download, '--version', $version)
   if ($freshEnrollment) { $arguments += '--fresh' }
   # An already-elevated SSH or deployment session has no interactive desktop
-  # on which Windows can show another UAC prompt. Starting it with RunAs in
-  # that environment returns Access is denied even though the caller already
-  # has a full administrator token. Execute directly in that case; ordinary
-  # desktop terminals still use RunAs and show the normal UAC prompt.
+  # on which Windows can show another UAC prompt. Invoke directly in that
+  # case; ordinary desktop terminals still use RunAs and show the normal UAC
+  # prompt.
   if (Test-Administrator) {
-    $process = Start-Process -FilePath $download -ArgumentList $arguments -PassThru -WindowStyle Hidden
+    & $download @arguments
+    if ($LASTEXITCODE -ne 0) { throw "Paperboat self-install failed with exit code $LASTEXITCODE." }
   } else {
     $process = Start-Process -FilePath $download -ArgumentList $arguments -Verb RunAs -PassThru -WindowStyle Hidden
   }
