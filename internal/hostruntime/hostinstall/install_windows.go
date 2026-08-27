@@ -666,13 +666,17 @@ func terminatePaperboatProcesses(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	command := exec.CommandContext(ctx, "taskkill.exe", "/F", "/T", "/IM", "pb.exe")
-	if err := command.Run(); err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) && exitErr.ExitCode() == 128 {
-			return nil
+	// The fresh installer is itself a pb.exe process. Never terminate that
+	// process while it is performing the replacement purge, or the dashboard
+	// command exits before the new enrollment can complete.
+	script := fmt.Sprintf(`$self=%d; Get-CimInstance Win32_Process -Filter "Name = 'pb.exe'" | Where-Object { $_.ProcessId -ne $self } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop }`, os.Getpid())
+	command := exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script)
+	if output, err := command.CombinedOutput(); err != nil {
+		message := strings.TrimSpace(string(output))
+		if message != "" {
+			return fmt.Errorf("terminate Paperboat processes: %w: %s", err, message)
 		}
-		return err
+		return fmt.Errorf("terminate Paperboat processes: %w", err)
 	}
 	return nil
 }
