@@ -175,10 +175,14 @@ func stageWindowsActivation(ctx context.Context, config WindowsConfig, release w
 }
 
 func activeWindowsServiceTargetsMatch(layout service.Layout, version string, hostd, updater, ssh windowsServiceTarget) bool {
-	if !exactReleasePattern.MatchString(version) || !strings.EqualFold(hostd.Executable, layout.Binary) || !strings.EqualFold(updater.Executable, layout.Binary) {
+	if !exactReleasePattern.MatchString(version) || !strings.EqualFold(hostd.Executable, layout.Binary) || !windowsUpdaterExecutableMatches(layout, updater.Executable) {
 		return false
 	}
 	return ssh.Executable == "" || strings.EqualFold(ssh.Executable, layout.Binary)
+}
+
+func windowsUpdaterExecutableMatches(layout service.Layout, executable string) bool {
+	return strings.EqualFold(executable, layout.Binary) || strings.EqualFold(executable, layout.BinaryRollback)
 }
 
 func describeWindowsActivationComponent(path, architecture string) (windowsActivationComponent, error) {

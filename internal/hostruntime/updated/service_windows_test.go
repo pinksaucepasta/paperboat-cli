@@ -86,4 +86,13 @@ func TestWindowsActiveServiceTargetsUseCanonicalBinary(t *testing.T) {
 	if activeWindowsServiceTargetsMatch(layout, "2026.08.23.1", hostd, updater, ssh) {
 		t.Fatal("runtime artifact accepted as hostd")
 	}
+	hostd.Executable = layout.Binary
+	updater.Executable = layout.BinaryRollback
+	if !activeWindowsServiceTargetsMatch(layout, "2026.08.23.1", hostd, updater, ssh) {
+		t.Fatal("intentional rollback artifact rejected as updater")
+	}
+	updater.Executable = `C:\Temp\pb.exe`
+	if activeWindowsServiceTargetsMatch(layout, "2026.08.23.1", hostd, updater, ssh) {
+		t.Fatal("mutable updater artifact accepted")
+	}
 }
