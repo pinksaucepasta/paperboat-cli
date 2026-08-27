@@ -695,7 +695,18 @@ func uninstallWindows(ctx context.Context, purge bool) error {
 	} {
 		installer, makeErr := service.New(service.Config{Platform: "windows", Kind: item.kind, ConfigRoot: WindowsProgramDataRoot(), Executable: item.executable, User: "Paperboat", Group: "Paperboat", Arguments: item.args, Controller: service.WindowsController{}})
 		if makeErr == nil {
-			result = errors.Join(result, installer.Uninstall(ctx))
+			uninstallErr := installer.Uninstall(ctx)
+			if errors.Is(uninstallErr, service.ErrInvalidDefinition) {
+				// An interrupted activation can remove the declaration file after
+				// SCM has retained the owned service. Remove that orphan by its
+				// exact fixed command instead of leaving the next install stuck.
+				if orphanErr := removeOrphanWindowsService(ctx, serviceNameForKind(item.kind), item.executable, item.args); orphanErr == nil {
+					uninstallErr = nil
+				} else {
+					uninstallErr = errors.Join(uninstallErr, orphanErr)
+				}
+			}
+			result = errors.Join(result, uninstallErr)
 		}
 	}
 	for _, path := range []string{WindowsInstallConfigPath(), WindowsHostdTokenPath()} {
@@ -711,6 +722,65 @@ func uninstallWindows(ctx context.Context, purge bool) error {
 		}
 	}
 	return result
+}
+
+func serviceNameForKind(kind string) string {
+	if kind == service.UpdaterKind {
+		return "PaperboatUpdated"
+	}
+	return "PaperboatHostd"
+}
+
+func removeOrphanWindowsService(ctx context.Context, name, executable string, args []string) error {
+	manager, err := mgr.Connect()
+	if err != nil {
+		return err
+	}
+	defer manager.Disconnect()
+	current, err := manager.OpenService(name)
+	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer current.Close()
+	config, err := current.Config()
+	if err != nil {
+		return err
+	}
+	want := windows.ComposeCommandLine(append([]string{executable}, args...))
+	if !strings.EqualFold(config.BinaryPathName, want) || !strings.EqualFold(strings.TrimSpace(config.ServiceStartName), "LocalSystem") {
+		return service.ErrInvalidDefinition
+	}
+	status, err := current.Query()
+	if err != nil {
+		return err
+	}
+	if status.State != svc.Stopped {
+		if _, err := current.Control(svc.Stop); err != nil && !errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE) {
+			return err
+		}
+		deadline := time.Now().Add(30 * time.Second)
+		for status.State != svc.Stopped {
+			if !time.Now().Before(deadline) {
+				return context.DeadlineExceeded
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(100 * time.Millisecond):
+			}
+			status, err = current.Query()
+			if err != nil {
+				return err
+			}
+		}
+	}
+	if err := current.Delete(); err != nil && !errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
+		return err
+	}
+	return nil
 }
 
 func installWindowsServices(ctx context.Context, layout service.Layout, upgradeMode string) error {
