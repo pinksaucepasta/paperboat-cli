@@ -254,20 +254,15 @@ func TestSignedUpdateAvailableNeverOffersDowngrade(t *testing.T) {
 	}
 }
 
-func TestUpdateCheckFallsBackToSignedOriginWhenUpdaterIsUnavailable(t *testing.T) {
+func TestUpdateCheckRequiresManagedUpdater(t *testing.T) {
 	oldVersion := buildinfo.Version
 	oldSocket := updateControlSocketForCommand
-	oldResolve := resolveVerifiedUpdateForCommand
 	defer func() {
 		buildinfo.Version = oldVersion
 		updateControlSocketForCommand = oldSocket
-		resolveVerifiedUpdateForCommand = oldResolve
 	}()
 	buildinfo.Version = "2026.08.18.1"
 	updateControlSocketForCommand = func() string { return filepath.Join(t.TempDir(), "missing-updater.sock") }
-	resolveVerifiedUpdateForCommand = func(context.Context) (bootstrap.ArtifactTarget, string, error) {
-		return bootstrap.ArtifactTarget{Version: "2026.08.18.2"}, "/tmp/verified-pb", nil
-	}
 	command, _, err := newRootCommand().Find([]string{"update", "check"})
 	if err != nil {
 		t.Fatal(err)
@@ -276,35 +271,20 @@ func TestUpdateCheckFallsBackToSignedOriginWhenUpdaterIsUnavailable(t *testing.T
 	command.SetContext(context.Background())
 	command.SetOut(&output)
 	command.SetErr(&output)
-	if err := actionUpdateCheck(command, nil); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(output.String(), "Paperboat 2026.08.18.2 is available") {
-		t.Fatalf("fallback output = %q", output.String())
+	if err := actionUpdateCheck(command, nil); err == nil {
+		t.Fatalf("expected managed updater error, output=%q", output.String())
 	}
 }
 
-func TestUpdateFallsBackToSignedOriginAndInstallsCLIWhenUpdaterIsUnavailable(t *testing.T) {
+func TestUpdateRequiresManagedUpdater(t *testing.T) {
 	oldVersion := buildinfo.Version
 	oldSocket := updateControlSocketForCommand
-	oldResolve := resolveVerifiedUpdateForCommand
-	oldInstall := installSignedCLIForCommand
 	defer func() {
 		buildinfo.Version = oldVersion
 		updateControlSocketForCommand = oldSocket
-		resolveVerifiedUpdateForCommand = oldResolve
-		installSignedCLIForCommand = oldInstall
 	}()
 	buildinfo.Version = "2026.08.18.1"
 	updateControlSocketForCommand = func() string { return filepath.Join(t.TempDir(), "missing-updater.sock") }
-	resolveVerifiedUpdateForCommand = func(context.Context) (bootstrap.ArtifactTarget, string, error) {
-		return bootstrap.ArtifactTarget{Version: "2026.08.18.2"}, "/tmp/verified-pb", nil
-	}
-	var installedExecutable, installedArtifact string
-	installSignedCLIForCommand = func(executable, artifact string) error {
-		installedExecutable, installedArtifact = executable, artifact
-		return nil
-	}
 	command, _, err := newRootCommand().Find([]string{"update"})
 	if err != nil {
 		t.Fatal(err)
@@ -313,14 +293,8 @@ func TestUpdateFallsBackToSignedOriginAndInstallsCLIWhenUpdaterIsUnavailable(t *
 	command.SetContext(context.Background())
 	command.SetOut(&output)
 	command.SetErr(&output)
-	if err := actionUpdate(command, nil); err != nil {
-		t.Fatal(err)
-	}
-	if installedExecutable == "" || installedArtifact != "/tmp/verified-pb" {
-		t.Fatalf("fallback installer arguments = executable %q artifact %q", installedExecutable, installedArtifact)
-	}
-	if !strings.Contains(output.String(), "Updated pb to 2026.08.18.2") {
-		t.Fatalf("fallback output = %q", output.String())
+	if err := actionUpdate(command, nil); err == nil {
+		t.Fatalf("expected managed updater error, output=%q", output.String())
 	}
 }
 

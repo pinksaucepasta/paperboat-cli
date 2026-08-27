@@ -3060,11 +3060,7 @@ type updateCheckResult struct {
 	Verified         bool   `json:"verified"`
 }
 
-var (
-	resolveVerifiedUpdateForCommand = resolveVerifiedUpdate
-	installSignedCLIForCommand      = selfupdate.InstallCLI
-	updateControlSocketForCommand   = updatedControlSocket
-)
+var updateControlSocketForCommand = updatedControlSocket
 
 func actionUpdateCheck(command *cobra.Command, _ []string) error {
 	ctx, cancel := context.WithTimeout(command.Context(), 30*time.Second)
@@ -3081,18 +3077,7 @@ func actionUpdateCheck(command *cobra.Command, _ []string) error {
 		}
 		return writeUpdateCheckResult(command, response.Version, available)
 	}
-	if !errors.Is(err, updated.ErrUnavailable) {
-		return fmt.Errorf("check with paperboat-updated: %w", err)
-	}
-	artifact, _, err := resolveVerifiedUpdateForCommand(ctx)
-	if err != nil {
-		return err
-	}
-	available, err := signedUpdateAvailable(buildinfo.Version, artifact.Version)
-	if err != nil {
-		return fmt.Errorf("validate signed update version: %w", err)
-	}
-	return writeUpdateCheckResult(command, artifact.Version, available)
+	return fmt.Errorf("check with paperboat-updated: %w", err)
 }
 
 func writeUpdateCheckResult(command *cobra.Command, latest string, available bool) error {
@@ -3142,13 +3127,7 @@ func actionUpdateStatus(command *cobra.Command, _ []string) error {
 		result := updateStatusResult{CLIVersion: buildinfo.Version, RuntimeVersion: response.Version, RuntimeAvailable: response.Version != "", LastCheck: response.Observation.CheckedAt, NextCheck: response.Observation.NextCheckAt, LastFailure: response.Observation.Failure, Supervisor: response.Supervisor}
 		return writeUpdateStatusResult(command, result, response.Supervisor.MaintenanceRequired, response.Supervisor.StagedVersion)
 	}
-	if !errors.Is(err, updated.ErrUnavailable) {
-		return fmt.Errorf("read paperboat-updated status: %w", err)
-	}
-	// Client installations do not run the privileged updater service. Keep the
-	// status command useful there without pretending a runtime supervisor exists.
-	result := updateStatusResult{CLIVersion: buildinfo.Version}
-	return writeUpdateStatusResult(command, result, false, "")
+	return fmt.Errorf("read paperboat-updated status: %w", err)
 }
 
 func writeUpdateStatusResult(command *cobra.Command, result updateStatusResult, maintenanceRequired bool, stagedVersion string) error {
@@ -3191,34 +3170,7 @@ func actionUpdate(command *cobra.Command, _ []string) error {
 		}
 		return writeUpdateResult(command, updateResult{PreviousVersion: buildinfo.Version, Version: response.Version, CLIUpdated: response.Updated, RuntimeUpdated: response.Updated, SupervisorUpdated: response.Supervisor.Applied}, response.Version)
 	}
-	if !errors.Is(err, updated.ErrUnavailable) {
-		return fmt.Errorf("update with paperboat-updated: %w", err)
-	}
-	artifact, verified, err := resolveVerifiedUpdateForCommand(ctx)
-	if err != nil {
-		return err
-	}
-	result := updateResult{PreviousVersion: buildinfo.Version, Version: artifact.Version}
-	if buildinfo.Version != "dev" {
-		comparison, compareErr := selfupdate.CompareVersions(artifact.Version, buildinfo.Version)
-		if compareErr != nil || comparison < 0 {
-			return errors.New("the signed release origin returned an older version; refusing to downgrade pb")
-		}
-	}
-	if artifact.Version != buildinfo.Version {
-		executable, executableErr := os.Executable()
-		if executableErr != nil {
-			return executableErr
-		}
-		if executableErr = installSignedCLIForCommand(executable, verified); executableErr != nil {
-			if errors.Is(executableErr, os.ErrPermission) {
-				return fmt.Errorf("install pb update: %w; the updater service is unavailable and this installation is protected, run `sudo pb update` or reinstall Paperboat", executableErr)
-			}
-			return fmt.Errorf("install pb update: %w", executableErr)
-		}
-		result.CLIUpdated = true
-	}
-	return writeUpdateResult(command, result, artifact.Version)
+	return fmt.Errorf("update with paperboat-updated: %w", err)
 }
 
 func writeUpdateResult(command *cobra.Command, result updateResult, version string) error {
@@ -3236,26 +3188,6 @@ func writeUpdateResult(command *cobra.Command, result updateResult, version stri
 	}
 	fmt.Fprintf(command.OutOrStdout(), "Updated Paperboat runtime to %s.\n", version)
 	return nil
-}
-
-func resolveVerifiedUpdate(ctx context.Context) (bootstrap.ArtifactTarget, string, error) {
-	releaseURL := strings.TrimSpace(buildinfo.DefaultReleaseURL)
-	if releaseURL == "" {
-		return bootstrap.ArtifactTarget{}, "", errors.New("this pb build does not define a signed release origin")
-	}
-	artifact, err := selfupdate.Resolve(ctx, releaseURL, &http.Client{Transport: httptransport.Default(), Timeout: 30 * time.Second})
-	if err != nil {
-		return bootstrap.ArtifactTarget{}, "", fmt.Errorf("resolve latest signed release: %w", err)
-	}
-	stateRoot, err := helperconfig.DefaultStateRoot(os.Getenv)
-	if err != nil {
-		return bootstrap.ArtifactTarget{}, "", err
-	}
-	verified, err := bootstrap.FetchVerifiedArtifact(ctx, artifact, filepath.Join(stateRoot, "self-update", "tuf"), &http.Client{Transport: httptransport.Default(), Timeout: 2 * time.Minute})
-	if err != nil {
-		return bootstrap.ArtifactTarget{}, "", fmt.Errorf("verify latest signed pb release: %w", err)
-	}
-	return artifact, verified, nil
 }
 
 func waitForWindowsUpdateActivation(ctx context.Context, version string) (updated.ControlResponse, error) {
