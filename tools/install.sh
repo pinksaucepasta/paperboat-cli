@@ -175,7 +175,10 @@ cleanup_existing() {
   if [ "$os" = darwin ]; then
     sudo -n rm -f /usr/local/libexec/paperboat/pb 2>/dev/null || true
   else
-    rm -f /usr/local/libexec/paperboat/pb
+    # The packaged runtime may be owned by root even when the dashboard
+    # command is run as an unprivileged user. Best-effort removal must never
+    # abort the installer before the user-owned replacement is installed.
+    sudo -n rm -f /usr/local/libexec/paperboat/pb 2>/dev/null || rm -f /usr/local/libexec/paperboat/pb 2>/dev/null || true
   fi
 }
 
