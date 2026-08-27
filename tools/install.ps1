@@ -79,6 +79,10 @@ function Assert-InstalledVersion([string]$Path, [string]$ExpectedVersion) {
 if (-not (Assert-InstalledVersion $download $version)) {
   throw "Downloaded Paperboat release does not report version $version."
 }
+# Invoke-WebRequest may attach a Zone.Identifier stream to executable downloads.
+# Clear that mark before invoking the verified file, including from elevated SSH
+# sessions where SmartScreen cannot display an interactive approval dialog.
+Unblock-File -LiteralPath $download -ErrorAction SilentlyContinue
 
 function Test-Administrator {
   $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
