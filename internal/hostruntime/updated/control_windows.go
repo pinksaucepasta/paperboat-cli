@@ -23,6 +23,9 @@ import (
 
 var ErrWindowsActivationUnavailable = errors.New("Windows updater activation is unavailable")
 
+var windowsActivationHandoffDelay = 2 * time.Second
+var startWindowsActivator = startWindowsActivatorService
+
 type windowsController struct {
 	activeVersion string
 	ownerSID      string
@@ -91,30 +94,44 @@ func (c *windowsController) run(ctx context.Context) error {
 			}
 			return acceptErr
 		}
-		_ = c.handle(connection)
+		activationPending, _ := c.handle(connection)
 		_ = connection.Close()
-		if activationRequested(c.handoff) {
+		if activationPending {
+			delay := windowsActivationHandoffDelay
+			if delay > 0 {
+				timer := time.NewTimer(delay)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return nil
+				case <-timer.C:
+				}
+			}
+			if err := startWindowsActivator(); err != nil {
+				continue
+			}
+			c.handoffOnce.Do(func() { close(c.handoff) })
 			return nil
 		}
 	}
 }
 
-func (c *windowsController) handle(connection net.Conn) error {
+func (c *windowsController) handle(connection net.Conn) (bool, error) {
 	if connection == nil {
-		return ErrInvalidControl
+		return false, ErrInvalidControl
 	}
 	_ = connection.SetDeadline(time.Now().Add(maxUpdateControlTimeout))
 	reader := bufio.NewReaderSize(io.LimitReader(connection, (4<<10)+1), (4<<10)+1)
 	body, err := reader.ReadBytes('\n')
 	if err != nil || len(body) == 0 || len(body) > 4<<10 {
-		return json.NewEncoder(connection).Encode(ControlResponse{Schema: ControlProtocolV1, Status: "error", ErrorCode: "invalid_request"})
+		return false, json.NewEncoder(connection).Encode(ControlResponse{Schema: ControlProtocolV1, Status: "error", ErrorCode: "invalid_request"})
 	}
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
 	var request ControlRequest
 	var extra any
 	if decoder.Decode(&request) != nil || decoder.Decode(&extra) != io.EOF || request.Schema != ControlProtocolV1 || !validControlRequest(request) {
-		return json.NewEncoder(connection).Encode(ControlResponse{Schema: ControlProtocolV1, Status: "error", ErrorCode: "invalid_request"})
+		return false, json.NewEncoder(connection).Encode(ControlResponse{Schema: ControlProtocolV1, Status: "error", ErrorCode: "invalid_request"})
 	}
 	response, invokeErr := c.invoke(context.Background(), request)
 	if invokeErr != nil {
@@ -130,15 +147,9 @@ func (c *windowsController) handle(connection net.Conn) error {
 		response.Status = "ok"
 	}
 	if err := json.NewEncoder(connection).Encode(response); err != nil {
-		return err
+		return false, err
 	}
-	if response.Pending {
-		if err := startWindowsActivatorService(); err != nil {
-			return err
-		}
-		c.handoffOnce.Do(func() { close(c.handoff) })
-	}
-	return nil
+	return response.Pending, nil
 }
 
 func (c *windowsController) invoke(ctx context.Context, request ControlRequest) (ControlResponse, error) {

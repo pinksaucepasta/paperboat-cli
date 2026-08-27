@@ -39,6 +39,7 @@ type windowsActivationJournal struct {
 	Runtime, CLI, Hostd, Updater, PreviousBinary                  windowsActivationComponent
 	OldHostd, NewHostd, OldUpdater, NewUpdater, OldSSH, NewSSH    windowsServiceTarget
 	PreviousCLIRecord, NewCLIRecord                               string
+	LocalDaemonWasRunning                                         bool
 	Failure                                                       string
 }
 
@@ -48,11 +49,11 @@ var errInvalidWindowsActivation = errors.New("invalid Windows activation transac
 // has deterministic tests without pretending a macOS filesystem models SCM.
 type windowsActivationBackend interface {
 	WriteJournal(windowsActivationJournal) error
-	StopServices(context.Context) error
+	StopServices(context.Context, bool) error
 	ActivateBinary(context.Context, windowsActivationJournal) error
 	RestoreBinary(context.Context, windowsActivationJournal) error
 	SetServiceTargets(context.Context, windowsServiceTarget, windowsServiceTarget, windowsServiceTarget) error
-	StartServices(context.Context, bool, bool, bool) error
+	StartServices(context.Context, bool, bool, bool, bool) error
 	VerifyHealth(context.Context, windowsActivationJournal) error
 	CommitCLI(context.Context, windowsActivationJournal) error
 	Quarantine(context.Context, windowsActivationJournal) error
@@ -78,7 +79,7 @@ func executeWindowsActivation(ctx context.Context, backend windowsActivationBack
 	if err = backend.WriteJournal(journal); err != nil {
 		return journal, err
 	}
-	if err = backend.StopServices(ctx); err != nil {
+	if err = backend.StopServices(ctx, journal.LocalDaemonWasRunning); err != nil {
 		return rollbackWindowsActivation(ctx, backend, journal, err)
 	}
 	if err = backend.ActivateBinary(ctx, journal); err != nil {
@@ -87,7 +88,7 @@ func executeWindowsActivation(ctx context.Context, backend windowsActivationBack
 	if err = backend.SetServiceTargets(ctx, journal.NewHostd, journal.NewUpdater, journal.NewSSH); err != nil {
 		return rollbackWindowsActivation(ctx, backend, journal, err)
 	}
-	if err = backend.StartServices(ctx, true, true, journal.NewSSH.WasRunning); err != nil {
+	if err = backend.StartServices(ctx, true, true, journal.NewSSH.WasRunning, journal.LocalDaemonWasRunning); err != nil {
 		return rollbackWindowsActivation(ctx, backend, journal, err)
 	}
 	journal.Stage = windowsActivationServicesLive
@@ -114,7 +115,7 @@ func rollbackWindowsActivation(ctx context.Context, backend windowsActivationBac
 	defer cancel()
 	journal.Stage, journal.Failure = windowsActivationRollingBack, boundedWindowsActivationFailure(cause)
 	journalErr := backend.WriteJournal(journal)
-	stopErr := backend.StopServices(ctx)
+	stopErr := backend.StopServices(ctx, journal.LocalDaemonWasRunning)
 	var targetErr error
 	var binaryErr error
 	if stopErr == nil {
@@ -168,7 +169,7 @@ func completeWindowsRollback(_ context.Context, backend windowsActivationBackend
 	if journal.Stage != windowsActivationRollbackReady {
 		return journal, errors.Join(cause, errInvalidWindowsActivation)
 	}
-	if err := backend.StartServices(ctx, journal.OldHostd.WasRunning, journal.OldUpdater.WasRunning, journal.OldSSH.WasRunning); err != nil {
+	if err := backend.StartServices(ctx, journal.OldHostd.WasRunning, journal.OldUpdater.WasRunning, journal.OldSSH.WasRunning, journal.LocalDaemonWasRunning); err != nil {
 		return journal, errors.Join(cause, err)
 	}
 	journal.Stage = windowsActivationRolledBack

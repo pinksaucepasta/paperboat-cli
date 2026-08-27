@@ -21,9 +21,11 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/binarytarget"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostdproto"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostinstall"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/nativesignature"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/workerupdate"
+	"github.com/pinksaucepasta/paperboat/internal/localdaemon"
 	"github.com/pinksaucepasta/paperboat/internal/windowssecurity"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
@@ -111,6 +113,14 @@ func stageWindowsActivation(ctx context.Context, config WindowsConfig, release w
 	if !activeWindowsServiceTargetsMatch(layout, config.ActiveVersion, oldHostd, oldUpdater, oldSSH) {
 		return windowsActivationJournal{}, errInvalidWindowsActivation
 	}
+	localDaemonLock, err := windowsLocalDaemonLockPath()
+	if err != nil {
+		return windowsActivationJournal{}, err
+	}
+	localDaemonWasRunning, err := localdaemon.WindowsOwnerServiceRunning(localDaemonLock, config.OwnerSID)
+	if err != nil {
+		return windowsActivationJournal{}, err
+	}
 	previousBinary, err := describeWindowsActivationComponent(layout.Binary, config.Architecture)
 	if err != nil {
 		return windowsActivationJournal{}, err
@@ -161,8 +171,9 @@ func stageWindowsActivation(ctx context.Context, config WindowsConfig, release w
 		Schema: windowsActivationJournalSchema, TransactionID: hex.EncodeToString(transaction[:]), PreviousVersion: config.ActiveVersion, Version: release.Version, Architecture: config.Architecture, Stage: windowsActivationStaged,
 		Runtime: staged["runtime"], CLI: staged["cli"], Hostd: staged["hostd"], Updater: staged["updater"], PreviousBinary: previousBinary,
 		OldHostd: oldHostd, OldUpdater: oldUpdater, OldSSH: oldSSH, NewSSH: newSSH,
-		NewHostd:   windowsServiceTarget{Executable: layout.Binary, Arguments: []string{"__runtime-hostd"}, WasRunning: oldHostd.WasRunning},
-		NewUpdater: windowsServiceTarget{Executable: layout.Binary, Arguments: []string{"__runtime-updated"}, WasRunning: oldUpdater.WasRunning},
+		LocalDaemonWasRunning: localDaemonWasRunning,
+		NewHostd:              windowsServiceTarget{Executable: layout.Binary, Arguments: []string{"__runtime-hostd"}, WasRunning: oldHostd.WasRunning},
+		NewUpdater:            windowsServiceTarget{Executable: layout.Binary, Arguments: []string{"__runtime-updated"}, WasRunning: oldUpdater.WasRunning},
 	}
 	backend := newWindowsSCMActivationBackend(config)
 	if err := backend.WriteJournal(journal); err != nil {
@@ -532,8 +543,24 @@ func (b *windowsSCMActivationBackend) WriteJournal(j windowsActivationJournal) e
 	}
 	return applyWindowsReleaseACL(path, "D:P(A;;FA;;;SY)(A;;FA;;;BA)")
 }
-func (b *windowsSCMActivationBackend) StopServices(ctx context.Context) error {
-	return stopNamedWindowsServices(ctx, windowsActivationServiceNames(b.config.SetupMode)...)
+func windowsLocalDaemonLockPath() (string, error) {
+	config, err := hostinstall.LoadWindowsRuntimeConfig()
+	if err != nil || !filepath.IsAbs(config.StateRoot) || filepath.Clean(config.StateRoot) != config.StateRoot {
+		return "", errors.Join(errInvalidWindowsActivation, err)
+	}
+	return filepath.Join(filepath.Dir(config.StateRoot), "state", "daemon.lock"), nil
+}
+
+func (b *windowsSCMActivationBackend) StopServices(ctx context.Context, localDaemonWasRunning bool) error {
+	serviceErr := stopNamedWindowsServices(ctx, windowsActivationServiceNames(b.config.SetupMode)...)
+	if !localDaemonWasRunning {
+		return serviceErr
+	}
+	lockPath, err := windowsLocalDaemonLockPath()
+	if err != nil {
+		return errors.Join(serviceErr, err)
+	}
+	return errors.Join(serviceErr, localdaemon.StopWindowsOwnerService(ctx, lockPath, b.config.OwnerSID))
 }
 
 func windowsStableBinaryDACL(ownerSID string) string {
@@ -752,7 +779,7 @@ func normalizeWindowsRollbackTargets(hostd, updater, ssh windowsServiceTarget) (
 	}
 	return hostd, updater, ssh, nil
 }
-func (b *windowsSCMActivationBackend) StartServices(ctx context.Context, hostd, updater, ssh bool) error {
+func (b *windowsSCMActivationBackend) StartServices(ctx context.Context, hostd, updater, ssh, localDaemon bool) error {
 	if hostd {
 		if err := startNamedWindowsService(ctx, windowsHostdService); err != nil {
 			return err
@@ -764,7 +791,12 @@ func (b *windowsSCMActivationBackend) StartServices(ctx context.Context, hostd, 
 		}
 	}
 	if b.config.SetupMode == "host" && ssh {
-		return startNamedWindowsService(ctx, windowsSSHService)
+		if err := startNamedWindowsService(ctx, windowsSSHService); err != nil {
+			return err
+		}
+	}
+	if localDaemon {
+		return localdaemon.StartWindowsOwnerService(ctx, b.config.OwnerSID)
 	}
 	return nil
 }

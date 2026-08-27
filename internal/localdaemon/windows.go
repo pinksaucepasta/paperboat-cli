@@ -63,3 +63,21 @@ func InstallCurrentUserService(ctx context.Context, executable, configPath, serv
 func RemoveCurrentUserService(ctx context.Context, executable string) error {
 	return removeWindowsCurrentUserService(ctx, executable)
 }
+
+// WindowsOwnerServiceRunning verifies the SID-bound daemon owner record and
+// process identity before reporting that the enrolled user's daemon is live.
+// It is used by the LocalSystem updater before replacing the managed binary.
+func WindowsOwnerServiceRunning(lockPath, ownerSID string) (bool, error) {
+	return windowsOwnerServiceRunning(lockPath, ownerSID)
+}
+
+// StopWindowsOwnerService ends the fixed scheduled task and terminates only
+// the exact SID-bound daemon process recorded in lockPath.
+func StopWindowsOwnerService(ctx context.Context, lockPath, ownerSID string) error {
+	return stopWindowsOwnerService(ctx, lockPath, ownerSID)
+}
+
+// StartWindowsOwnerService starts the enrolled user's fixed scheduled task.
+func StartWindowsOwnerService(ctx context.Context, ownerSID string) error {
+	return startWindowsOwnerService(ctx, ownerSID)
+}

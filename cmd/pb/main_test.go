@@ -308,6 +308,26 @@ func TestUpdateWithProgressHonorsCancellation(t *testing.T) {
 	}
 }
 
+func TestWindowsUpdateReturnsStagedResultSoCanonicalCallerCanExit(t *testing.T) {
+	response := updated.ControlResponse{Version: "2026.08.27.50", Pending: true}
+	result := updateCommandResult("windows", "2026.08.27.46", response)
+	if !result.ActivationPending || result.CLIUpdated || result.RuntimeUpdated {
+		t.Fatalf("result = %+v", result)
+	}
+	command, _, err := newRootCommand().Find([]string{"update"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	command.SetOut(&output)
+	if err := writeUpdateResult(command, result, response.Version); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "staged") || !strings.Contains(output.String(), "pb update status") {
+		t.Fatalf("output = %q", output.String())
+	}
+}
+
 func TestSignedUpdateAvailableNeverOffersDowngrade(t *testing.T) {
 	for _, test := range []struct {
 		installed string

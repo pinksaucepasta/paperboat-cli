@@ -10,8 +10,10 @@ import (
 )
 
 type recordingWindowsActivationBackend struct {
-	events []string
-	fail   string
+	events             []string
+	fail               string
+	stoppedLocalDaemon bool
+	startedLocalDaemon bool
 }
 
 func (b *recordingWindowsActivationBackend) event(name string) error {
@@ -24,7 +26,8 @@ func (b *recordingWindowsActivationBackend) event(name string) error {
 func (b *recordingWindowsActivationBackend) WriteJournal(j windowsActivationJournal) error {
 	return b.event("journal:" + string(j.Stage))
 }
-func (b *recordingWindowsActivationBackend) StopServices(context.Context) error {
+func (b *recordingWindowsActivationBackend) StopServices(_ context.Context, localDaemon bool) error {
+	b.stoppedLocalDaemon = b.stoppedLocalDaemon || localDaemon
 	return b.event("stop")
 }
 func (b *recordingWindowsActivationBackend) ActivateBinary(_ context.Context, _ windowsActivationJournal) error {
@@ -36,7 +39,8 @@ func (b *recordingWindowsActivationBackend) RestoreBinary(_ context.Context, _ w
 func (b *recordingWindowsActivationBackend) SetServiceTargets(_ context.Context, h, _, _ windowsServiceTarget) error {
 	return b.event("targets:" + h.Executable)
 }
-func (b *recordingWindowsActivationBackend) StartServices(_ context.Context, h, u, ssh bool) error {
+func (b *recordingWindowsActivationBackend) StartServices(_ context.Context, h, u, ssh, localDaemon bool) error {
+	b.startedLocalDaemon = b.startedLocalDaemon || localDaemon
 	return b.event("start")
 }
 func (b *recordingWindowsActivationBackend) VerifyHealth(context.Context, windowsActivationJournal) error {
@@ -65,6 +69,19 @@ func TestWindowsActivationCommitsCLIOnlyAfterHealth(t *testing.T) {
 	want := []string{"journal:switching", "stop", "activate", "targets:C:\\Program Files\\Paperboat\\bin\\pb.exe", "start", "journal:services_live", "health", "cli:", "journal:committed"}
 	if !reflect.DeepEqual(b.events, want) {
 		t.Fatalf("events=%q want=%q", b.events, want)
+	}
+}
+
+func TestWindowsActivationSuspendsAndRestartsRecordedLocalDaemon(t *testing.T) {
+	b := &recordingWindowsActivationBackend{}
+	journal := testWindowsActivationJournal()
+	journal.LocalDaemonWasRunning = true
+	result, err := executeWindowsActivation(context.Background(), b, journal)
+	if err != nil || result.Stage != windowsActivationCommitted {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if !b.stoppedLocalDaemon || !b.startedLocalDaemon {
+		t.Fatalf("local daemon lifecycle: stopped=%t started=%t", b.stoppedLocalDaemon, b.startedLocalDaemon)
 	}
 }
 

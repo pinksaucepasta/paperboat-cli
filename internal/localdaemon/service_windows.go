@@ -180,6 +180,50 @@ func stopOwnedWindowsDaemon(ctx context.Context, lockPath, ownerSID, _ string) e
 	return process.TerminateAndWait(bounded)
 }
 
+func windowsOwnerServiceRunning(lockPath, ownerSID string) (bool, error) {
+	record, err := readWindowsDaemonPIDLock(lockPath, ownerSID)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	process, err := openWindowsDaemonProcess(record.Record.PID)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer process.Close()
+	identity, err := process.Identity()
+	if err != nil {
+		return false, err
+	}
+	if err := validateOwnedWindowsDaemon(identity, record, ownerSID); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func stopWindowsOwnerService(ctx context.Context, lockPath, ownerSID string) error {
+	if ctx == nil || !filepath.IsAbs(lockPath) || filepath.Clean(lockPath) != lockPath || ownerSID == "" {
+		return ErrInvalidInventoryConfig
+	}
+	taskErr := runWindowsTaskCommand(ctx, "/End", "/TN", windowsDaemonTaskName(ownerSID))
+	if isMissingWindowsTaskError(taskErr) || isWindowsTaskNotRunningError(taskErr) {
+		taskErr = nil
+	}
+	return errors.Join(taskErr, stopOwnedWindowsDaemon(ctx, lockPath, ownerSID, ""))
+}
+
+func startWindowsOwnerService(ctx context.Context, ownerSID string) error {
+	if ctx == nil || ownerSID == "" {
+		return ErrInvalidInventoryConfig
+	}
+	return runWindowsTaskCommand(ctx, "/Run", "/TN", windowsDaemonTaskName(ownerSID))
+}
+
 func defaultReadWindowsDaemonPIDLock(path, ownerSID string) (windowsDaemonPIDLock, error) {
 	_, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -594,4 +638,12 @@ func isMissingWindowsTaskError(err error) bool {
 	}
 	value := strings.ToLower(err.Error())
 	return strings.Contains(value, "does not exist") || strings.Contains(value, "cannot find") || strings.Contains(value, "not found")
+}
+
+func isWindowsTaskNotRunningError(err error) bool {
+	if err == nil {
+		return false
+	}
+	value := strings.ToLower(err.Error())
+	return strings.Contains(value, "not currently running") || strings.Contains(value, "is not running")
 }

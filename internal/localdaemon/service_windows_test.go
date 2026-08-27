@@ -133,6 +133,45 @@ func TestStopOwnedWindowsDaemonTerminatesOnlyExactRecordedProcess(t *testing.T) 
 	}
 }
 
+func TestWindowsOwnerServiceLifecycleUsesFixedTaskAndExactProcess(t *testing.T) {
+	executable := filepath.Join(t.TempDir(), "pb.exe")
+	if err := os.WriteFile(executable, []byte("fixture"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	identity := windowsDaemonProcessIdentity{PID: 4243, OwnerSID: "S-1-5-21-101", Executable: executable, Arguments: []string{executable, "__local-daemon"}, CreationTime: time.Now().UTC()}
+	record := testWindowsDaemonLock(t, identity)
+	process := &fakeWindowsDaemonProcess{identity: identity}
+	previousRead, previousOpen, previousTask := readWindowsDaemonPIDLock, openWindowsDaemonProcess, runWindowsTaskCommand
+	t.Cleanup(func() {
+		readWindowsDaemonPIDLock, openWindowsDaemonProcess, runWindowsTaskCommand = previousRead, previousOpen, previousTask
+	})
+	readWindowsDaemonPIDLock = func(string, string) (windowsDaemonPIDLock, error) { return record, nil }
+	openWindowsDaemonProcess = func(uint32) (windowsDaemonProcess, error) { return process, nil }
+	var calls [][]string
+	runWindowsTaskCommand = func(_ context.Context, arguments ...string) error {
+		calls = append(calls, append([]string(nil), arguments...))
+		return nil
+	}
+	lockPath := filepath.Join(t.TempDir(), "daemon.lock")
+	running, err := windowsOwnerServiceRunning(lockPath, identity.OwnerSID)
+	if err != nil || !running {
+		t.Fatalf("running=%t error=%v", running, err)
+	}
+	if err := stopWindowsOwnerService(context.Background(), lockPath, identity.OwnerSID); err != nil {
+		t.Fatal(err)
+	}
+	if err := startWindowsOwnerService(context.Background(), identity.OwnerSID); err != nil {
+		t.Fatal(err)
+	}
+	if !process.terminated {
+		t.Fatal("validated daemon was not terminated")
+	}
+	want := [][]string{{"/End", "/TN", windowsDaemonTaskName(identity.OwnerSID)}, {"/Run", "/TN", windowsDaemonTaskName(identity.OwnerSID)}}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("task calls=%q want=%q", calls, want)
+	}
+}
+
 func TestWindowsDaemonOwnerRecordRoundTripsExactIdentity(t *testing.T) {
 	ownerSID, err := currentWindowsUserSID()
 	if err != nil {

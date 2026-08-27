@@ -3036,6 +3036,7 @@ type updateResult struct {
 	CLIUpdated        bool   `json:"cli_updated"`
 	RuntimeUpdated    bool   `json:"runtime_updated"`
 	SupervisorUpdated bool   `json:"supervisor_updated"`
+	ActivationPending bool   `json:"activation_pending,omitempty"`
 }
 
 func updateCommand() *cobra.Command {
@@ -3162,24 +3163,13 @@ func actionUpdate(command *cobra.Command, _ []string) error {
 	}
 	response, err := updateWithProgress(command, ctx, client.Update)
 	if err == nil {
-		if runtime.GOOS == "windows" && response.Pending {
-			if !updateJSON(command) {
-				fmt.Fprintln(command.ErrOrStderr(), "Update staged; waiting for Windows services to activate it...")
-			}
-			var report func(time.Duration)
-			if !updateJSON(command) {
-				report = func(elapsed time.Duration) {
-					fmt.Fprintf(command.ErrOrStderr(), "Windows service activation is still in progress (%s)...\n", elapsed.Round(time.Second))
-				}
-			}
-			response, err = waitForWindowsUpdateActivationWithProgress(ctx, response.Version, report)
-			if err != nil {
-				return fmt.Errorf("wait for Paperboat Windows activation: %w", err)
-			}
-		}
-		return writeUpdateResult(command, updateResult{PreviousVersion: buildinfo.Version, Version: response.Version, CLIUpdated: response.Updated, RuntimeUpdated: response.Updated, SupervisorUpdated: response.Supervisor.Applied}, response.Version)
+		return writeUpdateResult(command, updateCommandResult(runtime.GOOS, buildinfo.Version, response), response.Version)
 	}
 	return fmt.Errorf("update with paperboat-updated: %w", err)
+}
+
+func updateCommandResult(platform, previousVersion string, response updated.ControlResponse) updateResult {
+	return updateResult{PreviousVersion: previousVersion, Version: response.Version, CLIUpdated: response.Updated, RuntimeUpdated: response.Updated, SupervisorUpdated: response.Supervisor.Applied, ActivationPending: platform == "windows" && response.Pending}
 }
 
 var updateProgressInterval = 5 * time.Second
@@ -3233,6 +3223,10 @@ func writeUpdateResult(command *cobra.Command, result updateResult, version stri
 	if jsonOutput {
 		return json.NewEncoder(command.OutOrStdout()).Encode(map[string]any{"schema_version": "1.0", "ok": true, "data": result})
 	}
+	if result.ActivationPending {
+		fmt.Fprintf(command.OutOrStdout(), "Paperboat %s is staged. Windows will activate it in the background; run `pb update status` to confirm.\n", version)
+		return nil
+	}
 	if !result.CLIUpdated && !result.RuntimeUpdated && !result.SupervisorUpdated {
 		fmt.Fprintf(command.OutOrStdout(), "pb %s is already up to date.\n", version)
 		return nil
@@ -3243,46 +3237,6 @@ func writeUpdateResult(command *cobra.Command, result updateResult, version stri
 	}
 	fmt.Fprintf(command.OutOrStdout(), "Updated Paperboat runtime to %s.\n", version)
 	return nil
-}
-
-func waitForWindowsUpdateActivation(ctx context.Context, version string) (updated.ControlResponse, error) {
-	return waitForWindowsUpdateActivationWithProgress(ctx, version, nil)
-}
-
-func waitForWindowsUpdateActivationWithProgress(ctx context.Context, version string, report func(time.Duration)) (updated.ControlResponse, error) {
-	if version == "" {
-		return updated.ControlResponse{}, errors.New("updater returned an empty pending version")
-	}
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-	started := time.Now()
-	lastReport := started
-	interval := updateProgressInterval
-	if interval <= 0 {
-		interval = 5 * time.Second
-	}
-	for {
-		client, err := updated.NewClient(updateControlSocketForCommand(), 10*time.Second)
-		if err == nil {
-			status, statusErr := client.Status(ctx)
-			if statusErr == nil && status.ActivationFailure != "" {
-				return updated.ControlResponse{}, errors.New(status.ActivationFailure)
-			}
-			if statusErr == nil && status.Version == version && !status.Pending && status.Updated {
-				return status, nil
-			}
-		}
-		select {
-		case <-ctx.Done():
-			return updated.ControlResponse{}, ctx.Err()
-		case <-ticker.C:
-			if report != nil && time.Since(lastReport) >= interval {
-				elapsed := time.Since(started)
-				report(elapsed)
-				lastReport = time.Now()
-			}
-		}
-	}
 }
 
 func actionApproveMaintenance(command *cobra.Command, _ []string) error {
@@ -3299,13 +3253,6 @@ func actionApproveMaintenance(command *cobra.Command, _ []string) error {
 	response, err := client.ApproveMaintenance(ctx, release)
 	if err != nil {
 		return fmt.Errorf("approve supervisor maintenance: %w", err)
-	}
-	if runtime.GOOS == "windows" && response.Pending {
-		activated, waitErr := waitForWindowsUpdateActivation(ctx, response.Version)
-		if waitErr != nil {
-			return fmt.Errorf("wait for Paperboat Windows maintenance activation: %w", waitErr)
-		}
-		response.Version, response.Supervisor.Version, response.Supervisor.Applied, response.Supervisor.MaintenanceRequired = activated.Version, activated.Version, true, false
 	}
 	jsonOutput, _ := command.Flags().GetBool("json")
 	if jsonOutput {
