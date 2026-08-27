@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostinstall"
 )
@@ -55,7 +56,8 @@ func runServiceCommand(ctx context.Context, args []string, stdin io.Reader, _, _
 
 func authorizePersistedUninstall(ctx context.Context) error {
 	executable := systemWorkerExecutable()
-	command := exec.CommandContext(ctx, "/usr/bin/sudo", "--", executable, "__runtime-service", "uninstall-persisted")
+	command := exec.CommandContext(ctx, "/usr/bin/sudo", "--", "/usr/bin/env",
+		"PAPERBOAT_INVOKING_UID="+strconv.Itoa(os.Getuid()), executable, "__runtime-service", "uninstall-persisted")
 	var stderr bytes.Buffer
 	command.Stderr = &stderr
 	if err := command.Run(); err != nil {

@@ -393,13 +393,7 @@ func ensureManagedDirectories(paths installPaths, request Request) error {
 	// hostd runs as the enrolled account and must be able to create its
 	// authenticated socket and fence state. The updater remains root-owned.
 	hostdDir := filepath.Dir(paths.hostdSocket)
-	if err := secureRootDirectory(hostdDir, 0o700); err != nil {
-		return err
-	}
-	if err := os.Chown(hostdDir, request.UID, request.GID); err != nil {
-		return err
-	}
-	if err := os.Chmod(hostdDir, 0o700); err != nil {
+	if err := secureManagedUserDirectory(hostdDir, 0o700, request.UID, request.GID); err != nil {
 		return err
 	}
 	for _, item := range []struct {
@@ -415,6 +409,34 @@ func ensureManagedDirectories(paths installPaths, request Request) error {
 		}
 	}
 	return nil
+}
+
+// secureManagedUserDirectory accepts the two owners that can safely have
+// created a runtime socket directory: root from a prior installation, or the
+// enrolled account from a running hostd. It rejects every other owner and
+// never follows symlinks before transferring ownership to the enrolled user.
+func secureManagedUserDirectory(path string, mode os.FileMode, uid, gid int) error {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return ErrInvalidRequest
+	}
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		if err := os.MkdirAll(path, mode); err != nil {
+			return err
+		}
+		info, err = os.Lstat(path)
+	}
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o022 != 0 {
+		return ErrInvalidRequest
+	}
+	owner := ownerUID(info)
+	if owner != 0 && owner != uid {
+		return ErrInvalidRequest
+	}
+	if err := os.Chown(path, uid, gid); err != nil {
+		return err
+	}
+	return os.Chmod(path, mode)
 }
 
 func writeInstallMetadata(path string, request Request) error {
@@ -723,7 +745,11 @@ func workerEnvironment(request Request) map[string]string {
 }
 
 func invokingUID() int {
-	uid, err := strconv.Atoi(os.Getenv("SUDO_UID"))
+	value := os.Getenv("SUDO_UID")
+	if value == "" {
+		value = os.Getenv("PAPERBOAT_INVOKING_UID")
+	}
+	uid, err := strconv.Atoi(value)
 	if err != nil {
 		return -1
 	}

@@ -101,6 +101,24 @@ func TestLoadInstallMetadataPreservesNotExist(t *testing.T) {
 	}
 }
 
+func TestSecureManagedUserDirectoryAdoptsExistingUserOwnedDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "hostd")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	uid, gid := os.Getuid(), os.Getgid()
+	if err := secureManagedUserDirectory(dir, 0o700, uid, gid); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ownerUID(info) != uid || info.Mode().Perm() != 0o700 {
+		t.Fatalf("directory owner/mode=%d/%o", ownerUID(info), info.Mode().Perm())
+	}
+}
+
 func TestValidateBindsSignedArtifactAndInvokingUID(t *testing.T) {
 	request := validRequest(t)
 	if err := Validate(request, request.UID); err != nil {
@@ -146,6 +164,15 @@ func TestValidRunIdentityAllowsOnlyNormalUsersOrRoot(t *testing.T) {
 				t.Fatalf("validRunIdentity()=%v want %v", got, test.want)
 			}
 		})
+	}
+}
+
+func TestInvokingUIDUsesExplicitCallerWhenSudoOmitsUID(t *testing.T) {
+	t.Setenv("SUDO_UID", "")
+	want := os.Getuid()
+	t.Setenv("PAPERBOAT_INVOKING_UID", strconv.Itoa(want))
+	if got := invokingUID(); got != want {
+		t.Fatalf("invokingUID()=%d want %d", got, want)
 	}
 }
 
