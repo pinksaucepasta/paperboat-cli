@@ -111,9 +111,6 @@ func Install(ctx context.Context, request Request) error {
 	if err != nil {
 		return errors.Join(ErrInvalidRequest, err)
 	}
-	if err := hostd.Install(ctx); err != nil {
-		return errors.Join(err, rollbackFiles(paths, journal))
-	}
 	// Migrate away from the pre-hostd monolithic worker service. Leaving it
 	// active would start a second runtime against the same control endpoint.
 	legacyWorker, legacyErr := legacyWorkerInstaller(request, paths)
@@ -130,6 +127,9 @@ func Install(ctx context.Context, request Request) error {
 			return base
 		}
 		return errors.Join(base, legacyWorker.Install(ctx))
+	}
+	if err := hostd.Install(ctx); err != nil {
+		return restoreLegacyWorker(errors.Join(err, rollbackFiles(paths, journal)))
 	}
 	var legacyHost *service.Installer
 	if request.SetupMode == "host" {
