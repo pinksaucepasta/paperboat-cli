@@ -109,7 +109,7 @@ var quietProcessLogger = slog.New(slog.NewTextHandler(io.Discard, nil))
 // logger because their stderr is owned by the service manager and is part of
 // runtime diagnostics, not an interactive terminal.
 func configureProcessLogging(args []string) {
-	if len(args) > 0 && strings.HasPrefix(args[0], "__") {
+	if len(args) > 0 && (strings.HasPrefix(args[0], "__runtime-") || args[0] == "__local-daemon" || args[0] == "__windows-sshd-service") {
 		return
 	}
 	slog.SetDefault(quietProcessLogger)
