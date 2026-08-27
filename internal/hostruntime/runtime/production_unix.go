@@ -47,6 +47,7 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/peerrelay"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/servelease"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/server"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/updated"
 	"github.com/pinksaucepasta/paperboat/internal/httptransport"
 	"github.com/pinksaucepasta/paperboat/internal/managedssh"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/networkcheck"
@@ -521,6 +522,11 @@ func NewProductionHost(ctx context.Context, version string, environ func(string)
 			scope = "unknown"
 		}
 		sender := &runtimeObservationSender{endpoint: runtimeEndpoint, tokens: renewingTokens, proofs: enrollment.ProofSource{StateRoot: runtimeConfig.StateRoot}, operationID: operationID, environmentID: identity.EnvironmentID, machineID: machineID, reporterVersion: version, client: &http.Client{Transport: transport, Timeout: 10 * time.Second}, availability: availabilityService, receiptPath: filepath.Join(runtimeConfig.StateRoot, "runtime", "server-heartbeat.json"), installationGeneration: uint64(machineRegistration.InstallationGeneration), workerGeneration: bootState.Generation, osBootID: bootState.OSBootID, serviceScope: scope, connector: manager, relayLatency: regionalCache, relaySuccess: relayRegion}
+		updaterClient, updaterErr := newProductionUpdaterClient()
+		if updaterErr != nil {
+			return nil, updaterErr
+		}
+		sender.updater = updaterClient
 		runtimeObservation = &runtimeObservationService{sender: sender, interval: runtimeConfig.Limits.HeartbeatInterval, timeout: 10 * time.Second}
 	}
 	var hostedLifecycle *hosted.Lifecycle
@@ -922,6 +928,11 @@ func newProductionClientCoordinator(ctx context.Context, version string, environ
 		scope = "unknown"
 	}
 	sender := &runtimeObservationSender{endpoint: controlURL.ResolveReference(&url.URL{Path: "/v1/runtime-observations"}).String(), tokens: control, proofs: control, operationID: operationID, environmentID: registration.EnvironmentID, machineID: registration.MachineID, reporterVersion: version, client: &http.Client{Transport: transport, Timeout: 10 * time.Second}, receiptPath: filepath.Join(runtimeConfig.StateRoot, "runtime", "server-heartbeat.json"), installationGeneration: uint64(registration.InstallationGeneration), workerGeneration: bootState.Generation, osBootID: bootState.OSBootID, serviceScope: scope, connector: manager, capabilities: []string{"file_receive", "preview_launch"}, relayLatency: regionalCache, relaySuccess: relayRegion}
+	updaterClient, updaterErr := newProductionUpdaterClient()
+	if updaterErr != nil {
+		return nil, updaterErr
+	}
+	sender.updater = updaterClient
 	observation := &runtimeObservationService{sender: sender, interval: runtimeConfig.Limits.HeartbeatInterval, timeout: 10 * time.Second}
 	listen := valueOrRuntime(environ("PAPERBOAT_RUNTIME_LISTEN_ADDRESS"), "127.0.0.1:8080")
 	localControlToken, err := writeLocalControlToken(runtimeConfig.StateRoot)
@@ -1277,6 +1288,9 @@ type runtimeObservationSender struct {
 	availability interface {
 		Observation() *availability.Observation
 	}
+	updater interface {
+		Status(context.Context) (updated.ControlResponse, error)
+	}
 	receiptPath            string
 	installationGeneration uint64
 	workerGeneration       uint64
@@ -1296,6 +1310,16 @@ func (s *runtimeObservationSender) Send(ctx context.Context) error {
 	now := time.Now().UTC()
 	relayLatency := s.nextRelayLatency(now)
 	availabilityState := availabilityObservation(s.availability)
+	var updaterState *updated.ControlResponse
+	var updaterErr error
+	if s.updater != nil {
+		status, err := s.updater.Status(ctx)
+		if err != nil {
+			updaterErr = err
+		} else {
+			updaterState = &status
+		}
+	}
 	body, err := json.Marshal(struct {
 		EnvironmentID      string                          `json:"environment_id"`
 		ResourceID         string                          `json:"resource_id"`
@@ -1313,7 +1337,7 @@ func (s *runtimeObservationSender) Send(ctx context.Context) error {
 		Availability:       availabilityState,
 		RuntimeDiagnostics: s.runtimeDiagnostics(now),
 		RelayLatency:       relayLatency,
-		Update:             s.updateObservation(now, availabilityState),
+		Update:             s.updateObservationFrom(now, availabilityState, updaterState, updaterErr),
 	})
 	if err != nil {
 		return err
@@ -1368,11 +1392,41 @@ type runtimeUpdateObservation struct {
 }
 
 func (s *runtimeObservationSender) updateObservation(now time.Time, availabilityState *availability.Observation) *runtimeUpdateObservation {
+	return s.updateObservationFrom(now, availabilityState, nil, nil)
+}
+
+func (s *runtimeObservationSender) updateObservationFrom(now time.Time, availabilityState *availability.Observation, updaterState *updated.ControlResponse, updaterErr error) *runtimeUpdateObservation {
 	if s.reporterVersion == "" || s.installationGeneration == 0 || s.workerGeneration == 0 || s.osBootID == "" {
 		return nil
 	}
 	state, target, errorCode := "healthy", "", ""
 	var rollbackCount uint64
+	if updaterErr != nil {
+		return &runtimeUpdateObservation{
+			Schema: "paperboat.update-observation/v1", State: "failed", CurrentVersion: s.reporterVersion,
+			TargetVersion: s.reporterVersion, Channel: "stable", OperationID: "update-" + strconv.FormatUint(s.workerGeneration, 10) + "-" + strconv.FormatInt(now.UnixNano(), 10),
+			InstallationGeneration: s.installationGeneration, WorkerGeneration: s.workerGeneration, OSBootID: s.osBootID,
+			ErrorCode: "updater_unavailable", ObservedAt: now,
+		}
+	}
+	if updaterState != nil {
+		if updaterState.Observation.Failure != "" || updaterState.Status != "ok" {
+			return &runtimeUpdateObservation{
+				Schema: "paperboat.update-observation/v1", State: "failed", CurrentVersion: s.reporterVersion,
+				TargetVersion: s.reporterVersion, Channel: "stable", OperationID: "update-" + strconv.FormatUint(s.workerGeneration, 10) + "-" + strconv.FormatInt(now.UnixNano(), 10),
+				InstallationGeneration: s.installationGeneration, WorkerGeneration: s.workerGeneration, OSBootID: s.osBootID,
+				ErrorCode: "update_failed", ObservedAt: now,
+			}
+		}
+		// A successful updater status is authoritative. The active binary
+		// version remains the value authenticated by this runtime heartbeat.
+		return &runtimeUpdateObservation{
+			Schema: "paperboat.update-observation/v1", State: "healthy", CurrentVersion: s.reporterVersion,
+			Channel: "stable", OperationID: "update-" + strconv.FormatUint(s.workerGeneration, 10) + "-" + strconv.FormatInt(now.UnixNano(), 10),
+			InstallationGeneration: s.installationGeneration, WorkerGeneration: s.workerGeneration, OSBootID: s.osBootID,
+			ObservedAt: now,
+		}
+	}
 	if availabilityState != nil {
 		if availabilityState.UpdateHealth == "unknown" {
 			return nil

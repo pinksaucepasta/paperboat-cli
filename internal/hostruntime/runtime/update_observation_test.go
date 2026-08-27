@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/availability"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/updated"
 )
 
 func TestRuntimeUpdateObservationUsesPlatformChannelAndFences(t *testing.T) {
@@ -26,6 +27,18 @@ func TestRuntimeUpdateObservationUsesPlatformChannelAndFences(t *testing.T) {
 	}
 	if got := sender.updateObservation(now, &availability.Observation{UpdateHealth: "unknown"}); got != nil {
 		t.Fatalf("unknown updater emitted observation=%+v", got)
+	}
+}
+
+func TestRuntimeUpdateObservationUsesUpdaterStatus(t *testing.T) {
+	now := time.Now().UTC()
+	sender := &runtimeObservationSender{reporterVersion: "2026.08.20.12", installationGeneration: 4, workerGeneration: 9, osBootID: "boot-1"}
+	response := &updated.ControlResponse{Status: "ok"}
+	if observation := sender.updateObservationFrom(now, nil, response, nil); observation == nil || observation.State != "healthy" {
+		t.Fatalf("healthy updater observation=%+v", observation)
+	}
+	if observation := sender.updateObservationFrom(now, nil, nil, updated.ErrUnavailable); observation == nil || observation.State != "failed" || observation.ErrorCode != "updater_unavailable" {
+		t.Fatalf("unavailable updater observation=%+v", observation)
 	}
 }
 
