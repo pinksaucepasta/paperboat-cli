@@ -26,6 +26,7 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntimeentry"
 	"github.com/pinksaucepasta/paperboat/internal/windows/previewbroker"
 	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/svc"
 )
 
 const windowsOwnerWorkloadEnvironment = "PAPERBOAT_WINDOWS_OWNER_WORKLOAD"
@@ -46,7 +47,17 @@ func runHostdInner(ctx context.Context, output io.Writer) error {
 	if err != nil {
 		return err
 	}
+	// The SCM parent launches the owner workload with CreateProcessAsUser.
+	// That child is deliberately not an SCM service process. Relying solely on
+	// an inherited environment marker is fragile on Windows because token
+	// environment construction can omit overrides under S4U. Use the process
+	// context as the authoritative boundary, while retaining the marker for
+	// explicit diagnostics and older service environments.
 	if os.Getenv(windowsOwnerWorkloadEnvironment) != "1" {
+		isService, serviceErr := svc.IsWindowsService()
+		if serviceErr == nil && !isService {
+			return runOwnerHostd(ctx, output, install)
+		}
 		return runWindowsHostdService(install)
 	}
 	if sid, sidErr := currentWindowsSID(); sidErr != nil || sid != install.OwnerSID {
