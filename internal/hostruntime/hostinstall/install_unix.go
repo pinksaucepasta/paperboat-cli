@@ -368,7 +368,10 @@ func platformPaths() installPaths {
 }
 
 func ensureHostdToken(paths installPaths, request Request) error {
-	if err := secureRootDirectory(filepath.Dir(paths.hostdToken), 0o700); err != nil {
+	// Hostd runs as the enrolled user, while the token directory is root-owned.
+	// Keep the directory non-writable to that user but traversable so hostd can
+	// read its 0600 token file.
+	if err := secureRootDirectory(filepath.Dir(paths.hostdToken), 0o755); err != nil {
 		return err
 	}
 	info, err := os.Lstat(paths.hostdToken)
