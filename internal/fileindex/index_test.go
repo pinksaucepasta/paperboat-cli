@@ -75,6 +75,21 @@ func TestDarwinIndexExcludesSystemLibraryAndApplicationBundles(t *testing.T) {
 	}
 }
 
+func TestWindowsIndexExcludesProfileApplicationState(t *testing.T) {
+	root := filepath.Join("fixtures", "windows-home")
+	for _, name := range []string{"AppData", "Application Data", "Local Settings"} {
+		if !skipDirectory("windows", root, root, name) {
+			t.Fatalf("Windows profile state directory %q was not excluded", name)
+		}
+	}
+	if skipDirectory("windows", root, root, "Documents") {
+		t.Fatal("ordinary Windows user directory was excluded")
+	}
+	if skipDirectory("windows", root, filepath.Join(root, "Documents"), "AppData") {
+		t.Fatal("nested user directory named AppData was excluded")
+	}
+}
+
 func TestBackgroundRefreshIsConsumedWithoutStaleCache(t *testing.T) {
 	root := t.TempDir()
 	cachePath := filepath.Join(t.TempDir(), "index.json")

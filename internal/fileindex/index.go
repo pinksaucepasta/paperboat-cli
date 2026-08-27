@@ -171,6 +171,18 @@ func skipDirectory(goos, root, parent, name string) bool {
 	if name == "node_modules" || name == "vendor" {
 		return true
 	}
+	// Windows user profiles contain a large, frequently changing AppData tree
+	// (and compatibility junctions such as Application Data/Local Settings).
+	// It is application state rather than user files, and recursively walking it
+	// makes the first Send Files picker take tens of seconds. Keep the index
+	// focused on files a user would normally send while retaining similarly named
+	// directories nested inside the workspace.
+	if goos == "windows" && parent == root {
+		switch strings.ToLower(name) {
+		case "appdata", "application data", "local settings":
+			return true
+		}
+	}
 	if goos != "darwin" {
 		return false
 	}

@@ -4302,7 +4302,13 @@ func actionHomeSendToMachine(command *cobra.Command, machine api.UserMachine) er
 		candidates, refreshErr = fileindex.Current(ctx, searchRoot, cachePath)
 		return refreshErr
 	}
-	if fileindex.RefreshReady(cachePath) {
+	// A previously written index is sufficient to populate the picker
+	// immediately. Refresh it in the background so opening Send Files never
+	// blocks on a full profile walk (notably Windows' large AppData tree).
+	if cached, cacheOK := fileindex.Load(searchRoot, cachePath); cacheOK {
+		candidates = cached
+		fileindex.RefreshInBackground(searchRoot, cachePath)
+	} else if fileindex.RefreshReady(cachePath) {
 		err = loadIndex(command.Context())
 	} else {
 		err = homeLoading(command, "Send files", "Refreshing files", loadIndex)
