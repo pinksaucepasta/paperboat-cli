@@ -7,6 +7,7 @@ import (
 	"fmt"
 	dbus "github.com/godbus/dbus/v5"
 	secretservice "github.com/zalando/go-keyring/secret_service"
+	"os"
 )
 
 type KeyringStore struct{}
@@ -19,6 +20,26 @@ func unavailableCredentialStore(err error) error {
 
 func linuxSecretAttributes(ref string) map[string]string {
 	return map[string]string{"service": keyringService, "account": ref}
+}
+
+// CredentialStoreAvailable reports whether a Secret Service owner is
+// discoverable on the current login session. Headless Linux sessions often
+// have no D-Bus session at all; callers can select the protected owner-only
+// file store before attempting to persist credentials in that case.
+func CredentialStoreAvailable() bool {
+	if os.Getenv("DBUS_SESSION_BUS_ADDRESS") == "" {
+		return false
+	}
+	bus, err := dbus.SessionBus()
+	if err != nil {
+		return false
+	}
+	defer bus.Close()
+	var owned bool
+	if err := bus.BusObject().Call("org.freedesktop.DBus.NameHasOwner", 0, "org.freedesktop.secrets").Store(&owned); err != nil {
+		return false
+	}
+	return owned
 }
 func linuxSecretItem(service *secretservice.SecretService, ref string) (dbus.ObjectPath, error) {
 	collection := service.GetLoginCollection()
@@ -56,40 +77,43 @@ func (KeyringStore) Set(ref, value string) error {
 func (KeyringStore) Get(ref string) (string, error) {
 	service, err := secretservice.NewSecretService()
 	if err != nil {
-		return "", err
+		return "", unavailableCredentialStore(err)
 	}
 	item, err := linuxSecretItem(service, ref)
 	if errors.Is(err, errKeyringSecretNotFound) {
 		return "", ErrSecretNotFound
 	}
 	if err != nil {
-		return "", err
+		return "", unavailableCredentialStore(err)
 	}
 	session, err := service.OpenSession()
 	if err != nil {
-		return "", err
+		return "", unavailableCredentialStore(err)
 	}
 	defer service.Close(session)
 	if err := service.Unlock(item); err != nil {
-		return "", err
+		return "", unavailableCredentialStore(err)
 	}
 	secret, err := service.GetSecret(item, session.Path())
 	if err != nil {
-		return "", err
+		return "", unavailableCredentialStore(err)
 	}
 	return string(secret.Value), nil
 }
 func (KeyringStore) Delete(ref string) error {
 	service, err := secretservice.NewSecretService()
 	if err != nil {
-		return err
+		return unavailableCredentialStore(err)
 	}
 	item, err := linuxSecretItem(service, ref)
 	if errors.Is(err, errKeyringSecretNotFound) {
 		return nil
 	}
 	if err != nil {
-		return err
+		return unavailableCredentialStore(err)
 	}
-	return service.Delete(item)
+	if err := service.Delete(item); err != nil {
+		return unavailableCredentialStore(err)
+	}
+	return nil
 }

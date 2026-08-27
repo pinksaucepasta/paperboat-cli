@@ -38,6 +38,16 @@ func installBootstrapCLI(ctx context.Context, session *bootstrap.ClientSession, 
 		return err
 	}
 	cfg.ServerURL = strings.TrimRight(serverURL, "/")
+	// Dashboard bootstrap is non-interactive. On headless Linux there is no
+	// Secret Service session, so select the owner-only file store before any
+	// profile or E2EE material is written. Desktop sessions keep using the OS
+	// credential store; this does not weaken their storage policy.
+	if !cfg.Auth.AllowFileFallback && !config.CredentialStoreAvailable() {
+		cfg.Auth.AllowFileFallback = true
+		if err := cfg.Save(); err != nil {
+			return fmt.Errorf("enable protected file credential storage: %w", err)
+		}
+	}
 	store, err := config.ProfileStoreFor(cfg)
 	if err != nil {
 		return err
