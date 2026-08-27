@@ -40,7 +40,6 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/health"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hosted"
 	runtimeidentity "github.com/pinksaucepasta/paperboat/internal/hostruntime/identity"
-	"github.com/pinksaucepasta/paperboat/internal/hostruntime/machinecontrol"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/observability"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/peerattempt"
 	peeridentityenrollment "github.com/pinksaucepasta/paperboat/internal/hostruntime/peeridentity"
@@ -838,11 +837,24 @@ func newProductionClientCoordinator(ctx context.Context, version string, environ
 		}
 		return "op_client_" + hex.EncodeToString(value), nil
 	}
-	control, err := machinecontrol.NewSource(machinecontrol.Config{ControlURL: controlURL.String(), StateRoot: runtimeConfig.StateRoot, Transport: transport, Timeout: 15 * time.Second, RenewBefore: 10 * time.Minute, OperationID: operationID})
+	identity, err := enrollment.LoadRuntimeIdentityForRenewal(runtimeConfig.StateRoot, time.Now().UTC())
+	if err != nil || identity.MachineID != registration.MachineID || identity.EnvironmentID != registration.EnvironmentID {
+		return nil, errors.Join(ErrProductionInvalid, err)
+	}
+	// Client-mode runtimes are enrolled helpers, not host machine-control
+	// principals. Use their renewable runtime identity for control-plane calls,
+	// exactly as the shared host runtime does. A machine-control source rejects
+	// client registrations and prevents hostd from ever becoming ready.
+	runtimeTokens, err := enrollment.NewRenewingTokenSource(enrollment.RenewingTokenConfig{
+		ControlURL: controlURL.String(), StateRoot: runtimeConfig.StateRoot, Transport: transport,
+		RenewBefore: 10 * time.Minute, Timeout: 15 * time.Second, Clock: func() time.Time { return time.Now().UTC() }, OperationID: operationID, Metrics: metrics,
+	})
 	if err != nil {
 		return nil, err
 	}
-	peerEnrollment, err := peeridentityenrollment.New(peeridentityenrollment.Config{ControlURL: controlURL.String(), StateRoot: runtimeConfig.StateRoot, Transport: transport, Timeout: 15 * time.Second}, control)
+	runtimeProofs := enrollment.ProofSource{StateRoot: runtimeConfig.StateRoot}
+	runtimeIdentity := hostedManagedSSHIdentity{tokens: runtimeTokens, proofs: runtimeProofs}
+	peerEnrollment, err := peeridentityenrollment.New(peeridentityenrollment.Config{ControlURL: controlURL.String(), StateRoot: runtimeConfig.StateRoot, Transport: transport, Timeout: 15 * time.Second}, runtimeIdentity)
 	if err != nil {
 		return nil, err
 	}
@@ -861,18 +873,18 @@ func newProductionClientCoordinator(ctx context.Context, version string, environ
 	_ = cache.Refresh(refreshCtx)
 	cancel()
 	revocations := auth.NewRevocationCache()
-	revocationRefresh, err := newRevocationRefreshService(controlURL.ResolveReference(&url.URL{Path: "/v1/helper-trust/revocations"}).String(), control, control, operationID, revocations, transport, 15*time.Second)
+	revocationRefresh, err := newRevocationRefreshService(controlURL.ResolveReference(&url.URL{Path: "/v1/helper-trust/revocations"}).String(), runtimeTokens, runtimeProofs, operationID, revocations, transport, 15*time.Second)
 	if err != nil {
 		return nil, err
 	}
 	authorizationRefresh := serviceGroup{&jwksRefreshService{cache: cache, interval: time.Minute}, revocationRefresh, newPeerEnrollmentRuntimeService(peerEnrollment, 2*time.Second)}
 	verifier := auth.Verifier{Keys: cache, Clock: productionClock{}, Replays: auth.NewReplayCache(4096, productionClock{}), Revocations: revocations, ClockSkew: 30 * time.Second, RefreshTimeout: 2 * time.Second}
-	authorizer, err := NewCredentialAuthorizer(CredentialAuthConfig{Issuer: issuer, EnvironmentID: registration.EnvironmentID, MachineID: registration.MachineID, HelperID: "machine-control", Verifier: verifier, Revocations: revocations})
+	authorizer, err := NewCredentialAuthorizer(CredentialAuthConfig{Issuer: issuer, EnvironmentID: registration.EnvironmentID, MachineID: registration.MachineID, HelperID: identity.HelperID, Verifier: verifier, Revocations: revocations})
 	if err != nil {
 		return nil, err
 	}
 	admissions, err := connector.NewHTTPSAdmissionSource(connector.AdmissionSourceConfig{
-		Endpoint: controlURL.ResolveReference(&url.URL{Path: "/v1/connectors/admission"}).String(), AllowedHosts: []string{controlURL.Hostname()}, Tokens: control, Proofs: control,
+		Endpoint: controlURL.ResolveReference(&url.URL{Path: "/v1/connectors/admission"}).String(), AllowedHosts: []string{controlURL.Hostname()}, Tokens: runtimeTokens, Proofs: runtimeProofs,
 		Verifier: verifier, Clock: productionClock{}, Issuer: issuer, EnvironmentID: registration.EnvironmentID, MachineID: registration.MachineID,
 		ConnectorID: "runtime", EdgePool: valueOrRuntime(environ("PAPERBOAT_EDGE_POOL"), "default"), OperationID: operationID, Transport: transport,
 	})
@@ -927,7 +939,7 @@ func newProductionClientCoordinator(ctx context.Context, version string, environ
 	if scope != "system" && scope != "user" {
 		scope = "unknown"
 	}
-	sender := &runtimeObservationSender{endpoint: controlURL.ResolveReference(&url.URL{Path: "/v1/runtime-observations"}).String(), tokens: control, proofs: control, operationID: operationID, environmentID: registration.EnvironmentID, machineID: registration.MachineID, reporterVersion: version, client: &http.Client{Transport: transport, Timeout: 10 * time.Second}, receiptPath: filepath.Join(runtimeConfig.StateRoot, "runtime", "server-heartbeat.json"), installationGeneration: uint64(registration.InstallationGeneration), workerGeneration: bootState.Generation, osBootID: bootState.OSBootID, serviceScope: scope, connector: manager, capabilities: []string{"file_receive", "preview_launch"}, relayLatency: regionalCache, relaySuccess: relayRegion}
+	sender := &runtimeObservationSender{endpoint: controlURL.ResolveReference(&url.URL{Path: "/v1/runtime-observations"}).String(), tokens: runtimeTokens, proofs: runtimeProofs, operationID: operationID, environmentID: registration.EnvironmentID, machineID: registration.MachineID, reporterVersion: version, client: &http.Client{Transport: transport, Timeout: 10 * time.Second}, receiptPath: filepath.Join(runtimeConfig.StateRoot, "runtime", "server-heartbeat.json"), installationGeneration: uint64(registration.InstallationGeneration), workerGeneration: bootState.Generation, osBootID: bootState.OSBootID, serviceScope: scope, connector: manager, capabilities: []string{"file_receive", "preview_launch"}, relayLatency: regionalCache, relaySuccess: relayRegion}
 	updaterClient, updaterErr := newProductionUpdaterClient()
 	if updaterErr != nil {
 		return nil, updaterErr
@@ -956,7 +968,7 @@ func newProductionClientCoordinator(ctx context.Context, version string, environ
 	if err != nil {
 		return nil, err
 	}
-	attempts, err := peerattempt.New(peerattempt.Config{ControlURL: controlURL.String(), StateRoot: runtimeConfig.StateRoot, Transport: transport, Timeout: 15 * time.Second}, control)
+	attempts, err := peerattempt.New(peerattempt.Config{ControlURL: controlURL.String(), StateRoot: runtimeConfig.StateRoot, Transport: transport, Timeout: 15 * time.Second}, runtimeIdentity)
 	if err != nil {
 		return nil, err
 	}
