@@ -225,8 +225,8 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	if err := saveBootstrapRegistration(identityStore, *serverURL, material, windowsAccountName(account.Username), sshConfig.Port); err != nil {
 		return fmt.Errorf("save machine registration: %w", err)
 	}
-	// Both modes receive the local CLI profile. Host additionally installs the
-	// managed runtime and background services.
+	// Client mode receives the local CLI profile. Host mode installs only the
+	// managed runtime so it cannot revoke another client's E2EE authority.
 	if shouldInstallBootstrapCLI(material) && !resume.ClientInstalled {
 		if err := installBootstrapCLI(ctx, material.ClientSession, *serverURL); err != nil {
 			return fmt.Errorf("initialize Paperboat CLI session: %w", err)

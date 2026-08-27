@@ -156,8 +156,8 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 			return err
 		}
 	}
-	// Both modes receive the local CLI profile. Host additionally installs the
-	// managed runtime and background services.
+	// Client mode receives the local CLI profile. Host mode installs only the
+	// managed runtime so it cannot revoke another client's E2EE authority.
 	if err := completeBootstrapCLIResume(ctx, *stateRoot, *serverURL, material, &resume, installBootstrapCLI, bootstrap.SaveResume); err != nil {
 		if shouldInstallBootstrapCLI(material) {
 			return fmt.Errorf("initialize Paperboat CLI session: %w", err)
