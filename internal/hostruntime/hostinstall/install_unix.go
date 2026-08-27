@@ -114,6 +114,15 @@ func Install(ctx context.Context, request Request) error {
 	if err := hostd.Install(ctx); err != nil {
 		return errors.Join(err, rollbackFiles(paths, journal))
 	}
+	// Migrate away from the pre-hostd monolithic worker service. Leaving it
+	// active would start a second runtime against the same control endpoint.
+	if legacyWorker, legacyErr := legacyWorkerInstaller(request, paths); legacyErr == nil {
+		if err := legacyWorker.Uninstall(ctx); err != nil {
+			return errors.Join(err, hostd.Uninstall(ctx), rollbackFiles(paths, journal))
+		}
+	} else {
+		return errors.Join(legacyErr, hostd.Uninstall(ctx), rollbackFiles(paths, journal))
+	}
 	var legacyHost *service.Installer
 	if request.SetupMode == "host" {
 		legacyHost, err = hostInstaller(request, paths)
@@ -254,6 +263,18 @@ func installers(request Request, paths installPaths) (*service.Installer, *servi
 		return nil, nil, err
 	}
 	return hostd, updater, nil
+}
+
+func legacyWorkerInstaller(request Request, paths installPaths) (*service.Installer, error) {
+	controller := service.Controller(service.SystemdController{Runner: service.ExecRunner{}})
+	if runtime.GOOS == "darwin" {
+		controller = service.LaunchdController{Runner: service.ExecRunner{}, UID: request.UID}
+	}
+	return service.New(service.Config{
+		Platform: request.Platform, Kind: service.WorkerKind, ConfigRoot: string(os.PathSeparator), Executable: paths.worker,
+		User: request.User, Group: request.Group, Arguments: []string{"__runtime-host"}, Controller: controller,
+		Environment: workerEnvironment(request),
+	})
 }
 
 func componentLayout(paths installPaths) (service.Layout, error) {
@@ -522,6 +543,9 @@ func recoverInterrupted(ctx context.Context, request Request, paths installPaths
 		if hostd, updater, installErr := installers(request, paths); installErr == nil {
 			_ = hostd.Uninstall(ctx)
 			_ = updater.Uninstall(ctx)
+			if legacy, legacyErr := legacyWorkerInstaller(request, paths); legacyErr == nil {
+				_ = legacy.Uninstall(ctx)
+			}
 			if request.SetupMode == "host" {
 				if legacy, legacyErr := hostInstaller(request, paths); legacyErr == nil {
 					_ = legacy.Uninstall(ctx)
