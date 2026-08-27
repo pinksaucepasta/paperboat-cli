@@ -72,7 +72,7 @@ function Assert-InstalledVersion([string]$Path, [string]$ExpectedVersion) {
   if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
   $output = (& $Path --version 2>&1 | Out-String)
   if ($LASTEXITCODE -ne 0) { return $false }
-  $versionMatches = [regex]::Matches($output, '(?m)^[\t ]*(Version[\t ]+[0-9A-Za-z._-]+)[\t ]*$')
+  $versionMatches = [regex]::Matches($output, '(Version[\t ]+[0-9A-Za-z._-]+)')
   return $versionMatches.Count -eq 1 -and $versionMatches[0].Groups[1].Value -eq ("Version " + $ExpectedVersion)
 }
 
