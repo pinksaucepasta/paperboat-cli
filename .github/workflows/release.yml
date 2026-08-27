@@ -524,7 +524,10 @@ jobs:
               asset = assets[name]
               digest = asset.get('digest')
               expected_url = f'https://github.com/{repository}/releases/download/{release_version}/{name}'
-              if asset.get('url') != expected_url:
+              # The API `url` is the REST asset endpoint.  The immutable
+              # public download URL is exposed as `browser_download_url` and
+              # is the URL written into current.json/TUF targets.
+              if asset.get('browserDownloadUrl') != expected_url:
                   raise SystemExit(f'GitHub asset URL mismatch: {name}')
               if asset.get('size') != path.stat().st_size:
                   raise SystemExit(f'GitHub asset size mismatch: {name}')
