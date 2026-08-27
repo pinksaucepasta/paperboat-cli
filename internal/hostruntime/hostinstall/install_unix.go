@@ -116,21 +116,29 @@ func Install(ctx context.Context, request Request) error {
 	}
 	// Migrate away from the pre-hostd monolithic worker service. Leaving it
 	// active would start a second runtime against the same control endpoint.
-	if legacyWorker, legacyErr := legacyWorkerInstaller(request, paths); legacyErr == nil {
-		if err := legacyWorker.Uninstall(ctx); err != nil {
-			return errors.Join(err, hostd.Uninstall(ctx), rollbackFiles(paths, journal))
-		}
-	} else {
+	legacyWorker, legacyErr := legacyWorkerInstaller(request, paths)
+	if legacyErr != nil {
 		return errors.Join(legacyErr, hostd.Uninstall(ctx), rollbackFiles(paths, journal))
+	}
+	_, legacyWorkerWasInstalledErr := os.Lstat(legacyWorker.DefinitionPath())
+	legacyWorkerWasInstalled := legacyWorkerWasInstalledErr == nil
+	if err := legacyWorker.Uninstall(ctx); err != nil {
+		return errors.Join(err, hostd.Uninstall(ctx), rollbackFiles(paths, journal))
+	}
+	restoreLegacyWorker := func(base error) error {
+		if !legacyWorkerWasInstalled {
+			return base
+		}
+		return errors.Join(base, legacyWorker.Install(ctx))
 	}
 	var legacyHost *service.Installer
 	if request.SetupMode == "host" {
 		legacyHost, err = hostInstaller(request, paths)
 		if err != nil {
-			return errors.Join(err, hostd.Uninstall(ctx), rollbackFiles(paths, journal))
+			return restoreLegacyWorker(errors.Join(err, hostd.Uninstall(ctx), rollbackFiles(paths, journal)))
 		}
 		if err := legacyHost.Install(ctx); err != nil {
-			return errors.Join(err, hostd.Uninstall(ctx), rollbackFiles(paths, journal))
+			return restoreLegacyWorker(errors.Join(err, hostd.Uninstall(ctx), rollbackFiles(paths, journal)))
 		}
 	}
 	if err := updater.Install(ctx); err != nil {
@@ -139,20 +147,20 @@ func Install(ctx context.Context, request Request) error {
 		if legacyHost != nil {
 			hostErr = errors.Join(hostErr, legacyHost.Uninstall(ctx))
 		}
-		return errors.Join(err, hostErr, rollbackFiles(paths, journal))
+		return restoreLegacyWorker(errors.Join(err, hostErr, rollbackFiles(paths, journal)))
 	}
 	if request.SetupMode == "client" {
 		obsoleteHost, hostErr := hostInstaller(request, paths)
 		if hostErr != nil {
-			return errors.Join(hostErr, updater.Uninstall(ctx), hostd.Uninstall(ctx), rollbackFiles(paths, journal))
+			return restoreLegacyWorker(errors.Join(hostErr, updater.Uninstall(ctx), hostd.Uninstall(ctx), rollbackFiles(paths, journal)))
 		}
 		_, statErr := os.Lstat(obsoleteHost.DefinitionPath())
 		if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
-			return errors.Join(statErr, updater.Uninstall(ctx), hostd.Uninstall(ctx), rollbackFiles(paths, journal))
+			return restoreLegacyWorker(errors.Join(statErr, updater.Uninstall(ctx), hostd.Uninstall(ctx), rollbackFiles(paths, journal)))
 		}
 		if statErr == nil {
 			if err := obsoleteHost.Uninstall(ctx); err != nil {
-				return errors.Join(err, updater.Uninstall(ctx), hostd.Uninstall(ctx), rollbackFiles(paths, journal))
+				return restoreLegacyWorker(errors.Join(err, updater.Uninstall(ctx), hostd.Uninstall(ctx), rollbackFiles(paths, journal)))
 			}
 		}
 	}
