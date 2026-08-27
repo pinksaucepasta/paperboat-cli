@@ -238,23 +238,6 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 			return fmt.Errorf("persist CLI enrollment progress: %w", err)
 		}
 	}
-	if material.SetupMode == "client" {
-		if material.Artifact == nil {
-			return errors.New("client enrollment did not return a verified artifact")
-		}
-		if err := InstallClient(ctx, ClientInstallConfig{
-			StateRoot: *stateRoot, WorkspaceRoot: home, ControlURL: material.ControlURL,
-			MachineID: material.UserMachineID, ListenAddress: material.HelperListenAddress,
-			Artifact: *material.Artifact,
-		}, stdin, stdout, stderr); err != nil {
-			return fmt.Errorf("install managed client service: %w", err)
-		}
-		if err := bootstrap.ClearResume(*stateRoot); err != nil {
-			return fmt.Errorf("clear completed client enrollment resume state: %w", err)
-		}
-		fmt.Fprintln(stdout, "Paperboat Windows client runtime is installed. It will resume after reboot.")
-		return nil
-	}
 	if !shouldInstallBootstrapHostRuntime(material) {
 		return errors.New("enrollment setup mode does not install a managed runtime")
 	}
