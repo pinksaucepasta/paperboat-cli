@@ -56,7 +56,19 @@ func runHostdInner(ctx context.Context, output io.Writer) error {
 	if os.Getenv(windowsOwnerWorkloadEnvironment) != "1" {
 		isService, serviceErr := svc.IsWindowsService()
 		if serviceErr == nil && !isService {
+			if sid, sidErr := currentWindowsSID(); sidErr != nil || sid != install.OwnerSID {
+				return errors.New("Paperboat Windows hostd workload is not running as the enrolled owner")
+			}
 			return runOwnerHostd(ctx, output, install)
+		}
+		// If the service-context probe is unavailable, an enrolled-owner SID is
+		// still sufficient to distinguish the CreateProcessAsUser workload from
+		// the LocalSystem SCM parent. Never infer owner execution for any other
+		// account; that process must enter the SCM dispatcher instead.
+		if serviceErr != nil {
+			if sid, sidErr := currentWindowsSID(); sidErr == nil && sid == install.OwnerSID {
+				return runOwnerHostd(ctx, output, install)
+			}
 		}
 		return runWindowsHostdService(install)
 	}
