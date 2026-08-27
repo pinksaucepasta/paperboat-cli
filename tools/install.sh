@@ -153,6 +153,30 @@ remove_privileged_file() {
   fi
 }
 
+# Authenticate once before any privileged install step. The dashboard command
+# normally runs as the signed-in user, so never require callers to wrap the
+# entire script in sudo. When a terminal is available sudo can prompt there
+# even though this script itself receives its input from curl's pipe.
+prepare_privileges() {
+  [ "$(id -u)" -eq 0 ] && return 0
+  needs_sudo=false
+  if [ "$os" = darwin ]; then
+    needs_sudo=true
+  elif [ "$setup_mode" = host ] || { [ "$pair" = true ] && [ "$pair_mode" = host ]; }; then
+    needs_sudo=true
+  fi
+  [ "$needs_sudo" = true ] || return 0
+  command -v sudo >/dev/null 2>&1 || { echo "pb installer: sudo is required for this setup" >&2; exit 1; }
+  if sudo -n true 2>/dev/null; then
+    return 0
+  fi
+  if [ -r /dev/tty ] && sudo -v </dev/tty >/dev/tty 2>/dev/tty; then
+    return 0
+  fi
+  echo "pb installer: administrator approval is required; run this command from a terminal with sudo access" >&2
+  exit 1
+}
+
 cleanup_existing() {
   old=/usr/local/bin/pb
   if [ "$(id -u)" -eq 0 ]; then
@@ -258,6 +282,17 @@ else
   exit 1
 fi
 [ "$actual" = "$expected" ] || { echo "pb installer: release asset digest verification failed" >&2; exit 1; }
+
+# Resolve token metadata before privilege preflight so dashboard Host tokens
+# get the same behavior as explicit --setup host installs.
+if [ "$pair" = true ]; then
+  first=${enrollment_token%${enrollment_token#?}}
+  case "$first" in
+    0|2|4|6|8|B|D|F|H|J|L|N|P|R|T|V|X|Z) pair_mode=host ;;
+    *) pair_mode=client ;;
+  esac
+fi
+prepare_privileges
 
 # Preserve the existing installation if download or verification fails.
 cleanup_existing
