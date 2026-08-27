@@ -53,6 +53,56 @@ pathlib.Path(sys.argv[1]).write_text(json.dumps(body, separators=(",", ":")) + "
 PY
 }
 
+write_matching_targets_metadata() {
+  local current_path=$1
+  local targets_path=$2
+  python3 - "$current_path" "$targets_path" <<'PY'
+import json
+import pathlib
+import sys
+
+current = json.loads(pathlib.Path(sys.argv[1]).read_text())
+targets = {}
+for name, asset in current["assets"].items():
+    index_target = {
+        "component": "pb",
+        "target_path": name,
+        "asset_name": name,
+        "repository": current["repository"],
+        "download_url": asset["url"],
+        "sha256": asset["sha256"],
+        "length": asset["length"],
+        "platform": asset["platform"],
+        "architecture": asset["architecture"],
+        "binary_format": asset["format"],
+    }
+    targets[name] = {
+        "hashes": {"sha256": asset["sha256"]},
+        "length": asset["length"],
+        "custom": {
+            "schema": "paperboat.tuf-asset/v1",
+            "kind": "github-release-asset",
+            "version": current["version"],
+            "platform": asset["platform"],
+            "architecture": asset["architecture"],
+            "format": asset["format"],
+            "asset_name": name,
+            "repository": current["repository"],
+            "url": asset["url"],
+            "sha256": asset["sha256"],
+            "length": asset["length"],
+            "release_index": {
+                "schema": "paperboat.release-index/v1",
+                "release_id": "rel_" + current["version"],
+                "version": current["version"],
+                "targets": [index_target],
+            },
+        },
+    }
+pathlib.Path(sys.argv[2]).write_text(json.dumps({"signed": {"targets": targets}}) + "\n")
+PY
+}
+
 select_checksum_backend() {
   if command -v sha256sum >/dev/null 2>&1; then
     printf '%s\n' sha256sum
@@ -255,6 +305,32 @@ if run_test_publisher "$bundle" "$release_root" 2026.08.22.23 "$digest" >/dev/nu
 fi
 test "$before" = "$(snapshot)"
 
+candidate_version=2026.08.22.23
+write_current_manifest "$candidate/current.json" "$candidate_version"
+write_matching_targets_metadata "$candidate/current.json" "$candidate/tuf/metadata/targets.json"
+python3 - "$candidate/tuf/metadata/targets.json" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+body = json.loads(path.read_text())
+body["signed"]["targets"]["pb-linux-amd64"]["custom"]["version"] = "2026.08.22.24"
+path.write_text(json.dumps(body) + "\n")
+PY
+mismatch_bundle="$temporary/mismatch.tgz"
+tar -C "$candidate" -czf "$mismatch_bundle" current.json install windows tuf
+mismatch_digest=$(run_checksum "$checksum_backend" "$mismatch_bundle" | awk '{print $1}')
+if run_test_publisher "$mismatch_bundle" "$release_root" "$candidate_version" "$mismatch_digest" >/dev/null 2>&1; then
+  echo 'publisher accepted current.json and TUF version drift' >&2
+  exit 1
+fi
+test "$before" = "$(snapshot)"
+write_matching_targets_metadata "$candidate/current.json" "$candidate/tuf/metadata/targets.json"
+bundle="$temporary/candidate.tgz"
+tar -C "$candidate" -czf "$bundle" current.json install windows tuf
+digest=$(run_checksum "$checksum_backend" "$bundle" | awk '{print $1}')
+
 # renameat2(RENAME_EXCHANGE) is a Linux deployment requirement. Exercise the
 # success path there with a fake Docker CLI that proves the parent RO mount;
 # other development hosts still execute the two pre-activation failure tests.
@@ -294,10 +370,6 @@ exit 0
 EOF
   chmod 0700 "$temporary/bin/docker" "$temporary/bin/chown"
 
-  candidate_version=2026.08.22.23
-  write_current_manifest "$candidate/current.json" "$candidate_version"
-  tar -C "$candidate" -czf "$bundle" current.json install windows tuf
-  digest=$(run_checksum "$checksum_backend" "$bundle" | awk '{print $1}')
   expected="$temporary/expected"
   cp -R "$candidate" "$expected"
   expected_candidate=$(snapshot_directory "$expected")
@@ -314,6 +386,7 @@ EOF
   printf x > "$next/install"
   printf x > "$next/windows"
   for name in root targets snapshot timestamp; do printf x > "$next/tuf/metadata/$name.json"; done
+  write_matching_targets_metadata "$next/current.json" "$next/tuf/metadata/targets.json"
   next_bundle="$temporary/next.tgz"
   tar -C "$next" -czf "$next_bundle" current.json install windows tuf
   next_digest=$(run_checksum "$checksum_backend" "$next_bundle" | awk '{print $1}')
