@@ -75,13 +75,16 @@ Unblock-File -LiteralPath $download -ErrorAction SilentlyContinue
 # directory even after it has been verified and unblocked. An already-elevated
 # session stages the same verified bytes in the administrator-owned Paperboat
 # bootstrap directory before invoking the self-installer.
-$trustedBootstrap = Join-Path ${env:ProgramFiles} 'Paperboat\bootstrap\pb.exe'
+$trustedBootstrapDirectory = Join-Path ${env:ProgramFiles} 'Paperboat\bootstrap'
 function Stage-TrustedBootstrap([string]$Source) {
-  $directory = Split-Path -Parent $trustedBootstrap
-  New-Item -ItemType Directory -Force -Path $directory | Out-Null
-  Copy-Item -LiteralPath $Source -Destination $trustedBootstrap -Force
-  Unblock-File -LiteralPath $trustedBootstrap -ErrorAction SilentlyContinue
-  return $trustedBootstrap
+  New-Item -ItemType Directory -Force -Path $trustedBootstrapDirectory | Out-Null
+  # Never replace a fixed bootstrap path: an older Paperboat process may still
+  # have it open, and Windows correctly rejects that replacement with access
+  # denied. Each verified download gets its own immutable staging path.
+  $staged = Join-Path $trustedBootstrapDirectory ('pb-' + [guid]::NewGuid().ToString('N') + '.exe')
+  Copy-Item -LiteralPath $Source -Destination $staged -Force
+  Unblock-File -LiteralPath $staged -ErrorAction SilentlyContinue
+  return $staged
 }
 
 function Assert-InstalledVersion([string]$Path, [string]$ExpectedVersion) {
