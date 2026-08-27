@@ -71,6 +71,19 @@ if ($actual -ne [string]$assetMetadata.sha256) { throw "Paperboat release asset 
 # PowerShell can otherwise reject the version probe itself with Access denied.
 Unblock-File -LiteralPath $download -ErrorAction SilentlyContinue
 
+# Hardened Windows policies can deny execution from a user-writable temporary
+# directory even after it has been verified and unblocked. An already-elevated
+# session stages the same verified bytes in the administrator-owned Paperboat
+# bootstrap directory before invoking the self-installer.
+$trustedBootstrap = Join-Path ${env:ProgramFiles} 'Paperboat\bootstrap\pb.exe'
+function Stage-TrustedBootstrap([string]$Source) {
+  $directory = Split-Path -Parent $trustedBootstrap
+  New-Item -ItemType Directory -Force -Path $directory | Out-Null
+  Copy-Item -LiteralPath $Source -Destination $trustedBootstrap -Force
+  Unblock-File -LiteralPath $trustedBootstrap -ErrorAction SilentlyContinue
+  return $trustedBootstrap
+}
+
 function Assert-InstalledVersion([string]$Path, [string]$ExpectedVersion) {
   if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
   $capture = [IO.Path]::GetTempFileName()
@@ -104,6 +117,7 @@ if ($freshEnrollment -or -not (Assert-InstalledVersion $installedPb $version) -o
   # case; ordinary desktop terminals still use RunAs and show the normal UAC
   # prompt.
   if (Test-Administrator) {
+    $installerExecutable = Stage-TrustedBootstrap $download
     # Keep the elevated path in-process so an administrator SSH session does
     # not depend on an interactive desktop UAC broker. Some Windows policy
     # configurations reject direct execution from the temporary download
@@ -111,13 +125,13 @@ if ($freshEnrollment -or -not (Assert-InstalledVersion $installedPb $version) -o
     # already-elevated token.
     $directExitCode = 1
     try {
-      & $download @arguments
+      & $installerExecutable @arguments
       $directExitCode = $LASTEXITCODE
     } catch {
       $directExitCode = 1
     }
     if ($directExitCode -ne 0) {
-      $process = Start-Process -FilePath $download -ArgumentList $arguments -PassThru -Wait -WindowStyle Hidden
+      $process = Start-Process -FilePath $installerExecutable -ArgumentList $arguments -PassThru -Wait -WindowStyle Hidden
       if ($process.ExitCode -ne 0) { throw "Paperboat self-install failed with exit code $($process.ExitCode)." }
     }
   } else {
