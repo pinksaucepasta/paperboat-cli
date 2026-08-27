@@ -135,8 +135,22 @@ func (s *Service) Check(ctx context.Context) (workerupdate.Result, error) {
 	if s == nil || s.manager == nil {
 		return workerupdate.Result{}, ErrInvalidConfig
 	}
-	result, err := s.manager.Check(ctx, s.source.Resolve)
-	return workerupdate.Result{Version: result.Version, Updated: result.Updated}, err
+	// A check only resolves and verifies the signed release metadata. It must
+	// never call Manager.Check, which performs the full activation transaction
+	// (including the health-monitoring hold) and made `pb update check` appear
+	// hung while also unexpectedly installing an update.
+	return resolveRelease(ctx, s.manager.ActiveVersion(), s.source.Resolve)
+}
+
+func resolveRelease(ctx context.Context, activeVersion string, resolve workerupdate.Resolver) (workerupdate.Result, error) {
+	if resolve == nil {
+		return workerupdate.Result{}, ErrInvalidConfig
+	}
+	release, found, err := resolve(ctx)
+	if err != nil || !found {
+		return workerupdate.Result{Version: activeVersion}, err
+	}
+	return workerupdate.Result{Version: release.Version}, nil
 }
 
 // HTTPHealth is a bounded local hostd readiness check. The endpoint must be a

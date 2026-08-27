@@ -53,3 +53,32 @@ func TestValidUnixWorkerIdentitySupportsOnlyExactPairs(t *testing.T) {
 		}
 	}
 }
+
+func TestResolveReleaseDoesNotActivateOrWaitForMonitor(t *testing.T) {
+	called := false
+	result, err := resolveRelease(context.Background(), "2026.08.27.46", func(context.Context) (workerupdate.Release, bool, error) {
+		called = true
+		return workerupdate.Release{Version: "2026.08.27.47"}, true, nil
+	})
+	if err != nil {
+		t.Fatalf("resolveRelease error = %v", err)
+	}
+	if !called {
+		t.Fatal("resolver was not called")
+	}
+	if result.Version != "2026.08.27.47" || result.Updated {
+		t.Fatalf("result = %+v, want version-only result", result)
+	}
+}
+
+func TestResolveReleaseKeepsActiveVersionWhenNoRelease(t *testing.T) {
+	result, err := resolveRelease(context.Background(), "2026.08.27.46", func(context.Context) (workerupdate.Release, bool, error) {
+		return workerupdate.Release{}, false, nil
+	})
+	if err != nil {
+		t.Fatalf("resolveRelease error = %v", err)
+	}
+	if result.Version != "2026.08.27.46" || result.Updated {
+		t.Fatalf("result = %+v, want active version", result)
+	}
+}
