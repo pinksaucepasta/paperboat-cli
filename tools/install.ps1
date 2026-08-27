@@ -120,6 +120,10 @@ if ($freshEnrollment) {
   )) {
     Remove-Item -LiteralPath $statePath -Recurse -Force -ErrorAction SilentlyContinue
   }
+  if ([string]::IsNullOrWhiteSpace($name)) {
+    $name = [string]$env:COMPUTERNAME
+  }
+  $name = $name.Trim().ToLowerInvariant()
   $first = $token.Substring(0, 1)
   $setupMode = if ('02468BDFHJLNPRTVXZ'.Contains($first)) { 'host' } else { 'client' }
   Remove-Item Env:PAPERBOAT_ENROLLMENT_TOKEN -ErrorAction SilentlyContinue
