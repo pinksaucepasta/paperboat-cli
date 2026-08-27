@@ -142,17 +142,6 @@ func (s *Service) Check(ctx context.Context) (workerupdate.Result, error) {
 	return resolveRelease(ctx, s.manager.ActiveVersion(), s.source.Resolve)
 }
 
-func resolveRelease(ctx context.Context, activeVersion string, resolve workerupdate.Resolver) (workerupdate.Result, error) {
-	if resolve == nil {
-		return workerupdate.Result{}, ErrInvalidConfig
-	}
-	release, found, err := resolve(ctx)
-	if err != nil || !found {
-		return workerupdate.Result{Version: activeVersion}, err
-	}
-	return workerupdate.Result{Version: release.Version}, nil
-}
-
 // HTTPHealth is a bounded local hostd readiness check. The endpoint must be a
 // fixed loopback URL supplied by the service definition, not a release index
 // or user-controlled redirect. It is evaluated on every hostd heartbeat during

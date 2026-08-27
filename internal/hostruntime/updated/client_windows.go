@@ -38,6 +38,7 @@ type ControlResponse struct {
 	ActivationFailure string                  `json:"activation_failure,omitempty"`
 	Observation       autoupdate.Observation  `json:"observation"`
 	ErrorCode         string                  `json:"error_code,omitempty"`
+	ErrorMessage      string                  `json:"error_message,omitempty"`
 	Supervisor        supervisorupdate.Result `json:"supervisor,omitempty"`
 }
 
@@ -87,11 +88,11 @@ func (c *Client) callRequest(ctx context.Context, request ControlRequest) (Contr
 	decoder.DisallowUnknownFields()
 	var response ControlResponse
 	var extra any
-	if decoder.Decode(&response) != nil || decoder.Decode(&extra) != io.EOF || response.Schema != ControlProtocolV1 || (response.Status != "ok" && response.Status != "error") {
+	if decoder.Decode(&response) != nil || decoder.Decode(&extra) != io.EOF || response.Schema != ControlProtocolV1 || (response.Status != "ok" && response.Status != "error") || !validControlResponseError(response.Status, response.ErrorCode, response.ErrorMessage) {
 		return ControlResponse{}, ErrInvalidControl
 	}
 	if response.ErrorCode != "" {
-		return ControlResponse{}, errors.New(response.ErrorCode)
+		return ControlResponse{}, &ControlError{Code: response.ErrorCode, Message: response.ErrorMessage}
 	}
 	return response, nil
 }

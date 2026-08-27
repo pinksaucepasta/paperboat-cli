@@ -5,7 +5,6 @@ package updated
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -63,11 +62,11 @@ func (c *Client) callRequest(ctx context.Context, request ControlRequest) (Contr
 	decoder.DisallowUnknownFields()
 	var response ControlResponse
 	var extra any
-	if decoder.Decode(&response) != nil || decoder.Decode(&extra) != io.EOF || response.Schema != ControlProtocolV1 || (response.Status != "ok" && response.Status != "error") {
+	if decoder.Decode(&response) != nil || decoder.Decode(&extra) != io.EOF || response.Schema != ControlProtocolV1 || (response.Status != "ok" && response.Status != "error") || !validControlResponseError(response.Status, response.ErrorCode, response.ErrorMessage) {
 		return ControlResponse{}, ErrInvalidControl
 	}
 	if response.ErrorCode != "" {
-		return ControlResponse{}, errors.New(response.ErrorCode)
+		return ControlResponse{}, &ControlError{Code: response.ErrorCode, Message: response.ErrorMessage}
 	}
 	return response, nil
 }

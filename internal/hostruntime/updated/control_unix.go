@@ -47,6 +47,7 @@ type ControlResponse struct {
 	ActivationFailure string                  `json:"activation_failure,omitempty"`
 	Observation       autoupdate.Observation  `json:"observation"`
 	ErrorCode         string                  `json:"error_code,omitempty"`
+	ErrorMessage      string                  `json:"error_message,omitempty"`
 	Supervisor        supervisorupdate.Result `json:"supervisor,omitempty"`
 }
 
@@ -139,6 +140,7 @@ func (s *controlServer) handle(connection *net.UnixConn) error {
 		response.Schema = ControlProtocolV1
 		response.Status = "error"
 		response.ErrorCode = controlErrorCode(invokeErr)
+		response.ErrorMessage = boundedControlErrorMessage(invokeErr)
 	}
 	return s.respond(connection, response)
 }

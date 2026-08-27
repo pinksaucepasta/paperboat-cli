@@ -58,6 +58,37 @@ func TestControlClientUsesOnlyFixedOperations(t *testing.T) {
 	<-done
 }
 
+func TestControlClientSurfacesBoundedUpdaterDiagnostic(t *testing.T) {
+	path := testSocketPath(t)
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	server := controlServer{socketPath: path, uid: os.Geteuid(), gid: os.Getegid(), invoke: func(context.Context, string) (ControlResponse, error) {
+		return ControlResponse{}, errors.New("service target is invalid\nrestart required")
+	}}
+	done := make(chan struct{})
+	go func() {
+		connection, acceptErr := listener.AcceptUnix()
+		if acceptErr == nil {
+			_ = server.handle(connection)
+			_ = connection.Close()
+		}
+		close(done)
+	}()
+	client, err := NewClient(path, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Check(context.Background())
+	var controlErr *ControlError
+	if !errors.As(err, &controlErr) || controlErr.Code != "update_failed" || controlErr.Message != "service target is invalid restart required" {
+		t.Fatalf("error=%#v", err)
+	}
+	<-done
+}
+
 func TestControlRejectsUnknownFields(t *testing.T) {
 	path := testSocketPath(t)
 	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})

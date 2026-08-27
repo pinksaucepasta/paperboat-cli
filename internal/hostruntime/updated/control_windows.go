@@ -121,6 +121,7 @@ func (c *windowsController) handle(connection net.Conn) error {
 		response.Schema = ControlProtocolV1
 		response.Status = "error"
 		response.ErrorCode = controlErrorCodeWindows(invokeErr)
+		response.ErrorMessage = boundedControlErrorMessage(invokeErr)
 	}
 	if response.Schema == "" {
 		response.Schema = ControlProtocolV1
@@ -163,7 +164,12 @@ func (c *windowsController) invoke(ctx context.Context, request ControlRequest) 
 		}
 		return response, nil
 	case "check":
-		result, err := c.scheduler.CheckNow(ctx)
+		// A manual check is read-only. Calling Scheduler.CheckNow here used the
+		// automatic activation callback and could stage, stop services, and roll
+		// back a release merely because the user asked what version was current.
+		c.checkMu.Lock()
+		result, err := resolveRelease(ctx, c.activeVersion, c.resolve)
+		c.checkMu.Unlock()
 		response.Version, response.Updated, response.Observation = result.Version, false, c.scheduler.Snapshot()
 		return response, err
 	case "update":
