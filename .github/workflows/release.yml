@@ -184,7 +184,7 @@ jobs:
             echo "Linux release asset failed its version smoke test: $asset" >&2
             exit 1
           fi
-          version_line=$(printf '%s\n' "$version_output" | sed -nE 's/^[[:space:]]*(Version[[:space:]]+[0-9A-Za-z._-]+)[[:space:]]*$/\1/p')
+          version_line=$(printf '%s\n' "$version_output" | grep -Eo 'Version[[:space:]]+[0-9A-Za-z._-]+' | tail -n 1 || true)
           if [ "$version_line" != "Version $RELEASE_VERSION" ]; then
             echo "Linux release asset reported an unexpected version: ${version_line:-<missing>} (want $RELEASE_VERSION)" >&2
             exit 1
@@ -258,9 +258,9 @@ jobs:
           $versionOutput = (& $output --version 2>&1 | Out-String)
           $exitCode = $LASTEXITCODE
           if ($exitCode -ne 0) { throw 'Windows release asset failed its version smoke test.' }
-          $versionMatches = [regex]::Matches($versionOutput, '(?m)^[\t ]*(Version[\t ]+[0-9A-Za-z._-]+)[\t ]*$')
+          $versionMatches = [regex]::Matches($versionOutput, 'Version[\t ]+[0-9A-Za-z._-]+')
           $expectedVersionLine = "Version $env:RELEASE_VERSION"
-          if ($versionMatches.Count -ne 1 -or $versionMatches[0].Groups[1].Value -ne $expectedVersionLine) {
+          if ($versionMatches.Count -ne 1 -or $versionMatches[0].Value -ne $expectedVersionLine) {
             throw "Windows release asset reported an unexpected version (want $env:RELEASE_VERSION): $versionOutput"
           }
       - name: Record native Windows qualification handoff
@@ -372,7 +372,7 @@ jobs:
             echo 'macOS release binary failed its version smoke test.' >&2
             exit 1
           fi
-          version_line=$(printf '%s\n' "$version_output" | sed -nE 's/^[[:space:]]*(Version[[:space:]]+[0-9A-Za-z._-]+)[[:space:]]*$/\1/p')
+          version_line=$(printf '%s\n' "$version_output" | grep -Eo 'Version[[:space:]]+[0-9A-Za-z._-]+' | tail -n 1 || true)
           if [ "$version_line" != "Version $RELEASE_VERSION" ]; then
             echo "macOS release binary reported an unexpected version: ${version_line:-<missing>} (want $RELEASE_VERSION)" >&2
             exit 1
