@@ -4,6 +4,7 @@ package hostinstall
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -83,6 +84,12 @@ func Install(ctx context.Context, request Request) error {
 		return err
 	}
 	paths := platformPaths()
+	if err := ensureHostdToken(paths, request); err != nil {
+		return err
+	}
+	if err := ensureManagedDirectories(paths, request); err != nil {
+		return err
+	}
 	if err := recoverInterrupted(ctx, request, paths); err != nil {
 		return err
 	}
@@ -100,34 +107,43 @@ func Install(ctx context.Context, request Request) error {
 	if err := writeJournal(paths.journal, journal); err != nil {
 		return errors.Join(err, rollbackFiles(paths, journal))
 	}
-	worker, host, err := installers(request, paths)
+	hostd, updater, err := installers(request, paths)
 	if err != nil {
 		return errors.Join(ErrInvalidRequest, err)
 	}
-	if host != nil {
-		if err := host.Install(ctx); err != nil {
-			return errors.Join(err, rollbackFiles(paths, journal))
+	if err := hostd.Install(ctx); err != nil {
+		return errors.Join(err, rollbackFiles(paths, journal))
+	}
+	var legacyHost *service.Installer
+	if request.SetupMode == "host" {
+		legacyHost, err = hostInstaller(request, paths)
+		if err != nil {
+			return errors.Join(err, hostd.Uninstall(ctx), rollbackFiles(paths, journal))
+		}
+		if err := legacyHost.Install(ctx); err != nil {
+			return errors.Join(err, hostd.Uninstall(ctx), rollbackFiles(paths, journal))
 		}
 	}
-	if err := worker.Install(ctx); err != nil {
+	if err := updater.Install(ctx); err != nil {
 		var hostErr error
-		if host != nil {
-			hostErr = host.Uninstall(ctx)
+		hostErr = hostd.Uninstall(ctx)
+		if legacyHost != nil {
+			hostErr = errors.Join(hostErr, legacyHost.Uninstall(ctx))
 		}
 		return errors.Join(err, hostErr, rollbackFiles(paths, journal))
 	}
 	if request.SetupMode == "client" {
 		obsoleteHost, hostErr := hostInstaller(request, paths)
 		if hostErr != nil {
-			return errors.Join(hostErr, worker.Uninstall(ctx), rollbackFiles(paths, journal))
+			return errors.Join(hostErr, updater.Uninstall(ctx), hostd.Uninstall(ctx), rollbackFiles(paths, journal))
 		}
 		_, statErr := os.Lstat(obsoleteHost.DefinitionPath())
 		if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
-			return errors.Join(statErr, worker.Uninstall(ctx), rollbackFiles(paths, journal))
+			return errors.Join(statErr, updater.Uninstall(ctx), hostd.Uninstall(ctx), rollbackFiles(paths, journal))
 		}
 		if statErr == nil {
 			if err := obsoleteHost.Uninstall(ctx); err != nil {
-				return errors.Join(err, worker.Uninstall(ctx), rollbackFiles(paths, journal))
+				return errors.Join(err, updater.Uninstall(ctx), hostd.Uninstall(ctx), rollbackFiles(paths, journal))
 			}
 		}
 	}
@@ -184,15 +200,20 @@ func UninstallPersisted(ctx context.Context) error {
 }
 
 func uninstallValidated(ctx context.Context, request Request, paths installPaths) error {
-	worker, host, err := installers(request, paths)
+	hostd, updater, err := installers(request, paths)
 	if err != nil {
 		return errors.Join(ErrInvalidRequest, err)
 	}
-	serviceErr := worker.Uninstall(ctx)
+	serviceErr := hostd.Uninstall(ctx)
 	var restoreErr error
-	if host != nil {
-		serviceErr = errors.Join(serviceErr, host.Uninstall(ctx))
-		restoreErr = hostservice.NewPlatformApplier(filepath.Join(paths.runtimeState, "power-baseline.json")).Apply(ctx, hostservice.AllowSleep)
+	serviceErr = errors.Join(serviceErr, updater.Uninstall(ctx))
+	if request.SetupMode == "host" {
+		if legacy, legacyErr := hostInstaller(request, paths); legacyErr == nil {
+			serviceErr = errors.Join(serviceErr, legacy.Uninstall(ctx))
+			restoreErr = hostservice.NewPlatformApplier(filepath.Join(paths.runtimeState, "power-baseline.json")).Apply(ctx, hostservice.AllowSleep)
+		} else {
+			serviceErr = errors.Join(serviceErr, legacyErr)
+		}
 	}
 	journal, journalErr := loadJournal(paths.journal)
 	if journalErr == nil {
@@ -205,26 +226,52 @@ func uninstallValidated(ctx context.Context, request Request, paths installPaths
 }
 
 func installers(request Request, paths installPaths) (*service.Installer, *service.Installer, error) {
-	workerController := service.Controller(service.SystemdController{Runner: service.ExecRunner{}})
-	if runtime.GOOS == "darwin" {
-		workerController = service.LaunchdController{Runner: service.ExecRunner{}, UID: request.UID}
+	layout, err := componentLayout(paths)
+	if err != nil {
+		return nil, nil, err
 	}
-	worker, err := service.New(service.Config{
-		Platform: request.Platform, Kind: service.WorkerKind, ConfigRoot: string(os.PathSeparator), Executable: paths.worker,
-		User: request.User, Group: request.Group, Arguments: []string{"__runtime-host"}, Controller: workerController,
-		Environment: workerEnvironment(request),
+	hostdController, err := service.ComponentController(request.Platform, service.HostdKind, request.UID, service.ExecRunner{})
+	if err != nil {
+		return nil, nil, err
+	}
+	hostd, err := service.NewHostdInstaller(service.ComponentConfig{
+		Layout: layout, User: request.User, Group: request.Group, UID: request.UID, GID: request.GID,
+		HostdTokenFile: paths.hostdToken, Environment: workerEnvironment(request), Controller: hostdController,
 	})
 	if err != nil {
 		return nil, nil, err
 	}
-	if request.SetupMode == "client" {
-		return worker, nil, nil
-	}
-	host, err := hostInstaller(request, paths)
+	updaterController, err := service.ComponentController(request.Platform, service.UpdaterKind, request.UID, service.ExecRunner{})
 	if err != nil {
 		return nil, nil, err
 	}
-	return worker, host, nil
+	updater, err := service.NewUpdaterInstaller(service.ComponentConfig{
+		Layout: layout, User: request.User, Group: request.Group, UID: request.UID, GID: request.GID,
+		HostdTokenFile: paths.hostdToken, ReleaseRepository: request.Artifact.RepositoryURL, MachineID: request.UserMachineID,
+		HealthURL: "http://" + request.HelperListenAddress + "/healthz", Controller: updaterController,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return hostd, updater, nil
+}
+
+func componentLayout(paths installPaths) (service.Layout, error) {
+	layout, err := service.DefaultLayout(runtime.GOOS)
+	if err != nil {
+		return service.Layout{}, err
+	}
+	layout.InstallRoot = paths.root
+	layout.ReleasesRoot = filepath.Join(paths.root, "releases")
+	layout.Binary = paths.worker
+	layout.BinaryRollback = paths.workerRollback
+	layout.BinaryStaged = paths.workerNext
+	layout.UpdateStateRoot = paths.updateState
+	layout.HostdSocket = paths.hostdSocket
+	if err := layout.Validate(); err != nil {
+		return service.Layout{}, err
+	}
+	return layout, nil
 }
 
 func hostInstaller(request Request, paths installPaths) (*service.Installer, error) {
@@ -248,9 +295,10 @@ func hostInstaller(request Request, paths installPaths) (*service.Installer, err
 }
 
 type installPaths struct {
-	root, installerState, runtimeState                 string
-	worker, workerNext, workerRollback, workerPrevious string
-	journal, metadata, legacyMetadata                  string
+	root, installerState, runtimeState                  string
+	worker, workerNext, workerRollback, workerPrevious  string
+	journal, metadata, legacyMetadata                   string
+	hostdToken, hostdSocket, updaterSocket, updateState string
 }
 type installJournal struct {
 	Schema    string    `json:"schema"`
@@ -271,12 +319,73 @@ func platformPaths() installPaths {
 	}
 	p := installPaths{root: root, installerState: installerState, runtimeState: runtimeState, legacyMetadata: legacyMetadata}
 	p.worker = filepath.Join(root, "pb")
-	p.workerNext = p.worker + ".next"
-	p.workerRollback = p.worker + ".rollback"
-	p.workerPrevious = p.worker + ".previous"
+	// Release slots are kept in a dedicated root-owned directory so the
+	// updater can atomically stage, promote, and roll back without touching the
+	// command path or relying on a caller-controlled location.
+	releases := filepath.Join(root, "releases")
+	p.workerNext = filepath.Join(releases, "pb.staged")
+	p.workerRollback = filepath.Join(releases, "pb.rollback")
+	p.workerPrevious = filepath.Join(releases, "pb.previous")
 	p.journal = filepath.Join(installerState, "install-journal.json")
 	p.metadata = filepath.Join(installerState, "install-metadata.json")
+	p.hostdToken = filepath.Join(runtimeState, "hostd.token")
+	p.hostdSocket = "/var/run/paperboat-hostd/hostd.sock"
+	p.updaterSocket = "/var/run/paperboat-updated/control.sock"
+	p.updateState = "/var/lib/paperboat-updated"
+	if runtime.GOOS == "darwin" {
+		p.updateState = filepath.Join(runtimeState, "updated")
+	}
 	return p
+}
+
+func ensureHostdToken(paths installPaths, request Request) error {
+	if err := secureRootDirectory(filepath.Dir(paths.hostdToken), 0o700); err != nil {
+		return err
+	}
+	info, err := os.Lstat(paths.hostdToken)
+	if errors.Is(err, os.ErrNotExist) {
+		token := make([]byte, 32)
+		if _, err := rand.Read(token); err != nil {
+			return err
+		}
+		if err := os.WriteFile(paths.hostdToken, token, 0o600); err != nil {
+			return err
+		}
+	} else if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o600 {
+		return ErrInvalidRequest
+	}
+	if err := os.Chown(paths.hostdToken, request.UID, request.GID); err != nil {
+		return err
+	}
+	return os.Chmod(paths.hostdToken, 0o600)
+}
+
+func ensureManagedDirectories(paths installPaths, request Request) error {
+	// hostd runs as the enrolled account and must be able to create its
+	// authenticated socket and fence state. The updater remains root-owned.
+	hostdDir := filepath.Dir(paths.hostdSocket)
+	if err := secureRootDirectory(hostdDir, 0o700); err != nil {
+		return err
+	}
+	if err := os.Chown(hostdDir, request.UID, request.GID); err != nil {
+		return err
+	}
+	if err := os.Chmod(hostdDir, 0o700); err != nil {
+		return err
+	}
+	for _, item := range []struct {
+		path string
+		mode os.FileMode
+	}{
+		{filepath.Dir(paths.updaterSocket), 0o755},
+		{paths.updateState, 0o700},
+		{filepath.Join(paths.root, "releases"), 0o755},
+	} {
+		if err := secureRootDirectory(item.path, item.mode); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func writeInstallMetadata(path string, request Request) error {
@@ -410,10 +519,13 @@ func recoverInterrupted(ctx context.Context, request Request, paths installPaths
 		return err
 	}
 	if regularFile(paths.worker) {
-		if worker, host, installErr := installers(request, paths); installErr == nil {
-			_ = worker.Uninstall(ctx)
-			if host != nil {
-				_ = host.Uninstall(ctx)
+		if hostd, updater, installErr := installers(request, paths); installErr == nil {
+			_ = hostd.Uninstall(ctx)
+			_ = updater.Uninstall(ctx)
+			if request.SetupMode == "host" {
+				if legacy, legacyErr := hostInstaller(request, paths); legacyErr == nil {
+					_ = legacy.Uninstall(ctx)
+				}
 			}
 		}
 	}
@@ -476,6 +588,7 @@ func removeInstalledFiles(paths installPaths) error {
 	for _, path := range []string{
 		paths.worker, paths.workerNext, paths.workerRollback, paths.workerPrevious,
 		paths.metadata, paths.legacyMetadata,
+		paths.hostdToken, paths.hostdSocket, paths.updaterSocket,
 		filepath.Join(paths.runtimeState, "power-baseline.json"),
 		filepath.Join(paths.runtimeState, "availability-policy.json"),
 		filepath.Join(paths.runtimeState, "update-current.json"),
@@ -490,6 +603,14 @@ func removeInstalledFiles(paths installPaths) error {
 			continue
 		}
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			result = errors.Join(result, err)
+		}
+	}
+	for _, directory := range []string{paths.updateState, filepath.Dir(paths.hostdSocket), filepath.Dir(paths.updaterSocket), filepath.Join(paths.root, "releases")} {
+		if directory == "" || directory == "." || directory == string(filepath.Separator) || !filepath.IsAbs(directory) {
+			continue
+		}
+		if err := os.RemoveAll(directory); err != nil {
 			result = errors.Join(result, err)
 		}
 	}

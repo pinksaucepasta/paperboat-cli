@@ -80,6 +80,20 @@ func TestPlatformPathsKeepLinuxInstallerStateOutsideSystemdStateDirectory(t *tes
 	}
 }
 
+func TestComponentLayoutUsesDedicatedReleaseSlots(t *testing.T) {
+	paths := platformPaths()
+	layout, err := componentLayout(paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if layout.Binary != paths.worker || layout.BinaryRollback != paths.workerRollback || layout.BinaryStaged != paths.workerNext {
+		t.Fatalf("layout does not match installed slots: %+v / %+v", layout, paths)
+	}
+	if filepath.Dir(layout.BinaryRollback) != layout.ReleasesRoot || filepath.Dir(layout.BinaryStaged) != layout.ReleasesRoot {
+		t.Fatalf("release slots escaped release root: %+v", layout)
+	}
+}
+
 func TestLoadInstallMetadataPreservesNotExist(t *testing.T) {
 	_, err := loadInstallMetadata(filepath.Join(t.TempDir(), "missing.json"), os.Getuid())
 	if !errors.Is(err, os.ErrNotExist) {
