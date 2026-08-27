@@ -109,7 +109,7 @@ func TestHostdAndUpdaterInstallersUseOneStableBinary(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				for _, expected := range []string{"User=alice", "Group=staff", "RuntimeDirectory=paperboat-hostd", "NoNewPrivileges=true", "PAPERBOAT_BINARY=" + layout.Binary, "PAPERBOAT_RUNTIME_CURRENT=" + layout.Binary, "PAPERBOAT_HOSTD_SOCKET=" + layout.HostdSocket} {
+				for _, expected := range []string{"User=alice", "Group=staff", "RuntimeDirectory=paperboat-hostd", "RuntimeDirectoryMode=0700", "NoNewPrivileges=true", "PAPERBOAT_BINARY=" + layout.Binary, "PAPERBOAT_RUNTIME_CURRENT=" + layout.Binary, "PAPERBOAT_HOSTD_SOCKET=" + layout.HostdSocket} {
 					if !strings.Contains(string(hostdDefinition), expected) {
 						t.Fatalf("hostd missing %q:\n%s", expected, hostdDefinition)
 					}
