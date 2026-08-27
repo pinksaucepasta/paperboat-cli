@@ -107,7 +107,21 @@ function Assert-InstalledVersion([string]$Path, [string]$ExpectedVersion) {
 function Test-Administrator {
   $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
   $principal = [Security.Principal.WindowsPrincipal]::new($identity)
-  return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { return $false }
+  # IsInRole can report the Administrators group for a split UAC token even
+  # when the current process cannot write machine-wide paths. Probe the exact
+  # directory used for trusted staging so we never surface a raw Access Denied
+  # before the RunAs fallback gets a chance to handle it.
+  $probe = Join-Path $trustedBootstrapDirectory ('.elevation-' + [guid]::NewGuid().ToString('N'))
+  try {
+    New-Item -ItemType Directory -Force -Path $trustedBootstrapDirectory | Out-Null
+    New-Item -ItemType File -Path $probe -Force | Out-Null
+    Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+    return $true
+  } catch {
+    Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+    return $false
+  }
 }
 
 if ($freshEnrollment -or -not (Assert-InstalledVersion $installedPb $version) -or (Get-FileHash -Algorithm SHA256 -LiteralPath $installedPb -ErrorAction SilentlyContinue).Hash.ToLowerInvariant() -ne $actual) {
@@ -120,21 +134,29 @@ if ($freshEnrollment -or -not (Assert-InstalledVersion $installedPb $version) -o
   # case; ordinary desktop terminals still use RunAs and show the normal UAC
   # prompt.
   if (Test-Administrator) {
-    $installerExecutable = Stage-TrustedBootstrap $download
+    $installerExecutable = $null
+    try { $installerExecutable = Stage-TrustedBootstrap $download } catch { $installerExecutable = $null }
     # Keep the elevated path in-process so an administrator SSH session does
     # not depend on an interactive desktop UAC broker. Some Windows policy
     # configurations reject direct execution from the temporary download
     # path; retry through CreateProcess in that case while retaining the
     # already-elevated token.
     $directExitCode = 1
-    try {
-      & $installerExecutable @arguments
-      $directExitCode = $LASTEXITCODE
-    } catch {
-      $directExitCode = 1
+    if ($null -ne $installerExecutable) {
+      try {
+        & $installerExecutable @arguments
+        $directExitCode = $LASTEXITCODE
+      } catch {
+        $directExitCode = 1
+      }
     }
     if ($directExitCode -ne 0) {
-      $process = Start-Process -FilePath $installerExecutable -ArgumentList $arguments -PassThru -Wait -WindowStyle Hidden
+      $runAsPath = if ($null -ne $installerExecutable) { $installerExecutable } else { $download }
+      try {
+        $process = Start-Process -FilePath $runAsPath -ArgumentList $arguments -Verb RunAs -PassThru -Wait -WindowStyle Hidden
+      } catch {
+        throw "Paperboat self-install could not start with administrator privileges: $($_.Exception.Message)"
+      }
       if ($process.ExitCode -ne 0) { throw "Paperboat self-install failed with exit code $($process.ExitCode)." }
     }
   } else {
