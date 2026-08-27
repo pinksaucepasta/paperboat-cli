@@ -35,7 +35,7 @@ if ([string]$assetMetadata.platform -ne 'windows' -or [string]$assetMetadata.arc
 $expectedUrl = "https://github.com/$repo/releases/download/$version/$asset"
 if ([string]$assetMetadata.url -ne $expectedUrl) { throw 'Paperboat release asset URL is not an immutable GitHub release URL.' }
 
-$dir = Join-Path $env:TEMP 'Paperboat\bootstrap'
+$dir = Join-Path $env:TEMP ('Paperboat\bootstrap-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 $download = Join-Path $dir $asset
 $partial = "$download.download"
@@ -72,7 +72,12 @@ function Assert-InstalledVersion([string]$Path, [string]$ExpectedVersion) {
   if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
   $output = (& $Path --version 2>&1 | Out-String)
   if ($LASTEXITCODE -ne 0) { return $false }
-  return $output -match ("(?m)^.*\bVersion\s+" + [regex]::Escape($ExpectedVersion) + "\s*$")
+  $versionMatches = [regex]::Matches($output, '(?m)^[\t ]*(Version[\t ]+[0-9A-Za-z._-]+)[\t ]*$')
+  return $versionMatches.Count -eq 1 -and $versionMatches[0].Groups[1].Value -eq ("Version " + $ExpectedVersion)
+}
+
+if (-not (Assert-InstalledVersion $download $version)) {
+  throw "Downloaded Paperboat release does not report version $version."
 }
 
 function Test-Administrator {

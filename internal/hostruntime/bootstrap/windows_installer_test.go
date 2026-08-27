@@ -18,6 +18,9 @@ func TestWindowsInstallerDoesNotRequestUACFromElevatedSession(t *testing.T) {
 	if adminBranch < 0 || directStart < adminBranch || runAsStart < directStart {
 		t.Fatal("Windows installer does not separate elevated direct execution from desktop UAC elevation")
 	}
+	if !strings.Contains(script, "Assert-InstalledVersion $download $version") {
+		t.Fatal("Windows installer does not verify the downloaded executable reports current.json's version")
+	}
 	cleanup := strings.Index(script, "foreach ($statePath in @(")
 	installedCheck := strings.LastIndex(script, "if (-not (Assert-InstalledVersion $installedPb $version))")
 	if cleanup < 0 || installedCheck < 0 || cleanup < installedCheck {
