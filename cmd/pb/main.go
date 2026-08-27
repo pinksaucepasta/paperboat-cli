@@ -3160,9 +3160,12 @@ func actionUpdate(command *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
-	response, err := client.Update(ctx)
+	response, err := updateWithProgress(command, ctx, client.Update)
 	if err == nil {
 		if runtime.GOOS == "windows" && response.Pending {
+			if !updateJSON(command) {
+				fmt.Fprintln(command.ErrOrStderr(), "Update staged; waiting for Windows services to activate it...")
+			}
 			response, err = waitForWindowsUpdateActivation(ctx, response.Version)
 			if err != nil {
 				return fmt.Errorf("wait for Paperboat Windows activation: %w", err)
@@ -3171,6 +3174,52 @@ func actionUpdate(command *cobra.Command, _ []string) error {
 		return writeUpdateResult(command, updateResult{PreviousVersion: buildinfo.Version, Version: response.Version, CLIUpdated: response.Updated, RuntimeUpdated: response.Updated, SupervisorUpdated: response.Supervisor.Applied}, response.Version)
 	}
 	return fmt.Errorf("update with paperboat-updated: %w", err)
+}
+
+var updateProgressInterval = 5 * time.Second
+
+// updateWithProgress keeps the control protocol single-response and bounded,
+// while making the deliberately long health-monitoring hold visible to human
+// users. JSON mode remains machine-clean: progress is omitted entirely.
+func updateWithProgress(command *cobra.Command, ctx context.Context, update func(context.Context) (updated.ControlResponse, error)) (updated.ControlResponse, error) {
+	if update == nil {
+		return updated.ControlResponse{}, errors.New("update operation is unavailable")
+	}
+	if updateJSON(command) {
+		return update(ctx)
+	}
+	fmt.Fprintln(command.ErrOrStderr(), "Checking for a signed Paperboat update...")
+	type result struct {
+		response updated.ControlResponse
+		err      error
+	}
+	resultCh := make(chan result, 1)
+	started := time.Now()
+	go func() {
+		response, err := update(ctx)
+		resultCh <- result{response: response, err: err}
+	}()
+	interval := updateProgressInterval
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case result := <-resultCh:
+			return result.response, result.err
+		case <-ctx.Done():
+			return updated.ControlResponse{}, ctx.Err()
+		case <-ticker.C:
+			fmt.Fprintf(command.ErrOrStderr(), "Update is still in progress (%s); verifying runtime health...\n", time.Since(started).Round(time.Second))
+		}
+	}
+}
+
+func updateJSON(command *cobra.Command) bool {
+	jsonOutput, _ := command.Flags().GetBool("json")
+	return jsonOutput
 }
 
 func writeUpdateResult(command *cobra.Command, result updateResult, version string) error {

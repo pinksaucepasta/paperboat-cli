@@ -41,6 +41,7 @@ import (
 	doctorpkg "github.com/pinksaucepasta/paperboat/internal/doctor"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/bootstrap"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/identity"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/updated"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntimecmd"
 	"github.com/pinksaucepasta/paperboat/internal/httptransport"
 	"github.com/pinksaucepasta/paperboat/internal/inbox"
@@ -227,6 +228,66 @@ func TestUpdateCommandContract(t *testing.T) {
 		if childErr != nil || child == nil || child.Flags().Lookup("json") == nil {
 			t.Fatalf("find %v: command=%v error=%v", path, child, childErr)
 		}
+	}
+}
+
+func TestUpdateWithProgressReportsHumanProgressOnStderr(t *testing.T) {
+	oldInterval := updateProgressInterval
+	updateProgressInterval = time.Millisecond
+	defer func() { updateProgressInterval = oldInterval }()
+	command, _, err := newRootCommand().Find([]string{"update"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	command.SetContext(context.Background())
+	var stderr bytes.Buffer
+	command.SetErr(&stderr)
+	started := make(chan struct{})
+	resultCh := make(chan updated.ControlResponse, 1)
+	go func() {
+		response, updateErr := updateWithProgress(command, command.Context(), func(context.Context) (updated.ControlResponse, error) {
+			close(started)
+			time.Sleep(5 * time.Millisecond)
+			return updated.ControlResponse{Version: "2026.08.27.47"}, nil
+		})
+		if updateErr != nil {
+			t.Errorf("updateWithProgress error = %v", updateErr)
+		}
+		resultCh <- response
+	}()
+	<-started
+	response := <-resultCh
+	if response.Version != "2026.08.27.47" {
+		t.Fatalf("response = %+v", response)
+	}
+	if !strings.Contains(stderr.String(), "Checking for a signed Paperboat update") || !strings.Contains(stderr.String(), "still in progress") {
+		t.Fatalf("progress output = %q", stderr.String())
+	}
+}
+
+func TestUpdateWithProgressDoesNotWriteJSONStdout(t *testing.T) {
+	oldInterval := updateProgressInterval
+	updateProgressInterval = time.Millisecond
+	defer func() { updateProgressInterval = oldInterval }()
+	command, _, err := newRootCommand().Find([]string{"update"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := command.Flags().Set("json", "true"); err != nil {
+		t.Fatal(err)
+	}
+	command.SetContext(context.Background())
+	var stdout, stderr bytes.Buffer
+	command.SetOut(&stdout)
+	command.SetErr(&stderr)
+	_, err = updateWithProgress(command, command.Context(), func(context.Context) (updated.ControlResponse, error) {
+		return updated.ControlResponse{Version: "2026.08.27.47"}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stdout.Len() != 0 || stderr.Len() != 0 {
+		t.Fatalf("progress contaminated machine output: stdout=%q stderr=%q", stdout.String(), stderr.String())
 	}
 }
 
