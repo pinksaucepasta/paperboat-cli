@@ -126,8 +126,9 @@ func (c *helperWebSocketConnection) Close() error {
 }
 
 type helperTerminalConn struct {
-	message helperMessageConnection
-	target  *resolver.TerminalTarget
+	message        helperMessageConnection
+	target         *resolver.TerminalTarget
+	runtimeVersion string
 
 	readMu        sync.Mutex
 	current       *helperOutput
@@ -182,6 +183,28 @@ func newHelperTerminalConn(message helperMessageConnection, target *resolver.Ter
 	}
 	return &helperTerminalConn{message: message, target: target, out: make(chan helperOutput, queue), done: make(chan struct{}), inputWrites: make(chan helperWrite, 64), controlWrites: make(chan helperWrite, 16), detachWrites: make(chan helperWrite, 1), ackWrites: make(chan helperWrite, 1), ackNotify: make(chan struct{}, 1), responses: make(map[string]chan helperFrame), inputResults: make(chan TerminalInputResult, 256), inputQueue: inputQueue}
 }
+
+func newInitializedHelperTerminalConn(ctx context.Context, message helperMessageConnection, target *resolver.TerminalTarget, queue int) (*helperTerminalConn, error) {
+	connection := newHelperTerminalConn(message, target, queue)
+	if target != nil && target.Debug {
+		healthCtx, cancelHealth := context.WithTimeout(ctx, 2*time.Second)
+		frame, err := connection.requestSync(healthCtx, "health.v1", json.RawMessage(`{}`))
+		cancelHealth()
+		if err != nil {
+			return nil, fmt.Errorf("query terminal runtime version: %w", err)
+		}
+		connection.runtimeVersion = helperResponseRuntimeVersion(frame)
+		if connection.runtimeVersion == "" {
+			return nil, errors.New("terminal runtime returned an invalid version")
+		}
+	}
+	if err := connection.initialize(ctx); err != nil {
+		return nil, err
+	}
+	return connection, nil
+}
+
+func (c *helperTerminalConn) TerminalRuntimeVersion() string { return c.runtimeVersion }
 
 func helperHandshake(ctx context.Context, message helperMessageConnection) (bool, error) {
 	payload, _ := json.Marshal(map[string]any{"min_version": helperProtocolVersion, "max_version": helperProtocolVersion, "capabilities": helperCapabilities()})
@@ -571,6 +594,18 @@ func helperResponseGeneration(frame helperFrame) uint64 {
 	}
 	_ = json.Unmarshal(frame.Payload, &response)
 	return response.Result.Generation
+}
+
+func helperResponseRuntimeVersion(frame helperFrame) string {
+	var response struct {
+		Result struct {
+			Version string `json:"version"`
+		} `json:"result"`
+	}
+	if frame.Type != "response" || json.Unmarshal(frame.Payload, &response) != nil {
+		return ""
+	}
+	return strings.TrimSpace(response.Result.Version)
 }
 
 func helperResponseTerminalModes(frame helperFrame) string {

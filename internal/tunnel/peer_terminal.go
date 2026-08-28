@@ -366,11 +366,7 @@ func (t *PeerTerminalTunnel) InvalidateMachine(machineID string) {
 
 func (t *PeerTerminalTunnel) Dial(ctx context.Context, info resolver.ConnectInfo) (Conn, error) {
 	return t.dial(ctx, info, "terminal", peerApplication{helper: func(attachCtx context.Context, message helperMessageConnection, target *resolver.TerminalTarget) (Conn, error) {
-		terminal := newHelperTerminalConn(message, target, t.outputQueueChunks())
-		if err := terminal.initialize(attachCtx); err != nil {
-			return nil, err
-		}
-		return terminal, nil
+		return newInitializedHelperTerminalConn(attachCtx, message, target, t.outputQueueChunks())
 	}}, nil)
 }
 
@@ -4370,6 +4366,13 @@ type ownedPeerTerminalConn struct {
 }
 
 type ownedPeerExecConn struct{ *ownedPeerTerminalConn }
+
+func (c *ownedPeerTerminalConn) TerminalRuntimeVersion() string {
+	if c == nil {
+		return ""
+	}
+	return TerminalRuntimeVersion(c.Conn)
+}
 
 func ownPeerConnection(connection *ownedPeerTerminalConn) Conn {
 	if _, ok := connection.Conn.(ExecConn); ok {

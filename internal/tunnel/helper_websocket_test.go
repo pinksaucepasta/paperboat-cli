@@ -50,9 +50,10 @@ type earlyOutputMessageConnection struct {
 		kind helperMessageType
 		data []byte
 	}
-	closed       chan struct{}
-	once         sync.Once
-	attachBinary [][]byte
+	closed        chan struct{}
+	once          sync.Once
+	attachBinary  [][]byte
+	healthPayload json.RawMessage
 }
 
 func newEarlyOutputMessageConnection() *earlyOutputMessageConnection {
@@ -84,6 +85,18 @@ func (c *earlyOutputMessageConnection) WriteMessage(_ context.Context, kind help
 	var payload map[string]any
 	_ = json.Unmarshal(frame.Payload, &payload)
 	response := helperFrame{Type: "response", RequestID: frame.RequestID, Version: helperProtocolVersion}
+	if frame.Capability == "health.v1" {
+		response.Payload = c.healthPayload
+		if len(response.Payload) == 0 {
+			response.Payload = json.RawMessage(`{"result":{"version":"2026.08.27.65"}}`)
+		}
+		encoded, _ := json.Marshal(response)
+		c.reads <- struct {
+			kind helperMessageType
+			data []byte
+		}{helperStructuredMessage, encoded}
+		return nil
+	}
 	switch payload["action"] {
 	case "snapshot":
 		response.Type = "error"
@@ -110,6 +123,40 @@ func (c *earlyOutputMessageConnection) WriteMessage(_ context.Context, kind help
 		data []byte
 	}{helperStructuredMessage, encoded}
 	return nil
+}
+
+func TestDebugTerminalCapturesExactRemoteRuntimeVersion(t *testing.T) {
+	message := newEarlyOutputMessageConnection()
+	connection, err := newInitializedHelperTerminalConn(context.Background(), message, &resolver.TerminalTarget{SessionID: "ses_debug", CWD: "/workspace", Debug: true}, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := TerminalRuntimeVersion(connection); got != "2026.08.27.65" {
+		t.Fatalf("runtime version = %q", got)
+	}
+	_ = message.Close()
+	connection.finish(0, nil)
+}
+
+func TestDebugTerminalRejectsMissingRemoteRuntimeVersion(t *testing.T) {
+	message := newEarlyOutputMessageConnection()
+	message.healthPayload = json.RawMessage(`{"result":{}}`)
+	if _, err := newInitializedHelperTerminalConn(context.Background(), message, &resolver.TerminalTarget{SessionID: "ses_debug", CWD: "/workspace", Debug: true}, 4); err == nil || !strings.Contains(err.Error(), "invalid version") {
+		t.Fatalf("error = %v", err)
+	}
+	_ = message.Close()
+}
+
+func TestHelperResponseRuntimeVersionRejectsMalformedResponse(t *testing.T) {
+	if got := helperResponseRuntimeVersion(helperFrame{Type: "response", Payload: json.RawMessage(`{"result":{"version":" 2026.08.27.65 "}}`)}); got != "2026.08.27.65" {
+		t.Fatalf("runtime version = %q", got)
+	}
+	if got := helperResponseRuntimeVersion(helperFrame{Type: "error", Payload: json.RawMessage(`{"result":{"version":"2026.08.27.65"}}`)}); got != "" {
+		t.Fatalf("error response exposed runtime version %q", got)
+	}
+	if got := helperResponseRuntimeVersion(helperFrame{Type: "response", Payload: json.RawMessage(`{"result":`)}); got != "" {
+		t.Fatalf("malformed response exposed runtime version %q", got)
+	}
 }
 
 func (c *earlyOutputMessageConnection) Close() error {

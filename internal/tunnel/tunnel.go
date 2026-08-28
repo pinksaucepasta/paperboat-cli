@@ -24,6 +24,16 @@ type Conn interface {
 	Wait() (exitCode int, err error)
 }
 
+// TerminalRuntimeVersion returns the exact remote pb runtime reported over
+// the active terminal transport. It is empty for normal sessions and for
+// transports that could not provide optional debug metadata.
+func TerminalRuntimeVersion(conn Conn) string {
+	if versioned, ok := conn.(interface{ TerminalRuntimeVersion() string }); ok {
+		return versioned.TerminalRuntimeVersion()
+	}
+	return ""
+}
+
 type InputHalfCloser interface {
 	CloseWrite() error
 }

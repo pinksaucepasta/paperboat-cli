@@ -66,7 +66,7 @@ func (t LocalPeerTunnel) request(info resolver.ConnectInfo, consumer, operationI
 }
 
 func terminalLocalPayload(target *resolver.TerminalTarget) localapi.PeerTerminalPayload {
-	return localapi.PeerTerminalPayload{Protocol: target.Protocol, ThreadID: target.ThreadID, TerminalID: target.TerminalID, SessionID: target.SessionID, CWD: target.CWD, Environment: target.Env, Columns: target.Cols, Rows: target.Rows, RestartIfNotRunning: target.RestartIfNotRunning, ReplayHistory: target.ReplayHistory, AfterSequence: target.AfterSequence, InputAttachmentID: target.InputAttachmentID}
+	return localapi.PeerTerminalPayload{Protocol: target.Protocol, Debug: target.Debug, ThreadID: target.ThreadID, TerminalID: target.TerminalID, SessionID: target.SessionID, CWD: target.CWD, Environment: target.Env, Columns: target.Cols, Rows: target.Rows, RestartIfNotRunning: target.RestartIfNotRunning, ReplayHistory: target.ReplayHistory, AfterSequence: target.AfterSequence, InputAttachmentID: target.InputAttachmentID}
 }
 
 func (t LocalPeerTunnel) Dial(ctx context.Context, info resolver.ConnectInfo) (Conn, error) {
@@ -82,7 +82,12 @@ func (t LocalPeerTunnel) Dial(ctx context.Context, info resolver.ConnectInfo) (C
 	if err != nil {
 		return nil, err
 	}
-	connection, err := NewLocalPeerConn(stream)
+	var connection Conn
+	if info.Terminal.Debug {
+		connection, err = newLocalPeerDebugConn(stream)
+	} else {
+		connection, err = NewLocalPeerConn(stream)
+	}
 	if err != nil {
 		_ = stream.Close()
 	}

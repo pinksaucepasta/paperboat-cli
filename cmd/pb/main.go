@@ -5151,6 +5151,7 @@ func addConnectFlags(command *cobra.Command) {
 	command.Flags().String("transport", "", "peer transport: a (auto), d (direct QUIC), q (relay QUIC), w (relay WSS), or r (relay race)")
 	command.Flags().String("name", "", "name for the fresh terminal session")
 	command.Flags().String("session", "", "attach an existing terminal session by name or ID")
+	command.Flags().Bool("debug", false, "show the pb versions used by this terminal session")
 	addStatusBarFlags(command)
 }
 
@@ -5374,6 +5375,7 @@ func sessionCobraCommand() *cobra.Command {
 	}}
 	attach.Flags().String("session", "", "")
 	_ = attach.Flags().MarkHidden("session")
+	attach.Flags().Bool("debug", false, "show the pb versions used by this terminal session")
 	addStatusBarFlags(attach)
 	command.AddCommand(attach)
 	list := &cobra.Command{Use: "list [environment]", Short: "List durable terminal sessions", Args: commandArgs(cobra.MaximumNArgs(1)), RunE: actionRun(source.Action)}
@@ -5677,7 +5679,7 @@ func actionContext(cobraCommand *cobra.Command, args []string) *command.Context 
 	}
 	hours, _ := cobraCommand.Flags().GetFloat64("hours")
 	set.Float64("hours", hours, "")
-	for _, name := range []string{"json", "wide", "yes", "clear", "all", "indefinite", "public", "detach", "select-environment"} {
+	for _, name := range []string{"json", "wide", "yes", "clear", "all", "indefinite", "public", "detach", "select-environment", "debug"} {
 		value, _ := cobraCommand.Flags().GetBool(name)
 		values[name] = strconv.FormatBool(value)
 		set.Bool(name, value, "")
@@ -9687,6 +9689,9 @@ func actionConnectTarget(c *command.Context, requested string) error {
 			Right:  d.cfg.StatusBar.Right,
 		},
 	})
+	if c.Bool("debug") {
+		bar.SetDebugVersions(buildinfo.Version, "")
+	}
 	defer func() { _ = bar.Close() }()
 	useStatusBar := bar.Enabled()
 	var closeTelemetry func()
@@ -9843,6 +9848,7 @@ func actionConnectTarget(c *command.Context, requested string) error {
 				}
 			}
 			if info.Terminal != nil {
+				info.Terminal.Debug = c.Bool("debug")
 				info.Terminal.RestartIfNotRunning = true
 				info.Terminal.ReplayHistory = true
 				info.Terminal.SequenceSink = recordTerminalSequence
@@ -9908,6 +9914,9 @@ func actionConnectTarget(c *command.Context, requested string) error {
 			return errors.New(msg)
 		}
 		return fmt.Errorf("connect to %q: %w", project, err)
+	}
+	if c.Bool("debug") {
+		bar.SetDebugVersions(buildinfo.Version, tunnel.TerminalRuntimeVersion(conn))
 	}
 	defer func() {
 		if transferClient != nil {
@@ -10001,6 +10010,7 @@ func actionConnectTarget(c *command.Context, requested string) error {
 			return nil, resolveErr
 		}
 		if freshInfo.Terminal != nil {
+			freshInfo.Terminal.Debug = c.Bool("debug")
 			freshInfo.Terminal.RestartIfNotRunning = false
 			freshInfo.Terminal.ReplayHistory = false
 			freshInfo.Terminal.AfterSequence = int(lastTerminalSequence.Load())
@@ -10015,6 +10025,9 @@ func actionConnectTarget(c *command.Context, requested string) error {
 				return nil, tunnel.StopReconnect(dialErr)
 			}
 			return nil, dialErr
+		}
+		if c.Bool("debug") {
+			bar.SetDebugVersions(buildinfo.Version, tunnel.TerminalRuntimeVersion(freshConn))
 		}
 		if pastePolicy != nil {
 			freshTransfer := transferClient

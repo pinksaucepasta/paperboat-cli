@@ -92,8 +92,8 @@ func (p *preparedWebSocketTerminal) Attach(ctx context.Context) (Conn, error) {
 			resultErr = err
 			return
 		}
-		connection := newHelperTerminalConn(message, p.target, p.queue)
-		if err := connection.initialize(ctx); err != nil {
+		connection, err := newInitializedHelperTerminalConn(ctx, message, p.target, p.queue)
+		if err != nil {
 			_ = ws.Close(websocket.StatusInternalError, "initialize_failed")
 			resultErr = err
 			return

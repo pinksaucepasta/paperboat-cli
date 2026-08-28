@@ -26,7 +26,12 @@ const (
 	localPeerExecSignal
 	localPeerExecDetach
 	localPeerClosed
+	localPeerMetadata
 )
+
+type localPeerMetadataPayload struct {
+	RuntimeVersion string `json:"runtime_version,omitempty"`
+}
 
 type localPeerWriter struct {
 	writer io.Writer
@@ -53,7 +58,7 @@ func readLocalPeerFrame(reader io.Reader) (byte, []byte, error) {
 		return 0, nil, err
 	}
 	size := binary.BigEndian.Uint32(header[1:])
-	if size > localPeerMaximumFrame || header[0] < localPeerData || header[0] > localPeerClosed {
+	if size > localPeerMaximumFrame || header[0] < localPeerData || header[0] > localPeerMetadata {
 		return 0, nil, ErrPeerTerminalInvalid
 	}
 	payload := make([]byte, size)
@@ -66,12 +71,31 @@ func readLocalPeerFrame(reader io.Reader) (byte, []byte, error) {
 // ServeLocalPeerConn projects the terminal connection contract over one
 // authenticated local Unix stream. The remote carrier remains daemon-owned.
 func ServeLocalPeerConn(ctx context.Context, local net.Conn, remote Conn) error {
+	return serveLocalPeerConn(ctx, local, remote, false)
+}
+
+// ServeLocalPeerDebugConn includes one negotiated metadata frame before the
+// terminal byte stream. Normal terminal and exec streams remain unchanged.
+func ServeLocalPeerDebugConn(ctx context.Context, local net.Conn, remote Conn) error {
+	return serveLocalPeerConn(ctx, local, remote, true)
+}
+
+func serveLocalPeerConn(ctx context.Context, local net.Conn, remote Conn, includeMetadata bool) error {
 	if ctx == nil || local == nil || remote == nil {
 		return ErrPeerTerminalInvalid
 	}
 	defer local.Close()
 	defer remote.Close()
 	writer := &localPeerWriter{writer: local}
+	if includeMetadata {
+		metadata, err := json.Marshal(localPeerMetadataPayload{RuntimeVersion: TerminalRuntimeVersion(remote)})
+		if err != nil || len(metadata) > localPeerMaximumFrame {
+			return ErrPeerTerminalInvalid
+		}
+		if err := writer.write(localPeerMetadata, metadata); err != nil {
+			return err
+		}
+	}
 	remoteExec, isExec := remote.(ExecConn)
 	done := make(chan error, 3)
 	outputDone := make(chan struct{})
@@ -210,17 +234,20 @@ func ServeLocalPeerConn(ctx context.Context, local net.Conn, remote Conn) error 
 }
 
 type localPeerConn struct {
-	connection net.Conn
-	writer     *localPeerWriter
-	data       chan []byte
-	result     chan localPeerWaitResult
-	done       chan struct{}
-	closed     chan struct{}
-	events     chan ExecEvent
-	exec       bool
-	mu         sync.Mutex
-	pending    []byte
-	once       sync.Once
+	connection     net.Conn
+	writer         *localPeerWriter
+	runtimeVersion string
+	initialKind    byte
+	initialPayload []byte
+	data           chan []byte
+	result         chan localPeerWaitResult
+	done           chan struct{}
+	closed         chan struct{}
+	events         chan ExecEvent
+	exec           bool
+	mu             sync.Mutex
+	pending        []byte
+	once           sync.Once
 }
 
 type localPeerWaitResult struct {
@@ -229,7 +256,15 @@ type localPeerWaitResult struct {
 }
 
 func NewLocalPeerConn(connection net.Conn) (Conn, error) {
-	value, err := newLocalPeerConn(connection, false)
+	value, err := newLocalPeerConn(connection, false, false)
+	if err != nil {
+		return nil, err
+	}
+	return &localBasicPeerConn{inner: value.(*localPeerConn)}, nil
+}
+
+func newLocalPeerDebugConn(connection net.Conn) (Conn, error) {
+	value, err := newLocalPeerConn(connection, false, true)
 	if err != nil {
 		return nil, err
 	}
@@ -246,28 +281,53 @@ func (c *localBasicPeerConn) Wait() (int, error)             { return c.inner.Wa
 func (c *localBasicPeerConn) CloseWrite() error              { return c.inner.CloseWrite() }
 
 func NewLocalExecPeerConn(connection net.Conn) (ExecConn, error) {
-	value, err := newLocalPeerConn(connection, true)
+	value, err := newLocalPeerConn(connection, true, false)
 	if err != nil {
 		return nil, err
 	}
 	return value.(*localPeerConn), nil
 }
 
-func newLocalPeerConn(connection net.Conn, exec bool) (Conn, error) {
+func newLocalPeerConn(connection net.Conn, exec, expectMetadata bool) (Conn, error) {
 	if connection == nil {
 		return nil, ErrPeerTerminalInvalid
 	}
 	value := &localPeerConn{connection: connection, writer: &localPeerWriter{writer: connection}, data: make(chan []byte, 16), result: make(chan localPeerWaitResult, 1), done: make(chan struct{}), closed: make(chan struct{}), events: make(chan ExecEvent, 256), exec: exec}
+	if expectMetadata {
+		_ = connection.SetReadDeadline(time.Now().Add(time.Second))
+		kind, payload, err := readLocalPeerFrame(connection)
+		_ = connection.SetReadDeadline(time.Time{})
+		if err != nil {
+			var networkError net.Error
+			if !errors.As(err, &networkError) || !networkError.Timeout() {
+				return nil, err
+			}
+		} else if kind == localPeerMetadata {
+			var metadata localPeerMetadataPayload
+			if json.Unmarshal(payload, &metadata) != nil {
+				return nil, ErrPeerTerminalInvalid
+			}
+			value.runtimeVersion = metadata.RuntimeVersion
+		} else {
+			value.initialKind, value.initialPayload = kind, payload
+		}
+	}
 	go value.readLoop()
 	return value, nil
 }
+
+func (c *localBasicPeerConn) TerminalRuntimeVersion() string { return c.inner.runtimeVersion }
 
 func (c *localPeerConn) readLoop() {
 	defer close(c.done)
 	defer close(c.data)
 	defer close(c.events)
 	for {
-		kind, payload, err := readLocalPeerFrame(c.connection)
+		kind, payload, err := c.initialKind, c.initialPayload, error(nil)
+		c.initialKind, c.initialPayload = 0, nil
+		if kind == 0 {
+			kind, payload, err = readLocalPeerFrame(c.connection)
+		}
 		if err != nil {
 			if !errors.Is(err, ErrPeerTerminalInvalid) {
 				err = errors.Join(ErrTransportLost, err)

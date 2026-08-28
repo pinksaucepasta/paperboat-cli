@@ -202,6 +202,9 @@ type TerminalTarget struct {
 	TerminalID    string
 	SessionID     string
 	CWD           string
+	// Debug requests connection-scoped runtime diagnostics for the local
+	// status bar. It is never sent to the control plane or remote shell.
+	Debug bool
 	// Env is local-terminal environment forwarded on attach (TERM, COLORTERM,
 	// ...) so the remote PTY spawns with the client's terminal capabilities.
 	// Applied by the Paperboat host runtime when the PTY (re)starts.

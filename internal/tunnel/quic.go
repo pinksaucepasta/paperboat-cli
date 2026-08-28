@@ -80,8 +80,8 @@ func (p *preparedNativeTerminal) Attach(ctx context.Context) (Conn, error) {
 			resultErr = err
 			return
 		}
-		connection := newHelperTerminalConn(message, p.target, p.queue)
-		resultErr = connection.initialize(ctx)
+		connection, err := newInitializedHelperTerminalConn(ctx, message, p.target, p.queue)
+		resultErr = err
 		if resultErr != nil {
 			_ = message.Close()
 			return

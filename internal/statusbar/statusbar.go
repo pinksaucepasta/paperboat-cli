@@ -91,6 +91,8 @@ type Bar struct {
 	session         string
 	connection      string
 	transport       string
+	localVersion    string
+	remoteVersion   string
 	credits         string
 	storage         string
 	configSync      string
@@ -466,6 +468,17 @@ func (b *Bar) SetTransport(transport string) {
 	default:
 		b.transport = ""
 	}
+	b.drawLocked()
+	b.mu.Unlock()
+}
+
+// SetDebugVersions exposes the exact local CLI and remote runtime builds for
+// this terminal connection. It is separate from configurable widgets so the
+// per-session --debug flag cannot silently hide it through saved layout state.
+func (b *Bar) SetDebugVersions(local, remote string) {
+	b.mu.Lock()
+	b.localVersion = safeLabel(local)
+	b.remoteVersion = safeLabel(remote)
 	b.drawLocked()
 	b.mu.Unlock()
 }
@@ -927,6 +940,13 @@ func (b *Bar) layoutRegionsLocked(layout Layout) (left, center, right string) {
 	left = b.regionLocked(layout.Left)
 	center = b.regionLocked(layout.Center)
 	right = b.regionLocked(layout.Right)
+	if b.localVersion != "" {
+		remote := b.remoteVersion
+		if remote == "" {
+			remote = "?"
+		}
+		right = joinWidgets(right, "pb "+b.localVersion+" / host "+remote)
+	}
 	if b.transport != "" {
 		right = joinWidgets(right, b.semanticLocked(b.transport, "accent"))
 	}

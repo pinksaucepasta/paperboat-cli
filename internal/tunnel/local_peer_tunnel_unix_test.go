@@ -4,6 +4,7 @@ package tunnel
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -45,10 +46,10 @@ func TestLocalPeerTunnelTerminalPreservesFramingAndWaitLifecycle(t *testing.T) {
 		requestSeen <- request
 		client, bridge := net.Pipe()
 		remote := &blockingWaitRemote{
-			localPeerRemote: &localPeerRemote{Conn: remoteServer},
+			localPeerRemote: &localPeerRemote{Conn: remoteServer, runtimeVersion: "2026.08.27.65"},
 			release:         releaseWait,
 		}
-		go func() { _ = ServeLocalPeerConn(context.Background(), bridge, remote) }()
+		go func() { _ = ServeLocalPeerDebugConn(context.Background(), bridge, remote) }()
 		return client, nil
 	})
 	server, err := localapi.NewServer(localapi.ServerConfig{
@@ -91,6 +92,7 @@ func TestLocalPeerTunnelTerminalPreservesFramingAndWaitLifecycle(t *testing.T) {
 		Terminal: &resolver.TerminalTarget{
 			EnvironmentID: "environment_1",
 			SessionID:     "session_1",
+			Debug:         true,
 			Auth: resolver.AuthTarget{
 				Token:     "credential",
 				ExpiresAt: time.Now().Add(time.Minute).UTC().Format(time.RFC3339),
@@ -101,10 +103,17 @@ func TestLocalPeerTunnelTerminalPreservesFramingAndWaitLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer connection.Close()
+	if got := TerminalRuntimeVersion(connection); got != "2026.08.27.65" {
+		t.Fatalf("runtime version=%q", got)
+	}
 	select {
 	case request := <-requestSeen:
 		if request.Consumer != "terminal" || request.OperationID != "session_1" {
 			t.Fatalf("peer request consumer=%q operation=%q", request.Consumer, request.OperationID)
+		}
+		var payload localapi.PeerTerminalPayload
+		if json.Unmarshal(request.Payload, &payload) != nil || !payload.Debug {
+			t.Fatalf("peer terminal debug payload=%s", request.Payload)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("terminal peer request was not observed")

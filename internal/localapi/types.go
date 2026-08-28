@@ -62,6 +62,7 @@ type PeerStreamRequest struct {
 
 type PeerTerminalPayload struct {
 	Protocol            string            `json:"protocol"`
+	Debug               bool              `json:"debug,omitempty"`
 	ThreadID            string            `json:"thread_id,omitempty"`
 	TerminalID          string            `json:"terminal_id,omitempty"`
 	SessionID           string            `json:"session_id,omitempty"`

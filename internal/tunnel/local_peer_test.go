@@ -12,9 +12,10 @@ import (
 
 type localPeerRemote struct {
 	net.Conn
-	mu          sync.Mutex
-	rows, cols  uint16
-	closeOnWait bool
+	mu             sync.Mutex
+	rows, cols     uint16
+	closeOnWait    bool
+	runtimeVersion string
 }
 
 func (c *localPeerRemote) Resize(rows, cols uint16) error {
@@ -29,7 +30,8 @@ func (c *localPeerRemote) Wait() (int, error) {
 	}
 	return 7, nil
 }
-func (c *localPeerRemote) CloseWrite() error { return nil }
+func (c *localPeerRemote) CloseWrite() error              { return nil }
+func (c *localPeerRemote) TerminalRuntimeVersion() string { return c.runtimeVersion }
 
 type localPeerExecRemote struct {
 	*localPeerRemote
@@ -160,6 +162,60 @@ func TestOwnedPeerConnectionExposesExecOnlyForExecConnections(t *testing.T) {
 	exec := ownPeerConnection(&ownedPeerTerminalConn{Conn: &localPeerExecRemote{localPeerRemote: &localPeerRemote{}}})
 	if _, ok := exec.(ExecConn); !ok {
 		t.Fatal("owned exec connection did not expose exec controls")
+	}
+}
+
+func TestOwnedAndLocalPeerConnectionsPreserveRuntimeVersion(t *testing.T) {
+	localClient, localServer := net.Pipe()
+	remoteServer, remotePeer := net.Pipe()
+	remote := &localPeerRemote{Conn: remoteServer, runtimeVersion: "2026.08.27.65"}
+	owned := &ownedPeerTerminalConn{Conn: remote}
+	if got := TerminalRuntimeVersion(owned); got != "2026.08.27.65" {
+		t.Fatalf("owned runtime version=%q", got)
+	}
+	served := make(chan error, 1)
+	go func() { served <- ServeLocalPeerDebugConn(context.Background(), localServer, owned) }()
+	connection, err := newLocalPeerDebugConn(localClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := TerminalRuntimeVersion(connection); got != "2026.08.27.65" {
+		t.Fatalf("local runtime version=%q", got)
+	}
+	_ = connection.Close()
+	_ = remotePeer.Close()
+	select {
+	case <-served:
+	case <-time.After(time.Second):
+		t.Fatal("local peer server did not stop")
+	}
+}
+
+func TestLocalPeerDebugConnPreservesFirstFrameFromDaemonWithoutMetadata(t *testing.T) {
+	localClient, localServer := net.Pipe()
+	remoteServer, remotePeer := net.Pipe()
+	served := make(chan error, 1)
+	go func() {
+		served <- ServeLocalPeerConn(context.Background(), localServer, &localPeerRemote{Conn: remoteServer})
+	}()
+	go func() { _, _ = remotePeer.Write([]byte("banner")) }()
+	connection, err := newLocalPeerDebugConn(localClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := TerminalRuntimeVersion(connection); got != "" {
+		t.Fatalf("runtime version=%q", got)
+	}
+	buffer := make([]byte, len("banner"))
+	if _, err := io.ReadFull(connection, buffer); err != nil || string(buffer) != "banner" {
+		t.Fatalf("first frame=%q err=%v", buffer, err)
+	}
+	_ = connection.Close()
+	_ = remotePeer.Close()
+	select {
+	case <-served:
+	case <-time.After(time.Second):
+		t.Fatal("local peer server did not stop")
 	}
 }
 

@@ -3032,6 +3032,27 @@ func TestConnectStatusBarOverridesAreValidated(t *testing.T) {
 	}
 }
 
+func TestTerminalDebugFlagIsAvailableOnShorthandAndConnect(t *testing.T) {
+	root := newRootCommand()
+	if flag := root.Flags().Lookup("debug"); flag == nil || flag.DefValue != "false" {
+		t.Fatalf("root debug flag = %#v", flag)
+	}
+	connect, _, err := root.Find([]string{"connect"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if flag := connect.Flags().Lookup("debug"); flag == nil || flag.DefValue != "false" {
+		t.Fatalf("connect debug flag = %#v", flag)
+	}
+	attach, _, err := root.Find([]string{"session", "attach"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if flag := attach.Flags().Lookup("debug"); flag == nil || flag.DefValue != "false" {
+		t.Fatalf("session attach debug flag = %#v", flag)
+	}
+}
+
 func TestConfigAssignHostedMachineJSONContract(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.json")
