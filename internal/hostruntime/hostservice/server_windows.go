@@ -23,9 +23,11 @@ import (
 )
 
 const (
-	ProtocolV1 = "paperboat.host-service/v1"
-	AllowSleep = "allow_sleep"
-	KeepAwake  = "keep_awake"
+	ProtocolV1                       = "paperboat.host-service/v1"
+	AllowSleep                       = "allow_sleep"
+	KeepAwake                        = "keep_awake"
+	maxAuthorizedKeys                = 256
+	windowsHostServiceMaxRequestSize = 64 << 10
 )
 
 var (
@@ -36,26 +38,29 @@ var (
 )
 
 type Request struct {
-	Schema    string                    `json:"schema"`
-	Operation string                    `json:"operation"`
-	Mode      string                    `json:"mode,omitempty"`
-	Version   int64                     `json:"version,omitempty"`
-	Artifact  *bootstrap.ArtifactTarget `json:"artifact,omitempty"`
+	Schema         string                    `json:"schema"`
+	Operation      string                    `json:"operation"`
+	Mode           string                    `json:"mode,omitempty"`
+	Version        int64                     `json:"version,omitempty"`
+	Artifact       *bootstrap.ArtifactTarget `json:"artifact,omitempty"`
+	AuthorizedKeys *[]string                 `json:"authorized_keys,omitempty"`
 }
 type Response struct {
-	Schema             string    `json:"schema"`
-	Status             string    `json:"status"`
-	DesiredMode        string    `json:"desired_mode"`
-	DesiredVersion     int64     `json:"desired_version"`
-	ObservedMode       string    `json:"observed_mode,omitempty"`
-	ObservedVersion    int64     `json:"observed_version,omitempty"`
-	ObservedAt         time.Time `json:"observed_at,omitempty"`
-	ErrorCode          string    `json:"error_code,omitempty"`
-	HostServiceVersion string    `json:"host_service_version"`
-	Scope              string    `json:"scope"`
-	UpdateVersion      string    `json:"update_version,omitempty"`
-	UpdateRollbacks    uint64    `json:"update_rollbacks"`
-	UpdateHealth       string    `json:"update_health"`
+	Schema                   string    `json:"schema"`
+	Status                   string    `json:"status"`
+	DesiredMode              string    `json:"desired_mode"`
+	DesiredVersion           int64     `json:"desired_version"`
+	ObservedMode             string    `json:"observed_mode,omitempty"`
+	ObservedVersion          int64     `json:"observed_version,omitempty"`
+	ObservedAt               time.Time `json:"observed_at,omitempty"`
+	ErrorCode                string    `json:"error_code,omitempty"`
+	HostServiceVersion       string    `json:"host_service_version"`
+	Scope                    string    `json:"scope"`
+	UpdateVersion            string    `json:"update_version,omitempty"`
+	UpdateRollbacks          uint64    `json:"update_rollbacks"`
+	UpdateHealth             string    `json:"update_health"`
+	AuthorizedKeysReconciled bool      `json:"authorized_keys_reconciled,omitempty"`
+	AuthorizedKeysChanged    bool      `json:"authorized_keys_changed,omitempty"`
 }
 type State struct {
 	Schema          string    `json:"schema"`
@@ -78,6 +83,9 @@ type UpdateDiagnostics interface {
 	RollbackCount() uint64
 	UpdateHealth() string
 }
+type AuthorizedKeysReconciler interface {
+	ReconcileAuthorizedKeys(context.Context, []string) (bool, error)
+}
 type Config struct {
 	SocketPath        string
 	StatePath         string
@@ -89,6 +97,7 @@ type Config struct {
 	Version           string
 	Updates           UpdateActivator
 	UpdateDiagnostics UpdateDiagnostics
+	AuthorizedKeys    AuthorizedKeysReconciler
 	Ready             func() error
 	Heartbeat         func() error
 	HeartbeatInterval time.Duration
@@ -122,7 +131,7 @@ func (s *Server) Run(ctx context.Context) error {
 			return err
 		}
 	}
-	listener, err := winio.ListenPipe(s.config.SocketPath, &winio.PipeConfig{SecurityDescriptor: hostServiceSecurityDescriptor(s.config.SID), InputBufferSize: 16 << 10, OutputBufferSize: 16 << 10})
+	listener, err := winio.ListenPipe(s.config.SocketPath, &winio.PipeConfig{SecurityDescriptor: hostServiceSecurityDescriptor(s.config.SID), InputBufferSize: windowsHostServiceMaxRequestSize, OutputBufferSize: 16 << 10})
 	if err != nil {
 		return err
 	}
@@ -148,9 +157,9 @@ func (s *Server) Run(ctx context.Context) error {
 
 func (s *Server) serve(connection net.Conn) error {
 	_ = connection.SetDeadline(time.Now().Add(5 * time.Second))
-	reader := bufio.NewReaderSize(io.LimitReader(connection, (16<<10)+1), (16<<10)+1)
+	reader := bufio.NewReaderSize(io.LimitReader(connection, windowsHostServiceMaxRequestSize+1), windowsHostServiceMaxRequestSize+1)
 	body, err := reader.ReadBytes('\n')
-	if err != nil || len(body) == 0 || len(body) > 16<<10 {
+	if err != nil || len(body) == 0 || len(body) > windowsHostServiceMaxRequestSize {
 		return s.respond(connection, s.errorResponse("invalid_request"))
 	}
 	decoder := json.NewDecoder(bytes.NewReader(body))
@@ -164,7 +173,7 @@ func (s *Server) serve(connection net.Conn) error {
 		return s.respond(connection, s.errorResponse("invalid_request"))
 	}
 	if request.Operation == "diagnostics" {
-		if request.Mode != "" || request.Version != 0 || request.Artifact != nil {
+		if request.Mode != "" || request.Version != 0 || request.Artifact != nil || request.AuthorizedKeys != nil {
 			return s.respond(connection, s.errorResponse("invalid_request"))
 		}
 		s.mu.Lock()
@@ -173,7 +182,7 @@ func (s *Server) serve(connection net.Conn) error {
 		return s.respond(connection, s.response(current))
 	}
 	if request.Operation == "activate_update" {
-		if request.Mode != "" || request.Version != 0 || request.Artifact == nil || s.config.Updates == nil {
+		if request.Mode != "" || request.Version != 0 || request.Artifact == nil || request.AuthorizedKeys != nil || s.config.Updates == nil {
 			return s.respond(connection, s.errorResponse("invalid_request"))
 		}
 		version, activateErr := s.config.Updates.Activate(context.Background(), *request.Artifact)
@@ -184,7 +193,22 @@ func (s *Server) serve(connection net.Conn) error {
 		response.UpdateVersion = version
 		return s.respond(connection, response)
 	}
-	if request.Operation != "apply_availability" || request.Artifact != nil || !validMode(request.Mode) || request.Version < 0 {
+	if request.Operation == "reconcile_ssh_authorized_keys" {
+		if request.Mode != "" || request.Version != 0 || request.Artifact != nil || request.AuthorizedKeys == nil || len(*request.AuthorizedKeys) > maxAuthorizedKeys || s.config.AuthorizedKeys == nil {
+			return s.respond(connection, s.errorResponse("invalid_request"))
+		}
+		reconcileCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		changed, reconcileErr := s.config.AuthorizedKeys.ReconcileAuthorizedKeys(reconcileCtx, append([]string(nil), (*request.AuthorizedKeys)...))
+		cancel()
+		if reconcileErr != nil {
+			return s.respond(connection, s.errorResponse("ssh_authorized_keys_reconcile_failed"))
+		}
+		response := s.errorResponse("")
+		response.AuthorizedKeysReconciled = true
+		response.AuthorizedKeysChanged = changed
+		return s.respond(connection, response)
+	}
+	if request.Operation != "apply_availability" || request.Artifact != nil || request.AuthorizedKeys != nil || !validMode(request.Mode) || request.Version < 0 {
 		return s.respond(connection, s.errorResponse("invalid_request"))
 	}
 	s.mu.Lock()

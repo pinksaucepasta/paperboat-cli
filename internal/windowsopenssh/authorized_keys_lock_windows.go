@@ -3,6 +3,7 @@
 package windowsopenssh
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -12,7 +13,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-func lockAuthorizedKeys(stateRoot string) (func(), error) {
+func lockAuthorizedKeys(ctx context.Context, stateRoot string) (func(), error) {
 	sum := sha256.Sum256([]byte(strings.ToLower(stateRoot)))
 	name, err := windows.UTF16PtrFromString("Local\\PaperboatOpenSSHAuthorizedKeys-" + hex.EncodeToString(sum[:16]))
 	if err != nil {
@@ -22,10 +23,30 @@ func lockAuthorizedKeys(stateRoot string) (func(), error) {
 	if err != nil {
 		return nil, err
 	}
-	state, waitErr := windows.WaitForSingleObject(handle, uint32((30*time.Second)/time.Millisecond))
-	if waitErr != nil || state != windows.WAIT_OBJECT_0 && state != windows.WAIT_ABANDONED {
-		windows.CloseHandle(handle)
-		return nil, errors.Join(ErrQualificationEnrollment, waitErr)
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if err := ctx.Err(); err != nil {
+			windows.CloseHandle(handle)
+			return nil, err
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			windows.CloseHandle(handle)
+			return nil, ErrQualificationEnrollment
+		}
+		wait := min(remaining, 50*time.Millisecond)
+		state, waitErr := windows.WaitForSingleObject(handle, uint32(wait/time.Millisecond))
+		if waitErr != nil {
+			windows.CloseHandle(handle)
+			return nil, errors.Join(ErrQualificationEnrollment, waitErr)
+		}
+		if state == windows.WAIT_OBJECT_0 || state == windows.WAIT_ABANDONED {
+			break
+		}
+		if state != uint32(windows.WAIT_TIMEOUT) {
+			windows.CloseHandle(handle)
+			return nil, ErrQualificationEnrollment
+		}
 	}
 	return func() {
 		_ = windows.ReleaseMutex(handle)

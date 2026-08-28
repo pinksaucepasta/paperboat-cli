@@ -135,6 +135,11 @@ func runWindowsHostdService(install hostinstall.WindowsRuntimeConfig) error {
 				cancelSidecars()
 				return service.PrivilegedSidecar{}, err
 			}
+			authorizedKeys, err := hostservice.NewWindowsAuthorizedKeys()
+			if err != nil {
+				cancelSidecars()
+				return service.PrivilegedSidecar{}, err
+			}
 			availability, err := hostservice.New(hostservice.Config{
 				SocketPath:        hostservice.DefaultSocketPath(),
 				StatePath:         filepath.Join(hostinstall.WindowsProgramDataRoot(), "availability-policy.json"),
@@ -142,6 +147,7 @@ func runWindowsHostdService(install hostinstall.WindowsRuntimeConfig) error {
 				Applier:           hostservice.NewPlatformApplier(filepath.Join(hostinstall.WindowsProgramDataRoot(), "power-baseline.json")),
 				Version:           buildinfo.Version,
 				UpdateDiagnostics: updateDiagnostics,
+				AuthorizedKeys:    authorizedKeys,
 				Ready: func() error {
 					close(availabilityReady)
 					return nil

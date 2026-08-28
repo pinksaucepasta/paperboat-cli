@@ -27,7 +27,35 @@ func NewClient(socketPath string, timeout time.Duration) (*Client, error) {
 	return &Client{socketPath: socketPath, timeout: timeout}, nil
 }
 func DefaultSocketPath() string { return defaultSocketPath }
+
+func (c *Client) ReconcileAuthorizedKeys(ctx context.Context, keys []string) (bool, error) {
+	if len(keys) > maxAuthorizedKeys {
+		return false, ErrInvalidRequest
+	}
+	requestKeys := make([]string, len(keys))
+	copy(requestKeys, keys)
+	response, err := c.call(ctx, Request{Schema: ProtocolV1, Operation: "reconcile_ssh_authorized_keys", AuthorizedKeys: &requestKeys})
+	if err != nil {
+		return false, err
+	}
+	if !response.AuthorizedKeysReconciled || response.UpdateVersion != "" {
+		return false, ErrInvalidRequest
+	}
+	return response.AuthorizedKeysChanged, nil
+}
+
 func (c *Client) Activate(ctx context.Context, artifact bootstrap.ArtifactTarget) (string, error) {
+	response, err := c.call(ctx, Request{Schema: ProtocolV1, Operation: "activate_update", Artifact: &artifact})
+	if err != nil {
+		return "", err
+	}
+	if response.UpdateVersion == "" || response.UpdateVersion != artifact.Version || response.AuthorizedKeysReconciled || response.AuthorizedKeysChanged {
+		return "", ErrInvalidRequest
+	}
+	return response.UpdateVersion, nil
+}
+
+func (c *Client) call(ctx context.Context, request Request) (Response, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -35,7 +63,7 @@ func (c *Client) Activate(ctx context.Context, artifact bootstrap.ArtifactTarget
 	defer cancel()
 	connection, err := winio.DialPipeContext(dialCtx, c.socketPath)
 	if err != nil {
-		return "", err
+		return Response{}, err
 	}
 	defer connection.Close()
 	deadline := time.Now().Add(c.timeout)
@@ -43,21 +71,27 @@ func (c *Client) Activate(ctx context.Context, artifact bootstrap.ArtifactTarget
 		deadline = limit
 	}
 	_ = connection.SetDeadline(deadline)
-	if err := json.NewEncoder(connection).Encode(Request{Schema: ProtocolV1, Operation: "activate_update", Artifact: &artifact}); err != nil {
-		return "", err
+	body, err := json.Marshal(request)
+	if err != nil || len(body)+1 > windowsHostServiceMaxRequestSize {
+		return Response{}, errors.Join(ErrInvalidRequest, err)
+	}
+	body = append(body, '\n')
+	written, err := connection.Write(body)
+	if err != nil {
+		return Response{}, err
+	}
+	if written != len(body) {
+		return Response{}, io.ErrShortWrite
 	}
 	decoder := json.NewDecoder(io.LimitReader(connection, 16<<10))
 	decoder.DisallowUnknownFields()
 	var response Response
 	var extra any
 	if decoder.Decode(&response) != nil || decoder.Decode(&extra) != io.EOF || response.Schema != ProtocolV1 || response.Scope != "system" || response.HostServiceVersion == "" {
-		return "", ErrInvalidRequest
+		return Response{}, ErrInvalidRequest
 	}
 	if response.ErrorCode != "" {
-		return "", errors.New(response.ErrorCode)
+		return Response{}, errors.New(response.ErrorCode)
 	}
-	if response.UpdateVersion == "" || response.UpdateVersion != artifact.Version {
-		return "", ErrInvalidRequest
-	}
-	return response.UpdateVersion, nil
+	return response, nil
 }

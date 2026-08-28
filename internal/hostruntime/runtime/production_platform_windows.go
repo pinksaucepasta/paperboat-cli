@@ -17,7 +17,6 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/availability"
 	runtimeidentity "github.com/pinksaucepasta/paperboat/internal/hostruntime/identity"
 	"github.com/pinksaucepasta/paperboat/internal/managedssh"
-	"github.com/pinksaucepasta/paperboat/internal/windowsopenssh"
 	"golang.org/x/sys/windows"
 )
 
@@ -121,7 +120,7 @@ func productionManagedSSH(ctx context.Context, controlURL string, transport http
 		keys.Keys = nil
 	}
 	sshStateRoot := filepath.Join(programData, "Paperboat", "ssh")
-	if _, err := windowsopenssh.ReconcileAuthorizedKeys(sshStateRoot, keys.Keys); err != nil {
+	if _, err := reconcilePlatformAuthorizedKeys(sshStateRoot, 0, keys.Keys); err != nil {
 		return nil, nil, err
 	}
 	return host, &managedSSHKeyReconciler{client: client, identity: identity, registration: registration, workerGeneration: generation, setID: setID, publicKeys: publicKeys, home: sshStateRoot, interval: 30 * time.Second, timeout: 10 * time.Second}, nil

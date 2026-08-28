@@ -243,7 +243,7 @@ func enrollEphemeralAuthorizedKey(path string, keyLine []byte) (*authorizedKeysE
 		return nil, errors.Join(ErrQualificationEnrollment, err)
 	}
 	stateRoot := filepath.Dir(filepath.Dir(path))
-	unlock, err := lockAuthorizedKeys(stateRoot)
+	unlock, err := lockAuthorizedKeys(context.Background(), stateRoot)
 	if err != nil {
 		return nil, errors.Join(ErrQualificationEnrollment, err)
 	}

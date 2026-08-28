@@ -31,7 +31,12 @@ func ExecuteHostService(ctx context.Context, args []string, stderr io.Writer) in
 		return 1
 	}
 	applier := hostservice.NewPlatformApplier(filepath.Join(hostinstall.WindowsProgramDataRoot(), "power-baseline.json"))
-	server, err := hostservice.New(hostservice.Config{SocketPath: hostservice.DefaultSocketPath(), StatePath: filepath.Join(hostinstall.WindowsProgramDataRoot(), "availability-policy.json"), SID: config.OwnerSID, Applier: applier, Version: buildinfo.Version})
+	authorizedKeys, err := hostservice.NewWindowsAuthorizedKeys()
+	if err != nil {
+		fmt.Fprintln(stderr, "pb:", err)
+		return 1
+	}
+	server, err := hostservice.New(hostservice.Config{SocketPath: hostservice.DefaultSocketPath(), StatePath: filepath.Join(hostinstall.WindowsProgramDataRoot(), "availability-policy.json"), SID: config.OwnerSID, Applier: applier, Version: buildinfo.Version, AuthorizedKeys: authorizedKeys})
 	if err != nil {
 		fmt.Fprintln(stderr, "pb:", err)
 		return 1

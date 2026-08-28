@@ -2,6 +2,7 @@ package windowsopenssh
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -15,10 +16,17 @@ import (
 // ReconcileAuthorizedKeys atomically replaces only PaperboatSshd's dedicated
 // authorization file. It never reads or writes a user's .ssh directory.
 func ReconcileAuthorizedKeys(stateRoot string, publicKeys []string) (bool, error) {
-	if !filepath.IsAbs(stateRoot) || filepath.Clean(stateRoot) != stateRoot || len(publicKeys) > 256 {
+	return ReconcileAuthorizedKeysContext(context.Background(), stateRoot, publicKeys)
+}
+
+func ReconcileAuthorizedKeysContext(ctx context.Context, stateRoot string, publicKeys []string) (bool, error) {
+	if ctx == nil || !filepath.IsAbs(stateRoot) || filepath.Clean(stateRoot) != stateRoot || len(publicKeys) > 256 {
 		return false, ErrInvalidConfig
 	}
-	unlock, err := lockAuthorizedKeys(stateRoot)
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	unlock, err := lockAuthorizedKeys(ctx, stateRoot)
 	if err != nil {
 		return false, err
 	}
@@ -53,6 +61,9 @@ func ReconcileAuthorizedKeys(stateRoot string, publicKeys []string) (bool, error
 	}
 	if bytes.Equal(existing, body) {
 		return false, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
 	}
 	if err := atomicfile.Write(path, body, atomicfile.Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1}); err != nil {
 		return false, err
