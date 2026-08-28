@@ -25,6 +25,7 @@ var runWindowsTaskCommand = defaultWindowsTaskCommand
 var startWindowsDetachedDaemon = defaultStartWindowsDetachedDaemon
 var readWindowsDaemonPIDLock = defaultReadWindowsDaemonPIDLock
 var openWindowsDaemonProcess = defaultOpenWindowsDaemonProcess
+var windowsDaemonLayout = hostruntimeservice.DefaultLayout
 
 var errUnsafeWindowsDaemonProcess = errors.New("unsafe Windows local daemon process identity")
 
@@ -271,7 +272,19 @@ func windowsDaemonLockHeld(path string) (bool, error) {
 
 func validateOwnedWindowsDaemon(identity windowsDaemonProcessIdentity, lock windowsDaemonPIDLock, ownerSID string) error {
 	record := lock.Record
-	executable, digest, err := normalizedWindowsDaemonIdentity(identity.Executable, identity.Arguments)
+	executable := identity.Executable
+	if !strings.EqualFold(filepath.Clean(executable), record.Executable) {
+		layout, layoutErr := windowsDaemonLayout("windows")
+		if layoutErr != nil || !strings.EqualFold(record.Executable, layout.Binary) || !strings.EqualFold(filepath.Clean(executable), layout.BinaryRollback) {
+			return errUnsafeWindowsDaemonProcess
+		}
+		// Windows keeps the image path of a running process attached to the
+		// file after an atomic stable-to-rollback rename. The command line and
+		// owner record still name the stable launcher, so validate that exact
+		// recorded identity while accepting only the canonical rollback slot.
+		executable = record.Executable
+	}
+	executable, digest, err := normalizedWindowsDaemonIdentity(executable, identity.Arguments)
 	if err != nil || identity.PID == 0 || identity.PID != record.PID || !strings.EqualFold(identity.OwnerSID, ownerSID) || identity.CreationTime.IsZero() || identity.CreationTime.UnixNano() != record.CreationTimeUnixNano || executable != record.Executable || digest != record.ArgumentsSHA256 {
 		return errUnsafeWindowsDaemonProcess
 	}

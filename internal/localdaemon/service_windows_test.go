@@ -279,6 +279,50 @@ func TestValidateOwnedWindowsDaemonRejectsForeignSIDPathCommandAndPIDReuse(t *te
 	}
 }
 
+func TestValidateOwnedWindowsDaemonAcceptsCanonicalRollbackRename(t *testing.T) {
+	root := t.TempDir()
+	layout := hostruntimeservice.Layout{
+		InstallRoot:    root,
+		Binary:         filepath.Join(root, "bin", "pb.exe"),
+		ReleasesRoot:   filepath.Join(root, "releases"),
+		BinaryRollback: filepath.Join(root, "releases", "pb.rollback.exe"),
+	}
+	previousLayout := windowsDaemonLayout
+	windowsDaemonLayout = func(string) (hostruntimeservice.Layout, error) { return layout, nil }
+	t.Cleanup(func() { windowsDaemonLayout = previousLayout })
+	for _, path := range []string{layout.Binary, layout.BinaryRollback} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("fixture"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	identity := windowsDaemonProcessIdentity{
+		PID:          43,
+		OwnerSID:     "S-1-5-21-100",
+		Executable:   layout.Binary,
+		Arguments:    []string{layout.Binary, "__local-daemon", "--server", "https://api.example.test"},
+		CreationTime: time.Now().UTC(),
+	}
+	record := testWindowsDaemonLock(t, identity)
+	identity.Executable = layout.BinaryRollback
+	if err := validateOwnedWindowsDaemon(identity, record, identity.OwnerSID); err != nil {
+		t.Fatalf("canonical rollback rename rejected: %v", err)
+	}
+
+	identity.Executable = filepath.Join(layout.ReleasesRoot, "arbitrary.exe")
+	if err := validateOwnedWindowsDaemon(identity, record, identity.OwnerSID); !errors.Is(err, errUnsafeWindowsDaemonProcess) {
+		t.Fatalf("arbitrary release path error = %v", err)
+	}
+
+	record.Record.Executable = strings.ToLower(filepath.Join(layout.ReleasesRoot, "other.exe"))
+	identity.Executable = layout.BinaryRollback
+	if err := validateOwnedWindowsDaemon(identity, record, identity.OwnerSID); !errors.Is(err, errUnsafeWindowsDaemonProcess) {
+		t.Fatalf("rollback with non-stable owner record error = %v", err)
+	}
+}
+
 func TestStopOwnedWindowsDaemonChecksCanceledContextBeforeTermination(t *testing.T) {
 	previousRead := readWindowsDaemonPIDLock
 	t.Cleanup(func() { readWindowsDaemonPIDLock = previousRead })
