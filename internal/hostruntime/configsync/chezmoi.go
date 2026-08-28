@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/pinksaucepasta/paperboat/internal/processlaunch"
+
 	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
 )
 
@@ -184,6 +186,7 @@ func canonicalAbsolutePath(path string) bool {
 
 func runChezmoi(ctx context.Context, binary string, arguments ...string) error {
 	command := exec.CommandContext(ctx, binary, arguments...)
+	processlaunch.ConfigureBackground(command)
 	command.Env = append(os.Environ(), "CHEZMOI_NO_PAGER=1")
 	if _, err := command.CombinedOutput(); err != nil {
 		return fmt.Errorf("%w: chezmoi operation failed", ErrConfigRepositoryInvalid)

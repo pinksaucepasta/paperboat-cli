@@ -71,13 +71,16 @@ func WindowsOwnerServiceRunning(lockPath, ownerSID string) (bool, error) {
 	return windowsOwnerServiceRunning(lockPath, ownerSID)
 }
 
-// StopWindowsOwnerService ends the fixed scheduled task and terminates only
-// the exact SID-bound daemon process recorded in lockPath.
+// StopWindowsOwnerService stops the dedicated SCM service when installed,
+// ends the legacy scheduled task for pre-migration installations, and
+// terminates only the exact SID-bound daemon process recorded in lockPath.
 func StopWindowsOwnerService(ctx context.Context, lockPath, ownerSID string) error {
 	return stopWindowsOwnerService(ctx, lockPath, ownerSID)
 }
 
-// StartWindowsOwnerService starts the enrolled user's fixed scheduled task.
+// StartWindowsOwnerService starts the dedicated SCM service. Older installs
+// temporarily fall back to their fixed scheduled task until migration has
+// completed.
 func StartWindowsOwnerService(ctx context.Context, ownerSID string) error {
 	return startWindowsOwnerService(ctx, ownerSID)
 }

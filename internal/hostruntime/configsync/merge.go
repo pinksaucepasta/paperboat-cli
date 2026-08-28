@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"unicode/utf8"
+
+	"github.com/pinksaucepasta/paperboat/internal/processlaunch"
 )
 
 var ErrTextMergeConflict = errors.New("config text merge is not clean")
@@ -30,6 +32,7 @@ func mergeRegularText(ctx context.Context, gitBinary string, base, local, remote
 	}
 	output := &boundedMergeBuffer{limit: maxBytes}
 	command := exec.CommandContext(ctx, gitBinary, "merge-file", "-p", "-q", paths[0], paths[1], paths[2])
+	processlaunch.ConfigureBackground(command)
 	command.Stdout = output
 	command.Stderr = &boundedMergeBuffer{limit: 64 << 10}
 	err = command.Run()

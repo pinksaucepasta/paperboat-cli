@@ -52,6 +52,10 @@ func (b *recordingWindowsActivationBackend) CommitCLI(_ context.Context, j windo
 func (b *recordingWindowsActivationBackend) Quarantine(context.Context, windowsActivationJournal) error {
 	return b.event("quarantine")
 }
+func (b *recordingWindowsActivationBackend) FinalizeServices(_ context.Context, _ windowsActivationJournal) error {
+	b.startedLocalDaemon = true
+	return b.event("finalize")
+}
 
 func testWindowsActivationJournal() windowsActivationJournal {
 	c := windowsActivationComponent{Path: `C:\Paperboat\candidate.exe`, SHA256: strings.Repeat("a", 64), Length: 1}
@@ -66,7 +70,7 @@ func TestWindowsActivationCommitsCLIOnlyAfterHealth(t *testing.T) {
 	if err != nil || result.Stage != windowsActivationCommitted {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
-	want := []string{"journal:switching", "stop", "activate", "targets:C:\\Program Files\\Paperboat\\bin\\pb.exe", "start", "journal:services_live", "health", "cli:", "journal:committed"}
+	want := []string{"journal:switching", "stop", "activate", "targets:C:\\Program Files\\Paperboat\\bin\\pb.exe", "start", "journal:services_live", "health", "cli:", "journal:committed", "finalize"}
 	if !reflect.DeepEqual(b.events, want) {
 		t.Fatalf("events=%q want=%q", b.events, want)
 	}

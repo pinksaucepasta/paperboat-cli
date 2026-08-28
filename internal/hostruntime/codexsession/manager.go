@@ -14,6 +14,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pinksaucepasta/paperboat/internal/processlaunch"
+
 	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
 )
 
@@ -95,6 +97,7 @@ func New(config Config) (*Manager, error) {
 	if config.Command == nil {
 		config.Command = func(ctx context.Context, name string, args ...string) Command {
 			cmd := exec.CommandContext(ctx, name, args...)
+			processlaunch.ConfigureBackground(cmd)
 			cmd.Env = append([]string(nil), config.Environment...)
 			return &execCommand{Cmd: cmd}
 		}
@@ -399,6 +402,7 @@ func writeDescriptor(dir string, d Descriptor) error {
 }
 func codexVersion(ctx context.Context, path string, env []string) (string, error) {
 	cmd := exec.CommandContext(ctx, path, "--version")
+	processlaunch.ConfigureBackground(cmd)
 	cmd.Env = env
 	body, err := cmd.Output()
 	if err != nil {
@@ -416,6 +420,7 @@ func codexPreflight(ctx context.Context, path string, env []string) (string, err
 		return "", err
 	}
 	command := exec.CommandContext(ctx, path, "login", "status")
+	processlaunch.ConfigureBackground(command)
 	command.Env = env
 	if output, loginErr := command.CombinedOutput(); loginErr != nil {
 		return "", fmt.Errorf("Codex authentication is unavailable: %s", strings.TrimSpace(string(output)))

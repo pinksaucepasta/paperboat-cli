@@ -18,7 +18,10 @@ import (
 	"unsafe"
 
 	hostruntimeservice "github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
+	"github.com/pinksaucepasta/paperboat/internal/processlaunch"
 	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/svc"
+	"golang.org/x/sys/windows/svc/mgr"
 )
 
 var runWindowsTaskCommand = defaultWindowsTaskCommand
@@ -26,6 +29,9 @@ var startWindowsDetachedDaemon = defaultStartWindowsDetachedDaemon
 var readWindowsDaemonPIDLock = defaultReadWindowsDaemonPIDLock
 var openWindowsDaemonProcess = defaultOpenWindowsDaemonProcess
 var windowsDaemonLayout = hostruntimeservice.DefaultLayout
+var probeWindowsLocalDaemonService = defaultProbeWindowsLocalDaemonService
+var stopWindowsLocalDaemonService = defaultStopWindowsLocalDaemonService
+var startWindowsLocalDaemonService = defaultStartWindowsLocalDaemonService
 
 var errUnsafeWindowsDaemonProcess = errors.New("unsafe Windows local daemon process identity")
 
@@ -34,6 +40,8 @@ type windowsDaemonPIDLock struct {
 }
 
 const windowsDaemonOwnerSchema = "paperboat.windows-local-daemon-owner/v1"
+const windowsLocalDaemonServiceName = "PaperboatLocalDaemon"
+const windowsLocalDaemonServiceStopTimeout = 30 * time.Second
 
 type windowsDaemonOwnerRecord struct {
 	Schema               string `json:"schema"`
@@ -92,6 +100,84 @@ func installWindowsCurrentUserService(ctx context.Context, executable, configPat
 	return nil
 }
 
+// RemoveWindowsLegacyTask removes the pre-SCM ONLOGON task for exactly one
+// enrolled owner. The task name is derived from the SID, so callers never
+// accept a task name supplied by an untrusted request.
+func RemoveWindowsLegacyTask(ctx context.Context, ownerSID string) error {
+	if ctx == nil || !validWindowsOwnerSID(ownerSID) {
+		return ErrInvalidInventoryConfig
+	}
+	err := runWindowsTaskCommand(ctx, "/Delete", "/TN", windowsDaemonTaskName(ownerSID), "/F")
+	if isMissingWindowsTaskError(err) {
+		return nil
+	}
+	return err
+}
+
+// StopWindowsLegacyTask ends the exact pre-SCM task without deleting its
+// rollback registration.
+func StopWindowsLegacyTask(ctx context.Context, ownerSID string) error {
+	if ctx == nil || !validWindowsOwnerSID(ownerSID) {
+		return ErrInvalidInventoryConfig
+	}
+	err := runWindowsTaskCommand(ctx, "/End", "/TN", windowsDaemonTaskName(ownerSID))
+	if isMissingWindowsTaskError(err) || isWindowsTaskNotRunningError(err) {
+		return nil
+	}
+	return err
+}
+
+// RemoveWindowsLegacyService removes the legacy task and terminates its
+// owner-scoped process, if one is still present. It is used while migrating to
+// the LocalDaemon SCM service and deliberately does not touch the new service.
+func RemoveWindowsLegacyService(ctx context.Context, lockPath, ownerSID string) error {
+	if ctx == nil || !filepath.IsAbs(lockPath) || filepath.Clean(lockPath) != lockPath || !validWindowsOwnerSID(ownerSID) {
+		return ErrInvalidInventoryConfig
+	}
+	taskErr := RemoveWindowsLegacyTask(ctx, ownerSID)
+	stopErr := stopOwnedWindowsDaemon(ctx, lockPath, ownerSID, "")
+	return errors.Join(taskErr, stopErr)
+}
+
+// StopWindowsLegacyService stops the pre-SCM task and its exact owner process
+// without deleting the task. Install and update migrations retain that
+// rollback point until the replacement SCM service is running.
+func StopWindowsLegacyService(ctx context.Context, lockPath, ownerSID string) error {
+	if ctx == nil || !filepath.IsAbs(lockPath) || filepath.Clean(lockPath) != lockPath || !validWindowsOwnerSID(ownerSID) {
+		return ErrInvalidInventoryConfig
+	}
+	taskErr := StopWindowsLegacyTask(ctx, ownerSID)
+	return errors.Join(taskErr, stopOwnedWindowsDaemon(ctx, lockPath, ownerSID, ""))
+}
+
+// WindowsLocalDaemonServiceInstalled reports whether the dedicated SCM
+// service exists. It is used by migration to avoid terminating a process that
+// is already owned by the new service when a stale legacy task remains.
+func WindowsLocalDaemonServiceInstalled() (bool, error) {
+	return probeWindowsLocalDaemonService()
+}
+
+// WindowsLocalDaemonServiceRunning reports the authoritative SCM state. It is
+// independent of the child lock so an updater can stop a service that is still
+// starting and has not published its owner record yet.
+func WindowsLocalDaemonServiceRunning() (bool, error) {
+	manager, err := mgr.Connect()
+	if err != nil {
+		return false, err
+	}
+	defer manager.Disconnect()
+	item, err := manager.OpenService(windowsLocalDaemonServiceName)
+	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer item.Close()
+	status, err := item.Query()
+	return err == nil && status.State != svc.Stopped, err
+}
+
 // resolveWindowsDaemonExecutable binds the persistent task to the stable MSI
 // launcher instead of the mutable cli-current payload. Major upgrades and
 // updater slot rotation may replace the payload, but the launcher path remains
@@ -136,16 +222,14 @@ func removeWindowsCurrentUserService(ctx context.Context, executable string) err
 	if err != nil {
 		return err
 	}
-	taskErr := runWindowsTaskCommand(ctx, "/Delete", "/TN", windowsDaemonTaskName(ownerSID), "/F")
-	if isMissingWindowsTaskError(taskErr) {
-		taskErr = nil
-	}
+	serviceErr := stopWindowsLocalDaemonService(ctx)
+	taskErr := RemoveWindowsLegacyTask(ctx, ownerSID)
 	paths, pathsErr := CurrentUserPaths()
 	if pathsErr != nil {
-		return errors.Join(taskErr, pathsErr)
+		return errors.Join(serviceErr, taskErr, pathsErr)
 	}
 	stopErr := stopOwnedWindowsDaemon(ctx, paths.LockPath, ownerSID, executable)
-	return errors.Join(taskErr, stopErr)
+	return errors.Join(serviceErr, taskErr, stopErr)
 }
 
 func stopOwnedWindowsDaemon(ctx context.Context, lockPath, ownerSID, _ string) error {
@@ -211,18 +295,115 @@ func stopWindowsOwnerService(ctx context.Context, lockPath, ownerSID string) err
 	if ctx == nil || !filepath.IsAbs(lockPath) || filepath.Clean(lockPath) != lockPath || ownerSID == "" {
 		return ErrInvalidInventoryConfig
 	}
-	taskErr := runWindowsTaskCommand(ctx, "/End", "/TN", windowsDaemonTaskName(ownerSID))
-	if isMissingWindowsTaskError(taskErr) || isWindowsTaskNotRunningError(taskErr) {
-		taskErr = nil
+	installed, probeErr := probeWindowsLocalDaemonService()
+	serviceErr := stopWindowsLocalDaemonService(ctx)
+	var taskErr error
+	if !installed && probeErr == nil {
+		taskErr = StopWindowsLegacyTask(ctx, ownerSID)
 	}
-	return errors.Join(taskErr, stopOwnedWindowsDaemon(ctx, lockPath, ownerSID, ""))
+	return errors.Join(probeErr, serviceErr, taskErr, stopOwnedWindowsDaemon(ctx, lockPath, ownerSID, ""))
 }
 
 func startWindowsOwnerService(ctx context.Context, ownerSID string) error {
-	if ctx == nil || ownerSID == "" {
+	if ctx == nil || !validWindowsOwnerSID(ownerSID) {
 		return ErrInvalidInventoryConfig
 	}
-	return runWindowsTaskCommand(ctx, "/Run", "/TN", windowsDaemonTaskName(ownerSID))
+	if err := startWindowsLocalDaemonService(ctx); err != nil {
+		if !errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+			return err
+		}
+		// Keep pre-migration updates recoverable. Once the new service is
+		// installed, all normal starts use SCM and never reach this branch.
+		return runWindowsTaskCommand(ctx, "/Run", "/TN", windowsDaemonTaskName(ownerSID))
+	}
+	return nil
+}
+
+func validWindowsOwnerSID(ownerSID string) bool {
+	sid, err := windows.StringToSid(ownerSID)
+	return err == nil && sid != nil && sid.IsValid()
+}
+
+func defaultProbeWindowsLocalDaemonService() (bool, error) {
+	manager, err := mgr.Connect()
+	if err != nil {
+		return false, err
+	}
+	defer manager.Disconnect()
+	item, err := manager.OpenService(windowsLocalDaemonServiceName)
+	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, item.Close()
+}
+
+func defaultStartWindowsLocalDaemonService(ctx context.Context) error {
+	if ctx == nil {
+		return ErrInvalidInventoryConfig
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	manager, err := mgr.Connect()
+	if err != nil {
+		return err
+	}
+	defer manager.Disconnect()
+	item, err := manager.OpenService(windowsLocalDaemonServiceName)
+	if err != nil {
+		return err
+	}
+	defer item.Close()
+	err = item.Start()
+	if errors.Is(err, windows.ERROR_SERVICE_ALREADY_RUNNING) || errors.Is(err, windows.ERROR_SERVICE_REQUEST_TIMEOUT) {
+		return nil
+	}
+	return err
+}
+
+func defaultStopWindowsLocalDaemonService(ctx context.Context) error {
+	if ctx == nil {
+		return ErrInvalidInventoryConfig
+	}
+	manager, err := mgr.Connect()
+	if err != nil {
+		return err
+	}
+	defer manager.Disconnect()
+	item, err := manager.OpenService(windowsLocalDaemonServiceName)
+	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer item.Close()
+	if _, err := item.Control(svc.Stop); err != nil && !errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE) {
+		return err
+	}
+	deadline := time.NewTimer(windowsLocalDaemonServiceStopTimeout)
+	defer deadline.Stop()
+	for {
+		status, err := item.Query()
+		if err != nil {
+			return err
+		}
+		if status.State == svc.Stopped {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return context.DeadlineExceeded
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }
 
 func defaultReadWindowsDaemonPIDLock(path, ownerSID string) (windowsDaemonPIDLock, error) {
@@ -596,6 +777,7 @@ func defaultWindowsTaskCommand(ctx context.Context, arguments ...string) error {
 		}
 	}
 	command := exec.CommandContext(ctx, executable, arguments...)
+	processlaunch.ConfigureBackground(command)
 	output, err := command.CombinedOutput()
 	if err != nil {
 		return &windowsTaskCommandError{err: err, output: redactTaskOutput(output)}

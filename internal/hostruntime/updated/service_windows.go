@@ -74,6 +74,25 @@ func RunWindows(ctx context.Context, config WindowsConfig) error {
 	} else if resumed {
 		return nil
 	}
+	// Repair the durable, silent LocalDaemon service before reporting updater
+	// readiness. Do not cross an active transaction's rollback boundary: the
+	// candidate activator finalizes this migration only after its journal is
+	// durably committed.
+	finalizeLocalDaemon := true
+	if journal, journalErr := loadWindowsActivationJournal(config); journalErr == nil {
+		finalizeLocalDaemon = journal.Stage == windowsActivationCommitted || journal.Stage == windowsActivationRolledBack
+	} else if !errors.Is(journalErr, os.ErrNotExist) {
+		return journalErr
+	}
+	persisted, err := hostinstall.LoadWindowsRuntimeConfig()
+	if err != nil {
+		return err
+	}
+	if finalizeLocalDaemon && persisted.Committed {
+		if err := hostinstall.EnsureWindowsLocalDaemonService(ctx); err != nil {
+			return err
+		}
+	}
 	state := struct {
 		Schema      string    `json:"schema"`
 		MachineID   string    `json:"machine_id"`

@@ -11,6 +11,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/pinksaucepasta/paperboat/internal/processlaunch"
 	winenv "github.com/pinksaucepasta/paperboat/internal/windowsenvironment"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
@@ -44,7 +45,7 @@ func (h *sshdServiceHandler) Execute(_ []string, requests <-chan svc.ChangeReque
 	if executable, executableErr := os.Executable(); executableErr == nil {
 		command.Env = winenv.WithCommandDirectory(os.Environ(), filepath.Dir(executable))
 	}
-	command.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NEW_PROCESS_GROUP}
+	processlaunch.ConfigureBackground(command)
 	job, err := windows.CreateJobObject(nil, nil)
 	if err != nil {
 		status <- svc.Status{State: svc.Stopped}

@@ -24,6 +24,7 @@ import (
 	hostruntime "github.com/pinksaucepasta/paperboat/internal/hostruntime/runtime"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntimeentry"
+	"github.com/pinksaucepasta/paperboat/internal/processlaunch"
 	"github.com/pinksaucepasta/paperboat/internal/windows/previewbroker"
 	"golang.org/x/sys/windows"
 )
@@ -505,6 +506,7 @@ type windowsRuntimeWorker struct {
 
 func startWindowsRuntimeWorker(ctx context.Context, executable, socket, tokenPath, workerID string) (*windowsRuntimeWorker, error) {
 	command := exec.CommandContext(ctx, executable, "__runtime-worker", "--socket", socket, "--token-file", tokenPath, "--worker-id", workerID, "--version", buildinfo.Version, "--api-min", "1", "--api-max", "1", "--wait-activation")
+	processlaunch.ConfigureBackground(command)
 	control, err := command.StdinPipe()
 	if err != nil {
 		return nil, err

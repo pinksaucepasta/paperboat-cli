@@ -20,6 +20,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pinksaucepasta/paperboat/internal/processlaunch"
+
 	"github.com/coder/websocket"
 	"github.com/pinksaucepasta/paperboat/internal/api"
 	"golang.org/x/term"
@@ -252,6 +254,7 @@ func ValidateForwardedArgs(args []string) error {
 }
 func version(ctx context.Context, path string) (string, error) {
 	command := exec.CommandContext(ctx, path, "--version")
+	processlaunch.ConfigureBackground(command)
 	body, err := command.Output()
 	if err != nil {
 		return "", err

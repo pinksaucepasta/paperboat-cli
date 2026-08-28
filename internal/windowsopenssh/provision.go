@@ -12,6 +12,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/pinksaucepasta/paperboat/internal/processlaunch"
 )
 
 const (
@@ -40,6 +42,7 @@ type CommandRunner struct{}
 
 func (CommandRunner) Run(ctx context.Context, name string, arguments ...string) ([]byte, error) {
 	command := exec.CommandContext(ctx, name, arguments...)
+	processlaunch.ConfigureBackground(command)
 	// Keep stdout and stderr on distinct OS handles. Windows OpenSSH and
 	// PowerShell attach stream semantics to those handles; merging them at the
 	// process boundary can make an otherwise successful remote command report a

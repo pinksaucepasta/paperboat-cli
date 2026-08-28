@@ -16,6 +16,7 @@ import (
 	"unsafe"
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/pty"
+	"github.com/pinksaucepasta/paperboat/internal/processlaunch"
 	"golang.org/x/sys/windows"
 )
 
@@ -57,6 +58,7 @@ func (p *pipeProcess) Start(context.Context) error {
 	// Start suspended so the process cannot exit or create descendants before
 	// Paperboat assigns it to the kill-on-close Job Object.
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: windows.CREATE_SUSPENDED}
+	processlaunch.ConfigureBackground(cmd)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err

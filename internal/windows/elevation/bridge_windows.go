@@ -1223,10 +1223,14 @@ func createProcessForRun(executable, parameters, directory string) (windows.Hand
 	if err != nil {
 		return 0, err
 	}
-	var startup windows.StartupInfo
-	startup.Cb = uint32(unsafe.Sizeof(startup))
+	startup := windows.StartupInfo{
+		Cb:         uint32(unsafe.Sizeof(windows.StartupInfo{})),
+		Flags:      windows.STARTF_USESHOWWINDOW,
+		ShowWindow: windows.SW_HIDE,
+	}
 	var process windows.ProcessInformation
-	if err := windows.CreateProcess(nil, commandLine, nil, nil, false, 0, nil, workingDirectory, &startup, &process); err != nil {
+	flags := uint32(windows.CREATE_NO_WINDOW | windows.CREATE_NEW_PROCESS_GROUP)
+	if err := windows.CreateProcess(nil, commandLine, nil, nil, false, flags, nil, workingDirectory, &startup, &process); err != nil {
 		return 0, err
 	}
 	_ = windows.CloseHandle(process.Thread)

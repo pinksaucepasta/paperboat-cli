@@ -384,6 +384,8 @@ func renderWindowsService(config Config) ([]byte, error) {
 		description = "Paperboat stable host supervisor"
 	} else if config.Kind == UpdaterKind {
 		description = "Paperboat signed update service"
+	} else if config.Kind == DaemonKind {
+		description = "Paperboat local daemon"
 	}
 	definition := windowsServiceDefinition{
 		Schema: "paperboat.windows-service/v1", Name: name,
@@ -438,7 +440,7 @@ func (WindowsController) Apply(ctx context.Context, definitionPath string, upgra
 			// user workload, so workloads never run as SYSTEM.
 			ServiceStartName: "LocalSystem",
 		}
-		if definition.Name == "PaperboatHostd" || definition.Name == "PaperboatUpdated" {
+		if definition.Name == "PaperboatHostd" || definition.Name == "PaperboatUpdated" || definition.Name == "PaperboatLocalDaemon" {
 			config.SidType = windows.SERVICE_SID_TYPE_UNRESTRICTED
 		}
 		service, err = manager.CreateService(definition.Name, definition.Executable, config, definition.Arguments...)
@@ -464,7 +466,7 @@ func (WindowsController) Apply(ctx context.Context, definitionPath string, upgra
 		current.StartType = mgr.StartAutomatic
 		current.ErrorControl = mgr.ErrorNormal
 		current.ServiceStartName = "LocalSystem"
-		if definition.Name == "PaperboatHostd" || definition.Name == "PaperboatUpdated" {
+		if definition.Name == "PaperboatHostd" || definition.Name == "PaperboatUpdated" || definition.Name == "PaperboatLocalDaemon" {
 			current.SidType = windows.SERVICE_SID_TYPE_UNRESTRICTED
 		}
 		if err := service.UpdateConfig(current); err != nil {
@@ -476,7 +478,7 @@ func (WindowsController) Apply(ctx context.Context, definitionPath string, upgra
 			}
 		}
 	}
-	if definition.Name == "PaperboatHostd" || definition.Name == "PaperboatUpdated" || isWindowsPreviewServiceName(definition.Name) {
+	if definition.Name == "PaperboatHostd" || definition.Name == "PaperboatUpdated" || definition.Name == "PaperboatLocalDaemon" || isWindowsPreviewServiceName(definition.Name) {
 		// Owner-scoped workloads run behind a privileged token bridge. If the
 		// enrolled owner logs off or the child fails, SCM retries the bridge with
 		// bounded backoff instead of leaving a LocalSystem workload behind or
@@ -492,7 +494,7 @@ func (WindowsController) Apply(ctx context.Context, definitionPath string, upgra
 			return err
 		}
 	}
-	if definition.Name == "PaperboatHostd" || definition.Name == "PaperboatUpdated" {
+	if definition.Name == "PaperboatHostd" || definition.Name == "PaperboatUpdated" || definition.Name == "PaperboatLocalDaemon" {
 		installed, configErr := service.Config()
 		wantPath := windows.ComposeCommandLine(append([]string{definition.Executable}, definition.Arguments...))
 		validIdentity := configErr == nil && strings.EqualFold(installed.BinaryPathName, wantPath) && strings.EqualFold(installed.ServiceStartName, "LocalSystem") && installed.StartType == mgr.StartAutomatic && installed.ErrorControl == mgr.ErrorNormal

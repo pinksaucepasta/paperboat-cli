@@ -580,12 +580,12 @@ func launchEnrolledProcess(config ServiceEntryConfig) (result *enrolledProcess, 
 	if err != nil {
 		return nil, err
 	}
-	startup := windows.StartupInfo{Cb: uint32(unsafe.Sizeof(windows.StartupInfo{}))}
+	startup := enrolledProcessStartupInfo()
 	var processInfo windows.ProcessInformation
 	// The process must not execute before its kill-on-close job owns it. In
 	// particular, a fast process could otherwise create grandchildren between
 	// CreateProcessAsUser and AssignProcessToJobObject.
-	flags := uint32(windows.CREATE_UNICODE_ENVIRONMENT | windows.CREATE_NEW_PROCESS_GROUP | windows.CREATE_SUSPENDED)
+	flags := enrolledProcessCreationFlags()
 	if err := windows.CreateProcessAsUser(primary, nil, &command[0], nil, nil, false, flags, &environment[0], workingDirectoryUTF16, &startup, &processInfo); err != nil {
 		return nil, err
 	}
@@ -605,6 +605,18 @@ func launchEnrolledProcess(config ServiceEntryConfig) (result *enrolledProcess, 
 	result = &enrolledProcess{process: processInfo.Process, job: job, sessionID: sessionID, profile: profile}
 	profile = nil
 	return result, nil
+}
+
+func enrolledProcessStartupInfo() windows.StartupInfo {
+	return windows.StartupInfo{
+		Cb:         uint32(unsafe.Sizeof(windows.StartupInfo{})),
+		Flags:      windows.STARTF_USESHOWWINDOW,
+		ShowWindow: windows.SW_HIDE,
+	}
+}
+
+func enrolledProcessCreationFlags() uint32 {
+	return windows.CREATE_UNICODE_ENVIRONMENT | windows.CREATE_NEW_PROCESS_GROUP | windows.CREATE_NO_WINDOW | windows.CREATE_SUSPENDED
 }
 
 func cleanFailedEnrolledLaunch(info windows.ProcessInformation, job windows.Handle) error {

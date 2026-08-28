@@ -10,6 +10,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/pinksaucepasta/paperboat/internal/processlaunch"
 )
 
 var ErrInvalid = errors.New("native executable signature verification failed")
@@ -24,7 +26,9 @@ type Runner interface {
 type CommandRunner struct{}
 
 func (CommandRunner) Run(ctx context.Context, name string, arguments ...string) ([]byte, error) {
-	return exec.CommandContext(ctx, name, arguments...).CombinedOutput()
+	command := exec.CommandContext(ctx, name, arguments...)
+	processlaunch.ConfigureBackground(command)
+	return command.CombinedOutput()
 }
 
 // Verifier performs the native checks for a staged target. Linux targets have

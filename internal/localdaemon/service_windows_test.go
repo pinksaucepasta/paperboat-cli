@@ -142,8 +142,12 @@ func TestWindowsOwnerServiceLifecycleUsesFixedTaskAndExactProcess(t *testing.T) 
 	record := testWindowsDaemonLock(t, identity)
 	process := &fakeWindowsDaemonProcess{identity: identity}
 	previousRead, previousOpen, previousTask := readWindowsDaemonPIDLock, openWindowsDaemonProcess, runWindowsTaskCommand
+	previousStopService, previousStartService := stopWindowsLocalDaemonService, startWindowsLocalDaemonService
+	previousProbeService := probeWindowsLocalDaemonService
 	t.Cleanup(func() {
 		readWindowsDaemonPIDLock, openWindowsDaemonProcess, runWindowsTaskCommand = previousRead, previousOpen, previousTask
+		stopWindowsLocalDaemonService, startWindowsLocalDaemonService = previousStopService, previousStartService
+		probeWindowsLocalDaemonService = previousProbeService
 	})
 	readWindowsDaemonPIDLock = func(string, string) (windowsDaemonPIDLock, error) { return record, nil }
 	openWindowsDaemonProcess = func(uint32) (windowsDaemonProcess, error) { return process, nil }
@@ -152,6 +156,9 @@ func TestWindowsOwnerServiceLifecycleUsesFixedTaskAndExactProcess(t *testing.T) 
 		calls = append(calls, append([]string(nil), arguments...))
 		return nil
 	}
+	stopWindowsLocalDaemonService = func(context.Context) error { return nil }
+	startWindowsLocalDaemonService = func(context.Context) error { return windows.ERROR_SERVICE_DOES_NOT_EXIST }
+	probeWindowsLocalDaemonService = func() (bool, error) { return false, nil }
 	lockPath := filepath.Join(t.TempDir(), "daemon.lock")
 	running, err := windowsOwnerServiceRunning(lockPath, identity.OwnerSID)
 	if err != nil || !running {
@@ -358,10 +365,13 @@ func TestRemoveWindowsCurrentUserServiceIgnoresMissingTaskAndStaleLock(t *testin
 	if err := os.WriteFile(executable, []byte("fixture"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	previousTask, previousRead := runWindowsTaskCommand, readWindowsDaemonPIDLock
-	t.Cleanup(func() { runWindowsTaskCommand, readWindowsDaemonPIDLock = previousTask, previousRead })
+	previousTask, previousRead, previousStop := runWindowsTaskCommand, readWindowsDaemonPIDLock, stopWindowsLocalDaemonService
+	t.Cleanup(func() {
+		runWindowsTaskCommand, readWindowsDaemonPIDLock, stopWindowsLocalDaemonService = previousTask, previousRead, previousStop
+	})
 	runWindowsTaskCommand = func(context.Context, ...string) error { return errors.New("task does not exist") }
 	readWindowsDaemonPIDLock = func(string, string) (windowsDaemonPIDLock, error) { return windowsDaemonPIDLock{}, os.ErrNotExist }
+	stopWindowsLocalDaemonService = func(context.Context) error { return nil }
 	if err := removeWindowsCurrentUserService(context.Background(), executable); err != nil {
 		t.Fatal(err)
 	}

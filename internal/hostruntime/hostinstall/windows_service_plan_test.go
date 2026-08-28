@@ -14,10 +14,10 @@ func TestWindowsRuntimeServicesUseCanonicalBinary(t *testing.T) {
 		t.Fatal(err)
 	}
 	definitions := windowsRuntimeServiceDefinitions(layout)
-	if len(definitions) != 2 {
+	if len(definitions) != 3 {
 		t.Fatalf("definitions=%+v", definitions)
 	}
-	if definitions[0].kind != service.HostdKind || definitions[1].kind != service.UpdaterKind {
+	if definitions[0].kind != service.HostdKind || definitions[1].kind != service.DaemonKind || definitions[2].kind != service.UpdaterKind {
 		t.Fatalf("service order=%+v", definitions)
 	}
 	for _, definition := range definitions {
@@ -25,7 +25,7 @@ func TestWindowsRuntimeServicesUseCanonicalBinary(t *testing.T) {
 			t.Fatalf("service %q executable=%q want=%q", definition.kind, definition.executable, layout.Binary)
 		}
 	}
-	if !reflect.DeepEqual(definitions[0].arguments, []string{"__runtime-hostd"}) || !reflect.DeepEqual(definitions[1].arguments, []string{"__runtime-updated"}) {
+	if !reflect.DeepEqual(definitions[0].arguments, []string{"__runtime-hostd"}) || !reflect.DeepEqual(definitions[1].arguments, []string{"__runtime-local-daemon"}) || !reflect.DeepEqual(definitions[2].arguments, []string{"__runtime-updated"}) {
 		t.Fatalf("definitions=%+v", definitions)
 	}
 }

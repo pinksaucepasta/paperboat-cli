@@ -57,6 +57,7 @@ type windowsActivationBackend interface {
 	VerifyHealth(context.Context, windowsActivationJournal) error
 	CommitCLI(context.Context, windowsActivationJournal) error
 	Quarantine(context.Context, windowsActivationJournal) error
+	FinalizeServices(context.Context, windowsActivationJournal) error
 }
 
 func executeWindowsActivation(ctx context.Context, backend windowsActivationBackend, journal windowsActivationJournal) (result windowsActivationJournal, err error) {
@@ -64,6 +65,9 @@ func executeWindowsActivation(ctx context.Context, backend windowsActivationBack
 		return journal, errInvalidWindowsActivation
 	}
 	if journal.Stage == windowsActivationCommitted || journal.Stage == windowsActivationRolledBack {
+		if journal.Stage == windowsActivationCommitted {
+			return journal, backend.FinalizeServices(ctx, journal)
+		}
 		return journal, nil
 	}
 	if journal.Stage == windowsActivationRollbackReady {
@@ -88,7 +92,10 @@ func executeWindowsActivation(ctx context.Context, backend windowsActivationBack
 	if err = backend.SetServiceTargets(ctx, journal.NewHostd, journal.NewUpdater, journal.NewSSH); err != nil {
 		return rollbackWindowsActivation(ctx, backend, journal, err)
 	}
-	if err = backend.StartServices(ctx, true, true, journal.NewSSH.WasRunning, journal.LocalDaemonWasRunning); err != nil {
+	// The legacy LocalDaemon task is intentionally kept stopped during the
+	// reversible portion of activation. After the new binary is committed,
+	// FinalizeServices installs the silent SCM replacement and removes the task.
+	if err = backend.StartServices(ctx, true, true, journal.NewSSH.WasRunning, false); err != nil {
 		return rollbackWindowsActivation(ctx, backend, journal, err)
 	}
 	journal.Stage = windowsActivationServicesLive
@@ -107,7 +114,7 @@ func executeWindowsActivation(ctx context.Context, backend windowsActivationBack
 		// must still restore both services and the previous CLI pointer.
 		return rollbackWindowsActivation(ctx, backend, journal, err)
 	}
-	return journal, nil
+	return journal, backend.FinalizeServices(ctx, journal)
 }
 
 func rollbackWindowsActivation(ctx context.Context, backend windowsActivationBackend, journal windowsActivationJournal, cause error) (windowsActivationJournal, error) {

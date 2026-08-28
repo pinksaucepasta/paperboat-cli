@@ -122,6 +122,11 @@ func stageWindowsActivation(ctx context.Context, config WindowsConfig, release w
 	if err != nil {
 		return windowsActivationJournal{}, err
 	}
+	localDaemonServiceRunning, err := localdaemon.WindowsLocalDaemonServiceRunning()
+	if err != nil {
+		return windowsActivationJournal{}, err
+	}
+	localDaemonWasRunning = localDaemonWasRunning || localDaemonServiceRunning
 	previousBinary, err := describeWindowsActivationComponent(layout.Binary, config.Architecture)
 	if err != nil {
 		return windowsActivationJournal{}, err
@@ -581,14 +586,15 @@ func windowsLocalDaemonLockPath() (string, error) {
 
 func (b *windowsSCMActivationBackend) StopServices(ctx context.Context, localDaemonWasRunning bool) error {
 	serviceErr := stopNamedWindowsServices(ctx, windowsActivationServiceNames(b.config.SetupMode)...)
-	if !localDaemonWasRunning {
-		return serviceErr
-	}
 	lockPath, err := windowsLocalDaemonLockPath()
 	if err != nil {
 		return errors.Join(serviceErr, err)
 	}
-	return errors.Join(serviceErr, localdaemon.StopWindowsOwnerService(ctx, lockPath, b.config.OwnerSID))
+	stopErr := localdaemon.StopWindowsOwnerService(ctx, lockPath, b.config.OwnerSID)
+	if !localDaemonWasRunning && errors.Is(stopErr, os.ErrNotExist) {
+		stopErr = nil
+	}
+	return errors.Join(serviceErr, stopErr)
 }
 
 func windowsStableBinaryDACL(ownerSID string) string {
@@ -820,6 +826,13 @@ func (b *windowsSCMActivationBackend) StartServices(ctx context.Context, hostd, 
 		return localdaemon.StartWindowsOwnerService(ctx, b.config.OwnerSID)
 	}
 	return nil
+}
+
+func (b *windowsSCMActivationBackend) FinalizeServices(ctx context.Context, journal windowsActivationJournal) error {
+	if journal.Stage != windowsActivationCommitted {
+		return errInvalidWindowsActivation
+	}
+	return hostinstall.EnsureWindowsLocalDaemonService(ctx)
 }
 func (b *windowsSCMActivationBackend) VerifyHealth(ctx context.Context, journal windowsActivationJournal) error {
 	if err := requireNamedWindowsServicesRunning(windowsHostdService, windowsUpdaterService); err != nil {

@@ -29,6 +29,8 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/nativesignature"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/releaseindex"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
+	"github.com/pinksaucepasta/paperboat/internal/localdaemon"
+	"github.com/pinksaucepasta/paperboat/internal/processlaunch"
 	winenv "github.com/pinksaucepasta/paperboat/internal/windowsenvironment"
 	"github.com/pinksaucepasta/paperboat/internal/windowsopenssh"
 	"github.com/pinksaucepasta/paperboat/internal/windowssecurity"
@@ -403,6 +405,105 @@ func windowsOpenSSHConfig(layout service.Layout, ownerSID string) windowsopenssh
 	return config
 }
 
+func windowsLocalDaemonLockPath(stateRoot string) (string, error) {
+	if !safeAbsolute(stateRoot) {
+		return "", ErrInvalidRequest
+	}
+	return filepath.Join(filepath.Dir(stateRoot), "state", "daemon.lock"), nil
+}
+
+func waitWindowsLocalDaemonReady(ctx context.Context, ownerSID, stateRoot string) error {
+	lockPath, err := windowsLocalDaemonLockPath(stateRoot)
+	if err != nil {
+		return err
+	}
+	deadline := time.NewTimer(30 * time.Second)
+	defer deadline.Stop()
+	tick := time.NewTicker(200 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		running, probeErr := localdaemon.WindowsOwnerServiceRunning(lockPath, ownerSID)
+		if probeErr == nil && running {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return errors.Join(probeErr, ctx.Err())
+		case <-deadline.C:
+			return errors.Join(probeErr, errors.New("Paperboat local daemon service did not become ready"))
+		case <-tick.C:
+		}
+	}
+}
+
+// prepareWindowsLocalDaemonMigration stops the exact owner-scoped ONLOGON task
+// and its process without deleting the task. The task remains the rollback
+// point until the replacement SCM service has started successfully.
+func prepareWindowsLocalDaemonMigration(ctx context.Context, ownerSID, stateRoot string) error {
+	lockPath, err := windowsLocalDaemonLockPath(stateRoot)
+	if err != nil {
+		return err
+	}
+	if err := localdaemon.StopWindowsLegacyTask(ctx, ownerSID); err != nil {
+		return err
+	}
+	installed, err := localdaemon.WindowsLocalDaemonServiceInstalled()
+	if err != nil {
+		return err
+	}
+	running, err := localdaemon.WindowsLocalDaemonServiceRunning()
+	if err != nil {
+		return err
+	}
+	if installed && running {
+		return nil
+	}
+	return localdaemon.StopWindowsLegacyService(ctx, lockPath, ownerSID)
+}
+
+// EnsureWindowsLocalDaemonService upgrades an existing Windows installation
+// from the owner-scoped scheduled task to the protected LocalDaemon SCM
+// service. It is idempotent and is also called by the updater so an in-place
+// upgrade from a pre-SCM release cannot leave the task behind.
+func EnsureWindowsLocalDaemonService(ctx context.Context) error {
+	if !isAdministrator() {
+		return ErrNotPrivileged
+	}
+	config, err := LoadWindowsRuntimeConfig()
+	if err != nil {
+		return err
+	}
+	layout, err := service.DefaultLayout("windows")
+	if err != nil {
+		return err
+	}
+	if err := prepareWindowsLocalDaemonMigration(ctx, config.OwnerSID, config.StateRoot); err != nil {
+		return fmt.Errorf("migrate Paperboat local daemon task: %w", err)
+	}
+	lockPath, err := windowsLocalDaemonLockPath(config.StateRoot)
+	if err != nil {
+		return err
+	}
+	if running, probeErr := localdaemon.WindowsOwnerServiceRunning(lockPath, config.OwnerSID); probeErr == nil && running {
+		return localdaemon.RemoveWindowsLegacyTask(ctx, config.OwnerSID)
+	}
+	installer, err := service.New(service.Config{
+		Platform: "windows", Kind: service.DaemonKind, ConfigRoot: WindowsProgramDataRoot(),
+		Executable: layout.Binary, User: "Paperboat", Group: "Paperboat",
+		Arguments: []string{"__runtime-local-daemon"}, Controller: service.WindowsController{},
+	})
+	if err != nil {
+		return err
+	}
+	if err := installer.Install(ctx); err != nil {
+		return err
+	}
+	if err := waitWindowsLocalDaemonReady(ctx, config.OwnerSID, config.StateRoot); err != nil {
+		return err
+	}
+	return localdaemon.RemoveWindowsLegacyTask(ctx, config.OwnerSID)
+}
+
 // removeWindowsSSHBeforeActivation releases the old runtime image before any
 // slot rotation. The service is removed only after its ownership check passes.
 // Client completes its Paperboat-owned SSH state cleanup after its new runtime
@@ -452,7 +553,7 @@ func windowsRuntimeServiceExists() bool {
 		return true
 	}
 	defer manager.Disconnect()
-	for _, name := range []string{"PaperboatHostd", "PaperboatUpdated"} {
+	for _, name := range []string{"PaperboatHostd", "PaperboatUpdated", "PaperboatLocalDaemon"} {
 		current, err := manager.OpenService(name)
 		if err == nil {
 			current.Close()
@@ -471,7 +572,7 @@ func stopWindowsRuntimeServices(ctx context.Context) error {
 		return err
 	}
 	defer manager.Disconnect()
-	for _, name := range []string{"PaperboatHostd", "PaperboatUpdated"} {
+	for _, name := range []string{"PaperboatHostd", "PaperboatUpdated", "PaperboatLocalDaemon"} {
 		current, openErr := manager.OpenService(name)
 		if errors.Is(openErr, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
 			continue
@@ -518,7 +619,13 @@ func Uninstall(ctx context.Context, request Request) error {
 	if err != nil {
 		return err
 	}
-	return errors.Join(uninstallWindows(ctx, false), removePaperboatSSHState(ctx, windowsOpenSSHConfig(layout, request.OwnerSID)))
+	runtimeErr := uninstallWindows(ctx, false)
+	lockPath, lockErr := windowsLocalDaemonLockPath(request.StateRoot)
+	legacyErr := lockErr
+	if lockErr == nil {
+		legacyErr = localdaemon.RemoveWindowsLegacyService(ctx, lockPath, request.OwnerSID)
+	}
+	return errors.Join(runtimeErr, legacyErr, removePaperboatSSHState(ctx, windowsOpenSSHConfig(layout, request.OwnerSID)))
 }
 
 func UninstallPersisted(ctx context.Context) error {
@@ -533,7 +640,13 @@ func UninstallPersisted(ctx context.Context) error {
 	if layoutErr != nil {
 		return layoutErr
 	}
-	return errors.Join(uninstallWindows(ctx, false), removePaperboatSSHState(ctx, windowsOpenSSHConfig(layout, config.OwnerSID)))
+	runtimeErr := uninstallWindows(ctx, false)
+	lockPath, lockErr := windowsLocalDaemonLockPath(config.StateRoot)
+	legacyErr := lockErr
+	if lockErr == nil {
+		legacyErr = localdaemon.RemoveWindowsLegacyService(ctx, lockPath, config.OwnerSID)
+	}
+	return errors.Join(runtimeErr, legacyErr, removePaperboatSSHState(ctx, windowsOpenSSHConfig(layout, config.OwnerSID)))
 }
 
 // Repair restores the persisted Windows runtime and its role-scoped OpenSSH
@@ -560,7 +673,7 @@ func Repair(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	request := Request{SetupMode: config.SetupMode, OwnerSID: config.OwnerSID}
+	request := Request{SetupMode: config.SetupMode, OwnerSID: config.OwnerSID, StateRoot: config.StateRoot}
 	if err := removeWindowsSSHBeforeActivation(ctx, request, layout); err != nil {
 		return err
 	}
@@ -594,7 +707,7 @@ func reconcileWindowsRepairVersion(ctx context.Context, config WindowsRuntimeCon
 		return config, err
 	}
 	defer manager.Disconnect()
-	for _, item := range []struct{ name, argument string }{{"PaperboatHostd", "__runtime-hostd"}, {"PaperboatUpdated", "__runtime-updated"}} {
+	for _, item := range []struct{ name, argument string }{{"PaperboatHostd", "__runtime-hostd"}, {"PaperboatUpdated", "__runtime-updated"}, {"PaperboatLocalDaemon", "__runtime-local-daemon"}} {
 		registered, err := manager.OpenService(item.name)
 		if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
 			return config, nil
@@ -629,6 +742,10 @@ func Purge(ctx context.Context) error {
 		return ErrNotPrivileged
 	}
 	layout, layoutErr := service.DefaultLayout("windows")
+	persisted, persistedErr := LoadWindowsRuntimeConfig()
+	if errors.Is(persistedErr, os.ErrNotExist) {
+		persistedErr = nil
+	}
 	var result error
 	if layoutErr != nil {
 		result = errors.Join(result, layoutErr)
@@ -657,6 +774,13 @@ func Purge(ctx context.Context) error {
 	// dashboard install fails halfway through cleanup.
 	result = errors.Join(result, terminatePaperboatProcesses(ctx))
 	result = errors.Join(result, uninstallWindows(ctx, true))
+	if persistedErr == nil && persisted.OwnerSID != "" {
+		if lockPath, lockErr := windowsLocalDaemonLockPath(persisted.StateRoot); lockErr != nil {
+			result = errors.Join(result, lockErr)
+		} else {
+			result = errors.Join(result, localdaemon.RemoveWindowsLegacyService(ctx, lockPath, persisted.OwnerSID))
+		}
+	}
 	return result
 }
 
@@ -669,6 +793,7 @@ func terminatePaperboatProcesses(ctx context.Context) error {
 	// command exits before the new enrollment can complete.
 	script := fmt.Sprintf(`$self=%d; Get-CimInstance Win32_Process -Filter "Name = 'pb.exe'" | Where-Object { $_.ProcessId -ne $self } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop }`, os.Getpid())
 	command := exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script)
+	processlaunch.ConfigureBackground(command)
 	if output, err := command.CombinedOutput(); err != nil {
 		message := strings.TrimSpace(string(output))
 		if message != "" {
@@ -688,6 +813,7 @@ func terminateStaleWindowsRuntimeProcesses(ctx context.Context) error {
 	// commit rotates the installed slot.
 	const script = `$ErrorActionPreference = 'Stop'; Get-CimInstance Win32_Process -Filter "Name = 'pb.exe'" | Where-Object { $_.CommandLine -match '__(runtime-(hostd|worker|updated)|windows-sshd-service)' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop }`
 	command := exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script)
+	processlaunch.ConfigureBackground(command)
 	if output, err := command.CombinedOutput(); err != nil {
 		message := strings.TrimSpace(string(output))
 		if len(message) > 2048 {
@@ -716,6 +842,7 @@ func uninstallWindows(ctx context.Context, purge bool) error {
 	}{
 		{service.HostdKind, runtimeCurrent, []string{"__runtime-hostd"}},
 		{service.UpdaterKind, runtimeCurrent, []string{"__runtime-updated"}},
+		{service.DaemonKind, runtimeCurrent, []string{"__runtime-local-daemon"}},
 	} {
 		installer, makeErr := service.New(service.Config{Platform: "windows", Kind: item.kind, ConfigRoot: WindowsProgramDataRoot(), Executable: item.executable, User: "Paperboat", Group: "Paperboat", Arguments: item.args, Controller: service.WindowsController{}})
 		if makeErr == nil {
@@ -749,10 +876,14 @@ func uninstallWindows(ctx context.Context, purge bool) error {
 }
 
 func serviceNameForKind(kind string) string {
-	if kind == service.UpdaterKind {
+	switch kind {
+	case service.UpdaterKind:
 		return "PaperboatUpdated"
+	case service.DaemonKind:
+		return "PaperboatLocalDaemon"
+	default:
+		return "PaperboatHostd"
 	}
-	return "PaperboatHostd"
 }
 
 func removeOrphanWindowsService(ctx context.Context, name, executable string, args []string) error {
@@ -848,9 +979,20 @@ func installWindowsServices(ctx context.Context, layout service.Layout, upgradeM
 }
 
 func installWindowsRoleServices(ctx context.Context, request Request, layout service.Layout, upgradeMode string) error {
+	if err := prepareWindowsLocalDaemonMigration(ctx, request.OwnerSID, request.StateRoot); err != nil {
+		return fmt.Errorf("migrate Paperboat local daemon task: %w", err)
+	}
 	return executeWindowsServiceInstallPlan(request.SetupMode,
 		func() error { return installWindowsSSHAfterActivation(ctx, request, layout) },
-		func() error { return installWindowsServices(ctx, layout, upgradeMode) },
+		func() error {
+			if err := installWindowsServices(ctx, layout, upgradeMode); err != nil {
+				return err
+			}
+			if err := waitWindowsLocalDaemonReady(ctx, request.OwnerSID, request.StateRoot); err != nil {
+				return err
+			}
+			return localdaemon.RemoveWindowsLegacyTask(ctx, request.OwnerSID)
+		},
 		func() error { return removePaperboatSSHState(ctx, windowsOpenSSHConfig(layout, request.OwnerSID)) },
 	)
 }

@@ -18,6 +18,7 @@ type windowsRuntimeServiceDefinition struct {
 func windowsRuntimeServiceDefinitions(layout service.Layout) []windowsRuntimeServiceDefinition {
 	return []windowsRuntimeServiceDefinition{
 		{kind: service.HostdKind, executable: layout.Binary, arguments: []string{"__runtime-hostd"}},
+		{kind: service.DaemonKind, executable: layout.Binary, arguments: []string{"__runtime-local-daemon"}},
 		{kind: service.UpdaterKind, executable: layout.Binary, arguments: []string{"__runtime-updated"}},
 	}
 }

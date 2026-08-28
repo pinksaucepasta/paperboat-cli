@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/pinksaucepasta/paperboat/internal/processlaunch"
 )
 
 type Runner interface {
@@ -29,6 +31,7 @@ func (ExecRunner) Run(ctx context.Context, name string, arguments ...string) err
 func (ExecRunner) Output(ctx context.Context, name string, arguments ...string) (string, error) {
 	output := &boundedCommandOutput{limit: 8 << 10}
 	command := exec.CommandContext(ctx, name, arguments...)
+	processlaunch.ConfigureBackground(command)
 	command.Stdout, command.Stderr = output, output
 	if err := command.Run(); err != nil {
 		return output.String(), &CommandError{Tool: name, Output: output.String(), Cause: err}

@@ -420,6 +420,16 @@ func activatorRuntimeCommand() *cobra.Command {
 	}, SilenceUsage: true, SilenceErrors: true}
 }
 
+func localDaemonRuntimeCommand() *cobra.Command {
+	return &cobra.Command{Use: "__runtime-local-daemon", Hidden: true, DisableFlagParsing: true, RunE: func(command *cobra.Command, args []string) error {
+		code := hostruntimecmd.Execute(command.Context(), append([]string{"local-daemon-service"}, args...), command.InOrStdin(), command.OutOrStdout(), command.ErrOrStderr())
+		if code != 0 {
+			return exitCodeError{code: code}
+		}
+		return nil
+	}, SilenceUsage: true, SilenceErrors: true}
+}
+
 func windowsSSHDServiceCommand() *cobra.Command {
 	command := &cobra.Command{
 		Use:    "__windows-sshd-service",
@@ -3013,6 +3023,7 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(runtimeWorkerCommand())
 	root.AddCommand(updatedRuntimeCommand())
 	root.AddCommand(activatorRuntimeCommand())
+	root.AddCommand(localDaemonRuntimeCommand())
 	root.AddCommand(windowsSSHDServiceCommand())
 	root.AddCommand(localDaemonCommand())
 	root.AddCommand(statusCommand())
@@ -6161,16 +6172,7 @@ func drainPendingRevocations(ctx context.Context, issuer string, store config.Pr
 	return errors.Join(errs...)
 }
 
-var openBrowser = func(target string) error {
-	var cmd *exec.Cmd
-	switch runtime.GOOS {
-	case "darwin":
-		cmd = exec.Command("open", target)
-	default:
-		cmd = exec.Command("xdg-open", target)
-	}
-	return cmd.Start()
-}
+var openBrowser = platformOpenBrowser
 
 func backendClient(c *command.Context) (*api.Client, error) {
 	d, err := buildDeps(c)
