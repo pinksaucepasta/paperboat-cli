@@ -690,6 +690,11 @@ func Uninstall(ctx context.Context, request Request) error {
 	if err := Validate(request, 0); err != nil {
 		return err
 	}
+	unlock, err := lockWindowsLocalDaemonMigration(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	layout, err := service.DefaultLayout("windows")
 	if err != nil {
 		return err
@@ -707,6 +712,11 @@ func UninstallPersisted(ctx context.Context) error {
 	if !isAdministrator() {
 		return ErrNotPrivileged
 	}
+	unlock, err := lockWindowsLocalDaemonMigration(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	config, err := LoadWindowsRuntimeConfig()
 	if err != nil {
 		return err
@@ -821,6 +831,11 @@ func Purge(ctx context.Context) error {
 	if !isAdministrator() {
 		return ErrNotPrivileged
 	}
+	unlock, err := lockWindowsLocalDaemonMigration(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	layout, layoutErr := service.DefaultLayout("windows")
 	persisted, persistedErr := LoadWindowsRuntimeConfig()
 	if errors.Is(persistedErr, os.ErrNotExist) {
