@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -112,6 +113,96 @@ func (function roundTripFunc) RoundTrip(request *http.Request) (*http.Response, 
 	return function(request)
 }
 
+type transientArtifactError struct{}
+
+func (transientArtifactError) Error() string   { return "temporary TLS handshake timeout" }
+func (transientArtifactError) Timeout() bool   { return true }
+func (transientArtifactError) Temporary() bool { return true }
+
+func TestArtifactRetryTransportRetriesTransientGET(t *testing.T) {
+	calls := 0
+	transport := &artifactRetryTransport{base: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		calls++
+		if request.Method != http.MethodGet {
+			t.Fatalf("method=%s", request.Method)
+		}
+		if calls < 3 {
+			return nil, transientArtifactError{}
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Header: make(http.Header), Request: request}, nil
+	}), delays: []time.Duration{0, 0}}
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://get.pprbt.dev/metadata/timestamp.json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := transport.RoundTrip(request)
+	if err != nil || response.StatusCode != http.StatusOK || calls != 3 {
+		t.Fatalf("response=%v calls=%d err=%v", response, calls, err)
+	}
+}
+
+func TestArtifactRetryTransportRetriesDialDeadlineWhileRequestIsLive(t *testing.T) {
+	calls := 0
+	transport := &artifactRetryTransport{base: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		calls++
+		if calls == 1 {
+			return nil, &net.OpError{Op: "dial", Net: "tcp", Err: os.ErrDeadlineExceeded}
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Header: make(http.Header), Request: request}, nil
+	}), delays: []time.Duration{0}}
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://get.pprbt.dev/metadata/timestamp.json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := transport.RoundTrip(request)
+	if err != nil || response.StatusCode != http.StatusOK || calls != 2 {
+		t.Fatalf("response=%v calls=%d err=%v", response, calls, err)
+	}
+}
+
+func TestArtifactRetryTransportDoesNotRetryWritesOrPermanentTLSFailures(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		method string
+		err    error
+	}{
+		{name: "write", method: http.MethodPost, err: transientArtifactError{}},
+		{name: "certificate", method: http.MethodGet, err: errors.New("x509: certificate signed by unknown authority")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			transport := &artifactRetryTransport{base: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				calls++
+				return nil, test.err
+			}), delays: []time.Duration{0, 0}}
+			request, err := http.NewRequestWithContext(context.Background(), test.method, "https://get.pprbt.dev/metadata/timestamp.json", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := transport.RoundTrip(request); !errors.Is(err, test.err) || calls != 1 {
+				t.Fatalf("calls=%d err=%v", calls, err)
+			}
+		})
+	}
+}
+
+func TestArtifactRetryTransportStopsWhenRequestIsCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	calls := 0
+	transport := &artifactRetryTransport{base: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls++
+		cancel()
+		return nil, transientArtifactError{}
+	}), delays: []time.Duration{time.Hour}}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://get.pprbt.dev/metadata/timestamp.json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := transport.RoundTrip(request); !errors.Is(err, context.Canceled) || calls != 1 {
+		t.Fatalf("calls=%d err=%v", calls, err)
+	}
+}
+
 func (r testTUFRepository) server(t *testing.T) *httptest.Server {
 	t.Helper()
 	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -161,6 +252,39 @@ func TestFetchVerifiedArtifactThroughTUF(t *testing.T) {
 	}
 	if err := secureArtifactFile(path); err != nil {
 		t.Fatalf("artifact security error=%v", err)
+	}
+}
+
+func TestFetchVerifiedArtifactRetriesTransientMetadataAndAssetConnections(t *testing.T) {
+	body := []byte("verified pb binary")
+	repository := newTestTUFRepository(t, body, "2026.08.28.1", time.Now().UTC().Add(time.Hour))
+	server := repository.server(t)
+	defer server.Close()
+	client := server.Client()
+	base := client.Transport
+	calls := map[string]int{}
+	client.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		key := ""
+		switch {
+		case request.URL.Path == "/metadata/timestamp.json":
+			key = "metadata"
+		case request.URL.Hostname() == "github.com":
+			key = "asset"
+		}
+		if key != "" {
+			calls[key]++
+			if calls[key] == 1 {
+				return nil, transientArtifactError{}
+			}
+		}
+		return base.RoundTrip(request)
+	})
+	path, err := fetchVerifiedArtifact(context.Background(), descriptor(server.URL, "2026.08.28.1"), filepath.Join(t.TempDir(), "tuf"), client, repository.root, runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(path); err != nil || string(got) != string(body) || calls["metadata"] != 2 || calls["asset"] != 2 {
+		t.Fatalf("artifact=%q metadata_calls=%d asset_calls=%d err=%v", got, calls["metadata"], calls["asset"], err)
 	}
 }
 

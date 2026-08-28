@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/releaseindex"
+	"github.com/pinksaucepasta/paperboat/internal/httptransport"
 	"github.com/theupdateframework/go-tuf/v2/metadata/config"
 	"github.com/theupdateframework/go-tuf/v2/metadata/updater"
 )
@@ -427,6 +429,13 @@ func secureArtifactHTTPClient(base *http.Client, origin string) *http.Client {
 	if result.Timeout <= 0 {
 		result.Timeout = 2 * time.Minute
 	}
+	transport := result.Transport
+	if transport == nil {
+		transport = httptransport.Default()
+	}
+	if _, alreadyRetrying := transport.(*artifactRetryTransport); !alreadyRetrying {
+		result.Transport = &artifactRetryTransport{base: transport, delays: []time.Duration{100 * time.Millisecond, 300 * time.Millisecond}}
+	}
 	previous := result.CheckRedirect
 	result.CheckRedirect = func(request *http.Request, via []*http.Request) error {
 		if len(via) >= 5 || parsedOrigin(request.URL.String()) != origin || request.URL.Scheme != "https" || request.URL.User != nil {
@@ -438,4 +447,50 @@ func secureArtifactHTTPClient(base *http.Client, origin string) *http.Client {
 		return nil
 	}
 	return result
+}
+
+// artifactRetryTransport retries only idempotent TUF metadata and artifact
+// GETs that failed before any response was received. The enclosing client
+// timeout and request context remain the hard deadline, while certificate,
+// policy, HTTP status, and response-body failures stay authoritative.
+type artifactRetryTransport struct {
+	base   http.RoundTripper
+	delays []time.Duration
+}
+
+func (t *artifactRetryTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if t == nil || t.base == nil || request == nil {
+		return nil, ErrArtifactTarget
+	}
+	retryableRequest := request.Method == http.MethodGet && (request.Body == nil || request.Body == http.NoBody)
+	for attempt := 0; ; attempt++ {
+		response, err := t.base.RoundTrip(request.Clone(request.Context()))
+		if contextErr := request.Context().Err(); contextErr != nil {
+			if response != nil && response.Body != nil {
+				_ = response.Body.Close()
+			}
+			return nil, contextErr
+		}
+		if err == nil || !retryableRequest || attempt >= len(t.delays) || !transientArtifactTransportError(request.Context(), err) {
+			return response, err
+		}
+		if response != nil && response.Body != nil {
+			_ = response.Body.Close()
+		}
+		timer := time.NewTimer(t.delays[attempt])
+		select {
+		case <-request.Context().Done():
+			timer.Stop()
+			return nil, request.Context().Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func transientArtifactTransportError(ctx context.Context, err error) bool {
+	if err == nil || ctx.Err() != nil || errors.Is(err, context.Canceled) {
+		return false
+	}
+	var networkError net.Error
+	return errors.As(err, &networkError) && (networkError.Timeout() || networkError.Temporary())
 }
