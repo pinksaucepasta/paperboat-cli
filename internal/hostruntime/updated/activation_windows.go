@@ -26,6 +26,7 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/workerupdate"
 	"github.com/pinksaucepasta/paperboat/internal/localdaemon"
+	"github.com/pinksaucepasta/paperboat/internal/windowsopenssh"
 	"github.com/pinksaucepasta/paperboat/internal/windowssecurity"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
@@ -501,8 +502,23 @@ func configureWindowsRecovery(item *mgr.Service) error {
 }
 
 func validateWindowsRecovery(item *mgr.Service) error {
+	return validateWindowsRecoveryActions(item, standardWindowsRecoveryActions())
+}
+
+func standardWindowsRecoveryActions() []mgr.RecoveryAction {
+	return []mgr.RecoveryAction{{Type: mgr.ServiceRestart, Delay: 5 * time.Second}, {Type: mgr.ServiceRestart, Delay: 15 * time.Second}, {Type: mgr.ServiceRestart, Delay: time.Minute}}
+}
+
+func windowsRecoveryActionsForService(name string) []mgr.RecoveryAction {
+	if name == windowsSSHService {
+		return windowsopenssh.ServiceRecoveryActions()
+	}
+	return standardWindowsRecoveryActions()
+}
+
+func validateWindowsRecoveryActions(item *mgr.Service, expected []mgr.RecoveryAction) error {
 	actions, err := item.RecoveryActions()
-	if err != nil || len(actions) != 3 || actions[0].Type != mgr.ServiceRestart || actions[0].Delay != 5*time.Second || actions[1].Type != mgr.ServiceRestart || actions[1].Delay != 15*time.Second || actions[2].Type != mgr.ServiceRestart || actions[2].Delay != time.Minute {
+	if err != nil || !windowsRecoveryActionsMatch(actions, expected) {
 		return errors.Join(errInvalidWindowsActivation, err)
 	}
 	nonCrash, err := item.RecoveryActionsOnNonCrashFailures()
@@ -510,6 +526,18 @@ func validateWindowsRecovery(item *mgr.Service) error {
 		return errors.Join(errInvalidWindowsActivation, err)
 	}
 	return nil
+}
+
+func windowsRecoveryActionsMatch(actual, expected []mgr.RecoveryAction) bool {
+	if len(actual) != len(expected) {
+		return false
+	}
+	for index := range actual {
+		if actual[index] != expected[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func startWindowsActivatorService() error {
@@ -1054,7 +1082,7 @@ func setWindowsServiceTarget(name string, target windowsServiceTarget) error {
 	if err != nil || !strings.EqualFold(updated.BinaryPathName, config.BinaryPathName) || !validPrivilegedWindowsServiceConfig(updated, mgr.StartAutomatic, mgr.ErrorNormal) {
 		return errors.Join(errInvalidWindowsActivation, err)
 	}
-	return validateWindowsRecovery(item)
+	return validateWindowsRecoveryActions(item, windowsRecoveryActionsForService(name))
 }
 func stopNamedWindowsServices(ctx context.Context, names ...string) error {
 	manager, err := mgr.Connect()

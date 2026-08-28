@@ -20,6 +20,13 @@ var paperboatServiceRecovery = []mgr.RecoveryAction{
 	{Type: mgr.NoAction, Delay: 0},
 }
 
+// ServiceRecoveryActions returns the exact SCM recovery policy owned by the
+// Paperboat OpenSSH service. Update activation must preserve this policy when
+// it changes only the service executable target.
+func ServiceRecoveryActions() []mgr.RecoveryAction {
+	return append([]mgr.RecoveryAction(nil), paperboatServiceRecovery...)
+}
+
 func InstallService(ctx context.Context, serviceExecutable, sshdPath, configPath string) error {
 	if ctx == nil || !filepath.IsAbs(serviceExecutable) || !filepath.IsAbs(sshdPath) || !filepath.IsAbs(configPath) {
 		return ErrInvalidConfig

@@ -4,6 +4,7 @@ package updated
 
 import (
 	"testing"
+	"time"
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostinstall"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
@@ -56,6 +57,23 @@ func TestPrivilegedWindowsServiceIdentityContract(t *testing.T) {
 	config.SidType = windows.SERVICE_SID_TYPE_NONE
 	if validPrivilegedWindowsServiceConfig(config, mgr.StartAutomatic, mgr.ErrorNormal) {
 		t.Fatal("mutable service SID type accepted")
+	}
+}
+
+func TestWindowsRecoveryPolicyIsServiceSpecific(t *testing.T) {
+	standard := windowsRecoveryActionsForService(windowsHostdService)
+	if !windowsRecoveryActionsMatch(standard, []mgr.RecoveryAction{{Type: mgr.ServiceRestart, Delay: 5 * time.Second}, {Type: mgr.ServiceRestart, Delay: 15 * time.Second}, {Type: mgr.ServiceRestart, Delay: time.Minute}}) {
+		t.Fatal("hostd/updater recovery policy changed")
+	}
+	if !windowsRecoveryActionsMatch(windowsRecoveryActionsForService(windowsUpdaterService), standard) {
+		t.Fatal("PaperboatUpdated does not use the standard recovery policy")
+	}
+	ssh := windowsRecoveryActionsForService(windowsSSHService)
+	if !windowsRecoveryActionsMatch(ssh, []mgr.RecoveryAction{{Type: mgr.ServiceRestart, Delay: 5 * time.Second}, {Type: mgr.ServiceRestart, Delay: 30 * time.Second}, {Type: mgr.NoAction}}) {
+		t.Fatal("PaperboatSshd recovery policy changed")
+	}
+	if windowsRecoveryActionsMatch(standard, ssh) {
+		t.Fatal("PaperboatSshd incorrectly shares the updater recovery policy")
 	}
 }
 
