@@ -165,6 +165,15 @@ func TestWindowsActivationServiceSetIsRoleScoped(t *testing.T) {
 	if got, want := windowsActivationServiceNames("host"), []string{"PaperboatSshd", "PaperboatHostd", "PaperboatUpdated"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("host=%q want=%q", got, want)
 	}
+	if got, want := windowsActivationServiceStartNames("host", true, true, true), []string{"PaperboatSshd", "PaperboatHostd", "PaperboatUpdated"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("host start order=%q want=%q", got, want)
+	}
+	if got, want := windowsActivationServiceStartNames("client", true, true, true), []string{"PaperboatHostd", "PaperboatUpdated"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("client start order=%q want=%q", got, want)
+	}
+	if got, want := windowsActivationServiceStartNames("host", false, true, true), []string{"PaperboatSshd", "PaperboatUpdated"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("filtered host start order=%q want=%q", got, want)
+	}
 	sshArguments := []string{"__windows-sshd-service", "--sshd", `C:\Program Files\OpenSSH\sshd.exe`, "--config", `C:\ProgramData\Paperboat\ssh\sshd_config`}
 	target := windowsServiceTarget{Executable: "sshd", Arguments: sshArguments}
 	if !validWindowsSSHRoleTarget("host", target) || validWindowsSSHRoleTarget("host", windowsServiceTarget{}) || validWindowsSSHRoleTarget("client", target) || !validWindowsSSHRoleTarget("client", windowsServiceTarget{}) {

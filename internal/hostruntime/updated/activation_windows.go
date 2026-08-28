@@ -808,18 +808,11 @@ func normalizeWindowsRollbackTargets(hostd, updater, ssh windowsServiceTarget) (
 	return hostd, updater, ssh, nil
 }
 func (b *windowsSCMActivationBackend) StartServices(ctx context.Context, hostd, updater, ssh, localDaemon bool) error {
-	if hostd {
-		if err := startNamedWindowsService(ctx, windowsHostdService); err != nil {
-			return err
-		}
-	}
-	if updater {
-		if err := startNamedWindowsService(ctx, windowsUpdaterService); err != nil {
-			return err
-		}
-	}
-	if b.config.SetupMode == "host" && ssh {
-		if err := startNamedWindowsService(ctx, windowsSSHService); err != nil {
+	// Hostd validates its managed SSH loopback target during startup. Start SSH
+	// first so both activation and rollback can bring a host runtime up from a
+	// fully stopped service set without a dependency deadlock.
+	for _, name := range windowsActivationServiceStartNames(b.config.SetupMode, hostd, updater, ssh) {
+		if err := startNamedWindowsService(ctx, name); err != nil {
 			return err
 		}
 	}

@@ -253,6 +253,20 @@ func windowsActivationServiceNames(setupMode string) []string {
 	return []string{"PaperboatHostd", "PaperboatUpdated"}
 }
 
+func windowsActivationServiceStartNames(setupMode string, hostd, updater, ssh bool) []string {
+	names := make([]string, 0, 3)
+	if setupMode == "host" && ssh {
+		names = append(names, "PaperboatSshd")
+	}
+	if hostd {
+		names = append(names, "PaperboatHostd")
+	}
+	if updater {
+		names = append(names, "PaperboatUpdated")
+	}
+	return names
+}
+
 func validWindowsSSHRoleTarget(setupMode string, target windowsServiceTarget) bool {
 	return setupMode == "host" && target.Executable != "" || setupMode == "client" && target.Executable == ""
 }
