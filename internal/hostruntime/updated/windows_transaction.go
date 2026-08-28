@@ -274,3 +274,10 @@ func validWindowsSSHRoleTarget(setupMode string, target windowsServiceTarget) bo
 func windowsActivationBlocksVersion(journal windowsActivationJournal, version string) bool {
 	return journal.Stage != windowsActivationCommitted && journal.Stage != windowsActivationRolledBack && (journal.Version == version || journal.PreviousVersion == version)
 }
+
+func windowsActivationNeedsResume(journal windowsActivationJournal, activeVersion string, activatorOwnsTransaction bool) bool {
+	if journal.Stage == windowsActivationCommitted || journal.Stage == windowsActivationRolledBack || activeVersion == journal.Version {
+		return false
+	}
+	return !activatorOwnsTransaction
+}

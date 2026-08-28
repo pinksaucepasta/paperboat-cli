@@ -1173,10 +1173,14 @@ func resumeWindowsActivation(ctx context.Context, config WindowsConfig) (bool, e
 	if err != nil {
 		return false, err
 	}
-	if journal.Stage == windowsActivationCommitted || journal.Stage == windowsActivationRolledBack {
+	if !windowsActivationNeedsResume(journal, config.ActiveVersion, false) {
 		return false, nil
 	}
-	if config.ActiveVersion == journal.Version {
+	activatorOwnsTransaction, err := windowsActivatorOwnsTransaction()
+	if err != nil {
+		return false, err
+	}
+	if !windowsActivationNeedsResume(journal, config.ActiveVersion, activatorOwnsTransaction) {
 		return false, nil
 	}
 	target := workerupdate.ComponentTarget{SHA256: journal.Updater.SHA256, Length: journal.Updater.Length, Platform: "windows", Architecture: journal.Architecture}
@@ -1195,6 +1199,27 @@ func resumeWindowsActivation(ctx context.Context, config WindowsConfig) (bool, e
 		return false, err
 	}
 	return true, nil
+}
+
+func windowsActivatorOwnsTransaction() (bool, error) {
+	manager, err := mgr.Connect()
+	if err != nil {
+		return false, err
+	}
+	defer manager.Disconnect()
+	item, err := manager.OpenService(windowsActivatorService)
+	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer item.Close()
+	status, err := item.Query()
+	if err != nil {
+		return false, err
+	}
+	return status.State != svc.Stopped, nil
 }
 
 func validWindowsActivationPaths(config WindowsConfig, journal windowsActivationJournal) bool {

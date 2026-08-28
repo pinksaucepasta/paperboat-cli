@@ -204,3 +204,24 @@ func TestWindowsActivationBlocksBothSidesUntilTerminalJournal(t *testing.T) {
 		t.Fatal("committed activation remains fenced")
 	}
 }
+
+func TestWindowsUpdaterDoesNotResumeTransactionOwnedByRunningActivator(t *testing.T) {
+	journal := testWindowsActivationJournal()
+	for _, stage := range []windowsActivationStage{windowsActivationSwitching, windowsActivationServicesLive, windowsActivationRollingBack, windowsActivationRollbackReady} {
+		journal.Stage = stage
+		if windowsActivationNeedsResume(journal, journal.PreviousVersion, true) {
+			t.Fatalf("stage %q resumed while activator owned transaction", stage)
+		}
+		if !windowsActivationNeedsResume(journal, journal.PreviousVersion, false) {
+			t.Fatalf("stage %q did not resume after activator stopped", stage)
+		}
+	}
+	journal.Stage = windowsActivationCommitted
+	if windowsActivationNeedsResume(journal, journal.PreviousVersion, false) {
+		t.Fatal("committed transaction resumed")
+	}
+	journal.Stage = windowsActivationStaged
+	if windowsActivationNeedsResume(journal, journal.Version, false) {
+		t.Fatal("active candidate version resumed its own transaction")
+	}
+}
