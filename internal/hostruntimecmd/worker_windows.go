@@ -69,7 +69,15 @@ func runHostdInner(ctx context.Context, output io.Writer) error {
 	return runOwnerHostd(ctx, output, install)
 }
 
-func windowsHostdWorkerEnvironment(install hostinstall.WindowsRuntimeConfig, layout service.Layout, runtimeExecutable string) map[string]string {
+func windowsHostdWorkerEnvironment(install hostinstall.WindowsRuntimeConfig, layout service.Layout, runtimeExecutable string) (map[string]string, error) {
+	systemDirectory, err := windows.GetSystemDirectory()
+	if err != nil {
+		return nil, err
+	}
+	shell := filepath.Join(systemDirectory, "cmd.exe")
+	if err := validateWindowsWorkerExecutable(shell); err != nil {
+		return nil, errors.Join(errors.New("Paperboat Windows command shell is unavailable"), err)
+	}
 	return map[string]string{
 		windowsOwnerWorkloadEnvironment:    "1",
 		"PAPERBOAT_WINDOWS_OWNER_SID":      install.OwnerSID,
@@ -83,7 +91,11 @@ func windowsHostdWorkerEnvironment(install hostinstall.WindowsRuntimeConfig, lay
 		"PAPERBOAT_MACHINE_ID":             install.MachineID,
 		"PAPERBOAT_SETUP_MODE":             install.SetupMode,
 		"PAPERBOAT_RUNTIME_SERVICE_SCOPE":  "user",
-	}
+		// CreateEnvironmentBlock does not guarantee ComSpec for S4U and
+		// service-created owner tokens. Pin the native system shell explicitly;
+		// the production host validates this value before starting any session.
+		"PAPERBOAT_SHELL": shell,
+	}, nil
 }
 
 // runWindowsHostdService is the only SCM-facing hostd path. The child marker
@@ -95,7 +107,10 @@ func runWindowsHostdService(install hostinstall.WindowsRuntimeConfig) error {
 		return err
 	}
 	hostdExecutable, runtimeExecutable := layout.Binary, layout.Binary
-	environment := windowsHostdWorkerEnvironment(install, layout, runtimeExecutable)
+	environment, err := windowsHostdWorkerEnvironment(install, layout, runtimeExecutable)
+	if err != nil {
+		return err
+	}
 	token, err := readWindowsHostdTokenForSID(install.TokenFile, install.OwnerSID)
 	if err != nil {
 		return err

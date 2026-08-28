@@ -4,12 +4,14 @@ package hostruntimecmd
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostdproto"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostinstall"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
+	"golang.org/x/sys/windows"
 )
 
 func TestWindowsWorkerRejectsNonPipeEndpoint(t *testing.T) {
@@ -28,9 +30,20 @@ func TestWindowsHostdWorkerEnvironmentCarriesInstalledRole(t *testing.T) {
 	}
 	for _, role := range []string{"host", "client"} {
 		install := hostinstall.WindowsRuntimeConfig{SetupMode: role, OwnerSID: "S-1-5-21-1", TokenFile: hostinstall.WindowsHostdTokenPath(), StateRoot: `C:\State`, Workspace: `C:\Workspace`, ControlURL: "https://api.pprbt.dev", ListenAddress: "127.0.0.1:8080", MachineID: "machine"}
-		environment := windowsHostdWorkerEnvironment(install, layout, `C:\Program Files\Paperboat\runtime.exe`)
+		environment, err := windowsHostdWorkerEnvironment(install, layout, `C:\Program Files\Paperboat\runtime.exe`)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if environment["PAPERBOAT_SETUP_MODE"] != role {
 			t.Fatalf("role=%q environment=%q", role, environment["PAPERBOAT_SETUP_MODE"])
+		}
+		systemDirectory, err := windows.GetSystemDirectory()
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantShell := filepath.Join(systemDirectory, "cmd.exe")
+		if environment["PAPERBOAT_SHELL"] != wantShell {
+			t.Fatalf("role=%q shell=%q, want %q", role, environment["PAPERBOAT_SHELL"], wantShell)
 		}
 	}
 }
