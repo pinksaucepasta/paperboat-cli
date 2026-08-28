@@ -175,7 +175,7 @@ func WindowsLocalDaemonServiceRunning() (bool, error) {
 	}
 	defer item.Close()
 	status, err := item.Query()
-	return err == nil && status.State != svc.Stopped, err
+	return err == nil && status.State == svc.Running, err
 }
 
 // resolveWindowsDaemonExecutable binds the persistent task to the stable MSI

@@ -469,6 +469,11 @@ func EnsureWindowsLocalDaemonService(ctx context.Context) error {
 	if !isAdministrator() {
 		return ErrNotPrivileged
 	}
+	unlock, err := lockWindowsLocalDaemonMigration(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	config, err := LoadWindowsRuntimeConfig()
 	if err != nil {
 		return err
@@ -484,7 +489,19 @@ func EnsureWindowsLocalDaemonService(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if running, probeErr := localdaemon.WindowsOwnerServiceRunning(lockPath, config.OwnerSID); probeErr == nil && running {
+	installed, err := localdaemon.WindowsLocalDaemonServiceInstalled()
+	if err != nil {
+		return err
+	}
+	serviceRunning, err := localdaemon.WindowsLocalDaemonServiceRunning()
+	if err != nil {
+		return err
+	}
+	ownerRunning, err := localdaemon.WindowsOwnerServiceRunning(lockPath, config.OwnerSID)
+	if err != nil {
+		return err
+	}
+	if installed && serviceRunning && ownerRunning {
 		return localdaemon.RemoveWindowsLegacyTask(ctx, config.OwnerSID)
 	}
 	installer, err := service.New(service.Config{
@@ -502,6 +519,53 @@ func EnsureWindowsLocalDaemonService(ctx context.Context) error {
 		return err
 	}
 	return localdaemon.RemoveWindowsLegacyTask(ctx, config.OwnerSID)
+}
+
+// The activator and the newly restarted updater can both observe a committed
+// activation journal. Serialize their idempotent service migration so one
+// caller cannot stop an SCM service while the other is waiting for readiness.
+func lockWindowsLocalDaemonMigration(ctx context.Context) (func(), error) {
+	if ctx == nil {
+		return nil, ErrInvalidRequest
+	}
+	name, err := windows.UTF16PtrFromString(`Global\PaperboatLocalDaemonMigration`)
+	if err != nil {
+		return nil, err
+	}
+	descriptor, err := windows.SecurityDescriptorFromString(`O:SYG:SYD:P(A;;GA;;;SY)(A;;GA;;;BA)`)
+	if err != nil {
+		return nil, err
+	}
+	attributes := windows.SecurityAttributes{
+		Length:             uint32(unsafe.Sizeof(windows.SecurityAttributes{})),
+		SecurityDescriptor: descriptor,
+	}
+	handle, err := windows.CreateMutex(&attributes, false, name)
+	runtime.KeepAlive(descriptor)
+	if err != nil {
+		return nil, err
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			windows.CloseHandle(handle)
+			return nil, err
+		}
+		state, waitErr := windows.WaitForSingleObject(handle, 100)
+		if waitErr != nil {
+			windows.CloseHandle(handle)
+			return nil, waitErr
+		}
+		if state == windows.WAIT_OBJECT_0 || state == windows.WAIT_ABANDONED {
+			return func() {
+				_ = windows.ReleaseMutex(handle)
+				_ = windows.CloseHandle(handle)
+			}, nil
+		}
+		if state != uint32(windows.WAIT_TIMEOUT) {
+			windows.CloseHandle(handle)
+			return nil, ErrInvalidRequest
+		}
+	}
 }
 
 // removeWindowsSSHBeforeActivation releases the old runtime image before any
@@ -979,6 +1043,11 @@ func installWindowsServices(ctx context.Context, layout service.Layout, upgradeM
 }
 
 func installWindowsRoleServices(ctx context.Context, request Request, layout service.Layout, upgradeMode string) error {
+	unlock, err := lockWindowsLocalDaemonMigration(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	if err := prepareWindowsLocalDaemonMigration(ctx, request.OwnerSID, request.StateRoot); err != nil {
 		return fmt.Errorf("migrate Paperboat local daemon task: %w", err)
 	}
