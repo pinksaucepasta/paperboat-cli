@@ -8,6 +8,7 @@ import (
 	"io"
 	"path/filepath"
 
+	"github.com/pinksaucepasta/paperboat/internal/buildinfo"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostinstall"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/updated"
@@ -50,5 +51,13 @@ func windowsUpdatedConfig() (updated.WindowsConfig, error) {
 	if err != nil {
 		return updated.WindowsConfig{}, err
 	}
-	return updated.WindowsConfig{StateRoot: layout.UpdateStateRoot, Binary: layout.Binary, BinaryRollback: layout.BinaryRollback, BinaryStaged: layout.BinaryStaged, OwnerSID: config.OwnerSID, MachineID: config.MachineID, RepositoryURL: config.Artifact.RepositoryURL, TokenFile: config.TokenFile, InstallState: filepath.Join(hostinstall.WindowsProgramDataRoot(), "runtime-install.json"), ControlSocket: `\\.\pipe\PaperboatUpdatedControl`, HostdSocket: layout.HostdSocket, HealthURL: "http://" + config.ListenAddress + "/healthz", ActiveVersion: config.Artifact.Version, Architecture: config.Artifact.Architecture, AutomaticActivation: true, SetupMode: config.SetupMode}, nil
+	return windowsUpdatedConfigFor(config, layout, buildinfo.Version), nil
+}
+
+func windowsUpdatedConfigFor(config hostinstall.WindowsRuntimeConfig, layout service.Layout, runningVersion string) updated.WindowsConfig {
+	// The running signed executable is the active updater during activation.
+	// runtime-install.json deliberately remains on the previous version until
+	// health verification commits the transaction, so using its version here
+	// makes every candidate updater report the old version and forces rollback.
+	return updated.WindowsConfig{StateRoot: layout.UpdateStateRoot, Binary: layout.Binary, BinaryRollback: layout.BinaryRollback, BinaryStaged: layout.BinaryStaged, OwnerSID: config.OwnerSID, MachineID: config.MachineID, RepositoryURL: config.Artifact.RepositoryURL, TokenFile: config.TokenFile, InstallState: filepath.Join(hostinstall.WindowsProgramDataRoot(), "runtime-install.json"), ControlSocket: `\\.\pipe\PaperboatUpdatedControl`, HostdSocket: layout.HostdSocket, HealthURL: "http://" + config.ListenAddress + "/healthz", ActiveVersion: runningVersion, Architecture: config.Artifact.Architecture, AutomaticActivation: true, SetupMode: config.SetupMode}
 }
