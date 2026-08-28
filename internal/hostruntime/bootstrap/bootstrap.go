@@ -11,12 +11,14 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -38,6 +40,7 @@ const (
 	// or an error log with unbounded data.
 	maxBootstrapResponseBody = 64 << 10
 	maxBootstrapErrorBody    = 8 << 10
+	bootstrapRequestAttempts = 3
 )
 
 type Config struct {
@@ -291,14 +294,41 @@ func client(config Config) *http.Client {
 }
 
 func request(ctx context.Context, client *http.Client, method, target string, body []byte, output any) error {
-	request, err := http.NewRequestWithContext(ctx, method, target, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	request.Header.Set("Content-Type", "application/json")
-	response, err := client.Do(request)
-	if err != nil {
-		return err
+	var response *http.Response
+	for attempt := 0; attempt < bootstrapRequestAttempts; attempt++ {
+		request, err := http.NewRequestWithContext(ctx, method, target, bytes.NewReader(body))
+		if err != nil {
+			return err
+		}
+		request.Header.Set("Content-Type", "application/json")
+		var wroteRequest atomic.Bool
+		trace := &httptrace.ClientTrace{WroteRequest: func(httptrace.WroteRequestInfo) { wroteRequest.Store(true) }}
+		request = request.WithContext(httptrace.WithClientTrace(request.Context(), trace))
+		response, err = client.Do(request)
+		if err == nil {
+			break
+		}
+		if response != nil && response.Body != nil {
+			response.Body.Close()
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		// A dashboard token is single-use and CreatePairing is not itself
+		// idempotent. Retry only while net/http proves that no request bytes
+		// reached the connection. Once WroteRequest fires, the protected
+		// verifier resume flow owns uncertain-outcome recovery.
+		if wroteRequest.Load() || !transientBootstrapError(err) || attempt+1 == bootstrapRequestAttempts {
+			return err
+		}
+		delay := 250 * time.Millisecond << attempt
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
 	}
 	defer response.Body.Close()
 	encoded, err := io.ReadAll(io.LimitReader(response.Body, maxBootstrapResponseBody+1))

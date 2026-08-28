@@ -6,8 +6,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -135,6 +137,67 @@ func TestCreatePairingSurfacesServerErrorBody(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "invalid_user_machine_pairing") || !strings.Contains(err.Error(), "Pairing details are invalid or unsupported.") || !strings.Contains(err.Error(), strconv.Quote(serverBody)) {
 		t.Fatalf("error = %v, want server code, message, and exact bounded body", err)
+	}
+}
+
+func TestCreatePairingRetriesOnlyBeforeRequestIsWritten(t *testing.T) {
+	workspace, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	expires := time.Now().UTC().Add(time.Minute)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(writer).Encode(map[string]any{"data": Pairing{ID: "cmp_retry", UserCode: "ABCD1234", ExpiresAt: expires}})
+	}))
+	defer server.Close()
+	calls := 0
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		calls++
+		if calls < 3 {
+			return nil, &net.OpError{Op: "dial", Net: "tcp", Err: os.ErrDeadlineExceeded}
+		}
+		return server.Client().Transport.RoundTrip(request)
+	})
+	config := Config{
+		ServerURL: server.URL, EnrollmentToken: "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOP",
+		DisplayName: "Studio", WorkspaceRoot: workspace, Verifier: "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOP",
+		PublicIdentityKey: testPublicIdentityKey, HTTP: &http.Client{Transport: transport, Timeout: 2 * time.Second},
+	}
+	pairing, err := CreatePairing(context.Background(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 3 || pairing.ID != "cmp_retry" {
+		t.Fatalf("calls=%d pairing=%#v", calls, pairing)
+	}
+}
+
+func TestCreatePairingDoesNotRetryAfterRequestIsWritten(t *testing.T) {
+	workspace, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		calls++
+		trace := httptrace.ContextClientTrace(request.Context())
+		if trace == nil || trace.WroteRequest == nil {
+			t.Fatal("bootstrap request did not install a write trace")
+		}
+		trace.WroteRequest(httptrace.WroteRequestInfo{})
+		return nil, &net.OpError{Op: "read", Net: "tcp", Err: os.ErrDeadlineExceeded}
+	})
+	config := Config{
+		ServerURL: "https://api.example.test", EnrollmentToken: "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOP",
+		DisplayName: "Studio", WorkspaceRoot: workspace, Verifier: "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOP",
+		PublicIdentityKey: testPublicIdentityKey, HTTP: &http.Client{Transport: transport, Timeout: 2 * time.Second},
+	}
+	if _, err := CreatePairing(context.Background(), config); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("error=%v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("calls=%d, want 1", calls)
 	}
 }
 
