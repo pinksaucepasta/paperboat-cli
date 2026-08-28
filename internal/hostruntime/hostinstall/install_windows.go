@@ -315,6 +315,11 @@ func Install(ctx context.Context, request Request) error {
 	if err := Validate(request, 0); err != nil {
 		return err
 	}
+	unlock, err := lockWindowsLocalDaemonMigration(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	layout, err := service.DefaultLayout("windows")
 	if err != nil {
 		return err
@@ -542,8 +547,14 @@ func lockWindowsLocalDaemonMigration(ctx context.Context) (func(), error) {
 	}
 	handle, err := windows.CreateMutex(&attributes, false, name)
 	runtime.KeepAlive(descriptor)
-	if err != nil {
+	if err != nil && !errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
+		if handle != 0 {
+			_ = windows.CloseHandle(handle)
+		}
 		return nil, err
+	}
+	if handle == 0 {
+		return nil, ErrInvalidRequest
 	}
 	for {
 		if err := ctx.Err(); err != nil {
@@ -719,6 +730,11 @@ func Repair(ctx context.Context) error {
 	if !isAdministrator() {
 		return ErrNotPrivileged
 	}
+	unlock, err := lockWindowsLocalDaemonMigration(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	config, err := LoadWindowsRuntimeConfig()
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) && !windowsRuntimeServiceExists() {
@@ -1043,11 +1059,6 @@ func installWindowsServices(ctx context.Context, layout service.Layout, upgradeM
 }
 
 func installWindowsRoleServices(ctx context.Context, request Request, layout service.Layout, upgradeMode string) error {
-	unlock, err := lockWindowsLocalDaemonMigration(ctx)
-	if err != nil {
-		return err
-	}
-	defer unlock()
 	if err := prepareWindowsLocalDaemonMigration(ctx, request.OwnerSID, request.StateRoot); err != nil {
 		return fmt.Errorf("migrate Paperboat local daemon task: %w", err)
 	}
