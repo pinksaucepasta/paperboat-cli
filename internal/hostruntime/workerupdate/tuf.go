@@ -97,11 +97,26 @@ func (s TUFSource) Active(ctx context.Context, version string) (Release, error) 
 	if err != nil {
 		return Release{}, err
 	}
+	if !activeVersionPermitted(index, version) {
+		return Release{}, ErrReleaseRevoked
+	}
 	release, ok := releaseFromIndex(index)
 	if !ok || release.Version != version {
 		return Release{}, ErrInvalidRelease
 	}
 	return release, nil
+}
+
+func activeVersionPermitted(index releaseindex.Index, version string) bool {
+	if !validVersion(version) || index.Version == version && index.Revoked || index.MinimumVersion != "" && compareVersion(version, index.MinimumVersion) < 0 {
+		return false
+	}
+	for _, revoked := range index.RevokedVersions {
+		if revoked == version {
+			return false
+		}
+	}
+	return true
 }
 
 func (s TUFSource) Fetch(ctx context.Context, release Release) (io.ReadCloser, error) {

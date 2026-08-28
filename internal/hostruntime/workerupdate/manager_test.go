@@ -48,6 +48,76 @@ func TestWorkerUpdateCutsOverWithoutRestartingHostd(t *testing.T) {
 	if err != nil || journal.Stage != updateflow.StageIdle || journal.ActiveVersion != fixture.candidate.Version {
 		t.Fatalf("journal=%+v err=%v", journal, err)
 	}
+	recovered, err := ActiveReleaseFromJournal(fixture.paths.journal, fixture.candidate.Version)
+	if err != nil || !sameReleaseTargets(recovered, fixture.candidate) {
+		t.Fatalf("recovered=%+v err=%v", recovered, err)
+	}
+}
+
+func TestWorkerUpdateSeedsSignedActiveStateBeforeFirstUpdate(t *testing.T) {
+	fixture := newFixture(t)
+	if err := fixture.manager.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	journal, err := updateflow.Load(fixture.paths.journal)
+	if err != nil || journal.Stage != updateflow.StageIdle || journal.ActiveVersion != fixture.active.Version || journal.ActiveDigest != fixture.active.SHA256 {
+		t.Fatalf("journal=%+v err=%v", journal, err)
+	}
+	recovered, err := RecoveryReleaseFromJournal(fixture.paths.journal, fixture.active.Version)
+	if err != nil || !sameReleaseTargets(recovered, fixture.active) {
+		t.Fatalf("recovered=%+v err=%v", recovered, err)
+	}
+}
+
+func TestActiveReleaseFromLegacyMonitoringJournalUsesVerifiedCandidate(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "transaction.json")
+	candidate := release("2026.08.27.55", []byte("signed package"))
+	journal := updateflow.Journal{
+		Schema: updateflow.SchemaV1, TransactionID: "txn-legacy", Stage: updateflow.StageMonitoring,
+		ActiveVersion: "2026.08.27.52", CandidateVersion: candidate.Version,
+		CandidateDigest: candidate.SHA256, CandidateLength: candidate.Length,
+		StagedPath: filepath.Join(root, "pb"), HostdAPIMin: candidate.HostdAPIMin, HostdAPIMax: candidate.HostdAPIMax,
+		RuntimeAPIMin: candidate.RuntimeAPIMin, RuntimeAPIMax: candidate.RuntimeAPIMax,
+		WorkerID: "runtime-2026.08.27.55", WorkerEpoch: 2, BootID: "hostd",
+		StageUpdatedAt: time.Now().Add(-time.Minute).UTC(), HealthDeadline: time.Now().Add(time.Minute).UTC(),
+	}
+	if err := updateflow.Write(path, journal, os.Geteuid(), os.Getegid()); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := ActiveReleaseFromJournal(path, candidate.Version)
+	if err != nil || !sameReleaseTargets(recovered, candidate) {
+		t.Fatalf("recovered=%+v err=%v", recovered, err)
+	}
+	if _, err := ActiveReleaseFromJournal(path, journal.ActiveVersion); !errors.Is(err, ErrInvalidRelease) {
+		t.Fatalf("legacy active release error=%v", err)
+	}
+}
+
+func TestRecoverLegacyPromotedCandidateCommitsHealthyTransaction(t *testing.T) {
+	fixture := newFixture(t)
+	now := time.Now().UTC()
+	journal := updateflow.Journal{
+		Schema: updateflow.SchemaV1, TransactionID: "txn-legacy", Stage: updateflow.StageMonitoring,
+		ActiveVersion: fixture.active.Version, CandidateVersion: fixture.candidate.Version,
+		CandidateDigest: fixture.candidate.SHA256, CandidateLength: fixture.candidate.Length,
+		StagedPath: fixture.paths.current, HostdAPIMin: fixture.candidate.HostdAPIMin, HostdAPIMax: fixture.candidate.HostdAPIMax,
+		RuntimeAPIMin: fixture.candidate.RuntimeAPIMin, RuntimeAPIMax: fixture.candidate.RuntimeAPIMax,
+		WorkerID: workerID(fixture.candidate.Version), WorkerEpoch: 2, BootID: "hostd",
+		StageUpdatedAt: now.Add(-2 * time.Minute), HealthDeadline: now.Add(-time.Minute),
+	}
+	if err := updateflow.Write(fixture.paths.journal, journal, os.Geteuid(), os.Getegid()); err != nil {
+		t.Fatal(err)
+	}
+	fixture.manager.active = fixture.candidate
+	fixture.hostd.active = hostdproto.Status{State: hostdproto.StateActive, WorkerID: workerID(fixture.candidate.Version), APIVersion: 1, Epoch: 2, LastHeartbeatUnixMilli: now.UnixMilli()}
+	if err := fixture.manager.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	committed, err := updateflow.Load(fixture.paths.journal)
+	if err != nil || committed.Stage != updateflow.StageIdle || committed.ActiveVersion != fixture.candidate.Version || committed.ActiveDigest != fixture.candidate.SHA256 {
+		t.Fatalf("journal=%+v err=%v", committed, err)
+	}
 }
 
 func TestRuntimeStagingPatternPreservesDarwinPackageSuffix(t *testing.T) {

@@ -32,6 +32,7 @@ var (
 	ErrInvalidRelease = errors.New("invalid worker release")
 	ErrBlocked        = errors.New("worker updates require recovery")
 	ErrQuarantined    = errors.New("worker release is quarantined")
+	ErrReleaseRevoked = errors.New("worker release is revoked")
 	ErrUnsafeStorage  = errors.New("unsafe worker release storage")
 )
 
@@ -345,12 +346,15 @@ func (m *Manager) Recover(ctx context.Context) error {
 func (m *Manager) recoverLocked(ctx context.Context) error {
 	journal, err := updateflow.Load(m.config.StatePath)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil
+		return m.write(m.newJournal())
 	}
 	if err != nil {
 		return ErrBlocked
 	}
 	if journal.ActiveVersion != m.active.Version {
+		if journal.ActiveDigest == "" && journal.CandidateVersion == m.active.Version && (journal.Stage == updateflow.StageMonitoring || journal.Stage == updateflow.StageCommitted) {
+			return m.recoverLegacyPromotedCandidate(ctx, journal)
+		}
 		return ErrBlocked
 	}
 	switch journal.Recovery() {
@@ -397,6 +401,28 @@ func (m *Manager) recoverLocked(ctx context.Context) error {
 	default:
 		return ErrBlocked
 	}
+}
+
+// recoverLegacyPromotedCandidate completes a transaction written before the
+// journal retained the previous active release metadata. The promoted,
+// verified candidate can commit after its health hold, but a failed health
+// check remains blocked because reconstructing rollback identity from local
+// bytes would weaken the signed release boundary.
+func (m *Manager) recoverLegacyPromotedCandidate(ctx context.Context, journal updateflow.Journal) error {
+	if journal.Stage == updateflow.StageMonitoring {
+		if err := m.monitor(ctx, journal, m.active); err != nil {
+			return errors.Join(err, ErrBlocked)
+		}
+		next, err := m.transition(journal, updateflow.StageCommitted)
+		if err != nil {
+			return err
+		}
+		if err := m.write(next); err != nil {
+			return err
+		}
+		journal = next
+	}
+	return m.finishCommitted(journal)
 }
 
 func (m *Manager) monitorAndCommitRecovered(ctx context.Context, journal updateflow.Journal) error {
@@ -741,13 +767,13 @@ func (m *Manager) removeStaged() error {
 }
 
 func (m *Manager) newJournal() updateflow.Journal {
-	return updateflow.Journal{Schema: updateflow.SchemaV1, TransactionID: transactionID(), Stage: updateflow.StageIdle,
-		ActiveVersion: m.active.Version, BootID: "hostd", StageUpdatedAt: m.now()}
+	return withActiveRelease(updateflow.Journal{Schema: updateflow.SchemaV1, TransactionID: transactionID(), Stage: updateflow.StageIdle,
+		ActiveVersion: m.active.Version, BootID: "hostd", StageUpdatedAt: m.now()}, m.active)
 }
 
 func (m *Manager) idleJournal(from updateflow.Journal, failure updateflow.Failure, quarantine string) updateflow.Journal {
-	journal := updateflow.Journal{Schema: updateflow.SchemaV1, TransactionID: from.TransactionID, Stage: updateflow.StageIdle,
-		ActiveVersion: m.active.Version, BootID: from.BootID, StageUpdatedAt: m.now(), RollbackCount: from.RollbackCount, LastFailure: failure}
+	journal := withActiveRelease(updateflow.Journal{Schema: updateflow.SchemaV1, TransactionID: from.TransactionID, Stage: updateflow.StageIdle,
+		ActiveVersion: m.active.Version, BootID: from.BootID, StageUpdatedAt: m.now(), RollbackCount: from.RollbackCount, LastFailure: failure}, m.active)
 	if quarantine != "" {
 		journal = withRelease(journal, Release{Version: quarantine, SHA256: from.CandidateDigest, Length: from.CandidateLength, Platform: runtime.GOOS, Architecture: runtime.GOARCH, HostdAPIMin: from.HostdAPIMin, HostdAPIMax: from.HostdAPIMax, RuntimeAPIMin: from.RuntimeAPIMin, RuntimeAPIMax: from.RuntimeAPIMax}, m.config.BinaryStaged)
 	}
@@ -789,6 +815,83 @@ func withRelease(journal updateflow.Journal, release Release, path string) updat
 	journal.HostdAPIMin, journal.HostdAPIMax, journal.RuntimeAPIMin, journal.RuntimeAPIMax = release.HostdAPIMin, release.HostdAPIMax, release.RuntimeAPIMin, release.RuntimeAPIMax
 	return journal
 }
+
+func withActiveRelease(journal updateflow.Journal, release Release) updateflow.Journal {
+	journal.ActiveVersion = release.Version
+	journal.ActiveDigest, journal.ActiveLength = release.SHA256, release.Length
+	journal.ActiveHostdAPIMin, journal.ActiveHostdAPIMax = release.HostdAPIMin, release.HostdAPIMax
+	journal.ActiveRuntimeAPIMin, journal.ActiveRuntimeAPIMax = release.RuntimeAPIMin, release.RuntimeAPIMax
+	return journal
+}
+
+// ActiveReleaseFromJournal returns release identity that was previously
+// derived from signed metadata and durably bound to the update transaction.
+// Journals written before active metadata was retained remain recoverable only
+// while their verified candidate is at or beyond cutover.
+func ActiveReleaseFromJournal(path, version string) (Release, error) {
+	journal, err := updateflow.Load(path)
+	if err != nil {
+		return Release{}, err
+	}
+	release, err := releaseForVersion(journal, version)
+	if err != nil {
+		return Release{}, err
+	}
+	return completeJournalRelease(release)
+}
+
+// RecoveryReleaseFromJournal returns the logical pre-transaction active
+// release when its metadata is available. The executable may already be the
+// promoted candidate, so its version is used only to bind the journal to the
+// process that is attempting recovery.
+func RecoveryReleaseFromJournal(path, executableVersion string) (Release, error) {
+	journal, err := updateflow.Load(path)
+	if err != nil {
+		return Release{}, err
+	}
+	if journal.ActiveDigest != "" && (journal.ActiveVersion == executableVersion || journal.CandidateVersion == executableVersion && candidateMayBeActive(journal.Stage)) {
+		return completeJournalRelease(activeReleaseFromJournal(journal))
+	}
+	release, err := releaseForVersion(journal, executableVersion)
+	if err != nil {
+		return Release{}, err
+	}
+	return completeJournalRelease(release)
+}
+
+func releaseForVersion(journal updateflow.Journal, version string) (Release, error) {
+	if journal.ActiveVersion == version && journal.ActiveDigest != "" {
+		return activeReleaseFromJournal(journal), nil
+	}
+	if journal.CandidateVersion == version && candidateMayBeActive(journal.Stage) {
+		return releaseFromJournal(journal), nil
+	}
+	return Release{}, ErrInvalidRelease
+}
+
+func activeReleaseFromJournal(journal updateflow.Journal) Release {
+	return Release{
+		Version: journal.ActiveVersion, SHA256: journal.ActiveDigest, Length: journal.ActiveLength,
+		Platform: runtime.GOOS, Architecture: runtime.GOARCH,
+		HostdAPIMin: journal.ActiveHostdAPIMin, HostdAPIMax: journal.ActiveHostdAPIMax,
+		RuntimeAPIMin: journal.ActiveRuntimeAPIMin, RuntimeAPIMax: journal.ActiveRuntimeAPIMax,
+	}
+}
+
+func completeJournalRelease(release Release) (Release, error) {
+	component := ComponentTarget{SHA256: release.SHA256, Length: release.Length, Platform: release.Platform, Architecture: release.Architecture}
+	release.CLISHA256, release.CLILength, release.CLIPlatform, release.CLIArchitecture = release.SHA256, release.Length, release.Platform, release.Architecture
+	release.Hostd, release.Updater, release.Launcher = component, component, component
+	if err := validateRelease(release); err != nil {
+		return Release{}, err
+	}
+	return release, nil
+}
+
+func candidateMayBeActive(stage updateflow.Stage) bool {
+	return stage == updateflow.StageCutover || stage == updateflow.StageMonitoring || stage == updateflow.StageCommitted
+}
+
 func releaseFromJournal(j updateflow.Journal) Release {
 	return Release{Version: j.CandidateVersion, SHA256: j.CandidateDigest, Length: j.CandidateLength, Platform: runtime.GOOS, Architecture: runtime.GOARCH, HostdAPIMin: j.HostdAPIMin, HostdAPIMax: j.HostdAPIMax, RuntimeAPIMin: j.RuntimeAPIMin, RuntimeAPIMax: j.RuntimeAPIMax}
 }

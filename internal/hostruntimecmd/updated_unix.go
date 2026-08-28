@@ -44,7 +44,7 @@ func runUpdated(ctx context.Context, args []string, _ io.Writer, stderr io.Write
 		return err
 	}
 	source := workerupdate.TUFSource{RepositoryURL: repository, StateRoot: filepath.Join(stateRoot, "tuf"), MachineID: machineID}
-	active, err := source.Active(ctx, buildinfo.Version)
+	active, err := resolveUpdatedActive(ctx, filepath.Join(stateRoot, "transaction.json"), buildinfo.Version, source.Active)
 	if err != nil {
 		return err
 	}
@@ -57,6 +57,27 @@ func runUpdated(ctx context.Context, args []string, _ io.Writer, stderr io.Write
 		return err
 	}
 	return updaterService.Run(ctx)
+}
+
+func resolveUpdatedActive(ctx context.Context, journalPath, version string, resolve func(context.Context, string) (workerupdate.Release, error)) (workerupdate.Release, error) {
+	active, err := resolve(ctx, version)
+	if err == nil || !errors.Is(err, workerupdate.ErrInvalidRelease) {
+		return active, err
+	}
+	recovered, journalErr := workerupdate.RecoveryReleaseFromJournal(journalPath, version)
+	if journalErr != nil {
+		return workerupdate.Release{}, err
+	}
+	if recovered.Version != version {
+		_, policyErr := resolve(ctx, recovered.Version)
+		if policyErr == nil {
+			return recovered, nil
+		}
+		if !errors.Is(policyErr, workerupdate.ErrInvalidRelease) {
+			return workerupdate.Release{}, policyErr
+		}
+	}
+	return recovered, nil
 }
 
 func validRuntimeIdentity(uid, gid int) bool {
