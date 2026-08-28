@@ -98,6 +98,103 @@ func TestEnrollBindsKeyAndPersistsPrivateIdentity(t *testing.T) {
 	}
 }
 
+func TestEnrollRetriesTransientExchangeFailureWithSameIdentity(t *testing.T) {
+	stateRoot := filepath.Join(t.TempDir(), "state")
+	credential := strings.Repeat("g", 32)
+	attempts := 0
+	publicKey := ""
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		var input struct {
+			Credential string `json:"credential"`
+			PublicKey  string `json:"public_key"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			t.Error(err)
+			return
+		}
+		if input.Credential != credential || input.PublicKey == "" {
+			t.Errorf("attempt %d changed enrollment input: %#v", attempts, input)
+		}
+		if publicKey == "" {
+			publicKey = input.PublicKey
+		} else if input.PublicKey != publicKey {
+			t.Errorf("attempt %d changed public key", attempts)
+		}
+		if attempts < 3 {
+			http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"helper_id":"helper_1","machine_id":"machine_1","environment_id":"env_1","credential":"identity-credential-0123456789012345","expires_at":"2099-01-01T00:00:00Z"}}`))
+	}))
+	defer server.Close()
+	client, err := NewClient(server.Client().Transport, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := client.Enroll(context.Background(), Config{ControlURL: server.URL, StateRoot: stateRoot, EnrollmentCredential: credential})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 3 || result.HelperID != "helper_1" {
+		t.Fatalf("attempts=%d result=%#v", attempts, result)
+	}
+}
+
+func TestEnrollRetriesTransientTransportFailure(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"helper_id":"helper_1","machine_id":"machine_1","environment_id":"env_1","credential":"identity-credential-0123456789012345","expires_at":"2099-01-01T00:00:00Z"}}`))
+	}))
+	defer server.Close()
+	attempts := 0
+	transport := enrollmentRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		attempts++
+		if attempts == 1 {
+			return nil, errors.New("temporary network failure")
+		}
+		return server.Client().Transport.RoundTrip(request)
+	})
+	client, err := NewClient(transport, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := client.Enroll(context.Background(), Config{ControlURL: server.URL, StateRoot: filepath.Join(t.TempDir(), "state"), EnrollmentCredential: strings.Repeat("g", 32)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 || result.HelperID != "helper_1" {
+		t.Fatalf("attempts=%d result=%#v", attempts, result)
+	}
+}
+
+func TestEnrollDoesNotRetryRejectedExchange(t *testing.T) {
+	attempts := 0
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts++
+		http.Error(w, "rejected", http.StatusUnauthorized)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.Client().Transport, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Enroll(context.Background(), Config{ControlURL: server.URL, StateRoot: filepath.Join(t.TempDir(), "state"), EnrollmentCredential: strings.Repeat("g", 32)})
+	if !errors.Is(err, ErrEnrollmentExchangeRejected) || errors.Is(err, ErrEnrollmentExchangeUnavailable) {
+		t.Fatalf("error=%v", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts=%d", attempts)
+	}
+}
+
+type enrollmentRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f enrollmentRoundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
 func TestHostedBootstrapUsesHelperProofAndValidatesMemoryOnlyMaterial(t *testing.T) {
 	stateRoot := filepath.Join(t.TempDir(), "state")
 	script := "echo setup\n"

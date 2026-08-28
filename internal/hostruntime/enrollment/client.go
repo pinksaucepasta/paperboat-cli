@@ -29,7 +29,10 @@ var (
 	ErrInvalid                        = errors.New("invalid helper enrollment")
 	ErrFlyWorkloadIdentityUnavailable = errors.New("Fly workload identity is unavailable")
 	ErrEnrollmentExchangeRejected     = errors.New("helper enrollment exchange was rejected")
+	ErrEnrollmentExchangeUnavailable  = errors.New("helper enrollment exchange is unavailable")
 )
+
+const enrollmentExchangeAttempts = 4
 
 type Config struct {
 	ControlURL           string `json:"control_url"`
@@ -298,14 +301,6 @@ func (c *Client) enroll(ctx context.Context, config Config, endpointPath string,
 		return RuntimeIdentity{}, ErrInvalid
 	}
 	body, _ := json.Marshal(payload)
-	requestCtx, cancel := context.WithTimeout(ctx, c.timeout)
-	defer cancel()
-	request, err := http.NewRequestWithContext(requestCtx, http.MethodPost, base.String(), bytes.NewReader(body))
-	if err != nil {
-		return RuntimeIdentity{}, err
-	}
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("Accept", "application/json")
 	transport := c.transport
 	if transport == nil {
 		transport, err = controlTransport(config.ControlCAFile)
@@ -314,18 +309,30 @@ func (c *Client) enroll(ctx context.Context, config Config, endpointPath string,
 		}
 	}
 	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return ErrInvalid }}
-	response, err := client.Do(request)
-	if err != nil {
-		return RuntimeIdentity{}, errors.Join(ErrInvalid, ErrEnrollmentExchangeRejected)
-	}
-	defer response.Body.Close()
-	limited := io.LimitReader(response.Body, 64<<10+1)
-	responseBody, readErr := io.ReadAll(limited)
-	if readErr != nil {
-		return RuntimeIdentity{}, readErr
-	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 || len(responseBody) > 64<<10 {
-		return RuntimeIdentity{}, errors.Join(ErrInvalid, ErrEnrollmentExchangeRejected)
+	var responseBody []byte
+	for attempt := 0; attempt < enrollmentExchangeAttempts; attempt++ {
+		status, value, exchangeErr := c.enrollmentExchangeAttempt(ctx, client, base.String(), body)
+		if exchangeErr == nil && status >= 200 && status < 300 {
+			responseBody = value
+			break
+		}
+		if ctx.Err() != nil {
+			return RuntimeIdentity{}, ctx.Err()
+		}
+		if exchangeErr != nil && errors.Is(exchangeErr, ErrInvalid) || exchangeErr == nil && !retryableEnrollmentExchangeStatus(status) {
+			return RuntimeIdentity{}, errors.Join(ErrInvalid, ErrEnrollmentExchangeRejected)
+		}
+		if attempt+1 == enrollmentExchangeAttempts {
+			return RuntimeIdentity{}, ErrEnrollmentExchangeUnavailable
+		}
+		delay := 500 * time.Millisecond << attempt
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return RuntimeIdentity{}, ctx.Err()
+		case <-timer.C:
+		}
 	}
 	var envelope struct {
 		Data RuntimeIdentity `json:"data"`
@@ -343,6 +350,34 @@ func (c *Client) enroll(ctx context.Context, config Config, endpointPath string,
 		return RuntimeIdentity{}, err
 	}
 	return result, nil
+}
+
+func (c *Client) enrollmentExchangeAttempt(ctx context.Context, client *http.Client, endpoint string, body []byte) (int, []byte, error) {
+	requestCtx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(requestCtx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return 0, nil, err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json")
+	response, err := client.Do(request)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer response.Body.Close()
+	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 64<<10+1))
+	if err != nil {
+		return response.StatusCode, nil, err
+	}
+	if len(responseBody) > 64<<10 {
+		return response.StatusCode, nil, ErrInvalid
+	}
+	return response.StatusCode, responseBody, nil
+}
+
+func retryableEnrollmentExchangeStatus(status int) bool {
+	return status == http.StatusRequestTimeout || status == http.StatusTooEarly || status == http.StatusTooManyRequests || status >= 500 && status <= 599
 }
 
 func validControlURL(raw string) (*url.URL, error) {
