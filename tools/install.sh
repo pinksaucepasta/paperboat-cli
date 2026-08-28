@@ -186,13 +186,36 @@ prepare_privileges() {
 cleanup_existing() {
   old=/usr/local/bin/pb
   if [ "$(id -u)" -eq 0 ]; then
-    launchctl bootout system/com.pinksaucepasta.paperboat.runtime-host 2>/dev/null || true
-    rm -f /Library/LaunchDaemons/com.pinksaucepasta.paperboat.runtime-host.plist
+    for label in \
+      com.pinksaucepasta.paperboat.runtime-host \
+      com.pinksaucepasta.paperboat.runtime-privileged \
+      com.pinksaucepasta.paperboat.hostd \
+      com.pinksaucepasta.paperboat.updated
+    do
+      launchctl bootout "system/$label" 2>/dev/null || true
+    done
+    rm -f \
+      /Library/LaunchDaemons/com.pinksaucepasta.paperboat.runtime-host.plist \
+      /Library/LaunchDaemons/com.pinksaucepasta.paperboat.runtime-privileged.plist \
+      /Library/LaunchDaemons/com.pinksaucepasta.paperboat.hostd.plist \
+      /Library/LaunchDaemons/com.pinksaucepasta.paperboat.updated.plist
     rm -rf "/Library/PrivilegedHelperTools/Paperboat" "/Library/Application Support/Paperboat"
     rm -f "$old"
   elif [ "$os" = darwin ]; then
-    sudo -n launchctl bootout system/com.pinksaucepasta.paperboat.runtime-host 2>/dev/null || true
-    sudo -n rm -f /Library/LaunchDaemons/com.pinksaucepasta.paperboat.runtime-host.plist "$old" 2>/dev/null || true
+    for label in \
+      com.pinksaucepasta.paperboat.runtime-host \
+      com.pinksaucepasta.paperboat.runtime-privileged \
+      com.pinksaucepasta.paperboat.hostd \
+      com.pinksaucepasta.paperboat.updated
+    do
+      sudo -n launchctl bootout "system/$label" 2>/dev/null || true
+    done
+    sudo -n rm -f \
+      /Library/LaunchDaemons/com.pinksaucepasta.paperboat.runtime-host.plist \
+      /Library/LaunchDaemons/com.pinksaucepasta.paperboat.runtime-privileged.plist \
+      /Library/LaunchDaemons/com.pinksaucepasta.paperboat.hostd.plist \
+      /Library/LaunchDaemons/com.pinksaucepasta.paperboat.updated.plist \
+      "$old" 2>/dev/null || true
     sudo -n rm -rf "/Library/PrivilegedHelperTools/Paperboat" "/Library/Application Support/Paperboat" 2>/dev/null || true
   fi
   if [ "$os" = darwin ]; then
@@ -200,8 +223,16 @@ cleanup_existing() {
     rm -f "$HOME/Library/LaunchAgents/com.pinksaucepasta.paperboat.local-daemon.plist"
   else
     systemctl --user disable --now paperboat-local-daemon.service 2>/dev/null || true
-    sudo -n systemctl disable --now paperboat-runtime-host.service 2>/dev/null || true
-    sudo -n rm -f /etc/systemd/system/paperboat-runtime-host.service 2>/dev/null || true
+    sudo -n systemctl disable --now \
+      paperboat-runtime-host.service \
+      paperboat-runtime-privileged.service \
+      paperboat-hostd.service \
+      paperboat-updated.service 2>/dev/null || true
+    sudo -n rm -f \
+      /etc/systemd/system/paperboat-runtime-host.service \
+      /etc/systemd/system/paperboat-runtime-privileged.service \
+      /etc/systemd/system/paperboat-hostd.service \
+      /etc/systemd/system/paperboat-updated.service 2>/dev/null || true
     rm -f "$HOME/.config/systemd/user/paperboat-local-daemon.service"
     rm -f "$HOME/.local/bin/pb"
   fi

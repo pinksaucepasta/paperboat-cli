@@ -55,6 +55,11 @@ cat > "$temporary/bin/sudo" <<'EOF'
 printf '%s\n' "$*" >> "$PAPERBOAT_TEST_SUDO_LOG"
 exit 1
 EOF
+cat > "$temporary/bin/systemctl" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "$PAPERBOAT_TEST_SYSTEMCTL_LOG"
+exit 0
+EOF
 cat > "$temporary/bin/rm" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$*" >> "$PAPERBOAT_TEST_RM_LOG"
@@ -68,11 +73,12 @@ for argument do
 done
 exec /bin/rm "$@"
 EOF
-chmod 0700 "$temporary/bin/uname" "$temporary/bin/curl" "$temporary/bin/id" "$temporary/bin/sudo" "$temporary/bin/rm"
+chmod 0700 "$temporary/bin/uname" "$temporary/bin/curl" "$temporary/bin/id" "$temporary/bin/sudo" "$temporary/bin/systemctl" "$temporary/bin/rm"
 
 PAPERBOAT_TEST_CURL_LOG="$temporary/curl.log" \
 PAPERBOAT_TEST_RM_LOG="$temporary/rm.log" \
 PAPERBOAT_TEST_SUDO_LOG="$temporary/sudo.log" \
+PAPERBOAT_TEST_SYSTEMCTL_LOG="$temporary/systemctl.log" \
 PAPERBOAT_RELEASE_METADATA_URL=https://release.example/current.json \
 PAPERBOAT_GITHUB_REPOSITORY=example/paperboat-cli \
 PAPERBOAT_INSTALL_DIR="$temporary/install" \
@@ -89,6 +95,10 @@ fi
 grep -qx 'paperboat-test' "$temporary/output"
 grep -q '/usr/local/libexec/paperboat/pb' "$temporary/sudo.log"
 grep -q '/usr/local/libexec/paperboat/pb' "$temporary/rm.log"
+grep -q '^--user disable --now paperboat-local-daemon.service$' "$temporary/systemctl.log"
+for unit in paperboat-runtime-host.service paperboat-runtime-privileged.service paperboat-hostd.service paperboat-updated.service; do
+  grep -q "$unit" "$temporary/sudo.log"
+done
 
 if PAPERBOAT_RELEASE_METADATA_URL=http://release.example/current.json PATH="$temporary/bin:/usr/bin:/bin" "$installer" >/dev/null 2>"$temporary/insecure-error"; then
   echo 'installer accepted an insecure release metadata URL' >&2
