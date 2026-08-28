@@ -18,7 +18,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -49,8 +48,6 @@ var (
 	removePaperboatSSHState   = windowsopenssh.RemovePaperboatState
 	setupPaperboatSSH         = windowsopenssh.Setup
 )
-
-var standaloneVersionPattern = regexp.MustCompile(`^[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]+$`)
 
 type Request struct {
 	Schema              string                   `json:"schema"`
@@ -370,11 +367,8 @@ func Install(ctx context.Context, request Request) error {
 	// UpgradeReload would treat existing declarations as stable and leave the
 	// services stopped.
 	if err := runWindowsInstallPhase(ctx, "install Paperboat Windows services", func() error {
-		return installWindowsServices(ctx, layout, "")
+		return installWindowsRoleServices(ctx, request, layout, "")
 	}); err != nil {
-		return err
-	}
-	if err := runWindowsInstallPhase(ctx, "finalize Paperboat OpenSSH role", func() error { return installWindowsSSHAfterActivation(ctx, request, layout) }); err != nil {
 		return err
 	}
 	return nil
@@ -591,10 +585,7 @@ func Repair(ctx context.Context) error {
 	if err := writeWindowsConfig(config); err != nil {
 		return err
 	}
-	if err := installWindowsServices(ctx, layout, ""); err != nil {
-		return err
-	}
-	return installWindowsSSHAfterActivation(ctx, request, layout)
+	return installWindowsRoleServices(ctx, request, layout, "")
 }
 
 func reconcileWindowsRepairVersion(ctx context.Context, config WindowsRuntimeConfig, layout service.Layout) (WindowsRuntimeConfig, error) {
@@ -637,20 +628,27 @@ func Purge(ctx context.Context) error {
 	if !isAdministrator() {
 		return ErrNotPrivileged
 	}
+	layout, layoutErr := service.DefaultLayout("windows")
+	var result error
+	if layoutErr != nil {
+		result = errors.Join(result, layoutErr)
+	} else {
+		// The updater's one-shot activator can survive an interrupted activation
+		// after its versioned executable has been removed. Delete its exact owned
+		// SCM declaration before removing release slots.
+		result = errors.Join(result, removeWindowsActivatorService(ctx, layout))
+	}
 	if _, err := os.Stat(WindowsProgramDataRoot()); errors.Is(err, os.ErrNotExist) {
-		return nil
+		return result
 	} else if err != nil {
-		return err
+		return errors.Join(result, err)
 	}
 	// Windows OpenSSH is a shared WinGet dependency. Purge only removes the
 	// dedicated PaperboatSshd service, Paperboat SSH keys/configuration, and
 	// firewall deltas that Paperboat recorded as its own. This must happen
 	// before the Paperboat runtime slots are removed because their fixed path
 	// is the ownership proof for PaperboatSshd.
-	var result error
-	if layout, err := service.DefaultLayout("windows"); err != nil {
-		result = errors.Join(result, err)
-	} else {
+	if layoutErr == nil {
 		result = errors.Join(result, removePaperboatSSHState(ctx, windowsOpenSSHConfig(layout, "")))
 	}
 	// A service can have been removed already while its old pb.exe process is
@@ -809,13 +807,36 @@ func removeOrphanWindowsService(ctx context.Context, name, executable string, ar
 	return nil
 }
 
+func removeWindowsActivatorService(ctx context.Context, layout service.Layout) error {
+	manager, err := mgr.Connect()
+	if err != nil {
+		return err
+	}
+	current, err := manager.OpenService("PaperboatUpdateActivator")
+	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+		_ = manager.Disconnect()
+		return nil
+	}
+	if err != nil {
+		_ = manager.Disconnect()
+		return err
+	}
+	config, configErr := current.Config()
+	closeErr := current.Close()
+	disconnectErr := manager.Disconnect()
+	if configErr != nil || closeErr != nil || disconnectErr != nil {
+		return errors.Join(configErr, closeErr, disconnectErr)
+	}
+	arguments, err := windows.DecomposeCommandLine(config.BinaryPathName)
+	if err != nil || len(arguments) != 2 || !windowsActivatorServiceOwned(layout, filepath.Clean(arguments[0]), arguments[1:], config.ServiceStartName) {
+		return errors.Join(service.ErrInvalidDefinition, err)
+	}
+	return removeOrphanWindowsService(ctx, "PaperboatUpdateActivator", filepath.Clean(arguments[0]), []string{"__runtime-activate"})
+}
+
 func installWindowsServices(ctx context.Context, layout service.Layout, upgradeMode string) error {
-	hostdExecutable, updaterExecutable, _ := windowsRuntimePaths(layout)
-	for _, item := range []struct {
-		kind, executable string
-		args             []string
-	}{{service.HostdKind, hostdExecutable, []string{"__runtime-hostd"}}, {service.UpdaterKind, updaterExecutable, []string{"__runtime-updated"}}} {
-		installer, err := service.New(service.Config{Platform: "windows", Kind: item.kind, ConfigRoot: WindowsProgramDataRoot(), Executable: item.executable, User: "Paperboat", Group: "Paperboat", Arguments: item.args, Controller: service.WindowsController{}, UpgradeMode: upgradeMode})
+	for _, item := range windowsRuntimeServiceDefinitions(layout) {
+		installer, err := service.New(service.Config{Platform: "windows", Kind: item.kind, ConfigRoot: WindowsProgramDataRoot(), Executable: item.executable, User: "Paperboat", Group: "Paperboat", Arguments: item.arguments, Controller: service.WindowsController{}, UpgradeMode: upgradeMode})
 		if err != nil {
 			return err
 		}
@@ -824,6 +845,14 @@ func installWindowsServices(ctx context.Context, layout service.Layout, upgradeM
 		}
 	}
 	return nil
+}
+
+func installWindowsRoleServices(ctx context.Context, request Request, layout service.Layout, upgradeMode string) error {
+	return executeWindowsServiceInstallPlan(request.SetupMode,
+		func() error { return installWindowsSSHAfterActivation(ctx, request, layout) },
+		func() error { return installWindowsServices(ctx, layout, upgradeMode) },
+		func() error { return removePaperboatSSHState(ctx, windowsOpenSSHConfig(layout, request.OwnerSID)) },
+	)
 }
 
 func Validate(request Request, _ int) error {
