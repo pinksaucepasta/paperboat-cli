@@ -1422,18 +1422,22 @@ func (s *runtimeObservationSender) updateObservationFrom(now time.Time, availabi
 		}
 	}
 	if updaterState != nil {
+		currentVersion := s.reporterVersion
+		if updaterState.Version != "" {
+			currentVersion = updaterState.Version
+		}
 		if updaterState.Observation.Failure != "" || updaterState.Status != "ok" {
 			return &runtimeUpdateObservation{
-				Schema: "paperboat.update-observation/v1", State: "failed", CurrentVersion: s.reporterVersion,
-				TargetVersion: s.reporterVersion, Channel: "stable", OperationID: "update-" + strconv.FormatUint(s.workerGeneration, 10) + "-" + strconv.FormatInt(now.UnixNano(), 10),
+				Schema: "paperboat.update-observation/v1", State: "failed", CurrentVersion: currentVersion,
+				TargetVersion: currentVersion, Channel: "stable", OperationID: "update-" + strconv.FormatUint(s.workerGeneration, 10) + "-" + strconv.FormatInt(now.UnixNano(), 10),
 				InstallationGeneration: s.installationGeneration, WorkerGeneration: s.workerGeneration, OSBootID: s.osBootID,
 				ErrorCode: "update_failed", ObservedAt: now,
 			}
 		}
-		// A successful updater status is authoritative. The active binary
-		// version remains the value authenticated by this runtime heartbeat.
+		// The updater owns activation and is authoritative for the installed
+		// version. The runtime process can remain alive across that activation.
 		return &runtimeUpdateObservation{
-			Schema: "paperboat.update-observation/v1", State: "healthy", CurrentVersion: s.reporterVersion,
+			Schema: "paperboat.update-observation/v1", State: "healthy", CurrentVersion: currentVersion,
 			Channel: "stable", OperationID: "update-" + strconv.FormatUint(s.workerGeneration, 10) + "-" + strconv.FormatInt(now.UnixNano(), 10),
 			InstallationGeneration: s.installationGeneration, WorkerGeneration: s.workerGeneration, OSBootID: s.osBootID,
 			ObservedAt: now,

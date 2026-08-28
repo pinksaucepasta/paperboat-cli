@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/autoupdate"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/availability"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/updated"
 )
@@ -33,9 +34,17 @@ func TestRuntimeUpdateObservationUsesPlatformChannelAndFences(t *testing.T) {
 func TestRuntimeUpdateObservationUsesUpdaterStatus(t *testing.T) {
 	now := time.Now().UTC()
 	sender := &runtimeObservationSender{reporterVersion: "2026.08.20.12", installationGeneration: 4, workerGeneration: 9, osBootID: "boot-1"}
-	response := &updated.ControlResponse{Status: "ok"}
-	if observation := sender.updateObservationFrom(now, nil, response, nil); observation == nil || observation.State != "healthy" {
+	response := &updated.ControlResponse{Status: "ok", Version: "2026.08.20.13"}
+	if observation := sender.updateObservationFrom(now, nil, response, nil); observation == nil || observation.State != "healthy" || observation.CurrentVersion != response.Version {
 		t.Fatalf("healthy updater observation=%+v", observation)
+	}
+	response = &updated.ControlResponse{Status: "ok"}
+	if observation := sender.updateObservationFrom(now, nil, response, nil); observation == nil || observation.CurrentVersion != sender.reporterVersion {
+		t.Fatalf("versionless updater observation=%+v", observation)
+	}
+	response = &updated.ControlResponse{Status: "error", Version: "2026.08.20.13", Observation: autoupdate.Observation{Failure: "activation failed"}}
+	if observation := sender.updateObservationFrom(now, nil, response, nil); observation == nil || observation.State != "failed" || observation.CurrentVersion != response.Version || observation.TargetVersion != response.Version || observation.ErrorCode != "update_failed" {
+		t.Fatalf("failed updater observation=%+v", observation)
 	}
 	if observation := sender.updateObservationFrom(now, nil, nil, updated.ErrUnavailable); observation == nil || observation.State != "failed" || observation.ErrorCode != "updater_unavailable" {
 		t.Fatalf("unavailable updater observation=%+v", observation)
