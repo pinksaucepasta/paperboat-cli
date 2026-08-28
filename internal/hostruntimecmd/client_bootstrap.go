@@ -4,14 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
 	"github.com/pinksaucepasta/paperboat/internal/api"
 	"github.com/pinksaucepasta/paperboat/internal/config"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/bootstrap"
-	"github.com/pinksaucepasta/paperboat/internal/localdaemon"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/identitybootstrap"
 )
 
@@ -54,13 +52,7 @@ func installBootstrapCLI(ctx context.Context, session *bootstrap.ClientSession, 
 	}
 	cred := config.Credential{AccessToken: session.AccessToken, RefreshToken: session.RefreshToken, TokenType: session.TokenType, ExpiresAt: time.Now().UTC().Add(time.Duration(session.ExpiresIn) * time.Second)}
 	client := api.New(cfg.ServerURL, cred, nil)
-	executable, err := os.Executable()
-	if err != nil {
-		return err
-	}
-	return installBootstrapCLIWith(ctx, session, cfg.ServerURL, store, cred, client, enrollBootstrapCLIIdentity, func(ctx context.Context) error {
-		return localdaemon.InstallCurrentUserService(ctx, executable, cfg.Path(), cfg.ServerURL)
-	})
+	return installBootstrapCLIWith(ctx, session, cfg.ServerURL, store, cred, client, enrollBootstrapCLIIdentity, bootstrapLocalDaemonInstaller(cfg))
 }
 
 func installBootstrapCLIWith(ctx context.Context, session *bootstrap.ClientSession, issuer string, store config.ProfileStore, cred config.Credential, client bootstrapCLIClient, enroll bootstrapCLIIdentityInstaller, installDaemon func(context.Context) error) error {

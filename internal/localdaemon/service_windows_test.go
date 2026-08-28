@@ -36,43 +36,46 @@ func (p *fakeWindowsDaemonProcess) TerminateAndWait(ctx context.Context) error {
 
 func (*fakeWindowsDaemonProcess) Close() error { return nil }
 
-func TestInstallWindowsCurrentUserServiceStartsDetachedUserDaemon(t *testing.T) {
+func TestInstallWindowsCurrentUserServiceRequiresManagedService(t *testing.T) {
 	executable := filepath.Join(t.TempDir(), "pb.exe")
 	if err := os.WriteFile(executable, []byte("fixture"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	configPath := filepath.Join(t.TempDir(), "config.json")
 
-	previousTask, previousStart := runWindowsTaskCommand, startWindowsDetachedDaemon
+	previousProbe := probeWindowsLocalDaemonService
 	t.Cleanup(func() {
-		runWindowsTaskCommand = previousTask
-		startWindowsDetachedDaemon = previousStart
+		probeWindowsLocalDaemonService = previousProbe
 	})
-	var taskCalls [][]string
-	runWindowsTaskCommand = func(_ context.Context, arguments ...string) error {
-		taskCalls = append(taskCalls, append([]string(nil), arguments...))
-		return nil
+	probeWindowsLocalDaemonService = func() (bool, error) { return false, nil }
+	if err := installWindowsCurrentUserService(context.Background(), executable, configPath, "https://api.example.test"); !errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+		t.Fatalf("error=%v want missing managed service", err)
 	}
-	var startedExecutable string
-	var startedArguments []string
-	startWindowsDetachedDaemon = func(path string, arguments []string) error {
-		startedExecutable = path
-		startedArguments = append([]string(nil), arguments...)
-		return nil
-	}
+}
 
-	if err := installWindowsCurrentUserService(context.Background(), executable, configPath, "https://api.example.test"); err != nil {
+func TestInstallWindowsCurrentUserServiceUsesManagedServiceWithoutLegacyTask(t *testing.T) {
+	executable := filepath.Join(t.TempDir(), "pb.exe")
+	if err := os.WriteFile(executable, []byte("fixture"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if len(taskCalls) != 1 || len(taskCalls[0]) < 2 || taskCalls[0][0] != "/Create" {
-		t.Fatalf("task calls=%q, want one create", taskCalls)
+	previousProbe, previousStart := probeWindowsLocalDaemonService, startWindowsLocalDaemonService
+	previousTask := runWindowsTaskCommand
+	t.Cleanup(func() {
+		probeWindowsLocalDaemonService, startWindowsLocalDaemonService = previousProbe, previousStart
+		runWindowsTaskCommand = previousTask
+	})
+	probeWindowsLocalDaemonService = func() (bool, error) { return true, nil }
+	started := false
+	startWindowsLocalDaemonService = func(context.Context) error { started = true; return nil }
+	runWindowsTaskCommand = func(context.Context, ...string) error {
+		t.Fatal("managed install created a legacy scheduled task")
+		return nil
 	}
-	if startedExecutable != executable {
-		t.Fatalf("started executable=%q want=%q", startedExecutable, executable)
+	if err := installWindowsCurrentUserService(context.Background(), executable, "", "https://api.example.test"); err != nil {
+		t.Fatal(err)
 	}
-	wantArguments := []string{"__local-daemon", "--config", configPath, "--server", "https://api.example.test"}
-	if !reflect.DeepEqual(startedArguments, wantArguments) {
-		t.Fatalf("started arguments=%q want=%q", startedArguments, wantArguments)
+	if !started {
+		t.Fatal("managed local daemon service was not started")
 	}
 }
 
@@ -133,7 +136,7 @@ func TestStopOwnedWindowsDaemonTerminatesOnlyExactRecordedProcess(t *testing.T) 
 	}
 }
 
-func TestWindowsOwnerServiceLifecycleUsesFixedTaskAndExactProcess(t *testing.T) {
+func TestWindowsOwnerServiceLifecycleStopsLegacyButRequiresManagedStart(t *testing.T) {
 	executable := filepath.Join(t.TempDir(), "pb.exe")
 	if err := os.WriteFile(executable, []byte("fixture"), 0o700); err != nil {
 		t.Fatal(err)
@@ -167,13 +170,13 @@ func TestWindowsOwnerServiceLifecycleUsesFixedTaskAndExactProcess(t *testing.T) 
 	if err := stopWindowsOwnerService(context.Background(), lockPath, identity.OwnerSID); err != nil {
 		t.Fatal(err)
 	}
-	if err := startWindowsOwnerService(context.Background(), identity.OwnerSID); err != nil {
-		t.Fatal(err)
+	if err := startWindowsOwnerService(context.Background(), identity.OwnerSID); !errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+		t.Fatalf("start error=%v want missing managed service", err)
 	}
 	if !process.terminated {
 		t.Fatal("validated daemon was not terminated")
 	}
-	want := [][]string{{"/End", "/TN", windowsDaemonTaskName(identity.OwnerSID)}, {"/Run", "/TN", windowsDaemonTaskName(identity.OwnerSID)}}
+	want := [][]string{{"/End", "/TN", windowsDaemonTaskName(identity.OwnerSID)}}
 	if !reflect.DeepEqual(calls, want) {
 		t.Fatalf("task calls=%q want=%q", calls, want)
 	}

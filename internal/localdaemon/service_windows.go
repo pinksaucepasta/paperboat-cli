@@ -25,7 +25,6 @@ import (
 )
 
 var runWindowsTaskCommand = defaultWindowsTaskCommand
-var startWindowsDetachedDaemon = defaultStartWindowsDetachedDaemon
 var readWindowsDaemonPIDLock = defaultReadWindowsDaemonPIDLock
 var openWindowsDaemonProcess = defaultOpenWindowsDaemonProcess
 var windowsDaemonLayout = hostruntimeservice.DefaultLayout
@@ -70,34 +69,17 @@ func installWindowsCurrentUserService(ctx context.Context, executable, configPat
 	if ctx == nil || !validWindowsExecutable(executable) || configPath != "" && !validWindowsConfigPath(configPath) || !validTaskText(serverURL) {
 		return ErrInvalidInventoryConfig
 	}
-	ownerSID, err := currentWindowsUserSID()
+	installed, err := probeWindowsLocalDaemonService()
 	if err != nil {
 		return err
 	}
-	taskName := windowsDaemonTaskName(ownerSID)
-	arguments := []string{"__local-daemon"}
-	commandLine := quoteWindowsTaskArg(filepath.Clean(executable)) + " __local-daemon"
-	if configPath != "" {
-		arguments = append(arguments, "--config", filepath.Clean(configPath))
-		commandLine += " --config " + quoteWindowsTaskArg(filepath.Clean(configPath))
+	if installed {
+		// Managed installations own one silent SCM service. Never recreate the
+		// old interactive ONLOGON task after migration merely because a CLI
+		// command observed a cold local pipe.
+		return startWindowsLocalDaemonService(ctx)
 	}
-	if serverURL != "" {
-		arguments = append(arguments, "--server", strings.TrimSpace(serverURL))
-		commandLine += " --server " + quoteWindowsTaskArg(strings.TrimSpace(serverURL))
-	}
-	if err := runWindowsTaskCommand(ctx, "/Create", "/TN", taskName, "/TR", commandLine, "/SC", "ONLOGON", "/RL", "LIMITED", "/F"); err != nil {
-		return fmt.Errorf("install Paperboat local daemon task: %w", err)
-	}
-	// Start immediately in the caller's authenticated user context. An ONLOGON
-	// task cannot run in a non-interactive OpenSSH session, while an S4U task
-	// cannot use the network credentials required by the client daemon. The
-	// detached process covers the current session and the task restores it on
-	// future interactive logons. The daemon's SID-bound process lock makes a
-	// concurrent task launch harmless.
-	if err := startWindowsDetachedDaemon(filepath.Clean(executable), arguments); err != nil {
-		return fmt.Errorf("start Paperboat local daemon: %w", err)
-	}
-	return nil
+	return windows.ERROR_SERVICE_DOES_NOT_EXIST
 }
 
 // RemoveWindowsLegacyTask removes the pre-SCM ONLOGON task for exactly one
@@ -202,18 +184,6 @@ func resolveManagedWindowsDaemonExecutable(executable string, layout hostruntime
 	return executable
 }
 
-func defaultStartWindowsDetachedDaemon(executable string, arguments []string) error {
-	command := exec.Command(executable, arguments...)
-	command.SysProcAttr = &windows.SysProcAttr{
-		CreationFlags: windows.DETACHED_PROCESS | windows.CREATE_NEW_PROCESS_GROUP | windows.CREATE_BREAKAWAY_FROM_JOB,
-		HideWindow:    true,
-	}
-	if err := command.Start(); err != nil {
-		return err
-	}
-	return command.Process.Release()
-}
-
 func removeWindowsCurrentUserService(ctx context.Context, executable string) error {
 	if ctx == nil || !validWindowsExecutable(executable) {
 		return ErrInvalidInventoryConfig
@@ -308,15 +278,7 @@ func startWindowsOwnerService(ctx context.Context, ownerSID string) error {
 	if ctx == nil || !validWindowsOwnerSID(ownerSID) {
 		return ErrInvalidInventoryConfig
 	}
-	if err := startWindowsLocalDaemonService(ctx); err != nil {
-		if !errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
-			return err
-		}
-		// Keep pre-migration updates recoverable. Once the new service is
-		// installed, all normal starts use SCM and never reach this branch.
-		return runWindowsTaskCommand(ctx, "/Run", "/TN", windowsDaemonTaskName(ownerSID))
-	}
-	return nil
+	return startWindowsLocalDaemonService(ctx)
 }
 
 func validWindowsOwnerSID(ownerSID string) bool {

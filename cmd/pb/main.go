@@ -1575,7 +1575,7 @@ func ensureLocalDaemonService(ctx context.Context, cfg *config.Config) error {
 
 // requireLocalDaemonService is the bounded recovery path for peer commands.
 // It covers reboot followed only by a non-interactive Windows OpenSSH logon,
-// where an ONLOGON task cannot start the per-user daemon.
+// where the managed local daemon service is temporarily cold.
 func requireLocalDaemonService(ctx context.Context, cfg *config.Config) error {
 	matches, err := localDaemonRegistrationMatches(cfg)
 	if err != nil {

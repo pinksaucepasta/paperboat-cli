@@ -3,6 +3,9 @@
 package updated
 
 import (
+	"context"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,6 +14,32 @@ import (
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc/mgr"
 )
+
+func TestWaitForWindowsUpdaterVersionWaitsForApplicationReadiness(t *testing.T) {
+	calls := 0
+	err := waitForWindowsUpdaterVersion(context.Background(), "2026.08.28.2", time.Second, time.Millisecond, func(context.Context) (ControlResponse, error) {
+		calls++
+		if calls < 3 {
+			return ControlResponse{Version: "2026.08.28.1"}, nil
+		}
+		return ControlResponse{Version: "2026.08.28.2"}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 3 {
+		t.Fatalf("status calls=%d want=3", calls)
+	}
+}
+
+func TestWaitForWindowsUpdaterVersionReturnsExactMismatch(t *testing.T) {
+	err := waitForWindowsUpdaterVersion(context.Background(), "2026.08.28.2", 5*time.Millisecond, time.Millisecond, func(context.Context) (ControlResponse, error) {
+		return ControlResponse{Version: "2026.08.28.1"}, nil
+	})
+	if !errors.Is(err, errInvalidWindowsActivation) || !strings.Contains(err.Error(), `got "2026.08.28.1", want "2026.08.28.2"`) {
+		t.Fatalf("error=%v", err)
+	}
+}
 
 func testWindowsUpdaterConfig(t *testing.T) WindowsConfig {
 	t.Helper()

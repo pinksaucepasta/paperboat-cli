@@ -836,7 +836,7 @@ func (b *windowsSCMActivationBackend) FinalizeServices(ctx context.Context, jour
 }
 func (b *windowsSCMActivationBackend) VerifyHealth(ctx context.Context, journal windowsActivationJournal) error {
 	if err := requireNamedWindowsServicesRunning(windowsHostdService, windowsUpdaterService); err != nil {
-		return err
+		return fmt.Errorf("verify Windows runtime services: %w", err)
 	}
 	token, err := os.ReadFile(b.config.TokenFile)
 	if err != nil {
@@ -853,7 +853,7 @@ func (b *windowsSCMActivationBackend) VerifyHealth(ctx context.Context, journal 
 			break
 		}
 		if time.Now().After(deadline) {
-			return errors.Join(errInvalidWindowsActivation, activeErr)
+			return errors.Join(errors.New("verify PaperboatHostd active heartbeat"), errInvalidWindowsActivation, activeErr)
 		}
 		select {
 		case <-ctx.Done():
@@ -862,7 +862,7 @@ func (b *windowsSCMActivationBackend) VerifyHealth(ctx context.Context, journal 
 		}
 	}
 	if b.config.HealthURL == "" {
-		return errInvalidWindowsActivation
+		return errors.Join(errors.New("verify runtime health URL"), errInvalidWindowsActivation)
 	}
 	request, _ := http.NewRequestWithContext(ctx, http.MethodGet, b.config.HealthURL, nil)
 	response, err := (&http.Client{Timeout: 5 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}).Do(request)
@@ -876,16 +876,15 @@ func (b *windowsSCMActivationBackend) VerifyHealth(ctx context.Context, journal 
 	if response.StatusCode != http.StatusOK || json.NewDecoder(io.LimitReader(response.Body, 8<<10)).Decode(&health) != nil || !health.Live {
 		return fmt.Errorf("runtime health returned HTTP %d", response.StatusCode)
 	}
-	client, err := NewClient(b.config.ControlSocket, 10*time.Second)
+	client, err := NewClient(b.config.ControlSocket, 2*time.Second)
 	if err != nil {
+		return fmt.Errorf("verify PaperboatUpdated control: %w", err)
+	}
+	if err := waitForWindowsUpdaterVersion(ctx, journal.Version, 30*time.Second, 250*time.Millisecond, client.Status); err != nil {
 		return err
 	}
-	updaterStatus, err := client.Status(ctx)
-	if err != nil || updaterStatus.Version != journal.Version {
-		return errors.Join(errInvalidWindowsActivation, err)
-	}
 	if !matchesWindowsComponent(journal.CLI.Path, workerupdate.ComponentTarget{SHA256: journal.CLI.SHA256, Length: journal.CLI.Length, Platform: "windows", Architecture: journal.Architecture}) {
-		return errInvalidWindowsActivation
+		return errors.Join(errors.New("verify staged Windows CLI component"), errInvalidWindowsActivation)
 	}
 	if journal.NewSSH.WasRunning {
 		if err := requireNamedWindowsServicesRunning(windowsSSHService); err != nil {
@@ -893,6 +892,36 @@ func (b *windowsSCMActivationBackend) VerifyHealth(ctx context.Context, journal 
 		}
 	}
 	return nil
+}
+
+func waitForWindowsUpdaterVersion(ctx context.Context, want string, timeout, retryDelay time.Duration, status func(context.Context) (ControlResponse, error)) error {
+	if ctx == nil || !exactReleasePattern.MatchString(want) || timeout <= 0 || retryDelay <= 0 || status == nil {
+		return errors.Join(errors.New("verify PaperboatUpdated control version"), errInvalidWindowsActivation)
+	}
+	bounded, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	var lastVersion string
+	var lastErr error
+	for {
+		response, err := status(bounded)
+		if err == nil && response.Version == want {
+			return nil
+		}
+		lastVersion, lastErr = response.Version, err
+		timer := time.NewTimer(retryDelay)
+		select {
+		case <-bounded.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			message := fmt.Errorf("verify PaperboatUpdated control version: got %q, want %q", lastVersion, want)
+			return errors.Join(message, errInvalidWindowsActivation, lastErr, bounded.Err())
+		case <-timer.C:
+		}
+	}
 }
 
 func requireNamedWindowsServicesRunning(names ...string) error {
@@ -904,12 +933,15 @@ func requireNamedWindowsServicesRunning(names ...string) error {
 	for _, name := range names {
 		item, err := manager.OpenService(name)
 		if err != nil {
-			return err
+			return fmt.Errorf("open Windows service %s: %w", name, err)
 		}
 		status, queryErr := item.Query()
 		closeErr := item.Close()
-		if queryErr != nil || closeErr != nil || status.State != svc.Running {
-			return errors.Join(errInvalidWindowsActivation, queryErr, closeErr)
+		if queryErr != nil || closeErr != nil {
+			return errors.Join(fmt.Errorf("query Windows service %s", name), errInvalidWindowsActivation, queryErr, closeErr)
+		}
+		if status.State != svc.Running {
+			return errors.Join(fmt.Errorf("Windows service %s state is %d, want %d", name, status.State, svc.Running), errInvalidWindowsActivation)
 		}
 	}
 	return nil
