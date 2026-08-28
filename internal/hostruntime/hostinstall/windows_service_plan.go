@@ -1,6 +1,7 @@
 package hostinstall
 
 import (
+	"errors"
 	"regexp"
 	"strings"
 
@@ -24,13 +25,16 @@ func windowsRuntimeServiceDefinitions(layout service.Layout) []windowsRuntimeSer
 func executeWindowsServiceInstallPlan(setupMode string, installSSH, installRuntime, cleanupSSH func() error) error {
 	switch setupMode {
 	case "host":
-		// PaperboatHostd must be registered before OpenSSH host-key ACLs are
-		// applied. Windows resolves NT SERVICE\PaperboatHostd only after SCM has
-		// created the service with its unrestricted service SID.
-		if err := installRuntime(); err != nil {
+		// Hostd validates the managed SSH loopback endpoint as it starts. The
+		// service SID used by the host-key ACL is deterministic, so OpenSSH can
+		// be installed before Hostd is first registered.
+		if err := installSSH(); err != nil {
 			return err
 		}
-		return installSSH()
+		if err := installRuntime(); err != nil {
+			return errors.Join(err, cleanupSSH())
+		}
+		return nil
 	case "client":
 		if err := installRuntime(); err != nil {
 			return err

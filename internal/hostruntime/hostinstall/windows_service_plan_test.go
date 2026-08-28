@@ -30,7 +30,7 @@ func TestWindowsRuntimeServicesUseCanonicalBinary(t *testing.T) {
 	}
 }
 
-func TestWindowsHostServicesRegisterRuntimeBeforeSSH(t *testing.T) {
+func TestWindowsHostServicesInstallSSHBeforeStartingRuntime(t *testing.T) {
 	var events []string
 	err := executeWindowsServiceInstallPlan("host", func() error {
 		events = append(events, "ssh")
@@ -42,12 +42,12 @@ func TestWindowsHostServicesRegisterRuntimeBeforeSSH(t *testing.T) {
 		events = append(events, "cleanup-ssh")
 		return nil
 	})
-	if err != nil || !reflect.DeepEqual(events, []string{"runtime", "ssh"}) {
+	if err != nil || !reflect.DeepEqual(events, []string{"ssh", "runtime"}) {
 		t.Fatalf("events=%q err=%v", events, err)
 	}
 }
 
-func TestWindowsHostServicesDoNotProvisionSSHWhenRuntimeFails(t *testing.T) {
+func TestWindowsHostServicesCleanSSHWhenRuntimeFails(t *testing.T) {
 	var events []string
 	runtimeFailure := errors.New("runtime failed")
 	err := executeWindowsServiceInstallPlan("host", func() error {
@@ -60,7 +60,7 @@ func TestWindowsHostServicesDoNotProvisionSSHWhenRuntimeFails(t *testing.T) {
 		events = append(events, "cleanup-ssh")
 		return nil
 	})
-	if !errors.Is(err, runtimeFailure) || !reflect.DeepEqual(events, []string{"runtime"}) {
+	if !errors.Is(err, runtimeFailure) || !reflect.DeepEqual(events, []string{"ssh", "runtime", "cleanup-ssh"}) {
 		t.Fatalf("events=%q err=%v", events, err)
 	}
 }
