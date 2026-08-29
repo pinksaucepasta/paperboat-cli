@@ -148,6 +148,13 @@ func (s *controlServer) handle(connection *net.UnixConn) error {
 	if err := s.respond(connection, response); err != nil {
 		return err
 	}
+	// Finish the response stream before a successful update can replace this
+	// process image. The client validates EOF to reject appended control data,
+	// so closing only the write half gives it a complete response while the
+	// server retains the connection long enough to schedule the handoff.
+	if err := connection.CloseWrite(); err != nil {
+		return err
+	}
 	if s.afterResponse != nil {
 		s.afterResponse(request, response)
 	}

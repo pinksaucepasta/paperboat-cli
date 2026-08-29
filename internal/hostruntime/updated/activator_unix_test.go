@@ -4,6 +4,7 @@ package updated
 
 import (
 	"context"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -20,16 +21,22 @@ func (r *recordingRunner) Output(context.Context, string, ...string) (string, er
 	return "", nil
 }
 
-func TestFixedUpdaterRestarterUsesOnlyPlatformService(t *testing.T) {
+func TestFixedSupervisorActivatorReloadsHostdBeforeUpdater(t *testing.T) {
 	runner := &recordingRunner{}
-	if err := (FixedUpdaterRestarter{Platform: runtime.GOOS, Runner: runner}).Restart(context.Background()); err != nil {
+	if err := (FixedSupervisorActivator{Platform: runtime.GOOS, Runner: runner}).Activate(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	want := "launchctl kickstart -k system/com.pinksaucepasta.paperboat.updated"
-	if runtime.GOOS == "linux" {
-		want = "systemctl --no-block restart paperboat-updated.service"
+	want := []string{
+		"launchctl kickstart -k system/com.pinksaucepasta.paperboat.hostd",
+		"launchctl kickstart -k system/com.pinksaucepasta.paperboat.updated",
 	}
-	if len(runner.calls) != 1 || runner.calls[0] != want {
+	if runtime.GOOS == "linux" {
+		want = []string{
+			"systemctl restart paperboat-hostd.service",
+			"systemctl restart paperboat-updated.service",
+		}
+	}
+	if !reflect.DeepEqual(runner.calls, want) {
 		t.Fatalf("restart calls = %q, want %q", runner.calls, want)
 	}
 }

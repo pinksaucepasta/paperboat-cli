@@ -9,11 +9,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 
 	"github.com/pinksaucepasta/paperboat/internal/buildinfo"
-	"github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/updated"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/workerupdate"
 )
@@ -50,7 +48,11 @@ func runUpdated(ctx context.Context, args []string, _ io.Writer, stderr io.Write
 	if err != nil {
 		return err
 	}
-	updaterService, err := updated.New(updated.Config{StateRoot: stateRoot, Binary: binary, BinaryRollback: binaryRollback, BinaryStaged: binaryStaged, Active: active, WorkerUID: uid, WorkerGID: gid, SocketPath: socket, Token: token, RepositoryURL: repository, MachineID: machineID, Health: updated.HTTPHealth{Endpoint: healthURL}, ControlSocket: controlSocket, Restarter: updated.FixedUpdaterRestarter{Platform: runtime.GOOS, Runner: service.ExecRunner{}}})
+	restarter, err := updated.NewFixedUpdaterReexec(binary)
+	if err != nil {
+		return err
+	}
+	updaterService, err := updated.New(updated.Config{StateRoot: stateRoot, Binary: binary, BinaryRollback: binaryRollback, BinaryStaged: binaryStaged, Active: active, WorkerUID: uid, WorkerGID: gid, SocketPath: socket, Token: token, RepositoryURL: repository, MachineID: machineID, Health: updated.HTTPHealth{Endpoint: healthURL}, ControlSocket: controlSocket, Restarter: restarter})
 	if err != nil {
 		return err
 	}

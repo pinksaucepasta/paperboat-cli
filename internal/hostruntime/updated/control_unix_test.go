@@ -189,6 +189,53 @@ func TestCommittedUpdateSchedulesUpdaterRestartAfterResponse(t *testing.T) {
 	}
 }
 
+func TestControlResponseIsReadableBeforePostCommitHandoffCompletes(t *testing.T) {
+	path := testSocketPath(t)
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	handoffStarted := make(chan struct{})
+	releaseHandoff := make(chan struct{})
+	server := controlServer{
+		socketPath: path,
+		uid:        os.Geteuid(),
+		gid:        os.Getegid(),
+		invokeRequest: func(context.Context, ControlRequest) (ControlResponse, error) {
+			return ControlResponse{Schema: ControlProtocolV1, Status: "ok", Version: "2.0.0", Updated: true}, nil
+		},
+		afterResponse: func(ControlRequest, ControlResponse) {
+			close(handoffStarted)
+			<-releaseHandoff
+		},
+	}
+	done := make(chan struct{})
+	go func() {
+		connection, acceptErr := listener.AcceptUnix()
+		if acceptErr == nil {
+			_ = server.handle(connection)
+			_ = connection.Close()
+		}
+		close(done)
+	}()
+	client, err := NewClient(path, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := client.Update(context.Background())
+	if err != nil || response.Version != "2.0.0" || !response.Updated {
+		t.Fatalf("response=%#v error=%v", response, err)
+	}
+	select {
+	case <-handoffStarted:
+	case <-time.After(time.Second):
+		t.Fatal("post-response handoff did not start")
+	}
+	close(releaseHandoff)
+	<-done
+}
+
 func testSocketPath(t *testing.T) string {
 	t.Helper()
 	file, err := os.CreateTemp("", "pbupd-")
