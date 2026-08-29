@@ -13,11 +13,12 @@ $freshEnrollment = -not [string]::IsNullOrWhiteSpace($token)
 $requestedVersion = if ($env:PAPERBOAT_VERSION) { [string]$env:PAPERBOAT_VERSION } else { 'latest' }
 $repo = if ($env:PAPERBOAT_GITHUB_REPOSITORY) { [string]$env:PAPERBOAT_GITHUB_REPOSITORY } else { 'pinksaucepasta/paperboat-cli' }
 
+if ($server -notmatch '^https://') { throw 'Paperboat server URL must use HTTPS.' }
 if ($metadataUrl -notmatch '^https://') { throw 'Paperboat release metadata URL must use HTTPS.' }
 if ($repo -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw 'Paperboat release repository is invalid.' }
 if ($freshEnrollment -and $token -notmatch '^[0-9A-Z]{26}$') { throw 'Paperboat enrollment token is invalid.' }
 
-$arch = if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq 'Arm64') { 'arm64' } else { 'amd64' }
+$arch = if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq 'Arm64') { 'arm64' } elseif ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq 'X64') { 'amd64' } else { throw 'Paperboat supports only Windows AMD64 and ARM64.' }
 $asset = "pb-windows-$arch.exe"
 $current = (Invoke-WebRequest -UseBasicParsing -Uri $metadataUrl -TimeoutSec 30).Content | ConvertFrom-Json
 $version = [string]$current.version
@@ -67,20 +68,12 @@ $file = Get-Item -LiteralPath $download
 if ([int64]$file.Length -ne [int64]$assetMetadata.length) { throw "Paperboat release asset length verification failed for $asset." }
 $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $download).Hash.ToLowerInvariant()
 if ($actual -ne [string]$assetMetadata.sha256) { throw "Paperboat release asset digest verification failed for $asset." }
-# Clear the download's Zone.Identifier before the first execution. Windows
-# PowerShell can otherwise reject the version probe itself with Access denied.
+
 Unblock-File -LiteralPath $download -ErrorAction SilentlyContinue
 
-# Hardened Windows policies can deny execution from a user-writable temporary
-# directory even after it has been verified and unblocked. An already-elevated
-# session stages the same verified bytes in the administrator-owned Paperboat
-# bootstrap directory before invoking the self-installer.
 $trustedBootstrapDirectory = Join-Path ${env:ProgramFiles} 'Paperboat\bootstrap'
 function Stage-TrustedBootstrap([string]$Source) {
   New-Item -ItemType Directory -Force -Path $trustedBootstrapDirectory | Out-Null
-  # Never replace a fixed bootstrap path: an older Paperboat process may still
-  # have it open, and Windows correctly rejects that replacement with access
-  # denied. Each verified download gets its own immutable staging path.
   $staged = Join-Path $trustedBootstrapDirectory ('pb-' + [guid]::NewGuid().ToString('N') + '.exe')
   Copy-Item -LiteralPath $Source -Destination $staged -Force
   Unblock-File -LiteralPath $staged -ErrorAction SilentlyContinue
@@ -104,35 +97,27 @@ function Assert-InstalledVersion([string]$Path, [string]$ExpectedVersion) {
   return $versionMatches.Count -eq 1 -and $versionMatches[0].Groups[1].Value -eq ("Version " + $ExpectedVersion)
 }
 
+if (-not (Assert-InstalledVersion $download $version)) {
+  throw "Downloaded Paperboat release does not report version $version."
+}
+
 function Test-Administrator {
   $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
   $principal = [Security.Principal.WindowsPrincipal]::new($identity)
-  if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { return $false }
-  # IsInRole can report the Administrators group for a split UAC token even
-  # when the current process cannot write machine-wide paths. Probe the exact
-  # directory used for trusted staging so we never surface a raw Access Denied
-  # before the RunAs fallback gets a chance to handle it.
-  $probe = Join-Path $trustedBootstrapDirectory ('.elevation-' + [guid]::NewGuid().ToString('N'))
-  try {
-    New-Item -ItemType Directory -Force -Path $trustedBootstrapDirectory | Out-Null
-    New-Item -ItemType File -Path $probe -Force | Out-Null
-    Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
-    return $true
-  } catch {
-    Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
-    return $false
-  }
+  return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
 if ($freshEnrollment -or -not (Assert-InstalledVersion $installedPb $version) -or (Get-FileHash -Algorithm SHA256 -LiteralPath $installedPb -ErrorAction SilentlyContinue).Hash.ToLowerInvariant() -ne $actual) {
   # __install is implemented by the downloaded pb.exe itself. This is the
-  # only elevation boundary and avoids downloading another executable.
+  # only binary-install elevation boundary and avoids downloading another
+  # executable.
   $arguments = @('__install', '--source', $download, '--version', $version)
   if ($freshEnrollment) { $arguments += '--fresh' }
-  # An already-elevated SSH or deployment session has no interactive desktop
-  # on which Windows can show another UAC prompt. Invoke directly in that
-  # case; ordinary desktop terminals still use RunAs and show the normal UAC
-  # prompt.
+  # An already-elevated SSH or deployment process has no interactive desktop
+  # on which Windows can show another UAC prompt. Starting it with RunAs in
+  # that environment returns Access is denied even though the caller already
+  # has a full administrator token. Execute directly in that case; ordinary
+  # desktop terminals still use RunAs and show the normal UAC prompt.
   $installerExecutable = $null
   try { $installerExecutable = Stage-TrustedBootstrap $download } catch { $installerExecutable = $null }
   if ($null -ne $installerExecutable) {
@@ -140,20 +125,29 @@ if ($freshEnrollment -or -not (Assert-InstalledVersion $installedPb $version) -o
   }
   $runAsPath = if ($null -ne $installerExecutable) { $installerExecutable } else { $download }
   if (Test-Administrator) {
-    & $runAsPath @arguments
+    # The trusted Program Files staging directory is intentionally not
+    # user-readable. An already elevated process can execute the original
+    # verified download from the user's temp directory directly.
+    & $download @arguments
     if ($LASTEXITCODE -ne 0) { throw "Paperboat self-install failed with exit code $LASTEXITCODE." }
   } else {
     $elevatedArguments = @($arguments)
     if ($runAsPath.Contains(' ')) { $elevatedArguments[2] = '"' + $arguments[2] + '"' }
-    $process = Start-Process -FilePath $runAsPath -ArgumentList $elevatedArguments -Verb RunAs -PassThru -Wait -WindowStyle Hidden
-    if ($process.ExitCode -ne 0) { throw "Paperboat self-install failed with exit code $($process.ExitCode)." }
+    $installOutput = Join-Path $dir 'install.stdout'
+    $installError = Join-Path $dir 'install.stderr'
+    $process = Start-Process -FilePath $runAsPath -ArgumentList $elevatedArguments -Verb RunAs -PassThru -Wait -WindowStyle Hidden -RedirectStandardOutput $installOutput -RedirectStandardError $installError
+    if ($process.ExitCode -ne 0) {
+      $detail = ((Get-Content -LiteralPath $installOutput -Raw -ErrorAction SilentlyContinue) + (Get-Content -LiteralPath $installError -Raw -ErrorAction SilentlyContinue)).Trim()
+      if ($detail.Length -gt 2000) { $detail = $detail.Substring(0, 2000) }
+      throw "Paperboat self-install failed with exit code $($process.ExitCode): $detail"
+    }
   }
 }
 if (-not (Assert-InstalledVersion $installedPb $version)) { throw "Installed Paperboat does not report release $version." }
 
 if ($freshEnrollment) {
   # Only cross the replacement boundary after the verified elevated install
-  # has succeeded. If UAC is denied or the elevated session cannot start,
+  # has succeeded. If UAC is denied or the elevated process cannot start,
   # the existing enrollment remains intact and the token can be retried.
   # __install --fresh already removes machine-wide services and state.
   foreach ($statePath in @(
@@ -169,12 +163,10 @@ if ($freshEnrollment) {
   $first = $token.Substring(0, 1)
   $setupMode = if ('02468BDFHJLNPRTVXZ'.Contains($first)) { 'host' } else { 'client' }
   Remove-Item Env:PAPERBOAT_ENROLLMENT_TOKEN -ErrorAction SilentlyContinue
-  $pairArguments = @('pair', '--server', $server, '--enrollment-token', $token, '--name', $name, "--setup-mode=$setupMode")
-  if (Test-Administrator) {
-    & $installedPb @pairArguments
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-  } else {
-    $pairProcess = Start-Process -FilePath $installedPb -ArgumentList $pairArguments -Verb RunAs -PassThru -Wait
-    if ($pairProcess.ExitCode -ne 0) { exit $pairProcess.ExitCode }
-  }
+  # Pair in the original user's process so the CLI profile, DPAPI credentials,
+  # endpoint identity, and daemon state belong to the user who pasted the
+  # dashboard command. The installed pb elevates only its machine-service
+  # commit after this user-owned state has been created.
+  & $installedPb pair --server $server --enrollment-token $token --name $name "--setup-mode=$setupMode"
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
