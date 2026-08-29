@@ -72,12 +72,14 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	if err := machinename.Validate(*name); err != nil {
 		return fmt.Errorf("invalid machine name: %w", err)
 	}
+	defaultStateRoot, err := helperconfig.DefaultStateRoot(os.Getenv)
+	if err != nil {
+		return err
+	}
 	if *stateRoot == "" {
-		var err error
-		*stateRoot, err = helperconfig.DefaultStateRoot(os.Getenv)
-		if err != nil {
-			return err
-		}
+		*stateRoot = defaultStateRoot
+	} else if !strings.EqualFold(filepath.Clean(*stateRoot), defaultStateRoot) {
+		return errors.New("custom Windows runtime state roots are not supported")
 	}
 	if !filepath.IsAbs(*stateRoot) || filepath.Clean(*stateRoot) != *stateRoot {
 		return errors.New("Windows runtime state root is invalid")

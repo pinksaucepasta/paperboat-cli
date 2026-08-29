@@ -1782,6 +1782,10 @@ func PrepareWindowsLocalDaemonState(runtimeStateRoot, ownerSID string) error {
 		return err
 	}
 	defer windows.CloseHandle(handle)
+	rootFinal, err := windowsFinalPath(handle)
+	if err != nil || !strings.EqualFold(rootFinal, windowsExpectedFinalPath(root)) {
+		return errors.Join(err, ErrInvalidRequest)
+	}
 	access := windowsLocalDaemonStateRootDACL(ownerSID)
 	if err := applyWindowsHandleOwnedDACL(handle, owner, access); err != nil {
 		return err
@@ -1789,7 +1793,7 @@ func PrepareWindowsLocalDaemonState(runtimeStateRoot, ownerSID string) error {
 	// Existing lock, owner, and diagnostic files can retain a protected DACL
 	// from an earlier S4U session. Repair the bounded Paperboat-owned subtree
 	// while the root remains pinned against replacement.
-	if err := repairWindowsLocalDaemonTreeChildren(root, owner); err != nil {
+	if err := repairWindowsLocalDaemonTreeChildren(root, handle, owner); err != nil {
 		return err
 	}
 	if !windowsRuntimeHandleSecurityMatches(handle, owner, access) {
@@ -1860,10 +1864,15 @@ func openWindowsLocalDaemonStateObject(path string, directory bool) (windows.Han
 	return handle, nil
 }
 
-func repairWindowsLocalDaemonTreeChildren(root string, owner *windows.SID) error {
+func repairWindowsLocalDaemonTreeChildren(root string, rootHandle windows.Handle, owner *windows.SID) error {
 	if !safeAbsolute(root) || owner == nil || !owner.IsValid() {
 		return ErrInvalidRequest
 	}
+	rootFinal, err := windowsFinalPath(rootHandle)
+	if err != nil {
+		return err
+	}
+	rootPrefix := strings.TrimRight(rootFinal, `\/`) + string(filepath.Separator)
 	return filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -1875,6 +1884,12 @@ func repairWindowsLocalDaemonTreeChildren(root string, owner *windows.SID) error
 		if err != nil {
 			return err
 		}
+		finalPath, finalErr := windowsFinalPath(handle)
+		var information windows.ByHandleFileInformation
+		infoErr := windows.GetFileInformationByHandle(handle, &information)
+		if finalErr != nil || infoErr != nil || !strings.HasPrefix(strings.ToLower(finalPath), strings.ToLower(rootPrefix)) || !entry.IsDir() && information.NumberOfLinks != 1 {
+			return errors.Join(finalErr, infoErr, windows.CloseHandle(handle), ErrInvalidRequest)
+		}
 		access := "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + owner.String() + ")"
 		if entry.IsDir() {
 			access = windowssecurity.OwnerFullControlDirectoryDACL(owner.String())
@@ -1882,6 +1897,34 @@ func repairWindowsLocalDaemonTreeChildren(root string, owner *windows.SID) error
 		applyErr := applyWindowsHandleOwnedDACL(handle, owner, access)
 		return errors.Join(applyErr, windows.CloseHandle(handle))
 	})
+}
+
+func windowsFinalPath(handle windows.Handle) (string, error) {
+	buffer := make([]uint16, 512)
+	for {
+		length, err := windows.GetFinalPathNameByHandle(handle, &buffer[0], uint32(len(buffer)), 0)
+		if err != nil {
+			return "", err
+		}
+		if length == 0 {
+			return "", ErrInvalidRequest
+		}
+		if int(length) < len(buffer) {
+			return filepath.Clean(windows.UTF16ToString(buffer[:length])), nil
+		}
+		if length > 32<<10 {
+			return "", ErrInvalidRequest
+		}
+		buffer = make([]uint16, int(length)+1)
+	}
+}
+
+func windowsExpectedFinalPath(path string) string {
+	path = filepath.Clean(path)
+	if strings.HasPrefix(path, `\\`) {
+		return filepath.Clean(`\\?\UNC\` + strings.TrimPrefix(path, `\\`))
+	}
+	return filepath.Clean(`\\?\` + path)
 }
 
 func windowsLocalDaemonStateRootDACL(ownerSID string) string {

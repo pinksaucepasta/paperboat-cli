@@ -21,6 +21,7 @@ func TestWindowsUpdaterUsesRunningBinaryVersionDuringActivation(t *testing.T) {
 		ListenAddress: "127.0.0.1:8080",
 		TokenFile:     hostinstall.WindowsHostdTokenPath(),
 		SetupMode:     "host",
+		StateRoot:     `C:\Users\Pujan\AppData\Local\Paperboat\runtime`,
 		Artifact: bootstrap.ArtifactTarget{
 			Version:       "2026.08.27.61",
 			Architecture:  "amd64",
@@ -33,5 +34,8 @@ func TestWindowsUpdaterUsesRunningBinaryVersionDuringActivation(t *testing.T) {
 	}
 	if config.ActiveVersion == install.Artifact.Version {
 		t.Fatal("candidate updater inherited the uncommitted persisted version")
+	}
+	if config.RuntimeStateRoot != install.StateRoot {
+		t.Fatalf("runtime state root = %q, want persisted owner root %q", config.RuntimeStateRoot, install.StateRoot)
 	}
 }

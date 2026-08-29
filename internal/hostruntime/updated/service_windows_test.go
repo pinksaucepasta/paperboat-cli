@@ -47,7 +47,7 @@ func testWindowsUpdaterConfig(t *testing.T) WindowsConfig {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return WindowsConfig{StateRoot: layout.UpdateStateRoot, Binary: layout.Binary, BinaryRollback: layout.BinaryRollback, BinaryStaged: layout.BinaryStaged, OwnerSID: "S-1-5-21-1-2-3-1001", MachineID: "machine", RepositoryURL: "https://get.pprbt.dev", TokenFile: hostinstall.WindowsHostdTokenPath(), InstallState: hostinstall.WindowsInstallConfigPath(), ControlSocket: `\\.\pipe\PaperboatUpdatedControl`, HostdSocket: layout.HostdSocket, HealthURL: "http://127.0.0.1:8080/healthz", ActiveVersion: "2026.08.23.1", Architecture: "amd64", SetupMode: "client"}
+	return WindowsConfig{StateRoot: layout.UpdateStateRoot, RuntimeStateRoot: `C:\Users\Pujan\AppData\Local\Paperboat\runtime`, Binary: layout.Binary, BinaryRollback: layout.BinaryRollback, BinaryStaged: layout.BinaryStaged, OwnerSID: "S-1-5-21-1-2-3-1001", MachineID: "machine", RepositoryURL: "https://get.pprbt.dev", TokenFile: hostinstall.WindowsHostdTokenPath(), InstallState: hostinstall.WindowsInstallConfigPath(), ControlSocket: `\\.\pipe\PaperboatUpdatedControl`, HostdSocket: layout.HostdSocket, HealthURL: "http://127.0.0.1:8080/healthz", ActiveVersion: "2026.08.23.1", Architecture: "amd64", SetupMode: "client"}
 }
 
 func TestWindowsUpdaterRejectsMutableTrustAndPathInputs(t *testing.T) {
@@ -59,6 +59,7 @@ func TestWindowsUpdaterRejectsMutableTrustAndPathInputs(t *testing.T) {
 		func(c *WindowsConfig) { c.TokenFile = `C:\Temp\token` },
 		func(c *WindowsConfig) { c.InstallState = `C:\Temp\state.json` },
 		func(c *WindowsConfig) { c.StateRoot = `C:\Temp\updates` },
+		func(c *WindowsConfig) { c.RuntimeStateRoot = `C:\Temp\owner-state` },
 		func(c *WindowsConfig) { c.ControlSocket = `\\.\pipe\attacker` },
 		func(c *WindowsConfig) { c.HealthURL = "http://10.0.0.1:8080/healthz" },
 		func(c *WindowsConfig) { c.Architecture = "386" },

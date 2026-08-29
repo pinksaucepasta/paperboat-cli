@@ -114,7 +114,7 @@ func stageWindowsActivation(ctx context.Context, config WindowsConfig, release w
 	if !activeWindowsServiceTargetsMatch(layout, config.ActiveVersion, oldHostd, oldUpdater, oldSSH) {
 		return windowsActivationJournal{}, errInvalidWindowsActivation
 	}
-	localDaemonLock, err := windowsLocalDaemonLockPath()
+	localDaemonLock, err := windowsLocalDaemonLockPath(config.RuntimeStateRoot)
 	if err != nil {
 		return windowsActivationJournal{}, err
 	}
@@ -576,22 +576,21 @@ func (b *windowsSCMActivationBackend) WriteJournal(j windowsActivationJournal) e
 	}
 	return applyWindowsReleaseACL(path, "D:P(A;;FA;;;SY)(A;;FA;;;BA)")
 }
-func windowsLocalDaemonLockPath() (string, error) {
-	config, err := hostinstall.LoadWindowsRuntimeConfig()
-	if err != nil || !filepath.IsAbs(config.StateRoot) || filepath.Clean(config.StateRoot) != config.StateRoot {
-		return "", errors.Join(errInvalidWindowsActivation, err)
+func windowsLocalDaemonLockPath(runtimeStateRoot string) (string, error) {
+	if !filepath.IsAbs(runtimeStateRoot) || filepath.Clean(runtimeStateRoot) != runtimeStateRoot {
+		return "", errInvalidWindowsActivation
 	}
-	return filepath.Join(filepath.Dir(config.StateRoot), "state", "daemon.lock"), nil
+	return filepath.Join(filepath.Dir(runtimeStateRoot), "state", "daemon.lock"), nil
 }
 
 func (b *windowsSCMActivationBackend) StopServices(ctx context.Context, localDaemonWasRunning bool) error {
 	serviceErr := stopNamedWindowsServices(ctx, windowsActivationServiceNames(b.config.SetupMode)...)
-	lockPath, err := windowsLocalDaemonLockPath()
+	lockPath, err := windowsLocalDaemonLockPath(b.config.RuntimeStateRoot)
 	if err != nil {
 		return errors.Join(serviceErr, err)
 	}
 	stopErr := localdaemon.StopWindowsOwnerService(ctx, lockPath, b.config.OwnerSID)
-	stateErr := hostinstall.PrepareWindowsLocalDaemonState(b.config.StateRoot, b.config.OwnerSID)
+	stateErr := hostinstall.PrepareWindowsLocalDaemonState(b.config.RuntimeStateRoot, b.config.OwnerSID)
 	// A stale session-scoped lock DACL can prevent the first owner-process
 	// cleanup after SCM has stopped the service. Once the privileged state
 	// repair succeeds, retry that exact idempotent stop before slot rotation.
@@ -822,7 +821,7 @@ func normalizeWindowsRollbackTargets(hostd, updater, ssh windowsServiceTarget) (
 }
 func (b *windowsSCMActivationBackend) StartServices(ctx context.Context, hostd, updater, ssh, localDaemon bool) error {
 	if localDaemon {
-		if err := hostinstall.PrepareWindowsLocalDaemonState(b.config.StateRoot, b.config.OwnerSID); err != nil {
+		if err := hostinstall.PrepareWindowsLocalDaemonState(b.config.RuntimeStateRoot, b.config.OwnerSID); err != nil {
 			return err
 		}
 	}
