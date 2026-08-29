@@ -123,6 +123,72 @@ func TestControlRejectsUnknownFields(t *testing.T) {
 	<-done
 }
 
+func TestControlStatusRemainsResponsiveDuringUpdate(t *testing.T) {
+	path := testSocketPath(t)
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	updateStarted := make(chan struct{})
+	releaseUpdate := make(chan struct{})
+	server := controlServer{socketPath: path, uid: os.Geteuid(), gid: os.Getegid(), invokeRequest: func(_ context.Context, request ControlRequest) (ControlResponse, error) {
+		switch request.Operation {
+		case "update":
+			close(updateStarted)
+			<-releaseUpdate
+			return ControlResponse{Schema: ControlProtocolV1, Status: "ok", Version: "2.0.0", Updated: true}, nil
+		case "status":
+			return ControlResponse{Schema: ControlProtocolV1, Status: "ok", Version: "1.0.0"}, nil
+		default:
+			return ControlResponse{}, ErrInvalidControl
+		}
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go server.serve(ctx, listener)
+	client, err := NewClient(path, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updateDone := make(chan error, 1)
+	go func() {
+		_, updateErr := client.Update(context.Background())
+		updateDone <- updateErr
+	}()
+	select {
+	case <-updateStarted:
+	case <-time.After(time.Second):
+		t.Fatal("update did not reach the control server")
+	}
+	status, err := client.Status(context.Background())
+	if err != nil || status.Version != "1.0.0" {
+		t.Fatalf("status during update = %#v, %v", status, err)
+	}
+	close(releaseUpdate)
+	if err := <-updateDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+type channelRestarter chan struct{}
+
+func (r channelRestarter) Restart(context.Context) error {
+	close(r)
+	return nil
+}
+
+func TestCommittedUpdateSchedulesUpdaterRestartAfterResponse(t *testing.T) {
+	restarted := make(channelRestarter)
+	service := &Service{restarter: restarted}
+	service.afterControlResponse(ControlRequest{Operation: "update"}, ControlResponse{Status: "ok", Updated: true})
+	select {
+	case <-restarted:
+	case <-time.After(time.Second):
+		t.Fatal("committed update did not schedule updater restart")
+	}
+}
+
 func testSocketPath(t *testing.T) string {
 	t.Helper()
 	file, err := os.CreateTemp("", "pbupd-")

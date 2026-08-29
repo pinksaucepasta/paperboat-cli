@@ -57,6 +57,7 @@ type controlServer struct {
 	gid           int
 	invoke        func(context.Context, string) (ControlResponse, error) // legacy test seam
 	invokeRequest func(context.Context, ControlRequest) (ControlResponse, error)
+	afterResponse func(ControlRequest, ControlResponse)
 }
 
 func (s *controlServer) listen() (*net.UnixListener, error) {
@@ -108,8 +109,10 @@ func (s *controlServer) serve(ctx context.Context, listener *net.UnixListener) {
 		if err != nil {
 			return
 		}
-		_ = s.handle(connection)
-		_ = connection.Close()
+		go func(connection *net.UnixConn) {
+			defer connection.Close()
+			_ = s.handle(connection)
+		}(connection)
 	}
 }
 
@@ -142,7 +145,13 @@ func (s *controlServer) handle(connection *net.UnixConn) error {
 		response.ErrorCode = controlErrorCode(invokeErr)
 		response.ErrorMessage = boundedControlErrorMessage(invokeErr)
 	}
-	return s.respond(connection, response)
+	if err := s.respond(connection, response); err != nil {
+		return err
+	}
+	if s.afterResponse != nil {
+		s.afterResponse(request, response)
+	}
+	return nil
 }
 
 var exactReleasePattern = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$`)
@@ -186,8 +195,6 @@ func (s *controlServer) respond(writer io.Writer, response ControlResponse) erro
 }
 
 func (s *Service) controlRequest(ctx context.Context, operation string) (ControlResponse, error) {
-	s.controlMu.Lock()
-	defer s.controlMu.Unlock()
 	return s.controlRequestWithRequest(ctx, ControlRequest{Operation: operation})
 }
 
@@ -203,6 +210,8 @@ func (s *Service) controlRequestWithRequest(ctx context.Context, request Control
 		response.Version, response.Updated = result.Version, result.Updated
 		return response, err
 	case "update":
+		s.controlMu.Lock()
+		defer s.controlMu.Unlock()
 		response := ControlResponse{Schema: ControlProtocolV1, Status: "ok", Observation: s.Snapshot()}
 		result, err := s.UpdateNow(ctx)
 		response.Version, response.Updated = result.Version, result.Updated

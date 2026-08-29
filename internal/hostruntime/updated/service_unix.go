@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -39,21 +40,24 @@ type Config struct {
 	RepositoryURL  string
 	MachineID      string
 	Health         workerupdate.HealthChecker
+	Restarter      interface{ Restart(context.Context) error }
 	// ControlSocket is the fixed local socket exposed to the enrolled user for
 	// pb update, check, and status. It is not an updater command channel.
 	ControlSocket string
 }
 
 type Service struct {
-	manager   *workerupdate.Manager
-	source    workerupdate.TUFSource
-	scheduler *autoupdate.Scheduler
-	control   controlServer
-	controlMu sync.Mutex
+	manager      *workerupdate.Manager
+	source       workerupdate.TUFSource
+	scheduler    *autoupdate.Scheduler
+	control      controlServer
+	controlMu    sync.Mutex
+	restarter    interface{ Restart(context.Context) error }
+	restartDelay time.Duration
 }
 
 func New(config Config) (*Service, error) {
-	if !filepath.IsAbs(config.StateRoot) || !filepath.IsAbs(config.ControlSocket) || !validUnixWorkerIdentity(config.WorkerUID, config.WorkerGID) || len(config.Token) != 32 || config.SocketPath == "" || config.RepositoryURL == "" || config.MachineID == "" || config.Health == nil {
+	if !filepath.IsAbs(config.StateRoot) || !filepath.IsAbs(config.ControlSocket) || !validUnixWorkerIdentity(config.WorkerUID, config.WorkerGID) || len(config.Token) != 32 || config.SocketPath == "" || config.RepositoryURL == "" || config.MachineID == "" || config.Health == nil || config.Restarter == nil {
 		return nil, ErrInvalidConfig
 	}
 	if err := secureRoot(config.StateRoot); err != nil {
@@ -77,15 +81,19 @@ func New(config Config) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
+	service := &Service{manager: manager, source: source, restarter: config.Restarter, restartDelay: 250 * time.Millisecond}
 	scheduler, err := autoupdate.New(autoupdate.Config{Check: func(ctx context.Context) (autoupdate.Result, error) {
 		workerResult, workerErr := manager.Check(ctx, source.Resolve)
+		if workerErr == nil && workerResult.Updated {
+			service.scheduleUpdaterRestart()
+		}
 		return autoupdate.Result{Version: workerResult.Version, Updated: workerResult.Updated}, workerErr
 	}})
 	if err != nil {
 		return nil, err
 	}
-	service := &Service{manager: manager, source: source, scheduler: scheduler}
-	service.control = controlServer{socketPath: config.ControlSocket, uid: config.WorkerUID, gid: config.WorkerGID, invokeRequest: service.controlRequestWithRequest}
+	service.scheduler = scheduler
+	service.control = controlServer{socketPath: config.ControlSocket, uid: config.WorkerUID, gid: config.WorkerGID, invokeRequest: service.controlRequestWithRequest, afterResponse: service.afterControlResponse}
 	return service, nil
 }
 
@@ -119,7 +127,33 @@ func (s *Service) UpdateNow(ctx context.Context) (workerupdate.Result, error) {
 	if s == nil || s.manager == nil {
 		return workerupdate.Result{}, ErrInvalidConfig
 	}
-	return s.manager.Check(ctx, s.source.ResolveManual)
+	result, err := s.manager.Check(ctx, s.source.ResolveManual)
+	return result, err
+}
+
+func (s *Service) afterControlResponse(request ControlRequest, response ControlResponse) {
+	if request.Operation == "update" && response.Status == "ok" && response.Updated {
+		s.scheduleUpdaterRestart()
+	}
+}
+
+func (s *Service) scheduleUpdaterRestart() {
+	if s == nil || s.restarter == nil {
+		return
+	}
+	delay := s.restartDelay
+	go func() {
+		if delay > 0 {
+			timer := time.NewTimer(delay)
+			defer timer.Stop()
+			<-timer.C
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := s.restarter.Restart(ctx); err != nil {
+			slog.Error("restart paperboat-updated after committed update", "error", err)
+		}
+	}()
 }
 
 func (s *Service) Snapshot() autoupdate.Observation {

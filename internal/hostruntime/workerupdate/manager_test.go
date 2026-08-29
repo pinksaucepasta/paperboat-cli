@@ -54,6 +54,36 @@ func TestWorkerUpdateCutsOverWithoutRestartingHostd(t *testing.T) {
 	}
 }
 
+func TestActiveVersionRemainsReadableDuringHealthHold(t *testing.T) {
+	fixture := newFixture(t)
+	health := &blockingHealth{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	fixture.manager.config.Health = health
+	updateDone := make(chan error, 1)
+	go func() {
+		_, err := fixture.manager.Activate(context.Background(), fixture.candidate)
+		updateDone <- err
+	}()
+	select {
+	case <-health.entered:
+	case <-time.After(time.Second):
+		t.Fatal("update did not enter its health hold")
+	}
+	version := make(chan string, 1)
+	go func() { version <- fixture.manager.ActiveVersion() }()
+	select {
+	case got := <-version:
+		if got != fixture.active.Version {
+			t.Fatalf("active version during hold = %q, want %q", got, fixture.active.Version)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("active version blocked behind the update transaction")
+	}
+	close(health.release)
+	if err := <-updateDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestWorkerUpdateSeedsSignedActiveStateBeforeFirstUpdate(t *testing.T) {
 	fixture := newFixture(t)
 	if err := fixture.manager.Recover(context.Background()); err != nil {
@@ -415,6 +445,20 @@ func (*fakeWorker) Stop(context.Context) error { return nil }
 type fakeHealth struct{ err error }
 
 func (h *fakeHealth) Check(context.Context, hostdproto.Status, Release) error { return h.err }
+
+type blockingHealth struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (h *blockingHealth) Check(context.Context, hostdproto.Status, Release) error {
+	select {
+	case h.entered <- struct{}{}:
+	default:
+	}
+	<-h.release
+	return nil
+}
 
 type nativeVerifierFunc func(context.Context, string, string, string) error
 

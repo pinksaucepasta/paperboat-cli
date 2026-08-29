@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/binarytarget"
@@ -167,9 +168,10 @@ type Config struct {
 // quarantine slot after a failed activation, and a later verified stage
 // atomically replaces it.
 type Manager struct {
-	mu     sync.Mutex
-	config Config
-	active Release
+	mu            sync.Mutex
+	config        Config
+	active        Release
+	activeVersion atomic.Value
 }
 
 type Result struct {
@@ -196,7 +198,9 @@ func New(config Config) (*Manager, error) {
 	if err := validateConfig(config); err != nil {
 		return nil, err
 	}
-	return &Manager{config: config, active: config.Active}, nil
+	manager := &Manager{config: config, active: config.Active}
+	manager.activeVersion.Store(config.Active.Version)
+	return manager, nil
 }
 
 // Check resolves a signed cohort-eligible target and applies it through the
@@ -214,9 +218,14 @@ func (m *Manager) Check(ctx context.Context, resolve Resolver) (Result, error) {
 }
 
 func (m *Manager) ActiveVersion() string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.active.Version
+	if m == nil {
+		return ""
+	}
+	version := m.activeVersion.Load()
+	if version == nil {
+		return ""
+	}
+	return version.(string)
 }
 
 func (m *Manager) Activate(ctx context.Context, release Release) (Result, error) {
@@ -330,7 +339,7 @@ func (m *Manager) Activate(ctx context.Context, release Release) (Result, error)
 	if err = m.write(journal); err != nil {
 		return Result{Version: m.active.Version}, err
 	}
-	m.active = release
+	m.setActive(release)
 	return Result{Version: release.Version, Updated: true}, m.finishCommitted(journal)
 }
 
@@ -394,7 +403,7 @@ func (m *Manager) recoverLocked(ctx context.Context) error {
 	case updateflow.RecoveryContinueMonitor:
 		return m.monitorAndCommitRecovered(ctx, journal)
 	case updateflow.RecoveryFinalizeCleanup:
-		m.active = releaseFromJournal(journal)
+		m.setActive(releaseFromJournal(journal))
 		return m.finishCommitted(journal)
 	case updateflow.RecoveryPerformRollback:
 		return ErrBlocked
@@ -439,8 +448,13 @@ func (m *Manager) monitorAndCommitRecovered(ctx context.Context, journal updatef
 	if err := m.write(next); err != nil {
 		return err
 	}
-	m.active = release
+	m.setActive(release)
 	return m.finishCommitted(next)
+}
+
+func (m *Manager) setActive(release Release) {
+	m.active = release
+	m.activeVersion.Store(release.Version)
 }
 
 func (m *Manager) monitor(ctx context.Context, journal updateflow.Journal, release Release) error {

@@ -19,6 +19,28 @@ type FixedSupervisorActivator struct {
 	Runner   service.Runner
 }
 
+// FixedUpdaterRestarter reloads only the updater after a committed worker
+// update. The target is fixed by platform so an enrolled user cannot select a
+// service, executable, or argument through the control socket.
+type FixedUpdaterRestarter struct {
+	Platform string
+	Runner   service.Runner
+}
+
+func (r FixedUpdaterRestarter) Restart(ctx context.Context) error {
+	if r.Runner == nil || r.Platform != runtime.GOOS {
+		return errors.New("invalid fixed updater restarter")
+	}
+	switch r.Platform {
+	case "linux":
+		return r.Runner.Run(ctx, "systemctl", "--no-block", "restart", "paperboat-updated.service")
+	case "darwin":
+		return r.Runner.Run(ctx, "launchctl", "kickstart", "-k", "system/com.pinksaucepasta.paperboat.updated")
+	default:
+		return errors.New("unsupported updater platform")
+	}
+}
+
 func (a FixedSupervisorActivator) Activate(ctx context.Context) error {
 	return a.restart(ctx)
 }
