@@ -8,6 +8,12 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+// OwnerFullControlDirectoryDACL is the canonical protected, inheritable DACL
+// for per-user Paperboat state that must survive Windows S4U logon sessions.
+func OwnerFullControlDirectoryDACL(ownerSID string) string {
+	return "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;" + ownerSID + ")"
+}
+
 // ProtectedDACLMatches compares a protected file DACL with the requested
 // descriptor. Windows may serialize the current elevated administrator SID as
 // the well-known LA alias, so compare that canonical representation too. LA

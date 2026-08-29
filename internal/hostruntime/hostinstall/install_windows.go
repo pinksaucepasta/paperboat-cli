@@ -466,6 +466,18 @@ func prepareWindowsLocalDaemonMigration(ctx context.Context, ownerSID, stateRoot
 	return localdaemon.StopWindowsLegacyService(ctx, lockPath, ownerSID)
 }
 
+func prepareWindowsLocalDaemonMigrationAndState(ctx context.Context, ownerSID, stateRoot string) error {
+	migrationErr := prepareWindowsLocalDaemonMigration(ctx, ownerSID, stateRoot)
+	stateErr := PrepareWindowsLocalDaemonState(stateRoot, ownerSID)
+	// A stale lock DACL can make the first legacy-process probe fail after its
+	// SCM parent is already stopped. Repair the exact owner state, then retry
+	// the idempotent migration before any service is started.
+	if migrationErr != nil && stateErr == nil {
+		migrationErr = prepareWindowsLocalDaemonMigration(ctx, ownerSID, stateRoot)
+	}
+	return errors.Join(migrationErr, stateErr)
+}
+
 // EnsureWindowsLocalDaemonService upgrades an existing Windows installation
 // from the owner-scoped scheduled task to the protected LocalDaemon SCM
 // service. It is idempotent and is also called by the updater so an in-place
@@ -487,7 +499,7 @@ func EnsureWindowsLocalDaemonService(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := prepareWindowsLocalDaemonMigration(ctx, config.OwnerSID, config.StateRoot); err != nil {
+	if err := prepareWindowsLocalDaemonMigrationAndState(ctx, config.OwnerSID, config.StateRoot); err != nil {
 		return fmt.Errorf("migrate Paperboat local daemon task: %w", err)
 	}
 	installed, err := localdaemon.WindowsLocalDaemonServiceInstalled()
@@ -1077,7 +1089,7 @@ func installWindowsServices(ctx context.Context, layout service.Layout, upgradeM
 }
 
 func installWindowsRoleServices(ctx context.Context, request Request, layout service.Layout, upgradeMode string) error {
-	if err := prepareWindowsLocalDaemonMigration(ctx, request.OwnerSID, request.StateRoot); err != nil {
+	if err := prepareWindowsLocalDaemonMigrationAndState(ctx, request.OwnerSID, request.StateRoot); err != nil {
 		return fmt.Errorf("migrate Paperboat local daemon task: %w", err)
 	}
 	return executeWindowsServiceInstallPlan(request.SetupMode,
@@ -1741,6 +1753,141 @@ func ensureWindowsDirectory(path, ownerSID string) error {
 	}
 	return applyWindowsACL(path, ownerSID, true)
 }
+
+// PrepareWindowsLocalDaemonState repairs the enrolled user's LocalDaemon
+// state before an SCM service starts. Windows S4U logon SIDs are temporary;
+// state inherited from one service session must therefore be rebound to the
+// permanent enrolled SID by the elevated installer or updater.
+func PrepareWindowsLocalDaemonState(runtimeStateRoot, ownerSID string) error {
+	lockPath, err := windowsLocalDaemonLockPath(runtimeStateRoot)
+	if err != nil || !validSID(ownerSID) {
+		return ErrInvalidRequest
+	}
+	root := filepath.Dir(lockPath)
+	if err := rejectWindowsReparseAncestors(root); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return err
+	}
+	if err := rejectWindowsReparseAncestors(root); err != nil {
+		return err
+	}
+	owner, err := windows.StringToSid(ownerSID)
+	if err != nil || owner == nil || !owner.IsValid() {
+		return ErrInvalidRequest
+	}
+	handle, err := openWindowsLocalDaemonStateRoot(root)
+	if err != nil {
+		return err
+	}
+	defer windows.CloseHandle(handle)
+	access := windowsLocalDaemonStateRootDACL(ownerSID)
+	if err := applyWindowsHandleOwnedDACL(handle, owner, access); err != nil {
+		return err
+	}
+	// Existing lock, owner, and diagnostic files can retain a protected DACL
+	// from an earlier S4U session. Repair the bounded Paperboat-owned subtree
+	// while the root remains pinned against replacement.
+	if err := repairWindowsLocalDaemonTreeChildren(root, owner); err != nil {
+		return err
+	}
+	if !windowsRuntimeHandleSecurityMatches(handle, owner, access) {
+		return ErrInvalidRequest
+	}
+	return nil
+}
+
+func rejectWindowsReparseAncestors(path string) error {
+	path = filepath.Clean(path)
+	volume := filepath.VolumeName(path)
+	if volume == "" || !filepath.IsAbs(path) {
+		return ErrInvalidRequest
+	}
+	root := volume + string(filepath.Separator)
+	relative, err := filepath.Rel(root, path)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return ErrInvalidRequest
+	}
+	current := root
+	for _, part := range strings.Split(relative, string(filepath.Separator)) {
+		if part == "" || part == "." {
+			continue
+		}
+		current = filepath.Join(current, part)
+		info, statErr := os.Lstat(current)
+		if errors.Is(statErr, os.ErrNotExist) {
+			break
+		}
+		if statErr != nil || info.Mode()&os.ModeSymlink != 0 {
+			return ErrInvalidRequest
+		}
+		attributes, attrErr := windows.GetFileAttributes(windows.StringToUTF16Ptr(current))
+		if attrErr != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+			return ErrInvalidRequest
+		}
+	}
+	return nil
+}
+
+func openWindowsLocalDaemonStateRoot(path string) (windows.Handle, error) {
+	return openWindowsLocalDaemonStateObject(path, true)
+}
+
+func openWindowsLocalDaemonStateObject(path string, directory bool) (windows.Handle, error) {
+	pointer, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return 0, err
+	}
+	flags := uint32(windows.FILE_FLAG_OPEN_REPARSE_POINT)
+	if directory {
+		flags |= windows.FILE_FLAG_BACKUP_SEMANTICS
+	}
+	handle, err := windows.CreateFile(pointer, windows.READ_CONTROL|windows.WRITE_DAC|windows.WRITE_OWNER, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, flags, 0)
+	if err != nil {
+		return 0, err
+	}
+	var information windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(handle, &information); err != nil {
+		windows.CloseHandle(handle)
+		return 0, err
+	}
+	isDirectory := information.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0
+	if information.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 || isDirectory != directory {
+		windows.CloseHandle(handle)
+		return 0, ErrInvalidRequest
+	}
+	return handle, nil
+}
+
+func repairWindowsLocalDaemonTreeChildren(root string, owner *windows.SID) error {
+	if !safeAbsolute(root) || owner == nil || !owner.IsValid() {
+		return ErrInvalidRequest
+	}
+	return filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if path == root {
+			return nil
+		}
+		handle, err := openWindowsLocalDaemonStateObject(path, entry.IsDir())
+		if err != nil {
+			return err
+		}
+		access := "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + owner.String() + ")"
+		if entry.IsDir() {
+			access = windowssecurity.OwnerFullControlDirectoryDACL(owner.String())
+		}
+		applyErr := applyWindowsHandleOwnedDACL(handle, owner, access)
+		return errors.Join(applyErr, windows.CloseHandle(handle))
+	})
+}
+
+func windowsLocalDaemonStateRootDACL(ownerSID string) string {
+	return windowssecurity.OwnerFullControlDirectoryDACL(ownerSID)
+}
+
 func secureWindowsFile(path, ownerSID string) error {
 	info, err := os.Lstat(path)
 	if err != nil {

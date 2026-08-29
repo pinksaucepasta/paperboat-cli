@@ -591,10 +591,17 @@ func (b *windowsSCMActivationBackend) StopServices(ctx context.Context, localDae
 		return errors.Join(serviceErr, err)
 	}
 	stopErr := localdaemon.StopWindowsOwnerService(ctx, lockPath, b.config.OwnerSID)
+	stateErr := hostinstall.PrepareWindowsLocalDaemonState(b.config.StateRoot, b.config.OwnerSID)
+	// A stale session-scoped lock DACL can prevent the first owner-process
+	// cleanup after SCM has stopped the service. Once the privileged state
+	// repair succeeds, retry that exact idempotent stop before slot rotation.
+	if stopErr != nil && stateErr == nil {
+		stopErr = localdaemon.StopWindowsOwnerService(ctx, lockPath, b.config.OwnerSID)
+	}
 	if !localDaemonWasRunning && errors.Is(stopErr, os.ErrNotExist) {
 		stopErr = nil
 	}
-	return errors.Join(serviceErr, stopErr)
+	return errors.Join(serviceErr, stopErr, stateErr)
 }
 
 func windowsStableBinaryDACL(ownerSID string) string {
@@ -814,6 +821,11 @@ func normalizeWindowsRollbackTargets(hostd, updater, ssh windowsServiceTarget) (
 	return hostd, updater, ssh, nil
 }
 func (b *windowsSCMActivationBackend) StartServices(ctx context.Context, hostd, updater, ssh, localDaemon bool) error {
+	if localDaemon {
+		if err := hostinstall.PrepareWindowsLocalDaemonState(b.config.StateRoot, b.config.OwnerSID); err != nil {
+			return err
+		}
+	}
 	// Hostd validates its managed SSH loopback target during startup. Start SSH
 	// first so both activation and rollback can bring a host runtime up from a
 	// fully stopped service set without a dependency deadlock.

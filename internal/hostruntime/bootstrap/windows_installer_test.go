@@ -13,12 +13,13 @@ func TestWindowsInstallerDoesNotRequestUACFromElevatedSession(t *testing.T) {
 	}
 	script := string(body)
 	adminBranch := strings.Index(script, "if (Test-Administrator) {")
-	runAsStart := strings.Index(script, "Start-Process -FilePath $runAsPath -ArgumentList $elevatedArguments -Verb RunAs")
-	if adminBranch < 0 || runAsStart < 0 {
-		t.Fatal("Windows installer must handle both elevated and UAC sessions")
+	adminStart := strings.Index(script, "& $download @arguments")
+	runAsStart := strings.Index(script, "$process = Start-Process -FilePath $runAsPath -ArgumentList $elevatedArguments -Verb RunAs -PassThru -Wait -WindowStyle Hidden")
+	if adminBranch < 0 || adminStart < adminBranch || runAsStart < adminStart {
+		t.Fatal("Windows installer must execute directly for administrators and use UAC for non-administrators")
 	}
-	if !strings.Contains(script, "& $runAsPath @arguments") {
-		t.Fatal("Windows installer must invoke the bootstrap directly from a verified elevated session")
+	if !strings.Contains(script, "$arguments[2] = $installerExecutable") {
+		t.Fatal("Windows installer must pass the trusted staged source path to the elevated child")
 	}
 	unblock := strings.Index(script, "Unblock-File -LiteralPath $download")
 	if unblock < 0 {
@@ -27,14 +28,11 @@ func TestWindowsInstallerDoesNotRequestUACFromElevatedSession(t *testing.T) {
 	if !strings.Contains(script, "$trustedBootstrapDirectory = Join-Path ${env:ProgramFiles} 'Paperboat\\bootstrap'") || !strings.Contains(script, "pb-' + [guid]::NewGuid().ToString('N') + '.exe'") || !strings.Contains(script, "Stage-TrustedBootstrap $download") {
 		t.Fatal("Windows installer must stage the verified bootstrap in a trusted administrator-owned path")
 	}
-	if !strings.Contains(script, "New-Item -ItemType File -Path $probe -Force") || !strings.Contains(script, "catch { $installerExecutable = $null }") || !strings.Contains(script, "-FilePath $runAsPath -ArgumentList $elevatedArguments -Verb RunAs") {
+	if !strings.Contains(script, "New-Item -ItemType Directory -Force -Path $trustedBootstrapDirectory") || !strings.Contains(script, "catch { $installerExecutable = $null }") || !strings.Contains(script, "-FilePath $runAsPath -ArgumentList $elevatedArguments -Verb RunAs") {
 		t.Fatal("Windows installer must verify effective staging privileges and fall back through RunAs without leaking Access Denied")
 	}
-	if !strings.Contains(script, "$arguments[2] = $installerExecutable") {
-		t.Fatal("Windows installer must pass the trusted staged source path to the elevated child")
-	}
-	if !strings.Contains(script, "$pairProcess = Start-Process -FilePath $installedPb -ArgumentList $pairArguments -Verb RunAs -PassThru -Wait") {
-		t.Fatal("Windows installer must run host pairing through the full administrator token")
+	if !strings.Contains(script, "& $installedPb pair --server $server --enrollment-token $token") || strings.Contains(script, "$pairProcess = Start-Process") {
+		t.Fatal("Windows installer must pair in the original user's process")
 	}
 	if strings.Contains(script, "\n  if (-not $process.WaitForExit(1200000))") && strings.Index(script, "\n  if (-not $process.WaitForExit(1200000))") < runAsStart {
 		t.Fatal("Windows installer waits for an elevation process before creating it")

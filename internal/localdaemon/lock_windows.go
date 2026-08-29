@@ -155,7 +155,7 @@ func validateWindowsLockFile(path string) error {
 func windowsLockSDDL(ownerSID string) string { return processLockSecurity + ownerSID + ")" }
 
 func windowsOwnerStateDirectorySDDL(ownerSID string) string {
-	return "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;" + ownerSID + ")"
+	return windowssecurity.OwnerFullControlDirectoryDACL(ownerSID)
 }
 
 func setWindowsLockParentDACL(path, ownerSID string) error {

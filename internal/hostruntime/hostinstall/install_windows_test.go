@@ -5,10 +5,14 @@ package hostinstall
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
 	"github.com/pinksaucepasta/paperboat/internal/windowsopenssh"
+	"github.com/pinksaucepasta/paperboat/internal/windowssecurity"
+	"golang.org/x/sys/windows"
 )
 
 func TestWindowsSSHServiceSetFollowsHostClientTransition(t *testing.T) {
@@ -85,4 +89,70 @@ func TestRunWindowsInstallPhaseReturnsNamedDeadline(t *testing.T) {
 		t.Fatalf("phase error = %v", err)
 	}
 	close(finished)
+}
+
+func TestPrepareWindowsLocalDaemonStateRepairsSiblingStateTree(t *testing.T) {
+	if !isAdministrator() {
+		t.Skip("requires an elevated Windows token")
+	}
+	user, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil || user == nil || user.User.Sid == nil {
+		t.Fatalf("resolve current user SID: %v", err)
+	}
+	ownerSID := user.User.Sid.String()
+	base := filepath.Join(t.TempDir(), "Paperboat")
+	runtimeRoot := filepath.Join(base, "runtime")
+	stateRoot := filepath.Join(base, "state")
+	if err := os.MkdirAll(runtimeRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(stateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	staleLock := filepath.Join(stateRoot, "daemon.lock")
+	if err := os.WriteFile(staleLock, []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	staleSID := "S-1-5-5-999-999"
+	administrators, err := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootHandle, err := openWindowsLocalDaemonStateRoot(stateRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := applyWindowsHandleOwnedDACL(rootHandle, administrators, windowssecurity.OwnerFullControlDirectoryDACL(staleSID)); err != nil {
+		windows.CloseHandle(rootHandle)
+		t.Fatalf("seed stale state-root owner and DACL: %v", err)
+	}
+	if err := windows.CloseHandle(rootHandle); err != nil {
+		t.Fatal(err)
+	}
+	lockHandle, _, err := openWindowsRuntimeObject(staleLock, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := applyWindowsHandleOwnedDACL(lockHandle, administrators, "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;"+staleSID+")"); err != nil {
+		windows.CloseHandle(lockHandle)
+		t.Fatalf("seed stale lock owner and DACL: %v", err)
+	}
+	if err := windows.CloseHandle(lockHandle); err != nil {
+		t.Fatal(err)
+	}
+	if !windowssecurity.OwnerMatchesSID(stateRoot, administrators) || !windowssecurity.OwnerMatchesSID(staleLock, administrators) {
+		t.Fatal("fixture did not reproduce the Administrators-owned stale state")
+	}
+	if err := PrepareWindowsLocalDaemonState(runtimeRoot, ownerSID); err != nil {
+		t.Fatalf("prepare LocalDaemon state: %v", err)
+	}
+	if !windowssecurity.OwnerMatchesSID(stateRoot, user.User.Sid) || !windowssecurity.ProtectedDACLMatches(stateRoot, windowsLocalDaemonStateRootDACL(ownerSID)) {
+		t.Fatal("LocalDaemon state root was not rebound to the permanent enrolled SID")
+	}
+	if !windowssecurity.OwnerMatchesSID(staleLock, user.User.Sid) || !windowssecurity.ProtectedDACLMatches(staleLock, "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;"+ownerSID+")") {
+		t.Fatal("existing LocalDaemon state was not rebound to the permanent enrolled SID")
+	}
+	if err := os.WriteFile(filepath.Join(stateRoot, "daemon.lock.owner.json.new"), []byte("owner"), 0o600); err != nil {
+		t.Fatalf("write state after repair: %v", err)
+	}
 }
