@@ -6,10 +6,8 @@ import (
 	"context"
 	"errors"
 	"io"
-	"path/filepath"
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
-	"github.com/pinksaucepasta/paperboat/internal/localdaemon"
 )
 
 func runLocalDaemonService(_ context.Context, args []string, _ io.Writer, _ io.Writer) error {
@@ -22,11 +20,6 @@ func runLocalDaemonService(_ context.Context, args []string, _ io.Writer, _ io.W
 	}
 	layout, err := service.DefaultLayout("windows")
 	if err != nil {
-		return err
-	}
-	stateDirectory := filepath.Join(filepath.Dir(install.StateRoot), "state")
-	if err := localdaemon.PrepareWindowsOwnerState(stateDirectory, install.OwnerSID); err != nil {
-		recordWindowsServiceLaunchFailure("PaperboatLocalDaemon", err)
 		return err
 	}
 	return service.RunWindowsService(service.ServiceEntryConfig{

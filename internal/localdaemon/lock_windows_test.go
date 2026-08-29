@@ -3,7 +3,6 @@
 package localdaemon
 
 import (
-	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -30,7 +29,7 @@ func TestVerifyWindowsLockACLAcceptsProtectedDACLSerialization(t *testing.T) {
 	}
 }
 
-func TestPrepareWindowsOwnerStateRebindsExistingTreeToPermanentOwner(t *testing.T) {
+func TestEnsureWindowsLockParentReplacesSessionScopedDirectoryDACL(t *testing.T) {
 	token := windows.GetCurrentProcessToken()
 	user, err := token.GetTokenUser()
 	if err != nil || user == nil || user.User.Sid == nil {
@@ -38,13 +37,20 @@ func TestPrepareWindowsOwnerStateRebindsExistingTreeToPermanentOwner(t *testing.
 	}
 	ownerSID := user.User.Sid.String()
 	root := filepath.Join(t.TempDir(), "state")
-	if err := PrepareWindowsOwnerState(root, ownerSID); err != nil {
-		if errors.Is(err, windows.ERROR_NOT_ALL_ASSIGNED) || errors.Is(err, windows.ERROR_PRIVILEGE_NOT_HELD) {
-			t.Skipf("repairing another Windows service owner requires LocalSystem restore privilege: %v", err)
-		}
-		t.Fatalf("prepare owner state: %v", err)
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
 	}
-	if !windowssecurity.OwnerMatchesSID(root, user.User.Sid) || !windowssecurity.ProtectedDACLMatches(root, windowsOwnerStateDirectorySDDL(ownerSID)) {
-		t.Fatal("state directory was not rebound to the permanent owner")
+	if err := setWindowsLockACL(root, ownerSID); err != nil {
+		t.Fatalf("set non-inheritable session-style DACL: %v", err)
+	}
+	if err := ensureWindowsLockParent(root, ownerSID); err != nil {
+		t.Fatalf("repair lock parent: %v", err)
+	}
+	if !windowssecurity.ProtectedDACLMatches(root, windowsOwnerStateDirectorySDDL(ownerSID)) {
+		t.Fatal("lock parent was not rebound to the permanent inheritable DACL")
+	}
+	child := filepath.Join(root, "daemon.lock.owner.json.new")
+	if err := os.WriteFile(child, []byte("owner"), 0o600); err != nil {
+		t.Fatalf("create owner record after DACL repair: %v", err)
 	}
 }

@@ -102,65 +102,10 @@ func ensureWindowsLockParent(path, ownerSID string) error {
 	if err := rejectWindowsReparseAncestors(path); err != nil {
 		return err
 	}
-	return setWindowsOwnerStateDACL(path, ownerSID, true)
-}
-
-// PrepareWindowsOwnerState repairs LocalDaemon state created by an older S4U
-// logon. A logon SID is session-scoped, so inheriting its default DACL strands
-// the next service process after an update, reboot, or logoff. The SCM parent
-// calls this as LocalSystem before launching the enrolled user workload. The
-// pinned directory handle prevents replacement while the protected,
-// inheritable DACL and permanent owner are applied.
-func PrepareWindowsOwnerState(path, ownerSID string) error {
-	if !filepath.IsAbs(path) || filepath.Clean(path) != path || validateWindowsOwnerSID(ownerSID) != nil {
-		return ErrInvalidInventoryConfig
-	}
-	if err := rejectWindowsReparseAncestors(path); err != nil {
-		return err
-	}
-	if err := os.MkdirAll(path, 0o700); err != nil {
-		return err
-	}
-	if err := rejectWindowsReparseAncestors(path); err != nil {
-		return err
-	}
-	handle, err := openWindowsOwnerState(path, true, windows.READ_CONTROL|windows.WRITE_DAC|windows.WRITE_OWNER)
-	if err != nil {
-		return err
-	}
-	defer windows.CloseHandle(handle)
-	owner, err := windows.StringToSid(ownerSID)
-	if err != nil || owner == nil || !owner.IsValid() {
-		return ErrInvalidInventoryConfig
-	}
-	sddl := windowsOwnerStateDirectorySDDL(ownerSID)
-	descriptor, err := windows.SecurityDescriptorFromString(sddl)
-	if err != nil {
-		return err
-	}
-	absolute, err := descriptor.ToAbsolute()
-	if err != nil {
-		return err
-	}
-	dacl, _, err := absolute.DACL()
-	if err != nil {
-		return err
-	}
-	err = windowssecurity.WithRestorePrivilege(func() error {
-		if err := windows.SetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil); err != nil {
-			return err
-		}
-		runtime.KeepAlive(absolute)
-		return windows.SetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION, owner, nil, nil, nil)
-	})
-	runtime.KeepAlive(absolute)
-	if err != nil {
-		return err
-	}
-	if !windowssecurity.HandleOwnerMatchesSID(handle, owner) || !windowssecurity.ProtectedHandleDACLMatches(handle, sddl) {
-		return localapi.ErrUnsafeSocket
-	}
-	return nil
+	// S4U logon SIDs are session-scoped. Replace the directory's default DACL
+	// from inside the enrolled user process before creating the owner record so
+	// future service sessions inherit access through the permanent account SID.
+	return setWindowsLockParentDACL(path, ownerSID)
 }
 
 func rejectWindowsReparseAncestors(path string) error {
@@ -213,11 +158,8 @@ func windowsOwnerStateDirectorySDDL(ownerSID string) string {
 	return "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;" + ownerSID + ")"
 }
 
-func setWindowsOwnerStateDACL(path, ownerSID string, directory bool) error {
-	sddl := windowsLockSDDL(ownerSID)
-	if directory {
-		sddl = windowsOwnerStateDirectorySDDL(ownerSID)
-	}
+func setWindowsLockParentDACL(path, ownerSID string) error {
+	sddl := windowsOwnerStateDirectorySDDL(ownerSID)
 	descriptor, err := windows.SecurityDescriptorFromString(sddl)
 	if err != nil {
 		return err
@@ -230,7 +172,7 @@ func setWindowsOwnerStateDACL(path, ownerSID string, directory bool) error {
 	if err != nil {
 		return err
 	}
-	handle, err := openWindowsOwnerState(path, directory, windows.READ_CONTROL|windows.WRITE_DAC)
+	handle, err := openWindowsLockParent(path, windows.READ_CONTROL|windows.WRITE_DAC)
 	if err != nil {
 		return err
 	}
@@ -245,15 +187,12 @@ func setWindowsOwnerStateDACL(path, ownerSID string, directory bool) error {
 	return nil
 }
 
-func openWindowsOwnerState(path string, directory bool, access uint32) (windows.Handle, error) {
+func openWindowsLockParent(path string, access uint32) (windows.Handle, error) {
 	pointer, err := windows.UTF16PtrFromString(path)
 	if err != nil {
 		return 0, err
 	}
-	flags := uint32(windows.FILE_FLAG_OPEN_REPARSE_POINT)
-	if directory {
-		flags |= windows.FILE_FLAG_BACKUP_SEMANTICS
-	}
+	flags := uint32(windows.FILE_FLAG_OPEN_REPARSE_POINT | windows.FILE_FLAG_BACKUP_SEMANTICS)
 	handle, err := windows.CreateFile(pointer, access, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, flags, 0)
 	if err != nil {
 		return 0, err
@@ -263,8 +202,7 @@ func openWindowsOwnerState(path string, directory bool, access uint32) (windows.
 		windows.CloseHandle(handle)
 		return 0, err
 	}
-	isDirectory := information.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0
-	if information.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 || isDirectory != directory {
+	if information.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 || information.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 {
 		windows.CloseHandle(handle)
 		return 0, localapi.ErrUnsafeSocket
 	}
