@@ -5,6 +5,7 @@ package localdaemon
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -25,6 +26,7 @@ import (
 )
 
 var runWindowsTaskCommand = defaultWindowsTaskCommand
+var listWindowsTaskNames = defaultListWindowsTaskNames
 var readWindowsDaemonPIDLock = defaultReadWindowsDaemonPIDLock
 var openWindowsDaemonProcess = defaultOpenWindowsDaemonProcess
 var windowsDaemonLayout = hostruntimeservice.DefaultLayout
@@ -96,6 +98,54 @@ func RemoveWindowsLegacyTask(ctx context.Context, ownerSID string) error {
 	return err
 }
 
+// RemoveAllWindowsLegacyTasks removes only the retired owner-scoped daemon
+// tasks in Paperboat's dedicated folder. Fresh cleanup cannot depend on a
+// surviving runtime-install.json: an interrupted uninstall may remove
+// ProgramData first while leaving a task that would reopen a console at the
+// next logon.
+func RemoveAllWindowsLegacyTasks(ctx context.Context) error {
+	if ctx == nil {
+		return ErrInvalidInventoryConfig
+	}
+	names, err := listWindowsTaskNames(ctx)
+	if err != nil {
+		// A disabled or unavailable Task Scheduler cannot launch the retired
+		// task. Do not strand a fresh installation when there is no safe task
+		// identity to delete; the exact owner-derived cleanup still runs when
+		// runtime-install.json survives.
+		return nil
+	}
+	var result error
+	for _, name := range names {
+		if !isWindowsLegacyDaemonTaskName(name) {
+			continue
+		}
+		endErr := runWindowsTaskCommand(ctx, "/End", "/TN", name)
+		if isMissingWindowsTaskError(endErr) || isWindowsTaskNotRunningError(endErr) {
+			endErr = nil
+		}
+		deleteErr := runWindowsTaskCommand(ctx, "/Delete", "/TN", name, "/F")
+		if isMissingWindowsTaskError(deleteErr) {
+			deleteErr = nil
+		}
+		result = errors.Join(result, endErr, deleteErr)
+	}
+	return result
+}
+
+func isWindowsLegacyDaemonTaskName(name string) bool {
+	const prefix = `\Paperboat\LocalDaemon-`
+	if len(name) != len(prefix)+16 || !strings.EqualFold(name[:len(prefix)], prefix) {
+		return false
+	}
+	for _, character := range name[len(prefix):] {
+		if !(character >= '0' && character <= '9' || character >= 'a' && character <= 'f' || character >= 'A' && character <= 'F') {
+			return false
+		}
+	}
+	return true
+}
+
 // StopWindowsLegacyTask ends the exact pre-SCM task without deleting its
 // rollback registration.
 func StopWindowsLegacyTask(ctx context.Context, ownerSID string) error {
@@ -143,21 +193,35 @@ func WindowsLocalDaemonServiceInstalled() (bool, error) {
 // independent of the child lock so an updater can stop a service that is still
 // starting and has not published its owner record yet.
 func WindowsLocalDaemonServiceRunning() (bool, error) {
+	state, installed, err := windowsLocalDaemonServiceState()
+	return err == nil && installed && state == svc.Running, err
+}
+
+// WindowsLocalDaemonServiceActive reports whether SCM still owns a live or
+// transitioning service process. Migration must not terminate the SID-bound
+// owner lock while SCM is in StartPending or StopPending: that lock can
+// already belong to the managed service rather than the retired task.
+func WindowsLocalDaemonServiceActive() (bool, error) {
+	state, installed, err := windowsLocalDaemonServiceState()
+	return err == nil && installed && state != svc.Stopped, err
+}
+
+func windowsLocalDaemonServiceState() (svc.State, bool, error) {
 	manager, err := mgr.Connect()
 	if err != nil {
-		return false, err
+		return svc.Stopped, false, err
 	}
 	defer manager.Disconnect()
 	item, err := manager.OpenService(windowsLocalDaemonServiceName)
 	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
-		return false, nil
+		return svc.Stopped, false, nil
 	}
 	if err != nil {
-		return false, err
+		return svc.Stopped, false, err
 	}
 	defer item.Close()
 	status, err := item.Query()
-	return err == nil && status.State == svc.Running, err
+	return status.State, err == nil, err
 }
 
 // resolveWindowsDaemonExecutable binds the persistent task to the stable MSI
@@ -745,6 +809,41 @@ func defaultWindowsTaskCommand(ctx context.Context, arguments ...string) error {
 		return &windowsTaskCommandError{err: err, output: redactTaskOutput(output)}
 	}
 	return nil
+}
+
+func defaultListWindowsTaskNames(ctx context.Context) ([]string, error) {
+	if ctx == nil {
+		return nil, ErrInvalidInventoryConfig
+	}
+	executable := filepath.Join(os.Getenv("SystemRoot"), "System32", "schtasks.exe")
+	if !validWindowsSystemExecutable(executable) {
+		var err error
+		executable, err = exec.LookPath("schtasks.exe")
+		if err != nil {
+			return nil, err
+		}
+	}
+	command := exec.CommandContext(ctx, executable, "/Query", "/FO", "CSV", "/NH")
+	processlaunch.ConfigureBackground(command)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		return nil, &windowsTaskCommandError{err: err, output: redactTaskOutput(output)}
+	}
+	reader := csv.NewReader(strings.NewReader(string(output)))
+	reader.FieldsPerRecord = -1
+	var names []string
+	for {
+		record, readErr := reader.Read()
+		if errors.Is(readErr, io.EOF) {
+			return names, nil
+		}
+		if readErr != nil {
+			return nil, readErr
+		}
+		if len(record) > 0 && isWindowsLegacyDaemonTaskName(record[0]) {
+			names = append(names, record[0])
+		}
+	}
 }
 
 func validWindowsSystemExecutable(path string) bool {

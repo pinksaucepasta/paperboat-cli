@@ -79,6 +79,52 @@ func TestInstallWindowsCurrentUserServiceUsesManagedServiceWithoutLegacyTask(t *
 	}
 }
 
+func TestRemoveAllWindowsLegacyTasksDeletesOnlyExactOwnedNames(t *testing.T) {
+	previousList, previousRun := listWindowsTaskNames, runWindowsTaskCommand
+	t.Cleanup(func() { listWindowsTaskNames, runWindowsTaskCommand = previousList, previousRun })
+	listWindowsTaskNames = func(context.Context) ([]string, error) {
+		return []string{
+			`\Paperboat\LocalDaemon-0123456789abcdef`,
+			`\Paperboat\LocalDaemon-ABCDEF0123456789`,
+			`\Paperboat\LocalDaemon-not-a-hash`,
+			`\Other\LocalDaemon-0123456789abcdef`,
+			`\Paperboat\Preview-0123456789abcdef`,
+		}, nil
+	}
+	var calls [][]string
+	runWindowsTaskCommand = func(_ context.Context, arguments ...string) error {
+		calls = append(calls, append([]string(nil), arguments...))
+		return nil
+	}
+	if err := RemoveAllWindowsLegacyTasks(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	want := [][]string{
+		{"/End", "/TN", `\Paperboat\LocalDaemon-0123456789abcdef`},
+		{"/Delete", "/TN", `\Paperboat\LocalDaemon-0123456789abcdef`, "/F"},
+		{"/End", "/TN", `\Paperboat\LocalDaemon-ABCDEF0123456789`},
+		{"/Delete", "/TN", `\Paperboat\LocalDaemon-ABCDEF0123456789`, "/F"},
+	}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("task calls=%q want=%q", calls, want)
+	}
+}
+
+func TestRemoveAllWindowsLegacyTasksToleratesUnavailableScheduler(t *testing.T) {
+	previousList, previousRun := listWindowsTaskNames, runWindowsTaskCommand
+	t.Cleanup(func() { listWindowsTaskNames, runWindowsTaskCommand = previousList, previousRun })
+	listWindowsTaskNames = func(context.Context) ([]string, error) {
+		return nil, errors.New("task scheduler unavailable")
+	}
+	runWindowsTaskCommand = func(context.Context, ...string) error {
+		t.Fatal("task command ran without an enumerated exact task")
+		return nil
+	}
+	if err := RemoveAllWindowsLegacyTasks(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestResolveManagedWindowsDaemonExecutableUsesStableBinary(t *testing.T) {
 	root := t.TempDir()
 	layout := hostruntimeservice.Layout{

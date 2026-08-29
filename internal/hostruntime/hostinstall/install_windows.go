@@ -456,11 +456,11 @@ func prepareWindowsLocalDaemonMigration(ctx context.Context, ownerSID, stateRoot
 	if err != nil {
 		return err
 	}
-	running, err := localdaemon.WindowsLocalDaemonServiceRunning()
+	active, err := localdaemon.WindowsLocalDaemonServiceActive()
 	if err != nil {
 		return err
 	}
-	if installed && running {
+	if installed && active {
 		return nil
 	}
 	return localdaemon.StopWindowsLegacyService(ctx, lockPath, ownerSID)
@@ -490,37 +490,36 @@ func EnsureWindowsLocalDaemonService(ctx context.Context) error {
 	if err := prepareWindowsLocalDaemonMigration(ctx, config.OwnerSID, config.StateRoot); err != nil {
 		return fmt.Errorf("migrate Paperboat local daemon task: %w", err)
 	}
-	lockPath, err := windowsLocalDaemonLockPath(config.StateRoot)
-	if err != nil {
-		return err
-	}
 	installed, err := localdaemon.WindowsLocalDaemonServiceInstalled()
 	if err != nil {
 		return err
 	}
-	serviceRunning, err := localdaemon.WindowsLocalDaemonServiceRunning()
-	if err != nil {
-		return err
+	install := func(installCtx context.Context) error {
+		installer, err := service.New(service.Config{
+			Platform: "windows", Kind: service.DaemonKind, ConfigRoot: WindowsProgramDataRoot(),
+			Executable: layout.Binary, User: "Paperboat", Group: "Paperboat",
+			Arguments: []string{"__runtime-local-daemon"}, Controller: service.WindowsController{},
+		})
+		if err != nil {
+			return err
+		}
+		return installer.Install(installCtx)
 	}
-	ownerRunning, err := localdaemon.WindowsOwnerServiceRunning(lockPath, config.OwnerSID)
-	if err != nil {
-		return err
-	}
-	if installed && serviceRunning && ownerRunning {
-		return localdaemon.RemoveWindowsLegacyTask(ctx, config.OwnerSID)
-	}
-	installer, err := service.New(service.Config{
-		Platform: "windows", Kind: service.DaemonKind, ConfigRoot: WindowsProgramDataRoot(),
-		Executable: layout.Binary, User: "Paperboat", Group: "Paperboat",
-		Arguments: []string{"__runtime-local-daemon"}, Controller: service.WindowsController{},
-	})
-	if err != nil {
-		return err
-	}
-	if err := installer.Install(ctx); err != nil {
-		return err
-	}
-	if err := waitWindowsLocalDaemonReady(ctx, config.OwnerSID, config.StateRoot); err != nil {
+	// The stable SCM definition already owns the canonical executable. An
+	// idempotent readiness repair must start it, not run Installer.Install:
+	// Windows upgrades deliberately stop an existing service before applying
+	// its definition, which can kill the process another migration just made
+	// ready.
+	if err := activateLocalDaemon(ctx, localDaemonActivation{
+		Installed: installed,
+		Start: func(startCtx context.Context) error {
+			return localdaemon.StartWindowsOwnerService(startCtx, config.OwnerSID)
+		},
+		Install: install,
+		WaitReady: func(waitCtx context.Context) error {
+			return waitWindowsLocalDaemonReady(waitCtx, config.OwnerSID, config.StateRoot)
+		},
+	}); err != nil {
 		return err
 	}
 	return localdaemon.RemoveWindowsLegacyTask(ctx, config.OwnerSID)
@@ -842,6 +841,10 @@ func Purge(ctx context.Context) error {
 		persistedErr = nil
 	}
 	var result error
+	// Remove retired logon tasks even when an interrupted uninstall already
+	// removed ProgramData and its owner SID record. The task names are strictly
+	// limited to Paperboat's hashed legacy daemon namespace.
+	result = errors.Join(result, localdaemon.RemoveAllWindowsLegacyTasks(ctx))
 	if layoutErr != nil {
 		result = errors.Join(result, layoutErr)
 	} else {
