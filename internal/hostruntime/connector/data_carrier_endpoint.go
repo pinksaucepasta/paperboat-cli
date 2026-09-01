@@ -9,6 +9,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	quic "github.com/quic-go/quic-go"
@@ -152,7 +153,7 @@ func dialTCPMux(ctx context.Context, endpoint DataCarrierEndpointConfig) (io.Rea
 	dialer := tls.Dialer{Config: tlsConfig}
 	connection, err := dialer.DialContext(ctx, "tcp", endpoint.Address)
 	if err != nil {
-		return nil, DataCarrierIdentity{}, fmt.Errorf("%w: TCP carrier dial: %v", ErrDataCarrierTLS, err)
+		return nil, DataCarrierIdentity{}, fmt.Errorf("%w: TCP carrier dial: %w", ErrDataCarrierTLS, err)
 	}
 	tlsConnection, ok := connection.(*tls.Conn)
 	if !ok {
@@ -194,7 +195,7 @@ func dialQUIC(ctx context.Context, endpoint DataCarrierEndpointConfig) (DataCarr
 	}
 	connection, err := quic.DialAddr(ctx, endpoint.Address, tlsConfig, defaultQUICConfig())
 	if err != nil {
-		return nil, DataCarrierIdentity{}, fmt.Errorf("%w: QUIC carrier dial: %v", ErrDataCarrierTLS, err)
+		return nil, DataCarrierIdentity{}, fmt.Errorf("%w: QUIC carrier dial: %w", ErrDataCarrierTLS, err)
 	}
 	state := connection.ConnectionState().TLS
 	if state.NegotiatedProtocol != DataCarrierALPN {
@@ -217,7 +218,7 @@ func NewTCPMuxDialer(endpoint DataCarrierEndpointConfig) DataCarrierDialer {
 		}
 		link, peerIdentity, err := dialTCPMux(ctx, endpoint)
 		if err != nil {
-			return DataCarrierDialResult{}, &TransportDialError{Transport: TCPMux, Err: err, Fallback: false}
+			return DataCarrierDialResult{}, newTransportDialError(TCPMux, err)
 		}
 		if request.Identity != (DataCarrierIdentity{}) && peerIdentity != request.Identity {
 			_ = link.Close()
@@ -235,7 +236,7 @@ func NewQUICDialer(endpoint DataCarrierEndpointConfig) DataCarrierDialer {
 		}
 		session, peerIdentity, err := dialQUIC(ctx, endpoint)
 		if err != nil {
-			return DataCarrierDialResult{}, &TransportDialError{Transport: QUIC, Err: err, Fallback: true}
+			return DataCarrierDialResult{}, newTransportDialError(QUIC, err)
 		}
 		if request.Identity != (DataCarrierIdentity{}) && peerIdentity != request.Identity {
 			_ = session.Close()
@@ -266,22 +267,53 @@ func NewNetworkDialer(config NetworkDialerConfig) DataCarrierDialer {
 			var peerIdentity DataCarrierIdentity
 			link, peerIdentity, err = dialTCPMux(ctx, config.TCPMux)
 			if err == nil {
+				if request.Identity != (DataCarrierIdentity{}) && peerIdentity != request.Identity {
+					_ = link.Close()
+					return DataCarrierDialResult{}, newTransportDialError(TCPMux, ErrDataCarrierAdmission)
+				}
 				return DataCarrierDialResult{Link: link, PeerIdentity: peerIdentity, Transport: request.Transport, EdgeID: request.EdgeID, FailureDomain: request.FailureDomain}, nil
 			}
 		case QUIC:
 			var peerIdentity DataCarrierIdentity
 			session, peerIdentity, err = dialQUIC(ctx, config.QUIC)
 			if err == nil {
+				if request.Identity != (DataCarrierIdentity{}) && peerIdentity != request.Identity {
+					_ = session.Close()
+					return DataCarrierDialResult{}, newTransportDialError(QUIC, ErrDataCarrierAdmission)
+				}
 				return DataCarrierDialResult{Session: session, PeerIdentity: peerIdentity, Transport: request.Transport, EdgeID: request.EdgeID, FailureDomain: request.FailureDomain}, nil
 			}
 		default:
 			err = ErrInvalidDataCarrierEndpoint
 		}
 		if err != nil {
-			return DataCarrierDialResult{}, &TransportDialError{Transport: request.Transport, Err: err, Fallback: request.Transport == QUIC}
+			return DataCarrierDialResult{}, newTransportDialError(request.Transport, err)
 		}
 		return DataCarrierDialResult{}, ErrInvalidDataCarrierEndpoint
 	}
+}
+
+func newTransportDialError(transport Transport, err error) *TransportDialError {
+	return &TransportDialError{Transport: transport, Err: err, Fallback: dataCarrierDialFallbackEligible(err)}
+}
+
+// dataCarrierDialFallbackEligible classifies only failures that are safe to
+// retry on the other transport.  Authentication, admission, endpoint, and
+// protocol errors are terminal even when their text mentions a network
+// operation.  A context deadline is also terminal because the caller's
+// overall operation has expired.
+func dataCarrierDialFallbackEligible(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if errors.Is(err, ErrInvalidDataCarrierEndpoint) || errors.Is(err, ErrDataCarrierAdmission) {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNREFUSED) {
+		return true
+	}
+	var networkErr net.Error
+	return errors.As(err, &networkErr) && (networkErr.Timeout() || networkErr.Temporary())
 }
 
 func defaultQUICConfig() *quic.Config {

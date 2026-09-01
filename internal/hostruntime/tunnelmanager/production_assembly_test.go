@@ -163,6 +163,81 @@ func TestLiveDataCarrierSessionSourceBindsDurableApplyRequest(t *testing.T) {
 	}
 }
 
+func TestWelcomeDataCarrierSessionSourceRefreshesReconnectIdentity(t *testing.T) {
+	config := newProductionAssemblyConfig(t)
+	initial := config.SessionSource.Identity
+	current := initial
+	dialer := connector.DataCarrierDialer(func(context.Context, connector.DataCarrierDialRequest) (connector.DataCarrierDialResult, error) {
+		return connector.DataCarrierDialResult{}, errors.New("dial must not run while preparing identity")
+	})
+	var descriptorCalls int
+	deferred := &welcomeDataCarrierSessionSource{
+		hello: config.Control.Hello,
+		factory: func(_ context.Context, welcome connectorprotocol.Welcome, _ ApplyRequest) (connector.DataCarrierSessionSource, error) {
+			descriptorCalls++
+			if welcome.SessionID == "" {
+				return connector.DataCarrierSessionSource{}, ErrProductionIdentityMissing
+			}
+			poolConfig := connector.DefaultDataCarrierPoolConfig()
+			poolConfig.Session = current
+			return connector.NewDataCarrierSessionSource(current, poolConfig, dialer)
+		},
+	}
+	welcomeOne := connectorprotocol.Welcome{SessionID: initial.SessionID}
+	if err := deferred.ObserveWelcome(welcomeOne); err != nil {
+		t.Fatal(err)
+	}
+	request := ApplyRequest{
+		Tunnel:    hoststate.Tunnel{ID: initial.TunnelID},
+		Connector: hoststate.Connector{ID: initial.ConnectorID, TunnelID: initial.TunnelID, HostID: initial.HostID},
+		Snapshot:  hoststate.ConfigSnapshot{Generation: initial.Generation},
+	}
+	prepared, err := deferred.PrepareDataCarrier(context.Background(), request)
+	if err != nil {
+		t.Fatalf("initial preparation: %v", err)
+	}
+	if prepared.Identity != initial {
+		t.Fatalf("initial identity=%+v, want %+v", prepared.Identity, initial)
+	}
+
+	nextHello := config.Control.Hello
+	nextHello.ProcessGeneration++
+	nextHello.Auth.ProcessGeneration = nextHello.ProcessGeneration
+	if err := deferred.UpdateHello(nextHello); err != nil {
+		t.Fatalf("refresh hello: %v", err)
+	}
+	waitContext, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	_, err = deferred.PrepareDataCarrier(waitContext, request)
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("pre-Welcome preparation error=%v, want context deadline", err)
+	}
+
+	// A Welcome alone cannot make the old process generation usable. This
+	// models a stale carrier descriptor returned during reconnect fencing.
+	welcomeTwo := connectorprotocol.Welcome{SessionID: "session-reconnected-01"}
+	if err := deferred.ObserveWelcome(welcomeTwo); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := deferred.PrepareDataCarrier(context.Background(), request); !errors.Is(err, ErrGenerationConflict) {
+		t.Fatalf("stale carrier identity error=%v, want ErrGenerationConflict", err)
+	}
+
+	current = initial
+	current.SessionID = welcomeTwo.SessionID
+	current.ProcessGeneration = nextHello.ProcessGeneration
+	prepared, err = deferred.PrepareDataCarrier(context.Background(), request)
+	if err != nil {
+		t.Fatalf("reconnected preparation: %v", err)
+	}
+	if prepared.Identity != current {
+		t.Fatalf("reconnected identity=%+v, want %+v", prepared.Identity, current)
+	}
+	if descriptorCalls != 3 {
+		t.Fatalf("descriptor calls=%d, want 3", descriptorCalls)
+	}
+}
+
 func TestProductionAssemblyRunsOneControlLoopAndCancelsItBeforeStoreShutdown(t *testing.T) {
 	assembly, _, err := OpenProductionAssembly(newProductionAssemblyConfig(t))
 	if err != nil {

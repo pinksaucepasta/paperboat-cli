@@ -98,7 +98,11 @@ type ProductionAssembly struct {
 	Applier *CoordinatedConfigApplier
 	Control *connectorrotation.ControlSession
 
-	controlRunner   *connector.DataCarrierControlRunner
+	controlRunner *connector.DataCarrierControlRunner
+	// deferredCarrier is the Welcome-bound carrier source used by the
+	// production bootstrap path. Its expected Hello must move with a fresh
+	// reconnect process generation before the manager can prepare a carrier.
+	deferredCarrier *welcomeDataCarrierSessionSource
 	controlStream   func(context.Context) (io.ReadWriteCloser, error)
 	observeWelcome  func(connectorprotocol.Welcome) error
 	helloRequestID  string
@@ -199,6 +203,7 @@ func OpenProductionAssembly(config ProductionAssemblyConfig) (*ProductionAssembl
 		Applier:         applier,
 		Control:         control,
 		controlRunner:   runner,
+		deferredCarrier: deferred,
 		controlStream:   config.ControlStream,
 		observeWelcome:  observeWelcome,
 		helloRequestID:  config.HelloRequestID,
@@ -477,6 +482,17 @@ func (a *ProductionAssembly) reconnectControl(ctx context.Context, done chan str
 			a.reportControlFailure(err, attempt+1)
 			continue
 		}
+		// A reconnect's carrier descriptor is checked against the current
+		// control Hello. Refresh this expectation before opening the new stream
+		// so a later route reconciliation cannot compare the new carrier
+		// process epoch with the initial bootstrap epoch.
+		if a.deferredCarrier != nil {
+			if err := a.deferredCarrier.UpdateHello(controlConfig.Hello); err != nil {
+				finalErr := errors.Join(ErrProductionControlRestartRequired, err)
+				a.finishControl(done, finalErr)
+				return finalErr
+			}
+		}
 		stream, err := a.controlStream(ctx)
 		if err != nil || stream == nil {
 			if stream != nil {
@@ -645,12 +661,12 @@ type liveDataCarrierSessionSource struct {
 }
 
 type welcomeDataCarrierSessionSource struct {
-	factory CarrierDescriptorSource
-	hello   connectorprotocol.Hello
-	mu      sync.RWMutex
-	welcome connectorprotocol.Welcome
-	ready   chan struct{}
-	once    sync.Once
+	factory     CarrierDescriptorSource
+	hello       connectorprotocol.Hello
+	mu          sync.RWMutex
+	welcome     connectorprotocol.Welcome
+	ready       chan struct{}
+	readyClosed bool
 }
 
 func (s *welcomeDataCarrierSessionSource) ObserveWelcome(welcome connectorprotocol.Welcome) error {
@@ -663,8 +679,34 @@ func (s *welcomeDataCarrierSessionSource) ObserveWelcome(welcome connectorprotoc
 		s.ready = make(chan struct{})
 	}
 	ready := s.ready
+	if !s.readyClosed {
+		close(ready)
+		s.readyClosed = true
+	}
 	s.mu.Unlock()
-	s.once.Do(func() { close(ready) })
+	return nil
+}
+
+// UpdateHello advances the control identity expected by the deferred carrier
+// source. A new control session must carry the same durable connector binding
+// and a strictly higher process generation. Resetting the readiness gate makes
+// a concurrent reconciliation wait for the matching reconnect Welcome instead
+// of pairing a fresh Hello with the prior session.
+func (s *welcomeDataCarrierSessionSource) UpdateHello(hello connectorprotocol.Hello) error {
+	if s == nil || s.factory == nil {
+		return errors.Join(ErrProductionIdentityMissing, ErrProductionAssemblyInvalid)
+	}
+	if err := hello.Validate(time.Time{}); err != nil {
+		return errors.Join(ErrProductionIdentityMissing, err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.hello.AccountID != hello.AccountID || s.hello.TunnelID != hello.TunnelID || s.hello.ConnectorID != hello.ConnectorID || s.hello.HostID != hello.HostID || hello.ProcessGeneration <= s.hello.ProcessGeneration {
+		return errors.Join(ErrGenerationConflict, ErrProductionIdentityMissing)
+	}
+	s.hello = hello
+	s.ready = make(chan struct{})
+	s.readyClosed = false
 	return nil
 }
 

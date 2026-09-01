@@ -12,6 +12,7 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"syscall"
 	"testing"
 	"time"
 
@@ -232,6 +233,205 @@ func TestDataCarrierEndpointQUICAuthenticatedRoundTrip(t *testing.T) {
 		t.Fatalf("QUIC body = %q, want %q", got, body)
 	}
 }
+
+func TestDataCarrierEndpointTCPConnectionRefusedFallsBackToQUIC(t *testing.T) {
+	clientTLS, serverTLS, _ := testDataCarrierCertificates(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	tcpListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen TCP refusal address: %v", err)
+	}
+	tcpAddress := tcpListener.Addr().String()
+	if err := tcpListener.Close(); err != nil {
+		t.Fatalf("close TCP refusal address: %v", err)
+	}
+
+	packetConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatalf("listen UDP: %v", err)
+	}
+	defer packetConn.Close()
+	quicListener, err := quic.Listen(packetConn, serverTLS.Clone(), defaultQUICConfig())
+	if err != nil {
+		t.Fatalf("listen QUIC: %v", err)
+	}
+	defer quicListener.Close()
+
+	identity := testDataCarrierIdentity()
+	carrierConfig := testDataCarrierConfig()
+	endpoint := func(address string) DataCarrierEndpointConfig {
+		return DataCarrierEndpointConfig{
+			Address: address,
+			TLS:     clientTLS,
+			PeerBinding: func(tls.ConnectionState) (DataCarrierIdentity, error) {
+				return identity, nil
+			},
+			ExpectedIdentity: identity,
+		}
+	}
+	poolConfig := DataCarrierPoolConfig{
+		MaximumCarriers: 1,
+		QueueDepth:      1,
+		Preferred:       TCPMux,
+		Fallback:        QUIC,
+		EdgeID:          "edge-a",
+		FailureDomains:  []string{"domain-a"},
+		Session:         identity,
+		Carrier:         carrierConfig,
+	}
+	networkDialer := NewNetworkDialer(NetworkDialerConfig{
+		TCPMux: endpoint(tcpAddress),
+		QUIC:   endpoint(quicListener.Addr().String()),
+	})
+	var calls []Transport
+	dialer := func(ctx context.Context, request DataCarrierDialRequest) (DataCarrierDialResult, error) {
+		calls = append(calls, request.Transport)
+		return networkDialer(ctx, request)
+	}
+	serverResult := make(chan struct {
+		carrier *DataCarrier
+		err     error
+	}, 1)
+	go func() {
+		connection, err := quicListener.Accept(ctx)
+		if err != nil {
+			serverResult <- struct {
+				carrier *DataCarrier
+				err     error
+			}{err: err}
+			return
+		}
+		session := newQUICDataCarrierSession(connection)
+		carrier, err := NewDataCarrierServerWithSession(ctx, session, carrierConfig, DataCarrierAdmission{
+			Identity:  identity,
+			Authorize: func(context.Context, StreamOpen) error { return nil },
+		})
+		serverResult <- struct {
+			carrier *DataCarrier
+			err     error
+		}{carrier: carrier, err: err}
+	}()
+
+	pool, err := NewDataCarrierPool(ctx, poolConfig, dialer)
+	if err != nil {
+		t.Fatalf("new pool: %v", err)
+	}
+	defer pool.Close()
+	if err := pool.Connect(ctx); err != nil {
+		t.Fatalf("connect with TCP fallback: %v", err)
+	}
+	if selected, ok := pool.SelectedTransport(); !ok || selected != QUIC {
+		t.Fatalf("selected transport = %q, %v, want QUIC", selected, ok)
+	}
+	if len(calls) != 2 || calls[0] != TCPMux || calls[1] != QUIC {
+		t.Fatalf("dial sequence = %v, want TCPMux/QUIC", calls)
+	}
+	select {
+	case result := <-serverResult:
+		if result.err != nil {
+			t.Fatalf("new QUIC server carrier: %v", result.err)
+		}
+		defer result.carrier.Close()
+	case <-ctx.Done():
+		t.Fatalf("QUIC server did not accept fallback: %v", ctx.Err())
+	}
+}
+
+func TestDataCarrierEndpointTLSFailureDoesNotFallback(t *testing.T) {
+	clientTLS, serverTLS, _ := testDataCarrierCertificates(t)
+	clientTLS = clientTLS.Clone()
+	clientTLS.RootCAs = x509.NewCertPool()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+	handshakeResult := make(chan error, 1)
+	go func() {
+		connection, err := listener.Accept()
+		if err != nil {
+			handshakeResult <- err
+			return
+		}
+		tlsConnection := tls.Server(connection, serverTLS.Clone())
+		err = tlsConnection.HandshakeContext(ctx)
+		_ = connection.Close()
+		handshakeResult <- err
+	}()
+
+	identity := testDataCarrierIdentity()
+	dialer := NewNetworkDialer(NetworkDialerConfig{
+		TCPMux: DataCarrierEndpointConfig{
+			Address: listener.Addr().String(),
+			TLS:     clientTLS,
+			PeerBinding: func(tls.ConnectionState) (DataCarrierIdentity, error) {
+				return identity, nil
+			},
+			ExpectedIdentity: identity,
+		},
+	})
+	_, err = dialer(ctx, DataCarrierDialRequest{Transport: TCPMux, Identity: identity})
+	if err == nil {
+		t.Fatal("TLS failure unexpectedly succeeded")
+	}
+	var dialErr *TransportDialError
+	if !errors.As(err, &dialErr) {
+		t.Fatalf("dial error = %v, want TransportDialError", err)
+	}
+	if dialErr.Fallback {
+		t.Fatalf("TLS failure marked fallback eligible: %v", err)
+	}
+	if dataCarrierDialFallbackEligible(dialErr.Err) {
+		t.Fatalf("TLS failure classified as transient: %v", dialErr.Err)
+	}
+	select {
+	case <-handshakeResult:
+	case <-ctx.Done():
+		t.Fatalf("TLS server handshake did not finish: %v", ctx.Err())
+	}
+}
+
+func TestDataCarrierEndpointFallbackClassification(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "timeout", err: dataCarrierTimeoutError{}, want: true},
+		{name: "temporary", err: dataCarrierTemporaryError{}, want: true},
+		{name: "connection refused", err: &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}, want: true},
+		{name: "eof", err: io.EOF, want: true},
+		{name: "tls", err: ErrDataCarrierTLS, want: false},
+		{name: "admission", err: ErrDataCarrierAdmission, want: false},
+		{name: "endpoint", err: ErrInvalidDataCarrierEndpoint, want: false},
+		{name: "protocol", err: errors.Join(ErrDataCarrierTLS, errors.New("negotiated ALPN")), want: false},
+		{name: "canceled", err: context.Canceled, want: false},
+		{name: "deadline", err: context.DeadlineExceeded, want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := dataCarrierDialFallbackEligible(test.err); got != test.want {
+				t.Fatalf("fallback eligible = %v, want %v for %v", got, test.want, test.err)
+			}
+		})
+	}
+}
+
+type dataCarrierTimeoutError struct{}
+
+func (dataCarrierTimeoutError) Error() string   { return "data carrier timeout" }
+func (dataCarrierTimeoutError) Timeout() bool   { return true }
+func (dataCarrierTimeoutError) Temporary() bool { return false }
+
+type dataCarrierTemporaryError struct{}
+
+func (dataCarrierTemporaryError) Error() string   { return "temporary data carrier failure" }
+func (dataCarrierTemporaryError) Timeout() bool   { return false }
+func (dataCarrierTemporaryError) Temporary() bool { return true }
 
 func testDataCarrierCertificates(t *testing.T) (clientTLS, serverTLS *tls.Config, pool *x509.CertPool) {
 	t.Helper()
