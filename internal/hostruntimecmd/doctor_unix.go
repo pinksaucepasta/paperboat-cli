@@ -151,18 +151,54 @@ func collectDoctor(ctx context.Context, stateRoot string) doctorReport {
 }
 
 func systemServiceScope(ctx context.Context) (string, error) {
-	if runtime.GOOS == "linux" {
-		output, err := exec.CommandContext(ctx, "/usr/bin/systemctl", "is-active", "paperboat-runtime-host.service").Output()
-		if err != nil || strings.TrimSpace(string(output)) != "active" {
-			return "system", errors.New("inactive")
-		}
-		return "system", nil
-	}
-	output, err := exec.CommandContext(ctx, "/bin/launchctl", "print", "system/com.pinksaucepasta.paperboat.runtime-host").Output()
-	if err != nil || len(output) == 0 {
+	return systemServiceScopeFor(ctx, false)
+}
+
+// systemServiceScopeFor verifies the native service ownership for the
+// requested setup role. Host mode is composed of the stable hostd supervisor
+// and the privileged power-management service. The old monolithic
+// runtime-host service is intentionally removed during installation and must
+// never be used as a readiness requirement.
+func systemServiceScopeFor(ctx context.Context, hostMode bool) (string, error) {
+	return systemServiceScopeWithRunner(ctx, runtime.GOOS, hostMode, runSystemServiceCommand)
+}
+
+type systemServiceCommandRunner func(context.Context, string, ...string) ([]byte, error)
+
+func systemServiceScopeWithRunner(ctx context.Context, platform string, hostMode bool, run systemServiceCommandRunner) (string, error) {
+	if ctx == nil || run == nil {
 		return "system", errors.New("inactive")
 	}
+	var commands [][]string
+	switch platform {
+	case "linux":
+		commands = append(commands,
+			[]string{"/usr/bin/systemctl", "is-active", "paperboat-hostd.service"},
+		)
+		if hostMode {
+			commands = append(commands, []string{"/usr/bin/systemctl", "is-active", "paperboat-runtime-privileged.service"})
+		}
+	case "darwin":
+		commands = append(commands,
+			[]string{"/bin/launchctl", "print", "system/com.pinksaucepasta.paperboat.hostd"},
+		)
+		if hostMode {
+			commands = append(commands, []string{"/bin/launchctl", "print", "system/com.pinksaucepasta.paperboat.runtime-privileged"})
+		}
+	default:
+		return "system", errors.New("inactive")
+	}
+	for _, command := range commands {
+		output, err := run(ctx, command[0], command[1:]...)
+		if err != nil || (platform == "linux" && strings.TrimSpace(string(output)) != "active") || (platform == "darwin" && len(output) == 0) {
+			return "system", errors.New("inactive")
+		}
+	}
 	return "system", nil
+}
+
+func runSystemServiceCommand(ctx context.Context, name string, args ...string) ([]byte, error) {
+	return exec.CommandContext(ctx, name, args...).Output()
 }
 
 func hostDiagnostics(ctx context.Context) (hostservice.Response, error) {

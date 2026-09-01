@@ -158,6 +158,123 @@ func TestMachineAttachmentSessionSourceSharesAndReleasesMachineCarrier(t *testin
 	}
 }
 
+func TestMachineAttachmentNetworkSourceFallsBackAfterStalledQUIC(t *testing.T) {
+	identityValue := testPreviewCarrierIdentity(1)
+	config := connector.DefaultDataCarrierPoolConfig()
+	config.MaximumCarriers = 1
+	config.QueueDepth = 1
+	config.Preferred = connector.QUIC
+	config.Fallback = connector.TCPMux
+	config.SingleTransport = false
+	config.EdgeID = "edge_fallback"
+	config.FailureDomains = []string{"edge_fallback"}
+
+	var (
+		mu       sync.Mutex
+		attempts []connector.DataCarrierDialRequest
+	)
+	base := connector.DataCarrierDialer(func(ctx context.Context, request connector.DataCarrierDialRequest) (connector.DataCarrierDialResult, error) {
+		mu.Lock()
+		attempts = append(attempts, request)
+		mu.Unlock()
+		if request.Transport == connector.QUIC {
+			<-ctx.Done()
+			return connector.DataCarrierDialResult{}, &connector.TransportDialError{Transport: request.Transport, Err: context.DeadlineExceeded, Fallback: true}
+		}
+		return connector.DataCarrierDialResult{
+			Session:       newPreviewTestDataCarrierSession(),
+			PeerIdentity:  request.Identity,
+			Transport:     request.Transport,
+			EdgeID:        request.EdgeID,
+			FailureDomain: request.FailureDomain,
+		}, nil
+	})
+	dialer := boundedMachineAttachmentDialer(base, 20*time.Millisecond)
+	config.Session = identityValue
+	source, err := connector.NewDataCarrierSessionSource(identityValue, config, dialer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	prepared, err := source.Prepare(ctx)
+	if err != nil {
+		t.Fatalf("prepare after QUIC stall: %v", err)
+	}
+	defer prepared.Abort(context.Background())
+	if got := prepared.State(); got != connector.DataCarrierLifecyclePrepared {
+		t.Fatalf("prepared state = %s", got)
+	}
+	if transport, ok := prepared.SelectedTransport(); !ok || transport != connector.TCPMux {
+		t.Fatalf("selected transport = %s, ok=%v, want TCPMux", transport, ok)
+	}
+	mu.Lock()
+	gotAttempts := append([]connector.DataCarrierDialRequest(nil), attempts...)
+	mu.Unlock()
+	if len(gotAttempts) != 2 || gotAttempts[0].Transport != connector.QUIC || gotAttempts[0].Attempt != 1 || gotAttempts[1].Transport != connector.TCPMux || gotAttempts[1].Attempt != 2 {
+		t.Fatalf("dial attempts = %#v, want bounded QUIC then TCP fallback", gotAttempts)
+	}
+	if gotAttempts[0].Identity != identityValue || gotAttempts[1].Identity != identityValue {
+		t.Fatalf("dial identity was not preserved across fallback: %#v", gotAttempts)
+	}
+}
+
+type previewTestDataCarrierSession struct {
+	done      chan struct{}
+	closeOnce sync.Once
+}
+
+func newPreviewTestDataCarrierSession() *previewTestDataCarrierSession {
+	return &previewTestDataCarrierSession{done: make(chan struct{})}
+}
+
+func (s *previewTestDataCarrierSession) OpenStream(ctx context.Context) (connector.DataCarrierStreamLink, error) {
+	if ctx == nil {
+		return nil, context.Canceled
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-s.done:
+		return nil, connector.ErrDataCarrierClosed
+	}
+}
+
+func (s *previewTestDataCarrierSession) AcceptStream(ctx context.Context) (connector.DataCarrierStreamLink, error) {
+	if ctx == nil {
+		return nil, context.Canceled
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-s.done:
+		return nil, connector.ErrDataCarrierClosed
+	}
+}
+
+func (s *previewTestDataCarrierSession) Ping(ctx context.Context) error {
+	if ctx == nil {
+		return context.Canceled
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.done:
+		return connector.ErrDataCarrierClosed
+	default:
+		return nil
+	}
+}
+
+func (s *previewTestDataCarrierSession) Close() error {
+	s.closeOnce.Do(func() { close(s.done) })
+	return nil
+}
+
+func (s *previewTestDataCarrierSession) CloseChan() <-chan struct{} { return s.done }
+
+var _ connector.DataCarrierSession = (*previewTestDataCarrierSession)(nil)
+
 func TestMachineAttachmentSessionSourceRejectsMachineAndEndpointMismatch(t *testing.T) {
 	stateRoot, store := newMachineAttachmentIdentity(t)
 	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)

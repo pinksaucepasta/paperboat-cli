@@ -23,6 +23,12 @@ import (
 
 const serverResponseLimit = 64 << 10
 
+// connectorOriginCapabilities is the canonical, sorted set accepted by the
+// server for tunnel origin routes. Connector protocol capabilities are
+// negotiated separately on the connector session and do not belong in this
+// resource request.
+var connectorOriginCapabilities = []string{"h2c", "http", "tcp_private", "unix"}
+
 type serverClient struct {
 	base *url.URL
 	auth MachineAuth
@@ -42,7 +48,7 @@ func (c *serverClient) issue(ctx context.Context, tunnel, host, key string) (ser
 		HostID       string   `json:"host_id"`
 		Capabilities []string `json:"capabilities"`
 		TTL          int      `json:"ttl_seconds"`
-	}{host, []string{"connector-v1", "data-carrier-v1", "credential-rotation-v1"}, 300})
+	}{host, append([]string(nil), connectorOriginCapabilities...), 300})
 	var out serverEnrollment
 	status, err := c.do(ctx, http.MethodPost, path, key, body, &out)
 	if err != nil {

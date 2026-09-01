@@ -30,11 +30,31 @@ var (
 	ErrMachineAttachmentTrustRequired      = errors.New("preview edge server trust binding is required")
 )
 
+const defaultMachineAttachmentDialAttemptTimeout = 5 * time.Second
+
+// machineAttachmentDialTimeoutError is intentionally distinct from
+// context.DeadlineExceeded. connector's pool treats a caller cancellation or
+// overall deadline as a terminal boundary, while an individual transport
+// attempt must remain eligible for the configured fallback (QUIC -> TLS/TCP).
+// Keeping the timeout typed also makes the reason observable without exposing
+// endpoint or credential material.
+type machineAttachmentDialTimeoutError struct {
+	transport connector.Transport
+	timeout   time.Duration
+}
+
+func (e machineAttachmentDialTimeoutError) Error() string {
+	return fmt.Sprintf("%s carrier dial attempt timed out after %s", e.transport, e.timeout)
+}
+
+func (machineAttachmentDialTimeoutError) Timeout() bool   { return true }
+func (machineAttachmentDialTimeoutError) Temporary() bool { return true }
+
 // DataCarrierSessionSourceFactory is the narrow test and deployment seam for
 // turning an admitted, TLS-configured endpoint set into a staged connector
-// carrier. Production uses connector.NewNetworkDataCarrierSessionSource.
-// Tests may inject a deterministic source without replacing admission or
-// machine-key validation.
+// carrier. Production uses the bounded network factory below, while tests may
+// inject a deterministic source without replacing admission or machine-key
+// validation.
 type DataCarrierSessionSourceFactory func(connector.DataCarrierIdentity, connector.DataCarrierPoolConfig, connector.NetworkDialerConfig) (connector.DataCarrierSessionSource, error)
 
 // MachineAttachmentSessionSourceConfig contains only local machine state and
@@ -114,7 +134,7 @@ func NewMachineAttachmentSessionSource(config MachineAttachmentSessionSourceConf
 		config.Clock = func() time.Time { return time.Now().UTC() }
 	}
 	if config.SessionFactory == nil {
-		config.SessionFactory = connector.NewNetworkDataCarrierSessionSource
+		config.SessionFactory = newMachineAttachmentNetworkSessionSource
 	}
 	if config.Carrier.MaximumCarriers != 0 && config.Carrier.MaximumCarriers != 1 {
 		return nil, fmt.Errorf("%w: preview source requires one shared carrier", ErrMachineAttachmentSessionInvalid)
@@ -124,6 +144,61 @@ func NewMachineAttachmentSessionSource(config MachineAttachmentSessionSourceConf
 		stateRoot: config.StateRoot, carrier: config.Carrier, tlsLeafLifetime: config.TLSLeafLifetime, clock: config.Clock,
 		factory: config.SessionFactory, entries: make(map[machineAttachmentSessionKey]*machineAttachmentSessionEntry),
 	}, nil
+}
+
+// newMachineAttachmentNetworkSessionSource is the production factory for
+// admitted preview carriers. Each transport attempt receives its own bounded
+// context, so a black-holed QUIC path cannot consume the complete foreground
+// readiness deadline before the authenticated TLS/TCP fallback is tried.
+func newMachineAttachmentNetworkSessionSource(identity connector.DataCarrierIdentity, config connector.DataCarrierPoolConfig, endpoints connector.NetworkDialerConfig) (connector.DataCarrierSessionSource, error) {
+	networkDialer := connector.NewNetworkDialer(endpoints)
+	return connector.NewDataCarrierSessionSource(identity, config, boundedMachineAttachmentDialer(networkDialer, defaultMachineAttachmentDialAttemptTimeout))
+}
+
+func boundedMachineAttachmentDialer(base connector.DataCarrierDialer, timeout time.Duration) connector.DataCarrierDialer {
+	return func(ctx context.Context, request connector.DataCarrierDialRequest) (connector.DataCarrierDialResult, error) {
+		if base == nil || ctx == nil {
+			return connector.DataCarrierDialResult{}, connector.ErrInvalidDataCarrierConfig
+		}
+		if timeout <= 0 {
+			return base(ctx, request)
+		}
+		attemptContext, cancel := context.WithTimeout(ctx, timeout)
+		result, err := base(attemptContext, request)
+		timedOut := attemptContext.Err() == context.DeadlineExceeded && ctx.Err() == nil
+		cancel()
+		// The caller's context is the operation boundary. Do not let the
+		// connector pool interpret a transport wrapper's fallback bit as a
+		// reason to start another attempt after the whole readiness operation
+		// has been canceled or expired.
+		if err != nil && ctx.Err() != nil {
+			if result.Link != nil {
+				_ = result.Link.Close()
+			}
+			if result.Session != nil {
+				_ = result.Session.Close()
+			}
+			return connector.DataCarrierDialResult{}, &connector.TransportDialError{
+				Transport: request.Transport,
+				Err:       ctx.Err(),
+				Fallback:  false,
+			}
+		}
+		if !timedOut {
+			return result, err
+		}
+		if result.Link != nil {
+			_ = result.Link.Close()
+		}
+		if result.Session != nil {
+			_ = result.Session.Close()
+		}
+		return connector.DataCarrierDialResult{}, &connector.TransportDialError{
+			Transport: request.Transport,
+			Err:       machineAttachmentDialTimeoutError{transport: request.Transport, timeout: timeout},
+			Fallback:  request.Transport == connector.QUIC,
+		}
+	}
 }
 
 // AcquirePreviewDataCarrier obtains or shares the active carrier bound to the

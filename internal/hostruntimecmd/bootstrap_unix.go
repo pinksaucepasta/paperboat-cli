@@ -304,7 +304,7 @@ func bootstrapWorkerReady(ctx context.Context, response *http.Response, stateRoo
 	if !requireSystemService {
 		return true
 	}
-	_, err := systemServiceScope(ctx)
+	_, err := systemServiceScopeFor(ctx, true)
 	return err == nil
 }
 
