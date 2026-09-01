@@ -3,10 +3,19 @@ package preview
 import (
 	"context"
 	"errors"
+	"net"
 	"sync"
 	"testing"
 	"time"
 )
+
+func TestLeaseObserverCarrierRetriesTransportFailure(t *testing.T) {
+	err := classifyLeaseObserverError(&net.DNSError{Err: "temporary lookup failure", Name: "api.pprbt.dev", IsTemporary: true})
+	var retryable *RetryableCarrierError
+	if !errors.As(err, &retryable) {
+		t.Fatalf("network error = %v, want retryable carrier error", err)
+	}
+}
 
 func TestLeaseObserverCarrierWaitsForStableHostReadiness(t *testing.T) {
 	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)

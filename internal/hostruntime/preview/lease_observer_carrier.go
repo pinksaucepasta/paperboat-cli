@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"sync"
 	"time"
 
@@ -216,6 +217,10 @@ func classifyLeaseObserverError(err error) error {
 	}
 	var retryable interface{ Retryable() bool }
 	if errors.As(err, &retryable) && retryable.Retryable() {
+		return &RetryableCarrierError{Err: err}
+	}
+	var networkErr net.Error
+	if errors.As(err, &networkErr) {
 		return &RetryableCarrierError{Err: err}
 	}
 	return err
