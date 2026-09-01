@@ -256,12 +256,16 @@ func StartForeground(ctx context.Context, config ForegroundConfig) (*Foreground,
 				}
 				target = preview.LeaseTarget{Scheme: targetScheme, Address: net.JoinHostPort("127.0.0.1", strconv.Itoa(int(port)))}
 			}
+			lifecycle := preview.LeaseLifecycleOwned
+			if carrier, ok := config.Carrier.(preview.LeaseLifecycleCarrier); ok {
+				lifecycle = carrier.LeaseLifecycleOwnership()
+			}
 			return preview.Start(sessionCtx, preview.SessionConfig{
 				LeaseClient: config.LeaseClient, Carrier: config.Carrier,
 				OwnerDeviceID: config.OwnerDeviceID, OwnerSessionID: config.OwnerSessionID,
 				Target:     target,
 				AccessMode: config.AccessMode, UserDeadline: config.UserDeadline,
-				Duration: config.Duration,
+				Duration: config.Duration, LeaseLifecycle: lifecycle,
 			})
 		}
 	}

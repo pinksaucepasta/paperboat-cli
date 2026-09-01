@@ -103,6 +103,22 @@ type Carrier interface {
 	Close(context.Context) error
 }
 
+// LeaseLifecycleOwnership identifies which process is authoritative for
+// renewing and stopping a lease. Foreground carriers own the lifecycle by
+// default. The production CLI observer delegates it to stable hostd.
+type LeaseLifecycleOwnership uint8
+
+const (
+	LeaseLifecycleOwned LeaseLifecycleOwnership = iota
+	LeaseLifecycleObserved
+)
+
+// LeaseLifecycleCarrier lets a carrier explicitly delegate server lease
+// mutations to another process while retaining readiness observation.
+type LeaseLifecycleCarrier interface {
+	LeaseLifecycleOwnership() LeaseLifecycleOwnership
+}
+
 // RetryableCarrierError lets a carrier request a bounded reconnect retry while
 // preserving the existing lease and URL. Non-retryable setup errors fail fast.
 type RetryableCarrierError struct {
@@ -146,6 +162,7 @@ type SessionConfig struct {
 	MaxReconnectBackoff time.Duration
 	ParentPollInterval  time.Duration
 	DisableParentWatch  bool
+	LeaseLifecycle      LeaseLifecycleOwnership
 	ParentPID           func() int
 	Random              io.Reader
 	Now                 func() time.Time
@@ -328,6 +345,9 @@ func validateSessionConfig(config SessionConfig) error {
 	if config.AccessMode != "" && config.AccessMode != "public" && config.AccessMode != "private" {
 		return fmt.Errorf("%w: access mode must be public or private", ErrSessionInvalid)
 	}
+	if config.LeaseLifecycle != LeaseLifecycleOwned && config.LeaseLifecycle != LeaseLifecycleObserved {
+		return fmt.Errorf("%w: lease lifecycle ownership is invalid", ErrSessionInvalid)
+	}
 	if config.Duration < 0 {
 		return fmt.Errorf("%w: duration cannot be negative", ErrSessionInvalid)
 	}
@@ -445,13 +465,17 @@ func (s *Session) run() {
 	defer close(s.done)
 
 	renewDone := make(chan error, 1)
-	go func() {
-		err := s.renewLoop(s.ctx)
-		if err != nil {
-			s.cancel()
-		}
-		renewDone <- err
-	}()
+	if s.config.LeaseLifecycle == LeaseLifecycleObserved {
+		renewDone <- nil
+	} else {
+		go func() {
+			err := s.renewLoop(s.ctx)
+			if err != nil {
+				s.cancel()
+			}
+			renewDone <- err
+		}()
+	}
 
 	carrierErr := s.runCarrier(s.ctx)
 	s.cancel()
@@ -460,9 +484,12 @@ func (s *Session) run() {
 	carrierCloseCtx, cancelCarrierClose := context.WithTimeout(context.Background(), s.config.ShutdownTimeout)
 	carrierCloseErr := s.closeCarrier(carrierCloseCtx)
 	cancelCarrierClose()
-	leaseStopCtx, cancelLeaseStop := context.WithTimeout(context.Background(), s.config.ShutdownTimeout)
-	leaseStopErr := stopLease(leaseStopCtx, s.config.LeaseClient, s.currentLease(), s.stopIdempotencyKey)
-	cancelLeaseStop()
+	var leaseStopErr error
+	if s.config.LeaseLifecycle == LeaseLifecycleOwned {
+		leaseStopCtx, cancelLeaseStop := context.WithTimeout(context.Background(), s.config.ShutdownTimeout)
+		leaseStopErr = stopLease(leaseStopCtx, s.config.LeaseClient, s.currentLease(), s.stopIdempotencyKey)
+		cancelLeaseStop()
+	}
 
 	primary := carrierErr
 	if renewErr != nil {
@@ -724,12 +751,22 @@ func (s *Session) markReady(lease Lease) error {
 	}
 	s.mu.Lock()
 	if s.readySet {
-		if s.ready.ID == lease.ID && s.ready.Endpoint == lease.Endpoint {
+		if s.ready.ID != lease.ID || s.ready.Endpoint != lease.Endpoint {
+			s.mu.Unlock()
+			return fmt.Errorf("%w: carrier reported a second lease", ErrSessionInvalid)
+		}
+		if lease.Generation < s.lease.Generation {
+			s.mu.Unlock()
+			return fmt.Errorf("%w: carrier regressed the lease generation", ErrSessionInvalid)
+		}
+		if lease.Generation == s.lease.Generation {
 			s.mu.Unlock()
 			return nil
 		}
+		s.lease = lease
+		s.ready = lease
 		s.mu.Unlock()
-		return fmt.Errorf("%w: carrier reported a second lease", ErrSessionInvalid)
+		return s.rekeyManagers(lease)
 	}
 	s.ready = lease
 	// Readiness is a server mutation and therefore advances the strong ETag.
@@ -739,6 +776,15 @@ func (s *Session) markReady(lease Lease) error {
 	s.lease = lease
 	s.readySet = true
 	s.mu.Unlock()
+
+	if err := s.rekeyManagers(lease); err != nil {
+		return err
+	}
+	s.readyOnce.Do(func() { close(s.readyDone) })
+	return nil
+}
+
+func (s *Session) rekeyManagers(lease Lease) error {
 
 	s.managerMu.Lock()
 	managers := make([]*SessionManager, 0, len(s.managers))
@@ -752,7 +798,6 @@ func (s *Session) markReady(lease Lease) error {
 			return fmt.Errorf("%w: manager rejected ready lease: %v", ErrLeaseLost, err)
 		}
 	}
-	s.readyOnce.Do(func() { close(s.readyDone) })
 	return nil
 }
 

@@ -102,6 +102,12 @@ func (c *LeaseObserverCarrier) MachineAuthSource() (api.MachineAuthSource, error
 // to create the preview; injected carriers used by tests may omit this seam.
 func (c *LeaseObserverCarrier) NeedsOwnerSessionLease() bool { return c != nil }
 
+// LeaseLifecycleOwnership makes stable hostd the sole authority for renew and
+// stop. The CLI continues to observe state and owns only its local owner lease.
+func (c *LeaseObserverCarrier) LeaseLifecycleOwnership() LeaseLifecycleOwnership {
+	return LeaseLifecycleObserved
+}
+
 func (c *LeaseObserverCarrier) Run(ctx context.Context, lease Lease, ready func(Lease) error) error {
 	if c == nil || ctx == nil || ready == nil {
 		return ErrLeaseObserverInvalid
@@ -132,6 +138,7 @@ func (c *LeaseObserverCarrier) Run(ctx context.Context, lease Lease, ready func(
 		c.mu.Unlock()
 	}()
 
+	lastETag := ""
 	for {
 		observed, err := reader.Get(runCtx, lease.ID)
 		if err != nil {
@@ -146,11 +153,12 @@ func (c *LeaseObserverCarrier) Run(ctx context.Context, lease Lease, ready func(
 		observed.CreateOperationID = lease.CreateOperationID
 		switch {
 		case isReadyLease(observed):
-			if err := ready(observed); err != nil {
-				return err
+			if observed.ETag != lastETag {
+				if err := ready(observed); err != nil {
+					return err
+				}
+				lastETag = observed.ETag
 			}
-			<-runCtx.Done()
-			return nil
 		case observed.State == "expired":
 			return ErrLeaseExpired
 		case observed.State == "stopped", observed.State == "owner_disconnected":
@@ -214,4 +222,5 @@ func classifyLeaseObserverError(err error) error {
 }
 
 var _ Carrier = (*LeaseObserverCarrier)(nil)
+var _ LeaseLifecycleCarrier = (*LeaseObserverCarrier)(nil)
 var _ LeaseReader = (*APILeaseClient)(nil)

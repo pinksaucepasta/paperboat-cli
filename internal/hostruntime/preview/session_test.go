@@ -543,3 +543,36 @@ func TestSessionRenewalUsesLeaseAdvancedDuringRenewalWait(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestObservedSessionDelegatesRenewAndStopToStableRuntime(t *testing.T) {
+	client := &sessionLeaseClient{}
+	carrier := &sessionCarrier{closed: make(chan struct{}), run: func(ctx context.Context, lease Lease, ready func(Lease) error) error {
+		lease = sessionReadyLease(lease)
+		lease.ETag = formatLeaseETag(lease.ID, 2)
+		if err := ready(lease); err != nil {
+			return err
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+	session, err := Start(context.Background(), SessionConfig{
+		LeaseClient: client, Carrier: carrier, OwnerDeviceID: "device_1", OwnerSessionID: "session_1",
+		Target: LeaseTarget{Scheme: "http", Address: "127.0.0.1:3000"}, LeaseLifecycle: LeaseLifecycleObserved,
+		RenewInterval: time.Millisecond, ShutdownTimeout: time.Second, DisableParentWatch: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.WaitReady(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if err := session.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.renewed) != 0 || len(client.stopLeases) != 0 {
+		t.Fatalf("observer mutated server lease: renew=%d stop=%d", len(client.renewed), len(client.stopLeases))
+	}
+}
