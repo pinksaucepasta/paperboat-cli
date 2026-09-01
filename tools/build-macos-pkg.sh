@@ -50,6 +50,15 @@ trap cleanup EXIT HUP INT TERM
 mkdir -p "$root/payload/usr/local/bin"
 install -m 0755 "$binary" "$root/payload/usr/local/bin/pb"
 
+# macOS refuses an unsigned executable when launchd starts it from a
+# privileged helper location. TUF authenticates the development release
+# bytes; add an ad-hoc Mach-O signature when a Developer ID application
+# signature is not already present so the installed hostd/updater can run.
+if ! codesign --verify --strict "$root/payload/usr/local/bin/pb" >/dev/null 2>&1; then
+  codesign --force --sign - --timestamp=none "$root/payload/usr/local/bin/pb"
+fi
+codesign --verify --strict "$root/payload/usr/local/bin/pb"
+
 pkgbuild \
   --root "$root/payload" \
   --identifier dev.pprbt.paperboat \
