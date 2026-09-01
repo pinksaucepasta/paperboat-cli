@@ -89,12 +89,6 @@ func TestWindowsUninstallHandoffAcceptsOnlyReadyProtectedStatus(t *testing.T) {
 	}
 }
 
-func TestWindowsUninstallDefersPreviewCleanupToElevatedHandoff(t *testing.T) {
-	if err := cleanupUninstallDurablePreviewServices(nil); err != nil {
-		t.Fatalf("Windows uninstall called the user preview broker before handoff: %v", err)
-	}
-}
-
 func TestWindowsUninstallRequiresConfirmedDaemonStopBeforeProductRemoval(t *testing.T) {
 	if !platformRequiresConfirmedDaemonStop() {
 		t.Fatal("Windows uninstall may remove product/state after uncertain daemon termination")

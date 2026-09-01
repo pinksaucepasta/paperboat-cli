@@ -18,7 +18,6 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/health"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/history"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/operation"
-	"github.com/pinksaucepasta/paperboat/internal/hostruntime/preview"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/process"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/protocol"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/pty"
@@ -33,8 +32,6 @@ type SessionLauncher interface {
 
 type DispatcherConfig struct {
 	Sessions        *session.Manager
-	Previews        *preview.Registry
-	PreviewControl  preview.PreviewControl
 	ConfigApply     configapply.Handler
 	Health          HealthSource
 	SessionLauncher SessionLauncher
@@ -72,9 +69,6 @@ func NewDispatcher(config DispatcherConfig) (*Dispatcher, error) {
 
 func (d *Dispatcher) Capabilities() []string {
 	capabilities := []string{"terminal.v1", "health.v1"}
-	if d.config.Previews != nil {
-		capabilities = append(capabilities, "preview.public.v1")
-	}
 	if d.config.ConfigApply != nil {
 		capabilities = append(capabilities, "config.apply.v1")
 	}
@@ -91,8 +85,6 @@ func (d *Dispatcher) Handle(ctx context.Context, authorization Authorization, ca
 	switch capability {
 	case "terminal.v1":
 		return d.terminal(ctx, authorization, payload)
-	case "preview.public.v1":
-		return d.preview(ctx, authorization, payload)
 	case "health.v1":
 		return result(d.config.Health.Snapshot())
 	case "config.apply.v1":
@@ -665,76 +657,6 @@ func (d *Dispatcher) terminal(ctx context.Context, authorization Authorization, 
 	}
 }
 
-type previewRequest struct {
-	Action                string `json:"action"`
-	LogicalName           string `json:"logical_name,omitempty"`
-	TargetHost            string `json:"target_host,omitempty"`
-	TargetPort            uint16 `json:"target_port,omitempty"`
-	PublicAcknowledgement bool   `json:"public_acknowledgement,omitempty"`
-	Access                string `json:"access,omitempty"`
-	Identity              string `json:"identity,omitempty"`
-}
-
-func (d *Dispatcher) preview(ctx context.Context, authorization Authorization, payload json.RawMessage) operation.Outcome {
-	if d.config.Previews == nil || authorization.EnvironmentID == "" {
-		return failure("capability_required")
-	}
-	var request previewRequest
-	if decodeStrict(payload, &request) != nil || request.Access != "" {
-		return failure("unsupported_preview_policy")
-	}
-	identity := authorization.ResourceID
-	if request.Identity != "" && (d.config.PreviewControl != nil || request.Identity != identity) {
-		return failure("not_found_or_forbidden")
-	}
-	switch request.Action {
-	case "list":
-		if d.config.PreviewControl != nil {
-			return domainResult(d.config.PreviewControl.List(ctx))
-		}
-		return domainResult(d.config.Previews.ListEnvironment(authorization.EnvironmentID), nil)
-	case "register":
-		target := preview.Target{Host: request.TargetHost, Port: request.TargetPort}
-		if d.config.PreviewControl != nil {
-			remote, err := d.config.PreviewControl.Register(ctx, request.LogicalName, target, request.PublicAcknowledgement, 0, false)
-			if err != nil {
-				return failure("preview_control_unavailable")
-			}
-			value, err := d.config.Previews.RegisterCanonical(remote.PreviewKey, remote.URL, authorization.EnvironmentID, remote.LogicalName, target)
-			return domainResult(value, err)
-		}
-		value, err := d.config.Previews.Register(identity, authorization.EnvironmentID, request.LogicalName, target, request.PublicAcknowledgement)
-		return domainResult(value, err)
-	case "get":
-		if identity == "" {
-			return failure("not_found_or_forbidden")
-		}
-		value, err := d.config.Previews.Get(identity)
-		return domainResult(value, err)
-	case "probe":
-		if identity == "" {
-			return failure("not_found_or_forbidden")
-		}
-		value, err := d.config.Previews.Probe(ctx, identity)
-		return domainResult(value, err)
-	case "remove":
-		if d.config.PreviewControl != nil {
-			remote, err := d.config.PreviewControl.Remove(ctx, request.LogicalName)
-			if err != nil {
-				return failure("preview_control_unavailable")
-			}
-			return domainResult(d.config.Previews.Remove(remote.PreviewKey))
-		}
-		if identity == "" {
-			return failure("not_found_or_forbidden")
-		}
-		value, err := d.config.Previews.Remove(identity)
-		return domainResult(value, err)
-	default:
-		return failure("invalid_request")
-	}
-}
-
 func (d *Dispatcher) cwd(value string) (string, bool) {
 	if value == "" {
 		value = d.config.WorkspaceRoot
@@ -756,6 +678,9 @@ func (d *Dispatcher) randomID(prefix string) string {
 }
 
 func decodeStrict(payload []byte, target any) error {
+	if err := rejectDuplicateJSONKeys(payload); err != nil {
+		return err
+	}
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
@@ -763,6 +688,62 @@ func decodeStrict(payload []byte, target any) error {
 	}
 	var extra any
 	if err := decoder.Decode(&extra); err != io.EOF {
+		return errors.New("trailing JSON")
+	}
+	return nil
+}
+
+func rejectDuplicateJSONKeys(payload []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.UseNumber()
+	var walk func() error
+	walk = func() error {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		delimiter, compound := token.(json.Delim)
+		if !compound {
+			return nil
+		}
+		switch delimiter {
+		case '{':
+			seen := make(map[string]struct{})
+			for decoder.More() {
+				keyToken, err := decoder.Token()
+				if err != nil {
+					return err
+				}
+				key, ok := keyToken.(string)
+				if !ok {
+					return errors.New("JSON object key is not a string")
+				}
+				if _, exists := seen[key]; exists {
+					return errors.New("duplicate JSON object key")
+				}
+				seen[key] = struct{}{}
+				if err := walk(); err != nil {
+					return err
+				}
+			}
+			_, err = decoder.Token()
+			return err
+		case '[':
+			for decoder.More() {
+				if err := walk(); err != nil {
+					return err
+				}
+			}
+			_, err = decoder.Token()
+			return err
+		default:
+			return errors.New("unexpected JSON delimiter")
+		}
+	}
+	if err := walk(); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
 		return errors.New("trailing JSON")
 	}
 	return nil
@@ -809,7 +790,7 @@ func domainResult(value any, err error) operation.Outcome {
 		return failure("operation_canceled")
 	case errors.Is(err, context.DeadlineExceeded):
 		return failure("deadline_exceeded")
-	case errors.Is(err, session.ErrSessionUnknown), errors.Is(err, preview.ErrNotFound):
+	case errors.Is(err, session.ErrSessionUnknown):
 		return failure("not_found_or_forbidden")
 	case errors.Is(err, session.ErrSessionExists):
 		return failure("session_exists")
@@ -821,12 +802,8 @@ func domainResult(value any, err error) operation.Outcome {
 		return failure("input_id_conflict")
 	case errors.Is(err, session.ErrInputUnknown):
 		return failure("input_unknown")
-	case errors.Is(err, preview.ErrResourceLimit):
-		return failure("resource_limit")
 	case errors.Is(err, session.ErrResourceLimit), errors.Is(err, session.ErrInputJournalFull):
 		return failure("resource_limit")
-	case errors.Is(err, preview.ErrInvalidTarget):
-		return failure("invalid_preview_target")
 	case errors.Is(err, configapply.ErrRevisionConflict):
 		return failure("config_revision_conflict")
 	case errors.Is(err, configapply.ErrInvalidRequest):

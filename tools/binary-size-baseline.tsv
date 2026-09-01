@@ -1,5 +1,16 @@
-# Reviewed 2026-08-05 after the P2P/ICE, E2EE, transfer, preview, SSH, and diagnostics cutover.
-# Updating a size requires package/dependency attribution in the reviewing change.
-darwin	arm64	50330994
-linux	amd64	54210658
-linux	arm64	49652276
+# Reviewed 2026-09-01 for TRK-38 against the 2026-08-05 baseline. Exact Go 1.26.6
+# Make binary-size builds changed darwin/arm64 50330994 -> 64288082
+# (+13957088, +27.73%), linux/amd64 54210658 -> 68953700 (+14743042,
+# +27.20%), and linux/arm64 49652276 -> 63154726 (+13502450, +27.19%).
+# Reproducible `go tool nm -size` attribution against the checkpoint source
+# identifies non-TLS growth in hostruntime/preview (+293634),
+# environmentmanager (+269870), hostruntime/tunnelmanager (+189218),
+# connectorprotocol (+165153), api (+159625), config (+156210),
+# fxamacker/cbor (+153382), workerupdate (+135015), tunnelenrollment (+134035),
+# connectorrotation (+127625), environmente2ee (+119710), x/net/http2
+# (+116458), codexsession (+107430), and envinject (+101616) bytes. The
+# remaining measured growth includes Go runtime/linker/static data and newly
+# reachable feature code. Updating a size requires this attribution.
+darwin	arm64	64288082
+linux	amd64	68953700
+linux	arm64	63154726

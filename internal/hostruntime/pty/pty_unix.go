@@ -213,7 +213,7 @@ func validDimensions(dimensions Dimensions) bool {
 	return dimensions.Columns >= 1 && dimensions.Columns <= 1000 && dimensions.Rows >= 1 && dimensions.Rows <= 1000
 }
 func validEnvironment(environment []string) bool {
-	if len(environment) > 128 {
+	if len(environment) > maximumProcessEnvironmentEntries {
 		return false
 	}
 	seen := make(map[string]bool, len(environment))
@@ -221,10 +221,11 @@ func validEnvironment(environment []string) bool {
 	for _, entry := range environment {
 		total += len(entry)
 		key, value, ok := strings.Cut(entry, "=")
-		if !ok || key == "" || len(entry) > 4096 || total > 64<<10 || strings.ContainsAny(key, "\x00\r\n") || strings.ContainsRune(value, '\x00') || seen[key] {
+		folded := strings.ToUpper(key)
+		if !ok || key == "" || len(entry) > maximumProcessEnvironmentEntryBytes || total > maximumProcessEnvironmentBytes || strings.ContainsAny(key, "\x00\r\n") || strings.ContainsRune(value, '\x00') || seen[folded] {
 			return false
 		}
-		seen[key] = true
+		seen[folded] = true
 	}
 	return true
 }

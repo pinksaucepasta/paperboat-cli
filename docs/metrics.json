@@ -56,6 +56,10 @@
       }
     },
     {
+      "name": "paperboat_runtime_crash_loop",
+      "kind": "gauge"
+    },
+    {
       "name": "paperboat_runtime_delivery_total",
       "kind": "counter",
       "labels": {
@@ -67,6 +71,101 @@
           "canceled",
           "delivered",
           "failed"
+        ]
+      }
+    },
+    {
+      "name": "paperboat_runtime_doctor_checks_total",
+      "kind": "counter",
+      "labels": {
+        "check": [
+          "clock",
+          "config",
+          "credential",
+          "dns",
+          "edge",
+          "origin",
+          "resource",
+          "state",
+          "transport"
+        ],
+        "outcome": [
+          "degraded",
+          "failed",
+          "ok",
+          "unknown"
+        ]
+      }
+    },
+    {
+      "name": "paperboat_runtime_health_dimension",
+      "kind": "gauge",
+      "labels": {
+        "dimension": [
+          "access",
+          "certificate",
+          "config",
+          "dns",
+          "edge",
+          "origin",
+          "route",
+          "service",
+          "update"
+        ],
+        "status": [
+          "degraded",
+          "down",
+          "not_applicable",
+          "ready",
+          "unknown"
+        ]
+      }
+    },
+    {
+      "name": "paperboat_runtime_health_probe_latency_seconds",
+      "kind": "histogram",
+      "labels": {
+        "dimension": [
+          "access",
+          "certificate",
+          "config",
+          "dns",
+          "edge",
+          "origin",
+          "route",
+          "service",
+          "update"
+        ]
+      }
+    },
+    {
+      "name": "paperboat_runtime_health_transitions_total",
+      "kind": "counter",
+      "labels": {
+        "dimension": [
+          "access",
+          "certificate",
+          "config",
+          "dns",
+          "edge",
+          "origin",
+          "route",
+          "service",
+          "update"
+        ],
+        "from": [
+          "degraded",
+          "down",
+          "not_applicable",
+          "ready",
+          "unknown"
+        ],
+        "to": [
+          "degraded",
+          "down",
+          "not_applicable",
+          "ready",
+          "unknown"
         ]
       }
     },
@@ -204,6 +303,39 @@
       }
     },
     {
+      "name": "paperboat_runtime_service_restarts_total",
+      "kind": "counter",
+      "labels": {
+        "reason": [
+          "crash",
+          "shutdown",
+          "unknown",
+          "upgrade"
+        ]
+      }
+    },
+    {
+      "name": "paperboat_runtime_service_uptime_seconds",
+      "kind": "gauge"
+    },
+    {
+      "name": "paperboat_runtime_state_evidence",
+      "kind": "gauge",
+      "labels": {
+        "kind": [
+          "clock",
+          "config",
+          "credential",
+          "dns",
+          "edge",
+          "origin",
+          "resource",
+          "state",
+          "transport"
+        ]
+      }
+    },
+    {
       "name": "paperboat_runtime_terminal_bytes_total",
       "kind": "counter",
       "labels": {
@@ -300,8 +432,40 @@
       }
     },
     {
+      "name": "paperboat_runtime_update_operations_total",
+      "kind": "counter",
+      "labels": {
+        "outcome": [
+          "canceled",
+          "failed",
+          "success"
+        ],
+        "phase": [
+          "activate",
+          "download",
+          "health_gate",
+          "quarantine",
+          "rollback",
+          "stage",
+          "verify"
+        ]
+      }
+    },
+    {
       "name": "paperboat_runtime_update_rollbacks_total",
       "kind": "counter"
+    },
+    {
+      "name": "paperboat_runtime_watchdog_failures_total",
+      "kind": "counter",
+      "labels": {
+        "reason": [
+          "crash",
+          "timeout",
+          "unhealthy",
+          "unknown"
+        ]
+      }
     }
   ]
 }

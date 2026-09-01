@@ -32,3 +32,11 @@ func runLocalDaemonService(_ context.Context, args []string, _ io.Writer, _ io.W
 		},
 	})
 }
+
+func executeLocalDaemonService(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	if err := runLocalDaemonService(ctx, args, stdout, stderr); err != nil {
+		writeError(stderr, err)
+		return 1
+	}
+	return 0
+}

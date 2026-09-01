@@ -52,7 +52,10 @@ asset targets, and atomically publishes `current.json`, installers, and TUF meta
 server publishes metadata only; installers and runtime updates download executable bytes from
 the immutable GitHub release URLs recorded in the signed metadata.
 
-Incident procedures are maintained in [runbooks.md](runbooks.md).
+General incident procedures are maintained in [runbooks.md](runbooks.md).
+The complete v1 preview and tunnel workflow is in
+[preview-tunnels.md](preview-tunnels.md), with focused recovery procedures in
+[runbooks-preview-tunnels.md](runbooks-preview-tunnels.md).
 
 ## Machine runtime services
 
@@ -109,42 +112,32 @@ standard process environment and native macOS proxy settings for all runtime-own
 control, WebSocket, update, artifact, and configuration traffic. Proxy URLs must use
 `http` or `https`, contain a host, and contain no credentials, path, query, or fragment;
 invalid policy prevents the runtime from starting. Paperboat never downloads or executes
-PAC/WPAD scripts and never accepts proxy credentials in configuration.
+network PAC/WPAD scripts and never accepts proxy credentials in configuration. For private
+preview hostnames, hostd may install its own narrow local PAC rule that routes only those
+names through the authenticated local Paperboat proxy.
 
 `pb pair` installs the terminal host and its `runtime` connector. Configuration sync is a
 separate per-user `__runtime-config` service and starts only while the local machine has an
 assignment. Neither process initializes preview monitoring.
 
-`pb preview create` starts one per-user service per preview. `--machine` resolves an owned,
-online paired machine and uses a two-minute `preview_launch` credential to ask that
-machine's host runtime to install the same isolated service. Each runner owns one preview
-connector whose connector ID is the server-issued preview key. Its durable descriptor
-stores the original absolute expiry; after reboot the runner resumes only a matching,
-active server record and uses the remaining lifetime. Expiry or server revocation removes
-the route, descriptor, and service definition. A crash retains the descriptor so the OS
-service can retry without extending expiry.
+`pb preview <port|url|path>` creates one temporary server lease and dispatches it to the
+stable host runtime. The host runtime owns the machine-wide authenticated carrier, origin
+probe, owner-session heartbeat, recovery, and cleanup. CLI processes observe the lease and
+never create competing carriers or per-preview operating-system services.
 
-`pb serve` is private and local by default. Foreground mode owns an ephemeral
-`127.0.0.1` HTTP listener directly and has no account, control-plane, machine-runtime, or
-route dependency. `--listen-port` requests an exact loopback port and fails on conflict.
-`--detach` installs `__runtime-serve`; its v1 descriptor contains only the canonical source
-path and filesystem identity, file/directory kind, SPA policy, private visibility, requested
-and assigned loopback port, owner mode, service definition, service generation, and original
-absolute expiry. It contains no credential. `pb preview list` reads this owner-only local
-state, and `pb preview revoke <name>` retires the service without contacting the backend.
-Successfully ingested Inbox files remain user-owned.
+`pb preview list` reads canonical server resources. `pb preview stop <preview>` revokes the
+lease and converges the route, carrier registration, and owner session. `--domain` attaches
+a verified custom domain. `--private` uses the hostd-owned narrow local proxy/PAC route so
+browser traffic carries no Paperboat credential or browser login state.
 
-`pb serve --public` retains the control-plane preview registration, management lease,
-reconciliation, and public Caddy route lifecycle. Public mode never uses a requested local
-port and remains explicitly outside the private-content E2EE claim.
-
-`pb doctor` verifies the local lease protocol and compares served descriptors with their
-loopback listeners without returning source paths. Session-mode transitions, unpair, and
-uninstall retire all durable preview services before authority or state is removed.
+`pb tunnel doctor --bundle /absolute/output.zip` previews a bounded, redacted host-runtime
+support bundle without returning source paths or secrets. Add `--write-bundle` to publish
+the previewed file. Session-mode transitions, unpair, and uninstall revoke runtime authority
+and retire affected preview routes.
 
 Machine-control credentials renew in memory and are bound to the enrolled Ed25519 key and
 installation generation. Reinstall, unpair, or machine revocation invalidates them. Never
-copy a runtime state directory to another machine or edit preview service descriptors.
+copy a runtime state directory to another machine.
 
 ## Container hostd and updates
 

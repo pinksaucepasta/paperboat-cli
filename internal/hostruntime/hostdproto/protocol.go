@@ -42,13 +42,15 @@ var workerIDPattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$`)
 type Type string
 
 const (
-	TypeHello     Type = "hello"
-	TypeWelcome   Type = "welcome"
-	TypeReady     Type = "ready"
-	TypeActivate  Type = "activate"
-	TypeHeartbeat Type = "heartbeat"
-	TypeStatus    Type = "status"
-	TypeError     Type = "error"
+	TypeHello              Type = "hello"
+	TypeWelcome            Type = "welcome"
+	TypeReady              Type = "ready"
+	TypeActivate           Type = "activate"
+	TypeHeartbeat          Type = "heartbeat"
+	TypeStatus             Type = "status"
+	TypeError              Type = "error"
+	TypeUpdateGateRequest  Type = "update_gate_request"
+	TypeUpdateGateResponse Type = "update_gate_response"
 )
 
 // Message is one strictly framed lifecycle message. Each message has a fixed
@@ -239,6 +241,10 @@ func Decode(frame []byte) (Message, error) {
 		message = &Status{}
 	case TypeError:
 		message = &Error{}
+	case TypeUpdateGateRequest:
+		message = &UpdateGateRequest{}
+	case TypeUpdateGateResponse:
+		message = &UpdateGateResponse{}
 	default:
 		return nil, ErrInvalidFrame
 	}

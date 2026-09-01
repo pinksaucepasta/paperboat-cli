@@ -35,6 +35,8 @@ type WindowsConfig struct {
 	SetupMode                                                                  string
 	VerifyExecutable                                                           func(context.Context, string, string) error
 	ResolveRelease                                                             workerupdate.Resolver
+	ActivationGate                                                             workerupdate.ActivationGate
+	CandidateStarter                                                           func(context.Context, workerupdate.StartRequest) (workerupdate.Worker, error)
 }
 
 func validLoopbackHealthURL(value string) bool {
@@ -124,7 +126,7 @@ func validWindowsConfig(config WindowsConfig) bool {
 	}
 	layout, layoutErr := service.DefaultLayout("windows")
 	sid, err := windows.StringToSid(config.OwnerSID)
-	return layoutErr == nil && err == nil && sid != nil && sid.IsValid() && config.MachineID != "" && config.RepositoryURL != "" && config.StateRoot == layout.UpdateStateRoot && filepath.Base(config.RuntimeStateRoot) == "runtime" && strings.EqualFold(filepath.Base(filepath.Dir(config.RuntimeStateRoot)), "Paperboat") && config.Binary == layout.Binary && config.BinaryRollback == layout.BinaryRollback && config.BinaryStaged == layout.BinaryStaged && config.TokenFile == hostinstall.WindowsHostdTokenPath() && config.InstallState == hostinstall.WindowsInstallConfigPath() && config.ControlSocket == `\\.\pipe\PaperboatUpdatedControl` && config.HostdSocket == layout.HostdSocket && validLoopbackHealthURL(config.HealthURL) && exactReleasePattern.MatchString(config.ActiveVersion) && (config.Architecture == "amd64" || config.Architecture == "arm64") && (config.SetupMode == "host" || config.SetupMode == "client")
+	return layoutErr == nil && err == nil && sid != nil && sid.IsValid() && config.MachineID != "" && config.RepositoryURL != "" && config.ActivationGate != nil && config.CandidateStarter != nil && config.StateRoot == layout.UpdateStateRoot && filepath.Base(config.RuntimeStateRoot) == "runtime" && strings.EqualFold(filepath.Base(filepath.Dir(config.RuntimeStateRoot)), "Paperboat") && config.Binary == layout.Binary && config.BinaryRollback == layout.BinaryRollback && config.BinaryStaged == layout.BinaryStaged && config.TokenFile == hostinstall.WindowsHostdTokenPath() && config.InstallState == hostinstall.WindowsInstallConfigPath() && config.ControlSocket == `\\.\pipe\PaperboatUpdatedControl` && config.HostdSocket == layout.HostdSocket && validLoopbackHealthURL(config.HealthURL) && exactReleasePattern.MatchString(config.ActiveVersion) && (config.Architecture == "amd64" || config.Architecture == "arm64") && (config.SetupMode == "host" || config.SetupMode == "client")
 }
 
 func validateWindowsPrivilegedInstallConfig(config WindowsConfig) error {

@@ -10,8 +10,6 @@ import (
 	"runtime"
 	"strings"
 	"testing"
-
-	"howett.net/plist"
 )
 
 type controller struct {
@@ -54,6 +52,22 @@ func TestSystemdDefinitionSignalsWorkerBeforeForceCleaningCgroup(t *testing.T) {
 	}
 }
 
+func TestSystemdHostdLoadsOnlyFixedEncryptedEnvironmentCredential(t *testing.T) {
+	credential := "/var/lib/paperboat-installer/environment/host-key.cred"
+	body, err := renderSystemd(Config{Platform: "linux", Kind: HostdKind, User: "paperboat", Group: "paperboat", Executable: "/usr/local/libexec/paperboat/pb", EncryptedCredentials: map[string]string{"paperboat-environment-host-key": credential}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition := string(body)
+	if !strings.Contains(definition, "LoadCredentialEncrypted=paperboat-environment-host-key:"+credential+"\n") || !strings.Contains(definition, "PrivateMounts=true\n") || !strings.Contains(definition, "LimitCORE=0\n") {
+		t.Fatalf("encrypted credential confinement missing:\n%s", definition)
+	}
+	if safeEncryptedCredentials(Config{Platform: "linux", Kind: HostdKind, EncryptedCredentials: map[string]string{"other": credential}}) ||
+		safeEncryptedCredentials(Config{Platform: "darwin", Kind: HostdKind, EncryptedCredentials: map[string]string{"paperboat-environment-host-key": credential}}) {
+		t.Fatal("unsafe encrypted credential declaration accepted")
+	}
+}
+
 func TestSystemdDefinitionEscapesSpecifiersAndEnvironmentExpansion(t *testing.T) {
 	body, err := renderSystemd(Config{Kind: WorkerKind, User: "paperboat", Group: "paperboat", Executable: "/opt/pb%stable", Arguments: []string{"$TOKEN"}, Environment: map[string]string{"VALUE": "$HOME%h"}})
 	if err != nil {
@@ -66,20 +80,13 @@ func TestSystemdDefinitionEscapesSpecifiersAndEnvironmentExpansion(t *testing.T)
 	}
 }
 
-func TestPreviewSystemdDefinitionKeepsSourceTmpVisible(t *testing.T) {
-	body, err := renderSystemd(Config{Kind: PreviewKind, Instance: "abc123", Executable: "/opt/pb", Arguments: []string{"__runtime-serve"}, Environment: map[string]string{"HOME": "/home/test"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(body), "PrivateTmp=true") {
-		t.Fatalf("preview worker must see user-selected /tmp sources:\n%s", body)
-	}
-	body, err = renderSystemd(Config{Kind: WorkerKind, User: "paperboat", Group: "paperboat", Executable: "/opt/pb", Arguments: []string{"run"}})
+func TestSystemdWorkerUsesPrivateTmp(t *testing.T) {
+	body, err := renderSystemd(Config{Kind: WorkerKind, User: "paperboat", Group: "paperboat", Executable: "/opt/pb", Arguments: []string{"run"}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(string(body), "PrivateTmp=true") {
-		t.Fatalf("non-preview worker lost PrivateTmp:\n%s", body)
+		t.Fatalf("worker lost PrivateTmp:\n%s", body)
 	}
 }
 
@@ -171,36 +178,6 @@ func TestLaunchdDefinitionIsEscapedValidXML(t *testing.T) {
 	}
 }
 
-func TestLaunchdDefinitionUsesTypedStructuredValues(t *testing.T) {
-	config := Config{
-		Kind: PreviewKind, Instance: "docs", Executable: "/Applications/Paperboat & Tools/pb",
-		User: "test", Group: "staff", Arguments: []string{"preview", "<docs>"},
-		Environment: map[string]string{"PAPERBOAT_VALUE": `a&b<"c">`},
-	}
-	body, err := renderLaunchd(config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var decoded struct {
-		Label                string
-		ProgramArguments     []string
-		EnvironmentVariables map[string]string
-		RunAtLoad            bool
-		KeepAlive            struct{ SuccessfulExit bool }
-		Umask                uint64
-	}
-	format, err := plist.Unmarshal(body, &decoded)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if format != plist.XMLFormat || decoded.Label != previewLabel("docs") || !decoded.RunAtLoad ||
-		decoded.KeepAlive.SuccessfulExit || decoded.Umask != 0o77 ||
-		len(decoded.ProgramArguments) != 3 || decoded.ProgramArguments[0] != config.Executable ||
-		decoded.ProgramArguments[2] != "<docs>" || decoded.EnvironmentVariables["PAPERBOAT_VALUE"] != `a&b<"c">` {
-		t.Fatalf("decoded launchd definition=%+v format=%d", decoded, format)
-	}
-}
-
 func TestHostServiceDefinitionsRunAsRootInBootDomain(t *testing.T) {
 	for _, platform := range []string{"linux", "darwin"} {
 		t.Run(platform, func(t *testing.T) {
@@ -283,54 +260,6 @@ func TestAccountNamesAllowSafelyPlacedDots(t *testing.T) {
 		if safeAccount(value) {
 			t.Fatalf("unsafe account %q was accepted", value)
 		}
-	}
-}
-
-func TestPreviewServiceDefinitionsAreIsolatedAndCrashRestartOnly(t *testing.T) {
-	for _, platform := range []string{"darwin", "linux"} {
-		t.Run(platform, func(t *testing.T) {
-			installer, err := New(Config{Platform: platform, Kind: PreviewKind, Instance: "abc123", ConfigRoot: t.TempDir(), Executable: executable(t), User: "test", Group: "test", Arguments: []string{"__runtime-preview", "--name", "docs"}, Controller: &controller{}})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := installer.Install(context.Background()); err != nil {
-				t.Fatal(err)
-			}
-			body, _ := os.ReadFile(installer.DefinitionPath())
-			definition := string(body)
-			if strings.Contains(installer.DefinitionPath(), "runtime-config") || strings.Contains(installer.DefinitionPath(), "runtime-host") {
-				t.Fatalf("preview collided with singleton service: %s", installer.DefinitionPath())
-			}
-			if platform == "darwin" {
-				if !strings.HasSuffix(installer.DefinitionPath(), "/Library/LaunchAgents/com.pinksaucepasta.paperboat.runtime-preview.abc123.plist") || !strings.Contains(definition, "<key>SuccessfulExit</key>") || !strings.Contains(definition, "<false") {
-					t.Fatalf("path=%s body=%s", installer.DefinitionPath(), body)
-				}
-			} else if !strings.HasSuffix(installer.DefinitionPath(), "/.config/systemd/user/paperboat-preview-abc123.service") || !strings.Contains(definition, "Restart=on-failure") || !strings.Contains(definition, "WantedBy=default.target") {
-				t.Fatalf("path=%s body=%s", installer.DefinitionPath(), body)
-			}
-		})
-	}
-}
-
-func TestOneShotServiceDeletionRequiresNaturalSuccess(t *testing.T) {
-	tests := []struct {
-		name         string
-		deleteOnExit bool
-		exitCode     uint32
-		interrupted  bool
-		want         bool
-	}{
-		{name: "natural completion", deleteOnExit: true, want: true},
-		{name: "workload failure", deleteOnExit: true, exitCode: 1},
-		{name: "session interruption", deleteOnExit: true, interrupted: true},
-		{name: "durable service", exitCode: 0},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			if got := shouldDeleteOneShotService(test.deleteOnExit, test.exitCode, test.interrupted); got != test.want {
-				t.Fatalf("shouldDeleteOneShotService() = %t, want %t", got, test.want)
-			}
-		})
 	}
 }
 

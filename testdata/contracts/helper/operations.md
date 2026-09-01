@@ -58,35 +58,6 @@ Stable file-transfer errors are `invalid_path`, `invalid_size`, `batch_limit`,
 `offset_conflict`, `digest_mismatch`, `no_active_writer`, `recipient_unavailable`,
 `storage_unavailable`, `resource_limit`, `canceled`, and `delivery_timeout`.
 
-## Preview identity and readiness
-
-Preview registration, listing, and removal are agent operations handled by the local
-the `pb` host runtime. Every operation is bound to the machine's assigned environment;
-cross-environment IDs, names, state, and URLs are rejected and never disclosed. A
-successful registration response returns the public URL to the calling agent, which
-surfaces it in the existing terminal session. `pb` and the dashboard may list the user's
-active previews/tunnels account-wide with associated project, machine, and user context,
-and may revoke an existing preview, but cannot create one.
-
-The control plane owns `preview_base_domain`. A preview key is lowercase ASCII matching
-`p-[a-z2-7]{26}`: `p-` plus the first 130 bits of
-`HMAC-SHA256(preview_identity_key, environment_id || 0x00 || logical_name)`, base32 without
-padding. The public hostname is `{preview_key}.{preview_base_domain}`. The server detects
-the cryptographically improbable collision and derives again with a persisted positive
-counter. Keys are retained for 30 days after expiry or removal and cannot be reassigned to
-another environment during retention. Deleting the environment permanently tombstones
-its keys for the same period.
-
-Changing a target port or reconnecting preserves the key. Preview states are
-`registering`, `ready`, `degraded`, `offline`, `expired`, and `removed`. A route alone is
-not readiness: `ready` requires helper, route, public edge, and target probes. Public HTTP
-returns `503` with `Retry-After` for registering/degraded, `502` for an unhealthy target,
-`503` for offline, `410` for expired, and `404` for removed or unknown. Public WSS closes
-with `1013` for retryable readiness failures. All responses carry
-`X-Robots-Tag: noindex, nofollow, noarchive`. First creation requires an explicit public
-access acknowledgement; no field may imply privacy.
-
-
 ## Config application
 
 `config.apply.v1` is advertised for hosted profiles and for BYOD only when the server has

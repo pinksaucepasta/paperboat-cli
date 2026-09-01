@@ -103,7 +103,7 @@ func (r staticPolicyResolver) Policy(frame protocol.Frame) (auth.Policy, error) 
 		base.CredentialClass = "codex_manage"
 		base.Scopes = []string{"codex:prepare", "codex:browse", "codex:renew", "codex:stop"}
 		base.MaxLifetime = 5 * time.Minute
-	case "terminal.v1", "health.v1", "preview.public.v1":
+	case "terminal.v1", "health.v1":
 		base.CredentialClass = "terminal_operation"
 		base.Scopes = []string{"terminal:operate"}
 		base.MaxLifetime = 5 * time.Minute
@@ -120,7 +120,9 @@ func (r staticPolicyResolver) Policy(frame protocol.Frame) (auth.Policy, error) 
 	case "preview.launch.v1":
 		base.CredentialClass = "preview_launch"
 		base.Scopes = []string{"preview:launch"}
+		base.OperationID = frame.OperationID
 		base.MaxLifetime = 5 * time.Minute
+		base.SingleUse = true
 	case "file-transfer.v1":
 		base.CredentialClass = "file_transfer"
 		base.Scopes = []string{"file:transfer"}

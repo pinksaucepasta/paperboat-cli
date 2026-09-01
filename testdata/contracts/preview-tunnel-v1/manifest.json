@@ -1,0 +1,72 @@
+{
+  "manifest_version": 1,
+  "contract_version": "1.0.0",
+  "family": "paperboat.preview-tunnel",
+  "status": "approved",
+  "authority": "PREVIEW_TUNNEL_OVERHAUL.md",
+  "artifacts": [
+    {
+      "id": "preview-tunnel.contracts",
+      "path": "contracts.md",
+      "type": "specification",
+      "sha256": "b2069c269e297ab28923974681fb396a88bb5b08f0867e62b93cef9e19e60656",
+      "consumers": ["paperboat", "paperboat-server", "paperboat-tunnel", "paperboat-web"]
+    },
+    {
+      "id": "preview-tunnel.attachment",
+      "path": "schemas/attachment.schema.json",
+      "type": "json-schema",
+      "sha256": "082c274d0ac80e2773e42cee189dde0699649c14bda964bc8b42fb84be585411",
+      "consumers": ["paperboat", "paperboat-server", "paperboat-tunnel", "paperboat-web"]
+    },
+    {
+      "id": "preview-tunnel.attachment-vectors",
+      "path": "fixtures/attachment.ndjson",
+      "type": "contract-vectors",
+      "sha256": "58ac94a9fbda2a398d39e9a02244611c2fdaf3d7c9657c92c06a4a6bc51f26d5",
+      "consumers": ["paperboat", "paperboat-server", "paperboat-tunnel", "paperboat-web"]
+    },
+    {
+      "id": "preview-tunnel.dispatch",
+      "path": "schemas/dispatch.schema.json",
+      "type": "json-schema",
+      "sha256": "50fb165c8b1b4fe5d7fd7aa853d675b59e5ef0a9313cbb841d1c01f06324a153",
+      "consumers": ["paperboat", "paperboat-server", "paperboat-tunnel", "paperboat-web"]
+    },
+    {
+      "id": "preview-tunnel.dispatch-vectors",
+      "path": "fixtures/dispatch.ndjson",
+      "type": "contract-vectors",
+      "sha256": "433f97f303fd4057dac8d40392cb6f57baf44bb15e3067bb22e870efb90ff55a",
+      "consumers": ["paperboat", "paperboat-server", "paperboat-tunnel", "paperboat-web"]
+    },
+    {
+      "id": "preview-tunnel.private-access",
+      "path": "schemas/private_access.schema.json",
+      "type": "json-schema",
+      "sha256": "5191ee38b5c34dba1398c892d7e9dca8b317a48d9fa52d79f3db3c84659726be",
+      "consumers": ["paperboat", "paperboat-server", "paperboat-tunnel", "paperboat-web"]
+    },
+    {
+      "id": "preview-tunnel.private-access-vectors",
+      "path": "fixtures/private_access.ndjson",
+      "type": "contract-vectors",
+      "sha256": "86a5e9f1349ab56085abf9bc51deb4e13a6a8f3d5e0ec3ada3269e1a03f020a6",
+      "consumers": ["paperboat", "paperboat-server", "paperboat-tunnel", "paperboat-web"]
+    },
+    {
+      "id": "preview-tunnel.resources",
+      "path": "schemas/resources.schema.json",
+      "type": "json-schema",
+      "sha256": "bd49f0b7d7fa818433c9d33b077d88ca143d8372e7fc5123b4cc86ff3dc855d4",
+      "consumers": ["paperboat", "paperboat-server", "paperboat-tunnel", "paperboat-web"]
+    },
+    {
+      "id": "preview-tunnel.resource-vectors",
+      "path": "fixtures/resources.ndjson",
+      "type": "contract-vectors",
+      "sha256": "a188317f6e35be99decff19d8b767c179fcf681b1e15fa31e1530b025c615a18",
+      "consumers": ["paperboat", "paperboat-server", "paperboat-tunnel", "paperboat-web"]
+    }
+  ]
+}

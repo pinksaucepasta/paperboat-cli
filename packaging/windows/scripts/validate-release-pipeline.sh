@@ -38,7 +38,12 @@ required = {
     'actions/download-artifact@',
     'merge-multiple: true',
     'actions/upload-artifact@',
+    'go run ./tools/release-plan manifest',
+    'go run ./tools/release-plan plan',
+    'go run ./tools/release-plan validate',
     'go run ./tools/tuf-repository publish',
+    '-manifest "$PAPERBOAT_RELEASE_MANIFEST"',
+    '-deployment-plan "$PAPERBOAT_RELEASE_DEPLOYMENT_PLAN"',
     'PAPERBOAT_GITHUB_REPOSITORY: ${{ github.repository }}',
     '-windows-amd64-native-evidence',
     '-windows-arm64-native-evidence',
@@ -98,6 +103,8 @@ for value in forbidden:
 
 if '-github-release-url' in workflow:
     raise SystemExit('release workflow uses the removed -github-release-url TUF option')
+if '-percentage' in workflow:
+    raise SystemExit('release workflow uses the removed percentage-based rollout option')
 
 if 'cmd/pb-launcher' in release_builder or 'WindowsArtifactRole' in release_builder:
     raise SystemExit('release builder must compile only cmd/pb')

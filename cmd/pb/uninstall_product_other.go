@@ -24,10 +24,6 @@ func platformProductHandoffRequired() bool { return false }
 
 func platformRequiresConfirmedDaemonStop() bool { return false }
 
-func cleanupUninstallDurablePreviewServices(command *cobra.Command) error {
-	return cleanupDurablePreviewServices(command)
-}
-
 func unsafeCleanupPathTraversal(_ string, info os.FileInfo) (bool, error) {
 	return info.Mode()&os.ModeSymlink != 0, nil
 }

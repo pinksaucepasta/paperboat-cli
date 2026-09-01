@@ -3,6 +3,7 @@ package identity
 import (
 	"bytes"
 	"crypto/ed25519"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -40,10 +41,36 @@ type Key struct {
 	private    ed25519.PrivateKey
 }
 
+const environmentWrappingDomain = "paperboat-environment-host-at-rest-wrap-v1\x00"
+
 func (k Key) Public() ed25519.PublicKey {
 	return append(ed25519.PublicKey(nil), k.private.Public().(ed25519.PublicKey)...)
 }
 func (k Key) Sign(message []byte) []byte { return ed25519.Sign(k.private, message) }
+
+// EnvironmentWrappingKey derives the local-only root used to seal the
+// dedicated ENV recipient key. It is deliberately separate from the ENV key
+// itself and from signing operations: callers only receive a derived key, and
+// the machine identity seed never leaves this package.
+func (k Key) EnvironmentWrappingKey() ([32]byte, error) {
+	if len(k.private) != ed25519.PrivateKeySize || k.ID == "" {
+		return [32]byte{}, ErrInvalidStore
+	}
+	public := k.private.Public().(ed25519.PublicKey)
+	if k.ID != "ed25519:"+jwkThumbprint(public) {
+		return [32]byte{}, ErrInvalidStore
+	}
+	seed := k.private.Seed()
+	defer clear(seed)
+	mac := hmac.New(sha256.New, seed)
+	_, _ = mac.Write([]byte(environmentWrappingDomain))
+	_, _ = mac.Write(public)
+	derived := mac.Sum(nil)
+	defer clear(derived)
+	var result [32]byte
+	copy(result[:], derived)
+	return result, nil
+}
 
 type document struct {
 	Version   int       `json:"version"`
@@ -88,6 +115,14 @@ func Open(config Config) (*Store, error) {
 }
 
 func (s *Store) Current() Key { s.mu.RLock(); defer s.mu.RUnlock(); return cloneKey(s.key) }
+
+// EnvironmentWrappingKey derives the local-only root for portable ENV key
+// custody from the current machine identity.
+func (s *Store) EnvironmentWrappingKey() ([32]byte, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.key.EnvironmentWrappingKey()
+}
 
 func (s *Store) Rotate(expectedKeyID string) (Key, error) {
 	s.mu.Lock()
@@ -247,12 +282,3 @@ func rejectDuplicateKeys(data []byte) error {
 }
 
 func cloneKey(key Key) Key { key.private = append(ed25519.PrivateKey(nil), key.private...); return key }
-
-func syncDirectory(path string) error {
-	directory, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer directory.Close()
-	return directory.Sync()
-}

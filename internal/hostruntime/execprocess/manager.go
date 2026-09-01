@@ -35,6 +35,10 @@ const (
 	StateSignaled   State = "signaled"
 	StateCanceled   State = "canceled"
 	StateFailed     State = "failed"
+
+	maximumProcessEnvironmentEntries    = 272
+	maximumProcessEnvironmentEntryBytes = 128 + 1 + 32_767
+	maximumProcessEnvironmentBytes      = 320 << 10
 )
 
 type State string
@@ -75,16 +79,17 @@ type Event struct {
 }
 
 type Config struct {
-	WorkspaceRoot     string
-	BaseEnvironment   []string
-	MaximumActive     int
-	MaximumOperations int
-	ReplayBytes       int
-	ChunkBytes        int
-	CancelGrace       time.Duration
-	Clock             func() time.Time
-	Store             *store.Store
-	Retention         time.Duration
+	WorkspaceRoot      string
+	BaseEnvironment    []string
+	ManagedEnvironment func() ([]string, error)
+	MaximumActive      int
+	MaximumOperations  int
+	ReplayBytes        int
+	ChunkBytes         int
+	CancelGrace        time.Duration
+	Clock              func() time.Time
+	Store              *store.Store
+	Retention          time.Duration
 }
 
 type Manager struct {
@@ -256,6 +261,29 @@ func (m *Manager) Get(operationID string) (*Execution, error) {
 	return execution, nil
 }
 
+// ActiveSnapshots returns the identity-bearing executions which must survive
+// a coordination-worker replacement. Completed retained history is excluded.
+func (m *Manager) ActiveSnapshots() []Snapshot {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	executions := make([]*Execution, 0, len(m.operations))
+	for _, execution := range m.operations {
+		executions = append(executions, execution)
+	}
+	m.mu.Unlock()
+	result := make([]Snapshot, 0, len(executions))
+	for _, execution := range executions {
+		snapshot := execution.Snapshot()
+		if !terminalState(snapshot.State) {
+			result = append(result, snapshot)
+		}
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].OperationID < result[j].OperationID })
+	return result
+}
+
 func (m *Manager) validate(request Request) (Request, [sha256.Size]byte, error) {
 	if !validID(request.OperationID) || len(request.Argv) == 0 || len(request.Argv) > 64 || request.Timeout < 0 || request.Timeout > 24*time.Hour || request.PTY && (request.Dimensions.Columns == 0 || request.Dimensions.Rows == 0) || !request.PTY && request.Dimensions != (pty.Dimensions{}) {
 		return Request{}, [sha256.Size]byte{}, ErrInvalid
@@ -276,11 +304,17 @@ func (m *Manager) validate(request Request) (Request, [sha256.Size]byte, error) 
 		return Request{}, [sha256.Size]byte{}, ErrInvalid
 	}
 	envTotal := 0
+	envNames := make(map[string]struct{}, len(request.Environment))
 	for key, value := range request.Environment {
 		envTotal += len(key) + len(value)
 		if !environmentKey.MatchString(key) || len(value) > 4096 || envTotal > 64<<10 || strings.ContainsRune(value, '\x00') {
 			return Request{}, [sha256.Size]byte{}, ErrInvalid
 		}
+		folded := strings.ToUpper(key)
+		if _, duplicate := envNames[folded]; duplicate {
+			return Request{}, [sha256.Size]byte{}, ErrInvalid
+		}
+		envNames[folded] = struct{}{}
 	}
 	canonical, err := json.Marshal(request)
 	if err != nil {
@@ -495,7 +529,20 @@ func (e *Execution) run(parent context.Context) {
 		ctx, cancel = context.WithTimeout(parent, e.request.Timeout)
 		defer cancel()
 	}
-	process, err := newProcess(processConfig{Request: e.request, WorkspaceRoot: e.manager.config.WorkspaceRoot, BaseEnvironment: e.manager.config.BaseEnvironment, ChunkBytes: e.manager.config.ChunkBytes, Output: e.output})
+	baseEnvironment := e.manager.config.BaseEnvironment
+	if provider := e.manager.config.ManagedEnvironment; provider != nil {
+		managed, environmentErr := provider()
+		if environmentErr != nil || !validBaseEnvironment(managed) {
+			e.finish(StateFailed, Result{ExitedAt: e.manager.config.Clock()}, "environment_unavailable")
+			return
+		}
+		baseEnvironment = mergedEnvironmentLists(baseEnvironment, managed)
+	}
+	if !validBaseEnvironment(mergedEnvironment(baseEnvironment, e.request.Environment)) {
+		e.finish(StateFailed, Result{ExitedAt: e.manager.config.Clock()}, "environment_unavailable")
+		return
+	}
+	process, err := newProcess(processConfig{Request: e.request, WorkspaceRoot: e.manager.config.WorkspaceRoot, BaseEnvironment: baseEnvironment, ChunkBytes: e.manager.config.ChunkBytes, Output: e.output})
 	if err != nil {
 		e.finish(StateFailed, Result{ExitedAt: e.manager.config.Clock()}, "exec_start_failed")
 		return
@@ -693,13 +740,19 @@ func (e *Execution) signalLocked() {
 }
 
 func validBaseEnvironment(values []string) bool {
+	if len(values) > maximumProcessEnvironmentEntries {
+		return false
+	}
 	seen := map[string]bool{}
+	total := 0
 	for _, entry := range values {
+		total += len(entry)
 		key, value, ok := strings.Cut(entry, "=")
-		if !ok || !environmentKey.MatchString(key) || strings.ContainsRune(value, '\x00') || seen[key] {
+		folded := strings.ToUpper(key)
+		if !ok || !environmentKey.MatchString(key) || len(entry) > maximumProcessEnvironmentEntryBytes || total > maximumProcessEnvironmentBytes || strings.ContainsRune(value, '\x00') || seen[folded] {
 			return false
 		}
-		seen[key] = true
+		seen[folded] = true
 	}
 	return true
 }
@@ -731,12 +784,48 @@ func cloneEvent(event Event) Event {
 }
 func mergedEnvironment(base []string, overrides map[string]string) []string {
 	values := map[string]string{}
+	canonicalNames := map[string]string{}
 	for _, entry := range base {
 		key, value, _ := strings.Cut(entry, "=")
+		canonicalNames[strings.ToUpper(key)] = key
 		values[key] = value
 	}
 	for key, value := range overrides {
+		outputName := key
+		if existing := canonicalNames[strings.ToUpper(key)]; existing != "" {
+			outputName = existing
+		}
+		canonicalNames[strings.ToUpper(key)] = outputName
+		values[outputName] = value
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	result := make([]string, 0, len(keys))
+	for _, key := range keys {
+		result = append(result, key+"="+values[key])
+	}
+	return result
+}
+
+func mergedEnvironmentLists(base, overrides []string) []string {
+	values := make(map[string]string, len(base)+len(overrides))
+	canonicalNames := make(map[string]string, len(base)+len(overrides))
+	for _, entry := range base {
+		key, value, _ := strings.Cut(entry, "=")
+		canonicalNames[strings.ToUpper(key)] = key
 		values[key] = value
+	}
+	for _, entry := range overrides {
+		key, value, _ := strings.Cut(entry, "=")
+		outputName := key
+		if existing := canonicalNames[strings.ToUpper(key)]; existing != "" {
+			outputName = existing
+		}
+		canonicalNames[strings.ToUpper(key)] = outputName
+		values[outputName] = value
 	}
 	keys := make([]string, 0, len(values))
 	for key := range values {

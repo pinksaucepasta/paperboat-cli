@@ -324,6 +324,16 @@ func Install(ctx context.Context, request Request) error {
 	if err != nil {
 		return err
 	}
+	lifecycle, err := newWindowsLifecycleManager(request, layout, true)
+	if err != nil {
+		return err
+	}
+	// Recover the durable hostd/updater transaction before touching SCM,
+	// binaries, credentials, or machine state. A corrupt/stale journal is a
+	// fail-closed startup condition.
+	if err := lifecycle.Recover(ctx); err != nil {
+		return err
+	}
 	if err := runWindowsInstallPhase(ctx, "prepare Paperboat machine state", func() error { return ensureWindowsMachineDirectory(WindowsProgramDataRoot(), request.OwnerSID) }); err != nil {
 		return err
 	}
@@ -491,11 +501,21 @@ func EnsureWindowsLocalDaemonService(ctx context.Context) error {
 		return err
 	}
 	defer unlock()
-	config, err := LoadWindowsRuntimeConfig()
+	layout, err := service.DefaultLayout("windows")
 	if err != nil {
 		return err
 	}
-	layout, err := service.DefaultLayout("windows")
+	// Recover hostd/updater before touching the legacy LocalDaemon service or
+	// its state. The updater may invoke this migration during startup, so a
+	// stale lifecycle journal must remain a fail-closed boundary here too.
+	preflight, err := newWindowsLifecycleManager(Request{Platform: "windows"}, layout, true)
+	if err != nil {
+		return err
+	}
+	if err := preflight.Recover(ctx); err != nil {
+		return err
+	}
+	config, err := LoadWindowsRuntimeConfig()
 	if err != nil {
 		return err
 	}
@@ -711,12 +731,18 @@ func Uninstall(ctx context.Context, request Request) error {
 		return err
 	}
 	runtimeErr := uninstallWindows(ctx, false)
+	if runtimeErr != nil {
+		return runtimeErr
+	}
 	lockPath, lockErr := windowsLocalDaemonLockPath(request.StateRoot)
 	legacyErr := lockErr
 	if lockErr == nil {
 		legacyErr = localdaemon.RemoveWindowsLegacyService(ctx, lockPath, request.OwnerSID)
 	}
-	return errors.Join(runtimeErr, legacyErr, removePaperboatSSHState(ctx, windowsOpenSSHConfig(layout, request.OwnerSID)))
+	if legacyErr != nil {
+		return legacyErr
+	}
+	return removePaperboatSSHState(ctx, windowsOpenSSHConfig(layout, request.OwnerSID))
 }
 
 func UninstallPersisted(ctx context.Context) error {
@@ -728,21 +754,60 @@ func UninstallPersisted(ctx context.Context) error {
 		return err
 	}
 	defer unlock()
+	layout, err := service.DefaultLayout("windows")
+	if err != nil {
+		return err
+	}
+	preflight, err := newWindowsLifecycleManager(Request{Platform: "windows"}, layout, true)
+	if err != nil {
+		return err
+	}
+	if err := preflight.Recover(ctx); err != nil {
+		return err
+	}
 	config, err := LoadWindowsRuntimeConfig()
 	if err != nil {
 		return err
 	}
-	layout, layoutErr := service.DefaultLayout("windows")
-	if layoutErr != nil {
-		return layoutErr
-	}
 	runtimeErr := uninstallWindows(ctx, false)
+	if runtimeErr != nil {
+		return runtimeErr
+	}
 	lockPath, lockErr := windowsLocalDaemonLockPath(config.StateRoot)
 	legacyErr := lockErr
 	if lockErr == nil {
 		legacyErr = localdaemon.RemoveWindowsLegacyService(ctx, lockPath, config.OwnerSID)
 	}
-	return errors.Join(runtimeErr, legacyErr, removePaperboatSSHState(ctx, windowsOpenSSHConfig(layout, config.OwnerSID)))
+	if legacyErr != nil {
+		return legacyErr
+	}
+	return removePaperboatSSHState(ctx, windowsOpenSSHConfig(layout, config.OwnerSID))
+}
+
+// Stop stops the persisted hostd and updater services without removing their
+// declarations or binaries. It uses pending installers so a missing runtime
+// image cannot prevent lifecycle recovery or a durable stop.
+func Stop(ctx context.Context) error {
+	if !isAdministrator() {
+		return ErrNotPrivileged
+	}
+	unlock, err := lockWindowsLocalDaemonMigration(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	layout, err := service.DefaultLayout("windows")
+	if err != nil {
+		return err
+	}
+	lifecycle, err := newWindowsLifecycleManager(Request{Platform: "windows"}, layout, true)
+	if err != nil {
+		return err
+	}
+	if err := lifecycle.Recover(ctx); err != nil {
+		return err
+	}
+	return lifecycle.Stop(ctx)
 }
 
 // Repair restores the persisted Windows runtime and its role-scoped OpenSSH
@@ -756,6 +821,20 @@ func Repair(ctx context.Context) error {
 		return err
 	}
 	defer unlock()
+	layout, err := service.DefaultLayout("windows")
+	if err != nil {
+		return err
+	}
+	// Build the pending lifecycle boundary before reading or migrating the
+	// persisted config, then recover it before any security or service-state
+	// mutation. Missing binaries are valid at this recovery boundary.
+	preflight, err := newWindowsLifecycleManager(Request{Platform: "windows"}, layout, true)
+	if err != nil {
+		return err
+	}
+	if err := preflight.Recover(ctx); err != nil {
+		return err
+	}
 	config, err := LoadWindowsRuntimeConfig()
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) && !windowsRuntimeServiceExists() {
@@ -765,10 +844,6 @@ func Repair(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-	}
-	layout, err := service.DefaultLayout("windows")
-	if err != nil {
-		return err
 	}
 	config, err = reconcileWindowsRepairVersion(ctx, config, layout)
 	if err != nil {
@@ -848,50 +923,68 @@ func Purge(ctx context.Context) error {
 	}
 	defer unlock()
 	layout, layoutErr := service.DefaultLayout("windows")
+	if layoutErr != nil {
+		return layoutErr
+	}
+	preflight, err := newWindowsLifecycleManager(Request{Platform: "windows"}, layout, true)
+	if err != nil {
+		return err
+	}
+	if err := preflight.Recover(ctx); err != nil {
+		return err
+	}
 	persisted, persistedErr := LoadWindowsRuntimeConfig()
 	if errors.Is(persistedErr, os.ErrNotExist) {
 		persistedErr = nil
 	}
-	var result error
+	if persistedErr != nil {
+		return persistedErr
+	}
 	// Remove retired logon tasks even when an interrupted uninstall already
 	// removed ProgramData and its owner SID record. The task names are strictly
 	// limited to Paperboat's hashed legacy daemon namespace.
-	result = errors.Join(result, localdaemon.RemoveAllWindowsLegacyTasks(ctx))
-	if layoutErr != nil {
-		result = errors.Join(result, layoutErr)
-	} else {
-		// The updater's one-shot activator can survive an interrupted activation
-		// after its versioned executable has been removed. Delete its exact owned
-		// SCM declaration before removing release slots.
-		result = errors.Join(result, removeWindowsActivatorService(ctx, layout))
+	if err := localdaemon.RemoveAllWindowsLegacyTasks(ctx); err != nil {
+		return err
+	}
+	// The updater's one-shot activator can survive an interrupted activation
+	// after its versioned executable has been removed. Delete its exact owned
+	// SCM declaration before removing release slots.
+	if err := removeWindowsActivatorService(ctx, layout); err != nil {
+		return err
 	}
 	if _, err := os.Stat(WindowsProgramDataRoot()); errors.Is(err, os.ErrNotExist) {
-		return result
+		return nil
 	} else if err != nil {
-		return errors.Join(result, err)
+		return err
 	}
 	// Windows OpenSSH is a shared WinGet dependency. Purge only removes the
 	// dedicated PaperboatSshd service, Paperboat SSH keys/configuration, and
 	// firewall deltas that Paperboat recorded as its own. This must happen
 	// before the Paperboat runtime slots are removed because their fixed path
 	// is the ownership proof for PaperboatSshd.
-	if layoutErr == nil {
-		result = errors.Join(result, removePaperboatSSHState(ctx, windowsOpenSSHConfig(layout, "")))
+	if err := removePaperboatSSHState(ctx, windowsOpenSSHConfig(layout, "")); err != nil {
+		return err
 	}
 	// A service can have been removed already while its old pb.exe process is
 	// still alive. Terminate only the fixed Paperboat executable before deleting
 	// the release slots, otherwise pb.rollback.exe remains locked and a fresh
 	// dashboard install fails halfway through cleanup.
-	result = errors.Join(result, terminatePaperboatProcesses(ctx))
-	result = errors.Join(result, uninstallWindows(ctx, true))
-	if persistedErr == nil && persisted.OwnerSID != "" {
+	if err := terminatePaperboatProcesses(ctx); err != nil {
+		return err
+	}
+	if err := uninstallWindows(ctx, true); err != nil {
+		return err
+	}
+	if persisted.OwnerSID != "" {
 		if lockPath, lockErr := windowsLocalDaemonLockPath(persisted.StateRoot); lockErr != nil {
-			result = errors.Join(result, lockErr)
+			return lockErr
 		} else {
-			result = errors.Join(result, localdaemon.RemoveWindowsLegacyService(ctx, lockPath, persisted.OwnerSID))
+			if err := localdaemon.RemoveWindowsLegacyService(ctx, lockPath, persisted.OwnerSID); err != nil {
+				return err
+			}
 		}
 	}
-	return result
+	return nil
 }
 
 func terminatePaperboatProcesses(ctx context.Context) error {
@@ -942,47 +1035,41 @@ func uninstallWindows(ctx context.Context, purge bool) error {
 	if err != nil {
 		return err
 	}
-	var result error
-	result = errors.Join(result, winenv.RemoveMachinePath(filepath.Dir(layout.Binary)))
-	runtimeCurrent, _, _ := windowsRuntimePaths(layout)
-	for _, item := range []struct {
-		kind       string
-		executable string
-		args       []string
-	}{
-		{service.HostdKind, runtimeCurrent, []string{"__runtime-hostd"}},
-		{service.UpdaterKind, runtimeCurrent, []string{"__runtime-updated"}},
-		{service.DaemonKind, runtimeCurrent, []string{"__runtime-local-daemon"}},
-	} {
-		installer, makeErr := service.New(service.Config{Platform: "windows", Kind: item.kind, ConfigRoot: WindowsProgramDataRoot(), Executable: item.executable, User: "Paperboat", Group: "Paperboat", Arguments: item.args, Controller: service.WindowsController{}})
-		if makeErr == nil {
-			uninstallErr := installer.Uninstall(ctx)
-			if errors.Is(uninstallErr, service.ErrInvalidDefinition) {
-				// An interrupted activation can remove the declaration file after
-				// SCM has retained the owned service. Remove that orphan by its
-				// exact fixed command instead of leaving the next install stuck.
-				if orphanErr := removeOrphanWindowsService(ctx, serviceNameForKind(item.kind), item.executable, item.args); orphanErr == nil {
-					uninstallErr = nil
-				} else {
-					uninstallErr = errors.Join(uninstallErr, orphanErr)
-				}
-			}
-			result = errors.Join(result, uninstallErr)
-		}
+	hostd, updater, daemon, err := windowsRoleInstallers(layout, true)
+	if err != nil {
+		return err
+	}
+	lifecycle, err := newWindowsLifecycleManagerForInstallers(layout, hostd, updater, nil)
+	if err != nil {
+		return err
+	}
+	// Recovery must be a separate fail-closed step. Do not delete binaries or
+	// machine configuration if the previous journal cannot be reconciled.
+	if err := lifecycle.Recover(ctx); err != nil {
+		return err
+	}
+	if err := lifecycle.Uninstall(ctx); err != nil {
+		return err
+	}
+	if err := daemon.Uninstall(ctx); err != nil {
+		return err
+	}
+	if err := winenv.RemoveMachinePath(filepath.Dir(layout.Binary)); err != nil {
+		return err
 	}
 	for _, path := range []string{WindowsInstallConfigPath(), WindowsHostdTokenPath()} {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			result = errors.Join(result, err)
+			return err
 		}
 	}
 	if purge {
-		for _, path := range []string{layout.ReleasesRoot, filepath.Join(WindowsProgramDataRoot(), "services"), layout.UpdateStateRoot} {
+		for _, path := range []string{layout.ReleasesRoot, filepath.Join(WindowsProgramDataRoot(), "services"), filepath.Join(WindowsProgramDataRoot(), "service-lifecycle"), layout.UpdateStateRoot} {
 			if err := os.RemoveAll(path); err != nil {
-				result = errors.Join(result, err)
+				return err
 			}
 		}
 	}
-	return result
+	return nil
 }
 
 func serviceNameForKind(kind string) string {
@@ -1075,36 +1162,90 @@ func removeWindowsActivatorService(ctx context.Context, layout service.Layout) e
 	return removeOrphanWindowsService(ctx, "PaperboatUpdateActivator", filepath.Clean(arguments[0]), []string{"__runtime-activate"})
 }
 
-func installWindowsServices(ctx context.Context, layout service.Layout, upgradeMode string) error {
-	for _, item := range windowsRuntimeServiceDefinitions(layout) {
-		installer, err := service.New(service.Config{Platform: "windows", Kind: item.kind, ConfigRoot: WindowsProgramDataRoot(), Executable: item.executable, User: "Paperboat", Group: "Paperboat", Arguments: item.arguments, Controller: service.WindowsController{}, UpgradeMode: upgradeMode})
-		if err != nil {
-			return err
-		}
-		if err := installer.Install(ctx); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func installWindowsRoleServices(ctx context.Context, request Request, layout service.Layout, upgradeMode string) error {
+	hostd, updater, daemon, err := windowsRoleInstallers(layout, false)
+	if err != nil {
+		return err
+	}
+	lifecycle, err := newWindowsLifecycleManagerForInstallers(layout, hostd, updater, &request)
+	if err != nil {
+		return err
+	}
+	if err := lifecycle.Recover(ctx); err != nil {
+		return err
+	}
 	if err := prepareWindowsLocalDaemonMigrationAndState(ctx, request.OwnerSID, request.StateRoot); err != nil {
 		return fmt.Errorf("migrate Paperboat local daemon task: %w", err)
 	}
 	return executeWindowsServiceInstallPlan(request.SetupMode,
 		func() error { return installWindowsSSHAfterActivation(ctx, request, layout) },
 		func() error {
-			if err := installWindowsServices(ctx, layout, upgradeMode); err != nil {
-				return err
+			var lifecycleErr error
+			if upgradeMode == "" {
+				lifecycleErr = lifecycle.Install(ctx)
+			} else {
+				lifecycleErr = lifecycle.Repair(ctx)
+			}
+			if lifecycleErr != nil {
+				return lifecycleErr
+			}
+			if err := daemon.Install(ctx); err != nil {
+				return errors.Join(err, lifecycle.Uninstall(ctx))
 			}
 			if err := waitWindowsLocalDaemonReady(ctx, request.OwnerSID, request.StateRoot); err != nil {
-				return err
+				return errors.Join(err, daemon.Uninstall(ctx), lifecycle.Uninstall(ctx))
 			}
-			return localdaemon.RemoveWindowsLegacyTask(ctx, request.OwnerSID)
+			if err := localdaemon.RemoveWindowsLegacyTask(ctx, request.OwnerSID); err != nil {
+				return errors.Join(err, daemon.Uninstall(ctx), lifecycle.Uninstall(ctx))
+			}
+			return nil
 		},
 		func() error { return removePaperboatSSHState(ctx, windowsOpenSSHConfig(layout, request.OwnerSID)) },
 	)
+}
+
+func windowsRoleInstallers(layout service.Layout, allowMissingExecutable bool) (*service.Installer, *service.Installer, *service.Installer, error) {
+	runtimeCurrent, _, _ := windowsRuntimePaths(layout)
+	newInstaller := func(kind string, arguments []string) (*service.Installer, error) {
+		config := service.Config{Platform: "windows", Kind: kind, ConfigRoot: WindowsProgramDataRoot(), Executable: runtimeCurrent, User: "Paperboat", Group: "Paperboat", Arguments: arguments, Controller: service.WindowsController{}}
+		if allowMissingExecutable {
+			return service.NewPending(config)
+		}
+		return service.New(config)
+	}
+	hostd, err := newInstaller(service.HostdKind, []string{"__runtime-hostd"})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	updater, err := newInstaller(service.UpdaterKind, []string{"__runtime-updated"})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	daemon, err := newInstaller(service.DaemonKind, []string{"__runtime-local-daemon"})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return hostd, updater, daemon, nil
+}
+
+func newWindowsLifecycleManager(request Request, layout service.Layout, allowMissingExecutable bool) (*service.LifecycleManager, error) {
+	hostd, updater, _, err := windowsRoleInstallers(layout, allowMissingExecutable)
+	if err != nil {
+		return nil, err
+	}
+	return newWindowsLifecycleManagerForInstallers(layout, hostd, updater, &request)
+}
+
+func newWindowsLifecycleManagerForInstallers(_ service.Layout, hostd, updater *service.Installer, request *Request) (*service.LifecycleManager, error) {
+	var probe func(context.Context) error
+	if request != nil && request.HelperListenAddress != "" {
+		var err error
+		probe, err = service.NewHTTPReadinessProbe("http://" + request.HelperListenAddress + "/healthz")
+		if err != nil {
+			return nil, err
+		}
+	}
+	return service.NewHostLifecycleManager(service.HostLifecycleConfig{StateRoot: filepath.Join(WindowsProgramDataRoot(), "service-lifecycle"), Hostd: hostd, Updater: updater, HostdProbe: probe})
 }
 
 func Validate(request Request, _ int) error {

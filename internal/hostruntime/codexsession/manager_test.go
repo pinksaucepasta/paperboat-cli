@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -65,5 +66,24 @@ func TestDirectoriesAreSortedAndExcludeEscapingSymlinks(t *testing.T) {
 		if page.Directories[i] != want[i] {
 			t.Fatalf("directories = %v", page.Directories)
 		}
+	}
+}
+
+func TestResolvedEnvironmentUsesCurrentManagedValues(t *testing.T) {
+	value := "first"
+	config := Config{
+		Environment: []string{"PATH=/bin", "TOKEN=base"},
+		ManagedEnvironment: func() ([]string, error) {
+			return []string{"EMPTY=", "TOKEN=" + value}, nil
+		},
+	}
+	first, err := resolvedEnvironment(config)
+	if err != nil || !reflect.DeepEqual(first, []string{"EMPTY=", "PATH=/bin", "TOKEN=first"}) {
+		t.Fatalf("first=%q err=%v", first, err)
+	}
+	value = "second"
+	second, err := resolvedEnvironment(config)
+	if err != nil || !reflect.DeepEqual(second, []string{"EMPTY=", "PATH=/bin", "TOKEN=second"}) {
+		t.Fatalf("second=%q err=%v", second, err)
 	}
 }

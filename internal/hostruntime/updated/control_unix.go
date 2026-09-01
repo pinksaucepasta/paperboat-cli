@@ -16,6 +16,7 @@ import (
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/autoupdate"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/supervisorupdate"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/workerupdate"
 	"github.com/pinksaucepasta/paperboat/internal/ospeer"
 )
 
@@ -39,16 +40,17 @@ type ControlRequest struct {
 }
 
 type ControlResponse struct {
-	Schema            string                  `json:"schema"`
-	Status            string                  `json:"status"`
-	Version           string                  `json:"version,omitempty"`
-	Updated           bool                    `json:"updated"`
-	Pending           bool                    `json:"pending,omitempty"`
-	ActivationFailure string                  `json:"activation_failure,omitempty"`
-	Observation       autoupdate.Observation  `json:"observation"`
-	ErrorCode         string                  `json:"error_code,omitempty"`
-	ErrorMessage      string                  `json:"error_message,omitempty"`
-	Supervisor        supervisorupdate.Result `json:"supervisor,omitempty"`
+	Schema            string                        `json:"schema"`
+	Status            string                        `json:"status"`
+	Version           string                        `json:"version,omitempty"`
+	Updated           bool                          `json:"updated"`
+	Pending           bool                          `json:"pending,omitempty"`
+	ActivationFailure string                        `json:"activation_failure,omitempty"`
+	Observation       autoupdate.Observation        `json:"observation"`
+	ErrorCode         string                        `json:"error_code,omitempty"`
+	ErrorMessage      string                        `json:"error_message,omitempty"`
+	Supervisor        supervisorupdate.Result       `json:"supervisor,omitempty"`
+	Transaction       workerupdate.TransactionState `json:"transaction"`
 }
 
 type controlServer struct {
@@ -201,20 +203,18 @@ func (s *controlServer) respond(writer io.Writer, response ControlResponse) erro
 	return json.NewEncoder(writer).Encode(response)
 }
 
-func (s *Service) controlRequest(ctx context.Context, operation string) (ControlResponse, error) {
-	return s.controlRequestWithRequest(ctx, ControlRequest{Operation: operation})
-}
-
 func (s *Service) controlRequestWithRequest(ctx context.Context, request ControlRequest) (ControlResponse, error) {
 	switch request.Operation {
 	case "status":
 		response := ControlResponse{Schema: ControlProtocolV1, Status: "ok", Observation: s.Snapshot()}
 		response.Version = s.manager.ActiveVersion()
+		response.Transaction, _ = s.manager.TransactionState()
 		return response, nil
 	case "check":
 		response := ControlResponse{Schema: ControlProtocolV1, Status: "ok", Observation: s.Snapshot()}
 		result, err := s.Check(ctx)
 		response.Version, response.Updated = result.Version, result.Updated
+		response.Transaction, _ = s.manager.TransactionState()
 		return response, err
 	case "update":
 		s.controlMu.Lock()
@@ -223,6 +223,7 @@ func (s *Service) controlRequestWithRequest(ctx context.Context, request Control
 		result, err := s.UpdateNow(ctx)
 		response.Version, response.Updated = result.Version, result.Updated
 		response.Observation = s.Snapshot()
+		response.Transaction, _ = s.manager.TransactionState()
 		return response, err
 	case "approve-maintenance":
 		return ControlResponse{Schema: ControlProtocolV1, Status: "error"}, ErrInvalidControl

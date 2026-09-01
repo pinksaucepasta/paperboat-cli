@@ -6,9 +6,12 @@ func TestTakeLogoutCredentialsAtomicallyRemovesActiveAndHistoricalSessions(t *te
 	dir := t.TempDir()
 	store := ProfileStore{Path: dir, Secrets: &faultSecretStore{values: map[string]string{}}}
 	issuer := "https://api.example.com"
-	if err := store.Save(Profile{Issuer: issuer, CLIClientSessionID: "cls_active"}, Credential{AccessToken: "access-active", RefreshToken: "refresh-active"}); err != nil {
+	accountID := "account_active"
+	if err := store.Save(Profile{Issuer: issuer, Account: Account{ID: accountID}, CLIClientSessionID: "cls_active"}, Credential{AccessToken: "access-active", RefreshToken: "refresh-active"}); err != nil {
 		t.Fatal(err)
 	}
+	environmentRef := environmentManagerIdentitySecretRef(issuer, accountID, "cls_active")
+	store.Secrets.(*faultSecretStore).values[environmentRef] = "encrypted-manager-record"
 	if err := store.QueueRevocation(issuer, "cls_old", "refresh-old"); err != nil {
 		t.Fatal(err)
 	}
@@ -28,6 +31,9 @@ func TestTakeLogoutCredentialsAtomicallyRemovesActiveAndHistoricalSessions(t *te
 	}
 	if records, err := store.PendingRevocations(issuer); err != nil || len(records) != 0 {
 		t.Fatalf("pending revocations remain: %#v, %v", records, err)
+	}
+	if _, ok := store.Secrets.(*faultSecretStore).values[environmentRef]; ok {
+		t.Fatal("ENV manager private keys remain after logout")
 	}
 }
 

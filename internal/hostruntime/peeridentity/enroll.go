@@ -83,22 +83,23 @@ func (c *Client) Ensure(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if len(endpoint.Certificate) > 0 {
-		return nil
-	}
 	registration, err := store.Registration()
-	if err != nil || uint64(registration.InstallationGeneration) != endpoint.Generation {
+	if err != nil || registration.InstallationGeneration < 1 || uint64(registration.InstallationGeneration) != endpoint.Generation {
 		return ErrInvalid
 	}
+	// Newer endpoint state persists the complete root set alongside the
+	// certificate. Older state only has the certificate issuer, so refresh the
+	// authenticated status response once before constructing ENV verification;
+	// this is what lets an ENV authority signed by a different enrolled root
+	// bootstrap after an upgrade.
+	refreshing := len(endpoint.Certificate) > 0 && len(endpoint.TrustedKeys) == 0
 	noisePublic := endpoint.NoisePublicKey()
 	quicPublic := endpoint.QUICPublicKey()
-	requestOperation := operationID("op_peer_machine_request_", registration.MachineID, endpoint.Generation, noisePublic[:], quicPublic)
-	requestBody, _ := json.Marshal(struct {
-		OperationID    string `json:"operation_id"`
-		Generation     uint64 `json:"generation"`
-		NoisePublicKey string `json:"noise_public_key"`
-		QUICPublicKey  string `json:"quic_public_key"`
-	}{requestOperation, endpoint.Generation, base64.RawURLEncoding.EncodeToString(noisePublic[:]), base64.RawURLEncoding.EncodeToString(quicPublic)})
+	if !refreshing && len(endpoint.Certificate) > 0 {
+		return nil
+	}
+	requestConflict := false
+	var status int
 	var pending struct {
 		RequestID  string    `json:"request_id"`
 		EndpointID string    `json:"endpoint_id"`
@@ -108,13 +109,22 @@ func (c *Client) Ensure(ctx context.Context) error {
 		ExpiresAt  time.Time `json:"expires_at"`
 		SafetyCode string    `json:"safety_code"`
 	}
-	status, err := c.post(ctx, "/v1/machine-peer-identity", requestOperation, requestBody, &pending)
-	requestConflict := status == http.StatusConflict
-	if err != nil && !requestConflict {
-		return err
-	}
-	if !requestConflict && (status != http.StatusCreated || pending.EndpointID != registration.MachineID || pending.Generation != endpoint.Generation || pending.NoiseKey != base64.RawURLEncoding.EncodeToString(noisePublic[:]) || pending.QUICKey != base64.RawURLEncoding.EncodeToString(quicPublic) || pending.SafetyCode != safetyCode(registration.MachineID, endpoint.Generation, noisePublic, quicPublic)) {
-		return ErrInvalid
+	if !refreshing {
+		requestOperation := operationID("op_peer_machine_request_", registration.MachineID, endpoint.Generation, noisePublic[:], quicPublic)
+		requestBody, _ := json.Marshal(struct {
+			OperationID    string `json:"operation_id"`
+			Generation     uint64 `json:"generation"`
+			NoisePublicKey string `json:"noise_public_key"`
+			QUICPublicKey  string `json:"quic_public_key"`
+		}{requestOperation, endpoint.Generation, base64.RawURLEncoding.EncodeToString(noisePublic[:]), base64.RawURLEncoding.EncodeToString(quicPublic)})
+		status, err = c.post(ctx, "/v1/machine-peer-identity", requestOperation, requestBody, &pending)
+		requestConflict = status == http.StatusConflict
+		if err != nil && !requestConflict {
+			return err
+		}
+		if !requestConflict && (status != http.StatusCreated || pending.EndpointID != registration.MachineID || pending.Generation != endpoint.Generation || pending.NoiseKey != base64.RawURLEncoding.EncodeToString(noisePublic[:]) || pending.QUICKey != base64.RawURLEncoding.EncodeToString(quicPublic) || pending.SafetyCode != safetyCode(registration.MachineID, endpoint.Generation, noisePublic, quicPublic)) {
+			return ErrInvalid
+		}
 	}
 	statusOperation := operationID("op_peer_machine_status_", registration.MachineID, endpoint.Generation, nil, nil)
 	statusBody, _ := json.Marshal(struct {
@@ -131,6 +141,9 @@ func (c *Client) Ensure(ctx context.Context) error {
 		return err
 	}
 	if status == http.StatusAccepted && approved.State == "pending" {
+		if refreshing {
+			return ErrInvalid
+		}
 		if requestConflict {
 			return ErrPending
 		}
@@ -151,7 +164,14 @@ func (c *Client) Ensure(ctx context.Context) error {
 		clear(certificate)
 		return ErrInvalid
 	}
-	return store.SavePeerEndpointCertificate(key.PublicKey, certificate, c.config.Clock().UTC())
+	if refreshing && !bytes.Equal(endpoint.Certificate, certificate) {
+		clear(certificate)
+		return ErrInvalid
+	}
+	// Retain the complete authenticated account root set. The endpoint
+	// certificate may be issued by one account root while ENV authority
+	// documents are signed by another root in that same approved set.
+	return store.SavePeerEndpointCertificateWithTrustedKeys(key.PublicKey, trusted, certificate, c.config.Clock().UTC())
 }
 
 func parseCanonicalTime(value string) (time.Time, error) {

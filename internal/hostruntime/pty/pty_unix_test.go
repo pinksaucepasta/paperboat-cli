@@ -149,7 +149,7 @@ func TestAdapterRejectsEscapedCWDAndInvalidEnvironment(t *testing.T) {
 
 func TestProcessPolicyRejectsUnboundedOrNULStaticValues(t *testing.T) {
 	tooManyArguments := make([]string, 65)
-	tooManyEnvironment := make([]string, 129)
+	tooManyEnvironment := make([]string, maximumProcessEnvironmentEntries+1)
 	for index := range tooManyEnvironment {
 		tooManyEnvironment[index] = fmt.Sprintf("KEY_%d=value", index)
 	}
@@ -160,11 +160,15 @@ func TestProcessPolicyRejectsUnboundedOrNULStaticValues(t *testing.T) {
 		{arguments: []string{"bad\x00argument"}},
 		{arguments: tooManyArguments},
 		{environment: []string{"BAD=bad\x00value"}},
+		{environment: []string{"Token=one", "TOKEN=two"}},
 		{environment: tooManyEnvironment},
 	} {
 		if _, err := ValidateProcessPolicy("/bin/sh", test.arguments, test.environment); !errors.Is(err, ErrInvalidCommand) {
 			t.Fatalf("arguments=%d environment=%d err=%v", len(test.arguments), len(test.environment), err)
 		}
+	}
+	if _, err := ValidateProcessPolicy("/bin/sh", nil, []string{"LONG=" + strings.Repeat("x", 32_767)}); err != nil {
+		t.Fatalf("ENV Injection maximum value rejected: %v", err)
 	}
 }
 

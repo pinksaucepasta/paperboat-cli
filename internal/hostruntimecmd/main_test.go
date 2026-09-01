@@ -3,12 +3,6 @@ package hostruntimecmd
 import (
 	"bufio"
 	"bytes"
-	"encoding/json"
-	"net/http"
-	"net/http/httptest"
-	"os"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 )
@@ -22,53 +16,6 @@ func TestRunVersion(t *testing.T) {
 		if !strings.HasPrefix(stdout.String(), "pb ") {
 			t.Fatalf("%s version output = %q", argument, stdout.String())
 		}
-	}
-}
-
-func TestPreviewCreatePrintsPublicURLAndAcknowledgement(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if request.Header.Get("Authorization") != "Bearer local-agent-token-01234567890123456789" {
-			t.Errorf("authorization=%q", request.Header.Get("Authorization"))
-		}
-		var payload map[string]any
-		_ = json.NewDecoder(request.Body).Decode(&payload)
-		if payload["action"] != "create" || payload["logical_name"] != "web" || payload["target_port"] != float64(3000) || payload["public_acknowledgement"] != true || payload["duration_seconds"] != float64(7200) {
-			t.Errorf("payload=%v", payload)
-		}
-		_, _ = writer.Write([]byte(`{"data":{"id":"prv_1","environment_id":"env_1","logical_name":"web","preview_key":"p-abcdefghijklmnopqrstuvwxyz","url":"https://p-abcdefghijklmnopqrstuvwxyz.preview.test","target_port":3000,"state":"registering"}}`))
-	}))
-	defer server.Close()
-	tokenFile := filepath.Join(t.TempDir(), "token")
-	if err := os.WriteFile(tokenFile, []byte("local-agent-token-01234567890123456789\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := readPreviewAuthorizationToken(tokenFile); err != nil {
-		t.Fatalf("read preview authorization token: %v", err)
-	}
-	t.Setenv("PAPERBOAT_PREVIEW_REGISTRATION_ENDPOINT", server.URL+"/v1/preview-registrations")
-	t.Setenv("PAPERBOAT_RUNTIME_AGENT_TOKEN_FILE", tokenFile)
-	var stdout, stderr bytes.Buffer
-	if code := run([]string{"preview", "create", "--name", "web", "--port", "3000", "--public", "--duration", "2h"}, &stdout, &stderr); code != 0 {
-		t.Fatalf("code=%d stderr=%q", code, stderr.String())
-	}
-	if !strings.Contains(stdout.String(), "https://p-abcdefghijklmnopqrstuvwxyz.preview.test") || !strings.Contains(stdout.String(), "anyone with this URL can access it") {
-		t.Fatalf("stdout=%q", stdout.String())
-	}
-}
-
-func TestPreviewRejectsInsecureTokenFile(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("POSIX mode bits are not a Windows authorization boundary")
-	}
-	tokenFile := filepath.Join(t.TempDir(), "token")
-	if err := os.WriteFile(tokenFile, []byte("local-agent-token-01234567890123456789\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PAPERBOAT_PREVIEW_REGISTRATION_ENDPOINT", "http://127.0.0.1:38080/v1/preview-registrations")
-	t.Setenv("PAPERBOAT_RUNTIME_AGENT_TOKEN_FILE", tokenFile)
-	var stdout, stderr bytes.Buffer
-	if code := run([]string{"preview", "list"}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "authorization is unavailable") {
-		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
 }
 

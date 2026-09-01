@@ -4,26 +4,28 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/preview"
 )
 
-type PreviewRunConfig struct {
-	Name       string
-	Port       uint16
-	Duration   time.Duration
-	Indefinite bool
-	Ready      func(preview.ControlRecord) error
+// PreviewSession is the canonical v1 foreground lease lifecycle. A session
+// owns renewal, carrier reconnect, and revocation; serve only publishes its
+// endpoint after WaitReady succeeds.
+type PreviewSession interface {
+	WaitReady(context.Context) (preview.Lease, error)
+	Wait() error
+	Stop(context.Context) error
 }
 
-type PreviewRunner func(context.Context, PreviewRunConfig) error
-
-type ManagementLease interface {
-	Run(context.Context) error
-	Release(context.Context) error
-}
+// PreviewSessionStarter creates a session after the loopback origin listener
+// has selected its actual port.
+type PreviewSessionStarter func(context.Context, uint16) (PreviewSession, error)
 
 type LifecycleEvent struct {
 	Operation string
@@ -32,24 +34,41 @@ type LifecycleEvent struct {
 }
 
 type ForegroundConfig struct {
-	Source       Source
-	Name         string
-	Duration     time.Duration
-	Indefinite   bool
-	SPA          bool
-	Preview      PreviewRunner
+	Source     Source
+	Name       string
+	Duration   time.Duration
+	Indefinite bool
+	SPA        bool
+	Session    PreviewSessionStarter
+	// LeaseClient and Carrier are the production composition boundary for the
+	// canonical foreground preview session. When both are supplied and Session
+	// is nil, StartForeground creates the session after the listener chooses its
+	// actual port. No URL is published until that session reports readiness.
+	LeaseClient    preview.LeaseClient
+	Carrier        preview.Carrier
+	OwnerDeviceID  string
+	OwnerSessionID string
+	AccessMode     string
+	TargetScheme   string
+	// Target is the origin supplied to a canonical preview lease. When set,
+	// StartForeground skips the retired static loopback listener and lets the
+	// authenticated preview carrier connect to this explicit HTTP/HTTPS/h2c,
+	// Unix, or TCP target. It is valid only for the automatic LeaseClient plus
+	// Carrier workflow.
+	Target       *preview.LeaseTarget
+	UserDeadline *time.Time
 	ReadyTimeout time.Duration
 	DrainTimeout time.Duration
-	Lease        ManagementLease
 	Observe      func(LifecycleEvent)
 }
 
 type Foreground struct {
-	Record preview.ControlRecord
-	server *Server
-	cancel context.CancelFunc
-	done   chan error
-	once   sync.Once
+	Lease   preview.Lease
+	server  *Server
+	done    chan error
+	session PreviewSession
+	cancel  context.CancelFunc
+	once    sync.Once
 }
 
 type Local struct {
@@ -149,6 +168,38 @@ func (l *Local) stop(timeout time.Duration, primary error, observe func(Lifecycl
 	return result
 }
 
+func cleanupForegroundStartup(server *Server, cancel context.CancelFunc, timeout time.Duration, primary error, observe func(LifecycleEvent)) error {
+	startedAt := time.Now()
+	drainCtx, cancelDrain := context.WithTimeout(context.Background(), timeout)
+	var shutdownErr error
+	if server != nil {
+		shutdownErr = server.Shutdown(drainCtx)
+	}
+	cancelDrain()
+	cancel()
+	result := errors.Join(primary, shutdownErr)
+	if observe != nil {
+		observe(LifecycleEvent{Operation: "cleanup", Result: eventResult(result), Duration: time.Since(startedAt)})
+	}
+	return result
+}
+
+func validForegroundTarget(target preview.LeaseTarget) bool {
+	scheme := strings.ToLower(strings.TrimSpace(target.Scheme))
+	if scheme != "http" && scheme != "https" && scheme != "h2c" && scheme != "unix" && scheme != "tcp" {
+		return false
+	}
+	address := strings.TrimSpace(target.Address)
+	return address != "" && len(address) <= 512 && !strings.ContainsAny(address, "\x00\r\n")
+}
+
+func foregroundServerDone(server *Server) <-chan error {
+	if server == nil {
+		return nil
+	}
+	return server.Done()
+}
+
 func StartForeground(ctx context.Context, config ForegroundConfig) (*Foreground, error) {
 	startedAt := time.Now()
 	emit := func(operation, result string, since time.Time) {
@@ -156,7 +207,10 @@ func StartForeground(ctx context.Context, config ForegroundConfig) (*Foreground,
 			config.Observe(LifecycleEvent{Operation: operation, Result: result, Duration: time.Since(since)})
 		}
 	}
-	if ctx == nil || config.Preview == nil || config.Name == "" || config.Indefinite == (config.Duration > 0) {
+	autoSession := config.Session == nil && config.LeaseClient != nil && config.Carrier != nil
+	partialSession := config.LeaseClient != nil && config.Carrier == nil || config.LeaseClient == nil && config.Carrier != nil
+	targetWorkflow := config.Target != nil
+	if ctx == nil || partialSession || config.Session != nil && (config.LeaseClient != nil || config.Carrier != nil) || config.Session == nil && !autoSession || config.Name == "" || config.Duration < 0 || targetWorkflow && !autoSession || targetWorkflow && !validForegroundTarget(*config.Target) || !autoSession && config.Session == nil && config.Indefinite == (config.Duration > 0) {
 		emit("validation", "failed", startedAt)
 		return nil, ErrInvalidSource
 	}
@@ -166,73 +220,102 @@ func StartForeground(ctx context.Context, config ForegroundConfig) (*Foreground,
 	if config.DrainTimeout <= 0 {
 		config.DrainTimeout = DefaultDrainTimeout
 	}
-	handler, err := NewHandler(HandlerConfig{Source: config.Source, SPA: config.SPA})
-	if err != nil {
-		emit("validation", "failed", startedAt)
-		return nil, err
+	var server *Server
+	var err error
+	if !targetWorkflow {
+		var handler http.Handler
+		handler, err = NewHandler(HandlerConfig{Source: config.Source, SPA: config.SPA})
+		if err != nil {
+			emit("validation", "failed", startedAt)
+			return nil, err
+		}
+		listenerStartedAt := time.Now()
+		server, err = Start(handler)
+		if err != nil {
+			emit("listener_start", "failed", listenerStartedAt)
+			return nil, fmt.Errorf("start static server: %w", err)
+		}
+		emit("listener_start", "ok", listenerStartedAt)
 	}
 	emit("validation", "ok", startedAt)
-	listenerStartedAt := time.Now()
-	server, err := Start(handler)
-	if err != nil {
-		emit("listener_start", "failed", listenerStartedAt)
-		return nil, fmt.Errorf("start static server: %w", err)
-	}
-	emit("listener_start", "ok", listenerStartedAt)
 	previewCtx, cancelPreview := context.WithCancel(context.WithoutCancel(ctx))
-	leaseDone := make(chan error, 1)
-	if config.Lease != nil {
-		go func() { leaseDone <- config.Lease.Run(previewCtx) }()
-	}
-	ready := make(chan preview.ControlRecord, 1)
+	ready := make(chan preview.Lease, 1)
 	previewDone := make(chan error, 1)
-	go func() {
-		previewDone <- config.Preview(previewCtx, PreviewRunConfig{
-			Name: config.Name, Port: server.Port(), Duration: config.Duration, Indefinite: config.Indefinite,
-			Ready: func(record preview.ControlRecord) error {
-				select {
-				case ready <- record:
-					return nil
-				case <-previewCtx.Done():
-					return previewCtx.Err()
+	var session PreviewSession
+	var readyLease preview.Lease
+	sessionStarter := config.Session
+	if autoSession {
+		sessionStarter = func(sessionCtx context.Context, port uint16) (PreviewSession, error) {
+			target := preview.LeaseTarget{}
+			if config.Target != nil {
+				target = *config.Target
+			} else {
+				targetScheme := config.TargetScheme
+				if targetScheme == "" {
+					targetScheme = "http"
 				}
-			},
-		})
-		close(previewDone)
-	}()
+				target = preview.LeaseTarget{Scheme: targetScheme, Address: net.JoinHostPort("127.0.0.1", strconv.Itoa(int(port)))}
+			}
+			return preview.Start(sessionCtx, preview.SessionConfig{
+				LeaseClient: config.LeaseClient, Carrier: config.Carrier,
+				OwnerDeviceID: config.OwnerDeviceID, OwnerSessionID: config.OwnerSessionID,
+				Target:     target,
+				AccessMode: config.AccessMode, UserDeadline: config.UserDeadline,
+				Duration: config.Duration,
+			})
+		}
+	}
+	if sessionStarter != nil {
+		var port uint16
+		if server != nil {
+			port = server.Port()
+		}
+		session, err = sessionStarter(previewCtx, port)
+		if err != nil {
+			return nil, cleanupForegroundStartup(server, cancelPreview, config.DrainTimeout, err, config.Observe)
+		}
+		if session == nil {
+			return nil, cleanupForegroundStartup(server, cancelPreview, config.DrainTimeout, errors.New("preview session starter returned no session"), config.Observe)
+		}
+		go func() {
+			previewDone <- session.Wait()
+		}()
+		go func() {
+			lease, readyErr := session.WaitReady(previewCtx)
+			if readyErr != nil {
+				return
+			}
+			readyLease = lease
+			select {
+			case ready <- lease:
+			case <-previewCtx.Done():
+			}
+		}()
+	}
 
 	cleanup := func(primary error) error {
 		cleanupStartedAt := time.Now()
-		drainCtx, cancelDrain := context.WithTimeout(context.Background(), config.DrainTimeout)
-		shutdownErr := server.Shutdown(drainCtx)
-		cancelDrain()
 		cancelPreview()
-		var previewErr error
-		select {
-		case previewErr = <-previewDone:
-			if errors.Is(previewErr, context.Canceled) {
-				previewErr = nil
-			}
-		case <-time.After(config.DrainTimeout):
-			previewErr = errors.New("preview cleanup timed out")
+		drainCtx, cancelDrain := context.WithTimeout(context.Background(), config.DrainTimeout)
+		var shutdownErr error
+		if server != nil {
+			shutdownErr = server.Shutdown(drainCtx)
 		}
-		var releaseErr error
-		if config.Lease != nil {
-			releaseCtx, cancelRelease := context.WithTimeout(context.Background(), config.DrainTimeout)
-			releaseErr = config.Lease.Release(releaseCtx)
-			cancelRelease()
-		}
-		result := errors.Join(primary, shutdownErr, previewErr, releaseErr)
+		cancelDrain()
+		releaseCtx, cancelRelease := context.WithTimeout(context.Background(), config.DrainTimeout)
+		previewErr := session.Stop(releaseCtx)
+		cancelRelease()
+		result := errors.Join(primary, shutdownErr, previewErr)
 		emit("cleanup", eventResult(result), cleanupStartedAt)
 		return result
 	}
 
 	timer := time.NewTimer(config.ReadyTimeout)
 	defer timer.Stop()
-	var record preview.ControlRecord
+	var lease preview.Lease
 	select {
-	case record = <-ready:
-		if record.URL == "" || record.State != "ready" {
+	case lease = <-ready:
+		if lease.Endpoint == "" || lease.State != "ready" {
 			return nil, cleanup(errors.New("preview became ready without a public URL"))
 		}
 		emit("readiness", "ok", startedAt)
@@ -241,24 +324,22 @@ func StartForeground(ctx context.Context, config ForegroundConfig) (*Foreground,
 			err = errors.New("preview stopped before readiness")
 		}
 		return nil, cleanup(fmt.Errorf("create preview: %w", err))
-	case err = <-server.Done():
+	case err = <-foregroundServerDone(server):
 		return nil, cleanup(fmt.Errorf("static server stopped before readiness: %w", err))
 	case <-timer.C:
 		emit("readiness", "timeout", startedAt)
 		return nil, cleanup(errors.New("preview readiness timed out"))
 	case <-ctx.Done():
 		return nil, cleanup(ctx.Err())
-	case err = <-leaseDone:
-		return nil, cleanup(errors.Join(errors.New("serve management lease lost"), err))
 	}
 
-	foreground := &Foreground{Record: record, server: server, cancel: cancelPreview, done: make(chan error, 1)}
+	foreground := &Foreground{Lease: readyLease, server: server, done: make(chan error, 1), session: session, cancel: cancelPreview}
 	go func() {
 		var primary error
 		var expiry <-chan time.Time
 		var expiryTimer *time.Timer
-		if record.ExpiresAt != nil {
-			remaining := time.Until(record.ExpiresAt.UTC())
+		if lease.UserDeadline != nil {
+			remaining := time.Until(lease.UserDeadline.UTC())
 			if remaining < 0 {
 				remaining = 0
 			}
@@ -268,14 +349,12 @@ func StartForeground(ctx context.Context, config ForegroundConfig) (*Foreground,
 		}
 		select {
 		case primary = <-previewDone:
-		case primary = <-server.Done():
+		case primary = <-foregroundServerDone(server):
 		case <-expiry:
 		case <-ctx.Done():
 			primary = ctx.Err()
-		case leaseErr := <-leaseDone:
-			primary = errors.Join(errors.New("serve management lease lost"), leaseErr)
 		}
-		foreground.done <- foreground.stop(config.DrainTimeout, primary, previewDone, config.Lease, config.Observe)
+		foreground.done <- foreground.stop(config.DrainTimeout, primary, config.Observe)
 		close(foreground.done)
 	}()
 	return foreground, nil
@@ -283,33 +362,26 @@ func StartForeground(ctx context.Context, config ForegroundConfig) (*Foreground,
 
 func (f *Foreground) Wait() error { return <-f.done }
 
-func (f *Foreground) stop(timeout time.Duration, primary error, previewDone <-chan error, lease ManagementLease, observe func(LifecycleEvent)) error {
+func (f *Foreground) stop(timeout time.Duration, primary error, observe func(LifecycleEvent)) error {
 	var result error
 	f.once.Do(func() {
 		startedAt := time.Now()
-		drainCtx, cancelDrain := context.WithTimeout(context.Background(), timeout)
-		shutdownErr := f.server.Shutdown(drainCtx)
-		cancelDrain()
-		f.cancel()
-		var previewErr error
-		select {
-		case previewErr = <-previewDone:
-			if errors.Is(previewErr, context.Canceled) {
-				previewErr = nil
-			}
-		case <-time.After(timeout):
-			previewErr = errors.New("preview cleanup timed out")
+		if f.cancel != nil {
+			f.cancel()
 		}
+		drainCtx, cancelDrain := context.WithTimeout(context.Background(), timeout)
+		var shutdownErr error
+		if f.server != nil {
+			shutdownErr = f.server.Shutdown(drainCtx)
+		}
+		cancelDrain()
+		stopCtx, cancelStop := context.WithTimeout(context.Background(), timeout)
+		previewErr := f.session.Stop(stopCtx)
+		cancelStop()
 		if errors.Is(primary, context.Canceled) {
 			primary = nil
 		}
-		var releaseErr error
-		if lease != nil {
-			releaseCtx, cancelRelease := context.WithTimeout(context.Background(), timeout)
-			releaseErr = lease.Release(releaseCtx)
-			cancelRelease()
-		}
-		result = errors.Join(primary, shutdownErr, previewErr, releaseErr)
+		result = errors.Join(primary, shutdownErr, previewErr)
 		if observe != nil {
 			observe(LifecycleEvent{Operation: "drain", Result: eventResult(result), Duration: time.Since(startedAt)})
 			observe(LifecycleEvent{Operation: "listener_stop", Result: eventResult(shutdownErr), Duration: time.Since(startedAt)})

@@ -21,6 +21,20 @@
   their endpoint credential boundary and never enter a server/tunnel request, database, log,
   metric, diagnostic bundle, or audit record.
 
+### ENV host-recipient custody
+
+Native hosts retain the approved OS/systemd secure-store paths for the dedicated X25519 ENV
+recipient. Portable OCI hosts (including Docker and Podman) and Firecracker guests use the
+runtime's default writable state instead: a domain-separated key derived from the local machine
+identity seals a separate recipient key in an authenticated AES-GCM envelope at
+`environment/host-key.sealed`. The recipient private key is never accepted from an environment
+variable, setup flag, mount, or server response, and it is never written as plaintext.
+
+The writable state and machine identity must survive a restart for offline ENV recovery. If the
+identity or state is recreated, the old envelope cannot be opened; the runtime creates a new
+recipient only in new state and requires the normal server authorization for it. The server can
+authorize and revoke the public recipient but cannot derive or decrypt the local wrapping key.
+
 ## Exposed operational metadata
 
 The control plane and tunnel may process only the metadata needed for authorization, routing,

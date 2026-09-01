@@ -7,7 +7,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
@@ -56,9 +55,6 @@ import (
 	helperconfig "github.com/pinksaucepasta/paperboat/internal/hostruntime/config"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/enrollment"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/identity"
-	"github.com/pinksaucepasta/paperboat/internal/hostruntime/preview"
-	hostruntime "github.com/pinksaucepasta/paperboat/internal/hostruntime/runtime"
-	"github.com/pinksaucepasta/paperboat/internal/hostruntime/servelease"
 	service "github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/updated"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntimecmd"
@@ -77,14 +73,12 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/recoverykey"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/transfercrypto"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/transportmanager"
-	"github.com/pinksaucepasta/paperboat/internal/privatepreviewproxy"
 	"github.com/pinksaucepasta/paperboat/internal/processlifetime"
 	"github.com/pinksaucepasta/paperboat/internal/prompt"
 	"github.com/pinksaucepasta/paperboat/internal/remotepath"
 	"github.com/pinksaucepasta/paperboat/internal/resolver"
 	"github.com/pinksaucepasta/paperboat/internal/selector"
 	"github.com/pinksaucepasta/paperboat/internal/selfupdate"
-	servepkg "github.com/pinksaucepasta/paperboat/internal/serve"
 	"github.com/pinksaucepasta/paperboat/internal/session"
 	"github.com/pinksaucepasta/paperboat/internal/statusbar"
 	"github.com/pinksaucepasta/paperboat/internal/telemetry"
@@ -506,7 +500,10 @@ func localDaemonCommand() *cobra.Command {
 				return err
 			}
 			transportConfig := httptransport.DevelopmentConfig()
-			transportConfig.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS13}
+			if transportConfig.TLSConfig == nil {
+				transportConfig.TLSConfig = &tls.Config{}
+			}
+			transportConfig.TLSConfig.MinVersion = tls.VersionTLS13
 			peerHTTPTransport, err := httptransport.New(transportConfig)
 			if err != nil {
 				return err
@@ -646,9 +643,7 @@ func doctorCommandV1() *cobra.Command {
 					}
 					return nil
 				}
-				if err := repairWindowsOpenSSH(command.Context()); err != nil {
-					return err
-				}
+				return repairWindowsOpenSSH(command.Context())
 			}
 			_, snapshot, err := localDaemonSnapshot(command, installLocalDaemonService)
 			if err != nil {
@@ -1774,206 +1769,6 @@ func configRuntimeCommand() *cobra.Command {
 	return command
 }
 
-func previewRuntimeCommand() *cobra.Command {
-	command := &cobra.Command{
-		Use:    "__runtime-preview",
-		Hidden: true,
-		Args:   commandArgs(cobra.NoArgs),
-		RunE: func(command *cobra.Command, _ []string) error {
-			stateRoot, _ := command.Flags().GetString("state-root")
-			name, _ := command.Flags().GetString("name")
-			port, _ := command.Flags().GetUint16("port")
-			duration, _ := command.Flags().GetDuration("duration")
-			indefinite, _ := command.Flags().GetBool("indefinite")
-			expiresAtValue, _ := command.Flags().GetString("expires-at")
-			descriptorPath, _ := command.Flags().GetString("descriptor")
-			serviceDefinition, _ := command.Flags().GetString("service-definition")
-			var expiresAt *time.Time
-			if expiresAtValue != "" {
-				parsed, parseErr := time.Parse(time.RFC3339Nano, expiresAtValue)
-				if parseErr != nil {
-					return invocationError(errors.New("invalid preview runtime expiry"))
-				}
-				expiresAt = &parsed
-			}
-			if stateRoot == "" || name == "" || port == 0 || indefinite && (duration != 0 || expiresAt != nil) || !indefinite && duration <= 0 && expiresAt == nil {
-				return invocationError(errors.New("invalid preview runtime descriptor"))
-			}
-			if handled, serviceErr := enterWindowsPreviewService(command.Context(), stateRoot, name); handled || serviceErr != nil {
-				return serviceErr
-			}
-			if handled, testErr := runWindowsPreviewNativeE2E(command.Context(), stateRoot, name); handled {
-				return testErr
-			}
-			store, err := identity.Open(identity.Config{StateRoot: stateRoot})
-			if err != nil {
-				return err
-			}
-			registration, err := store.Registration()
-			if err != nil {
-				return err
-			}
-			err = hostruntimeentry.RunPreviewWorker(command.Context(), hostruntimeentry.PreviewWorkerConfig{
-				ControlURL: registration.ServerURL, StateRoot: stateRoot, Name: name, Port: port,
-				Duration: duration, Indefinite: indefinite, ExpiresAt: expiresAt, DescriptorPath: descriptorPath, ServiceDefinition: serviceDefinition,
-				Ready: func(record preview.ControlRecord) error {
-					return json.NewEncoder(command.OutOrStdout()).Encode(record)
-				},
-			})
-			if err != nil {
-				fmt.Fprintf(command.ErrOrStderr(), "preview worker: %v\n", err)
-			}
-			return err
-		},
-		SilenceUsage: true, SilenceErrors: true,
-	}
-	command.Flags().String("state-root", "", "runtime state directory")
-	command.Flags().String("name", "", "preview name")
-	command.Flags().Uint16("port", 0, "local target port")
-	command.Flags().Duration("duration", 0, "preview lifetime")
-	command.Flags().String("expires-at", "", "absolute preview expiry")
-	command.Flags().String("descriptor", "", "durable preview descriptor")
-	command.Flags().String("service-definition", "", "preview service definition")
-	command.Flags().Bool("indefinite", false, "run until explicitly revoked")
-	return command
-}
-
-func privatePreviewRuntimeCommand() *cobra.Command {
-	command := &cobra.Command{
-		Use: "__runtime-private-preview", Hidden: true, Args: commandArgs(cobra.NoArgs),
-		RunE: func(command *cobra.Command, _ []string) error {
-			stateRoot, _ := command.Flags().GetString("state-root")
-			name, _ := command.Flags().GetString("name")
-			indefinite, _ := command.Flags().GetBool("indefinite")
-			expiresAtValue, _ := command.Flags().GetString("expires-at")
-			var expiresAt *time.Time
-			if expiresAtValue != "" {
-				value, err := time.Parse(time.RFC3339Nano, expiresAtValue)
-				if err != nil {
-					return invocationError(errors.New("invalid private preview runtime expiry"))
-				}
-				expiresAt = &value
-			}
-			if !filepath.IsAbs(stateRoot) || name == "" || indefinite == (expiresAt != nil) {
-				return invocationError(errors.New("invalid private preview runtime descriptor"))
-			}
-			if handled, serviceErr := enterWindowsPreviewService(command.Context(), stateRoot, name); handled || serviceErr != nil {
-				return serviceErr
-			}
-			if handled, testErr := runWindowsPreviewNativeE2E(command.Context(), stateRoot, name); handled {
-				return testErr
-			}
-			remote, err := hostruntimeentry.ReadPrivatePreviewService(stateRoot, name)
-			if err != nil {
-				return err
-			}
-			if err := hostruntimeentry.BeginPrivatePreviewService(stateRoot, name); err != nil {
-				return err
-			}
-			failStartup := func(cause error) error {
-				return errors.Join(cause, hostruntimeentry.MarkPrivatePreviewServiceFailed(stateRoot, name, cause))
-			}
-			ctx := command.Context()
-			var cancel context.CancelFunc
-			if expiresAt != nil {
-				ctx, cancel = context.WithDeadline(ctx, *expiresAt)
-				defer cancel()
-			}
-			action := actionContext(command, nil)
-			dependencies, err := buildDeps(action)
-			if err != nil || dependencies.peerApplications == nil {
-				return failStartup(errors.Join(errors.New("private peer transport is unavailable"), err))
-			}
-			client, err := backendForCommand(command)
-			if err != nil {
-				return failStartup(err)
-			}
-			proxy, err := privatepreviewproxy.Start(ctx, privatepreviewproxy.Config{ListenPort: remote.ListenPort, Dial: func(dialCtx context.Context) (io.ReadWriteCloser, error) {
-				target, targetErr := privatePreviewPeerTarget(dialCtx, client, remote.MachineID, remote.MachineName, remote.EnvironmentID, remote.MachineGeneration)
-				if targetErr != nil {
-					return nil, targetErr
-				}
-				return dependencies.peerApplications.DialPrivatePreview(dialCtx, target, remote.TargetPort)
-			}})
-			if err != nil {
-				return failStartup(err)
-			}
-			defer proxy.Close()
-			if err := hostruntimeentry.MarkPrivatePreviewServiceReady(stateRoot, name, proxy.URL); err != nil {
-				return failStartup(err)
-			}
-			waitErr := proxy.Wait()
-			if errors.Is(context.Cause(ctx), context.Canceled) {
-				return waitErr
-			}
-			cleanupErr := hostruntimeentry.CompletePrivatePreviewService(context.Background(), stateRoot, name)
-			return errors.Join(waitErr, cleanupErr)
-		}, SilenceUsage: true, SilenceErrors: true,
-	}
-	command.Flags().String("state-root", "", "runtime state directory")
-	command.Flags().String("name", "", "preview name")
-	command.Flags().String("expires-at", "", "absolute preview expiry")
-	command.Flags().String("descriptor", "", "durable preview descriptor")
-	command.Flags().String("service-definition", "", "preview service definition")
-	command.Flags().Bool("indefinite", false, "run until explicitly revoked")
-	return command
-}
-
-func serveRuntimeCommand() *cobra.Command {
-	command := &cobra.Command{
-		Use:    "__runtime-serve",
-		Hidden: true,
-		Args:   commandArgs(cobra.NoArgs),
-		RunE: func(command *cobra.Command, _ []string) error {
-			stateRoot, _ := command.Flags().GetString("state-root")
-			name, _ := command.Flags().GetString("name")
-			indefinite, _ := command.Flags().GetBool("indefinite")
-			expiresAtValue, _ := command.Flags().GetString("expires-at")
-			descriptorPath, _ := command.Flags().GetString("descriptor")
-			serviceDefinition, _ := command.Flags().GetString("service-definition")
-			var expiresAt *time.Time
-			if expiresAtValue != "" {
-				parsed, parseErr := time.Parse(time.RFC3339Nano, expiresAtValue)
-				if parseErr != nil {
-					return invocationError(errors.New("invalid serve runtime expiry"))
-				}
-				expiresAt = &parsed
-			}
-			if stateRoot == "" || name == "" || !filepath.IsAbs(descriptorPath) || indefinite == (expiresAt != nil) {
-				return invocationError(errors.New("invalid serve runtime descriptor"))
-			}
-			if handled, serviceErr := enterWindowsPreviewService(command.Context(), stateRoot, name); handled || serviceErr != nil {
-				return serviceErr
-			}
-			if handled, testErr := runWindowsPreviewNativeE2E(command.Context(), stateRoot, name); handled {
-				return testErr
-			}
-			controlURL := ""
-			if store, openErr := identity.Open(identity.Config{StateRoot: stateRoot}); openErr == nil {
-				if registration, registrationErr := store.Registration(); registrationErr == nil {
-					controlURL = registration.ServerURL
-				}
-			}
-			err := hostruntimeentry.RunServeWorker(command.Context(), hostruntimeentry.ServeWorkerConfig{
-				ControlURL: controlURL, StateRoot: stateRoot, Name: name, ExpiresAt: expiresAt,
-				Indefinite: indefinite, DescriptorPath: descriptorPath, ServiceDefinition: serviceDefinition,
-			})
-			if err != nil {
-				fmt.Fprintf(command.ErrOrStderr(), "serve worker: %v\n", err)
-			}
-			return err
-		},
-		SilenceUsage: true, SilenceErrors: true,
-	}
-	command.Flags().String("state-root", "", "runtime state directory")
-	command.Flags().String("name", "", "preview name")
-	command.Flags().String("expires-at", "", "absolute preview expiry")
-	command.Flags().String("descriptor", "", "durable preview descriptor")
-	command.Flags().String("service-definition", "", "preview service definition")
-	command.Flags().Bool("indefinite", false, "run until explicitly revoked")
-	return command
-}
-
 func pairCommand() *cobra.Command {
 	command := &cobra.Command{
 		Use:   "pair",
@@ -2438,9 +2233,6 @@ func unpairCommand() *cobra.Command {
 			if registration.ServerURL != d.cfg.ServerURL {
 				return errors.New("this machine is registered to a different Paperboat server")
 			}
-			if err := cleanupDurablePreviewServices(command); err != nil {
-				return fmt.Errorf("stop durable previews before unpairing: %w", err)
-			}
 			machine, err := client.UnpairMachine(command.Context(), registration.MachineID)
 			if err != nil {
 				return err
@@ -2508,7 +2300,6 @@ func uninstallCommand() *cobra.Command {
 			daemonStopConfirmed := false
 			cleanupErr := performUninstallCleanup([]uninstallCleanupStep{
 				{name: "resolve Paperboat Inbox preservation", run: func() error { return inboxErr }},
-				{name: "stop durable previews", run: func() error { return cleanupUninstallDurablePreviewServices(command) }},
 				{name: "stop local daemon", run: func() error {
 					if executableErr != nil {
 						return executableErr
@@ -2593,54 +2384,6 @@ func performUninstallCleanup(steps []uninstallCleanupStep) error {
 		if err := step.run(); err != nil {
 			result = errors.Join(result, uninstallStepFailure{name: step.name, err: err})
 		}
-	}
-	return result
-}
-
-func cleanupDurablePreviewServices(command *cobra.Command) error {
-	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" && runtime.GOOS != "windows" {
-		return nil
-	}
-	rootList, err := durablePreviewStateRoots(command)
-	if err != nil {
-		return err
-	}
-	if runtime.GOOS == "windows" {
-		return cleanupDurablePreviewServicesWindows(command.Context(), rootList)
-	}
-	return cleanupDurablePreviewStateRoots(command, rootList)
-}
-
-func durablePreviewStateRoots(command *cobra.Command) ([]string, error) {
-	roots := make(map[string]struct{})
-	if root := strings.TrimSpace(os.Getenv("PAPERBOAT_RUNTIME_STATE_ROOT")); root != "" {
-		roots[filepath.Clean(root)] = struct{}{}
-	}
-	if root, err := helperconfig.DefaultStateRoot(os.Getenv); err == nil {
-		roots[filepath.Clean(root)] = struct{}{}
-	}
-	if root, _ := command.Flags().GetString("state-root"); strings.TrimSpace(root) != "" {
-		root, err := filepath.Abs(root)
-		if err != nil {
-			return nil, err
-		}
-		roots[filepath.Clean(root)] = struct{}{}
-	}
-	rootList := make([]string, 0, len(roots))
-	for root := range roots {
-		rootList = append(rootList, root)
-	}
-	sort.Strings(rootList)
-	return rootList, nil
-}
-
-func cleanupDurablePreviewStateRoots(command *cobra.Command, rootList []string) error {
-	var result error
-	for _, root := range rootList {
-		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(command.Context()), 30*time.Second)
-		err := hostruntimeentry.RemoveAllPreviewServices(cleanupCtx, root)
-		cancel()
-		result = errors.Join(result, err)
 	}
 	return result
 }
@@ -2962,6 +2705,7 @@ func newRootCommand() *cobra.Command {
 	}}
 	environments.Flags().Bool("json", false, "print JSON")
 	root.AddCommand(environments)
+	root.AddCommand(environmentVariablesCobraCommand())
 
 	root.AddCommand(doctorCommandV1())
 	ping := &cobra.Command{Use: "ping <machine>", Short: "Measure authenticated connectivity to a machine", Args: commandArgs(cobra.ExactArgs(1)), RunE: actionPing}
@@ -2997,16 +2741,11 @@ func newRootCommand() *cobra.Command {
 	}
 	configTree.AddCommand(statusBarConfigCommand(), configConflictCobraCommand(), configForceCobraCommand())
 	root.AddCommand(configTree)
-	previewTree := specTree(previewCommand(), "preview")
-	previewTree.RunE = func(command *cobra.Command, _ []string) error {
-		if !term.IsTerminal(int(os.Stdin.Fd())) {
-			return command.Help()
-		}
-		return actionHomePreviews(command)
-	}
-	root.AddCommand(previewTree)
-	root.AddCommand(serveCommand())
-	root.AddCommand(previewsCobraCommand())
+	root.AddCommand(previewCobraCommandV1())
+	root.AddCommand(tunnelCobraCommandV1())
+	access := &cobra.Command{Use: "access", Short: "Open authenticated private access", Args: commandArgs(cobra.NoArgs)}
+	access.AddCommand(accessTunnelCobraCommandV1())
+	root.AddCommand(access)
 	root.AddCommand(specTree(inboxCommand(), "inbox"))
 	root.AddCommand(sessionCobraCommand())
 	root.AddCommand(sessionsCobraCommand())
@@ -3029,9 +2768,6 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(statusCommand())
 	root.AddCommand(waitCommand())
 	root.AddCommand(bugreportCommand())
-	root.AddCommand(previewRuntimeCommand())
-	root.AddCommand(privatePreviewRuntimeCommand())
-	root.AddCommand(serveRuntimeCommand())
 	root.AddCommand(privilegedHostServiceCommand())
 	root.AddCommand(privilegedServiceOperationCommand())
 	root.AddCommand(platformInstallCommand())
@@ -3314,7 +3050,7 @@ func configureShellCompletion(root *cobra.Command) {
 		return
 	}
 	machine := machineCompletion
-	for _, path := range [][]string{{"connect"}, {"exec"}, {"ssh"}, {"codex"}, {"ping"}, {"doctor"}, {"wait"}, {"machine", "revoke"}, {"previews", "revoke"}} {
+	for _, path := range [][]string{{"connect"}, {"exec"}, {"ssh"}, {"codex"}, {"ping"}, {"doctor"}, {"wait"}, {"machine", "revoke"}} {
 		if command, _, err := root.Find(path); err == nil && command != nil {
 			command.ValidArgsFunction = machine
 		}
@@ -3334,8 +3070,8 @@ func configureShellCompletion(root *cobra.Command) {
 			}
 		}
 	}
-	if command, _, err := root.Find([]string{"preview", "revoke"}); err == nil && command != nil {
-		command.ValidArgsFunction = previewCompletion
+	if command, _, err := root.Find([]string{"preview", "stop"}); err == nil && command != nil {
+		command.ValidArgsFunction = previewStopCompletion
 	}
 	if command, _, err := root.Find([]string{"send"}); err == nil && command != nil {
 		_ = command.RegisterFlagCompletionFunc("to", transferTargetCompletion)
@@ -3359,13 +3095,6 @@ func transferTargetCompletion(command *cobra.Command, args []string, toComplete 
 		return nil, cobra.ShellCompDirectiveNoFileComp
 	}
 	return localCompletion(command, "transfer_target", "", toComplete)
-}
-
-func previewCompletion(command *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-	if len(args) > 0 {
-		return nil, cobra.ShellCompDirectiveNoFileComp
-	}
-	return localCompletion(command, "preview", "", toComplete)
 }
 
 func sessionCompletion(command *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
@@ -3481,10 +3210,9 @@ func actionHome(command *cobra.Command) error {
 			Actions:       map[string]string{"ctrl+e": "toggle-email"},
 			HeaderActions: map[int]string{2: "toggle-email"},
 			Items: []selector.Item{
-				{ID: "serve", Title: "Serve a file or directory", Description: "Publish static content from this device"},
 				{ID: "machines", Title: "Machines", Description: "Open terminals, run Codex, create previews, send files, or manage computers"},
 				{ID: "sessions", Title: "Terminal sessions", Description: "Attach, inspect, close, rename, or delete durable sessions"},
-				{ID: "previews", Title: "Public previews", Description: "Inspect or revoke application preview URLs"},
+				{ID: "environment-variables", Title: "ENV Injection", Description: "Manage redacted global and per-machine variables for new processes"},
 				{ID: "config", Title: "Configuration", Description: "Inspect sync status, CLI settings, and status bar preferences"},
 				{ID: "doctor", Title: "Diagnostics", Description: "Check local setup, authentication, and connectivity"},
 				{ID: "account", Title: "Account", Description: "View, sign in, switch, or sign out"},
@@ -3559,11 +3287,9 @@ type homePrefetch struct {
 	favorites *asyncHomeValue[favoriteSet]
 	machines  *asyncHomeValue[[]api.UserMachine]
 	sessions  *asyncHomeValue[[]machineSession]
-	previews  *asyncHomeValue[[]api.Preview]
 
 	machinesClaimed atomic.Bool
 	sessionsClaimed atomic.Bool
-	previewsClaimed atomic.Bool
 }
 
 func startHomePrefetch(command *cobra.Command) (*homePrefetch, error) {
@@ -3575,7 +3301,6 @@ func startHomePrefetch(command *cobra.Command) (*homePrefetch, error) {
 	prefetch := &homePrefetch{
 		favorites: startAsyncHomeValue(ctx, func(ctx context.Context) (favoriteSet, error) { return loadFavorites(ctx, client) }),
 		machines:  startAsyncHomeValue(ctx, client.ListUserMachines),
-		previews:  startAsyncHomeValue(ctx, client.ListPreviews),
 	}
 	prefetch.sessions = startAsyncHomeValue(ctx, func(ctx context.Context) ([]machineSession, error) {
 		machines, loadErr := prefetch.machines.await(ctx)
@@ -3604,12 +3329,10 @@ func primeHomeFileIndex() {
 
 func runHomeAction(command *cobra.Command, action string) error {
 	switch action {
-	case "serve":
-		return executeInteractiveCommand(command, []string{"serve"})
 	case "sessions":
 		return actionHomeSessions(command)
-	case "previews":
-		return actionHomePreviews(command)
+	case "environment-variables":
+		return runEnvironmentVariablesTUI(command)
 	case "machines":
 		return actionHomeMachines(command)
 	case "config":
@@ -3904,108 +3627,6 @@ func machineSessionFavoriteID(entry machineSession) string {
 	return entry.target.id + ":" + entry.session.ID
 }
 
-func actionHomePreviews(command *cobra.Command) error {
-	client, err := backendForCommand(command)
-	if err != nil {
-		return err
-	}
-	usePrefetch := true
-	for {
-		var favorites favoriteSet
-		var previews []api.Preview
-		var err error
-		loaded := false
-		if usePrefetch {
-			usePrefetch = false
-			if prefetch := homePrefetchFor(command); prefetch != nil && prefetch.previewsClaimed.CompareAndSwap(false, true) {
-				work := func(ctx context.Context) error {
-					var loadErr error
-					favorites, loadErr = prefetch.favorites.await(ctx)
-					if loadErr == nil {
-						previews, loadErr = prefetch.previews.await(ctx)
-					}
-					return loadErr
-				}
-				err = runPrefetchedHomeLoad(command, "Public previews", "Loading previews", prefetch.favorites.ready() && prefetch.previews.ready(), work)
-				loaded = err == nil && prefetch.favorites.fresh() && prefetch.previews.fresh()
-			}
-		}
-		if !loaded {
-			err = homeLoading(command, "Public previews", "Loading previews", func(ctx context.Context) error {
-				var loadErr error
-				favorites, loadErr = loadFavorites(ctx, client)
-				if loadErr != nil {
-					return loadErr
-				}
-				previews, loadErr = client.ListPreviews(ctx)
-				return loadErr
-			})
-		}
-		if err != nil {
-			return friendlyCommandError(err)
-		}
-		previews = enrichLocalServeSources(previews)
-		slices.SortStableFunc(previews, func(a, b api.Preview) int {
-			return compareFavorites(favorites.IsFavorite("preview", a.ID), favorites.IsFavorite("preview", b.ID))
-		})
-		items := make([]selector.Item, 0, len(previews))
-		byID := make(map[string]api.Preview, len(previews))
-		for _, preview := range previews {
-			expiry := "indefinite"
-			if preview.ExpiresAt != nil {
-				expiry = "expires " + relativeTime(preview.ExpiresAt)
-			}
-			favorite := favorites.IsFavorite("preview", preview.ID)
-			source := preview.SourceKind
-			if source == "" {
-				source = "application"
-			}
-			descriptionParts := []string{preview.EnvironmentName, preview.State, source, expiry}
-			if preview.SourcePath != "" {
-				descriptionParts = append(descriptionParts, preview.SourcePath)
-			}
-			items = append(items, selector.Item{ID: preview.ID, Title: preview.LogicalName, Description: strings.Join(descriptionParts, "  ·  "), Search: preview.URL + " " + preview.EnvironmentKind + " " + preview.OwnerMode + " " + preview.SourcePath + " favorite starred", Favorite: favorite})
-			byID[preview.ID] = preview
-		}
-		selection, selectErr := selector.ChooseWithAction(selector.Options{Title: "Public previews", Subtitle: "Anyone with a listed URL can access it", Items: items, Empty: "No public previews yet", Footer: "↑/↓ move  enter open  ctrl+f favorite  esc back", Actions: map[string]string{"ctrl+f": "favorite"}, Stdin: os.Stdin, Output: command.ErrOrStderr()})
-		if selectErr != nil {
-			return selectErr
-		}
-		preview := byID[selection.Item.ID]
-		if selection.Action == "favorite" {
-			if favoriteErr := setFavorite(command.Context(), client, "preview", preview.ID, !favorites.IsFavorite("preview", preview.ID)); favoriteErr != nil {
-				return favoriteErr
-			}
-			continue
-		}
-		revokeTitle := "Revoke preview"
-		revokeDescription := "Remove this public URL"
-		if preview.SourceKind == "file" || preview.SourceKind == "directory" {
-			revokeTitle = "Stop serving"
-			revokeDescription = "Stop the local static server and remove its public URL"
-		}
-		action, actionErr := chooseHomeAction(command, preview.LogicalName, []selector.Item{
-			{ID: "open", Title: "Open preview", Description: preview.URL},
-			{ID: "revoke", Title: revokeTitle, Description: revokeDescription},
-		})
-		if errors.Is(actionErr, selector.ErrCanceled) {
-			continue
-		}
-		if actionErr != nil {
-			return actionErr
-		}
-		if action.ID == "open" {
-			if openErr := openBrowser(preview.URL); openErr != nil {
-				return openErr
-			}
-			continue
-		}
-		if revokeErr := executeInteractiveCommand(command, []string{"preview", "revoke", preview.ID}); revokeErr != nil {
-			return revokeErr
-		}
-	}
-}
-
 func actionHomeMachines(command *cobra.Command) error {
 	client, err := backendForCommand(command)
 	if err != nil {
@@ -4107,10 +3728,8 @@ func actionHomeMachines(command *cobra.Command) error {
 				if errors.Is(runErr, selector.ErrCanceled) {
 					runErr = nil
 				}
-			case "preview":
-				runErr = actionHomeCreateMachinePreview(command, machine)
-			case "previews":
-				runErr = actionHomeMachinePreviews(command, client, machine)
+			case "environment-variables":
+				runErr = runEnvironmentVariableScopeTUI(command, client, environmentVariableTarget{machineID: machine.ID, machineName: machine.DisplayName})
 			case "send":
 				runErr = actionHomeSendToMachine(command, machine)
 			case "rename":
@@ -4149,6 +3768,9 @@ func actionHomeMachines(command *cobra.Command) error {
 func machineHomeActions(machine api.UserMachine) []selector.Item {
 	actions := make([]selector.Item, 0, 8)
 	actions = append(actions, selector.Item{ID: "rename", Title: "Rename", Description: "Change this machine's display name"})
+	if machineSupportsEnvironmentInjection(machine) {
+		actions = append(actions, selector.Item{ID: "environment-variables", Title: "ENV Injection", Description: "Manage variables applied to new processes on this machine"})
+	}
 	if machine.Capabilities.TerminalHost.Configured {
 		actions = append(actions,
 			selector.Item{ID: "terminal", Title: "Create terminal session", Description: "Start and attach to a new durable session"},
@@ -4160,14 +3782,8 @@ func machineHomeActions(machine api.UserMachine) []selector.Item {
 			actions = append(actions, selector.Item{ID: "send", Title: "Send files", Description: "Search, select, drop, or paste files for this machine"})
 		}
 	}
-	if machine.Capabilities.PreviewLaunch.Configured {
-		actions = append(actions, selector.Item{ID: "preview", Title: "Create preview", Description: "Publish an application port from this machine"})
-	}
 	if machine.Capabilities.TerminalHost.Configured {
 		actions = append(actions, selector.Item{ID: "sessions", Title: "Sessions", Description: "List durable terminal sessions on this machine"})
-	}
-	if machine.Capabilities.PreviewLaunch.Configured {
-		actions = append(actions, selector.Item{ID: "previews", Title: "Previews", Description: "Open or revoke previews created on this machine"})
 	}
 	if machine.SetupMode == "host" {
 		actions = append(actions,
@@ -4247,85 +3863,6 @@ func effectiveMachineMode(machine api.UserMachine) string {
 		return "client"
 	}
 	return ""
-}
-
-func actionHomeMachinePreviews(command *cobra.Command, client *api.Client, machine api.UserMachine) error {
-	var previews []api.Preview
-	var favorites favoriteSet
-	err := homeLoading(command, "Previews", "Loading previews from "+machine.DisplayName, func(ctx context.Context) error {
-		var loadErr error
-		favorites, loadErr = loadFavorites(ctx, client)
-		if loadErr != nil {
-			return loadErr
-		}
-		items, loadErr := client.ListPreviews(ctx)
-		if loadErr != nil {
-			return loadErr
-		}
-		for _, preview := range items {
-			if preview.EnvironmentID == machine.EnvironmentID {
-				previews = append(previews, preview)
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		return friendlyCommandError(err)
-	}
-	for {
-		slices.SortStableFunc(previews, func(a, b api.Preview) int {
-			return compareFavorites(favorites.IsFavorite("preview", a.ID), favorites.IsFavorite("preview", b.ID))
-		})
-		items := make([]selector.Item, 0, len(previews))
-		byID := make(map[string]api.Preview, len(previews))
-		for _, preview := range previews {
-			favorite := favorites.IsFavorite("preview", preview.ID)
-			items = append(items, selector.Item{ID: preview.ID, Title: preview.LogicalName, Description: fmt.Sprintf("%s  ·  :%d  ·  %s", preview.State, preview.TargetPort, preview.URL), Search: preview.URL, Favorite: favorite})
-			byID[preview.ID] = preview
-		}
-		selection, selectErr := selector.ChooseWithAction(selector.Options{Title: "Previews", Subtitle: machine.DisplayName, Items: items, Empty: "No previews for this machine", Footer: "↑/↓ move  enter open  ctrl+f favorite  esc back", Actions: map[string]string{"ctrl+f": "favorite"}, Stdin: os.Stdin, Output: command.ErrOrStderr()})
-		if selectErr != nil {
-			return selectErr
-		}
-		preview := byID[selection.Item.ID]
-		if selection.Action == "favorite" {
-			favorite := !favorites.IsFavorite("preview", preview.ID)
-			if err := setFavorite(command.Context(), client, "preview", preview.ID, favorite); err != nil {
-				return err
-			}
-			favorites.Set("preview", preview.ID, favorite)
-			continue
-		}
-		action, actionErr := chooseHomeAction(command, preview.LogicalName, []selector.Item{{ID: "open", Title: "Open preview", Description: preview.URL}, {ID: "revoke", Title: "Revoke preview", Description: "Remove this public URL"}})
-		if actionErr != nil {
-			return actionErr
-		}
-		if action.ID == "open" {
-			if err := openBrowser(preview.URL); err != nil {
-				return err
-			}
-			continue
-		}
-		return executeInteractiveCommand(command, []string{"preview", "revoke", preview.ID})
-	}
-}
-
-func actionHomeCreateMachinePreview(command *cobra.Command, machine api.UserMachine) error {
-	portText, err := prompt.Text(prompt.TextOptions{Title: "Application port", Description: "Port where the application is already listening on " + machine.DisplayName, Placeholder: "3000", Stdin: os.Stdin, Output: command.ErrOrStderr(), Validate: func(value string) error {
-		port, parseErr := strconv.ParseUint(value, 10, 16)
-		if parseErr != nil || port == 0 {
-			return errors.New("port must be between 1 and 65535")
-		}
-		return nil
-	}})
-	if errors.Is(err, prompt.ErrCanceled) {
-		return selector.ErrCanceled
-	}
-	if err != nil {
-		return err
-	}
-	name := "preview-" + portText
-	return executeInteractiveCommand(command, []string{"preview", "create", "--machine", machine.ID, "--name", name, "--port", portText, "--public"})
 }
 
 func actionHomeSendToMachine(command *cobra.Command, machine api.UserMachine) error {
@@ -4678,7 +4215,7 @@ func actionHomeDoctor(command *cobra.Command) error {
 		{ID: "inbox", Title: "Paperboat Inbox", Description: report.InboxState + "  ·  " + report.InboxPath},
 		{ID: "config", Title: "Configuration service", Description: report.ConfigService},
 		{ID: "runtime", Title: "Host runtime", Description: report.HostRuntime},
-		{ID: "workloads", Title: "Local workloads", Description: fmt.Sprintf("%s  ·  %d sessions  ·  %d previews  ·  %d transfers", report.WorkloadCounts, report.ActiveSessions, report.ActivePreviews, report.ActiveTransfers)},
+		{ID: "workloads", Title: "Local workloads", Description: fmt.Sprintf("%s  ·  %d sessions  ·  %d transfers", report.WorkloadCounts, report.ActiveSessions, report.ActiveTransfers)},
 	}
 	ctx := actionContext(command, nil)
 	d, err := buildDeps(ctx)
@@ -5235,19 +4772,6 @@ func specTree(source *command.Spec, use string) *cobra.Command {
 		if use == "config" && child.Name == "unassign" {
 			entry.Flags().Bool("yes", false, "confirm removal")
 		}
-		if use == "preview" {
-			if child.Name == "create" {
-				entry.Flags().String("name", "", "stable preview name")
-				entry.Flags().Uint("port", 0, "local target port")
-				entry.Flags().String("machine", "", "online paired machine")
-				entry.Flags().Duration("duration", 24*time.Hour, "preview lifetime")
-				entry.Flags().Bool("indefinite", false, "keep until explicitly revoked")
-				entry.Flags().Bool("public", false, "acknowledge public access")
-				entry.Flags().Uint("listen-port", 0, "private loopback listener port")
-				entry.Flags().Bool("detach", false, "continue after this command exits")
-				entry.Flags().Bool("json", false, "print JSON")
-			}
-		}
 		root.AddCommand(entry)
 	}
 	return root
@@ -5414,29 +4938,6 @@ func sessionCobraCommand() *cobra.Command {
 		}
 		command.AddCommand(entry)
 	}
-	return command
-}
-
-func previewsCobraCommand() *cobra.Command {
-	command := &cobra.Command{Use: "previews", Short: "List public previews", Args: commandArgs(cobra.NoArgs), RunE: func(command *cobra.Command, args []string) error {
-		jsonOutput, _ := command.Flags().GetBool("json")
-		if !jsonOutput && term.IsTerminal(int(os.Stdin.Fd())) {
-			return actionHomePreviews(command)
-		}
-		return actionRun(previewListCommand)(command, args)
-	}}
-	command.Flags().Bool("json", false, "print JSON")
-	entry := &cobra.Command{Use: "revoke <environment>", Short: "Revoke previews in an environment", Args: commandArgs(cobra.ExactArgs(1)), RunE: func(command *cobra.Command, args []string) error {
-		all, _ := command.Flags().GetBool("all")
-		if !all {
-			return invocationError(errors.New("pb previews revoke requires --all"))
-		}
-		return actionRun(previewRevokeAllCommand)(command, args)
-	}}
-	entry.Flags().Bool("all", false, "revoke all previews in the environment")
-	entry.Flags().Bool("yes", false, "confirm revocation")
-	entry.Flags().Bool("json", false, "print JSON")
-	command.AddCommand(entry)
 	return command
 }
 
@@ -6486,7 +5987,10 @@ func buildDeps(c *command.Context) (*deps, error) {
 			return nil, storeErr
 		}
 		transportConfig := httptransport.DevelopmentConfig()
-		transportConfig.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS13}
+		if transportConfig.TLSConfig == nil {
+			transportConfig.TLSConfig = &tls.Config{}
+		}
+		transportConfig.TLSConfig.MinVersion = tls.VersionTLS13
 		peerTransport, transportErr := httptransport.New(transportConfig)
 		if transportErr != nil {
 			return nil, transportErr
@@ -6757,444 +6261,10 @@ func environmentsCommand() *command.Spec {
 	}
 }
 
-func previewCommand() *command.Spec {
-	return &command.Spec{Name: "preview", Usage: "Manage private serves and public previews", Subcommands: []*command.Spec{
-		{Name: "create", Action: previewCreateCommand},
-		{Name: "list", Flags: []command.Flag{&command.BoolFlag{Name: "json"}}, Action: previewListCommand},
-		{Name: "revoke", ArgsUsage: "<preview>", Flags: []command.Flag{&command.BoolFlag{Name: "yes"}, &command.BoolFlag{Name: "json"}}, Action: previewRemoveCommand},
-	}}
-}
-
-func serveCommand() *cobra.Command {
-	command := &cobra.Command{
-		Use:   "serve [path]",
-		Short: "Serve a local file or directory privately",
-		Args:  commandArgs(cobra.MaximumNArgs(1)),
-		RunE: func(command *cobra.Command, args []string) error {
-			err := runServeCommand(command, args)
-			jsonOutput, _ := command.Flags().GetBool("json")
-			if err == nil || !jsonOutput {
-				return err
-			}
-			if encodeErr := json.NewEncoder(command.OutOrStdout()).Encode(map[string]any{"schema_version": "1.0", "ok": false, "error": serveErrorEnvelope(err)}); encodeErr != nil {
-				return encodeErr
-			}
-			exitCode := 1
-			if errors.Is(err, errUsage) {
-				exitCode = 2
-			}
-			return exitCodeError{code: exitCode}
-		},
-	}
-	command.Flags().String("name", "", "stable preview name")
-	command.Flags().Duration("duration", 24*time.Hour, "preview lifetime")
-	command.Flags().Bool("indefinite", false, "keep until explicitly revoked")
-	command.Flags().Bool("detach", false, "continue serving after this command exits")
-	command.Flags().Bool("spa", false, "fall back to index.html for navigation requests")
-	command.Flags().Bool("public", false, "create a public preview")
-	command.Flags().Uint16("listen-port", 0, "private loopback listener port")
-	command.Flags().Bool("json", false, "print JSON")
-	return command
-}
-
-func serveErrorEnvelope(err error) map[string]any {
-	code, category, retryable, recovery := "serve_failed", "local_io", false, "Run `pb doctor`, correct the reported problem, then retry."
-	switch {
-	case errors.Is(err, errUsage):
-		code, category, recovery = "serve_invocation_invalid", "usage", "Correct the command arguments and retry."
-	case errors.Is(err, servepkg.ErrInvalidSource):
-		code, recovery = "serve_source_invalid", "Select an existing regular file or directory on this device."
-	case errors.Is(err, servepkg.ErrSourceChanged):
-		code, recovery = "serve_source_changed", "Select the source again so Paperboat can pin its current identity."
-	case errors.Is(err, errServeProtocolIncompatible):
-		code, category, recovery = "protocol_incompatible", "protocol", "Upgrade and restart the local Paperboat runtime, then retry."
-	case errors.Is(err, hostruntimeentry.ErrPreviewServiceMissing):
-		code, category, retryable, recovery = "preview_worker_missing", "worker_failed", true, "The detached worker exited before readiness; inspect its service logs and retry."
-	case errors.Is(err, hostruntimeentry.ErrPreviewServiceFailed):
-		code, category, retryable, recovery = "preview_worker_failed", "worker_failed", true, "The detached worker failed before readiness; inspect its service logs and retry."
-	case errors.Is(err, context.DeadlineExceeded):
-		code, category, retryable, recovery = "readiness_timeout", "unavailable_retryable", true, "Inspect `pb preview list` before retrying with the same name."
-	case errors.Is(err, context.Canceled):
-		code, category, recovery = "serve_canceled", "canceled", "No retry is needed."
-	default:
-		var apiErr *api.APIError
-		if errors.As(err, &apiErr) && apiErr.Code != "" {
-			code = apiErr.Code
-			category = "unavailable_retryable"
-			retryable = apiErr.Code == "machine_offline" || apiErr.Status >= 500
-			if apiErr.Code == "machine_capability_unavailable" {
-				category, retryable = "authorization_or_entitlement", false
-			}
-		}
-	}
-	message := sentence(userFacingError(err))
-	if len(message) > 240 {
-		message = message[:237] + "..."
-	}
-	return map[string]any{
-		"code": code, "category": category, "message": message, "retryable": retryable,
-		"state_changed": "unknown", "outcome_uncertain": false, "recovery": recovery,
-		"public_state_created": "unknown", "local_state_created": "unknown", "cleanup": "not_required",
-	}
-}
-
-var errServeProtocolIncompatible = errors.New("local runtime does not support pb serve")
-
-func runServeCommand(command *cobra.Command, args []string) error {
-	interactive := term.IsTerminal(int(os.Stdin.Fd()))
-	jsonOutput, _ := command.Flags().GetBool("json")
-	if jsonOutput {
-		interactive = false
-	}
-	if len(args) == 0 && !interactive {
-		return invocationError(errors.New("pb serve requires <path> without an interactive terminal"))
-	}
-	configPath, _ := command.Flags().GetString("config")
-	cfg, configErr := config.Load(configPath)
-	if configErr != nil {
-		return configErr
-	}
-	serveTelemetry, closeTelemetry := connectTelemetry(cfg, io.Discard)
-	defer closeTelemetry()
-	emit := func(stage, outcome string, started time.Time) {
-		event := telemetry.Event{Name: "serve.lifecycle", At: time.Now().UTC(), Stage: stage, Outcome: outcome, LatencyMS: time.Since(started).Milliseconds()}
-		if event.Validate() == nil {
-			serveTelemetry.Record(event)
-		}
-	}
-	var source servepkg.Source
-	var stagedDrop bool
-	var err error
-	selectionStarted := time.Now()
-	if len(args) == 1 {
-		source, err = servepkg.ResolveSource(args[0])
-	} else {
-		source, stagedDrop, err = selectServeSource(command)
-	}
-	if err != nil {
-		emit("selection", eventResultForTelemetry(err), selectionStarted)
-		return err
-	}
-	emit("selection", "ok", selectionStarted)
-	validationStarted := time.Now()
-	if err := source.Revalidate(); err != nil {
-		emit("validation", "failed", validationStarted)
-		return fmt.Errorf("validate serve source: %w", err)
-	}
-	emit("validation", "ok", validationStarted)
-	spa, _ := command.Flags().GetBool("spa")
-	if spa && source.Kind != servepkg.SourceDirectory {
-		return invocationError(errors.New("--spa requires a directory source"))
-	}
-	duration, _ := command.Flags().GetDuration("duration")
-	indefinite, _ := command.Flags().GetBool("indefinite")
-	if indefinite && command.Flags().Changed("duration") || !indefinite && (duration < time.Second || duration > 365*24*time.Hour) {
-		return invocationError(errors.New("use a positive --duration up to 365 days, or --indefinite"))
-	}
-	public, _ := command.Flags().GetBool("public")
-	listenPort, _ := command.Flags().GetUint16("listen-port")
-	if public && command.Flags().Changed("listen-port") {
-		return invocationError(errors.New("--listen-port is available only for private serve"))
-	}
-	var inboxPath, plannedInboxPath string
-	if stagedDrop {
-		inboxPath, err = configuredInboxPath()
-		if err != nil {
-			return err
-		}
-		plannedInboxPath, err = servepkg.PlanInboxCopy(source, inboxPath)
-		if err != nil {
-			return err
-		}
-	}
-	if public && interactive {
-		lifetime := duration.String()
-		if indefinite {
-			lifetime = "until explicitly stopped"
-		}
-		description := source.Path + "\nPublic access: anyone with the URL can access it\nLifetime: " + lifetime
-		if stagedDrop {
-			description += "\nInbox copy: " + plannedInboxPath
-		}
-		confirmed, confirmErr := prompt.Confirm(prompt.ConfirmOptions{
-			Title:       "Publish this " + string(source.Kind) + "?",
-			Description: description,
-			Stdin:       os.Stdin, Output: command.ErrOrStderr(),
-		})
-		if confirmErr != nil {
-			return confirmErr
-		}
-		if !confirmed {
-			return selector.ErrCanceled
-		}
-	}
-	if stagedDrop {
-		copied, copyErr := servepkg.CopyFileToInbox(command.Context(), source, inboxPath)
-		if copyErr != nil {
-			return copyErr
-		}
-		if copied.Path != plannedInboxPath {
-			return errors.New("the planned Inbox filename was taken before the copy completed; the collision-safe copy remains in the Inbox, so select it and retry")
-		}
-		source, err = servepkg.ResolveSource(copied.Path)
-		if err != nil {
-			return err
-		}
-	}
-	name, _ := command.Flags().GetString("name")
-	name = normalizeServeName(name, filepath.Base(source.Path))
-	if name == "" {
-		return invocationError(errors.New("serve preview name must contain a letter or number"))
-	}
-	detach, _ := command.Flags().GetBool("detach")
-	if !public {
-		return runPrivateServe(command, source, name, duration, indefinite, detach, spa, listenPort, emit, jsonOutput)
-	}
-	stateRoot := strings.TrimSpace(os.Getenv("PAPERBOAT_RUNTIME_STATE_ROOT"))
-	if stateRoot == "" {
-		stateRoot, err = helperconfig.DefaultStateRoot(os.Getenv)
-		if err != nil {
-			return err
-		}
-	}
-	registrationStore, err := identity.Open(identity.Config{StateRoot: stateRoot})
-	if err != nil {
-		return err
-	}
-	registration, err := registrationStore.Registration()
-	if err != nil {
-		return errors.New("run `pb setup` before serving a file or directory")
-	}
-	if err := validateLocalServeCapability(command, registration); err != nil {
-		return err
-	}
-	var record preview.ControlRecord
-	execution := "foreground"
-	var foreground *servepkg.Foreground
-	var managementLease *servelease.Keeper
-	if detach {
-		execution = "detached"
-		executable, executableErr := os.Executable()
-		if executableErr != nil {
-			return executableErr
-		}
-		executable, executableErr = filepath.EvalSymlinks(executable)
-		if executableErr != nil {
-			return executableErr
-		}
-		var expiresAt *time.Time
-		if !indefinite {
-			value := time.Now().UTC().Add(duration)
-			expiresAt = &value
-		}
-		if err := hostruntimeentry.InstallServeService(command.Context(), executable, stateRoot, name, source, spa, expiresAt, indefinite, true, 0); err != nil {
-			return err
-		}
-		// A connector acceptance attempt is bounded at 25 seconds. Leave enough
-		// startup budget for one complete retry after the supervisor backoff.
-		readyCtx, cancelReady := context.WithTimeout(command.Context(), 60*time.Second)
-		defer cancelReady()
-		record, err = hostruntimeentry.WaitPreviewServiceReady(readyCtx, stateRoot, name)
-		if err != nil {
-			cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancelCleanup()
-			cleanupErr := hostruntimeentry.RemovePreviewService(cleanupCtx, stateRoot, name)
-			message := "serve registration timed out; the detached service was stopped"
-			if cleanupErr != nil {
-				message = "serve registration timed out; detached service cleanup also failed"
-			}
-			return errors.Join(errors.New(message), err, cleanupErr)
-		}
-	} else {
-		managementLease, err = acquireServeManagementLease(command.Context(), stateRoot, name)
-		if err != nil {
-			emit("lease_acquire", "failed", time.Now())
-			return fmt.Errorf("acquire foreground management lease: %w", err)
-		}
-		emit("lease_acquire", "ok", time.Now())
-		foreground, err = servepkg.StartForeground(command.Context(), servepkg.ForegroundConfig{
-			Source: source, Name: name, Duration: duration, Indefinite: indefinite, SPA: spa,
-			Lease: managementLease,
-			Observe: func(event servepkg.LifecycleEvent) {
-				telemetryEvent := telemetry.Event{Name: "serve.lifecycle", At: time.Now().UTC(), Stage: event.Operation, Outcome: event.Result, DurationNS: event.Duration.Nanoseconds(), EnvironmentID: registration.EnvironmentID}
-				if telemetryEvent.Validate() == nil {
-					serveTelemetry.Record(telemetryEvent)
-				}
-			},
-			Preview: func(ctx context.Context, run servepkg.PreviewRunConfig) error {
-				return hostruntimeentry.RunPreviewWorker(ctx, hostruntimeentry.PreviewWorkerConfig{
-					ControlURL: registration.ServerURL, StateRoot: stateRoot, Name: run.Name, Port: run.Port,
-					Duration: run.Duration, Indefinite: run.Indefinite, Ready: run.Ready,
-					SourceKind: string(source.Kind), OwnerMode: "foreground",
-				})
-			},
-		})
-		if err != nil {
-			releaseCtx, cancelRelease := context.WithTimeout(context.Background(), 5*time.Second)
-			_ = managementLease.Release(releaseCtx)
-			cancelRelease()
-			return err
-		}
-		record = foreground.Record
-	}
-	if jsonOutput {
-		data := map[string]any{
-			"operation_id": record.OperationID, "preview_id": record.ID,
-			"name": name, "machine_id": registration.MachineID, "source_path": source.Path,
-			"source_kind": source.Kind, "url": record.URL, "state": record.State,
-			"execution": execution, "expires_at": record.ExpiresAt,
-		}
-		if err := json.NewEncoder(command.OutOrStdout()).Encode(map[string]any{"schema_version": "1.0", "ok": true, "data": data}); err != nil {
-			return err
-		}
-	} else {
-		lifetime := duration.String()
-		if indefinite {
-			lifetime = "until stopped"
-		}
-		fmt.Fprintf(command.OutOrStdout(), "Serving: %s\nAccess:  Public for %s\nURL:     %s\n", source.Path, lifetime, record.URL)
-	}
-	if foreground != nil {
-		return foreground.Wait()
-	}
-	emit("ownership_transfer", "ok", time.Now())
-	return nil
-}
-
-func runPrivateServe(command *cobra.Command, source servepkg.Source, name string, duration time.Duration, indefinite, detach, spa bool, listenPort uint16, emit func(string, string, time.Time), jsonOutput bool) error {
-	execution := "foreground"
-	var localURL string
-	var expiresAt *time.Time
-	if !indefinite {
-		value := time.Now().UTC().Add(duration)
-		expiresAt = &value
-	}
-	if detach {
-		execution = "detached"
-		stateRoot := strings.TrimSpace(os.Getenv("PAPERBOAT_RUNTIME_STATE_ROOT"))
-		var err error
-		if stateRoot == "" {
-			stateRoot, err = helperconfig.DefaultStateRoot(os.Getenv)
-			if err != nil {
-				return err
-			}
-		}
-		executable, err := os.Executable()
-		if err != nil {
-			return err
-		}
-		executable, err = filepath.EvalSymlinks(executable)
-		if err != nil {
-			return err
-		}
-		if err := hostruntimeentry.InstallServeService(command.Context(), executable, stateRoot, name, source, spa, expiresAt, indefinite, false, listenPort); err != nil {
-			return err
-		}
-		readyCtx, cancelReady := context.WithTimeout(command.Context(), 30*time.Second)
-		defer cancelReady()
-		record, err := hostruntimeentry.WaitPreviewServiceReady(readyCtx, stateRoot, name)
-		if err != nil {
-			cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), 10*time.Second)
-			cleanupErr := hostruntimeentry.RemovePreviewService(cleanupCtx, stateRoot, name)
-			cancelCleanup()
-			return errors.Join(errors.New("private serve listener did not become ready; detached service was stopped"), err, cleanupErr)
-		}
-		localURL = record.URL
-	} else {
-		local, err := servepkg.StartLocal(command.Context(), servepkg.LocalConfig{
-			Source: source, Duration: duration, Indefinite: indefinite, SPA: spa, ListenPort: listenPort,
-			Observe: func(event servepkg.LifecycleEvent) {
-				emit(event.Operation, event.Result, time.Now().Add(-event.Duration))
-			},
-		})
-		if err != nil {
-			return err
-		}
-		localURL = local.URL
-		if err := printPrivateServeResult(command, source, name, localURL, execution, expiresAt, jsonOutput); err != nil {
-			return err
-		}
-		return local.Wait()
-	}
-	return printPrivateServeResult(command, source, name, localURL, execution, expiresAt, jsonOutput)
-}
-
-func printPrivateServeResult(command *cobra.Command, source servepkg.Source, name, localURL, execution string, expiresAt *time.Time, jsonOutput bool) error {
-	if jsonOutput {
-		return json.NewEncoder(command.OutOrStdout()).Encode(map[string]any{"schema_version": "1.0", "ok": true, "data": map[string]any{
-			"name": name, "source_path": source.Path, "source_kind": source.Kind, "url": localURL,
-			"visibility": "private", "listener": "loopback", "execution": execution, "expires_at": expiresAt,
-		}})
-	}
-	lifetime := "until stopped"
-	if expiresAt != nil {
-		lifetime = time.Until(*expiresAt).Round(time.Second).String()
-	}
-	_, err := fmt.Fprintf(command.OutOrStdout(), "Serving: %s\nAccess:  Private on this device for %s\nURL:     %s\n", source.Path, lifetime, localURL)
-	return err
-}
-
-func eventResultForTelemetry(err error) string {
-	if errors.Is(err, context.Canceled) || errors.Is(err, selector.ErrCanceled) {
-		return "canceled"
-	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		return "timeout"
-	}
-	return "failed"
-}
-
-func acquireServeManagementLease(ctx context.Context, stateRoot, name string) (*servelease.Keeper, error) {
-	var local struct {
-		Schema        string `json:"schema"`
-		ListenAddress string `json:"listen_address"`
-	}
-	if err := readOwnerOnlyJSON(filepath.Join(stateRoot, "runtime", "worker-local.json"), &local); err != nil {
-		return nil, err
-	}
-	host, port, splitErr := net.SplitHostPort(local.ListenAddress)
-	if local.Schema != "paperboat.worker-local/v1" || splitErr != nil || host != "127.0.0.1" || port == "" {
-		return nil, servelease.ErrInvalid
-	}
-	tokenPath := filepath.Join(stateRoot, "runtime", "local-control-token")
-	token, err := readOwnerOnlyFile(tokenPath, 1024)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, errServeProtocolIncompatible
-		}
-		return nil, err
-	}
-	client, err := servelease.NewClient("http://"+local.ListenAddress+"/v1/serve-leases", strings.TrimSpace(string(token)), nil)
-	if err != nil {
-		return nil, err
-	}
-	lease, err := client.Acquire(ctx, name)
-	if err != nil {
-		if errors.Is(err, servelease.ErrInvalid) {
-			return nil, errServeProtocolIncompatible
-		}
-		return nil, err
-	}
-	return &servelease.Keeper{Client: client, Lease: lease, Interval: 5 * time.Second}, nil
-}
-
-func readOwnerOnlyJSON(path string, target any) error {
-	data, err := readOwnerOnlyFile(path, 16<<10)
-	if err != nil {
-		return err
-	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	if decoder.Decode(target) != nil || decoder.Decode(&struct{}{}) != io.EOF {
-		return servelease.ErrInvalid
-	}
-	return nil
-}
-
 func readOwnerOnlyFile(path string, limit int64) ([]byte, error) {
 	info, err := os.Lstat(path)
 	if err != nil || !ownerOnlyRegularFile(path, info) {
-		return nil, errors.Join(servelease.ErrInvalid, err)
+		return nil, errors.Join(errors.New("invalid owner-only file"), err)
 	}
 	file, err := os.Open(path)
 	if err != nil {
@@ -7203,393 +6273,16 @@ func readOwnerOnlyFile(path string, limit int64) ([]byte, error) {
 	defer file.Close()
 	opened, err := file.Stat()
 	if err != nil || !os.SameFile(info, opened) || !ownerOnlyRegularFile(path, opened) {
-		return nil, errors.Join(servelease.ErrInvalid, err)
+		return nil, errors.Join(errors.New("invalid owner-only file"), err)
 	}
 	data, err := io.ReadAll(io.LimitReader(file, limit+1))
 	if err != nil {
 		return nil, err
 	}
 	if int64(len(data)) > limit {
-		return nil, servelease.ErrInvalid
+		return nil, errors.New("invalid owner-only file")
 	}
 	return data, nil
-}
-
-func validateLocalServeCapability(command *cobra.Command, registration identity.Registration) error {
-	client, err := backendForCommand(command)
-	if err != nil {
-		return err
-	}
-	machines, err := client.ListUserMachines(command.Context())
-	if err != nil {
-		return friendlyCommandError(err)
-	}
-	for _, machine := range machines {
-		if machine.ID != registration.MachineID {
-			continue
-		}
-		if !machine.Capabilities.PreviewLaunch.Configured {
-			return &api.APIError{Code: "machine_capability_unavailable", Message: "This device is not configured to launch previews. Run `pb setup --mode client` or `pb pair`."}
-		}
-		if !machine.Online || !machine.Capabilities.PreviewLaunch.Observed {
-			return &api.APIError{Code: "machine_offline", Message: "This device's preview runtime is offline. Run `pb doctor`, then retry."}
-		}
-		return nil
-	}
-	return &api.APIError{Code: "machine_offline", Message: "This device is not registered with the active Paperboat account. Run `pb setup`, then retry."}
-}
-
-func selectServeSource(command *cobra.Command) (servepkg.Source, bool, error) {
-	root, err := os.Getwd()
-	if err != nil {
-		return servepkg.Source{}, false, err
-	}
-	const parentID = "\x00serve-parent"
-	for {
-		sources, discoverErr := servepkg.DiscoverSources(command.Context(), root, servepkg.DefaultDiscoveryLimit, 1)
-		if discoverErr != nil {
-			return servepkg.Source{}, false, discoverErr
-		}
-		items := make([]selector.Item, 0, len(sources)+1)
-		byPath := make(map[string]servepkg.Source, len(sources))
-		parent := filepath.Dir(root)
-		if parent != root {
-			items = append(items, selector.Item{ID: parentID, Title: ".. (parent directory)", Description: "Open directory", Search: "parent up"})
-		}
-		for index, source := range sources {
-			title := filepath.Base(source.Path)
-			description := string(source.Kind)
-			if index == 0 {
-				title = ". (serve this directory)"
-			} else if source.Kind == servepkg.SourceDirectory {
-				description = "directory  ·  open"
-			}
-			items = append(items, selector.Item{ID: source.Path, Title: title, Description: description, Search: source.Path + " " + title})
-			byPath[source.Path] = source
-		}
-		var dropped servepkg.Source
-		choice, chooseErr := selector.Choose(selector.Options{
-			Title: "Serve a file or directory", Subtitle: "This device  ·  " + root,
-			Items: items, Empty: "No files or directories are available", Footer: "type to filter  enter select/open  esc cancel",
-			Stdin: os.Stdin, Output: command.ErrOrStderr(), InputSelection: func(value string) (selector.Item, bool) {
-				source, ok := servepkg.ParseDroppedFile(value)
-				if !ok {
-					return selector.Item{}, false
-				}
-				dropped = source
-				return selector.Item{ID: source.Path, Title: filepath.Base(source.Path)}, true
-			},
-		})
-		if chooseErr != nil {
-			return servepkg.Source{}, false, chooseErr
-		}
-		if dropped.Path != "" && choice.ID == dropped.Path {
-			return dropped, true, dropped.Revalidate()
-		}
-		if choice.ID == parentID {
-			root = parent
-			continue
-		}
-		selected, ok := byPath[choice.ID]
-		if !ok {
-			return servepkg.Source{}, false, errors.New("selected serve source is no longer available")
-		}
-		if selected.Kind == servepkg.SourceDirectory && selected.Path != root {
-			root = selected.Path
-			continue
-		}
-		if err := selected.Revalidate(); err != nil {
-			return servepkg.Source{}, false, err
-		}
-		return selected, false, nil
-	}
-}
-
-func normalizeServeName(explicit, fallback string) string {
-	value := strings.ToLower(strings.TrimSpace(explicit))
-	if value == "" {
-		value = strings.ToLower(strings.TrimSpace(fallback))
-	}
-	var result strings.Builder
-	lastSeparator := false
-	for _, character := range value {
-		valid := character >= 'a' && character <= 'z' || character >= '0' && character <= '9' || character == '_' || character == '-'
-		if valid {
-			if result.Len() < 128 {
-				result.WriteRune(character)
-			}
-			lastSeparator = character == '-' || character == '_'
-		} else if result.Len() > 0 && !lastSeparator {
-			result.WriteByte('-')
-			lastSeparator = true
-		}
-	}
-	return strings.Trim(result.String(), "-_")
-}
-
-func previewCreateCommand(c *command.Context) error {
-	name := strings.TrimSpace(c.String("name"))
-	port := c.Uint("port")
-	if c.Args().Len() == 1 {
-		parsed, err := strconv.ParseUint(c.Args().First(), 10, 16)
-		if err != nil || parsed == 0 || port != 0 {
-			return invocationError(errors.New("preview create accepts one target port, either positionally or through --port"))
-		}
-		port = uint(parsed)
-	}
-	duration := c.Duration("duration")
-	indefinite := c.Bool("indefinite")
-	if port < 1 || port > 65535 {
-		return invocationError(errors.New("preview create requires a target port"))
-	}
-	if name == "" {
-		name = fmt.Sprintf("port-%d", port)
-	}
-	if indefinite && c.Bool("duration-set") || !indefinite && (duration < time.Second || duration > 365*24*time.Hour) {
-		return invocationError(errors.New("use a positive --duration up to 365 days, or --indefinite"))
-	}
-	if !c.Bool("public") {
-		return previewCreatePrivate(c, name, uint16(port), duration, indefinite)
-	}
-	requestedMachine := strings.TrimSpace(c.String("machine"))
-	if requestedMachine != "" {
-		client, err := backendClient(c)
-		if err != nil {
-			return err
-		}
-		machines, err := client.ListUserMachines(c.Context)
-		if err != nil {
-			return err
-		}
-		var matches []api.UserMachine
-		for _, machine := range machines {
-			if machine.ID == requestedMachine || machine.DisplayName == requestedMachine {
-				matches = append(matches, machine)
-			}
-		}
-		if len(matches) == 0 {
-			return errors.New("selected paired machine was not found")
-		}
-		if len(matches) > 1 {
-			return errors.New("machine name is ambiguous; use the machine ID")
-		}
-		if !matches[0].Capabilities.PreviewLaunch.Configured {
-			return &api.APIError{Code: "machine_capability_unavailable", Message: "This machine is not configured to launch previews."}
-		}
-		if !matches[0].Online || !matches[0].Capabilities.PreviewLaunch.Observed {
-			return &api.APIError{Code: "machine_offline", Message: "The selected machine is offline."}
-		}
-		descriptor, err := client.MachinePreviewLaunchDescriptor(c.Context, matches[0].ID)
-		if err != nil {
-			return err
-		}
-		launchCtx, cancel := context.WithTimeout(c.Context, 35*time.Second)
-		defer cancel()
-		record, err := api.LaunchMachinePreview(launchCtx, descriptor, api.PreviewLaunchRequest{OperationID: newIdempotencyKey(), Name: name, Port: uint16(port), DurationSeconds: int64(duration / time.Second), Indefinite: indefinite}, nil)
-		if err != nil {
-			var launchErr *api.PreviewLaunchError
-			if errors.As(err, &launchErr) {
-				if c.Bool("json") {
-					if encodeErr := json.NewEncoder(c.Writer).Encode(map[string]any{"schema_version": "1.0", "ok": false, "error": launchErr}); encodeErr != nil {
-						return encodeErr
-					}
-					return exitCodeError{code: 1}
-				}
-				return fmt.Errorf("%s Recovery: %s", launchErr.Message, launchErr.Recovery)
-			}
-			return err
-		}
-		if c.Bool("json") {
-			return json.NewEncoder(c.Writer).Encode(map[string]any{"schema_version": "1.0", "ok": true, "data": record})
-		}
-		fmt.Fprintf(c.Writer, "%s\nPublic preview: anyone with this URL can access it.\n", record.URL)
-		return nil
-	}
-	stateRoot := os.Getenv("PAPERBOAT_RUNTIME_STATE_ROOT")
-	var err error
-	if stateRoot == "" {
-		stateRoot, err = helperconfig.DefaultStateRoot(os.Getenv)
-		if err != nil {
-			return err
-		}
-	}
-	registrationStore, err := identity.Open(identity.Config{StateRoot: stateRoot})
-	if err != nil {
-		return err
-	}
-	if _, err := registrationStore.Registration(); err != nil {
-		return errors.New("run `pb setup` before creating a preview")
-	}
-	executable, err := os.Executable()
-	if err != nil {
-		return err
-	}
-	executable, err = filepath.EvalSymlinks(executable)
-	if err != nil {
-		return err
-	}
-	var expiresAt *time.Time
-	if !indefinite {
-		value := time.Now().UTC().Add(duration)
-		expiresAt = &value
-	}
-	if err := hostruntimeentry.InstallPreviewService(c.Context, executable, stateRoot, name, uint16(port), expiresAt, indefinite); err != nil {
-		return err
-	}
-	readyCtx, cancel := context.WithTimeout(c.Context, 25*time.Second)
-	defer cancel()
-	record, err := hostruntimeentry.WaitPreviewServiceReady(readyCtx, stateRoot, name)
-	if err != nil {
-		cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), 10*time.Second)
-		cleanupErr := hostruntimeentry.RemovePreviewService(cleanupCtx, stateRoot, name)
-		cancelCleanup()
-		return errors.Join(fmt.Errorf("public preview readiness failed: %w", err), cleanupErr)
-	}
-	if c.Bool("json") {
-		return json.NewEncoder(c.Writer).Encode(map[string]any{"schema_version": "1.0", "ok": true, "data": record})
-	}
-	fmt.Fprintf(c.Writer, "%s\nPublic preview: anyone with this URL can access it.\n", record.URL)
-	return nil
-}
-
-func previewCreatePrivate(c *command.Context, name string, targetPort uint16, duration time.Duration, indefinite bool) error {
-	client, err := backendClient(c)
-	if err != nil {
-		return err
-	}
-	machines, err := client.ListUserMachines(c.Context)
-	if err != nil {
-		return friendlyCommandError(err)
-	}
-	requested := strings.TrimSpace(c.String("machine"))
-	eligible := make([]api.UserMachine, 0, len(machines))
-	for _, machine := range machines {
-		if !machine.Capabilities.PreviewLaunch.Configured || !machine.Capabilities.PreviewLaunch.Observed || !machine.Online || machine.EnvironmentID == "" || machine.InstallationGeneration < 1 {
-			continue
-		}
-		if requested == "" || machine.ID == requested || strings.EqualFold(machine.DisplayName, requested) {
-			eligible = append(eligible, machine)
-		}
-	}
-	if len(eligible) == 0 {
-		return &api.APIError{Code: "private_preview_unavailable", Message: "No matching online paired machine is ready for private previews."}
-	}
-	if len(eligible) > 1 {
-		return invocationError(errors.New("multiple paired machines are eligible; pass --machine with the stable machine ID"))
-	}
-	machine := eligible[0]
-	if c.Bool("detach") {
-		stateRoot := strings.TrimSpace(os.Getenv("PAPERBOAT_RUNTIME_STATE_ROOT"))
-		if stateRoot == "" {
-			stateRoot, err = helperconfig.DefaultStateRoot(os.Getenv)
-			if err != nil {
-				return err
-			}
-		}
-		executable, err := os.Executable()
-		if err != nil {
-			return err
-		}
-		executable, err = filepath.EvalSymlinks(executable)
-		if err != nil {
-			return err
-		}
-		var expiresAt *time.Time
-		if !indefinite {
-			value := time.Now().UTC().Add(duration)
-			expiresAt = &value
-		}
-		remote := hostruntimeentry.PrivatePreviewRuntimeDescriptor{MachineID: machine.ID, MachineName: machine.DisplayName, EnvironmentID: machine.EnvironmentID, MachineGeneration: uint64(machine.InstallationGeneration), TargetPort: targetPort, ListenPort: uint16(c.Uint("listen-port"))}
-		policyVersion := buildinfo.Version
-		if policyVersion == "" {
-			policyVersion = "development"
-		}
-		runtimePolicy, err := helperconfig.FromEnv(policyVersion, os.Getenv)
-		if err != nil {
-			return err
-		}
-		if err := hostruntimeentry.InstallPrivatePreviewService(c.Context, executable, stateRoot, name, remote, expiresAt, indefinite, runtimePolicy.Resources.MaxPreviewTargets); err != nil {
-			return err
-		}
-		readyCtx, cancelReady := context.WithTimeout(c.Context, 30*time.Second)
-		defer cancelReady()
-		record, err := hostruntimeentry.WaitPreviewServiceReady(readyCtx, stateRoot, name)
-		if err != nil {
-			cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), 10*time.Second)
-			cleanupErr := hostruntimeentry.RemovePreviewService(cleanupCtx, stateRoot, name)
-			cancelCleanup()
-			return errors.Join(errors.New("private preview readiness failed; detached service was stopped"), err, cleanupErr)
-		}
-		if c.Bool("json") {
-			return json.NewEncoder(c.Writer).Encode(map[string]any{"schema_version": "1.0", "ok": true, "data": map[string]any{"name": name, "machine_id": machine.ID, "target_port": targetPort, "url": record.URL, "visibility": "private", "listener": "loopback", "execution": "detached", "expires_at": expiresAt}})
-		}
-		fmt.Fprintf(c.Writer, "%s\nPrivate preview: available only on this device.\n", record.URL)
-		return nil
-	}
-	dependencies, err := buildDeps(c)
-	if err != nil {
-		return err
-	}
-	if dependencies.peerApplications == nil {
-		return errors.New("private peer transport is unavailable")
-	}
-	proxyCtx := c.Context
-	var cancel context.CancelFunc
-	if !indefinite {
-		proxyCtx, cancel = context.WithTimeout(proxyCtx, duration)
-		defer cancel()
-	}
-	proxy, err := privatepreviewproxy.Start(proxyCtx, privatepreviewproxy.Config{ListenPort: uint16(c.Uint("listen-port")), Dial: func(ctx context.Context) (io.ReadWriteCloser, error) {
-		target, targetErr := privatePreviewPeerTarget(ctx, client, machine.ID, machine.DisplayName, machine.EnvironmentID, uint64(machine.InstallationGeneration))
-		if targetErr != nil {
-			return nil, targetErr
-		}
-		return dependencies.peerApplications.DialPrivatePreview(ctx, target, targetPort)
-	}})
-	if err != nil {
-		return err
-	}
-	defer proxy.Close()
-	var expiresAt *time.Time
-	if !indefinite {
-		value := time.Now().UTC().Add(duration)
-		expiresAt = &value
-	}
-	if c.Bool("json") {
-		if err := json.NewEncoder(c.Writer).Encode(map[string]any{"schema_version": "1.0", "ok": true, "data": map[string]any{"name": name, "machine_id": machine.ID, "target_port": targetPort, "url": proxy.URL, "visibility": "private", "listener": "loopback", "execution": "foreground", "expires_at": expiresAt}}); err != nil {
-			return err
-		}
-	} else {
-		fmt.Fprintf(c.Writer, "%s\nPrivate preview: available only on this device.\n", proxy.URL)
-	}
-	return proxy.Wait()
-}
-
-func privatePreviewPeerTarget(ctx context.Context, client *api.Client, machineID, machineName, environmentID string, generation uint64) (resolver.ConnectInfo, error) {
-	if client == nil || machineID == "" || environmentID == "" || generation == 0 {
-		return resolver.ConnectInfo{}, errors.New("private preview target is invalid")
-	}
-	descriptor, err := client.MachinePreviewLaunchDescriptor(ctx, machineID)
-	if err != nil {
-		return resolver.ConnectInfo{}, err
-	}
-	return resolver.ConnectInfo{
-		TargetKind:        "machine",
-		ProjectID:         machineID,
-		Project:           machineName,
-		MachineGeneration: generation,
-		Transport:         string(tunnel.TerminalTransportDirect),
-		Terminal: &resolver.TerminalTarget{
-			Protocol:      "paperboat.private-preview.v1",
-			EnvironmentID: environmentID,
-			Auth: resolver.AuthTarget{
-				Method:    descriptor.Auth.Method,
-				Token:     descriptor.Auth.Token,
-				ExpiresAt: descriptor.Auth.ExpiresAt.Format(time.RFC3339Nano),
-				Scopes:    descriptor.Auth.Scopes,
-			},
-		},
-	}, nil
 }
 
 func inboxCommand() *command.Spec {
@@ -7691,336 +6384,6 @@ func setInboxPath(c *command.Context, path string) error {
 		return json.NewEncoder(c.Writer).Encode(map[string]any{"schema_version": "1.0", "ok": true, "data": map[string]string{"path": path}})
 	}
 	fmt.Fprintln(c.Writer, path)
-	return nil
-}
-
-var reconcileExpiredPreviewServicesForList = hostruntimeentry.ReconcileExpiredPreviewServices
-
-const previewListCleanupWarning = "Warning: local preview cleanup could not run; server previews are still listed, but local entries may include expired services.\n"
-
-func previewListCommand(c *command.Context) error {
-	if stateRoot := previewRuntimeStateRoot(); stateRoot != "" {
-		if err := reconcileExpiredPreviewServicesForList(c.Context, stateRoot, time.Now().UTC()); err != nil && c.ErrWriter != nil {
-			_, _ = io.WriteString(c.ErrWriter, previewListCleanupWarning)
-		}
-	}
-	privateItems := listLocalPrivateServes()
-	client, err := backendClient(c)
-	if err != nil {
-		if len(privateItems) == 0 {
-			return err
-		}
-		return writePreviewList(c, nil, privateItems)
-	}
-	items, err := client.ListPreviews(c.Context)
-	if err != nil {
-		if len(privateItems) == 0 {
-			return friendlyCommandError(err)
-		}
-		return writePreviewList(c, nil, privateItems)
-	}
-	items = enrichLocalServeSources(items)
-	return writePreviewList(c, items, privateItems)
-}
-
-type localPrivateServe struct {
-	Name       string     `json:"name"`
-	URL        string     `json:"url"`
-	SourcePath string     `json:"source_path"`
-	SourceKind string     `json:"source_kind"`
-	Machine    string     `json:"machine,omitempty"`
-	State      string     `json:"state"`
-	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
-}
-
-func writePreviewList(c *command.Context, items []api.Preview, privateItems []localPrivateServe) error {
-	if c.Bool("json") {
-		return json.NewEncoder(c.Writer).Encode(map[string]any{"schema_version": "1.0", "ok": true, "data": map[string]any{"previews": items, "private_serves": privateItems}})
-	}
-	w := tabwriter.NewWriter(c.Writer, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "NAME\tVISIBILITY\tENVIRONMENT\tTYPE\tSOURCE\tOWNER\tPATH\tSTATE\tEXPIRES\tURL")
-	for _, item := range privateItems {
-		expires := "indefinite"
-		if item.ExpiresAt != nil {
-			expires = relativeTime(item.ExpiresAt)
-		}
-		environment := "this device"
-		if item.Machine != "" {
-			environment = item.Machine
-		}
-		fmt.Fprintf(w, "%s\tprivate\t%s\tlocal\t%s\tdetached\t%s\t%s\t%s\t%s\n", item.Name, environment, item.SourceKind, item.SourcePath, item.State, expires, item.URL)
-	}
-	for _, item := range items {
-		expires := "indefinite"
-		if item.ExpiresAt != nil {
-			expires = relativeTime(item.ExpiresAt)
-		}
-		fmt.Fprintf(w, "%s\tpublic\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", item.LogicalName, item.EnvironmentName, item.EnvironmentKind, item.SourceKind, item.OwnerMode, item.SourcePath, item.State, expires, item.URL)
-	}
-	return w.Flush()
-}
-
-func listLocalPrivateServes() []localPrivateServe {
-	stateRoot := previewRuntimeStateRoot()
-	if stateRoot == "" {
-		return nil
-	}
-	entries, err := os.ReadDir(filepath.Join(stateRoot, "previews", "active"))
-	if err != nil {
-		return nil
-	}
-	items := make([]localPrivateServe, 0)
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
-			continue
-		}
-		data, err := readOwnerOnlyFile(filepath.Join(stateRoot, "previews", "active", entry.Name()), 1<<20)
-		if err != nil {
-			continue
-		}
-		descriptor, decodeErr := hostruntime.DecodePreviewRuntimeDescriptor(data)
-		if decodeErr != nil || descriptor.BindAddress != "127.0.0.1" || descriptor.ServiceGeneration == 0 || descriptor.Record == nil || !strings.HasPrefix(descriptor.Record.URL, "http://127.0.0.1:") {
-			continue
-		}
-		item := localPrivateServe{Name: descriptor.Name, URL: descriptor.Record.URL, State: descriptor.Record.State, ExpiresAt: descriptor.ExpiresAt}
-		if descriptor.Serve != nil && descriptor.PrivateRemote == nil && descriptor.Serve.Visibility == "private" && descriptor.Serve.OwnerMode == "detached" && filepath.IsAbs(descriptor.Serve.SourcePath) {
-			item.SourcePath, item.SourceKind = descriptor.Serve.SourcePath, string(descriptor.Serve.SourceKind)
-		} else if descriptor.PrivateRemote != nil && descriptor.Serve == nil && descriptor.PrivateRemote.MachineID != "" && descriptor.PrivateRemote.MachineName != "" && descriptor.PrivateRemote.EnvironmentID != "" && descriptor.PrivateRemote.MachineGeneration > 0 && descriptor.PrivateRemote.TargetPort > 0 {
-			item.SourcePath, item.SourceKind, item.Machine = fmt.Sprintf("127.0.0.1:%d", descriptor.PrivateRemote.TargetPort), "remote-port", descriptor.PrivateRemote.MachineName
-		} else {
-			continue
-		}
-		items = append(items, item)
-	}
-	sort.Slice(items, func(i, j int) bool { return items[i].Name < items[j].Name })
-	return items
-}
-
-func previewRuntimeStateRoot() string {
-	stateRoot := strings.TrimSpace(os.Getenv("PAPERBOAT_RUNTIME_STATE_ROOT"))
-	if stateRoot != "" {
-		return stateRoot
-	}
-	stateRoot, err := helperconfig.DefaultStateRoot(os.Getenv)
-	if err != nil {
-		return ""
-	}
-	return stateRoot
-}
-
-func enrichLocalServeSources(items []api.Preview) []api.Preview {
-	stateRoot := strings.TrimSpace(os.Getenv("PAPERBOAT_RUNTIME_STATE_ROOT"))
-	if stateRoot == "" {
-		var err error
-		stateRoot, err = helperconfig.DefaultStateRoot(os.Getenv)
-		if err != nil {
-			return items
-		}
-	}
-	directory, err := os.Open(filepath.Join(stateRoot, "previews", "active"))
-	if err != nil {
-		return items
-	}
-	defer directory.Close()
-	entries, err := directory.ReadDir(-1)
-	if err != nil {
-		return items
-	}
-	paths := make(map[string]string)
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
-			continue
-		}
-		path := filepath.Join(stateRoot, "previews", "active", entry.Name())
-		info, statErr := os.Lstat(path)
-		if statErr != nil || !ownerOnlyRegularFile(path, info) {
-			continue
-		}
-		file, openErr := os.Open(path)
-		if openErr != nil {
-			continue
-		}
-		openedInfo, openedStatErr := file.Stat()
-		if openedStatErr != nil || !ownerOnlyRegularFile(path, openedInfo) || !os.SameFile(info, openedInfo) {
-			file.Close()
-			continue
-		}
-		var descriptor struct {
-			Schema string `json:"schema"`
-			Record *struct {
-				ID string `json:"id"`
-			} `json:"record"`
-			Serve *struct {
-				SourcePath string `json:"source_path"`
-			} `json:"serve"`
-		}
-		decoder := json.NewDecoder(io.LimitReader(file, 1<<20))
-		decodeErr := decoder.Decode(&descriptor)
-		if decodeErr == nil {
-			var trailing any
-			if trailingErr := decoder.Decode(&trailing); trailingErr != io.EOF {
-				decodeErr = errors.New("preview descriptor contains trailing data")
-			}
-		}
-		closeErr := file.Close()
-		if decodeErr != nil || closeErr != nil || descriptor.Schema != "paperboat.preview-runtime/v1" || descriptor.Record == nil || descriptor.Record.ID == "" || descriptor.Serve == nil || !filepath.IsAbs(descriptor.Serve.SourcePath) {
-			continue
-		}
-		paths[descriptor.Record.ID] = filepath.Clean(descriptor.Serve.SourcePath)
-	}
-	for index := range items {
-		if path := paths[items[index].ID]; path != "" && (items[index].SourceKind == "file" || items[index].SourceKind == "directory") {
-			items[index].SourcePath = path
-		}
-	}
-	return items
-}
-
-func previewRemoveCommand(c *command.Context) error {
-	if c.Args().Len() > 1 {
-		return errors.New("usage: pb preview revoke [preview-id] --yes")
-	}
-	previewID := c.Args().First()
-	for _, local := range listLocalPrivateServes() {
-		if previewID != local.Name {
-			continue
-		}
-		if !c.Bool("yes") {
-			confirmed, confirmErr := confirmAction(fmt.Sprintf("Stop private serve %q?", local.Name))
-			if confirmErr != nil {
-				return confirmErr
-			}
-			if !confirmed {
-				return errors.New("preview revocation canceled")
-			}
-		}
-		stateRoot := strings.TrimSpace(os.Getenv("PAPERBOAT_RUNTIME_STATE_ROOT"))
-		if stateRoot == "" {
-			var err error
-			stateRoot, err = helperconfig.DefaultStateRoot(os.Getenv)
-			if err != nil {
-				return err
-			}
-		}
-		if err := hostruntimeentry.RemovePreviewService(c.Context, stateRoot, local.Name); err != nil {
-			return err
-		}
-		if c.Bool("json") {
-			return json.NewEncoder(c.Writer).Encode(map[string]any{"schema_version": "1.0", "ok": true, "data": map[string]any{"name": local.Name, "state": "removed", "visibility": "private"}})
-		}
-		fmt.Fprintf(c.Writer, "Stopped private serve %s.\n", local.Name)
-		return nil
-	}
-	client, err := backendClient(c)
-	if err != nil {
-		return err
-	}
-	items, err := client.ListPreviews(c.Context)
-	if err != nil {
-		return friendlyCommandError(err)
-	}
-	var selected api.Preview
-	if previewID == "" {
-		choices := make([]selector.Item, 0, len(items))
-		byID := make(map[string]api.Preview, len(items))
-		for _, item := range items {
-			expiry := "indefinite"
-			if item.ExpiresAt != nil {
-				expiry = "expires " + relativeTime(item.ExpiresAt)
-			}
-			description := fmt.Sprintf("%s  ·  %s  ·  :%d  ·  %s", item.EnvironmentName, item.State, item.TargetPort, expiry)
-			choices = append(choices, selector.Item{ID: item.ID, Title: item.LogicalName, Description: description, Search: item.EnvironmentKind + " " + item.URL})
-			byID[item.ID] = item
-		}
-		choice, selectErr := selector.Choose(selector.Options{Title: "Choose a preview to revoke", Subtitle: "Public preview URLs", Items: choices, Empty: "no previews are available", Stdin: os.Stdin, Output: os.Stderr})
-		if selectErr != nil {
-			if errors.Is(selectErr, selector.ErrCanceled) {
-				return errors.New("preview selection canceled")
-			}
-			return selectErr
-		}
-		selected, previewID = byID[choice.ID], choice.ID
-	} else {
-		for _, item := range items {
-			if item.ID == previewID {
-				selected = item
-				break
-			}
-		}
-	}
-	if selected.ID == "" {
-		return friendlyCommandError(fmt.Errorf("preview %q was not found", previewID))
-	}
-	fmt.Fprintf(c.ErrWriter, "Preview: %s (%s, %s)\n", selected.LogicalName, selected.EnvironmentName, selected.EnvironmentKind)
-	fmt.Fprintf(c.ErrWriter, "Project: %s  Resource: %s  User: %s\n", selected.ProjectID, selected.ResourceID, selected.UserID)
-	if !c.Bool("yes") {
-		action := "Revoke public preview"
-		if selected.SourceKind == "file" || selected.SourceKind == "directory" {
-			action = "Stop serving"
-		}
-		confirmed, confirmErr := confirmAction(fmt.Sprintf("%s %q?", action, selected.LogicalName))
-		if confirmErr != nil {
-			return confirmErr
-		}
-		if !confirmed {
-			return errors.New("preview revocation canceled")
-		}
-	}
-	item, err := client.RemovePreview(c.Context, previewID, newIdempotencyKey())
-	if err != nil {
-		return friendlyCommandError(err)
-	}
-	if c.Bool("json") {
-		return json.NewEncoder(c.Writer).Encode(map[string]any{"schema_version": "1.0", "ok": true, "data": map[string]any{"preview_id": item.ID, "state": item.State}})
-	}
-	if selected.SourceKind == "file" || selected.SourceKind == "directory" {
-		fmt.Fprintf(c.Writer, "Stopped serving %s.\n", item.LogicalName)
-	} else {
-		fmt.Fprintf(c.Writer, "Removed preview %s.\n", item.LogicalName)
-	}
-	return nil
-}
-
-func previewRevokeAllCommand(c *command.Context) error {
-	client, err := backendClient(c)
-	if err != nil {
-		return err
-	}
-	target, err := resolveEnvironmentTarget(c.Context, client, c.Args().First())
-	if err != nil {
-		return err
-	}
-	items, err := client.ListPreviews(c.Context)
-	if err != nil {
-		return friendlyCommandError(err)
-	}
-	selected := make([]api.Preview, 0, len(items))
-	for _, item := range items {
-		if item.EnvironmentID == target.id || item.ProjectID == target.id || item.ResourceID == target.id || strings.EqualFold(item.EnvironmentName, target.name) {
-			selected = append(selected, item)
-		}
-	}
-	fmt.Fprintf(c.ErrWriter, "Environment: %s (%s)\n", target.name, target.id)
-	fmt.Fprintf(c.ErrWriter, "Active previews to revoke: %d\n", len(selected))
-	if !c.Bool("yes") {
-		return errors.New("preview revocation requires --yes")
-	}
-	revoked := 0
-	var revokeErrors []error
-	for _, item := range selected {
-		if _, err := client.RemovePreview(c.Context, item.ID, newIdempotencyKey()); err != nil {
-			revokeErrors = append(revokeErrors, fmt.Errorf("revoke preview %s: %w", item.LogicalName, err))
-			continue
-		}
-		revoked++
-	}
-	if len(revokeErrors) > 0 {
-		return fmt.Errorf("revoked %d of %d previews in %s; remote state changed: %w", revoked, len(selected), target.name, errors.Join(revokeErrors...))
-	}
-	if c.Bool("json") {
-		return json.NewEncoder(c.Writer).Encode(map[string]any{"schema_version": "1.0", "ok": true, "data": map[string]any{"environment_id": target.id, "environment_name": target.name, "revoked": revoked}})
-	}
-	fmt.Fprintf(c.Writer, "Revoked %d previews in %s.\n", revoked, target.name)
 	return nil
 }
 
@@ -11316,42 +9679,29 @@ func doctorProxyDiagnosis(err error) (proxyDoctorDiagnosis, bool) {
 }
 
 type localDoctorReport struct {
-	StateRoot               string   `json:"state_root,omitempty"`
-	SetupState              string   `json:"setup_state"`
-	MachineID               string   `json:"machine_id,omitempty"`
-	EnvironmentID           string   `json:"environment_id,omitempty"`
-	InstallationGeneration  int64    `json:"installation_generation,omitempty"`
-	SetupRoles              []string `json:"setup_roles,omitempty"`
-	SetupMode               string   `json:"setup_mode,omitempty"`
-	IdentityState           string   `json:"identity_state"`
-	CredentialState         string   `json:"machine_control_credential"`
-	InboxPath               string   `json:"inbox_path,omitempty"`
-	InboxState              string   `json:"inbox_state"`
-	ConfigService           string   `json:"config_service"`
-	HostRuntime             string   `json:"host_runtime"`
-	ActivePreviews          int      `json:"active_previews"`
-	ExpiredPreviews         int      `json:"expired_previews"`
-	InvalidPreviews         int      `json:"invalid_previews"`
-	ServedPreviews          int      `json:"served_previews"`
-	ActiveServedPreviews    int      `json:"active_served_previews"`
-	InvalidServeSources     int      `json:"invalid_serve_sources"`
-	ActiveServeListeners    int      `json:"active_serve_listeners"`
-	MissingServeListeners   int      `json:"missing_serve_listeners"`
-	ServeLeaseAuthority     string   `json:"serve_lease_authority"`
-	RuntimeForegroundServes uint64   `json:"runtime_foreground_serves"`
-	RuntimeDetachedServes   uint64   `json:"runtime_detached_serves"`
-	RemoteServedPreviews    int      `json:"remote_served_previews"`
-	RouteReadiness          string   `json:"route_readiness"`
-	ActiveSessions          uint64   `json:"active_sessions"`
-	ActiveProcesses         uint64   `json:"active_processes"`
-	ActiveAttachments       uint64   `json:"active_attachments"`
-	ActiveTransfers         uint64   `json:"active_transfers"`
-	WorkloadCounts          string   `json:"workload_counts_state"`
-	RecoveryActions         []string `json:"recovery_actions,omitempty"`
+	StateRoot              string   `json:"state_root,omitempty"`
+	SetupState             string   `json:"setup_state"`
+	MachineID              string   `json:"machine_id,omitempty"`
+	EnvironmentID          string   `json:"environment_id,omitempty"`
+	InstallationGeneration int64    `json:"installation_generation,omitempty"`
+	SetupRoles             []string `json:"setup_roles,omitempty"`
+	SetupMode              string   `json:"setup_mode,omitempty"`
+	IdentityState          string   `json:"identity_state"`
+	CredentialState        string   `json:"machine_control_credential"`
+	InboxPath              string   `json:"inbox_path,omitempty"`
+	InboxState             string   `json:"inbox_state"`
+	ConfigService          string   `json:"config_service"`
+	HostRuntime            string   `json:"host_runtime"`
+	ActiveSessions         uint64   `json:"active_sessions"`
+	ActiveProcesses        uint64   `json:"active_processes"`
+	ActiveAttachments      uint64   `json:"active_attachments"`
+	ActiveTransfers        uint64   `json:"active_transfers"`
+	WorkloadCounts         string   `json:"workload_counts_state"`
+	RecoveryActions        []string `json:"recovery_actions,omitempty"`
 }
 
 func collectLocalDoctor() localDoctorReport {
-	report := localDoctorReport{SetupState: "not_set_up", IdentityState: "missing", CredentialState: "missing", InboxState: "unconfigured", ConfigService: "not_installed", HostRuntime: "not_paired", WorkloadCounts: "unavailable", ServeLeaseAuthority: "unavailable", RouteReadiness: "unavailable"}
+	report := localDoctorReport{SetupState: "not_set_up", IdentityState: "missing", CredentialState: "missing", InboxState: "unconfigured", ConfigService: "not_installed", HostRuntime: "not_paired", WorkloadCounts: "unavailable"}
 	stateRoot := strings.TrimSpace(os.Getenv("PAPERBOAT_RUNTIME_STATE_ROOT"))
 	if stateRoot == "" {
 		root, err := helperconfig.DefaultStateRoot(os.Getenv)
@@ -11426,10 +9776,6 @@ func collectLocalDoctor() localDoctorReport {
 		}
 	}
 	inspectLocalRuntimeHealth(&report, stateRoot)
-	inspectLocalPreviewDescriptors(&report, filepath.Join(stateRoot, "previews", "active"), time.Now().UTC())
-	if report.RuntimeDetachedServes != uint64(report.ActiveServedPreviews) {
-		report.RecoveryActions = append(report.RecoveryActions, "restart the local runtime to reconcile detached serve workload inventory")
-	}
 	return report
 }
 
@@ -11501,122 +9847,6 @@ func inspectLocalRuntimeHealth(report *localDoctorReport, stateRoot string) {
 	report.ActiveProcesses = health.Workloads["processes"]
 	report.ActiveAttachments = health.Workloads["attachments"]
 	report.ActiveTransfers = health.Workloads["transfers"]
-	report.RuntimeForegroundServes = health.Workloads["serves_foreground"]
-	report.RuntimeDetachedServes = health.Workloads["serves_detached"]
-	inspectServeLeaseAuthority(report, stateRoot, local.ListenAddress, client)
-}
-
-func inspectServeLeaseAuthority(report *localDoctorReport, stateRoot, listenAddress string, client *http.Client) {
-	token, err := readOwnerOnlyFile(filepath.Join(stateRoot, "runtime", "local-control-token"), 1024)
-	if err != nil {
-		report.ServeLeaseAuthority = "invalid_or_missing"
-		report.RecoveryActions = append(report.RecoveryActions, "restart the local runtime to restore foreground serve lease authority")
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	request, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+listenAddress+"/v1/serve-leases", nil)
-	request.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(token)))
-	response, err := client.Do(request)
-	if err != nil {
-		report.ServeLeaseAuthority = "unavailable"
-		return
-	}
-	defer response.Body.Close()
-	var status struct {
-		Schema string `json:"schema_version"`
-	}
-	if response.StatusCode != http.StatusOK || json.NewDecoder(io.LimitReader(response.Body, 4096)).Decode(&status) != nil || status.Schema != servelease.ProtocolVersion {
-		report.ServeLeaseAuthority = "protocol_incompatible"
-		report.RecoveryActions = append(report.RecoveryActions, "upgrade and restart the local runtime before using foreground serve")
-		return
-	}
-	report.ServeLeaseAuthority = "ready"
-}
-
-func inspectLocalPreviewDescriptors(report *localDoctorReport, directory string, now time.Time) {
-	entries, err := os.ReadDir(directory)
-	if errors.Is(err, os.ErrNotExist) {
-		return
-	}
-	if err != nil {
-		report.InvalidPreviews++
-		report.RecoveryActions = append(report.RecoveryActions, "repair ownership of the active preview directory")
-		return
-	}
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
-			continue
-		}
-		file, err := os.Open(filepath.Join(directory, entry.Name()))
-		if err != nil {
-			report.InvalidPreviews++
-			continue
-		}
-		data, readErr := io.ReadAll(io.LimitReader(file, (64<<10)+1))
-		closeErr := file.Close()
-		descriptor, decodeErr := hostruntime.DecodePreviewRuntimeDescriptor(data)
-		validPreview := descriptor.Serve == nil && descriptor.PrivateRemote == nil && descriptor.Port != 0
-		validRemote := descriptor.Serve == nil && descriptor.PrivateRemote != nil
-		validServe := descriptor.Serve != nil
-		if readErr != nil || closeErr != nil || len(data) > 64<<10 || decodeErr != nil || !validPreview && !validServe && !validRemote {
-			report.InvalidPreviews++
-			continue
-		}
-		if validServe {
-			report.ServedPreviews++
-			if _, sourceErr := servepkg.ResolvePinnedSource(descriptor.Serve.SourcePath, descriptor.Serve.SourceKind, descriptor.Serve.SourceIdentity); sourceErr != nil {
-				report.InvalidServeSources++
-			}
-			if descriptor.Port != 0 && (descriptor.ExpiresAt == nil || descriptor.ExpiresAt.After(now)) {
-				connection, dialErr := net.DialTimeout("tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(descriptor.Port))), 200*time.Millisecond)
-				if connection != nil {
-					connection.Close()
-				}
-				if dialErr == nil {
-					report.ActiveServeListeners++
-				} else {
-					report.MissingServeListeners++
-				}
-			}
-		}
-		if descriptor.ExpiresAt != nil && !descriptor.ExpiresAt.After(now) {
-			report.ExpiredPreviews++
-		} else {
-			report.ActivePreviews++
-			if validServe {
-				report.ActiveServedPreviews++
-			}
-		}
-	}
-	if report.ExpiredPreviews > 0 || report.InvalidPreviews > 0 || report.InvalidServeSources > 0 || report.MissingServeListeners > 0 {
-		report.RecoveryActions = append(report.RecoveryActions, "restart the paired host runtime or recreate affected previews to reconcile descriptors")
-	}
-}
-
-func compareLocalServedPreviewRoutes(report *localDoctorReport, previews []api.Preview) {
-	ready := 0
-	for _, item := range previews {
-		served := item.SourceKind == "file" || item.SourceKind == "directory"
-		if item.ResourceID != report.MachineID || !served || item.State == "removed" || item.State == "expired" {
-			continue
-		}
-		report.RemoteServedPreviews++
-		if item.State == "ready" {
-			ready++
-		}
-	}
-	local := report.ActiveServedPreviews + int(report.RuntimeForegroundServes)
-	switch {
-	case report.RemoteServedPreviews != local:
-		report.RouteReadiness = "workload_route_drift"
-		report.RecoveryActions = append(report.RecoveryActions, "revoke orphan served previews and restart the local runtime to reconcile workload and route state")
-	case ready != report.RemoteServedPreviews:
-		report.RouteReadiness = "not_ready"
-		report.RecoveryActions = append(report.RecoveryActions, "inspect served preview readiness and connector health before retrying")
-	default:
-		report.RouteReadiness = "ready"
-	}
 }
 
 func doctorUserMachine(ctx context.Context, client *api.Client, machineID string) (api.UserMachine, error) {

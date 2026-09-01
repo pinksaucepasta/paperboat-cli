@@ -9,7 +9,6 @@ REPEAT="${REPEAT:-5}"
 TEST_TIMEOUT="${TEST_TIMEOUT:-45}"
 SCRIPT_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 TERMINAL_READY="${GATE8_TERMINAL_READY:-$SCRIPT_ROOT/gate8-terminal-ready.py}"
-PREVIEW_WS="${GATE8_PREVIEW_WS:-$SCRIPT_ROOT/gate8-preview-ws}"
 TRANSITION_RUNNER="${GATE8_TRANSITION_RUNNER:-$SCRIPT_ROOT/gate8-transitions.sh}"
 case "$RESULT_ROOT" in
   "$HOME"/*) ;;
@@ -26,10 +25,6 @@ RESULTS="$RESULT_ROOT/results.jsonl"
 : >"$RESULT_ROOT/assertions.jsonl"
 exec 9>>"$RESULTS"
 exec 8>>"$RESULT_ROOT/assertions.jsonl"
-
-json_string() {
-  jq -Rn --arg value "$1" '$value'
-}
 
 run_case() {
   local category="$1" transport="$2" name="$3"
@@ -94,169 +89,16 @@ assert_case() {
   flock -u 8
 }
 
-preview_instance() {
-  printf '%s' "$1" | sha256sum | cut -c1-16
-}
-
-preview_cleanup_detail() {
-  local name="$1" listen_port="${2:-}" instance unit definition link descriptor detail=""
-  instance="$(preview_instance "$name")"
-  unit="paperboat-preview-$instance.service"
-  definition="$HOME/.config/systemd/user/$unit"
-  link="$HOME/.config/systemd/user/default.target.wants/$unit"
-  descriptor="$HOME/.local/state/paperboat/runtime/previews/active/$instance.json"
-  for path in "$definition" "$link" "$descriptor"; do
-    if test -e "$path" || test -L "$path"; then
-      detail="$detail path=$path"
-    fi
-  done
-  if systemctl --user list-unit-files "$unit" --no-legend --no-pager 2>/dev/null | grep -Fq "$unit"; then
-    detail="$detail unit_file=$unit"
-  fi
-  if systemctl --user list-units --all "$unit" --no-legend --no-pager 2>/dev/null | grep -Fq "$unit"; then
-    detail="$detail loaded_unit=$unit"
-  fi
-  if test -n "$listen_port" && ss -ltnp | grep -q ":$listen_port "; then
-    detail="$detail listener=$listen_port"
-  fi
-  if pgrep -af "$instance|$name" 2>/dev/null | grep -v -E 'pgrep -af|gate8-e2e' >/dev/null; then
-    detail="$detail process=$instance"
-  fi
-  printf '%s' "$detail"
-}
-
-assert_preview_cleanup() {
-  local id="$1" name="$2" listen_port="${3:-}" deadline=$((SECONDS + 30)) detail
-  while ((SECONDS < deadline)); do
-    detail="$(preview_cleanup_detail "$name" "$listen_port")"
-    test -n "$detail" || break
-    sleep 0.2
-  done
-  assert_case "$id" artifact-cleanup "$(test -z "$detail" && echo true || echo false)" "${detail:-exact}"
-}
-
-wait_preview_absent() {
-  local name="$1" deadline=$((SECONDS + 30))
-  while ((SECONDS < deadline)); do
-    if pb preview list --json 2>/dev/null | jq -e --arg name "$name" \
-      '([.data.previews[], .data.private_serves[]] | map(select(.name == $name)) | length) == 0' >/dev/null; then
-      return 0
-    fi
-    sleep 0.2
-  done
-  return 1
-}
-
 snapshot() {
   local name="$1"
   pb status --json >"$RESULT_ROOT/status-$name.json" 2>"$RESULT_ROOT/status-$name.stderr" || true
   ps -ef >"$RESULT_ROOT/processes-$name.txt"
 }
 
-selected_path() {
-  local value
-  value="$(pb status "$TARGET" --json 2>/dev/null | jq -r '.machines[0].selected_path // "none"')"
-  test "$value" = direct && value=direct_quic
-  test "$value" = relay && value=relay_quic
-  printf '%s\n' "$value"
-}
-
-wait_path() {
-  local expected="$1" deadline=$((SECONDS + 30)) value
-  while ((SECONDS < deadline)); do
-    value="$(selected_path)"
-    test "$value" = relay && value=relay_quic
-    case ",$expected," in
-      *",$value,"*) printf '%s\n' "$value"; return 0 ;;
-    esac
-    sleep 0.2
-  done
-  value="$(selected_path)"
-  test "$value" = relay && value=relay_quic
-  printf '%s\n' "$value"
-  return 1
-}
-
-record_path_until_stopped() {
-  local destination="$1" stop_file="$2" value previous=""
-  while ! test -e "$stop_file"; do
-    value="$(selected_path)"
-    if test "$value" != "$previous"; then
-      printf '%s\t%s\n' "$(date +%s%3N)" "$value" >>"$destination"
-      previous="$value"
-    fi
-    sleep 0.1
-  done
-}
-
-transition_case() {
-  local mode="$1" id="$2" output history stop_file
-	output="$RESULT_ROOT/cases/transition-$id.output"
-  history="$RESULT_ROOT/cases/transition-$id.paths"
-  stop_file="$RESULT_ROOT/cases/transition-$id.stop"
-  rm -f "$stop_file"
-  sudo /usr/local/sbin/paperboat-gate8-network allow-udp
-  pb exec "$TARGET" --transport "$mode" -- sh -c 'i=0; while test "$i" -lt 900; do printf "%s\n" "$i"; i=$((i+1)); sleep 0.2; done' >"$output" 2>"$RESULT_ROOT/cases/transition-$id.stderr" &
-  local client_pid=$!
-  record_path_until_stopped "$history" "$stop_file" &
-  local observer_pid=$!
-  local initial relay_only blocked relay_restored restored blocked_again relay_restored_again restored_again
-  initial="$(wait_path direct_quic,relay_quic,wss || true)"
-  if test "$mode" = a; then
-    sudo /usr/local/sbin/paperboat-gate8-network relay-only-udp
-    relay_only="$(wait_path relay_quic || true)"
-  else
-    relay_only="$initial"
-  fi
-  sudo /usr/local/sbin/paperboat-gate8-network block-udp
-  blocked="$(wait_path wss || true)"
-  sudo /usr/local/sbin/paperboat-gate8-network relay-only-udp
-  relay_restored="$(wait_path relay_quic || true)"
-  if test "$mode" = a; then
-    sudo /usr/local/sbin/paperboat-gate8-network allow-udp
-    restored="$(wait_path direct_quic || true)"
-  else
-    restored="$relay_restored"
-  fi
-
-  sudo /usr/local/sbin/paperboat-gate8-network block-udp
-  blocked_again="$(wait_path wss || true)"
-  sudo /usr/local/sbin/paperboat-gate8-network relay-only-udp
-  relay_restored_again="$(wait_path relay_quic || true)"
-  if test "$mode" = a; then
-    sudo /usr/local/sbin/paperboat-gate8-network allow-udp
-    restored_again="$(wait_path direct_quic || true)"
-  else
-    restored_again="$relay_restored_again"
-  fi
-	sudo /usr/local/sbin/paperboat-gate8-network allow-udp
-  kill -TERM "$client_pid" 2>/dev/null || true
-  wait "$client_pid" 2>/dev/null || true
-  touch "$stop_file"
-  wait "$observer_pid" 2>/dev/null || true
-  local path_sequence=false
-  if test "$blocked" = wss && test "$relay_restored" = relay_quic && test "$blocked_again" = wss && test "$relay_restored_again" = relay_quic; then
-    if test "$mode" = a && test "$relay_only" = relay_quic && test "$restored" = direct_quic && test "$restored_again" = direct_quic; then
-      path_sequence=true
-    elif test "$mode" = r && test "$restored" = relay_quic && test "$restored_again" = relay_quic; then
-      path_sequence=true
-    fi
-  fi
-  assert_case "transition-$id" path-sequence "$path_sequence" \
-    "initial=$initial relay_only=$relay_only blocked=$blocked relay_restored=$relay_restored restored=$restored blocked_again=$blocked_again relay_restored_again=$relay_restored_again restored_again=$restored_again"
-  assert_case "transition-$id" continuous-output \
-    "$(awk 'NR==1{p=$1;next}{if($1!=p+1)exit 1;p=$1}END{if(NR<3)exit 1}' "$output" && echo true || echo false)" \
-    "lines=$(wc -l <"$output")"
-}
-
-snapshot before
 cleanup_network() {
-  local pid identity
-  for pid in "${forward_pid:-}" "${occupied_pid:-}"; do
+  local pid
+  for pid in "${forward_pid:-}"; do
     test -z "$pid" || kill -TERM "$pid" 2>/dev/null || true
-  done
-  for identity in "${private_preview_name:-}" "${restart_preview_name:-}" "${occupied_name:-}" "${private_name:-}" "${public_id:-}" "${expiry_name:-}" "${source_name:-}"; do
-    test -z "$identity" || pb preview revoke "$identity" --yes --json >/dev/null 2>&1 || true
   done
   sudo /usr/local/sbin/paperboat-gate8-network allow-udp >/dev/null 2>&1 || true
 }
@@ -267,9 +109,9 @@ for required in pb jq timeout flock script ssh scp sftp rsync git curl sudo pyth
   command -v "$required" >/dev/null || { printf 'missing required command: %s\n' "$required" >&2; exit 2; }
 done
 test -r "$TERMINAL_READY" || { printf 'missing terminal fixture: %s\n' "$TERMINAL_READY" >&2; exit 2; }
-test -x "$PREVIEW_WS" || { printf 'missing WebSocket fixture: %s\n' "$PREVIEW_WS" >&2; exit 2; }
 test -x "$TRANSITION_RUNNER" || { printf 'missing transition runner: %s\n' "$TRANSITION_RUNNER" >&2; exit 2; }
 sudo -n /usr/local/sbin/paperboat-gate8-network allow-udp
+snapshot before
 
 # Installed artifact and service preflight. Expected hashes are supplied by
 # the matched build/deploy step; an unset value is an acceptance failure.
@@ -446,153 +288,6 @@ done
 kill -TERM "$forward_pid" 2>/dev/null || true
 wait "$forward_pid" 2>/dev/null || true
 assert_case forward-auto-local reachable "$forward_ready" exact
-
-# Private machine preview: browser-to-loopback HTTP/1.1, direct-only remote
-# HTTP/3. The target fixture runs on Hetzner at 127.0.0.1:38142.
-private_preview_name="g8-machine-private-$(date +%s)"
-private_listen=39195
-run_case preview private create pb preview create --machine "$TARGET" --port 38142 --listen-port "$private_listen" --detach --duration 15m --name "$private_preview_name" --json
-machine_private_name="$(jq -r '.data.name // empty' "$RESULT_ROOT/cases/preview-private-create.stdout")"
-machine_private_url="$(jq -r '.data.url // empty' "$RESULT_ROOT/cases/preview-private-create.stdout")"
-assert_case preview-private-create identity "$(test "$machine_private_name" = "$private_preview_name" -a "$machine_private_url" = "http://127.0.0.1:$private_listen" && echo true || echo false)" "name=$machine_private_name url=$machine_private_url"
-run_case preview private http curl --fail --silent --show-error --max-time 30 "http://127.0.0.1:$private_listen/http"
-assert_case preview-private-http exact-body "$(test "$(cat "$RESULT_ROOT/cases/preview-private-http.stdout")" = preview-http-ok && echo true || echo false)" exact
-run_case preview private sse curl --no-buffer --fail --silent --show-error --max-time 30 "http://127.0.0.1:$private_listen/sse"
-assert_case preview-private-sse events "$(grep -q 'data: one' "$RESULT_ROOT/cases/preview-private-sse.stdout" && grep -q 'data: two' "$RESULT_ROOT/cases/preview-private-sse.stdout" && echo true || echo false)" exact
-run_case preview private websocket "$PREVIEW_WS" "ws://127.0.0.1:$private_listen/ws" gate8-ws
-assert_case preview-private-websocket exact-echo "$(test "$(cat "$RESULT_ROOT/cases/preview-private-websocket.stdout")" = echo:gate8-ws && echo true || echo false)" exact
-dd if=/dev/urandom of="$RESULT_ROOT/payload/preview-stream.bin" bs=1048576 count=8 status=none
-run_case preview private stream curl --fail --silent --show-error --max-time 45 --data-binary "@$RESULT_ROOT/payload/preview-stream.bin" "http://127.0.0.1:$private_listen/stream"
-assert_case preview-private-stream sha256 "$(test "$(sha256sum "$RESULT_ROOT/payload/preview-stream.bin" | cut -d' ' -f1)" = "$(sha256sum "$RESULT_ROOT/cases/preview-private-stream.stdout" | cut -d' ' -f1)" && echo true || echo false)" exact
-for run in 1 2 3 4; do run_case preview_concurrent private "$run" curl --fail --silent --show-error --max-time 30 "http://127.0.0.1:$private_listen/http" & done
-wait
-sudo /usr/local/sbin/paperboat-gate8-network block-udp
-EXPECTED_EXIT=nonzero run_case preview private direct-loss curl --fail --silent --show-error --max-time 5 "http://127.0.0.1:$private_listen/http"
-sudo /usr/local/sbin/paperboat-gate8-network allow-udp
-private_recovered=false
-private_recovery_deadline=$((SECONDS + 60))
-while ((SECONDS < private_recovery_deadline)); do
-  private_recovery_remaining=$((private_recovery_deadline - SECONDS))
-  private_recovery_attempt_timeout=5
-  if ((private_recovery_remaining < private_recovery_attempt_timeout)); then
-    private_recovery_attempt_timeout="$private_recovery_remaining"
-  fi
-  if curl --fail --silent --max-time "$private_recovery_attempt_timeout" "http://127.0.0.1:$private_listen/http" | grep -q preview-http-ok; then
-    private_recovered=true
-    break
-  fi
-  sleep 0.5
-done
-assert_case preview-private-recovery restored "$private_recovered" exact
-run_case preview private revoke pb preview revoke "$machine_private_name" --yes --json
-assert_case preview-private-listener removed "$( ! ss -ltn | grep -q ":$private_listen " && echo true || echo false)" exact
-assert_preview_cleanup preview-private-revoke "$private_preview_name" "$private_listen"
-
-# Detached machine previews survive daemon restart and report worker failures
-# without waiting for the command timeout.
-restart_preview_name="g8-machine-restart-$(date +%s%N)"
-restart_listen=39196
-run_case preview_restart private create pb preview create --machine "$TARGET" --port 38142 --listen-port "$restart_listen" --detach --duration 5m --name "$restart_preview_name" --json
-systemctl --user restart paperboat-local-daemon.service
-restart_ready=false
-restart_deadline=$((SECONDS + 30))
-restart_run=0
-while ((SECONDS < restart_deadline)); do
-  restart_run=$((restart_run + 1))
-  restart_code="$(curl --silent --output "$RESULT_ROOT/cases/preview-restart-body-$restart_run" --write-out '%{http_code}' --max-time 3 "http://127.0.0.1:$restart_listen/http" 2>"$RESULT_ROOT/cases/preview-restart-error-$restart_run" || true)"
-  restart_body="$(cat "$RESULT_ROOT/cases/preview-restart-body-$restart_run" 2>/dev/null || true)"
-  printf '%s run=%d code=%s body=%s error=%s\n' "$(date -u +%FT%T.%3NZ)" "$restart_run" "$restart_code" "$restart_body" "$(tr '\n' ' ' <"$RESULT_ROOT/cases/preview-restart-error-$restart_run")" >>"$RESULT_ROOT/cases/preview-restart.timeline"
-  if test "$restart_code" = 200 && test "$restart_body" = preview-http-ok; then
-    restart_ready=true
-    break
-  fi
-  sleep 0.5
-done
-assert_case preview-restart-private-fetch exact-body "$restart_ready" "$(tail -1 "$RESULT_ROOT/cases/preview-restart.timeline")"
-run_case preview_restart private revoke pb preview revoke "$restart_preview_name" --yes --json
-assert_preview_cleanup preview-restart-private-revoke "$restart_preview_name" "$restart_listen"
-
-occupied_listen=39197
-python3 -m http.server "$occupied_listen" --bind 127.0.0.1 >"$RESULT_ROOT/cases/preview-occupied-server.stdout" 2>"$RESULT_ROOT/cases/preview-occupied-server.stderr" &
-occupied_pid=$!
-sleep 0.2
-occupied_ready="$(kill -0 "$occupied_pid" 2>/dev/null && ss -ltn | grep -q ":$occupied_listen " && echo true || echo false)"
-assert_case preview-failure-fixture occupied "$occupied_ready" "port=$occupied_listen"
-occupied_name="g8-machine-occupied-$(date +%s%N)"
-EXPECTED_EXIT=nonzero run_case preview_failure private occupied-port pb preview create --machine "$TARGET" --port 38142 --listen-port "$occupied_listen" --detach --duration 5m --name "$occupied_name" --json
-kill -TERM "$occupied_pid" 2>/dev/null || true
-wait "$occupied_pid" 2>/dev/null || true
-assert_case preview-failure-private-occupied-port immediate \
-  "$(jq -e 'select(.id=="preview_failure-private-occupied-port") | .elapsed_ms < 10000' "$RESULTS" >/dev/null && echo true || echo false)" exact
-assert_case preview-failure-private-occupied-port diagnostic \
-  "$(grep -Eqi 'address already in use|bind|listen' "$RESULT_ROOT/cases/preview_failure-private-occupied-port.stderr" && echo true || echo false)" exact
-assert_preview_cleanup preview-failure-private-occupied "$occupied_name" "$occupied_listen"
-
-# Local private serve and public serve lifecycle. Public is verified over H3,
-# then with UDP blocked so the typed relay HTTP/2 fallback is mandatory.
-mkdir -p "$RESULT_ROOT/site"
-printf '<!doctype html><title>gate8</title><h1>gate8-preview</h1>\n' >"$RESULT_ROOT/site/index.html"
-private_name="g8-private-$(date +%s)"
-public_name="g8-public-$(date +%s)"
-run_case serve private create pb serve "$RESULT_ROOT/site" --detach --duration 15m --name "$private_name" --json
-run_case serve public create pb serve "$RESULT_ROOT/site" --public --detach --duration 15m --name "$public_name" --json
-run_case preview none list pb preview list --json
-run_case previews none list pb previews --json
-private_identity="$(jq -r '.data.name // empty' "$RESULT_ROOT/cases/serve-private-create.stdout" 2>/dev/null)"
-public_id="$(jq -r '..|.preview_id? // .id? // empty' "$RESULT_ROOT/cases/serve-public-create.stdout" 2>/dev/null | head -1 || true)"
-private_url="$(jq -r '..|.url? // empty' "$RESULT_ROOT/cases/serve-private-create.stdout" 2>/dev/null | head -1 || true)"
-public_url="$(jq -r '..|.url? // empty' "$RESULT_ROOT/cases/serve-public-create.stdout" 2>/dev/null | head -1 || true)"
-assert_case serve-private-create identity "$(test "$private_identity" = "$private_name" -a -n "$private_url" && echo true || echo false)" "name=$private_identity url=$private_url"
-assert_case serve-public-create identity "$(test -n "$public_id" -a -n "$public_url" && echo true || echo false)" "id=$public_id url=$public_url"
-systemctl --user restart paperboat-local-daemon.service
-sleep 2
-assert_case serve-restart daemon-active "$(systemctl --user is-active paperboat-local-daemon.service >/dev/null 2>&1 && echo true || echo false)" exact
-test -z "$private_url" || run_case preview private fetch curl --fail --silent --show-error --max-time 30 "$private_url"
-public_ready=false
-if test -n "$public_url"; then
-  for ready_run in $(seq 1 30); do
-    ready_code="$(curl --http3-only --silent --output "$RESULT_ROOT/cases/preview-public-ready-$ready_run.stdout" --write-out '%{http_code}' --max-time 5 "$public_url" 2>"$RESULT_ROOT/cases/preview-public-ready-$ready_run.stderr" || true)"
-    printf '%s run=%s http3=%s\n' "$(date -u +%FT%T.%3NZ)" "$ready_run" "$ready_code" >>"$RESULT_ROOT/cases/preview-public-readiness.timeline"
-    if test "$ready_code" = 200; then public_ready=true; break; fi
-    sleep 0.5
-  done
-fi
-assert_case preview-public-readiness reachable "$public_ready" "$(tail -1 "$RESULT_ROOT/cases/preview-public-readiness.timeline" 2>/dev/null || true)"
-test -z "$public_url" || run_case preview public h3 curl --http3-only --fail --silent --show-error --max-time 30 "$public_url"
-sudo /usr/local/sbin/paperboat-gate8-network block-udp
-test -z "$public_url" || run_case preview public h2 curl --http2 --fail --silent --show-error --max-time 30 "$public_url"
-sudo /usr/local/sbin/paperboat-gate8-network allow-udp
-test -z "$private_identity" || run_case preview private revoke pb preview revoke "$private_identity" --yes --json
-test -z "$public_id" || run_case preview public revoke pb preview revoke "$public_id" --yes --json
-test -z "$private_identity" || assert_preview_cleanup serve-private-revoke "$private_identity"
-test -z "$public_name" || assert_preview_cleanup serve-public-revoke "$public_name"
-
-# Expiry and source replacement must retire detached services without an
-# explicit revoke and without leaving local runtime artifacts.
-printf 'gate8-expiry\n' >"$RESULT_ROOT/site-expiry.txt"
-expiry_name="g8-expiry-$(date +%s%N)"
-run_case serve_expiry private create pb serve "$RESULT_ROOT/site-expiry.txt" --detach --duration 3s --name "$expiry_name" --json
-expiry_url="$(jq -r '.data.url // empty' "$RESULT_ROOT/cases/serve_expiry-private-create.stdout")"
-test -z "$expiry_url" || run_case serve_expiry private fetch curl --fail --silent --show-error --max-time 10 "$expiry_url"
-sleep 4
-run_case serve_expiry none reconcile pb preview list --json
-assert_case serve-expiry absent "$(wait_preview_absent "$expiry_name" && echo true || echo false)" exact
-assert_preview_cleanup serve-expiry-cleanup "$expiry_name"
-
-printf 'gate8-source-a\n' >"$RESULT_ROOT/site-source.txt"
-source_name="g8-source-$(date +%s%N)"
-run_case serve_source private create pb serve "$RESULT_ROOT/site-source.txt" --detach --duration 5m --name "$source_name" --json
-printf 'gate8-source-b\n' >"$RESULT_ROOT/site-source.replacement"
-mv "$RESULT_ROOT/site-source.replacement" "$RESULT_ROOT/site-source.txt"
-systemctl --user restart "paperboat-preview-$(preview_instance "$source_name").service" >/dev/null 2>&1 || true
-run_case serve_source none reconcile pb preview list --json
-assert_case serve-source absent "$(wait_preview_absent "$source_name" && echo true || echo false)" exact
-sleep 1
-assert_preview_cleanup serve-source-cleanup "$source_name"
-run_case preview none final-list pb preview list --json
-assert_case preview-final-list empty "$(jq -e '(.data.previews | length) == 0 and (.data.private_serves | length) == 0' "$RESULT_ROOT/cases/preview-none-final-list.stdout" >/dev/null 2>&1 && echo true || echo false)" exact
-preview_artifact_count="$({ find "$HOME/.config/systemd/user" -maxdepth 1 -type f -name 'paperboat-preview-*.service' -print 2>/dev/null; find "$HOME/.config/systemd/user/default.target.wants" -maxdepth 1 -type l -name 'paperboat-preview-*.service' -print 2>/dev/null; find "$HOME/.local/state/paperboat/runtime/previews/active" -maxdepth 1 -type f -name '*.json' -print 2>/dev/null; } | wc -l | awk '{print $1}')"
-assert_case preview-final-artifacts empty "$(test "$preview_artifact_count" = 0 && echo true || echo false)" "count=$preview_artifact_count"
 
 # Diagnostics and support artifacts.
 run_case diagnostics none bugreport pb bugreport --record --json </dev/null

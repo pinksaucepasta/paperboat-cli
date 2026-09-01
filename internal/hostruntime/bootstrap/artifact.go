@@ -49,22 +49,6 @@ type ArtifactTarget struct {
 	TargetPath    string `json:"target_path"`
 }
 
-type tufTargetCustom struct {
-	Schema       string `json:"schema"`
-	Kind         string `json:"kind"`
-	Version      string `json:"version"`
-	Platform     string `json:"platform"`
-	Architecture string `json:"architecture"`
-}
-
-type tufReleaseIndexCustom struct {
-	Schema       string `json:"schema"`
-	Kind         string `json:"kind"`
-	Channel      string `json:"channel"`
-	Platform     string `json:"platform"`
-	Architecture string `json:"architecture"`
-}
-
 // tufAssetCustom is the signed contract published for every release asset.
 // The release policy is embedded in the asset target metadata so bootstrap and
 // the updater have one TUF target to verify and download. There is no separate
@@ -492,5 +476,5 @@ func transientArtifactTransportError(ctx context.Context, err error) bool {
 		return false
 	}
 	var networkError net.Error
-	return errors.As(err, &networkError) && (networkError.Timeout() || networkError.Temporary())
+	return errors.As(err, &networkError) && networkError.Timeout()
 }

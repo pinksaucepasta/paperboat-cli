@@ -70,13 +70,6 @@ func execute(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 		}
 		return 0
 	}
-	if args[0] == "preview" {
-		if err := runPreview(ctx, args[1:], stdout, stderr); err != nil {
-			writeError(stderr, err)
-			return 1
-		}
-		return 0
-	}
 	if args[0] == "run" {
 		if len(args) != 1 {
 			writeError(stderr, fmt.Errorf("run does not accept arguments"))
@@ -121,11 +114,7 @@ func execute(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 		return 0
 	}
 	if args[0] == "local-daemon-service" {
-		if err := runLocalDaemonService(ctx, args[1:], stdout, stderr); err != nil {
-			writeError(stderr, err)
-			return 1
-		}
-		return 0
+		return executeLocalDaemonService(ctx, args[1:], stdout, stderr)
 	}
 
 	err := fmt.Errorf("unknown command %q", args[0])

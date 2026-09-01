@@ -18,8 +18,8 @@ import (
 )
 
 func runServiceCommand(ctx context.Context, args []string, stdin io.Reader, _, _ io.Writer) error {
-	if len(args) != 1 || args[0] != "install" && args[0] != "commit" && args[0] != "uninstall" && args[0] != "uninstall-persisted" && args[0] != "purge" {
-		return errors.New("service requires install, commit, or uninstall")
+	if len(args) != 1 || args[0] != "install" && args[0] != "commit" && args[0] != "repair" && args[0] != "repair-persisted" && args[0] != "stop" && args[0] != "uninstall" && args[0] != "uninstall-persisted" && args[0] != "purge" {
+		return errors.New("service requires install, commit, repair, repair-persisted, stop, or uninstall")
 	}
 	if args[0] == "uninstall" && os.Geteuid() != 0 {
 		if _, err := os.Stat(systemWorkerExecutable()); errors.Is(err, os.ErrNotExist) {
@@ -38,6 +38,9 @@ func runServiceCommand(ctx context.Context, args []string, stdin io.Reader, _, _
 	if args[0] == "uninstall-persisted" {
 		return hostinstall.UninstallPersisted(ctx)
 	}
+	if args[0] == "repair-persisted" {
+		return hostinstall.RepairPersisted(ctx)
+	}
 	if args[0] == "purge" {
 		return purgeSystemInstallation(ctx)
 	}
@@ -50,6 +53,12 @@ func runServiceCommand(ctx context.Context, args []string, stdin io.Reader, _, _
 	}
 	if args[0] == "commit" {
 		return hostinstall.Commit(request)
+	}
+	if args[0] == "repair" {
+		return hostinstall.Repair(ctx, request)
+	}
+	if args[0] == "stop" {
+		return hostinstall.Stop(ctx, request)
 	}
 	return hostinstall.Install(ctx, request)
 }

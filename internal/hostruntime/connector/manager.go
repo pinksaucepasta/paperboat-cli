@@ -98,10 +98,11 @@ type Result struct {
 	DrainEscalated bool
 }
 type Status struct {
-	Connected  bool
-	Generation uint64
-	Transport  Transport
-	Stopping   bool
+	Connected         bool
+	Generation        uint64
+	NetworkGeneration uint64
+	Transport         Transport
+	Stopping          bool
 }
 type activeConnection struct {
 	generation uint64
@@ -110,15 +111,16 @@ type activeConnection struct {
 }
 
 type Manager struct {
-	opMu     sync.Mutex
-	mu       sync.RWMutex
-	config   Config
-	ctx      context.Context
-	cancel   context.CancelFunc
-	used     map[string]time.Time
-	active   *activeConnection
-	retired  map[*activeConnection]struct{}
-	stopping bool
+	opMu              sync.Mutex
+	mu                sync.RWMutex
+	config            Config
+	ctx               context.Context
+	cancel            context.CancelFunc
+	used              map[string]time.Time
+	active            *activeConnection
+	retired           map[*activeConnection]struct{}
+	stopping          bool
+	networkGeneration uint64
 }
 
 func New(config Config) (*Manager, error) {
@@ -244,13 +246,47 @@ func (m *Manager) dial(ctx context.Context, admission Admission) (Connection, Tr
 func (m *Manager) Status() Status {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	status := Status{Stopping: m.stopping}
+	status := Status{Stopping: m.stopping, NetworkGeneration: m.networkGeneration}
 	if m.active != nil {
 		status.Connected = true
 		status.Generation = m.active.generation
 		status.Transport = m.active.transport
 	}
 	return status
+}
+
+// NetworkChanged fences the active carrier for a newer network generation.
+// The logical connector identity is untouched; the supervisor will stage a
+// fresh admission and Manager.Accept will promote it after readiness. Clearing
+// active here prevents traffic from remaining bound to a dead route while the
+// replacement is in flight.
+func (m *Manager) NetworkChanged(generation uint64) bool {
+	if m == nil || generation == 0 {
+		return false
+	}
+	m.opMu.Lock()
+	m.mu.Lock()
+	if m.stopping || generation <= m.networkGeneration {
+		m.mu.Unlock()
+		m.opMu.Unlock()
+		return false
+	}
+	m.networkGeneration = generation
+	old := m.active
+	m.active = nil
+	if old != nil {
+		m.retired[old] = struct{}{}
+	}
+	m.mu.Unlock()
+	m.opMu.Unlock()
+	if old == nil {
+		return false
+	}
+	if err := old.connection.Retire(); err != nil {
+		_ = old.connection.Close()
+	}
+	go m.waitRetired(old)
+	return true
 }
 
 func (m *Manager) ResourceCounts() map[string]uint64 {

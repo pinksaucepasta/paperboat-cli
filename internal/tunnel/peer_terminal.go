@@ -82,9 +82,6 @@ type PeerTerminalTunnel struct {
 	pmtu                 *networkadaptation.PMTUCache
 	relayPMTU            *networkadaptation.AsyncPMTU
 	lifetime             *networkadaptation.LifetimeCache
-	lifetimeMu           sync.Mutex
-	lifetimeActive       map[networkadaptation.Fingerprint]bool
-	lifetimeLast         map[networkadaptation.Fingerprint]time.Time
 	networkCheckMu       sync.Mutex
 	networkChecks        map[networkadaptation.Fingerprint]networkcheck.STUNObservation
 	ipv6Mu               sync.RWMutex
@@ -143,7 +140,7 @@ func NewPeerTerminalTunnel(config PeerTerminalConfig) (*PeerTerminalTunnel, erro
 	if err != nil {
 		return nil, err
 	}
-	result := &PeerTerminalTunnel{config: config, pmtu: pmtu, relayPMTU: relayPMTU, lifetime: lifetime, lifetimeActive: make(map[networkadaptation.Fingerprint]bool), lifetimeLast: make(map[networkadaptation.Fingerprint]time.Time), networkChecks: make(map[networkadaptation.Fingerprint]networkcheck.STUNObservation), ipv6Viable: make(map[networkadaptation.Fingerprint]bool), ipv6Known: make(map[networkadaptation.Fingerprint]bool), ipv6Active: make(map[networkadaptation.Fingerprint]bool), regionalCache: networkcheck.NewRegionalCache(), authorities: clientauthority.NewCache(), signalingSubstrate: &signaling.SubstrateManager{}}
+	result := &PeerTerminalTunnel{config: config, pmtu: pmtu, relayPMTU: relayPMTU, lifetime: lifetime, networkChecks: make(map[networkadaptation.Fingerprint]networkcheck.STUNObservation), ipv6Viable: make(map[networkadaptation.Fingerprint]bool), ipv6Known: make(map[networkadaptation.Fingerprint]bool), ipv6Active: make(map[networkadaptation.Fingerprint]bool), regionalCache: networkcheck.NewRegionalCache(), authorities: clientauthority.NewCache(), signalingSubstrate: &signaling.SubstrateManager{}}
 	if _, err := rand.Read(result.operationSeed[:]); err != nil {
 		return nil, err
 	}
@@ -1249,7 +1246,6 @@ func (t *PeerTerminalTunnel) dial(ctx context.Context, info resolver.ConnectInfo
 				if err == nil {
 					lease.Release()
 					lease = retry.lease
-					leaseConnection = retry.connection
 					leasePath = retry.path
 					candidate = retryCandidate
 				} else {
@@ -1933,7 +1929,6 @@ type streamCoordinator struct {
 	desired          *terminalPathCandidate
 	prepared         *terminalPathCandidate
 	handle           resumablestream.CarrierHandle
-	recover          func(context.Context) (*terminalPathCandidate, error)
 	detached         time.Time
 	availability     <-chan connectionmanager.AvailabilitySnapshot
 	reconcileWake    chan struct{}
@@ -2069,20 +2064,6 @@ type terminalAttachment struct {
 	target      *resolver.TerminalTarget
 	application peerApplication
 	keyDelivery *peerTransferKeyDelivery
-}
-
-func (c *terminalPathCandidate) revoker(client *api.Client) func() error {
-	if c == nil || client == nil || c.intentID == "" || c.attempt == 0 {
-		return nil
-	}
-	intentID, attempt := c.intentID, c.attempt
-	digest := sha256.Sum256([]byte("peer-attempt-close\x00" + intentID))
-	operationID := "op_peer_revoke_" + hex.EncodeToString(digest[:16])
-	return func() error {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		return client.RevokePeerAttempt(ctx, operationID, intentID, attempt)
-	}
 }
 
 func newRelayTerminalPathCandidate(region string, health connectionmanager.ActiveHealthConnection, attach func(context.Context, terminalAttachment) (Conn, error)) (*terminalPathCandidate, error) {
@@ -2258,7 +2239,7 @@ func (c *terminalPathCandidate) trackStream(header streamauth.Header, stream *re
 	c.mu.Lock()
 	pool := c.pool
 	c.mu.Unlock()
-	coordinator := &streamCoordinator{ctx: ctx, cancel: cancel, stream: stream, header: header, current: c, recover: c.promote, committedEpoch: 1, reconcileWake: make(chan struct{}, 1)}
+	coordinator := &streamCoordinator{ctx: ctx, cancel: cancel, stream: stream, header: header, current: c, committedEpoch: 1, reconcileWake: make(chan struct{}, 1)}
 	if pool != nil {
 		coordinator.availability, coordinator.unsubscribe = pool.SubscribeAvailability(peerquic.ClassInteractive)
 	}
@@ -2272,10 +2253,6 @@ func (c *terminalPathCandidate) trackStream(header streamauth.Header, stream *re
 	if pool == nil {
 		coordinator.setDesiredRevision(standby, false, revision)
 	}
-}
-
-func (c *streamCoordinator) setDesired(source *terminalPathCandidate, promote bool) {
-	c.setDesiredRevision(source, promote, terminalPublicationRevision.Add(1))
 }
 
 func (c *streamCoordinator) setDesiredRevision(source *terminalPathCandidate, promote bool, revision uint64) {
@@ -2609,31 +2586,6 @@ func (c *streamCoordinator) clearFailedPrepared(event resumablestream.Event) {
 		c.handle = resumablestream.CarrierHandle{}
 	}
 	c.mu.Unlock()
-}
-
-func (c *streamCoordinator) recoverySource(ctx context.Context) *terminalPathCandidate {
-	c.mu.Lock()
-	source, recover := c.desired, c.recover
-	c.mu.Unlock()
-	if source != nil {
-		return source
-	}
-	if recover == nil {
-		return nil
-	}
-	value, err := recover(ctx)
-	if err != nil || value == nil {
-		return nil
-	}
-	value.retainSource()
-	c.mu.Lock()
-	old := c.desired
-	c.desired = value
-	c.mu.Unlock()
-	if old != nil {
-		old.releaseSource()
-	}
-	return value
 }
 
 func (c *streamCoordinator) commitSource(source *terminalPathCandidate) {
@@ -3028,25 +2980,6 @@ func (c *terminalRaceConnector) freshProbeDescriptor(ctx context.Context) (direc
 	return descriptor, authority, err
 }
 
-func (c *terminalRaceConnector) freshTransportDescriptor(ctx context.Context) (directpath.AttemptDescriptor, peersession.Authority, error) {
-	if c == nil || ctx == nil || c.descriptors == nil || c.owner == nil || c.clientAuthority == nil {
-		return directpath.AttemptDescriptor{}, peersession.Authority{}, ErrPeerTerminalInvalid
-	}
-	attempt, network := c.owner.attempt.Add(1), c.networkGeneration.Load()
-	if attempt == 0 || attempt > math.MaxInt64 || network == 0 || network > math.MaxInt64 {
-		return directpath.AttemptDescriptor{}, peersession.Authority{}, ErrPeerTerminalInvalid
-	}
-	descriptor, err := c.descriptors.Acquire(ctx, directpath.Generation{Attempt: attempt, Network: network})
-	if err != nil {
-		if errors.Is(err, directpath.ErrDescriptorUnavailable) {
-			err = &terminalTransportError{transport: "peer descriptor", cause: err}
-		}
-		return directpath.AttemptDescriptor{}, peersession.Authority{}, err
-	}
-	authority, err := peersession.New(peersession.Config{Descriptor: descriptor.Document, LocalCertificate: c.clientAuthority.LocalCertificate, PeerCertificate: c.clientAuthority.MachineCertificate, LocalNoisePrivate: c.clientAuthority.LocalKeys.NoisePrivate, Consumer: descriptor.Document.Consumer})
-	return descriptor, authority, err
-}
-
 func (c *terminalRaceConnector) freshRecoveryDescriptor(ctx context.Context, path connectionmanager.Path) (directpath.AttemptDescriptor, peersession.Authority, error) {
 	source := c.directRecovery
 	if path == connectionmanager.PathRelayQUIC {
@@ -3400,42 +3333,6 @@ func (p lifetimeProbeCandidate) Close() error {
 		return nil
 	}
 	return p.candidate.Close()
-}
-
-func (t *PeerTerminalTunnel) startLifetimeMeasurement(ctx context.Context, fingerprint networkadaptation.Fingerprint, dialer networkadaptation.QUICProbeDialer) {
-	if t == nil || ctx == nil || !fingerprint.Valid() || dialer == nil || t.lifetime == nil {
-		return
-	}
-	t.lifetimeMu.Lock()
-	last := t.lifetimeLast[fingerprint]
-	if t.lifetimeActive[fingerprint] || !last.IsZero() && t.config.Now().Sub(last) < networkadaptation.DevelopmentLifetimePolicy().EvidenceTTL {
-		t.lifetimeMu.Unlock()
-		return
-	}
-	t.lifetimeActive[fingerprint] = true
-	t.lifetimeMu.Unlock()
-	go func() {
-		defer func() {
-			t.lifetimeMu.Lock()
-			t.lifetimeActive[fingerprint] = false
-			t.lifetimeMu.Unlock()
-		}()
-		prober, err := networkadaptation.NewQUICLifetimeProber(dialer)
-		if err != nil {
-			return
-		}
-		measurer, err := networkadaptation.NewLifetimeMeasurer(networkadaptation.DevelopmentMeasurementPolicy(), t.lifetime, prober)
-		if err != nil {
-			return
-		}
-		measurement, measureErr := measurer.Measure(ctx, fingerprint)
-		if measureErr == nil {
-			t.lifetimeMu.Lock()
-			t.lifetimeLast[fingerprint] = t.config.Now()
-			t.lifetimeMu.Unlock()
-			t.recordMappingLifetime(fingerprint, networkcheck.MappingLifetimeBucket(measurement.LowerBound))
-		}
-	}()
 }
 
 func (c *terminalRaceConnector) DialProbe(ctx context.Context, attempt connectionmanager.ProbeAttempt) (connectionmanager.ProbeTransport, error) {

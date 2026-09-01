@@ -1,0 +1,211 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://paperboat.dev/contracts/telemetry-v1/schemas/health.schema.json",
+  "title": "Paperboat detailed health snapshot",
+  "description": "The internal, secret-safe health snapshot shared by Paperboat services and diagnostics.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "updated_at", "overall", "dimensions", "etag"],
+  "properties": {
+    "schema": { "const": "paperboat.health/v1" },
+    "updated_at": { "$ref": "#/definitions/utc_timestamp" },
+    "overall": { "$ref": "#/definitions/overall_health" },
+    "dimensions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "service",
+        "edge",
+        "config",
+        "route",
+        "origin",
+        "dns",
+        "certificate",
+        "access",
+        "update"
+      ],
+      "properties": {
+        "service": { "$ref": "#/definitions/dimension_health" },
+        "edge": { "$ref": "#/definitions/dimension_health" },
+        "config": { "$ref": "#/definitions/dimension_health" },
+        "route": { "$ref": "#/definitions/dimension_health" },
+        "origin": { "$ref": "#/definitions/dimension_health" },
+        "dns": { "$ref": "#/definitions/dimension_health" },
+        "certificate": { "$ref": "#/definitions/dimension_health" },
+        "access": { "$ref": "#/definitions/dimension_health" },
+        "update": { "$ref": "#/definitions/dimension_health" }
+      }
+    },
+    "etag": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "maxLength": 71
+    }
+  },
+  "definitions": {
+    "utc_timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "Z$",
+      "maxLength": 40
+    },
+    "dimension": {
+      "type": "string",
+      "enum": [
+        "service",
+        "edge",
+        "config",
+        "route",
+        "origin",
+        "dns",
+        "certificate",
+        "access",
+        "update"
+      ]
+    },
+    "status": {
+      "type": "string",
+      "enum": ["unknown", "ready", "degraded", "down", "not_applicable"]
+    },
+    "retry": {
+      "type": "string",
+      "enum": ["none", "scheduled", "wait_for_change", "not_retryable"]
+    },
+    "safe_text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[^\\x00-\\x1F\\x7F]*$",
+      "allOf": [
+        { "not": { "pattern": "(?i)[a-z][a-z0-9+.-]*://" } },
+        { "not": { "pattern": "(?i)[a-z0-9-]+\\.[a-z]{2,}" } },
+        { "not": { "pattern": "(?i)(bearer|basic)[[:space:]]+[a-z0-9._~+/=-]+" } },
+        { "not": { "pattern": "(?i)-----begin[^\\r\\n]*private key-----" } },
+        {
+          "not": {
+            "pattern": "(?i)(authorization|proxy-authorization|cookie|set-cookie|token|secret|password|private[_ -]?key|api[_ -]?key)[[:space:]]*[:=]"
+          }
+        }
+      ]
+    },
+    "safe_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$",
+      "allOf": [
+        { "not": { "pattern": "(?i)[a-z][a-z0-9+.-]*://" } },
+        { "not": { "pattern": "(?i)[a-z0-9-]+\\.[a-z]{2,}" } }
+      ]
+    },
+    "optional_safe_id": {
+      "type": "string",
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$",
+      "allOf": [
+        { "not": { "pattern": "(?i)[a-z][a-z0-9+.-]*://" } },
+        { "not": { "pattern": "(?i)[a-z0-9-]+\\.[a-z]{2,}" } }
+      ]
+    },
+    "stable_code": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9_]{0,63}$"
+    },
+    "dimension_health": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "code", "since", "summary", "repair_action", "retry"],
+      "properties": {
+        "status": { "$ref": "#/definitions/status" },
+        "code": { "$ref": "#/definitions/stable_code" },
+        "since": { "$ref": "#/definitions/utc_timestamp" },
+        "broken_since": { "$ref": "#/definitions/utc_timestamp" },
+        "summary": { "$ref": "#/definitions/safe_text" },
+        "repair_action": { "$ref": "#/definitions/safe_text" },
+        "correlation_id": { "$ref": "#/definitions/optional_safe_id" },
+        "retry": { "$ref": "#/definitions/retry" },
+        "next_retry_at": { "$ref": "#/definitions/utc_timestamp" },
+        "suppressed_by": { "$ref": "#/definitions/dimension" }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "status": { "enum": ["unknown", "ready", "not_applicable"] }
+          },
+          "not": { "required": ["broken_since"] }
+        },
+        {
+          "properties": {
+            "status": { "enum": ["degraded", "down"] }
+          },
+          "required": ["broken_since"]
+        }
+      ],
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "properties": {
+                "retry": { "enum": ["none", "wait_for_change", "not_retryable"] }
+              },
+              "not": { "required": ["next_retry_at"] }
+            },
+            {
+              "properties": { "retry": { "const": "scheduled" } },
+              "required": ["next_retry_at"]
+            }
+          ]
+        }
+      ]
+    },
+    "overall_health": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "code", "since", "summary", "repair_action", "retry"],
+      "properties": {
+        "status": { "$ref": "#/definitions/status" },
+        "code": { "$ref": "#/definitions/stable_code" },
+        "dimension": { "$ref": "#/definitions/dimension" },
+        "since": { "$ref": "#/definitions/utc_timestamp" },
+        "broken_since": { "$ref": "#/definitions/utc_timestamp" },
+        "summary": { "$ref": "#/definitions/safe_text" },
+        "repair_action": { "$ref": "#/definitions/safe_text" },
+        "correlation_id": { "$ref": "#/definitions/optional_safe_id" },
+        "retry": { "$ref": "#/definitions/retry" },
+        "next_retry_at": { "$ref": "#/definitions/utc_timestamp" }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "status": { "enum": ["unknown", "ready", "not_applicable"] }
+          },
+          "not": { "required": ["broken_since"] }
+        },
+        {
+          "properties": {
+            "status": { "enum": ["degraded", "down"] }
+          },
+          "required": ["broken_since"]
+        }
+      ],
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "properties": {
+                "retry": { "enum": ["none", "wait_for_change", "not_retryable"] }
+              },
+              "not": { "required": ["next_retry_at"] }
+            },
+            {
+              "properties": { "retry": { "const": "scheduled" } },
+              "required": ["next_retry_at"]
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

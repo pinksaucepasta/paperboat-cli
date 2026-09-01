@@ -131,7 +131,6 @@ func Negotiate(ctx context.Context, config NegotiationConfig) (*ice.Conn, error)
 					select {
 					case local = <-localDone:
 						localFinished = true
-						received++
 					case <-ctx.Done():
 						cancel()
 						return nil, errors.Join(ctx.Err(), closeTransport(), result.connection.Close(), config.Assembly.Close())
@@ -149,7 +148,6 @@ func Negotiate(ctx context.Context, config NegotiationConfig) (*ice.Conn, error)
 					select {
 					case remote = <-remoteDone:
 						remoteFinished = true
-						received++
 					case <-ctx.Done():
 						cancel()
 						return nil, errors.Join(ctx.Err(), closeTransport(), result.connection.Close(), config.Assembly.Close())

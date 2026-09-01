@@ -27,16 +27,18 @@ var (
 type Stage string
 
 const (
-	StageIdle             Stage = "idle"
-	StageChecking         Stage = "checking"
-	StageStaged           Stage = "staged"
-	StageCandidateStarted Stage = "candidate_started"
-	StageCandidateReady   Stage = "candidate_ready"
-	StageCutover          Stage = "cutover"
-	StageMonitoring       Stage = "monitoring"
-	StageCommitted        Stage = "committed"
-	StageRollback         Stage = "rollback"
-	StageBlocked          Stage = "blocked"
+	StageIdle                Stage = "idle"
+	StageChecking            Stage = "checking"
+	StageStaged              Stage = "staged"
+	StageCandidateStarted    Stage = "candidate_started"
+	StageCandidateValidating Stage = "candidate_validating"
+	StageCandidateReady      Stage = "candidate_ready"
+	StageDraining            Stage = "draining"
+	StageCutover             Stage = "cutover"
+	StageMonitoring          Stage = "monitoring"
+	StageCommitted           Stage = "committed"
+	StageRollback            Stage = "rollback"
+	StageBlocked             Stage = "blocked"
 )
 
 type Failure string
@@ -46,40 +48,43 @@ const (
 	FailureVerification         Failure = "verification_failed"
 	FailureCompatibility        Failure = "incompatible"
 	FailureCandidate            Failure = "candidate_failed"
+	FailureCanary               Failure = "canary_failed"
+	FailureDrain                Failure = "drain_failed"
 	FailureHealth               Failure = "health_failed"
 	FailureRollback             Failure = "rollback_failed"
 	FailureContradictoryJournal Failure = "recovery_required"
 )
 
 type Journal struct {
-	Schema              string    `json:"schema"`
-	TransactionID       string    `json:"transaction_id"`
-	Stage               Stage     `json:"stage"`
-	ActiveVersion       string    `json:"active_version"`
-	ActiveDigest        string    `json:"active_digest,omitempty"`
-	ActiveLength        int64     `json:"active_length,omitempty"`
-	ActiveHostdAPIMin   uint16    `json:"active_hostd_api_min,omitempty"`
-	ActiveHostdAPIMax   uint16    `json:"active_hostd_api_max,omitempty"`
-	ActiveRuntimeAPIMin uint16    `json:"active_runtime_api_min,omitempty"`
-	ActiveRuntimeAPIMax uint16    `json:"active_runtime_api_max,omitempty"`
-	RollbackVersion     string    `json:"rollback_version,omitempty"`
-	CandidateVersion    string    `json:"candidate_version,omitempty"`
-	CandidateDigest     string    `json:"candidate_digest,omitempty"`
-	CandidateLength     int64     `json:"candidate_length,omitempty"`
-	StagedPath          string    `json:"staged_path,omitempty"`
-	HostdAPIMin         uint16    `json:"hostd_api_min,omitempty"`
-	HostdAPIMax         uint16    `json:"hostd_api_max,omitempty"`
-	RuntimeAPIMin       uint16    `json:"runtime_api_min,omitempty"`
-	RuntimeAPIMax       uint16    `json:"runtime_api_max,omitempty"`
-	WorkerID            string    `json:"worker_id,omitempty"`
-	WorkerEpoch         uint64    `json:"worker_epoch,omitempty"`
-	BootID              string    `json:"boot_id"`
-	StageUpdatedAt      time.Time `json:"stage_updated_at"`
-	HealthDeadline      time.Time `json:"health_deadline,omitempty"`
-	AttemptCount        uint32    `json:"attempt_count"`
-	RollbackCount       uint32    `json:"rollback_count"`
-	LastFailure         Failure   `json:"last_failure,omitempty"`
-	CleanupComplete     bool      `json:"cleanup_complete"`
+	Schema                  string    `json:"schema"`
+	TransactionID           string    `json:"transaction_id"`
+	Stage                   Stage     `json:"stage"`
+	ActiveVersion           string    `json:"active_version"`
+	ActiveDigest            string    `json:"active_digest,omitempty"`
+	ActiveLength            int64     `json:"active_length,omitempty"`
+	ActiveHostdAPIMin       uint16    `json:"active_hostd_api_min,omitempty"`
+	ActiveHostdAPIMax       uint16    `json:"active_hostd_api_max,omitempty"`
+	ActiveRuntimeAPIMin     uint16    `json:"active_runtime_api_min,omitempty"`
+	ActiveRuntimeAPIMax     uint16    `json:"active_runtime_api_max,omitempty"`
+	RollbackVersion         string    `json:"rollback_version,omitempty"`
+	CandidateVersion        string    `json:"candidate_version,omitempty"`
+	CandidateDigest         string    `json:"candidate_digest,omitempty"`
+	CandidateManifestDigest string    `json:"candidate_manifest_digest,omitempty"`
+	CandidateLength         int64     `json:"candidate_length,omitempty"`
+	StagedPath              string    `json:"staged_path,omitempty"`
+	HostdAPIMin             uint16    `json:"hostd_api_min,omitempty"`
+	HostdAPIMax             uint16    `json:"hostd_api_max,omitempty"`
+	RuntimeAPIMin           uint16    `json:"runtime_api_min,omitempty"`
+	RuntimeAPIMax           uint16    `json:"runtime_api_max,omitempty"`
+	WorkerID                string    `json:"worker_id,omitempty"`
+	WorkerEpoch             uint64    `json:"worker_epoch,omitempty"`
+	BootID                  string    `json:"boot_id"`
+	StageUpdatedAt          time.Time `json:"stage_updated_at"`
+	HealthDeadline          time.Time `json:"health_deadline,omitempty"`
+	AttemptCount            uint32    `json:"attempt_count"`
+	RollbackCount           uint32    `json:"rollback_count"`
+	LastFailure             Failure   `json:"last_failure,omitempty"`
+	CleanupComplete         bool      `json:"cleanup_complete"`
 }
 
 func (j Journal) Validate() error {
@@ -96,7 +101,7 @@ func (j Journal) Validate() error {
 	if hasActiveMetadata && (!digestPattern.MatchString(j.ActiveDigest) || j.ActiveLength < 1 || invalidRange(j.ActiveHostdAPIMin, j.ActiveHostdAPIMax) || j.ActiveHostdAPIMin == 0 || invalidRange(j.ActiveRuntimeAPIMin, j.ActiveRuntimeAPIMax) || j.ActiveRuntimeAPIMin == 0) {
 		return ErrInvalidJournal
 	}
-	if j.CandidateDigest != "" && !digestPattern.MatchString(j.CandidateDigest) || j.CandidateLength < 0 {
+	if j.CandidateDigest != "" && !digestPattern.MatchString(j.CandidateDigest) || j.CandidateManifestDigest != "" && !digestPattern.MatchString(j.CandidateManifestDigest) || j.CandidateLength < 0 {
 		return ErrInvalidJournal
 	}
 	if j.StagedPath != "" && (!filepath.IsAbs(j.StagedPath) || filepath.Clean(j.StagedPath) != j.StagedPath) {
@@ -131,6 +136,7 @@ type RecoveryAction string
 const (
 	RecoveryKeepActive       RecoveryAction = "keep_active"
 	RecoveryDiscardCandidate RecoveryAction = "discard_candidate"
+	RecoveryRestoreDrain     RecoveryAction = "restore_drained_active"
 	RecoveryQueryHostd       RecoveryAction = "query_hostd_epoch"
 	RecoveryContinueMonitor  RecoveryAction = "continue_monitoring"
 	RecoveryFinalizeCleanup  RecoveryAction = "finalize_cleanup"
@@ -145,8 +151,10 @@ func (j Journal) Recovery() RecoveryAction {
 	switch j.Stage {
 	case StageIdle, StageChecking:
 		return RecoveryKeepActive
-	case StageStaged, StageCandidateStarted, StageCandidateReady:
+	case StageStaged, StageCandidateStarted, StageCandidateValidating, StageCandidateReady:
 		return RecoveryDiscardCandidate
+	case StageDraining:
+		return RecoveryRestoreDrain
 	case StageCutover:
 		return RecoveryQueryHostd
 	case StageMonitoring:
@@ -195,12 +203,14 @@ func Load(path string) (Journal, error) {
 func allowed(from, to Stage) bool {
 	allowedNext := map[Stage][]Stage{
 		StageIdle: {StageChecking}, StageChecking: {StageStaged, StageIdle, StageBlocked},
-		StageStaged:           {StageCandidateStarted, StageIdle, StageBlocked},
-		StageCandidateStarted: {StageCandidateReady, StageRollback, StageBlocked},
-		StageCandidateReady:   {StageCutover, StageRollback, StageBlocked},
-		StageCutover:          {StageMonitoring, StageRollback, StageBlocked},
-		StageMonitoring:       {StageCommitted, StageRollback, StageBlocked},
-		StageCommitted:        {StageIdle}, StageRollback: {StageIdle, StageBlocked},
+		StageStaged:              {StageCandidateStarted, StageIdle, StageBlocked},
+		StageCandidateStarted:    {StageCandidateValidating, StageRollback, StageBlocked},
+		StageCandidateValidating: {StageCandidateReady, StageRollback, StageBlocked},
+		StageCandidateReady:      {StageDraining, StageRollback, StageBlocked},
+		StageDraining:            {StageCutover, StageRollback, StageBlocked},
+		StageCutover:             {StageMonitoring, StageRollback, StageBlocked},
+		StageMonitoring:          {StageCommitted, StageRollback, StageBlocked},
+		StageCommitted:           {StageIdle}, StageRollback: {StageIdle, StageBlocked},
 	}
 	for _, candidate := range allowedNext[from] {
 		if candidate == to {
@@ -216,13 +226,13 @@ func validID(value string) bool {
 func validVersion(value string) bool { return versionPattern.MatchString(value) }
 func requiresCandidate(stage Stage) bool {
 	switch stage {
-	case StageStaged, StageCandidateStarted, StageCandidateReady, StageCutover, StageMonitoring, StageCommitted, StageRollback:
+	case StageStaged, StageCandidateStarted, StageCandidateValidating, StageCandidateReady, StageDraining, StageCutover, StageMonitoring, StageCommitted, StageRollback:
 		return true
 	}
 	return false
 }
 func knownStage(stage Stage) bool {
-	for _, value := range []Stage{StageIdle, StageChecking, StageStaged, StageCandidateStarted, StageCandidateReady, StageCutover, StageMonitoring, StageCommitted, StageRollback, StageBlocked} {
+	for _, value := range []Stage{StageIdle, StageChecking, StageStaged, StageCandidateStarted, StageCandidateValidating, StageCandidateReady, StageDraining, StageCutover, StageMonitoring, StageCommitted, StageRollback, StageBlocked} {
 		if value == stage {
 			return true
 		}
@@ -230,7 +240,7 @@ func knownStage(stage Stage) bool {
 	return false
 }
 func knownFailure(f Failure) bool {
-	for _, value := range []Failure{FailureNone, FailureVerification, FailureCompatibility, FailureCandidate, FailureHealth, FailureRollback, FailureContradictoryJournal} {
+	for _, value := range []Failure{FailureNone, FailureVerification, FailureCompatibility, FailureCandidate, FailureCanary, FailureDrain, FailureHealth, FailureRollback, FailureContradictoryJournal} {
 		if value == f {
 			return true
 		}

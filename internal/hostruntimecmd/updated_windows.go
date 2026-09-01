@@ -7,11 +7,14 @@ import (
 	"errors"
 	"io"
 	"path/filepath"
+	"time"
 
 	"github.com/pinksaucepasta/paperboat/internal/buildinfo"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostdproto"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostinstall"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/updated"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/workerupdate"
 )
 
 // runUpdated is the SCM entry point. It rejects arguments so the service can
@@ -51,7 +54,21 @@ func windowsUpdatedConfig() (updated.WindowsConfig, error) {
 	if err != nil {
 		return updated.WindowsConfig{}, err
 	}
-	return windowsUpdatedConfigFor(config, layout, buildinfo.Version), nil
+	result := windowsUpdatedConfigFor(config, layout, buildinfo.Version)
+	token, err := readWindowsHostdTokenForSID(config.TokenFile, config.OwnerSID)
+	if err != nil {
+		return updated.WindowsConfig{}, err
+	}
+	client, err := hostdproto.NewClient(layout.HostdSocket, token, 31*time.Minute)
+	clear(token)
+	if err != nil {
+		return updated.WindowsConfig{}, err
+	}
+	result.ActivationGate, err = workerupdate.NewDeploymentActivationGate(workerupdate.DeploymentActivationGateConfig{Provider: workerupdate.HostdDeploymentProvider{Client: client}})
+	if err != nil {
+		return updated.WindowsConfig{}, err
+	}
+	return result, nil
 }
 
 func windowsUpdatedConfigFor(config hostinstall.WindowsRuntimeConfig, layout service.Layout, runningVersion string) updated.WindowsConfig {
@@ -59,5 +76,10 @@ func windowsUpdatedConfigFor(config hostinstall.WindowsRuntimeConfig, layout ser
 	// runtime-install.json deliberately remains on the previous version until
 	// health verification commits the transaction, so using its version here
 	// makes every candidate updater report the old version and forces rollback.
-	return updated.WindowsConfig{StateRoot: layout.UpdateStateRoot, RuntimeStateRoot: config.StateRoot, Binary: layout.Binary, BinaryRollback: layout.BinaryRollback, BinaryStaged: layout.BinaryStaged, OwnerSID: config.OwnerSID, MachineID: config.MachineID, RepositoryURL: config.Artifact.RepositoryURL, TokenFile: config.TokenFile, InstallState: filepath.Join(hostinstall.WindowsProgramDataRoot(), "runtime-install.json"), ControlSocket: `\\.\pipe\PaperboatUpdatedControl`, HostdSocket: layout.HostdSocket, HealthURL: "http://" + config.ListenAddress + "/healthz", ActiveVersion: runningVersion, Architecture: config.Artifact.Architecture, AutomaticActivation: true, SetupMode: config.SetupMode}
+	tokenFile := config.TokenFile
+	return updated.WindowsConfig{StateRoot: layout.UpdateStateRoot, RuntimeStateRoot: config.StateRoot, Binary: layout.Binary, BinaryRollback: layout.BinaryRollback, BinaryStaged: layout.BinaryStaged, OwnerSID: config.OwnerSID, MachineID: config.MachineID, RepositoryURL: config.Artifact.RepositoryURL, TokenFile: tokenFile, InstallState: filepath.Join(hostinstall.WindowsProgramDataRoot(), "runtime-install.json"), ControlSocket: `\\.\pipe\PaperboatUpdatedControl`, HostdSocket: layout.HostdSocket, HealthURL: "http://" + config.ListenAddress + "/healthz", ActiveVersion: runningVersion, Architecture: config.Artifact.Architecture, AutomaticActivation: true, SetupMode: config.SetupMode,
+		CandidateStarter: func(ctx context.Context, request workerupdate.StartRequest) (workerupdate.Worker, error) {
+			return startWindowsRuntimeWorkerForRelease(ctx, request.Executable, request.HostdEndpoint, tokenFile, request.WorkerID, request.Release.Version, request.Release.HostdAPIMin, request.Release.HostdAPIMax)
+		},
+	}
 }

@@ -4,7 +4,6 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -290,73 +289,4 @@ func runTestChezmoi(ctx context.Context, _ string, arguments ...string) error {
 		return ErrConfigRepositoryInvalid
 	}
 	return nil
-}
-
-func writeChezmoiTestShim(t *testing.T, root string) string {
-	t.Helper()
-	if runtime.GOOS == "windows" {
-		powerShellPath := filepath.Join(root, "chezmoi-test.ps1")
-		powerShell := `param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Rest)
-$configIndex = [Array]::IndexOf($Rest, '--config')
-if ($configIndex -lt 0 -or $configIndex + 2 -ge $Rest.Length) { exit 2 }
-$config = $Rest[$configIndex + 1]
-$sourceDir = ((Get-Content -LiteralPath $config | Where-Object { $_ -match '^sourceDir = ' }) -replace '^sourceDir = "(.*)"$','$1') -replace '\\\\','\'
-$destDir = ((Get-Content -LiteralPath $config | Where-Object { $_ -match '^destDir = ' }) -replace '^destDir = "(.*)"$','$1') -replace '\\\\','\'
-$operationIndex = $configIndex + 2
-$operation = $Rest[$operationIndex]
-switch ($operation) {
-  'apply' { Get-ChildItem -LiteralPath $sourceDir -Filter '*.txt' -File | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $destDir $_.Name) -Force } }
-  'add' { for ($i = $operationIndex + 1; $i -lt $Rest.Length; $i++) { if ($Rest[$i] -ne '--') { Copy-Item -LiteralPath $Rest[$i] -Destination (Join-Path $sourceDir (Split-Path $Rest[$i] -Leaf)) -Force } } }
-  'forget' { $value = $Rest[$Rest.Length - 1]; Remove-Item -LiteralPath (Join-Path $sourceDir (Split-Path $value -Leaf)) -Force -ErrorAction SilentlyContinue }
-  default { exit 2 }
-}
-`
-		if err := os.WriteFile(powerShellPath, []byte(powerShell), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		path := filepath.Join(root, "chezmoi-test.cmd")
-		command := "@powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"%~dp0chezmoi-test.ps1\" %*\r\n"
-		if err := os.WriteFile(path, []byte(command), 0o700); err != nil {
-			t.Fatal(err)
-		}
-		return path
-	}
-	path := filepath.Join(root, "chezmoi-test")
-	script := `#!/bin/sh
-set -eu
-config=""
-while [ "$#" -gt 0 ]; do
-  if [ "$1" = "--config" ]; then config="$2"; shift 2; break; fi
-  shift
-done
-source_dir=$(sed -n 's/^sourceDir = "\(.*\)"$/\1/p' "$config")
-dest_dir=$(sed -n 's/^destDir = "\(.*\)"$/\1/p' "$config")
-operation="$1"
-shift
-case "$operation" in
-  apply)
-    for source in "$source_dir"/*.txt; do
-      if [ -f "$source" ]; then cp "$source" "$dest_dir/$(basename "$source")"; fi
-    done
-    ;;
-  add)
-    while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done
-    shift
-    while [ "$#" -gt 0 ]; do
-      cp "$1" "$source_dir/$(basename "$1")"
-      shift
-    done
-    ;;
-  forget)
-    while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done
-    shift
-    rm -f "$source_dir/$(basename "$1")"
-    ;;
-  *) exit 2 ;;
-esac
-`
-	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	return path
 }

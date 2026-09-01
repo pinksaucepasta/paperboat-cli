@@ -28,8 +28,9 @@ pb doctor                    # check auth + environment connectivity
 pb Studio -- git status      # execute an exact argv vector on a machine
 pb exec Studio --cwd /src -- make test
 pb config path|show          # inspect the local config
-pb serve ./dist              # serve privately on this device
-pb serve ./dist --public     # publish through a public preview
+pb preview 3000              # publish a local port
+pb preview ./dist            # publish a local file or directory
+pb preview 3000 --private    # require the local Paperboat runtime
 ```
 
 Flags may appear before or after the environment name.
@@ -44,30 +45,24 @@ name=value`, `--pty`, and `--json`. Non-PTY execution keeps stdout and stderr se
 PTY mode merges them and forwards terminal resize events. JSON mode emits the versioned
 `paperboat.exec-event/v1` JSON Lines stream and returns the remote process exit status.
 
-## Serve a file or directory
+## Preview a local target
 
-`pb serve [path]` serves a regular file or static directory privately on an IPv4 loopback
-listener by default. It needs no Paperboat setup, account, machine runtime, or network
-connection. `--listen-port` requests one specific loopback port; otherwise the OS selects
-an available port. `--public` explicitly creates the existing public Paperboat preview and
-does not accept `--listen-port`.
+`pb preview <port|url|path>` exposes one local HTTP service, file, or directory through a
+temporary Paperboat preview. The stable host runtime owns the authenticated carrier and
+keeps the server lease, route, and origin readiness synchronized.
 
 ```sh
-pb serve ./report.html
-pb serve ./dist --spa --listen-port 8080
-pb serve ./demo.pdf --detach
-pb serve ./dist --public --duration 1h
+pb preview 3000
+pb preview http://127.0.0.1:8080
+pb preview ./report.html --duration 1h
+pb preview ./dist --domain preview.example.com
+pb preview 3000 --private
 ```
 
-Without a path in an interactive terminal, `pb serve` opens the local file-and-directory
-picker. Pasting or dropping one file stages a verified, collision-safe copy under
-`Paperboat Inbox/serve`; public mode asks for confirmation before publishing. The Inbox
-copy remains after serving stops. `--detach` transfers ownership to an isolated local user
-service so serving survives CLI exit. List it with `pb preview list` and stop it by name
-with `pb preview revoke <name>`.
-
-Non-interactive and JSON invocations require a path. Use `--indefinite` instead of
-`--duration` only when the listener should remain until explicitly stopped.
+Use `pb preview list` to inspect active previews and `pb preview stop <preview>` to stop
+one. `--domain` attaches a verified custom domain and may be repeated. Private preview
+hostnames are routed through the narrow local Paperboat proxy; browsers receive no
+Paperboat credential, cookie, or redirect flow.
 
 Interactive attaches forward `TERM`, `COLORTERM`, `TERM_PROGRAM`,
 `TERM_PROGRAM_VERSION`, and locale variables when they are set locally.

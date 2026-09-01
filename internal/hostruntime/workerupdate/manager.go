@@ -42,19 +42,28 @@ var (
 // checks this exact version, hash, length, platform, and architecture before
 // making it executable.
 type Release struct {
-	Version         string
-	SHA256          string
-	Length          int64
-	Platform        string
-	Architecture    string
-	CLISHA256       string
-	CLILength       int64
-	CLIPlatform     string
-	CLIArchitecture string
-	HostdAPIMin     uint16
-	HostdAPIMax     uint16
-	RuntimeAPIMin   uint16
-	RuntimeAPIMax   uint16
+	Version           string
+	SHA256            string
+	Length            int64
+	Platform          string
+	Architecture      string
+	ManifestSHA256    string
+	CanaryPath        string
+	CanaryStatus      int
+	CanarySamples     uint16
+	CanaryTimeout     time.Duration
+	DrainTimeout      time.Duration
+	StabilityWindow   time.Duration
+	StabilityInterval time.Duration
+	RollbackTimeout   time.Duration
+	CLISHA256         string
+	CLILength         int64
+	CLIPlatform       string
+	CLIArchitecture   string
+	HostdAPIMin       uint16
+	HostdAPIMax       uint16
+	RuntimeAPIMin     uint16
+	RuntimeAPIMax     uint16
 	// Supervisor targets are present in every signed release index. They are
 	// kept separate from the worker/CLI targets because replacing them is a
 	// supervisor-class maintenance operation.
@@ -153,14 +162,20 @@ type Config struct {
 	Starter        Starter
 	Hostd          Hostd
 	Health         HealthChecker
+	Gate           ActivationGate
+	Events         EventSink
 	NativeVerifier NativeVerifier
 	// InstallPackage is the privileged macOS package boundary. A pkg is never
 	// renamed into an executable slot; the installer returns the executable
 	// installed by the verified package so it can be staged atomically.
-	InstallPackage func(context.Context, string) (string, error)
-	MonitorWindow  time.Duration
-	HealthInterval time.Duration
-	Now            func() time.Time
+	InstallPackage  func(context.Context, string) (string, error)
+	MonitorWindow   time.Duration
+	HealthInterval  time.Duration
+	CanaryTimeout   time.Duration
+	DrainTimeout    time.Duration
+	RollbackTimeout time.Duration
+	Now             func() time.Time
+	WriteJournal    func(string, updateflow.Journal, int, int) error
 }
 
 // Manager permits exactly one transaction. It retains at most runtime-current,
@@ -186,8 +201,20 @@ func New(config Config) (*Manager, error) {
 	if config.HealthInterval == 0 {
 		config.HealthInterval = time.Second
 	}
+	if config.CanaryTimeout == 0 {
+		config.CanaryTimeout = 30 * time.Second
+	}
+	if config.DrainTimeout == 0 {
+		config.DrainTimeout = 30 * time.Second
+	}
+	if config.RollbackTimeout == 0 {
+		config.RollbackTimeout = 2 * time.Minute
+	}
 	if config.Now == nil {
 		config.Now = time.Now
+	}
+	if config.WriteJournal == nil {
+		config.WriteJournal = updateflow.Write
 	}
 	if config.NativeVerifier == nil {
 		config.NativeVerifier = nativesignature.New(nil)
@@ -251,6 +278,7 @@ func (m *Manager) Activate(ctx context.Context, release Release) (Result, error)
 	}
 
 	journal := m.newJournal()
+	m.record(ctx, EventScheduled, journal, release, "")
 	if err := m.write(journal); err != nil {
 		return Result{Version: m.active.Version}, err
 	}
@@ -266,6 +294,7 @@ func (m *Manager) Activate(ctx context.Context, release Release) (Result, error)
 		_ = m.write(journal)
 		return Result{Version: m.active.Version}, err
 	}
+	m.record(ctx, EventDownloading, journal, release, "")
 	journal = withRelease(journal, release, m.config.BinaryStaged)
 	if journal, err = m.transition(journal, updateflow.StageStaged); err != nil {
 		return Result{Version: m.active.Version}, err
@@ -293,27 +322,66 @@ func (m *Manager) Activate(ctx context.Context, release Release) (Result, error)
 		return Result{Version: m.active.Version}, m.failBeforeCutover(journal, worker, updateflow.FailureCandidate, err)
 	}
 	journal.WorkerID, journal.WorkerEpoch = ready.WorkerID, ready.Epoch
+	if journal, err = m.transition(journal, updateflow.StageCandidateValidating); err != nil {
+		return Result{Version: m.active.Version}, err
+	}
+	if err = m.write(journal); err != nil {
+		return Result{Version: m.active.Version}, err
+	}
+	m.record(ctx, EventCandidateValidating, journal, release, "")
+	if err = m.gate(ctx, releaseDuration(release.CanaryTimeout, m.config.CanaryTimeout), func(gateCtx context.Context) error {
+		request := m.gateRequest(journal, release, ready)
+		if err := request.validate(hostdproto.StateCandidate); err != nil {
+			return err
+		}
+		return m.config.Gate.Candidate(gateCtx, request)
+	}); err != nil {
+		return Result{Version: m.active.Version}, m.failBeforeCutover(journal, worker, updateflow.FailureCanary, err, release.Version)
+	}
 	if journal, err = m.transition(journal, updateflow.StageCandidateReady); err != nil {
 		return Result{Version: m.active.Version}, err
 	}
 	if err = m.write(journal); err != nil {
 		return Result{Version: m.active.Version}, err
 	}
+	if journal, err = m.transition(journal, updateflow.StageDraining); err != nil {
+		return Result{Version: m.active.Version}, err
+	}
+	if err = m.write(journal); err != nil {
+		return Result{Version: m.active.Version}, err
+	}
+	m.record(ctx, EventDraining, journal, release, "")
+	if err = m.gate(ctx, releaseDuration(release.DrainTimeout, m.config.DrainTimeout), func(gateCtx context.Context) error {
+		request := m.gateRequest(journal, release, ready)
+		if err := request.validate(hostdproto.StateCandidate); err != nil {
+			return err
+		}
+		return m.config.Gate.Drain(gateCtx, request)
+	}); err != nil {
+		return Result{Version: m.active.Version}, m.restoreAfterDrain(ctx, journal, release, worker, err)
+	}
 
 	// Persist cutover intent before filesystem rotation or hostd activation.
 	// Recovery can then query hostd and deterministically restore one owner.
 	if journal, err = m.transition(journal, updateflow.StageCutover); err != nil {
-		return Result{Version: m.active.Version}, err
+		return Result{Version: m.active.Version}, m.restoreAfterDrain(ctx, journal, release, worker, err)
 	}
 	if err = m.write(journal); err != nil {
-		return Result{Version: m.active.Version}, err
+		return Result{Version: m.active.Version}, m.restoreAfterDrain(ctx, journal, release, worker, err)
 	}
+	m.record(ctx, EventActivating, journal, release, "")
 	if err = m.promoteStorage(); err != nil {
-		return Result{Version: m.active.Version}, m.rollbackPreActivation(journal, worker, err)
+		if restoreErr := m.restoreStorage(); restoreErr != nil {
+			return Result{Version: m.active.Version}, m.restoreAfterDrain(ctx, journal, release, worker, errors.Join(err, errStorageRestoreFailed, restoreErr))
+		}
+		return Result{Version: m.active.Version}, m.restoreAfterDrain(ctx, journal, release, worker, err)
 	}
 	journal.StagedPath = m.config.Binary
 	if err = m.write(journal); err != nil {
-		return Result{Version: m.active.Version}, err
+		if restoreErr := m.restoreStorage(); restoreErr != nil {
+			return Result{Version: m.active.Version}, m.restoreAfterDrain(ctx, journal, release, worker, errors.Join(err, errStorageRestoreFailed, restoreErr))
+		}
+		return Result{Version: m.active.Version}, m.restoreAfterDrain(ctx, journal, release, worker, err)
 	}
 	active, err := worker.Activate(ctx)
 	if err != nil || !matches(active, hostdproto.StateActive, request.WorkerID, ready.Epoch) {
@@ -327,6 +395,8 @@ func (m *Manager) Activate(ctx context.Context, release Release) (Result, error)
 	if journal, err = m.transition(journal, updateflow.StageMonitoring); err != nil {
 		return Result{Version: m.active.Version}, err
 	}
+	journal.HealthDeadline = m.now().Add(releaseDuration(release.StabilityWindow, m.config.MonitorWindow))
+	m.record(ctx, EventStability, journal, release, "")
 	if err = m.write(journal); err != nil {
 		return Result{Version: m.active.Version}, err
 	}
@@ -339,7 +409,11 @@ func (m *Manager) Activate(ctx context.Context, release Release) (Result, error)
 	if err = m.write(journal); err != nil {
 		return Result{Version: m.active.Version}, err
 	}
+	if err = m.commitGate(ctx, journal, release); err != nil {
+		return Result{Version: m.active.Version}, err
+	}
 	m.setActive(release)
+	m.record(ctx, EventCommitted, journal, release, "")
 	return Result{Version: release.Version, Updated: true}, m.finishCommitted(journal)
 }
 
@@ -374,6 +448,8 @@ func (m *Manager) recoverLocked(ctx context.Context) error {
 			return err
 		}
 		return m.write(m.idleJournal(journal, updateflow.FailureCandidate, ""))
+	case updateflow.RecoveryRestoreDrain:
+		return m.restoreAfterDrain(ctx, journal, releaseFromJournal(journal), nil, errInterruptedDrainRecovery)
 	case updateflow.RecoveryQueryHostd:
 		status, statusErr := m.config.Hostd.Active(ctx)
 		if statusErr != nil {
@@ -394,16 +470,17 @@ func (m *Manager) recoverLocked(ctx context.Context) error {
 			return m.monitorAndCommitRecovered(ctx, next)
 		}
 		if err := m.restoreStorage(); err != nil {
-			return err
+			return m.restoreAfterDrain(ctx, journal, releaseFromJournal(journal), nil, errors.Join(errInterruptedDrainRecovery, errStorageRestoreFailed, err))
 		}
-		if err := m.removeStaged(); err != nil {
-			return err
-		}
-		return m.write(m.idleJournal(journal, updateflow.FailureCandidate, ""))
+		return m.restoreAfterDrain(ctx, journal, releaseFromJournal(journal), nil, errInterruptedDrainRecovery)
 	case updateflow.RecoveryContinueMonitor:
 		return m.monitorAndCommitRecovered(ctx, journal)
 	case updateflow.RecoveryFinalizeCleanup:
-		m.setActive(releaseFromJournal(journal))
+		release := releaseFromJournal(journal)
+		if err := m.commitGate(ctx, journal, release); err != nil {
+			return err
+		}
+		m.setActive(release)
 		return m.finishCommitted(journal)
 	case updateflow.RecoveryPerformRollback:
 		return ErrBlocked
@@ -431,6 +508,9 @@ func (m *Manager) recoverLegacyPromotedCandidate(ctx context.Context, journal up
 		}
 		journal = next
 	}
+	if err := m.commitGate(ctx, journal, releaseFromJournal(journal)); err != nil {
+		return err
+	}
 	return m.finishCommitted(journal)
 }
 
@@ -448,13 +528,95 @@ func (m *Manager) monitorAndCommitRecovered(ctx context.Context, journal updatef
 	if err := m.write(next); err != nil {
 		return err
 	}
+	if err := m.commitGate(ctx, next, release); err != nil {
+		return err
+	}
 	m.setActive(release)
 	return m.finishCommitted(next)
 }
 
+func (m *Manager) commitGate(ctx context.Context, journal updateflow.Journal, release Release) error {
+	return m.gate(ctx, releaseDuration(release.CanaryTimeout, m.config.CanaryTimeout), func(gateCtx context.Context) error {
+		request := m.gateRequest(journal, release, hostdproto.Status{State: hostdproto.StateActive, WorkerID: journal.WorkerID, APIVersion: 1, Epoch: journal.WorkerEpoch})
+		if err := request.validate(hostdproto.StateActive); err != nil {
+			return err
+		}
+		return m.config.Gate.Commit(gateCtx, request)
+	})
+}
+
+// restoreAfterDrain compensates an uncertain or interrupted drain before any
+// binary cutover. The old worker remains the only active worker, but its edge
+// route may already reject new streams. Recovery therefore proves the exact
+// current tuple and restored end-to-end path before discarding the candidate.
+func (m *Manager) restoreAfterDrain(ctx context.Context, journal updateflow.Journal, failed Release, candidate Worker, cause error) error {
+	next, transitionErr := m.transition(journal, updateflow.StageRollback)
+	if transitionErr != nil {
+		next = journal
+	}
+	next.LastFailure = updateflow.FailureDrain
+	journalErr := transitionErr
+	if transitionErr == nil {
+		journalErr = m.write(next)
+	}
+	status, statusErr := m.config.Hostd.Active(ctx)
+	if statusErr == nil && status.State != hostdproto.StateActive {
+		statusErr = ErrInvalidRelease
+	}
+	rollbackCtx, cancel := context.WithTimeout(ctx, releaseDuration(failed.RollbackTimeout, m.config.RollbackTimeout))
+	request := GateRequest{TransactionID: journal.TransactionID, Previous: failed, Candidate: m.active, Worker: status}
+	restoreErr := statusErr
+	if restoreErr == nil {
+		restoreErr = request.validate(hostdproto.StateActive)
+	}
+	if restoreErr == nil {
+		restoreErr = m.config.Gate.Rollback(rollbackCtx, request)
+	}
+	cancel()
+	if restoreErr != nil {
+		blocked, blockErr := m.transition(next, updateflow.StageBlocked)
+		if blockErr == nil {
+			blockErr = m.write(blocked)
+		}
+		return errors.Join(cause, journalErr, restoreErr, blockErr, ErrBlocked)
+	}
+	if journalErr != nil || errors.Is(cause, errStorageRestoreFailed) {
+		blocked, blockErr := m.transition(next, updateflow.StageBlocked)
+		if blockErr == nil {
+			blockErr = m.write(blocked)
+		}
+		return errors.Join(cause, journalErr, blockErr, ErrBlocked)
+	}
+	if candidate != nil {
+		m.stopWorker(candidate)
+	}
+	if err := m.removeStaged(); err != nil {
+		return errors.Join(cause, err, ErrBlocked)
+	}
+	idle := m.idleJournal(next, updateflow.FailureDrain, failed.Version)
+	if err := m.write(idle); err != nil {
+		return errors.Join(cause, err, ErrBlocked)
+	}
+	m.record(ctx, EventRolledBack, idle, failed, safeFailure(cause))
+	if errors.Is(cause, errInterruptedDrainRecovery) {
+		return nil
+	}
+	return cause
+}
+
+var errInterruptedDrainRecovery = errors.New("interrupted drain recovered")
+var errStorageRestoreFailed = errors.New("worker update storage restore failed")
+
 func (m *Manager) setActive(release Release) {
 	m.active = release
 	m.activeVersion.Store(release.Version)
+}
+
+func releaseDuration(signed, fallback time.Duration) time.Duration {
+	if signed > 0 {
+		return signed
+	}
+	return fallback
 }
 
 func (m *Manager) monitor(ctx context.Context, journal updateflow.Journal, release Release) error {
@@ -462,33 +624,45 @@ func (m *Manager) monitor(ctx context.Context, journal updateflow.Journal, relea
 	if deadline.IsZero() {
 		return ErrBlocked
 	}
-	for {
-		status, err := m.config.Hostd.Active(ctx)
-		if err != nil || !matches(status, hostdproto.StateActive, journal.WorkerID, journal.WorkerEpoch) {
-			if err != nil {
-				return err
-			}
-			return updateflow.ErrInvalidJournal
-		}
-		if err := m.config.Health.Check(ctx, status, release); err != nil {
+	status, err := m.config.Hostd.Active(ctx)
+	if err != nil || !matches(status, hostdproto.StateActive, journal.WorkerID, journal.WorkerEpoch) {
+		if err != nil {
 			return err
 		}
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return nil
-		}
-		delay := m.config.HealthInterval
-		if delay > remaining {
-			delay = remaining
-		}
-		timer := time.NewTimer(delay)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
-		}
+		return updateflow.ErrInvalidJournal
 	}
+	if err := m.config.Health.Check(ctx, status, release); err != nil {
+		return err
+	}
+	remaining := time.Until(deadline)
+	interval := releaseDuration(release.StabilityInterval, m.config.HealthInterval)
+	if remaining <= 0 {
+		remaining = interval
+	}
+	if err := m.gate(ctx, remaining, func(gateCtx context.Context) error {
+		request := m.gateRequest(journal, release, status)
+		request.Window, request.Interval = releaseDuration(release.StabilityWindow, remaining), interval
+		if request.Interval > request.Window {
+			request.Interval = request.Window
+		}
+		if err := request.validate(hostdproto.StateActive); err != nil {
+			return err
+		}
+		return m.config.Gate.Active(gateCtx, request)
+	}); err != nil {
+		return err
+	}
+	status, err = m.config.Hostd.Active(ctx)
+	if err != nil || !matches(status, hostdproto.StateActive, journal.WorkerID, journal.WorkerEpoch) {
+		if err != nil {
+			return err
+		}
+		return updateflow.ErrInvalidJournal
+	}
+	if err := m.config.Health.Check(ctx, status, release); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (m *Manager) rollbackActive(ctx context.Context, journal updateflow.Journal, failed Release, candidate Worker, cause error) error {
@@ -532,39 +706,103 @@ func (m *Manager) rollbackActive(ctx context.Context, journal updateflow.Journal
 	if err := m.restoreStorage(); err != nil {
 		return errors.Join(cause, err, ErrBlocked)
 	}
+	rollbackStatus, statusErr := m.config.Hostd.Active(ctx)
+	if statusErr != nil {
+		return errors.Join(cause, statusErr, ErrBlocked)
+	}
+	rollbackCtx, rollbackCancel := context.WithTimeout(ctx, releaseDuration(failed.RollbackTimeout, m.config.RollbackTimeout))
+	rollbackGateRequest := GateRequest{TransactionID: journal.TransactionID, Previous: failed, Candidate: previous, Worker: rollbackStatus}
+	rollbackErr := rollbackGateRequest.validate(hostdproto.StateActive)
+	if rollbackErr == nil {
+		rollbackErr = m.config.Gate.Rollback(rollbackCtx, rollbackGateRequest)
+	}
+	rollbackCancel()
+	if rollbackErr != nil {
+		next.LastFailure = updateflow.FailureRollback
+		if blocked, transitionErr := m.transition(next, updateflow.StageBlocked); transitionErr == nil {
+			_ = m.write(blocked)
+		}
+		return errors.Join(cause, rollbackErr, ErrBlocked)
+	}
 	if candidate != nil {
-		_ = candidate.Stop(context.Background())
+		m.stopWorker(candidate)
 	}
 	idle := m.idleJournal(next, updateflow.FailureHealth, failed.Version)
 	idle.RollbackCount = next.RollbackCount
 	if err := m.write(idle); err != nil {
 		return errors.Join(cause, err)
 	}
+	m.record(ctx, EventRolledBack, next, failed, safeFailure(cause))
+	m.record(ctx, EventQuarantined, next, failed, safeFailure(cause))
 	return cause
 }
 
-func (m *Manager) rollbackPreActivation(journal updateflow.Journal, worker Worker, cause error) error {
-	if err := m.restoreStorage(); err != nil {
-		return errors.Join(cause, err, ErrBlocked)
-	}
+func (m *Manager) failBeforeCutover(journal updateflow.Journal, worker Worker, failure updateflow.Failure, cause error, quarantine ...string) error {
 	if worker != nil {
-		_ = worker.Stop(context.Background())
-	}
-	journal.LastFailure = updateflow.FailureCandidate
-	next, err := m.transition(journal, updateflow.StageRollback)
-	if err != nil {
-		return errors.Join(cause, err)
-	}
-	return errors.Join(cause, m.write(m.idleJournal(next, updateflow.FailureCandidate, journal.CandidateVersion)))
-}
-
-func (m *Manager) failBeforeCutover(journal updateflow.Journal, worker Worker, failure updateflow.Failure, cause error) error {
-	if worker != nil {
-		_ = worker.Stop(context.Background())
+		m.stopWorker(worker)
 	}
 	_ = m.removeStaged()
 	journal.LastFailure = failure
-	return errors.Join(cause, m.write(m.idleJournal(journal, failure, "")))
+	version := ""
+	if len(quarantine) > 0 {
+		version = quarantine[0]
+	}
+	writeErr := m.write(m.idleJournal(journal, failure, version))
+	if version != "" {
+		m.record(context.Background(), EventQuarantined, journal, releaseFromJournal(journal), safeFailure(cause))
+	}
+	return errors.Join(cause, writeErr)
+}
+
+func (m *Manager) gate(ctx context.Context, timeout time.Duration, invoke func(context.Context) error) error {
+	if ctx == nil || invoke == nil || timeout <= 0 {
+		return ErrActivationGate
+	}
+	gateCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	if err := invoke(gateCtx); err != nil {
+		return errors.Join(ErrActivationGate, err)
+	}
+	return nil
+}
+
+func (m *Manager) gateRequest(journal updateflow.Journal, candidate Release, worker hostdproto.Status) GateRequest {
+	return GateRequest{TransactionID: journal.TransactionID, Previous: m.active, Candidate: candidate, Worker: worker}
+}
+
+func (m *Manager) record(ctx context.Context, phase EventPhase, journal updateflow.Journal, release Release, failure string) {
+	if m.config.Events == nil {
+		return
+	}
+	eventCtx := ctx
+	if eventCtx == nil || eventCtx.Err() != nil {
+		var cancel context.CancelFunc
+		eventCtx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+	}
+	_ = m.config.Events.RecordUpdateEvent(eventCtx, Event{At: m.now(), Phase: phase, TransactionID: journal.TransactionID, FromVersion: m.active.Version, ToVersion: release.Version, Failure: failure})
+}
+
+func safeFailure(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "canceled"
+	}
+	return "failed"
+}
+
+func (m *Manager) stopWorker(worker Worker) {
+	if worker == nil {
+		return
+	}
+	stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = worker.Stop(stopCtx)
 }
 
 func (m *Manager) finishCommitted(journal updateflow.Journal) error {
@@ -803,7 +1041,7 @@ func (m *Manager) transition(journal updateflow.Journal, stage updateflow.Stage)
 }
 func (m *Manager) now() time.Time { return m.config.Now().UTC() }
 func (m *Manager) write(journal updateflow.Journal) error {
-	return updateflow.Write(m.config.StatePath, journal, m.config.OwnerUID, m.config.OwnerGID)
+	return m.config.WriteJournal(m.config.StatePath, journal, m.config.OwnerUID, m.config.OwnerGID)
 }
 
 func (m *Manager) quarantinedLocked() (string, error) {
@@ -826,6 +1064,7 @@ func (m *Manager) startRequest(release Release, executable string) StartRequest 
 
 func withRelease(journal updateflow.Journal, release Release, path string) updateflow.Journal {
 	journal.CandidateVersion, journal.CandidateDigest, journal.CandidateLength, journal.StagedPath = release.Version, release.SHA256, release.Length, path
+	journal.CandidateManifestDigest = release.ManifestSHA256
 	journal.HostdAPIMin, journal.HostdAPIMax, journal.RuntimeAPIMin, journal.RuntimeAPIMax = release.HostdAPIMin, release.HostdAPIMax, release.RuntimeAPIMin, release.RuntimeAPIMax
 	return journal
 }
@@ -907,7 +1146,7 @@ func candidateMayBeActive(stage updateflow.Stage) bool {
 }
 
 func releaseFromJournal(j updateflow.Journal) Release {
-	return Release{Version: j.CandidateVersion, SHA256: j.CandidateDigest, Length: j.CandidateLength, Platform: runtime.GOOS, Architecture: runtime.GOARCH, HostdAPIMin: j.HostdAPIMin, HostdAPIMax: j.HostdAPIMax, RuntimeAPIMin: j.RuntimeAPIMin, RuntimeAPIMax: j.RuntimeAPIMax}
+	return Release{Version: j.CandidateVersion, SHA256: j.CandidateDigest, ManifestSHA256: j.CandidateManifestDigest, Length: j.CandidateLength, Platform: runtime.GOOS, Architecture: runtime.GOARCH, HostdAPIMin: j.HostdAPIMin, HostdAPIMax: j.HostdAPIMax, RuntimeAPIMin: j.RuntimeAPIMin, RuntimeAPIMax: j.RuntimeAPIMax}
 }
 func workerID(version string) string { return "runtime-" + version }
 func matches(status hostdproto.Status, state hostdproto.State, id string, epoch uint64) bool {
@@ -915,7 +1154,7 @@ func matches(status hostdproto.Status, state hostdproto.State, id string, epoch 
 }
 
 func validateConfig(config Config) error {
-	if config.Fetcher == nil || config.Starter == nil || config.Hostd == nil || config.Health == nil || config.OwnerUID < 0 || config.OwnerGID < 0 || !validWorkerIdentity(config.WorkerUID, config.WorkerGID) || len(config.Capability) != 32 || config.HostdEndpoint == "" || config.MonitorWindow <= 0 || config.HealthInterval <= 0 || config.HealthInterval > config.MonitorWindow || validateRelease(config.Active) != nil {
+	if config.Fetcher == nil || config.Starter == nil || config.Hostd == nil || config.Health == nil || config.Gate == nil || config.OwnerUID < 0 || config.OwnerGID < 0 || !validWorkerIdentity(config.WorkerUID, config.WorkerGID) || len(config.Capability) != 32 || config.HostdEndpoint == "" || config.MonitorWindow <= 0 || config.HealthInterval <= 0 || config.HealthInterval > config.MonitorWindow || config.HealthInterval > 30*time.Second || config.CanaryTimeout <= 0 || config.CanaryTimeout > 30*time.Second || config.DrainTimeout <= 0 || config.DrainTimeout > 2*time.Minute || config.RollbackTimeout <= 0 || config.RollbackTimeout > 2*time.Minute || validateRelease(config.Active) != nil {
 		return ErrInvalidConfig
 	}
 	paths := []string{config.StatePath, config.Binary, config.BinaryRollback, config.BinaryStaged}

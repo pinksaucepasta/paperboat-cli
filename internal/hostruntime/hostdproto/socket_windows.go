@@ -47,6 +47,7 @@ type SocketConfig struct {
 	RequestTimeout time.Duration
 	MaxConcurrent  int
 	Workloads      func() WorkloadStatus
+	UpdateGate     UpdateGateHandler
 }
 
 type Server struct {
@@ -64,7 +65,7 @@ func NewServer(config SocketConfig) (*Server, error) {
 	if config.MaxConcurrent == 0 {
 		config.MaxConcurrent = defaultMaxConcurrent
 	}
-	if config.RequestTimeout < 100*time.Millisecond || config.RequestTimeout > time.Minute || config.MaxConcurrent < 1 || config.MaxConcurrent > maxConcurrent {
+	if config.RequestTimeout < 100*time.Millisecond || config.RequestTimeout > 31*time.Minute || config.MaxConcurrent < 1 || config.MaxConcurrent > maxConcurrent {
 		return nil, ErrSocketConfig
 	}
 	if err := secureStatePathWindows(config.StatePath, config.SID); err != nil {
@@ -153,7 +154,19 @@ func (s *Server) serveOne(connection net.Conn) {
 		s.writeError(connection, err)
 		return
 	}
-	response, err := s.controller.Handle(request)
+	var response Message
+	if gate, ok := request.(*UpdateGateRequest); ok {
+		if s.config.UpdateGate == nil {
+			s.writeError(connection, ErrNotReady)
+			return
+		}
+		gateCtx, cancel := context.WithTimeout(context.Background(), s.config.RequestTimeout)
+		value, gateErr := s.config.UpdateGate.HandleUpdateGate(gateCtx, *gate)
+		cancel()
+		response, err = value, gateErr
+	} else {
+		response, err = s.controller.Handle(request)
+	}
 	if err != nil {
 		s.writeError(connection, err)
 		return
@@ -194,7 +207,7 @@ func NewClient(socketPath string, token []byte, timeout time.Duration) (*Client,
 	if timeout == 0 {
 		timeout = defaultRequestTimeout
 	}
-	if timeout < 100*time.Millisecond || timeout > time.Minute {
+	if timeout < 100*time.Millisecond || timeout > 31*time.Minute {
 		return nil, ErrSocketConfig
 	}
 	return &Client{socketPath: socketPath, token: append([]byte(nil), token...), timeout: timeout}, nil
@@ -247,6 +260,18 @@ func (c *Client) Active(ctx context.Context) (Status, error) {
 		return Status{}, ErrInvalidFrame
 	}
 	return *status, nil
+}
+
+func (c *Client) UpdateGate(ctx context.Context, request UpdateGateRequest) (UpdateGateResponse, error) {
+	response, err := c.Request(ctx, request)
+	if err != nil {
+		return UpdateGateResponse{}, err
+	}
+	gate, ok := response.(*UpdateGateResponse)
+	if !ok || gate.validate() != nil {
+		return UpdateGateResponse{}, ErrInvalidFrame
+	}
+	return *gate, nil
 }
 
 func errorForCode(code string) error {

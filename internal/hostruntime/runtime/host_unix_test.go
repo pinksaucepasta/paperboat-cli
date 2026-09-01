@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -18,6 +19,7 @@ import (
 	"github.com/coder/websocket"
 	runtimeconfig "github.com/pinksaucepasta/paperboat/internal/hostruntime/config"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/configapply"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/envinject"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/preview"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/process"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/protocol"
@@ -28,6 +30,36 @@ import (
 )
 
 type hostAuthorizer struct{}
+
+const runtimeTestHostRecipientKeyID = "envk_IwY-MQtEprrsxiSheZeY7fXcsuKArWSF8qsJfiPSteM"
+
+func TestCommandManagedEnvironmentDoesNotMutatePersistedCommand(t *testing.T) {
+	variables := map[string]string{"API_TOKEN": "canary-secret", "EMPTY": ""}
+	path := filepath.Join(t.TempDir(), "environment-cache.json")
+	managed, err := envinject.Open(context.Background(), envinject.Config{
+		Path: path, HighWaterPath: filepath.Join(t.TempDir(), "environment-high-water.json"), IntegrityKey: bytes.Repeat([]byte{0x42}, 32), AllowHighWaterInitialize: true, AccountID: "acct_1", MachineID: "mach_1",
+		InstallationGeneration: 1, HostKeyGeneration: 1, HostRecipientKeyID: runtimeTestHostRecipientKeyID,
+		GenesisMarker: runtimeTestGenesisMarkerFor(t, path),
+		Processor:     runtimeTestEnvironmentProcessor{variables: variables},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := managed.Apply(context.Background(), envinject.Bundle{Schema: envinject.BundleSchema}); err != nil {
+		t.Fatal(err)
+	}
+	persisted := pty.Command{Path: "/bin/sh", Env: []string{"PATH=/bin", "API_TOKEN=base"}}
+	launched, err := commandWithManagedEnvironment(persisted, managed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(persisted.Env, "\x00"); strings.Contains(got, "canary-secret") || got != "PATH=/bin\x00API_TOKEN=base" {
+		t.Fatalf("persisted environment changed: %q", got)
+	}
+	if got := strings.Join(launched.Env, "\x00"); !strings.Contains(got, "API_TOKEN=canary-secret") || !strings.Contains(got, "EMPTY=") {
+		t.Fatalf("launch environment=%q", got)
+	}
+}
 
 func (hostAuthorizer) Authorize(context.Context, protocol.Frame) (server.Authorization, error) {
 	return server.Authorization{JournalBinding: "test:user:client", EnvironmentID: "env_test", UserID: "user_test", ClientID: "client_test"}, nil
@@ -163,8 +195,8 @@ func TestHostCompositionNegotiatesAuthenticatedHealthAndClosesDurableState(t *te
 		}
 		return frame
 	}
-	writeFrame(protocol.Frame{Type: "hello", RequestID: "req_hello", Version: "1.0", Payload: json.RawMessage(`{"min_version":"1.0","max_version":"1.0","capabilities":["terminal.v1","health.v1","preview.public.v1","config.apply.v1"]}`)})
-	if welcome := readFrame(); welcome.Type != "welcome" || !bytes.Contains(welcome.Payload, []byte(`"preview.public.v1"`)) || !bytes.Contains(welcome.Payload, []byte(`"config.apply.v1"`)) {
+	writeFrame(protocol.Frame{Type: "hello", RequestID: "req_hello", Version: "1.0", Payload: json.RawMessage(`{"min_version":"1.0","max_version":"1.0","capabilities":["terminal.v1","health.v1","config.apply.v1"]}`)})
+	if welcome := readFrame(); welcome.Type != "welcome" || bytes.Contains(welcome.Payload, []byte(`"preview.public.v1"`)) || !bytes.Contains(welcome.Payload, []byte(`"config.apply.v1"`)) {
 		t.Fatalf("welcome=%#v", welcome)
 	}
 	writeFrame(protocol.Frame{Type: "request", RequestID: "req_health", Version: "1.0", OperationID: "op_health_0001", Capability: "health.v1", DeadlineMS: 5_000, Payload: json.RawMessage(`{}`)})

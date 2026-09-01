@@ -3,16 +3,19 @@
 package config
 
 import (
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	dbus "github.com/godbus/dbus/v5"
 	secretservice "github.com/zalando/go-keyring/secret_service"
 	"os"
+	"sort"
 )
 
 type KeyringStore struct{}
 
 var errKeyringSecretNotFound = errors.New("credential not found")
+var errKeyringSecretAmbiguous = errors.New("duplicate credentials found")
 
 func unavailableCredentialStore(err error) error {
 	return fmt.Errorf("%w: %v", ErrCredentialStoreUnavailable, err)
@@ -41,17 +44,29 @@ func CredentialStoreAvailable() bool {
 	}
 	return owned
 }
-func linuxSecretItem(service *secretservice.SecretService, ref string) (dbus.ObjectPath, error) {
+func linuxSecretItems(service *secretservice.SecretService, ref string) ([]dbus.ObjectPath, error) {
 	collection := service.GetLoginCollection()
 	if err := service.Unlock(collection.Path()); err != nil {
-		return "", err
+		return nil, err
 	}
 	items, err := service.SearchItems(collection, linuxSecretAttributes(ref))
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if len(items) == 0 {
-		return "", errKeyringSecretNotFound
+		return nil, errKeyringSecretNotFound
+	}
+	sort.Slice(items, func(left, right int) bool { return string(items[left]) < string(items[right]) })
+	return items, nil
+}
+
+func linuxSecretItem(service *secretservice.SecretService, ref string) (dbus.ObjectPath, error) {
+	items, err := linuxSecretItems(service, ref)
+	if err != nil {
+		return "", err
+	}
+	if len(items) != 1 {
+		return "", errKeyringSecretAmbiguous
 	}
 	return items[0], nil
 }
@@ -70,6 +85,48 @@ func (KeyringStore) Set(ref, value string) error {
 		return unavailableCredentialStore(err)
 	}
 	if err := service.CreateItem(collection, fmt.Sprintf("%s/%s", keyringService, ref), linuxSecretAttributes(ref), secretservice.NewSecret(session.Path(), value)); err != nil {
+		return unavailableCredentialStore(err)
+	}
+	// Secret Service's replace flag is not consistently implemented when a
+	// legacy client already created duplicate matching items. Reconcile to one
+	// deterministic item before reporting success so reads can always fail
+	// closed instead of selecting an arbitrary old secret.
+	items, err := linuxSecretItems(service, ref)
+	if err != nil {
+		return unavailableCredentialStore(err)
+	}
+	desired := []byte(value)
+	defer clear(desired)
+	var keep dbus.ObjectPath
+	for _, item := range items {
+		if err := service.Unlock(item); err != nil {
+			return unavailableCredentialStore(err)
+		}
+		secret, err := service.GetSecret(item, session.Path())
+		if err != nil {
+			return unavailableCredentialStore(err)
+		}
+		matches := subtle.ConstantTimeCompare(secret.Value, desired) == 1
+		clear(secret.Value)
+		if matches && keep == "" {
+			keep = item
+		}
+	}
+	if keep == "" {
+		return unavailableCredentialStore(errKeyringSecretAmbiguous)
+	}
+	for _, item := range items {
+		if item != keep {
+			if err := service.Delete(item); err != nil {
+				return unavailableCredentialStore(err)
+			}
+		}
+	}
+	canonical, err := linuxSecretItems(service, ref)
+	if err != nil || len(canonical) != 1 || canonical[0] != keep {
+		if err == nil {
+			err = errKeyringSecretAmbiguous
+		}
 		return unavailableCredentialStore(err)
 	}
 	return nil
@@ -105,15 +162,17 @@ func (KeyringStore) Delete(ref string) error {
 	if err != nil {
 		return unavailableCredentialStore(err)
 	}
-	item, err := linuxSecretItem(service, ref)
+	items, err := linuxSecretItems(service, ref)
 	if errors.Is(err, errKeyringSecretNotFound) {
 		return nil
 	}
 	if err != nil {
 		return unavailableCredentialStore(err)
 	}
-	if err := service.Delete(item); err != nil {
-		return unavailableCredentialStore(err)
+	for _, item := range items {
+		if err := service.Delete(item); err != nil {
+			return unavailableCredentialStore(err)
+		}
 	}
 	return nil
 }

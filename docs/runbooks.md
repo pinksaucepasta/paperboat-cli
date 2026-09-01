@@ -124,19 +124,19 @@ reports repeated failures.
 
 ## Served preview workload drift
 
-Detection: a served preview has no ready local listener, a detached listener has no active
-preview, a source identity is invalid, or an expired descriptor remains installed.
+Detection: an active preview has no ready carrier or origin, its owner session expired, its
+route generation is stale, or its source identity is invalid.
 
-1. Identify the preview, machine, operation, and descriptor generation without recording
-   the source path, directory entries, public URL, or contents.
-2. Use `pb preview revoke <id>` to converge public and local state. Do not kill only the
-   listener or delete only the descriptor.
-3. For a replaced or escaping source, keep the workload stopped; have the owning user
-   select the intended source again. Never update a descriptor to accept a new identity.
-4. If shutdown cleanup was interrupted, revoke the preview before removing the inactive
-   service definition and descriptor.
-5. Verify no loopback listener, service definition, descriptor, credential renewal loop,
-   or public route remains. Preserve successfully copied `Paperboat Inbox/serve` files.
+1. Identify the preview, machine, operation, connector session, and config generation
+   without recording source paths, public URLs, request data, or credentials.
+2. Use `pb preview stop <preview>` to converge server and host-runtime state. Do not remove
+   only the route or terminate only the carrier.
+3. For a replaced or escaping source, keep the preview stopped and have the owner select
+   the intended target again. Never weaken the stored source identity check.
+4. If cleanup was interrupted, let hostd reconcile the terminal lease before removing any
+   orphaned local owner session.
+5. Verify no route, owner session, carrier registration, credential-renewal loop, or private
+   proxy rule remains for the stopped preview.
 
 ## Recovery evidence
 
@@ -144,3 +144,7 @@ For every incident, record the redacted timeline, affected stable IDs, configure
 version/protocol, root cause, containment, recovery verification, and whether
 alerts or thresholds need adjustment. Exercise these runbooks against a
 production-shaped environment before release.
+
+Preview, durable tunnel, custom-domain, connector, private-access, and update
+procedures are collected in
+[runbooks-preview-tunnels.md](runbooks-preview-tunnels.md).

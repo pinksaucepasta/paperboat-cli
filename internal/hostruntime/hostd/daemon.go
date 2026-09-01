@@ -14,7 +14,6 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/execprocess"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/filetransfer"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/preview"
-	"github.com/pinksaucepasta/paperboat/internal/hostruntime/servelease"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/session"
 	"github.com/pinksaucepasta/paperboat/internal/managedssh"
 )
@@ -24,8 +23,29 @@ var (
 	ErrInvalidState  = errors.New("invalid hostd state")
 )
 
+// ReplacementCommittedError reports cleanup failure after the candidate has
+// already become the sole coordination worker. Callers must publish the new
+// worker identity while still surfacing the predecessor cleanup error.
+type ReplacementCommittedError struct{ Err error }
+
+func (e *ReplacementCommittedError) Error() string {
+	if e == nil || e.Err == nil {
+		return "worker replacement committed"
+	}
+	return "worker replacement committed: " + e.Err.Error()
+}
+
+func (e *ReplacementCommittedError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
 // Service is deliberately the small lifecycle contract shared by stable
-// ingress/workload services and replaceable coordination services.
+// ingress/workload services and replaceable coordination services. Shutdown
+// must be idempotent and clean partial allocations even when Start returned an
+// error; hostd always invokes it for a failed start.
 type Service interface {
 	Start(context.Context) error
 	Shutdown(context.Context) error
@@ -37,17 +57,25 @@ type Component struct {
 	Service  Service
 }
 
+// TunnelWorkloads is the stable ownership boundary for durable tunnel
+// reconciliation. Coordination-worker replacement may inspect counts but must
+// never acquire or stop the manager.
+type TunnelWorkloads interface {
+	Service
+	ResourceCounts() map[string]uint64
+}
+
 // Workloads is the only owner of live workload managers.  It is intentionally
 // exposed read-only through Daemon so protocol handlers can use the same
 // managers without duplicating process ownership in workers.
 type Workloads struct {
-	Sessions    *session.Manager
-	Executions  *execprocess.Manager
-	Transfers   *filetransfer.Service
-	Previews    *preview.Registry
-	Codex       *codexsession.Manager
-	ServeLeases *servelease.Manager
-	ManagedSSH  *managedssh.Host
+	Sessions   *session.Manager
+	Executions *execprocess.Manager
+	Transfers  *filetransfer.Service
+	Previews   *preview.Registry
+	Codex      *codexsession.Manager
+	ManagedSSH *managedssh.Host
+	Tunnels    TunnelWorkloads
 }
 
 func (w Workloads) valid() bool {
@@ -107,13 +135,16 @@ func (d *Daemon) Start(ctx context.Context) error {
 	}
 	for _, component := range d.config.Components {
 		if err := component.Service.Start(ctx); err != nil {
-			if !component.Required {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), d.config.ShutdownTimeout)
+			failedCleanupErr := component.Service.Shutdown(cleanupCtx)
+			cancel()
+			if !component.Required && failedCleanupErr == nil {
 				continue
 			}
-			cleanupCtx, cancel := context.WithTimeout(context.Background(), d.config.ShutdownTimeout)
+			cleanupCtx, cancel = context.WithTimeout(context.Background(), d.config.ShutdownTimeout)
 			cleanupErr := d.shutdownStarted(cleanupCtx)
 			cancel()
-			return errors.Join(fmt.Errorf("start stable %s: %w", component.Name, err), cleanupErr)
+			return errors.Join(fmt.Errorf("start stable %s: %w", component.Name, err), failedCleanupErr, cleanupErr)
 		}
 		d.started = append(d.started, component)
 	}
@@ -171,11 +202,16 @@ func NewWorkerController(daemon *Daemon) (*WorkerController, error) {
 }
 
 func (c *WorkerController) Start(ctx context.Context, worker Service) error {
-	if worker == nil || !c.daemon.Running() {
+	if worker == nil {
 		return ErrInvalidState
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.daemon.mu.RLock()
+	defer c.daemon.mu.RUnlock()
+	if !c.daemon.running || c.daemon.stopped {
+		return ErrInvalidState
+	}
 	if c.running {
 		return ErrInvalidState
 	}
@@ -190,11 +226,16 @@ func (c *WorkerController) Start(ctx context.Context, worker Service) error {
 // It never calls into daemon workloads and therefore cannot terminate a PTY,
 // Codex process, transfer, preview, serve listener, or managed SSH stream.
 func (c *WorkerController) Replace(ctx context.Context, candidate Service) error {
-	if candidate == nil || !c.daemon.Running() {
+	if candidate == nil {
 		return ErrInvalidState
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.daemon.mu.RLock()
+	defer c.daemon.mu.RUnlock()
+	if !c.daemon.running || c.daemon.stopped {
+		return ErrInvalidState
+	}
 	if !c.running || c.active == nil {
 		return ErrInvalidState
 	}
@@ -206,7 +247,7 @@ func (c *WorkerController) Replace(ctx context.Context, candidate Service) error
 	if err := previous.Shutdown(ctx); err != nil {
 		// The candidate is now the sole worker; do not re-activate a potentially
 		// partially shut-down predecessor.
-		return fmt.Errorf("stop fenced worker: %w", err)
+		return &ReplacementCommittedError{Err: fmt.Errorf("stop fenced worker: %w", err)}
 	}
 	return nil
 }

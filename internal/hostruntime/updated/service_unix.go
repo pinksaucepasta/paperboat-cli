@@ -22,6 +22,7 @@ import (
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/autoupdate"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostdproto"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/releaseeligibility"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/workerupdate"
 )
 
@@ -40,6 +41,8 @@ type Config struct {
 	RepositoryURL  string
 	MachineID      string
 	Health         workerupdate.HealthChecker
+	ActivationGate workerupdate.ActivationGate
+	Events         workerupdate.EventSink
 	Restarter      interface{ Restart(context.Context) error }
 	// ControlSocket is the fixed local socket exposed to the enrolled user for
 	// pb update, check, and status. It is not an updater command channel.
@@ -57,7 +60,7 @@ type Service struct {
 }
 
 func New(config Config) (*Service, error) {
-	if !filepath.IsAbs(config.StateRoot) || !filepath.IsAbs(config.ControlSocket) || !validUnixWorkerIdentity(config.WorkerUID, config.WorkerGID) || len(config.Token) != 32 || config.SocketPath == "" || config.RepositoryURL == "" || config.MachineID == "" || config.Health == nil || config.Restarter == nil {
+	if !filepath.IsAbs(config.StateRoot) || !filepath.IsAbs(config.ControlSocket) || !validUnixWorkerIdentity(config.WorkerUID, config.WorkerGID) || len(config.Token) != 32 || config.SocketPath == "" || config.RepositoryURL == "" || config.MachineID == "" || config.Health == nil || config.ActivationGate == nil || config.Restarter == nil {
 		return nil, ErrInvalidConfig
 	}
 	if err := secureRoot(config.StateRoot); err != nil {
@@ -72,12 +75,16 @@ func New(config Config) (*Service, error) {
 			return nil, err
 		}
 	}
-	source := workerupdate.TUFSource{RepositoryURL: config.RepositoryURL, StateRoot: filepath.Join(config.StateRoot, "tuf"), MachineID: config.MachineID}
 	client, err := hostdproto.NewClient(config.SocketPath, config.Token, 5*time.Second)
 	if err != nil {
 		return nil, err
 	}
-	manager, err := workerupdate.New(workerupdate.Config{StatePath: filepath.Join(config.StateRoot, "transaction.json"), Binary: config.Binary, BinaryRollback: config.BinaryRollback, BinaryStaged: config.BinaryStaged, Active: config.Active, OwnerUID: 0, OwnerGID: 0, WorkerUID: config.WorkerUID, WorkerGID: config.WorkerGID, HostdEndpoint: config.SocketPath, Capability: config.Token, Fetcher: source, Starter: workerupdate.ExecStarter{}, Hostd: client, Health: config.Health, MonitorWindow: 10 * time.Minute, HealthInterval: time.Second})
+	deferral, err := releaseeligibility.NewFileStore(filepath.Join(config.StateRoot, "deferral.json"))
+	if err != nil {
+		return nil, err
+	}
+	source := workerupdate.TUFSource{RepositoryURL: config.RepositoryURL, StateRoot: filepath.Join(config.StateRoot, "tuf"), MachineID: config.MachineID, FailureDomain: workerupdate.HostdFailureDomainSource{Client: client, MachineID: config.MachineID}, Deferral: deferral}
+	manager, err := workerupdate.New(workerupdate.Config{StatePath: filepath.Join(config.StateRoot, "transaction.json"), Binary: config.Binary, BinaryRollback: config.BinaryRollback, BinaryStaged: config.BinaryStaged, Active: config.Active, OwnerUID: 0, OwnerGID: 0, WorkerUID: config.WorkerUID, WorkerGID: config.WorkerGID, HostdEndpoint: config.SocketPath, Capability: config.Token, Fetcher: source, Starter: workerupdate.ExecStarter{}, Hostd: client, Health: config.Health, Gate: config.ActivationGate, Events: config.Events, MonitorWindow: 10 * time.Minute, HealthInterval: time.Second})
 	if err != nil {
 		return nil, err
 	}

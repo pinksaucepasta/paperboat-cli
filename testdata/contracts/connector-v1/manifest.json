@@ -1,0 +1,37 @@
+{
+  "manifest_version": 1,
+  "contract_version": "1.0.0",
+  "family": "paperboat.connector",
+  "status": "approved",
+  "authority": "contracts/connector-v1/contracts.md",
+  "artifacts": [
+    {
+      "id": "connector-v1.contracts",
+      "path": "contracts.md",
+      "type": "specification",
+    "sha256": "b619ddba89a1b247dea907e70aa91648b58ad4258669755968201557cf7dcc56",
+      "consumers": ["paperboat", "paperboat-server", "paperboat-tunnel"]
+    },
+    {
+      "id": "connector-v1.bootstrap",
+      "path": "schemas/bootstrap.schema.json",
+      "type": "json-schema",
+    "sha256": "99a86366fde33e99bee14a2535a2f39434a0a7e3868227873bf380c96c27b03c",
+      "consumers": ["paperboat", "paperboat-server", "paperboat-tunnel"]
+    },
+    {
+      "id": "connector-v1.bootstrap-vectors",
+      "path": "fixtures/bootstrap.ndjson",
+      "type": "contract-vectors",
+    "sha256": "a1656fd9e86ba4fc853eb089ba33f0f4b6193cf2e49d1f10f33ebfcbc7cc22b0",
+      "consumers": ["paperboat", "paperboat-server", "paperboat-tunnel"]
+    },
+    {
+      "id": "connector-v1.vectors",
+      "path": "fixtures/vectors.ndjson",
+      "type": "contract-vectors",
+      "sha256": "b7a54915dfe2b6898fb8630d5f008266634367e253f859573c2e2b01b2bb00b8",
+      "consumers": ["paperboat", "paperboat-server", "paperboat-tunnel"]
+    }
+  ]
+}

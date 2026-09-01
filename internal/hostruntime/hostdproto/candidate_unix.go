@@ -82,13 +82,13 @@ func (c *Candidate) Heartbeat(ctx context.Context) error {
 }
 
 func readyForCandidate(value Welcome) Ready {
-	return Ready{WorkerID: value.WorkerID, APIVersion: value.APIVersion, Epoch: value.Epoch, Lease: value.Lease}
+	return Ready(value)
 }
 func activateForCandidate(value Welcome) Activate {
-	return Activate{WorkerID: value.WorkerID, APIVersion: value.APIVersion, Epoch: value.Epoch, Lease: value.Lease}
+	return Activate(value)
 }
 func heartbeatForCandidate(value Welcome) Heartbeat {
-	return Heartbeat{WorkerID: value.WorkerID, APIVersion: value.APIVersion, Epoch: value.Epoch, Lease: value.Lease}
+	return Heartbeat(value)
 }
 func candidateStatus(response Message, state State, lease Welcome) (Status, error) {
 	status, ok := response.(*Status)

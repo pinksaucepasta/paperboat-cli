@@ -536,6 +536,30 @@ func TestUserMachineRequestsUseScopedRoutes(t *testing.T) {
 	}
 }
 
+func TestUserMachineCapabilitiesDecodeEnvironmentInjection(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/machines" {
+			t.Fatalf("request path=%q", r.URL.Path)
+		}
+		writeData(w, http.StatusOK, UserMachinePage{
+			Items: []UserMachine{{ID: "um_env", SetupMode: "host", Capabilities: MachineCapabilities{
+				EnvironmentInjection: MachineCapability{Configured: true, Observed: true},
+			}}},
+			Pagination: Pagination{},
+		})
+	}))
+	defer srv.Close()
+
+	machines, err := New(srv.URL, config.Credential{}, srv.Client()).ListUserMachines(context.Background())
+	if err != nil || len(machines) != 1 {
+		t.Fatalf("machines=%+v err=%v", machines, err)
+	}
+	got := machines[0].Capabilities.EnvironmentInjection
+	if !got.Configured || !got.Observed {
+		t.Fatalf("environment injection capability=%+v", got)
+	}
+}
+
 func TestUserMachineRevokeRequestsUseBearer(t *testing.T) {
 	var seen []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -960,19 +984,5 @@ func TestProjectConnectionDescriptorDecodesCanonicalDescriptor(t *testing.T) {
 	}
 	if response.ProjectID != "prj_1" || response.Terminal.Endpoints.WSS != "wss://edge.paperboat.test/v1/runtime" || response.FileTransfer.Endpoint != "https://edge.paperboat.test/v1/file-transfers" {
 		t.Fatalf("canonical response not decoded: %#v", response)
-	}
-}
-
-func TestLaunchMachinePreviewAcceptsCanonicalRuntimeRecord(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"operation_id": "operation-123", "id": "prv_1", "environment_id": "env_1", "logical_name": "web", "preview_key": "p-test",
-			"url": "https://web.preview.example.test", "target_port": 3000, "state": "ready",
-		})
-	}))
-	defer server.Close()
-	record, err := LaunchMachinePreview(context.Background(), PreviewLaunchDescriptor{Endpoint: server.URL, Auth: AuthMaterial{Token: "token"}}, PreviewLaunchRequest{OperationID: "operation-123", Name: "web", Port: 3000}, server.Client().Transport)
-	if err != nil || record.ID != "prv_1" || record.EnvironmentID != "env_1" || record.TargetPort != 3000 {
-		t.Fatalf("record=%+v err=%v", record, err)
 	}
 }

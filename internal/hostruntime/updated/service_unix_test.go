@@ -22,9 +22,8 @@ func TestHTTPHealthRejectsCandidateWithoutFreshHeartbeat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	endpoint := "http://127.0.0.1" + parsed.Path + "/healthz"
 	// httptest uses a loopback IP but may not preserve it in URL on all hosts.
-	endpoint = strings.Replace(server.URL, parsed.Hostname(), "127.0.0.1", 1) + "/healthz"
+	endpoint := strings.Replace(server.URL, parsed.Hostname(), "127.0.0.1", 1) + "/healthz"
 	health := HTTPHealth{Endpoint: endpoint}
 	stale := hostdproto.Status{State: hostdproto.StateActive, WorkerID: "runtime", APIVersion: 1, Epoch: 1, LastHeartbeatUnixMilli: time.Now().Add(-16 * time.Second).UnixMilli()}
 	if err := health.Check(context.Background(), stale, workerupdate.Release{}); err == nil {

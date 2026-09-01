@@ -6,7 +6,7 @@
       "id": "cli.behavior",
       "path": "cli/behavior.json",
       "type": "command-behavior",
-      "sha256": "1c9faf3112fdb630a489f8e5f430da4946f2e7289d4089090d17eab66c5b3b5a",
+      "sha256": "1eb1dbb8100cb7ad0db118dcdf5c82f8e2fbcc9c8e8826e9513ca69188a7df49",
       "owner": "cli",
       "review": "preview-ownership-review",
       "consumers": [
@@ -17,7 +17,7 @@
       "id": "cli.command-tree",
       "path": "cli/command-tree.json",
       "type": "command-tree",
-      "sha256": "ffff0b183510ae585d00c94b16c5c0ff984769e8faed5f7bf84828b0b959ad89",
+      "sha256": "0eb6a189414e77a153ac4c4ed76b5032fdf1f3fae33dc1910428b9043b20ea9c",
       "owner": "cli",
       "review": "preview-ownership-review",
       "consumers": [
@@ -52,7 +52,7 @@
       "id": "credentials.classes",
       "path": "credentials/classes.json",
       "type": "credential-matrix",
-      "sha256": "b8b7cd161ca475bdff78496d28ebb8277655b6aab03f2bf04fb7932c042f386b",
+      "sha256": "edb100eda773908fcdae17442668e60931431de4ed7bac2b7cd7d9ea81a81c29",
       "owner": "server",
       "review": "initial-review",
       "consumers": [
@@ -199,7 +199,7 @@
       "id": "helper.operation.vectors",
       "path": "fixtures/helper/operations.ndjson",
       "type": "operation-vectors",
-      "sha256": "a7caf310cc248bcffcea82eff826f383703bec0859fbae8d8dc480f13a12b288",
+      "sha256": "0cbed2c28f0047b1f3c097c43d73ad8de78a63e13a5daca9db179984a6cfda0c",
       "owner": "helper",
       "review": "initial-review",
       "consumers": [
@@ -285,7 +285,7 @@
       "id": "helper.operations",
       "path": "helper/operations.md",
       "type": "specification",
-      "sha256": "b6ee87e26f8ca698469ab577dec056317615724a29b5d7906793e178e0443ae4",
+      "sha256": "0557300cb5189a65ab009c6b1c1a5cc895c7823e52cbdf50bb024fda1c89e1db",
       "owner": "helper",
       "review": "preview-ownership-review",
       "consumers": [
@@ -298,7 +298,7 @@
       "id": "helper.profiles",
       "path": "helper/profiles.json",
       "type": "capability-matrix",
-      "sha256": "393a412b92e0da4d538c9709ce2aa905de13734c11aca2864bcf9e8e1a4e030d",
+      "sha256": "8139b935baeb338e69d59dce3f5082bf610979614b6ef93f6ad653ff108bc536",
       "owner": "helper",
       "review": "initial-review",
       "consumers": [
@@ -533,19 +533,6 @@
       ]
     },
     {
-      "id": "preview.state",
-      "path": "states/preview.json",
-      "type": "state-table",
-      "sha256": "0133268d4c588bbd107467d899e35b87baa0240b3fa1360936288bfe2f4e7d39",
-      "owner": "server",
-      "review": "preview-ownership-review",
-      "consumers": [
-        "paperboat",
-        "paperboat-server",
-        "paperboat-tunnel"
-      ]
-    },
-    {
       "id": "session.state",
       "path": "states/session.json",
       "type": "state-table",
@@ -561,7 +548,7 @@
       "id": "cli.command.transcripts",
       "path": "transcripts/cli/commands.json",
       "type": "transcripts",
-      "sha256": "3b7d46e58e2c983f6fa536cad8bf52d2e60d96636f97ee6e5db6fb3f87ee8c5f",
+      "sha256": "a0509ebe3ea47b92a7f2738d355e43b6a8126a3f02fb79d6db9e2d84343a3176",
       "owner": "cli",
       "review": "preview-ownership-review",
       "consumers": [

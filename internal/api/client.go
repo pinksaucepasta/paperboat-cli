@@ -15,8 +15,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pinksaucepasta/paperboat/internal/httptransport"
-
 	"github.com/pinksaucepasta/paperboat/internal/buildinfo"
 	"github.com/pinksaucepasta/paperboat/internal/config"
 	"github.com/pinksaucepasta/paperboat/internal/remotepath"
@@ -25,6 +23,12 @@ import (
 // ErrUnauthenticated means the server rejected the reused credential. Callers
 // should route the user through Paperboat device login.
 var ErrUnauthenticated = errors.New("paperboat-server rejected the credential")
+
+// ErrMachineAuthReadRequiresClientSession reports that a machine-proof create
+// returned an operation but this client has no ordinary read credential to
+// fetch the resulting public lease. The server deliberately keeps preview
+// reads behind the client-session authorization boundary.
+var ErrMachineAuthReadRequiresClientSession = errors.New("machine-authenticated preview create requires a client-session read credential")
 
 // ErrIncompatibleVersion tells callers to upgrade instead of retrying.
 type ErrIncompatibleVersion struct{ Required, Message string }
@@ -94,6 +98,12 @@ func (e *APIError) Error() string {
 	return message
 }
 
+// Retryable classifies transport-level HTTP failures for lease/session
+// renewals without making callers branch on human-readable error messages.
+func (e *APIError) Retryable() bool {
+	return e != nil && (e.Status == http.StatusRequestTimeout || e.Status == http.StatusTooManyRequests || e.Status >= 500)
+}
+
 // Client talks to paperboat-server with a Paperboat client-session access token.
 type Client struct {
 	baseURL         string
@@ -101,6 +111,28 @@ type Client struct {
 	http            *http.Client
 	accessToken     string
 	sourceMachineID string
+	machineAuth     MachineAuthSource
+}
+
+// MachineAuthSource supplies the renewable machine-control bearer and signs
+// the exact request body for a mutating operation. It is intentionally a
+// narrow interface so the API client never persists or owns machine secrets.
+type MachineAuthSource interface {
+	Token(context.Context) (string, error)
+	Proof(context.Context, string, string, string, []byte) ([]byte, error)
+}
+
+// SetMachineAuth makes subsequent mutating requests use the authenticated
+// machine identity. Mutations must include Idempotency-Key; that key is bound
+// into the signed proof. GETs retain ordinary client-session authentication so
+// a create operation can fetch its public lease through the read middleware.
+// The source remains responsible for renewal and key material. Passing nil
+// restores ordinary client-session authentication for mutations.
+func (c *Client) SetMachineAuth(source MachineAuthSource) {
+	if c == nil {
+		return
+	}
+	c.machineAuth = source
 }
 
 func (c *Client) SetSourceMachineID(machineID string) {
@@ -638,12 +670,13 @@ type MachineCapability struct {
 }
 
 type MachineCapabilities struct {
-	FileReceive   MachineCapability `json:"file_receive"`
-	PreviewLaunch MachineCapability `json:"preview_launch"`
-	TerminalHost  MachineCapability `json:"terminal_host"`
-	CodexHost     MachineCapability `json:"codex_host"`
-	SessionHost   MachineCapability `json:"session_host"`
-	KeepAwake     MachineCapability `json:"keep_awake"`
+	FileReceive          MachineCapability `json:"file_receive"`
+	PreviewLaunch        MachineCapability `json:"preview_launch"`
+	TerminalHost         MachineCapability `json:"terminal_host"`
+	CodexHost            MachineCapability `json:"codex_host"`
+	SessionHost          MachineCapability `json:"session_host"`
+	KeepAwake            MachineCapability `json:"keep_awake"`
+	EnvironmentInjection MachineCapability `json:"environment_injection"`
 }
 
 type MachineSetupInput struct {
@@ -1057,47 +1090,6 @@ type FileTransfer struct {
 	InitiatingUserID     string             `json:"initiating_user_id"`
 	Auth                 AuthMaterial       `json:"auth"`
 	Policy               FileTransferPolicy `json:"policy"`
-}
-
-type PreviewLaunchDescriptor struct {
-	Endpoint  string       `json:"endpoint"`
-	MachineID string       `json:"machine_id"`
-	ExpiresAt time.Time    `json:"expires_at"`
-	Auth      AuthMaterial `json:"auth"`
-}
-
-type PreviewLaunchRequest struct {
-	OperationID     string `json:"operation_id"`
-	Name            string `json:"name"`
-	Port            uint16 `json:"port"`
-	DurationSeconds int64  `json:"duration_seconds,omitempty"`
-	Indefinite      bool   `json:"indefinite,omitempty"`
-}
-
-type PreviewLaunchError struct {
-	Code         string `json:"code"`
-	Message      string `json:"message"`
-	Retryable    bool   `json:"retryable"`
-	MachineID    string `json:"machine_id"`
-	Name         string `json:"name"`
-	Port         uint16 `json:"port"`
-	StateCreated bool   `json:"state_created"`
-	Cleanup      string `json:"cleanup"`
-	Recovery     string `json:"recovery"`
-}
-
-func (e *PreviewLaunchError) Error() string { return e.Message }
-
-type PreviewRecord struct {
-	OperationID   string     `json:"operation_id,omitempty"`
-	ID            string     `json:"id"`
-	EnvironmentID string     `json:"environment_id"`
-	PreviewKey    string     `json:"preview_key"`
-	LogicalName   string     `json:"logical_name"`
-	URL           string     `json:"url"`
-	TargetPort    int32      `json:"target_port"`
-	State         string     `json:"state"`
-	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
 }
 
 // ConnectionDescriptor is the cli-connect / connection-status descriptor. When
@@ -1619,62 +1611,6 @@ func (c *Client) MachineFileTransferDescriptor(ctx context.Context, destinationM
 	return out, err
 }
 
-func (c *Client) MachinePreviewLaunchDescriptor(ctx context.Context, machineID string) (PreviewLaunchDescriptor, error) {
-	if strings.TrimSpace(machineID) == "" {
-		return PreviewLaunchDescriptor{}, errors.New("machine ID is required")
-	}
-	var out PreviewLaunchDescriptor
-	err := c.do(ctx, http.MethodPost, "/v1/machines/"+url.PathEscape(machineID)+"/preview-launch-descriptor", nil, &out)
-	if err != nil {
-		return PreviewLaunchDescriptor{}, err
-	}
-	u, parseErr := url.Parse(out.Endpoint)
-	if parseErr != nil || u.Scheme != "https" || u.Host == "" || u.Path != "/v1/preview-launches" || out.MachineID != machineID || out.Auth.Method != "bearer" || out.Auth.Token == "" || out.ExpiresAt.IsZero() || out.Auth.ExpiresAt.IsZero() || !out.ExpiresAt.Equal(out.Auth.ExpiresAt) || len(out.Auth.Scopes) != 1 || out.Auth.Scopes[0] != "preview:launch" {
-		return PreviewLaunchDescriptor{}, errors.New("paperboat-server returned an invalid preview launch descriptor")
-	}
-	return out, nil
-}
-
-func LaunchMachinePreview(ctx context.Context, descriptor PreviewLaunchDescriptor, input PreviewLaunchRequest, transport http.RoundTripper) (PreviewRecord, error) {
-	if transport == nil {
-		transport = httptransport.Default()
-	}
-	body, err := json.Marshal(input)
-	if err != nil {
-		return PreviewRecord{}, err
-	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, descriptor.Endpoint, bytes.NewReader(body))
-	if err != nil {
-		return PreviewRecord{}, err
-	}
-	request.Header.Set("Authorization", "Bearer "+descriptor.Auth.Token)
-	request.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Transport: transport, Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("preview launch endpoint redirected") }}
-	response, err := client.Do(request)
-	if err != nil {
-		return PreviewRecord{}, fmt.Errorf("launch preview on machine: %w", err)
-	}
-	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		var envelope struct {
-			Error PreviewLaunchError `json:"error"`
-		}
-		decoder := json.NewDecoder(io.LimitReader(response.Body, 64<<10))
-		decoder.DisallowUnknownFields()
-		if decoder.Decode(&envelope) == nil && envelope.Error.Code != "" && envelope.Error.Message != "" {
-			return PreviewRecord{}, &envelope.Error
-		}
-		return PreviewRecord{}, fmt.Errorf("remote preview launch failed with status %d", response.StatusCode)
-	}
-	var record PreviewRecord
-	decoder := json.NewDecoder(io.LimitReader(response.Body, 64<<10))
-	decoder.DisallowUnknownFields()
-	if decoder.Decode(&record) != nil || decoder.Decode(&struct{}{}) != io.EOF || record.OperationID != input.OperationID || record.URL == "" || record.LogicalName == "" {
-		return PreviewRecord{}, errors.New("machine returned an invalid preview launch response")
-	}
-	return record, nil
-}
-
 // UserMachineConnectionReadiness polls readiness without minting a fresh
 // descriptor. Reconnects re-run UserMachineConnectionDescriptor after this reports
 // ready, matching the hosted-project flow.
@@ -1813,16 +1749,26 @@ func (c *Client) doStrict(ctx context.Context, method, path string, body, out an
 }
 
 func (c *Client) doRequest(ctx context.Context, method, path string, body, out any, headers http.Header, strict bool) error {
+	return c.doRequestMeta(ctx, method, path, body, out, headers, strict, nil)
+}
+
+// doRequestMeta is the same authenticated request path used by the rest of
+// the client, with response headers exposed to callers that need optimistic
+// concurrency metadata. Keeping this as a narrow extension avoids making
+// ETags or other transport headers part of every existing API method.
+func (c *Client) doRequestMeta(ctx context.Context, method, path string, body, out any, headers http.Header, strict bool, responseHeaders *http.Header) error {
 	if strings.TrimSpace(c.baseURL) == "" {
 		return errors.New("paperboat-server base URL is not configured")
 	}
 
 	var reader io.Reader
+	var encodedBody []byte
 	if body != nil {
 		encoded, err := json.Marshal(body)
 		if err != nil {
 			return fmt.Errorf("encode request body: %w", err)
 		}
+		encodedBody = encoded
 		reader = bytes.NewReader(encoded)
 	}
 
@@ -1845,12 +1791,35 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body, out a
 			req.Header.Add(key, value)
 		}
 	}
+	if c.machineAuth != nil && method != http.MethodGet && method != http.MethodHead && method != http.MethodOptions {
+		token, err := c.machineAuth.Token(ctx)
+		if err != nil || strings.TrimSpace(token) == "" {
+			return fmt.Errorf("machine authentication token: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("X-Paperboat-Machine-Identity", token)
+		operationID := strings.TrimSpace(req.Header.Get("Idempotency-Key"))
+		if operationID == "" {
+			return errors.New("machine-authenticated mutation requires Idempotency-Key")
+		}
+		proof, err := c.machineAuth.Proof(ctx, operationID, method, path, encodedBody)
+		if err != nil || len(proof) == 0 {
+			if err == nil {
+				err = errors.New("empty machine proof")
+			}
+			return fmt.Errorf("machine authentication proof: %w", err)
+		}
+		req.Header.Set("X-Paperboat-Machine-Proof", base64.RawURLEncoding.EncodeToString(proof))
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return fmt.Errorf("call %s %s: %w", method, path, err)
 	}
 	defer resp.Body.Close()
+	if responseHeaders != nil {
+		*responseHeaders = resp.Header.Clone()
+	}
 	if resp.StatusCode == http.StatusNoContent {
 		return nil
 	}

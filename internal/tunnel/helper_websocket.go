@@ -151,7 +151,6 @@ type helperTerminalConn struct {
 	ackSent                   atomic.Uint64
 	ackNotify                 chan struct{}
 	ackMu                     sync.Mutex
-	inputResultMu             sync.Mutex
 	inputResults              chan TerminalInputResult
 	inputQueue                *resolver.TerminalInputQueue
 	closing                   atomic.Bool

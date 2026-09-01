@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/connector"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/networkadaptation"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/networkmonitor"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/portmapping"
@@ -60,7 +61,9 @@ type networkChangeService struct {
 }
 
 type connectorNetworkRecovery interface{ NetworkChanged() }
+type connectorNetworkEventRecovery interface{ NetworkChangedEvent(connector.NetworkChange) }
 type directNetworkRecovery interface{ NetworkChanged(uint64) bool }
+type canonicalNetworkRecovery interface{ HandleNetworkEvent(networkmonitor.Event) }
 
 type directNetworkProxy struct {
 	mu     sync.RWMutex
@@ -85,28 +88,41 @@ type networkMetricRecorder interface {
 }
 
 type networkChangeHandler struct {
-	connector connectorNetworkRecovery
+	connector canonicalNetworkRecovery
 	direct    directNetworkRecovery
 	metrics   networkMetricRecorder
 	changed   func()
+	legacy    connectorNetworkRecovery
 }
 
 func (h *networkChangeHandler) SetObserver(observer func()) { h.changed = observer }
+
+// SetCanonical attaches the durable connector-v1 recovery path after the
+// tunnel assembly is constructed. The legacy connector remains the fallback
+// for hosts that do not opt into canonical tunnel-manager composition.
+func (h *networkChangeHandler) SetCanonical(recovery canonicalNetworkRecovery) {
+	if h != nil {
+		h.connector = recovery
+	}
+}
 
 func newNetworkChangeHandler(connector connectorNetworkRecovery, direct directNetworkRecovery, metrics networkMetricRecorder) (*networkChangeHandler, error) {
 	if connector == nil || metrics == nil {
 		return nil, ErrProductionInvalid
 	}
-	return &networkChangeHandler{connector: connector, direct: direct, metrics: metrics}, nil
+	return &networkChangeHandler{legacy: connector, direct: direct, metrics: metrics}, nil
 }
 
 func (h *networkChangeHandler) Handle(event networkmonitor.Event) {
-	if h == nil || h.connector == nil || h.metrics == nil || event.Generation == 0 {
+	if h == nil || h.metrics == nil || event.Generation == 0 {
 		return
 	}
 	h.record(event)
 	if h.changed != nil {
 		h.changed()
+	}
+	if h.connector != nil {
+		h.connector.HandleNetworkEvent(event)
 	}
 	if !event.Rebind {
 		return
@@ -116,7 +132,17 @@ func (h *networkChangeHandler) Handle(event networkmonitor.Event) {
 	if h.direct != nil {
 		h.direct.NetworkChanged(event.Generation)
 	}
-	h.connector.NetworkChanged()
+	// Canonical connector-v1 recovery owns carrier replacement. Do not also
+	// wake the legacy Supervisor, which would stage a second independent
+	// carrier for the same network event.
+	if h.connector != nil || h.legacy == nil {
+		return
+	}
+	if detailed, ok := h.legacy.(connectorNetworkEventRecovery); ok {
+		detailed.NetworkChangedEvent(connector.NetworkChange{Generation: event.Generation, Reasons: connector.NetworkReason(event.Reasons), Rebind: event.Rebind, Viable: event.Viable})
+	} else {
+		h.legacy.NetworkChanged()
+	}
 }
 
 func (h *networkChangeHandler) record(event networkmonitor.Event) {
@@ -136,6 +162,7 @@ func (h *networkChangeHandler) record(event networkmonitor.Event) {
 		{networkmonitor.ReasonNetworkCost, "network_cost"},
 		{networkmonitor.ReasonViability, "viability"},
 		{networkmonitor.ReasonWake, "wake"},
+		{networkmonitor.ReasonDNS, "dns"},
 	} {
 		if event.Reasons&item.reason != 0 {
 			_ = h.metrics.Record("paperboat_runtime_network_changes_total", 1, map[string]string{"reason": item.label, "action": action})
@@ -151,6 +178,10 @@ func newNetworkChangeService(changed func(networkmonitor.Event)) (*networkChange
 	if err != nil {
 		return nil, err
 	}
+	if err := observer.ConfigureDNS(networkmonitor.SystemDNSFingerprint, 15*time.Second); err != nil {
+		_ = observer.Close()
+		return nil, err
+	}
 	return &networkChangeService{observer: observer}, nil
 }
 
@@ -160,6 +191,10 @@ func newFingerprintingNetworkChangeService(secret []byte, changed func(networkmo
 	}
 	observer, err := networkmonitor.NewFingerprinting(secret, nil, changed)
 	if err != nil {
+		return nil, err
+	}
+	if err := observer.ConfigureDNS(networkmonitor.SystemDNSFingerprint, 15*time.Second); err != nil {
+		_ = observer.Close()
 		return nil, err
 	}
 	return &networkChangeService{observer: observer}, nil

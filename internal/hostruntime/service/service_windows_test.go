@@ -4,246 +4,164 @@ package service
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
-	"time"
 
 	"golang.org/x/sys/windows"
-	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
 )
 
-func writeWindowsRemovalTestDefinition(t *testing.T, root, name, executable string, arguments []string) string {
-	t.Helper()
-	path := filepath.Join(root, name+".json")
-	body, err := json.Marshal(windowsServiceDefinition{
-		Schema: "paperboat.windows-service/v1", Name: name, DisplayName: name,
-		Description: "test", Executable: executable, Arguments: arguments, Account: "SYSTEM",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, body, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	return path
-}
-
-func TestWindowsControllerRemoveMissingPreviewDeclarationFailsWhenServiceExists(t *testing.T) {
-	previousProbe := windowsServiceProbe
-	t.Cleanup(func() { windowsServiceProbe = previousProbe })
-
-	const name = "PaperboatPreview-0123456789abcdef"
-	var probedName string
-	windowsServiceProbe = func(name string) (bool, error) {
-		probedName = name
-		return true, nil
-	}
-	definitionPath := filepath.Join(t.TempDir(), name+".json")
-
-	err := (WindowsController{}).Remove(context.Background(), definitionPath)
-	if !errors.Is(err, ErrInvalidDefinition) {
-		t.Fatalf("Remove error = %v, want invalid-definition error", err)
-	}
-	if probedName != name {
-		t.Fatalf("probed service = %q, want %q", probedName, name)
-	}
-}
-
-func TestWindowsControllerRemoveMissingDeclarationIsIdempotentWhenServiceIsAbsent(t *testing.T) {
-	previousProbe := windowsServiceProbe
-	t.Cleanup(func() { windowsServiceProbe = previousProbe })
-
-	const name = "PaperboatPreview-0123456789abcdef"
-	windowsServiceProbe = func(string) (bool, error) { return false, nil }
-	definitionPath := filepath.Join(t.TempDir(), name+".json")
-
-	if err := (WindowsController{}).Remove(context.Background(), definitionPath); err != nil {
-		t.Fatalf("Remove error = %v, want nil", err)
-	}
-}
-
-func TestWindowsPreviewDeclarationDirectoryFailsClosed(t *testing.T) {
-	root := t.TempDir()
-	name := "PaperboatPreview-0123456789abcdef"
-	path := filepath.Join(root, name+".json")
-	if err := os.Mkdir(path, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := validateWindowsPreviewDeclarationEntry(entries[0]); !errors.Is(err, ErrInvalidDefinition) {
-		t.Fatalf("preview declaration directory error = %v, want invalid-definition", err)
-	}
-}
-
-func TestWindowsRemovalAcceptsMissingBinaryFromRealDeclaration(t *testing.T) {
-	root := t.TempDir()
-	const name = "PaperboatPreview-0123456789abcdef"
-	executable := filepath.Join(root, "releases", "runtime-current", "paperboat-runtime.exe")
-	stateRoot := filepath.Join(root, "state")
-	path := writeWindowsRemovalTestDefinition(t, root, name, executable, []string{
-		"__runtime-preview", "--state-root", stateRoot, "--name", "docs",
-	})
-	if _, err := os.Stat(executable); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("runtime-current fixture unexpectedly exists: %v", err)
-	}
-	for _, directory := range []string{filepath.Join(root, "releases"), filepath.Join(root, "releases", "runtime-current")} {
-		if _, err := os.Stat(directory); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("missing runtime ancestor %q unexpectedly exists: %v", directory, err)
-		}
-	}
-	if _, err := readWindowsServiceDefinition(path); !errors.Is(err, ErrInvalidDefinition) {
-		t.Fatalf("normal definition read error = %v, want invalid-definition", err)
-	}
-	definition, err := readWindowsServiceDefinitionForRemoval(path)
-	if err != nil {
-		t.Fatalf("removal definition read error = %v", err)
-	}
-	if definition.Executable != executable || definition.Name != name {
-		t.Fatalf("removal definition = %+v, want executable %q and name %q", definition, executable, name)
-	}
-	if state, ok := windowsPreviewStateRoot(definition.Arguments); !ok || state != stateRoot {
-		t.Fatalf("state root = %q, %v; want %q, true", state, ok, stateRoot)
-	}
-}
-
-func TestWindowsRemovalOwnershipUsesSCMCommandAndAccount(t *testing.T) {
-	root := t.TempDir()
-	const name = "PaperboatPreview-0123456789abcdef"
-	executable := filepath.Join(root, "releases", "runtime-current", "paperboat-runtime.exe")
-	arguments := []string{"__runtime-preview", "--state-root", filepath.Join(root, "state")}
-	path := writeWindowsRemovalTestDefinition(t, root, name, executable, arguments)
-	definition, err := readWindowsServiceDefinitionForRemoval(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := windows.ComposeCommandLine(append([]string{executable}, arguments...))
-	if !windowsServiceConfigurationOwnsDefinition(mgr.Config{BinaryPathName: want, ServiceStartName: "LocalSystem"}, definition) {
-		t.Fatal("matching SCM command/account was rejected")
-	}
-	for _, config := range []mgr.Config{
-		{BinaryPathName: windows.ComposeCommandLine([]string{filepath.Join(root, "other.exe")}), ServiceStartName: "LocalSystem"},
-		{BinaryPathName: want, ServiceStartName: "Administrator"},
+func TestWindowsServiceInstanceNamesAreBoundedAndRoleScoped(t *testing.T) {
+	const instance = "trk34-a1b2_c3"
+	for _, test := range []struct {
+		kind string
+		base string
+	}{
+		{kind: HostdKind, base: "PaperboatHostd"},
+		{kind: UpdaterKind, base: "PaperboatUpdated"},
+		{kind: HostKind, base: "PaperboatHost"},
+		{kind: ConfigKind, base: "PaperboatRuntimeConfig"},
+		{kind: DaemonKind, base: "PaperboatLocalDaemon"},
+		{kind: WorkerKind, base: "PaperboatRuntime"},
 	} {
-		if windowsServiceConfigurationOwnsDefinition(config, definition) {
-			t.Fatalf("foreign SCM configuration was accepted: %+v", config)
+		name := windowsServiceName(test.kind, instance)
+		want := test.base + "-" + instance
+		if name != want {
+			t.Fatalf("windowsServiceName(%q, %q)=%q, want %q", test.kind, instance, name, want)
+		}
+		path := filepath.Join(windowsServiceDefinitionRoot, name+".json")
+		parsed, err := windowsServiceNameFromDefinitionPath(path)
+		if err != nil || parsed != name {
+			t.Fatalf("windowsServiceNameFromDefinitionPath(%q)=%q, %v; want %q", path, parsed, err, name)
+		}
+	}
+	if got := windowsServiceName(HostdKind, ""); got != "PaperboatHostd" {
+		t.Fatalf("empty instance changed production service name: %q", got)
+	}
+	for _, instance := range []string{" leading", "trailing ", "bad\\name", "bad/name", strings.Repeat("x", windowsServiceInstanceMax+1)} {
+		if safeWindowsServiceKind(HostdKind, instance) {
+			t.Fatalf("unsafe instance accepted: %q", instance)
+		}
+	}
+	for _, path := range []string{
+		filepath.Join(windowsServiceDefinitionRoot, "PaperboatHostd-.json"),
+		filepath.Join(windowsServiceDefinitionRoot, "PaperboatHostd-foreign.name.json"),
+		filepath.Join(windowsServiceDefinitionRoot, "Foreign-"+instance+".json"),
+	} {
+		if _, err := windowsServiceNameFromDefinitionPath(path); !errors.Is(err, ErrInvalidDefinition) {
+			t.Fatalf("foreign/empty service path accepted: %q err=%v", path, err)
 		}
 	}
 }
 
-func TestWindowsRemovalRejectsTrailingJSON(t *testing.T) {
-	root := t.TempDir()
-	const name = "PaperboatPreview-0123456789abcdef"
-	path := writeWindowsRemovalTestDefinition(t, root, name, filepath.Join(root, "runtime-current.exe"), []string{"__runtime-preview"})
-	body, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
+func TestNativeWindowsRebootMetadataValidationIsFailClosed(t *testing.T) {
+	instance := "trk34-reboot-00112233445566778899"
+	root := `C:\ProgramData\paperboat-trk34-123456`
+	suffix := strings.TrimPrefix(instance, "trk34-reboot-")
+	metadata := nativeWindowsRebootMetadata{
+		Schema:                  nativeWindowsRebootMetadataSchema,
+		Instance:                instance,
+		OwnerSID:                "S-1-5-21-1-2-3-4",
+		ExecutableRoot:          root,
+		Executable:              filepath.Join(root, "service.test.exe"),
+		ConfigRoot:              filepath.Join(root, "config"),
+		StateRoot:               filepath.Join(root, "lifecycle"),
+		HostdName:               windowsServiceName(HostdKind, instance),
+		UpdaterName:             windowsServiceName(UpdaterKind, instance),
+		HostdDefinition:         filepath.Join(windowsServiceDefinitionRoot, windowsServiceName(HostdKind, instance)+".json"),
+		UpdaterDefinition:       filepath.Join(windowsServiceDefinitionRoot, windowsServiceName(UpdaterKind, instance)+".json"),
+		HostdDefinitionSHA256:   strings.Repeat("a", 64),
+		UpdaterDefinitionSHA256: strings.Repeat("b", 64),
+		HostdHealth:             "127.0.0.1:12345",
+		UpdaterHealth:           "127.0.0.1:12346",
+		HostdWorkloadFailure:    filepath.Join(os.TempDir(), nativeWindowsRebootMetadataPrefix+suffix+"-hostd-workload.failure.txt"),
+		UpdaterWorkloadFailure:  filepath.Join(os.TempDir(), nativeWindowsRebootMetadataPrefix+suffix+"-updater-workload.failure.txt"),
 	}
-	body = append(body, []byte(`
-{"schema":"paperboat.windows-service/v1"}`)...)
-	if err := os.WriteFile(path, body, 0o600); err != nil {
-		t.Fatal(err)
+	// The shape validator receives the platform temp root implicitly but touches
+	// neither SCM nor the filesystem.
+	if err := validateNativeWindowsRebootMetadataShape(metadata, metadata.metadataPath(), `C:\ProgramData`); err != nil {
+		t.Fatalf("valid reboot metadata rejected: %v", err)
 	}
-	if _, err := readWindowsServiceDefinitionForRemoval(path); !errors.Is(err, ErrInvalidDefinition) {
-		t.Fatalf("trailing JSON read error = %v, want invalid-definition", err)
+	mutations := []func(*nativeWindowsRebootMetadata){
+		func(candidate *nativeWindowsRebootMetadata) { candidate.Schema = "foreign" },
+		func(candidate *nativeWindowsRebootMetadata) { candidate.Instance = "trk34-reboot-" },
+		func(candidate *nativeWindowsRebootMetadata) {
+			candidate.Executable = filepath.Join(candidate.ExecutableRoot, "foreign.exe")
+		},
+		func(candidate *nativeWindowsRebootMetadata) { candidate.HostdName = "PaperboatHostd-foreign" },
+		func(candidate *nativeWindowsRebootMetadata) { candidate.HostdDefinitionSHA256 = "short" },
+		func(candidate *nativeWindowsRebootMetadata) { candidate.HostdHealth = "192.0.2.1:12345" },
+		func(candidate *nativeWindowsRebootMetadata) {
+			candidate.HostdWorkloadFailure = filepath.Join(`C:\Users\tester`, filepath.Base(candidate.HostdWorkloadFailure))
+		},
+		func(candidate *nativeWindowsRebootMetadata) { candidate.OwnerSID = "not-a-sid" },
+	}
+	for index, mutate := range mutations {
+		candidate := metadata
+		mutate(&candidate)
+		if err := validateNativeWindowsRebootMetadataShape(candidate, candidate.metadataPath(), `C:\ProgramData`); !errors.Is(err, ErrInvalidDefinition) {
+			t.Fatalf("metadata mutation %d accepted: %v", index, err)
+		}
 	}
 }
 
-func TestWindowsPreviewDeclarationOwnershipIsExact(t *testing.T) {
-	const stateRoot = `C:\ProgramData\Paperboat\state`
-	const logicalName = "docs"
-	serviceName := "PaperboatPreview-" + windowsPreviewInstanceFromName(logicalName)
-	definitionPath := filepath.Join(windowsServiceDefinitionRoot, serviceName+".json")
-	args := []string{
-		"__runtime-preview", "--state-root", stateRoot, "--name", logicalName,
-		"--descriptor", filepath.Join(stateRoot, "previews", "active", windowsPreviewInstanceFromName(logicalName)+".json"),
-		"--service-definition", definitionPath, "--port", "3000", "--indefinite",
-	}
+func TestWindowsServiceConfigTransitionRestoresOwnedDeclaration(t *testing.T) {
 	layout, err := DefaultLayout("windows")
 	if err != nil {
 		t.Fatal(err)
 	}
-	definition := windowsServiceDefinition{
-		Schema: "paperboat.windows-service/v1", Name: serviceName, Executable: layout.Binary,
-		Arguments: args, Account: "SYSTEM",
+	old := windowsServiceDefinition{
+		Schema: "paperboat.windows-service/v1", Name: "PaperboatHostd",
+		DisplayName: "old hostd", Description: "old declaration",
+		Executable: layout.Binary, Arguments: []string{"__runtime-hostd", "--restored"}, Account: "SYSTEM",
 	}
-	if err := validateWindowsPreviewDefinition(definitionPath, serviceName, stateRoot, definition); err != nil {
-		t.Fatalf("valid preview declaration rejected: %v", err)
+	current := mgr.Config{
+		BinaryPathName:   windows.ComposeCommandLine([]string{layout.Binary, "__runtime-hostd"}),
+		ServiceStartName: "LocalSystem", StartType: mgr.StartAutomatic,
+		SidType: windows.SERVICE_SID_TYPE_UNRESTRICTED,
 	}
-	for _, mutate := range []func(*windowsServiceDefinition){
-		func(d *windowsServiceDefinition) { d.Account = "Administrator" },
-		func(d *windowsServiceDefinition) { d.Executable = layout.BinaryRollback },
-		func(d *windowsServiceDefinition) { d.Arguments = append([]string{}, args[:len(args)-1]...) },
-		func(d *windowsServiceDefinition) {
-			d.Arguments = append([]string{}, args...)
-			d.Arguments[6] = filepath.Join(stateRoot, "previews", "active", "foreign.json")
-		},
-	} {
-		candidate := definition
-		candidate.Arguments = append([]string(nil), definition.Arguments...)
-		mutate(&candidate)
-		if err := validateWindowsPreviewDefinition(definitionPath, serviceName, stateRoot, candidate); !errors.Is(err, ErrInvalidDefinition) {
-			t.Fatalf("foreign preview declaration accepted: definition=%+v error=%v", candidate, err)
-		}
-	}
-}
-
-func TestWindowsPreviewServiceTerminalStatusRequiresSuccessfulStop(t *testing.T) {
-	tests := []struct {
-		name   string
-		status svc.Status
-		want   bool
-	}{
-		{name: "stopped successfully", status: svc.Status{State: svc.Stopped}, want: true},
-		{name: "start pending", status: svc.Status{State: svc.StartPending}},
-		{name: "running", status: svc.Status{State: svc.Running}},
-		{name: "stop pending", status: svc.Status{State: svc.StopPending}},
-		{name: "win32 failure", status: svc.Status{State: svc.Stopped, Win32ExitCode: 1}},
-		{name: "service failure", status: svc.Status{State: svc.Stopped, ServiceSpecificExitCode: 1}},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			if got := windowsPreviewServiceStatusTerminal(test.status); got != test.want {
-				t.Fatalf("terminal = %v, want %v for %+v", got, test.want, test.status)
-			}
-		})
-	}
-}
-
-func TestPollWindowsServiceDeletionWaitsThroughMarkedForDelete(t *testing.T) {
-	calls := 0
-	err := pollWindowsServiceDeletion(context.Background(), 100*time.Millisecond, time.Millisecond, func() error {
-		calls++
-		if calls < 3 {
-			return windows.ERROR_SERVICE_MARKED_FOR_DELETE
-		}
-		return windows.ERROR_SERVICE_DOES_NOT_EXIST
-	})
+	updated, err := windowsServiceConfigForDefinition(current, old)
 	if err != nil {
-		t.Fatalf("poll error = %v", err)
+		t.Fatalf("owned transition rejected: %v", err)
 	}
-	if calls != 3 {
-		t.Fatalf("probe calls = %d, want 3", calls)
+	wantPath := windows.ComposeCommandLine([]string{layout.Binary, "__runtime-hostd", "--restored"})
+	if updated.BinaryPathName != wantPath || updated.DisplayName != old.DisplayName || updated.Description != old.Description || updated.StartType != mgr.StartAutomatic || !isWindowsSystemAccount(updated.ServiceStartName) {
+		t.Fatalf("restored config=%+v want path=%q and old metadata", updated, wantPath)
+	}
+	for _, foreign := range []mgr.Config{
+		{BinaryPathName: windows.ComposeCommandLine([]string{`C:\Foreign\pb.exe`, "__runtime-hostd"}), ServiceStartName: "LocalSystem", SidType: windows.SERVICE_SID_TYPE_UNRESTRICTED},
+		{BinaryPathName: windows.ComposeCommandLine([]string{layout.Binary, "__runtime-hostd"}), ServiceStartName: "Administrator", SidType: windows.SERVICE_SID_TYPE_UNRESTRICTED},
+		{BinaryPathName: windows.ComposeCommandLine([]string{layout.Binary, "__runtime-hostd"}), ServiceStartName: "LocalSystem", SidType: windows.SERVICE_SID_TYPE_NONE},
+	} {
+		if _, err := windowsServiceConfigForDefinition(foreign, old); !errors.Is(err, ErrInvalidDefinition) {
+			t.Fatalf("foreign transition accepted: config=%+v err=%v", foreign, err)
+		}
 	}
 }
 
-func TestPollWindowsServiceDeletionBoundsBackgroundContext(t *testing.T) {
-	calls := 0
-	started := time.Now()
-	err := pollWindowsServiceDeletion(context.Background(), 12*time.Millisecond, time.Millisecond, func() error {
-		calls++
-		return windows.ERROR_SERVICE_MARKED_FOR_DELETE
-	})
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("poll error = %v, want deadline exceeded", err)
+func TestPendingWindowsInstallerAllowsRecoveryBeforeBinaryPublication(t *testing.T) {
+	layout, err := DefaultLayout("windows")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if calls == 0 || time.Since(started) > time.Second {
-		t.Fatalf("bounded poll calls=%d elapsed=%s", calls, time.Since(started))
+	config := Config{
+		Platform: "windows", Kind: HostdKind, ConfigRoot: `C:\ProgramData\Paperboat`,
+		Executable: layout.Binary, User: "Paperboat", Group: "Paperboat",
+		Arguments: []string{"__runtime-hostd"}, Controller: WindowsController{},
+	}
+	if _, err := New(config); !errors.Is(err, ErrInvalidDefinition) {
+		t.Fatalf("ordinary Windows installer accepted missing runtime: %v", err)
+	}
+	if _, err := NewPending(config); err != nil {
+		t.Fatalf("pending Windows installer rejected recovery boundary: %v", err)
+	}
+}
+
+func TestWindowsServiceEntryRejectsMissingContext(t *testing.T) {
+	if err := (WindowsController{}).Apply(context.Background(), `C:\ProgramData\Paperboat\missing.json`, false); err == nil {
+		t.Fatal("missing service definition unexpectedly accepted")
 	}
 }

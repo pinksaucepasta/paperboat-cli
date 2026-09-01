@@ -64,6 +64,35 @@ func TestStoreCreatesPrivateStableSigningIdentityAndRotatesAtomically(t *testing
 	}
 }
 
+func TestEnvironmentWrappingKeyIsStableAndRotatesWithMachineIdentity(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "identity")
+	random := append(bytes.Repeat([]byte{3}, 32), bytes.Repeat([]byte{4}, 32)...)
+	store, err := Open(Config{StateRoot: root, Random: bytes.NewReader(random)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := store.Current()
+	firstWrapping, err := store.EnvironmentWrappingKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(Config{StateRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopenedWrapping, err := reopened.EnvironmentWrappingKey()
+	if err != nil || firstWrapping != reopenedWrapping {
+		t.Fatalf("wrapping key changed on reopen: %x %x err=%v", firstWrapping, reopenedWrapping, err)
+	}
+	if _, err := store.Rotate(first.ID); err != nil {
+		t.Fatal(err)
+	}
+	rotatedWrapping, err := store.EnvironmentWrappingKey()
+	if err != nil || rotatedWrapping == firstWrapping {
+		t.Fatalf("wrapping key did not rotate: %x %x err=%v", firstWrapping, rotatedWrapping, err)
+	}
+}
+
 func TestMachineControlIsBoundToRegistrationAndSignsExactRequest(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "identity")
 	now := time.Date(2026, 2, 3, 4, 5, 6, 0, time.UTC)

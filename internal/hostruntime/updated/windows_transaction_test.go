@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 type recordingWindowsActivationBackend struct {
@@ -25,6 +26,12 @@ func (b *recordingWindowsActivationBackend) event(name string) error {
 }
 func (b *recordingWindowsActivationBackend) WriteJournal(j windowsActivationJournal) error {
 	return b.event("journal:" + string(j.Stage))
+}
+func (b *recordingWindowsActivationBackend) ProbeCandidate(_ context.Context, _ windowsActivationJournal) error {
+	return b.event("candidate")
+}
+func (b *recordingWindowsActivationBackend) StopCandidate(_ context.Context, _ windowsActivationJournal) error {
+	return b.event("candidate_stop")
 }
 func (b *recordingWindowsActivationBackend) StopServices(_ context.Context, localDaemon bool) error {
 	b.stoppedLocalDaemon = b.stoppedLocalDaemon || localDaemon
@@ -46,6 +53,12 @@ func (b *recordingWindowsActivationBackend) StartServices(_ context.Context, h, 
 func (b *recordingWindowsActivationBackend) VerifyHealth(context.Context, windowsActivationJournal) error {
 	return b.event("health")
 }
+func (b *recordingWindowsActivationBackend) Drain(context.Context, windowsActivationJournal) error {
+	return b.event("drain")
+}
+func (b *recordingWindowsActivationBackend) VerifyRollback(context.Context, windowsActivationJournal) error {
+	return b.event("verifyRollback")
+}
 func (b *recordingWindowsActivationBackend) CommitCLI(_ context.Context, j windowsActivationJournal) error {
 	return b.event("cli:" + j.NewCLIRecord)
 }
@@ -61,7 +74,7 @@ func testWindowsActivationJournal() windowsActivationJournal {
 	c := windowsActivationComponent{Path: `C:\Paperboat\candidate.exe`, SHA256: strings.Repeat("a", 64), Length: 1}
 	previous := c
 	previous.Path = `C:\Program Files\Paperboat\bin\pb.exe`
-	return windowsActivationJournal{Schema: windowsActivationJournalSchema, TransactionID: strings.Repeat("1", 32), PreviousVersion: "2026.08.22.1", Version: "2026.08.23.1", Architecture: "amd64", Stage: windowsActivationStaged, Runtime: c, CLI: c, Hostd: c, Updater: c, PreviousBinary: previous, OldHostd: windowsServiceTarget{Executable: `C:\Program Files\Paperboat\bin\pb.exe`, Arguments: []string{"__runtime-hostd"}, WasRunning: true}, NewHostd: windowsServiceTarget{Executable: `C:\Program Files\Paperboat\bin\pb.exe`, Arguments: []string{"__runtime-hostd"}}, OldUpdater: windowsServiceTarget{Executable: `C:\Program Files\Paperboat\bin\pb.exe`, Arguments: []string{"__runtime-updated"}, WasRunning: true}, NewUpdater: windowsServiceTarget{Executable: `C:\Program Files\Paperboat\bin\pb.exe`, Arguments: []string{"__runtime-updated"}}}
+	return windowsActivationJournal{Schema: windowsActivationJournalSchema, TransactionID: strings.Repeat("1", 32), PreviousVersion: "2026.08.22.1", Version: "2026.08.23.1", Architecture: "amd64", Stage: windowsActivationStaged, Runtime: c, CLI: c, Hostd: c, Updater: c, PreviousBinary: previous, OldHostd: windowsServiceTarget{Executable: `C:\Program Files\Paperboat\bin\pb.exe`, Arguments: []string{"__runtime-hostd"}, WasRunning: true}, NewHostd: windowsServiceTarget{Executable: `C:\Program Files\Paperboat\bin\pb.exe`, Arguments: []string{"__runtime-hostd"}}, OldUpdater: windowsServiceTarget{Executable: `C:\Program Files\Paperboat\bin\pb.exe`, Arguments: []string{"__runtime-updated"}, WasRunning: true}, NewUpdater: windowsServiceTarget{Executable: `C:\Program Files\Paperboat\bin\pb.exe`, Arguments: []string{"__runtime-updated"}}, ManifestSHA256: strings.Repeat("b", 64), CanaryPath: "/_paperboat/update-canary", CanaryStatus: 204, CanarySamples: 3, CanaryTimeout: time.Second, DrainTimeout: time.Second, StabilityWindow: time.Second, StabilityInterval: time.Second, RollbackTimeout: time.Second, HostdAPIMin: 1, HostdAPIMax: 2, RuntimeAPIMin: 1, RuntimeAPIMax: 2}
 }
 
 func TestWindowsActivationCommitsCLIOnlyAfterHealth(t *testing.T) {
@@ -70,7 +83,7 @@ func TestWindowsActivationCommitsCLIOnlyAfterHealth(t *testing.T) {
 	if err != nil || result.Stage != windowsActivationCommitted {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
-	want := []string{"journal:switching", "stop", "activate", "targets:C:\\Program Files\\Paperboat\\bin\\pb.exe", "start", "journal:services_live", "health", "cli:", "journal:committed", "finalize"}
+	want := []string{"journal:candidate_validating", "candidate", "journal:candidate_ready", "journal:draining", "drain", "candidate_stop", "journal:switching", "stop", "activate", "targets:C:\\Program Files\\Paperboat\\bin\\pb.exe", "start", "journal:services_live", "health", "cli:", "journal:committed", "finalize"}
 	if !reflect.DeepEqual(b.events, want) {
 		t.Fatalf("events=%q want=%q", b.events, want)
 	}
@@ -95,7 +108,7 @@ func TestWindowsActivationHealthFailureRestoresExactOldTargetsAndCLI(t *testing.
 	if err == nil || result.Stage != windowsActivationRolledBack {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
-	wantTail := []string{"journal:rolling_back", "stop", "restore", "targets:C:\\Program Files\\Paperboat\\bin\\pb.exe", "cli:", "quarantine", "journal:rollback_ready", "start", "journal:rolled_back"}
+	wantTail := []string{"journal:rolling_back", "stop", "restore", "targets:C:\\Program Files\\Paperboat\\bin\\pb.exe", "cli:", "quarantine", "journal:rollback_ready", "start", "verifyRollback", "journal:rolled_back"}
 	if !reflect.DeepEqual(b.events[len(b.events)-len(wantTail):], wantTail) {
 		t.Fatalf("events=%q", b.events)
 	}
@@ -109,7 +122,7 @@ func TestWindowsActivationRollbackReadyResumeOnlyStartsOldServices(t *testing.T)
 	if err == nil || result.Stage != windowsActivationRolledBack {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
-	want := []string{"start", "journal:rolled_back"}
+	want := []string{"start", "verifyRollback", "journal:rolled_back"}
 	if !reflect.DeepEqual(b.events, want) {
 		t.Fatalf("events=%q want=%q", b.events, want)
 	}
@@ -148,6 +161,48 @@ func TestWindowsActivationRecoveryNeverContinuesAmbiguousCutover(t *testing.T) {
 	result, err := executeWindowsActivation(context.Background(), b, j)
 	if err == nil || result.Stage != windowsActivationRolledBack || b.events[0] != "journal:rolling_back" {
 		t.Fatalf("result=%+v events=%q err=%v", result, b.events, err)
+	}
+}
+
+func TestWindowsActivationCandidateFailureLeavesOldRouteUndrained(t *testing.T) {
+	b := &recordingWindowsActivationBackend{fail: "candidate"}
+	result, err := executeWindowsActivation(context.Background(), b, testWindowsActivationJournal())
+	if err == nil || result.Stage != windowsActivationRolledBack {
+		t.Fatalf("result=%+v events=%q err=%v", result, b.events, err)
+	}
+	if slices.Contains(b.events, "drain") || slices.Contains(b.events, "stop") || slices.Contains(b.events, "restore") {
+		t.Fatalf("candidate failure touched old route/services: %q", b.events)
+	}
+	wantTail := []string{"journal:candidate_validating", "candidate", "journal:rolling_back", "candidate_stop", "quarantine", "journal:rolled_back"}
+	if len(b.events) < len(wantTail) || !reflect.DeepEqual(b.events[len(b.events)-len(wantTail):], wantTail) {
+		t.Fatalf("events=%q want tail=%q", b.events, wantTail)
+	}
+}
+
+func TestWindowsActivationCandidateStagesRecoverWithoutDrainingOldRoute(t *testing.T) {
+	for _, stage := range []windowsActivationStage{windowsActivationCandidateValidating, windowsActivationCandidateReady} {
+		b := &recordingWindowsActivationBackend{}
+		journal := testWindowsActivationJournal()
+		journal.Stage = stage
+		result, err := executeWindowsActivation(context.Background(), b, journal)
+		if err == nil || result.Stage != windowsActivationRolledBack {
+			t.Fatalf("stage=%q result=%+v events=%q err=%v", stage, result, b.events, err)
+		}
+		if slices.Contains(b.events, "drain") || slices.Contains(b.events, "stop") || slices.Contains(b.events, "restore") {
+			t.Fatalf("stage=%q touched old route/services: %q", stage, b.events)
+		}
+	}
+}
+
+func TestWindowsActivationJournalOrdersDrainBeforeSwitch(t *testing.T) {
+	b := &recordingWindowsActivationBackend{}
+	_, err := executeWindowsActivation(context.Background(), b, testWindowsActivationJournal())
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainIndex, switchIndex := slices.Index(b.events, "journal:draining"), slices.Index(b.events, "journal:switching")
+	if drainIndex < 0 || switchIndex < 0 || drainIndex >= switchIndex {
+		t.Fatalf("events=%q: drain must be durable before switching", b.events)
 	}
 }
 

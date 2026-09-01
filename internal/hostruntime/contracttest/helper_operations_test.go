@@ -4,13 +4,13 @@ import (
 	"bufio"
 	"encoding/json"
 	"os"
+	"strings"
 	"testing"
 )
 
 func TestNonTerminalOperationVectorCoverage(t *testing.T) {
 	required := map[string]bool{
 		"upload-valid": false, "upload-traversal": false, "upload-mime-mismatch": false,
-		"preview-register": false, "preview-private-request": false,
 		"config-stale-revision": false, "readiness-degraded": false,
 	}
 	f, err := os.Open("../../../testdata/contracts/fixtures/helper/operations.ndjson")
@@ -30,6 +30,11 @@ func TestNonTerminalOperationVectorCoverage(t *testing.T) {
 		}
 		if err := json.Unmarshal(scanner.Bytes(), &vector); err != nil {
 			t.Fatal(err)
+		}
+		for _, token := range retiredPreviewTokens {
+			if strings.Contains(string(scanner.Bytes()), token) {
+				t.Fatalf("retired preview contract token %q in operation vector %q", token, vector.Case)
+			}
 		}
 		if _, ok := required[vector.Case]; !ok {
 			t.Fatalf("unknown operation vector %q", vector.Case)
@@ -55,19 +60,114 @@ func TestNonTerminalOperationVectorCoverage(t *testing.T) {
 	}
 }
 
-func TestPreviewStateContract(t *testing.T) {
-	b, err := os.ReadFile("../../../testdata/contracts/states/preview.json")
+func TestRetiredPreviewStateArtifactIsAbsent(t *testing.T) {
+	statePath := "../../../testdata/contracts/states/preview.json"
+	if _, err := os.Stat(statePath); err == nil {
+		t.Fatalf("retired preview state artifact still exists: %s", statePath)
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("stat retired preview state artifact: %v", err)
+	}
+
+	b, err := os.ReadFile("../../../testdata/contracts/manifest.json")
 	if err != nil {
 		t.Fatal(err)
 	}
-	var state struct {
-		Initial string         `json:"initial"`
-		HTTP    map[string]int `json:"http"`
+	if strings.Contains(string(b), `states/preview.json`) {
+		t.Fatal("contract manifest still publishes retired preview state artifact")
 	}
-	if err := json.Unmarshal(b, &state); err != nil {
+}
+
+func TestPreviewCLIContractUsesCanonicalSurface(t *testing.T) {
+	b, err := os.ReadFile("../../../testdata/contracts/cli/command-tree.json")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if state.Initial != "registering" || state.HTTP["ready"] != 200 || state.HTTP["expired"] != 410 || state.HTTP["removed"] != 404 {
-		t.Fatalf("unexpected preview state contract: %#v", state)
+	var tree struct {
+		Commands []struct {
+			Name    string   `json:"name"`
+			Aliases []string `json:"aliases"`
+		} `json:"commands"`
 	}
+	if err := json.Unmarshal(b, &tree); err != nil {
+		t.Fatal(err)
+	}
+
+	seen := make(map[string]bool, len(tree.Commands))
+	for _, command := range tree.Commands {
+		if legacyPreviewCommands[command.Name] {
+			t.Fatalf("retired preview command %q remains in command tree", command.Name)
+		}
+		seen[command.Name] = true
+		for _, alias := range command.Aliases {
+			if legacyPreviewCommands[alias] {
+				t.Fatalf("retired preview command alias %q remains in command tree", alias)
+			}
+		}
+	}
+	for _, command := range []string{"preview", "preview list", "preview stop"} {
+		if !seen[command] {
+			t.Errorf("canonical preview command %q is missing from command tree", command)
+		}
+	}
+}
+
+func TestPreviewCLIArtifactsDoNotExposeLegacyCommands(t *testing.T) {
+	for _, artifact := range []struct {
+		path  string
+		field string
+	}{
+		{path: "../../../testdata/contracts/cli/behavior.json", field: "name"},
+		{path: "../../../testdata/contracts/transcripts/cli/commands.json", field: "command"},
+	} {
+		b, err := os.ReadFile(artifact.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var document struct {
+			Commands []map[string]json.RawMessage `json:"commands"`
+			Cases    []map[string]json.RawMessage `json:"cases"`
+		}
+		if err := json.Unmarshal(b, &document); err != nil {
+			t.Fatalf("decode %s: %v", artifact.path, err)
+		}
+		records := document.Commands
+		if artifact.field == "command" {
+			records = document.Cases
+		}
+		for _, record := range records {
+			var command string
+			if raw := record[artifact.field]; raw != nil {
+				if err := json.Unmarshal(raw, &command); err != nil {
+					t.Fatalf("decode %s command: %v", artifact.path, err)
+				}
+			}
+			if legacyPreviewCommands[command] {
+				t.Fatalf("retired preview command %q remains in %s", command, artifact.path)
+			}
+		}
+	}
+
+	b, err := os.ReadFile("../../../testdata/contracts/credentials/classes.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, token := range retiredPreviewTokens {
+		if strings.Contains(string(b), token) {
+			t.Fatalf("retired preview contract token %q remains in credential classes", token)
+		}
+	}
+}
+
+var retiredPreviewTokens = []string{
+	"preview.public.v1",
+	"preview.register",
+	"preview_registration",
+}
+
+var legacyPreviewCommands = map[string]bool{
+	"preview create":  true,
+	"preview revoke":  true,
+	"previews revoke": true,
+	"previews":        true,
+	"serve":           true,
 }

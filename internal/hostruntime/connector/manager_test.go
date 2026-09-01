@@ -199,6 +199,36 @@ func TestReplacementRetainsPreviousConnectionUntilItDisconnects(t *testing.T) {
 	}
 }
 
+func TestNetworkChangeFencesActiveCarrierWithoutChangingIdentity(t *testing.T) {
+	now := time.Now()
+	dialer := &fakeDialer{}
+	m := manager(t, dialer, now)
+	if _, err := m.Accept(context.Background(), admission(1, "jti_0001", now)); err != nil {
+		t.Fatal(err)
+	}
+	if !m.NetworkChanged(7) {
+		t.Fatal("network change did not fence active carrier")
+	}
+	status := m.Status()
+	if status.Connected || status.NetworkGeneration != 7 {
+		t.Fatalf("status after network change=%+v", status)
+	}
+	dialer.mu.Lock()
+	old := dialer.connections[0]
+	dialer.mu.Unlock()
+	old.done <- nil
+	if _, err := m.Accept(context.Background(), admission(2, "jti_0002", now)); err != nil {
+		t.Fatal(err)
+	}
+	status = m.Status()
+	if !status.Connected || status.Generation != 2 || status.NetworkGeneration != 7 {
+		t.Fatalf("status after replacement=%+v", status)
+	}
+	if m.NetworkChanged(7) {
+		t.Fatal("same network generation fenced a second time")
+	}
+}
+
 func TestShutdownCancelsDialAndStopsAdmission(t *testing.T) {
 	now := time.Now()
 	dialer := &fakeDialer{block: make(chan struct{}), started: make(chan struct{})}

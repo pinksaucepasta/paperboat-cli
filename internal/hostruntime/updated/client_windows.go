@@ -14,6 +14,7 @@ import (
 	"github.com/Microsoft/go-winio"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/autoupdate"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/supervisorupdate"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/workerupdate"
 )
 
 const ControlProtocolV1 = "paperboat.updated/v1"
@@ -30,16 +31,17 @@ type ControlRequest struct {
 	Release   string `json:"release,omitempty"`
 }
 type ControlResponse struct {
-	Schema            string                  `json:"schema"`
-	Status            string                  `json:"status"`
-	Version           string                  `json:"version,omitempty"`
-	Updated           bool                    `json:"updated"`
-	Pending           bool                    `json:"pending,omitempty"`
-	ActivationFailure string                  `json:"activation_failure,omitempty"`
-	Observation       autoupdate.Observation  `json:"observation"`
-	ErrorCode         string                  `json:"error_code,omitempty"`
-	ErrorMessage      string                  `json:"error_message,omitempty"`
-	Supervisor        supervisorupdate.Result `json:"supervisor,omitempty"`
+	Schema            string                        `json:"schema"`
+	Status            string                        `json:"status"`
+	Version           string                        `json:"version,omitempty"`
+	Updated           bool                          `json:"updated"`
+	Pending           bool                          `json:"pending,omitempty"`
+	ActivationFailure string                        `json:"activation_failure,omitempty"`
+	Observation       autoupdate.Observation        `json:"observation"`
+	ErrorCode         string                        `json:"error_code,omitempty"`
+	ErrorMessage      string                        `json:"error_message,omitempty"`
+	Supervisor        supervisorupdate.Result       `json:"supervisor,omitempty"`
+	Transaction       workerupdate.TransactionState `json:"transaction"`
 }
 
 type Client struct {

@@ -11,6 +11,30 @@ import (
 
 var ErrSupervisorInvalid = errors.New("invalid connector supervisor configuration")
 
+// NetworkReason mirrors the platform network monitor's privacy-preserving
+// reason bits without coupling the connector package to a specific OS monitor.
+type NetworkReason uint16
+
+const (
+	NetworkReasonDefaultRoute NetworkReason = 1 << iota
+	NetworkReasonInterfaceAddress
+	NetworkReasonAddressFamily
+	NetworkReasonProxy
+	NetworkReasonNetworkCost
+	NetworkReasonViability
+	NetworkReasonWake
+)
+
+// NetworkChange is the typed input used by the runtime network handler. The
+// generation fences stale callbacks and Rebind requests proactive replacement
+// of the current carrier.
+type NetworkChange struct {
+	Generation uint64
+	Reasons    NetworkReason
+	Rebind     bool
+	Viable     bool
+}
+
 type AdmissionSource interface {
 	Admission(context.Context) (Admission, error)
 }
@@ -48,13 +72,14 @@ type SupervisorConfig struct {
 }
 
 type Supervisor struct {
-	mu      sync.Mutex
-	config  SupervisorConfig
-	cancel  context.CancelFunc
-	done    chan struct{}
-	wake    chan struct{}
-	routes  chan struct{}
-	running bool
+	mu                sync.Mutex
+	config            SupervisorConfig
+	cancel            context.CancelFunc
+	done              chan struct{}
+	wake              chan struct{}
+	routes            chan struct{}
+	running           bool
+	networkGeneration uint64
 }
 
 func NewSupervisor(config SupervisorConfig) (*Supervisor, error) {
@@ -95,10 +120,48 @@ func (s *Supervisor) Start(ctx context.Context) error {
 }
 
 func (s *Supervisor) NetworkChanged() {
+	s.NetworkChangedEvent(NetworkChange{Rebind: true})
+}
+
+// NetworkChangedEvent records a monotonic network generation, fences the
+// manager's active carrier, and wakes both admission backoff and the active
+// connection wait. A route signal is deliberately used for rebind events so
+// recovery does not wait for a long TCP/FRP timeout.
+func (s *Supervisor) NetworkChangedEvent(change NetworkChange) {
+	if s == nil {
+		return
+	}
+	if change.Generation != 0 {
+		s.mu.Lock()
+		if change.Generation <= s.networkGeneration {
+			s.mu.Unlock()
+			return
+		}
+		s.networkGeneration = change.Generation
+		s.mu.Unlock()
+		s.config.Manager.NetworkChanged(change.Generation)
+	}
 	select {
 	case s.wake <- struct{}{}:
 	default:
 	}
+	if change.Rebind {
+		select {
+		case s.routes <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// NetworkGeneration returns the newest network generation accepted by the
+// supervisor. It is useful for health and support projections.
+func (s *Supervisor) NetworkGeneration() uint64 {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.networkGeneration
 }
 
 // RoutesChanged requests a fresh connector admission because proxy ownership is

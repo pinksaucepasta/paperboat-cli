@@ -220,7 +220,7 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 		Executable: executable, Artifact: *material.Artifact,
 		Home: home, Path: servicePath, StateRoot: *stateRoot, WorkspaceRoot: workspace, ControlURL: material.ControlURL,
 		UserMachineID: material.UserMachineID, Shell: resolvedShell, HelperListenAddress: material.HelperListenAddress,
-		SetupMode: material.SetupMode,
+		SetupMode: material.SetupMode, InstallationGeneration: material.InstallationGeneration,
 	}
 	previousGeneration := workerGeneration(*stateRoot)
 	fmt.Fprintln(stderr, "Paperboat must run before login and while this account is logged out.")

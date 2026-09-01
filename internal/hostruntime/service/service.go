@@ -29,7 +29,6 @@ const (
 	HostKind      = "host"
 	ConfigKind    = "config"
 	DaemonKind    = "daemon"
-	PreviewKind   = "preview"
 	HostdKind     = "hostd"
 	UpdaterKind   = "updater"
 	UpgradeReload = "reload_only"
@@ -45,15 +44,16 @@ type Controller interface {
 	Remove(context.Context, string) error
 }
 type Config struct {
-	Platform    string
-	Kind        string
-	Instance    string
-	ConfigRoot  string
-	Executable  string
-	User        string
-	Group       string
-	Arguments   []string
-	Environment map[string]string
+	Platform             string
+	Kind                 string
+	Instance             string
+	ConfigRoot           string
+	Executable           string
+	User                 string
+	Group                string
+	Arguments            []string
+	Environment          map[string]string
+	EncryptedCredentials map[string]string
 	// UpgradeMode controls only service-definition activation. The stable hostd
 	// service must not be restarted merely because its definition is rewritten:
 	// ordinary releases replace a child runtime under hostd ownership instead.
@@ -67,6 +67,22 @@ type Installer struct {
 }
 
 func New(config Config) (*Installer, error) {
+	return newInstaller(config, false)
+}
+
+// NewPending constructs a declaration installer before a fresh fixed binary
+// slot has been published. It is restricted to the privileged lifecycle
+// composition path; ordinary callers must use New so executable ownership and
+// mode are checked immediately.
+func NewPending(config Config) (*Installer, error) {
+	return newInstaller(config, true)
+}
+
+// newInstaller is also used by the host-install recovery boundary before the
+// first binary slot exists. It still validates the fixed path and every
+// declaration field; allowMissing only permits the one expected pre-stage
+// condition and is never exposed through the ordinary New constructor.
+func newInstaller(config Config, allowMissingExecutable bool) (*Installer, error) {
 	if config.Kind == "" {
 		config.Kind = WorkerKind
 	}
@@ -77,17 +93,26 @@ func New(config Config) (*Installer, error) {
 	// running. Target-platform render tests may deliberately produce another
 	// platform's declaration, but must still validate their local fixture using
 	// the host filesystem's security model.
+	missingExecutable := false
+	if allowMissingExecutable {
+		_, statErr := os.Lstat(config.Executable)
+		missingExecutable = errors.Is(statErr, os.ErrNotExist)
+	}
 	if runtime.GOOS == "windows" {
-		if err := safeExecutableWindows(config.Executable); err != nil {
+		if !missingExecutable {
+			if err := safeExecutableWindows(config.Executable); err != nil {
+				return nil, err
+			}
+		}
+	} else if !missingExecutable {
+		if err := safeExecutableForInstall(config.Executable, false); err != nil {
 			return nil, err
 		}
-	} else if err := safeExecutable(config.Executable); err != nil {
-		return nil, err
 	}
 	if !safeValues([]string{config.Executable}) {
 		return nil, ErrInvalidDefinition
 	}
-	if !safeValues(config.Arguments) || !safeEnvironment(config.Environment) || config.UpgradeMode != "" && config.UpgradeMode != UpgradeReload {
+	if !safeValues(config.Arguments) || !safeEnvironment(config.Environment) || !safeEncryptedCredentials(config) || config.UpgradeMode != "" && config.UpgradeMode != UpgradeReload {
 		return nil, ErrInvalidDefinition
 	}
 	var path string
@@ -104,13 +129,11 @@ func New(config Config) (*Installer, error) {
 			label = ConfigLabel
 		} else if config.Kind == DaemonKind {
 			label = DaemonLabel
-		} else if config.Kind == PreviewKind && safeInstance(config.Instance) {
-			label = previewLabel(config.Instance)
 		} else if config.Kind != WorkerKind {
 			return nil, ErrInvalidDefinition
 		}
 		directory := "LaunchDaemons"
-		if config.Kind == ConfigKind || config.Kind == DaemonKind || config.Kind == PreviewKind {
+		if config.Kind == ConfigKind || config.Kind == DaemonKind {
 			directory = "LaunchAgents"
 		}
 		path = filepath.Join(config.ConfigRoot, "Library", directory, label+".plist")
@@ -126,8 +149,6 @@ func New(config Config) (*Installer, error) {
 			path = filepath.Join(config.ConfigRoot, ".config", "systemd", "user", "paperboat-runtime-config.service")
 		} else if config.Kind == DaemonKind {
 			path = filepath.Join(config.ConfigRoot, ".config", "systemd", "user", "paperboat-local-daemon.service")
-		} else if config.Kind == PreviewKind && safeInstance(config.Instance) {
-			path = filepath.Join(config.ConfigRoot, ".config", "systemd", "user", "paperboat-preview-"+config.Instance+".service")
 		} else if config.Kind != WorkerKind && config.Kind != HostdKind && config.Kind != UpdaterKind {
 			return nil, ErrInvalidDefinition
 		}
@@ -148,39 +169,21 @@ func New(config Config) (*Installer, error) {
 	return &Installer{config: config, definitionPath: path}, nil
 }
 
-func (i *Installer) Install(ctx context.Context) error {
-	if err := ensureRoot(i.config.ConfigRoot); err != nil {
-		return fmt.Errorf("prepare service config root: %w", err)
+func safeExecutableForInstall(path string, allowMissing bool) error {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) && allowMissing {
+		return nil
 	}
-	if i.config.Platform == "windows" {
-		// Windows declarations live in the fixed machine state directory, not
-		// under caller ConfigRoot. Fresh MSI and portable-host setup must be able
-		// to create that protected declaration directory themselves.
-		if err := ensureRoot(filepath.Dir(i.definitionPath)); err != nil {
-			return fmt.Errorf("prepare Windows service declaration root: %w", err)
-		}
-	}
-	definition, err := i.render()
-	if err != nil {
-		return fmt.Errorf("render service declaration: %w", err)
-	}
-	info, statErr := os.Lstat(i.definitionPath)
-	upgrading := statErr == nil
-	if statErr == nil && (info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular()) {
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o111 == 0 || info.Mode().Perm()&0o022 != 0 {
 		return ErrInvalidDefinition
 	}
-	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
-		return statErr
-	}
-	var previous []byte
-	if upgrading {
-		previous, err = os.ReadFile(i.definitionPath)
-		if err != nil {
-			return err
-		}
-	}
-	if err := atomicWrite(i.definitionPath, definition, 0o600); err != nil {
-		return fmt.Errorf("write service declaration: %w", err)
+	return nil
+}
+
+func (i *Installer) Install(ctx context.Context) error {
+	previous, upgrading, err := i.writeDefinition(ctx)
+	if err != nil {
+		return err
 	}
 	// A stable hostd cannot be reloaded through launchd without restarting it,
 	// and a systemd daemon-reload is unnecessary until the next boot for this
@@ -195,6 +198,50 @@ func (i *Installer) Install(ctx context.Context) error {
 		return errors.Join(fmt.Errorf("apply service declaration: %w", err), rollbackErr)
 	}
 	return nil
+}
+
+// writeDefinition publishes the exact declaration without asking the native
+// service manager to activate it. LifecycleManager uses this as the prepare
+// phase so enablement and start are separate, journaled mutations. The public
+// Install method below retains its historical activate-on-first-install
+// behavior for callers that do not need a multi-component transaction.
+func (i *Installer) writeDefinition(ctx context.Context) (previous []byte, upgrading bool, resultErr error) {
+	if i == nil || ctx == nil {
+		return nil, false, ErrInvalidDefinition
+	}
+	if err := ensureRoot(i.config.ConfigRoot); err != nil {
+		return nil, false, fmt.Errorf("prepare service config root: %w", err)
+	}
+	if i.config.Platform == "windows" {
+		// Windows declarations live in the fixed machine state directory, not
+		// under caller ConfigRoot. Fresh MSI and portable-host setup must be able
+		// to create that protected declaration directory themselves.
+		if err := ensureRoot(filepath.Dir(i.definitionPath)); err != nil {
+			return nil, false, fmt.Errorf("prepare Windows service declaration root: %w", err)
+		}
+	}
+	definition, err := i.render()
+	if err != nil {
+		return nil, false, fmt.Errorf("render service declaration: %w", err)
+	}
+	info, statErr := os.Lstat(i.definitionPath)
+	upgrading = statErr == nil
+	if statErr == nil && (info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular()) {
+		return nil, false, ErrInvalidDefinition
+	}
+	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+		return nil, false, statErr
+	}
+	if upgrading {
+		previous, err = os.ReadFile(i.definitionPath)
+		if err != nil {
+			return nil, false, err
+		}
+	}
+	if err := atomicWrite(i.definitionPath, definition, 0o600); err != nil {
+		return nil, false, fmt.Errorf("write service declaration: %w", err)
+	}
+	return previous, upgrading, nil
 }
 
 func (i *Installer) rollback(ctx context.Context, previous []byte, upgrading bool) error {
@@ -222,10 +269,6 @@ func (i *Installer) Uninstall(ctx context.Context) error {
 }
 func (i *Installer) DefinitionPath() string { return i.definitionPath }
 
-func previewLabel(instance string) string {
-	return "com.pinksaucepasta.paperboat.runtime-preview." + instance
-}
-
 func (i *Installer) render() ([]byte, error) {
 	if i.config.Platform == "darwin" {
 		return renderLaunchd(i.config)
@@ -248,14 +291,6 @@ func renderLaunchd(config Config) ([]byte, error) {
 		label = ConfigLabel
 	} else if config.Kind == DaemonKind {
 		label = DaemonLabel
-	} else if config.Kind == PreviewKind {
-		label = previewLabel(config.Instance)
-	}
-	var keepAlive any = true
-	if config.Kind == PreviewKind {
-		keepAlive = struct {
-			SuccessfulExit bool `plist:"SuccessfulExit"`
-		}{SuccessfulExit: false}
 	}
 	definition := struct {
 		Label                string            `plist:"Label"`
@@ -265,12 +300,12 @@ func renderLaunchd(config Config) ([]byte, error) {
 		ProgramArguments     []string          `plist:"ProgramArguments"`
 		EnvironmentVariables map[string]string `plist:"EnvironmentVariables"`
 		RunAtLoad            bool              `plist:"RunAtLoad"`
-		KeepAlive            any               `plist:"KeepAlive"`
+		KeepAlive            bool              `plist:"KeepAlive"`
 		Umask                uint64            `plist:"Umask"`
 	}{
 		Label: label, ProcessType: "Background",
 		ProgramArguments:     append([]string{config.Executable}, config.Arguments...),
-		EnvironmentVariables: config.Environment, RunAtLoad: true, KeepAlive: keepAlive, Umask: 0o77,
+		EnvironmentVariables: config.Environment, RunAtLoad: true, KeepAlive: true, Umask: 0o77,
 	}
 	// launchd user agents inherit the logged-in user and reject UserName and
 	// GroupName keys. System services retain explicit identity fields.
@@ -292,8 +327,6 @@ func renderSystemd(config Config) ([]byte, error) {
 		description = "Paperboat config sync"
 	} else if config.Kind == DaemonKind {
 		description = "Paperboat local daemon"
-	} else if config.Kind == PreviewKind {
-		description = "Paperboat preview " + config.Instance
 	}
 	after := "local-fs.target"
 	if config.Kind == UpdaterKind {
@@ -314,7 +347,7 @@ func renderSystemd(config Config) ([]byte, error) {
 		serviceType = "notify"
 	}
 	options = append(options, unit.NewUnitOption("Service", "Type", serviceType))
-	if config.Kind != ConfigKind && config.Kind != DaemonKind && config.Kind != PreviewKind {
+	if config.Kind != ConfigKind && config.Kind != DaemonKind {
 		options = append(options,
 			unit.NewUnitOption("Service", "User", config.User),
 			unit.NewUnitOption("Service", "Group", config.Group),
@@ -330,16 +363,19 @@ func renderSystemd(config Config) ([]byte, error) {
 	for _, key := range sortedKeys(config.Environment) {
 		options = append(options, unit.NewUnitOption("Service", "Environment", systemdEscape(key+"="+config.Environment[key])))
 	}
-	restart := "always"
-	if config.Kind == PreviewKind {
-		restart = "on-failure"
+	for _, name := range sortedKeys(config.EncryptedCredentials) {
+		options = append(options, unit.NewUnitOption("Service", "LoadCredentialEncrypted", name+":"+config.EncryptedCredentials[name]))
+	}
+	if len(config.EncryptedCredentials) > 0 {
+		options = append(options, unit.NewUnitOption("Service", "PrivateMounts", "true"))
 	}
 	options = append(options,
-		unit.NewUnitOption("Service", "Restart", restart),
+		unit.NewUnitOption("Service", "Restart", "always"),
 		unit.NewUnitOption("Service", "RestartSec", "5s"),
 		unit.NewUnitOption("Service", "TimeoutStopSec", "60s"),
 		unit.NewUnitOption("Service", "KillMode", "mixed"),
 		unit.NewUnitOption("Service", "UMask", "0077"),
+		unit.NewUnitOption("Service", "LimitCORE", "0"),
 	)
 	if notify {
 		options = append(options,
@@ -369,13 +405,9 @@ func renderSystemd(config Config) ([]byte, error) {
 		noNewPrivileges = "true"
 	}
 	options = append(options, unit.NewUnitOption("Service", "NoNewPrivileges", noNewPrivileges))
-	// Detached serve workers must access the user-selected source path. A private
-	// /tmp namespace hides valid sources such as /tmp/site from the worker.
-	if config.Kind != PreviewKind {
-		options = append(options, unit.NewUnitOption("Service", "PrivateTmp", "true"))
-	}
+	options = append(options, unit.NewUnitOption("Service", "PrivateTmp", "true"))
 	wantedBy := "multi-user.target"
-	if config.Kind == ConfigKind || config.Kind == DaemonKind || config.Kind == PreviewKind {
+	if config.Kind == ConfigKind || config.Kind == DaemonKind {
 		wantedBy = "default.target"
 	}
 	options = append(options, unit.NewUnitOption("Install", "WantedBy", wantedBy))
@@ -432,6 +464,21 @@ func safeEnvironment(environment map[string]string) bool {
 	return true
 }
 
+func safeEncryptedCredentials(config Config) bool {
+	if len(config.EncryptedCredentials) == 0 {
+		return true
+	}
+	if config.Platform != "linux" || config.Kind != HostdKind || len(config.EncryptedCredentials) != 1 {
+		return false
+	}
+	for name, path := range config.EncryptedCredentials {
+		if name != "paperboat-environment-host-key" || !filepath.IsAbs(path) || filepath.Clean(path) != path || strings.ContainsAny(path, "\x00\r\n") {
+			return false
+		}
+	}
+	return true
+}
+
 func safeEnvironmentKey(value string) bool {
 	if value == "" {
 		return false
@@ -444,27 +491,12 @@ func safeEnvironmentKey(value string) bool {
 	return true
 }
 
-func shouldDeleteOneShotService(deleteOnExit bool, childExitCode uint32, interrupted bool) bool {
-	return deleteOnExit && childExitCode == 0 && !interrupted
-}
-
 func safeAccount(value string) bool {
 	if value == "" || len(value) > 128 {
 		return false
 	}
 	for index, char := range value {
 		if !(char == '_' || char == '-' || index > 0 && index < len(value)-1 && char == '.' && value[index-1] != '.' || char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9') {
-			return false
-		}
-	}
-	return true
-}
-func safeInstance(value string) bool {
-	if value == "" || len(value) > 63 {
-		return false
-	}
-	for index, char := range value {
-		if !(char >= 'a' && char <= 'z' || char >= '0' && char <= '9' || index > 0 && char == '-') {
 			return false
 		}
 	}

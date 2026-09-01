@@ -464,6 +464,30 @@ jobs:
                   raise SystemExit(f'invalid release file: {path}')
               print(f'{path.name}: {path.stat().st_size} bytes sha256={hashlib.sha256(path.read_bytes()).hexdigest()}')
           PY
+      - name: Create and validate signed manifest and deployment policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          input_dir="$RUNNER_TEMP/paperboat-release-inputs"
+          mkdir -p "$input_dir"
+          go run ./tools/release-plan manifest \
+            -version "$RELEASE_VERSION" \
+            -source-commit "$GITHUB_SHA" \
+            -toolchain "$(go env GOVERSION)" \
+            -artifacts "$GITHUB_WORKSPACE/dist" \
+            -output "$input_dir/manifest.json"
+          go run ./tools/release-plan plan \
+            -manifest "$input_dir/manifest.json" \
+            -policy-revision "$GITHUB_RUN_ID" \
+            -severity routine \
+            -cohort-seed "release-$RELEASE_VERSION" \
+            -output "$input_dir/deployment-plan.json"
+          go run ./tools/release-plan validate \
+            -manifest "$input_dir/manifest.json" \
+            -plan "$input_dir/deployment-plan.json" \
+            -artifacts "$GITHUB_WORKSPACE/dist"
+          printf 'PAPERBOAT_RELEASE_MANIFEST=%s\n' "$input_dir/manifest.json" >> "$GITHUB_ENV"
+          printf 'PAPERBOAT_RELEASE_DEPLOYMENT_PLAN=%s\n' "$input_dir/deployment-plan.json" >> "$GITHUB_ENV"
       - name: Create an immutable draft GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -621,10 +645,11 @@ jobs:
             -repository "$PAPERBOAT_TUF_REPOSITORY" \
             -version "$RELEASE_VERSION" \
             -artifacts "$GITHUB_WORKSPACE/dist" \
+            -manifest "$PAPERBOAT_RELEASE_MANIFEST" \
+            -deployment-plan "$PAPERBOAT_RELEASE_DEPLOYMENT_PLAN" \
             -windows-amd64-native-evidence "$GITHUB_WORKSPACE/qualification/windows-amd64-native-qualification.json" \
             -windows-arm64-native-evidence "$GITHUB_WORKSPACE/qualification/windows-arm64-native-qualification.json" \
             -rollout-revision "$GITHUB_RUN_ID" \
-            -percentage 100 \
             -severity routine
           go run ./tools/tuf-repository verify-published -repository "$PAPERBOAT_TUF_REPOSITORY"
       - name: Stage the atomic server publication

@@ -78,8 +78,6 @@ func platformProductHandoffRequired() bool { return true }
 
 func platformRequiresConfirmedDaemonStop() bool { return true }
 
-func cleanupUninstallDurablePreviewServices(*cobra.Command) error { return nil }
-
 func unsafeCleanupPathTraversal(path string, info os.FileInfo) (bool, error) {
 	if info.Mode()&os.ModeSymlink != 0 {
 		return true, nil

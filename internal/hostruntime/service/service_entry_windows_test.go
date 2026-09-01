@@ -5,7 +5,6 @@ package service
 import (
 	"context"
 	"errors"
-	"path/filepath"
 	"strings"
 	"testing"
 	"unsafe"
@@ -20,39 +19,6 @@ func TestOnlyContextCanceledDoesNotHideJoinedFailure(t *testing.T) {
 	}
 	if onlyContextCanceled(nil) || onlyContextCanceled(errors.Join(context.Canceled, errors.New("sidecar failed"))) {
 		t.Fatal("real sidecar failure was hidden by joined cancellation")
-	}
-}
-
-func TestOneShotPreviewDeletionRequiresExactOwnedDeclaration(t *testing.T) {
-	const stateRoot = `C:\ProgramData\Paperboat\state`
-	const logicalName = "one-shot"
-	serviceName := "PaperboatPreview-" + windowsPreviewInstanceFromName(logicalName)
-	definitionPath := filepath.Join(windowsServiceDefinitionRoot, serviceName+".json")
-	layout, err := DefaultLayout("windows")
-	if err != nil {
-		t.Fatal(err)
-	}
-	arguments := []string{
-		"__runtime-preview", "--state-root", stateRoot, "--name", logicalName,
-		"--descriptor", filepath.Join(stateRoot, "previews", "active", windowsPreviewInstanceFromName(logicalName)+".json"),
-		"--service-definition", definitionPath, "--port", "3000", "--indefinite",
-	}
-	definition := windowsServiceDefinition{
-		Schema: "paperboat.windows-service/v1", Name: serviceName, Executable: layout.Binary,
-		Arguments: arguments, Account: "SYSTEM",
-	}
-	gotRoot, err := validateWindowsOneShotPreviewDefinition(serviceName, definition)
-	if err != nil || gotRoot != stateRoot {
-		t.Fatalf("owned one-shot definition root=%q error=%v, want %q", gotRoot, err, stateRoot)
-	}
-	foreign := definition
-	foreign.Arguments = append([]string(nil), definition.Arguments...)
-	foreign.Arguments[8] = filepath.Join(windowsServiceDefinitionRoot, "PaperboatPreview-ffffffffffffffff.json")
-	if _, err := validateWindowsOneShotPreviewDefinition(serviceName, foreign); !errors.Is(err, ErrInvalidDefinition) {
-		t.Fatalf("foreign one-shot declaration error=%v, want invalid-definition", err)
-	}
-	if _, err := validateWindowsOneShotPreviewDefinition("PaperboatHostd", definition); !errors.Is(err, ErrWindowsServiceEntry) {
-		t.Fatalf("non-preview one-shot error=%v, want service-entry error", err)
 	}
 }
 

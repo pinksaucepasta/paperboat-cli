@@ -51,7 +51,6 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/connectionmanager"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/identitybootstrap"
 	"github.com/pinksaucepasta/paperboat/internal/resolver"
-	servepkg "github.com/pinksaucepasta/paperboat/internal/serve"
 	"github.com/pinksaucepasta/paperboat/internal/statusbar"
 	"github.com/pinksaucepasta/paperboat/internal/telemetry"
 	"github.com/pinksaucepasta/paperboat/internal/tunnel"
@@ -433,7 +432,7 @@ func TestPeerRacePolicyUsesOneSecondDirectPreference(t *testing.T) {
 
 func TestTransferAndPreviewCommandsDoNotExposeTransportSelection(t *testing.T) {
 	root := newRootCommand()
-	for _, path := range [][]string{{"send"}, {"preview", "create"}} {
+	for _, path := range [][]string{{"send"}, {"preview", "stop"}} {
 		command, _, err := root.Find(path)
 		if err != nil {
 			t.Fatal(err)
@@ -441,29 +440,6 @@ func TestTransferAndPreviewCommandsDoNotExposeTransportSelection(t *testing.T) {
 		if command.Flags().Lookup("transport") != nil || command.Flags().Lookup("path") != nil {
 			t.Fatalf("%v exposed a transport selector", path)
 		}
-	}
-}
-
-func TestPrivatePreviewTargetForcesDirectPeerTransport(t *testing.T) {
-	expires := time.Now().UTC().Add(time.Minute)
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if request.Method != http.MethodPost || request.URL.Path != "/v1/machines/machine_1/preview-launch-descriptor" {
-			http.NotFound(writer, request)
-			return
-		}
-		writeAPIData(t, writer, api.PreviewLaunchDescriptor{
-			Endpoint: "https://relay.example.test/v1/preview-launches", MachineID: "machine_1", ExpiresAt: expires,
-			Auth: api.AuthMaterial{Method: "bearer", Token: "preview-token", ExpiresAt: expires, Scopes: []string{"preview:launch"}},
-		})
-	}))
-	defer server.Close()
-	client := api.New(server.URL, config.Credential{AccessToken: "token"}, server.Client())
-	target, err := privatePreviewPeerTarget(context.Background(), client, "machine_1", "machine", "environment_1", 3)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if target.Transport != string(tunnel.TerminalTransportDirect) || target.Terminal == nil || target.Terminal.Auth.Token != "preview-token" {
-		t.Fatalf("target = %#v", target)
 	}
 }
 
@@ -870,7 +846,7 @@ func TestSpecTreeRegistersDeclaredFlagTypes(t *testing.T) {
 }
 
 func TestSpecTreeRegistersEveryDeclaredBoolFlag(t *testing.T) {
-	for _, source := range []*command.Spec{authCommand(), configCommand(), previewCommand(), inboxCommand()} {
+	for _, source := range []*command.Spec{authCommand(), configCommand(), inboxCommand()} {
 		tree := specTree(source, source.Name)
 		for _, childSpec := range source.Subcommands {
 			entry, _, err := tree.Find([]string{childSpec.Name})
@@ -918,8 +894,6 @@ func TestSpecTreeExecutesDeclaredFlagsIntoActions(t *testing.T) {
 		{name: "auth switch recovery key", source: authCommand, child: "switch", args: []string{"switch", "--recovery-key", "fixture-switch-key"}, wantStrings: map[string]string{"recovery-key": "fixture-switch-key"}},
 		{name: "auth status json", source: authCommand, child: "status", args: []string{"status", "--json"}, wantBools: map[string]bool{"json": true}},
 		{name: "config show json", source: configCommand, child: "show", args: []string{"show", "--json"}, wantBools: map[string]bool{"json": true}},
-		{name: "preview list json", source: previewCommand, child: "list", args: []string{"list", "--json"}, wantBools: map[string]bool{"json": true}},
-		{name: "preview revoke confirmation and json", source: previewCommand, child: "revoke", args: []string{"revoke", "preview-fixture", "--yes", "--json"}, wantBools: map[string]bool{"yes": true, "json": true}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -1071,69 +1045,6 @@ func TestInboxPathJSONExecutesWithDisposableIdentity(t *testing.T) {
 	}
 }
 
-func TestSpecTreePreservesUndeclaredConfigAndPreviewCreateFlags(t *testing.T) {
-	configTree := specTree(configCommand(), "config")
-	for commandName, flagNames := range map[string][]string{
-		"status":   {"json"},
-		"assign":   {"json", "mode", "yes"},
-		"unassign": {"json", "yes"},
-	} {
-		entry, _, err := configTree.Find([]string{commandName})
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, flagName := range flagNames {
-			if entry.Flags().Lookup(flagName) == nil {
-				t.Fatalf("config %s missing --%s", commandName, flagName)
-			}
-		}
-	}
-	previewTree := specTree(previewCommand(), "preview")
-	create, _, err := previewTree.Find([]string{"create"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, flagName := range []string{"name", "port", "machine", "duration", "indefinite", "public", "listen-port", "detach", "json"} {
-		if create.Flags().Lookup(flagName) == nil {
-			t.Fatalf("preview create missing --%s", flagName)
-		}
-	}
-	configCalled := false
-	configAction := specTreeActionTestCommand(t, configCommand(), "assign", func(ctx *command.Context) error {
-		configCalled = true
-		if ctx.String("mode") != "pull-only" || ctx.Bool("json") || ctx.Bool("yes") {
-			t.Fatalf("config assign defaults: mode=%q json=%t yes=%t", ctx.String("mode"), ctx.Bool("json"), ctx.Bool("yes"))
-		}
-		return nil
-	})
-	configAction.SetOut(io.Discard)
-	configAction.SetErr(io.Discard)
-	configAction.SetArgs([]string{"assign", "repository-fixture", "machine-fixture"})
-	if err := configAction.ExecuteContext(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if !configCalled {
-		t.Fatal("config assign action was not called")
-	}
-	previewCalled := false
-	previewAction := specTreeActionTestCommand(t, previewCommand(), "create", func(ctx *command.Context) error {
-		previewCalled = true
-		if ctx.Duration("duration") != 24*time.Hour || ctx.Bool("indefinite") || ctx.Bool("public") || ctx.Bool("detach") || ctx.Bool("json") || ctx.Uint("port") != 0 || ctx.Uint("listen-port") != 0 {
-			t.Fatalf("preview create defaults: duration=%s indefinite=%t public=%t detach=%t json=%t port=%d listen-port=%d", ctx.Duration("duration"), ctx.Bool("indefinite"), ctx.Bool("public"), ctx.Bool("detach"), ctx.Bool("json"), ctx.Uint("port"), ctx.Uint("listen-port"))
-		}
-		return nil
-	})
-	previewAction.SetOut(io.Discard)
-	previewAction.SetErr(io.Discard)
-	previewAction.SetArgs([]string{"create"})
-	if err := previewAction.ExecuteContext(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if !previewCalled {
-		t.Fatal("preview create action was not called")
-	}
-}
-
 func TestShellCompletionIsBoundedSilentAndResourceSpecific(t *testing.T) {
 	rootPath := commandRuntimeTestRoot(t)
 	t.Setenv("HOME", rootPath)
@@ -1144,7 +1055,7 @@ func TestShellCompletionIsBoundedSilentAndResourceSpecific(t *testing.T) {
 		t.Fatal(err)
 	}
 	root := newRootCommand()
-	for _, path := range [][]string{{"ping"}, {"wait"}, {"preview", "revoke"}, {"session", "attach"}, {"sessions", "delete"}} {
+	for _, path := range [][]string{{"ping"}, {"wait"}, {"preview", "stop"}, {"session", "attach"}, {"sessions", "delete"}} {
 		command, _, err := root.Find(path)
 		if err != nil || command.ValidArgsFunction == nil {
 			t.Fatalf("completion hook missing for %v: %v", path, err)
@@ -1703,7 +1614,7 @@ func TestCollectLocalDoctorDoesNotCreateUnconfiguredIdentity(t *testing.T) {
 	}
 }
 
-func TestCollectLocalDoctorReportsMachineInboxCredentialAndPreviews(t *testing.T) {
+func TestCollectLocalDoctorReportsMachineInboxCredential(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("PAPERBOAT_RUNTIME_STATE_ROOT", root)
 	store, err := identity.Open(identity.Config{StateRoot: root})
@@ -1722,88 +1633,9 @@ func TestCollectLocalDoctorReportsMachineInboxCredentialAndPreviews(t *testing.T
 	if err := store.SaveMachineControl(identity.MachineControl{MachineID: registration.MachineID, EnvironmentID: registration.EnvironmentID, InstallationGeneration: registration.InstallationGeneration, Credential: strings.Repeat("x", 32), ExpiresAt: time.Now().UTC().Add(time.Hour), KeyID: key.ID}); err != nil {
 		t.Fatal(err)
 	}
-	active := filepath.Join(root, "previews", "active")
-	if err := os.MkdirAll(active, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	expires := time.Now().UTC().Add(time.Hour)
-	descriptor, _ := json.Marshal(map[string]any{"schema": "paperboat.preview-runtime/v1", "name": "docs", "port": 3000, "indefinite": false, "expires_at": expires, "service_definition": ""})
-	if err := os.WriteFile(filepath.Join(active, "docs.json"), descriptor, 0o600); err != nil {
-		t.Fatal(err)
-	}
 	report := collectLocalDoctor()
-	if report.SetupState != "configured" || report.IdentityState != "valid" || report.MachineID != "machine_local" || report.InstallationGeneration != 4 || !slices.Equal(report.SetupRoles, []string{"interactive", "host"}) || report.InboxState != "ready" || report.CredentialState != "valid" || report.ActivePreviews != 1 || report.InvalidPreviews != 0 {
+	if report.SetupState != "configured" || report.IdentityState != "valid" || report.MachineID != "machine_local" || report.InstallationGeneration != 4 || !slices.Equal(report.SetupRoles, []string{"interactive", "host"}) || report.InboxState != "ready" || report.CredentialState != "valid" {
 		t.Fatalf("report=%+v", report)
-	}
-}
-
-func TestDoctorValidatesServedPreviewSourceWithoutReportingPath(t *testing.T) {
-	root := t.TempDir()
-	sourcePath := filepath.Join(root, "site")
-	if err := os.Mkdir(sourcePath, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	source, _ := servepkg.ResolveSource(sourcePath)
-	identityValue, _ := source.Identity()
-	expires := time.Now().UTC().Add(time.Hour)
-	descriptor, _ := json.Marshal(map[string]any{
-		"schema": "paperboat.preview-runtime/v1", "name": "site", "bind_address": "127.0.0.1", "port": 32000, "service_generation": 1, "indefinite": false, "expires_at": expires, "service_definition": "",
-		"serve": map[string]any{"source_path": source.Path, "source_kind": source.Kind, "source_identity": identityValue, "spa": false, "owner_mode": "detached", "visibility": "private"},
-	})
-	directory := filepath.Join(root, "previews", "active")
-	if err := os.MkdirAll(directory, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(directory, "site.json"), descriptor, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	report := localDoctorReport{}
-	inspectLocalPreviewDescriptors(&report, directory, time.Now().UTC())
-	if report.ActivePreviews != 1 || report.ServedPreviews != 1 || report.InvalidPreviews != 0 || report.InvalidServeSources != 0 {
-		t.Fatalf("report = %#v", report)
-	}
-	encoded, _ := json.Marshal(report)
-	if bytes.Contains(encoded, []byte(source.Path)) {
-		t.Fatalf("doctor leaked source path: %s", encoded)
-	}
-}
-
-func TestDoctorAcceptsPrivateRemotePreviewDescriptor(t *testing.T) {
-	root := t.TempDir()
-	expires := time.Now().UTC().Add(time.Hour)
-	descriptor, _ := json.Marshal(map[string]any{
-		"schema": "paperboat.preview-runtime/v1", "name": "remote", "bind_address": "127.0.0.1", "port": 32000, "service_generation": 7, "indefinite": false, "expires_at": expires, "service_definition": filepath.Join(root, "remote.service"),
-		"record":         map[string]any{"logical_name": "remote", "url": "http://127.0.0.1:32000", "target_port": 38142, "state": "ready", "expires_at": expires},
-		"private_remote": map[string]any{"machine_id": "machine_1", "machine_name": "Hetzner", "environment_id": "environment_1", "machine_generation": 4, "target_port": 38142, "listen_port": 32000},
-	})
-	directory := filepath.Join(root, "previews", "active")
-	if err := os.MkdirAll(directory, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(directory, "remote.json"), descriptor, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	report := localDoctorReport{}
-	inspectLocalPreviewDescriptors(&report, directory, time.Now().UTC())
-	if report.ActivePreviews != 1 || report.InvalidPreviews != 0 || report.ServedPreviews != 0 {
-		t.Fatalf("report=%#v", report)
-	}
-}
-
-func TestDoctorComparesServedRoutesWithLocalWorkloads(t *testing.T) {
-	report := localDoctorReport{MachineID: "machine_local", ActiveServedPreviews: 1, RuntimeForegroundServes: 1}
-	compareLocalServedPreviewRoutes(&report, []api.Preview{
-		{ID: "detached", ResourceID: "machine_local", SourceKind: "directory", State: "ready"},
-		{ID: "foreground", ResourceID: "machine_local", SourceKind: "file", State: "ready"},
-		{ID: "other", ResourceID: "machine_other", SourceKind: "file", State: "ready"},
-	})
-	if report.RouteReadiness != "ready" || report.RemoteServedPreviews != 2 {
-		t.Fatalf("report=%+v", report)
-	}
-	report = localDoctorReport{MachineID: "machine_local", ActiveServedPreviews: 1}
-	compareLocalServedPreviewRoutes(&report, []api.Preview{{ID: "orphan", ResourceID: "machine_local", SourceKind: "file", State: "ready"}, {ID: "orphan2", ResourceID: "machine_local", SourceKind: "file", State: "ready"}})
-	if report.RouteReadiness != "workload_route_drift" || len(report.RecoveryActions) == 0 {
-		t.Fatalf("drift report=%+v", report)
 	}
 }
 
@@ -2242,7 +2074,7 @@ func TestMachineTransportSnapshotRetainsAutoMarkerForMixedPaths(t *testing.T) {
 
 func TestCanonicalCommandsAreDiscoverable(t *testing.T) {
 	root := newRootCommand()
-	for _, path := range [][]string{{"login"}, {"logout"}, {"pair"}, {"session", "attach"}, {"session", "list"}, {"machine", "add"}, {"machine", "list"}, {"machine", "rename"}, {"machine", "revoke"}, {"machine", "availability"}, {"preview", "list"}, {"preview", "revoke"}} {
+	for _, path := range [][]string{{"login"}, {"logout"}, {"pair"}, {"session", "attach"}, {"session", "list"}, {"machine", "add"}, {"machine", "list"}, {"machine", "rename"}, {"machine", "revoke"}, {"machine", "availability"}, {"preview", "list"}, {"preview", "stop"}} {
 		command, remaining, err := root.Find(path)
 		if err != nil || len(remaining) != 0 || command == root {
 			t.Fatalf("command %q not discoverable: command=%v remaining=%q err=%v", path, command, remaining, err)
@@ -2348,26 +2180,6 @@ func TestMachineRevokeRequiresConfirmationBeforeBackend(t *testing.T) {
 	err := root.Execute()
 	if err == nil || !strings.Contains(err.Error(), "requires --yes") {
 		t.Fatalf("err=%v, want confirmation error", err)
-	}
-}
-
-func TestPreviewRevokeDisplaysResolvedContextBeforeConfirmation(t *testing.T) {
-	dir := t.TempDir()
-	configPath := filepath.Join(dir, "config.json")
-	var requests []string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests = append(requests, r.Method+" "+r.URL.Path)
-		if r.Method != http.MethodGet {
-			t.Fatalf("unexpected mutation before confirmation: %s %s", r.Method, r.URL.Path)
-		}
-		writeAPIData(t, w, []map[string]any{{"id": "prv_1", "environment_id": "env_1", "project_id": "prj_1", "resource_id": "um_1", "user_id": "usr_1", "logical_name": "web", "environment_name": "studio", "environment_kind": "byod", "owner_email": "owner@example.test", "url": "https://preview.example.test", "state": "ready", "target_port": 3000}})
-	}))
-	defer srv.Close()
-	writeTestProfile(t, dir, configPath, srv.URL)
-	var stderr bytes.Buffer
-	code := run(context.Background(), []string{"--config", configPath, "preview", "revoke", "prv_1"}, &bytes.Buffer{}, &stderr)
-	if code != 1 || !strings.Contains(stderr.String(), "Preview: web (studio, byod)") || !strings.Contains(stderr.String(), "Project: prj_1  Resource: um_1  User: usr_1") || len(requests) != 1 {
-		t.Fatalf("code=%d stderr=%q requests=%v", code, stderr.String(), requests)
 	}
 }
 
@@ -2555,97 +2367,6 @@ func TestSessionDeleteOpenSessionSendsDelete(t *testing.T) {
 	}
 }
 
-func TestPreviewsListsAndPurgesOnlySelectedEnvironment(t *testing.T) {
-	dir := t.TempDir()
-	configPath := filepath.Join(dir, "config.json")
-	var revoked []string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/projects":
-			writeAPIData(t, w, map[string]any{"items": []map[string]any{{"id": "prj_1", "name": "demo", "state": "ready"}}, "pagination": map[string]any{"next_offset": nil}})
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/previews":
-			writeAPIData(t, w, []map[string]any{
-				{"id": "prv_1", "environment_id": "prj_1", "project_id": "prj_1", "logical_name": "web", "environment_name": "demo", "state": "ready", "url": "https://one.example.test", "target_port": 3000},
-				{"id": "prv_2", "environment_id": "prj_2", "project_id": "prj_2", "logical_name": "other", "environment_name": "other", "state": "ready", "url": "https://two.example.test", "target_port": 4000},
-			})
-		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/v1/previews/"):
-			revoked = append(revoked, r.URL.Path)
-			writeAPIData(t, w, map[string]any{"id": "prv_1", "state": "removed"})
-		default:
-			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
-		}
-	}))
-	defer srv.Close()
-	writeTestProfile(t, dir, configPath, srv.URL)
-
-	var output bytes.Buffer
-	if code := run(context.Background(), []string{"--config", configPath, "previews"}, &output, &output); code != 0 || !strings.Contains(output.String(), "web") || !strings.Contains(output.String(), "other") {
-		t.Fatalf("list code=%d output=%q", code, output.String())
-	}
-	output.Reset()
-	if code := run(context.Background(), []string{"--config", configPath, "previews", "revoke", "demo", "--all"}, &output, &output); code != 1 || len(revoked) != 0 || !strings.Contains(output.String(), "Active previews to revoke: 1") || !strings.Contains(output.String(), "requires --yes") {
-		t.Fatalf("unconfirmed revoke code=%d revoked=%v output=%q", code, revoked, output.String())
-	}
-	output.Reset()
-	if code := run(context.Background(), []string{"--config", configPath, "previews", "revoke", "demo", "--all", "--yes", "--json"}, &output, &output); code != 0 {
-		t.Fatalf("revoke code=%d output=%q", code, output.String())
-	}
-	if len(revoked) != 1 || revoked[0] != "/v1/previews/prv_1" || !strings.Contains(output.String(), `"revoked":1`) {
-		t.Fatalf("revoked=%v output=%q", revoked, output.String())
-	}
-}
-
-func TestPreviewListContinuesWhenLocalCleanupFails(t *testing.T) {
-	dir := t.TempDir()
-	configPath := filepath.Join(dir, "config.json")
-	stateRoot := filepath.Join(dir, "stale-runtime")
-	if err := os.MkdirAll(filepath.Join(stateRoot, "previews", "active"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PAPERBOAT_RUNTIME_STATE_ROOT", stateRoot)
-
-	var requests atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests.Add(1)
-		if r.Method != http.MethodGet || r.URL.Path != "/v1/previews" {
-			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
-		}
-		writeAPIData(t, w, []map[string]any{{
-			"id": "prv_1", "environment_id": "env_1", "project_id": "prj_1", "resource_id": "um_1", "user_id": "usr_1",
-			"logical_name": "web", "environment_name": "studio", "environment_kind": "byod", "owner_email": "owner@example.test",
-			"url": "https://preview.example.test", "state": "ready", "target_port": 3000,
-		}})
-	}))
-	defer server.Close()
-	writeTestProfile(t, dir, configPath, server.URL)
-
-	previousReconciler := reconcileExpiredPreviewServicesForList
-	reconcileExpiredPreviewServicesForList = func(context.Context, string, time.Time) error {
-		return errors.New("Windows preview mutation does not match the enrolled runtime")
-	}
-	t.Cleanup(func() { reconcileExpiredPreviewServicesForList = previousReconciler })
-
-	var stdout, stderr bytes.Buffer
-	if code := run(context.Background(), []string{"--config", configPath, "preview", "list", "--json"}, &stdout, &stderr); code != 0 {
-		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
-	}
-	if requests.Load() != 1 {
-		t.Fatalf("server requests=%d, want 1", requests.Load())
-	}
-	var output struct {
-		OK   bool `json:"ok"`
-		Data struct {
-			Previews []api.Preview `json:"previews"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(stdout.Bytes(), &output); err != nil || !output.OK || len(output.Data.Previews) != 1 || output.Data.Previews[0].ID != "prv_1" {
-		t.Fatalf("stdout=%q output=%+v err=%v", stdout.String(), output, err)
-	}
-	if got := stderr.String(); got != previewListCleanupWarning || strings.Contains(got, "Windows preview mutation") {
-		t.Fatalf("stderr=%q", got)
-	}
-}
-
 func TestSessionListAcceptsDefaultEnvironment(t *testing.T) {
 	root := newRootCommand()
 	command, remaining, err := root.Find([]string{"session", "list"})
@@ -2694,7 +2415,7 @@ func TestMachineHomeActionsFollowConfiguredCapabilities(t *testing.T) {
 	for index, action := range actions {
 		ids[index] = action.ID
 	}
-	if !slices.Equal(ids, []string{"rename", "send", "preview", "previews"}) {
+	if !slices.Equal(ids, []string{"rename", "send"}) {
 		t.Fatalf("receive actions=%v", ids)
 	}
 	machine.SetupMode = "host"
@@ -2704,7 +2425,7 @@ func TestMachineHomeActionsFollowConfiguredCapabilities(t *testing.T) {
 	for _, action := range actions {
 		ids = append(ids, action.ID)
 	}
-	if !slices.Equal(ids, []string{"rename", "terminal", "codex", "send", "preview", "sessions", "previews", "allow-sleep", "keep-awake"}) {
+	if !slices.Equal(ids, []string{"rename", "environment-variables", "terminal", "codex", "send", "sessions", "allow-sleep", "keep-awake"}) {
 		t.Fatalf("host actions=%v", ids)
 	}
 }
@@ -2940,8 +2661,7 @@ func TestCompatibilityOnlyCommandsAreAbsent(t *testing.T) {
 	}
 	for parentName, removed := range map[string][]string{
 		"config":   {"enable", "disable"},
-		"preview":  {"remove", "purge"},
-		"previews": {"purge"},
+		"preview":  {"create", "revoke"},
 		"session":  {"purge"},
 		"sessions": {"purge"},
 	} {
@@ -3872,184 +3592,6 @@ func TestTerminalHostErrorDistinguishesCapabilityAndAvailability(t *testing.T) {
 	host.Capabilities.TerminalHost.Observed = true
 	if err := terminalHostError(host); err != nil {
 		t.Fatalf("ready host error = %v", err)
-	}
-}
-
-func TestServeCommandContractValidation(t *testing.T) {
-	file := filepath.Join(t.TempDir(), "index.html")
-	if err := os.WriteFile(file, []byte("ready"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	tests := []struct {
-		name string
-		args []string
-		want string
-	}{
-		{name: "missing path", args: []string{"serve"}, want: "requires <path>"},
-		{name: "invalid private duration", args: []string{"serve", file, "--duration", "0s"}, want: "positive --duration"},
-		{name: "duration conflict", args: []string{"serve", file, "--public", "--duration", "1h", "--indefinite"}, want: "--duration"},
-		{name: "spa file", args: []string{"serve", file, "--public", "--spa"}, want: "--spa requires a directory"},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			root := newRootCommand()
-			root.SetArgs(test.args)
-			err := root.ExecuteContext(context.Background())
-			if err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("error = %v, want %q", err, test.want)
-			}
-		})
-	}
-}
-
-func TestServeCommandIsLocalOnly(t *testing.T) {
-	root := newRootCommand()
-	serveEntry, _, err := root.Find([]string{"serve"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if serveEntry.Flags().Lookup("machine") != nil {
-		t.Fatal("serve exposes a machine selector")
-	}
-	for _, name := range []string{"name", "duration", "indefinite", "detach", "spa", "public", "listen-port", "json"} {
-		if serveEntry.Flags().Lookup(name) == nil {
-			t.Errorf("missing --%s", name)
-		}
-	}
-}
-
-func TestServeDefaultsToPrivateWithoutSetup(t *testing.T) {
-	file := filepath.Join(t.TempDir(), "index.html")
-	if err := os.WriteFile(file, []byte("ready"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PAPERBOAT_RUNTIME_STATE_ROOT", filepath.Join(t.TempDir(), "unconfigured"))
-	var stdout, stderr bytes.Buffer
-	root := newRootCommand()
-	root.SetOut(&stdout)
-	root.SetErr(&stderr)
-	root.SetArgs([]string{"--config", filepath.Join(t.TempDir(), "config.json"), "serve", file, "--json", "--duration", "1s"})
-	if err := root.ExecuteContext(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	var envelope struct {
-		OK   bool `json:"ok"`
-		Data struct {
-			URL        string `json:"url"`
-			Visibility string `json:"visibility"`
-			Listener   string `json:"listener"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(stdout.Bytes(), &envelope); err != nil {
-		t.Fatalf("stdout = %q: %v", stdout.String(), err)
-	}
-	if !envelope.OK || envelope.Data.Visibility != "private" || envelope.Data.Listener != "loopback" || !strings.HasPrefix(envelope.Data.URL, "http://127.0.0.1:") {
-		t.Fatalf("envelope = %#v", envelope)
-	}
-}
-
-func TestListLocalPrivateServesReadsOwnerOnlyDescriptor(t *testing.T) {
-	root := t.TempDir()
-	t.Setenv("PAPERBOAT_RUNTIME_STATE_ROOT", root)
-	source := filepath.Join(root, "site")
-	if err := os.Mkdir(source, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	expires := time.Now().UTC().Add(time.Hour)
-	descriptor := map[string]any{
-		"schema": "paperboat.preview-runtime/v1", "name": "docs", "bind_address": "127.0.0.1", "port": 32000,
-		"service_generation": 1, "indefinite": false, "expires_at": expires, "service_definition": filepath.Join(root, "docs.service"),
-		"record": map[string]any{"id": "", "environment_id": "", "logical_name": "", "preview_key": "", "url": "http://127.0.0.1:32000", "target_port": 0, "state": "ready", "expires_at": expires},
-		"serve":  map[string]any{"source_path": source, "source_kind": "directory", "source_identity": "dev:1:ino:2", "spa": false, "owner_mode": "detached", "visibility": "private", "listen_port": 0},
-	}
-	data, _ := json.Marshal(descriptor)
-	directory := filepath.Join(root, "previews", "active")
-	if err := os.MkdirAll(directory, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := atomicfile.Write(filepath.Join(directory, "docs.json"), data, atomicfile.Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1}); err != nil {
-		t.Fatal(err)
-	}
-	items := listLocalPrivateServes()
-	if len(items) != 1 || items[0].Name != "docs" || items[0].URL != "http://127.0.0.1:32000" || items[0].SourcePath != source {
-		t.Fatalf("items = %#v", items)
-	}
-}
-
-func TestServeJSONInvocationFailureUsesEnvelope(t *testing.T) {
-	var stdout, stderr bytes.Buffer
-	code := run(context.Background(), []string{"serve", "--json"}, &stdout, &stderr)
-	if code != 2 || stderr.Len() != 0 {
-		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
-	}
-	var envelope struct {
-		SchemaVersion string `json:"schema_version"`
-		OK            bool   `json:"ok"`
-		Error         struct {
-			Code               string `json:"code"`
-			Category           string `json:"category"`
-			PublicStateCreated any    `json:"public_state_created"`
-			Cleanup            string `json:"cleanup"`
-		} `json:"error"`
-	}
-	if json.Unmarshal(stdout.Bytes(), &envelope) != nil || envelope.SchemaVersion != "1.0" || envelope.OK || envelope.Error.Code != "serve_invocation_invalid" || envelope.Error.Category != "usage" || envelope.Error.PublicStateCreated != "unknown" || envelope.Error.Cleanup != "not_required" {
-		t.Fatalf("envelope = %#v", envelope)
-	}
-}
-
-func TestServeProtocolIncompatibleUsesTypedEnvelope(t *testing.T) {
-	envelope := serveErrorEnvelope(errServeProtocolIncompatible)
-	if envelope["code"] != "protocol_incompatible" || envelope["category"] != "protocol" {
-		t.Fatalf("envelope = %#v", envelope)
-	}
-}
-
-func TestNormalizeServeName(t *testing.T) {
-	if got := normalizeServeName("", "My Report (Final).HTML"); got != "my-report-final-html" {
-		t.Fatalf("derived name = %q", got)
-	}
-	if got := normalizeServeName("docs_v2", "ignored"); got != "docs_v2" {
-		t.Fatalf("explicit name = %q", got)
-	}
-}
-
-func TestEnrichLocalServeSources(t *testing.T) {
-	stateRoot := t.TempDir()
-	t.Setenv("PAPERBOAT_RUNTIME_STATE_ROOT", stateRoot)
-	directory := filepath.Join(stateRoot, "previews", "active")
-	if err := os.MkdirAll(directory, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	source := filepath.Join(t.TempDir(), "site")
-	descriptor := func(id, path string) []byte {
-		return []byte(fmt.Sprintf(`{"schema":"paperboat.preview-runtime/v1","record":{"id":%q},"serve":{"source_path":%q}}`, id, path))
-	}
-	if err := atomicfile.Write(filepath.Join(directory, "valid.json"), descriptor("served", source), atomicfile.Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1}); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(directory, "permissive.json"), descriptor("unsafe", "/private/unsafe"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	target := filepath.Join(directory, "target")
-	if err := atomicfile.Write(target, descriptor("linked", "/private/linked"), atomicfile.Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1}); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(target, filepath.Join(directory, "linked.json")); err != nil {
-		t.Fatal(err)
-	}
-	items := enrichLocalServeSources([]api.Preview{
-		{ID: "served", SourceKind: "directory"},
-		{ID: "unsafe", SourceKind: "file"},
-		{ID: "linked", SourceKind: "file"},
-		{ID: "served", SourceKind: "application"},
-	})
-	if items[0].SourcePath != filepath.Clean(source) {
-		t.Fatalf("valid source path = %q", items[0].SourcePath)
-	}
-	for index := 1; index < len(items); index++ {
-		if items[index].SourcePath != "" {
-			t.Fatalf("unsafe item %d was enriched with %q", index, items[index].SourcePath)
-		}
 	}
 }
 

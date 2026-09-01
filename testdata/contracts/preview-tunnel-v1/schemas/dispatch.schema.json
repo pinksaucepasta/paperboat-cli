@@ -1,0 +1,130 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "paperboat://contracts/preview-tunnel-v1/dispatch",
+  "title": "Paperboat preview dispatch v1 messages",
+  "oneOf": [
+    { "$ref": "#/definitions/dispatch_request" },
+    { "$ref": "#/definitions/dispatch_outcome" }
+  ],
+  "definitions": {
+    "schema": { "const": "paperboat.preview-tunnel/v1" },
+    "id": { "type": "string", "minLength": 3, "maxLength": 128 },
+    "trace_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[!-~]+$"
+    },
+    "trace_id": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 128,
+      "pattern": "^[!-~]+$"
+    },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "nullable_timestamp": {
+      "oneOf": [
+        { "$ref": "#/definitions/timestamp" },
+        { "type": "null" }
+      ]
+    },
+    "target": {
+      "type": "object",
+      "required": ["scheme", "address"],
+      "properties": {
+        "scheme": { "enum": ["http", "https", "h2c", "unix", "tcp"] },
+        "address": { "type": "string", "minLength": 1, "maxLength": 512 }
+      },
+      "additionalProperties": false
+    },
+    "lease_etag": {
+      "type": "string",
+      "pattern": "^\"ptv1:preview_lease:[A-Za-z0-9_-]+:[1-9][0-9]*\"$"
+    },
+    "request_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "dispatch_request": {
+      "type": "object",
+      "required": [
+        "schema",
+        "kind",
+        "preview_id",
+        "operation_id",
+        "account_id",
+        "actor_id",
+        "owner_device_id",
+        "owner_session_id",
+        "target",
+        "access_mode",
+        "endpoint",
+        "lease_deadline",
+        "lease_etag",
+        "state",
+        "allocation_state",
+        "edge_state",
+        "origin_state",
+        "created_at",
+        "last_renewed_at",
+        "expected_generation",
+        "idempotency_key",
+        "request_id",
+        "correlation_id",
+        "request_hash"
+      ],
+      "properties": {
+        "schema": { "$ref": "#/definitions/schema" },
+        "kind": { "const": "preview_dispatch" },
+        "preview_id": { "$ref": "#/definitions/id" },
+        "operation_id": { "$ref": "#/definitions/id" },
+        "account_id": { "$ref": "#/definitions/id" },
+        "actor_id": { "$ref": "#/definitions/id" },
+        "owner_device_id": { "$ref": "#/definitions/id" },
+        "owner_session_id": { "$ref": "#/definitions/id" },
+        "target": { "$ref": "#/definitions/target" },
+        "access_mode": { "enum": ["public", "private"] },
+        "endpoint": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https://preview-[a-z0-9-]+(?:\\.[a-z0-9-]+)+/?$"
+        },
+        "lease_deadline": { "$ref": "#/definitions/timestamp" },
+        "user_deadline": { "$ref": "#/definitions/nullable_timestamp" },
+        "lease_etag": { "$ref": "#/definitions/lease_etag" },
+        "state": { "enum": ["allocating", "connecting", "ready"] },
+        "allocation_state": { "enum": ["pending", "ready", "failed", "released"] },
+        "edge_state": { "enum": ["pending", "ready", "degraded", "down"] },
+        "origin_state": { "enum": ["unknown", "ready", "unavailable"] },
+        "created_at": { "$ref": "#/definitions/timestamp" },
+        "last_renewed_at": { "$ref": "#/definitions/timestamp" },
+        "expected_generation": { "type": "integer", "minimum": 1 },
+        "idempotency_key": { "$ref": "#/definitions/trace_key" },
+        "request_id": { "$ref": "#/definitions/trace_id" },
+        "correlation_id": { "$ref": "#/definitions/trace_id" },
+        "request_hash": { "$ref": "#/definitions/request_hash" }
+      },
+      "additionalProperties": false
+    },
+    "dispatch_outcome": {
+      "type": "object",
+      "required": [
+        "schema",
+        "kind",
+        "preview_id",
+        "operation_id",
+        "state",
+        "generation"
+      ],
+      "properties": {
+        "schema": { "$ref": "#/definitions/schema" },
+        "kind": { "const": "preview_dispatch" },
+        "preview_id": { "$ref": "#/definitions/id" },
+        "operation_id": { "$ref": "#/definitions/id" },
+        "state": { "enum": ["accepted", "ready", "failed"] },
+        "generation": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": false
+    }
+  }
+}

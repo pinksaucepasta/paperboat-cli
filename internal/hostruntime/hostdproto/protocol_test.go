@@ -259,15 +259,15 @@ func TestControllerRejectsEpochWrapAndRepeatedLease(t *testing.T) {
 }
 
 func readyFor(value Welcome) Ready {
-	return Ready{WorkerID: value.WorkerID, APIVersion: value.APIVersion, Epoch: value.Epoch, Lease: value.Lease}
+	return Ready(value)
 }
 
 func activateFor(value Welcome) Activate {
-	return Activate{WorkerID: value.WorkerID, APIVersion: value.APIVersion, Epoch: value.Epoch, Lease: value.Lease}
+	return Activate(value)
 }
 
 func heartbeatFor(value Welcome) Heartbeat {
-	return Heartbeat{WorkerID: value.WorkerID, APIVersion: value.APIVersion, Epoch: value.Epoch, Lease: value.Lease}
+	return Heartbeat(value)
 }
 
 func testLease(byteValue byte) string {

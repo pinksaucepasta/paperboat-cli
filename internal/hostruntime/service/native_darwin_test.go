@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -19,10 +20,19 @@ func TestNativeLaunchdServiceProcess(t *testing.T) {
 	if os.Getenv("PAPERBOAT_NATIVE_SERVICE_CHILD") != "1" {
 		t.Skip("native service child only")
 	}
+	if os.Getenv("PAPERBOAT_NATIVE_SERVICE_ROLE") == "updater" {
+		select {}
+	}
 	server := &http.Server{Addr: "127.0.0.1:18082", Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"live":true}`))
 	})}
-	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	listener, err := net.Listen("tcp", server.Addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		t.Fatal(err)
 	}
 }
@@ -35,6 +45,7 @@ func TestNativeLaunchdInstallUpgradeAndUninstall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	executable = installNativeServiceTestExecutable(t, executable)
 	definitionPath := filepath.Join("/Library", "LaunchDaemons", Label+".plist")
 	if _, err := os.Lstat(definitionPath); err == nil {
 		t.Fatalf("refusing to replace existing service definition %s", definitionPath)

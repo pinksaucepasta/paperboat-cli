@@ -5,6 +5,8 @@ import (
 	"errors"
 	"strings"
 	"time"
+
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/workerupdate"
 )
 
 const windowsActivationJournalSchema = "paperboat.windows-activation/v1"
@@ -13,13 +15,16 @@ const maxWindowsComponentSize int64 = 256 << 20
 type windowsActivationStage string
 
 const (
-	windowsActivationStaged        windowsActivationStage = "staged"
-	windowsActivationSwitching     windowsActivationStage = "switching"
-	windowsActivationServicesLive  windowsActivationStage = "services_live"
-	windowsActivationCommitted     windowsActivationStage = "committed"
-	windowsActivationRollingBack   windowsActivationStage = "rolling_back"
-	windowsActivationRollbackReady windowsActivationStage = "rollback_ready"
-	windowsActivationRolledBack    windowsActivationStage = "rolled_back"
+	windowsActivationStaged              windowsActivationStage = "staged"
+	windowsActivationCandidateValidating windowsActivationStage = "candidate_validating"
+	windowsActivationCandidateReady      windowsActivationStage = "candidate_ready"
+	windowsActivationDraining            windowsActivationStage = "draining"
+	windowsActivationSwitching           windowsActivationStage = "switching"
+	windowsActivationServicesLive        windowsActivationStage = "services_live"
+	windowsActivationCommitted           windowsActivationStage = "committed"
+	windowsActivationRollingBack         windowsActivationStage = "rolling_back"
+	windowsActivationRollbackReady       windowsActivationStage = "rollback_ready"
+	windowsActivationRolledBack          windowsActivationStage = "rolled_back"
 )
 
 type windowsActivationComponent struct {
@@ -41,6 +46,13 @@ type windowsActivationJournal struct {
 	PreviousCLIRecord, NewCLIRecord                               string
 	LocalDaemonWasRunning                                         bool
 	Failure                                                       string
+	ManifestSHA256                                                string
+	CanaryPath                                                    string
+	CanaryStatus                                                  int
+	CanarySamples                                                 uint16
+	CanaryTimeout, DrainTimeout, StabilityWindow                  time.Duration
+	StabilityInterval, RollbackTimeout                            time.Duration
+	HostdAPIMin, HostdAPIMax, RuntimeAPIMin, RuntimeAPIMax        uint16
 }
 
 var errInvalidWindowsActivation = errors.New("invalid Windows activation transaction")
@@ -49,18 +61,25 @@ var errInvalidWindowsActivation = errors.New("invalid Windows activation transac
 // has deterministic tests without pretending a macOS filesystem models SCM.
 type windowsActivationBackend interface {
 	WriteJournal(windowsActivationJournal) error
+	ProbeCandidate(context.Context, windowsActivationJournal) error
+	StopCandidate(context.Context, windowsActivationJournal) error
 	StopServices(context.Context, bool) error
 	ActivateBinary(context.Context, windowsActivationJournal) error
 	RestoreBinary(context.Context, windowsActivationJournal) error
 	SetServiceTargets(context.Context, windowsServiceTarget, windowsServiceTarget, windowsServiceTarget) error
 	StartServices(context.Context, bool, bool, bool, bool) error
 	VerifyHealth(context.Context, windowsActivationJournal) error
+	Drain(context.Context, windowsActivationJournal) error
+	VerifyRollback(context.Context, windowsActivationJournal) error
 	CommitCLI(context.Context, windowsActivationJournal) error
 	Quarantine(context.Context, windowsActivationJournal) error
 	FinalizeServices(context.Context, windowsActivationJournal) error
 }
 
 func executeWindowsActivation(ctx context.Context, backend windowsActivationBackend, journal windowsActivationJournal) (result windowsActivationJournal, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if backend == nil || !validWindowsActivationJournal(journal) {
 		return journal, errInvalidWindowsActivation
 	}
@@ -73,15 +92,45 @@ func executeWindowsActivation(ctx context.Context, backend windowsActivationBack
 	if journal.Stage == windowsActivationRollbackReady {
 		return completeWindowsRollback(ctx, backend, journal, errors.New("interrupted rollback recovered"))
 	}
+	// Candidate validation happens before the old route is drained. If the
+	// updater is interrupted at either candidate stage, the old service and
+	// route remain authoritative; only the staged candidate needs to be
+	// stopped and quarantined.
+	if journal.Stage == windowsActivationCandidateValidating || journal.Stage == windowsActivationCandidateReady {
+		return rollbackWindowsCandidate(ctx, backend, journal, errors.New("interrupted candidate validation recovered"))
+	}
 	// Once a previous activator may have changed SCM, recovery always restores
 	// the old exact commands first. It never guesses which candidate process
 	// survived a power loss.
 	if journal.Stage != windowsActivationStaged {
 		return rollbackWindowsActivation(ctx, backend, journal, errors.New("interrupted activation recovered"))
 	}
-	journal.Stage = windowsActivationSwitching
+	journal.Stage = windowsActivationCandidateValidating
 	if err = backend.WriteJournal(journal); err != nil {
 		return journal, err
+	}
+	if err = backend.ProbeCandidate(ctx, journal); err != nil {
+		return rollbackWindowsCandidate(ctx, backend, journal, err)
+	}
+	journal.Stage = windowsActivationCandidateReady
+	if err = backend.WriteJournal(journal); err != nil {
+		return rollbackWindowsCandidate(ctx, backend, journal, err)
+	}
+	journal.Stage = windowsActivationDraining
+	if err = backend.WriteJournal(journal); err != nil {
+		return rollbackWindowsCandidate(ctx, backend, journal, err)
+	}
+	if err = backend.Drain(ctx, journal); err != nil {
+		return rollbackWindowsActivation(ctx, backend, journal, err)
+	}
+	if err = backend.StopCandidate(ctx, journal); err != nil {
+		return rollbackWindowsActivation(ctx, backend, journal, err)
+	}
+	// Draining is now durable. The old route must be restored if any later
+	// service, binary, or health operation fails.
+	journal.Stage = windowsActivationSwitching
+	if err = backend.WriteJournal(journal); err != nil {
+		return rollbackWindowsActivation(ctx, backend, journal, err)
 	}
 	if err = backend.StopServices(ctx, journal.LocalDaemonWasRunning); err != nil {
 		return rollbackWindowsActivation(ctx, backend, journal, err)
@@ -118,7 +167,10 @@ func executeWindowsActivation(ctx context.Context, backend windowsActivationBack
 }
 
 func rollbackWindowsActivation(ctx context.Context, backend windowsActivationBackend, journal windowsActivationJournal, cause error) (windowsActivationJournal, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	journal.Stage, journal.Failure = windowsActivationRollingBack, boundedWindowsActivationFailure(cause)
 	journalErr := backend.WriteJournal(journal)
@@ -170,6 +222,30 @@ func rollbackWindowsActivation(ctx context.Context, backend windowsActivationBac
 	return result, errors.Join(startErr, cleanupErr)
 }
 
+// rollbackWindowsCandidate aborts a pre-drain candidate without touching the
+// currently active services or route. This is intentionally separate from the
+// full rollback path: a failed canary must not cause an unnecessary outage or
+// turn an undrained route into an uncertain one.
+func rollbackWindowsCandidate(ctx context.Context, backend windowsActivationBackend, journal windowsActivationJournal, cause error) (windowsActivationJournal, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	journal.Stage = windowsActivationRollingBack
+	journal.Failure = boundedWindowsActivationFailure(cause)
+	journalErr := backend.WriteJournal(journal)
+	stopErr := backend.StopCandidate(ctx, journal)
+	quarantineErr := backend.Quarantine(ctx, journal)
+	criticalErr := errors.Join(journalErr, stopErr)
+	if criticalErr != nil {
+		return journal, errors.Join(cause, criticalErr, quarantineErr)
+	}
+	journal.Stage = windowsActivationRolledBack
+	if err := backend.WriteJournal(journal); err != nil {
+		return journal, errors.Join(cause, quarantineErr, err)
+	}
+	return journal, errors.Join(cause, quarantineErr)
+}
+
 func completeWindowsRollback(_ context.Context, backend windowsActivationBackend, journal windowsActivationJournal, cause error) (windowsActivationJournal, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -177,6 +253,9 @@ func completeWindowsRollback(_ context.Context, backend windowsActivationBackend
 		return journal, errors.Join(cause, errInvalidWindowsActivation)
 	}
 	if err := backend.StartServices(ctx, journal.OldHostd.WasRunning, journal.OldUpdater.WasRunning, journal.OldSSH.WasRunning, journal.LocalDaemonWasRunning); err != nil {
+		return journal, errors.Join(cause, err)
+	}
+	if err := backend.VerifyRollback(ctx, journal); err != nil {
 		return journal, errors.Join(cause, err)
 	}
 	journal.Stage = windowsActivationRolledBack
@@ -187,7 +266,7 @@ func completeWindowsRollback(_ context.Context, backend windowsActivationBackend
 }
 
 func validWindowsActivationJournal(j windowsActivationJournal) bool {
-	if j.Schema != windowsActivationJournalSchema || len(j.TransactionID) != 32 || !lowerHex(j.TransactionID) || !exactReleasePattern.MatchString(j.Version) || !exactReleasePattern.MatchString(j.PreviousVersion) || !validWindowsActivationStage(j.Stage) || j.Architecture != "amd64" && j.Architecture != "arm64" || len(j.Failure) > 4096 {
+	if j.Schema != windowsActivationJournalSchema || len(j.TransactionID) != 32 || !lowerHex(j.TransactionID) || !exactReleasePattern.MatchString(j.Version) || !exactReleasePattern.MatchString(j.PreviousVersion) || !validWindowsActivationStage(j.Stage) || j.Architecture != "amd64" && j.Architecture != "arm64" || len(j.Failure) > 4096 || invalidWindowsAPIRange(j.HostdAPIMin, j.HostdAPIMax) || invalidWindowsAPIRange(j.RuntimeAPIMin, j.RuntimeAPIMax) || workerupdate.ValidateActivationPolicy(windowsCandidateRelease(j)) != nil {
 		return false
 	}
 	for _, component := range []windowsActivationComponent{j.Runtime, j.CLI, j.Hostd, j.Updater, j.PreviousBinary} {
@@ -214,6 +293,10 @@ func validWindowsActivationJournal(j windowsActivationJournal) bool {
 	return j.PreviousCLIRecord == "" && j.NewCLIRecord == ""
 }
 
+func invalidWindowsAPIRange(minimum, maximum uint16) bool {
+	return minimum == 0 || minimum > maximum || maximum > 1024
+}
+
 func validWindowsSSHArguments(arguments []string) bool {
 	return len(arguments) == 5 && arguments[0] == "__windows-sshd-service" && arguments[1] == "--sshd" && strings.EqualFold(arguments[2], `C:\Program Files\OpenSSH\sshd.exe`) && arguments[3] == "--config" && strings.EqualFold(arguments[4], `C:\ProgramData\Paperboat\ssh\sshd_config`)
 }
@@ -237,11 +320,15 @@ func boundedWindowsActivationFailure(cause error) string {
 
 func validWindowsActivationStage(stage windowsActivationStage) bool {
 	switch stage {
-	case windowsActivationStaged, windowsActivationSwitching, windowsActivationServicesLive, windowsActivationCommitted, windowsActivationRollingBack, windowsActivationRollbackReady, windowsActivationRolledBack:
+	case windowsActivationStaged, windowsActivationCandidateValidating, windowsActivationCandidateReady, windowsActivationDraining, windowsActivationSwitching, windowsActivationServicesLive, windowsActivationCommitted, windowsActivationRollingBack, windowsActivationRollbackReady, windowsActivationRolledBack:
 		return true
 	default:
 		return false
 	}
+}
+
+func windowsCandidateRelease(j windowsActivationJournal) workerupdate.Release {
+	return workerupdate.Release{Version: j.Version, SHA256: j.Runtime.SHA256, Length: j.Runtime.Length, Platform: "windows", Architecture: j.Architecture, ManifestSHA256: j.ManifestSHA256, CanaryPath: j.CanaryPath, CanaryStatus: j.CanaryStatus, CanarySamples: j.CanarySamples, CanaryTimeout: j.CanaryTimeout, DrainTimeout: j.DrainTimeout, StabilityWindow: j.StabilityWindow, StabilityInterval: j.StabilityInterval, RollbackTimeout: j.RollbackTimeout, HostdAPIMin: j.HostdAPIMin, HostdAPIMax: j.HostdAPIMax, RuntimeAPIMin: j.RuntimeAPIMin, RuntimeAPIMax: j.RuntimeAPIMax}
 }
 
 func lowerHex(value string) bool {

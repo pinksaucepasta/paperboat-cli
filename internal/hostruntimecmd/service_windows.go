@@ -5,18 +5,14 @@ package hostruntimecmd
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"io"
 	"os"
-	"path/filepath"
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostinstall"
-	"github.com/pinksaucepasta/paperboat/internal/hostruntimeentry"
 	"github.com/pinksaucepasta/paperboat/internal/windows/elevation"
 	"github.com/pinksaucepasta/paperboat/internal/windowsopenssh"
-	"golang.org/x/sys/windows"
 )
 
 // runServiceCommand is the sole privileged command bridge used by the MSI,
@@ -27,7 +23,7 @@ func runServiceCommand(ctx context.Context, args []string, stdin io.Reader, _, _
 		return runServiceBridge(ctx, args[1:])
 	}
 	if len(args) != 1 {
-		return errors.New("service requires install, commit, uninstall, uninstall-persisted, purge, or repair")
+		return errors.New("service requires install, commit, uninstall, uninstall-persisted, purge, repair, or stop")
 	}
 	switch args[0] {
 	case "uninstall-persisted":
@@ -45,6 +41,11 @@ func runServiceCommand(ctx context.Context, args []string, stdin io.Reader, _, _
 			return runElevatedServiceOperation(ctx, elevation.ActionRepair)
 		}
 		return repairWindowsInstallation(ctx)
+	case "stop":
+		if !elevation.IsCurrentProcessElevated() {
+			return runElevatedServiceOperation(ctx, elevation.ActionStop)
+		}
+		return hostinstall.Stop(ctx)
 	case "install", "commit", "uninstall":
 		request, err := hostinstall.Decode(stdin)
 		if err != nil {
@@ -63,7 +64,7 @@ func runServiceCommand(ctx context.Context, args []string, stdin io.Reader, _, _
 			return uninstallWindowsRuntime(ctx, request)
 		}
 	default:
-		return errors.New("service requires install, commit, uninstall, uninstall-persisted, purge, or repair")
+		return errors.New("service requires install, commit, uninstall, uninstall-persisted, purge, repair, or stop")
 	}
 }
 
@@ -100,20 +101,8 @@ func dispatchElevatedOperation(ctx context.Context, request elevation.Request) e
 			return hostinstall.Purge(ctx)
 		case elevation.ActionRepair:
 			return repairWindowsInstallation(ctx)
-		case elevation.ActionCleanupPreviews:
-			return cleanupElevatedPreviewServices(ctx, request.Payload)
-		case elevation.ActionInstallPreview, elevation.ActionRemovePreview:
-			var mutation hostruntimeentry.WindowsPreviewMutation
-			decoder := json.NewDecoder(bytes.NewReader(request.Payload))
-			decoder.DisallowUnknownFields()
-			var extra any
-			if decoder.Decode(&mutation) != nil || !errors.Is(decoder.Decode(&extra), io.EOF) {
-				return errors.New("invalid Windows preview mutation")
-			}
-			if request.Action == elevation.ActionRemovePreview && mutation.Kind != "remove" && mutation.Kind != "reconcile" || request.Action == elevation.ActionInstallPreview && (mutation.Kind == "remove" || mutation.Kind == "reconcile") {
-				return errors.New("invalid Windows preview mutation action")
-			}
-			return hostruntimeentry.ApplyWindowsPreviewMutation(ctx, mutation)
+		case elevation.ActionStop:
+			return hostinstall.Stop(ctx)
 		case elevation.ActionInstall, elevation.ActionInstallCommit, elevation.ActionCommit, elevation.ActionUninstall:
 			installRequest, err := hostinstall.Decode(bytes.NewReader(request.Payload))
 			if err != nil {
@@ -166,55 +155,9 @@ func repairWindowsInstallation(ctx context.Context) error {
 }
 
 func uninstallPersistedWindowsRuntime(ctx context.Context) error {
-	config, err := hostinstall.LoadWindowsRuntimeConfig()
-	if err != nil {
-		return hostinstall.UninstallPersisted(ctx)
-	}
-	return errors.Join(hostruntimeentry.RemoveAllPreviewServices(ctx, config.StateRoot), hostinstall.UninstallPersisted(ctx))
+	return hostinstall.UninstallPersisted(ctx)
 }
 
 func uninstallWindowsRuntime(ctx context.Context, request hostinstall.Request) error {
-	return errors.Join(hostruntimeentry.RemoveAllPreviewServices(ctx, request.StateRoot), hostinstall.Uninstall(ctx, request))
-}
-
-func cleanupElevatedPreviewServices(ctx context.Context, payload []byte) error {
-	var request struct {
-		Roots []string `json:"roots"`
-	}
-	decoder := json.NewDecoder(bytes.NewReader(payload))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&request); err != nil || len(request.Roots) == 0 || len(request.Roots) > 32 {
-		return errors.New("invalid Windows preview cleanup request")
-	}
-	var extra any
-	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		return errors.New("invalid Windows preview cleanup request")
-	}
-	var result error
-	for _, root := range request.Roots {
-		if !validPreviewCleanupRoot(root) {
-			result = errors.Join(result, errors.New("invalid Windows preview cleanup root"))
-			continue
-		}
-		result = errors.Join(result, hostruntimeentry.RemoveAllPreviewServices(ctx, root))
-	}
-	return result
-}
-
-func validPreviewCleanupRoot(root string) bool {
-	if root == "" || !filepath.IsAbs(root) || filepath.Clean(root) != root || filepath.VolumeName(root) == "" {
-		return false
-	}
-	if root == filepath.VolumeName(root)+string(filepath.Separator) {
-		return false
-	}
-	info, err := os.Lstat(root)
-	if err != nil {
-		return errors.Is(err, os.ErrNotExist)
-	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return false
-	}
-	attributes, err := windows.GetFileAttributes(windows.StringToUTF16Ptr(root))
-	return err == nil && attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT == 0
+	return hostinstall.Uninstall(ctx, request)
 }

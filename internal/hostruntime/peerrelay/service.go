@@ -38,8 +38,6 @@ import (
 var ErrInvalid = errors.New("invalid peer relay service configuration")
 var ErrAttemptLimit = errors.New("peer relay attempt limit reached")
 
-const defaultWSSFallbackDelay = time.Second
-
 type Source interface {
 	Next(context.Context) (api.PeerAttemptDescriptor, error)
 }

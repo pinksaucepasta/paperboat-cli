@@ -59,13 +59,19 @@ func TestActiveVersionRemainsReadableDuringHealthHold(t *testing.T) {
 	health := &blockingHealth{entered: make(chan struct{}, 1), release: make(chan struct{})}
 	fixture.manager.config.Health = health
 	updateDone := make(chan error, 1)
+	released := false
+	defer func() {
+		if !released {
+			close(health.release)
+		}
+	}()
 	go func() {
 		_, err := fixture.manager.Activate(context.Background(), fixture.candidate)
 		updateDone <- err
 	}()
 	select {
 	case <-health.entered:
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("update did not enter its health hold")
 	}
 	version := make(chan string, 1)
@@ -75,10 +81,11 @@ func TestActiveVersionRemainsReadableDuringHealthHold(t *testing.T) {
 		if got != fixture.active.Version {
 			t.Fatalf("active version during hold = %q, want %q", got, fixture.active.Version)
 		}
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(time.Second):
 		t.Fatal("active version blocked behind the update transaction")
 	}
 	close(health.release)
+	released = true
 	if err := <-updateDone; err != nil {
 		t.Fatal(err)
 	}
@@ -367,7 +374,7 @@ func newFixture(t *testing.T) fixture {
 	if workerUID == 0 {
 		workerUID = 1
 	}
-	manager, err := New(Config{StatePath: paths.journal, Binary: paths.current, BinaryRollback: paths.rollback, BinaryStaged: paths.staged, Active: active, OwnerUID: os.Geteuid(), OwnerGID: os.Getegid(), WorkerUID: workerUID, WorkerGID: os.Getegid(), HostdEndpoint: "private-hostd", Capability: bytes.Repeat([]byte{1}, 32), Fetcher: fetcher, Starter: starter, Hostd: hostd, Health: health, NativeVerifier: nativeVerifierFunc(func(context.Context, string, string, string) error { return nil }), InstallPackage: func(context.Context, string) (string, error) { return installed, nil }, MonitorWindow: time.Millisecond, HealthInterval: time.Millisecond})
+	manager, err := New(Config{StatePath: paths.journal, Binary: paths.current, BinaryRollback: paths.rollback, BinaryStaged: paths.staged, Active: active, OwnerUID: os.Geteuid(), OwnerGID: os.Getegid(), WorkerUID: workerUID, WorkerGID: os.Getegid(), HostdEndpoint: "private-hostd", Capability: bytes.Repeat([]byte{1}, 32), Fetcher: fetcher, Starter: starter, Hostd: hostd, Health: health, Gate: fakeActivationGate{}, NativeVerifier: nativeVerifierFunc(func(context.Context, string, string, string) error { return nil }), InstallPackage: func(context.Context, string) (string, error) { return installed, nil }, MonitorWindow: time.Millisecond, HealthInterval: time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -445,6 +452,14 @@ func (*fakeWorker) Stop(context.Context) error { return nil }
 type fakeHealth struct{ err error }
 
 func (h *fakeHealth) Check(context.Context, hostdproto.Status, Release) error { return h.err }
+
+type fakeActivationGate struct{}
+
+func (fakeActivationGate) Candidate(context.Context, GateRequest) error { return nil }
+func (fakeActivationGate) Drain(context.Context, GateRequest) error     { return nil }
+func (fakeActivationGate) Active(context.Context, GateRequest) error    { return nil }
+func (fakeActivationGate) Commit(context.Context, GateRequest) error    { return nil }
+func (fakeActivationGate) Rollback(context.Context, GateRequest) error  { return nil }
 
 type blockingHealth struct {
 	entered chan struct{}

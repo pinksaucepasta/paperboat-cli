@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -139,11 +140,24 @@ func TestStagedReleaseVerificationCannotSkipWhenRequired(t *testing.T) {
 	}
 }
 
+func TestStagedReleaseVerificationRejectsInvalidRequireFlag(t *testing.T) {
+	t.Setenv("PAPERBOAT_TEST_REQUIRE_STAGED", "true")
+	t.Setenv("PAPERBOAT_TEST_RELEASE_DIRECTORY", "")
+	t.Setenv("PAPERBOAT_TEST_GITHUB_RELEASE_DIRECTORY", "")
+	if _, _, err := stagedReleaseVerificationDirectories(); err == nil {
+		t.Fatal("invalid staged verification gate was accepted")
+	}
+}
+
 func stagedReleaseVerificationDirectories() (string, string, error) {
 	releaseRoot := strings.TrimSpace(os.Getenv("PAPERBOAT_TEST_RELEASE_DIRECTORY"))
 	githubRoot := strings.TrimSpace(os.Getenv("PAPERBOAT_TEST_GITHUB_RELEASE_DIRECTORY"))
+	require := strings.TrimSpace(os.Getenv("PAPERBOAT_TEST_REQUIRE_STAGED"))
+	if require != "" && require != "1" {
+		return "", "", fmt.Errorf("PAPERBOAT_TEST_REQUIRE_STAGED must be exactly 1 when set, got %q", require)
+	}
 	if releaseRoot == "" || githubRoot == "" {
-		if strings.TrimSpace(os.Getenv("PAPERBOAT_TEST_REQUIRE_STAGED")) == "1" {
+		if require == "1" {
 			return "", "", errors.New("required staged release or downloaded GitHub release directory is not set")
 		}
 		return "", "", nil

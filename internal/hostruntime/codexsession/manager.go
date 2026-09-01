@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/envinject"
 	"github.com/pinksaucepasta/paperboat/internal/processlaunch"
 
 	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
@@ -37,16 +37,17 @@ type Command interface {
 }
 
 type Config struct {
-	StateRoot        string
-	WorkspaceRoot    string
-	Environment      []string
-	CodexPath        string
-	MaxSessions      int
-	StopGrace        time.Duration
-	ReadinessTimeout time.Duration
-	Now              func() time.Time
-	Command          func(context.Context, string, ...string) Command
-	Preflight        func(context.Context) (string, error)
+	StateRoot          string
+	WorkspaceRoot      string
+	Environment        []string
+	ManagedEnvironment func() ([]string, error)
+	CodexPath          string
+	MaxSessions        int
+	StopGrace          time.Duration
+	ReadinessTimeout   time.Duration
+	Now                func() time.Time
+	Command            func(context.Context, string, ...string) Command
+	Preflight          func(context.Context) (string, error)
 }
 
 type Manager struct {
@@ -96,15 +97,23 @@ func New(config Config) (*Manager, error) {
 	}
 	if config.Command == nil {
 		config.Command = func(ctx context.Context, name string, args ...string) Command {
+			environment, err := resolvedEnvironment(config)
+			if err != nil {
+				return failedCommand{err: err}
+			}
 			cmd := exec.CommandContext(ctx, name, args...)
 			processlaunch.ConfigureBackground(cmd)
-			cmd.Env = append([]string(nil), config.Environment...)
+			cmd.Env = environment
 			return &execCommand{Cmd: cmd}
 		}
 	}
 	if config.Preflight == nil {
 		config.Preflight = func(ctx context.Context) (string, error) {
-			return codexPreflight(ctx, config.CodexPath, config.Environment)
+			environment, err := resolvedEnvironment(config)
+			if err != nil {
+				return "", err
+			}
+			return codexPreflight(ctx, config.CodexPath, environment)
 		}
 	}
 	if !canonicalAbsolute(config.StateRoot) || !canonicalAbsolute(config.WorkspaceRoot) || config.MaxSessions < 1 || config.StopGrace <= 0 || config.ReadinessTimeout <= 0 {
@@ -129,6 +138,24 @@ type execCommand struct{ *exec.Cmd }
 
 func (c *execCommand) Signal(signal os.Signal) error { return c.Process.Signal(signal) }
 func (c *execCommand) Kill() error                   { return c.Process.Kill() }
+
+type failedCommand struct{ err error }
+
+func (c failedCommand) Start() error           { return c.err }
+func (c failedCommand) Wait() error            { return c.err }
+func (c failedCommand) Signal(os.Signal) error { return c.err }
+func (c failedCommand) Kill() error            { return c.err }
+
+func resolvedEnvironment(config Config) ([]string, error) {
+	if config.ManagedEnvironment == nil {
+		return append([]string(nil), config.Environment...), nil
+	}
+	managed, err := config.ManagedEnvironment()
+	if err != nil {
+		return nil, err
+	}
+	return envinject.Merge(config.Environment, managed)
+}
 
 func (m *Manager) Prepare(ctx context.Context, id, requestedPath string, leaseExpiresAt time.Time) (Descriptor, error) {
 	if !validID(id) || !leaseExpiresAt.After(m.config.Now()) {
@@ -168,23 +195,18 @@ func (m *Manager) Prepare(ctx context.Context, id, requestedPath string, leaseEx
 		_ = os.RemoveAll(directory)
 		return Descriptor{}, errors.Join(ErrInvalid, err)
 	}
-	logPath := filepath.Join(directory, "app-server.log")
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-	if err != nil {
-		m.mu.Unlock()
-		_ = os.RemoveAll(directory)
-		return Descriptor{}, err
-	}
 	processCtx, cancel := context.WithCancel(context.Background())
 	command := m.config.Command(processCtx, m.config.CodexPath, "app-server", "--listen", listen)
 	if cmd, ok := command.(*execCommand); ok {
 		cmd.Dir = path
-		cmd.Stdout = &limitedWriter{writer: logFile, remaining: 1 << 20}
-		cmd.Stderr = cmd.Stdout
+		// The managed environment is write-only. The app server and child
+		// commands can echo their environment, so Paperboat must not persist or
+		// forward their stdout or stderr through its own logs.
+		cmd.Stdout = nil
+		cmd.Stderr = nil
 	}
 	if err := command.Start(); err != nil {
 		cancel()
-		_ = logFile.Close()
 		m.mu.Unlock()
 		_ = os.RemoveAll(directory)
 		return Descriptor{}, errors.Join(ErrCodexUnavailable, err)
@@ -196,7 +218,7 @@ func (m *Manager) Prepare(ctx context.Context, id, requestedPath string, leaseEx
 	s := &managed{descriptor: d, command: command, done: make(chan struct{})}
 	m.sessions[id] = s
 	m.mu.Unlock()
-	go func() { s.waitErr = command.Wait(); cancel(); _ = logFile.Close(); close(s.done) }()
+	go func() { s.waitErr = command.Wait(); cancel(); close(s.done) }()
 	if err := waitCodexAppServer(ctx, endpoint, m.config.ReadinessTimeout); err != nil {
 		_ = m.Stop(context.Background(), id)
 		return Descriptor{}, errors.Join(ErrCodexUnavailable, err)
@@ -422,29 +444,11 @@ func codexPreflight(ctx context.Context, path string, env []string) (string, err
 	command := exec.CommandContext(ctx, path, "login", "status")
 	processlaunch.ConfigureBackground(command)
 	command.Env = env
-	if output, loginErr := command.CombinedOutput(); loginErr != nil {
-		return "", fmt.Errorf("Codex authentication is unavailable: %s", strings.TrimSpace(string(output)))
+	if _, loginErr := command.CombinedOutput(); loginErr != nil {
+		// The managed environment is write-only. A child command can echo its
+		// own environment on failure, so none of its output may enter an error
+		// that is returned or logged by the host runtime.
+		return "", errors.New("Codex authentication is unavailable")
 	}
 	return version, nil
-}
-
-type limitedWriter struct {
-	writer    io.Writer
-	remaining int64
-}
-
-func (w *limitedWriter) Write(p []byte) (int, error) {
-	original := len(p)
-	if w.remaining <= 0 {
-		return original, nil
-	}
-	if int64(len(p)) > w.remaining {
-		p = p[:w.remaining]
-	}
-	n, err := w.writer.Write(p)
-	w.remaining -= int64(n)
-	if err != nil {
-		return n, err
-	}
-	return original, nil
 }

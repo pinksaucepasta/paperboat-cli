@@ -38,7 +38,7 @@ func TestCommandTreeHasUniqueNamesAndAliases(t *testing.T) {
 			seen[spelling] = command.Name
 		}
 	}
-	for _, required := range []string{"login", "serve", "session list", "preview list", "preview revoke", "machine add", "config assign", "doctor"} {
+	for _, required := range []string{"login", "preview", "preview list", "preview stop", "session list", "machine add", "config assign", "doctor"} {
 		if _, ok := seen[required]; !ok {
 			t.Errorf("missing required workflow spelling %q", required)
 		}

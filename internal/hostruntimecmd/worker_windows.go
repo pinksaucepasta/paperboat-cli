@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	gort "runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,9 +24,7 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostservice"
 	hostruntime "github.com/pinksaucepasta/paperboat/internal/hostruntime/runtime"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
-	"github.com/pinksaucepasta/paperboat/internal/hostruntimeentry"
 	"github.com/pinksaucepasta/paperboat/internal/processlaunch"
-	"github.com/pinksaucepasta/paperboat/internal/windows/previewbroker"
 	"golang.org/x/sys/windows"
 )
 
@@ -112,11 +111,6 @@ func runWindowsHostdService(install hostinstall.WindowsRuntimeConfig) error {
 	if err != nil {
 		return err
 	}
-	token, err := readWindowsHostdTokenForSID(install.TokenFile, install.OwnerSID)
-	if err != nil {
-		return err
-	}
-	brokerToken := previewbroker.DeriveToken(token)
 	return service.RunWindowsService(service.ServiceEntryConfig{
 		Name:        "PaperboatHostd",
 		Executable:  hostdExecutable,
@@ -128,8 +122,7 @@ func runWindowsHostdService(install hostinstall.WindowsRuntimeConfig) error {
 		},
 		StartPrivilegedSidecar: func(ctx context.Context) (service.PrivilegedSidecar, error) {
 			sidecarCtx, cancelSidecars := context.WithCancel(ctx)
-			results := make(chan error, 2)
-			previewReady := make(chan struct{})
+			results := make(chan error, 1)
 			availabilityReady := make(chan struct{})
 			updateDiagnostics, err := hostservice.NewWindowsUpdateDiagnostics(layout.UpdateStateRoot, install.MachineID)
 			if err != nil {
@@ -158,19 +151,12 @@ func runWindowsHostdService(install hostinstall.WindowsRuntimeConfig) error {
 				cancelSidecars()
 				return service.PrivilegedSidecar{}, err
 			}
-			go func() {
-				results <- (previewbroker.Server{OwnerSID: install.OwnerSID, Token: brokerToken, Ready: previewReady, Handle: func(callCtx context.Context, payload []byte) error {
-					return hostruntimeentry.ApplyEncodedWindowsPreviewMutation(callCtx, payload)
-				}}).Run(sidecarCtx)
-			}()
 			go func() { results <- availability.Run(sidecarCtx) }()
-			for previewReady != nil || availabilityReady != nil {
+			for availabilityReady != nil {
 				select {
 				case sidecarErr := <-results:
 					cancelSidecars()
 					return service.PrivilegedSidecar{}, sidecarErr
-				case <-previewReady:
-					previewReady = nil
 				case <-availabilityReady:
 					availabilityReady = nil
 				case <-time.After(15 * time.Second):
@@ -182,8 +168,7 @@ func runWindowsHostdService(install hostinstall.WindowsRuntimeConfig) error {
 			go func() {
 				first := <-results
 				cancelSidecars()
-				second := <-results
-				done <- errors.Join(first, second)
+				done <- first
 			}()
 			return service.PrivilegedSidecar{Done: done}, nil
 		},
@@ -203,9 +188,6 @@ func recordWindowsServiceLaunchFailure(name string, err error) {
 }
 
 func runOwnerHostd(ctx context.Context, output io.Writer, install hostinstall.WindowsRuntimeConfig) error {
-	if handled, err := runWindowsHostdNativeE2E(ctx, install); handled {
-		return err
-	}
 	socket, tokenPath, executable := os.Getenv("PAPERBOAT_HOSTD_SOCKET"), os.Getenv("PAPERBOAT_HOSTD_TOKEN_FILE"), os.Getenv("PAPERBOAT_RUNTIME_CURRENT")
 	if socket == "" {
 		socket = `\\.\pipe\PaperboatHostd`
@@ -259,7 +241,7 @@ func runOwnerHostd(ctx context.Context, output io.Writer, install hostinstall.Wi
 		shutdownWindowsStableHost(host)
 		return err
 	}
-	server, err := hostdproto.NewServer(hostdproto.SocketConfig{SocketPath: socket, StatePath: statePath, SID: sid, Token: token, APIMin: 1, APIMax: 1, Workloads: host.WorkloadStatus})
+	server, err := hostdproto.NewServer(hostdproto.SocketConfig{SocketPath: socket, StatePath: statePath, SID: sid, Token: token, APIMin: 1, APIMax: 1, Workloads: host.WorkloadStatus, UpdateGate: host.UpdateGate(), RequestTimeout: 31 * time.Minute})
 	if err != nil {
 		shutdownWindowsStableHost(host)
 		return err
@@ -505,7 +487,14 @@ type windowsRuntimeWorker struct {
 }
 
 func startWindowsRuntimeWorker(ctx context.Context, executable, socket, tokenPath, workerID string) (*windowsRuntimeWorker, error) {
-	command := exec.CommandContext(ctx, executable, "__runtime-worker", "--socket", socket, "--token-file", tokenPath, "--worker-id", workerID, "--version", buildinfo.Version, "--api-min", "1", "--api-max", "1", "--wait-activation")
+	return startWindowsRuntimeWorkerForRelease(ctx, executable, socket, tokenPath, workerID, buildinfo.Version, 1, 1)
+}
+
+func startWindowsRuntimeWorkerForRelease(ctx context.Context, executable, socket, tokenPath, workerID, version string, apiMin, apiMax uint16) (*windowsRuntimeWorker, error) {
+	if version == "" || apiMin == 0 || apiMin > apiMax || apiMax > 1024 {
+		return nil, errors.New("Windows runtime worker release parameters are invalid")
+	}
+	command := exec.CommandContext(ctx, executable, "__runtime-worker", "--socket", socket, "--token-file", tokenPath, "--worker-id", workerID, "--version", version, "--api-min", strconv.FormatUint(uint64(apiMin), 10), "--api-max", strconv.FormatUint(uint64(apiMax), 10), "--wait-activation")
 	processlaunch.ConfigureBackground(command)
 	control, err := command.StdinPipe()
 	if err != nil {
@@ -568,6 +557,9 @@ func (w *windowsRuntimeWorker) Activate(ctx context.Context) (hostdproto.Status,
 func (w *windowsRuntimeWorker) Stop(ctx context.Context) error {
 	if w == nil || w.command == nil || w.command.Process == nil {
 		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	_ = w.command.Process.Signal(os.Interrupt)
 	done := make(chan error, 1)

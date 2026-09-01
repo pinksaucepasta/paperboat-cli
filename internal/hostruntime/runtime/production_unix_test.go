@@ -12,12 +12,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -25,11 +27,15 @@ import (
 
 	clientapi "github.com/pinksaucepasta/paperboat/internal/api"
 	clientconfig "github.com/pinksaucepasta/paperboat/internal/config"
+	runtimeconfig "github.com/pinksaucepasta/paperboat/internal/hostruntime/config"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/connector"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/envinject"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/environmentenrollment"
 	runtimeidentity "github.com/pinksaucepasta/paperboat/internal/hostruntime/identity"
 	peeridentityenrollment "github.com/pinksaucepasta/paperboat/internal/hostruntime/peeridentity"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/peerrelay"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/server"
+	"github.com/pinksaucepasta/paperboat/internal/peertransport/endpointidentity"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/networkcheck"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/signaling"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/streamauth"
@@ -286,6 +292,15 @@ func managedSSHTestPublicKey(t *testing.T) string {
 	return strings.TrimSpace(string(ssh.MarshalAuthorizedKey(sshPublic)))
 }
 
+func managedSSHRuntimeTestHome(t *testing.T) string {
+	t.Helper()
+	home := t.TempDir()
+	if err := os.Chmod(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return home
+}
+
 func (c *rotatingManagedSSHClient) ManagedSSHAuthorizedKeys(context.Context, string, string, uint64, []byte) (clientapi.ManagedSSHAuthorizedKeys, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -314,7 +329,7 @@ func (s *refreshingManagedSSHIdentity) Proof(_ context.Context, operationID, _, 
 
 func TestManagedSSHKeyReconcilerConvergesAddAndRevocation(t *testing.T) {
 	key := managedSSHTestPublicKey(t)
-	home := t.TempDir()
+	home := managedSSHRuntimeTestHome(t)
 	client := &rotatingManagedSSHClient{keys: [][]string{{key}, nil}}
 	identity := &refreshingManagedSSHIdentity{}
 	service := &managedSSHKeyReconciler{client: client, identity: identity, registration: runtimeidentity.Registration{MachineID: "machine_1", InstallationGeneration: 4}, workerGeneration: 9, setID: "set_1", publicKeys: []string{"ssh-ed25519 AAAA host"}, home: home, ownerUID: uint32(os.Getuid()), interval: 10 * time.Millisecond, timeout: time.Second}
@@ -348,7 +363,7 @@ func TestManagedSSHKeyReconcilerConvergesAddAndRevocation(t *testing.T) {
 
 func TestManagedSSHKeyReconcilerActivatesPromotedHostWithoutRestart(t *testing.T) {
 	key := managedSSHTestPublicKey(t)
-	home := t.TempDir()
+	home := managedSSHRuntimeTestHome(t)
 	client := &rotatingManagedSSHClient{hostStates: []string{"pending", "active"}, keys: [][]string{{key}}}
 	identity := &refreshingManagedSSHIdentity{}
 	service := &managedSSHKeyReconciler{client: client, identity: identity, registration: runtimeidentity.Registration{MachineID: "machine_1", InstallationGeneration: 4}, workerGeneration: 10, setID: "set_1", publicKeys: []string{"ssh-ed25519 AAAA host"}, home: home, ownerUID: uint32(os.Getuid()), interval: 10 * time.Millisecond, timeout: time.Second}
@@ -376,7 +391,7 @@ func TestManagedSSHKeyReconcilerActivatesPromotedHostWithoutRestart(t *testing.T
 
 func TestManagedSSHKeyReconcilerFailsClosedWhenAuthorityRefreshFails(t *testing.T) {
 	key := managedSSHTestPublicKey(t)
-	home := t.TempDir()
+	home := managedSSHRuntimeTestHome(t)
 	client := &rotatingManagedSSHClient{keys: [][]string{{key}}, observeErrors: []error{nil, errors.New("authority unavailable")}}
 	service := &managedSSHKeyReconciler{client: client, identity: &refreshingManagedSSHIdentity{}, registration: runtimeidentity.Registration{MachineID: "machine_1", InstallationGeneration: 4}, workerGeneration: 11, setID: "set_1", publicKeys: []string{"ssh-ed25519 AAAA host"}, home: home, ownerUID: uint32(os.Getuid()), interval: 10 * time.Millisecond, timeout: time.Second}
 	if err := service.Start(t.Context()); err != nil {
@@ -406,7 +421,7 @@ func TestManagedSSHKeyReconcilerReportsTypedInitialAuthorityFailure(t *testing.T
 
 func TestManagedSSHKeyReconcilerRemovesManagedKeysOnShutdown(t *testing.T) {
 	key := managedSSHTestPublicKey(t)
-	home := t.TempDir()
+	home := managedSSHRuntimeTestHome(t)
 	service := &managedSSHKeyReconciler{client: &rotatingManagedSSHClient{keys: [][]string{{key}}}, identity: &refreshingManagedSSHIdentity{}, registration: runtimeidentity.Registration{MachineID: "machine_1", InstallationGeneration: 4}, workerGeneration: 12, setID: "set_1", publicKeys: []string{"ssh-ed25519 AAAA host"}, home: home, ownerUID: uint32(os.Getuid()), interval: time.Hour, timeout: time.Second}
 	if err := service.Start(t.Context()); err != nil {
 		t.Fatal(err)
@@ -433,11 +448,14 @@ func TestRuntimeObservationUsesRenewableIdentityAndExactBodyProof(t *testing.T) 
 		if r.URL.Path != "/v1/runtime-observations" || !strings.Contains(body.String(), `"environment_id":"prj_1"`) {
 			t.Errorf("request path/body = %s %s", r.URL.Path, body.String())
 		}
+		if strings.Contains(body.String(), `"environment":`) || strings.Contains(body.String(), `"environment_injection"`) {
+			t.Errorf("unattached secure ENV provider advertised capability or observation")
+		}
 		w.WriteHeader(http.StatusAccepted)
 	}))
 	defer server.Close()
 	proofs := &testProofSource{}
-	sender := &runtimeObservationSender{endpoint: server.URL + "/v1/runtime-observations", tokens: testTokenSource{}, proofs: proofs, operationID: func() (string, error) { return "op-1", nil }, environmentID: "prj_1", machineID: "mach_1", reporterVersion: "test", client: server.Client()}
+	sender := &runtimeObservationSender{endpoint: server.URL + "/v1/runtime-observations", tokens: testTokenSource{}, proofs: proofs, operationID: func() (string, error) { return "op-1", nil }, environmentID: "prj_1", machineID: "mach_1", reporterVersion: "test", client: server.Client(), environment: &envinject.Provider{}, workerGeneration: 1, osBootID: "boot-1", serviceScope: "system", connector: runtimeObservationConnector{}}
 	if err := sender.Send(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -446,6 +464,177 @@ func TestRuntimeObservationUsesRenewableIdentityAndExactBodyProof(t *testing.T) 
 	}
 	if len(proofs.body) == 0 || !bytes.Contains(proofs.body, []byte(`"resource_id":"mach_1"`)) {
 		t.Fatalf("proof body=%s", proofs.body)
+	}
+}
+
+func TestStoredEnvironmentEndpointRemainsVerifiableAfterNetworkExpiry(t *testing.T) {
+	rootPublic, rootPrivate, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	issuedAt := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Second)
+	certificate, err := endpointidentity.Sign(rootPrivate, endpointidentity.Claims{
+		AccountID: "acct_1", Role: endpointidentity.RoleMachine, EndpointID: "mach_1", Generation: 3, Serial: 1,
+		NoisePublicKey: [32]byte{1}, QUICPublicKey: ed25519.NewKeyFromSeed(bytes.Repeat([]byte{2}, 32)).Public().(ed25519.PublicKey),
+		IssuedAt: issuedAt, ExpiresAt: issuedAt.Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := certificate.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := endpointidentity.Verify(raw, rootPublic, endpointidentity.Expected{Role: endpointidentity.RoleMachine, EndpointID: "mach_1", Generation: 3}, time.Now().UTC()); err == nil {
+		t.Fatal("fixture PBEC is not expired")
+	}
+	verified, err := verifyStoredEnvironmentEndpoint(runtimeidentity.PeerEndpoint{Generation: 3, RootPublicKey: rootPublic, Certificate: raw}, "mach_1")
+	if err != nil || verified.Claims.AccountID != "acct_1" {
+		t.Fatalf("stored certificate=%+v error=%v", verified.Claims, err)
+	}
+}
+
+func TestEnvironmentInjectionSupportsHostProfilesWithLocalKeyCustody(t *testing.T) {
+	registration := runtimeidentity.Registration{SetupMode: "host", MachineID: "mach_1", InstallationGeneration: 1}
+	if !environmentInjectionEligible(runtimeconfig.Hosted, registration) {
+		t.Fatal("hosted host runtime did not enable ENV local key custody")
+	}
+	if !environmentInjectionEligible(runtimeconfig.BYOD, registration) {
+		t.Fatal("BYOD host runtime did not enable ENV local key custody")
+	}
+	registration.SetupMode = "client"
+	if environmentInjectionEligible(runtimeconfig.BYOD, registration) {
+		t.Fatal("client-only machine enabled host ENV custody")
+	}
+}
+
+type runtimeTestEnvironmentProcessor struct {
+	variables map[string]string
+}
+
+func (p runtimeTestEnvironmentProcessor) Restore(context.Context, envinject.Cache) (envinject.Verified, error) {
+	return envinject.Verified{}, nil
+}
+
+func (p runtimeTestEnvironmentProcessor) Apply(_ context.Context, cache envinject.Cache, _ envinject.Bundle) (envinject.Cache, envinject.Verified, error) {
+	cache.Authority = &envinject.Cursor{Generation: 9, AuthorityID: "sha256:" + strings.Repeat("a", 64)}
+	cache.GlobalManifest = &envinject.ManifestEnvelope{Version: 7, KeyEpoch: 2, ManifestID: "sha256:" + strings.Repeat("b", 64), Envelope: "ciphertext-global"}
+	cache.MachineManifest = &envinject.ManifestEnvelope{Version: 4, KeyEpoch: 1, ManifestID: "sha256:" + strings.Repeat("c", 64), Envelope: "ciphertext-machine"}
+	return cache, envinject.Verified{
+		Authority: cache.Authority,
+		Global:    &envinject.ManifestCursor{Version: 7, KeyEpoch: 2, ManifestID: cache.GlobalManifest.ManifestID},
+		Machine:   &envinject.ManifestCursor{Version: 4, KeyEpoch: 1, ManifestID: cache.MachineManifest.ManifestID},
+		Variables: p.variables,
+		Ready:     true,
+	}, nil
+}
+
+func TestRuntimeObservationAppliesEncryptedBundleAndAcknowledgesIt(t *testing.T) {
+	variables := map[string]string{"GLOBAL_TOKEN": "global-secret", "MACHINE_TOKEN": "machine-secret"}
+	var observations []envinject.Observation
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(body, []byte("global-secret")) || bytes.Contains(body, []byte("machine-secret")) {
+			t.Fatal("plaintext environment value reached the runtime request")
+		}
+		var request struct {
+			Environment        envinject.Observation         `json:"environment"`
+			RuntimeDiagnostics runtimeDiagnosticsObservation `json:"runtime_diagnostics"`
+		}
+		if err := json.Unmarshal(body, &request); err != nil {
+			t.Fatal(err)
+		}
+		observations = append(observations, request.Environment)
+		if !slices.Contains(request.RuntimeDiagnostics.Capabilities, "environment_injection") {
+			t.Fatal("ENV observation was sent without the matching runtime capability")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+			"accepted": true,
+			"environment_bundle": envinject.Bundle{
+				Schema: envinject.BundleSchema,
+			},
+		}})
+	}))
+	defer server.Close()
+	path := filepath.Join(t.TempDir(), "environment-cache.json")
+	store, err := envinject.Open(context.Background(), envinject.Config{
+		Path: path, HighWaterPath: filepath.Join(t.TempDir(), "environment-high-water.json"), IntegrityKey: bytes.Repeat([]byte{0x42}, 32), AllowHighWaterInitialize: true, AccountID: "acct_1", MachineID: "mach_1",
+		InstallationGeneration: 1, HostKeyGeneration: 1, HostRecipientKeyID: runtimeTestHostRecipientKeyID,
+		GenesisMarker: runtimeTestGenesisMarkerFor(t, path),
+		Processor:     runtimeTestEnvironmentProcessor{variables: variables},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender := &runtimeObservationSender{endpoint: server.URL, tokens: testTokenSource{}, proofs: &testProofSource{}, operationID: func() (string, error) { return "op-1", nil }, environmentID: "prj_1", machineID: "mach_1", reporterVersion: "test", client: server.Client(), environment: store, workerGeneration: 1, osBootID: "boot-1", serviceScope: "system", connector: runtimeObservationConnector{}}
+	if err := sender.Send(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := sender.Send(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(observations) != 2 || observations[0].State != "pending" || observations[1].State != "applied" || observations[1].Global == nil || observations[1].Global.Version != 7 || observations[1].Machine == nil || observations[1].Machine.Version != 4 || observations[1].ObservationSeq != 2 {
+		t.Fatalf("observations=%+v", observations)
+	}
+	if got, err := store.Environment(); err != nil || !reflect.DeepEqual(got, []string{"GLOBAL_TOKEN=global-secret", "MACHINE_TOKEN=machine-secret"}) {
+		t.Fatalf("environment=%q err=%v", got, err)
+	}
+}
+
+func TestEnvironmentBootstrapCommitsActiveBindingWithoutEnrollment(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "environment-cache.json")
+	store, err := envinject.Open(context.Background(), envinject.Config{
+		Path: path, HighWaterPath: path + ".high-water", IntegrityKey: bytes.Repeat([]byte{0x42}, 32), AllowHighWaterInitialize: true,
+		AccountID: "acct_1", MachineID: "mach_1", InstallationGeneration: 1, HostKeyGeneration: 1, HostRecipientKeyID: runtimeTestHostRecipientKeyID,
+		GenesisMarker: runtimeTestGenesisMarkerFor(t, path), Processor: runtimeTestEnvironmentProcessor{variables: map[string]string{"TOKEN": "secret"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Apply(context.Background(), envinject.Bundle{Schema: envinject.BundleSchema}); err != nil {
+		t.Fatal(err)
+	}
+	provider := &envinject.Provider{}
+	if err := provider.Attach(store); err != nil {
+		t.Fatal(err)
+	}
+	if provider.BindingState() != envinject.BindingActive {
+		t.Fatalf("binding state=%d, want active", provider.BindingState())
+	}
+	ready := make(chan struct{})
+	close(ready)
+	ensureCalls, commitCalls := 0, 0
+	bootstrap := newEnvironmentBootstrapService(provider, func(context.Context) (*envinject.Store, error) {
+		return nil, errors.New("unexpected store initialization")
+	}, time.Millisecond)
+	bootstrap.store = store
+	bootstrap.ensure = func(context.Context) error {
+		ensureCalls++
+		return environmentenrollment.ErrPending
+	}
+	bootstrap.commit = func(context.Context) error {
+		commitCalls++
+		return nil
+	}
+	bootstrap.observationReady = ready
+	if err := bootstrap.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-bootstrap.done:
+	case <-time.After(time.Second):
+		t.Fatal("environment bootstrap did not finish after active binding reconciliation")
+	}
+	if ensureCalls != 0 || commitCalls != 1 {
+		t.Fatalf("ensure calls=%d commit calls=%d", ensureCalls, commitCalls)
+	}
+	if err := bootstrap.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 }
 

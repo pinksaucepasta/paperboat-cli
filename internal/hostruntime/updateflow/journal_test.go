@@ -28,7 +28,8 @@ func TestJournalTransitionAndCrashRecovery(t *testing.T) {
 		stage    Stage
 		recovery RecoveryAction
 	}{
-		{StageCandidateStarted, RecoveryDiscardCandidate}, {StageCandidateReady, RecoveryDiscardCandidate},
+		{StageCandidateStarted, RecoveryDiscardCandidate}, {StageCandidateValidating, RecoveryDiscardCandidate},
+		{StageCandidateReady, RecoveryDiscardCandidate}, {StageDraining, RecoveryRestoreDrain},
 		{StageCutover, RecoveryQueryHostd}, {StageMonitoring, RecoveryContinueMonitor},
 		{StageCommitted, RecoveryFinalizeCleanup},
 	}

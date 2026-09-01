@@ -77,6 +77,17 @@ type recordingConnectorRecovery struct {
 	actions *[]string
 }
 
+type recordingCanonicalRecovery struct {
+	mu     *sync.Mutex
+	events []networkmonitor.Event
+}
+
+func (r *recordingCanonicalRecovery) HandleNetworkEvent(event networkmonitor.Event) {
+	r.mu.Lock()
+	r.events = append(r.events, event)
+	r.mu.Unlock()
+}
+
 func (r recordingConnectorRecovery) NetworkChanged() {
 	r.mu.Lock()
 	*r.actions = append(*r.actions, "connector")
@@ -174,6 +185,31 @@ func TestNetworkChangeHandlerFencesDirectBeforeConnectorWake(t *testing.T) {
 	}
 	if len(metrics.records) != 2 || metrics.records[0].name != "paperboat_runtime_network_generation" || metrics.records[0].value != 7 || metrics.records[1].labels["reason"] != "default_route" || metrics.records[1].labels["action"] != "rebind" {
 		t.Fatalf("metrics=%+v", metrics.records)
+	}
+}
+
+func TestNetworkChangeHandlerCanonicalRecoveryOwnsConnectorReplacement(t *testing.T) {
+	var mu sync.Mutex
+	var actions []string
+	direct := &recordingDirectRecovery{mu: &mu, actions: &actions}
+	canonical := &recordingCanonicalRecovery{mu: &mu}
+	metrics := &recordingNetworkMetrics{}
+	handler, err := newNetworkChangeHandler(recordingConnectorRecovery{mu: &mu, actions: &actions}, direct, metrics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler.SetCanonical(canonical)
+	handler.Handle(networkmonitor.Event{Generation: 12, Rebind: true, Reasons: networkmonitor.ReasonDefaultRoute, Viable: true})
+	mu.Lock()
+	defer mu.Unlock()
+	if len(canonical.events) != 1 || canonical.events[0].Generation != 12 {
+		t.Fatalf("canonical events=%+v", canonical.events)
+	}
+	if len(direct.generations) != 1 || direct.generations[0] != 12 {
+		t.Fatalf("direct generations=%v", direct.generations)
+	}
+	if len(actions) != 1 || actions[0] != "direct" {
+		t.Fatalf("legacy connector was also woken: actions=%v", actions)
 	}
 }
 

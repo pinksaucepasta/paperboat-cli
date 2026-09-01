@@ -40,14 +40,6 @@ type DiskConfig struct {
 	Clock         func() time.Time
 }
 
-// diagnosticOwner is deliberately opaque to the recorder. Platform helpers
-// enforce the native ownership contract: UID and mode bits on Unix, protected
-// SID ACLs on Windows.
-type diagnosticOwner struct {
-	uid int
-	sid string
-}
-
 type DiskStats struct {
 	DroppedRecords uint64
 	DroppedBytes   uint64

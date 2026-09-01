@@ -49,6 +49,9 @@ func NewResourceSampler(config ResourceSamplerConfig) (*ResourceSampler, error) 
 }
 
 func (s *ResourceSampler) Start(ctx context.Context) error {
+	if s == nil || ctx == nil {
+		return ErrInvalidResourceSampler
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -59,15 +62,19 @@ func (s *ResourceSampler) Start(ctx context.Context) error {
 	}
 	runCtx, cancel := context.WithCancel(context.Background())
 	s.cancel, s.done = cancel, make(chan struct{})
-	s.sample()
 	go s.run(runCtx, s.done)
 	return nil
 }
 
 func (s *ResourceSampler) Shutdown(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	s.mu.Lock()
 	cancel, done := s.cancel, s.done
-	s.cancel, s.done = nil, nil
 	s.mu.Unlock()
 	if cancel == nil {
 		return nil
@@ -75,6 +82,11 @@ func (s *ResourceSampler) Shutdown(ctx context.Context) error {
 	cancel()
 	select {
 	case <-done:
+		s.mu.Lock()
+		if s.done == done {
+			s.cancel, s.done = nil, nil
+		}
+		s.mu.Unlock()
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -83,6 +95,7 @@ func (s *ResourceSampler) Shutdown(ctx context.Context) error {
 
 func (s *ResourceSampler) run(ctx context.Context, done chan<- struct{}) {
 	defer close(done)
+	s.sample()
 	ticker := time.NewTicker(s.config.Interval)
 	defer ticker.Stop()
 	for {

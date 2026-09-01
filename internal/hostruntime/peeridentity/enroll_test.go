@@ -10,6 +10,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -40,6 +41,8 @@ func TestEnsureResumesPendingEnrollmentAndPersistsApprovedCertificate(t *testing
 		t.Fatal(err)
 	}
 	rootPublic, rootPrivate, _ := ed25519.GenerateKey(nil)
+	extraPublic, _, _ := ed25519.GenerateKey(nil)
+	extraFingerprint := sha256.Sum256(extraPublic)
 	var approved atomic.Bool
 	var requested atomic.Bool
 	var request struct {
@@ -85,7 +88,10 @@ func TestEnsureResumesPendingEnrollmentAndPersistsApprovedCertificate(t *testing
 			rootFingerprint := sha256.Sum256(rootPublic)
 			certificateFingerprint := sha256.Sum256(raw)
 			certificateDocument := api.EndpointCertificateDocument{Version: 1, AccountID: "account_01", KeyID: "aek_" + hex.EncodeToString(rootFingerprint[:]), EndpointID: "machine_01", Role: "machine", Generation: 3, Serial: 1, IssuedAt: now.Add(-time.Minute).Format(time.RFC3339), ExpiresAt: now.Add(time.Hour).Format(time.RFC3339), Certificate: base64.RawURLEncoding.EncodeToString(raw), CertificateFingerprint: hex.EncodeToString(certificateFingerprint[:])}
-			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"state": "approved", "trusted_keys": []api.E2EEKey{{KeyID: certificateDocument.KeyID, PublicKey: base64.RawURLEncoding.EncodeToString(rootPublic), Fingerprint: hex.EncodeToString(rootFingerprint[:]), Generation: 1}}, "certificate": certificateDocument}})
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"state": "approved", "trusted_keys": []api.E2EEKey{
+				{KeyID: certificateDocument.KeyID, PublicKey: base64.RawURLEncoding.EncodeToString(rootPublic), Fingerprint: hex.EncodeToString(rootFingerprint[:]), Generation: 1},
+				{KeyID: "aek_" + hex.EncodeToString(extraFingerprint[:]), PublicKey: base64.RawURLEncoding.EncodeToString(extraPublic), Fingerprint: hex.EncodeToString(extraFingerprint[:]), Generation: 2},
+			}, "certificate": certificateDocument}})
 		default:
 			http.NotFound(w, r)
 		}
@@ -109,5 +115,36 @@ func TestEnsureResumesPendingEnrollmentAndPersistsApprovedCertificate(t *testing
 	endpoint, err := store.PeerEndpoint()
 	if err != nil || len(endpoint.Certificate) == 0 {
 		t.Fatalf("endpoint=%+v err=%v", endpoint, err)
+	}
+	if len(endpoint.TrustedKeys) != 2 {
+		t.Fatalf("trusted endpoint roots=%d, want complete enrolled set", len(endpoint.TrustedKeys))
+	}
+	legacyPath := filepath.Join(stateRoot, "peer-endpoint.json")
+	legacyRaw, err := os.ReadFile(legacyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var legacy map[string]any
+	if err := json.Unmarshal(legacyRaw, &legacy); err != nil {
+		t.Fatal(err)
+	}
+	delete(legacy, "trusted_keys")
+	legacyRaw, err = json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyPath, legacyRaw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	legacyEndpoint, err := store.PeerEndpoint()
+	if err != nil || len(legacyEndpoint.TrustedKeys) != 0 {
+		t.Fatalf("legacy endpoint roots=%d err=%v, want refresh marker", len(legacyEndpoint.TrustedKeys), err)
+	}
+	if err := client.Ensure(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	refreshed, err := store.PeerEndpoint()
+	if err != nil || len(refreshed.TrustedKeys) != 2 {
+		t.Fatalf("refreshed endpoint roots=%d err=%v", len(refreshed.TrustedKeys), err)
 	}
 }

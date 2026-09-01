@@ -31,12 +31,6 @@ func TestWindowsWorkspaceRejectsRelativePath(t *testing.T) {
 	}
 }
 
-func TestWindowsDetachedServeCountStartsAtZero(t *testing.T) {
-	if got := activeDetachedServeCount(t.TempDir(), time.Now().UTC()); got != 0 {
-		t.Fatalf("count = %d, want 0", got)
-	}
-}
-
 func TestWindowsConnectorServiceReportsDisconnected(t *testing.T) {
 	service := &windowsConnectorService{manager: &connector.Manager{}}
 	capability := service.CapabilityHealth()

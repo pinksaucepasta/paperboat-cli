@@ -3,7 +3,6 @@ package releaseindex
 
 import (
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -12,10 +11,11 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/releasepolicy"
 )
 
 const SchemaV1 = "paperboat.release-index/v1"
-const RolloutSchemaV1 = "paperboat.release-rollout/v1"
 
 var ErrInvalid = errors.New("signed release index is invalid")
 var versionPattern = regexp.MustCompile(`^[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]+$`)
@@ -24,31 +24,33 @@ var valuePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:+/-]{0,127}$`)
 var repositoryPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
 
 type Index struct {
-	Schema                 string    `json:"schema"`
-	ReleaseID              string    `json:"release_id"`
-	Version                string    `json:"version"`
-	Channel                string    `json:"channel"`
-	Severity               string    `json:"severity"`
-	CreatedAt              time.Time `json:"created_at"`
-	Platform               string    `json:"platform"`
-	Architecture           string    `json:"architecture"`
-	BinaryFormat           string    `json:"binary_format"`
-	Targets                []Target  `json:"targets"`
-	HostdAPIMin            uint16    `json:"hostd_api_min"`
-	HostdAPIMax            uint16    `json:"hostd_api_max"`
-	RuntimeAPIMin          uint16    `json:"runtime_api_min"`
-	RuntimeAPIMax          uint16    `json:"runtime_api_max"`
-	MinimumVersion         string    `json:"minimum_permitted_version,omitempty"`
-	RevokedVersions        []string  `json:"revoked_versions,omitempty"`
-	RolloutPolicyRevision  uint64    `json:"rollout_policy_revision"`
-	SupervisorMaintenance  bool      `json:"supervisor_maintenance_required"`
-	Rollout                Rollout   `json:"rollout"`
-	Revoked                bool      `json:"revoked,omitempty"`
-	Stability              string    `json:"stability,omitempty"`
-	NativeTested           bool      `json:"native_tested,omitempty"`
-	TestedWindowsBuilds    []string  `json:"tested_windows_builds,omitempty"`
-	OpenSSHPackageID       string    `json:"openssh_package_id,omitempty"`
-	OpenSSHApprovedVersion string    `json:"openssh_approved_version,omitempty"`
+	Schema                 string              `json:"schema"`
+	ReleaseID              string              `json:"release_id"`
+	Version                string              `json:"version"`
+	Channel                string              `json:"channel"`
+	Severity               string              `json:"severity"`
+	CreatedAt              time.Time           `json:"created_at"`
+	Platform               string              `json:"platform"`
+	Architecture           string              `json:"architecture"`
+	BinaryFormat           string              `json:"binary_format"`
+	Targets                []Target            `json:"targets"`
+	HostdAPIMin            uint16              `json:"hostd_api_min"`
+	HostdAPIMax            uint16              `json:"hostd_api_max"`
+	RuntimeAPIMin          uint16              `json:"runtime_api_min"`
+	RuntimeAPIMax          uint16              `json:"runtime_api_max"`
+	MinimumVersion         string              `json:"minimum_permitted_version,omitempty"`
+	RevokedVersions        []string            `json:"revoked_versions,omitempty"`
+	RolloutPolicyRevision  uint64              `json:"rollout_policy_revision"`
+	SupervisorMaintenance  bool                `json:"supervisor_maintenance_required"`
+	ManifestSHA256         string              `json:"manifest_sha256"`
+	DeploymentPlanSHA256   string              `json:"deployment_plan_sha256"`
+	DeploymentPlan         *releasepolicy.Plan `json:"deployment_plan"`
+	Revoked                bool                `json:"revoked,omitempty"`
+	Stability              string              `json:"stability,omitempty"`
+	NativeTested           bool                `json:"native_tested,omitempty"`
+	TestedWindowsBuilds    []string            `json:"tested_windows_builds,omitempty"`
+	OpenSSHPackageID       string              `json:"openssh_package_id,omitempty"`
+	OpenSSHApprovedVersion string              `json:"openssh_approved_version,omitempty"`
 }
 
 type Target struct {
@@ -62,13 +64,6 @@ type Target struct {
 	Platform     string `json:"platform"`
 	Architecture string `json:"architecture"`
 	BinaryFormat string `json:"binary_format"`
-}
-type Rollout struct {
-	Schema     string     `json:"schema"`
-	CohortSeed string     `json:"cohort_seed"`
-	Percentage uint8      `json:"percentage"`
-	NotBefore  *time.Time `json:"not_before,omitempty"`
-	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
 }
 
 func Decode(reader io.Reader, now time.Time) (Index, error) {
@@ -110,7 +105,7 @@ func (i Index) Validate(now time.Time) error {
 	} else if i.Stability != "" || i.NativeTested || len(i.TestedWindowsBuilds) != 0 || i.OpenSSHPackageID != "" || i.OpenSSHApprovedVersion != "" {
 		return ErrInvalid
 	}
-	if i.MinimumVersion != "" && !versionPattern.MatchString(i.MinimumVersion) {
+	if i.MinimumVersion != "" && !releasepolicy.IsVersion(i.MinimumVersion) {
 		return ErrInvalid
 	}
 	revoked := map[string]bool{}
@@ -128,16 +123,16 @@ func (i Index) Validate(now time.Time) error {
 	if target.Component != "pb" || target.TargetPath != assetName || target.AssetName != assetName || !validRepository(target.Repository) || target.Platform != i.Platform || target.Architecture != i.Architecture || target.BinaryFormat != i.BinaryFormat || target.Length < 1 || target.Length > 512<<20 || len(target.SHA256) != sha256.Size*2 || !lowerHex(target.SHA256) || !ValidDownloadURL(target.DownloadURL, target.Repository, i.Version, assetName) {
 		return ErrInvalid
 	}
-	if i.Rollout.Schema != RolloutSchemaV1 || len(i.Rollout.CohortSeed) < 1 || len(i.Rollout.CohortSeed) > 128 || strings.ContainsAny(i.Rollout.CohortSeed, "\x00\r\n") || i.Rollout.Percentage > 100 {
+	if now.IsZero() || i.CreatedAt.After(now.Add(5*time.Minute)) || !releasepolicy.IsDigest(i.ManifestSHA256) || !releasepolicy.IsDigest(i.DeploymentPlanSHA256) || i.DeploymentPlan == nil || i.DeploymentPlan.ValidateAgainst(i.Version, i.ManifestSHA256) != nil || i.RolloutPolicyRevision != i.DeploymentPlan.PolicyRevision || i.Severity != i.DeploymentPlan.Severity {
 		return ErrInvalid
 	}
-	if i.Rollout.NotBefore != nil && i.Rollout.ExpiresAt != nil && !i.Rollout.ExpiresAt.After(*i.Rollout.NotBefore) {
+	planDigest, err := i.DeploymentPlan.PlanSHA256()
+	if err != nil || planDigest != i.DeploymentPlanSHA256 {
 		return ErrInvalid
 	}
-	if i.Rollout.NotBefore != nil && i.Rollout.NotBefore.IsZero() || i.Rollout.ExpiresAt != nil && i.Rollout.ExpiresAt.IsZero() {
+	if !i.DeploymentPlan.SupportsPlatform(i.Platform, i.Architecture) {
 		return ErrInvalid
 	}
-	_ = now
 	return nil
 }
 
@@ -145,15 +140,57 @@ func expectedChannel(platform, architecture string) string {
 	return "stable"
 }
 
-func (i Index) Eligible(machineID string, now time.Time, bypassCohort bool) bool {
-	if i.Validate(now) != nil || strings.TrimSpace(machineID) == "" || i.Revoked || i.Rollout.NotBefore != nil && now.Before(*i.Rollout.NotBefore) || i.Rollout.ExpiresAt != nil && !now.Before(*i.Rollout.ExpiresAt) {
+// EligibilityInput contains the live values used to select a release. The
+// failure domain is deliberately required and must come from a current
+// host-local observation; callers cannot use a wildcard or omit it.
+type EligibilityInput struct {
+	MachineID     string
+	Platform      string
+	Architecture  string
+	FailureDomain string
+	Now           time.Time
+	BypassCohort  bool
+	Deferral      *releasepolicy.Deferral
+}
+
+// EligibleFor applies every runtime safety gate. Manual selection bypasses
+// only cohort wave timing. Rollout state, revocation, minimum-version,
+// platform/architecture, exact failure-domain matching, and active deferrals
+// remain mandatory.
+func (i Index) EligibleFor(input EligibilityInput) bool {
+	if i.Validate(input.Now) != nil || !releasepolicy.IsIdentifier(input.MachineID) || input.Platform != i.Platform || input.Architecture != i.Architecture || !releasepolicy.IsPlatform(input.Platform, input.Architecture) || !releasepolicy.IsIdentifier(input.FailureDomain) || input.Now.Before(i.CreatedAt) || i.Revoked || versionRevoked(i.Version, i.RevokedVersions) || i.MinimumVersion != "" && compareVersion(i.Version, i.MinimumVersion) < 0 || i.DeploymentPlan.RolloutState != releasepolicy.RolloutStateActive {
 		return false
 	}
-	if bypassCohort {
-		return true
+	if input.Deferral != nil {
+		active, err := i.DeploymentPlan.DeferralActive(*input.Deferral, input.Now)
+		if err != nil || active {
+			return false
+		}
 	}
-	digest := sha256.Sum256([]byte(i.Rollout.CohortSeed + "\x00" + machineID))
-	return binary.BigEndian.Uint64(digest[:8])%10000 < uint64(i.Rollout.Percentage)*100
+	var cohort string
+	var eligible bool
+	if input.BypassCohort {
+		cohort, eligible = i.DeploymentPlan.CohortForManual(input.MachineID, input.Platform, input.Architecture, input.FailureDomain)
+	} else {
+		cohort, eligible = i.DeploymentPlan.CohortFor(input.MachineID, input.Platform, input.Architecture, input.FailureDomain, input.Now.Sub(i.CreatedAt))
+	}
+	return cohort != "" && eligible
+}
+
+func versionRevoked(version string, revoked []string) bool {
+	for _, candidate := range revoked {
+		if candidate == version {
+			return true
+		}
+	}
+	return false
+}
+
+// Eligible is retained as a strict compatibility wrapper. Without a live
+// failure-domain observation it always refuses selection, preventing old
+// callers from silently reverting to wildcard eligibility.
+func (i Index) Eligible(machineID string, now time.Time, bypassCohort bool) bool {
+	return i.EligibleFor(EligibilityInput{MachineID: machineID, Platform: i.Platform, Architecture: i.Architecture, FailureDomain: "", Now: now, BypassCohort: bypassCohort})
 }
 
 func (i Index) Component(name string) (Target, bool) {
@@ -193,6 +230,29 @@ func ValidDownloadURL(raw, repository, version, assetName string) bool {
 
 func validRepository(value string) bool {
 	return repositoryPattern.MatchString(value)
+}
+
+func compareVersion(left, right string) int {
+	lhs, rhs := strings.Split(left, "."), strings.Split(right, ".")
+	if len(lhs) != 4 || len(rhs) != 4 {
+		return 0
+	}
+	for index := range lhs {
+		var leftValue, rightValue uint64
+		for _, digit := range lhs[index] {
+			leftValue = leftValue*10 + uint64(digit-'0')
+		}
+		for _, digit := range rhs[index] {
+			rightValue = rightValue*10 + uint64(digit-'0')
+		}
+		if leftValue < rightValue {
+			return -1
+		}
+		if leftValue > rightValue {
+			return 1
+		}
+	}
+	return 0
 }
 func lowerHex(value string) bool {
 	_, err := hex.DecodeString(value)

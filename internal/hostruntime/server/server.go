@@ -1149,16 +1149,6 @@ func (r *byteReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-func resetTimer(timer *time.Timer, duration time.Duration) {
-	if !timer.Stop() {
-		select {
-		case <-timer.C:
-		default:
-		}
-	}
-	timer.Reset(duration)
-}
-
 func errorFrame(requestID, code, message string, retryable bool) protocol.Frame {
 	return errorFrameWithDetails(requestID, code, message, retryable, nil)
 }
@@ -1250,8 +1240,6 @@ func componentForCapability(capability string) string {
 	switch capability {
 	case "terminal.v1":
 		return "session"
-	case "preview.public.v1":
-		return "preview"
 	case "update.tuf.v1":
 		return "update"
 	default:

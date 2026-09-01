@@ -132,10 +132,6 @@ func connectionIdentity(entry *managedConnection) string {
 	return fmt.Sprintf("%p", entry.selection.Connection)
 }
 
-func (e *managedConnection) draining() bool {
-	return e != nil && !e.selectedRole && e.applicationLeases > 0
-}
-
 func entryOwned(e *managedConnection) bool {
 	return e != nil && (e.selectedRole || e.standbyRole || e.secondaryRole || e.applicationLeases > 0)
 }
@@ -1730,10 +1726,6 @@ func validClass(class peerquic.Class) bool {
 
 func validClassPath(class peerquic.Class, path Path) bool {
 	return validClass(class) && validPath(path) && (class != peerquic.ClassTransfer || path == PathDirectQUIC)
-}
-
-func udpSelection(entry *managedConnection) bool {
-	return entry != nil && (entry.selection.Path == PathDirectQUIC || entry.selection.Path == PathRelayQUIC)
 }
 
 func (p *Pool) signalLocked() {

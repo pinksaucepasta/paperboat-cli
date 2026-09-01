@@ -24,7 +24,7 @@ func ReadEnrollmentTokenFile(path string) (string, error) {
 	}
 	defer clearBytes(body)
 	token := strings.TrimSpace(string(body))
-	if len(token) < 32 || len(token) > 256 || strings.ContainsAny(token, "\x00\r\n") {
+	if len(token) < 26 || len(token) > 256 || strings.ContainsAny(token, "\x00\r\n") {
 		return "", ErrInvalid
 	}
 	return token, nil

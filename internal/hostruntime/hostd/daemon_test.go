@@ -2,6 +2,7 @@ package hostd
 
 import (
 	"context"
+	"errors"
 	"io"
 	"sync"
 	"testing"
@@ -36,6 +37,32 @@ type sessionOwner struct{ sessions *session.Manager }
 
 func (sessionOwner) Start(context.Context) error          { return nil }
 func (s sessionOwner) Shutdown(ctx context.Context) error { return s.sessions.Shutdown(ctx) }
+
+type tunnelWorkloadsStub struct{ testService }
+
+func (*tunnelWorkloadsStub) ResourceCounts() map[string]uint64 {
+	return map[string]uint64{"tunnels": 1}
+}
+
+type failingStartService struct {
+	testService
+	startErr    error
+	shutdownErr error
+}
+
+func (s *failingStartService) Start(context.Context) error {
+	s.mu.Lock()
+	s.starts++
+	s.mu.Unlock()
+	return s.startErr
+}
+
+func (s *failingStartService) Shutdown(context.Context) error {
+	s.mu.Lock()
+	s.shutdowns++
+	s.mu.Unlock()
+	return s.shutdownErr
+}
 
 type testPTY struct {
 	mu         sync.Mutex
@@ -74,7 +101,8 @@ func TestWorkerReplacementDoesNotTerminateHostdOwnedPTY(t *testing.T) {
 
 	// The other workload fields are non-nil test sentinels. They are not used
 	// by worker replacement and cannot be reached through WorkerController.
-	d, err := New(Config{Workloads: Workloads{Sessions: sessions, Executions: &execprocess.Manager{}, Transfers: &filetransfer.Service{}}, Components: []Component{{Name: "sessions", Required: true, Service: sessionOwner{sessions: sessions}}, {Name: "ingress", Required: true, Service: &testService{}}}})
+	tunnels := &tunnelWorkloadsStub{}
+	d, err := New(Config{Workloads: Workloads{Sessions: sessions, Executions: &execprocess.Manager{}, Transfers: &filetransfer.Service{}, Tunnels: tunnels}, Components: []Component{{Name: "sessions", Required: true, Service: sessionOwner{sessions: sessions}}, {Name: "tunnels", Required: true, Service: tunnels}, {Name: "ingress", Required: true, Service: &testService{}}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,6 +123,9 @@ func TestWorkerReplacementDoesNotTerminateHostdOwnedPTY(t *testing.T) {
 	if process.wasTerminated() {
 		t.Fatal("worker replacement terminated hostd-owned PTY")
 	}
+	if tunnels.shutdowns != 0 || d.Workloads().Tunnels != tunnels || d.Workloads().Tunnels.ResourceCounts()["tunnels"] != 1 {
+		t.Fatalf("worker replacement changed stable tunnel ownership: shutdowns=%d workloads=%#v", tunnels.shutdowns, d.Workloads().Tunnels)
+	}
 	if snapshots := sessions.List(); len(snapshots) != 1 || snapshots[0].State != session.Running {
 		t.Fatalf("sessions=%#v", snapshots)
 	}
@@ -104,11 +135,17 @@ func TestWorkerReplacementDoesNotTerminateHostdOwnedPTY(t *testing.T) {
 	if process.wasTerminated() {
 		t.Fatal("worker shutdown terminated hostd-owned PTY")
 	}
+	if tunnels.shutdowns != 0 {
+		t.Fatalf("worker shutdown stopped tunnel manager %d times", tunnels.shutdowns)
+	}
 	if err := d.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if !process.wasTerminated() {
 		t.Fatal("hostd shutdown did not terminate owned PTY")
+	}
+	if tunnels.shutdowns != 1 {
+		t.Fatalf("hostd shutdown stopped tunnel manager %d times", tunnels.shutdowns)
 	}
 }
 
@@ -132,5 +169,94 @@ func TestHostWorkloadsRejectPartialCommandOwnership(t *testing.T) {
 	})
 	if err != ErrInvalidConfig {
 		t.Fatalf("error = %v, want %v", err, ErrInvalidConfig)
+	}
+}
+
+func TestStartCleansPartiallyStartedRequiredComponent(t *testing.T) {
+	prior := &testService{}
+	startErr := errors.New("partial start")
+	failed := &failingStartService{startErr: startErr}
+	d, err := New(Config{
+		Workloads: Workloads{Transfers: &filetransfer.Service{}},
+		Components: []Component{
+			{Name: "prior", Required: true, Service: prior},
+			{Name: "tunnels", Required: true, Service: failed},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Start(context.Background()); !errors.Is(err, startErr) {
+		t.Fatalf("start error=%v", err)
+	}
+	if failed.shutdowns != 1 || prior.shutdowns != 1 {
+		t.Fatalf("cleanup failed component=%d prior=%d", failed.shutdowns, prior.shutdowns)
+	}
+}
+
+func TestOptionalStartFailureIsCleanedBeforeContinuing(t *testing.T) {
+	failed := &failingStartService{startErr: errors.New("optional unavailable")}
+	required := &testService{}
+	d, err := New(Config{
+		Workloads: Workloads{Transfers: &filetransfer.Service{}},
+		Components: []Component{
+			{Name: "optional", Required: false, Service: failed},
+			{Name: "required", Required: true, Service: required},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if failed.shutdowns != 1 || required.starts != 1 {
+		t.Fatalf("optional cleanup=%d required starts=%d", failed.shutdowns, required.starts)
+	}
+	if err := d.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if failed.shutdowns != 1 || required.shutdowns != 1 {
+		t.Fatalf("shutdown optional=%d required=%d", failed.shutdowns, required.shutdowns)
+	}
+}
+
+func TestWorkerReplacementReportsCommittedCandidateWhenPreviousCleanupFails(t *testing.T) {
+	d, err := New(Config{
+		Workloads:  Workloads{Transfers: &filetransfer.Service{}},
+		Components: []Component{{Name: "stable", Required: true, Service: &testService{}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	controller, err := NewWorkerController(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopErr := errors.New("previous cleanup failed")
+	previous := &failingStartService{shutdownErr: stopErr}
+	if err := controller.Start(context.Background(), previous); err != nil {
+		t.Fatal(err)
+	}
+	candidate := &testService{}
+	err = controller.Replace(context.Background(), candidate)
+	var committed *ReplacementCommittedError
+	if !errors.As(err, &committed) || !errors.Is(err, stopErr) {
+		t.Fatalf("replace error=%v", err)
+	}
+	if controller.active != candidate || !controller.running || candidate.starts != 1 {
+		t.Fatalf("candidate was not committed active=%#v running=%t starts=%d", controller.active, controller.running, candidate.starts)
+	}
+	if err := controller.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if candidate.shutdowns != 1 {
+		t.Fatalf("candidate shutdowns=%d", candidate.shutdowns)
+	}
+	if err := d.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 }

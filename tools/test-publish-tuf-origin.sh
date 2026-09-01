@@ -57,6 +57,7 @@ write_matching_targets_metadata() {
   local current_path=$1
   local targets_path=$2
   python3 - "$current_path" "$targets_path" <<'PY'
+import hashlib
 import json
 import pathlib
 import sys
@@ -64,6 +65,34 @@ import sys
 current = json.loads(pathlib.Path(sys.argv[1]).read_text())
 targets = {}
 for name, asset in current["assets"].items():
+    manifest_sha256 = "1" * 64
+    cohorts = []
+    for wave_name, percentage, start_after_seconds, max_concurrent in (("canary", 1, 0, 1), ("early", 10, 3600, 10), ("general", 100, 7200, 100)):
+        cohorts.append({
+            "name": wave_name,
+            "platform": asset["platform"],
+            "architecture": asset["architecture"],
+            "failure_domain": "*",
+            "percentage": percentage,
+            "start_after_seconds": start_after_seconds,
+            "max_concurrent": max_concurrent,
+        })
+    deployment_plan = {
+        "schema": "paperboat.release-deployment/v1",
+        "version": current["version"],
+        "manifest_sha256": manifest_sha256,
+        "channel": "stable",
+        "rollout_state": "active",
+        "severity": "routine",
+        "policy_revision": 1,
+        "cohort_seed": "test-seed",
+        "cohorts": cohorts,
+        "canary": {"path": "/healthz", "expected_status": 200, "timeout_seconds": 10, "samples": 3, "require_edge": True, "require_connector": True, "require_route": True, "require_origin": True},
+        "activation": {"drain_timeout_seconds": 30, "stability_window_seconds": 600, "stability_probe_interval_seconds": 30, "rollback_timeout_seconds": 60},
+        "security_deferral": {"max_seconds": 604800, "requires_approval": False},
+        "rollback": {"triggers": ["crash_loop", "watchdog_failure", "connector_authentication", "snapshot_apply", "edge_canary", "route_protocol", "state_migration", "readiness_regression"], "quarantine_seconds": 604800, "revoke_failed_release": True},
+    }
+    plan_bytes = (json.dumps(deployment_plan, separators=(",", ":"), ensure_ascii=True) + "\n").encode()
     index_target = {
         "component": "pb",
         "target_path": name,
@@ -95,7 +124,22 @@ for name, asset in current["assets"].items():
                 "schema": "paperboat.release-index/v1",
                 "release_id": "rel_" + current["version"],
                 "version": current["version"],
+                "channel": "stable",
+                "severity": "routine",
+                "created_at": "2026-08-31T12:00:00Z",
+                "platform": asset["platform"],
+                "architecture": asset["architecture"],
+                "binary_format": asset["format"],
                 "targets": [index_target],
+                "hostd_api_min": 1,
+                "hostd_api_max": 2,
+                "runtime_api_min": 1,
+                "runtime_api_max": 2,
+                "rollout_policy_revision": 1,
+                "supervisor_maintenance_required": False,
+                "manifest_sha256": manifest_sha256,
+                "deployment_plan_sha256": hashlib.sha256(plan_bytes).hexdigest(),
+                "deployment_plan": deployment_plan,
             },
         },
     }
@@ -326,6 +370,30 @@ if run_test_publisher "$mismatch_bundle" "$release_root" "$candidate_version" "$
   exit 1
 fi
 test "$before" = "$(snapshot)"
+
+for field in manifest_sha256 deployment_plan_sha256 deployment_plan; do
+  write_matching_targets_metadata "$candidate/current.json" "$candidate/tuf/metadata/targets.json"
+  python3 - "$candidate/tuf/metadata/targets.json" "$field" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+field = sys.argv[2]
+body = json.loads(path.read_text())
+del body["signed"]["targets"]["pb-linux-arm64"]["custom"]["release_index"][field]
+path.write_text(json.dumps(body) + "\n")
+PY
+  incomplete_bundle="$temporary/incomplete-$field.tgz"
+  tar -C "$candidate" -czf "$incomplete_bundle" current.json install windows tuf
+  incomplete_digest=$(run_checksum "$checksum_backend" "$incomplete_bundle" | awk '{print $1}')
+  if run_test_publisher "$incomplete_bundle" "$release_root" "$candidate_version" "$incomplete_digest" >/dev/null 2>&1; then
+    echo "publisher accepted release metadata missing $field" >&2
+    exit 1
+  fi
+  test "$before" = "$(snapshot)"
+done
+
 write_matching_targets_metadata "$candidate/current.json" "$candidate/tuf/metadata/targets.json"
 bundle="$temporary/candidate.tgz"
 tar -C "$candidate" -czf "$bundle" current.json install windows tuf

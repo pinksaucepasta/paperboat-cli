@@ -13,6 +13,11 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+// diagnosticOwner is the native Windows SID enforced for diagnostic files.
+type diagnosticOwner struct {
+	sid string
+}
+
 func resolveDiagnosticOwner(config DiskConfig) (diagnosticOwner, error) {
 	user, err := windows.GetCurrentProcessToken().GetTokenUser()
 	if err != nil || user == nil || user.User.Sid == nil || !user.User.Sid.IsValid() {

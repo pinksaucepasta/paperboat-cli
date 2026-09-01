@@ -23,6 +23,7 @@ import (
 )
 
 var ErrInvalid = errors.New("invalid network monitor configuration")
+var ErrDNSUnavailable = errors.New("system DNS fingerprint unavailable")
 var interestingInterfaceOnce sync.Once
 
 type Reason uint16
@@ -35,6 +36,7 @@ const (
 	ReasonNetworkCost
 	ReasonViability
 	ReasonWake
+	ReasonDNS
 )
 
 type Event struct {
@@ -46,6 +48,24 @@ type Event struct {
 	Viable           bool
 	Fingerprint      networkadaptation.Fingerprint
 	FingerprintValid bool
+}
+
+// DNSFingerprintSource returns an opaque, installation-local DNS
+// configuration fingerprint. It must never return resolver addresses or raw
+// configuration. The monitor stores only the digest and emits ReasonDNS when
+// the digest changes.
+type DNSFingerprintSource func(context.Context) ([32]byte, error)
+
+func validateDNSContext(ctx context.Context) error {
+	if ctx == nil {
+		return ErrInvalid
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	return nil
 }
 
 type netMonitor interface {
@@ -74,6 +94,12 @@ type Monitor struct {
 	newMappingManager            func(portmapping.Config, portmapping.BackendFactory) (*portmapping.Manager, error)
 	fingerprintSecret            []byte
 	networkIdentity              func() string
+	dnsSource                    DNSFingerprintSource
+	dnsFingerprint               [32]byte
+	dnsFingerprintSet            bool
+	dnsCancel                    context.CancelFunc
+	dnsDone                      chan struct{}
+	dnsPollInterval              time.Duration
 }
 
 func New(handle func(Event)) (*Monitor, error) {
@@ -113,7 +139,24 @@ func newNativeMonitor(secret []byte, networkIdentity func() string, handle func(
 }
 
 func newMonitor(backend netMonitor, handle func(Event)) *Monitor {
-	return &Monitor{backend: backend, handle: handle, portMappers: make(map[*portMapper]struct{})}
+	return &Monitor{backend: backend, handle: handle, portMappers: make(map[*portMapper]struct{}), dnsPollInterval: 15 * time.Second}
+}
+
+// ConfigureDNS installs the optional privacy-safe DNS observer. It must be
+// called before Start; a source error leaves the prior fingerprint intact and
+// does not fabricate a network generation.
+func (m *Monitor) ConfigureDNS(source DNSFingerprintSource, interval time.Duration) error {
+	if m == nil || source == nil || interval <= 0 {
+		return ErrInvalid
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.started || m.closed {
+		return ErrInvalid
+	}
+	m.dnsSource = source
+	m.dnsPollInterval = interval
+	return nil
 }
 
 type PortMapper interface {
@@ -423,7 +466,78 @@ func (m *Monitor) Start() error {
 	})
 	m.started = true
 	m.backend.Start()
+	if m.dnsSource != nil {
+		dnsCtx, cancel := context.WithCancel(context.Background())
+		m.dnsCancel = cancel
+		m.dnsDone = make(chan struct{})
+		done := m.dnsDone
+		interval := m.dnsPollInterval
+		go m.runDNS(dnsCtx, interval, done)
+	}
 	return nil
+}
+
+func (m *Monitor) runDNS(ctx context.Context, interval time.Duration, done chan struct{}) {
+	defer close(done)
+	// Establish a baseline without publishing a synthetic network change.
+	_, _ = m.CheckDNS(ctx)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			_, _ = m.CheckDNS(ctx)
+		}
+	}
+}
+
+// CheckDNS performs one deterministic DNS fingerprint sample. It is exported
+// for platform adapters and tests that already own their polling/debounce
+// loop. A changed fingerprint consumes one monotonic network generation and
+// emits exactly one DNS-only event.
+func (m *Monitor) CheckDNS(ctx context.Context) (bool, error) {
+	if m == nil || ctx == nil {
+		return false, ErrInvalid
+	}
+	m.mu.Lock()
+	if m.closed || m.dnsSource == nil {
+		m.mu.Unlock()
+		return false, ErrInvalid
+	}
+	source := m.dnsSource
+	m.mu.Unlock()
+	fingerprint, err := source(ctx)
+	if err != nil {
+		return false, err
+	}
+	if fingerprint == [32]byte{} {
+		return false, ErrInvalid
+	}
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return false, ErrInvalid
+	}
+	if !m.dnsFingerprintSet {
+		m.dnsFingerprint = fingerprint
+		m.dnsFingerprintSet = true
+		m.mu.Unlock()
+		return false, nil
+	}
+	if m.dnsFingerprint == fingerprint {
+		m.mu.Unlock()
+		return false, nil
+	}
+	m.dnsFingerprint = fingerprint
+	m.mu.Unlock()
+	generation, ok := m.nextGeneration()
+	if !ok {
+		return false, ErrInvalid
+	}
+	m.dispatch(Event{Generation: generation, Reasons: ReasonDNS, Rebind: true, Viable: true})
+	return true, nil
 }
 
 func (m *Monitor) dispatch(event Event) {
@@ -459,11 +573,19 @@ func (m *Monitor) Close() error {
 	mappingManager := m.mappingManager
 	m.mappingManager = nil
 	mappingCreateDone := m.mappingCreateDone
+	dnsCancel, dnsDone := m.dnsCancel, m.dnsDone
+	m.dnsCancel, m.dnsDone = nil, nil
 	mappers := make([]*portMapper, 0, len(m.portMappers))
 	for mapper := range m.portMappers {
 		mappers = append(mappers, mapper)
 	}
 	m.mu.Unlock()
+	if dnsCancel != nil {
+		dnsCancel()
+	}
+	if dnsDone != nil {
+		<-dnsDone
+	}
 	if mappingCreateDone != nil {
 		<-mappingCreateDone
 	}

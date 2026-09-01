@@ -21,9 +21,7 @@ const (
 	ActionUninstallPersist = "uninstall_persisted"
 	ActionPurge            = "purge"
 	ActionRepair           = "repair"
-	ActionCleanupPreviews  = "cleanup_previews"
-	ActionInstallPreview   = "install_preview"
-	ActionRemovePreview    = "remove_preview"
+	ActionStop             = "stop"
 
 	ActionOpenSSHSetup   = "setup"
 	ActionOpenSSHRepair  = "repair"
@@ -90,15 +88,6 @@ type Result struct {
 	ErrorMessage string `json:"error_message,omitempty"`
 }
 
-const (
-	statusOK        = "ok"
-	statusError     = "error"
-	statusCanceled  = "canceled"
-	statusTimedOut  = "timed_out"
-	statusPending   = "pending"
-	operationFailed = "operation_failed"
-)
-
 // RemoteError preserves a typed elevated-operation boundary while keeping the
 // returned message bounded and separate from the UAC launch errors above.
 type RemoteError struct {
@@ -122,45 +111,12 @@ func (e *RemoteError) Error() string {
 
 func (*RemoteError) Unwrap() error { return ErrElevatedOperation }
 
-func validOperationAction(operation, action string) bool {
-	switch operation {
-	case OperationRuntimeService:
-		switch action {
-		case ActionInstall, ActionInstallCommit, ActionCommit, ActionUninstall, ActionUninstallPersist, ActionPurge, ActionRepair, ActionCleanupPreviews, ActionInstallPreview, ActionRemovePreview:
-			return true
-		}
-	case OperationOpenSSH:
-		switch action {
-		case ActionOpenSSHSetup, ActionOpenSSHRepair, ActionOpenSSHRemove:
-			return true
-		}
-	}
-	return false
-}
-
-func actionNeedsPayload(operation, action string) bool {
-	return operation == OperationRuntimeService && (action == ActionInstall || action == ActionInstallCommit || action == ActionCommit || action == ActionUninstall || action == ActionCleanupPreviews || action == ActionInstallPreview || action == ActionRemovePreview)
-}
-
 // operationDuration is part of the bridge contract: the launcher and elevated
 // child use the same expiry. That gives callers a bounded result even if an
 // individual SCM or firewall API blocks during runtime activation.
 func operationDuration(operation, action string) time.Duration {
-	if operation == OperationRuntimeService && (action == ActionInstall || action == ActionInstallCommit || action == ActionCommit || action == ActionUninstall) {
+	if operation == OperationRuntimeService && (action == ActionInstall || action == ActionInstallCommit || action == ActionCommit || action == ActionUninstall || action == ActionStop) {
 		return RuntimeActivationDuration
 	}
 	return MaxOperationDuration
-}
-
-func validateRequest(request Request) error {
-	if request.Schema != SchemaV1 || strings.TrimSpace(request.RequestID) == "" || strings.TrimSpace(request.OwnerSID) == "" ||
-		!validOperationAction(request.Operation, request.Action) || request.CancelPath == "" || request.CreatedAt.IsZero() || request.ExpiresAt.IsZero() ||
-		!request.ExpiresAt.After(request.CreatedAt) || len(request.Payload) > MaxRequestBytes || (actionNeedsPayload(request.Operation, request.Action) && len(request.Payload) == 0) ||
-		(!actionNeedsPayload(request.Operation, request.Action) && len(request.Payload) != 0) {
-		return errors.New("invalid Windows elevation request")
-	}
-	if len(request.Payload) != 0 && !json.Valid(request.Payload) {
-		return errors.New("invalid Windows elevation request payload")
-	}
-	return nil
 }

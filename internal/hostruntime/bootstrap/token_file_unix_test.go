@@ -10,7 +10,7 @@ import (
 
 func TestEnrollmentTokenFileIsProtectedAndConsumed(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "enrollment-token")
-	const token = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOP"
+	const token = "ABCDEFGHJKLMNPQRSTUVWXYZ23"
 	if err := os.WriteFile(path, []byte(token+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}

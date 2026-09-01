@@ -17,6 +17,9 @@ import (
 
 	"github.com/Microsoft/go-winio"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/autoupdate"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostdproto"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/releaseeligibility"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/updateflow"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/workerupdate"
 	"github.com/pinksaucepasta/paperboat/internal/selfupdate"
 )
@@ -35,17 +38,19 @@ type windowsController struct {
 	mu            sync.Mutex
 	checkMu       sync.Mutex
 	config        WindowsConfig
+	source        workerupdate.TUFSource
 	handoff       chan struct{}
 	handoffOnce   sync.Once
 }
 
 func newWindowsController(config WindowsConfig) (*windowsController, error) {
 	resolve := config.ResolveRelease
+	var source workerupdate.TUFSource
 	if resolve == nil {
-		source := workerupdate.TUFSource{
-			RepositoryURL: config.RepositoryURL,
-			StateRoot:     filepath.Join(config.StateRoot, "tuf"),
-			MachineID:     config.MachineID,
+		var err error
+		source, err = newWindowsTUFSource(config)
+		if err != nil {
+			return nil, err
 		}
 		resolve = source.Resolve
 	}
@@ -55,6 +60,7 @@ func newWindowsController(config WindowsConfig) (*windowsController, error) {
 		socketPath:    config.ControlSocket,
 		resolve:       resolve,
 		config:        config,
+		source:        source,
 		handoff:       make(chan struct{}),
 	}
 	scheduler, err := autoupdate.New(autoupdate.Config{Check: controller.checkRelease})
@@ -63,6 +69,33 @@ func newWindowsController(config WindowsConfig) (*windowsController, error) {
 	}
 	controller.scheduler = scheduler
 	return controller, nil
+}
+
+func newWindowsTUFSource(config WindowsConfig) (workerupdate.TUFSource, error) {
+	token, err := os.ReadFile(config.TokenFile)
+	if err != nil {
+		return workerupdate.TUFSource{}, err
+	}
+	client, err := hostdproto.NewClient(config.HostdSocket, token, 31*time.Minute)
+	clear(token)
+	if err != nil {
+		return workerupdate.TUFSource{}, err
+	}
+	deferral, err := releaseeligibility.NewFileStore(filepath.Join(config.StateRoot, "deferral.json"))
+	if err != nil {
+		return workerupdate.TUFSource{}, err
+	}
+	return workerupdate.TUFSource{RepositoryURL: config.RepositoryURL, StateRoot: filepath.Join(config.StateRoot, "tuf"), MachineID: config.MachineID, FailureDomain: workerupdate.HostdFailureDomainSource{Client: client, MachineID: config.MachineID}, Deferral: deferral}, nil
+}
+
+func (c *windowsController) tufSource() (workerupdate.TUFSource, error) {
+	if c == nil {
+		return workerupdate.TUFSource{}, ErrWindowsActivationUnavailable
+	}
+	if c.source.RepositoryURL != "" {
+		return c.source, nil
+	}
+	return newWindowsTUFSource(c.config)
 }
 
 func (c *windowsController) run(ctx context.Context) error {
@@ -166,6 +199,7 @@ func (c *windowsController) invoke(ctx context.Context, request ControlRequest) 
 	switch request.Operation {
 	case "status":
 		if journal, err := loadWindowsActivationJournal(c.config); err == nil {
+			response.Transaction = windowsTransactionState(journal)
 			if journal.Version == c.activeVersion {
 				response.Pending = journal.Stage != windowsActivationCommitted
 				response.Updated = journal.Stage == windowsActivationCommitted
@@ -189,7 +223,10 @@ func (c *windowsController) invoke(ctx context.Context, request ControlRequest) 
 		}
 		c.checkMu.Lock()
 		defer c.checkMu.Unlock()
-		source := workerupdate.TUFSource{RepositoryURL: c.config.RepositoryURL, StateRoot: filepath.Join(c.config.StateRoot, "tuf"), MachineID: c.config.MachineID}
+		source, sourceErr := c.tufSource()
+		if sourceErr != nil {
+			return response, sourceErr
+		}
 		release, found, err := source.ResolveManual(ctx)
 		if err != nil || !found {
 			return response, err
@@ -212,7 +249,10 @@ func (c *windowsController) invoke(ctx context.Context, request ControlRequest) 
 		}
 		c.checkMu.Lock()
 		defer c.checkMu.Unlock()
-		source := workerupdate.TUFSource{RepositoryURL: c.config.RepositoryURL, StateRoot: filepath.Join(c.config.StateRoot, "tuf"), MachineID: c.config.MachineID}
+		source, sourceErr := c.tufSource()
+		if sourceErr != nil {
+			return response, sourceErr
+		}
 		release, found, err := source.ResolveSupervisorManual(ctx)
 		if err != nil || !found {
 			return response, err
@@ -233,6 +273,38 @@ func (c *windowsController) invoke(ctx context.Context, request ControlRequest) 
 	default:
 		return ControlResponse{}, ErrInvalidControl
 	}
+}
+
+func windowsTransactionState(journal windowsActivationJournal) workerupdate.TransactionState {
+	state := workerupdate.TransactionState{
+		Schema: workerupdate.TransactionSchemaV1, TransactionID: journal.TransactionID,
+		ActiveVersion: journal.PreviousVersion, CandidateVersion: journal.Version,
+		UpdatedAt: time.Now().UTC(),
+	}
+	switch journal.Stage {
+	case windowsActivationStaged:
+		state.Stage = updateflow.StageStaged
+	case windowsActivationCandidateValidating:
+		state.Stage = updateflow.StageCandidateValidating
+	case windowsActivationCandidateReady:
+		state.Stage = updateflow.StageCandidateReady
+	case windowsActivationDraining:
+		state.Stage = updateflow.StageDraining
+	case windowsActivationSwitching:
+		state.Stage = updateflow.StageCutover
+	case windowsActivationServicesLive:
+		state.Stage = updateflow.StageMonitoring
+	case windowsActivationCommitted:
+		state.Stage, state.ActiveVersion = updateflow.StageCommitted, journal.Version
+	case windowsActivationRollingBack, windowsActivationRollbackReady:
+		state.Stage = updateflow.StageRollback
+	case windowsActivationRolledBack:
+		state.Stage, state.Quarantined = updateflow.StageIdle, true
+	}
+	if journal.Failure != "" {
+		state.Failure = updateflow.FailureHealth
+	}
+	return state
 }
 
 func activationRequested(channel <-chan struct{}) bool {

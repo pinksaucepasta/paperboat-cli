@@ -51,7 +51,9 @@ type Claims struct {
 	Scope                  []string            `json:"scope"`
 	CredentialClass        string              `json:"credential_class"`
 	EnvironmentID          string              `json:"environment_id,omitempty"`
+	AccountID              string              `json:"account_id,omitempty"`
 	UserID                 string              `json:"user_id,omitempty"`
+	ActorID                string              `json:"actor_id,omitempty"`
 	CLIClientSessionID     string              `json:"cli_client_session_id,omitempty"`
 	HelperID               string              `json:"helper_id,omitempty"`
 	MachineID              string              `json:"machine_id,omitempty"`
@@ -59,6 +61,26 @@ type Claims struct {
 	SourceMachineID        string              `json:"source_machine_id,omitempty"`
 	SessionID              string              `json:"session_id,omitempty"`
 	OperationID            string              `json:"operation_id,omitempty"`
+	PreviewID              string              `json:"preview_id,omitempty"`
+	OwnerSessionID         string              `json:"owner_session_id,omitempty"`
+	TargetScheme           string              `json:"target_scheme,omitempty"`
+	TargetAddress          string              `json:"target_address,omitempty"`
+	AccessMode             string              `json:"access_mode,omitempty"`
+	Endpoint               string              `json:"endpoint,omitempty"`
+	LeaseDeadline          int64               `json:"lease_deadline,omitempty"`
+	UserDeadline           *int64              `json:"user_deadline,omitempty"`
+	LeaseETag              string              `json:"lease_etag,omitempty"`
+	State                  string              `json:"state,omitempty"`
+	AllocationState        string              `json:"allocation_state,omitempty"`
+	EdgeState              string              `json:"edge_state,omitempty"`
+	OriginState            string              `json:"origin_state,omitempty"`
+	CreatedAt              int64               `json:"created_at,omitempty"`
+	LastRenewedAt          int64               `json:"last_renewed_at,omitempty"`
+	ExpectedGeneration     int64               `json:"expected_generation,omitempty"`
+	IdempotencyKey         string              `json:"idempotency_key,omitempty"`
+	RequestID              string              `json:"request_id,omitempty"`
+	CorrelationID          string              `json:"correlation_id,omitempty"`
+	RequestHash            string              `json:"request_hash,omitempty"`
 	AssignmentID           string              `json:"assignment_id,omitempty"`
 	WarningRevision        string              `json:"warning_revision,omitempty"`
 	ConnectorID            string              `json:"connector_id,omitempty"`

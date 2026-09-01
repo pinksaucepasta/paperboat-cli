@@ -42,30 +42,6 @@ func (c *oneShotConnector) Connect(ctx context.Context, attempt Attempt) (Connec
 	return nil, ctx.Err()
 }
 
-type pairedSuccessConnector struct {
-	mu          sync.Mutex
-	started     chan Attempt
-	connections map[Path]Connection
-	ready       chan struct{}
-	received    int
-}
-
-func (c *pairedSuccessConnector) Connect(ctx context.Context, attempt Attempt) (Connection, error) {
-	c.started <- attempt
-	c.mu.Lock()
-	c.received++
-	if c.received == 2 {
-		close(c.ready)
-	}
-	c.mu.Unlock()
-	select {
-	case <-c.ready:
-		return c.connections[attempt.Path], nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-}
-
 func newFakeConnector() *fakeConnector {
 	return &fakeConnector{started: make(chan Attempt, 10), results: map[Path]chan connectResult{PathDirectQUIC: make(chan connectResult, 1), PathRelayQUIC: make(chan connectResult, 1), PathWSS: make(chan connectResult, 1)}}
 }

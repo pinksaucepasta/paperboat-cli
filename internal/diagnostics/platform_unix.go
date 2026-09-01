@@ -11,6 +11,11 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/atomicfile"
 )
 
+// diagnosticOwner is the native Unix owner enforced for diagnostic files.
+type diagnosticOwner struct {
+	uid int
+}
+
 func resolveDiagnosticOwner(config DiskConfig) (diagnosticOwner, error) {
 	if config.OwnerUID < 0 {
 		return diagnosticOwner{}, ErrInvalid

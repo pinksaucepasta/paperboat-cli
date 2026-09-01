@@ -13,7 +13,10 @@ import (
 
 const ClientID = "paperboat"
 
-var ClientScopes = []string{"account:read", "clients:revoke", "projects:read", "projects:connect", "session:refresh", "diagnostics:upload"}
+var ClientScopes = []string{
+	"account:read", "clients:revoke", "projects:read", "projects:connect", "session:refresh", "diagnostics:upload",
+	"previews:read", "previews:write", "tunnels:read", "tunnels:write", "operations:read", "operations:write",
+}
 
 type DeviceAuthorization struct {
 	DeviceCode              string `json:"device_code"`

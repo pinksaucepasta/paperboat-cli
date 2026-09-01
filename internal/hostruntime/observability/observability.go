@@ -27,19 +27,35 @@ var (
 )
 
 type Event struct {
-	Component     string
-	Operation     string
-	Result        string
-	ErrorCode     string
-	CorrelationID string
-	ResourceID    string
-	Duration      time.Duration
-	Bytes         uint64
-	Count         uint64
-	MachineID     string
-	State         string
-	Role          string
-	Generation    uint64
+	// Canonical event envelope. These fields are intentionally the same shape
+	// as server and edge telemetry so host events can be forwarded unchanged.
+	Schema        string        `json:"schema"`
+	At            time.Time     `json:"at"`
+	Severity      EventSeverity `json:"severity"`
+	Component     Dimension     `json:"component"`
+	Name          string        `json:"name"`
+	Code          string        `json:"code"`
+	Outcome       EventOutcome  `json:"outcome"`
+	Message       string        `json:"message"`
+	CorrelationID string        `json:"correlation_id"`
+	IDs           SafeIDs       `json:"ids"`
+	Generations   Generations   `json:"generations"`
+	Retry         RetryDecision `json:"retry"`
+	NextRetryAt   *time.Time    `json:"next_retry_at,omitempty"`
+
+	// Legacy runtime logger projection. They remain part of the in-process
+	// value for existing callers, but are excluded from canonical JSON.
+	Operation  string        `json:"-"`
+	Result     string        `json:"-"`
+	ErrorCode  string        `json:"-"`
+	ResourceID string        `json:"-"`
+	Duration   time.Duration `json:"-"`
+	Bytes      uint64        `json:"-"`
+	Count      uint64        `json:"-"`
+	MachineID  string        `json:"-"`
+	State      string        `json:"-"`
+	Role       string        `json:"-"`
+	Generation uint64        `json:"-"`
 }
 type Logger struct{ logger *slog.Logger }
 
@@ -50,23 +66,62 @@ func NewLogger(logger *slog.Logger) (*Logger, error) {
 	return &Logger{logger: logger}, nil
 }
 func (l *Logger) Log(ctx context.Context, event Event) error {
-	if event.Component == "" || event.Operation == "" || event.Result == "" {
+	component := string(event.Component)
+	operation := event.Operation
+	if operation == "" {
+		operation = event.Name
+	}
+	result := event.Result
+	if result == "" {
+		result = string(event.Outcome)
+	}
+	errorCode := event.ErrorCode
+	if errorCode == "" {
+		errorCode = event.Code
+	}
+	if component == "" || operation == "" || result == "" {
 		return ErrUnsafeValue
 	}
-	for _, value := range []string{event.Component, event.Operation, event.Result, event.ErrorCode, event.CorrelationID, event.ResourceID, event.MachineID, event.State, event.Role} {
+	for _, value := range []string{component, operation, result, errorCode, event.CorrelationID, event.ResourceID, event.MachineID, event.State, event.Role} {
 		if value != "" && !safeValue(value) {
 			return ErrUnsafeValue
 		}
 	}
-	attributes := []any{"component", event.Component, "operation", event.Operation, "result", event.Result, "duration_ms", event.Duration.Milliseconds(), "bytes", event.Bytes, "count", event.Count}
-	if event.ErrorCode != "" {
-		attributes = append(attributes, "error_code", event.ErrorCode)
+	if !validSafeIDs(event.IDs) {
+		return ErrUnsafeValue
+	}
+	message := event.Message
+	if message != "" {
+		var err error
+		message, err = safeBoundedString(message, maximumMessageBytes, false)
+		if err != nil {
+			return ErrUnsafeValue
+		}
+	}
+	attributes := []any{"component", component, "operation", operation, "result", result, "duration_ms", event.Duration.Milliseconds(), "bytes", event.Bytes, "count", event.Count}
+	if errorCode != "" {
+		attributes = append(attributes, "error_code", errorCode)
 	}
 	if event.CorrelationID != "" {
 		attributes = append(attributes, "correlation_id", event.CorrelationID)
 	}
 	if event.ResourceID != "" {
 		attributes = append(attributes, "resource_id", event.ResourceID)
+	}
+	if event.IDs.ResourceID != "" && event.ResourceID == "" {
+		attributes = append(attributes, "resource_id", event.IDs.ResourceID)
+	}
+	if event.IDs.SessionID != "" {
+		attributes = append(attributes, "session_id", event.IDs.SessionID)
+	}
+	if event.IDs.ProcessID != "" {
+		attributes = append(attributes, "process_id", event.IDs.ProcessID)
+	}
+	if event.IDs.ConfigID != "" {
+		attributes = append(attributes, "config_id", event.IDs.ConfigID)
+	}
+	if message != "" {
+		attributes = append(attributes, "message", message)
 	}
 	if event.MachineID != "" {
 		attributes = append(attributes, "machine_id", event.MachineID)
@@ -92,6 +147,28 @@ const (
 	Histogram Kind = "histogram"
 )
 
+const (
+	MetricServiceUptime      = "paperboat_runtime_service_uptime_seconds"
+	MetricServiceRestarts    = "paperboat_runtime_service_restarts_total"
+	MetricWatchdogFailures   = "paperboat_runtime_watchdog_failures_total"
+	MetricCrashLoop          = "paperboat_runtime_crash_loop"
+	MetricHealthDimension    = "paperboat_runtime_health_dimension"
+	MetricHealthTransitions  = "paperboat_runtime_health_transitions_total"
+	MetricUpdateOperations   = "paperboat_runtime_update_operations_total"
+	MetricDoctorChecks       = "paperboat_runtime_doctor_checks_total"
+	MetricHealthProbeLatency = "paperboat_runtime_health_probe_latency_seconds"
+	MetricStateEvidence      = "paperboat_runtime_state_evidence"
+)
+
+var (
+	healthMetricDimensions = set("service", "edge", "config", "route", "origin", "dns", "certificate", "access", "update")
+	healthMetricStatuses   = set("unknown", "ready", "degraded", "down", "not_applicable")
+	updateMetricPhases     = set("download", "verify", "stage", "activate", "health_gate", "rollback", "quarantine")
+	updateMetricOutcomes   = set("success", "failed", "canceled")
+	doctorMetricChecks     = set("state", "credential", "clock", "dns", "edge", "transport", "config", "origin", "resource")
+	doctorMetricOutcomes   = set("ok", "degraded", "failed", "unknown")
+)
+
 type Descriptor struct {
 	Name   string
 	Kind   Kind
@@ -107,6 +184,7 @@ type Registry struct {
 	descriptors    map[string]Descriptor
 	series         map[string]Series
 	histograms     map[string]histogramSeries
+	maxSeries      int
 	terminalFrames [2]atomic.Uint64
 	terminalBytes  [2]atomic.Uint64
 	terminalNanos  [2]atomic.Uint64
@@ -122,14 +200,27 @@ type histogramSeries struct {
 
 var histogramBounds = [...]float64{0.01, 0.05, 0.1, 0.5, 1, 5, 15, 30, math.Inf(1)}
 
+const (
+	maximumMetricDescriptors = 128
+	maximumMetricLabels      = 8
+	maximumMetricLabelValues = 64
+	maximumMetricSeries      = 4096
+)
+
 func NewRegistry(descriptors []Descriptor) (*Registry, error) {
-	registry := &Registry{descriptors: make(map[string]Descriptor), series: make(map[string]Series), histograms: make(map[string]histogramSeries)}
+	if len(descriptors) > maximumMetricDescriptors {
+		return nil, ErrUnknownMetric
+	}
+	registry := &Registry{descriptors: make(map[string]Descriptor, len(descriptors)), series: make(map[string]Series), histograms: make(map[string]histogramSeries), maxSeries: maximumMetricSeries}
 	for _, descriptor := range descriptors {
 		if !safeMetricName(descriptor.Name) || descriptor.Kind != Counter && descriptor.Kind != Gauge && descriptor.Kind != Histogram || registry.descriptors[descriptor.Name].Name != "" {
 			return nil, ErrUnknownMetric
 		}
+		if len(descriptor.Labels) > maximumMetricLabels {
+			return nil, ErrInvalidLabels
+		}
 		for label, values := range descriptor.Labels {
-			if !safeMetricName(label) || len(values) == 0 {
+			if !safeMetricName(label) || len(values) == 0 || len(values) > maximumMetricLabelValues {
 				return nil, ErrInvalidLabels
 			}
 			for value := range values {
@@ -138,11 +229,14 @@ func NewRegistry(descriptors []Descriptor) (*Registry, error) {
 				}
 			}
 		}
-		registry.descriptors[descriptor.Name] = descriptor
+		registry.descriptors[descriptor.Name] = cloneDescriptor(descriptor)
 	}
 	return registry, nil
 }
 func (r *Registry) Record(name string, value float64, labels map[string]string) error {
+	if r == nil {
+		return ErrUnknownMetric
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	descriptor, ok := r.descriptors[name]
@@ -175,6 +269,9 @@ func (r *Registry) Record(name string, value float64, labels map[string]string) 
 		copied[label] = labels[label]
 	}
 	series := r.series[key.String()]
+	if _, exists := r.series[key.String()]; !exists && len(r.series)+len(r.histograms) >= r.maxSeries {
+		return ErrInvalidLabels
+	}
 	series.Name = name
 	series.Labels = copied
 	if descriptor.Kind == Histogram {
@@ -182,11 +279,20 @@ func (r *Registry) Record(name string, value float64, labels map[string]string) 
 			return ErrInvalidLabels
 		}
 		histogram := r.histograms[key.String()]
+		if _, exists := r.histograms[key.String()]; !exists && len(r.series)+len(r.histograms) >= r.maxSeries {
+			return ErrInvalidLabels
+		}
 		histogram.Name, histogram.Labels = name, copied
+		if histogram.Count == ^uint64(0) || math.IsInf(histogram.Sum+value, 0) {
+			return ErrInvalidLabels
+		}
 		histogram.Count++
 		histogram.Sum += value
 		for index, bound := range histogramBounds {
 			if value <= bound {
+				if histogram.Buckets[index] == ^uint64(0) {
+					return ErrInvalidLabels
+				}
 				histogram.Buckets[index]++
 			}
 		}
@@ -197,6 +303,9 @@ func (r *Registry) Record(name string, value float64, labels map[string]string) 
 		if value < 0 {
 			return ErrInvalidLabels
 		}
+		if math.IsInf(series.Value+value, 0) {
+			return ErrInvalidLabels
+		}
 		series.Value += value
 	} else {
 		series.Value = value
@@ -205,6 +314,9 @@ func (r *Registry) Record(name string, value float64, labels map[string]string) 
 	return nil
 }
 func (r *Registry) Snapshot() []Series {
+	if r == nil {
+		return nil
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	result := make([]Series, 0, len(r.series))
@@ -266,6 +378,9 @@ func (r *Registry) Snapshot() []Series {
 
 // RecordTerminalStage is allocation-free and lock-free for the terminal hot path.
 func (r *Registry) RecordTerminalStage(stage string, duration time.Duration, bytes int) {
+	if r == nil {
+		return
+	}
 	index := -1
 	switch stage {
 	case "socket_to_pty":
@@ -288,11 +403,21 @@ func DefaultDescriptors() []Descriptor {
 		{Name: "paperboat_runtime_readiness", Kind: Gauge, Labels: map[string]map[string]bool{"capability": set("terminal", "upload", "preview", "health", "connector", "update"), "state": set("ready", "degraded", "unavailable")}},
 		{Name: "paperboat_runtime_connector_retries_total", Kind: Counter, Labels: map[string]map[string]bool{"transport": set("quic", "tcp_dedicated", "tcp_mux", "none"), "result": set("connected", "failed", "replaced", "canceled")}},
 		{Name: "paperboat_runtime_restart_total", Kind: Counter},
+		{Name: MetricServiceUptime, Kind: Gauge},
+		{Name: MetricServiceRestarts, Kind: Counter, Labels: map[string]map[string]bool{"reason": set("crash", "upgrade", "shutdown", "unknown")}},
+		{Name: MetricWatchdogFailures, Kind: Counter, Labels: map[string]map[string]bool{"reason": set("timeout", "crash", "unhealthy", "unknown")}},
+		{Name: MetricCrashLoop, Kind: Gauge},
 		{Name: "paperboat_runtime_renewal_failures_total", Kind: Counter},
 		{Name: "paperboat_runtime_connector_recovery_seconds", Kind: Gauge},
 		{Name: "paperboat_runtime_network_changes_total", Kind: Counter, Labels: map[string]map[string]bool{"reason": set("default_route", "interface_address", "address_family", "proxy", "network_cost", "viability", "wake"), "action": set("observe", "rebind")}},
 		{Name: "paperboat_runtime_network_generation", Kind: Gauge},
 		{Name: "paperboat_runtime_update_rollbacks_total", Kind: Counter},
+		{Name: MetricHealthDimension, Kind: Gauge, Labels: map[string]map[string]bool{"dimension": cloneSet(healthMetricDimensions), "status": cloneSet(healthMetricStatuses)}},
+		{Name: MetricHealthTransitions, Kind: Counter, Labels: map[string]map[string]bool{"dimension": cloneSet(healthMetricDimensions), "from": cloneSet(healthMetricStatuses), "to": cloneSet(healthMetricStatuses)}},
+		{Name: MetricUpdateOperations, Kind: Counter, Labels: map[string]map[string]bool{"phase": cloneSet(updateMetricPhases), "outcome": cloneSet(updateMetricOutcomes)}},
+		{Name: MetricDoctorChecks, Kind: Counter, Labels: map[string]map[string]bool{"check": cloneSet(doctorMetricChecks), "outcome": cloneSet(doctorMetricOutcomes)}},
+		{Name: MetricHealthProbeLatency, Kind: Histogram, Labels: map[string]map[string]bool{"dimension": cloneSet(healthMetricDimensions)}},
+		{Name: MetricStateEvidence, Kind: Gauge, Labels: map[string]map[string]bool{"kind": cloneSet(doctorMetricChecks)}},
 		{Name: "paperboat_runtime_terminal_events_total", Kind: Counter, Labels: map[string]map[string]bool{"event": set("replay_gap", "slow_consumer", "input_uncertain", "runtime_restart")}},
 		{Name: "paperboat_runtime_terminal_persistence_failures_total", Kind: Counter},
 		{Name: "paperboat_runtime_terminal_persistence_lag_bytes", Kind: Gauge},
@@ -414,6 +539,27 @@ func set(values ...string) map[string]bool {
 	result := make(map[string]bool, len(values))
 	for _, value := range values {
 		result[value] = true
+	}
+	return result
+}
+
+func cloneSet(values map[string]bool) map[string]bool {
+	result := make(map[string]bool, len(values))
+	for value, allowed := range values {
+		result[value] = allowed
+	}
+	return result
+}
+
+func cloneDescriptor(descriptor Descriptor) Descriptor {
+	result := descriptor
+	result.Labels = make(map[string]map[string]bool, len(descriptor.Labels))
+	for label, values := range descriptor.Labels {
+		copied := make(map[string]bool, len(values))
+		for value, allowed := range values {
+			copied[value] = allowed
+		}
+		result.Labels[label] = copied
 	}
 	return result
 }

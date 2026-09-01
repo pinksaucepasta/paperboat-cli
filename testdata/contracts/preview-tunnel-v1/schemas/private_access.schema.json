@@ -1,0 +1,375 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "paperboat://contracts/preview-tunnel-v1/private-access",
+  "title": "Paperboat private preview and tunnel access v1 messages",
+  "oneOf": [
+    { "$ref": "#/definitions/grant_issue_request" },
+    { "$ref": "#/definitions/grant_issue_response" },
+    { "$ref": "#/definitions/authorize_request" },
+    { "$ref": "#/definitions/allow_decision" },
+    { "$ref": "#/definitions/deny_decision" },
+    { "$ref": "#/definitions/carrier_snapshot" },
+    { "$ref": "#/definitions/error" }
+  ],
+  "definitions": {
+    "schema": { "const": "paperboat.preview-tunnel/v1" },
+    "kind": { "const": "private_access_authorization" },
+    "id": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "opaque_epoch": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "trace_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[!-~]+$"
+    },
+    "trace_id": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 128,
+      "pattern": "^[!-~]+$"
+    },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "audience": {
+      "type": "string",
+      "enum": [
+        "paperboat-preview-http",
+        "paperboat-tunnel-http",
+        "paperboat-tunnel-tcp"
+      ]
+    },
+    "resource_kind": { "enum": ["preview", "tunnel"] },
+    "protocol": { "enum": ["http", "tcp"] },
+    "carrier_admission": {
+      "type": "object",
+      "required": ["schema", "kind", "account_id", "device_id", "installation_generation", "accessor_public_key", "accessor_thumbprint", "resource_kind", "resource_id", "carrier_session_id", "route_id", "route_generation", "session_generation", "process_generation", "config_generation", "assignment_generation", "assignment_id", "config_content_hash", "edge_node_id", "edge_process_epoch", "edge_carrier_server_spki_sha256", "edge_carrier_server_certificate_chain_pem", "protocol", "match_type", "edge_endpoints", "expires_at", "tunnel_id", "carrier_connector_id"],
+      "properties": {
+        "schema": { "$ref": "#/definitions/schema" },
+        "kind": { "const": "private_access_carrier_admission" },
+        "account_id": { "$ref": "#/definitions/id" },
+        "device_id": { "$ref": "#/definitions/id" },
+        "installation_generation": { "type": "integer", "minimum": 1 },
+        "accessor_public_key": { "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$" },
+        "accessor_thumbprint": { "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$" },
+        "resource_kind": { "$ref": "#/definitions/resource_kind" },
+        "resource_id": { "$ref": "#/definitions/id" },
+        "tunnel_name": { "type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$" },
+        "route_name": { "type": "string", "minLength": 1, "maxLength": 80, "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$" },
+        "operation_id": { "$ref": "#/definitions/id" },
+        "connector_id": { "$ref": "#/definitions/id" },
+        "carrier_session_id": { "$ref": "#/definitions/id" },
+        "route_id": { "$ref": "#/definitions/id" },
+        "route_generation": { "type": "integer", "minimum": 1 },
+        "session_generation": { "type": "integer", "minimum": 1 },
+        "process_generation": { "type": "integer", "minimum": 1 },
+        "config_generation": { "type": "integer", "minimum": 1 },
+        "assignment_generation": { "type": "integer", "minimum": 1 },
+        "assignment_id": { "$ref": "#/definitions/id" },
+        "config_content_hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "edge_node_id": { "$ref": "#/definitions/id" },
+        "edge_process_epoch": { "$ref": "#/definitions/opaque_epoch" },
+        "edge_carrier_server_spki_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "edge_carrier_server_certificate_chain_pem": { "type": "string", "minLength": 1, "maxLength": 65536 },
+        "protocol": { "enum": ["http", "private_tcp"] },
+        "hostname": { "type": "string", "minLength": 3, "maxLength": 253, "pattern": "^[a-z0-9*.-]+$" },
+        "match_type": { "enum": ["exact", "managed_exact", "one_label_wildcard", "catch_all"] },
+        "wildcard_suffix": { "type": "string", "minLength": 3, "maxLength": 253, "pattern": "^[a-z0-9.-]+$" },
+        "edge_endpoints": { "type": "array", "minItems": 2, "maxItems": 2, "items": [{ "type": "string", "pattern": "^tls://[^/:]+:(6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[1-9][0-9]{0,3})$" }, { "type": "string", "pattern": "^quic://[^/:]+:(6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[1-9][0-9]{0,3})$" }], "additionalItems": false },
+        "expires_at": { "$ref": "#/definitions/timestamp" },
+        "tunnel_id": { "$ref": "#/definitions/id" },
+        "carrier_connector_id": { "$ref": "#/definitions/id" }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        { "if": { "properties": { "resource_kind": { "const": "preview" } } }, "then": { "required": ["operation_id"], "properties": { "protocol": { "const": "http" } }, "not": { "anyOf": [{ "required": ["connector_id"] }, { "required": ["tunnel_name"] }, { "required": ["route_name"] }] } } },
+        { "if": { "properties": { "resource_kind": { "const": "tunnel" } } }, "then": { "required": ["connector_id", "tunnel_name", "route_name"], "not": { "required": ["operation_id"] } } },
+        { "if": { "properties": { "protocol": { "const": "http" } } }, "then": { "required": ["hostname"] }, "else": { "properties": { "match_type": { "const": "catch_all" } }, "not": { "anyOf": [{ "required": ["hostname"] }, { "required": ["wildcard_suffix"] }] } } },
+        { "if": { "properties": { "match_type": { "const": "one_label_wildcard" } } }, "then": { "required": ["wildcard_suffix"], "properties": { "hostname": { "pattern": "^\\*\\.[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$" }, "wildcard_suffix": { "pattern": "^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$" } } }, "else": { "properties": { "hostname": { "pattern": "^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$" } }, "not": { "required": ["wildcard_suffix"] } } }
+      ]
+    },
+    "carrier_snapshot": {
+      "type": "object",
+      "required": ["schema", "kind", "complete", "admissions"],
+      "properties": {
+        "schema": { "$ref": "#/definitions/schema" },
+        "kind": { "const": "private_access_carrier_snapshot" },
+        "complete": { "const": true },
+        "admissions": { "type": "array", "maxItems": 4096, "items": { "$ref": "#/definitions/carrier_admission" } }
+      },
+      "additionalProperties": false
+    },
+    "request_fields": {
+      "type": "object",
+      "properties": {
+        "account_id": { "$ref": "#/definitions/id" },
+        "resource_kind": { "$ref": "#/definitions/resource_kind" },
+        "resource_id": { "$ref": "#/definitions/id" },
+        "route_id": { "$ref": "#/definitions/id" },
+        "audience": { "$ref": "#/definitions/audience" },
+        "device_id": { "$ref": "#/definitions/id" },
+        "session_id": { "$ref": "#/definitions/id" },
+        "installation_generation": { "type": "integer", "minimum": 1 },
+        "expires_at": { "$ref": "#/definitions/timestamp" },
+        "nonce": { "$ref": "#/definitions/id" },
+        "operation_id": { "$ref": "#/definitions/id" },
+        "connector_id": { "$ref": "#/definitions/id" },
+        "carrier_session_id": { "$ref": "#/definitions/id" },
+        "route_generation": { "type": "integer", "minimum": 1 },
+        "session_generation": { "type": "integer", "minimum": 1 },
+        "process_generation": { "type": "integer", "minimum": 1 },
+        "config_generation": { "type": "integer", "minimum": 1 },
+        "assignment_generation": { "type": "integer", "minimum": 1 },
+        "edge_node_id": { "$ref": "#/definitions/id" },
+        "edge_process_epoch": { "$ref": "#/definitions/opaque_epoch" },
+        "protocol": { "$ref": "#/definitions/protocol" },
+        "method": { "type": "string", "minLength": 1, "maxLength": 32, "pattern": "^[!-~]+$" },
+        "host": { "type": "string", "minLength": 1, "maxLength": 512, "pattern": "^[^\\r\\n]+$" },
+        "path": { "type": "string", "minLength": 1, "maxLength": 4096, "pattern": "^/[^\\r\\n]*$" },
+        "idempotency_key": { "$ref": "#/definitions/trace_key" },
+        "request_id": { "$ref": "#/definitions/trace_id" },
+        "correlation_id": { "$ref": "#/definitions/trace_id" }
+      },
+      "additionalProperties": false
+    },
+    "route_request_constraints": {
+      "allOf": [
+        { "$ref": "#/definitions/request_fields" },
+        {
+          "required": [
+            "resource_kind", "resource_id", "route_id", "audience", "expires_at",
+            "nonce", "carrier_session_id", "route_generation", "process_generation",
+            "config_generation", "protocol", "idempotency_key", "request_id",
+            "correlation_id"
+          ]
+        },
+        {
+          "if": { "properties": { "resource_kind": { "const": "preview" } } },
+          "then": {
+            "required": ["operation_id"],
+            "not": { "required": ["connector_id"] }
+          }
+        },
+        {
+          "if": { "properties": { "resource_kind": { "const": "tunnel" } } },
+          "then": { "required": ["connector_id"] }
+        },
+        {
+          "if": { "properties": { "protocol": { "const": "http" } } },
+          "then": {
+            "required": ["method", "host", "path"],
+            "properties": {
+              "audience": {
+                "enum": ["paperboat-preview-http", "paperboat-tunnel-http"]
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "audience": { "const": "paperboat-tunnel-tcp" },
+              "method": { "not": {} },
+              "host": { "not": {} },
+              "path": { "not": {} }
+            }
+          }
+        }
+      ]
+    },
+    "grant_issue_request": {
+      "type": "object",
+      "required": ["resource_kind", "resource_id", "route_id", "audience", "expires_at", "nonce", "carrier_session_id", "route_generation", "session_generation", "process_generation", "config_generation", "assignment_generation", "edge_node_id", "edge_process_epoch", "protocol", "idempotency_key", "request_id", "correlation_id"],
+      "properties": {
+        "resource_kind": { "$ref": "#/definitions/resource_kind" },
+        "resource_id": { "$ref": "#/definitions/id" },
+        "route_id": { "$ref": "#/definitions/id" },
+        "audience": { "$ref": "#/definitions/audience" },
+        "expires_at": { "$ref": "#/definitions/timestamp" },
+        "nonce": { "$ref": "#/definitions/id" },
+        "operation_id": { "$ref": "#/definitions/id" },
+        "connector_id": { "$ref": "#/definitions/id" },
+        "carrier_session_id": { "$ref": "#/definitions/id" },
+        "route_generation": { "type": "integer", "minimum": 1 },
+        "session_generation": { "type": "integer", "minimum": 1 },
+        "process_generation": { "type": "integer", "minimum": 1 },
+        "config_generation": { "type": "integer", "minimum": 1 },
+        "assignment_generation": { "type": "integer", "minimum": 1 },
+        "edge_node_id": { "$ref": "#/definitions/id" },
+        "edge_process_epoch": { "$ref": "#/definitions/opaque_epoch" },
+        "protocol": { "$ref": "#/definitions/protocol" },
+        "method": { "type": "string", "minLength": 1, "maxLength": 32, "pattern": "^[!-~]+$" },
+        "host": { "type": "string", "minLength": 1, "maxLength": 512, "pattern": "^[^\\r\\n]+$" },
+        "path": { "type": "string", "minLength": 1, "maxLength": 4096, "pattern": "^/[^\\r\\n]*$" },
+        "idempotency_key": { "$ref": "#/definitions/trace_key" },
+        "request_id": { "$ref": "#/definitions/trace_id" },
+        "correlation_id": { "$ref": "#/definitions/trace_id" }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        { "$ref": "#/definitions/route_request_constraints" },
+        {
+          "not": {
+            "anyOf": [
+              { "required": ["account_id"] },
+              { "required": ["device_id"] },
+              { "required": ["session_id"] }
+            ]
+          }
+        }
+      ]
+    },
+    "authorize_request": {
+      "type": "object",
+      "required": ["account_id", "resource_kind", "resource_id", "route_id", "audience", "device_id", "session_id", "installation_generation", "expires_at", "nonce", "carrier_session_id", "route_generation", "session_generation", "process_generation", "config_generation", "assignment_generation", "edge_node_id", "edge_process_epoch", "protocol", "idempotency_key", "request_id", "correlation_id"],
+      "properties": {
+        "account_id": { "$ref": "#/definitions/id" },
+        "resource_kind": { "$ref": "#/definitions/resource_kind" },
+        "resource_id": { "$ref": "#/definitions/id" },
+        "route_id": { "$ref": "#/definitions/id" },
+        "audience": { "$ref": "#/definitions/audience" },
+        "device_id": { "$ref": "#/definitions/id" },
+        "session_id": { "$ref": "#/definitions/id" },
+        "installation_generation": { "type": "integer", "minimum": 1 },
+        "expires_at": { "$ref": "#/definitions/timestamp" },
+        "nonce": { "$ref": "#/definitions/id" },
+        "operation_id": { "$ref": "#/definitions/id" },
+        "connector_id": { "$ref": "#/definitions/id" },
+        "carrier_session_id": { "$ref": "#/definitions/id" },
+        "route_generation": { "type": "integer", "minimum": 1 },
+        "session_generation": { "type": "integer", "minimum": 1 },
+        "process_generation": { "type": "integer", "minimum": 1 },
+        "config_generation": { "type": "integer", "minimum": 1 },
+        "assignment_generation": { "type": "integer", "minimum": 1 },
+        "edge_node_id": { "$ref": "#/definitions/id" },
+        "edge_process_epoch": { "$ref": "#/definitions/opaque_epoch" },
+        "protocol": { "$ref": "#/definitions/protocol" },
+        "method": { "type": "string", "minLength": 1, "maxLength": 32, "pattern": "^[!-~]+$" },
+        "host": { "type": "string", "minLength": 1, "maxLength": 512, "pattern": "^[^\\r\\n]+$" },
+        "path": { "type": "string", "minLength": 1, "maxLength": 4096, "pattern": "^/[^\\r\\n]*$" },
+        "idempotency_key": { "$ref": "#/definitions/trace_key" },
+        "request_id": { "$ref": "#/definitions/trace_id" },
+        "correlation_id": { "$ref": "#/definitions/trace_id" }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        { "$ref": "#/definitions/route_request_constraints" },
+        { "required": ["account_id", "device_id", "session_id"] }
+      ]
+    },
+    "grant_issue_response": {
+      "type": "object",
+      "required": ["schema", "kind", "grant", "expires_at", "request_id", "correlation_id", "request"],
+      "properties": {
+        "schema": { "$ref": "#/definitions/schema" },
+        "kind": { "$ref": "#/definitions/kind" },
+        "grant": { "type": "string", "minLength": 1, "maxLength": 16384, "writeOnly": true },
+        "expires_at": { "$ref": "#/definitions/timestamp" },
+        "request_id": { "$ref": "#/definitions/trace_id" },
+        "correlation_id": { "$ref": "#/definitions/trace_id" },
+        "request": { "$ref": "#/definitions/authorize_request" }
+      },
+      "additionalProperties": false
+    },
+    "decision_base": {
+      "type": "object",
+      "required": ["schema", "kind", "decision_id", "allowed", "reason", "expires_at", "request_id", "correlation_id"],
+      "properties": {
+        "schema": { "$ref": "#/definitions/schema" },
+        "kind": { "$ref": "#/definitions/kind" },
+        "decision_id": { "$ref": "#/definitions/id" },
+        "allowed": { "type": "boolean" },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "expires_at": { "$ref": "#/definitions/timestamp" },
+        "request_id": { "$ref": "#/definitions/trace_id" },
+        "correlation_id": { "$ref": "#/definitions/trace_id" },
+        "resource_kind": { "$ref": "#/definitions/resource_kind" },
+        "resource_id": { "$ref": "#/definitions/id" },
+        "route_id": { "$ref": "#/definitions/id" },
+        "operation_id": { "$ref": "#/definitions/id" },
+        "connector_id": { "$ref": "#/definitions/id" },
+        "carrier_session_id": { "$ref": "#/definitions/id" },
+        "route_generation": { "type": "integer", "minimum": 1 },
+        "session_generation": { "type": "integer", "minimum": 1 },
+        "process_generation": { "type": "integer", "minimum": 1 },
+        "config_generation": { "type": "integer", "minimum": 1 },
+        "assignment_generation": { "type": "integer", "minimum": 1 },
+        "protocol": { "$ref": "#/definitions/protocol" }
+      },
+      "additionalProperties": false
+    },
+    "allow_decision": {
+      "allOf": [
+        { "$ref": "#/definitions/decision_base" },
+        {
+          "type": "object",
+          "properties": {
+            "allowed": { "const": true },
+            "reason": { "const": "allowed" },
+            "resource_kind": { "$ref": "#/definitions/resource_kind" },
+            "resource_id": { "$ref": "#/definitions/id" },
+            "route_id": { "$ref": "#/definitions/id" },
+            "operation_id": { "$ref": "#/definitions/id" },
+            "connector_id": { "$ref": "#/definitions/id" },
+            "carrier_session_id": { "$ref": "#/definitions/id" },
+            "route_generation": { "type": "integer", "minimum": 1 },
+            "session_generation": { "type": "integer", "minimum": 1 },
+            "process_generation": { "type": "integer", "minimum": 1 },
+            "config_generation": { "type": "integer", "minimum": 1 },
+            "assignment_generation": { "type": "integer", "minimum": 1 },
+            "protocol": { "$ref": "#/definitions/protocol" }
+          },
+          "required": ["resource_kind", "resource_id", "route_id", "carrier_session_id", "route_generation", "session_generation", "process_generation", "config_generation", "assignment_generation", "protocol"]
+        }
+      ]
+    },
+    "deny_decision": {
+      "allOf": [
+        { "$ref": "#/definitions/decision_base" },
+        {
+          "type": "object",
+          "properties": {
+            "allowed": { "const": false },
+            "reason": {
+              "enum": ["unauthenticated", "account_mismatch", "device_revoked", "session_expired", "resource_not_found", "route_paused", "expired", "wrong_route", "protocol_denied", "identity_invalid", "rate_limited", "authorization_unavailable"]
+            }
+          },
+          "not": {
+            "anyOf": [
+              { "required": ["resource_kind"] },
+              { "required": ["resource_id"] },
+              { "required": ["route_id"] },
+              { "required": ["operation_id"] },
+              { "required": ["connector_id"] },
+              { "required": ["carrier_session_id"] },
+              { "required": ["route_generation"] },
+              { "required": ["session_generation"] },
+              { "required": ["process_generation"] },
+              { "required": ["config_generation"] },
+              { "required": ["assignment_generation"] },
+              { "required": ["protocol"] }
+            ]
+          }
+        }
+      ]
+    },
+    "error": {
+      "type": "object",
+      "required": ["schema", "kind", "code", "message", "retryable"],
+      "properties": {
+        "schema": { "$ref": "#/definitions/schema" },
+        "kind": { "const": "error" },
+        "code": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9_]+$" },
+        "message": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "retryable": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

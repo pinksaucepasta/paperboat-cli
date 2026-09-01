@@ -239,7 +239,8 @@ func TestDirectSetupContextUsesShortestEstablishmentDeadline(t *testing.T) {
 		t.Fatalf("descriptor deadline=%v ok=%v", deadline, ok)
 	}
 
-	if _, _, err := directSetupContext(nil, expiresAt); !errors.Is(err, ErrInvalid) {
+	var nilParent context.Context
+	if _, _, err := directSetupContext(nilParent, expiresAt); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("nil parent error=%v", err)
 	}
 }

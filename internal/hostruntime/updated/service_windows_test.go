@@ -11,9 +11,24 @@ import (
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostinstall"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/workerupdate"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc/mgr"
 )
+
+type noopWindowsActivationGate struct{}
+
+func (noopWindowsActivationGate) Candidate(context.Context, workerupdate.GateRequest) error {
+	return nil
+}
+func (noopWindowsActivationGate) Drain(context.Context, workerupdate.GateRequest) error  { return nil }
+func (noopWindowsActivationGate) Active(context.Context, workerupdate.GateRequest) error { return nil }
+func (noopWindowsActivationGate) Commit(context.Context, workerupdate.GateRequest) error {
+	return nil
+}
+func (noopWindowsActivationGate) Rollback(context.Context, workerupdate.GateRequest) error {
+	return nil
+}
 
 func TestWaitForWindowsUpdaterVersionWaitsForApplicationReadiness(t *testing.T) {
 	calls := 0
@@ -47,7 +62,9 @@ func testWindowsUpdaterConfig(t *testing.T) WindowsConfig {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return WindowsConfig{StateRoot: layout.UpdateStateRoot, RuntimeStateRoot: `C:\Users\Pujan\AppData\Local\Paperboat\runtime`, Binary: layout.Binary, BinaryRollback: layout.BinaryRollback, BinaryStaged: layout.BinaryStaged, OwnerSID: "S-1-5-21-1-2-3-1001", MachineID: "machine", RepositoryURL: "https://get.pprbt.dev", TokenFile: hostinstall.WindowsHostdTokenPath(), InstallState: hostinstall.WindowsInstallConfigPath(), ControlSocket: `\\.\pipe\PaperboatUpdatedControl`, HostdSocket: layout.HostdSocket, HealthURL: "http://127.0.0.1:8080/healthz", ActiveVersion: "2026.08.23.1", Architecture: "amd64", SetupMode: "client"}
+	return WindowsConfig{StateRoot: layout.UpdateStateRoot, RuntimeStateRoot: `C:\Users\Pujan\AppData\Local\Paperboat\runtime`, Binary: layout.Binary, BinaryRollback: layout.BinaryRollback, BinaryStaged: layout.BinaryStaged, OwnerSID: "S-1-5-21-1-2-3-1001", MachineID: "machine", RepositoryURL: "https://get.pprbt.dev", TokenFile: hostinstall.WindowsHostdTokenPath(), InstallState: hostinstall.WindowsInstallConfigPath(), ControlSocket: `\\.\pipe\PaperboatUpdatedControl`, HostdSocket: layout.HostdSocket, HealthURL: "http://127.0.0.1:8080/healthz", ActiveVersion: "2026.08.23.1", Architecture: "amd64", SetupMode: "client", ActivationGate: noopWindowsActivationGate{}, CandidateStarter: func(context.Context, workerupdate.StartRequest) (workerupdate.Worker, error) {
+		return nil, errors.New("candidate test stub")
+	}}
 }
 
 func TestWindowsUpdaterRejectsMutableTrustAndPathInputs(t *testing.T) {

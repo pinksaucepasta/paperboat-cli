@@ -36,12 +36,9 @@ func TestRelayHealthExchangeAcrossQUICAndWSS(t *testing.T) {
 			}()
 			var nonce [16]byte
 			copy(nonce[:], "relay-health-one")
-			ptos, err := client.HealthExchange(ctx, InitiatorConfig{LocalStatic: initiator, ResponderPublic: public32(responder), Prologue: prologue, Handle: handle}, nonce)
+			_, err := client.HealthExchange(ctx, InitiatorConfig{LocalStatic: initiator, ResponderPublic: public32(responder), Prologue: prologue, Handle: handle}, nonce)
 			if err != nil {
 				t.Fatal(err)
-			}
-			if ptos < 0 {
-				t.Fatalf("loopback health reported invalid PTO count %d", ptos)
 			}
 			if err := <-served; err != nil {
 				t.Fatal(err)

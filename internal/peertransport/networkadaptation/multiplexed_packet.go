@@ -5,7 +5,6 @@ import (
 	"errors"
 	"net"
 	"os"
-	"reflect"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -471,12 +470,4 @@ func (r *PMTURegistration) remoteSnapshot() PMTURemoteBinding {
 	r.remoteMu.Lock()
 	defer r.remoteMu.Unlock()
 	return r.remote
-}
-
-func nilMultiplexedPacketConn(connection *MultiplexedPacketConn) bool {
-	if connection == nil {
-		return true
-	}
-	value := reflect.ValueOf(connection)
-	return value.Kind() == reflect.Pointer && value.IsNil()
 }

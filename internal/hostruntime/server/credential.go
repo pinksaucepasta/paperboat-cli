@@ -111,15 +111,24 @@ func stableClaimsBinding(claims auth.Claims) (string, error) {
 		Class              string   `json:"class"`
 		Scopes             []string `json:"scopes"`
 		EnvironmentID      string   `json:"environment_id"`
+		AccountID          string   `json:"account_id"`
 		MachineID          string   `json:"machine_id"`
 		SourceMachineID    string   `json:"source_machine_id"`
 		UserID             string   `json:"user_id"`
+		ActorID            string   `json:"actor_id"`
 		CLIClientSessionID string   `json:"cli_client_session_id"`
 		HelperID           string   `json:"helper_id"`
 		SessionID          string   `json:"session_id"`
 		OperationID        string   `json:"operation_id"`
 		AssignmentID       string   `json:"assignment_id"`
-	}{claims.Issuer, claims.Subject, claims.CredentialClass, claims.Scope, claims.EnvironmentID, claims.MachineID, claims.SourceMachineID, claims.UserID, claims.CLIClientSessionID, claims.HelperID, claims.SessionID, claims.OperationID, claims.AssignmentID})
+		PreviewID          string   `json:"preview_id"`
+		OwnerSessionID     string   `json:"owner_session_id"`
+		ExpectedGeneration int64    `json:"expected_generation"`
+		IdempotencyKey     string   `json:"idempotency_key"`
+		RequestID          string   `json:"request_id"`
+		CorrelationID      string   `json:"correlation_id"`
+		RequestHash        string   `json:"request_hash"`
+	}{claims.Issuer, claims.Subject, claims.CredentialClass, claims.Scope, claims.EnvironmentID, claims.AccountID, claims.MachineID, claims.SourceMachineID, claims.UserID, claims.ActorID, claims.CLIClientSessionID, claims.HelperID, claims.SessionID, claims.OperationID, claims.AssignmentID, claims.PreviewID, claims.OwnerSessionID, claims.ExpectedGeneration, claims.IdempotencyKey, claims.RequestID, claims.CorrelationID, claims.RequestHash})
 	if err != nil {
 		return "", err
 	}

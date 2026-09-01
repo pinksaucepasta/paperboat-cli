@@ -7,7 +7,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -15,7 +14,6 @@ import (
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
-	"golang.org/x/sys/windows/svc/mgr"
 )
 
 var ErrWindowsServiceEntry = errors.New("invalid Windows Paperboat service entry")
@@ -35,10 +33,6 @@ type ServiceEntryConfig struct {
 	// Production callers use this for bounded service diagnostics; native
 	// qualification uses it to preserve exact S4U failure evidence.
 	LaunchFailure func(error)
-	// DeleteOnExit is used only by one-shot dynamic preview services. The
-	// LocalSystem parent removes its own SCM registration after the enrolled
-	// owner workload exits, so expiry and worker cleanup never require UAC.
-	DeleteOnExit bool
 	// StartPrivilegedSidecar starts fixed LocalSystem-only infrastructure owned
 	// by the SCM parent. The returned function must stop it synchronously.
 	StartPrivilegedSidecar func(context.Context) (PrivilegedSidecar, error)
@@ -252,14 +246,7 @@ func (s *serviceEntry) Execute(_ []string, requests <-chan svc.ChangeRequest, st
 			if exit.err != nil && s.config.LaunchFailure != nil {
 				s.config.LaunchFailure(exit.err)
 			}
-			var deleteErr error
-			if shouldDeleteOneShotService(s.config.DeleteOnExit, code, workloadInterrupted) {
-				deleteErr = deleteOwnWindowsService(s.config.Name)
-				if deleteErr != nil && s.config.LaunchFailure != nil {
-					s.config.LaunchFailure(deleteErr)
-				}
-			}
-			failed := exit.err != nil || code != 0 || workloadInterrupted || deleteErr != nil
+			failed := exit.err != nil || code != 0 || workloadInterrupted
 			if failed && code == 0 {
 				code = 1
 			}
@@ -307,64 +294,6 @@ func enrolledOwnerExists(value string) (bool, error) {
 		return false, nil
 	}
 	return err == nil, err
-}
-
-func deleteOwnWindowsService(name string) (resultErr error) {
-	definitionPath := filepath.Join(windowsServiceDefinitionRoot, name+".json")
-	definition, err := readWindowsServiceDefinitionForRemoval(definitionPath)
-	if err != nil {
-		return err
-	}
-	stateRoot, err := validateWindowsOneShotPreviewDefinition(name, definition)
-	if err != nil {
-		return err
-	}
-	manager, err := mgr.Connect()
-	if err != nil {
-		return err
-	}
-	defer func() { resultErr = errors.Join(resultErr, manager.Disconnect()) }()
-	current, err := manager.OpenService(name)
-	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	defer func() { resultErr = errors.Join(resultErr, current.Close()) }()
-	serviceConfig, err := current.Config()
-	if err != nil || !windowsServiceConfigurationOwnsDefinition(serviceConfig, definition) {
-		return errors.Join(err, ErrWindowsServiceEntry)
-	}
-	if err := current.Delete(); err != nil && !errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
-		return err
-	}
-	currentDefinition, err := readOwnedWindowsPreviewDefinitionForRemoval(definitionPath, name, stateRoot)
-	if err != nil {
-		return err
-	}
-	if !reflect.DeepEqual(currentDefinition, definition) {
-		return ErrWindowsServiceEntry
-	}
-	if err := os.Remove(definitionPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	return syncServiceDirectory(windowsServiceDefinitionRoot)
-}
-
-func validateWindowsOneShotPreviewDefinition(name string, definition windowsServiceDefinition) (string, error) {
-	if !isWindowsPreviewServiceName(name) {
-		return "", ErrWindowsServiceEntry
-	}
-	stateRoot, ok := windowsPreviewStateRoot(definition.Arguments)
-	if !ok {
-		return "", ErrWindowsServiceEntry
-	}
-	definitionPath := filepath.Join(windowsServiceDefinitionRoot, name+".json")
-	if err := validateWindowsPreviewDefinition(definitionPath, name, stateRoot, definition); err != nil {
-		return "", err
-	}
-	return stateRoot, nil
 }
 
 func stoppedServiceStatus(code uint32, failed bool) svc.Status {

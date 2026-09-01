@@ -19,7 +19,7 @@ $(jq -r --arg repo "$repo" '.artifacts[] | select(.consumers | index($repo)) | "
 EOF
 for file in $(find "$contracts" -type f | sort); do
   relative=${file#"$contracts/"}
-  case "$relative" in manifest.json|consumer.json|validate.sh|p2p-v1/*) continue ;; esac
+  case "$relative" in manifest.json|consumer.json|validate.sh|p2p-v1/*|preview-tunnel-v1/*|connector-v1/*|telemetry-v1/*) continue ;; esac
   jq -e --arg repo "$repo" --arg path "$relative" '.artifacts[] | select(.path == $path and (.consumers | index($repo)))' "$manifest" >/dev/null || { echo "$repo contracts: unknown or inapplicable artifact $relative" >&2; exit 1; }
 done
 p2p="$contracts/p2p-v1"
@@ -31,5 +31,35 @@ while IFS='|' read -r path digest; do
   [ "$actual" = "$digest" ] || { echo "$repo contracts: stale P2P $path" >&2; exit 1; }
 done <<EOF
 $(jq -r --arg repo "$repo" '.artifacts[] | select(.consumers | index($repo)) | "\(.path)|\(.sha256)"' "$p2p/manifest.json")
+EOF
+preview_tunnel="$contracts/preview-tunnel-v1"
+jq -e --arg repo "$repo" '.manifest_version == 1 and .family == "paperboat.preview-tunnel" and .contract_version == "1.0.0" and .status == "approved" and all(.artifacts[]; .consumers | index($repo))' "$preview_tunnel/manifest.json" >/dev/null || { echo "$repo contracts: invalid preview/tunnel manifest" >&2; exit 1; }
+while IFS='|' read -r path digest; do
+  file="$preview_tunnel/$path"
+  [ -f "$file" ] || { echo "$repo contracts: missing preview/tunnel $path" >&2; exit 1; }
+  actual=$(shasum -a 256 "$file" | awk '{print $1}')
+  [ "$actual" = "$digest" ] || { echo "$repo contracts: stale preview/tunnel $path" >&2; exit 1; }
+done <<EOF
+$(jq -r '.artifacts[] | "\(.path)|\(.sha256)"' "$preview_tunnel/manifest.json")
+EOF
+connector="$contracts/connector-v1"
+jq -e --arg repo "$repo" '.manifest_version == 1 and .family == "paperboat.connector" and .contract_version == "1.0.0" and .status == "approved" and all(.artifacts[]; .consumers | index($repo))' "$connector/manifest.json" >/dev/null || { echo "$repo contracts: invalid connector manifest" >&2; exit 1; }
+while IFS='|' read -r path digest; do
+  file="$connector/$path"
+  [ -f "$file" ] || { echo "$repo contracts: missing connector $path" >&2; exit 1; }
+  actual=$(shasum -a 256 "$file" | awk '{print $1}')
+  [ "$actual" = "$digest" ] || { echo "$repo contracts: stale connector $path" >&2; exit 1; }
+done <<EOF
+$(jq -r '.artifacts[] | "\(.path)|\(.sha256)"' "$connector/manifest.json")
+EOF
+telemetry="$contracts/telemetry-v1"
+jq -e --arg repo "$repo" '.manifest_version == 1 and .family == "paperboat.telemetry" and .contract_version == "1.0.0" and .status == "approved" and all(.artifacts[]; .consumers | index($repo))' "$telemetry/manifest.json" >/dev/null || { echo "$repo contracts: invalid telemetry manifest" >&2; exit 1; }
+while IFS='|' read -r path digest; do
+  file="$telemetry/$path"
+  [ -f "$file" ] || { echo "$repo contracts: missing telemetry $path" >&2; exit 1; }
+  actual=$(shasum -a 256 "$file" | awk '{print $1}')
+  [ "$actual" = "$digest" ] || { echo "$repo contracts: stale telemetry $path" >&2; exit 1; }
+done <<EOF
+$(jq -r '.artifacts[] | "\(.path)|\(.sha256)"' "$telemetry/manifest.json")
 EOF
 echo "$repo contracts: valid"

@@ -42,8 +42,8 @@ type capabilityProvider []string
 func (p capabilityProvider) Capabilities() []string { return append([]string(nil), p...) }
 
 func TestAvailableCapabilitiesDeriveFromImplementedProviders(t *testing.T) {
-	available, err := AvailableCapabilities(capabilityProvider{"terminal.v1", "health.v1"}, capabilityProvider{"preview.public.v1"})
-	if err != nil || !available["preview.public.v1"] || available["config.apply.v1"] {
+	available, err := AvailableCapabilities(capabilityProvider{"terminal.v1", "health.v1"}, capabilityProvider{"config.apply.v1"})
+	if err != nil || !available["config.apply.v1"] || available["preview.public.v1"] {
 		t.Fatalf("available=%v err=%v", available, err)
 	}
 	for _, providers := range [][]CapabilityProvider{{capabilityProvider{"terminal.v1"}}, {capabilityProvider{"terminal.v1", "health.v1"}, capabilityProvider{"health.v1"}}, {nil}} {

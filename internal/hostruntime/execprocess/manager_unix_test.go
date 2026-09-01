@@ -78,6 +78,64 @@ func TestExactArgvCWDEnvironmentAndSeparateStreams(t *testing.T) {
 	}
 }
 
+func TestManagedEnvironmentIsResolvedForEachNewProcess(t *testing.T) {
+	root := t.TempDir()
+	value := "first"
+	manager := testManager(t, root, func(config *Config) {
+		config.ManagedEnvironment = func() ([]string, error) {
+			return []string{"INJECTED=" + value, "OVERRIDE=managed"}, nil
+		}
+	})
+	run := func(operationID string, override map[string]string) string {
+		t.Helper()
+		execution, _, err := manager.Start(context.Background(), Request{OperationID: operationID, Argv: []string{"/bin/sh", "-c", `printf '%s|%s' "$INJECTED" "$OVERRIDE"`}, CWD: root, Environment: override})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := execution.Wait(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		var output strings.Builder
+		for _, event := range collect(t, execution) {
+			if event.Stream == "stdout" {
+				output.Write(event.Data)
+			}
+		}
+		return output.String()
+	}
+	if got := run("operation_managed_first", nil); got != "first|managed" {
+		t.Fatalf("first environment=%q", got)
+	}
+	value = "second"
+	if got := run("operation_managed_second", map[string]string{"override": "request"}); got != "second|request" {
+		t.Fatalf("second environment=%q", got)
+	}
+}
+
+func TestRequestRejectsCaseFoldedEnvironmentDuplicates(t *testing.T) {
+	root := t.TempDir()
+	manager := testManager(t, root, nil)
+	_, _, err := manager.Start(context.Background(), Request{OperationID: "operation_duplicate_environment", Argv: []string{"/bin/true"}, CWD: root, Environment: map[string]string{"Token": "one", "TOKEN": "two"}})
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestManagedEnvironmentFailureFailsClosed(t *testing.T) {
+	root := t.TempDir()
+	manager := testManager(t, root, func(config *Config) {
+		config.ManagedEnvironment = func() ([]string, error) { return nil, errors.New("secret detail") }
+	})
+	execution, _, err := manager.Start(context.Background(), Request{OperationID: "operation_managed_unavailable", Argv: []string{"/bin/true"}, CWD: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := execution.Wait(context.Background())
+	if err != nil || snapshot.State != StateFailed || snapshot.ErrorCode != "environment_unavailable" || strings.Contains(snapshot.ErrorCode, "secret detail") {
+		t.Fatalf("snapshot=%#v err=%v", snapshot, err)
+	}
+}
+
 func TestPipeProcessPreservesSymlinkInvocationName(t *testing.T) {
 	root := t.TempDir()
 	command := filepath.Join(root, "sh")

@@ -68,7 +68,6 @@ type physicalCarrier struct {
 	epoch   uint64
 	conn    net.Conn
 	state   carrierState
-	finSent bool
 	writeMu sync.Mutex
 }
 
@@ -114,7 +113,6 @@ type Conn struct {
 	writeDeadline time.Time
 	closed        bool
 	terminalErr   error
-	firstSendSeen bool
 	firstRecvSeen bool
 }
 

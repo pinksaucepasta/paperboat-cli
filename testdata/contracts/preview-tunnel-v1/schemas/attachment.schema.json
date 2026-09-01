@@ -1,0 +1,235 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "paperboat://contracts/preview-tunnel-v1/attachment",
+  "title": "Paperboat preview carrier attachment v1 messages",
+  "oneOf": [
+    { "$ref": "#/definitions/attachment" },
+    { "$ref": "#/definitions/admission" },
+    { "$ref": "#/definitions/snapshot" },
+    { "$ref": "#/definitions/observation" },
+    { "$ref": "#/definitions/detachment" }
+  ],
+  "definitions": {
+    "schema": { "const": "paperboat.preview-tunnel/v1" },
+    "kind": { "const": "preview_carrier_attachment" },
+    "id": { "type": "string", "minLength": 3, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*$" },
+    "opaque_epoch": { "type": "string", "minLength": 8, "maxLength": 128, "pattern": "^[A-Za-z0-9_-]+$" },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "request_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "public_key": { "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$" },
+    "thumbprint": { "type": "string", "pattern": "^sha256:[A-Za-z0-9_-]{43}$" },
+    "endpoint": { "type": "string", "format": "uri", "pattern": "^https://[^/?#]+/?$" },
+    "edge_endpoint": { "type": "string", "format": "uri", "pattern": "^(tls|quic)://[^/?#]+:[1-9][0-9]{0,4}$" },
+    "preview_carrier_alias": {
+      "type": "object",
+      "required": ["domain_id", "hostname", "match_type", "preview_generation", "domain_generation", "certificate_generation"],
+      "properties": {
+        "domain_id": { "$ref": "#/definitions/id" },
+        "hostname": { "type": "string", "minLength": 1, "maxLength": 253 },
+        "match_type": { "enum": ["exact", "one_label_wildcard"] },
+        "wildcard_labels": { "const": 1 },
+        "preview_generation": { "type": "integer", "minimum": 1 },
+        "domain_generation": { "type": "integer", "minimum": 1 },
+        "certificate_generation": { "type": "integer", "minimum": 1 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "match_type": { "const": "exact" } } },
+          "then": { "properties": { "hostname": { "pattern": "^[^*]+$" }, "wildcard_labels": { "not": {} } } }
+        },
+        {
+          "if": { "properties": { "match_type": { "const": "one_label_wildcard" } } },
+          "then": { "required": ["wildcard_labels"], "properties": { "hostname": { "pattern": "^\\*\\.[^.]+(?:\\.[^.]+)+$" } } }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "target": {
+      "type": "object",
+      "required": ["scheme", "address"],
+      "properties": {
+        "scheme": { "enum": ["http", "https", "h2c", "tcp", "unix"] },
+        "address": { "type": "string", "minLength": 1, "maxLength": 2048 }
+      },
+      "additionalProperties": false
+    },
+    "binding_properties": {
+      "account_id": { "$ref": "#/definitions/id" },
+      "preview_id": { "$ref": "#/definitions/id" },
+      "operation_id": { "$ref": "#/definitions/id" },
+      "owner_device_id": { "$ref": "#/definitions/id" },
+      "owner_session_id": { "$ref": "#/definitions/id" },
+      "host_id": { "$ref": "#/definitions/id" },
+      "lease_generation": { "type": "integer", "minimum": 1 },
+      "tunnel_id": { "$ref": "#/definitions/id" },
+      "connector_id": { "$ref": "#/definitions/id" },
+      "session_id": { "$ref": "#/definitions/id" },
+      "process_generation": { "type": "integer", "minimum": 1 },
+      "config_generation": { "type": "integer", "minimum": 1 },
+      "route_id": { "$ref": "#/definitions/id" },
+      "route_generation": { "type": "integer", "minimum": 1 },
+      "edge_node_id": { "$ref": "#/definitions/id" },
+      "edge_process_epoch": { "$ref": "#/definitions/opaque_epoch" },
+      "edge_carrier_server_spki_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+      "edge_carrier_server_certificate_chain_pem": { "type": "string", "minLength": 1, "maxLength": 65536 },
+      "machine_identity_public_key": { "$ref": "#/definitions/public_key" },
+      "machine_identity_thumbprint": { "$ref": "#/definitions/thumbprint" }
+    },
+    "binding": {
+      "type": "object",
+      "required": [
+        "account_id", "preview_id", "operation_id", "owner_device_id",
+        "owner_session_id", "host_id", "lease_generation", "tunnel_id",
+        "connector_id", "session_id", "process_generation", "config_generation",
+        "route_id", "route_generation", "edge_node_id", "edge_process_epoch", "edge_carrier_server_spki_sha256", "edge_carrier_server_certificate_chain_pem",
+        "machine_identity_public_key", "machine_identity_thumbprint"
+      ],
+      "properties": {
+        "account_id": { "$ref": "#/definitions/id" },
+        "preview_id": { "$ref": "#/definitions/id" },
+        "operation_id": { "$ref": "#/definitions/id" },
+        "owner_device_id": { "$ref": "#/definitions/id" },
+        "owner_session_id": { "$ref": "#/definitions/id" },
+        "host_id": { "$ref": "#/definitions/id" },
+        "lease_generation": { "type": "integer", "minimum": 1 },
+        "tunnel_id": { "$ref": "#/definitions/id" },
+        "connector_id": { "$ref": "#/definitions/id" },
+        "session_id": { "$ref": "#/definitions/id" },
+        "process_generation": { "type": "integer", "minimum": 1 },
+        "config_generation": { "type": "integer", "minimum": 1 },
+        "route_id": { "$ref": "#/definitions/id" },
+        "route_generation": { "type": "integer", "minimum": 1 },
+        "edge_node_id": { "$ref": "#/definitions/id" },
+        "edge_process_epoch": { "$ref": "#/definitions/opaque_epoch" },
+        "edge_carrier_server_spki_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "edge_carrier_server_certificate_chain_pem": { "type": "string", "minLength": 1, "maxLength": 65536 },
+        "machine_identity_public_key": { "$ref": "#/definitions/public_key" },
+        "machine_identity_thumbprint": { "$ref": "#/definitions/thumbprint" }
+      },
+      "additionalProperties": false
+    },
+    "attachment": {
+      "type": "object",
+      "required": [
+        "schema", "kind", "account_id", "preview_id", "operation_id",
+        "owner_device_id", "owner_session_id", "host_id", "lease_generation",
+        "tunnel_id", "connector_id", "session_id", "process_generation",
+        "config_generation", "route_id", "route_generation", "edge_node_id",
+        "edge_process_epoch", "edge_carrier_server_spki_sha256", "edge_carrier_server_certificate_chain_pem",
+        "machine_identity_public_key", "machine_identity_thumbprint",
+        "idempotency_key", "request_id", "correlation_id", "request_hash",
+        "endpoint", "target", "access_mode", "config_content_hash",
+        "edge_endpoints", "attachment_generation", "issued_at", "expires_at",
+        "state", "edge_ready", "origin_ready"
+      ],
+      "properties": {
+        "schema": { "$ref": "#/definitions/schema" },
+        "kind": { "$ref": "#/definitions/kind" },
+        "account_id": { "$ref": "#/definitions/id" },
+        "preview_id": { "$ref": "#/definitions/id" },
+        "operation_id": { "$ref": "#/definitions/id" },
+        "owner_device_id": { "$ref": "#/definitions/id" },
+        "owner_session_id": { "$ref": "#/definitions/id" },
+        "host_id": { "$ref": "#/definitions/id" },
+        "lease_generation": { "type": "integer", "minimum": 1 },
+        "tunnel_id": { "$ref": "#/definitions/id" },
+        "connector_id": { "$ref": "#/definitions/id" },
+        "session_id": { "$ref": "#/definitions/id" },
+        "process_generation": { "type": "integer", "minimum": 1 },
+        "config_generation": { "type": "integer", "minimum": 1 },
+        "route_id": { "$ref": "#/definitions/id" },
+        "route_generation": { "type": "integer", "minimum": 1 },
+        "edge_node_id": { "$ref": "#/definitions/id" },
+        "edge_process_epoch": { "$ref": "#/definitions/opaque_epoch" },
+        "edge_carrier_server_spki_sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "edge_carrier_server_certificate_chain_pem": { "type": "string", "minLength": 1, "maxLength": 65536 },
+        "machine_identity_public_key": { "$ref": "#/definitions/public_key" },
+        "machine_identity_thumbprint": { "$ref": "#/definitions/thumbprint" },
+        "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "request_id": { "$ref": "#/definitions/id" },
+        "correlation_id": { "$ref": "#/definitions/id" },
+        "request_hash": { "$ref": "#/definitions/request_hash" },
+        "endpoint": { "$ref": "#/definitions/endpoint" },
+        "target": { "$ref": "#/definitions/target" },
+        "access_mode": { "enum": ["public", "private"] },
+        "config_content_hash": { "$ref": "#/definitions/sha256" },
+        "edge_endpoints": { "type": "array", "minItems": 2, "maxItems": 2, "uniqueItems": true, "items": { "$ref": "#/definitions/edge_endpoint" } },
+        "attachment_generation": { "type": "integer", "minimum": 1 },
+        "issued_at": { "$ref": "#/definitions/timestamp" },
+        "expires_at": { "$ref": "#/definitions/timestamp" },
+        "state": { "enum": ["pending", "admitted", "edge_ready", "ready", "failed", "released"] },
+        "edge_ready": { "type": "boolean" },
+        "origin_ready": { "type": "boolean" },
+        "ready_at": { "$ref": "#/definitions/timestamp" },
+        "released_at": { "$ref": "#/definitions/timestamp" }
+      },
+      "additionalProperties": false
+    },
+    "admission": {
+      "type": "object",
+      "required": ["schema", "kind", "binding", "access_mode", "attachment_generation", "config_content_hash", "edge_endpoints", "endpoint", "expires_at"],
+      "properties": {
+        "schema": { "$ref": "#/definitions/schema" },
+        "kind": { "$ref": "#/definitions/kind" },
+        "binding": { "$ref": "#/definitions/binding" },
+        "access_mode": { "enum": ["public", "private"] },
+        "attachment_generation": { "type": "integer", "minimum": 1 },
+        "config_content_hash": { "$ref": "#/definitions/sha256" },
+        "edge_endpoints": { "type": "array", "minItems": 2, "maxItems": 2, "uniqueItems": true, "items": { "$ref": "#/definitions/edge_endpoint" } },
+        "endpoint": { "$ref": "#/definitions/endpoint" },
+        "expires_at": { "$ref": "#/definitions/timestamp" },
+        "state": { "enum": ["pending", "admitted", "edge_ready", "ready"] },
+        "hostname": { "$ref": "#/definitions/id" },
+        "route_kind": { "enum": ["preview_public_https_wss", "preview_private_https_wss"] },
+        "route_revision": { "type": "integer", "minimum": 1 },
+        "aliases": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "$ref": "#/definitions/preview_carrier_alias" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "detachment": {
+      "type": "object",
+      "required": ["schema", "kind", "binding", "attachment_generation", "reason", "observed_at"],
+      "properties": {
+        "schema": { "$ref": "#/definitions/schema" },
+        "kind": { "$ref": "#/definitions/kind" },
+        "binding": { "$ref": "#/definitions/binding" },
+        "attachment_generation": { "type": "integer", "minimum": 1 },
+        "reason": { "const": "server_detach" },
+        "observed_at": { "$ref": "#/definitions/timestamp" }
+      },
+      "additionalProperties": false
+    },
+    "observation": {
+      "type": "object",
+      "required": ["schema", "kind", "binding", "attachment_generation", "state", "observed_at"],
+      "properties": {
+        "schema": { "$ref": "#/definitions/schema" },
+        "kind": { "$ref": "#/definitions/kind" },
+        "binding": { "$ref": "#/definitions/binding" },
+        "attachment_generation": { "type": "integer", "minimum": 1 },
+        "state": { "enum": ["edge_ready", "detached", "expired"] },
+        "reason": { "type": "string", "maxLength": 128 },
+        "observed_at": { "$ref": "#/definitions/timestamp" }
+      },
+      "additionalProperties": false
+    },
+    "snapshot": {
+      "type": "object",
+      "required": ["schema", "kind", "complete", "admissions", "detachments"],
+      "properties": {
+        "schema": { "$ref": "#/definitions/schema" },
+        "kind": { "$ref": "#/definitions/kind" },
+        "complete": { "const": true },
+        "admissions": { "type": "array", "maxItems": 4096, "items": { "$ref": "#/definitions/admission" } },
+        "detachments": { "type": "array", "maxItems": 4096, "items": { "$ref": "#/definitions/detachment" } }
+      },
+      "additionalProperties": false
+    }
+  }
+}

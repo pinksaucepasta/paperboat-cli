@@ -1,0 +1,30 @@
+{
+  "manifest_version": 1,
+  "contract_version": "1.0.0",
+  "family": "paperboat.telemetry",
+  "status": "approved",
+  "authority": "PREVIEW_TUNNEL_OVERHAUL.md",
+  "artifacts": [
+    {
+      "id": "telemetry.contracts",
+      "path": "contracts.md",
+      "type": "specification",
+      "sha256": "ca79cad314b9925bd11ff2d9582f46f7c6c86da4a0a0e84ebb13dae2a0c8e106",
+      "consumers": ["paperboat", "paperboat-server", "paperboat-tunnel"]
+    },
+    {
+      "id": "telemetry.health",
+      "path": "schemas/health.schema.json",
+      "type": "json-schema",
+      "sha256": "98257101275b0357d103dc4f08d2252c52f8dd00afd2fc458755aadf07b6633a",
+      "consumers": ["paperboat", "paperboat-server", "paperboat-tunnel"]
+    },
+    {
+      "id": "telemetry.health-vectors",
+      "path": "fixtures/health.ndjson",
+      "type": "contract-vectors",
+      "sha256": "c504a814a646d0e5d3fc46ee53d1683d1063babd2ad36c2d72bca25543d43448",
+      "consumers": ["paperboat", "paperboat-server", "paperboat-tunnel"]
+    }
+  ]
+}

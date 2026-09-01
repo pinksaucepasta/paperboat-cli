@@ -44,6 +44,7 @@ func (s ProfileStore) TakeLogoutCredentials(issuer string) (credentials []Creden
 			s.Secrets.Delete(active.RefreshSecretRef),
 			s.DeleteManagedSSHIdentity(active.Issuer, active.CLIClientSessionID),
 			s.DeletePeerEndpointIdentity(active.Issuer, active.CLIClientSessionID),
+			s.deleteEnvironmentManagerIdentityForProfile(active.Issuer, active.Account.ID, active.CLIClientSessionID),
 			s.DeletePeerAccountRoot(active.Issuer, active.Account.ID),
 		)
 		for _, ref := range active.ObsoleteSecretRefs {

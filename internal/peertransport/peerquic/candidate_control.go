@@ -3,9 +3,6 @@ package peerquic
 import (
 	"context"
 	"io"
-	"time"
-
-	"github.com/quic-go/quic-go"
 )
 
 // OpenCandidateControl opens the reserved direct physical-candidate stream.
@@ -26,12 +23,4 @@ func (s *Session) OpenCandidateControl(ctx context.Context, payload []byte) (io.
 		return nil, err
 	}
 	return stream, nil
-}
-
-func candidateControlDeadline(ctx context.Context, stream *quic.Stream) func() {
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = stream.SetDeadline(deadline)
-		return func() { _ = stream.SetDeadline(time.Time{}) }
-	}
-	return func() {}
 }

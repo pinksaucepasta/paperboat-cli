@@ -3,6 +3,7 @@ package networkmonitor
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"math"
 	"net"
@@ -15,6 +16,8 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/portmapping"
 	"tailscale.com/net/netmon"
 )
+
+func testDNSFingerprint(value string) [32]byte { return sha256.Sum256([]byte(value)) }
 
 type fakeNetMonitor struct {
 	mu       sync.Mutex
@@ -202,6 +205,100 @@ func TestMonitorReportsLossOfViabilityWithoutRequestingRebind(t *testing.T) {
 		t.Fatalf("event=%+v", event)
 	}
 	_ = monitor.Close()
+}
+
+func TestMonitorPublishesDNSOnlyFingerprintChanges(t *testing.T) {
+	backend := &fakeNetMonitor{}
+	events := make(chan Event, 2)
+	monitor := newMonitor(backend, func(event Event) { events <- event })
+	var mu sync.Mutex
+	current := testDNSFingerprint("resolver-a")
+	if err := monitor.ConfigureDNS(func(context.Context) ([32]byte, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return current, nil
+	}, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := monitor.CheckDNS(context.Background()); err != nil || changed {
+		t.Fatalf("initial DNS sample changed=%t err=%v", changed, err)
+	}
+	if changed, err := monitor.CheckDNS(context.Background()); err != nil || changed {
+		t.Fatalf("unchanged DNS sample changed=%t err=%v", changed, err)
+	}
+	mu.Lock()
+	current = testDNSFingerprint("resolver-b")
+	mu.Unlock()
+	changed, err := monitor.CheckDNS(context.Background())
+	if err != nil || !changed {
+		t.Fatalf("changed DNS sample changed=%t err=%v", changed, err)
+	}
+	event := <-events
+	if event.Generation != 1 || event.Reasons != ReasonDNS || !event.Rebind || !event.Viable {
+		t.Fatalf("DNS event=%+v", event)
+	}
+	if changed, err := monitor.CheckDNS(context.Background()); err != nil || changed {
+		t.Fatalf("repeated DNS sample changed=%t err=%v", changed, err)
+	}
+	select {
+	case event := <-events:
+		t.Fatalf("duplicate DNS event=%+v", event)
+	default:
+	}
+	if err := monitor.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMonitorDNSFingerprintErrorsFailClosed(t *testing.T) {
+	backend := &fakeNetMonitor{}
+	events := make(chan Event, 1)
+	monitor := newMonitor(backend, func(event Event) { events <- event })
+	wantErr := errors.New("resolver unavailable")
+	if err := monitor.ConfigureDNS(func(context.Context) ([32]byte, error) {
+		return [32]byte{}, wantErr
+	}, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := monitor.CheckDNS(context.Background())
+	if changed || !errors.Is(err, wantErr) {
+		t.Fatalf("error sample changed=%t err=%v", changed, err)
+	}
+	if monitor.generation.Load() != 0 {
+		t.Fatalf("DNS source error consumed generation=%d", monitor.generation.Load())
+	}
+	select {
+	case event := <-events:
+		t.Fatalf("source error emitted event=%+v", event)
+	default:
+	}
+	if err := monitor.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMonitorDNSFingerprintShutdownCancelsSource(t *testing.T) {
+	backend := &fakeNetMonitor{}
+	started := make(chan struct{})
+	monitor := newMonitor(backend, func(Event) {})
+	if err := monitor.ConfigureDNS(func(ctx context.Context) ([32]byte, error) {
+		close(started)
+		<-ctx.Done()
+		return [32]byte{}, ctx.Err()
+	}, time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if err := monitor.Start(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("DNS source was not started")
+	}
+	if err := monitor.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestMonitorPublishesOpaqueStableFingerprintAndErasesSecret(t *testing.T) {

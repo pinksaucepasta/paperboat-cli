@@ -4,16 +4,12 @@ package service
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -27,6 +23,11 @@ const (
 	windowsServiceDeleteTimeout    = 30 * time.Second
 	windowsServiceDeleteDelay      = 500 * time.Millisecond
 	windowsServiceOperationTimeout = 30 * time.Second
+	// Instances are an internal qualification/test seam. Empty instances keep
+	// the one fixed service name used by a normal installation; a non-empty
+	// instance gets a bounded role-prefixed name so an acceptance run cannot
+	// collide with an existing Paperboat service by accident.
+	windowsServiceInstanceMax = 64
 )
 
 type windowsServiceDefinition struct {
@@ -40,25 +41,15 @@ type windowsServiceDefinition struct {
 	Account     string            `json:"account"`
 }
 
-// WindowsPreviewServiceArtifact is the ownership inventory used by preview
-// cleanup. A service without its declaration is deliberately not considered
-// owned: callers must surface that residue instead of deleting an ambiguous
-// SCM entry.
-type WindowsPreviewServiceArtifact struct {
-	Name       string
-	HasService bool
-	// ServiceTerminal is true only when SCM reports durable successful
-	// completion, or when the registration is already marked for deletion.
-	// Callers must not reconcile a descriptor-less service while this is false.
-	ServiceTerminal bool
-	HasDeclaration  bool
-	DeclarationRoot string
-	// DeclarationModifiedAt lets reconciliation preserve a just-created SCM
-	// registration during the descriptor publication/startup window.
-	DeclarationModifiedAt time.Time
+func windowsServiceName(kind, instance string) string {
+	base := windowsServiceBaseNameForKind(kind)
+	if base == "" || instance == "" {
+		return base
+	}
+	return base + "-" + instance
 }
 
-func windowsServiceName(kind, instance string) string {
+func windowsServiceBaseNameForKind(kind string) string {
 	switch kind {
 	case HostdKind:
 		return "PaperboatHostd"
@@ -70,23 +61,30 @@ func windowsServiceName(kind, instance string) string {
 		return "PaperboatRuntimeConfig"
 	case DaemonKind:
 		return "PaperboatLocalDaemon"
-	case PreviewKind:
-		return "PaperboatPreview-" + instance
-	default:
+	case WorkerKind:
 		return "PaperboatRuntime"
+	default:
+		return ""
 	}
 }
 
 func safeWindowsServiceKind(kind, instance string) bool {
-	if kind == PreviewKind {
-		return safeInstance(instance)
+	if windowsServiceBaseNameForKind(kind) == "" {
+		return false
 	}
-	return kind == WorkerKind || kind == HostKind || kind == HostdKind || kind == UpdaterKind || kind == ConfigKind || kind == DaemonKind
-}
-
-func isWindowsPreviewServiceName(name string) bool {
-	const prefix = "PaperboatPreview-"
-	return strings.HasPrefix(name, prefix) && safeInstance(strings.TrimPrefix(name, prefix))
+	if instance == "" {
+		return true
+	}
+	if len(instance) > windowsServiceInstanceMax || instance != strings.TrimSpace(instance) {
+		return false
+	}
+	for _, character := range instance {
+		if character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || character >= '0' && character <= '9' || character == '-' || character == '_' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func windowsServiceNameFromDefinitionPath(path string) (string, error) {
@@ -94,22 +92,53 @@ func windowsServiceNameFromDefinitionPath(path string) (string, error) {
 		return "", ErrInvalidDefinition
 	}
 	name := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-	switch name {
-	case "PaperboatHostd", "PaperboatUpdated", "PaperboatHost", "PaperboatRuntimeConfig", "PaperboatLocalDaemon", "PaperboatRuntime":
-		return name, nil
-	default:
-		if isWindowsPreviewServiceName(name) {
-			return name, nil
-		}
+	if windowsServiceBaseNameFromName(name) == "" {
 		return "", ErrInvalidDefinition
+	}
+	return name, nil
+}
+
+// windowsServiceBaseNameFromName accepts the fixed production names and the
+// same names with one bounded instance suffix. It deliberately does not
+// accept arbitrary SCM names, even when they happen to live under the
+// Paperboat declaration directory.
+func windowsServiceBaseNameFromName(name string) string {
+	for _, base := range []string{
+		"PaperboatHostd", "PaperboatUpdated", "PaperboatHost",
+		"PaperboatRuntimeConfig", "PaperboatLocalDaemon", "PaperboatRuntime",
+	} {
+		if strings.EqualFold(name, base) {
+			return base
+		}
+		prefix := base + "-"
+		if len(name) > len(prefix) && strings.EqualFold(name[:len(prefix)], prefix) {
+			instance := name[len(prefix):]
+			if safeWindowsServiceKind(windowsServiceKindForBaseName(base), instance) {
+				return base
+			}
+		}
+	}
+	return ""
+}
+
+func windowsServiceKindForBaseName(base string) string {
+	switch base {
+	case "PaperboatHostd":
+		return HostdKind
+	case "PaperboatUpdated":
+		return UpdaterKind
+	case "PaperboatHost":
+		return HostKind
+	case "PaperboatRuntimeConfig":
+		return ConfigKind
+	case "PaperboatLocalDaemon":
+		return DaemonKind
+	default:
+		return WorkerKind
 	}
 }
 
 var windowsServiceProbe = probeWindowsService
-
-var windowsServiceList = listWindowsServices
-
-var windowsPreviewServiceTerminalProbe = probeWindowsPreviewServiceTerminal
 
 func probeWindowsService(name string) (owned bool, resultErr error) {
 	manager, err := mgr.Connect()
@@ -131,168 +160,6 @@ func probeWindowsService(name string) (owned bool, resultErr error) {
 		return true, err
 	}
 	return true, nil
-}
-
-func listWindowsServices() (result []string, resultErr error) {
-	manager, err := mgr.Connect()
-	if err != nil {
-		return nil, err
-	}
-	defer func() { resultErr = errors.Join(resultErr, manager.Disconnect()) }()
-	names, err := manager.ListServices()
-	if err != nil {
-		return nil, err
-	}
-	result = make([]string, 0)
-	for _, name := range names {
-		if isWindowsPreviewServiceName(name) {
-			result = append(result, name)
-		}
-	}
-	sort.Strings(result)
-	return result, nil
-}
-
-func probeWindowsPreviewServiceTerminal(name string) (exists bool, terminal bool, resultErr error) {
-	manager, err := mgr.Connect()
-	if err != nil {
-		return false, false, err
-	}
-	defer func() { resultErr = errors.Join(resultErr, manager.Disconnect()) }()
-	service, err := manager.OpenService(name)
-	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
-		return false, false, nil
-	}
-	if errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
-		return true, true, nil
-	}
-	if err != nil {
-		return false, false, err
-	}
-	defer func() { resultErr = errors.Join(resultErr, service.Close()) }()
-	status, err := service.Query()
-	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
-		return false, false, nil
-	}
-	if errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
-		return true, true, nil
-	}
-	if err != nil {
-		return true, false, err
-	}
-	return true, windowsPreviewServiceStatusTerminal(status), nil
-}
-
-func windowsPreviewServiceStatusTerminal(status svc.Status) bool {
-	return status.State == svc.Stopped && status.Win32ExitCode == 0 && status.ServiceSpecificExitCode == 0
-}
-
-func validateWindowsPreviewDeclarationEntry(entry os.DirEntry) error {
-	if !entry.IsDir() {
-		return nil
-	}
-	name := strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name()))
-	if strings.EqualFold(filepath.Ext(entry.Name()), ".json") && isWindowsPreviewServiceName(name) {
-		return fmt.Errorf("preview declaration %s is a directory: %w", entry.Name(), ErrInvalidDefinition)
-	}
-	return nil
-}
-
-// ListWindowsPreviewServiceArtifacts inventories both SCM services and
-// declarations. It is intentionally fail-closed for malformed declarations;
-// an uninstall caller must not silently skip a state it cannot validate.
-func ListWindowsPreviewServiceArtifacts() ([]WindowsPreviewServiceArtifact, error) {
-	serviceNames, err := windowsServiceList()
-	if err != nil {
-		return nil, err
-	}
-	byName := make(map[string]WindowsPreviewServiceArtifact, len(serviceNames))
-	for _, name := range serviceNames {
-		exists, terminal, err := windowsPreviewServiceTerminalProbe(name)
-		if err != nil {
-			return nil, fmt.Errorf("query preview service %s status: %w", name, err)
-		}
-		if exists {
-			byName[name] = WindowsPreviewServiceArtifact{Name: name, HasService: true, ServiceTerminal: terminal}
-		}
-	}
-	entries, err := readWindowsServiceDefinitionEntries()
-	if err != nil {
-		return nil, err
-	}
-	for _, entry := range entries {
-		if err := validateWindowsPreviewDeclarationEntry(entry); err != nil {
-			return nil, err
-		}
-		if entry.IsDir() || !strings.EqualFold(filepath.Ext(entry.Name()), ".json") {
-			continue
-		}
-		name := strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name()))
-		if !isWindowsPreviewServiceName(name) {
-			continue
-		}
-		path := filepath.Join(windowsServiceDefinitionRoot, entry.Name())
-		definition, err := readWindowsServiceDefinitionForRemoval(path)
-		if err != nil {
-			return nil, fmt.Errorf("validate preview declaration %s: %w", entry.Name(), err)
-		}
-		stateRoot, ok := windowsPreviewStateRoot(definition.Arguments)
-		if !ok {
-			return nil, fmt.Errorf("validate preview declaration %s: %w", entry.Name(), ErrInvalidDefinition)
-		}
-		if err := validateWindowsPreviewDefinition(path, name, stateRoot, definition); err != nil {
-			return nil, fmt.Errorf("validate preview declaration %s: %w", entry.Name(), err)
-		}
-		info, err := entry.Info()
-		if err != nil {
-			return nil, fmt.Errorf("stat preview declaration %s: %w", entry.Name(), err)
-		}
-		artifact := byName[name]
-		artifact.Name = name
-		artifact.HasDeclaration = true
-		artifact.DeclarationRoot = stateRoot
-		artifact.DeclarationModifiedAt = info.ModTime().UTC()
-		byName[name] = artifact
-	}
-	result := make([]WindowsPreviewServiceArtifact, 0, len(byName))
-	for _, artifact := range byName {
-		result = append(result, artifact)
-	}
-	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
-	return result, nil
-}
-
-func readWindowsServiceDefinitionEntries() ([]os.DirEntry, error) {
-	info, err := os.Lstat(windowsServiceDefinitionRoot)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return nil, ErrInvalidDefinition
-	}
-	if err := validateWindowsDirectoryNoReparse(windowsServiceDefinitionRoot); err != nil {
-		return nil, err
-	}
-	return os.ReadDir(windowsServiceDefinitionRoot)
-}
-
-func windowsPreviewStateRoot(args []string) (string, bool) {
-	var root string
-	count := 0
-	for index, arg := range args {
-		if arg != "--state-root" {
-			continue
-		}
-		count++
-		if count != 1 || index+1 >= len(args) || args[index+1] == "" {
-			return "", false
-		}
-		root = args[index+1]
-	}
-	return root, count == 1
 }
 
 func validateWindowsDirectoryNoReparse(path string) error {
@@ -401,19 +268,322 @@ func renderWindowsService(config Config) ([]byte, error) {
 // installer; callers cannot pass an arbitrary executable through Apply.
 type WindowsController struct{}
 
-func (WindowsController) Apply(ctx context.Context, definitionPath string, upgrading bool) (resultErr error) {
+func windowsNativeOperationContext(ctx context.Context) (context.Context, context.CancelFunc, error) {
+	if ctx == nil {
+		return nil, nil, ErrLifecycleInvalid
+	}
+	operationCtx, cancel := context.WithTimeout(ctx, windowsServiceOperationTimeout)
+	return operationCtx, cancel, nil
+}
+
+// Inspect reports the SCM registration and process state for the exact
+// declaration path. A registered service without its declaration is returned
+// as native state so NativeTransactionalComponent can fail closed with an
+// uncertain outcome instead of treating the orphan as absent.
+func (WindowsController) Inspect(ctx context.Context, definitionPath string) (NativeControllerStatus, error) {
+	operationCtx, cancel, err := windowsNativeOperationContext(ctx)
+	if err != nil {
+		return NativeControllerStatus{}, err
+	}
+	defer cancel()
+	_ = operationCtx
+	name, err := windowsServiceNameFromDefinitionPath(definitionPath)
+	if err != nil {
+		return NativeControllerStatus{}, err
+	}
+	definition, definitionErr := readWindowsServiceDefinitionForRemoval(definitionPath)
+	if definitionErr != nil && !errors.Is(definitionErr, os.ErrNotExist) {
+		return NativeControllerStatus{}, definitionErr
+	}
+	manager, err := mgr.Connect()
+	if err != nil {
+		return NativeControllerStatus{}, err
+	}
+	defer manager.Disconnect()
+	service, err := manager.OpenService(name)
+	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+		return NativeControllerStatus{}, nil
+	}
+	if errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
+		return NativeControllerStatus{Registered: true}, nil
+	}
+	if err != nil {
+		return NativeControllerStatus{}, err
+	}
+	defer service.Close()
+	config, err := service.Config()
+	if err != nil {
+		return NativeControllerStatus{}, err
+	}
+	if definitionErr == nil && !windowsServiceConfigurationOwnsDefinition(config, definition) {
+		return NativeControllerStatus{}, ErrInvalidDefinition
+	}
+	status, err := service.Query()
+	if err != nil {
+		return NativeControllerStatus{}, err
+	}
+	running := status.State == svc.Running
+	return NativeControllerStatus{
+		Registered: true,
+		Enabled:    config.StartType == mgr.StartAutomatic,
+		Running:    running,
+		Ready:      running,
+	}, nil
+}
+
+// Enable registers or updates the exact declaration as an automatic
+// LocalSystem service but does not start it. Separating enablement from Start
+// lets LifecycleManager journal and roll back each phase independently.
+func (WindowsController) Enable(ctx context.Context, definitionPath string) (resultErr error) {
+	operationCtx, cancel, err := windowsNativeOperationContext(ctx)
+	if err != nil {
+		return err
+	}
+	defer cancel()
 	definition, err := readWindowsServiceDefinition(definitionPath)
 	if err != nil {
 		return err
 	}
-	if isWindowsPreviewServiceName(definition.Name) {
-		stateRoot, ok := windowsPreviewStateRoot(definition.Arguments)
-		if !ok {
-			return ErrInvalidDefinition
-		}
-		if err := validateWindowsPreviewDefinition(definitionPath, definition.Name, stateRoot, definition); err != nil {
+	manager, err := mgr.Connect()
+	if err != nil {
+		return err
+	}
+	defer func() { resultErr = errors.Join(resultErr, manager.Disconnect()) }()
+	service, err := manager.OpenService(definition.Name)
+	existing := err == nil
+	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+		service, err = manager.CreateService(definition.Name, definition.Executable, windowsServiceManagerConfig(definition), definition.Arguments...)
+		if err != nil {
 			return err
 		}
+	} else if err != nil {
+		return err
+	}
+	defer func() { resultErr = errors.Join(resultErr, service.Close()) }()
+	if existing {
+		config, configErr := service.Config()
+		if configErr != nil {
+			return configErr
+		}
+		updated, err := windowsServiceConfigForDefinition(config, definition)
+		if err != nil {
+			return err
+		}
+		if err := service.UpdateConfig(updated); err != nil {
+			return err
+		}
+	}
+	if err := configureWindowsServiceRecovery(service, definition.Name); err != nil {
+		return err
+	}
+	// A successful Enable must have an automatic start declaration. Querying it
+	// before returning catches SCM accepting an incomplete UpdateConfig.
+	config, err := service.Config()
+	if err != nil {
+		return err
+	}
+	if config.StartType != mgr.StartAutomatic || !windowsServiceConfigurationOwnsDefinition(config, definition) {
+		return ErrInvalidDefinition
+	}
+	_ = operationCtx // keeps all future SCM calls on the bounded operation context contract.
+	return nil
+}
+
+// windowsServiceConfigForDefinition is the owned transition boundary used by
+// lifecycle rollback. An SCM entry may still contain the just-failed new
+// declaration, so exact equality with the old declaration is not sufficient.
+// A transition is accepted only for the fixed Paperboat executable, expected
+// role argument, LocalSystem account, and service SID policy; a same-name
+// foreign registration cannot be adopted.
+func windowsServiceConfigForDefinition(current mgr.Config, definition windowsServiceDefinition) (mgr.Config, error) {
+	if !windowsServiceConfigurationOwnsDefinition(current, definition) && !windowsServiceConfigurationTrustedForTransition(current, definition) {
+		return mgr.Config{}, ErrInvalidDefinition
+	}
+	current.BinaryPathName = windows.ComposeCommandLine(append([]string{definition.Executable}, definition.Arguments...))
+	current.DisplayName = definition.DisplayName
+	current.Description = definition.Description
+	current.StartType = mgr.StartAutomatic
+	current.ErrorControl = mgr.ErrorNormal
+	current.ServiceStartName = "LocalSystem"
+	if windowsServiceUsesSID(definition.Name) {
+		current.SidType = windows.SERVICE_SID_TYPE_UNRESTRICTED
+	}
+	return current, nil
+}
+
+func windowsServiceConfigurationTrustedForTransition(config mgr.Config, definition windowsServiceDefinition) bool {
+	if !isWindowsSystemAccount(config.ServiceStartName) || !windowsServiceUsesSID(definition.Name) || config.SidType != windows.SERVICE_SID_TYPE_UNRESTRICTED {
+		return false
+	}
+	arguments, err := windows.DecomposeCommandLine(config.BinaryPathName)
+	if err != nil || len(arguments) != 2 {
+		return false
+	}
+	layout, err := DefaultLayout("windows")
+	if err != nil || !exactWindowsPath(filepath.Clean(arguments[0]), layout.Binary) {
+		return false
+	}
+	wantArgument := windowsServiceRoleArgument(definition.Name)
+	return wantArgument != "" && arguments[1] == wantArgument
+}
+
+func windowsServiceRoleArgument(name string) string {
+	base := windowsServiceBaseNameFromName(name)
+	return map[string]string{
+		"PaperboatHostd":         "__runtime-hostd",
+		"PaperboatUpdated":       "__runtime-updated",
+		"PaperboatLocalDaemon":   "__runtime-local-daemon",
+		"PaperboatHost":          "__runtime-host-service",
+		"PaperboatRuntimeConfig": "__runtime-config",
+	}[base]
+}
+
+func (WindowsController) Disable(ctx context.Context, definitionPath string) (resultErr error) {
+	operationCtx, cancel, err := windowsNativeOperationContext(ctx)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	definition, err := readWindowsServiceDefinitionForRemoval(definitionPath)
+	if err != nil {
+		return err
+	}
+	manager, err := mgr.Connect()
+	if err != nil {
+		return err
+	}
+	defer func() { resultErr = errors.Join(resultErr, manager.Disconnect()) }()
+	service, err := manager.OpenService(definition.Name)
+	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer func() { resultErr = errors.Join(resultErr, service.Close()) }()
+	config, err := service.Config()
+	if err != nil {
+		return err
+	}
+	updated, err := windowsServiceConfigForDefinition(config, definition)
+	if err != nil {
+		return err
+	}
+	updated.StartType = mgr.StartDisabled
+	if err := service.UpdateConfig(updated); err != nil {
+		return err
+	}
+	if operationCtx.Err() != nil {
+		return operationCtx.Err()
+	}
+	return nil
+}
+
+func (WindowsController) Start(ctx context.Context, definitionPath string) error {
+	operationCtx, cancel, err := windowsNativeOperationContext(ctx)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	definition, err := readWindowsServiceDefinition(definitionPath)
+	if err != nil {
+		return err
+	}
+	manager, err := mgr.Connect()
+	if err != nil {
+		return err
+	}
+	defer manager.Disconnect()
+	service, err := manager.OpenService(definition.Name)
+	if err != nil {
+		return err
+	}
+	defer service.Close()
+	config, err := service.Config()
+	if err != nil {
+		return err
+	}
+	if !windowsServiceConfigurationOwnsDefinition(config, definition) || config.StartType == mgr.StartDisabled {
+		return ErrInvalidDefinition
+	}
+	if err := service.Start(); err != nil && !errors.Is(err, windows.ERROR_SERVICE_ALREADY_RUNNING) && !errors.Is(err, windows.ERROR_SERVICE_REQUEST_TIMEOUT) {
+		return err
+	}
+	return waitWindowsService(operationCtx, service, svc.Running)
+}
+
+func (WindowsController) Stop(ctx context.Context, definitionPath string) error {
+	operationCtx, cancel, err := windowsNativeOperationContext(ctx)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	definition, err := readWindowsServiceDefinitionForRemoval(definitionPath)
+	if err != nil {
+		return err
+	}
+	manager, err := mgr.Connect()
+	if err != nil {
+		return err
+	}
+	defer manager.Disconnect()
+	service, err := manager.OpenService(definition.Name)
+	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer service.Close()
+	config, err := service.Config()
+	if err != nil {
+		return err
+	}
+	if !windowsServiceConfigurationOwnsDefinition(config, definition) {
+		return ErrInvalidDefinition
+	}
+	return stopWindowsService(operationCtx, service)
+}
+
+func windowsServiceManagerConfig(definition windowsServiceDefinition) mgr.Config {
+	config := mgr.Config{
+		ServiceType: windows.SERVICE_WIN32_OWN_PROCESS,
+		StartType:   mgr.StartAutomatic, ErrorControl: mgr.ErrorNormal,
+		DisplayName: definition.DisplayName, Description: definition.Description,
+		ServiceStartName: "LocalSystem",
+	}
+	if windowsServiceUsesSID(definition.Name) {
+		config.SidType = windows.SERVICE_SID_TYPE_UNRESTRICTED
+	}
+	return config
+}
+
+func windowsServiceUsesSID(name string) bool {
+	base := windowsServiceBaseNameFromName(name)
+	return base == "PaperboatHostd" || base == "PaperboatUpdated" || base == "PaperboatLocalDaemon"
+}
+
+func configureWindowsServiceRecovery(service *mgr.Service, name string) error {
+	if service == nil {
+		return ErrInvalidDefinition
+	}
+	if !windowsServiceUsesSID(name) {
+		return nil
+	}
+	if err := service.SetRecoveryActions([]mgr.RecoveryAction{
+		{Type: mgr.ServiceRestart, Delay: 5 * time.Second},
+		{Type: mgr.ServiceRestart, Delay: 15 * time.Second},
+		{Type: mgr.ServiceRestart, Delay: time.Minute},
+	}, 24*60*60); err != nil {
+		return err
+	}
+	return service.SetRecoveryActionsOnNonCrashFailures(true)
+}
+
+func (WindowsController) Apply(ctx context.Context, definitionPath string, upgrading bool) (resultErr error) {
+	definition, err := readWindowsServiceDefinition(definitionPath)
+	if err != nil {
+		return err
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -440,7 +610,7 @@ func (WindowsController) Apply(ctx context.Context, definitionPath string, upgra
 			// user workload, so workloads never run as SYSTEM.
 			ServiceStartName: "LocalSystem",
 		}
-		if definition.Name == "PaperboatHostd" || definition.Name == "PaperboatUpdated" || definition.Name == "PaperboatLocalDaemon" {
+		if windowsServiceUsesSID(definition.Name) {
 			config.SidType = windows.SERVICE_SID_TYPE_UNRESTRICTED
 		}
 		service, err = manager.CreateService(definition.Name, definition.Executable, config, definition.Arguments...)
@@ -460,14 +630,13 @@ func (WindowsController) Apply(ctx context.Context, definitionPath string, upgra
 		if configErr != nil {
 			return configErr
 		}
-		current.BinaryPathName = windows.ComposeCommandLine(append([]string{definition.Executable}, definition.Arguments...))
-		current.DisplayName = definition.DisplayName
-		current.Description = definition.Description
-		current.StartType = mgr.StartAutomatic
-		current.ErrorControl = mgr.ErrorNormal
-		current.ServiceStartName = "LocalSystem"
-		if definition.Name == "PaperboatHostd" || definition.Name == "PaperboatUpdated" || definition.Name == "PaperboatLocalDaemon" {
-			current.SidType = windows.SERVICE_SID_TYPE_UNRESTRICTED
+		// Never adopt a same-name registration until its current SCM
+		// declaration proves Paperboat ownership. This path is used by the
+		// standalone Installer.Install compatibility boundary, so the same
+		// collision refusal as Enable is required here too.
+		current, err = windowsServiceConfigForDefinition(current, definition)
+		if err != nil {
+			return err
 		}
 		if err := service.UpdateConfig(current); err != nil {
 			return err
@@ -478,11 +647,10 @@ func (WindowsController) Apply(ctx context.Context, definitionPath string, upgra
 			}
 		}
 	}
-	if definition.Name == "PaperboatHostd" || definition.Name == "PaperboatUpdated" || definition.Name == "PaperboatLocalDaemon" || isWindowsPreviewServiceName(definition.Name) {
+	if windowsServiceUsesSID(definition.Name) {
 		// Owner-scoped workloads run behind a privileged token bridge. If the
 		// enrolled owner logs off or the child fails, SCM retries the bridge with
-		// bounded backoff instead of leaving a LocalSystem workload behind or
-		// permanently losing a durable preview.
+		// bounded backoff instead of leaving a LocalSystem workload behind.
 		if err := service.SetRecoveryActions([]mgr.RecoveryAction{
 			{Type: mgr.ServiceRestart, Delay: 5 * time.Second},
 			{Type: mgr.ServiceRestart, Delay: 15 * time.Second},
@@ -494,7 +662,7 @@ func (WindowsController) Apply(ctx context.Context, definitionPath string, upgra
 			return err
 		}
 	}
-	if definition.Name == "PaperboatHostd" || definition.Name == "PaperboatUpdated" || definition.Name == "PaperboatLocalDaemon" {
+	if windowsServiceUsesSID(definition.Name) {
 		installed, configErr := service.Config()
 		wantPath := windows.ComposeCommandLine(append([]string{definition.Executable}, definition.Arguments...))
 		validIdentity := configErr == nil && strings.EqualFold(installed.BinaryPathName, wantPath) && strings.EqualFold(installed.ServiceStartName, "LocalSystem") && installed.StartType == mgr.StartAutomatic && installed.ErrorControl == mgr.ErrorNormal
@@ -531,12 +699,6 @@ func (WindowsController) Remove(ctx context.Context, definitionPath string) (res
 	}
 	if err != nil {
 		return err
-	}
-	if isWindowsPreviewServiceName(definition.Name) {
-		stateRoot, ok := windowsPreviewStateRoot(definition.Arguments)
-		if !ok || validateWindowsPreviewDefinition(definitionPath, definition.Name, stateRoot, definition) != nil {
-			return ErrInvalidDefinition
-		}
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -636,165 +798,6 @@ func windowsServiceConfigurationOwnsDefinition(config mgr.Config, definition win
 	return strings.EqualFold(config.BinaryPathName, wantPath) && isWindowsSystemAccount(config.ServiceStartName)
 }
 
-func exactWindowsPath(left, right string) bool {
-	return filepath.IsAbs(left) && filepath.IsAbs(right) && filepath.Clean(left) == left && filepath.Clean(right) == right && strings.EqualFold(left, right)
-}
-
-func windowsPreviewInstanceFromName(name string) string {
-	sum := sha256.Sum256([]byte(name))
-	return hex.EncodeToString(sum[:8])
-}
-
-func validateWindowsPreviewArguments(args []string, serviceName, stateRoot, definitionPath string) error {
-	if len(args) < 10 || !safeValues(args) || !isWindowsPreviewServiceName(serviceName) || !validWindowsStateRoot(stateRoot) {
-		return ErrInvalidDefinition
-	}
-	command := args[0]
-	if command != "__runtime-preview" && command != "__runtime-private-preview" && command != "__runtime-serve" {
-		return ErrInvalidDefinition
-	}
-	if args[1] != "--state-root" || !exactWindowsPath(args[2], stateRoot) || args[3] != "--name" || args[4] == "" || args[5] != "--descriptor" || args[7] != "--service-definition" {
-		return ErrInvalidDefinition
-	}
-	instance := windowsPreviewInstanceFromName(args[4])
-	if !strings.EqualFold(serviceName, "PaperboatPreview-"+instance) {
-		return ErrInvalidDefinition
-	}
-	expectedDescriptor := filepath.Join(stateRoot, "previews", "active", instance+".json")
-	if !exactWindowsPath(args[6], expectedDescriptor) || !exactWindowsPath(args[8], definitionPath) {
-		return ErrInvalidDefinition
-	}
-	index := 9
-	if command == "__runtime-preview" {
-		if index+2 > len(args) || args[index] != "--port" {
-			return ErrInvalidDefinition
-		}
-		port, err := strconv.ParseUint(args[index+1], 10, 16)
-		if err != nil || port == 0 {
-			return ErrInvalidDefinition
-		}
-		index += 2
-	}
-	if index >= len(args) {
-		return ErrInvalidDefinition
-	}
-	switch args[index] {
-	case "--indefinite":
-		index++
-	case "--expires-at":
-		if index+2 > len(args) || args[index+1] == "" {
-			return ErrInvalidDefinition
-		}
-		expires, err := time.Parse(time.RFC3339Nano, args[index+1])
-		if err != nil || expires.UTC().Format(time.RFC3339Nano) != args[index+1] {
-			return ErrInvalidDefinition
-		}
-		index += 2
-	default:
-		return ErrInvalidDefinition
-	}
-	if index != len(args) {
-		return ErrInvalidDefinition
-	}
-	return nil
-}
-
-func validateWindowsPreviewDeclarationRoot() error {
-	info, err := os.Lstat(windowsServiceDefinitionRoot)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return ErrInvalidDefinition
-	}
-	return validateWindowsDirectoryNoReparse(windowsServiceDefinitionRoot)
-}
-
-func validateWindowsPreviewDefinition(path, serviceName, stateRoot string, definition windowsServiceDefinition) error {
-	if !isWindowsPreviewServiceName(serviceName) || !validWindowsStateRoot(stateRoot) || !exactWindowsPath(path, filepath.Join(windowsServiceDefinitionRoot, serviceName+".json")) || !strings.EqualFold(definition.Name, serviceName) || !isWindowsSystemAccount(definition.Account) {
-		return ErrInvalidDefinition
-	}
-	layout, err := DefaultLayout("windows")
-	if err != nil || !exactWindowsPath(definition.Executable, layout.Binary) {
-		return errors.Join(ErrInvalidDefinition, err)
-	}
-	if err := validateWindowsExecutable(definition.Executable, true); err != nil {
-		return err
-	}
-	return validateWindowsPreviewArguments(definition.Arguments, serviceName, stateRoot, path)
-}
-
-// ValidateWindowsPreviewServiceOwnership proves that a declaration and its
-// SCM registration both describe the exact Paperboat preview service. It does
-// not mutate either object and is used as the preflight phase for bulk cleanup.
-func ValidateWindowsPreviewServiceOwnership(ctx context.Context, name, stateRoot string) (resultErr error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	_ = ctx
-	if !isWindowsPreviewServiceName(name) || !validWindowsStateRoot(stateRoot) {
-		return ErrInvalidDefinition
-	}
-	if err := validateWindowsPreviewDeclarationRoot(); err != nil {
-		return err
-	}
-	definitionPath := filepath.Join(windowsServiceDefinitionRoot, name+".json")
-	definition, err := readWindowsServiceDefinitionForRemoval(definitionPath)
-	if errors.Is(err, os.ErrNotExist) {
-		exists, probeErr := windowsServiceProbe(name)
-		if probeErr != nil {
-			return probeErr
-		}
-		if exists {
-			return ErrInvalidDefinition
-		}
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	declaredRoot, ok := windowsPreviewStateRoot(definition.Arguments)
-	if !ok || !sameWindowsServicePath(declaredRoot, stateRoot) {
-		return ErrInvalidDefinition
-	}
-	if err := validateWindowsPreviewDefinition(definitionPath, name, stateRoot, definition); err != nil {
-		return err
-	}
-	manager, err := mgr.Connect()
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if manager != nil {
-			resultErr = errors.Join(resultErr, manager.Disconnect())
-		}
-	}()
-	service, err := manager.OpenService(name)
-	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
-		return nil
-	}
-	if errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
-		disconnectErr := manager.Disconnect()
-		manager = nil
-		return errors.Join(disconnectErr, waitWindowsServiceDeletion(ctx, name))
-	}
-	if err != nil {
-		return err
-	}
-	config, configErr := service.Config()
-	closeErr := service.Close()
-	if configErr != nil || closeErr != nil {
-		return errors.Join(configErr, closeErr)
-	}
-	if !windowsServiceConfigurationOwnsDefinition(config, definition) {
-		return ErrInvalidDefinition
-	}
-	return nil
-}
-
 func isWindowsSystemAccount(value string) bool {
 	value = strings.TrimSpace(value)
 	return strings.EqualFold(value, "SYSTEM") || strings.EqualFold(value, "LocalSystem") || strings.EqualFold(value, `NT AUTHORITY\SYSTEM`)
@@ -857,62 +860,8 @@ func pollWindowsServiceDeletion(ctx context.Context, timeout, delay time.Duratio
 	}
 }
 
-// RemoveWindowsPreviewService removes one preview only after its declaration
-// and SCM command both prove ownership of the supplied runtime state root.
-// Missing executables are allowed during this removal-only validation because
-// the declaration and SCM command remain the ownership evidence.
-func RemoveWindowsPreviewService(ctx context.Context, name, stateRoot string) error {
-	if !isWindowsPreviewServiceName(name) || !validWindowsStateRoot(stateRoot) {
-		return ErrInvalidDefinition
-	}
-	if err := ValidateWindowsPreviewServiceOwnership(ctx, name, stateRoot); err != nil {
-		return err
-	}
-	definitionPath := filepath.Join(windowsServiceDefinitionRoot, name+".json")
-	if err := (WindowsController{}).Remove(ctx, definitionPath); err != nil {
-		return err
-	}
-	// The service removal and declaration deletion are separate mutations. The
-	// declaration may have been replaced while SCM was deleting the service,
-	// so prove the exact production declaration again immediately before the
-	// file removal instead of relying on the earlier preflight.
-	if err := ValidateWindowsPreviewServiceOwnership(ctx, name, stateRoot); err != nil {
-		return err
-	}
-	if _, err := readOwnedWindowsPreviewDefinitionForRemoval(definitionPath, name, stateRoot); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return err
-	}
-	if err := os.Remove(definitionPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	if _, err := os.Lstat(windowsServiceDefinitionRoot); errors.Is(err, os.ErrNotExist) {
-		return nil
-	} else if err != nil {
-		return err
-	}
-	return syncServiceDirectory(windowsServiceDefinitionRoot)
-}
-
-func readOwnedWindowsPreviewDefinitionForRemoval(path, name, stateRoot string) (windowsServiceDefinition, error) {
-	definition, err := readWindowsServiceDefinitionForRemoval(path)
-	if err != nil {
-		return windowsServiceDefinition{}, err
-	}
-	if err := validateWindowsPreviewDefinition(path, name, stateRoot, definition); err != nil {
-		return windowsServiceDefinition{}, err
-	}
-	return definition, nil
-}
-
-func validWindowsStateRoot(path string) bool {
-	return filepath.IsAbs(path) && filepath.Clean(path) == path && filepath.VolumeName(path) != ""
-}
-
-func sameWindowsServicePath(left, right string) bool {
-	return validWindowsStateRoot(left) && validWindowsStateRoot(right) && strings.EqualFold(filepath.Clean(left), filepath.Clean(right))
+func exactWindowsPath(left, right string) bool {
+	return filepath.IsAbs(left) && filepath.IsAbs(right) && filepath.Clean(left) == left && filepath.Clean(right) == right && strings.EqualFold(left, right)
 }
 
 func stopWindowsService(ctx context.Context, service *mgr.Service) error {
@@ -977,7 +926,10 @@ func waitWindowsService(ctx context.Context, service *mgr.Service, want svc.Stat
 	}
 }
 
-var _ Controller = WindowsController{}
+var (
+	_ Controller                = WindowsController{}
+	_ NativeLifecycleController = WindowsController{}
+)
 
 func (d windowsServiceDefinition) String() string {
 	return fmt.Sprintf("%s (%s)", d.Name, d.Executable)

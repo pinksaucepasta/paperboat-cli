@@ -4,6 +4,7 @@ package hostinstall
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"os"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/bootstrap"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/releaseindex"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
 )
 
 func TestDecodeRejectsUnknownAndTrailingFields(t *testing.T) {
@@ -78,6 +80,9 @@ func TestPlatformPathsKeepLinuxInstallerStateOutsideSystemdStateDirectory(t *tes
 	if paths.legacyMetadata != filepath.Join(paths.runtimeState, "install-metadata.json") {
 		t.Fatalf("legacy metadata path=%q", paths.legacyMetadata)
 	}
+	if filepath.Dir(paths.environmentCredential) != paths.environmentCredentialDirectory || filepath.Dir(paths.environmentCredentialDirectory) != paths.installerState || filepath.Dir(paths.environmentCredential) == paths.runtimeState {
+		t.Fatalf("encrypted ENV credential is not isolated in root-only installer state: %+v", paths)
+	}
 }
 
 func TestComponentLayoutUsesDedicatedReleaseSlots(t *testing.T) {
@@ -91,6 +96,106 @@ func TestComponentLayoutUsesDedicatedReleaseSlots(t *testing.T) {
 	}
 	if filepath.Dir(layout.BinaryRollback) != layout.ReleasesRoot || filepath.Dir(layout.BinaryStaged) != layout.ReleasesRoot {
 		t.Fatalf("release slots escaped release root: %+v", layout)
+	}
+}
+
+func TestPendingInstallersAllowRecoveryBeforeBinaryPublication(t *testing.T) {
+	request := validRequest(t)
+	root := t.TempDir()
+	paths := installPaths{
+		root:           root,
+		installerState: filepath.Join(root, "installer"),
+		runtimeState:   filepath.Join(root, "runtime"),
+		worker:         filepath.Join(root, "bin", "pb"),
+		workerNext:     filepath.Join(root, "releases", "pb.next"),
+		workerRollback: filepath.Join(root, "releases", "pb.rollback"),
+		workerPrevious: filepath.Join(root, "releases", "pb.previous"),
+		journal:        filepath.Join(root, "installer", "install-journal.json"),
+		metadata:       filepath.Join(root, "installer", "install-metadata.json"),
+		hostdToken:     filepath.Join(root, "runtime", "hostd.token"),
+		hostdSocket:    filepath.Join(root, "runtime", "hostd.sock"),
+		updateState:    filepath.Join(root, "runtime", "updates"),
+	}
+	request.Executable = paths.worker
+	request.StateRoot = paths.runtimeState
+	request.WorkspaceRoot = root
+	if err := os.MkdirAll(filepath.Dir(paths.worker), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := installers(request, paths); !errors.Is(err, service.ErrInvalidDefinition) {
+		t.Fatalf("ordinary installers accepted missing runtime: %v", err)
+	}
+	if _, _, err := pendingInstallers(request, paths); err != nil {
+		t.Fatalf("pending installers rejected recovery boundary: %v", err)
+	}
+}
+
+func TestFinalizeUninstallFailsClosedBeforeRemovingState(t *testing.T) {
+	root := t.TempDir()
+	paths := installPaths{
+		root:           filepath.Join(root, "install"),
+		runtimeState:   filepath.Join(root, "state"),
+		installerState: filepath.Join(root, "installer"),
+		worker:         filepath.Join(root, "install", "pb"),
+		metadata:       filepath.Join(root, "installer", "install-metadata.json"),
+		journal:        filepath.Join(root, "installer", "install-journal.json"),
+	}
+	for _, path := range []string{paths.worker, paths.metadata, filepath.Join(paths.runtimeState, "power-baseline.json")} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("keep"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	serviceErr := errors.New("native service removal failed")
+	powerRestores := 0
+	err := finalizeUninstall(context.Background(), Request{SetupMode: "host"}, paths,
+		func(context.Context) error { return serviceErr },
+		func(context.Context) error { powerRestores++; return nil })
+	if !errors.Is(err, serviceErr) {
+		t.Fatalf("finalize error=%v want=%v", err, serviceErr)
+	}
+	if powerRestores != 0 {
+		t.Fatalf("power restoration ran after service failure: %d", powerRestores)
+	}
+	for _, path := range []string{paths.worker, paths.metadata, filepath.Join(paths.runtimeState, "power-baseline.json")} {
+		body, readErr := os.ReadFile(path)
+		if readErr != nil || string(body) != "keep" {
+			t.Fatalf("state changed for %s: body=%q err=%v", path, body, readErr)
+		}
+	}
+}
+
+func TestFinalizeUninstallFailsClosedBeforeRemovingStateOnPowerRestoreError(t *testing.T) {
+	root := t.TempDir()
+	paths := installPaths{
+		root:           filepath.Join(root, "install"),
+		runtimeState:   filepath.Join(root, "state"),
+		installerState: filepath.Join(root, "installer"),
+		worker:         filepath.Join(root, "install", "pb"),
+		metadata:       filepath.Join(root, "installer", "install-metadata.json"),
+		journal:        filepath.Join(root, "installer", "install-journal.json"),
+	}
+	for _, path := range []string{paths.worker, paths.metadata} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("keep"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	powerErr := errors.New("power baseline restore failed")
+	if err := finalizeUninstall(context.Background(), Request{SetupMode: "host"}, paths,
+		func(context.Context) error { return nil },
+		func(context.Context) error { return powerErr }); !errors.Is(err, powerErr) {
+		t.Fatalf("finalize error=%v want=%v", err, powerErr)
+	}
+	for _, path := range []string{paths.worker, paths.metadata} {
+		body, readErr := os.ReadFile(path)
+		if readErr != nil || string(body) != "keep" {
+			t.Fatalf("state changed for %s: body=%q err=%v", path, body, readErr)
+		}
 	}
 }
 
@@ -232,8 +337,8 @@ func validRequest(t *testing.T) Request {
 		t.Fatal(err)
 	}
 	return Request{
-		SetupMode: "host",
-		Schema:    SchemaV1, Platform: runtime.GOOS, User: account.Username, UID: uid, Group: group.Name, GID: gid,
+		SetupMode: "host", InstallationGeneration: 1,
+		Schema: SchemaV1, Platform: runtime.GOOS, User: account.Username, UID: uid, Group: group.Name, GID: gid,
 		Executable: executable, Artifact: manifest,
 		Home: account.HomeDir, Path: "/usr/bin:/bin", StateRoot: state, WorkspaceRoot: account.HomeDir,
 		ControlURL: "https://control.example.test", UserMachineID: "um_test", Shell: shell,

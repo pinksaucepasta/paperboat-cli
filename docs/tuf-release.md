@@ -69,15 +69,39 @@ Keep TUF private keys out of the repository and runtime machines. Online role ke
 
 Use the signer for the current five-asset repository:
 
+First create and validate the canonical artifact manifest and signed deployment
+policy from the exact five files. The policy revision passed to the signer must
+match the plan's `policy_revision`.
+
 ```sh
+go run ./tools/release-plan manifest \
+  -version YYYY.MM.DD.X \
+  -source-commit <40-or-64-char-commit> \
+  -toolchain go1.26.6 \
+  -artifacts /absolute/path/to/five-assets \
+  -output /absolute/path/to/manifest.json
+
+go run ./tools/release-plan plan \
+  -manifest /absolute/path/to/manifest.json \
+  -policy-revision 1 \
+  -severity routine \
+  -cohort-seed release-YYYY.MM.DD.X \
+  -output /absolute/path/to/deployment-plan.json
+
+go run ./tools/release-plan validate \
+  -manifest /absolute/path/to/manifest.json \
+  -plan /absolute/path/to/deployment-plan.json \
+  -artifacts /absolute/path/to/five-assets
+
 paperboat-tuf publish \
   -repository /Users/pujan.pm/.local/share/paperboat-release/tuf-production \
   -version YYYY.MM.DD.X \
   -artifacts /absolute/path/to/five-assets \
+  -manifest /absolute/path/to/manifest.json \
+  -deployment-plan /absolute/path/to/deployment-plan.json \
   -windows-amd64-native-evidence /absolute/path/to/windows-amd64-native-qualification.json \
   -windows-arm64-native-evidence /absolute/path/to/windows-arm64-native-qualification.json \
   -rollout-revision 1 \
-  -percentage 100 \
   -severity routine
 
 paperboat-tuf verify-published \
@@ -85,5 +109,12 @@ paperboat-tuf verify-published \
 ```
 
 `refresh`, `promote`, `pause`, and `quarantine` update signed TUF metadata only. Review and publish the complete metadata directory atomically. The origin remains metadata-only.
+
+`promote`, `pause`, and `quarantine` mutate the single signed deployment policy
+and require a strictly higher policy revision. `promote` may widen eligible
+cohorts and sets `rollout_state=active`; `pause` sets `paused`; and `quarantine`
+sets `quarantined`. Automatic consumers are eligible only while the signed
+state is active. The quarantine command does not use the release index's
+cryptographic revocation flag.
 
 Before publication, verify that the GitHub release contains exactly the five expected asset names, that every URL in `current.json` and TUF points to that release, and that the origin's TUF target directory is empty.

@@ -109,6 +109,7 @@ tar -xzf "$bundle" -C "$next" --no-same-owner --no-same-permissions
 [[ -z "$(find "$next" -type l -print -quit)" ]] || { echo "staged release contains a symlink" >&2; exit 1; }
 
 python3 - "$next/current.json" "$next/tuf/metadata/targets.json" "$version" <<'PY'
+import hashlib
 import json, pathlib, re, sys
 path = pathlib.Path(sys.argv[1])
 value = json.loads(path.read_text())
@@ -214,6 +215,31 @@ for name, (platform, architecture, format_) in expected.items():
         "binary_format": format_,
     }.items():
         require_equal(index_target.get(key), wanted, f"TUF release index target does not match current.json for {name}: {key}")
+
+    # These fields are mandatory in the current release-index contract. A
+    # missing or null value is not a usable policy and must never cross the
+    # final pre-exchange boundary.
+    manifest_sha256 = release_index.get("manifest_sha256")
+    if not isinstance(manifest_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", manifest_sha256):
+        raise SystemExit(f"TUF release index manifest digest is invalid for {name}")
+    deployment_plan_sha256 = release_index.get("deployment_plan_sha256")
+    if not isinstance(deployment_plan_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", deployment_plan_sha256):
+        raise SystemExit(f"TUF release index deployment-plan digest is invalid for {name}")
+    deployment_plan = release_index.get("deployment_plan")
+    if not isinstance(deployment_plan, dict):
+        raise SystemExit(f"TUF release index deployment plan is missing for {name}")
+    if deployment_plan.get("schema") != "paperboat.release-deployment/v1" or deployment_plan.get("version") != version or deployment_plan.get("manifest_sha256") != manifest_sha256:
+        raise SystemExit(f"TUF release index deployment plan binding is invalid for {name}")
+    expected_plan_fields = {
+        "schema", "version", "manifest_sha256", "channel", "rollout_state", "severity",
+        "policy_revision", "cohort_seed", "cohorts", "canary", "activation",
+        "security_deferral", "rollback",
+    }
+    if set(deployment_plan) != expected_plan_fields:
+        raise SystemExit(f"TUF release index deployment plan is incomplete for {name}")
+    plan_bytes = (json.dumps(deployment_plan, separators=(",", ":"), ensure_ascii=True) + "\n").encode()
+    if hashlib.sha256(plan_bytes).hexdigest() != deployment_plan_sha256:
+        raise SystemExit(f"TUF release index deployment-plan digest does not match for {name}")
 PY
 
 for required in install windows tuf/metadata/root.json tuf/metadata/targets.json tuf/metadata/snapshot.json tuf/metadata/timestamp.json; do

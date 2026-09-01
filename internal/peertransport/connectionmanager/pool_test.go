@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"math"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -479,129 +478,10 @@ type promotionAwareConnection struct {
 
 func (c *promotionAwareConnection) PromoteStreams() { close(c.promoted) }
 
-type checkedPromotionConnection struct {
-	*fakeConnection
-	err          error
-	checkedCalls atomic.Uint64
-	asyncCalls   chan struct{}
-}
-
-type abortingCheckedPromotionConnection struct {
-	*checkedPromotionConnection
-	aborted chan error
-}
-
-func (c *abortingCheckedPromotionConnection) AbortApplications(err error) { c.aborted <- err }
-
-func (c *checkedPromotionConnection) PromoteStreamsChecked() error {
-	c.checkedCalls.Add(1)
-	return c.err
-}
-
-func (c *checkedPromotionConnection) PromoteStreams() { c.asyncCalls <- struct{}{} }
-
-func legacyTestPoolRejectsRecoveryWhenLogicalStreamPromotionFails(t *testing.T) {
-	pool, _ := NewPool(testRacer(t, newFakeConnector()), DevelopmentPoolConfig())
-	promotionErr := errors.New("logical stream attachment failed")
-	current := &checkedPromotionConnection{fakeConnection: &fakeConnection{}, err: promotionErr, asyncCalls: make(chan struct{}, 1)}
-	recovery := &fakeConnection{}
-	previous := &managedConnection{selection: Selection{Generation: 4, Path: PathWSS, Connection: current}, applicationLeases: 1}
-	pool.classes[peerquic.ClassInteractive] = &classState{generation: 4, selected: previous}
-
-	err := pool.PromoteRelayQUIC(peerquic.ClassInteractive, recovery)
-	if !errors.Is(err, promotionErr) {
-		t.Fatalf("promotion error=%v", err)
-	}
-	state := pool.classes[peerquic.ClassInteractive]
-	if current.checkedCalls.Load() != 1 || state.selected != previous || state.selected.selection.Connection != current || state.selected.selection.Path != PathWSS {
-		t.Fatalf("checked calls=%d state=%+v", current.checkedCalls.Load(), state)
-	}
-	if current.closeCount() != 0 || recovery.closeCount() != 1 {
-		t.Fatalf("current closes=%d recovery closes=%d", current.closeCount(), recovery.closeCount())
-	}
-	select {
-	case <-current.asyncCalls:
-		t.Fatal("rejected recovery triggered a second asynchronous logical stream promotion")
-	case <-time.After(10 * time.Millisecond):
-	}
-	_ = pool.Close()
-}
-
 type standbyAwareConnection struct {
 	*fakeConnection
 	mu       sync.Mutex
 	standbys []Connection
-}
-
-type orderedStandbyPromotion struct {
-	*standbyAwareConnection
-	promoted chan struct{}
-}
-
-func (c *orderedStandbyPromotion) PromoteStreamsChecked() error {
-	c.mu.Lock()
-	calls := len(c.standbys)
-	c.mu.Unlock()
-	if calls != 0 {
-		return errors.New("replacement standby published before ready carrier promotion")
-	}
-	close(c.promoted)
-	return nil
-}
-
-func (c *orderedStandbyPromotion) PromoteStreams() {}
-
-func legacyTestPoolPublishesReplacementStandbyAfterLogicalStreamPromotion(t *testing.T) {
-	pool, _ := NewPool(testRacer(t, newFakeConnector()), DevelopmentPoolConfig())
-	owner := &orderedStandbyPromotion{standbyAwareConnection: &standbyAwareConnection{fakeConnection: &fakeConnection{}}, promoted: make(chan struct{})}
-	relay := &standbyAwareConnection{fakeConnection: &fakeConnection{}}
-	wss := &fakeConnection{}
-	state := &classState{generation: 4,
-		selected:  &managedConnection{selection: Selection{Generation: 4, Path: PathDirectQUIC, Connection: owner}, applicationLeases: 1},
-		standby:   &managedConnection{selection: Selection{Generation: 4, Path: PathRelayQUIC, Connection: relay}},
-		secondary: &managedConnection{selection: Selection{Generation: 4, Path: PathWSS, Connection: wss}},
-	}
-	pool.classes[peerquic.ClassInteractive] = state
-	pool.mu.Lock()
-	pool.failHealthLocked(peerquic.ClassInteractive, state.selected)
-	pool.mu.Unlock()
-	select {
-	case <-owner.promoted:
-	case <-time.After(time.Second):
-		t.Fatal("logical stream promotion did not run")
-	}
-	deadline := time.Now().Add(time.Second)
-	for relay.lastStandby() != wss && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if relay.lastStandby() != wss {
-		t.Fatal("replacement WSS standby was not published after promotion")
-	}
-	_ = pool.Close()
-}
-
-func legacyTestPoolPublishesUpgradeStandbyAfterLogicalStreamPromotion(t *testing.T) {
-	pool, _ := NewPool(testRacer(t, newFakeConnector()), DevelopmentPoolConfig())
-	relay := &orderedStandbyPromotion{standbyAwareConnection: &standbyAwareConnection{fakeConnection: &fakeConnection{}}, promoted: make(chan struct{})}
-	direct := &standbyAwareConnection{fakeConnection: &fakeConnection{}}
-	wss := &fakeConnection{}
-	state := &classState{generation: 4,
-		selected: &managedConnection{selection: Selection{Generation: 4, Path: PathRelayQUIC, Connection: relay}, applicationLeases: 1},
-		standby:  &managedConnection{selection: Selection{Generation: 4, Path: PathWSS, Connection: wss}},
-	}
-	pool.classes[peerquic.ClassInteractive] = state
-	if err := pool.PromoteDirect(peerquic.ClassInteractive, direct); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-relay.promoted:
-	default:
-		t.Fatal("logical stream promotion did not run")
-	}
-	if direct.lastStandby() != relay {
-		t.Fatal("relay standby was not published to direct after promotion")
-	}
-	_ = pool.Close()
 }
 
 func (c *standbyAwareConnection) SetStandby(value Connection) {
@@ -617,47 +497,6 @@ func (c *standbyAwareConnection) lastStandby() Connection {
 		return nil
 	}
 	return c.standbys[len(c.standbys)-1]
-}
-
-func legacyTestPoolDirectPromotionMovesActiveLogicalStreams(t *testing.T) {
-	pool, _ := NewPool(testRacer(t, newFakeConnector()), DevelopmentPoolConfig())
-	relay := &promotionAwareConnection{fakeConnection: &fakeConnection{}, promoted: make(chan struct{})}
-	pool.classes[peerquic.ClassInteractive] = &classState{generation: 4, selected: &managedConnection{selection: Selection{Generation: 4, Path: PathRelayQUIC, Connection: relay}, applicationLeases: 1}}
-	if err := pool.PromoteDirect(peerquic.ClassInteractive, &fakeConnection{}); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-relay.promoted:
-	case <-time.After(time.Second):
-		t.Fatal("active logical streams were not notified of direct recovery")
-	}
-	_ = pool.Close()
-}
-
-func legacyTestPoolDirectPromotionStartsHealthForTransferredApplicationLease(t *testing.T) {
-	health := newPoolHealthRunner()
-	pool, _ := NewPool(testRacer(t, newFakeConnector()), PoolConfig{IdleGrace: time.Minute, Health: health, HealthTransport: poolHealthFactory})
-	relay := &fakeConnection{}
-	direct := &fakeConnection{}
-	pool.classes[peerquic.ClassInteractive] = &classState{generation: 4, selected: &managedConnection{selection: Selection{Generation: 4, Path: PathRelayQUIC, Connection: relay}, applicationLeases: 1}}
-	if err := pool.PromoteDirect(peerquic.ClassInteractive, direct); err != nil {
-		t.Fatal(err)
-	}
-	runs := map[Path]*poolHealthRun{}
-	for range 2 {
-		run := health.next(t)
-		runs[run.binding.Path] = run
-	}
-	for _, path := range []Path{PathDirectQUIC, PathRelayQUIC} {
-		run := runs[path]
-		if run == nil || run.binding.Generation != 5 {
-			t.Fatalf("health path=%v run=%+v", path, run)
-		}
-	}
-	_ = pool.Close()
-	for _, run := range runs {
-		run.assertCanceled(t)
-	}
 }
 
 func TestPoolRejectsIneligibleProbeWithoutTakingOwnership(t *testing.T) {
@@ -1769,66 +1608,6 @@ func TestPoolRetireSelectedPromotesWarmRelayWithoutReconnect(t *testing.T) {
 	_ = pool.Close()
 }
 
-func legacyTestPoolPromotesDirectToRelayToWSSWithoutLosingLease(t *testing.T) {
-	direct := &promotionAwareConnection{fakeConnection: &fakeConnection{}, promoted: make(chan struct{})}
-	relay := &promotionAwareConnection{fakeConnection: &fakeConnection{}, promoted: make(chan struct{})}
-	wss := &fakeConnection{}
-	state := &classState{
-		generation: 1,
-		selected:   &managedConnection{selection: Selection{Generation: 1, Path: PathDirectQUIC, Connection: direct}, applicationLeases: 1},
-		standby:    &managedConnection{selection: Selection{Generation: 1, Path: PathRelayQUIC, Connection: relay}},
-		secondary:  &managedConnection{selection: Selection{Generation: 1, Path: PathWSS, Connection: wss}},
-	}
-	pool := &Pool{classes: map[peerquic.Class]*classState{peerquic.ClassInteractive: state}, changes: make(chan struct{}, 1)}
-	if !pool.Retire(peerquic.ClassInteractive, direct) {
-		t.Fatal("direct retirement did not promote relay")
-	}
-	if state.selected == nil || state.selected.selection.Connection != relay || state.selected.applicationLeases != 1 || state.standby == nil || state.standby.selection.Connection != wss || state.secondary != nil {
-		t.Fatalf("after direct promotion: %+v", state)
-	}
-	select {
-	case <-direct.promoted:
-	case <-time.After(time.Second):
-		t.Fatal("direct streams were not notified of relay promotion")
-	}
-	if !pool.Retire(peerquic.ClassInteractive, relay) {
-		t.Fatal("relay retirement did not promote WSS")
-	}
-	if state.selected == nil || state.selected.selection.Connection != wss || state.selected.applicationLeases != 1 || state.standby != nil {
-		t.Fatalf("after relay promotion: %+v", state)
-	}
-	select {
-	case <-relay.promoted:
-	case <-time.After(time.Second):
-		t.Fatal("relay streams were not notified of WSS promotion")
-	}
-}
-
-func legacyTestPoolPromotesLateRelayFutureOverWSSAndRetainsFallback(t *testing.T) {
-	wss := &promotionAwareConnection{fakeConnection: &fakeConnection{}, promoted: make(chan struct{})}
-	relay := &fakeConnection{}
-	state := &classState{
-		generation: 1,
-		selected:   &managedConnection{selection: Selection{Generation: 1, Path: PathWSS, Connection: wss}, applicationLeases: 2},
-	}
-	pool := &Pool{classes: map[peerquic.Class]*classState{peerquic.ClassInteractive: state}, changes: make(chan struct{}, 1)}
-	future := make(chan StandbyResult, 1)
-	pool.adoptStandbyFutureLocked(peerquic.ClassInteractive, state, future)
-	future <- StandbyResult{Selection: Selection{Generation: 1, Path: PathRelayQUIC, Connection: relay}}
-	close(future)
-
-	select {
-	case <-wss.promoted:
-	case <-time.After(time.Second):
-		t.Fatal("WSS streams were not promoted to late relay QUIC")
-	}
-	pool.mu.Lock()
-	defer pool.mu.Unlock()
-	if state.selected == nil || state.selected.selection.Path != PathRelayQUIC || state.selected.selection.Connection != relay || state.selected.applicationLeases != 2 || state.standby == nil || state.standby.selection.Path != PathWSS || state.standby.selection.Connection != wss || state.standby.applicationLeases != 0 || wss.closeCount() != 0 {
-		t.Fatalf("state=%+v WSS_closes=%d", state, wss.closeCount())
-	}
-}
-
 func TestPoolRetainsCanonicalWSSAcrossRelayAndDirectPromotion(t *testing.T) {
 	wss := &standbyAwareConnection{fakeConnection: &fakeConnection{}}
 	relay := &standbyAwareConnection{fakeConnection: &fakeConnection{}}
@@ -1865,121 +1644,6 @@ func TestPoolRetainsCanonicalWSSAcrossRelayAndDirectPromotion(t *testing.T) {
 	}
 	if direct.lastStandby() != relay || wss.closeCount() != 0 || relay.closeCount() != 0 {
 		t.Fatalf("direct fallback=%p relay=%p closes relay=%d WSS=%d", direct.lastStandby(), relay, relay.closeCount(), wss.closeCount())
-	}
-}
-
-func legacyTestPoolRejectsLateFutureUpgradeWhenLogicalStreamPromotionFails(t *testing.T) {
-	promotionErr := errors.New("logical stream attachment failed")
-	wss := &checkedPromotionConnection{fakeConnection: &fakeConnection{}, err: promotionErr, asyncCalls: make(chan struct{}, 1)}
-	relay := &fakeConnection{}
-	state := &classState{
-		generation: 1,
-		selected:   &managedConnection{selection: Selection{Generation: 1, Path: PathWSS, Connection: wss}, applicationLeases: 2},
-	}
-	pool := &Pool{classes: map[peerquic.Class]*classState{peerquic.ClassInteractive: state}, changes: make(chan struct{}, 1), networkGeneration: 1}
-	future := make(chan StandbyResult, 1)
-	pool.adoptStandbyFutureLocked(peerquic.ClassInteractive, state, future)
-	future <- StandbyResult{Selection: Selection{Generation: 1, Path: PathRelayQUIC, Connection: relay}}
-	close(future)
-
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		pool.mu.Lock()
-		selected := state.selected
-		pool.mu.Unlock()
-		if wss.checkedCalls.Load() == 1 && relay.closeCount() > 0 {
-			if selected == nil || selected.selection.Connection != wss || selected.selection.Path != PathWSS || selected.applicationLeases != 2 {
-				t.Fatalf("failed future changed selected state: %+v", state)
-			}
-			return
-		}
-		time.Sleep(time.Millisecond)
-	}
-	t.Fatalf("checked_calls=%d relay_closes=%d state=%+v", wss.checkedCalls.Load(), relay.closeCount(), state)
-}
-
-func legacyTestPoolAbortsApplicationsWhenFailedPrimaryCannotPromoteStandby(t *testing.T) {
-	promotionErr := errors.New("logical stream attachment failed")
-	direct := &abortingCheckedPromotionConnection{checkedPromotionConnection: &checkedPromotionConnection{fakeConnection: &fakeConnection{}, err: promotionErr, asyncCalls: make(chan struct{}, 1)}, aborted: make(chan error, 1)}
-	relay := &fakeConnection{}
-	state := &classState{
-		generation: 1,
-		selected:   &managedConnection{selection: Selection{Generation: 1, Path: PathDirectQUIC, Connection: direct}, applicationLeases: 1},
-		standby:    &managedConnection{selection: Selection{Generation: 1, Path: PathRelayQUIC, Connection: relay}},
-	}
-	pool := &Pool{classes: map[peerquic.Class]*classState{peerquic.ClassInteractive: state}, changes: make(chan struct{}, 8), networkGeneration: 1}
-	if !pool.Retire(peerquic.ClassInteractive, direct) {
-		t.Fatal("failed primary was not retired")
-	}
-	select {
-	case err := <-direct.aborted:
-		if !errors.Is(err, promotionErr) || !errors.Is(err, ErrApplicationPromotion) {
-			t.Fatalf("abort error=%v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("failed fallback promotion did not abort applications")
-	}
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		pool.mu.Lock()
-		selected := state.selected
-		pool.mu.Unlock()
-		if selected == nil || selected.selection.Connection != relay {
-			return
-		}
-		time.Sleep(time.Millisecond)
-	}
-	t.Fatalf("failed fallback remained selected: %+v", state)
-}
-
-func legacyTestAutoFirstReadyConvergesWSSRelayDirectWithinOneGeneration(t *testing.T) {
-	connector := newFakeConnector()
-	pool, err := NewPool(testRacer(t, connector), DevelopmentPoolConfig())
-	if err != nil {
-		t.Fatal(err)
-	}
-	leaseResult := make(chan *Lease, 1)
-	go func() {
-		lease, _ := pool.Acquire(context.Background(), peerquic.ClassInteractive, ModeAuto, NetworkUnknown)
-		leaseResult <- lease
-	}()
-	seen := make(map[Path]bool, 3)
-	for range 3 {
-		seen[receiveAttempt(t, connector.started).Path] = true
-	}
-	if !seen[PathDirectQUIC] || !seen[PathRelayQUIC] || !seen[PathWSS] {
-		t.Fatalf("initial attempts=%v", seen)
-	}
-	wss := &promotionAwareConnection{fakeConnection: &fakeConnection{}, promoted: make(chan struct{})}
-	connector.results[PathWSS] <- connectResult{connection: wss}
-	lease := <-leaseResult
-	if lease == nil || lease.Connection != wss || lease.Path != PathWSS || lease.Generation != 1 {
-		t.Fatalf("first lease=%+v", lease)
-	}
-	relay := &promotionAwareConnection{fakeConnection: &fakeConnection{}, promoted: make(chan struct{})}
-	connector.results[PathRelayQUIC] <- connectResult{connection: relay}
-	select {
-	case <-wss.promoted:
-	case <-time.After(time.Second):
-		t.Fatal("WSS stream was not promoted to relay QUIC")
-	}
-	direct := &fakeConnection{}
-	connector.results[PathDirectQUIC] <- connectResult{connection: direct}
-	select {
-	case <-relay.promoted:
-	case <-time.After(time.Second):
-		t.Fatal("relay stream was not promoted to direct QUIC")
-	}
-	pool.mu.Lock()
-	state := pool.classLocked(peerquic.ClassInteractive)
-	if state.generation != 1 || state.selected == nil || state.selected.selection.Connection != direct || state.selected.applicationLeases != 1 || state.standby == nil || state.standby.selection.Connection != relay || state.secondary == nil || state.secondary.selection.Connection != wss {
-		pool.mu.Unlock()
-		t.Fatalf("converged state=%+v", state)
-	}
-	pool.mu.Unlock()
-	lease.Release()
-	if err := pool.Close(); err != nil {
-		t.Fatal(err)
 	}
 }
 

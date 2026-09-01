@@ -113,7 +113,7 @@ func windowsPathJoin(elements ...string) string {
 	result := ""
 	for _, element := range elements {
 		if result == "" {
-			result = strings.TrimRight(element, `\\`)
+			result = strings.TrimRight(element, `\`)
 			continue
 		}
 		result += `\` + strings.Trim(element, `\`)
@@ -135,9 +135,4 @@ func withinForPlatform(platform, root, value string) bool {
 
 func pathpkgIsCleanAbsolute(value string) bool {
 	return path.IsAbs(value) && path.Clean(value) == value
-}
-
-func within(root, path string) bool {
-	relative, err := filepath.Rel(root, path)
-	return err == nil && relative != "." && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
 }

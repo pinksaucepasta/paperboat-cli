@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/releaseindex"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/releasepolicy"
 	"github.com/sigstore/sigstore/pkg/signature"
 	"github.com/theupdateframework/go-tuf/v2/metadata"
 )
@@ -62,12 +63,21 @@ func newTestTUFRepository(t *testing.T, body []byte, version string, expires tim
 		format = "pkg"
 	}
 	repository := "pinksaucepasta/paperboat-cli"
+	manifest := strings.Repeat("b", 64)
+	plan, err := releasepolicy.Default(version, manifest, 1, "routine", "release-"+version, []releasepolicy.PlatformTarget{{Platform: runtime.GOOS, Architecture: runtime.GOARCH}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	planDigest, err := plan.PlanSHA256()
+	if err != nil {
+		t.Fatal(err)
+	}
 	index := releaseindex.Index{
 		Schema: releaseindex.SchemaV1, ReleaseID: "rel_" + version, Version: version, Channel: "stable", Severity: "routine",
 		CreatedAt: time.Now().UTC(), Platform: runtime.GOOS, Architecture: runtime.GOARCH, BinaryFormat: format,
 		Targets:     []releaseindex.Target{{Component: "pb", TargetPath: targetPath, AssetName: targetPath, Repository: repository, DownloadURL: "https://github.com/" + repository + "/releases/download/" + version + "/" + targetPath, SHA256: hex.EncodeToString(digestBytes[:]), Length: int64(len(body)), Platform: runtime.GOOS, Architecture: runtime.GOARCH, BinaryFormat: format}},
-		HostdAPIMin: 1, HostdAPIMax: 2, RuntimeAPIMin: 1, RuntimeAPIMax: 2, RolloutPolicyRevision: 1,
-		Rollout: releaseindex.Rollout{Schema: releaseindex.RolloutSchemaV1, CohortSeed: "release-" + version, Percentage: 100},
+		HostdAPIMin: 1, HostdAPIMax: 2, RuntimeAPIMin: 1, RuntimeAPIMax: 2, RolloutPolicyRevision: plan.PolicyRevision,
+		ManifestSHA256: manifest, DeploymentPlanSHA256: planDigest, DeploymentPlan: &plan,
 	}
 	custom, _ := json.Marshal(tufAssetCustom{Schema: "paperboat.tuf-asset/v1", Kind: "github-release-asset", Version: version, Platform: runtime.GOOS, Architecture: runtime.GOARCH, Format: format, AssetName: targetPath, Repository: repository, URL: index.Targets[0].DownloadURL, SHA256: hex.EncodeToString(digestBytes[:]), Length: int64(len(body)), ReleaseIndex: index})
 	raw := json.RawMessage(custom)
@@ -353,15 +363,6 @@ func TestFetchVerifiedReleaseComponentRejectsMissingTargetMetadata(t *testing.T)
 	}
 }
 
-func marshalJSON(t *testing.T, value any) []byte {
-	t.Helper()
-	raw, err := json.Marshal(value)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return raw
-}
-
 func newTestReleaseComponentRepositoryWithoutTargets(t *testing.T) testTUFRepository {
 	t.Helper()
 	keys := map[string]ed25519.PrivateKey{}
@@ -428,10 +429,19 @@ func newTestReleaseComponentRepositoryWithoutTargets(t *testing.T) testTUFReposi
 func testLinuxReleaseIndex() releaseindex.Index {
 	name := releaseindex.AssetName("linux", "amd64")
 	targets := []releaseindex.Target{{Component: "pb", TargetPath: name, AssetName: name, Repository: "pinksaucepasta/paperboat-cli", DownloadURL: "https://github.com/pinksaucepasta/paperboat-cli/releases/download/2026.08.22.22/" + name, SHA256: fmt.Sprintf("%064x", 1), Length: 1, Platform: "linux", Architecture: "amd64", BinaryFormat: "elf"}}
+	manifest := strings.Repeat("b", 64)
+	plan, err := releasepolicy.Default("2026.08.22.22", manifest, 1, "routine", "release-2026.08.22.22", []releasepolicy.PlatformTarget{{Platform: "linux", Architecture: "amd64"}})
+	if err != nil {
+		panic(err)
+	}
+	planDigest, err := plan.PlanSHA256()
+	if err != nil {
+		panic(err)
+	}
 	return releaseindex.Index{
 		Schema: releaseindex.SchemaV1, ReleaseID: "rel_2026.08.22.22", Version: "2026.08.22.22", Channel: "stable", Severity: "routine",
 		CreatedAt: time.Now().UTC(), Platform: "linux", Architecture: "amd64", BinaryFormat: "elf", Targets: targets,
-		HostdAPIMin: 1, HostdAPIMax: 2, RuntimeAPIMin: 1, RuntimeAPIMax: 2, RolloutPolicyRevision: 1,
-		Rollout: releaseindex.Rollout{Schema: releaseindex.RolloutSchemaV1, CohortSeed: "release-2026.08.22.22", Percentage: 100},
+		HostdAPIMin: 1, HostdAPIMax: 2, RuntimeAPIMin: 1, RuntimeAPIMax: 2, RolloutPolicyRevision: plan.PolicyRevision,
+		ManifestSHA256: manifest, DeploymentPlanSHA256: planDigest, DeploymentPlan: &plan,
 	}
 }

@@ -20,17 +20,12 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/execprocess"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/health"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/operation"
-	"github.com/pinksaucepasta/paperboat/internal/hostruntime/preview"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/process"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/protocol"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/pty"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/session"
 	"github.com/pinksaucepasta/paperboat/internal/managedssh"
 )
-
-type healthyProber struct{}
-
-func (healthyProber) Probe(context.Context, preview.Target) error { return nil }
 
 type testSessionLauncher struct {
 	sessions *session.Manager
@@ -355,15 +350,11 @@ func verticalServerCommand(t *testing.T, shellArgs []string) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	previews, err := preview.New(preview.Config{Prober: healthyProber{}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	readiness := health.New("test", []string{"terminal.v1", "health.v1", "preview.public.v1"}, nil)
+	readiness := health.New("test", []string{"terminal.v1", "health.v1"}, nil)
 	readiness.Set("terminal.v1", health.Ready, "", 0)
 	readiness.Set("health.v1", health.Ready, "", 0)
 	dispatcher, err := NewDispatcher(DispatcherConfig{
-		Sessions: sessions, Previews: previews, Health: readiness,
+		Sessions: sessions, Health: readiness,
 		SessionLauncher: testSessionLauncher{sessions: sessions, args: shellArgs}, WorkspaceRoot: root,
 		Random: bytes.NewReader(bytes.Repeat([]byte{1}, 256)),
 	})
@@ -372,7 +363,7 @@ func verticalServerCommand(t *testing.T, shellArgs []string) *Server {
 	}
 	journal, _ := operation.NewJournal(32)
 	server, err := New(Config{
-		Negotiator: protocol.Negotiator{Profile: config.BYOD, Available: map[string]bool{"terminal.v1": true, "health.v1": true, "preview.public.v1": true}},
+		Negotiator: protocol.Negotiator{Profile: config.BYOD, Available: map[string]bool{"terminal.v1": true, "health.v1": true}},
 		Journal:    journal,
 		Authorizer: authorizerFunc(func(context.Context, protocol.Frame) (Authorization, error) {
 			return Authorization{JournalBinding: "env:env_test_01:user:usr_1", EnvironmentID: "env_test_01", UserID: "usr_1", ClientID: "cli_1", ResourceID: "p-abcdefghijklmnopqrstuvwxyz"}, nil
@@ -533,7 +524,7 @@ func TestAttachLargeReplayUsesBinaryStreamNotStructuredResponse(t *testing.T) {
 	_ = client.Close()
 }
 
-func TestVerticalFramedTerminalPreviewAndReadiness(t *testing.T) {
+func TestVerticalFramedTerminalAndReadiness(t *testing.T) {
 	if _, err := os.Stat("/bin/sh"); err != nil {
 		t.Skip("requires /bin/sh")
 	}
@@ -541,7 +532,7 @@ func TestVerticalFramedTerminalPreviewAndReadiness(t *testing.T) {
 	client, peer := net.Pipe()
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- server.Serve(peer) }()
-	payload := json.RawMessage(`{"min_version":"1.0","max_version":"1.0","capabilities":["terminal.v1","health.v1","preview.public.v1"]}`)
+	payload := json.RawMessage(`{"min_version":"1.0","max_version":"1.0","capabilities":["terminal.v1","health.v1"]}`)
 	response := sendRequest(t, client, protocol.Frame{Type: "hello", RequestID: "req_hello", Version: "1.0", Payload: payload})
 	if response.Type != "welcome" {
 		t.Fatalf("welcome=%#v", response)
@@ -561,12 +552,6 @@ func TestVerticalFramedTerminalPreviewAndReadiness(t *testing.T) {
 		t.Fatalf("create payload=%s err=%v", response.Payload, err)
 	}
 
-	previewFrame := request("req_preview", "op_preview_0001", json.RawMessage(`{"action":"register","logical_name":"web","target_host":"127.0.0.1","target_port":3000,"public_acknowledgement":true}`))
-	previewFrame.Capability = "preview.public.v1"
-	if response = sendRequest(t, client, previewFrame); response.Type != "response" {
-		t.Fatalf("preview=%s", response.Payload)
-	}
-
 	healthFrame := request("req_health", "op_health_0001", json.RawMessage(`{}`))
 	healthFrame.Capability = "health.v1"
 	if response = sendRequest(t, client, healthFrame); response.Type != "response" {
@@ -581,7 +566,7 @@ func TestVerticalFramedTerminalPreviewAndReadiness(t *testing.T) {
 	<-serveDone
 }
 
-func TestDispatcherRejectsEscapedCWDAndOverriddenPreviewIdentity(t *testing.T) {
+func TestDispatcherRejectsEscapedCWDAndRemovedPreviewCapability(t *testing.T) {
 	server := verticalServer(t)
 	client, peer := net.Pipe()
 	go server.Serve(peer)
