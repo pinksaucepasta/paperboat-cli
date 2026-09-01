@@ -253,6 +253,7 @@ func (c *Client) CreatePreviewLease(ctx context.Context, input PreviewLeaseCreat
 	var headers http.Header
 	err = c.doRequestMeta(ctx, http.MethodPost, "/v1/previews", input, &response, http.Header{
 		"Idempotency-Key": []string{idempotencyKey},
+		"Accept-Encoding": []string{"identity"},
 	}, true, &headers)
 	if err != nil {
 		return PreviewLease{}, err
@@ -304,7 +305,9 @@ func (c *Client) GetPreviewLease(ctx context.Context, previewID string) (Preview
 	var lease PreviewLease
 	var headers http.Header
 	path := "/v1/previews/" + url.PathEscape(previewID)
-	if err := c.doRequestMeta(ctx, http.MethodGet, path, nil, &lease, nil, true, &headers); err != nil {
+	if err := c.doRequestMeta(ctx, http.MethodGet, path, nil, &lease, http.Header{
+		"Accept-Encoding": []string{"identity"},
+	}, true, &headers); err != nil {
 		return PreviewLease{}, err
 	}
 	lease.ETag = strings.TrimSpace(headers.Get("ETag"))
@@ -337,6 +340,7 @@ func (c *Client) RenewPreviewLease(ctx context.Context, lease PreviewLease, owne
 	}{OwnerSessionID: ownerSessionID}, &renewed, http.Header{
 		"If-Match":        []string{lease.ETag},
 		"Idempotency-Key": []string{idempotencyKey},
+		"Accept-Encoding": []string{"identity"},
 	}, true, &headers)
 	if err != nil {
 		return PreviewLease{}, err
@@ -366,6 +370,7 @@ func (c *Client) StopPreviewLease(ctx context.Context, lease PreviewLease, idemp
 	err := c.doRequestMeta(ctx, http.MethodDelete, path, nil, &stopped, http.Header{
 		"If-Match":        []string{lease.ETag},
 		"Idempotency-Key": []string{idempotencyKey},
+		"Accept-Encoding": []string{"identity"},
 	}, true, &headers)
 	if err != nil {
 		return PreviewLease{}, err

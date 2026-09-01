@@ -28,6 +28,9 @@ func TestPreviewLeaseClientFollowsCreateOperationAndUsesETags(t *testing.T) {
 		if r.Header.Get("Authorization") != "Bearer access-token" {
 			t.Errorf("authorization = %q", r.Header.Get("Authorization"))
 		}
+		if got := r.Header.Get("Accept-Encoding"); got != "identity" {
+			t.Errorf("Accept-Encoding = %q, want identity for strong ETag preservation", got)
+		}
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/previews":
 			if r.Header.Get("Idempotency-Key") != "create-key" {

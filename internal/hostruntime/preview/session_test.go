@@ -35,6 +35,16 @@ type sessionLeaseClient struct {
 	stopDone   chan struct{}
 }
 
+type sessionRenewObservationClient struct {
+	*sessionLeaseClient
+	called chan Lease
+}
+
+func (c *sessionRenewObservationClient) Renew(ctx context.Context, lease Lease, idempotencyKey string) (Lease, error) {
+	c.called <- lease
+	return c.sessionLeaseClient.Renew(ctx, lease, idempotencyKey)
+}
+
 func (c *sessionLeaseClient) Create(_ context.Context, request LeaseRequest) (Lease, error) {
 	c.mu.Lock()
 	c.created = append(c.created, request)
@@ -480,4 +490,56 @@ func TestSessionExpiryRevokesOnceAfterRenewalRetriesReachDeadline(t *testing.T) 
 		t.Fatalf("stop key reuse = %#v renew=%#v", client.stopKeys, client.renewKeys)
 	}
 	client.mu.Unlock()
+}
+
+func TestSessionRenewalUsesLeaseAdvancedDuringRenewalWait(t *testing.T) {
+	base := time.Now().UTC()
+	captured := make(chan struct{})
+	release := make(chan struct{})
+	var nowCalls atomic.Int32
+	now := func() time.Time {
+		if nowCalls.Add(1) == 2 {
+			close(captured)
+			<-release
+		}
+		return base
+	}
+
+	baseClient := &sessionLeaseClient{}
+	renewCalled := make(chan Lease, 1)
+	client := &sessionRenewObservationClient{sessionLeaseClient: baseClient, called: renewCalled}
+	carrier := &sessionCarrier{closed: make(chan struct{}), run: func(ctx context.Context, _ Lease, _ func(Lease) error) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+	session, err := Start(context.Background(), SessionConfig{
+		LeaseClient: client, Carrier: carrier, OwnerDeviceID: "device_1", OwnerSessionID: "session_1",
+		Target: LeaseTarget{Scheme: "http", Address: "127.0.0.1:3000"},
+		Now:    now, RenewInterval: time.Millisecond, ShutdownTimeout: time.Second, DisableParentWatch: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Stop(context.Background())
+
+	<-captured
+	ready := session.currentLease()
+	ready = sessionReadyLease(ready)
+	ready.ETag = formatLeaseETag(ready.ID, 2)
+	if err := session.markReady(ready); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+
+	select {
+	case renewedWith := <-renewCalled:
+		if renewedWith.Generation != 2 || renewedWith.ETag != formatLeaseETag(ready.ID, 2) {
+			t.Fatalf("renew used stale lease = %+v", renewedWith)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("renewal did not start")
+	}
+	if _, err := session.WaitReady(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 }

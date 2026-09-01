@@ -591,6 +591,17 @@ func (s *Session) renewLoop(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return nil
 		}
+		// Readiness and other server observations can advance the lease while
+		// this loop is waiting. Renew the latest authoritative generation, not
+		// the snapshot captured before the timer started.
+		lease = s.currentLease()
+		expiresAt = lease.LeaseDeadline
+		if lease.UserDeadline != nil && lease.UserDeadline.Before(expiresAt) {
+			expiresAt = *lease.UserDeadline
+		}
+		if !expiresAt.After(s.config.Now().UTC()) {
+			return ErrLeaseExpired
+		}
 		renewIdempotencyKey, keyErr := newSessionIdempotencyKey(s.config.Random)
 		if keyErr != nil {
 			return fmt.Errorf("%w: generate renew idempotency key: %v", ErrLeaseLost, keyErr)
