@@ -377,9 +377,11 @@ func TestTunnelDoctorPrintsDeterministicHealth(t *testing.T) {
 func TestTunnelDoctorBundleRequiresPreviewAndExplicitWrite(t *testing.T) {
 	oldReport := tunnelDoctorLocalReportForCommand
 	oldDNS := tunnelDoctorDNSCheckForCommand
+	oldHostDiagnostics := tunnelDoctorHostDiagnosticsForCommand
 	t.Cleanup(func() {
 		tunnelDoctorLocalReportForCommand = oldReport
 		tunnelDoctorDNSCheckForCommand = oldDNS
+		tunnelDoctorHostDiagnosticsForCommand = oldHostDiagnostics
 	})
 	tunnelDoctorLocalReportForCommand = func(context.Context) (localDoctorReport, error) {
 		return localDoctorReport{
@@ -389,6 +391,9 @@ func TestTunnelDoctorBundleRequiresPreviewAndExplicitWrite(t *testing.T) {
 		}, nil
 	}
 	tunnelDoctorDNSCheckForCommand = func(context.Context) bool { return true }
+	tunnelDoctorHostDiagnosticsForCommand = func(context.Context) (tunnelHostDiagnostics, error) {
+		return tunnelHostDiagnostics{}, errors.New("typed host diagnostics unavailable")
+	}
 	dimension := api.TunnelHealthDimension{Status: "healthy", Code: "ready"}
 	health := api.TunnelHealth{Schema: api.TunnelV1Schema, Kind: "health", ResourceKind: "tunnel", ResourceID: "tun_1", OverallCode: "ready", Summary: "Tunnel is ready.", RepairAction: "none", Since: time.Unix(1, 0).UTC(), Dimensions: api.TunnelHealthDimensions{Service: dimension, Edge: dimension, Config: dimension, Route: dimension, Origin: dimension, DNS: dimension, Certificate: dimension, Access: dimension, Update: dimension}}
 	withTunnelCommandClient(t, func(writer http.ResponseWriter, request *http.Request) {

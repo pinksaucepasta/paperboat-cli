@@ -5,13 +5,16 @@ package hostruntimecmd
 import (
 	"bytes"
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hostdproto"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/workerupdate"
 )
 
 func TestRuntimeWorkerEntryActivatesFencedHostdLease(t *testing.T) {
@@ -84,6 +87,163 @@ func TestRuntimeWorkerEntryActivatesFencedHostdLease(t *testing.T) {
 	if output.String() != expectedOutput {
 		t.Fatalf("output=%q", output.String())
 	}
+}
+
+// TestRunHostdKeepsStableObservationAliveAfterWorkerActivation protects the
+// real hostd ownership boundary. The external worker is only a lifecycle
+// candidate; activating or stopping it must not stop the stable host's
+// presence loop. The production host factory is injected here only to keep
+// the test deterministic and avoid starting a real control-plane client.
+func TestRunHostdKeepsStableObservationAliveAfterWorkerActivation(t *testing.T) {
+	root, err := os.MkdirTemp("/tmp", "pbh-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	hostdRoot := filepath.Join(root, "hostd")
+	if err := os.Mkdir(hostdRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(hostdRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	socket := filepath.Join(hostdRoot, "hostd.sock")
+	tokenPath := filepath.Join(root, "worker.token")
+	token := bytes.Repeat([]byte{0x53}, 32)
+	if err := os.WriteFile(tokenPath, token, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PAPERBOAT_HOSTD_SOCKET", socket)
+	t.Setenv("PAPERBOAT_HOSTD_TOKEN_FILE", tokenPath)
+	t.Setenv("PAPERBOAT_RUNTIME_CURRENT", filepath.Join(root, "pb"))
+
+	host := newRunHostdObservationHost()
+	worker := &runHostdObservationWorker{host: host}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- runHostdWith(ctx, io.Discard,
+			func(context.Context, string, func(string) string) (hostdHost, error) {
+				return host, nil
+			},
+			func(context.Context, workerupdate.StartRequest) (workerupdate.Worker, error) {
+				return worker, nil
+			},
+		)
+	}()
+
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	for host.postActivation.Load() < 2 {
+		select {
+		case <-host.notify:
+		case err := <-done:
+			t.Fatalf("runHostd exited before worker activation: %v", err)
+		case <-deadline.C:
+			t.Fatalf("post-activation observations=%d, want at least 2; total=%d", host.postActivation.Load(), host.calls.Load())
+		}
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runHostd did not shut down")
+	}
+	if !worker.stopped.Load() {
+		t.Fatal("hostd did not stop the external worker")
+	}
+	if !host.stopped.Load() {
+		t.Fatal("hostd did not shut down the stable host")
+	}
+}
+
+type runHostdObservationHost struct {
+	calls          atomic.Int64
+	postActivation atomic.Int64
+	activated      atomic.Bool
+	started        atomic.Bool
+	stopped        atomic.Bool
+	notify         chan struct{}
+	stop           chan struct{}
+	stopOnce       sync.Once
+	done           chan struct{}
+}
+
+func newRunHostdObservationHost() *runHostdObservationHost {
+	return &runHostdObservationHost{notify: make(chan struct{}, 16), stop: make(chan struct{}), done: make(chan struct{})}
+}
+
+func (h *runHostdObservationHost) StartHostd(context.Context) error {
+	if !h.started.CompareAndSwap(false, true) {
+		return nil
+	}
+	h.observe()
+	go func() {
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		defer close(h.done)
+		for {
+			select {
+			case <-ticker.C:
+				h.observe()
+			case <-h.stop:
+				return
+			}
+		}
+	}()
+	return nil
+}
+
+func (h *runHostdObservationHost) ShutdownHostd(context.Context) error {
+	h.stopOnce.Do(func() { close(h.stop) })
+	if h.started.Load() {
+		<-h.done
+	}
+	h.stopped.Store(true)
+	return nil
+}
+
+func (h *runHostdObservationHost) WorkloadStatus() hostdproto.WorkloadStatus {
+	return hostdproto.WorkloadStatus{Generation: 1}
+}
+
+func (*runHostdObservationHost) UpdateGate() hostdproto.UpdateGateHandler { return nil }
+
+func (h *runHostdObservationHost) activate() {
+	h.activated.Store(true)
+}
+
+func (h *runHostdObservationHost) observe() {
+	h.calls.Add(1)
+	if h.activated.Load() {
+		h.postActivation.Add(1)
+	}
+	select {
+	case h.notify <- struct{}{}:
+	default:
+	}
+}
+
+type runHostdObservationWorker struct {
+	host    *runHostdObservationHost
+	stopped atomic.Bool
+}
+
+func (w *runHostdObservationWorker) Ready(context.Context) (hostdproto.Status, error) {
+	return hostdproto.Status{State: hostdproto.StateCandidate, WorkerID: "runtime-test", APIVersion: 1, Epoch: 1}, nil
+}
+
+func (w *runHostdObservationWorker) Activate(context.Context) (hostdproto.Status, error) {
+	w.host.activate()
+	return hostdproto.Status{State: hostdproto.StateActive, WorkerID: "runtime-test", APIVersion: 1, Epoch: 1}, nil
+}
+
+func (w *runHostdObservationWorker) Stop(context.Context) error {
+	w.stopped.Store(true)
+	return nil
 }
 
 type lockedBuffer struct {

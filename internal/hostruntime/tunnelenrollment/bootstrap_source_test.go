@@ -5,12 +5,17 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -111,6 +116,45 @@ func TestHTTPSProductionAssemblySourceControlUsesOnlySignedHelloWebSocket(t *tes
 	}
 }
 
+type controlDialDeadlineTransport struct {
+	deadline chan time.Time
+}
+
+func (t *controlDialDeadlineTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	deadline, ok := request.Context().Deadline()
+	if !ok {
+		return nil, errors.New("control dial has no deadline")
+	}
+	t.deadline <- deadline
+	return nil, context.DeadlineExceeded
+}
+
+func TestHTTPSProductionAssemblySourceBoundsControlHandshake(t *testing.T) {
+	request, _ := productionActivationRequest(t)
+	transport := &controlDialDeadlineTransport{deadline: make(chan time.Time, 1)}
+	source, err := NewHTTPSProductionAssemblySource(HTTPSProductionAssemblySourceConfig{
+		ControlURL: "https://control.example", StateRoot: t.TempDir(), HostID: request.HostID,
+		Transport: transport, Auth: &bootstrapMachineAuth{}, Clock: bootstrapClock{now: time.Now().UTC()}, Origins: bootstrapOrigins{},
+		MachineTLSCertificate: bootstrapMachineTLSCertificate(t),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	_, err = source.openControlStream(context.Background(), request)
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("error = %v, want unavailable", err)
+	}
+	select {
+	case deadline := <-transport.deadline:
+		if deadline.IsZero() || !deadline.After(started) || deadline.After(started.Add(controlDialTimeout+time.Second)) {
+			t.Fatalf("control handshake deadline = %v, want within %s", deadline, controlDialTimeout)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("control dial transport was not called")
+	}
+}
+
 func TestHTTPSProductionAssemblySourceBootstrapBindsProofDescriptorAndLazySession(t *testing.T) {
 	now := time.Now().UTC()
 	request, private := productionActivationRequest(t)
@@ -159,6 +203,114 @@ func TestHTTPSProductionAssemblySourceBootstrapBindsProofDescriptorAndLazySessio
 	var bootstrap carrierBootstrapRequest
 	if json.Unmarshal(auth.body, &bootstrap) != nil || bootstrap.SessionID != descriptor.SessionID || bootstrap.ProcessGeneration != descriptor.ProcessGeneration || bootstrap.ConfigGeneration != descriptor.ConfigGeneration || bootstrap.ConfigContentHash != descriptor.ConfigContentHash {
 		t.Fatalf("bootstrap proof body = %+v", bootstrap)
+	}
+}
+
+func TestFetchCarrierDescriptorClassifiesTypedTransientErrors(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	request, _ := productionActivationRequest(t)
+	tests := []struct {
+		name        string
+		status      int
+		code        string
+		action      string
+		wantRetryAt bool
+	}{
+		{name: "carrier is not ready", status: http.StatusServiceUnavailable, code: "carrier_unavailable", action: "retry", wantRetryAt: true},
+		{name: "control service is unavailable", status: http.StatusServiceUnavailable, code: "connector_control_unavailable", action: "retry"},
+		{name: "control session is stale", status: http.StatusConflict, code: "connector_session_stale", action: "reconnect"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != rpath(request) {
+					t.Errorf("request = %s %s", r.Method, r.URL.Path)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(test.status)
+				retryable := true
+				retryAt := now.Add(time.Minute)
+				payload := carrierBootstrapErrorPayload{
+					Schema: carrierBootstrapErrorSchema, Kind: "error", Code: test.code, Component: "control",
+					Message: "temporary connector bootstrap failure", Outcome: "unchanged", Retryable: &retryable,
+					RepairAction: test.action, RequestID: "request_bootstrap_01", CorrelationID: "correlation_bootstrap_01",
+				}
+				if test.wantRetryAt {
+					payload.RetryAt = &retryAt
+				}
+				if err := json.NewEncoder(w).Encode(carrierBootstrapErrorResponse{Error: payload}); err != nil {
+					t.Errorf("encode error response: %v", err)
+				}
+			}))
+			defer server.Close()
+
+			source := newBootstrapSourceForTest(t, server, now, &bootstrapMachineAuth{})
+			_, err := source.fetchCarrierDescriptor(context.Background(), request, []byte(`{"bootstrap":true}`))
+			if !errors.Is(err, ErrUnavailable) || !errors.Is(err, tunnelmanager.ErrConnectorUnavailable) {
+				t.Fatalf("error = %v, want retryable unavailable connector error", err)
+			}
+			if errors.Is(err, ErrConflict) {
+				t.Fatalf("transient error was classified as conflict: %v", err)
+			}
+			var typed *CarrierBootstrapError
+			if !errors.As(err, &typed) || typed == nil {
+				t.Fatalf("error = %v, want CarrierBootstrapError", err)
+			}
+			if typed.StatusCode != test.status || typed.Code != test.code || !typed.Retryable || typed.RepairAction != test.action || (typed.RetryAt != nil) != test.wantRetryAt {
+				t.Fatalf("typed error = %+v", typed)
+			}
+		})
+	}
+}
+
+func TestFetchCarrierDescriptorRejectsNonRetryableOrMalformedTypedErrors(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	request, _ := productionActivationRequest(t)
+	tests := []struct {
+		name          string
+		status        int
+		body          string
+		want          error
+		wantTyped     bool
+		wantConnector bool
+	}{
+		{
+			name: "stale session without retry permission remains conflict", status: http.StatusConflict,
+			body: `{"error":{"schema":"paperboat.preview-tunnel/v1","kind":"error","code":"connector_session_stale","component":"control","message":"session changed","outcome":"unchanged","retryable":false,"repair_action":"reconnect","request_id":"request_01","correlation_id":"correlation_01"}}`,
+			want: ErrConflict, wantTyped: true,
+		},
+		{
+			name: "incomplete error falls back to status", status: http.StatusConflict,
+			body: `{"error":{"code":"connector_session_stale"}}`,
+			want: ErrConflict,
+		},
+		{
+			name: "duplicate error field falls back to status", status: http.StatusServiceUnavailable,
+			body: `{"error":{"schema":"paperboat.preview-tunnel/v1","schema":"paperboat.preview-tunnel/v1"}}`,
+			want: ErrUnavailable,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(test.status)
+				_, _ = w.Write([]byte(test.body))
+			}))
+			defer server.Close()
+			source := newBootstrapSourceForTest(t, server, now, &bootstrapMachineAuth{})
+			_, err := source.fetchCarrierDescriptor(context.Background(), request, []byte(`{"bootstrap":true}`))
+			if !errors.Is(err, test.want) {
+				t.Fatalf("error = %v, want %v", err, test.want)
+			}
+			if test.wantConnector && !errors.Is(err, tunnelmanager.ErrConnectorUnavailable) {
+				t.Fatalf("error = %v, want connector unavailable", err)
+			}
+			var typed *CarrierBootstrapError
+			if errors.As(err, &typed) != test.wantTyped {
+				t.Fatalf("typed error = %v, want present=%t", typed, test.wantTyped)
+			}
+		})
 	}
 }
 
@@ -264,6 +416,7 @@ func newBootstrapSourceForTest(t *testing.T, server *httptest.Server, now time.T
 		ControlURL: server.URL, StateRoot: t.TempDir(), HostID: "host_01", Transport: server.Client().Transport,
 		Auth:  auth,
 		Clock: bootstrapClock{now: now}, Origins: bootstrapOrigins{}, Drainer: bootstrapDrainer{},
+		MachineTLSCertificate: bootstrapMachineTLSCertificate(t),
 		Renewal: connectorrotation.CredentialRenewalSourceFunc(func(context.Context, time.Time) (string, string, error) {
 			return "renewal_nonce_01", "renewal_proof_01", nil
 		}),
@@ -272,6 +425,30 @@ func newBootstrapSourceForTest(t *testing.T, server *httptest.Server, now time.T
 		t.Fatal(err)
 	}
 	return source
+}
+
+func bootstrapMachineTLSCertificate(t *testing.T) func(time.Time, time.Duration, []*url.URL) (tls.Certificate, error) {
+	t.Helper()
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return func(now time.Time, lifetime time.Duration, uris []*url.URL) (tls.Certificate, error) {
+		serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+		if err != nil {
+			return tls.Certificate{}, err
+		}
+		template := &x509.Certificate{SerialNumber: serial, Subject: pkix.Name{CommonName: "machine-test"}, NotBefore: now.Add(-time.Second), NotAfter: now.Add(lifetime), KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, URIs: uris}
+		der, err := x509.CreateCertificate(rand.Reader, template, template, public, private)
+		if err != nil {
+			return tls.Certificate{}, err
+		}
+		leaf, err := x509.ParseCertificate(der)
+		if err != nil {
+			return tls.Certificate{}, err
+		}
+		return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: private, Leaf: leaf}, nil
+	}
 }
 
 func productionActivationRequest(t *testing.T) (ActivationRequest, ed25519.PrivateKey) {

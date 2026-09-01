@@ -213,7 +213,9 @@ func TestProductionAssemblyReconnectsWithFreshControlSessionAfterDisconnect(t *t
 	}
 	config.ControlSessionFactory = func(context.Context, *CoordinatedConfigApplier) (connectorrotation.ControlSessionConfig, error) {
 		fresh := config.Control
+		fresh.Hello.ProcessGeneration++
 		auth := fresh.Hello.Auth
+		auth.ProcessGeneration = fresh.Hello.ProcessGeneration
 		auth.Nonce = "reconnect-auth-nonce-02"
 		auth.IssuedAt = config.Clock.Now()
 		auth.ExpiresAt = config.Clock.Now().Add(time.Minute)
@@ -266,7 +268,7 @@ func TestProductionAssemblyReconnectsWithFreshControlSessionAfterDisconnect(t *t
 	if err := secondHello.DecodePayload(&secondHelloPayload); err != nil {
 		t.Fatalf("decode reconnect hello: %v", err)
 	}
-	if firstHelloPayload.Auth.Nonce == secondHelloPayload.Auth.Nonce || firstHelloPayload.Auth.IdentityKeyID != secondHelloPayload.Auth.IdentityKeyID || firstHelloPayload.Auth.IdentityKeyThumbprint != secondHelloPayload.Auth.IdentityKeyThumbprint || firstHelloPayload.Auth.SignedProof == secondHelloPayload.Auth.SignedProof || firstHelloPayload.AccountID != secondHelloPayload.AccountID || firstHelloPayload.TunnelID != secondHelloPayload.TunnelID || firstHelloPayload.ConnectorID != secondHelloPayload.ConnectorID || firstHelloPayload.HostID != secondHelloPayload.HostID {
+	if firstHelloPayload.Auth.Nonce == secondHelloPayload.Auth.Nonce || firstHelloPayload.Auth.IdentityKeyID != secondHelloPayload.Auth.IdentityKeyID || firstHelloPayload.Auth.IdentityKeyThumbprint != secondHelloPayload.Auth.IdentityKeyThumbprint || firstHelloPayload.Auth.SignedProof == secondHelloPayload.Auth.SignedProof || firstHelloPayload.AccountID != secondHelloPayload.AccountID || firstHelloPayload.TunnelID != secondHelloPayload.TunnelID || firstHelloPayload.ConnectorID != secondHelloPayload.ConnectorID || firstHelloPayload.HostID != secondHelloPayload.HostID || secondHelloPayload.ProcessGeneration <= firstHelloPayload.ProcessGeneration || secondHelloPayload.Auth.ProcessGeneration != secondHelloPayload.ProcessGeneration {
 		t.Fatalf("reconnect auth identity/nonce = first=%+v second=%+v", firstHelloPayload, secondHelloPayload)
 	}
 	freshWelcome := connectorprotocol.Welcome{
@@ -310,6 +312,63 @@ func TestProductionAssemblyReconnectsWithFreshControlSessionAfterDisconnect(t *t
 		}
 	case <-time.After(time.Second):
 		t.Fatal("disconnect was not reported before reconnect")
+	}
+	if err := assembly.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestProductionAssemblyStopsOnStaleReconnectProcessGeneration(t *testing.T) {
+	config := newProductionAssemblyConfig(t)
+	firstServer, firstClient := net.Pipe()
+	defer firstServer.Close()
+	var streamCalls int
+	config.ControlStream = func(ctx context.Context) (io.ReadWriteCloser, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		streamCalls++
+		if streamCalls == 1 {
+			return firstClient, nil
+		}
+		return nil, ErrProductionControlMissing
+	}
+	// This intentionally returns the original process generation. The server
+	// durably rejects it after the first session has been accepted; the
+	// assembly must stop and require a fresh process epoch instead of retrying
+	// the same stale identity forever.
+	config.ControlSessionFactory = func(context.Context, *CoordinatedConfigApplier) (connectorrotation.ControlSessionConfig, error) {
+		return config.Control, nil
+	}
+	assembly, _, err := OpenProductionAssembly(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := assembly.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := connectorprotocol.ReadFrame(firstServer); err != nil {
+		t.Fatalf("read initial hello: %v", err)
+	}
+	if err := firstServer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assembly.controlMu.Lock()
+	done := assembly.controlDone
+	assembly.controlMu.Unlock()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stale reconnect was retried instead of terminating")
+	}
+	assembly.controlMu.Lock()
+	controlErr := assembly.controlErr
+	assembly.controlMu.Unlock()
+	if !errors.Is(controlErr, ErrProductionControlRestartRequired) {
+		t.Fatalf("stale reconnect error = %v, want ErrProductionControlRestartRequired", controlErr)
+	}
+	if streamCalls != 1 {
+		t.Fatalf("stale reconnect opened %d streams, want 1", streamCalls)
 	}
 	if err := assembly.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)
@@ -371,7 +430,7 @@ func TestProductionControlReconnectDelayIsBoundedAndConnectorScoped(t *testing.T
 	}
 }
 
-func TestProductionAssemblyBootstrapsEmptyStoreBeforeCarrierActivation(t *testing.T) {
+func TestProductionAssemblyBootstrapsPersistedDesiredStateBeforeCarrierActivation(t *testing.T) {
 	config := newProductionAssemblyConfig(t)
 	identity := config.SessionSource.Identity
 	now := config.Clock.Now()
@@ -486,6 +545,21 @@ func TestProductionAssemblyBootstrapsEmptyStoreBeforeCarrierActivation(t *testin
 		}
 		carrierMu.Unlock()
 	}()
+	// Seed the exact desired snapshot before Start. This is the restart path:
+	// the manager must not synchronously wait for Welcome before it can open the
+	// control stream that supplies Welcome.
+	hostSnapshot := tunnelSnapshot(t, 1)
+	snapshot, err := connectorprotocol.NewSnapshot(identity.TunnelID, 1, hostSnapshot.Payload)
+	if err != nil {
+		t.Fatalf("new persisted snapshot: %v", err)
+	}
+	snapshot.AccountID = identity.AccountID
+	snapshot.ConnectorID = identity.ConnectorID
+	snapshot.SessionID = "session-live-01"
+	snapshot.ProcessGeneration = identity.ProcessGeneration
+	if _, err := assembly.Applier.PrepareSnapshot(context.Background(), snapshot); err != nil {
+		t.Fatalf("persist desired snapshot: %v", err)
+	}
 	if err := assembly.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -514,15 +588,7 @@ func TestProductionAssemblyBootstrapsEmptyStoreBeforeCarrierActivation(t *testin
 	if err := connectorprotocol.WriteFrame(controlServer, welcomeFrame); err != nil {
 		t.Fatalf("write welcome: %v", err)
 	}
-	hostSnapshot := tunnelSnapshot(t, 1)
-	snapshot, err := connectorprotocol.NewSnapshot(identity.TunnelID, 1, hostSnapshot.Payload)
-	if err != nil {
-		t.Fatalf("new snapshot: %v", err)
-	}
-	snapshot.AccountID = identity.AccountID
-	snapshot.ConnectorID = identity.ConnectorID
 	snapshot.SessionID = welcome.SessionID
-	snapshot.ProcessGeneration = identity.ProcessGeneration
 	snapshotFrame, err := connectorprotocol.NewFrame(connectorprotocol.MessageSnapshot, "snapshot-bootstrap-01", snapshot)
 	if err != nil {
 		t.Fatalf("snapshot frame: %v", err)

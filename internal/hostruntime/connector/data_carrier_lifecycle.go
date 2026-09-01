@@ -68,7 +68,14 @@ func PrepareDataCarrierRequest(ctx context.Context, request DataCarrierPrepareRe
 		return nil, ErrInvalidDataCarrierConfig
 	}
 	request.Config.Session = request.Identity
-	pool, err := NewDataCarrierPool(ctx, request.Config, request.Dialer)
+	// The context supplied to Prepare scopes the staging operation only. Once
+	// the pool has been activated, its carrier session must outlive the
+	// reconcile/apply call that staged it and remain owned by Prepared/Active
+	// lifecycle handles until Abort or Close. Passing the operation context
+	// directly here made DataCarrier.watch close an otherwise healthy session as
+	// soon as the manager returned from reconciliation.
+	lifetimeCtx := context.WithoutCancel(ctx)
+	pool, err := NewDataCarrierPool(lifetimeCtx, request.Config, request.Dialer)
 	if err != nil {
 		return nil, err
 	}

@@ -178,7 +178,25 @@ func (t *Transport) CloseIdleConnections() {
 
 func proxyFunction(snapshot ProxySnapshot) (func(*http.Request) (*url.URL, error), string, error) {
 	if snapshot.PACOnly && snapshot.HTTPProxy == "" && snapshot.HTTPSProxy == "" {
-		return nil, "", &ProxyError{Failure: ProxyAutomaticConfigurationUnsupported}
+		if snapshot.NoProxy == "" {
+			return nil, "", &ProxyError{Failure: ProxyAutomaticConfigurationUnsupported}
+		}
+		// Paperboat never evaluates PAC scripts. It may still connect directly
+		// to an administrator-declared NO_PROXY control-plane host while the
+		// operating system routes private preview names through Paperboat's own
+		// PAC. Every other destination remains fail-closed.
+		bypass := (&httpproxy.Config{HTTPProxy: "http://127.0.0.1:1", HTTPSProxy: "http://127.0.0.1:1", NoProxy: snapshot.NoProxy}).ProxyFunc()
+		proxy := func(request *http.Request) (*url.URL, error) {
+			selected, err := bypass(request.URL)
+			if err != nil {
+				return nil, &ProxyError{Failure: ProxyInvalid, Cause: err}
+			}
+			if selected == nil {
+				return nil, nil
+			}
+			return nil, &ProxyError{Failure: ProxyAutomaticConfigurationUnsupported}
+		}
+		return proxy, fmt.Sprintf("%d\x00pac-only\x00%s", snapshot.Generation, snapshot.NoProxy), nil
 	}
 	for _, raw := range []string{snapshot.HTTPProxy, snapshot.HTTPSProxy} {
 		if raw == "" {

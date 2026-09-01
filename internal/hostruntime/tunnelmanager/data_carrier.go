@@ -3,6 +3,8 @@ package tunnelmanager
 import (
 	"context"
 	"errors"
+	"net"
+	"time"
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/connector"
 )
@@ -31,21 +33,65 @@ func (b DataCarrierBuilder) PrepareCarrier(ctx context.Context, request ApplyReq
 	if identity.TunnelID != request.Tunnel.ID || identity.ConnectorID != request.Connector.ID || identity.HostID != request.Connector.HostID || identity.Generation != request.Snapshot.Generation || identity.AccountID == "" || identity.SessionID == "" || identity.ProcessGeneration == 0 {
 		return nil, ErrGenerationConflict
 	}
-	prepared, err := connector.PrepareDataCarrierRequest(ctx, preparedRequest)
-	if err != nil {
+	var prepared *connector.PreparedDataCarrier
+	for attempt := 0; ; attempt++ {
+		prepared, err = connector.PrepareDataCarrierRequest(ctx, preparedRequest)
+		if err == nil {
+			break
+		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return nil, err
 		}
 		if errors.Is(err, connector.ErrInvalidDataCarrierConfig) {
 			return nil, errors.Join(ErrInvalidConfig, err)
 		}
-		return nil, errors.Join(ErrConnectorUnavailable, err)
+		if !retryableDataCarrierPrepareError(err) {
+			return nil, errors.Join(ErrConnectorUnavailable, err)
+		}
+		// Edge admission is published asynchronously after the authenticated
+		// config ACK. A carrier can therefore reach the edge just before its
+		// staged admission appears. Retry that transient window within the
+		// manager's existing apply deadline instead of rejecting a valid
+		// connector generation after one race-lost dial.
+		delay := 100 * time.Millisecond * time.Duration(attempt+1)
+		if delay > time.Second {
+			delay = time.Second
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		_ = prepared.Abort(context.Background())
 		return nil, err
 	}
 	return dataCarrierPrepared{prepared: prepared}, nil
+}
+
+// retryableDataCarrierPrepareError admits only failures which can change
+// without changing the authenticated identity or configuration. Permanent
+// admission, endpoint, and TLS failures must surface immediately; otherwise
+// a bad credential or route binding would consume the entire manager apply
+// deadline while obscuring the actionable cause. Transport/network errors
+// remain retryable because the edge may be temporarily unavailable.
+func retryableDataCarrierPrepareError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, connector.ErrDataCarrierAdmission) || errors.Is(err, connector.ErrInvalidDataCarrierEndpoint) || errors.Is(err, connector.ErrDataCarrierTLS) {
+		return false
+	}
+	if errors.Is(err, connector.ErrDataCarrierClosed) || errors.Is(err, connector.ErrDataCarrierUnavailable) {
+		return true
+	}
+	var networkErr net.Error
+	return errors.As(err, &networkErr)
 }
 
 type dataCarrierPrepared struct {

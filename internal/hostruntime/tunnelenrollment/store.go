@@ -166,6 +166,7 @@ type record struct {
 	Credential           Credential  `json:"credential"`
 	EnrollmentID         string      `json:"enrollment_id,omitempty"`
 	TokenReference       string      `json:"token_reference,omitempty"`
+	PendingTokenCleanup  []string    `json:"pending_token_cleanup,omitempty"`
 	ConnectorID          string      `json:"connector_id,omitempty"`
 	OperationID          string      `json:"operation_id,omitempty"`
 	StableEndpointID     string      `json:"stable_endpoint_id,omitempty"`
@@ -208,6 +209,88 @@ func (s *FileCredentialStore) promoteCredential(tunnelID string, previous, next 
 	}
 	state.Records[tunnelID] = recordValue
 	return s.saveJournalLocked(state)
+}
+
+type processGenerationClaim struct {
+	tunnelID string
+	expected uint64
+	next     uint64
+}
+
+// ClaimProcessGeneration atomically advances one durable connector's process
+// epoch. The complete activation binding is compared before the update so a
+// reconnect cannot advance a different connector, credential, or operation
+// by reusing only a tunnel ID. The updated record is persisted before the
+// returned request may be used to authenticate a new control session.
+func (s *FileCredentialStore) ClaimProcessGeneration(ctx context.Context, expected ActivationRequest) (ActivationRequest, error) {
+	if s == nil || ctx == nil || !validActivationRequest(expected) {
+		return ActivationRequest{}, ErrInvalid
+	}
+	if err := ctx.Err(); err != nil {
+		return ActivationRequest{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, err := s.loadJournalLocked()
+	if err != nil {
+		return ActivationRequest{}, err
+	}
+	recordValue, ok := state.Records[expected.TunnelID]
+	if !ok || (recordValue.Phase != "active" && recordValue.Phase != "exchanged") {
+		return ActivationRequest{}, ErrConflict
+	}
+	current := recordValue.activationRequest()
+	if !sameActivationRequest(current, expected) {
+		return ActivationRequest{}, ErrConflict
+	}
+	if current.ProcessGeneration == ^uint64(0) {
+		return ActivationRequest{}, errors.Join(ErrConflict, errProcessGenerationExhausted)
+	}
+	if err := ctx.Err(); err != nil {
+		return ActivationRequest{}, err
+	}
+	recordValue.ProcessGeneration++
+	state.Records[expected.TunnelID] = recordValue
+	if err := s.saveJournalLocked(state); err != nil {
+		return ActivationRequest{}, err
+	}
+	return recordValue.activationRequest(), nil
+}
+
+// claimProcessGenerations advances all requested connector process epochs in
+// one journal transaction. The expected value makes a concurrent manager
+// fail closed instead of overwriting a newer epoch, and saveJournalLocked
+// publishes the complete update atomically before activation can begin.
+func (s *FileCredentialStore) claimProcessGenerations(claims []processGenerationClaim) (journal, error) {
+	if s == nil || len(claims) == 0 {
+		return journal{}, ErrInvalid
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, err := s.loadJournalLocked()
+	if err != nil {
+		return journal{}, err
+	}
+	seen := make(map[string]struct{}, len(claims))
+	for _, claim := range claims {
+		if !safeID(claim.tunnelID) || claim.expected == 0 || claim.expected == ^uint64(0) || claim.next != claim.expected+1 {
+			return journal{}, ErrConflict
+		}
+		if _, ok := seen[claim.tunnelID]; ok {
+			return journal{}, ErrConflict
+		}
+		seen[claim.tunnelID] = struct{}{}
+		recordValue, ok := state.Records[claim.tunnelID]
+		if !ok || (recordValue.Phase != "active" && recordValue.Phase != "exchanged") || recordValue.ProcessGeneration != claim.expected {
+			return journal{}, ErrConflict
+		}
+		recordValue.ProcessGeneration = claim.next
+		state.Records[claim.tunnelID] = recordValue
+	}
+	if err := s.saveJournalLocked(state); err != nil {
+		return journal{}, err
+	}
+	return state, nil
 }
 
 func (s *FileCredentialStore) loadJournal() (journal, error) {
@@ -324,15 +407,28 @@ func (r record) valid(tunnelID string) bool {
 	if r.TunnelID != tunnelID || connectorprotocol.ValidateIdentifier(r.TunnelID) != nil || connectorprotocol.ValidateIdentifier(r.HostID) != nil || !safeID(r.LocalKey) || !safeID(r.IssueKey) || !safeID(r.ExchangeKey) || !r.Credential.valid() {
 		return false
 	}
+	if len(r.PendingTokenCleanup) > 16 {
+		return false
+	}
+	seenCleanup := make(map[string]struct{}, len(r.PendingTokenCleanup))
+	for _, reference := range r.PendingTokenCleanup {
+		if !safeID(reference) || reference == r.TokenReference {
+			return false
+		}
+		if _, exists := seenCleanup[reference]; exists {
+			return false
+		}
+		seenCleanup[reference] = struct{}{}
+	}
 	switch r.Phase {
 	case "prepared":
 		return r.AccountID == "" && r.EnrollmentID == "" && r.TokenReference == "" && r.ConnectorID == "" && r.OperationID == "" && r.CredentialGeneration == 0 && r.ProcessGeneration == 0 && r.Projection == nil
 	case "issued":
-		return r.AccountID == "" && safeID(r.EnrollmentID) && safeID(r.TokenReference) && r.ConnectorID == "" && r.OperationID == "" && r.CredentialGeneration == 0 && r.ProcessGeneration == 0 && r.Projection == nil
+		return len(r.PendingTokenCleanup) == 0 && r.AccountID == "" && safeID(r.EnrollmentID) && safeID(r.TokenReference) && r.ConnectorID == "" && r.OperationID == "" && r.CredentialGeneration == 0 && r.ProcessGeneration == 0 && r.Projection == nil
 	case "exchanged":
-		return connectorprotocol.ValidateIdentifier(r.AccountID) == nil && safeID(r.EnrollmentID) && safeID(r.TokenReference) && connectorprotocol.ValidateIdentifier(r.ConnectorID) == nil && safeID(r.OperationID) && r.CredentialGeneration > 0 && r.ProcessGeneration > 0 && r.Projection == nil
+		return len(r.PendingTokenCleanup) == 0 && connectorprotocol.ValidateIdentifier(r.AccountID) == nil && safeID(r.EnrollmentID) && safeID(r.TokenReference) && connectorprotocol.ValidateIdentifier(r.ConnectorID) == nil && safeID(r.OperationID) && r.CredentialGeneration > 0 && r.ProcessGeneration > 0 && r.Projection == nil
 	case "active":
-		return connectorprotocol.ValidateIdentifier(r.AccountID) == nil && safeID(r.EnrollmentID) && safeID(r.TokenReference) && connectorprotocol.ValidateIdentifier(r.ConnectorID) == nil && safeID(r.OperationID) && r.CredentialGeneration > 0 && r.ProcessGeneration > 0 && r.Projection != nil && r.Projection.valid() && r.Projection.CredentialGeneration == r.CredentialGeneration && r.Projection.TunnelID == r.TunnelID && r.Projection.HostID == r.HostID && r.Projection.ConnectorID == r.ConnectorID && r.Projection.OperationID == r.OperationID && r.Projection.CredentialReference == r.Credential.Reference
+		return len(r.PendingTokenCleanup) == 0 && connectorprotocol.ValidateIdentifier(r.AccountID) == nil && safeID(r.EnrollmentID) && safeID(r.TokenReference) && connectorprotocol.ValidateIdentifier(r.ConnectorID) == nil && safeID(r.OperationID) && r.CredentialGeneration > 0 && r.ProcessGeneration > 0 && r.Projection != nil && r.Projection.valid() && r.Projection.CredentialGeneration == r.CredentialGeneration && r.Projection.TunnelID == r.TunnelID && r.Projection.HostID == r.HostID && r.Projection.ConnectorID == r.ConnectorID && r.Projection.OperationID == r.OperationID && r.Projection.CredentialReference == r.Credential.Reference
 	default:
 		return false
 	}

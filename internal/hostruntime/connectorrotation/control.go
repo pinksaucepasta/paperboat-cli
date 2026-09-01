@@ -340,6 +340,26 @@ func (s *ControlSession) HandleFrame(ctx context.Context, frame connectorprotoco
 		return nil, err
 	}
 	switch frame.Type {
+	case connectorprotocol.MessageAck:
+		var ack connectorprotocol.Ack
+		if err := frame.DecodePayload(&ack); err != nil {
+			return nil, err
+		}
+		if ack.Kind != connectorprotocol.AckReady {
+			return nil, connectorprotocol.ErrUnsupportedMessage
+		}
+		hello := s.client.Hello()
+		s.mu.RLock()
+		welcome := s.welcome
+		s.mu.RUnlock()
+		active, ok := s.client.Active()
+		if !ok || ack.AccountID != hello.AccountID || ack.TunnelID != hello.TunnelID || ack.ConnectorID != hello.ConnectorID || ack.SessionID != welcome.SessionID || ack.ProcessGeneration != hello.ProcessGeneration || ack.Generation != active.Generation || ack.ContentHash != active.ContentHash {
+			return nil, connectorprotocol.ErrIdentityMismatch
+		}
+		if ack.Status != connectorprotocol.AckApplied && ack.Status != connectorprotocol.AckDuplicate {
+			return nil, connectorprotocol.ErrSnapshotRequired
+		}
+		return nil, nil
 	case connectorprotocol.MessageSnapshot:
 		var snapshot connectorprotocol.Snapshot
 		if err := frame.DecodePayload(&snapshot); err != nil {
@@ -858,6 +878,17 @@ func (s *ControlSession) Serve(ctx context.Context, carrier io.ReadWriteCloser, 
 				renewalEvents = nil
 			}
 		case <-heartbeatEvents:
+			// The server only accepts a heartbeat for a promoted active
+			// snapshot. During the initial bootstrap the client has a candidate
+			// while readiness is still probing, but no active snapshot yet. Do
+			// not send that candidate as "last applied": the server correctly
+			// rejects it as snapshot-required and closes the control stream.
+			// Keep the timer alive and send the first heartbeat after the
+			// readiness path promotes the candidate.
+			if _, active := s.client.Active(); !active {
+				resetHeartbeat()
+				continue
+			}
 			frame, err := s.HeartbeatFrame(s.nextRequestID("heartbeat"), s.clock.Now().UTC())
 			if err != nil {
 				if !errors.Is(err, connectorprotocol.ErrSnapshotRequired) && !errors.Is(err, connectorprotocol.ErrNotReady) {

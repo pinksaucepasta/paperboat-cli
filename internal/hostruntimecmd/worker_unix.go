@@ -22,10 +22,34 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/workerupdate"
 )
 
+type hostdHost interface {
+	StartHostd(context.Context) error
+	ShutdownHostd(context.Context) error
+	WorkloadStatus() hostdproto.WorkloadStatus
+	UpdateGate() hostdproto.UpdateGateHandler
+}
+
+type hostdHostFactory func(context.Context, string, func(string) string) (hostdHost, error)
+type hostdWorkerFactory func(context.Context, workerupdate.StartRequest) (workerupdate.Worker, error)
+
 // runHostd starts hostd-owned workloads first, then launches the active
 // runtime artifact as a separately fenced child. No coordination runtime is
 // started in-process here.
 func runHostd(ctx context.Context, output io.Writer) error {
+	return runHostdWith(ctx, output,
+		func(ctx context.Context, version string, environ func(string) string) (hostdHost, error) {
+			return hostruntime.NewProductionHost(ctx, version, environ)
+		},
+		func(ctx context.Context, request workerupdate.StartRequest) (workerupdate.Worker, error) {
+			return (workerupdate.ExecStarter{}).Start(ctx, request)
+		},
+	)
+}
+
+func runHostdWith(ctx context.Context, output io.Writer, newHost hostdHostFactory, startWorker hostdWorkerFactory) error {
+	if newHost == nil || startWorker == nil {
+		return errors.New("hostd requires lifecycle factories")
+	}
 	socket, tokenPath, executable := os.Getenv("PAPERBOAT_HOSTD_SOCKET"), os.Getenv("PAPERBOAT_HOSTD_TOKEN_FILE"), os.Getenv("PAPERBOAT_RUNTIME_CURRENT")
 	if !filepath.IsAbs(socket) || !filepath.IsAbs(tokenPath) || !filepath.IsAbs(executable) {
 		return errors.New("hostd requires fixed socket, token, and active runtime paths")
@@ -41,18 +65,18 @@ func runHostd(ctx context.Context, output io.Writer) error {
 	if err := notifier.Starting(); err != nil {
 		return err
 	}
-	host, err := hostruntime.NewProductionHost(ctx, buildinfo.Version, os.Getenv)
+	host, err := newHost(ctx, buildinfo.Version, os.Getenv)
 	if err != nil {
 		_ = notifier.Degraded("hostd initialization failed")
 		return err
 	}
-	if err := host.StartStable(ctx); err != nil {
+	if err := host.StartHostd(ctx); err != nil {
 		_ = notifier.Degraded("hostd startup failed")
 		return err
 	}
 	server, err := hostdproto.NewServer(hostdproto.SocketConfig{SocketPath: socket, StatePath: filepath.Join(filepath.Dir(socket), "fence.json"), UID: os.Geteuid(), GID: os.Getegid(), Token: token, APIMin: 1, APIMax: 1, Workloads: host.WorkloadStatus, UpdateGate: host.UpdateGate(), RequestTimeout: 31 * time.Minute})
 	if err != nil {
-		shutdownStableHost(host)
+		shutdownHostd(host)
 		return err
 	}
 	serverCtx, stopServer := context.WithCancel(ctx)
@@ -60,10 +84,10 @@ func runHostd(ctx context.Context, output io.Writer) error {
 	go func() { serverDone <- server.Run(serverCtx) }()
 	if err := waitForHostdSocket(ctx, socket, serverDone); err != nil {
 		stopServer()
-		shutdownStableHost(host)
+		shutdownHostd(host)
 		return err
 	}
-	worker, err := workerupdate.ExecStarter{}.Start(ctx, workerupdate.StartRequest{Executable: executable, Release: workerupdate.Release{Version: buildinfo.Version, Platform: gort.GOOS, Architecture: gort.GOARCH, HostdAPIMin: 1, HostdAPIMax: 1}, WorkerID: "runtime-" + strings.ReplaceAll(buildinfo.Version, " ", "-"), UID: os.Geteuid(), GID: os.Getegid(), HostdEndpoint: socket, Capability: token, MutationsDisabled: true})
+	worker, err := startWorker(ctx, workerupdate.StartRequest{Executable: executable, Release: workerupdate.Release{Version: buildinfo.Version, Platform: gort.GOOS, Architecture: gort.GOARCH, HostdAPIMin: 1, HostdAPIMax: 1}, WorkerID: "runtime-" + strings.ReplaceAll(buildinfo.Version, " ", "-"), UID: os.Geteuid(), GID: os.Getegid(), HostdEndpoint: socket, Capability: token, MutationsDisabled: true})
 	if err == nil {
 		_, err = worker.Ready(ctx)
 	}
@@ -72,13 +96,13 @@ func runHostd(ctx context.Context, output io.Writer) error {
 	}
 	if err != nil {
 		stopServer()
-		shutdownStableHost(host)
+		shutdownHostd(host)
 		return err
 	}
 	if err := notifier.Ready(); err != nil {
 		_ = worker.Stop(context.Background())
 		stopServer()
-		shutdownStableHost(host)
+		shutdownHostd(host)
 		return err
 	}
 	fmt.Fprintln(output, "pb hostd ready")
@@ -109,7 +133,7 @@ run:
 	stopErr := worker.Stop(shutdownCtx)
 	stopServer()
 	serverErr := <-serverDone
-	return errors.Join(runErr, stopErr, serverErr, notifier.Stopping(), host.ShutdownStable(shutdownCtx))
+	return errors.Join(runErr, stopErr, serverErr, notifier.Stopping(), host.ShutdownHostd(shutdownCtx))
 }
 
 func waitForHostdSocket(ctx context.Context, socket string, done <-chan error) error {
@@ -132,11 +156,11 @@ func waitForHostdSocket(ctx context.Context, socket string, done <-chan error) e
 		}
 	}
 }
-func shutdownStableHost(host *hostruntime.Host) {
+func shutdownHostd(host hostdHost) {
 	if host != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		_ = host.ShutdownStable(ctx)
+		_ = host.ShutdownHostd(ctx)
 	}
 }
 

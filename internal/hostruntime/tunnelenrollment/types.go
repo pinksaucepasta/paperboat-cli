@@ -18,13 +18,15 @@ import (
 const Schema = "paperboat.tunnel-connector-enrollment/v1"
 
 var (
-	ErrInvalid        = errors.New("invalid tunnel connector enrollment")
-	ErrAuthentication = errors.New("tunnel connector enrollment authentication required")
-	ErrForbidden      = errors.New("tunnel connector enrollment forbidden")
-	ErrConflict       = errors.New("tunnel connector enrollment conflicts with durable state")
-	ErrUnavailable    = errors.New("tunnel connector enrollment temporarily unavailable")
-	ErrActivation     = errors.New("tunnel connector activation unavailable")
-	ErrSecretStore    = errors.New("tunnel connector protected credential store unavailable")
+	ErrInvalid             = errors.New("invalid tunnel connector enrollment")
+	ErrAuthentication      = errors.New("tunnel connector enrollment authentication required")
+	ErrForbidden           = errors.New("tunnel connector enrollment forbidden")
+	ErrConflict            = errors.New("tunnel connector enrollment conflicts with durable state")
+	ErrEnrollmentExpired   = errors.New("tunnel connector enrollment expired")
+	ErrEnrollmentRetryable = errors.New("tunnel connector enrollment requires retry")
+	ErrUnavailable         = errors.New("tunnel connector enrollment temporarily unavailable")
+	ErrActivation          = errors.New("tunnel connector activation unavailable")
+	ErrSecretStore         = errors.New("tunnel connector protected credential store unavailable")
 )
 
 type MachineAuth interface {

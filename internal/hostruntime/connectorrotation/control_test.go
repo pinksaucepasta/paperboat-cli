@@ -667,12 +667,18 @@ func TestControlSessionServeKeepsOneLoopForReadinessRotationHeartbeatAndRenewal(
 		t.Fatal("snapshot readiness did not start")
 	}
 
-	for !sawHeartbeat || !sawRenewal {
-		frame := readServeFrame(t, serverSide)
-		if !handleProactive(frame) {
-			t.Fatalf("unexpected proactive frame: %+v", frame)
-		}
+	// A bootstrap candidate is not an active snapshot yet. Heartbeats must
+	// wait for readiness promotion; sending one here makes the server reject
+	// the stream as snapshot-required. Renewal is independent and must still
+	// run while the readiness probe is in flight.
+	renewalFrame := readUntil(connectorprotocol.MessageAuthRenew)
+	if !handleProactive(renewalFrame) || !sawRenewal {
+		t.Fatalf("renewal was not sent while readiness was pending: %+v", renewalFrame)
 	}
+	if sawHeartbeat {
+		t.Fatal("heartbeat sent before the initial snapshot became active")
+	}
+	assertNoControlFrame(t, serverSide, 60*time.Millisecond)
 	close(readiness.release)
 	readyFrame := readUntil(connectorprotocol.MessageReady)
 	if readyFrame.Type != connectorprotocol.MessageReady || readyFrame.RequestID != snapshotFrame.RequestID {
@@ -681,6 +687,25 @@ func TestControlSessionServeKeepsOneLoopForReadinessRotationHeartbeatAndRenewal(
 	var ready connectorprotocol.Readiness
 	if err := readyFrame.DecodePayload(&ready); err != nil || ready.Generation != snapshot.Generation || !ready.EdgeReady || !ready.RouteReady || !ready.OriginReady {
 		t.Fatalf("snapshot readiness = %+v, err=%v", ready, err)
+	}
+	readyAck := connectorprotocol.Ack{
+		AccountID: ready.AccountID, TunnelID: ready.TunnelID, ConnectorID: ready.ConnectorID,
+		SessionID: ready.SessionID, ProcessGeneration: ready.ProcessGeneration,
+		Kind: connectorprotocol.AckReady, Status: connectorprotocol.AckApplied,
+		Generation: ready.Generation, ContentHash: ready.ContentHash,
+	}
+	readyAckFrame, err := connectorprotocol.NewFrame(connectorprotocol.MessageAck, readyFrame.RequestID, readyAck)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := connectorprotocol.WriteFrame(serverSide, readyAckFrame); err != nil {
+		t.Fatalf("write ready ack: %v", err)
+	}
+	for !sawHeartbeat {
+		frame := readServeFrame(t, serverSide)
+		if !handleProactive(frame) {
+			t.Fatalf("unexpected post-ready proactive frame: %+v", frame)
+		}
 	}
 
 	challengeFrame, err := connectorprotocol.NewFrame(connectorprotocol.MessageCredentialRotationChallenge, "req-live-rotation", challenge)

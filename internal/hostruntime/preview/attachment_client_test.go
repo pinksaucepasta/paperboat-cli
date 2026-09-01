@@ -193,7 +193,7 @@ func TestAttachmentClientRequiresLeaseETagAndClassifiesStalePrecondition(t *test
 	}
 }
 
-func TestAttachmentClientWaitsForAdmittedAndRecordsOriginReadiness(t *testing.T) {
+func TestAttachmentClientWaitsForAdmissionThenEdgeReadyAndRecordsOriginReadiness(t *testing.T) {
 	now := time.Now().UTC()
 	lease, base := providerTestLeaseAttachment(t, now, "preview_admission", "operation_admission_01", "route_admission_01", testPreviewCarrierIdentity(1), 1)
 	request, err := AttachmentRequestForLease(lease, "request_admission_01", "correlation_admission_01")
@@ -210,12 +210,15 @@ func TestAttachmentClientWaitsForAdmittedAndRecordsOriginReadiness(t *testing.T)
 	}
 	admitted := pending
 	admitted.State, admitted.AttachmentGeneration = "admitted", 2
-	ready := admitted
-	ready.State, ready.EdgeReady, ready.OriginReady = "ready", true, true
-	ready.AttachmentGeneration = 3
+	edgeReady := admitted
+	edgeReady.State, edgeReady.EdgeReady, edgeReady.OriginReady = "edge_ready", true, false
+	edgeReady.AttachmentGeneration = 3
+	ready := edgeReady
+	ready.State, ready.OriginReady = "ready", true
+	ready.AttachmentGeneration = 4
 	readyAt := now
 	ready.ReadyAt = &readyAt
-	for name, value := range map[string]Attachment{"pending": pending, "admitted": admitted, "ready": ready} {
+	for name, value := range map[string]Attachment{"pending": pending, "admitted": admitted, "edge_ready": edgeReady, "ready": ready} {
 		if err := value.Validate(now); err != nil {
 			t.Fatalf("%s attachment invalid: %v", name, err)
 		}
@@ -235,6 +238,8 @@ func TestAttachmentClientWaitsForAdmittedAndRecordsOriginReadiness(t *testing.T)
 				t.Fatalf("unexpected attachment path %q", req.URL.Path)
 			}
 			value = ready
+		} else if len(calls) > 1 {
+			value = edgeReady
 		}
 		body, err := json.Marshal(struct {
 			Data Attachment `json:"data"`
@@ -257,8 +262,15 @@ func TestAttachmentClientWaitsForAdmittedAndRecordsOriginReadiness(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.State != "admitted" || got.AttachmentGeneration != admitted.AttachmentGeneration {
+	if got.State != "admitted" || got.EdgeReady || got.AttachmentGeneration != admitted.AttachmentGeneration {
 		t.Fatalf("admitted attachment = %#v", got)
+	}
+	got, err = client.WaitForEdgeReady(context.Background(), request, got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != "edge_ready" || !got.EdgeReady || got.AttachmentGeneration != edgeReady.AttachmentGeneration {
+		t.Fatalf("edge-ready attachment = %#v", got)
 	}
 	got, err = client.ObserveOrigin(context.Background(), request, got, true)
 	if err != nil {
@@ -267,8 +279,45 @@ func TestAttachmentClientWaitsForAdmittedAndRecordsOriginReadiness(t *testing.T)
 	if got.State != "ready" || !got.EdgeReady || !got.OriginReady || got.AttachmentGeneration != ready.AttachmentGeneration {
 		t.Fatalf("ready attachment = %#v", got)
 	}
-	if len(calls) != 2 || calls[0] != "/v1/previews/preview_admission/carrier-attachment" || calls[1] != "/v1/previews/preview_admission/carrier-attachment/readiness" {
+	if len(calls) != 3 || calls[0] != "/v1/previews/preview_admission/carrier-attachment" || calls[1] != "/v1/previews/preview_admission/carrier-attachment" || calls[2] != "/v1/previews/preview_admission/carrier-attachment/readiness" {
 		t.Fatalf("attachment calls = %#v", calls)
+	}
+}
+
+func TestAttachmentClientAcceptsIdempotentOriginFailure(t *testing.T) {
+	now := time.Now().UTC()
+	lease, attachment := providerTestLeaseAttachment(t, now, "preview_origin_replay", "operation_origin_replay_01", "route_origin_replay_01", testPreviewCarrierIdentity(1), 1)
+	request, err := AttachmentRequestForLease(lease, "request_origin_replay_01", "correlation_origin_replay_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	attachment.RequestID = request.RequestID
+	attachment.CorrelationID = request.CorrelationID
+	attachment.RequestHash, err = request.Hash(attachment.AccountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attachment.State != "edge_ready" || !attachment.EdgeReady || attachment.OriginReady {
+		t.Fatalf("fixture attachment = %#v, want edge_ready", attachment)
+	}
+	body, err := json.Marshal(struct {
+		Data Attachment `json:"data"`
+	}{Data: attachment})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := attachmentClientWithTransport(t, roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path != "/v1/previews/preview_origin_replay/carrier-attachment/readiness" {
+			t.Fatalf("readiness path = %q", req.URL.Path)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(string(body))), Request: req}, nil
+	}))
+	got, err := client.ObserveOrigin(context.Background(), request, attachment, false)
+	if err != nil {
+		t.Fatalf("idempotent origin failure = %v", err)
+	}
+	if got.Binding != attachment.Binding || got.AttachmentGeneration != attachment.AttachmentGeneration || got.State != attachment.State || got.OriginReady != attachment.OriginReady {
+		t.Fatalf("idempotent attachment = %#v, want same binding/generation/state %#v", got, attachment)
 	}
 }
 

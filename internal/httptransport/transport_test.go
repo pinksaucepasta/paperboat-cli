@@ -60,6 +60,22 @@ func TestValidateProxySnapshotUsesTransportPolicy(t *testing.T) {
 	}
 }
 
+func TestPACOnlyAllowsOnlyExplicitNoProxyDestinations(t *testing.T) {
+	proxy, _, err := proxyFunction(ProxySnapshot{PACOnly: true, NoProxy: "api.pprbt.dev", Generation: 7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlURL, _ := url.Parse("https://api.pprbt.dev/v1/runtime-observations")
+	request := &http.Request{URL: controlURL}
+	if selected, err := proxy(request); err != nil || selected != nil {
+		t.Fatalf("control bypass selected=%v err=%v", selected, err)
+	}
+	request.URL, _ = url.Parse("https://example.test/")
+	if _, err := proxy(request); err == nil {
+		t.Fatal("PAC-only destination outside NO_PROXY was accepted")
+	}
+}
+
 func TestTransportReturnsTypedProxyAuthenticationFailure(t *testing.T) {
 	proxy := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) { writer.WriteHeader(http.StatusProxyAuthRequired) }))
 	defer proxy.Close()

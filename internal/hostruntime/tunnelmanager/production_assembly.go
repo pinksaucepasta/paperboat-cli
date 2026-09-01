@@ -67,8 +67,10 @@ type ProductionAssemblyConfig struct {
 	// ControlSessionFactory creates a fresh ControlSession for each bootstrap
 	// reconnect. ControlSession contains ClientSession state and cannot be
 	// reused after a peer disconnects. The factory must obtain a new
-	// server-authenticated Hello/Auth identity; this assembly only injects the
-	// durable applier and readiness boundary.
+	// server-authenticated Hello/Auth identity with a strictly higher
+	// ProcessGeneration and re-sign the Auth transcript; a new Welcome session
+	// ID alone is not sufficient for the server's durable stale-process fence.
+	// This assembly only injects the durable applier and readiness boundary.
 	ControlSessionFactory func(context.Context, *CoordinatedConfigApplier) (connectorrotation.ControlSessionConfig, error)
 	// ControlStream is intentionally a one-shot, already-authenticated stream
 	// provider. A replacement connector process must create a new assembly and
@@ -283,7 +285,17 @@ func (a *ProductionAssembly) Start(ctx context.Context) error {
 	if a == nil || a.Manager == nil || ctx == nil {
 		return ErrProductionAssemblyInvalid
 	}
-	if err := a.Manager.Start(ctx); err != nil {
+	// A descriptor source bound to Welcome cannot prepare a carrier until the
+	// control stream has delivered that frame. Start the manager lifecycle first
+	// without its synchronous initial reconcile, then acquire control; the
+	// manager's wake-up below reconciles once Welcome and the authoritative
+	// snapshot are available. Assemblies without a control stream retain the
+	// ordinary synchronous crash-recovery contract.
+	startManager := a.Manager.Start
+	if a.controlStream != nil {
+		startManager = a.Manager.StartDeferred
+	}
+	if err := startManager(ctx); err != nil {
 		return err
 	}
 	if a.networkRecovery != nil {
@@ -311,6 +323,10 @@ func (a *ProductionAssembly) Start(ctx context.Context) error {
 		return errors.Join(finalErr, a.Shutdown(context.Background()))
 	}
 	go a.runControlLoop(controlCtx, done, a.Control, a.controlRunner, stream, a.helloRequestID)
+	// StartDeferred intentionally skips inline reconciliation. Wake the loop
+	// after control ownership is established so Welcome can release the
+	// session-bound carrier prepare gate without waiting for the interval tick.
+	a.Manager.Notify()
 	return nil
 }
 
@@ -443,11 +459,21 @@ func (a *ProductionAssembly) reconnectControl(ctx context.Context, done chan str
 		}
 		controlConfig, err := a.controlFactory(ctx, a.Applier)
 		if err != nil {
+			if errors.Is(err, ErrProductionControlRestartRequired) {
+				finalErr := errors.Join(ErrProductionControlRestartRequired, err)
+				a.finishControl(done, finalErr)
+				return finalErr
+			}
 			a.reportControlFailure(err, attempt+1)
 			continue
 		}
 		control, runner, err := a.newControl(controlConfig)
 		if err != nil {
+			if errors.Is(err, ErrProductionControlRestartRequired) {
+				finalErr := errors.Join(ErrProductionControlRestartRequired, err)
+				a.finishControl(done, finalErr)
+				return finalErr
+			}
 			a.reportControlFailure(err, attempt+1)
 			continue
 		}
@@ -484,6 +510,22 @@ func (a *ProductionAssembly) newControl(config connectorrotation.ControlSessionC
 	}
 	if config.Hello.AccountID != a.accountID || config.Hello.TunnelID != a.tunnelID || config.Hello.ConnectorID != a.connectorID || config.Hello.HostID != a.hostID {
 		return nil, nil, connectorprotocol.ErrIdentityMismatch
+	}
+	// The server persists the highest process generation ever accepted for a
+	// connector and rejects a later session that reuses it. A reconnect must
+	// therefore be a fresh authenticated process epoch, not merely a new
+	// websocket/session ID. Keep the durable connector identity unchanged, but
+	// fail closed when the injected factory hands us a stale Hello. The factory
+	// owns the process-generation claim and must also re-sign Auth for it.
+	a.controlMu.Lock()
+	current := a.Control
+	a.controlMu.Unlock()
+	if current == nil || current.Session() == nil {
+		return nil, nil, ErrProductionControlRestartRequired
+	}
+	currentGeneration := current.Session().Hello().ProcessGeneration
+	if config.Hello.ProcessGeneration <= currentGeneration || config.Hello.Auth.ProcessGeneration != config.Hello.ProcessGeneration {
+		return nil, nil, errors.Join(ErrProductionControlRestartRequired, ErrGenerationConflict)
 	}
 	config.Applier = a.Applier
 	config.SnapshotReadiness = a.Applier

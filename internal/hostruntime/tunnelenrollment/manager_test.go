@@ -18,6 +18,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/pinksaucepasta/paperboat/internal/api"
 )
 
 type testAuth struct {
@@ -123,7 +125,90 @@ func TestManagerIssueExchangeActivateRestartAndNoSecretJournal(t *testing.T) {
 	}
 }
 
-func TestManagerResumeReattachesExactDurableActivationWithoutServerMutation(t *testing.T) {
+func TestManagerRecoversExpiredEnrollmentWithoutRotatingCredential(t *testing.T) {
+	now := time.Now().UTC()
+	oldToken := "pbce_" + strings.Repeat("o", 48)
+	newToken := "pbce_" + strings.Repeat("n", 48)
+	issueKeys := make([]string, 0, 2)
+	exchangeKeys := make([]string, 0, 2)
+	exchangeTokens := make([]string, 0, 2)
+	issueCalls, exchangeCalls := 0, 0
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/tunnels/tunnel_expired_01/connectors/enrollments":
+			issueCalls++
+			issueKeys = append(issueKeys, r.Header.Get("Idempotency-Key"))
+			token := oldToken
+			if issueCalls == 2 {
+				token = newToken
+			}
+			w.WriteHeader(http.StatusCreated)
+			writeEnvelope(t, w, serverEnrollment{Schema: api.TunnelV1Schema, Kind: "connector_enrollment", ID: fmt.Sprintf("enrollment_expired_%d", issueCalls), TunnelID: "tunnel_expired_01", HostID: "host_01", Token: token, ExpiresAt: now.Add(time.Minute), Capabilities: append([]string(nil), connectorOriginCapabilities...)})
+		case "/v1/tunnels/tunnel_expired_01/connectors/enrollments/exchange":
+			exchangeCalls++
+			exchangeKeys = append(exchangeKeys, r.Header.Get("Idempotency-Key"))
+			var document struct {
+				Token string `json:"token"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&document); err != nil {
+				t.Errorf("decode exchange body: %v", err)
+			}
+			exchangeTokens = append(exchangeTokens, document.Token)
+			if exchangeCalls == 1 {
+				w.WriteHeader(http.StatusGone)
+				_, _ = w.Write([]byte(`{"error":{"code":"enrollment_expired"}}`))
+				return
+			}
+			w.WriteHeader(http.StatusAccepted)
+			writeEnvelope(t, w, testServerActivation(now, "tunnel_expired_01", "connector_expired_01", "operation_expired_01"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	store, err := NewFileCredentialStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	activator := &testActivator{}
+	manager, err := NewManager(ManagerConfig{ControlURL: server.URL, HostID: "host_01", Auth: &testAuth{}, Transport: server.Client().Transport, Credentials: store, Activator: activator, ControlToken: "local-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	projection, err := manager.Enroll(context.Background(), "tunnel_expired_01", "local-expired-01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projection.ConnectorID != "connector_expired_01" || issueCalls != 2 || exchangeCalls != 2 || len(issueKeys) != 2 || len(exchangeKeys) != 2 || issueKeys[0] == issueKeys[1] || exchangeKeys[0] == exchangeKeys[1] {
+		t.Fatalf("projection=%+v issue_calls=%d exchange_calls=%d issue_keys=%q exchange_keys=%q", projection, issueCalls, exchangeCalls, issueKeys, exchangeKeys)
+	}
+	if len(exchangeTokens) != 2 || exchangeTokens[0] != oldToken || exchangeTokens[1] != newToken {
+		t.Fatalf("exchange tokens=%q", exchangeTokens)
+	}
+	journalBytes, err := os.ReadFile(filepath.Join(store.root, "journal.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(journalBytes, []byte(oldToken)) || bytes.Contains(journalBytes, []byte(newToken)) || bytes.Contains(journalBytes, []byte("pending_token_cleanup")) {
+		t.Fatalf("journal retained enrollment secret: %s", journalBytes)
+	}
+	for _, enrollmentID := range []string{"enrollment_expired_1", "enrollment_expired_2"} {
+		if _, err := os.Stat(filepath.Join(store.root, "credentials", "token-"+enrollmentID+".secret")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("token %s still present: %v", enrollmentID, err)
+		}
+	}
+	credentials, err := os.ReadDir(filepath.Join(store.root, "credentials"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(credentials) != 1 {
+		t.Fatalf("credential files=%d, want one authoritative credential", len(credentials))
+	}
+}
+
+func TestManagerResumeReattachesDurableActivationWithFreshProcessGeneration(t *testing.T) {
 	now := time.Now().UTC()
 	serverCalls := 0
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -163,8 +248,141 @@ func TestManagerResumeReattachesExactDurableActivationWithoutServerMutation(t *t
 	}
 	want := initial.input
 	got := rejoined.input
-	if got.AccountID != want.AccountID || got.TunnelID != want.TunnelID || got.HostID != want.HostID || got.ConnectorID != want.ConnectorID || got.OperationID != want.OperationID || got.CredentialReference != want.CredentialReference || got.CredentialKeyID != want.CredentialKeyID || got.CredentialThumbprint != want.CredentialThumbprint || got.CredentialGeneration != want.CredentialGeneration || got.ProcessGeneration != want.ProcessGeneration || !bytes.Equal(got.CredentialPublicKey, want.CredentialPublicKey) {
+	if got.AccountID != want.AccountID || got.TunnelID != want.TunnelID || got.HostID != want.HostID || got.ConnectorID != want.ConnectorID || got.OperationID != want.OperationID || got.CredentialReference != want.CredentialReference || got.CredentialKeyID != want.CredentialKeyID || got.CredentialThumbprint != want.CredentialThumbprint || got.CredentialGeneration != want.CredentialGeneration || got.ProcessGeneration != want.ProcessGeneration+1 || !bytes.Equal(got.CredentialPublicKey, want.CredentialPublicKey) {
 		t.Fatalf("resume binding\n got=%+v\nwant=%+v", got, want)
+	}
+}
+
+func TestManagerResumeClaimsProcessGenerationOncePerManagerLifetime(t *testing.T) {
+	store, tunnelID := writeResumeJournalFixture(t, 1)
+	firstActivator := &testActivator{}
+	first, err := NewManager(ManagerConfig{ControlURL: "https://api.example.test", HostID: "host_01", Auth: &testAuth{}, Credentials: store, Activator: firstActivator, ControlToken: "local-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Resume(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if firstActivator.calls != 1 || firstActivator.input.ProcessGeneration != 2 {
+		t.Fatalf("first resume calls=%d process_generation=%d", firstActivator.calls, firstActivator.input.ProcessGeneration)
+	}
+	if got := resumeJournalProcessGeneration(t, store, tunnelID); got != 2 {
+		t.Fatalf("first claim process_generation=%d, want 2", got)
+	}
+
+	// A retry in the same hostd lifetime reattaches with the already durable
+	// claim. It must not advance the epoch a second time.
+	if err := first.Resume(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if firstActivator.calls != 2 || firstActivator.input.ProcessGeneration != 2 {
+		t.Fatalf("same-manager retry calls=%d process_generation=%d", firstActivator.calls, firstActivator.input.ProcessGeneration)
+	}
+	if got := resumeJournalProcessGeneration(t, store, tunnelID); got != 2 {
+		t.Fatalf("same-manager retry process_generation=%d, want 2", got)
+	}
+
+	secondActivator := &testActivator{}
+	second, err := NewManager(ManagerConfig{ControlURL: "https://api.example.test", HostID: "host_01", Auth: &testAuth{}, Credentials: store, Activator: secondActivator, ControlToken: "local-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Resume(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if secondActivator.calls != 1 || secondActivator.input.ProcessGeneration != 3 {
+		t.Fatalf("restart resume calls=%d process_generation=%d", secondActivator.calls, secondActivator.input.ProcessGeneration)
+	}
+	if got := resumeJournalProcessGeneration(t, store, tunnelID); got != 3 {
+		t.Fatalf("restart claim process_generation=%d, want 3", got)
+	}
+}
+
+func TestManagerResumeClaimPersistenceFailureDoesNotActivateOrAdvance(t *testing.T) {
+	store, tunnelID := writeResumeJournalFixture(t, 1)
+	activator := &testActivator{}
+	manager, err := NewManager(ManagerConfig{ControlURL: "https://api.example.test", HostID: "host_01", Auth: &testAuth{}, Credentials: store, Activator: activator, ControlToken: "local-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.failSave = 1
+	if err := manager.Resume(context.Background()); !errors.Is(err, ErrSecretStore) {
+		t.Fatalf("claim persistence error=%v", err)
+	}
+	if activator.calls != 0 {
+		t.Fatalf("activation ran after failed claim persistence: %d", activator.calls)
+	}
+	if got := resumeJournalProcessGeneration(t, store, tunnelID); got != 1 {
+		t.Fatalf("failed claim process_generation=%d, want 1", got)
+	}
+
+	if err := manager.Resume(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if activator.calls != 1 || activator.input.ProcessGeneration != 2 {
+		t.Fatalf("retry calls=%d process_generation=%d", activator.calls, activator.input.ProcessGeneration)
+	}
+	if got := resumeJournalProcessGeneration(t, store, tunnelID); got != 2 {
+		t.Fatalf("retry process_generation=%d, want 2", got)
+	}
+}
+
+func TestManagerResumeProcessGenerationOverflowFailsClosed(t *testing.T) {
+	store, tunnelID := writeResumeJournalFixture(t, ^uint64(0))
+	activator := &testActivator{}
+	manager, err := NewManager(ManagerConfig{ControlURL: "https://api.example.test", HostID: "host_01", Auth: &testAuth{}, Credentials: store, Activator: activator, ControlToken: "local-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Resume(context.Background()); !errors.Is(err, ErrConflict) || !errors.Is(err, errProcessGenerationExhausted) {
+		t.Fatalf("overflow error=%v", err)
+	}
+	if activator.calls != 0 {
+		t.Fatalf("activation ran after generation overflow: %d", activator.calls)
+	}
+	if got := resumeJournalProcessGeneration(t, store, tunnelID); got != ^uint64(0) {
+		t.Fatalf("overflow process_generation=%d", got)
+	}
+}
+
+func TestFileCredentialStoreClaimProcessGenerationIsExactAndDurable(t *testing.T) {
+	store, tunnelID := writeResumeJournalFixture(t, 7)
+	state, err := store.loadJournal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := state.Records[tunnelID].activationRequest()
+	claimed, err := store.ClaimProcessGeneration(context.Background(), expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed.ProcessGeneration != expected.ProcessGeneration+1 || claimed.TunnelID != expected.TunnelID || claimed.ConnectorID != expected.ConnectorID || claimed.CredentialReference != expected.CredentialReference {
+		t.Fatalf("claimed request=%+v expected=%+v", claimed, expected)
+	}
+	if got := resumeJournalProcessGeneration(t, store, tunnelID); got != claimed.ProcessGeneration {
+		t.Fatalf("durable process_generation=%d, want %d", got, claimed.ProcessGeneration)
+	}
+	if _, err := store.ClaimProcessGeneration(context.Background(), expected); !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale claim error=%v, want ErrConflict", err)
+	}
+	if _, err := store.ClaimProcessGeneration(context.Background(), claimed); err != nil {
+		t.Fatalf("next exact claim: %v", err)
+	}
+}
+
+func TestFileCredentialStoreClaimProcessGenerationPersistenceFailureDoesNotAdvance(t *testing.T) {
+	store, tunnelID := writeResumeJournalFixture(t, 7)
+	state, err := store.loadJournal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := state.Records[tunnelID].activationRequest()
+	store.failSave = 1
+	if _, err := store.ClaimProcessGeneration(context.Background(), expected); !errors.Is(err, ErrSecretStore) {
+		t.Fatalf("claim error=%v, want ErrSecretStore", err)
+	}
+	if got := resumeJournalProcessGeneration(t, store, tunnelID); got != expected.ProcessGeneration {
+		t.Fatalf("failed claim advanced process_generation=%d, want %d", got, expected.ProcessGeneration)
 	}
 }
 
@@ -434,4 +652,35 @@ func testServerActivation(now time.Time, tunnelID, connectorID, operationID stri
 		"credential_generation": 3, "process_generation": 2,
 		"operation": map[string]any{"schema": "paperboat.preview-tunnel/v1", "kind": "operation", "id": operationID, "resource_kind": "connector", "resource_id": connectorID, "phase": "connecting", "state": "running", "progress": 60, "retrying": false, "correlation_id": "correlation_01", "created_at": now, "updated_at": now},
 	}
+}
+
+func writeResumeJournalFixture(t *testing.T, processGeneration uint64) (*FileCredentialStore, string) {
+	t.Helper()
+	store, err := NewFileCredentialStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := store.CreateKey(context.Background(), "credential-resume-claim-01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tunnelID := "tunnel_resume_claim_01"
+	now := time.Now().UTC()
+	projection := Projection{Schema: Schema, Kind: "tunnel_connector", TunnelID: tunnelID, HostID: "host_01", ConnectorID: "connector_resume_claim_01", OperationID: "operation_resume_claim_01", State: "ready", CredentialReference: credential.Reference, CredentialGeneration: 3, ReadyAt: &now}
+	state := journal{Version: 1, Records: map[string]record{
+		tunnelID: {AccountID: "account_01", TunnelID: tunnelID, HostID: "host_01", LocalKey: "local-resume-claim-01", IssueKey: "issue-resume-claim-01", ExchangeKey: "exchange-resume-claim-01", Credential: credential, EnrollmentID: "enrollment-resume-claim-01", TokenReference: "token-resume-claim-01", ConnectorID: "connector_resume_claim_01", OperationID: "operation_resume_claim_01", StableEndpointID: "123e4567-e89b-12d3-a456-426614174000", CredentialGeneration: 3, ProcessGeneration: processGeneration, Phase: "active", Projection: &projection},
+	}}
+	if err := store.saveJournal(state); err != nil {
+		t.Fatal(err)
+	}
+	return store, tunnelID
+}
+
+func resumeJournalProcessGeneration(t *testing.T, store *FileCredentialStore, tunnelID string) uint64 {
+	t.Helper()
+	state, err := store.loadJournal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return state.Records[tunnelID].ProcessGeneration
 }

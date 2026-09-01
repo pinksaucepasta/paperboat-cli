@@ -51,6 +51,11 @@ selected for this lease and bound to the selected machine and create operation. 
   preview. Device-authenticated local CLI creation uses the machine identity path and
   the verified machine ID, never a CLI client-session ID as `owner_device_id`.
 
+The managed preview endpoint is `https://<opaque-id>.preview.pprbt.dev` in production
+(or the same opaque label under a configured development base). The server generates
+the DNS-safe leftmost label, keeps it immutable for the lease, and never prefixes it
+with `preview-` or derives it from a user-controlled name.
+
 A ready preview resource exposes bounded `domains` summaries. Every summary uses
 `target_kind: "preview_lease"` and the owning `preview_id`, and contains only DNS,
 certificate, generation, ETag, and optional safe DNS instructions. Domain summaries

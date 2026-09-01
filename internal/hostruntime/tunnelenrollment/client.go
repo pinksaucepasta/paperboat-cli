@@ -66,7 +66,11 @@ func (c *serverClient) exchange(ctx context.Context, tunnel, host, key, token st
 		return serverActivation{}, err
 	}
 	body, err := json.Marshal(struct {
-		Token                       string `json:"enrollment_token"`
+		// The issue response intentionally calls this write-only value
+		// enrollment_token, but the exchange request contract calls it token.
+		// Keep the two wire documents distinct: the server rejects an exchange
+		// without the exact token field before it can consume the enrollment.
+		Token                       string `json:"token"`
 		HostID                      string `json:"host_id"`
 		ProtocolVersion             string `json:"protocol_version"`
 		SoftwareVersion             string `json:"software_version"`
@@ -135,7 +139,14 @@ func (c *serverClient) do(ctx context.Context, method, path, key string, body []
 			return resp.StatusCode, ErrAuthentication
 		case http.StatusForbidden:
 			return resp.StatusCode, ErrForbidden
-		case http.StatusConflict, http.StatusGone:
+		case http.StatusGone:
+			// Keep the generic conflict classification for callers that only
+			// understand the old status family, while exposing Gone so the
+			// manager can safely recover an unconsumed enrollment. A 409 is
+			// deliberately not treated as expired: it may mean the one-time
+			// token was already consumed or the idempotency body conflicts.
+			return resp.StatusCode, errors.Join(ErrConflict, ErrEnrollmentExpired)
+		case http.StatusConflict:
 			return resp.StatusCode, ErrConflict
 		default:
 			return resp.StatusCode, ErrUnavailable

@@ -547,11 +547,13 @@ func NewHost(ctx context.Context, config HostConfig, dependencies HostDependenci
 		stableComponents = append(stableComponents, stablehostd.Component{Name: "preview_recovery", Required: false, Service: dependencies.PreviewRecovery})
 	}
 	if dependencies.RuntimeObservationService != nil {
-		if stableHostOwnsCoordination() {
-			stableComponents = append(stableComponents, stablehostd.Component{Name: "runtime_observation", Required: false, Service: dependencies.RuntimeObservationService})
-		} else {
-			workerComponents = append(workerComponents, Component{Capability: "runtime_observation", Required: false, Service: dependencies.RuntimeObservationService})
-		}
+		// Presence is a stable host responsibility. The replaceable worker
+		// negotiates lifecycle only and is not guaranteed to run on every
+		// platform, so placing this service in workerComponents silently stops
+		// heartbeats after an update (and on hostd-only startup). Keep the
+		// observation loop alive with the same daemon that owns the machine
+		// identity and local control plane.
+		stableComponents = append(stableComponents, stablehostd.Component{Name: "runtime_observation", Required: false, Service: dependencies.RuntimeObservationService})
 	}
 	if dependencies.ManagedSSHService != nil {
 		stableComponents = append(stableComponents, stablehostd.Component{Name: "managed_ssh_authority", Required: true, Service: dependencies.ManagedSSHService})
@@ -715,6 +717,9 @@ func writeAgentToken(path string, random io.Reader) (string, error) {
 }
 
 func (h *Host) Start(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	h.workerMu.RLock()
 	worker := h.runtime
 	h.workerMu.RUnlock()
@@ -730,6 +735,20 @@ func (h *Host) Start(ctx context.Context) error {
 		return errors.Join(err, h.hostd.Shutdown(shutdownCtx))
 	}
 	return nil
+}
+
+// StartHostd starts only the stable daemon. The hostd process uses this entry
+// point before it launches the separately fenced runtime worker. Starting the
+// in-process Runtime here would create a second lifecycle owner and can stop
+// stable services when the external worker is activated or replaced.
+func (h *Host) StartHostd(ctx context.Context) error {
+	if h == nil || h.hostd == nil {
+		return ErrHostInvalid
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return h.hostd.Start(ctx)
 }
 
 // StartStable starts hostd-owned workloads and the coordination services whose
@@ -766,6 +785,9 @@ func (h *Host) ReplaceWorker(ctx context.Context, candidate *Runtime) error {
 }
 
 func (h *Host) Shutdown(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	h.workerMu.RLock()
 	worker := h.runtime
 	h.workerMu.RUnlock()
@@ -778,6 +800,19 @@ func (h *Host) Shutdown(ctx context.Context) error {
 		return worker.Shutdown(ctx)
 	}
 	return errors.Join(h.workers.Shutdown(ctx), h.hostd.Shutdown(ctx))
+}
+
+// ShutdownHostd drains the stable daemon after the external runtime worker has
+// stopped. It deliberately does not touch the in-process Runtime, which was
+// never started by StartHostd.
+func (h *Host) ShutdownHostd(ctx context.Context) error {
+	if h == nil || h.hostd == nil {
+		return ErrHostInvalid
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return h.hostd.Shutdown(ctx)
 }
 
 // ShutdownStable is used by the stable hostd process after its external worker

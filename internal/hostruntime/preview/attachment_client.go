@@ -45,9 +45,20 @@ var (
 // AttachmentAdmissionWaiter is implemented by an attachment transport that
 // can replay the same durable allocation until the server has accepted the
 // edge admission. The request and proof envelope remain unchanged; only the
-// server-issued attachment state/generation may advance.
+// server-issued attachment state/generation may advance. It returns as soon
+// as the server reports admitted, edge_ready, or ready. A carrier must use
+// AttachmentEdgeReadyWaiter after it has connected when it needs to wait for
+// the edge to observe that carrier.
 type AttachmentAdmissionWaiter interface {
 	WaitForAdmission(context.Context, AttachmentRequest, Attachment) (Attachment, error)
+}
+
+// AttachmentEdgeReadyWaiter waits for the edge-side observation of an
+// already-admitted carrier. This is a separate phase because the host must
+// connect the carrier while the attachment is only admitted; waiting for
+// edge_ready before dialing creates a circular handshake.
+type AttachmentEdgeReadyWaiter interface {
+	WaitForEdgeReady(context.Context, AttachmentRequest, Attachment) (Attachment, error)
 }
 
 // AttachmentReadinessObserver records the owner's origin probe after the
@@ -565,9 +576,9 @@ func (c *AttachmentClient) Allocate(ctx context.Context, request AttachmentReque
 }
 
 // WaitForAdmission replays the same idempotent allocation until the server
-// returns an admitted attachment. The client never marks edge readiness or
-// lease readiness locally. A context deadline is the caller's bound for an
-// edge that has not observed the admission yet.
+// accepts the edge publication. It returns for admitted, edge_ready, or ready
+// and never marks any state locally. A context deadline is the caller's bound
+// for an edge that has not accepted the admission yet.
 func (c *AttachmentClient) WaitForAdmission(ctx context.Context, request AttachmentRequest, initial Attachment) (Attachment, error) {
 	if c == nil || ctx == nil {
 		return Attachment{}, ErrAttachmentClientInvalid
@@ -583,11 +594,51 @@ func (c *AttachmentClient) WaitForAdmission(ctx context.Context, request Attachm
 	}
 	current := initial
 	for {
-		if _, err := current.Admission(); err == nil {
+		if current.State == "admitted" || (current.State == "edge_ready" || current.State == "ready") && current.EdgeReady {
+			return current, nil
+		}
+		if current.State != "pending" {
+			return Attachment{}, fmt.Errorf("%w: attachment cannot become admitted from %s", ErrAttachmentBinding, current.State)
+		}
+		timer := time.NewTimer(c.admissionPoll)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return Attachment{}, ctx.Err()
+		case <-timer.C:
+		}
+		next, err := c.Allocate(ctx, request)
+		if err != nil {
+			return Attachment{}, err
+		}
+		current = next
+	}
+}
+
+// WaitForEdgeReady replays the same idempotent allocation after the host has
+// connected the admitted carrier. The server's edge observation is the only
+// source of edge readiness; this method never promotes an admitted response
+// locally.
+func (c *AttachmentClient) WaitForEdgeReady(ctx context.Context, request AttachmentRequest, initial Attachment) (Attachment, error) {
+	if c == nil || ctx == nil {
+		return Attachment{}, ErrAttachmentClientInvalid
+	}
+	if err := request.Validate(); err != nil {
+		return Attachment{}, err
+	}
+	if strings.TrimSpace(request.LeaseETag) == "" {
+		return Attachment{}, api.ErrPreviewLeaseETagRequired
+	}
+	if err := validateAttachmentForRequest(initial, request); err != nil {
+		return Attachment{}, err
+	}
+	current := initial
+	for {
+		if (current.State == "edge_ready" || current.State == "ready") && current.EdgeReady {
 			return current, nil
 		}
 		if current.State != "pending" && current.State != "admitted" {
-			return Attachment{}, fmt.Errorf("%w: attachment cannot become admitted from %s", ErrAttachmentBinding, current.State)
+			return Attachment{}, fmt.Errorf("%w: attachment cannot become edge-ready from %s", ErrAttachmentBinding, current.State)
 		}
 		timer := time.NewTimer(c.admissionPoll)
 		select {
@@ -694,7 +745,18 @@ func (c *AttachmentClient) ObserveOrigin(ctx context.Context, request Attachment
 	if err := validateAttachmentForRequest(next, request); err != nil {
 		return Attachment{}, err
 	}
-	if next.Binding != attachment.Binding || next.AttachmentGeneration <= attachment.AttachmentGeneration {
+	if next.Binding != attachment.Binding {
+		return Attachment{}, fmt.Errorf("%w: readiness response binding changed", ErrAttachmentBinding)
+	}
+	// A failed origin probe is a durable, idempotent observation. The server
+	// may already have recorded the same false result while this carrier was
+	// reconnecting, so an unchanged edge_ready generation is a valid replay.
+	// Successful readiness must still advance the generation before it can be
+	// accepted by the host.
+	if !originReady && next.AttachmentGeneration == attachment.AttachmentGeneration && next.State == "edge_ready" && next.EdgeReady && !next.OriginReady {
+		return next, nil
+	}
+	if next.AttachmentGeneration <= attachment.AttachmentGeneration {
 		return Attachment{}, fmt.Errorf("%w: readiness response did not advance the current attachment", ErrAttachmentBinding)
 	}
 	return next, nil

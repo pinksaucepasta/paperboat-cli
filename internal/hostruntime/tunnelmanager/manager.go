@@ -198,6 +198,26 @@ func New(config Config) (*Manager, error) {
 // loop. A corrupt/unreadable durable store is fatal; per-tunnel origin or edge
 // failures are reported and retried without discarding an existing LKG.
 func (m *Manager) Start(ctx context.Context) error {
+	return m.start(ctx, true)
+}
+
+// StartDeferred starts the manager lifecycle and reconciliation loop without
+// running the initial reconciliation inline. It is for compositions whose
+// inputs are established by another concurrently starting protocol, such as a
+// connector control stream that must deliver Welcome before a carrier can be
+// prepared. The caller must arrange a Notify after that protocol is ready.
+// Ordinary users should call Start so crash recovery remains synchronous.
+func (m *Manager) StartDeferred(ctx context.Context) error {
+	if m == nil || ctx == nil {
+		return ErrInvalidConfig
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return m.start(ctx, false)
+}
+
+func (m *Manager) start(ctx context.Context, reconcile bool) error {
 	if m == nil || ctx == nil {
 		return ErrInvalidConfig
 	}
@@ -216,20 +236,22 @@ func (m *Manager) Start(ctx context.Context) error {
 	m.done = make(chan struct{})
 	m.started = true
 	m.mu.Unlock()
-	if err := m.ReconcileNow(ctx); err != nil {
-		m.mu.Lock()
-		m.stop()
-		close(m.done)
-		m.mu.Unlock()
-		m.opMu.Lock()
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), m.config.DrainTimeout)
-		cleanupErr := m.closeAll(cleanupCtx)
-		cancel()
-		m.opMu.Unlock()
-		m.mu.Lock()
-		m.started = false
-		m.mu.Unlock()
-		return errors.Join(err, cleanupErr)
+	if reconcile {
+		if err := m.ReconcileNow(ctx); err != nil {
+			m.mu.Lock()
+			m.stop()
+			close(m.done)
+			m.mu.Unlock()
+			m.opMu.Lock()
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), m.config.DrainTimeout)
+			cleanupErr := m.closeAll(cleanupCtx)
+			cancel()
+			m.opMu.Unlock()
+			m.mu.Lock()
+			m.started = false
+			m.mu.Unlock()
+			return errors.Join(err, cleanupErr)
+		}
 	}
 	go m.run()
 	return nil

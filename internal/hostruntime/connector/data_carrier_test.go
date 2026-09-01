@@ -391,6 +391,80 @@ func TestPreparedDataCarrierStagesReadinessAndExplicitActivation(t *testing.T) {
 	}
 }
 
+func TestPreparedDataCarrierSurvivesStagingContextCancellation(t *testing.T) {
+	identity := testDataCarrierIdentity()
+	config := DefaultDataCarrierPoolConfig()
+	config.MaximumCarriers = 1
+	config.FailureDomains = []string{"domain-a"}
+	config.Session = identity
+	config.Carrier = testDataCarrierConfig()
+
+	var edge *DataCarrier
+	dialer := func(_ context.Context, request DataCarrierDialRequest) (DataCarrierDialResult, error) {
+		local, remote := net.Pipe()
+		var err error
+		edge, err = NewDataCarrierServer(context.Background(), remote, config.Carrier, DataCarrierAdmission{
+			Identity:  identity,
+			Authorize: func(context.Context, StreamOpen) error { return nil },
+		})
+		if err != nil {
+			_ = local.Close()
+			_ = remote.Close()
+			return DataCarrierDialResult{}, err
+		}
+		return DataCarrierDialResult{
+			Link:          local,
+			PeerIdentity:  request.Identity,
+			Transport:     request.Transport,
+			EdgeID:        request.EdgeID,
+			FailureDomain: request.FailureDomain,
+		}, nil
+	}
+
+	stagingContext, cancel := context.WithCancel(context.Background())
+	prepared, err := PrepareDataCarrier(stagingContext, identity, config, dialer)
+	if err != nil {
+		cancel()
+		t.Fatalf("prepare carrier: %v", err)
+	}
+	active, err := prepared.Activate(context.Background())
+	if err != nil {
+		cancel()
+		_ = prepared.Abort(context.Background())
+		t.Fatalf("activate carrier: %v", err)
+	}
+	defer func() {
+		_ = active.Close(context.Background())
+		if edge != nil {
+			_ = edge.Close()
+		}
+	}()
+
+	// The reconcile/apply context is not the lifetime of an activated carrier.
+	// Give the old implementation enough time to observe cancellation before
+	// exercising the still-live edge connection.
+	cancel()
+	time.Sleep(100 * time.Millisecond)
+	if got := active.Pool().State(); got != DataCarrierPoolReady {
+		t.Fatalf("pool state after staging cancellation = %s, want ready", got)
+	}
+
+	open := testDataCarrierStreamOpen("route-after-staging", "request-after-staging")
+	stream, err := active.OpenStream(context.Background(), open)
+	if err != nil {
+		t.Fatalf("open stream after staging cancellation: %v", err)
+	}
+	defer stream.Close()
+	accepted, acceptedOpen, err := edge.AcceptStream(context.Background())
+	if err != nil {
+		t.Fatalf("accept stream after staging cancellation: %v", err)
+	}
+	defer accepted.Close()
+	if acceptedOpen != open {
+		t.Fatalf("accepted stream metadata = %+v, want %+v", acceptedOpen, open)
+	}
+}
+
 func TestPrepareDataCarrierRejectsIdentityMismatch(t *testing.T) {
 	identity := testDataCarrierIdentity()
 	config := DefaultDataCarrierPoolConfig()

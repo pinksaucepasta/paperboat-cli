@@ -9,7 +9,7 @@
       "id": "preview-tunnel.contracts",
       "path": "contracts.md",
       "type": "specification",
-      "sha256": "b2069c269e297ab28923974681fb396a88bb5b08f0867e62b93cef9e19e60656",
+      "sha256": "3c5dcddd8460eb35c46df1abb24fec56a34f6f05f9d58d40857c7c5d50377a05",
       "consumers": ["paperboat", "paperboat-server", "paperboat-tunnel", "paperboat-web"]
     },
     {
@@ -30,14 +30,14 @@
       "id": "preview-tunnel.dispatch",
       "path": "schemas/dispatch.schema.json",
       "type": "json-schema",
-      "sha256": "50fb165c8b1b4fe5d7fd7aa853d675b59e5ef0a9313cbb841d1c01f06324a153",
+      "sha256": "fc57de1026ecda545a4d233b68a11af8fa2cecd6fe39b718e553cebf9855a62a",
       "consumers": ["paperboat", "paperboat-server", "paperboat-tunnel", "paperboat-web"]
     },
     {
       "id": "preview-tunnel.dispatch-vectors",
       "path": "fixtures/dispatch.ndjson",
       "type": "contract-vectors",
-      "sha256": "433f97f303fd4057dac8d40392cb6f57baf44bb15e3067bb22e870efb90ff55a",
+      "sha256": "ee9f0b10f3c1d89ca9fb96b5485e1a97a941a38de5ba5980f99dda6a8575e55b",
       "consumers": ["paperboat", "paperboat-server", "paperboat-tunnel", "paperboat-web"]
     },
     {

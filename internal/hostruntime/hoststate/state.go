@@ -470,20 +470,35 @@ func validateStableEndpointIdentity(stableEndpointID string, snapshot ConfigSnap
 	return nil
 }
 
-func (r CredentialReference) validate(connectorID string) error {
+func (r CredentialReference) validate(_ string) error {
 	if r.Generation == 0 || len(r.Reference) == 0 || len(r.Reference) > maxCredentialRefSize || strings.TrimSpace(r.Reference) != r.Reference {
 		return ErrInvalidState
 	}
 	parsed, err := url.Parse(r.Reference)
-	if err != nil || parsed.User != nil || parsed.Opaque != "" || parsed.RawPath != "" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Host != "paperboat" || parsed.Path != path.Join("/connectors", connectorID) {
+	if err != nil || parsed.User != nil || parsed.Opaque != "" || parsed.RawPath != "" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Host != "paperboat" {
 		return ErrInvalidState
 	}
 	switch parsed.Scheme {
 	case "keychain", "credential-manager", "secret-service", "protected-file", "tpm":
-		return nil
+		// The reference is created before the server assigns its connector ID.
+		// Keep that local opaque key stable and bind it to the connector through
+		// the surrounding Connector record instead of requiring the path segment
+		// to equal the server-owned ID.
 	default:
 		return ErrInvalidState
 	}
+	if strings.Contains(parsed.EscapedPath(), "%") || parsed.Path == "" {
+		return ErrInvalidState
+	}
+	const prefix = "/connectors/"
+	if !strings.HasPrefix(parsed.Path, prefix) {
+		return ErrInvalidState
+	}
+	segment := strings.TrimPrefix(parsed.Path, prefix)
+	if strings.Contains(segment, "/") || !validID(segment) || path.Clean(parsed.Path) != parsed.Path {
+		return ErrInvalidState
+	}
+	return nil
 }
 
 func canonicalSafeJSON(payload []byte) ([]byte, error) {

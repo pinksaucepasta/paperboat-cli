@@ -102,7 +102,7 @@ func TestProductionRotationRuntimeDrainsPromotesAndShutsOnlyOldAssembly(t *testi
 	if err := manager.Resume(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if rejoined.input.CredentialReference != next.CredentialReference || rejoined.input.ProcessGeneration != next.ProcessGeneration {
+	if rejoined.input.CredentialReference != next.CredentialReference || rejoined.input.ProcessGeneration != next.ProcessGeneration+1 {
 		t.Fatalf("restart selected=%+v", rejoined.input)
 	}
 	if shutdownAssembly != nil {

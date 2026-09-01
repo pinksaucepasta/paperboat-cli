@@ -1562,6 +1562,15 @@ func (s *runtimeObservationService) Start(ctx context.Context) error {
 	if s.sender == nil || s.interval <= 0 || s.timeout <= 0 {
 		return ErrProductionInvalid
 	}
+	s.mu.Lock()
+	if s.cancel != nil {
+		s.mu.Unlock()
+		return nil
+	}
+	s.mu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	initial, cancel := context.WithTimeout(ctx, s.timeout)
 	err := s.sender.Send(initial)
 	cancel()
@@ -1571,8 +1580,13 @@ func (s *runtimeObservationService) Start(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.cancel != nil {
-		return ErrProductionInvalid
+		return nil
 	}
+	// Service.Start's context bounds startup only. The stable daemon owns the
+	// accepted service until it calls Shutdown; tying the loop to the caller's
+	// startup context silently stops machine presence after successful startup
+	// on supervisors that cancel that context. Partial starts are still safe
+	// because hostd always invokes Shutdown for an accepted or failed component.
 	runCtx, stop := context.WithCancel(context.Background())
 	s.cancel, s.done = stop, make(chan struct{})
 	go s.loop(runCtx, s.done)
@@ -1598,6 +1612,9 @@ func (s *runtimeObservationService) loop(ctx context.Context, done chan<- struct
 }
 
 func (s *runtimeObservationService) Shutdown(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	s.mu.Lock()
 	cancel, done := s.cancel, s.done
 	s.cancel, s.done = nil, nil

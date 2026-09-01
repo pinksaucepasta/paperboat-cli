@@ -35,10 +35,40 @@ import (
 )
 
 const (
-	carrierBootstrapSchema = "paperboat.connector-bootstrap/v1"
-	controlSubprotocol     = "paperboat.connector.v1"
-	bootstrapResponseLimit = 320 << 10
+	carrierBootstrapSchema      = "paperboat.connector-bootstrap/v1"
+	carrierBootstrapErrorSchema = "paperboat.preview-tunnel/v1"
+	controlSubprotocol          = "paperboat.connector.v1"
+	bootstrapResponseLimit      = 320 << 10
+	controlDialTimeout          = 15 * time.Second
 )
+
+// CarrierBootstrapError preserves the server's finite, machine-readable
+// failure contract. Callers must branch on Code, Retryable, and RepairAction,
+// rather than parsing a server message. StatusCode is retained for diagnostics
+// and fallback handling when a deployment returns a valid error envelope with
+// an unexpected status.
+type CarrierBootstrapError struct {
+	StatusCode    int
+	Code          string
+	Retryable     bool
+	RetryAt       *time.Time
+	RepairAction  string
+	RequestID     string
+	CorrelationID string
+}
+
+func (e *CarrierBootstrapError) Error() string {
+	if e == nil {
+		return "carrier bootstrap failed"
+	}
+	if e.Code != "" {
+		return "carrier bootstrap failed: " + e.Code
+	}
+	if e.StatusCode != 0 {
+		return "carrier bootstrap failed: HTTP " + strconv.Itoa(e.StatusCode)
+	}
+	return "carrier bootstrap failed"
+}
 
 // ControlIdentity is the safe, server-authoritative identity returned by the
 // enrollment exchange plus the registered account binding held by hostd.
@@ -49,17 +79,18 @@ type ControlIdentity struct {
 }
 
 type HTTPSProductionAssemblySourceConfig struct {
-	ControlURL    string
-	StateRoot     string
-	HostID        string
-	Transport     http.RoundTripper
-	Auth          MachineAuth
-	Clock         connectorprotocol.Clock
-	Origins       tunnelmanager.OriginProber
-	OriginStreams *tunnelmanager.OriginStreamForwarder
-	Drainer       connectorprotocol.Drainer
-	Renewal       connectorrotation.CredentialRenewalSource
-	Report        func(tunnelmanager.Observation)
+	ControlURL            string
+	StateRoot             string
+	HostID                string
+	Transport             http.RoundTripper
+	Auth                  MachineAuth
+	Clock                 connectorprotocol.Clock
+	Origins               tunnelmanager.OriginProber
+	OriginStreams         *tunnelmanager.OriginStreamForwarder
+	Drainer               connectorprotocol.Drainer
+	Renewal               connectorrotation.CredentialRenewalSource
+	Report                func(tunnelmanager.Observation)
+	MachineTLSCertificate func(time.Time, time.Duration, []*url.URL) (tls.Certificate, error)
 }
 
 // HTTPSProductionAssemblySource is the production control/bootstrap client.
@@ -67,37 +98,38 @@ type HTTPSProductionAssemblySourceConfig struct {
 // bootstrap uses renewable machine proof and returns only bounded public
 // endpoint/certificate material.
 type HTTPSProductionAssemblySource struct {
-	base          *url.URL
-	stateRoot     string
-	hostID        string
-	http          *http.Client
-	auth          MachineAuth
-	clock         connectorprotocol.Clock
-	origins       tunnelmanager.OriginProber
-	originStreams *tunnelmanager.OriginStreamForwarder
-	drainer       connectorprotocol.Drainer
-	renewal       connectorrotation.CredentialRenewalSource
-	report        func(tunnelmanager.Observation)
-	mu            sync.Mutex
-	drainers      map[string]*assemblyDrainer
-	credentials   *FileCredentialStore
-	rotations     map[string]*productionRotationRuntime
-	lifetime      context.Context
-	cancel        context.CancelFunc
-	started       bool
-	closed        bool
+	base                  *url.URL
+	stateRoot             string
+	hostID                string
+	http                  *http.Client
+	auth                  MachineAuth
+	clock                 connectorprotocol.Clock
+	origins               tunnelmanager.OriginProber
+	originStreams         *tunnelmanager.OriginStreamForwarder
+	drainer               connectorprotocol.Drainer
+	renewal               connectorrotation.CredentialRenewalSource
+	report                func(tunnelmanager.Observation)
+	machineTLSCertificate func(time.Time, time.Duration, []*url.URL) (tls.Certificate, error)
+	mu                    sync.Mutex
+	drainers              map[string]*assemblyDrainer
+	credentials           *FileCredentialStore
+	rotations             map[string]*productionRotationRuntime
+	lifetime              context.Context
+	cancel                context.CancelFunc
+	started               bool
+	closed                bool
 }
 
 func NewHTTPSProductionAssemblySource(config HTTPSProductionAssemblySourceConfig) (*HTTPSProductionAssemblySource, error) {
 	base, err := url.Parse(strings.TrimSpace(config.ControlURL))
-	if err != nil || base.Scheme != "https" || base.Hostname() == "" || base.User != nil || base.RawQuery != "" || base.Fragment != "" || !filepath.IsAbs(config.StateRoot) || filepath.Clean(config.StateRoot) != config.StateRoot || connectorprotocol.ValidateIdentifier(config.HostID) != nil || config.Auth == nil || config.Clock == nil || config.Origins == nil {
+	if err != nil || base.Scheme != "https" || base.Hostname() == "" || base.User != nil || base.RawQuery != "" || base.Fragment != "" || !filepath.IsAbs(config.StateRoot) || filepath.Clean(config.StateRoot) != config.StateRoot || connectorprotocol.ValidateIdentifier(config.HostID) != nil || config.Auth == nil || config.Clock == nil || config.Origins == nil || config.MachineTLSCertificate == nil {
 		return nil, ErrInvalid
 	}
 	client := &http.Client{Transport: config.Transport, Timeout: 20 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return ErrInvalid }}
 	if config.Report == nil {
 		config.Report = func(tunnelmanager.Observation) {}
 	}
-	return &HTTPSProductionAssemblySource{base: base, stateRoot: config.StateRoot, hostID: config.HostID, http: client, auth: config.Auth, clock: config.Clock, origins: config.Origins, originStreams: config.OriginStreams, drainer: config.Drainer, renewal: config.Renewal, report: config.Report, drainers: make(map[string]*assemblyDrainer), rotations: make(map[string]*productionRotationRuntime)}, nil
+	return &HTTPSProductionAssemblySource{base: base, stateRoot: config.StateRoot, hostID: config.HostID, http: client, auth: config.Auth, clock: config.Clock, origins: config.Origins, originStreams: config.OriginStreams, drainer: config.Drainer, renewal: config.Renewal, report: config.Report, machineTLSCertificate: config.MachineTLSCertificate, drainers: make(map[string]*assemblyDrainer), rotations: make(map[string]*productionRotationRuntime)}, nil
 }
 
 func (s *HTTPSProductionAssemblySource) BindCredentialStore(store *FileCredentialStore) error {
@@ -320,7 +352,15 @@ func (s *HTTPSProductionAssemblySource) openControlStream(ctx context.Context, r
 	// The stream lifetime is owned by stable hostd's context. An ordinary HTTP
 	// response timeout would tear down a healthy long-lived control session.
 	websocketClient.Timeout = 0
-	connection, response, err := websocket.Dial(ctx, endpoint.String(), &websocket.DialOptions{HTTPClient: &websocketClient, Subprotocols: []string{controlSubprotocol}, CompressionMode: websocket.CompressionDisabled})
+	// Bound only the initial handshake. Passing the stable lifetime context to
+	// websocket.Dial directly lets a dead/unroutable control endpoint keep
+	// activation stuck forever, leaving the enrollment manager's activating
+	// fence set and making every subsequent CLI retry look unavailable. The
+	// returned stream is still bound to ctx below, so a healthy WebSocket can
+	// live for the lifetime of hostd.
+	dialCtx, cancel := context.WithTimeout(ctx, controlDialTimeout)
+	defer cancel()
+	connection, response, err := websocket.Dial(dialCtx, endpoint.String(), &websocket.DialOptions{HTTPClient: &websocketClient, Subprotocols: []string{controlSubprotocol}, CompressionMode: websocket.CompressionDisabled})
 	if response != nil && response.Body != nil {
 		_ = response.Body.Close()
 	}
@@ -374,6 +414,27 @@ type carrierBootstrapDescriptor struct {
 	ExpiresAt            time.Time              `json:"expires_at"`
 }
 
+// carrierBootstrapErrorPayload mirrors only the structured error fields
+// defined by the connector bootstrap endpoint. Keeping the wire type private
+// prevents server diagnostics from becoming part of the success descriptor.
+type carrierBootstrapErrorPayload struct {
+	Schema        string     `json:"schema"`
+	Kind          string     `json:"kind"`
+	Code          string     `json:"code"`
+	Component     string     `json:"component"`
+	Message       string     `json:"message"`
+	Outcome       string     `json:"outcome"`
+	Retryable     *bool      `json:"retryable"`
+	RetryAt       *time.Time `json:"retry_at"`
+	RepairAction  string     `json:"repair_action"`
+	RequestID     string     `json:"request_id"`
+	CorrelationID string     `json:"correlation_id"`
+}
+
+type carrierBootstrapErrorResponse struct {
+	Error carrierBootstrapErrorPayload `json:"error"`
+}
+
 func (s *HTTPSProductionAssemblySource) carrierSessionSource(ctx context.Context, request ActivationRequest, controlIdentity ControlIdentity, hello connectorprotocol.Hello, welcome connectorprotocol.Welcome, apply tunnelmanager.ApplyRequest, signer CredentialSigner) (connector.DataCarrierSessionSource, error) {
 	bootstrapRequest := carrierBootstrapRequest{Schema: carrierBootstrapSchema, Kind: "carrier_bootstrap_request", SessionID: welcome.SessionID, ProcessGeneration: hello.ProcessGeneration, ConfigGeneration: apply.Snapshot.Generation, ConfigContentHash: apply.Snapshot.ContentHash}
 	body, err := json.Marshal(bootstrapRequest)
@@ -391,7 +452,7 @@ func (s *HTTPSProductionAssemblySource) carrierSessionSource(ctx context.Context
 	endpoints := make(map[string]connector.NetworkDialerConfig, len(descriptor.Carriers))
 	failureDomains := make([]string, 0, len(descriptor.Carriers))
 	for _, node := range descriptor.Carriers {
-		configs, err := carrierNodeEndpoints(ctx, descriptor, node, request, signer, identity, s.clock.Now().UTC())
+		configs, err := carrierNodeEndpoints(descriptor, node, identity, s.clock.Now().UTC(), s.machineTLSCertificate)
 		if err != nil {
 			return connector.DataCarrierSessionSource{}, err
 		}
@@ -402,8 +463,12 @@ func (s *HTTPSProductionAssemblySource) carrierSessionSource(ctx context.Context
 	pool.MaximumCarriers = len(failureDomains)
 	pool.EdgeID = descriptor.Carriers[0].EdgeNodeID
 	pool.FailureDomains = failureDomains
-	pool.Preferred = connector.QUIC
-	pool.Fallback = connector.TCPMux
+	// TCP mux is the universally reachable production baseline. QUIC remains
+	// an immediate typed fallback; preferring it here allowed a UDP path that
+	// completed its initial ping but disappeared behind common NAT/firewall
+	// mappings before the edge could publish the durable route.
+	pool.Preferred = connector.TCPMux
+	pool.Fallback = connector.QUIC
 	pool.SingleTransport = false
 	pool.Session = connector.DataCarrierIdentity{}
 	dialer := connector.DataCarrierDialer(func(dialCtx context.Context, dialRequest connector.DataCarrierDialRequest) (connector.DataCarrierDialResult, error) {
@@ -455,16 +520,7 @@ func (s *HTTPSProductionAssemblySource) fetchCarrierDescriptor(ctx context.Conte
 		return carrierBootstrapDescriptor{}, ErrUnavailable
 	}
 	if response.StatusCode != http.StatusOK {
-		switch response.StatusCode {
-		case http.StatusUnauthorized:
-			return carrierBootstrapDescriptor{}, ErrAuthentication
-		case http.StatusForbidden:
-			return carrierBootstrapDescriptor{}, ErrForbidden
-		case http.StatusConflict:
-			return carrierBootstrapDescriptor{}, ErrConflict
-		default:
-			return carrierBootstrapDescriptor{}, ErrUnavailable
-		}
+		return carrierBootstrapDescriptor{}, classifyCarrierBootstrapError(response.StatusCode, raw)
 	}
 	contentType, _, err := mime.ParseMediaType(response.Header.Get("Content-Type"))
 	if err != nil || contentType != "application/json" || rejectDuplicateJSON(raw) != nil {
@@ -485,6 +541,88 @@ func (s *HTTPSProductionAssemblySource) fetchCarrierDescriptor(ctx context.Conte
 		return carrierBootstrapDescriptor{}, ErrUnavailable
 	}
 	return descriptor, nil
+}
+
+// classifyCarrierBootstrapError keeps the existing status sentinels for
+// malformed or older server responses, while exposing the current structured
+// connector bootstrap contract to the manager. A transient bootstrap error
+// also carries ErrConnectorUnavailable so Manager reports it as a retryable
+// connector condition instead of treating it as an untyped activation fault.
+func classifyCarrierBootstrapError(status int, raw []byte) error {
+	payload, ok := decodeCarrierBootstrapError(raw)
+	if !ok {
+		switch status {
+		case http.StatusUnauthorized:
+			return ErrAuthentication
+		case http.StatusForbidden:
+			return ErrForbidden
+		case http.StatusConflict:
+			return ErrConflict
+		default:
+			return ErrUnavailable
+		}
+	}
+
+	structured := &CarrierBootstrapError{
+		StatusCode: status, Code: payload.Code, Retryable: payload.Retryable != nil && *payload.Retryable,
+		RepairAction: payload.RepairAction, RequestID: payload.RequestID, CorrelationID: payload.CorrelationID,
+	}
+	if payload.RetryAt != nil {
+		retryAt := payload.RetryAt.UTC()
+		structured.RetryAt = &retryAt
+	}
+
+	var classification error
+	switch status {
+	case http.StatusUnauthorized:
+		classification = ErrAuthentication
+	case http.StatusForbidden:
+		classification = ErrForbidden
+	case http.StatusConflict:
+		// A stale session is a recoverable control race. The next control
+		// reconnect supplies a new Welcome/session tuple before retrying.
+		if payload.Code == "connector_session_stale" && structured.Retryable && payload.RepairAction == "reconnect" {
+			classification = errors.Join(ErrUnavailable, tunnelmanager.ErrConnectorUnavailable)
+		} else {
+			classification = ErrConflict
+		}
+	default:
+		if structured.Retryable {
+			classification = errors.Join(ErrUnavailable, tunnelmanager.ErrConnectorUnavailable)
+		} else {
+			classification = ErrUnavailable
+		}
+	}
+	return errors.Join(classification, structured)
+}
+
+// decodeCarrierBootstrapError validates the complete error envelope before
+// exposing any of its fields. This endpoint has a finite error-code set and
+// rejects unknown or duplicate fields just like the success descriptor path.
+func decodeCarrierBootstrapError(raw []byte) (carrierBootstrapErrorPayload, bool) {
+	if len(raw) == 0 || rejectDuplicateJSON(raw) != nil {
+		return carrierBootstrapErrorPayload{}, false
+	}
+	var response carrierBootstrapErrorResponse
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&response) != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		return carrierBootstrapErrorPayload{}, false
+	}
+	payload := response.Error
+	if payload.Schema != carrierBootstrapErrorSchema || payload.Kind != "error" || payload.Component != "control" || !knownCarrierBootstrapErrorCode(payload.Code) || strings.TrimSpace(payload.Message) == "" || len(payload.Message) > 4096 || (payload.Outcome != "unchanged" && payload.Outcome != "changed" && payload.Outcome != "uncertain") || payload.Retryable == nil || strings.TrimSpace(payload.RepairAction) == "" || len(payload.RepairAction) > 128 || strings.TrimSpace(payload.RequestID) == "" || len(payload.RequestID) > 128 || strings.TrimSpace(payload.CorrelationID) == "" || len(payload.CorrelationID) > 128 {
+		return carrierBootstrapErrorPayload{}, false
+	}
+	return payload, true
+}
+
+func knownCarrierBootstrapErrorCode(code string) bool {
+	switch code {
+	case "invalid_content_type", "invalid_request", "machine_identity_required", "machine_identity_invalid", "connector_access_forbidden", "connector_session_stale", "carrier_unavailable", "connector_control_invalid", "connector_control_unavailable":
+		return true
+	default:
+		return false
+	}
 }
 
 func validateCarrierDescriptor(descriptor carrierBootstrapDescriptor, now time.Time, request ActivationRequest, identity ControlIdentity, welcome connectorprotocol.Welcome, apply tunnelmanager.ApplyRequest) error {
@@ -546,7 +684,7 @@ func parseCarrierNode(node carrierBootstrapNode) (map[string]*url.URL, *x509.Cer
 	return parsedEndpoints, pool, certificates, nil
 }
 
-func carrierNodeEndpoints(ctx context.Context, descriptor carrierBootstrapDescriptor, node carrierBootstrapNode, request ActivationRequest, signer CredentialSigner, identity connector.DataCarrierIdentity, now time.Time) (connector.NetworkDialerConfig, error) {
+func carrierNodeEndpoints(descriptor carrierBootstrapDescriptor, node carrierBootstrapNode, identity connector.DataCarrierIdentity, now time.Time, machineTLSCertificate func(time.Time, time.Duration, []*url.URL) (tls.Certificate, error)) (connector.NetworkDialerConfig, error) {
 	parsed, roots, _, err := parseCarrierNode(node)
 	if err != nil {
 		return connector.NetworkDialerConfig{}, err
@@ -556,7 +694,11 @@ func carrierNodeEndpoints(ctx context.Context, descriptor carrierBootstrapDescri
 	if err != nil {
 		return connector.NetworkDialerConfig{}, err
 	}
-	certificate, err := connectorCredentialTLSCertificate(ctx, request, signer, uri, now, descriptor.ExpiresAt)
+	if machineTLSCertificate == nil {
+		return connector.NetworkDialerConfig{}, ErrActivation
+	}
+	lifetime := descriptor.ExpiresAt.Sub(now)
+	certificate, err := machineTLSCertificate(now, lifetime, []*url.URL{uri})
 	if err != nil {
 		return connector.NetworkDialerConfig{}, err
 	}

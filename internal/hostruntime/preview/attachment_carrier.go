@@ -104,11 +104,24 @@ func (c *AttachmentCarrier) Run(ctx context.Context, lease Lease, ready func(Lea
 		if err != nil {
 			return classifyAttachmentCarrierError(err)
 		}
-	} else if attachment.State == "pending" {
+	}
+	if attachment.State == "pending" {
 		return classifyAttachmentCarrierError(ErrAttachmentAdmissionPending)
+	}
+	if attachment.State != "admitted" && (attachment.State != "edge_ready" && attachment.State != "ready" || !attachment.EdgeReady) {
+		return fmt.Errorf("%w: attachment is not edge-ready", ErrAttachmentBinding)
 	}
 	carrier, err := c.provider.CarrierForAttachment(ctx, lease, attachment)
 	if err != nil {
+		// Edge admission and local origin readiness are separate state
+		// transitions. If the edge has accepted this attachment but the
+		// host cannot acquire the authenticated carrier, publish the negative
+		// origin result before retrying. Otherwise the control plane remains
+		// stuck at edge_ready with no evidence that the host attempted the
+		// origin side of the handshake.
+		if errors.Is(err, ErrPreviewCarrierProviderUnavailable) {
+			err = c.reportOriginFailure(ctx, request, attachment, err)
+		}
 		return classifyAttachmentCarrierError(err)
 	}
 	c.mu.Lock()
@@ -131,8 +144,24 @@ func (c *AttachmentCarrier) Run(ctx context.Context, lease Lease, ready func(Lea
 		defer cancel()
 		_ = carrier.Close(closeCtx)
 	}()
+	// An admitted attachment is intentionally dialed before waiting for the
+	// edge observation. The authenticated carrier connection is what allows
+	// the edge to transition this attachment to edge_ready.
+	if attachment.State == "admitted" {
+		waiter, ok := c.attachments.(AttachmentEdgeReadyWaiter)
+		if !ok {
+			return classifyAttachmentCarrierError(ErrAttachmentAdmissionPending)
+		}
+		attachment, err = waiter.WaitForEdgeReady(ctx, request, attachment)
+		if err != nil {
+			return classifyAttachmentCarrierError(err)
+		}
+	}
+	if !attachment.EdgeReady || (attachment.State != "edge_ready" && attachment.State != "ready") {
+		return classifyAttachmentCarrierError(ErrAttachmentAdmissionPending)
+	}
 	var observedAttachment = attachment
-	return carrier.Run(ctx, lease, func(observed Lease) error {
+	err = carrier.Run(ctx, lease, func(observed Lease) error {
 		if observedAttachment.State != "ready" || !observedAttachment.OriginReady {
 			observer, ok := c.attachments.(AttachmentReadinessObserver)
 			if !ok {
@@ -146,6 +175,35 @@ func (c *AttachmentCarrier) Run(ctx context.Context, lease Lease, ready func(Lea
 		}
 		return ready(observed)
 	})
+	if err != nil && errors.Is(err, ErrDataCarrierPreviewOrigin) {
+		err = c.reportOriginFailure(ctx, request, observedAttachment, err)
+	}
+	return classifyAttachmentCarrierError(err)
+}
+
+// reportOriginFailure records the host-side half of an edge-admitted
+// attachment before the caller retries. The original failure remains the
+// primary error: readiness reporting is observability and state convergence,
+// not permission to hide a failed carrier attempt. A canceled attempt never
+// issues a late mutation.
+func (c *AttachmentCarrier) reportOriginFailure(ctx context.Context, request AttachmentRequest, attachment Attachment, cause error) error {
+	if cause == nil || ctx == nil || ctx.Err() != nil {
+		return cause
+	}
+	// Origin observations are valid only after the edge has observed the live
+	// carrier. An admitted response cannot be used to publish a negative
+	// origin result because that would skip the edge-ready transition.
+	if !attachment.EdgeReady || attachment.State != "edge_ready" && attachment.State != "ready" {
+		return cause
+	}
+	observer, ok := c.attachments.(AttachmentReadinessObserver)
+	if !ok {
+		return cause
+	}
+	if _, err := observer.ObserveOrigin(ctx, request, attachment, false); err != nil {
+		return errors.Join(cause, classifyAttachmentCarrierError(err))
+	}
+	return cause
 }
 
 func (c *AttachmentCarrier) requestForLease(lease Lease) (AttachmentRequest, error) {
@@ -198,6 +256,9 @@ func classifyAttachmentCarrierError(err error) error {
 		return &RetryableCarrierError{Err: err}
 	}
 	if errors.Is(err, ErrAttachmentAdmissionPending) {
+		return &RetryableCarrierError{Err: err}
+	}
+	if errors.Is(err, ErrDataCarrierPreviewOrigin) {
 		return &RetryableCarrierError{Err: err}
 	}
 	// Hostd owns renewal while carrier admission and origin probing are in
