@@ -373,50 +373,67 @@ func (m *Manager) Resume(ctx context.Context) error {
 	}
 	m.mu.Unlock()
 
-	clearRemaining := func(from int) {
-		m.mu.Lock()
-		defer m.mu.Unlock()
-		for _, tunnelID := range tunnelIDs[from:] {
-			delete(m.activating, tunnelID)
-		}
-	}
+	// Activation can wait for an independent control/carrier readiness event.
+	// Run each claimed connector independently so one unavailable tunnel cannot
+	// starve every other durable connector on this host. Journal commits remain
+	// serialized by commitResumeActivation because load+modify+save must never
+	// allow concurrent workers to overwrite one another's projection.
+	activationErrors := make([]error, len(tunnelIDs))
+	var waitGroup sync.WaitGroup
+	waitGroup.Add(len(tunnelIDs))
 	for index, tunnelID := range tunnelIDs {
-		recordValue := state.Records[tunnelID]
-		request := recordValue.activationRequest()
-		projection, activateErr := m.activator.Activate(ctx, request)
-		if activateErr != nil {
-			clearRemaining(index)
-			return errors.Join(ErrActivation, activateErr)
-		}
-		if !projection.valid() || projection.TunnelID != tunnelID || projection.HostID != recordValue.HostID || projection.ConnectorID != recordValue.ConnectorID || projection.OperationID != recordValue.OperationID || projection.CredentialReference != recordValue.Credential.Reference || projection.CredentialGeneration != recordValue.CredentialGeneration {
-			clearRemaining(index)
-			return ErrActivation
-		}
+		go func(index int, tunnelID string) {
+			defer waitGroup.Done()
+			defer m.clearActivation(tunnelID)
 
-		m.mu.Lock()
-		currentState, loadErr := m.store.loadJournal()
-		current, exists := currentState.Records[tunnelID]
-		if loadErr != nil || !exists || (current.Phase != "active" && current.Phase != "exchanged") || !sameActivationRequest(current.activationRequest(), request) {
-			delete(m.activating, tunnelID)
-			m.mu.Unlock()
-			clearRemaining(index + 1)
-			if loadErr != nil {
-				return loadErr
+			recordValue := state.Records[tunnelID]
+			request := recordValue.activationRequest()
+			projection, activateErr := m.activator.Activate(ctx, request)
+			if activateErr != nil {
+				activationErrors[index] = errors.Join(ErrActivation, activateErr)
+				return
 			}
-			return ErrConflict
-		}
-		current.Phase = "active"
-		current.Projection = &projection
-		currentState.Records[tunnelID] = current
-		err = m.store.saveJournal(currentState)
-		delete(m.activating, tunnelID)
-		m.mu.Unlock()
-		if err != nil {
-			clearRemaining(index + 1)
-			return err
-		}
+			if !projection.valid() || projection.TunnelID != tunnelID || projection.HostID != recordValue.HostID || projection.ConnectorID != recordValue.ConnectorID || projection.OperationID != recordValue.OperationID || projection.CredentialReference != recordValue.Credential.Reference || projection.CredentialGeneration != recordValue.CredentialGeneration {
+				activationErrors[index] = ErrActivation
+				return
+			}
+			activationErrors[index] = m.commitResumeActivation(tunnelID, request, projection)
+		}(index, tunnelID)
 	}
-	return nil
+	waitGroup.Wait()
+	for _, activationErr := range activationErrors {
+		err = errors.Join(err, activationErr)
+	}
+	return err
+}
+
+func (m *Manager) clearActivation(tunnelID string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	delete(m.activating, tunnelID)
+	m.mu.Unlock()
+}
+
+func (m *Manager) commitResumeActivation(tunnelID string, request ActivationRequest, projection Projection) error {
+	if m == nil || m.store == nil {
+		return ErrActivation
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	currentState, loadErr := m.store.loadJournal()
+	if loadErr != nil {
+		return loadErr
+	}
+	current, exists := currentState.Records[tunnelID]
+	if !exists || (current.Phase != "active" && current.Phase != "exchanged") || !sameActivationRequest(current.activationRequest(), request) {
+		return ErrConflict
+	}
+	current.Phase = "active"
+	current.Projection = &projection
+	currentState.Records[tunnelID] = current
+	return m.store.saveJournal(currentState)
 }
 
 func sameActivationRequest(left, right ActivationRequest) bool {

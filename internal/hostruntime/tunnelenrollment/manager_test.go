@@ -125,6 +125,41 @@ func TestManagerIssueExchangeActivateRestartAndNoSecretJournal(t *testing.T) {
 	}
 }
 
+type parallelResumeActivator struct {
+	blockTunnel  string
+	blockEntered chan struct{}
+	releaseBlock chan struct{}
+	otherEntered chan struct{}
+	blockOnce    sync.Once
+	otherOnce    sync.Once
+	mu           sync.Mutex
+	calls        map[string]int
+}
+
+func (a *parallelResumeActivator) Activate(ctx context.Context, in ActivationRequest) (Projection, error) {
+	a.mu.Lock()
+	if a.calls == nil {
+		a.calls = make(map[string]int)
+	}
+	a.calls[in.TunnelID]++
+	blocked := in.TunnelID == a.blockTunnel
+	if blocked {
+		a.blockOnce.Do(func() { close(a.blockEntered) })
+	} else {
+		a.otherOnce.Do(func() { close(a.otherEntered) })
+	}
+	a.mu.Unlock()
+	if blocked {
+		select {
+		case <-a.releaseBlock:
+		case <-ctx.Done():
+			return Projection{}, ctx.Err()
+		}
+	}
+	readyAt := time.Now().UTC()
+	return Projection{Schema: Schema, Kind: "tunnel_connector", TunnelID: in.TunnelID, HostID: in.HostID, ConnectorID: in.ConnectorID, OperationID: in.OperationID, State: "ready", CredentialReference: in.CredentialReference, CredentialGeneration: in.CredentialGeneration, ReadyAt: &readyAt}, nil
+}
+
 func TestManagerRecoversExpiredEnrollmentWithoutRotatingCredential(t *testing.T) {
 	now := time.Now().UTC()
 	oldToken := "pbce_" + strings.Repeat("o", 48)
@@ -295,6 +330,68 @@ func TestManagerResumeClaimsProcessGenerationOncePerManagerLifetime(t *testing.T
 	}
 	if got := resumeJournalProcessGeneration(t, store, tunnelID); got != 3 {
 		t.Fatalf("restart claim process_generation=%d, want 3", got)
+	}
+}
+
+func TestManagerResumeActivatesDurableConnectorsIndependently(t *testing.T) {
+	blockedTunnel := "tunnel_resume_blocked_01"
+	otherTunnel := "tunnel_resume_other_01"
+	store, tunnelIDs := writeMultiResumeJournalFixture(t, 1, blockedTunnel, otherTunnel)
+	activator := &parallelResumeActivator{
+		blockTunnel:  blockedTunnel,
+		blockEntered: make(chan struct{}),
+		releaseBlock: make(chan struct{}),
+		otherEntered: make(chan struct{}),
+	}
+	manager, err := NewManager(ManagerConfig{ControlURL: "https://api.example.test", HostID: "host_01", Auth: &testAuth{}, Credentials: store, Activator: activator, ControlToken: "local-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumeDone := make(chan error, 1)
+	go func() { resumeDone <- manager.Resume(context.Background()) }()
+
+	select {
+	case <-activator.otherEntered:
+	case <-time.After(time.Second):
+		t.Fatal("second durable connector was starved by blocked activation")
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		state, loadErr := store.loadJournal()
+		if loadErr != nil {
+			t.Fatal(loadErr)
+		}
+		if state.Records[otherTunnel].Phase == "active" && state.Records[otherTunnel].Projection != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("second durable connector did not commit while first was blocked")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-activator.blockEntered:
+	default:
+		t.Fatal("blocked connector was not started")
+	}
+	close(activator.releaseBlock)
+	if err := <-resumeDone; err != nil {
+		t.Fatal(err)
+	}
+	state, err := store.loadJournal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tunnelID := range tunnelIDs {
+		recordValue := state.Records[tunnelID]
+		if recordValue.Phase != "active" || recordValue.Projection == nil || recordValue.ProcessGeneration != 2 {
+			t.Fatalf("tunnel %s was not resumed independently: %+v", tunnelID, recordValue)
+		}
+	}
+	activator.mu.Lock()
+	defer activator.mu.Unlock()
+	if activator.calls[blockedTunnel] != 1 || activator.calls[otherTunnel] != 1 {
+		t.Fatalf("activation calls=%v", activator.calls)
 	}
 }
 
@@ -652,6 +749,36 @@ func testServerActivation(now time.Time, tunnelID, connectorID, operationID stri
 		"credential_generation": 3, "process_generation": 2,
 		"operation": map[string]any{"schema": "paperboat.preview-tunnel/v1", "kind": "operation", "id": operationID, "resource_kind": "connector", "resource_id": connectorID, "phase": "connecting", "state": "running", "progress": 60, "retrying": false, "correlation_id": "correlation_01", "created_at": now, "updated_at": now},
 	}
+}
+
+func writeMultiResumeJournalFixture(t *testing.T, processGeneration uint64, tunnelIDs ...string) (*FileCredentialStore, []string) {
+	t.Helper()
+	store, err := NewFileCredentialStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tunnelIDs) == 0 {
+		t.Fatal("multi-resume fixture requires at least one tunnel")
+	}
+	now := time.Now().UTC()
+	state := journal{Version: 1, Records: make(map[string]record, len(tunnelIDs))}
+	for index, tunnelID := range tunnelIDs {
+		credential, createErr := store.CreateKey(context.Background(), fmt.Sprintf("credential-resume-multi-%02d", index+1))
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		connectorID := fmt.Sprintf("connector_resume_multi_%02d", index+1)
+		operationID := fmt.Sprintf("operation_resume_multi_%02d", index+1)
+		projection := Projection{Schema: Schema, Kind: "tunnel_connector", TunnelID: tunnelID, HostID: "host_01", ConnectorID: connectorID, OperationID: operationID, State: "ready", CredentialReference: credential.Reference, CredentialGeneration: 3, ReadyAt: &now}
+		state.Records[tunnelID] = record{
+			AccountID: "account_01", TunnelID: tunnelID, HostID: "host_01", LocalKey: fmt.Sprintf("local-resume-multi-%02d", index+1), IssueKey: fmt.Sprintf("issue-resume-multi-%02d", index+1), ExchangeKey: fmt.Sprintf("exchange-resume-multi-%02d", index+1),
+			Credential: credential, EnrollmentID: fmt.Sprintf("enrollment-resume-multi-%02d", index+1), TokenReference: fmt.Sprintf("token-resume-multi-%02d", index+1), ConnectorID: connectorID, OperationID: operationID, StableEndpointID: "123e4567-e89b-12d3-a456-426614174000", CredentialGeneration: 3, ProcessGeneration: processGeneration, Phase: "active", Projection: &projection,
+		}
+	}
+	if err := store.saveJournal(state); err != nil {
+		t.Fatal(err)
+	}
+	return store, append([]string(nil), tunnelIDs...)
 }
 
 func writeResumeJournalFixture(t *testing.T, processGeneration uint64) (*FileCredentialStore, string) {
