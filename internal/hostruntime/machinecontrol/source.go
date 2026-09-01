@@ -68,7 +68,10 @@ func (s *Source) Token(ctx context.Context) (string, error) {
 		return "", ErrInvalid
 	}
 	now := s.config.Clock().UTC()
-	current, err := store.MachineControl(now, time.Hour)
+	// Renewal must authenticate with a credential that is valid now. The
+	// renewal window is applied below; an expiry grace period here could send
+	// an already expired credential to the control plane.
+	current, err := store.MachineControl(now, 0)
 	if err != nil {
 		return "", ErrInvalid
 	}

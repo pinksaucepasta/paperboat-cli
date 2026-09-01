@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -56,6 +57,37 @@ func TestSourceRenewsWithExactMachineProofAndPersistsResult(t *testing.T) {
 	persisted, err := store.MachineControl(now, 0)
 	if err != nil || persisted.Credential != newToken {
 		t.Fatalf("persisted=%+v err=%v", persisted, err)
+	}
+}
+
+func TestSourceRejectsExpiredCredentialWithoutRenewalRequest(t *testing.T) {
+	now := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+	root := filepath.Join(t.TempDir(), "runtime")
+	store, err := identity.Open(identity.Config{StateRoot: root, Random: bytes.NewReader(bytes.Repeat([]byte{6}, 32))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := store.Current()
+	if err := store.SaveRegistration(identity.Registration{ServerURL: "https://unused.test", MachineID: "mch_1", EnvironmentID: "env_1", PublicKeyID: key.ID, PublicIdentityKey: base64.RawURLEncoding.EncodeToString(key.Public()), InboxPath: filepath.Join(root, "inbox"), InstallationGeneration: 2, SetupRoles: []string{"interactive"}, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveMachineControl(identity.MachineControl{MachineID: "mch_1", EnvironmentID: "env_1", InstallationGeneration: 2, Credential: strings.Repeat("e", 40), ExpiresAt: now.Add(-time.Second), KeyID: key.ID}); err != nil {
+		t.Fatal(err)
+	}
+	var requests int
+	server := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		requests++
+	}))
+	defer server.Close()
+	source, err := NewSource(Config{ControlURL: server.URL, StateRoot: root, Transport: server.Client().Transport, Clock: func() time.Time { return now }, OperationID: func() (string, error) { return "operation-expired-1", nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.Token(t.Context()); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("expired token error = %v, want %v", err, ErrInvalid)
+	}
+	if requests != 0 {
+		t.Fatalf("renewal requests = %d, want none", requests)
 	}
 }
 
