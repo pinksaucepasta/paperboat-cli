@@ -200,6 +200,14 @@ func classifyAttachmentCarrierError(err error) error {
 	if errors.Is(err, ErrAttachmentAdmissionPending) {
 		return &RetryableCarrierError{Err: err}
 	}
+	// Hostd owns renewal while carrier admission and origin probing are in
+	// flight. A successful renewal can therefore make the readiness If-Match
+	// stale. Retry the same attachment operation with Session.currentLease;
+	// requestForLease updates only the transport ETag and keeps the immutable
+	// operation body and endpoint identity.
+	if errors.Is(err, ErrAttachmentLeaseETagStale) {
+		return &RetryableCarrierError{Err: err}
+	}
 	return err
 }
 

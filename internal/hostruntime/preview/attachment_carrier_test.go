@@ -103,6 +103,14 @@ func TestAttachmentCarrierRequiresDurableCreateOperation(t *testing.T) {
 	}
 }
 
+func TestAttachmentCarrierRetriesStaleLeaseETag(t *testing.T) {
+	err := classifyAttachmentCarrierError(errors.Join(ErrAttachmentLeaseETagStale, &AttachmentHTTPError{StatusCode: 412}))
+	var retryable *RetryableCarrierError
+	if !errors.As(err, &retryable) || !errors.Is(err, ErrAttachmentLeaseETagStale) {
+		t.Fatalf("stale ETag error = %v, want retryable stale precondition", err)
+	}
+}
+
 func TestAttachmentCarrierAdmitsBeforeProviderAndObservesOriginBeforeLeaseReady(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC()
