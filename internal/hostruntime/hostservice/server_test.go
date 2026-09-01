@@ -285,6 +285,46 @@ func TestDesiredPolicyPersistsBeforeApplicationFailure(t *testing.T) {
 	}
 }
 
+func TestPersistKeepsSharedHostdTokenParentTraversable(t *testing.T) {
+	root, err := os.MkdirTemp("", "pb-hostservice-shared-state-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "hostd.token"), []byte("01234567890123456789012345678901"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	server, err := New(Config{
+		SocketPath: filepath.Join(root, "host.sock"), StatePath: filepath.Join(root, "availability-policy.json"),
+		UID: os.Getuid(), GID: os.Getgid(), Applier: &fakeApplier{}, Version: "test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.apply(context.Background(), KeepAwake, 1); err != nil {
+		t.Fatal(err)
+	}
+	directoryInfo, err := os.Stat(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := directoryInfo.Mode().Perm(); got != 0o755 {
+		t.Fatalf("shared state directory mode=%#o, want 0755", got)
+	}
+	for _, path := range []string{server.config.StatePath, filepath.Join(root, "hostd.token")} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode().Perm(); got != 0o600 {
+			t.Fatalf("%s mode=%#o, want 0600", path, got)
+		}
+	}
+}
+
 func TestProtocolRejectsRemovedRestartUpdateOperation(t *testing.T) {
 	if os.Getuid() == 0 {
 		t.Skip("peer test requires a non-root enrolled user")

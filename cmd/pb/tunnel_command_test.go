@@ -871,6 +871,39 @@ func TestTunnelCreateUsesCanonicalInputAndJSONOutput(t *testing.T) {
 	}
 }
 
+func TestTunnelCreateResolvesCanonicalOperationOnlyResponse(t *testing.T) {
+	var requests []string
+	withTunnelCommandClient(t, func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/tunnels":
+			operation := validCommandOperation("tunnel", "tun_1")
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": operation})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/tunnels/tun_1":
+			tunnel := validCommandTunnel()
+			tunnel.AccessMode = "public"
+			w.Header().Set("ETag", tunnel.ETag)
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": tunnel})
+		default:
+			t.Fatalf("request=%s %s", r.Method, r.URL.Path)
+		}
+	})
+	var output bytes.Buffer
+	command := tunnelCobraCommandV1()
+	command.SetOut(&output)
+	command.SetArgs([]string{"create", "demo", "--port", "8080", "--json"})
+	if err := command.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(requests, ","); got != "POST /v1/tunnels,GET /v1/tunnels/tun_1" {
+		t.Fatalf("requests=%q", got)
+	}
+	if !strings.Contains(output.String(), `"kind":"tunnel_create"`) || !strings.Contains(output.String(), `"id":"tun_1"`) || !strings.Contains(output.String(), `"operation"`) {
+		t.Fatalf("output=%s", output.String())
+	}
+}
+
 func TestTunnelCreateReportsPartialDomainFailureAndUsesFreshKeys(t *testing.T) {
 	var keys []string
 	withTunnelCommandClient(t, func(w http.ResponseWriter, r *http.Request) {

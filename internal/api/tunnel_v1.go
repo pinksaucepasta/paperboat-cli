@@ -1370,9 +1370,15 @@ func (c *Client) GetTunnelV1(ctx context.Context, id string) (Tunnel, error) {
 	}
 	var out Tunnel
 	var h http.Header
-	e = c.doTunnelRequest(ctx, http.MethodGet, p, nil, &out, nil, &h)
+	// The ETag is the strong OCC token for the exact tunnel projection. A
+	// compression proxy may weaken it, so request the identity representation
+	// before comparing the header to the body ETag.
+	e = c.doTunnelRequest(ctx, http.MethodGet, p, nil, &out, http.Header{"Accept-Encoding": []string{"identity"}}, &h)
 	if e == nil {
 		e = validateTunnel(out)
+	}
+	if e == nil && out.ID != id {
+		e = ErrUnsafeTunnelResponse
 	}
 	if e == nil {
 		e = responseETag(h, out.ETag)
@@ -1389,16 +1395,54 @@ func (c *Client) CreateTunnelV1(ctx context.Context, in TunnelCreateInput, key s
 	}
 	var out TunnelMutation
 	e = c.doTunnelRequest(ctx, http.MethodPost, "/v1/tunnels", in, &out, h, nil)
-	if e == nil {
-		if out.Tunnel.Schema != "" {
-			e = validateTunnel(out.Tunnel)
+	if e != nil {
+		return out, e
+	}
+	if out.Operation.Schema != "" {
+		// An operation response carries the durable resource ID but not the
+		// resource projection. Validate that identity before using it for the
+		// follow-up read; this keeps an untrusted response from selecting an
+		// arbitrary path.
+		if e = validateOperation(&out.Operation, "tunnel", out.Tunnel.ID); e != nil {
+			return out, e
 		}
 	}
-	if e == nil && out.Operation.Schema != "" {
-		e = validateOperation(&out.Operation, "tunnel", out.Tunnel.ID)
+	operationOnly := out.Tunnel.Schema == ""
+	if operationOnly {
+		if out.Operation.Schema == "" {
+			return out, ErrUnsafeTunnelResponse
+		}
+		if c.machineAuth != nil && strings.TrimSpace(c.accessToken) == "" {
+			return out, ErrMachineAuthReadRequiresClientSession
+		}
+		resolved, fetchErr := c.GetTunnelV1(ctx, out.Operation.ResourceID)
+		if fetchErr != nil {
+			return out, fmt.Errorf("fetch tunnel after operation %s: %w", out.Operation.ID, fetchErr)
+		}
+		if resolved.ID != out.Operation.ResourceID {
+			return out, ErrUnsafeTunnelResponse
+		}
+		out.Tunnel = resolved
 	}
-	if e == nil && out.Tunnel.Schema == "" && out.Operation.Schema == "" {
-		e = ErrUnsafeTunnelResponse
+	if e = validateTunnel(out.Tunnel); e != nil {
+		return out, e
+	}
+	if operationOnly {
+		if out.Tunnel.Name != in.Name {
+			return out, ErrUnsafeTunnelResponse
+		}
+		wantAccessMode := in.AccessMode
+		if wantAccessMode == "" {
+			wantAccessMode = "public"
+		}
+		if out.Tunnel.AccessMode != wantAccessMode {
+			return out, ErrUnsafeTunnelResponse
+		}
+	}
+	if out.Operation.Schema != "" {
+		if e = validateOperation(&out.Operation, "tunnel", out.Tunnel.ID); e != nil {
+			return out, e
+		}
 	}
 	return out, e
 }

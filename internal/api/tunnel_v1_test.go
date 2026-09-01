@@ -147,8 +147,93 @@ func TestTunnelV1MutationBindsETagAndIdempotency(t *testing.T) {
 	}
 }
 
+func TestCreateTunnelV1ResolvesOperationOnlyResponse(t *testing.T) {
+	var requests []string
+	tunnel := validTunnelTestValue()
+	operation := validTunnelOperationTestValue("tunnel", tunnel.ID)
+	client := tunnelTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/tunnels":
+			if got := r.Header.Get("Idempotency-Key"); got != "create_1" {
+				t.Fatalf("create idempotency key = %q", got)
+			}
+			w.WriteHeader(http.StatusAccepted)
+			writeTunnelTestData(t, w, operation)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/tunnels/tun_1":
+			if got := r.Header.Get("Accept-Encoding"); got != "identity" {
+				t.Fatalf("get Accept-Encoding = %q", got)
+			}
+			w.Header().Set("ETag", tunnel.ETag)
+			writeTunnelTestData(t, w, tunnel)
+		default:
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+	})
+	out, err := client.CreateTunnelV1(context.Background(), TunnelCreateInput{
+		Name: "demo", AccessMode: "private", Origin: TunnelOriginInput{Scheme: "http", Address: "127.0.0.1:8080"},
+	}, "create_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Tunnel.ID != tunnel.ID || out.Tunnel.Name != "demo" || out.Tunnel.AccountID != tunnel.AccountID || out.Operation.ID != operation.ID || out.Operation.ResourceID != tunnel.ID {
+		t.Fatalf("mutation = %#v", out)
+	}
+	if got := strings.Join(requests, ","); got != "POST /v1/tunnels,GET /v1/tunnels/tun_1" {
+		t.Fatalf("requests = %q", got)
+	}
+}
+
+func TestCreateTunnelV1RejectsOperationResourceProjectionMismatch(t *testing.T) {
+	client := tunnelTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/tunnels/tun_1" {
+			if r.Method == http.MethodPost && r.URL.Path == "/v1/tunnels" {
+				writeTunnelTestData(t, w, validTunnelOperationTestValue("tunnel", "tun_1"))
+				return
+			}
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		mismatched := validTunnelTestValue()
+		mismatched.ID = "tun_2"
+		mismatched.ETag = `"tunnel:tun_2:3"`
+		w.Header().Set("ETag", mismatched.ETag)
+		writeTunnelTestData(t, w, mismatched)
+	})
+	_, err := client.CreateTunnelV1(context.Background(), TunnelCreateInput{
+		Name: "demo", AccessMode: "private", Origin: TunnelOriginInput{Scheme: "http", Address: "127.0.0.1:8080"},
+	}, "create_1")
+	if !errors.Is(err, ErrUnsafeTunnelResponse) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestCreateTunnelV1RejectsFailedOperationResourceRead(t *testing.T) {
+	client := tunnelTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/tunnels":
+			writeTunnelTestData(t, w, validTunnelOperationTestValue("tunnel", "tun_1"))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/tunnels/tun_1":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, `{"error":{"code":"temporarily_unavailable","message":"retry later"}}`)
+		default:
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+	})
+	_, err := client.CreateTunnelV1(context.Background(), TunnelCreateInput{
+		Name: "demo", AccessMode: "private", Origin: TunnelOriginInput{Scheme: "http", Address: "127.0.0.1:8080"},
+	}, "create_1")
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusServiceUnavailable || apiErr.Code != "temporarily_unavailable" {
+		t.Fatalf("error = %#v", err)
+	}
+}
+
 func TestTunnelV1GetRequiresMatchingResponseETag(t *testing.T) {
 	client := tunnelTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Accept-Encoding"); got != "identity" {
+			t.Fatalf("Accept-Encoding = %q", got)
+		}
 		w.Header().Set("ETag", `"wrong"`)
 		writeTunnelTestData(t, w, validTunnelTestValue())
 	})

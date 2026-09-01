@@ -333,7 +333,9 @@ func (s *Server) persistLocked() error {
 		return err
 	}
 	directory := filepath.Dir(s.config.StatePath)
-	if err := secureDirectory(directory, 0o700); err != nil {
+	// This directory is shared with the enrolled user's hostd token. Keep it
+	// traversable for hostd while the policy file itself remains owner-only.
+	if err := secureDirectory(directory, 0o755); err != nil {
 		return err
 	}
 	return atomicfile.Write(s.config.StatePath, body, atomicfile.Options{Mode: 0o600, OwnerUID: -1, OwnerGID: -1})

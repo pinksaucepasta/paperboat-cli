@@ -109,6 +109,18 @@ func validUnixWorkerIdentity(uid, gid int) bool {
 }
 
 func (s *Service) Run(ctx context.Context) error {
+	return s.run(ctx, nil)
+}
+
+// RunWithReady is the service-manager entry point for Unix service
+// declarations using Type=notify. The callback runs only after the updater's
+// authenticated control listener has been created, so READY=1 cannot race
+// service initialization.
+func (s *Service) RunWithReady(ctx context.Context, ready func() error) error {
+	return s.run(ctx, ready)
+}
+
+func (s *Service) run(ctx context.Context, ready func() error) error {
 	if s == nil || s.manager == nil || s.scheduler == nil {
 		return ErrInvalidConfig
 	}
@@ -124,6 +136,11 @@ func (s *Service) Run(ctx context.Context) error {
 		_ = os.Remove(s.control.socketPath)
 	}()
 	go s.control.serve(ctx, listener)
+	if ready != nil {
+		if err := ready(); err != nil {
+			return err
+		}
+	}
 	return s.scheduler.Run(ctx)
 }
 
