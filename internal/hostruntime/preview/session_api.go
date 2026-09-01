@@ -33,6 +33,7 @@ func (c *APILeaseClient) Create(ctx context.Context, request LeaseRequest) (Leas
 		},
 		AccessMode: request.AccessMode,
 		ExpiresAt:  request.UserDeadline,
+		Domains:    []string{},
 	}, request.IdempotencyKey)
 	if err != nil {
 		return Lease{}, err
