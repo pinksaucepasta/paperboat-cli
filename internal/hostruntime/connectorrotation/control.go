@@ -20,6 +20,7 @@ const (
 	defaultControlOutboundQueue = 16
 	maxControlOutboundQueue     = 1024
 	defaultRenewalLead          = 30 * time.Second
+	readinessCleanupTimeout     = 250 * time.Millisecond
 )
 
 // ReplacementReadiness is the host-side observation needed before a new
@@ -779,9 +780,7 @@ func (s *ControlSession) Serve(ctx context.Context, carrier io.ReadWriteCloser, 
 		if renewalTimer != nil {
 			renewalTimer.Stop()
 		}
-		if pending != nil {
-			pending.cancel()
-		}
+		stopSnapshotReadiness(pending)
 	}()
 	for {
 		select {
@@ -859,7 +858,7 @@ func (s *ControlSession) Serve(ctx context.Context, carrier io.ReadWriteCloser, 
 					pending.cancel()
 				}
 				readinessContext, readinessCancel := context.WithCancel(runContext)
-				state := &snapshotReadyState{snapshot: applied, requestID: result.frame.RequestID, cancel: readinessCancel}
+				state := &snapshotReadyState{snapshot: applied, requestID: result.frame.RequestID, cancel: readinessCancel, done: make(chan struct{})}
 				pending = state
 				go s.waitSnapshotReady(readinessContext, state, readyResults)
 			}
@@ -878,17 +877,11 @@ func (s *ControlSession) Serve(ctx context.Context, carrier io.ReadWriteCloser, 
 				renewalEvents = nil
 			}
 		case <-heartbeatEvents:
-			// The server only accepts a heartbeat for a promoted active
-			// snapshot. During the initial bootstrap the client has a candidate
-			// while readiness is still probing, but no active snapshot yet. Do
-			// not send that candidate as "last applied": the server correctly
-			// rejects it as snapshot-required and closes the control stream.
-			// Keep the timer alive and send the first heartbeat after the
-			// readiness path promotes the candidate.
-			if _, active := s.client.Active(); !active {
-				resetHeartbeat()
-				continue
-			}
+			// Heartbeat uses the promoted generation when one exists, and the
+			// exact staged candidate during bootstrap. The server accepts the
+			// latter only as a lease renewal; it never promotes readiness from a
+			// heartbeat. This keeps a slow carrier/origin probe from expiring the
+			// session that is waiting to become ready.
 			frame, err := s.HeartbeatFrame(s.nextRequestID("heartbeat"), s.clock.Now().UTC())
 			if err != nil {
 				if !errors.Is(err, connectorprotocol.ErrSnapshotRequired) && !errors.Is(err, connectorprotocol.ErrNotReady) {
@@ -1007,6 +1000,7 @@ type snapshotReadyState struct {
 	snapshot  connectorprotocol.Snapshot
 	requestID string
 	cancel    context.CancelFunc
+	done      chan struct{}
 }
 
 type snapshotReadyResult struct {
@@ -1021,11 +1015,42 @@ func (s *snapshotReadyState) matches(result snapshotReadyResult) bool {
 }
 
 func (s *ControlSession) waitSnapshotReady(ctx context.Context, state *snapshotReadyState, results chan<- snapshotReadyResult) {
+	defer close(state.done)
 	readiness, err := s.snapshotReadiness.WaitReady(ctx, state.snapshot)
 	result := snapshotReadyResult{snapshot: state.snapshot, requestID: state.requestID, readiness: readiness, err: err}
 	select {
 	case results <- result:
 	case <-ctx.Done():
+	}
+}
+
+// stopSnapshotReadiness cancels an in-flight readiness probe and waits only a
+// bounded interval for a cooperative provider to release its resources. The
+// Serve loop never waits for a replacement probe while it is live, so a
+// provider that fails to honor context cancellation cannot block heartbeats or
+// reconnect cleanup indefinitely.
+func stopSnapshotReadiness(state *snapshotReadyState) {
+	if state == nil {
+		return
+	}
+	if state.cancel != nil {
+		state.cancel()
+	}
+	if state.done == nil {
+		return
+	}
+	timer := time.NewTimer(readinessCleanupTimeout)
+	defer func() {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+	}()
+	select {
+	case <-state.done:
+	case <-timer.C:
 	}
 }
 

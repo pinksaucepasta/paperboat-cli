@@ -51,6 +51,23 @@ type snapshotControlReadiness struct {
 	calls   int
 }
 
+type nonCooperativeSnapshotReadiness struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (r *nonCooperativeSnapshotReadiness) WaitReady(_ context.Context, snapshot connectorprotocol.Snapshot) (connectorprotocol.Readiness, error) {
+	r.once.Do(func() { close(r.started) })
+	<-r.release
+	return connectorprotocol.Readiness{
+		AccountID: snapshot.AccountID, TunnelID: snapshot.TunnelID, ConnectorID: snapshot.ConnectorID,
+		SessionID: snapshot.SessionID, ProcessGeneration: snapshot.ProcessGeneration,
+		Generation: snapshot.Generation, ContentHash: snapshot.ContentHash,
+		EdgeReady: true, RouteReady: true, OriginReady: true,
+	}, nil
+}
+
 type immediateSnapshotReadiness struct{}
 
 func (immediateSnapshotReadiness) WaitReady(_ context.Context, snapshot connectorprotocol.Snapshot) (connectorprotocol.Readiness, error) {
@@ -581,6 +598,7 @@ func TestControlSessionServeKeepsOneLoopForReadinessRotationHeartbeatAndRenewal(
 		t.Fatalf("write welcome: %v", err)
 	}
 	var sawHeartbeat, sawRenewal bool
+	heartbeatCount := 0
 	handleProactive := func(frame connectorprotocol.Frame) bool {
 		switch frame.Type {
 		case connectorprotocol.MessageHeartbeat:
@@ -597,6 +615,7 @@ func TestControlSessionServeKeepsOneLoopForReadinessRotationHeartbeatAndRenewal(
 				t.Fatalf("write heartbeat ack: %v", err)
 			}
 			sawHeartbeat = true
+			heartbeatCount++
 			return true
 		case connectorprotocol.MessageAuthRenew:
 			var request connectorprotocol.RenewalRequest
@@ -667,18 +686,28 @@ func TestControlSessionServeKeepsOneLoopForReadinessRotationHeartbeatAndRenewal(
 		t.Fatal("snapshot readiness did not start")
 	}
 
-	// A bootstrap candidate is not an active snapshot yet. Heartbeats must
-	// wait for readiness promotion; sending one here makes the server reject
-	// the stream as snapshot-required. Renewal is independent and must still
-	// run while the readiness probe is in flight.
+	// The bootstrap candidate is not active yet, but it is an exact staged
+	// generation. Heartbeats must continue while the readiness probe is blocked
+	// so the server lease cannot expire and force a reconnect.
+	heartbeatsBeforeReadiness := heartbeatCount
 	renewalFrame := readUntil(connectorprotocol.MessageAuthRenew)
 	if !handleProactive(renewalFrame) || !sawRenewal {
 		t.Fatalf("renewal was not sent while readiness was pending: %+v", renewalFrame)
 	}
-	if sawHeartbeat {
-		t.Fatal("heartbeat sent before the initial snapshot became active")
+	for heartbeatCount < heartbeatsBeforeReadiness+3 {
+		frame := readServeFrame(t, serverSide)
+		if !handleProactive(frame) {
+			t.Fatalf("unexpected heartbeat-period frame while readiness was pending: %+v", frame)
+		}
 	}
-	assertNoControlFrame(t, serverSide, 60*time.Millisecond)
+	if got := heartbeatCount - heartbeatsBeforeReadiness; got < 3 {
+		t.Fatalf("heartbeats while readiness was pending=%d, want at least 3", got)
+	}
+	select {
+	case serveErr := <-serveDone:
+		t.Fatalf("control Serve ended while readiness was pending: %v", serveErr)
+	default:
+	}
 	close(readiness.release)
 	readyFrame := readUntil(connectorprotocol.MessageReady)
 	if readyFrame.Type != connectorprotocol.MessageReady || readyFrame.RequestID != snapshotFrame.RequestID {
@@ -778,6 +807,65 @@ func TestControlSessionServeKeepsOneLoopForReadinessRotationHeartbeatAndRenewal(
 	case <-serveDone:
 	case <-time.After(time.Second):
 		t.Fatal("control Serve did not stop after cancellation")
+	}
+}
+
+func TestControlSessionBoundsReadinessCleanupOnCancellation(t *testing.T) {
+	manager, _, _, challenge, now := testRotationFixture(t)
+	readiness := &nonCooperativeSnapshotReadiness{started: make(chan struct{}), release: make(chan struct{})}
+	hello := controlHello(challenge, challenge.OldIdentityKeyID, challenge.ProcessGeneration, challenge.OldCredentialGeneration, fixedClock{now: now})
+	control, err := NewControlSession(ControlSessionConfig{
+		Hello: hello, Applier: controlApplier{}, Drainer: controlDrainer{}, Rotation: manager,
+		Readiness: &controlReadiness{}, SnapshotReadiness: readiness, Clock: fixedClock{now: now},
+	})
+	if err != nil {
+		t.Fatalf("new control session: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	controlSide, serverSide := net.Pipe()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- control.Serve(ctx, controlSide, "req-cleanup-hello") }()
+	defer func() {
+		close(readiness.release)
+		_ = serverSide.Close()
+		cancel()
+	}()
+	_ = readServeFrame(t, serverSide)
+	welcome := controlWelcome(now, challenge.SessionID, hello.Capabilities)
+	welcome.Lease.HeartbeatIntervalMS = 20
+	welcomeFrame, err := connectorprotocol.NewFrame(connectorprotocol.MessageWelcome, "req-cleanup-welcome", welcome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := connectorprotocol.WriteFrame(serverSide, welcomeFrame); err != nil {
+		t.Fatalf("write welcome: %v", err)
+	}
+	snapshot := controlSnapshot(t, challenge, challenge.SessionID, challenge.ProcessGeneration)
+	snapshotFrame, err := connectorprotocol.NewFrame(connectorprotocol.MessageSnapshot, "req-cleanup-snapshot", snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := connectorprotocol.WriteFrame(serverSide, snapshotFrame); err != nil {
+		t.Fatalf("write snapshot: %v", err)
+	}
+	if frame := readServeFrame(t, serverSide); frame.Type != connectorprotocol.MessageAck {
+		t.Fatalf("snapshot response=%+v", frame)
+	}
+	select {
+	case <-readiness.started:
+	case <-time.After(time.Second):
+		t.Fatal("snapshot readiness did not start")
+	}
+	started := time.Now()
+	cancel()
+	_ = serverSide.Close()
+	select {
+	case <-serveDone:
+		if elapsed := time.Since(started); elapsed > time.Second {
+			t.Fatalf("Serve readiness cleanup took %s", elapsed)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Serve did not stop with bounded readiness cleanup")
 	}
 }
 

@@ -618,9 +618,10 @@ func (s *Session) renewLoop(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return nil
 		}
-		// Readiness and other server observations can advance the lease while
-		// this loop is waiting. Renew the latest authoritative generation, not
-		// the snapshot captured before the timer started.
+		// Readiness can advance the lease generation while the renewal timer
+		// is running.  Always send the latest lease projection so the renew
+		// CAS is based on the ETag that readiness installed, rather than the
+		// projection captured before the wait.
 		lease = s.currentLease()
 		expiresAt = lease.LeaseDeadline
 		if lease.UserDeadline != nil && lease.UserDeadline.Before(expiresAt) {
@@ -785,7 +786,6 @@ func (s *Session) markReady(lease Lease) error {
 }
 
 func (s *Session) rekeyManagers(lease Lease) error {
-
 	s.managerMu.Lock()
 	managers := make([]*SessionManager, 0, len(s.managers))
 	for manager := range s.managers {

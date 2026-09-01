@@ -618,19 +618,40 @@ func (s *ServerSession) HandleHeartbeat(ctx context.Context, heartbeat Heartbeat
 	if !s.lastHeartbeatSentAt.IsZero() && !heartbeat.SentAt.After(s.lastHeartbeatSentAt) {
 		return HeartbeatAck{}, codeError(ErrStaleSession, ReasonStaleGeneration, false, nil)
 	}
-	s.lastHeartbeatSentAt = heartbeat.SentAt
-	if !s.hasActive {
+	// A connector may need more than one heartbeat interval to make a newly
+	// staged configuration usable: the carrier, routes, and origin can still be
+	// probing while the old active generation is absent during bootstrap. Keep
+	// the lease alive only for the exact generation this session has staged (or
+	// the server is still offering), and never treat this heartbeat as
+	// readiness. Once an active generation exists it remains authoritative while
+	// a replacement candidate is being prepared.
+	var expected Snapshot
+	switch {
+	case s.hasActive:
+		expected = s.active
+	case s.hasCandidate:
+		expected = s.candidate
+	case s.pendingSnapshot != nil:
+		expected = *s.pendingSnapshot
+	default:
 		return HeartbeatAck{}, codeError(ErrSnapshotRequired, ReasonGenerationGap, true, nil)
 	}
-	if heartbeat.LastAppliedGeneration != s.active.Generation || heartbeat.LastAppliedHash != s.active.ContentHash {
+	if heartbeat.LastAppliedGeneration != expected.Generation || heartbeat.LastAppliedHash != expected.ContentHash {
 		// Keep the last-known-good snapshot for rollback/traffic inspection, but
 		// withdraw readiness until this process receives and promotes a matching
-		// full snapshot.
-		s.needsSnapshot = true
-		s.readyGeneration = 0
-		s.state = SessionAwaitingSnapshot
+		// full snapshot. A staged-only session has no LKG to withdraw and remains
+		// unready; the transport will close on this typed rejection.
+		if s.hasActive {
+			s.needsSnapshot = true
+			s.readyGeneration = 0
+			s.state = SessionAwaitingSnapshot
+		}
 		return HeartbeatAck{}, codeError(ErrSnapshotRequired, ReasonGenerationGap, true, nil)
 	}
+	// Advance the replay fence only after all identity, freshness, and exact
+	// generation checks pass. An invalid heartbeat cannot poison a subsequent
+	// valid heartbeat that carries the current candidate.
+	s.lastHeartbeatSentAt = heartbeat.SentAt
 	s.lastHeartbeat = now
 	leaseExpiry := now.Add(s.server.config.LeaseDuration)
 	if s.auth.CredentialExpiresAt.Before(leaseExpiry) {
@@ -1269,6 +1290,10 @@ func (c *ClientSession) Heartbeat(now time.Time) (Heartbeat, error) {
 	if err := c.ensureActiveLocked(now); err != nil {
 		return Heartbeat{}, err
 	}
+	// Prefer the last promoted generation during a cutover. During bootstrap,
+	// before the first candidate is promoted, report the exact staged candidate
+	// so the server can renew this session while carrier/route/origin readiness
+	// is still pending. This is liveness only and cannot activate the candidate.
 	current, ok := c.currentCandidateLocked()
 	if !ok {
 		return Heartbeat{}, codeError(ErrSnapshotRequired, ReasonGenerationGap, true, nil)

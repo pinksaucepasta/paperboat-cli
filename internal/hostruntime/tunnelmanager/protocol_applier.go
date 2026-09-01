@@ -44,7 +44,7 @@ func (a *CoordinatedConfigApplier) PrepareSnapshot(ctx context.Context, snapshot
 	if err != nil {
 		return nil, errors.Join(err, prepared.Abort(context.Background()))
 	}
-	return a.stage(ctx, prepared, snapshot.TunnelID, snapshot.ConnectorID, snapshot.Generation, decoded.DesiredState)
+	return a.stage(ctx, prepared, snapshot.AccountID, snapshot.TunnelID, snapshot.ConnectorID, snapshot.SessionID, snapshot.ProcessGeneration, snapshot.Generation, snapshot.ContentHash, decoded.DesiredState)
 }
 
 func (a *CoordinatedConfigApplier) PrepareDelta(ctx context.Context, delta connectorprotocol.Delta) (connectorprotocol.PreparedConfig, error) {
@@ -59,10 +59,10 @@ func (a *CoordinatedConfigApplier) PrepareDelta(ctx context.Context, delta conne
 	if err != nil {
 		return nil, errors.Join(err, prepared.Abort(context.Background()))
 	}
-	return a.stage(ctx, prepared, delta.TunnelID, delta.ConnectorID, delta.Generation, decoded.DesiredState)
+	return a.stage(ctx, prepared, delta.AccountID, delta.TunnelID, delta.ConnectorID, delta.SessionID, delta.ProcessGeneration, delta.Generation, delta.ContentHash, decoded.DesiredState)
 }
 
-func (a *CoordinatedConfigApplier) stage(ctx context.Context, prepared connectorprotocol.PreparedConfig, tunnelID, connectorID string, generation uint64, desiredState string) (connectorprotocol.PreparedConfig, error) {
+func (a *CoordinatedConfigApplier) stage(ctx context.Context, prepared connectorprotocol.PreparedConfig, accountID, tunnelID, connectorID, sessionID string, processGeneration, generation uint64, contentHash, desiredState string) (connectorprotocol.PreparedConfig, error) {
 	staged, ok := prepared.(stagedHostState)
 	if !ok {
 		return nil, errors.Join(ErrInvalidConfig, prepared.Abort(context.Background()))
@@ -112,6 +112,10 @@ func (a *CoordinatedConfigApplier) stage(ctx context.Context, prepared connector
 	if err := staged.Stage(ctx); err != nil {
 		return nil, errors.Join(err, prepared.Abort(context.Background()))
 	}
+	// Keep the authenticated session binding alongside the staged desired
+	// snapshot. This lets the manager distinguish a same-config reconnect from
+	// an already healthy carrier and reattach the carrier without changing LKG.
+	a.Manager.RecordControlSessionBinding(accountID, tunnelID, connectorID, sessionID, processGeneration, generation, contentHash)
 	a.Manager.Notify()
 	return prepared, nil
 }

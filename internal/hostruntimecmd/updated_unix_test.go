@@ -67,6 +67,10 @@ func (n *recordingProcessNotifier) Degraded(_ string) error {
 	return nil
 }
 
+func (n *recordingProcessNotifier) Draining() error {
+	n.record("draining")
+	return nil
+}
 func (n *recordingProcessNotifier) Stopping() error {
 	n.record("stopping")
 	return nil
@@ -142,11 +146,22 @@ func TestRunNotifiedUpdaterStopsAfterWatchdogFailure(t *testing.T) {
 	if len(events) < 4 || events[0] != "ready" || events[len(events)-1] != "stopping" {
 		t.Fatalf("notification events=%v", events)
 	}
-	if events[len(events)-2] != "degraded" {
+	if events[len(events)-3] != "degraded" || events[len(events)-2] != "draining" {
 		t.Fatalf("notification events=%v", events)
 	}
 }
 
+func TestRunNotifiedUpdaterRejectsExitBeforeReadiness(t *testing.T) {
+	readyNeverCalled := func(context.Context, func() error) error { return nil }
+	notifier := &recordingProcessNotifier{watchdogSeen: make(chan struct{}, 1)}
+	err := runNotifiedUpdater(context.Background(), updaterRunnerFunc(readyNeverCalled), notifier)
+	if !errors.Is(err, errUpdaterExitedBeforeReadiness) {
+		t.Fatalf("run error=%v", err)
+	}
+	if got := notifier.snapshot(); len(got) != 2 || got[0] != "degraded" || got[1] != "stopping" {
+		t.Fatalf("notification events=%v", got)
+	}
+}
 func TestResolveUpdatedActiveRecoversVerifiedMonitoringCandidate(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "transaction.json")

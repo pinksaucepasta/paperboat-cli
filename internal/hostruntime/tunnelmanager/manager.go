@@ -73,6 +73,19 @@ type ApplyRequest struct {
 	Recovery  bool
 }
 
+// controlSessionBinding records the authenticated connector session which
+// supplied a snapshot. It is separate from the durable config generation:
+// reconnects may keep the same configuration while requiring a fresh carrier
+// bound to a new server session/process epoch.
+type controlSessionBinding struct {
+	AccountID         string
+	ConnectorID       string
+	SessionID         string
+	ProcessGeneration uint64
+	Generation        uint64
+	ContentHash       string
+}
+
 type ProbeResult struct {
 	Ready         bool
 	FailureCode   string
@@ -160,7 +173,11 @@ type Manager struct {
 	closed  bool
 	active  map[string]Active
 	seen    map[string]uint64
-	wake    chan struct{}
+	// sessionBindings is the latest accepted connector-v1 session per tunnel.
+	// It is an in-memory liveness fence only; desired/LKG state remains in the
+	// durable store.
+	sessionBindings map[string]controlSessionBinding
+	wake            chan struct{}
 	// networkGeneration is the highest host-wide event observed for legacy
 	// callers. networkStates is the authoritative per-tunnel fence. Keeping the
 	// host-wide watermark preserves the old monitor API while allowing each
@@ -191,7 +208,35 @@ func New(config Config) (*Manager, error) {
 	if config.ReconcileInterval <= 0 || config.ApplyTimeout <= 0 || config.DrainTimeout <= 0 {
 		return nil, ErrInvalidConfig
 	}
-	return &Manager{config: config, active: make(map[string]Active), seen: make(map[string]uint64), networkStates: make(map[string]networkRecoveryState), wake: make(chan struct{}, 1)}, nil
+	return &Manager{config: config, active: make(map[string]Active), seen: make(map[string]uint64), sessionBindings: make(map[string]controlSessionBinding), networkStates: make(map[string]networkRecoveryState), wake: make(chan struct{}, 1)}, nil
+}
+
+// RecordControlSessionBinding remembers the exact authenticated session that
+// staged a config snapshot. Process generations are monotonic for one durable
+// connector. Older or equal-generation/different-session observations are
+// ignored so delayed stale frames cannot fence a newer carrier.
+func (m *Manager) RecordControlSessionBinding(accountID, tunnelID, connectorID, sessionID string, processGeneration, generation uint64, contentHash string) {
+	if m == nil || accountID == "" || tunnelID == "" || connectorID == "" || sessionID == "" || processGeneration == 0 || generation == 0 || contentHash == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return
+	}
+	if m.sessionBindings == nil {
+		m.sessionBindings = make(map[string]controlSessionBinding)
+	}
+	previous, ok := m.sessionBindings[tunnelID]
+	if ok {
+		if processGeneration < previous.ProcessGeneration || (processGeneration == previous.ProcessGeneration && (accountID != previous.AccountID || connectorID != previous.ConnectorID || sessionID != previous.SessionID)) {
+			return
+		}
+		if processGeneration == previous.ProcessGeneration && sessionID == previous.SessionID && generation < previous.Generation {
+			return
+		}
+	}
+	m.sessionBindings[tunnelID] = controlSessionBinding{AccountID: accountID, ConnectorID: connectorID, SessionID: sessionID, ProcessGeneration: processGeneration, Generation: generation, ContentHash: contentHash}
 }
 
 // Start performs synchronous crash recovery before starting the reconciliation
@@ -383,7 +428,13 @@ func (m *Manager) reconcileTunnel(ctx context.Context, tunnel hoststate.Tunnel, 
 		return ErrGenerationConflict
 	}
 	if current != nil && current.ConnectorID() == connector.ID && current.Generation() == tunnel.DesiredGeneration && current.ContentHash() == tunnel.DesiredSnapshot.ContentHash {
-		return nil
+		if m.activeMatchesControlSession(tunnel.ID, current) {
+			return nil
+		}
+		// The durable config is unchanged, but the authenticated control
+		// session changed. Reattach the same config with the new session
+		// identity without promoting another config/LKG generation.
+		return m.apply(ctx, tunnel, connector, tunnel.DesiredSnapshot, false, false)
 	}
 	if current == nil && tunnel.LastKnownGood != nil {
 		lkg, err := hoststate.ParseTunnelConfigSnapshot(tunnel.LastKnownGood.Payload, tunnel.ID, tunnel.LastKnownGood.Generation)
@@ -406,7 +457,10 @@ func (m *Manager) reconcileTunnel(ctx context.Context, tunnel hoststate.Tunnel, 
 		}
 	}
 	if current != nil && current.ConnectorID() == connector.ID && current.Generation() == tunnel.DesiredGeneration && current.ContentHash() == tunnel.DesiredSnapshot.ContentHash {
-		return nil
+		if m.activeMatchesControlSession(tunnel.ID, current) {
+			return nil
+		}
+		return m.apply(ctx, tunnel, connector, tunnel.DesiredSnapshot, false, false)
 	}
 	return m.apply(ctx, tunnel, connector, tunnel.DesiredSnapshot, false, true)
 }
@@ -493,7 +547,7 @@ func (m *Manager) apply(ctx context.Context, tunnel hoststate.Tunnel, connector 
 		return ErrNotStarted
 	}
 	active, err := candidate.Activate(ctx)
-	if err != nil || active == nil || active.TunnelID() != tunnel.ID || active.ConnectorID() != connector.ID || active.Generation() != snapshot.Generation || active.ContentHash() != snapshot.ContentHash {
+	if err != nil || active == nil || active.TunnelID() != tunnel.ID || active.ConnectorID() != connector.ID || active.Generation() != snapshot.Generation || active.ContentHash() != snapshot.ContentHash || !m.activeMatchesControlSession(tunnel.ID, active) {
 		m.activationMu.Unlock()
 		if active != nil {
 			_ = m.closeActive(context.Background(), active)
@@ -693,6 +747,38 @@ func (m *Manager) activeFor(tunnelID string) Active {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.active[tunnelID]
+}
+
+// activeMatchesControlSession reports whether a published carrier is still
+// bound to the latest authenticated control session which supplied the
+// desired snapshot. No binding is recorded for ordinary restart recovery, so
+// legacy/test candidates retain the existing same-generation no-op behavior.
+func (m *Manager) activeMatchesControlSession(tunnelID string, active Active) bool {
+	if m == nil || active == nil {
+		return false
+	}
+	m.mu.RLock()
+	binding, bound := m.sessionBindings[tunnelID]
+	m.mu.RUnlock()
+	if !bound {
+		return true
+	}
+	if active.ConnectorID() != binding.ConnectorID || active.Generation() != binding.Generation || active.ContentHash() != binding.ContentHash {
+		return false
+	}
+	provider, ok := active.(ActiveCarrierProvider)
+	// Non-data-carrier candidates (legacy runtimes and deterministic manager
+	// fakes) have no session identity to refresh. Preserve their existing
+	// same-generation no-op behavior; the production DataCarrier runtime
+	// implements ActiveCarrierProvider and is checked below.
+	if !ok || provider.ActiveDataCarrier() == nil {
+		return true
+	}
+	identity, ok := provider.ActiveDataCarrier().Identity()
+	if !ok {
+		return false
+	}
+	return identity.AccountID == binding.AccountID && identity.TunnelID == tunnelID && identity.ConnectorID == binding.ConnectorID && identity.SessionID == binding.SessionID && identity.ProcessGeneration == binding.ProcessGeneration && identity.Generation == binding.Generation
 }
 
 // ActiveForTunnel returns the exact currently published runtime. The boolean

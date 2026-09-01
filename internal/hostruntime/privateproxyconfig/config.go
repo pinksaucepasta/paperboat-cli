@@ -143,7 +143,11 @@ func (m *Manager) Remove(ctx context.Context) error {
 		if matchErr != nil {
 			return matchErr
 		}
-		if matches && j.Phase == "prepared" {
+		// Restore may already have completed before the process stopped. Once
+		// the platform state exactly matches the captured prior state, the
+		// journal is stale regardless of whether the last durable phase was
+		// prepared or applied.
+		if matches {
 			return m.removeJournal()
 		}
 		return ErrConflict
@@ -177,7 +181,7 @@ func (m *Manager) Recover(ctx context.Context) error {
 		if matchErr != nil {
 			return matchErr
 		}
-		if matches && j.Phase == "prepared" {
+		if matches {
 			return m.removeJournal()
 		}
 		return ErrConflict

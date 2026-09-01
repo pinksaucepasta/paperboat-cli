@@ -118,6 +118,22 @@ func TestManagerRecoverPreparedJournal(t *testing.T) {
 	}
 }
 
+func TestManagerRecoverRemovesAppliedJournalAfterPriorStateWasRestored(t *testing.T) {
+	f := &fakeAdapter{state: "exact-prior"}
+	path := filepath.Join(t.TempDir(), "j")
+	m, _ := New(path, f)
+	prior, _ := json.Marshal("exact-prior")
+	if err := m.write(journal{Version: 1, Adapter: "fake", PACURL: "http://127.0.0.1:9/a.pac", Phase: "applied", Prior: prior}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale journal remains: %v", err)
+	}
+}
+
 func TestManagerConcurrentInstallIsIdempotent(t *testing.T) {
 	f := &fakeAdapter{state: "off"}
 	m, _ := New(filepath.Join(t.TempDir(), "j"), f)

@@ -253,6 +253,9 @@ func (c *Client) CreatePreviewLease(ctx context.Context, input PreviewLeaseCreat
 	var headers http.Header
 	err = c.doRequestMeta(ctx, http.MethodPost, "/v1/previews", input, &response, http.Header{
 		"Idempotency-Key": []string{idempotencyKey},
+		// The control plane's ETag is a strong OCC token. Explicitly request
+		// the identity representation so an intermediary compression layer
+		// cannot rewrite or remove that validator.
 		"Accept-Encoding": []string{"identity"},
 	}, true, &headers)
 	if err != nil {
@@ -306,6 +309,8 @@ func (c *Client) GetPreviewLease(ctx context.Context, previewID string) (Preview
 	var headers http.Header
 	path := "/v1/previews/" + url.PathEscape(previewID)
 	if err := c.doRequestMeta(ctx, http.MethodGet, path, nil, &lease, http.Header{
+		// A strong ETag describes the exact representation used for OCC. Do
+		// not let a proxy's response encoder transform this representation.
 		"Accept-Encoding": []string{"identity"},
 	}, true, &headers); err != nil {
 		return PreviewLease{}, err
@@ -318,7 +323,7 @@ func (c *Client) GetPreviewLease(ctx context.Context, previewID string) (Preview
 		return PreviewLease{}, fmt.Errorf("%w: response ID does not match requested preview", ErrPreviewLeaseInvalid)
 	}
 	if _, err := previewLeaseETag(lease.ID, lease.ETag); err != nil {
-		return PreviewLease{}, err
+		return PreviewLease{}, fmt.Errorf("%w (received %q)", err, lease.ETag)
 	}
 	return lease, nil
 }

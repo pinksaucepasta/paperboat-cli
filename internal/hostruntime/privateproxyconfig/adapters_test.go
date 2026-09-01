@@ -52,6 +52,22 @@ func TestMacSnapshotUsesExactArgvAndSkipsDisabled(t *testing.T) {
 	}
 }
 
+func TestMacMatchesIgnoresRetainedURLOnlyWhenProxyIsDisabled(t *testing.T) {
+	want, _ := json.Marshal(macState{Services: []macService{{Name: "Wi-Fi", Enabled: false}}})
+	r := &scriptedRunner{outputs: [][]byte{[]byte("Wi-Fi\n"), []byte("URL: http://127.0.0.1:56837/proxy.pac\nEnabled: No\n")}}
+	matched, err := NewMacOSAdapter(r).Matches(context.Background(), want)
+	if err != nil || !matched {
+		t.Fatalf("matched=%v err=%v", matched, err)
+	}
+
+	want, _ = json.Marshal(macState{Services: []macService{{Name: "Wi-Fi", URL: "http://127.0.0.1:1/proxy.pac", Enabled: true}}})
+	r = &scriptedRunner{outputs: [][]byte{[]byte("Wi-Fi\n"), []byte("URL: http://127.0.0.1:2/proxy.pac\nEnabled: Yes\n")}}
+	matched, err = NewMacOSAdapter(r).Matches(context.Background(), want)
+	if err != nil || matched {
+		t.Fatalf("matched=%v err=%v", matched, err)
+	}
+}
+
 func TestLinuxRequiresExplicitGNOMESession(t *testing.T) {
 	r := &scriptedRunner{}
 	a := NewLinuxAdapter(r, func(string) string { return "" })

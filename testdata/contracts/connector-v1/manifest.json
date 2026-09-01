@@ -9,7 +9,7 @@
       "id": "connector-v1.contracts",
       "path": "contracts.md",
       "type": "specification",
-    "sha256": "b619ddba89a1b247dea907e70aa91648b58ad4258669755968201557cf7dcc56",
+    "sha256": "9d74a769e3169cfc981084ce759b0ca2c3dfb65f4adb8176ac6b82a1ad30c7fc",
       "consumers": ["paperboat", "paperboat-server", "paperboat-tunnel"]
     },
     {

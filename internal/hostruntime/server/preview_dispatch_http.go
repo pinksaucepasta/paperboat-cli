@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -40,35 +41,35 @@ func NewPreviewDispatchHandler(config PreviewDispatchHandlerConfig) (http.Handle
 	}
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodPost {
-			writer.WriteHeader(http.StatusMethodNotAllowed)
+			rejectPreviewDispatch(writer, http.StatusMethodNotAllowed, "method")
 			return
 		}
 		if contentType := strings.TrimSpace(strings.Split(request.Header.Get("Content-Type"), ";")[0]); contentType != "application/json" {
-			writer.WriteHeader(http.StatusUnsupportedMediaType)
+			rejectPreviewDispatch(writer, http.StatusUnsupportedMediaType, "content_type")
 			return
 		}
 		body, readErr := io.ReadAll(io.LimitReader(request.Body, maxPreviewDispatchBytes+1))
 		if readErr != nil || len(body) > maxPreviewDispatchBytes {
-			writer.WriteHeader(http.StatusRequestEntityTooLarge)
+			rejectPreviewDispatch(writer, http.StatusRequestEntityTooLarge, "body_limit")
 			return
 		}
 		var input preview.DispatchRequest
 		if decodeStrict(body, &input) != nil {
-			writer.WriteHeader(http.StatusBadRequest)
+			rejectPreviewDispatch(writer, http.StatusBadRequest, "body_decode")
 			return
 		}
 		if _, err := input.Validate(config.MachineID, config.Now()); err != nil {
-			writer.WriteHeader(http.StatusBadRequest)
+			rejectPreviewDispatch(writer, http.StatusBadRequest, "request_validation")
 			return
 		}
 		token, ok := bearerToken(request.Header.Values("Authorization"))
 		if !ok {
-			writer.WriteHeader(http.StatusUnauthorized)
+			rejectPreviewDispatch(writer, http.StatusUnauthorized, "bearer")
 			return
 		}
 		authorizer, err := config.Authorizer(token)
 		if err != nil {
-			writer.WriteHeader(http.StatusUnauthorized)
+			rejectPreviewDispatch(writer, http.StatusUnauthorized, "authorizer")
 			return
 		}
 		if closer, ok := authorizer.(interface{ CloseAuthorization() }); ok {
@@ -76,17 +77,17 @@ func NewPreviewDispatchHandler(config PreviewDispatchHandlerConfig) (http.Handle
 		}
 		authorized, err := authorizer.Authorize(request.Context(), protocol.Frame{Type: "request", Version: protocol.ProtocolVersion, OperationID: input.OperationID, Capability: "preview.launch.v1"})
 		if err != nil || authorized.MachineID != config.MachineID {
-			writer.WriteHeader(http.StatusForbidden)
+			rejectPreviewDispatch(writer, http.StatusForbidden, "authorization")
 			return
 		}
 		claims, ok := authorized.Value.(auth.Claims)
 		if !ok {
-			writer.WriteHeader(http.StatusForbidden)
+			rejectPreviewDispatch(writer, http.StatusForbidden, "claims")
 			return
 		}
 		dispatchAuthorization, err := previewDispatchAuthorization(claims, input)
 		if err != nil {
-			writer.WriteHeader(http.StatusForbidden)
+			rejectPreviewDispatch(writer, http.StatusForbidden, "claim_binding")
 			return
 		}
 		outcome, err := config.Dispatcher.Dispatch(request.Context(), dispatchAuthorization, input)
@@ -103,6 +104,11 @@ func NewPreviewDispatchHandler(config PreviewDispatchHandlerConfig) (http.Handle
 		writer.WriteHeader(status)
 		_ = json.NewEncoder(writer).Encode(outcome)
 	}), nil
+}
+
+func rejectPreviewDispatch(writer http.ResponseWriter, status int, stage string) {
+	log.Printf("preview dispatch request rejected stage=%s status=%d", stage, status)
+	writer.WriteHeader(status)
 }
 
 func previewDispatchAuthorization(claims auth.Claims, request preview.DispatchRequest) (preview.DispatchAuthorization, error) {
@@ -149,6 +155,7 @@ func writePreviewDispatchError(writer http.ResponseWriter, err error) {
 	case errors.Is(err, preview.ErrDispatchConflict), errors.Is(err, preview.ErrSessionConflict):
 		status, code = http.StatusConflict, "preview_dispatch_conflict"
 	}
+	log.Printf("preview dispatch rejected code=%s status=%d", code, status)
 	writer.Header().Set("Content-Type", "application/json")
 	writer.Header().Set("Cache-Control", "no-store")
 	writer.WriteHeader(status)

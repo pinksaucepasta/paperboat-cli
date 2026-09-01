@@ -257,10 +257,16 @@ The `welcome` lease's `session_id` equals `welcome.session_id`; heartbeat
 interval is shorter than the lease. A connector heartbeat reports the exact
 active generation/hash and has a `sent_at` within ±2 minutes of server time.
 For one session, `sent_at` must be strictly increasing. Equal or older
-heartbeats are stale and do not renew a lease. A heartbeat with a generation or
-hash different from active readiness withdraws readiness, retains the LKG,
-and requests a full snapshot. Before the first snapshot, heartbeat is invalid
-and snapshot recovery is required.
+heartbeats are stale and do not renew a lease. While the first snapshot is
+staged but its carrier, routes, or origin are still becoming ready, a session
+with no active generation may report that exact staged generation/hash. The
+server may renew the lease from that pending heartbeat, but it remains
+`awaiting_ready` and never promotes readiness from a heartbeat. During a
+replacement, the existing active generation remains the heartbeat value until
+the replacement is explicitly ready. A heartbeat with a generation or hash
+different from the exact active or pending generation withdraws readiness,
+retains the LKG when one exists, and requests a full snapshot. Before any
+snapshot is staged, heartbeat is invalid and snapshot recovery is required.
 
 The server renews the lease only after identity, generation, freshness, active
 credential, and content-hash checks. Direct SQL persistence repeats the

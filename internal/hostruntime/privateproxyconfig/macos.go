@@ -122,7 +122,23 @@ func (a *MacOSAdapter) Matches(ctx context.Context, want json.RawMessage) (bool,
 	if err != nil {
 		return false, err
 	}
-	return string(got) == string(want), nil
+	var gotState, wantState macState
+	if json.Unmarshal(got, &gotState) != nil || json.Unmarshal(want, &wantState) != nil || len(gotState.Services) != len(wantState.Services) {
+		return false, nil
+	}
+	for index := range gotState.Services {
+		current, expected := gotState.Services[index], wantState.Services[index]
+		if current.Name != expected.Name || current.Enabled != expected.Enabled {
+			return false, nil
+		}
+		// macOS retains the last PAC URL after auto-proxy is disabled. The URL
+		// is operationally irrelevant while disabled and must not turn a
+		// completed restore into a false ownership conflict.
+		if expected.Enabled && current.URL != expected.URL {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 func (a *MacOSAdapter) Restore(ctx context.Context, raw json.RawMessage) error {
 	var state macState
@@ -144,12 +160,14 @@ func (a *MacOSAdapter) rollback(ctx context.Context, services []macService, caus
 }
 func (a *MacOSAdapter) restoreOne(ctx context.Context, s macService) error {
 	var result error
-	_, err := a.runner.Run(ctx, networksetup, "-setautoproxyurl", s.Name, s.URL)
-	result = errors.Join(result, err)
+	if s.URL != "" {
+		_, err := a.runner.Run(ctx, networksetup, "-setautoproxyurl", s.Name, s.URL)
+		result = errors.Join(result, err)
+	}
 	state := "off"
 	if s.Enabled {
 		state = "on"
 	}
-	_, err = a.runner.Run(ctx, networksetup, "-setautoproxystate", s.Name, state)
+	_, err := a.runner.Run(ctx, networksetup, "-setautoproxystate", s.Name, state)
 	return errors.Join(result, err)
 }

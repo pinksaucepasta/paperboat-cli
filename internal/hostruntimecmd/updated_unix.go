@@ -107,9 +107,12 @@ func (f updaterRunnerFunc) Run(ctx context.Context, ready func() error) error {
 	return f(ctx, ready)
 }
 
+var errUpdaterExitedBeforeReadiness = errors.New("paperboat-updated exited before readiness")
+
 type processNotifier interface {
 	Ready() error
 	Degraded(string) error
+	Draining() error
 	Stopping() error
 	WatchdogInterval() time.Duration
 	Watchdog() error
@@ -143,7 +146,9 @@ func runNotifiedUpdater(ctx context.Context, runner updaterRunner, notifier proc
 			if readyErr != nil {
 				cancel()
 				runErr := <-done
-				return errors.Join(readyErr, notifier.Degraded("updater readiness notification failed"), runErr, notifier.Stopping())
+				degradedErr := notifier.Degraded("updater readiness notification failed")
+				stoppingErr := notifier.Stopping()
+				return errors.Join(readyErr, degradedErr, runErr, stoppingErr)
 			}
 			goto running
 		case runErr := <-done:
@@ -154,14 +159,19 @@ func runNotifiedUpdater(ctx context.Context, runner updaterRunner, notifier proc
 				if readyErr == nil {
 					return errors.Join(runErr, notifier.Stopping())
 				}
-				return errors.Join(runErr, readyErr, notifier.Degraded("updater readiness notification failed"), notifier.Stopping())
+				degradedErr := notifier.Degraded("updater readiness notification failed")
+				stoppingErr := notifier.Stopping()
+				return errors.Join(runErr, readyErr, degradedErr, stoppingErr)
 			default:
-				return errors.Join(runErr, notifier.Degraded("updater exited before readiness"), notifier.Stopping())
+				degradedErr := notifier.Degraded("updater exited before readiness")
+				stoppingErr := notifier.Stopping()
+				return errors.Join(errUpdaterExitedBeforeReadiness, runErr, degradedErr, stoppingErr)
 			}
 		case <-ctx.Done():
+			drainErr := notifier.Draining()
 			cancel()
 			runErr := <-done
-			return errors.Join(ctx.Err(), runErr, notifier.Stopping())
+			return errors.Join(ctx.Err(), drainErr, runErr, notifier.Stopping())
 		}
 	}
 
@@ -180,14 +190,18 @@ running:
 		case err := <-done:
 			return errors.Join(err, notifier.Stopping())
 		case <-ctx.Done():
+			drainErr := notifier.Draining()
 			cancel()
 			runErr := <-done
-			return errors.Join(runErr, notifier.Stopping())
+			return errors.Join(drainErr, runErr, notifier.Stopping())
 		case <-watchdog:
 			if err := notifier.Watchdog(); err != nil {
+				degradedErr := notifier.Degraded("updater watchdog notification failed")
+				drainErr := notifier.Draining()
 				cancel()
 				runErr := <-done
-				return errors.Join(err, notifier.Degraded("updater watchdog notification failed"), runErr, notifier.Stopping())
+				stoppingErr := notifier.Stopping()
+				return errors.Join(err, degradedErr, drainErr, runErr, stoppingErr)
 			}
 		}
 	}

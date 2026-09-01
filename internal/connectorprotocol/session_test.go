@@ -184,6 +184,51 @@ func testSessionPair(t *testing.T) (*ServerSession, *ClientSession, *testClock, 
 	return serverSession, client, clock, applier, snapshot
 }
 
+func testPendingSessionPair(t *testing.T) (*ServerSession, *ClientSession, *testClock, Snapshot) {
+	t.Helper()
+	now := time.Date(2026, 8, 30, 10, 0, 0, 0, time.UTC)
+	clock := &testClock{now: now}
+	auth, _ := testAuth(t, now, 1)
+	snapshot, err := NewSnapshot("tunnel_1", 1, testConfigPayload(1, "preview.example.test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(ServerConfig{
+		Authenticator: AuthenticatorFuncs{AuthenticateFunc: func(context.Context, AuthRequest) (AuthResult, error) {
+			return AuthResult{AccountID: auth.AccountID, TunnelID: auth.TunnelID, ConnectorID: auth.ConnectorID, HostID: auth.HostID, IdentityKeyID: auth.IdentityKeyID, IdentityKeyThumbprint: auth.IdentityKeyThumbprint, ProcessGeneration: auth.ProcessGeneration, CredentialGeneration: auth.CredentialGeneration, CredentialExpiresAt: now.Add(time.Hour), LeaseExpiresAt: now.Add(time.Hour)}, nil
+		}},
+		Snapshots:    SnapshotSourceFunc(func(context.Context, string) (Snapshot, error) { return snapshot, nil }),
+		Capabilities: requiredCapabilityList(), Clock: clock, LeaseDuration: time.Minute, HeartbeatInterval: 10 * time.Second,
+		SessionIDs: func() (string, error) { return "sess_pending", nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverSession, welcome, first, err := server.Accept(context.Background(), Hello{Protocol: ProtocolName, MinVersion: "1.0", MaxVersion: "1.0", AccountID: auth.AccountID, TunnelID: auth.TunnelID, ConnectorID: auth.ConnectorID, HostID: auth.HostID, ProcessGeneration: auth.ProcessGeneration, Capabilities: requiredCapabilityList(), Auth: auth})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applier := &stagedApplier{}
+	client, err := NewClientSession(ClientSessionConfig{Hello: Hello{Protocol: ProtocolName, MinVersion: "1.0", MaxVersion: "1.0", AccountID: auth.AccountID, TunnelID: auth.TunnelID, ConnectorID: auth.ConnectorID, HostID: auth.HostID, ProcessGeneration: auth.ProcessGeneration, Capabilities: requiredCapabilityList(), Auth: auth}, Applier: applier, Clock: clock})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.AcceptWelcome(welcome); err != nil {
+		t.Fatal(err)
+	}
+	ack, err := client.ApplySnapshot(context.Background(), first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := serverSession.HandleAck(context.Background(), ack); err != nil {
+		t.Fatal(err)
+	}
+	if serverSession.State() != SessionAwaitingReady || client.State() != SessionAwaitingReady {
+		t.Fatalf("pending states server=%s client=%s", serverSession.State(), client.State())
+	}
+	return serverSession, client, clock, snapshot
+}
+
 func TestClientSessionApplyRenewalIsMonotonicAndReplaySafe(t *testing.T) {
 	_, client, clock, _, _ := testSessionPair(t)
 	now := clock.Now()
@@ -349,6 +394,38 @@ func TestHeartbeatMismatchWithdrawsReadinessButRetainsLKG(t *testing.T) {
 	current, ready, generation := serverSession.Current()
 	if ready || generation != 0 || current.ContentHash != first.ContentHash {
 		t.Fatalf("heartbeat mismatch state current=%+v ready=%t generation=%d", current, ready, generation)
+	}
+}
+
+func TestHeartbeatRenewsLeaseWhileInitialSnapshotReadinessIsPending(t *testing.T) {
+	serverSession, client, clock, snapshot := testPendingSessionPair(t)
+	if _, active, generation := serverSession.Current(); active || generation != 0 {
+		t.Fatalf("pending session unexpectedly active: active=%t generation=%d", active, generation)
+	}
+	previousExpiry := serverSession.Lease().ExpiresAt
+	for i := 0; i < 3; i++ {
+		clock.Advance(time.Second)
+		heartbeat, err := client.Heartbeat(clock.Now())
+		if err != nil {
+			t.Fatalf("pending heartbeat %d: %v", i, err)
+		}
+		if heartbeat.LastAppliedGeneration != snapshot.Generation || heartbeat.LastAppliedHash != snapshot.ContentHash {
+			t.Fatalf("pending heartbeat %d reported %+v, want generation=%d hash=%s", i, heartbeat, snapshot.Generation, snapshot.ContentHash)
+		}
+		ack, err := serverSession.HandleHeartbeat(context.Background(), heartbeat)
+		if err != nil {
+			t.Fatalf("server pending heartbeat %d: %v", i, err)
+		}
+		if !ack.LeaseExpiresAt.After(previousExpiry) {
+			t.Fatalf("pending heartbeat %d did not renew lease: previous=%s next=%s", i, previousExpiry, ack.LeaseExpiresAt)
+		}
+		previousExpiry = ack.LeaseExpiresAt
+		if serverSession.State() != SessionAwaitingReady {
+			t.Fatalf("pending heartbeat %d promoted state=%s", i, serverSession.State())
+		}
+	}
+	if _, active := client.Active(); active {
+		t.Fatal("pending heartbeats promoted the client candidate")
 	}
 }
 
