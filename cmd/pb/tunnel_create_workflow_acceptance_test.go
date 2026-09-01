@@ -380,7 +380,7 @@ func TestTunnelCreateWorkflowHumanOutputIsFinalAndSecretSafe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, expected := range []string{"Created tunnel workflow (tun_workflow)", "Connector connector_workflow is ready", "https://demo.example.test -> http://127.0.0.1:8080", "DNS for app.example.test:", "app.example.test\tCNAME\tedge.example.test\t300"} {
+	for _, expected := range []string{"Created tunnel workflow (tun_workflow)", "Connector connector_workflow is ready", "https://123e4567-e89b-42d3-a456-426614174000.tunnels.example.test -> http://127.0.0.1:8080", "DNS for app.example.test:", "app.example.test\tCNAME\tedge.example.test\t300"} {
 		if !strings.Contains(stdout, expected) {
 			t.Fatalf("output missing %q: %s", expected, stdout)
 		}

@@ -75,7 +75,7 @@ func withTunnelCommandClient(t *testing.T, handler http.HandlerFunc) {
 }
 
 func validCommandTunnel() api.Tunnel {
-	return api.Tunnel{Schema: api.TunnelV1Schema, Kind: "tunnel", ID: "tun_1", AccountID: "acc_1", Generation: 4, ETag: `"tunnel:tun_1:4"`, Name: "demo", AccessMode: "private", DesiredState: "active", StableEndpointID: "endpoint_1", StableEndpoint: "https://demo.example.test", CreatedByHostID: "host_1", CreatedByActorID: "user_1", SummaryCode: "ready", CreatedAt: time.Unix(1, 0).UTC(), UpdatedAt: time.Unix(2, 0).UTC()}
+	return api.Tunnel{Schema: api.TunnelV1Schema, Kind: "tunnel", ID: "tun_1", AccountID: "acc_1", Generation: 4, ETag: `"tunnel:tun_1:4"`, Name: "demo", AccessMode: "private", DesiredState: "active", StableEndpointID: "123e4567-e89b-42d3-a456-426614174000", StableEndpoint: "https://123e4567-e89b-42d3-a456-426614174000.tunnels.example.test", CreatedByHostID: "host_1", CreatedByActorID: "user_1", SummaryCode: "ready", CreatedAt: time.Unix(1, 0).UTC(), UpdatedAt: time.Unix(2, 0).UTC()}
 }
 
 func validCommandOperation(kind, id string) api.TunnelOperation {
