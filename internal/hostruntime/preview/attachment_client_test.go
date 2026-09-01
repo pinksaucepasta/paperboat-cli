@@ -1,7 +1,9 @@
 package preview
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -318,6 +320,117 @@ func TestAttachmentClientAcceptsIdempotentOriginFailure(t *testing.T) {
 	}
 	if got.Binding != attachment.Binding || got.AttachmentGeneration != attachment.AttachmentGeneration || got.State != attachment.State || got.OriginReady != attachment.OriginReady {
 		t.Fatalf("idempotent attachment = %#v, want same binding/generation/state %#v", got, attachment)
+	}
+}
+
+func TestAttachmentClientObserveOriginMatchesServerMachineProofBinding(t *testing.T) {
+	now := time.Now().UTC()
+	lease, attachment := providerTestLeaseAttachment(t, now, "preview_proof_binding", "operation_proof_binding_01", "route_proof_binding_01", testPreviewCarrierIdentity(1), 1)
+	request, err := AttachmentRequestForLease(lease, "request_proof_binding_01", "correlation_proof_binding_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	attachment.RequestID = request.RequestID
+	attachment.CorrelationID = request.CorrelationID
+	attachment.RequestHash, err = request.Hash(attachment.AccountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var proofOperation, proofMethod, proofPath string
+	var proofBody []byte
+	next := attachment
+	next.State = "ready"
+	next.OriginReady = true
+	next.AttachmentGeneration++
+	readyAt := now
+	next.ReadyAt = &readyAt
+	responseBody, err := json.Marshal(struct {
+		Data Attachment `json:"data"`
+	}{Data: next})
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method != http.MethodPost || req.URL.Path != "/v1/previews/preview_proof_binding/carrier-attachment/readiness" {
+			t.Fatalf("request = %s %s", req.Method, req.URL.Path)
+		}
+		if req.Header.Get("Idempotency-Key") != request.IdempotencyKey || req.Header.Get("If-Match") != request.LeaseETag {
+			t.Fatalf("binding headers = %#v", req.Header)
+		}
+		if req.Header.Get("X-Paperboat-Machine-Identity") != "identity" {
+			t.Fatalf("machine identity = %q", req.Header.Get("X-Paperboat-Machine-Identity"))
+		}
+		encodedProof, decodeErr := base64.RawURLEncoding.DecodeString(req.Header.Get("X-Paperboat-Machine-Proof"))
+		if decodeErr != nil {
+			t.Fatalf("machine proof = %q, err=%v", req.Header.Get("X-Paperboat-Machine-Proof"), decodeErr)
+		}
+		body, readErr := io.ReadAll(req.Body)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if !bytes.Equal(body, proofBody) {
+			t.Fatalf("proof body and transmitted body differ: proof=%s request=%s", proofBody, body)
+		}
+		var proofEnvelope struct {
+			OperationID string `json:"operation_id"`
+			Method      string `json:"method"`
+			Path        string `json:"path"`
+			BodySHA256  string `json:"body_sha256"`
+		}
+		if err := json.Unmarshal(encodedProof, &proofEnvelope); err != nil {
+			t.Fatalf("machine proof payload = %v", err)
+		}
+		bodyHash := sha256.Sum256(body)
+		if proofEnvelope.OperationID != request.IdempotencyKey || proofEnvelope.Method != http.MethodPost || proofEnvelope.Path != req.URL.Path || proofEnvelope.BodySHA256 != base64.RawURLEncoding.EncodeToString(bodyHash[:]) {
+			t.Fatalf("machine proof payload = %#v", proofEnvelope)
+		}
+		var mutation struct {
+			Request              AttachmentRequest `json:"request"`
+			Binding              Binding           `json:"binding"`
+			AttachmentGeneration uint64            `json:"attachment_generation"`
+			OriginReady          bool              `json:"origin_ready"`
+		}
+		decoder := json.NewDecoder(bytes.NewReader(body))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&mutation); err != nil {
+			t.Fatalf("readiness body = %v", err)
+		}
+		if err := decoder.Decode(&struct{}{}); err != io.EOF {
+			t.Fatalf("readiness body trailing data = %v", err)
+		}
+		if mutation.Request.OperationID != request.OperationID || mutation.Request.IdempotencyKey != request.IdempotencyKey || mutation.Binding.OperationID != request.OperationID || mutation.AttachmentGeneration != attachment.AttachmentGeneration || !mutation.OriginReady {
+			t.Fatalf("readiness binding = %#v", mutation)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(bytes.NewReader(responseBody)), Request: req}, nil
+	})
+	client, err := NewAttachmentClient(AttachmentClientConfig{
+		ControlURL: "https://api.example.test", AllowedHosts: []string{"api.example.test"}, Transport: transport,
+		Tokens:     tokenSourceFunc(func(context.Context) (string, error) { return "token", nil }),
+		Identities: tokenSourceFunc(func(context.Context) (string, error) { return "identity", nil }),
+		Proofs: controlProof(func(_ context.Context, operationID, method, path string, body []byte) ([]byte, error) {
+			proofOperation, proofMethod, proofPath, proofBody = operationID, method, path, append([]byte(nil), body...)
+			bodyHash := sha256.Sum256(body)
+			return json.Marshal(struct {
+				OperationID string `json:"operation_id"`
+				Method      string `json:"method"`
+				Path        string `json:"path"`
+				BodySHA256  string `json:"body_sha256"`
+			}{operationID, method, path, base64.RawURLEncoding.EncodeToString(bodyHash[:])})
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := client.ObserveOrigin(context.Background(), request, attachment, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != "ready" || !got.OriginReady || got.AttachmentGeneration != next.AttachmentGeneration {
+		t.Fatalf("ready attachment = %#v", got)
+	}
+	if proofOperation != request.IdempotencyKey || proofMethod != http.MethodPost || proofPath != "/v1/previews/preview_proof_binding/carrier-attachment/readiness" {
+		t.Fatalf("proof binding = op=%q method=%q path=%q", proofOperation, proofMethod, proofPath)
 	}
 }
 

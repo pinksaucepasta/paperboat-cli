@@ -108,13 +108,17 @@ type exchangeCredentialStore struct{}
 func (exchangeCredentialStore) CreateKey(context.Context, string) (Credential, error) {
 	return Credential{}, errors.New("not used")
 }
+
 func (exchangeCredentialStore) Sign(context.Context, string, []byte) ([]byte, error) {
 	return []byte("credential-proof"), nil
 }
+
 func (exchangeCredentialStore) PutEnrollmentToken(context.Context, string, string) (string, error) {
 	return "", errors.New("not used")
 }
+
 func (exchangeCredentialStore) EnrollmentToken(context.Context, string) (string, error) {
 	return "", errors.New("not used")
 }
+
 func (exchangeCredentialStore) DeleteEnrollmentToken(context.Context, string) error { return nil }

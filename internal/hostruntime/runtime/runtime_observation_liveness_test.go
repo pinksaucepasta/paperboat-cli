@@ -160,8 +160,12 @@ func TestRuntimeObservationServiceOutlivesStartupContext(t *testing.T) {
 		osBootID:         "boot-runtime-observation",
 	}
 	service := &runtimeObservationService{sender: sender, interval: 15 * time.Millisecond, timeout: 250 * time.Millisecond}
+	// Production host composition wraps the observation loop with the regional
+	// monitor. Exercise the group itself so a caller-owned startup context
+	// cannot accidentally become the lifetime of the second service.
+	group := serviceGroup{runtimeObservationGroupMember{}, service}
 	startupCtx, cancelStartup := context.WithCancel(context.Background())
-	if err := service.Start(startupCtx); err != nil {
+	if err := group.Start(startupCtx); err != nil {
 		t.Fatal(err)
 	}
 	cancelStartup()
@@ -176,10 +180,15 @@ func TestRuntimeObservationServiceOutlivesStartupContext(t *testing.T) {
 	}
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), time.Second)
 	defer cancelShutdown()
-	if err := service.Shutdown(shutdownCtx); err != nil {
+	if err := group.Shutdown(shutdownCtx); err != nil {
 		t.Fatal(err)
 	}
 }
+
+type runtimeObservationGroupMember struct{}
+
+func (runtimeObservationGroupMember) Start(context.Context) error    { return nil }
+func (runtimeObservationGroupMember) Shutdown(context.Context) error { return nil }
 
 func readServerHeartbeatReceipt(path string) (serverHeartbeatReceipt, error) {
 	body, err := os.ReadFile(path)

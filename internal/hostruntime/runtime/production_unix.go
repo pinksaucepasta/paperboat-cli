@@ -613,7 +613,20 @@ func newProductionHost(ctx context.Context, version string, environ func(string)
 			scope = "unknown"
 		}
 		capabilities := []string{"file_receive", "preview_launch", "terminal_host", "codex_host", "session_host", "keep_awake"}
-		sender := &runtimeObservationSender{endpoint: runtimeEndpoint, tokens: renewingTokens, proofs: enrollment.ProofSource{StateRoot: runtimeConfig.StateRoot}, operationID: operationID, environmentID: identity.EnvironmentID, machineID: machineID, reporterVersion: version, client: &http.Client{Transport: transport, Timeout: 10 * time.Second}, availability: availabilityService, environment: runtimeEnvironment, onEnvironmentObservation: markEnvironmentObservationReady, receiptPath: filepath.Join(runtimeConfig.StateRoot, "runtime", "server-heartbeat.json"), installationGeneration: uint64(machineRegistration.InstallationGeneration), workerGeneration: bootState.Generation, osBootID: bootState.OSBootID, serviceScope: scope, connector: manager, capabilities: capabilities, relayLatency: regionalCache, relaySuccess: relayRegion}
+		// Presence must not queue behind the work-plane token source. Managed
+		// SSH, peer enrollment, and availability all share renewingTokens and a
+		// single renewal mutex; when one of those calls is slow, a liveness
+		// heartbeat can otherwise miss several 15-second ticks. Give the stable
+		// observation service its own renewable source so its bounded request can
+		// fail independently while the current identity remains shared on disk.
+		observationTokens, observationTokensErr := enrollment.NewRenewingTokenSource(enrollment.RenewingTokenConfig{
+			ControlURL: controlURL.String(), StateRoot: runtimeConfig.StateRoot, Transport: transport,
+			RenewBefore: 5 * time.Minute, Timeout: 15 * time.Second, Clock: func() time.Time { return time.Now().UTC() }, OperationID: operationID, Metrics: metrics,
+		})
+		if observationTokensErr != nil {
+			return nil, observationTokensErr
+		}
+		sender := &runtimeObservationSender{endpoint: runtimeEndpoint, tokens: observationTokens, proofs: enrollment.ProofSource{StateRoot: runtimeConfig.StateRoot}, operationID: operationID, environmentID: identity.EnvironmentID, machineID: machineID, reporterVersion: version, client: &http.Client{Transport: transport, Timeout: 10 * time.Second}, availability: availabilityService, environment: runtimeEnvironment, onEnvironmentObservation: markEnvironmentObservationReady, receiptPath: filepath.Join(runtimeConfig.StateRoot, "runtime", "server-heartbeat.json"), installationGeneration: uint64(machineRegistration.InstallationGeneration), workerGeneration: bootState.Generation, osBootID: bootState.OSBootID, serviceScope: scope, connector: manager, capabilities: capabilities, relayLatency: regionalCache, relaySuccess: relayRegion}
 		updaterClient, updaterErr := newProductionUpdaterClient()
 		if updaterErr != nil {
 			return nil, updaterErr

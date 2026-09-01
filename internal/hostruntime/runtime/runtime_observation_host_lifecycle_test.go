@@ -53,7 +53,7 @@ func TestRuntimeObservationRemainsStableAcrossWorkerReplacement(t *testing.T) {
 		Listener:                  func() (net.Listener, error) { return listener, nil },
 		ConfigApply:               configapply.ConformanceHandler{},
 		SessionLauncherFactory:    testSessionLauncherFactory("/bin/sh", []string{"-l"}, []string{"PATH=/usr/bin:/bin"}),
-		RuntimeObservationService: observation,
+		RuntimeObservationService: serviceGroup{runtimeObservationGroupMember{}, observation},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -101,6 +101,71 @@ func TestRuntimeObservationRemainsStableAcrossWorkerReplacement(t *testing.T) {
 	time.Sleep(4 * observation.interval)
 	if got := transport.calls.Load(); got != stoppedAt {
 		t.Fatalf("observation loop continued after host shutdown: calls=%d want=%d", got, stoppedAt)
+	}
+}
+
+// TestStartHostdKeepsProductionObservationGroupAlive verifies the lifecycle
+// used by hostruntimecmd: hostd starts the production observation group, then
+// the separately fenced worker is activated. The worker Runtime must remain
+// New in this process; otherwise its shutdown can take the machine heartbeat
+// down with it.
+func TestStartHostdKeepsProductionObservationGroupAlive(t *testing.T) {
+	transport := &livenessObservationTransport{notify: make(chan struct{}, 32)}
+	sender := &runtimeObservationSender{
+		endpoint:         "https://observations.invalid/v1/runtime-observations",
+		tokens:           livenessObservationTokenSource{},
+		proofs:           livenessObservationProofSource{},
+		operationID:      func() (string, error) { return "op_runtime_observation_hostd_only_0001", nil },
+		environmentID:    "env_runtime_observation_hostd_only",
+		machineID:        "machine_runtime_observation_hostd_only",
+		reporterVersion:  "test",
+		client:           &http.Client{Transport: transport},
+		workerGeneration: 1,
+		osBootID:         "boot-runtime-observation-hostd-only",
+	}
+	observation := &runtimeObservationService{sender: sender, interval: 15 * time.Millisecond, timeout: 250 * time.Millisecond}
+	root := t.TempDir()
+	host, err := NewHost(context.Background(), HostConfig{
+		Runtime: runtimeconfig.Config{
+			Profile:   runtimeconfig.BYOD,
+			StateRoot: root,
+			Version:   "test",
+			Limits:    runtimeconfig.DefaultLimits,
+			Resources: runtimeconfig.DefaultResources,
+		},
+		ListenAddress: "127.0.0.1:0",
+		WorkspaceRoot: root,
+		EnvironmentID: "env_runtime_observation_hostd_only",
+		MachineID:     "machine_runtime_observation_hostd_only",
+	}, HostDependencies{
+		Authorizer:                func(string) (server.Authorizer, error) { return hostAuthorizer{}, nil },
+		Listener:                  func() (net.Listener, error) { return &hostListener{closed: make(chan struct{})}, nil },
+		ConfigApply:               configapply.ConformanceHandler{},
+		SessionLauncherFactory:    testSessionLauncherFactory("/bin/sh", []string{"-l"}, []string{"PATH=/usr/bin:/bin"}),
+		RuntimeObservationService: serviceGroup{runtimeObservationGroupMember{}, observation},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	startupCtx, cancelStartup := context.WithCancel(context.Background())
+	if err := host.StartHostd(startupCtx); err != nil {
+		cancelStartup()
+		t.Fatal(err)
+	}
+	cancelStartup()
+	if state := host.State(); state != New {
+		t.Fatalf("replaceable runtime state = %q, want %q", state, New)
+	}
+	waitForRuntimeObservationCalls(t, transport, 2)
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), time.Second)
+	defer cancelShutdown()
+	if err := host.ShutdownHostd(shutdownCtx); err != nil {
+		t.Fatal(err)
+	}
+	stoppedAt := transport.calls.Load()
+	time.Sleep(4 * observation.interval)
+	if got := transport.calls.Load(); got != stoppedAt {
+		t.Fatalf("observation loop continued after hostd shutdown: calls=%d want=%d", got, stoppedAt)
 	}
 }
 

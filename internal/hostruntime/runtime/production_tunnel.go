@@ -173,9 +173,11 @@ func (s *ProductionTunnelEnrollment) Start(ctx context.Context) error {
 		s.mu.Unlock()
 		return ErrProductionTunnelEnrollmentStarted
 	}
+	s.recoveryErr = nil
 	s.recoveryHealth = ProductionTunnelRecoveryHealth{State: productionTunnelRecoveryStarting}
 	if s.lifecycle != nil {
 		if err := s.lifecycle.Start(ctx); err != nil {
+			s.recoveryErr = err
 			s.recoveryHealth = productionTunnelRecoveryHealthForError(err, false)
 			s.mu.Unlock()
 			return err
