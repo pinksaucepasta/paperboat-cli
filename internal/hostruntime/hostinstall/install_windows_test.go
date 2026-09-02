@@ -70,6 +70,56 @@ func TestWindowsSSHServiceSetFollowsHostClientTransition(t *testing.T) {
 	}
 }
 
+func TestWindowsHostRuntimeFailurePreservesManagedSSHState(t *testing.T) {
+	programData := t.TempDir()
+	t.Setenv("ProgramData", programData)
+	layout, err := service.DefaultLayout("windows")
+	if err != nil {
+		t.Fatal(err)
+	}
+	previousRemoveService, previousRemoveState := removePaperboatSSHService, removePaperboatSSHState
+	t.Cleanup(func() {
+		removePaperboatSSHService = previousRemoveService
+		removePaperboatSSHState = previousRemoveState
+	})
+	var serviceRemovals, stateRemovals []windowsopenssh.Config
+	removePaperboatSSHService = func(_ context.Context, config windowsopenssh.Config) error {
+		serviceRemovals = append(serviceRemovals, config)
+		if _, err := os.ReadFile(filepath.Join(config.StateRoot, "hostkeys", "ssh_host_ed25519_key.pub")); err != nil {
+			return err
+		}
+		return nil
+	}
+	removePaperboatSSHState = func(_ context.Context, config windowsopenssh.Config) error {
+		stateRemovals = append(stateRemovals, config)
+		return nil
+	}
+	host := Request{SetupMode: "host", OwnerSID: "S-1-5-21-1-2-3-4"}
+	hostKeyPath := filepath.Join(windowsopenssh.DefaultConfig(nil).StateRoot, "hostkeys", "ssh_host_ed25519_key.pub")
+	if err := os.MkdirAll(filepath.Dir(hostKeyPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(hostKeyPath, []byte("ssh-ed25519 AAAA preserved\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := cleanupWindowsSSHAfterRuntimeFailure(context.Background(), host, layout); err != nil {
+		t.Fatal(err)
+	}
+	if len(serviceRemovals) != 1 || len(stateRemovals) != 0 {
+		t.Fatalf("host cleanup removed service=%d state=%d", len(serviceRemovals), len(stateRemovals))
+	}
+	client := Request{SetupMode: "client", OwnerSID: host.OwnerSID}
+	if err := cleanupWindowsSSHAfterRuntimeFailure(context.Background(), client, layout); err != nil {
+		t.Fatal(err)
+	}
+	if len(serviceRemovals) != 1 || len(stateRemovals) != 1 {
+		t.Fatalf("client cleanup removed service=%d state=%d", len(serviceRemovals), len(stateRemovals))
+	}
+	if contents, err := os.ReadFile(hostKeyPath); err != nil || string(contents) != "ssh-ed25519 AAAA preserved\n" {
+		t.Fatalf("host key after rollback=%q err=%v", contents, err)
+	}
+}
+
 func TestRunWindowsInstallPhaseReturnsNamedDeadline(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	started := make(chan struct{})

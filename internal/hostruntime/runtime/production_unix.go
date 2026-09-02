@@ -895,10 +895,25 @@ func productionManagedSSHUnix(ctx context.Context, controlURL string, transport 
 	return host, reconciler, nil
 }
 
+func managedSSHInitialOperationIDs(registration runtimeidentity.Registration, observationGeneration uint64, fingerprint [32]byte) (string, string) {
+	suffix := registration.MachineID + "-" + strconv.FormatUint(uint64(registration.InstallationGeneration), 10) + "-" + strconv.FormatUint(observationGeneration, 10) + "-" + hex.EncodeToString(fingerprint[:])
+	return "managed-ssh-observe-" + suffix, "managed-ssh-keys-" + suffix
+}
+
+// reconcileManagedSSHAuthority retains the original operation-ID helper for
+// callers that do not have a host-key inventory. Production host setup uses
+// reconcileManagedSSHAuthorityWithFingerprint below so retries are scoped to
+// the exact persisted host-key set.
 func reconcileManagedSSHAuthority(ctx context.Context, client managedSSHControlClient, identitySource managedSSHIdentitySource, registration runtimeidentity.Registration, observationGeneration uint64, setID string, publicKeys []string) (clientapi.ManagedSSHAuthorizedKeys, bool, error) {
 	return reconcileManagedSSHAuthorityWithOperations(ctx, client, identitySource, registration, observationGeneration, setID, publicKeys,
 		"managed-ssh-observe-"+registration.MachineID+"-"+strconv.FormatUint(uint64(registration.InstallationGeneration), 10)+"-"+strconv.FormatUint(observationGeneration, 10),
 		"managed-ssh-keys-"+registration.MachineID+"-"+strconv.FormatUint(uint64(registration.InstallationGeneration), 10)+"-"+strconv.FormatUint(observationGeneration, 10))
+}
+
+func reconcileManagedSSHAuthorityWithFingerprint(ctx context.Context, client managedSSHControlClient, identitySource managedSSHIdentitySource, registration runtimeidentity.Registration, observationGeneration uint64, setID string, fingerprint [32]byte, publicKeys []string) (clientapi.ManagedSSHAuthorizedKeys, bool, error) {
+	observeOperationID, keyOperationID := managedSSHInitialOperationIDs(registration, observationGeneration, fingerprint)
+	return reconcileManagedSSHAuthorityWithOperations(ctx, client, identitySource, registration, observationGeneration, setID, publicKeys,
+		observeOperationID, keyOperationID)
 }
 
 func reconcileManagedSSHAuthorityWithOperations(ctx context.Context, client managedSSHControlClient, identitySource managedSSHIdentitySource, registration runtimeidentity.Registration, observationGeneration uint64, setID string, publicKeys []string, observeOperationID, keyOperationID string) (clientapi.ManagedSSHAuthorizedKeys, bool, error) {

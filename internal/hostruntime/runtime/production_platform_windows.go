@@ -108,7 +108,7 @@ func productionManagedSSH(ctx context.Context, controlURL string, transport http
 	// a distinct set identity.
 	setID := "sshks_" + fmtHex(inventory.Fingerprint[:16]) + "_" + fmtHexUint(uint64(registration.InstallationGeneration))
 	client := api.New(controlURL, config.Credential{}, &http.Client{Transport: transport, Timeout: 15 * time.Second})
-	keys, active, err := reconcileManagedSSHAuthority(ctx, client, identity, registration, generation, setID, publicKeys)
+	keys, active, err := reconcileManagedSSHAuthorityWithFingerprint(ctx, client, identity, registration, generation, setID, inventory.Fingerprint, publicKeys)
 	if err != nil {
 		var apiErr *api.APIError
 		if errors.As(err, &apiErr) {

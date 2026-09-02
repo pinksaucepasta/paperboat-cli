@@ -632,6 +632,22 @@ func installWindowsSSHAfterActivation(ctx context.Context, request Request, layo
 	return err
 }
 
+// cleanupWindowsSSHAfterRuntimeFailure rolls back only the service registration
+// for a host installation. The host key inventory is the identity used by the
+// managed-SSH operation and must survive a failed runtime activation so an
+// exact retry can replay its immutable operation. Client installations have
+// no managed-SSH authority and may remove their complete owned state.
+func cleanupWindowsSSHAfterRuntimeFailure(ctx context.Context, request Request, layout service.Layout) error {
+	config := windowsOpenSSHConfig(layout, request.OwnerSID)
+	if request.SetupMode == "host" {
+		return removePaperboatSSHService(ctx, config)
+	}
+	if request.SetupMode == "client" {
+		return removePaperboatSSHState(ctx, config)
+	}
+	return ErrInvalidRequest
+}
+
 func Commit(request Request) error {
 	if !isAdministrator() {
 		return ErrNotPrivileged
@@ -1200,7 +1216,7 @@ func installWindowsRoleServices(ctx context.Context, request Request, layout ser
 			}
 			return nil
 		},
-		func() error { return removePaperboatSSHState(ctx, windowsOpenSSHConfig(layout, request.OwnerSID)) },
+		func() error { return cleanupWindowsSSHAfterRuntimeFailure(ctx, request, layout) },
 	)
 }
 

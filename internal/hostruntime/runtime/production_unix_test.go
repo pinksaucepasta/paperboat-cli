@@ -8,8 +8,10 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -210,7 +212,9 @@ type managedSSHTestClient struct {
 }
 
 func (c *managedSSHTestClient) ObserveManagedSSHHostKeys(_ context.Context, machineID, identity, operationID, setID string, generation, observation uint64, keys []string, proof []byte) (clientapi.ManagedSSHHostKeySet, error) {
-	if machineID != "machine_1" || operationID != "managed-ssh-observe-machine_1-4-7" || setID != "set_1" || generation != 4 || observation != 7 || len(keys) != 1 {
+	wantFingerprint := sha256.Sum256([]byte("host-set-one"))
+	wantObserveOperation, _ := managedSSHInitialOperationIDs(runtimeidentity.Registration{MachineID: "machine_1", InstallationGeneration: 4}, 7, wantFingerprint)
+	if machineID != "machine_1" || operationID != wantObserveOperation || setID != "set_1" || generation != 4 || observation != 7 || len(keys) != 1 {
 		return clientapi.ManagedSSHHostKeySet{}, errors.New("wrong host-key observation")
 	}
 	c.observedIdentity, c.observedProof = identity, append([]byte(nil), proof...)
@@ -229,7 +233,9 @@ func TestManagedSSHAuthorityUsesCurrentCredentialAndExactProofBodies(t *testing.
 	identity := &managedSSHTestIdentity{tokens: []string{"machine-credential-1", "machine-credential-2"}}
 	client := &managedSSHTestClient{}
 	registration := runtimeidentity.Registration{MachineID: "machine_1", InstallationGeneration: 4}
-	keys, active, err := reconcileManagedSSHAuthority(t.Context(), client, identity, registration, 7, "set_1", []string{"ssh-ed25519 AAAA host"})
+	fingerprint := sha256.Sum256([]byte("host-set-one"))
+	observeOperationID, keyOperationID := managedSSHInitialOperationIDs(registration, 7, fingerprint)
+	keys, active, err := reconcileManagedSSHAuthorityWithFingerprint(t.Context(), client, identity, registration, 7, "set_1", fingerprint, []string{"ssh-ed25519 AAAA host"})
 	if err != nil || !active || len(keys.Keys) != 1 {
 		t.Fatalf("keys=%#v active=%t err=%v", keys, active, err)
 	}
@@ -247,8 +253,30 @@ func TestManagedSSHAuthorityUsesCurrentCredentialAndExactProofBodies(t *testing.
 	if string(identity.proofs[1].body) != "{}" || identity.proofs[1].method != http.MethodPost || identity.proofs[1].path != "/v1/machines/machine_1/ssh-authorized-keys" {
 		t.Fatalf("authorized-key proof = %#v", identity.proofs[1])
 	}
-	if string(client.observedProof) != "proof-managed-ssh-observe-machine_1-4-7" || string(client.keysProof) != "proof-managed-ssh-keys-machine_1-4-7" {
+	if string(client.observedProof) != "proof-"+observeOperationID || string(client.keysProof) != "proof-"+keyOperationID {
 		t.Fatalf("proofs=%q,%q", client.observedProof, client.keysProof)
+	}
+}
+
+func TestManagedSSHInitialOperationIDsBindExactHostKeyFingerprint(t *testing.T) {
+	registration := runtimeidentity.Registration{MachineID: "machine_1", InstallationGeneration: 4}
+	first := sha256.Sum256([]byte("host-set-one"))
+	second := sha256.Sum256([]byte("host-set-two"))
+	observeFirst, keysFirst := managedSSHInitialOperationIDs(registration, 7, first)
+	observeReplay, keysReplay := managedSSHInitialOperationIDs(registration, 7, first)
+	observeSecond, keysSecond := managedSSHInitialOperationIDs(registration, 7, second)
+	observeLater, keysLater := managedSSHInitialOperationIDs(registration, 8, first)
+	if observeFirst != observeReplay || keysFirst != keysReplay {
+		t.Fatalf("same fingerprint did not produce stable operation IDs: %q/%q vs %q/%q", observeFirst, keysFirst, observeReplay, keysReplay)
+	}
+	if observeFirst == observeSecond || keysFirst == keysSecond {
+		t.Fatalf("different fingerprints reused operation IDs: %q/%q vs %q/%q", observeFirst, keysFirst, observeSecond, keysSecond)
+	}
+	if observeFirst == observeLater || keysFirst == keysLater {
+		t.Fatalf("different observation generations reused operation IDs: %q/%q vs %q/%q", observeFirst, keysFirst, observeLater, keysLater)
+	}
+	if !strings.Contains(observeFirst, hex.EncodeToString(first[:])) || !strings.Contains(keysFirst, hex.EncodeToString(first[:])) {
+		t.Fatalf("operation IDs do not bind exact fingerprint: %q/%q", observeFirst, keysFirst)
 	}
 }
 
