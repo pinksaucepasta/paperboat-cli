@@ -103,6 +103,31 @@ func TestSocketAllowsRootUpdaterOnlyWithCapability(t *testing.T) {
 	}
 }
 
+type fixedUpdateGate struct{ target UpdateGateTargetBinding }
+
+func (g fixedUpdateGate) HandleUpdateGate(context.Context, UpdateGateRequest) (UpdateGateResponse, error) {
+	return UpdateGateResponse{Target: g.target}, nil
+}
+
+func TestSocketRoundTripsUpdateGateResponse(t *testing.T) {
+	config := testSocketConfig(t)
+	config.UpdateGate = fixedUpdateGate{target: UpdateGateTargetBinding{
+		Scope: UpdateGateScopeStandalone, MachineID: "machine_01", FailureDomain: "standalone",
+	}}
+	_, cancel, done := startSocketServer(t, config)
+	defer stopSocketServer(t, cancel, done)
+	client := testSocketClient(t, config)
+	response, err := client.UpdateGate(context.Background(), UpdateGateRequest{
+		Operation: UpdateGateTarget, TransactionID: "transaction_01", Version: "2026.09.02.6", ManifestSHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Target != config.UpdateGate.(fixedUpdateGate).target {
+		t.Fatalf("target=%+v", response.Target)
+	}
+}
+
 func TestSocketRepliesWithTypedErrorsAndBoundsRequests(t *testing.T) {
 	config := testSocketConfig(t)
 	config.RequestTimeout = 100 * time.Millisecond

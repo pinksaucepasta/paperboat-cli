@@ -168,7 +168,7 @@ func (s *Server) serveOne(connection *net.UnixConn) {
 		gateCtx, cancel := context.WithTimeout(context.Background(), s.config.RequestTimeout)
 		value, gateErr := s.config.UpdateGate.HandleUpdateGate(gateCtx, *gate)
 		cancel()
-		response, err = value, gateErr
+		response, err = &value, gateErr
 	} else {
 		response, err = s.controller.Handle(request)
 	}
