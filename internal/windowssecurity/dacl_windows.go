@@ -40,11 +40,19 @@ func ProtectedHandleDACLMatches(handle windows.Handle, expected string) bool {
 
 func protectedDACLMatches(got *windows.SECURITY_DESCRIPTOR, expected string) bool {
 	control, _, err := got.Control()
-	if err != nil || control&windows.SE_DACL_PROTECTED == 0 {
+	if err != nil {
 		return false
 	}
 	actual := dacl(got.String())
-	if actual == dacl(expected) {
+	expectedDACL := dacl(expected)
+	// SDDL's AI flag records that Windows auto-inherited this ACL; unlike P it
+	// does not mean inheritance is still enabled. Accept an exact AI bootstrap
+	// descriptor only when the caller explicitly supplied an AI descriptor.
+	expectsAutoInherited := strings.Contains(expected, "D:AI")
+	if control&windows.SE_DACL_PROTECTED == 0 && !expectsAutoInherited {
+		return false
+	}
+	if actual == expectedDACL {
 		return true
 	}
 	token, err := windows.OpenCurrentProcessToken()

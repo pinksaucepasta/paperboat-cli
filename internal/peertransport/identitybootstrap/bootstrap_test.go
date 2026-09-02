@@ -20,6 +20,24 @@ import (
 
 type bootstrapClientFunc func(context.Context, string, api.E2EEBootstrapInput) (api.E2EEBootstrapResult, error)
 
+type freshBootstrapClientFunc func(context.Context, string, api.E2EEBootstrapInput) (api.E2EEBootstrapResult, error)
+
+func (f freshBootstrapClientFunc) E2EERoot(context.Context) (api.E2EERoot, error) {
+	return api.E2EERoot{}, &api.APIError{Status: 404, Code: "not_found"}
+}
+func (f freshBootstrapClientFunc) BootstrapE2EE(ctx context.Context, operation string, input api.E2EEBootstrapInput) (api.E2EEBootstrapResult, error) {
+	return f(ctx, operation, input)
+}
+func (f freshBootstrapClientFunc) BootstrapE2EEFresh(ctx context.Context, operation string, input api.E2EEBootstrapInput) (api.E2EEBootstrapResult, error) {
+	return f(ctx, operation, input)
+}
+func (freshBootstrapClientFunc) RequestCLIEndpoint(context.Context, api.CLIEndpointRequestInput) (api.PendingEndpointIdentity, error) {
+	return api.PendingEndpointIdentity{}, errors.New("fresh bootstrap must not request endpoint enrollment")
+}
+func (freshBootstrapClientFunc) EndpointCertificate(context.Context, string, uint64) (api.EndpointCertificateDocument, error) {
+	return api.EndpointCertificateDocument{}, errors.New("fresh bootstrap must not poll endpoint enrollment")
+}
+
 func (bootstrapClientFunc) E2EERoot(context.Context) (api.E2EERoot, error) {
 	return api.E2EERoot{}, &api.APIError{Status: 404, Code: "not_found"}
 }
@@ -228,6 +246,71 @@ func TestEnrollCLINewRootCreatesPersistsAndExactlyReplaysIdentity(t *testing.T) 
 	second, err := EnrollCLI(context.Background(), request)
 	if err != nil || client.requests != 0 || second.RootFingerprint != first.RootFingerprint || second.CertificateFingerprint != first.CertificateFingerprint {
 		t.Fatalf("second enrollment did not replay: requests=%d result=%+v err=%v", client.requests, second, err)
+	}
+}
+
+func TestFreshBootstrapPersistsIdentityBeforeReturning(t *testing.T) {
+	now := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	root := t.TempDir()
+	store := config.ProfileStore{Path: root, Secrets: config.FileSecretStore{Dir: filepath.Join(root, "secrets")}}
+	client := freshBootstrapClientFunc(func(_ context.Context, _ string, input api.E2EEBootstrapInput) (api.E2EEBootstrapResult, error) {
+		return bootstrapResult(input), nil
+	})
+	request := CLIRequest{Store: store, Client: client, Issuer: "https://api.example.test", AccountID: "account_1", CLIClientSessionID: "cli_fresh", Now: func() time.Time { return now }, Fresh: true}
+	result, err := EnrollCLI(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootPublic, err := store.LoadPeerAccountRootPublic(request.Issuer, request.AccountID)
+	if err != nil || len(rootPublic) != ed25519.PublicKeySize {
+		t.Fatalf("stored root err=%v", err)
+	}
+	stored, err := store.LoadPeerCertificate(request.Issuer, request.CLIClientSessionID)
+	if err != nil {
+		t.Fatalf("stored certificate: %v", err)
+	}
+	if got := sha256.Sum256(stored.Raw); hex.EncodeToString(got[:]) != result.CertificateFingerprint {
+		t.Fatalf("stored certificate fingerprint=%x want=%s", got, result.CertificateFingerprint)
+	}
+}
+
+func TestFreshBootstrapUsesEndpointScopedSigningKeyAndExactlyReplays(t *testing.T) {
+	now := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	root := t.TempDir()
+	store := config.ProfileStore{Path: root, Secrets: config.FileSecretStore{Dir: filepath.Join(root, "secrets")}}
+	old, err := store.PeerIdentityKeys("https://api.example.test", "account_1", "cli_old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldPublic := append(ed25519.PublicKey(nil), old.RootPrivate.Public().(ed25519.PublicKey)...)
+	clearKeys(&old)
+
+	var firstOperation, firstPublic string
+	client := freshBootstrapClientFunc(func(_ context.Context, operation string, input api.E2EEBootstrapInput) (api.E2EEBootstrapResult, error) {
+		if firstOperation == "" {
+			firstOperation, firstPublic = operation, input.RootPublicKey
+		} else if operation != firstOperation || input.RootPublicKey != firstPublic {
+			t.Fatal("fresh enrollment retry changed its durable endpoint identity")
+		}
+		return bootstrapResult(input), nil
+	})
+	request := CLIRequest{Store: store, Client: client, Issuer: "https://api.example.test", AccountID: "account_1", CLIClientSessionID: "cli_fresh", Now: func() time.Time { return now }, Fresh: true}
+	first, err := EnrollCLI(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := EnrollCLI(context.Background(), request)
+	if err != nil || second.RootFingerprint != first.RootFingerprint || second.CertificateFingerprint != first.CertificateFingerprint {
+		t.Fatalf("fresh replay result=%+v want=%+v err=%v", second, first, err)
+	}
+	freshPublic, err := base64.RawURLEncoding.Strict().DecodeString(firstPublic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clear(freshPublic)
+	defer clear(oldPublic)
+	if bytes.Equal(freshPublic, oldPublic) {
+		t.Fatal("fresh enrollment reused the account-scoped signing identity")
 	}
 }
 

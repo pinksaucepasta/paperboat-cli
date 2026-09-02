@@ -117,6 +117,65 @@ func TestPeerIdentityKeysForExistingRootNeverCreatesRoot(t *testing.T) {
 	}
 }
 
+func TestFreshPeerIdentityKeysUsesEndpointScopedSignerAndReplays(t *testing.T) {
+	root := t.TempDir()
+	secrets := &peerTestSecretStore{values: map[string]string{}}
+	store := ProfileStore{Path: root, Secrets: secrets}
+	issuer := "https://api.example.test"
+	accountID := "account_1"
+	old, err := store.PeerIdentityKeys(issuer, accountID, "cli_old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clearPeerIdentity(&old)
+	oldRoot := append([]byte(nil), old.RootPrivate...)
+	defer clear(oldRoot)
+
+	first, err := store.FreshPeerIdentityKeys(issuer, accountID, "cli_fresh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clearPeerIdentity(&first)
+	second, err := store.FreshPeerIdentityKeys(issuer, accountID, "cli_fresh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clearPeerIdentity(&second)
+	if bytes.Equal(first.RootPrivate, oldRoot) {
+		t.Fatal("fresh endpoint reused account-scoped signing key")
+	}
+	if !bytes.Equal(first.RootPrivate, second.RootPrivate) || first.NoisePrivate != second.NoisePrivate || !bytes.Equal(first.QUICPrivate, second.QUICPrivate) {
+		t.Fatal("same fresh endpoint did not replay its durable identity")
+	}
+
+	other, err := store.FreshPeerIdentityKeys(issuer, accountID, "cli_other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clearPeerIdentity(&other)
+	if bytes.Equal(first.RootPrivate, other.RootPrivate) {
+		t.Fatal("different endpoint sessions share signing key")
+	}
+	seed, found, err := loadPeerKey(secrets, peerIdentitySecretRef(issuer, "cli_fresh", "endpoint-signing"), "endpoint_signing_seed")
+	if err != nil || !found {
+		t.Fatalf("fresh signing seed was not durable: found=%t err=%v", found, err)
+	}
+	clear(seed)
+}
+
+func TestFreshPeerIdentityKeysRejectsPartialIdentity(t *testing.T) {
+	root := t.TempDir()
+	secrets := &peerTestSecretStore{values: map[string]string{}}
+	store := ProfileStore{Path: root, Secrets: secrets}
+	issuer := "https://api.example.test"
+	if err := storePeerKey(secrets, peerIdentitySecretRef(issuer, "cli_fresh", "endpoint-signing"), "endpoint_signing_seed", bytes.Repeat([]byte{3}, ed25519.SeedSize)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.FreshPeerIdentityKeys(issuer, "account_1", "cli_fresh"); err == nil {
+		t.Fatal("partial fresh endpoint identity accepted")
+	}
+}
+
 func TestPeerAccountRootExportImportIsConflictSafe(t *testing.T) {
 	issuer := "https://api.example.test"
 	accountID := "account_1"
@@ -156,6 +215,9 @@ func TestProfileRemovalErasesPeerIdentityCustody(t *testing.T) {
 	if _, err := store.PeerIdentityKeys(issuer, "account_1", "cli_1"); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.FreshPeerIdentityKeys(issuer, "account_1", "cli_1"); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := store.SavePeerCertificate(issuer, "cli_1", bytes.Repeat([]byte{7}, 172)); err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +227,7 @@ func TestProfileRemovalErasesPeerIdentityCustody(t *testing.T) {
 	if _, err := store.Remove(issuer); err != nil {
 		t.Fatal(err)
 	}
-	for _, ref := range []string{peerIdentitySecretRef(issuer, "account_1", "account-root"), peerIdentitySecretRef(issuer, "cli_1", "endpoint-noise"), peerIdentitySecretRef(issuer, "cli_1", "endpoint-quic"), peerIdentitySecretRef(issuer, "cli_1", "endpoint-certificate")} {
+	for _, ref := range []string{peerIdentitySecretRef(issuer, "account_1", "account-root"), peerIdentitySecretRef(issuer, "cli_1", "endpoint-noise"), peerIdentitySecretRef(issuer, "cli_1", "endpoint-quic"), peerIdentitySecretRef(issuer, "cli_1", "endpoint-signing"), peerIdentitySecretRef(issuer, "cli_1", "endpoint-certificate")} {
 		if _, err := secrets.Get(ref); !errors.Is(err, ErrSecretNotFound) {
 			t.Fatalf("secret %s remains: %v", ref, err)
 		}

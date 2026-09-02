@@ -383,7 +383,9 @@ func Bootstrap(ctx context.Context, request Request) (Result, error) {
 	}
 	var keys config.PeerIdentityKeys
 	var err error
-	if rootExists && !request.AllowRootReplacement {
+	if request.AllowRootReplacement {
+		keys, err = request.Store.FreshPeerIdentityKeys(request.Issuer, request.AccountID, request.CLIClientSessionID)
+	} else if rootExists {
 		keys, err = request.Store.PeerIdentityKeysForExistingRoot(request.Issuer, request.AccountID, request.CLIClientSessionID)
 		if errors.Is(err, config.ErrSecretNotFound) {
 			return Result{}, ErrPairingRequired
@@ -449,6 +451,12 @@ func Bootstrap(ctx context.Context, request Request) (Result, error) {
 		return Result{}, ErrInvalid
 	}
 	if _, err := verifyEnrolledCLI(response.Certificate, trusted, request.AccountID, request.CLIClientSessionID, keys, now); err != nil {
+		return Result{}, err
+	}
+	if err := request.Store.SavePeerAccountRootPublic(request.Issuer, request.AccountID, rootPublic); err != nil {
+		return Result{}, err
+	}
+	if _, err := request.Store.SavePeerCertificate(request.Issuer, request.CLIClientSessionID, raw); err != nil {
 		return Result{}, err
 	}
 	return Result{RootFingerprint: hex.EncodeToString(keyFingerprint[:]), CertificateFingerprint: document.CertificateFingerprint, Certificate: certificate}, nil
