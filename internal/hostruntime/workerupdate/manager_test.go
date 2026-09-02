@@ -134,6 +134,27 @@ func TestNewerNativePackageSupersedesBlockedPreCutoverWorkerTransaction(t *testi
 	}
 }
 
+func TestNewerNativePackageSupersedesIdleOlderJournal(t *testing.T) {
+	fixture := newFixture(t)
+	journal := withActiveRelease(updateflow.Journal{
+		Schema: updateflow.SchemaV1, TransactionID: "txn-idle-package-upgrade", Stage: updateflow.StageIdle,
+		BootID: "hostd", StageUpdatedAt: time.Now().UTC(),
+	}, fixture.active)
+	if err := updateflow.Write(fixture.paths.journal, journal, os.Geteuid(), os.Getegid()); err != nil {
+		t.Fatal(err)
+	}
+	packaged := release("2026.08.18.3", fixture.fetcher.body)
+	fixture.manager.active = packaged
+	fixture.manager.activeVersion.Store(packaged.Version)
+	if err := fixture.manager.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := updateflow.Load(fixture.paths.journal)
+	if err != nil || recovered.Stage != updateflow.StageIdle || recovered.ActiveVersion != packaged.Version || recovered.ActiveDigest != packaged.SHA256 {
+		t.Fatalf("journal=%+v err=%v", recovered, err)
+	}
+}
+
 func TestOlderExecutableCannotSupersedeBlockedWorkerTransaction(t *testing.T) {
 	fixture := newFixture(t)
 	now := time.Now().UTC()

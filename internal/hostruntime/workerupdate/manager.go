@@ -447,7 +447,7 @@ func (m *Manager) recoverLocked(ctx context.Context) error {
 		// active version; never use this path for rollback or an equal/older
 		// executable, where the journal remains the recovery authority.
 		if compareVersion(m.active.Version, journal.ActiveVersion) > 0 &&
-			(journal.Stage == updateflow.StageChecking || journal.Stage == updateflow.StageStaged || journal.Stage == updateflow.StageCandidateStarted || journal.Stage == updateflow.StageCandidateValidating || journal.Stage == updateflow.StageCandidateReady || journal.Stage == updateflow.StageDraining || journal.Stage == updateflow.StageRollback || journal.Stage == updateflow.StageBlocked) {
+			(journal.Stage == updateflow.StageIdle || journal.Stage == updateflow.StageChecking || journal.Stage == updateflow.StageStaged || journal.Stage == updateflow.StageCandidateStarted || journal.Stage == updateflow.StageCandidateValidating || journal.Stage == updateflow.StageCandidateReady || journal.Stage == updateflow.StageDraining || journal.Stage == updateflow.StageRollback || journal.Stage == updateflow.StageBlocked) {
 			if err := m.removeStaged(); err != nil {
 				return err
 			}
