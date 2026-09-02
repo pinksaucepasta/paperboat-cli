@@ -47,18 +47,25 @@ unsigned="$root/pb-darwin-arm64-unsigned.pkg"
 cleanup() { rm -rf "$root"; }
 trap cleanup EXIT HUP INT TERM
 
-mkdir -p "$root/payload/usr/local/bin"
-install -m 0755 "$binary" "$root/payload/usr/local/bin/pb"
+payload="$root/payload"
+cli_payload="$payload/usr/local/bin/pb"
+helper_payload="$payload/Library/PrivilegedHelperTools/Paperboat/pb"
+mkdir -p "$(dirname -- "$cli_payload")" "$(dirname -- "$helper_payload")"
+install -m 0755 "$binary" "$cli_payload"
 
 # macOS refuses Go's linker-only signature when launchd starts the executable
 # from a privileged helper location. TUF authenticates the development release
 # bytes; replace that linker signature with a complete ad-hoc Mach-O signature
 # so the installed hostd/updater can run when Developer ID material is absent.
-codesign --force --sign - --timestamp=none "$root/payload/usr/local/bin/pb"
-codesign --verify --strict "$root/payload/usr/local/bin/pb"
+# Sign one staged copy, then install those signed bytes at both runtime paths.
+# This keeps the CLI and privileged helper byte-identical across upgrades.
+codesign --force --sign - --timestamp=none "$cli_payload"
+install -m 0755 "$cli_payload" "$helper_payload"
+codesign --verify --strict "$cli_payload"
+codesign --verify --strict "$helper_payload"
 
 pkgbuild \
-  --root "$root/payload" \
+  --root "$payload" \
   --identifier dev.pprbt.paperboat \
   --version "$version" \
   --install-location / \
