@@ -197,7 +197,8 @@ func (s *Service) Check(ctx context.Context) (workerupdate.Result, error) {
 	// never call Manager.Check, which performs the full activation transaction
 	// (including the health-monitoring hold) and made `pb update check` appear
 	// hung while also unexpectedly installing an update.
-	return resolveRelease(ctx, s.manager.ActiveVersion(), s.source.Resolve)
+	result, err := s.scheduler.CheckNow(ctx)
+	return workerupdate.Result{Version: result.Version, Updated: false}, err
 }
 
 // HTTPHealth is a bounded local hostd readiness check. The endpoint must be a
