@@ -80,6 +80,22 @@ func TestNativeLegacyOwnerFullSecurityMigration(t *testing.T) {
 		t.Fatal("WiX machine-root bootstrap state did not reach its final SYSTEM-owned state")
 	}
 	if err := os.Remove(WindowsProgramDataRoot()); err != nil {
+		t.Fatalf("reset standalone machine-root transition fixture: %v", err)
+	}
+	if err := os.Mkdir(WindowsProgramDataRoot(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	standaloneBootstrapDACL := windowsRuntimeStandaloneBootstrapRootDACL()
+	if err := applyWindowsOwnedDACL(WindowsProgramDataRoot(), administrators, standaloneBootstrapDACL); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureWindowsMachineDirectory(WindowsProgramDataRoot(), ownerSID); err != nil {
+		t.Fatalf("complete exact standalone machine-root bootstrap state: %v", err)
+	}
+	if !windowsRuntimeSecurityMatches(WindowsProgramDataRoot(), trustedOwner, currentRootDACL) {
+		t.Fatal("standalone machine-root bootstrap state did not reach its final SYSTEM-owned state")
+	}
+	if err := os.Remove(WindowsProgramDataRoot()); err != nil {
 		t.Fatalf("reset atomic machine-root fixture: %v", err)
 	}
 	if err := os.Mkdir(WindowsProgramDataRoot(), 0o700); err != nil {

@@ -50,6 +50,12 @@ type ResumeRecord struct {
 	SetupOperationID        string    `json:"setup_operation_id,omitempty"`
 	ExpectedUserMachineID   string    `json:"expected_user_machine_id,omitempty"`
 	ExpectedGeneration      int64     `json:"expected_installation_generation,omitempty"`
+	// RequestedArtifact binds an authenticated setup operation to the signed
+	// release target that the server was asked to issue. Material.Artifact is
+	// retained as the authoritative binding after issuance; this field closes
+	// the pre-material window where reusing an operation for a different target
+	// would otherwise create an idempotency conflict or cross-release replay.
+	RequestedArtifact *ArtifactTarget `json:"requested_artifact,omitempty"`
 }
 
 func ResumePath(stateRoot string) string {
@@ -125,10 +131,13 @@ func LoadResume(stateRoot, serverURL, publicIdentityKey, enrollmentToken, displa
 // journal for an authenticated Host setup. It replaces an older journal only
 // when every immutable machine binding matches and the journal is expired with
 // no material or locally committed installation progress.
-func PrepareAuthenticatedSetupResume(stateRoot, serverURL, publicIdentityKey, displayName, machineID string, installationGeneration int64, now time.Time) (ResumeRecord, error) {
+func PrepareAuthenticatedSetupResume(stateRoot, serverURL, publicIdentityKey, displayName, machineID string, installationGeneration int64, artifact ArtifactTarget, now time.Time) (ResumeRecord, error) {
 	serverURL = strings.TrimRight(strings.TrimSpace(serverURL), "/")
 	publicIdentityKey, displayName, machineID = strings.TrimSpace(publicIdentityKey), strings.TrimSpace(displayName), strings.TrimSpace(machineID)
 	if !filepath.IsAbs(stateRoot) || !validResumeServer(serverURL) || publicIdentityKey == "" || displayName == "" || machineID == "" || installationGeneration < 1 || now.IsZero() {
+		return ResumeRecord{}, ErrResumeBinding
+	}
+	if err := VerifyArtifactTarget(artifact); err != nil {
 		return ResumeRecord{}, ErrResumeBinding
 	}
 	existing, err := loadResumeDocument(stateRoot)
@@ -140,20 +149,31 @@ func PrepareAuthenticatedSetupResume(stateRoot, serverURL, publicIdentityKey, di
 			expired = true
 		}
 		if existing.AuthenticatedSetup {
-			if exactAuthenticatedBinding && !expired {
-				return existing, nil
-			}
-			// A server-issued material response is itself durable recovery
-			// authority. If the exact authenticated Host journal expired after
-			// material was persisted, keep its verifier and operation ID so the
-			// authenticated host-setup endpoint can renew it. Do not permit this
-			// path after local installation progress: those checkpoints have their
-			// own recovery flow and must not be silently replayed by setup.
-			if exactAuthenticatedBinding && expired && existing.Material != nil && !existing.RuntimeEnrolled && !existing.ClientInstalled {
-				return existing, nil
-			}
-			if !exactAuthenticatedBinding || !expired || existing.Material != nil || existing.RuntimeEnrolled || existing.ClientInstalled {
+			if !exactAuthenticatedBinding {
 				return ResumeRecord{}, ErrResumeBinding
+			}
+			progress := existing.RuntimeEnrolled || existing.ClientInstalled
+			if !authenticatedSetupArtifactMatches(existing, artifact) {
+				// A target change must never replay the old verifier and
+				// idempotency operation. Only an expired journal with no local
+				// installation progress may be replaced with a new operation.
+				if progress || !expired {
+					return ResumeRecord{}, ErrResumeBinding
+				}
+			} else {
+				if !expired {
+					return existing, nil
+				}
+				// A server-issued material response is durable recovery
+				// authority. Reuse the exact operation only when the signed
+				// artifact is unchanged and no local installation checkpoint
+				// has been committed.
+				if existing.Material != nil && !progress {
+					return existing, nil
+				}
+				if progress {
+					return ResumeRecord{}, ErrResumeBinding
+				}
 			}
 		} else if !exactBase || !existing.PairingStarted || !expired || existing.Material != nil || existing.RuntimeEnrolled || existing.ClientInstalled {
 			return ResumeRecord{}, ErrResumeBinding
@@ -176,10 +196,24 @@ func PrepareAuthenticatedSetupResume(stateRoot, serverURL, publicIdentityKey, di
 	record.SetupOperationID = "host-setup-" + base64.RawURLEncoding.EncodeToString(operationBytes)
 	record.ExpectedUserMachineID = machineID
 	record.ExpectedGeneration = installationGeneration
+	record.RequestedArtifact = cloneArtifactTarget(artifact)
 	if err := SaveResume(stateRoot, record); err != nil {
 		return ResumeRecord{}, err
 	}
 	return record, nil
+}
+
+func authenticatedSetupArtifactMatches(record ResumeRecord, requested ArtifactTarget) bool {
+	bound := record.RequestedArtifact
+	if bound == nil && record.Material != nil {
+		bound = record.Material.Artifact
+	}
+	return bound != nil && *bound == requested
+}
+
+func cloneArtifactTarget(target ArtifactTarget) *ArtifactTarget {
+	copy := target
+	return &copy
 }
 
 func loadResumeDocument(stateRoot string) (ResumeRecord, error) {
@@ -292,6 +326,11 @@ func validateResumeRecord(record ResumeRecord, loaded bool) error {
 	if record.AuthenticatedSetup {
 		if record.SetupMode != "host" || record.requiresEnrollmentToken() || len(record.SetupOperationID) < 8 || len(record.SetupOperationID) > 128 || record.ExpectedUserMachineID == "" || record.ExpectedGeneration < 1 {
 			return ErrResumeBinding
+		}
+		if record.RequestedArtifact != nil {
+			if err := VerifyArtifactTarget(*record.RequestedArtifact); err != nil {
+				return fmt.Errorf("%w: requested artifact: %v", ErrResumeBinding, err)
+			}
 		}
 	} else if record.SetupOperationID != "" || record.ExpectedUserMachineID != "" || record.ExpectedGeneration != 0 {
 		return ErrResumeBinding

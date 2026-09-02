@@ -180,11 +180,12 @@ func TestAuthenticatedHostSetupResumeReusesLiveAndReplacesOnlyExactExpiredEmptyJ
 	now := time.Now().UTC()
 	server := "https://api.example.test"
 	publicKey := base64.RawURLEncoding.EncodeToString(make([]byte, 32))
-	first, err := PrepareAuthenticatedSetupResume(root, server, publicKey, "Victus", "mch_1", 7, now)
+	artifact := ArtifactTarget{Schema: ArtifactTargetSchemaV1, Kind: ArtifactKindPB, Version: "2026.08.22.22", Platform: runtime.GOOS, Architecture: runtime.GOARCH, RepositoryURL: server, TargetPath: releaseindex.AssetName(runtime.GOOS, runtime.GOARCH)}
+	first, err := PrepareAuthenticatedSetupResume(root, server, publicKey, "Victus", "mch_1", 7, artifact, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := PrepareAuthenticatedSetupResume(root, server, publicKey, "Victus", "mch_1", 7, now.Add(time.Minute))
+	second, err := PrepareAuthenticatedSetupResume(root, server, publicKey, "Victus", "mch_1", 7, artifact, now.Add(time.Minute))
 	if err != nil || second.Verifier != first.Verifier || second.SetupOperationID != first.SetupOperationID {
 		t.Fatalf("live authenticated resume=%+v err=%v, first=%+v", second, err, first)
 	}
@@ -196,7 +197,7 @@ func TestAuthenticatedHostSetupResumeReusesLiveAndReplacesOnlyExactExpiredEmptyJ
 	if err := SaveResume(root, legacy); err != nil {
 		t.Fatal(err)
 	}
-	replaced, err := PrepareAuthenticatedSetupResume(root, server, publicKey, "Victus", "mch_1", 7, now)
+	replaced, err := PrepareAuthenticatedSetupResume(root, server, publicKey, "Victus", "mch_1", 7, artifact, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,7 +211,7 @@ func TestAuthenticatedHostSetupResumeReusesLiveAndReplacesOnlyExactExpiredEmptyJ
 	if err := SaveResume(root, legacy); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := PrepareAuthenticatedSetupResume(root, server, publicKey, "Victus", "mch_1", 7, now); !errors.Is(err, ErrResumeBinding) {
+	if _, err := PrepareAuthenticatedSetupResume(root, server, publicKey, "Victus", "mch_1", 7, artifact, now); !errors.Is(err, ErrResumeBinding) {
 		t.Fatalf("mismatched stale journal error=%v", err)
 	}
 	loaded, err := loadResumeDocument(root)
@@ -224,7 +225,7 @@ func TestAuthenticatedHostSetupResumeReusesLiveAndReplacesOnlyExactExpiredEmptyJ
 	if err := SaveResume(root, first); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := PrepareAuthenticatedSetupResume(root, server, publicKey, "Victus", "mch_2", 8, now); !errors.Is(err, ErrResumeBinding) {
+	if _, err := PrepareAuthenticatedSetupResume(root, server, publicKey, "Victus", "mch_2", 8, artifact, now); !errors.Is(err, ErrResumeBinding) {
 		t.Fatalf("mismatched authenticated journal error=%v", err)
 	}
 	loaded, err = loadResumeDocument(root)
@@ -243,7 +244,7 @@ func TestAuthenticatedHostSetupResumeReusesLiveAndReplacesOnlyExactExpiredEmptyJ
 	expiredMaterial.Material = &Material{
 		Schema: "paperboat.byod-installation/v1", UserMachineID: "mch_1", UserMachineEnrollmentID: "ume_1", EnvironmentID: "env_1",
 		ControlURL: server, HelperID: "helper_1", ReuseIdentity: true, ExpiresAt: now.Add(-time.Minute),
-		Artifact:            &ArtifactTarget{Schema: ArtifactTargetSchemaV1, Kind: ArtifactKindPB, Version: "2026.08.22.22", Platform: runtime.GOOS, Architecture: runtime.GOARCH, RepositoryURL: server, TargetPath: releaseindex.AssetName(runtime.GOOS, runtime.GOARCH)},
+		Artifact:            &artifact,
 		HelperListenAddress: "127.0.0.1:38080", InstallationGeneration: 7, SetupRoles: []string{"host"}, SetupMode: "host",
 		ClientSession: &ClientSession{Schema: "paperboat.cli-session/v1", SessionID: "cls_1", AccessToken: "access-012345678901234567890123456789", RefreshToken: "refresh-012345678901234567890123456789", TokenType: "Bearer", ExpiresIn: 3600},
 	}
@@ -254,9 +255,38 @@ func TestAuthenticatedHostSetupResumeReusesLiveAndReplacesOnlyExactExpiredEmptyJ
 	if err := atomicfile.Write(ResumePath(root), encoded, atomicfile.CurrentOwnerOptions(0o600)); err != nil {
 		t.Fatal(err)
 	}
-	reused, err := PrepareAuthenticatedSetupResume(root, server, publicKey, "Victus", "mch_1", 7, now)
+	reused, err := PrepareAuthenticatedSetupResume(root, server, publicKey, "Victus", "mch_1", 7, artifact, now)
 	if err != nil || reused.Verifier != first.Verifier || reused.SetupOperationID != first.SetupOperationID || reused.Material == nil {
 		t.Fatalf("expired material resume=%+v err=%v", reused, err)
+	}
+	newArtifact := artifact
+	newArtifact.Version = "2026.08.22.23"
+	replaced, err = PrepareAuthenticatedSetupResume(root, server, publicKey, "Victus", "mch_1", 7, newArtifact, now)
+	if err != nil || replaced.Verifier == reused.Verifier || replaced.SetupOperationID == reused.SetupOperationID || replaced.Material != nil || replaced.RequestedArtifact == nil || *replaced.RequestedArtifact != newArtifact {
+		t.Fatalf("changed-artifact replacement=%+v err=%v", replaced, err)
+	}
+
+	// Once either local installation checkpoint is committed, changing the
+	// artifact cannot discard the recovery journal or create a second setup
+	// operation.
+	for _, checkpoint := range []string{"client", "runtime"} {
+		progress := expiredMaterial
+		progress.ClientInstalled = checkpoint == "client"
+		progress.RuntimeEnrolled = checkpoint == "runtime"
+		encoded, err = json.Marshal(progress)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := atomicfile.Write(ResumePath(root), encoded, atomicfile.CurrentOwnerOptions(0o600)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := PrepareAuthenticatedSetupResume(root, server, publicKey, "Victus", "mch_1", 7, newArtifact, now); !errors.Is(err, ErrResumeBinding) {
+			t.Fatalf("changed artifact with %s progress error=%v", checkpoint, err)
+		}
+		loaded, err := loadResumeDocument(root)
+		if err != nil || loaded.Verifier != expiredMaterial.Verifier || loaded.SetupOperationID != expiredMaterial.SetupOperationID {
+			t.Fatalf("changed artifact mutated %s recovery journal: %+v err=%v", checkpoint, loaded, err)
+		}
 	}
 }
 
@@ -277,5 +307,104 @@ func TestAuthenticatedHostSetupMaterialCannotChangeMachineGenerationOrVerifiedAr
 	changed.InstallationGeneration++
 	if err := ValidateAuthenticatedSetupMaterial(record, changed); !errors.Is(err, ErrResumeBinding) {
 		t.Fatalf("changed generation error=%v", err)
+	}
+}
+
+func TestAuthenticatedHostSetupResumeRotatesExpiredJournalForChangedArtifact(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	server := "https://api.example.test"
+	publicKey := base64.RawURLEncoding.EncodeToString(make([]byte, 32))
+	oldArtifact := ArtifactTarget{Schema: ArtifactTargetSchemaV1, Kind: ArtifactKindPB, Version: "2026.08.22.22", Platform: runtime.GOOS, Architecture: runtime.GOARCH, RepositoryURL: server, TargetPath: releaseindex.AssetName(runtime.GOOS, runtime.GOARCH)}
+	newArtifact := oldArtifact
+	newArtifact.Version = "2026.08.23.1"
+	first, err := PrepareAuthenticatedSetupResume(root, server, publicKey, "Victus", "mch_1", 7, oldArtifact, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.PairingStarted = true
+	first.PairingExpiresAt = now.Add(-time.Minute)
+	first.Material = &Material{
+		Schema: "paperboat.byod-installation/v1", UserMachineID: "mch_1", UserMachineEnrollmentID: "ume_1", EnvironmentID: "env_1",
+		ControlURL: server, HelperID: "helper_1", ReuseIdentity: true, ExpiresAt: now.Add(-time.Minute), Artifact: &oldArtifact,
+		HelperListenAddress: "127.0.0.1:38080", InstallationGeneration: 7, SetupRoles: []string{"host"}, SetupMode: "host",
+		ClientSession: &ClientSession{Schema: "paperboat.cli-session/v1", SessionID: "cls_1", AccessToken: "access-012345678901234567890123456789", RefreshToken: "refresh-012345678901234567890123456789", TokenType: "Bearer", ExpiresIn: 3600},
+	}
+	encoded, err := json.Marshal(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := atomicfile.Write(ResumePath(root), encoded, atomicfile.CurrentOwnerOptions(0o600)); err != nil {
+		t.Fatal(err)
+	}
+	rotated, err := PrepareAuthenticatedSetupResume(root, server, publicKey, "Victus", "mch_1", 7, newArtifact, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rotated.SetupOperationID == first.SetupOperationID || rotated.Verifier == first.Verifier {
+		t.Fatalf("changed artifact reused durable request: rotated=%+v first=%+v", rotated, first)
+	}
+	if rotated.Material != nil || rotated.PairingStarted || rotated.RequestedArtifact == nil || *rotated.RequestedArtifact != newArtifact {
+		t.Fatalf("rotated journal retained old progress or target: %+v", rotated)
+	}
+}
+
+func TestAuthenticatedHostSetupResumeRejectsChangedArtifactAfterProgress(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	server := "https://api.example.test"
+	publicKey := base64.RawURLEncoding.EncodeToString(make([]byte, 32))
+	oldArtifact := ArtifactTarget{Schema: ArtifactTargetSchemaV1, Kind: ArtifactKindPB, Version: "2026.08.22.22", Platform: runtime.GOOS, Architecture: runtime.GOARCH, RepositoryURL: server, TargetPath: releaseindex.AssetName(runtime.GOOS, runtime.GOARCH)}
+	newArtifact := oldArtifact
+	newArtifact.Version = "2026.08.23.1"
+	record, err := PrepareAuthenticatedSetupResume(root, server, publicKey, "Victus", "mch_1", 7, oldArtifact, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record.PairingStarted = true
+	record.RuntimeEnrolled = true
+	record.PairingExpiresAt = now.Add(-time.Minute)
+	record.Material = &Material{
+		Schema: "paperboat.byod-installation/v1", UserMachineID: "mch_1", UserMachineEnrollmentID: "ume_1", EnvironmentID: "env_1",
+		ControlURL: server, HelperID: "helper_1", ReuseIdentity: true, ExpiresAt: now.Add(-time.Minute), Artifact: &oldArtifact,
+		HelperListenAddress: "127.0.0.1:38080", InstallationGeneration: 7, SetupRoles: []string{"host"}, SetupMode: "host",
+		ClientSession: &ClientSession{Schema: "paperboat.cli-session/v1", SessionID: "cls_1", AccessToken: "access-012345678901234567890123456789", RefreshToken: "refresh-012345678901234567890123456789", TokenType: "Bearer", ExpiresIn: 3600},
+	}
+	encoded, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := atomicfile.Write(ResumePath(root), encoded, atomicfile.CurrentOwnerOptions(0o600)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PrepareAuthenticatedSetupResume(root, server, publicKey, "Victus", "mch_1", 7, newArtifact, now); !errors.Is(err, ErrResumeBinding) {
+		t.Fatalf("changed artifact after progress error=%v", err)
+	}
+	loaded, err := loadResumeDocument(root)
+	if err != nil || loaded.SetupOperationID != record.SetupOperationID || !loaded.RuntimeEnrolled {
+		t.Fatalf("progress journal changed after rejected target: %+v err=%v", loaded, err)
+	}
+}
+
+func TestAuthenticatedHostSetupResumeRejectsUnknownActiveArtifact(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now().UTC()
+	server := "https://api.example.test"
+	publicKey := base64.RawURLEncoding.EncodeToString(make([]byte, 32))
+	artifact := ArtifactTarget{Schema: ArtifactTargetSchemaV1, Kind: ArtifactKindPB, Version: "2026.08.22.22", Platform: runtime.GOOS, Architecture: runtime.GOARCH, RepositoryURL: server, TargetPath: releaseindex.AssetName(runtime.GOOS, runtime.GOARCH)}
+	record := NewResumeRecord(server, publicKey, "", "Victus", "host", "legacy-verifier-01234567890123456789", now.Add(time.Hour))
+	record.AuthenticatedSetup = true
+	record.SetupOperationID = "host-setup-legacy"
+	record.ExpectedUserMachineID = "mch_1"
+	record.ExpectedGeneration = 7
+	if err := SaveResume(root, record); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PrepareAuthenticatedSetupResume(root, server, publicKey, "Victus", "mch_1", 7, artifact, now); !errors.Is(err, ErrResumeBinding) {
+		t.Fatalf("active journal without artifact binding error=%v", err)
+	}
+	loaded, err := loadResumeDocument(root)
+	if err != nil || loaded.SetupOperationID != record.SetupOperationID {
+		t.Fatalf("unknown active journal changed: %+v err=%v", loaded, err)
 	}
 }

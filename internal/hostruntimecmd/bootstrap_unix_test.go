@@ -318,9 +318,14 @@ func TestBootstrapHealthMatchesSignedArtifactVersion(t *testing.T) {
 	if !bootstrapHealthMatches(response(http.StatusOK, `{"live":true,"version":"2026.07.26","capabilities":{},"checked_at":"2026-07-26T00:00:00Z"}`), "2026.07.26") {
 		t.Fatal("matching signed artifact version was not ready")
 	}
+	if !bootstrapHealthMatches(response(http.StatusOK, `{"live":true}`), "2026.07.26") {
+		t.Fatal("stable liveness response was not ready")
+	}
 	for name, candidate := range map[string]*http.Response{
 		"legacy version": response(http.StatusOK, `{"live":true,"version":"legacy","capabilities":{},"checked_at":"2026-07-26T00:00:00Z"}`),
 		"not live":       response(http.StatusOK, `{"live":false,"version":"2026.07.26","capabilities":{},"checked_at":"2026-07-26T00:00:00Z"}`),
+		"empty object":   response(http.StatusOK, `{}`),
+		"oversized":      response(http.StatusOK, `{"live":true,"padding":"`+strings.Repeat("x", 64<<10)+`"}`),
 		"trailing data":  response(http.StatusOK, `{"live":true,"version":"2026.07.26","capabilities":{},"checked_at":"2026-07-26T00:00:00Z"} {}`),
 		"wrong status":   response(http.StatusServiceUnavailable, `{}`),
 	} {

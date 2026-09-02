@@ -2001,7 +2001,7 @@ func setupCommand() *cobra.Command {
 				if _, err := client.RegisterManagedSSHTarget(command.Context(), machine.ID, uint64(machine.InstallationGeneration), account.Username, uint16(sshPortValue), "managed-ssh-target-"+strings.TrimPrefix(newIdempotencyKey(), "pb-")); err != nil {
 					return rollbackHostFailure(fmt.Errorf("register SSH target: %w", err))
 				}
-				resume, err := bootstrap.PrepareAuthenticatedSetupResume(stateRoot, d.cfg.ServerURL, publicIdentityKey, strings.TrimSpace(name), machine.ID, machine.InstallationGeneration, time.Now().UTC())
+				resume, err := bootstrap.PrepareAuthenticatedSetupResume(stateRoot, d.cfg.ServerURL, publicIdentityKey, strings.TrimSpace(name), machine.ID, machine.InstallationGeneration, artifact, time.Now().UTC())
 				if err != nil {
 					return rollbackHostFailure(fmt.Errorf("prepare authenticated Host setup recovery: %w", err))
 				}

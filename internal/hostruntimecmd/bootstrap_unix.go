@@ -322,10 +322,28 @@ func serverHeartbeatReady(stateRoot, expectedVersion string, previousGeneration 
 }
 
 func bootstrapHealthMatches(response *http.Response, expectedVersion string) bool {
-	var snapshot health.Snapshot
-	decoder := json.NewDecoder(io.LimitReader(response.Body, 64<<10))
+	if response == nil || response.Body == nil || response.StatusCode != http.StatusOK {
+		return false
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, 64<<10+1))
+	if err != nil || len(body) == 0 || len(body) > 64<<10 {
+		return false
+	}
+	// /healthz is intentionally a stable liveness endpoint. Older managed
+	// hostd releases returned the full health snapshot, while the current
+	// endpoint returns only {"live":true}. The signed artifact version is
+	// proven independently by worker-boot and server-heartbeat below, so do
+	// not require mutable diagnostics fields from the liveness response.
+	var liveness struct {
+		Live bool `json:"live"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
 	var extra any
-	if response.StatusCode != http.StatusOK || decoder.Decode(&snapshot) != nil || decoder.Decode(&extra) != io.EOF || !snapshot.Live || snapshot.Version != expectedVersion {
+	if decoder.Decode(&liveness) != nil || decoder.Decode(&extra) != io.EOF || !liveness.Live {
+		return false
+	}
+	var snapshot health.Snapshot
+	if json.Unmarshal(body, &snapshot) == nil && snapshot.Version != "" && snapshot.Version != expectedVersion {
 		return false
 	}
 	return true

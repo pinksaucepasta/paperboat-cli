@@ -1067,7 +1067,7 @@ func terminateStaleWindowsRuntimeProcesses(ctx context.Context) error {
 	// Match only durable runtime entry points. The dashboard installer itself
 	// is a pb.exe bootstrap process and must remain alive while the elevated
 	// commit rotates the installed slot.
-	const script = `$ErrorActionPreference = 'Stop'; Get-CimInstance Win32_Process -Filter "Name = 'pb.exe'" | Where-Object { $_.CommandLine -match '__(runtime-(hostd|worker|updated)|windows-sshd-service)' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop }`
+	const script = staleWindowsRuntimeProcessScript
 	command := exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script)
 	processlaunch.ConfigureBackground(command)
 	if output, err := command.CombinedOutput(); err != nil {
@@ -1082,6 +1082,10 @@ func terminateStaleWindowsRuntimeProcesses(ctx context.Context) error {
 	}
 	return nil
 }
+
+const staleWindowsRuntimeProcessPattern = `__(runtime-(hostd|worker|updated|local-daemon)|local-daemon|windows-sshd-service)`
+
+const staleWindowsRuntimeProcessScript = `$ErrorActionPreference = 'Stop'; Get-CimInstance Win32_Process -Filter "Name = 'pb.exe'" | Where-Object { $_.CommandLine -match '` + staleWindowsRuntimeProcessPattern + `' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop }`
 
 func uninstallWindows(ctx context.Context, purge bool) error {
 	layout, err := service.DefaultLayout("windows")
@@ -1483,7 +1487,8 @@ func ensureWindowsMachineDirectory(path, ownerSID string) error {
 	if !windowssecurity.HandleOwnerMatchesSID(handle, trustedOwner) {
 		administrators, ownerErr := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
 		trustedTransition := windowssecurity.ProtectedHandleDACLMatches(handle, windowsRuntimeCurrentRootDACL(ownerSID)) ||
-			windowssecurity.ProtectedHandleDACLMatches(handle, windowsRuntimeMSIBootstrapRootDACL())
+			windowssecurity.ProtectedHandleDACLMatches(handle, windowsRuntimeMSIBootstrapRootDACL()) ||
+			windowssecurity.ProtectedHandleDACLMatches(handle, windowsRuntimeStandaloneBootstrapRootDACL())
 		if ownerErr != nil || !windowssecurity.HandleOwnerMatchesSID(handle, administrators) || !trustedTransition {
 			return fmt.Errorf("validate existing Windows runtime root owner: %w", ErrInvalidRequest)
 		}
@@ -1513,6 +1518,15 @@ func windowsRuntimeCurrentRootDACL(ownerSID string) string {
 
 func windowsRuntimeMSIBootstrapRootDACL() string {
 	return "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
+}
+
+// The standalone dashboard installer creates ProgramData through the normal
+// inherited Windows directory ACL before a machine owner SID exists. Accept
+// only that exact protected inherited bootstrap state, then atomically replace
+// it with the final SYSTEM-owned, enrolled-user-readable runtime ACL. Any
+// additional or changed ACE remains fail-closed.
+func windowsRuntimeStandaloneBootstrapRootDACL() string {
+	return "D:AI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIIOID;GA;;;CO)(A;OICIID;0x1200a9;;;BU)(A;CIID;DCLCRPCR;;;BU)"
 }
 
 func windowsRuntimeSecurityMatches(path string, owner *windows.SID, dacl string) bool {

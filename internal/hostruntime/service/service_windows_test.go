@@ -160,6 +160,19 @@ func TestPendingWindowsInstallerAllowsRecoveryBeforeBinaryPublication(t *testing
 	}
 }
 
+func TestWindowsControllerInspectChecksSCMBeforeMissingDeclaration(t *testing.T) {
+	source, err := os.ReadFile("service_windows.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	open := strings.Index(text, "manager.OpenService(name)")
+	read := strings.Index(text, "readWindowsServiceDefinitionForRemoval(definitionPath)")
+	if open < 0 || read < 0 || open >= read {
+		t.Fatal("Windows inspection must prove SCM registration before requiring the declaration tree")
+	}
+}
+
 func TestWindowsServiceEntryRejectsMissingContext(t *testing.T) {
 	if err := (WindowsController{}).Apply(context.Background(), `C:\ProgramData\Paperboat\missing.json`, false); err == nil {
 		t.Fatal("missing service definition unexpectedly accepted")

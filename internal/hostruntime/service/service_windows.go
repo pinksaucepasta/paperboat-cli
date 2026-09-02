@@ -291,10 +291,6 @@ func (WindowsController) Inspect(ctx context.Context, definitionPath string) (Na
 	if err != nil {
 		return NativeControllerStatus{}, err
 	}
-	definition, definitionErr := readWindowsServiceDefinitionForRemoval(definitionPath)
-	if definitionErr != nil && !errors.Is(definitionErr, os.ErrNotExist) {
-		return NativeControllerStatus{}, definitionErr
-	}
 	manager, err := mgr.Connect()
 	if err != nil {
 		return NativeControllerStatus{}, err
@@ -311,11 +307,18 @@ func (WindowsController) Inspect(ctx context.Context, definitionPath string) (Na
 		return NativeControllerStatus{}, err
 	}
 	defer service.Close()
+	// Read and validate the declaration only after SCM proves the service
+	// exists. On a genuinely clean machine the declaration directory itself is
+	// absent, which is an ordinary empty state rather than an invalid path.
+	definition, definitionErr := readWindowsServiceDefinitionForRemoval(definitionPath)
+	if definitionErr != nil {
+		return NativeControllerStatus{}, definitionErr
+	}
 	config, err := service.Config()
 	if err != nil {
 		return NativeControllerStatus{}, err
 	}
-	if definitionErr == nil && !windowsServiceConfigurationOwnsDefinition(config, definition) {
+	if !windowsServiceConfigurationOwnsDefinition(config, definition) {
 		return NativeControllerStatus{}, ErrInvalidDefinition
 	}
 	status, err := service.Query()
@@ -444,7 +447,7 @@ func (WindowsController) Disable(ctx context.Context, definitionPath string) (re
 		return err
 	}
 	defer cancel()
-	definition, err := readWindowsServiceDefinitionForRemoval(definitionPath)
+	name, err := windowsServiceNameFromDefinitionPath(definitionPath)
 	if err != nil {
 		return err
 	}
@@ -453,7 +456,7 @@ func (WindowsController) Disable(ctx context.Context, definitionPath string) (re
 		return err
 	}
 	defer func() { resultErr = errors.Join(resultErr, manager.Disconnect()) }()
-	service, err := manager.OpenService(definition.Name)
+	service, err := manager.OpenService(name)
 	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
 		return nil
 	}
@@ -461,6 +464,10 @@ func (WindowsController) Disable(ctx context.Context, definitionPath string) (re
 		return err
 	}
 	defer func() { resultErr = errors.Join(resultErr, service.Close()) }()
+	definition, err := readWindowsServiceDefinitionForRemoval(definitionPath)
+	if err != nil {
+		return err
+	}
 	config, err := service.Config()
 	if err != nil {
 		return err
@@ -518,7 +525,7 @@ func (WindowsController) Stop(ctx context.Context, definitionPath string) error 
 		return err
 	}
 	defer cancel()
-	definition, err := readWindowsServiceDefinitionForRemoval(definitionPath)
+	name, err := windowsServiceNameFromDefinitionPath(definitionPath)
 	if err != nil {
 		return err
 	}
@@ -527,7 +534,7 @@ func (WindowsController) Stop(ctx context.Context, definitionPath string) error 
 		return err
 	}
 	defer manager.Disconnect()
-	service, err := manager.OpenService(definition.Name)
+	service, err := manager.OpenService(name)
 	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
 		return nil
 	}
@@ -535,6 +542,10 @@ func (WindowsController) Stop(ctx context.Context, definitionPath string) error 
 		return err
 	}
 	defer service.Close()
+	definition, err := readWindowsServiceDefinitionForRemoval(definitionPath)
+	if err != nil {
+		return err
+	}
 	config, err := service.Config()
 	if err != nil {
 		return err

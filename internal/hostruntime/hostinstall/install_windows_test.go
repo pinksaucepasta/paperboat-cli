@@ -7,6 +7,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
@@ -14,6 +16,34 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/windowssecurity"
 	"golang.org/x/sys/windows"
 )
+
+func TestStaleWindowsRuntimeProcessScriptIncludesEveryInstalledRuntimeRole(t *testing.T) {
+	pattern := regexp.MustCompile(staleWindowsRuntimeProcessPattern)
+	tests := []struct {
+		name string
+		line string
+		want bool
+	}{
+		{name: "hostd", line: `"C:\\Program Files\\Paperboat\\bin\\pb.exe" __runtime-hostd`, want: true},
+		{name: "worker", line: `"C:\\Program Files\\Paperboat\\bin\\pb.exe" __runtime-worker`, want: true},
+		{name: "updated", line: `"C:\\Program Files\\Paperboat\\bin\\pb.exe" __runtime-updated`, want: true},
+		{name: "local daemon supervisor", line: `"C:\\Program Files\\Paperboat\\bin\\pb.exe" __runtime-local-daemon`, want: true},
+		{name: "local daemon worker", line: `"C:\\Program Files\\Paperboat\\bin\\pb.exe" __local-daemon --server https://api.pprbt.dev`, want: true},
+		{name: "managed ssh", line: `"C:\\Program Files\\Paperboat\\bin\\pb.exe" __windows-sshd-service --sshd sshd.exe`, want: true},
+		{name: "unrelated pb process", line: `"C:\\Program Files\\Paperboat\\bin\\pb.exe" --version`, want: false},
+		{name: "unrelated runtime command", line: `"C:\\Program Files\\Paperboat\\bin\\pb.exe" __runtime-client`, want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := pattern.MatchString(test.line); got != test.want {
+				t.Fatalf("pattern match=%t for %q, want %t", got, test.line, test.want)
+			}
+		})
+	}
+	if !strings.Contains(staleWindowsRuntimeProcessScript, staleWindowsRuntimeProcessPattern) {
+		t.Fatal("stale runtime process script does not use the bounded runtime-role pattern")
+	}
+}
 
 func TestWindowsSSHServiceSetFollowsHostClientTransition(t *testing.T) {
 	layout, err := service.DefaultLayout("windows")
