@@ -60,6 +60,28 @@ func TestStandaloneUpdateGateCompletesExactLifecycleAndReload(t *testing.T) {
 	}
 }
 
+func TestStandaloneUpdateGateCompletesWithNoProtectedWorkloads(t *testing.T) {
+	health := http.NewServeMux()
+	registerHostLivenessAndDiagnostics(health, nil, nil, nil, nil)
+	gate, err := newStandaloneUpdateGate(standaloneUpdateGateConfig{
+		MachineID: "machine_01", StatePath: filepath.Join(t.TempDir(), "gate.json"), Health: health,
+		Workloads: func() hostdproto.WorkloadStatus { return hostdproto.WorkloadStatus{} },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetResponse, err := gate.HandleUpdateGate(context.Background(), standaloneGateRequest(hostdproto.UpdateGateTarget, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := targetResponse.Target
+	for _, operation := range []string{hostdproto.UpdateGateCandidate, hostdproto.UpdateGateDrain, hostdproto.UpdateGateStability, hostdproto.UpdateGateCommit} {
+		if _, err := gate.HandleUpdateGate(context.Background(), standaloneGateRequest(operation, &target)); err != nil {
+			t.Fatalf("%s: %v", operation, err)
+		}
+	}
+}
+
 func TestStandaloneUpdateGateRejectsDrainWithProtectedWorkloads(t *testing.T) {
 	health := http.NewServeMux()
 	registerHostLivenessAndDiagnostics(health, nil, nil, nil, nil)

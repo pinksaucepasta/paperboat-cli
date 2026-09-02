@@ -110,7 +110,7 @@ func (g *standaloneUpdateGate) HandleUpdateGate(ctx context.Context, request hos
 		if !exists || transaction.Committed || !transaction.PolicyBound || transaction.Version != request.Version || transaction.Manifest != request.ManifestSHA256 || transaction.Target != target {
 			return hostdproto.UpdateGateResponse{}, errStandaloneUpdateGate
 		}
-		if workloads := g.config.Workloads(); workloads.Protected != 0 || workloads.Generation == 0 {
+		if workloads := g.config.Workloads(); workloads.Protected != 0 {
 			return hostdproto.UpdateGateResponse{}, errStandaloneUpdateGate
 		}
 		transaction.Drained = true
@@ -141,7 +141,7 @@ func (g *standaloneUpdateGate) HandleUpdateGate(ctx context.Context, request hos
 		if !exists || transaction.Committed || !transaction.Drained || transaction.Version != request.Version || transaction.Manifest != request.ManifestSHA256 || transaction.Path != request.Path || transaction.Status != request.ExpectedStatus || transaction.Samples != request.Samples || transaction.Target != target {
 			return hostdproto.UpdateGateResponse{}, errStandaloneUpdateGate
 		}
-		if workloads := g.config.Workloads(); workloads.Protected != 0 || workloads.Generation == 0 {
+		if workloads := g.config.Workloads(); workloads.Protected != 0 {
 			return hostdproto.UpdateGateResponse{}, errStandaloneUpdateGate
 		}
 		if err := g.probe(ctx, request); err != nil {
