@@ -106,6 +106,54 @@ func TestWorkerUpdateSeedsSignedActiveStateBeforeFirstUpdate(t *testing.T) {
 	}
 }
 
+func TestNewerNativePackageSupersedesBlockedPreCutoverWorkerTransaction(t *testing.T) {
+	fixture := newFixture(t)
+	now := time.Now().UTC()
+	journal := withRelease(withActiveRelease(updateflow.Journal{
+		Schema: updateflow.SchemaV1, TransactionID: "txn-blocked-package-upgrade", Stage: updateflow.StageBlocked,
+		BootID: "hostd", StageUpdatedAt: now, LastFailure: updateflow.FailureDrain,
+	}, fixture.active), fixture.candidate, fixture.paths.staged)
+	if err := os.WriteFile(fixture.paths.staged, fixture.fetcher.body, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := updateflow.Write(fixture.paths.journal, journal, os.Geteuid(), os.Getegid()); err != nil {
+		t.Fatal(err)
+	}
+	packaged := release("2026.08.18.3", fixture.fetcher.body)
+	fixture.manager.active = packaged
+	fixture.manager.activeVersion.Store(packaged.Version)
+	if err := fixture.manager.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := updateflow.Load(fixture.paths.journal)
+	if err != nil || recovered.Stage != updateflow.StageIdle || recovered.ActiveVersion != packaged.Version || recovered.ActiveDigest != packaged.SHA256 {
+		t.Fatalf("journal=%+v err=%v", recovered, err)
+	}
+	if _, err := os.Stat(fixture.paths.staged); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("superseded staged candidate remains: %v", err)
+	}
+}
+
+func TestOlderExecutableCannotSupersedeBlockedWorkerTransaction(t *testing.T) {
+	fixture := newFixture(t)
+	now := time.Now().UTC()
+	newer := release("2026.08.18.4", fixture.fetcher.body)
+	journal := withRelease(withActiveRelease(updateflow.Journal{
+		Schema: updateflow.SchemaV1, TransactionID: "txn-blocked-no-downgrade", Stage: updateflow.StageBlocked,
+		BootID: "hostd", StageUpdatedAt: now, LastFailure: updateflow.FailureDrain,
+	}, newer), fixture.candidate, fixture.paths.staged)
+	if err := updateflow.Write(fixture.paths.journal, journal, os.Geteuid(), os.Getegid()); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.manager.Recover(context.Background()); !errors.Is(err, ErrBlocked) {
+		t.Fatalf("recover error=%v, want blocked", err)
+	}
+	persisted, err := updateflow.Load(fixture.paths.journal)
+	if err != nil || persisted.TransactionID != journal.TransactionID || persisted.Stage != updateflow.StageBlocked {
+		t.Fatalf("journal=%+v err=%v", persisted, err)
+	}
+}
+
 func TestActiveReleaseFromLegacyMonitoringJournalUsesVerifiedCandidate(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "transaction.json")

@@ -440,6 +440,19 @@ func (m *Manager) recoverLocked(ctx context.Context) error {
 		return ErrBlocked
 	}
 	if journal.ActiveVersion != m.active.Version {
+		// A native package installation atomically replaces the runtime and its
+		// service declarations outside this worker transaction. If that newer,
+		// signed executable starts successfully, it supersedes any interrupted
+		// pre-cutover worker transaction. Retire only transactions for an older
+		// active version; never use this path for rollback or an equal/older
+		// executable, where the journal remains the recovery authority.
+		if compareVersion(m.active.Version, journal.ActiveVersion) > 0 &&
+			(journal.Stage == updateflow.StageChecking || journal.Stage == updateflow.StageStaged || journal.Stage == updateflow.StageCandidateStarted || journal.Stage == updateflow.StageCandidateValidating || journal.Stage == updateflow.StageCandidateReady || journal.Stage == updateflow.StageDraining || journal.Stage == updateflow.StageRollback || journal.Stage == updateflow.StageBlocked) {
+			if err := m.removeStaged(); err != nil {
+				return err
+			}
+			return m.write(m.newJournal())
+		}
 		if journal.ActiveDigest == "" && journal.CandidateVersion == m.active.Version && (journal.Stage == updateflow.StageMonitoring || journal.Stage == updateflow.StageCommitted) {
 			return m.recoverLegacyPromotedCandidate(ctx, journal)
 		}
