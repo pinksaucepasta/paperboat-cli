@@ -133,7 +133,9 @@ jobs:
         run: ./packaging/windows/scripts/validate-release-pipeline.sh
       - name: Run focused release safety tests
         shell: bash
-        run: go test -count=1 ./cmd/pb ./internal/hostruntime/bootstrap ./internal/hostruntime/service
+        run: |
+          go test -count=1 ./cmd/pb ./internal/hostruntime/bootstrap ./internal/hostruntime/service
+          ./tools/test-macos-install-preservation.sh
 
   release-linux:
     name: Build Linux ${{ matrix.architecture }} asset

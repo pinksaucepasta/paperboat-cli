@@ -246,7 +246,7 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 		request, _ := http.NewRequestWithContext(readyCtx, http.MethodGet, "http://"+material.HelperListenAddress+"/healthz", nil)
 		response, requestErr := healthClient.Do(request)
 		if requestErr == nil && bootstrapWorkerReady(readyCtx, response, *stateRoot, material.Artifact.Version, previousGeneration, material.SetupMode == "host") &&
-			(material.SetupMode != "client" || bootstrapUpdaterReady(readyCtx, material.Artifact.Version)) {
+			bootstrapUpdaterReady(readyCtx, material.Artifact.Version) {
 			if err := authorizeServiceOperation(ctx, executable, "commit", installRequest, stdout, stderr); err != nil {
 				failureErr := errors.Join(err, authorizeServiceOperation(ctx, executable, "uninstall", installRequest, stdout, stderr), workerCommand.Rollback())
 				return failBootstrapInstallation(ctx, failureErr, material, *stateRoot, "service_readiness")

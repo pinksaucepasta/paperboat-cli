@@ -88,7 +88,10 @@ func Install(ctx context.Context, request Request) error {
 	paths := platformPaths()
 	var err error
 	var legacyHost *service.Installer
-	if request.SetupMode == "host" {
+	// hostd now owns the runtime control plane. The separate privileged host
+	// service is retained only for power policy and must not bind the same
+	// loopback address as hostd.
+	if request.SetupMode == "host" && runtime.GOOS != "darwin" {
 		legacyHost, err = hostInstallerWithMissing(request, paths, true)
 		if err != nil {
 			return errors.Join(ErrInvalidRequest, err)
@@ -159,6 +162,20 @@ func Install(ctx context.Context, request Request) error {
 			return base
 		}
 		return errors.Join(base, legacyWorker.Install(ctx))
+	}
+	// Early macOS host builds used the privileged host-service label for the
+	// monolithic runtime. The split hostd binds the runtime health/control port,
+	// while the privileged role owns only power policy. Remove the obsolete
+	// declaration before starting hostd so both cannot contend for the port.
+	var obsoleteDarwinHost *service.Installer
+	if request.SetupMode == "host" && runtime.GOOS == "darwin" {
+		obsoleteDarwinHost, err = hostInstallerWithMissing(request, paths, true)
+		if err != nil {
+			return restoreLegacyWorker(errors.Join(err, rollbackFiles(paths, journal)))
+		}
+		if err := obsoleteDarwinHost.Uninstall(ctx); err != nil {
+			return restoreLegacyWorker(errors.Join(err, rollbackFiles(paths, journal)))
+		}
 	}
 	if err := lifecycle.Install(ctx); err != nil {
 		return restoreLegacyWorker(errors.Join(err, rollbackFiles(paths, journal)))
@@ -246,7 +263,7 @@ func Repair(ctx context.Context, request Request) error {
 		return errors.Join(ErrInvalidRequest, err)
 	}
 	var legacyHost *service.Installer
-	if request.SetupMode == "host" {
+	if request.SetupMode == "host" && runtime.GOOS != "darwin" {
 		legacyHost, err = hostInstallerWithMissing(request, paths, true)
 		if err != nil {
 			return errors.Join(ErrInvalidRequest, err)
@@ -318,7 +335,7 @@ func Stop(ctx context.Context, request Request) error {
 		return errors.Join(ErrInvalidRequest, err)
 	}
 	var legacyHost *service.Installer
-	if request.SetupMode == "host" {
+	if request.SetupMode == "host" && runtime.GOOS != "darwin" {
 		legacyHost, err = hostInstallerWithMissing(request, paths, true)
 		if err != nil {
 			return errors.Join(ErrInvalidRequest, err)
@@ -340,7 +357,7 @@ func uninstallValidated(ctx context.Context, request Request, paths installPaths
 		return errors.Join(ErrInvalidRequest, err)
 	}
 	var legacyHost *service.Installer
-	if request.SetupMode == "host" {
+	if request.SetupMode == "host" && runtime.GOOS != "darwin" {
 		legacyHost, err = hostInstallerWithMissing(request, paths, true)
 		if err != nil {
 			return errors.Join(ErrInvalidRequest, err)
@@ -946,6 +963,18 @@ func validRunIdentity(request Request) bool {
 }
 
 func workerEnvironment(request Request) map[string]string {
+	controlHost := ""
+	if parsed, err := url.Parse(request.ControlURL); err == nil {
+		controlHost = parsed.Hostname()
+	}
+	releaseHost := ""
+	if parsed, err := url.Parse(request.Artifact.RepositoryURL); err == nil {
+		releaseHost = parsed.Hostname()
+	}
+	directHosts := controlHost
+	if releaseHost != "" && releaseHost != controlHost {
+		directHosts += "," + releaseHost
+	}
 	return map[string]string{
 		"HOME": request.Home, "PATH": request.Path, "PAPERBOAT_RUNTIME_PROFILE": "byod",
 		"PAPERBOAT_RUNTIME_STATE_ROOT": request.StateRoot, "PAPERBOAT_WORKSPACE_ROOT": request.WorkspaceRoot,
@@ -953,6 +982,10 @@ func workerEnvironment(request Request) map[string]string {
 		"PAPERBOAT_SHELL": request.Shell, "PAPERBOAT_RUNTIME_LISTEN_ADDRESS": request.HelperListenAddress,
 		"PAPERBOAT_RUNTIME_SERVICE_SCOPE": "system",
 		"PAPERBOAT_SETUP_MODE":            request.SetupMode,
+		// Paperboat's own narrow private-preview PAC applies to browsers. The
+		// managed control plane must remain direct so enabling that PAC cannot
+		// prevent hostd/updater from starting.
+		"PAPERBOAT_NO_PROXY": directHosts,
 	}
 }
 

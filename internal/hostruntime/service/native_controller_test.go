@@ -150,6 +150,91 @@ func TestLaunchdNativeLifecycleStopBootsOutAndStartReRegistersDeclaration(t *tes
 	}
 }
 
+func TestLaunchdInspectRecognizesKeepAliveProcessProjection(t *testing.T) {
+	output := `system/com.pinksaucepasta.paperboat.updated = {
+	active count = 1
+	state = waiting
+	pid = 81626
+}`
+	runner := &outputCommandRunner{outputs: []string{output}}
+	status, err := (LaunchdController{Runner: runner, UID: 501, Label: UpdaterLabel}).Inspect(context.Background(), "")
+	if err != nil || !status.Registered || !status.Enabled || !status.Running || !status.Ready {
+		t.Fatalf("status=%+v err=%v", status, err)
+	}
+}
+
+func TestLaunchdInspectRequiresTopLevelHealthyProjection(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		ready  bool
+	}{
+		{
+			name: "running state",
+			output: `system/com.pinksaucepasta.paperboat.hostd = {
+	state = running
+}`,
+			ready: true,
+		},
+		{
+			name: "spawn scheduled",
+			output: `system/com.pinksaucepasta.paperboat.hostd = {
+	active count = 0
+	state = spawn scheduled
+last exit code = 1
+}`,
+		},
+		{
+			name: "nested running state",
+			output: `system/com.pinksaucepasta.paperboat.hostd = {
+	state = waiting
+	properties = {
+	state = running
+	active count = 1
+	pid = 81626
+	}
+}`,
+		},
+		{
+			name: "nested process projection",
+			output: `system/com.pinksaucepasta.paperboat.hostd = {
+	state = waiting
+	properties = {
+	active count = 1
+	pid = 81626
+	}
+}`,
+		},
+		{
+			name: "top-level process projection",
+			output: `system/com.pinksaucepasta.paperboat.hostd = {
+	active count = 1
+	state = waiting
+	pid = 81626
+}`,
+			ready: true,
+		},
+		{
+			name: "zero pid",
+			output: `system/com.pinksaucepasta.paperboat.hostd = {
+	active count = 1
+	state = waiting
+	pid = 0
+}`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runner := &outputCommandRunner{outputs: []string{test.output}}
+			status, err := (LaunchdController{Runner: runner, UID: 501, Label: HostdLabel}).Inspect(context.Background(), "")
+			if err != nil || status.Ready != test.ready || status.Running != test.ready {
+				t.Fatalf("status=%+v err=%v", status, err)
+			}
+		})
+	}
+}
+
 func TestLaunchdNativeLifecycleAbsentIsIdempotent(t *testing.T) {
 	absent := errors.New("launchctl: service not found")
 	runner := &outputCommandRunner{errors: []error{absent}}

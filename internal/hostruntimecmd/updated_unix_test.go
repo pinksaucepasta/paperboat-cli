@@ -196,6 +196,27 @@ func TestResolveUpdatedActiveDoesNotBypassSignedRevocation(t *testing.T) {
 	}
 }
 
+func TestResolveUpdatedActiveRecoversJournaledRevokedExecutable(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "transaction.json")
+	version := "2026.08.27.55"
+	journal := updateflow.Journal{
+		Schema: updateflow.SchemaV1, TransactionID: "txn-revoked", Stage: updateflow.StageIdle,
+		ActiveVersion: version, ActiveDigest: strings.Repeat("a", 64), ActiveLength: 900,
+		ActiveHostdAPIMin: 1, ActiveHostdAPIMax: 1, ActiveRuntimeAPIMin: 1, ActiveRuntimeAPIMax: 1,
+		BootID: "hostd", StageUpdatedAt: time.Now().UTC(),
+	}
+	if err := updateflow.Write(path, journal, os.Geteuid(), os.Getegid()); err != nil {
+		t.Fatal(err)
+	}
+	active, err := resolveUpdatedActive(context.Background(), path, version, func(context.Context, string) (workerupdate.Release, error) {
+		return workerupdate.Release{}, workerupdate.ErrReleaseRevoked
+	})
+	if err != nil || active.Version != version || active.SHA256 != journal.ActiveDigest {
+		t.Fatalf("active=%+v err=%v", active, err)
+	}
+}
+
 func TestResolveUpdatedActiveUsesPersistedPreviousReleaseForRollback(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "transaction.json")

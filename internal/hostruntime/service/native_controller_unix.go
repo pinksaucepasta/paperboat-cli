@@ -5,6 +5,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -150,7 +151,16 @@ func (c LaunchdController) Inspect(ctx context.Context, _ string) (NativeControl
 		}
 		return NativeControllerStatus{}, err
 	}
-	running := strings.Contains(output, "state = running")
+	status := parseLaunchdPrintStatus(output)
+	// launchctl does not always emit a top-level `state = running` line for a
+	// healthy KeepAlive LaunchDaemon. A positive active count together with a
+	// process id is the stable native running signal in that projection. A
+	// spawn-scheduled job is failed, even if a stale or nested process
+	// projection happens to contain a positive count and pid.
+	running := status.state == "running" || status.activeCount > 0 && status.pid > 0
+	if status.state == "spawn scheduled" {
+		running = false
+	}
 	return NativeControllerStatus{Registered: true, Enabled: true, Running: running, Ready: running}, nil
 }
 
@@ -242,6 +252,95 @@ func (c LaunchdController) domain() string {
 }
 
 func (c LaunchdController) service() string { return c.domain() + "/" + c.label() }
+
+type launchdPrintStatus struct {
+	state       string
+	activeCount int
+	pid         int
+}
+
+func parseLaunchdPrintStatus(output string) launchdPrintStatus {
+	var status launchdPrintStatus
+	depth := 0
+	rootStarted := false
+	for _, rawLine := range strings.Split(output, "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+
+		if !rootStarted {
+			if strings.Contains(line, "{") {
+				rootStarted = true
+				depth = launchdBraceDelta(line)
+				continue
+			}
+			// Keep accepting the compact key/value projection used by older
+			// launchctl versions and tests that omit the enclosing block.
+			parseLaunchdPrintField(line, &status)
+			continue
+		}
+
+		if depth == 1 {
+			parseLaunchdPrintField(line, &status)
+		}
+		depth += launchdBraceDelta(line)
+		if depth <= 0 {
+			break
+		}
+	}
+	return status
+}
+
+func parseLaunchdPrintField(line string, status *launchdPrintStatus) {
+	key, value, ok := strings.Cut(line, "=")
+	if !ok {
+		return
+	}
+	value = strings.TrimSpace(value)
+	switch strings.TrimSpace(key) {
+	case "state":
+		status.state = value
+	case "active count":
+		if activeCount, err := strconv.Atoi(value); err == nil {
+			status.activeCount = activeCount
+		}
+	case "pid":
+		if pid, err := strconv.Atoi(value); err == nil {
+			status.pid = pid
+		}
+	}
+}
+
+func launchdBraceDelta(line string) int {
+	delta := 0
+	inQuotes := false
+	escaped := false
+	for _, character := range line {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if inQuotes {
+			switch character {
+			case '\\':
+				escaped = true
+			case '"':
+				inQuotes = false
+			}
+			continue
+		}
+		switch character {
+		case '"':
+			inQuotes = true
+		case '{':
+			delta++
+		case '}':
+			delta--
+		}
+	}
+	return delta
+}
 
 func parseNativeProperties(output string) map[string]string {
 	properties := make(map[string]string)

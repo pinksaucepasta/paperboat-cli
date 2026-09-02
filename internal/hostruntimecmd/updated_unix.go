@@ -209,8 +209,15 @@ running:
 
 func resolveUpdatedActive(ctx context.Context, journalPath, version string, resolve func(context.Context, string) (workerupdate.Release, error)) (workerupdate.Release, error) {
 	active, err := resolve(ctx, version)
-	if err == nil || !errors.Is(err, workerupdate.ErrInvalidRelease) {
+	if err == nil {
 		return active, err
+	}
+	// The resident updater must remain available when the release it is
+	// currently executing is revoked. A verified local journal is the trust
+	// anchor for recovery; without it, a revoked or unknown executable still
+	// fails closed.
+	if !errors.Is(err, workerupdate.ErrInvalidRelease) && !errors.Is(err, workerupdate.ErrReleaseRevoked) {
+		return workerupdate.Release{}, err
 	}
 	recovered, journalErr := workerupdate.RecoveryReleaseFromJournal(journalPath, version)
 	if journalErr != nil {

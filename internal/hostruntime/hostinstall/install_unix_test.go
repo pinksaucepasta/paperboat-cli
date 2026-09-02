@@ -30,6 +30,13 @@ func TestDecodeRejectsUnknownAndTrailingFields(t *testing.T) {
 	}
 }
 
+func TestWorkerEnvironmentKeepsControlAndReleasePlanesOutsideSystemPAC(t *testing.T) {
+	environment := workerEnvironment(Request{ControlURL: "https://api.pprbt.dev", Artifact: bootstrap.ArtifactTarget{RepositoryURL: "https://get.pprbt.dev/tuf"}, SetupMode: "host"})
+	if environment["PAPERBOAT_NO_PROXY"] != "api.pprbt.dev,get.pprbt.dev" {
+		t.Fatalf("PAPERBOAT_NO_PROXY=%q", environment["PAPERBOAT_NO_PROXY"])
+	}
+}
+
 func TestRemoveInstalledFilesDeletesOnlyAllowlistedHostState(t *testing.T) {
 	root, state := filepath.Join(t.TempDir(), "install"), filepath.Join(t.TempDir(), "state")
 	if err := os.MkdirAll(root, 0o755); err != nil {

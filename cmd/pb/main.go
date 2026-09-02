@@ -231,6 +231,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if exitErr, ok := err.(interface{ ExitCode() int }); ok {
+		if len(args) > 0 && strings.HasPrefix(args[0], "__runtime-") {
+			fmt.Fprintln(stderr, "pb:", err)
+		}
 		return exitErr.ExitCode()
 	}
 	if message := userFacingError(err); message != "" {

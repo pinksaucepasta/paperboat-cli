@@ -48,6 +48,26 @@ func TestActiveVersionPermittedEnforcesSignedRevocations(t *testing.T) {
 	}
 }
 
+func TestCurrentRevokedReleaseRemainsIdentifiableButNotActivatable(t *testing.T) {
+	plan, err := releasepolicy.Default("2026.08.27.56", strings.Repeat("b", 64), 1, "security", "revoked-test", []releasepolicy.PlatformTarget{{Platform: "linux", Architecture: "amd64"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	index := releaseindex.Index{
+		Version: "2026.08.27.56", Revoked: true, ManifestSHA256: strings.Repeat("b", 64),
+		DeploymentPlan: &plan,
+		Targets:        []releaseindex.Target{{Component: "pb", SHA256: strings.Repeat("a", 64), Length: 10, Platform: "linux", Architecture: "amd64"}},
+		HostdAPIMin:    1, HostdAPIMax: 1, RuntimeAPIMin: 1, RuntimeAPIMax: 1,
+	}
+	release, ok := releaseFromIndex(index)
+	if !ok || release.Version != index.Version {
+		t.Fatalf("release=%+v ok=%v", release, ok)
+	}
+	if activeVersionPermitted(index, release.Version) {
+		t.Fatal("revoked current release was activatable")
+	}
+}
+
 func TestReleaseFromIndexProjectsSignedActivationPolicy(t *testing.T) {
 	manifest := strings.Repeat("b", 64)
 	plan, err := releasepolicy.Default("2026.08.31.1", manifest, 7, "security", "signed-seed", []releasepolicy.PlatformTarget{{Platform: "linux", Architecture: "amd64"}})

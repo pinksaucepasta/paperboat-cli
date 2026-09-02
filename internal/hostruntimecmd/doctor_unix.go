@@ -155,8 +155,9 @@ func systemServiceScope(ctx context.Context) (string, error) {
 }
 
 // systemServiceScopeFor verifies the native service ownership for the
-// requested setup role. Host mode is composed of the stable hostd supervisor
-// and the privileged power-management service. The old monolithic
+// requested setup role. Every managed runtime includes the stable hostd and
+// updater services. Host mode also includes the privileged power-management
+// service. The old monolithic
 // runtime-host service is intentionally removed during installation and must
 // never be used as a readiness requirement.
 func systemServiceScopeFor(ctx context.Context, hostMode bool) (string, error) {
@@ -174,6 +175,7 @@ func systemServiceScopeWithRunner(ctx context.Context, platform string, hostMode
 	case "linux":
 		commands = append(commands,
 			[]string{"/usr/bin/systemctl", "is-active", "paperboat-hostd.service"},
+			[]string{"/usr/bin/systemctl", "is-active", "paperboat-updated.service"},
 		)
 		if hostMode {
 			commands = append(commands, []string{"/usr/bin/systemctl", "is-active", "paperboat-runtime-privileged.service"})
@@ -181,8 +183,9 @@ func systemServiceScopeWithRunner(ctx context.Context, platform string, hostMode
 	case "darwin":
 		commands = append(commands,
 			[]string{"/bin/launchctl", "print", "system/com.pinksaucepasta.paperboat.hostd"},
+			[]string{"/bin/launchctl", "print", "system/com.pinksaucepasta.paperboat.updated"},
 		)
-		if hostMode {
+		if hostMode && platform != "darwin" {
 			commands = append(commands, []string{"/bin/launchctl", "print", "system/com.pinksaucepasta.paperboat.runtime-privileged"})
 		}
 	default:

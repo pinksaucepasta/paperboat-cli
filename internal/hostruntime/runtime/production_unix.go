@@ -1259,6 +1259,20 @@ func openProductionEnvironment(ctx context.Context, stateRoot, controlURL string
 		InstallationGeneration: uint64(registration.InstallationGeneration), HostKeyGeneration: hostKeyGeneration,
 		HostRecipientKeyID: keyID, GenesisMarker: genesisMarker, Processor: processor,
 	})
+	if runtime.GOOS == "darwin" && errors.Is(err, envinject.ErrInvalidSnapshot) {
+		// Older macOS hosts encrypted this cache with a login-Keychain recipient
+		// that a pre-login LaunchDaemon cannot load. The cache contains only
+		// encrypted LKG material; discard both authenticated state files together
+		// and re-open against the identity-wrapped portable recipient.
+		if resetErr := resetLegacyEnvironmentCacheForPortableSource(stateRoot); resetErr != nil {
+			return nil, errors.Join(err, resetErr)
+		}
+		store, err = envinject.Open(ctx, envinject.Config{
+			Path: filepath.Join(stateRoot, "environment", "cache.json"), HighWaterPath: filepath.Join(stateRoot, "environment-high-water.json"), IntegrityKey: integrityKey[:], AllowHighWaterInitialize: true, AccountID: certificate.Claims.AccountID, MachineID: registration.MachineID,
+			InstallationGeneration: uint64(registration.InstallationGeneration), HostKeyGeneration: hostKeyGeneration,
+			HostRecipientKeyID: keyID, GenesisMarker: genesisMarker, Processor: processor,
+		})
+	}
 	if err != nil {
 		return nil, err
 	}

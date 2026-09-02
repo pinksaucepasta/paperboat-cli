@@ -133,10 +133,11 @@ case "$release_metadata_url" in
 esac
 command -v curl >/dev/null 2>&1 || { echo "pb installer: curl is required" >&2; exit 1; }
 
-# Always start from a clean local state.  Dashboard commands are one-shot
-# enrollment commands, so a stale daemon/config must never survive into the
-# new installation.  Cleanup is deliberately best-effort for paths that do
-# not exist and never touches user files outside Paperboat's own locations.
+# Fresh enrollment starts from clean local state. An install-only invocation is
+# an in-place CLI upgrade and must preserve enrolled identities, hostd, updater,
+# service declarations, and runtime state. The managed updater owns runtime
+# activation after setup; deleting it here makes `pb update` permanently
+# unreachable.
 remove_privileged_file() {
   cleanup_path=$1
   if [ "$(id -u)" -eq 0 ]; then
@@ -331,8 +332,11 @@ if [ "$pair" = true ]; then
 fi
 prepare_privileges
 
-# Preserve the existing installation if download or verification fails.
-cleanup_existing
+# Preserve the existing installation if download or verification fails. Only
+# an explicit setup/pair flow is authorized to replace enrollment state.
+if [ -n "$setup_mode" ] || [ "$pair" = true ]; then
+  cleanup_existing
+fi
 
 if [ "$os" = darwin ]; then
   command -v installer >/dev/null 2>&1 || { echo "pb installer: macOS installer is required" >&2; exit 1; }

@@ -191,20 +191,22 @@ func (s TUFSource) eligible(ctx context.Context, index releaseindex.Index, now t
 	return index.EligibleFor(releaseindex.EligibilityInput{MachineID: s.MachineID, Platform: index.Platform, Architecture: index.Architecture, FailureDomain: domain, Now: now, BypassCohort: bypassCohort}), nil
 }
 
-// Active resolves the signed metadata for the runtime already selected by the
-// stable launcher. Startup fails closed if that executable is not the exact
-// signed active version; an updater never invents a hash for a local file.
+// Active resolves signed metadata for the runtime already selected by the
+// stable launcher. A current release that has since been revoked remains
+// identifiable so the resident updater can start and replace it; Resolve and
+// FetchComponent continue to reject it for new activation. An updater never
+// invents metadata for an older or unknown local executable.
 func (s TUFSource) Active(ctx context.Context, version string) (Release, error) {
 	now := s.now()
 	index, err := bootstrap.FetchVerifiedReleaseIndex(ctx, s.RepositoryURL, filepath.Join(s.StateRoot, "index"), s.HTTP, now)
 	if err != nil {
 		return Release{}, err
 	}
-	if !activeVersionPermitted(index, version) {
-		return Release{}, ErrReleaseRevoked
-	}
 	release, ok := releaseFromIndex(index)
 	if !ok || release.Version != version {
+		if !activeVersionPermitted(index, version) {
+			return Release{}, ErrReleaseRevoked
+		}
 		return Release{}, ErrInvalidRelease
 	}
 	return release, nil
@@ -243,7 +245,7 @@ func (s TUFSource) FetchComponent(ctx context.Context, release Release, componen
 		return nil, err
 	}
 	selected, ok := releaseFromIndex(index)
-	if !ok || !sameReleaseTargets(selected, release) {
+	if !ok || !activeVersionPermitted(index, release.Version) || !sameReleaseTargets(selected, release) {
 		return nil, ErrInvalidRelease
 	}
 	path, err := bootstrap.FetchVerifiedReleaseComponent(ctx, s.RepositoryURL, filepath.Join(s.StateRoot, "targets"), index, component, s.HTTP, now)

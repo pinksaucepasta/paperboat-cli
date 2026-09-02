@@ -103,8 +103,8 @@ func TestPortableEnvironmentKeySourceRecreatedIdentityCannotOpenOldState(t *test
 }
 
 func TestProductionEnvironmentKeySourceSelectsPortableWithoutNativeBoundary(t *testing.T) {
-	if goruntime.GOOS != "linux" {
-		t.Skip("portable fallback selection is Linux-specific")
+	if goruntime.GOOS != "linux" && goruntime.GOOS != "darwin" {
+		t.Skip("portable service selection is Unix-specific")
 	}
 	// A systemd credential alone cannot own the mutable monotonic genesis
 	// marker, so headless service execution still uses the identity-wrapped
@@ -127,6 +127,31 @@ func TestProductionEnvironmentKeySourceSelectsPortableWithoutNativeBoundary(t *t
 		t.Fatal(err)
 	}
 	material.Destroy()
+}
+
+func TestResetLegacyEnvironmentCacheForPortableSource(t *testing.T) {
+	if goruntime.GOOS != "darwin" {
+		t.Skip("macOS migration")
+	}
+	root := t.TempDir()
+	cache := filepath.Join(root, "environment", "cache.json")
+	highWater := filepath.Join(root, "environment-high-water.json")
+	if err := os.MkdirAll(filepath.Dir(cache), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{cache, highWater} {
+		if err := os.WriteFile(path, []byte("encrypted"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := resetLegacyEnvironmentCacheForPortableSource(root); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{cache, highWater} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s still exists: %v", path, err)
+		}
+	}
 }
 
 func TestProductionEnvironmentKeySourceLiveIntegration(t *testing.T) {

@@ -4,6 +4,7 @@ package runtime
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"runtime"
 
@@ -34,15 +35,17 @@ func newPortableEnvironmentKeySource(stateRoot string, registration runtimeident
 	return source, nil
 }
 
-// productionEnvironmentKeySourceForState uses the desktop Secret Service when
-// it is actually reachable. Headless Linux uses the identity-wrapped portable
-// store because the systemd credential is intentionally immutable at runtime,
-// while ENV genesis has a monotonic prepare/commit marker that must survive
-// restarts in the same authenticated custody record. OCI and Firecracker guests
-// take the same branch without any setup input.
+// productionEnvironmentKeySourceForState uses a desktop credential store only
+// on Windows. Linux and macOS host runtimes can start before login, where a
+// Secret Service or login Keychain is unavailable. They use the
+// identity-wrapped portable store so ENV genesis survives those restarts in
+// the same authenticated custody record.
 func productionEnvironmentKeySourceForState(stateRoot string, registration runtimeidentity.Registration) (environmentkey.Source, error) {
-	if runtime.GOOS != "linux" {
+	if runtime.GOOS == "windows" {
 		return productionEnvironmentKeySource(registration), nil
+	}
+	if runtime.GOOS == "darwin" {
+		return newPortableEnvironmentKeySource(stateRoot, registration)
 	}
 	if clientconfig.CredentialStoreAvailable() {
 		return environmentkey.KeyringSource{
@@ -52,4 +55,17 @@ func productionEnvironmentKeySourceForState(stateRoot string, registration runti
 		}, nil
 	}
 	return newPortableEnvironmentKeySource(stateRoot, registration)
+}
+
+func resetLegacyEnvironmentCacheForPortableSource(stateRoot string) error {
+	if runtime.GOOS != "darwin" || !filepath.IsAbs(stateRoot) {
+		return nil
+	}
+	for _, name := range []string{"environment/cache.json", "environment-high-water.json"} {
+		path := filepath.Join(filepath.Clean(stateRoot), name)
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
 }
