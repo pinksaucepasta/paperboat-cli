@@ -234,6 +234,31 @@ func TestPriorityProxySourceAndBypassComposition(t *testing.T) {
 	}
 }
 
+func TestPriorityProxySourcePreservesAdministratorBypassWithSystemPAC(t *testing.T) {
+	source := PriorityProxySource{
+		Administrator: StaticProxySource{Value: ProxySnapshot{NoProxy: "api.pprbt.dev,get.pprbt.dev"}},
+		System:        StaticProxySource{Value: ProxySnapshot{PACOnly: true, Generation: 9}},
+	}
+	snapshot, err := source.Snapshot(context.Background())
+	if err != nil || !snapshot.PACOnly || snapshot.NoProxy != "api.pprbt.dev,get.pprbt.dev" {
+		t.Fatalf("snapshot=%+v err=%v", snapshot, err)
+	}
+	selectProxy, _, err := proxyFunction(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, raw := range []string{"https://api.pprbt.dev/healthz", "https://get.pprbt.dev/tuf/metadata/timestamp.json"} {
+		request, _ := http.NewRequest(http.MethodGet, raw, nil)
+		if selected, err := selectProxy(request); err != nil || selected != nil {
+			t.Fatalf("%s selected=%v err=%v", raw, selected, err)
+		}
+	}
+	request, _ := http.NewRequest(http.MethodGet, "https://example.test/", nil)
+	if _, err := selectProxy(request); err == nil {
+		t.Fatal("system PAC destination outside administrator bypass was accepted")
+	}
+}
+
 func TestProxyExcludesSimpleSystemHosts(t *testing.T) {
 	selectProxy, _, err := proxyFunction(ProxySnapshot{HTTPSProxy: "http://proxy.test", ExcludeSimpleHosts: true})
 	if err != nil {

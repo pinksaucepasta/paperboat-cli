@@ -265,7 +265,7 @@ func (s PriorityProxySource) Snapshot(ctx context.Context) (ProxySnapshot, error
 		if err != nil {
 			return ProxySnapshot{}, err
 		}
-		if proxyConfigured(administrator) {
+		if administrator.HTTPProxy != "" || administrator.HTTPSProxy != "" || administrator.PACOnly {
 			return administrator, nil
 		}
 	}
