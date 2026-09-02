@@ -557,6 +557,30 @@ func EnsureWindowsLocalDaemonService(ctx context.Context) error {
 	return localdaemon.RemoveWindowsLegacyTask(ctx, config.OwnerSID)
 }
 
+// WindowsLocalDaemonServiceReady proves that the canonical LocalDaemon SCM
+// service and its enrolled-owner endpoint are already ready. Updated uses this
+// read-only check to avoid reacquiring the migration mutex while an installer
+// that already completed the migration is waiting for updater readiness.
+func WindowsLocalDaemonServiceReady(ownerSID, stateRoot string) bool {
+	if !validSID(ownerSID) || !safeAbsolute(stateRoot) {
+		return false
+	}
+	layout, err := service.DefaultLayout("windows")
+	if err != nil {
+		return false
+	}
+	installer, err := service.New(service.Config{
+		Platform: "windows", Kind: service.DaemonKind, ConfigRoot: WindowsProgramDataRoot(),
+		Executable: layout.Binary, User: "Paperboat", Group: "Paperboat",
+		Arguments: []string{"__runtime-local-daemon"}, Controller: service.WindowsController{},
+	})
+	if err != nil {
+		return false
+	}
+	status, err := (service.WindowsController{}).Inspect(context.Background(), installer.DefinitionPath())
+	return err == nil && status.Registered && status.Enabled && status.Running && status.Ready
+}
+
 // The activator and the newly restarted updater can both observe a committed
 // activation journal. Serialize their idempotent service migration so one
 // caller cannot stop an SCM service while the other is waiting for readiness.
@@ -1220,43 +1244,23 @@ func removeWindowsActivatorService(ctx context.Context, layout service.Layout) e
 }
 
 func installWindowsRoleServices(ctx context.Context, request Request, layout service.Layout, upgradeMode string) error {
-	hostd, updater, daemon, err := windowsRoleInstallers(layout, false)
-	if err != nil {
-		return err
-	}
-	lifecycle, err := newWindowsLifecycleManagerForInstallers(layout, hostd, updater, &request)
-	if err != nil {
-		return err
-	}
 	return executeWindowsServiceInstallPlan(request.SetupMode,
 		func() error { return installWindowsSSHAfterActivation(ctx, request, layout) },
 		func() error {
-			if err := lifecycle.Recover(ctx); err != nil {
-				return err
-			}
 			if err := prepareWindowsLocalDaemonMigrationAndState(ctx, request.OwnerSID, request.StateRoot); err != nil {
 				return fmt.Errorf("migrate Paperboat local daemon task: %w", err)
 			}
 			return nil
 		},
 		func() error {
-			var lifecycleErr error
-			if upgradeMode == "" {
-				lifecycleErr = lifecycle.Install(ctx)
-			} else {
-				lifecycleErr = lifecycle.Repair(ctx)
-			}
-			if lifecycleErr != nil {
-				return lifecycleErr
-			}
-			if err := daemon.Install(ctx); err != nil {
-				return errors.Join(err, lifecycle.Uninstall(ctx))
+			if err := installWindowsServices(ctx, layout, upgradeMode); err != nil {
+				return err
 			}
 			if err := waitWindowsLocalDaemonReady(ctx, request.OwnerSID, request.StateRoot); err != nil {
-				return errors.Join(err, daemon.Uninstall(ctx), lifecycle.Uninstall(ctx))
+				return err
 			}
 			if err := localdaemon.RemoveWindowsLegacyTask(ctx, request.OwnerSID); err != nil {
-				return errors.Join(err, daemon.Uninstall(ctx), lifecycle.Uninstall(ctx))
+				return err
 			}
 			return nil
 		},
@@ -1264,30 +1268,81 @@ func installWindowsRoleServices(ctx context.Context, request Request, layout ser
 	)
 }
 
+// installWindowsServices preserves the native dependency order proven by the
+// Windows acceptance path: Hostd, LocalDaemon, then Updated. Updated repairs
+// LocalDaemon before publishing readiness, so starting it while the outer
+// installer holds the LocalDaemon migration mutex creates a cross-process
+// lock cycle. Keep each independently rollback-safe installer in the proven
+// order rather than composing Updated into that outer lock transaction.
+func installWindowsServices(ctx context.Context, layout service.Layout, upgradeMode string) error {
+	for _, item := range windowsRuntimeServiceDefinitions(layout) {
+		installer, err := service.New(service.Config{
+			Platform: "windows", Kind: item.kind, ConfigRoot: WindowsProgramDataRoot(),
+			Executable: item.executable, User: "Paperboat", Group: "Paperboat",
+			Arguments: item.arguments, Controller: service.WindowsController{}, UpgradeMode: upgradeMode,
+		})
+		if err != nil {
+			return err
+		}
+		if err := installer.Install(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func repairWindowsServices(ctx context.Context, layout service.Layout, kinds ...string) error {
+	wanted := make(map[string]struct{}, len(kinds))
+	for _, kind := range kinds {
+		wanted[kind] = struct{}{}
+	}
+	for _, item := range windowsRuntimeServiceDefinitions(layout) {
+		if len(wanted) != 0 {
+			if _, ok := wanted[item.kind]; !ok {
+				continue
+			}
+		}
+		installer, err := service.New(service.Config{
+			Platform: "windows", Kind: item.kind, ConfigRoot: WindowsProgramDataRoot(),
+			Executable: item.executable, User: "Paperboat", Group: "Paperboat",
+			Arguments: item.arguments, Controller: service.WindowsController{}, UpgradeMode: service.UpgradeReload,
+		})
+		if err != nil {
+			return err
+		}
+		if err := installer.Install(ctx); err != nil {
+			return err
+		}
+		controller := service.WindowsController{}
+		if err := controller.Start(ctx, installer.DefinitionPath()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // repairWindowsRoleServices repairs the native role declarations after the
 // persisted config and runtime binary have been restored. PaperboatSshd is
 // intentionally not installed here: host-mode repair establishes it before
 // lifecycle recovery and keeps it in place until this final phase succeeds.
 func repairWindowsRoleServices(ctx context.Context, request Request, layout service.Layout) error {
-	hostd, updater, daemon, err := windowsRoleInstallers(layout, false)
-	if err != nil {
+	// Repair existing declarations without restarting healthy services. The
+	// post-overhaul Installer.Install path stopped each existing role in turn;
+	// restarting Hostd also replaced the updater's control dependency while
+	// repair was waiting for Updated readiness. Restore the old idempotent
+	// declaration repair behavior and explicitly start only stopped roles.
+	// Updated refuses to run an independently supplied binary until that exact
+	// version is present in signed release metadata. Repairing Hostd and the
+	// local daemon must not therefore wait for an uncommitted updater candidate.
+	// Signed release activation installs Updated after the version is committed.
+	if err := repairWindowsServices(ctx, layout, service.HostdKind, service.DaemonKind); err != nil {
 		return err
-	}
-	lifecycle, err := newWindowsLifecycleManagerForInstallers(layout, hostd, updater, &request)
-	if err != nil {
-		return err
-	}
-	if err := lifecycle.Repair(ctx); err != nil {
-		return err
-	}
-	if err := daemon.Install(ctx); err != nil {
-		return errors.Join(err, lifecycle.Uninstall(ctx))
 	}
 	if err := waitWindowsLocalDaemonReady(ctx, request.OwnerSID, request.StateRoot); err != nil {
-		return errors.Join(err, daemon.Uninstall(ctx), lifecycle.Uninstall(ctx))
+		return err
 	}
 	if err := localdaemon.RemoveWindowsLegacyTask(ctx, request.OwnerSID); err != nil {
-		return errors.Join(err, daemon.Uninstall(ctx), lifecycle.Uninstall(ctx))
+		return err
 	}
 	return nil
 }

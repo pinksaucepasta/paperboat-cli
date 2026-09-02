@@ -19,17 +19,25 @@ import (
 
 // runUpdated is the SCM entry point. It rejects arguments so the service can
 // never turn the update boundary into a general command runner.
-func runUpdated(ctx context.Context, args []string, _ io.Writer, _ io.Writer) error {
+func runUpdated(ctx context.Context, args []string, _ io.Writer, stderr io.Writer) error {
 	if len(args) != 0 {
 		return errors.New("updated does not accept arguments")
 	}
 	workerConfig, err := windowsUpdatedConfig()
 	if err != nil {
+		recordWindowsServiceLaunchFailure("PaperboatUpdated", err)
 		return err
 	}
-	return service.RunWindowsSystemServiceWithReady("PaperboatUpdated", func(serviceCtx context.Context, ready func() error) error {
+	err = service.RunWindowsSystemServiceWithReady("PaperboatUpdated", func(serviceCtx context.Context, ready func() error) error {
 		return updated.RunWindowsWithReady(serviceCtx, workerConfig, ready)
 	})
+	if err != nil {
+		recordWindowsServiceLaunchFailure("PaperboatUpdated", err)
+		if stderr != nil {
+			_, _ = io.WriteString(stderr, "PaperboatUpdated startup failed: "+err.Error()+"\n")
+		}
+	}
+	return err
 }
 
 func runActivator(_ context.Context, args []string, _ io.Writer, _ io.Writer) error {

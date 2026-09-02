@@ -20,6 +20,11 @@ import (
 var ErrWindowsServiceEntry = errors.New("invalid Windows Paperboat service entry")
 var ErrEnrolledOwnerMissing = errors.New("enrolled Windows owner account no longer exists")
 
+// ErrWindowsServiceHandoff indicates that a service has started its successor
+// and is exiting intentionally before SCM readiness. It is not a startup
+// failure and must not be reported as one by the SCM entry wrapper.
+var ErrWindowsServiceHandoff = errors.New("Windows Paperboat service handed off")
+
 // ServiceEntryConfig is the fixed, generated service command. A service entry
 // never accepts a caller-provided command line. The updater runs directly as
 // LocalSystem; hostd uses the enrolled SID to obtain an interactive user token
@@ -104,7 +109,11 @@ func (s *systemServiceEntry) Execute(_ []string, requests <-chan svc.ChangeReque
 	if s.waitReady {
 		select {
 		case <-readyCh:
-		case <-done:
+		case err := <-done:
+			if errors.Is(err, ErrWindowsServiceHandoff) {
+				statuses <- stoppedServiceStatus(0, false)
+				return false, 0
+			}
 			statuses <- stoppedServiceStatus(1, true)
 			return true, 1
 		case request := <-requests:
@@ -115,7 +124,7 @@ func (s *systemServiceEntry) Execute(_ []string, requests <-chan svc.ChangeReque
 				statuses <- svc.Status{State: svc.StopPending, Accepts: accepts}
 				cancel()
 				err := <-done
-				if err != nil && !errors.Is(err, context.Canceled) {
+				if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, ErrWindowsServiceHandoff) {
 					statuses <- stoppedServiceStatus(1, true)
 					return true, 1
 				}

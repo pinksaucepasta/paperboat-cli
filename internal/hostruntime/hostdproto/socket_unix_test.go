@@ -50,7 +50,7 @@ func TestSocketLifecyclePersistsFenceAndRejectsSupersededWorker(t *testing.T) {
 	if info, err := os.Stat(config.SocketPath); err != nil || info.Mode().Perm() != 0o600 {
 		t.Fatalf("socket permissions info=%v err=%v", info, err)
 	}
-	if got := server.Status(); got.State != StateActive || got.Epoch != 2 || got.WorkerID != "runtime-new" {
+	if got := server.Status(); got.State != StateActive || got.Epoch != second.Epoch || got.WorkerID != "runtime-new" {
 		t.Fatalf("server status=%+v", got)
 	}
 	stopSocketServer(t, cancel, done)
@@ -63,8 +63,8 @@ func TestSocketLifecyclePersistsFenceAndRejectsSupersededWorker(t *testing.T) {
 	defer stopSocketServer(t, cancel, done)
 	restarted := testSocketClient(t, config)
 	next := negotiateSocket(t, restarted, "runtime-next")
-	if next.Epoch != 3 {
-		t.Fatalf("restart epoch=%d, want 3", next.Epoch)
+	if next.Epoch != second.Epoch+1 {
+		t.Fatalf("restart epoch=%d, want %d", next.Epoch, second.Epoch+1)
 	}
 }
 
@@ -278,6 +278,22 @@ func startSocketServer(t *testing.T, config SocketConfig) (*Server, context.Canc
 	}
 }
 
+func requestSocket(t *testing.T, client *Client, request Message) (Message, error) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		response, err := client.Request(context.Background(), request)
+		var operation *net.OpError
+		if err == nil || !errors.As(err, &operation) {
+			return response, err
+		}
+		if time.Now().After(deadline) {
+			return nil, err
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func stopSocketServer(t *testing.T, cancel context.CancelFunc, done <-chan error) {
 	t.Helper()
 	cancel()
@@ -302,7 +318,7 @@ func testSocketClient(t *testing.T, config SocketConfig) *Client {
 
 func negotiateSocket(t *testing.T, client *Client, workerID string) Welcome {
 	t.Helper()
-	response, err := client.Request(context.Background(), Hello{WorkerID: workerID, Version: "2026.08.18.3", APIMin: 1, APIMax: 2})
+	response, err := requestSocket(t, client, Hello{WorkerID: workerID, Version: "2026.08.18.3", APIMin: 1, APIMax: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -320,9 +336,18 @@ func clientHeartbeat(client *Client, welcome Welcome) error {
 
 func rawSocketConnection(t *testing.T, path string) net.Conn {
 	t.Helper()
-	connection, err := net.DialTimeout("unix", path, time.Second)
-	if err != nil {
-		t.Fatal(err)
+	deadline := time.Now().Add(time.Second)
+	var connection net.Conn
+	var err error
+	for {
+		connection, err = net.DialTimeout("unix", path, 50*time.Millisecond)
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal(err)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 	if err := connection.SetDeadline(time.Now().Add(time.Second)); err != nil {
 		connection.Close()

@@ -56,9 +56,12 @@ $ErrorActionPreference = 'Stop'
 
 Set-Variable -Name ScriptRoot -Value (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Variable -Name RequiredConfirmation -Value 'RUN-FRESH-WINDOWS-ACCEPTANCE'
+# Runtime role declarations live under ServicesRoot. PaperboatSshd is a
+# separately-owned OpenSSH declaration under ProgramData\Paperboat\ssh and is
+# validated by the host-role readiness check below.
 Set-Variable -Name ExpectedServiceNames -Value @('PaperboatHostd', 'PaperboatLocalDaemon', 'PaperboatUpdated')
 Set-Variable -Name OwnedServiceNames -Value @(
-    'PaperboatHostd', 'PaperboatLocalDaemon', 'PaperboatUpdated',
+    'PaperboatSshd', 'PaperboatHostd', 'PaperboatLocalDaemon', 'PaperboatUpdated',
     'PaperboatHost', 'PaperboatRuntimeConfig', 'PaperboatRuntime'
 )
 
@@ -94,6 +97,8 @@ function Get-PaperboatPaths {
     }
     $programFilesRoot = Join-Path $env:ProgramFiles 'Paperboat'
     $programDataRoot = Join-Path $env:ProgramData 'Paperboat'
+    $openSSHRoot = Join-Path $env:ProgramFiles 'OpenSSH'
+    $sshStateRoot = Join-Path $programDataRoot 'ssh'
     $localAppDataRoot = if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) { '' } else { Join-Path $env:LOCALAPPDATA 'Paperboat' }
     $roamingAppDataRoot = if ([string]::IsNullOrWhiteSpace($env:APPDATA)) { '' } else { Join-Path $env:APPDATA 'Paperboat' }
     [pscustomobject]@{
@@ -106,6 +111,10 @@ function Get-PaperboatPaths {
         ServicesRoot      = Join-Path $programDataRoot 'services'
         LifecycleRoot     = Join-Path $programDataRoot 'service-lifecycle'
         UpdateRoot        = Join-Path $programDataRoot 'updated'
+        OpenSSHRoot       = $openSSHRoot
+        SSHDPath          = Join-Path $openSSHRoot 'sshd.exe'
+        SSHStateRoot      = $sshStateRoot
+        SSHConfig         = Join-Path $sshStateRoot 'sshd_config'
         LocalAppDataRoot  = $localAppDataRoot
         RoamingAppDataRoot = $roamingAppDataRoot
     }
@@ -236,8 +245,25 @@ function Assert-ServiceRecord([string]$Name, [string]$Argument, [pscustomobject]
     if ([string]$service.StartMode -ne 'Auto') {
         Fail 'A Paperboat Windows service is not configured for automatic start.'
     }
+    if ([string]$service.ServiceStartName -ine 'LocalSystem') {
+        Fail 'A Paperboat Windows service is not configured for the LocalSystem boundary.'
+    }
     if ($RequireRunning -and [string]$service.State -ne 'Running') {
         Fail 'An expected Paperboat Windows service is not running.'
+    }
+    if ($RequireRunning) {
+        if ([uint32]$service.ProcessId -eq 0) {
+            Fail 'An expected Paperboat Windows service has no live process.'
+        }
+        try {
+            $process = @(Get-CimInstance -ClassName Win32_Process -Filter ('ProcessId={0}' -f [uint32]$service.ProcessId) -ErrorAction Stop) | Select-Object -First 1
+        } catch {
+            Fail 'An expected Paperboat Windows service process could not be inspected.'
+        }
+        if ($null -eq $process -or
+            -not [string]::Equals([string]$process.ExecutablePath, [string]$Paths.Binary, [StringComparison]::OrdinalIgnoreCase)) {
+            Fail 'An expected Paperboat Windows service is running an unexpected executable.'
+        }
     }
 }
 
@@ -253,6 +279,140 @@ function Assert-ServiceSet([pscustomobject]$Paths, [bool]$RequireRunning) {
     Check 'three managed roles are present with exact executable/argument ownership'
 }
 
+function Format-WindowsServiceArgument([string]$Value) {
+    if ([string]::IsNullOrWhiteSpace($Value) -or $Value.Contains('"')) {
+        Fail 'A Windows service argument is empty or contains an unsafe quote.'
+    }
+    if ($Value.IndexOf(' ') -ge 0 -or $Value.IndexOf([char]9) -ge 0) {
+        return '"' + $Value + '"'
+    }
+    return $Value
+}
+
+function Read-PaperboatSSHConfig([pscustomobject]$Paths) {
+    Assert-SafeOwnedRoot $Paths.SSHStateRoot
+    if (-not (Test-Path -LiteralPath $Paths.SSHConfig -PathType Leaf) -or Test-ReparsePoint $Paths.SSHConfig) {
+        Fail 'The managed Paperboat OpenSSH configuration is missing or unsafe.'
+    }
+    try {
+        $lines = @(Get-Content -LiteralPath $Paths.SSHConfig -ErrorAction Stop)
+    } catch {
+        Fail 'The managed Paperboat OpenSSH configuration could not be read.'
+    }
+    $ports = @()
+    $addresses = @()
+    foreach ($line in $lines) {
+        $text = [string]$line
+        if ($text -match '^\s*Port\s+([0-9]{1,5})\s*(?:#.*)?$') {
+            $ports += [int]$Matches[1]
+        }
+        if ($text -match '^\s*ListenAddress\s+(\S+)\s*(?:#.*)?$') {
+            $addresses += [string]$Matches[1]
+        }
+    }
+    if ($ports.Count -ne 1 -or $ports[0] -lt 1 -or $ports[0] -gt 65535) {
+        Fail 'The managed Paperboat OpenSSH configuration does not define exactly one valid port.'
+    }
+    $uniqueAddresses = @($addresses | Sort-Object -Unique)
+    if ($uniqueAddresses.Count -ne 2 -or
+        $uniqueAddresses -notcontains '127.0.0.1' -or $uniqueAddresses -notcontains '::1') {
+        Fail 'The managed Paperboat OpenSSH configuration is not restricted to both loopback families.'
+    }
+    [pscustomobject]@{
+        Port      = [int]$ports[0]
+        Addresses = $uniqueAddresses
+    }
+}
+
+function Assert-PaperboatSSH([pscustomobject]$Paths) {
+    $sshConfig = Read-PaperboatSSHConfig $Paths
+    if (-not (Test-Path -LiteralPath $Paths.SSHDPath -PathType Leaf) -or Test-ReparsePoint $Paths.SSHDPath) {
+        Fail 'The approved Paperboat OpenSSH daemon binary is missing or unsafe.'
+    }
+    $service = Get-ServiceRecord 'PaperboatSshd'
+    if ($null -eq $service) {
+        Fail 'PaperboatSshd is missing from a host-mode installation.'
+    }
+    if ([string]$service.StartMode -ne 'Auto' -or [string]$service.ServiceStartName -ine 'LocalSystem') {
+        Fail 'PaperboatSshd is not configured as an automatic LocalSystem service.'
+    }
+    if ([string]$service.State -ne 'Running' -or [uint32]$service.ProcessId -eq 0) {
+        Fail 'PaperboatSshd is not running with a live service process.'
+    }
+    $expectedCommand = (Format-WindowsServiceArgument $Paths.Binary) +
+        ' __windows-sshd-service --sshd ' + (Format-WindowsServiceArgument $Paths.SSHDPath) +
+        ' --config ' + (Format-WindowsServiceArgument $Paths.SSHConfig)
+    if (-not [string]::Equals([string]$service.PathName, $expectedCommand, [StringComparison]::OrdinalIgnoreCase)) {
+        Fail 'PaperboatSshd points at an unexpected executable, daemon, or configuration.'
+    }
+
+    try {
+        $listeners = @(Get-NetTCPConnection -State Listen -LocalPort $sshConfig.Port -ErrorAction Stop)
+    } catch {
+        Fail 'PaperboatSshd listeners could not be inspected.'
+    }
+    if ($listeners.Count -eq 0) {
+        Fail 'PaperboatSshd has no listening TCP endpoint.'
+    }
+    $seen = @{'127.0.0.1' = $false; '::1' = $false}
+    foreach ($listener in $listeners) {
+        $address = ([string]$listener.LocalAddress).Trim()
+        if (-not $seen.ContainsKey($address)) {
+            Fail 'PaperboatSshd exposes a non-loopback TCP listener.'
+        }
+        if ([uint32]$listener.OwningProcess -eq 0) {
+            Fail 'PaperboatSshd has a listener without an owning process.'
+        }
+        try {
+            $process = @(Get-CimInstance -ClassName Win32_Process -Filter ('ProcessId={0}' -f [uint32]$listener.OwningProcess) -ErrorAction Stop) | Select-Object -First 1
+        } catch {
+            Fail 'PaperboatSshd listener ownership could not be inspected.'
+        }
+        if ($null -eq $process -or
+            -not [string]::Equals([string]$process.ExecutablePath, [string]$Paths.SSHDPath, [StringComparison]::OrdinalIgnoreCase)) {
+            Fail 'PaperboatSshd listener is owned by an unexpected executable.'
+        }
+        if ([uint32]$process.ProcessId -ne [uint32]$service.ProcessId -and
+            [uint32]$process.ParentProcessId -ne [uint32]$service.ProcessId) {
+            Fail 'PaperboatSshd listener is not owned by the PaperboatSshd service process tree.'
+        }
+        $seen[$address] = $true
+    }
+    if (-not $seen['127.0.0.1'] -or -not $seen['::1']) {
+        Fail 'PaperboatSshd does not listen on both 127.0.0.1 and ::1.'
+    }
+    Check ('PaperboatSshd is running with owned sshd.exe listeners on both loopback families at port ' + $sshConfig.Port)
+}
+
+function Assert-NoPaperboatSSH {
+    if ($null -ne (Get-ServiceRecord 'PaperboatSshd')) {
+        Fail 'PaperboatSshd must not be installed for a client-mode installation.'
+    }
+    $processes = @(Get-CimInstance -ClassName Win32_Process -Filter "Name='pb.exe'" -ErrorAction Stop)
+    foreach ($process in $processes) {
+        if ([string]$process.CommandLine -match '(?i)(^|\s)__windows-sshd-service(\s|$)') {
+            Fail 'A Paperboat SSH service wrapper is still running for a client-mode installation.'
+        }
+    }
+    Check 'client-mode installation has no PaperboatSshd service or orphan SSH wrapper'
+}
+
+function Assert-SSHHealth([pscustomobject]$Paths, [pscustomobject]$Config) {
+    switch ([string]$Config.setup_mode) {
+        'host' {
+            Assert-PaperboatSSH $Paths
+            return
+        }
+        'client' {
+            Assert-NoPaperboatSSH
+            return
+        }
+        default {
+            Fail 'The installed setup role is not a recognized Windows host or client mode.'
+        }
+    }
+}
+
 function Get-ListenUri([pscustomobject]$Config) {
     $listen = ([string]$Config.listen_address).Trim()
     if ($listen -notmatch '^(127\.0\.0\.1|\[::1\]):([1-9][0-9]{0,4})$') {
@@ -262,11 +422,11 @@ function Get-ListenUri([pscustomobject]$Config) {
     if ($port -lt 1 -or $port -gt 65535) {
         Fail 'The installed runtime listen port is invalid.'
     }
-    $host = $Matches[1]
-    if ($host.StartsWith('[')) {
-        return 'http://' + $host + ':' + $port + '/healthz'
+    $listenHost = $Matches[1]
+    if ($listenHost.StartsWith('[')) {
+        return 'http://' + $listenHost + ':' + $port + '/healthz'
     }
-    return 'http://' + $host + ':' + $port + '/healthz'
+    return 'http://' + $listenHost + ':' + $port + '/healthz'
 }
 
 function Assert-Health([pscustomobject]$Config) {
@@ -335,6 +495,34 @@ function Get-JsonData($Envelope) {
 
 function Invoke-PbJson([string[]]$Arguments) {
     return Invoke-PbProcess $Arguments $true
+}
+
+function Assert-UpdaterHealth([pscustomobject]$Config, $Status = $null) {
+    if ($null -eq $Status) {
+        $envelope = Invoke-PbJson @('update', 'status', '--json')
+        if ($null -eq $envelope -or
+            $null -eq $envelope.PSObject.Properties['ok'] -or -not [bool]$envelope.ok) {
+            Fail 'pb update status did not return a successful response.'
+        }
+        $Status = Get-JsonData $envelope
+    }
+    if ($null -eq $Status -or
+        [string]$Status.cli_version -eq '' -or
+        [string]$Status.runtime_version -eq '' -or
+        -not [bool]$Status.runtime_available) {
+        Fail 'PaperboatUpdated did not report an available runtime and CLI.'
+    }
+    if ([bool]$Status.activation_pending -or -not [string]::IsNullOrWhiteSpace([string]$Status.activation_failure)) {
+        Fail 'PaperboatUpdated reports a pending or failed activation.'
+    }
+    if ([string]$Status.runtime_version -cne [string]$Config.artifact.version) {
+        Fail 'PaperboatUpdated runtime version does not match committed installation metadata.'
+    }
+    if ($null -ne $Status.PSObject.Properties['supervisor'] -and
+        $null -ne $Status.supervisor -and [bool]$Status.supervisor.maintenance_required) {
+        Fail 'PaperboatUpdated reports that supervisor maintenance is still required.'
+    }
+    Check ('PaperboatUpdated is ready with runtime ' + [string]$Status.runtime_version + ' and no activation failure')
 }
 
 function Get-StatusMachine($Status, [pscustomobject]$Config) {
@@ -415,7 +603,9 @@ function Wait-ForHealthy([pscustomobject]$Paths, [int]$TimeoutSeconds) {
         try {
             $config = Read-InstallConfig $Paths
             Assert-ServiceSet $Paths $true
+            Assert-SSHHealth $Paths $config
             Assert-Health $config
+            Assert-UpdaterHealth $config
             Assert-DoctorAndStatus $Paths
             return
         } catch {
@@ -440,7 +630,9 @@ function Assert-Installed([pscustomobject]$Paths) {
         }
     }
     Assert-ServiceSet $Paths $true
+    Assert-SSHHealth $Paths $config
     Assert-Health $config
+    Assert-UpdaterHealth $config
     Assert-DoctorAndStatus $Paths
     if (-not [string]::IsNullOrWhiteSpace($ExpectedVersion)) {
         $versionOutput = Invoke-PbProcess @('--version') $false
@@ -557,8 +749,11 @@ function Invoke-Update([pscustomobject]$Paths) {
         $statusEnvelope = Invoke-PbJson @('update', 'status', '--json')
         $status = Get-JsonData $statusEnvelope
         if ([bool]$status.runtime_available -and [string]$status.activation_failure -eq '' -and -not [bool]$status.activation_pending) {
+            $config = Read-InstallConfig $Paths
             Assert-ServiceSet $Paths $true
-            Assert-Health (Read-InstallConfig $Paths)
+            Assert-SSHHealth $Paths $config
+            Assert-Health $config
+            Assert-UpdaterHealth $config $status
             Check 'signed updater path converged with no activation failure'
             return
         }

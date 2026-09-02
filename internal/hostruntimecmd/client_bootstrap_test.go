@@ -248,6 +248,9 @@ func (bootstrapClientStub) E2EERoot(context.Context) (api.E2EERoot, error) {
 func (bootstrapClientStub) BootstrapE2EE(context.Context, string, api.E2EEBootstrapInput) (api.E2EEBootstrapResult, error) {
 	return api.E2EEBootstrapResult{}, errors.New("not used by this test")
 }
+func (bootstrapClientStub) BootstrapE2EEFresh(context.Context, string, api.E2EEBootstrapInput) (api.E2EEBootstrapResult, error) {
+	return api.E2EEBootstrapResult{}, errors.New("not used by this test")
+}
 func (bootstrapClientStub) RequestCLIEndpoint(context.Context, api.CLIEndpointRequestInput) (api.PendingEndpointIdentity, error) {
 	return api.PendingEndpointIdentity{}, errors.New("not used by this test")
 }

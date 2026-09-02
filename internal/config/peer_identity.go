@@ -161,6 +161,24 @@ func (s ProfileStore) SavePeerCertificate(issuer, endpointID string, raw []byte)
 	return s.peerCertificate(issuer, endpointID, raw)
 }
 
+// DeletePeerCertificate removes only the endpoint certificate while retaining
+// its durable signing and transport keys. Fresh enrollment recovery uses this
+// when an interrupted attempt left a certificate signed by an earlier key.
+func (s ProfileStore) DeletePeerCertificate(issuer, endpointID string) (resultErr error) {
+	if s.Path == "" || s.Secrets == nil || !validCredentialID(endpointID) {
+		return ErrCredentialStoreUnavailable
+	}
+	issuer, err := NormalizeIssuer(issuer)
+	if err != nil {
+		return err
+	}
+	lock := newSharedLock(s.profilePath(issuer) + ".peer-certificate.lock")
+	if err := lock.Lock(); err != nil {
+		return err
+	}
+	return errors.Join(s.Secrets.Delete(peerIdentitySecretRef(issuer, endpointID, "endpoint-certificate")), lock.Unlock())
+}
+
 func (s ProfileStore) peerCertificate(issuer, endpointID string, proposed []byte) (state PeerCertificateState, resultErr error) {
 	if s.Path == "" || s.Secrets == nil || !validCredentialID(endpointID) {
 		return PeerCertificateState{}, ErrCredentialStoreUnavailable

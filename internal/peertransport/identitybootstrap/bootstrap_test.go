@@ -10,6 +10,7 @@ import (
 	"errors"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -427,4 +428,17 @@ func bootstrapResult(input api.E2EEBootstrapInput) api.E2EEBootstrapResult {
 	public, _ := base64.RawURLEncoding.DecodeString(input.RootPublicKey)
 	root := rootDocument(ed25519.PublicKey(public))
 	return api.E2EEBootstrapResult{KeyID: rootKeyID(ed25519.PublicKey(public)), TrustedKeys: root.TrustedKeys, Certificate: input.Certificate}
+}
+
+func TestSameEndpointCertificateDocumentIgnoresCompatibilityOnlyRootFingerprint(t *testing.T) {
+	want := api.EndpointCertificateDocument{Version: 1, AccountID: "account_1", KeyID: "aek_key", EndpointID: "cli_1", Role: "cli", Generation: 1, Serial: 1, IssuedAt: "2026-08-03T00:00:00Z", ExpiresAt: "2026-09-02T00:00:00Z", Certificate: "certificate", CertificateFingerprint: strings.Repeat("a", 64), RootFingerprint: strings.Repeat("b", 64)}
+	got := want
+	got.RootFingerprint = ""
+	if !sameEndpointCertificateDocument(got, want) {
+		t.Fatal("compatibility-only root fingerprint changed canonical document equality")
+	}
+	got.Serial++
+	if sameEndpointCertificateDocument(got, want) {
+		t.Fatal("canonical certificate field mismatch was accepted")
+	}
 }

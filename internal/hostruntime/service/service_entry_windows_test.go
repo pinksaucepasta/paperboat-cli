@@ -99,6 +99,28 @@ func TestSystemServiceEntryFailsIfRunExitsBeforeReadiness(t *testing.T) {
 	}
 }
 
+func TestSystemServiceEntryTreatsHandoffBeforeReadinessAsCleanStop(t *testing.T) {
+	statuses := make(chan svc.Status, 8)
+	requests := make(chan svc.ChangeRequest)
+	entry := &systemServiceEntry{
+		waitReady: true,
+		run: func(context.Context, func() error) error {
+			return ErrWindowsServiceHandoff
+		},
+	}
+
+	failed, code := entry.Execute(nil, requests, statuses)
+	if failed || code != 0 {
+		t.Fatalf("service outcome failed=%v code=%d want clean handoff", failed, code)
+	}
+	if status := <-statuses; status.State != svc.StartPending {
+		t.Fatalf("initial service state=%d want start pending", status.State)
+	}
+	if status := <-statuses; status.State != svc.Stopped || status.Win32ExitCode != 0 {
+		t.Fatalf("handoff service status=%+v want clean stop", status)
+	}
+}
+
 func TestOnlyContextCanceledDoesNotHideJoinedFailure(t *testing.T) {
 	if !onlyContextCanceled(context.Canceled) || !onlyContextCanceled(errors.Join(context.Canceled, context.Canceled)) {
 		t.Fatal("cancellation-only result was not recognized")

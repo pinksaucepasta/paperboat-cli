@@ -37,6 +37,7 @@ type WindowsConfig struct {
 	ResolveRelease                                                             workerupdate.Resolver
 	ActivationGate                                                             workerupdate.ActivationGate
 	CandidateStarter                                                           func(context.Context, workerupdate.StartRequest) (workerupdate.Worker, error)
+	localDaemonReady                                                           func() bool
 }
 
 func validLoopbackHealthURL(value string) bool {
@@ -82,6 +83,9 @@ func RunWindowsWithReady(ctx context.Context, config WindowsConfig, ready func()
 	if resumed, err := resumeWindowsActivation(ctx, config); err != nil {
 		return err
 	} else if resumed {
+		if ready != nil {
+			return service.ErrWindowsServiceHandoff
+		}
 		return nil
 	}
 	// Repair the durable, silent LocalDaemon service before reporting updater
@@ -98,7 +102,12 @@ func RunWindowsWithReady(ctx context.Context, config WindowsConfig, ready func()
 	if err != nil {
 		return err
 	}
-	if finalizeLocalDaemon && persisted.Committed {
+	// The installer and repair path already migrate, start, and probe the
+	// canonical LocalDaemon before starting Updated. Calling the same migration
+	// here would wait on the installer's Global mutex while SCM waits for this
+	// updater to publish readiness. Only an updater started outside that
+	// protected path must run the legacy migration itself.
+	if finalizeLocalDaemon && persisted.Committed && !config.LocalDaemonReady() {
 		if err := hostinstall.EnsureWindowsLocalDaemonService(ctx); err != nil {
 			return err
 		}
@@ -123,6 +132,13 @@ func RunWindowsWithReady(ctx context.Context, config WindowsConfig, ready func()
 		return err
 	}
 	return controller.run(ctx, ready)
+}
+
+func (config WindowsConfig) LocalDaemonReady() bool {
+	if config.localDaemonReady != nil {
+		return config.localDaemonReady()
+	}
+	return hostinstall.WindowsLocalDaemonServiceReady(config.OwnerSID, config.RuntimeStateRoot)
 }
 
 func validWindowsConfig(config WindowsConfig) bool {

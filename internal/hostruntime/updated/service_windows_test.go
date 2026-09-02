@@ -91,6 +91,15 @@ func TestWindowsUpdaterRejectsMutableTrustAndPathInputs(t *testing.T) {
 	}
 }
 
+func TestWindowsUpdaterLocalDaemonReadyUsesInjectedProbe(t *testing.T) {
+	config := testWindowsUpdaterConfig(t)
+	calls := 0
+	config.localDaemonReady = func() bool { calls++; return true }
+	if !config.LocalDaemonReady() || calls != 1 {
+		t.Fatalf("ready=%v calls=%d", config.LocalDaemonReady(), calls)
+	}
+}
+
 func TestPrivilegedWindowsServiceIdentityContract(t *testing.T) {
 	config := mgr.Config{ServiceStartName: "LocalSystem", StartType: mgr.StartAutomatic, ErrorControl: mgr.ErrorNormal, SidType: windows.SERVICE_SID_TYPE_UNRESTRICTED}
 	if !validPrivilegedWindowsServiceConfig(config, mgr.StartAutomatic, mgr.ErrorNormal) {

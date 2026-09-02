@@ -24,6 +24,13 @@ var ErrPairingRequired = errors.New("this account already has an E2EE root; appr
 var ErrEnrollmentExpired = errors.New("CLI endpoint enrollment request expired before approval")
 var ErrEstablishedRootUnavailable = errors.New("this account has established E2EE state, but its server root is unavailable; explicit recovery is required")
 
+type invalidResponseError struct{ Stage string }
+
+func (e invalidResponseError) Error() string {
+	return "invalid E2EE identity bootstrap response: " + e.Stage
+}
+func (e invalidResponseError) Unwrap() error { return ErrInvalid }
+
 type Client interface {
 	E2EERoot(context.Context) (api.E2EERoot, error)
 	BootstrapE2EE(context.Context, string, api.E2EEBootstrapInput) (api.E2EEBootstrapResult, error)
@@ -369,7 +376,7 @@ func existingEnrollmentOperationID(accountID, endpointID string, noise [32]byte,
 
 func Bootstrap(ctx context.Context, request Request) (Result, error) {
 	if ctx == nil || request.Client == nil || request.Store.Path == "" || request.Store.Secrets == nil || !boundedID(request.AccountID) || !boundedID(request.CLIClientSessionID) {
-		return Result{}, ErrInvalid
+		return Result{}, invalidResponseError{Stage: "request"}
 	}
 	now := time.Now().UTC()
 	if request.Now != nil {
@@ -399,7 +406,7 @@ func Bootstrap(ctx context.Context, request Request) (Result, error) {
 	defer clearKeys(&keys)
 	rootPublic, ok := keys.RootPrivate.Public().(ed25519.PublicKey)
 	if !ok || len(rootPublic) != ed25519.PublicKeySize {
-		return Result{}, ErrInvalid
+		return Result{}, invalidResponseError{Stage: "local_signing_key"}
 	}
 	keyFingerprint := sha256.Sum256(rootPublic)
 	keyID := "aek_" + hex.EncodeToString(keyFingerprint[:])
@@ -416,6 +423,13 @@ func Bootstrap(ctx context.Context, request Request) (Result, error) {
 	}
 	certificate, raw, err := loadOrCreateCertificate(request, keys, rootPublic, now)
 	if err != nil {
+		var detailed invalidResponseError
+		if errors.As(err, &detailed) {
+			return Result{}, err
+		}
+		if errors.Is(err, ErrInvalid) {
+			return Result{}, invalidResponseError{Stage: "local_certificate"}
+		}
 		return Result{}, err
 	}
 	certificateFingerprint := sha256.Sum256(raw)
@@ -443,14 +457,23 @@ func Bootstrap(ctx context.Context, request Request) (Result, error) {
 		trusted = []endpointidentity.TrustedKey{{KeyID: keyID, PublicKey: append(ed25519.PublicKey(nil), rootPublic...), Fingerprint: keyFingerprint, Generation: 1}}
 		trustedErr = nil
 	}
-	if trustedErr != nil || response.KeyID != keyID || response.Certificate != document {
-		return Result{}, ErrInvalid
+	if trustedErr != nil {
+		return Result{}, invalidResponseError{Stage: "trusted_keys"}
+	}
+	if response.KeyID != keyID {
+		return Result{}, invalidResponseError{Stage: "key_id"}
+	}
+	if !sameEndpointCertificateDocument(response.Certificate, document) {
+		return Result{}, invalidResponseError{Stage: "certificate_document"}
 	}
 	defer trustedkeys.Clear(trusted)
 	if _, ok := trustedkeys.ByPublic(trusted, rootPublic); !ok {
-		return Result{}, ErrInvalid
+		return Result{}, invalidResponseError{Stage: "new_key_missing"}
 	}
 	if _, err := verifyEnrolledCLI(response.Certificate, trusted, request.AccountID, request.CLIClientSessionID, keys, now); err != nil {
+		if errors.Is(err, ErrInvalid) {
+			return Result{}, invalidResponseError{Stage: "certificate_verification"}
+		}
 		return Result{}, err
 	}
 	if err := request.Store.SavePeerAccountRootPublic(request.Issuer, request.AccountID, rootPublic); err != nil {
@@ -462,19 +485,50 @@ func Bootstrap(ctx context.Context, request Request) (Result, error) {
 	return Result{RootFingerprint: hex.EncodeToString(keyFingerprint[:]), CertificateFingerprint: document.CertificateFingerprint, Certificate: certificate}, nil
 }
 
+// Compare the canonical wire fields explicitly. Struct equality is unsuitable
+// here because EndpointCertificateDocument also carries compatibility-only
+// fields that are intentionally omitted by the v1 server response.
+func sameEndpointCertificateDocument(left, right api.EndpointCertificateDocument) bool {
+	return left.Version == right.Version && left.AccountID == right.AccountID &&
+		left.KeyID == right.KeyID && left.EndpointID == right.EndpointID &&
+		left.Role == right.Role && left.Generation == right.Generation &&
+		left.Serial == right.Serial && left.IssuedAt == right.IssuedAt &&
+		left.ExpiresAt == right.ExpiresAt && left.Certificate == right.Certificate &&
+		left.CertificateFingerprint == right.CertificateFingerprint
+}
+
 func loadOrCreateCertificate(request Request, keys config.PeerIdentityKeys, rootPublic ed25519.PublicKey, now time.Time) (endpointidentity.Certificate, []byte, error) {
 	state, err := request.Store.LoadPeerCertificate(request.Issuer, request.CLIClientSessionID)
 	if err == nil {
 		certificate, verifyErr := endpointidentity.Verify(state.Raw, rootPublic, endpointidentity.Expected{AccountID: request.AccountID, Role: endpointidentity.RoleCLI, EndpointID: request.CLIClientSessionID, Generation: 1}, now)
-		if verifyErr != nil || certificate.Claims.NoisePublicKey != keys.NoisePublic || !bytes.Equal(certificate.Claims.QUICPublicKey, keys.QUICPrivate.Public().(ed25519.PublicKey)) {
+		if verifyErr != nil {
+			if request.AllowRootReplacement {
+				clear(state.Raw)
+				if err := request.Store.DeletePeerCertificate(request.Issuer, request.CLIClientSessionID); err != nil {
+					return endpointidentity.Certificate{}, nil, err
+				}
+				return createPeerCertificate(request, keys, rootPublic, now)
+			}
 			clear(state.Raw)
-			return endpointidentity.Certificate{}, nil, ErrInvalid
+			return endpointidentity.Certificate{}, nil, invalidResponseError{Stage: "local_certificate_signature"}
+		}
+		if certificate.Claims.NoisePublicKey != keys.NoisePublic {
+			clear(state.Raw)
+			return endpointidentity.Certificate{}, nil, invalidResponseError{Stage: "local_certificate_noise_key"}
+		}
+		if !bytes.Equal(certificate.Claims.QUICPublicKey, keys.QUICPrivate.Public().(ed25519.PublicKey)) {
+			clear(state.Raw)
+			return endpointidentity.Certificate{}, nil, invalidResponseError{Stage: "local_certificate_quic_key"}
 		}
 		return certificate, state.Raw, nil
 	}
 	if !errors.Is(err, config.ErrSecretNotFound) {
 		return endpointidentity.Certificate{}, nil, err
 	}
+	return createPeerCertificate(request, keys, rootPublic, now)
+}
+
+func createPeerCertificate(request Request, keys config.PeerIdentityKeys, rootPublic ed25519.PublicKey, now time.Time) (endpointidentity.Certificate, []byte, error) {
 	quicPublic := keys.QUICPrivate.Public().(ed25519.PublicKey)
 	certificate, err := endpointidentity.Sign(keys.RootPrivate, endpointidentity.Claims{AccountID: request.AccountID, Role: endpointidentity.RoleCLI, EndpointID: request.CLIClientSessionID, NoisePublicKey: keys.NoisePublic, QUICPublicKey: quicPublic, Generation: 1, Serial: 1, IssuedAt: now, ExpiresAt: now.Add(CertificateLifetime)})
 	if err != nil {
@@ -484,7 +538,7 @@ func loadOrCreateCertificate(request Request, keys config.PeerIdentityKeys, root
 	if err != nil {
 		return endpointidentity.Certificate{}, nil, err
 	}
-	state, err = request.Store.SavePeerCertificate(request.Issuer, request.CLIClientSessionID, raw)
+	state, err := request.Store.SavePeerCertificate(request.Issuer, request.CLIClientSessionID, raw)
 	if err != nil {
 		clear(raw)
 		return endpointidentity.Certificate{}, nil, err
