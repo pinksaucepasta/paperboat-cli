@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -896,7 +897,12 @@ func productionManagedSSHUnix(ctx context.Context, controlURL string, transport 
 }
 
 func managedSSHInitialOperationIDs(registration runtimeidentity.Registration, observationGeneration uint64, fingerprint [32]byte) (string, string) {
-	suffix := registration.MachineID + "-" + strconv.FormatUint(uint64(registration.InstallationGeneration), 10) + "-" + strconv.FormatUint(observationGeneration, 10) + "-" + hex.EncodeToString(fingerprint[:])
+	// Machine proofs cap operation IDs at 128 bytes. Hash the complete durable
+	// identity rather than embedding it verbatim so IDs remain bounded while
+	// still changing for every machine, installation, observation and host-key
+	// fingerprint tuple.
+	digest := sha256.Sum256([]byte(registration.MachineID + "\x00" + strconv.FormatUint(uint64(registration.InstallationGeneration), 10) + "\x00" + strconv.FormatUint(observationGeneration, 10) + "\x00" + hex.EncodeToString(fingerprint[:])))
+	suffix := base64.RawURLEncoding.EncodeToString(digest[:])
 	return "managed-ssh-observe-" + suffix, "managed-ssh-keys-" + suffix
 }
 

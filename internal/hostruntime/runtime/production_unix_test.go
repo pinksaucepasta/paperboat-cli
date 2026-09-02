@@ -11,7 +11,6 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -275,8 +274,8 @@ func TestManagedSSHInitialOperationIDsBindExactHostKeyFingerprint(t *testing.T) 
 	if observeFirst == observeLater || keysFirst == keysLater {
 		t.Fatalf("different observation generations reused operation IDs: %q/%q vs %q/%q", observeFirst, keysFirst, observeLater, keysLater)
 	}
-	if !strings.Contains(observeFirst, hex.EncodeToString(first[:])) || !strings.Contains(keysFirst, hex.EncodeToString(first[:])) {
-		t.Fatalf("operation IDs do not bind exact fingerprint: %q/%q", observeFirst, keysFirst)
+	if len(observeFirst) > 128 || len(keysFirst) > 128 {
+		t.Fatalf("operation IDs exceed machine-proof bound: %d/%d", len(observeFirst), len(keysFirst))
 	}
 }
 
