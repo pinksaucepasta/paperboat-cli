@@ -488,10 +488,34 @@ func (m *Manager) recoverLocked(ctx context.Context) error {
 		m.setActive(release)
 		return m.finishCommitted(journal)
 	case updateflow.RecoveryPerformRollback:
-		return ErrBlocked
+		return m.restoreBlockedTransaction(ctx, journal)
 	default:
 		return ErrBlocked
 	}
+}
+
+// restoreBlockedTransaction retries the exact rollback already recorded in a
+// valid blocked journal. The previous release and deployment binding remain
+// fully authenticated by the journal and hostd; no local identity is guessed.
+// This keeps paperboat-updated available after a transient rollback failure.
+func (m *Manager) restoreBlockedTransaction(ctx context.Context, journal updateflow.Journal) error {
+	rollback, err := m.transition(journal, updateflow.StageRollback)
+	if err != nil {
+		return ErrBlocked
+	}
+	if err := m.write(rollback); err != nil {
+		return errors.Join(err, ErrBlocked)
+	}
+	// StageRollback is the first persisted recovery stage. A subsequent crash
+	// may leave StageBlocked, which transitions back through StageRollback here.
+	// restoreAfterDrain expects the pre-rollback stage for its own transition.
+	recovery := rollback
+	recovery.Stage = updateflow.StageDraining
+	failed := releaseFromJournal(rollback)
+	if err := m.restoreAfterDrain(ctx, recovery, failed, nil, errInterruptedDrainRecovery); err != nil {
+		return errors.Join(err, ErrBlocked)
+	}
+	return nil
 }
 
 // recoverLegacyPromotedCandidate completes a transaction written before the

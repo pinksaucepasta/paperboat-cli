@@ -163,6 +163,11 @@ func (j Journal) Recovery() RecoveryAction {
 		return RecoveryFinalizeCleanup
 	case StageRollback:
 		return RecoveryPerformRollback
+	case StageBlocked:
+		// A blocked transaction already failed its rollback attempt. Startup must
+		// retry that same durable rollback instead of permanently preventing the
+		// updater control service from coming online.
+		return RecoveryPerformRollback
 	default:
 		return RecoveryRequired
 	}
@@ -210,7 +215,7 @@ func allowed(from, to Stage) bool {
 		StageDraining:            {StageCutover, StageRollback, StageBlocked},
 		StageCutover:             {StageMonitoring, StageRollback, StageBlocked},
 		StageMonitoring:          {StageCommitted, StageRollback, StageBlocked},
-		StageCommitted:           {StageIdle}, StageRollback: {StageIdle, StageBlocked},
+		StageCommitted:           {StageIdle}, StageRollback: {StageIdle, StageBlocked}, StageBlocked: {StageRollback},
 	}
 	for _, candidate := range allowedNext[from] {
 		if candidate == to {

@@ -176,11 +176,11 @@ func TestTRK28JournalRecoveryActionsAndRestartSafety(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := fixture.manager.Recover(context.Background()); !errors.Is(err, ErrBlocked) {
-		t.Fatalf("rollback recovery error=%v", err)
+		t.Fatalf("rollback recovery error=%v, want retryable blocked state without a recorded drain", err)
 	}
 	persisted, err := updateflow.Load(fixture.paths.journal)
 	if err != nil || persisted.Stage != updateflow.StageRollback {
-		t.Fatalf("rollback journal was not held for explicit recovery: %+v err=%v", persisted, err)
+		t.Fatalf("rollback journal was not retained after failed retry: %+v err=%v", persisted, err)
 	}
 }
 
