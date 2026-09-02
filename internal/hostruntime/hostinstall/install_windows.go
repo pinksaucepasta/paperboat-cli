@@ -868,47 +868,53 @@ func Repair(ctx context.Context) error {
 	// passed only the user state and owner SID, allowing SCM rollback to restore
 	// Hostd without an application probe or an SSH readiness boundary.
 	request := windowsRepairRequest(config)
-	sshPrepared := false
-	if request.SetupMode == "host" {
-		// Recover can restore a previously-running Hostd from its journal. Make
-		// PaperboatSshd healthy first so that rollback never starts Hostd against
-		// an absent managed-SSH loopback endpoint.
-		if err := installWindowsSSHAfterActivation(ctx, request, layout); err != nil {
-			return fmt.Errorf("prepare Paperboat OpenSSH before lifecycle recovery: %w", err)
-		}
-		sshPrepared = true
-	}
-	if err := preflight.Recover(ctx); err != nil {
-		if sshPrepared {
-			return errors.Join(err, cleanupWindowsSSHAfterRuntimeFailure(ctx, request, layout))
-		}
-		return err
-	}
-	if err := removeWindowsSSHBeforeActivation(ctx, request, layout); err != nil {
-		return err
-	}
-	if err := repairWindowsRuntimeBinary(ctx, config, layout); err != nil {
-		return err
-	}
-	if err := ensureWindowsMachineDirectory(WindowsProgramDataRoot(), config.OwnerSID); err != nil {
-		return err
-	}
-	if err := winenv.EnsureMachinePath(filepath.Dir(layout.Binary)); err != nil {
-		return err
-	}
-	if err := ensureWindowsDirectory(config.StateRoot, config.OwnerSID); err != nil {
-		return err
-	}
-	if err := repairWindowsTreeACL(config.StateRoot, config.OwnerSID); err != nil {
-		return err
-	}
-	if err := ensureWindowsToken(config.OwnerSID); err != nil {
-		return err
-	}
-	if err := writeWindowsConfig(config); err != nil {
-		return err
-	}
-	return installWindowsRoleServices(ctx, request, layout, "")
+	// Keep one host-mode SSH service alive across the complete repair. The
+	// previous flow prepared PaperboatSshd for preflight recovery, deleted it
+	// immediately afterwards, then installed it again inside the role plan.
+	// Windows SCM deletion is asynchronous, so that gap could leave the second
+	// install marked-for-delete or let Hostd race an absent loopback target.
+	return executeWindowsServiceRepairPlan(
+		request.SetupMode,
+		func() error {
+			if err := installWindowsSSHAfterActivation(ctx, request, layout); err != nil {
+				return fmt.Errorf("prepare Paperboat OpenSSH before lifecycle recovery: %w", err)
+			}
+			return nil
+		},
+		func() error {
+			return preflight.Recover(ctx)
+		},
+		func() error {
+			if err := repairWindowsRuntimeBinary(ctx, config, layout); err != nil {
+				return err
+			}
+			if err := ensureWindowsMachineDirectory(WindowsProgramDataRoot(), config.OwnerSID); err != nil {
+				return err
+			}
+			if err := winenv.EnsureMachinePath(filepath.Dir(layout.Binary)); err != nil {
+				return err
+			}
+			if err := ensureWindowsDirectory(config.StateRoot, config.OwnerSID); err != nil {
+				return err
+			}
+			if err := repairWindowsTreeACL(config.StateRoot, config.OwnerSID); err != nil {
+				return err
+			}
+			if err := ensureWindowsToken(config.OwnerSID); err != nil {
+				return err
+			}
+			if err := writeWindowsConfig(config); err != nil {
+				return err
+			}
+			return prepareWindowsLocalDaemonMigrationAndState(ctx, request.OwnerSID, request.StateRoot)
+		},
+		func() error {
+			return repairWindowsRoleServices(ctx, request, layout)
+		},
+		func() error {
+			return cleanupWindowsSSHAfterRuntimeFailure(ctx, request, layout)
+		},
+	)
 }
 
 // windowsRepairRequest carries the persisted values needed to reconstruct the
@@ -1252,6 +1258,34 @@ func installWindowsRoleServices(ctx context.Context, request Request, layout ser
 		},
 		func() error { return cleanupWindowsSSHAfterRuntimeFailure(ctx, request, layout) },
 	)
+}
+
+// repairWindowsRoleServices repairs the native role declarations after the
+// persisted config and runtime binary have been restored. PaperboatSshd is
+// intentionally not installed here: host-mode repair establishes it before
+// lifecycle recovery and keeps it in place until this final phase succeeds.
+func repairWindowsRoleServices(ctx context.Context, request Request, layout service.Layout) error {
+	hostd, updater, daemon, err := windowsRoleInstallers(layout, false)
+	if err != nil {
+		return err
+	}
+	lifecycle, err := newWindowsLifecycleManagerForInstallers(layout, hostd, updater, &request)
+	if err != nil {
+		return err
+	}
+	if err := lifecycle.Repair(ctx); err != nil {
+		return err
+	}
+	if err := daemon.Install(ctx); err != nil {
+		return errors.Join(err, lifecycle.Uninstall(ctx))
+	}
+	if err := waitWindowsLocalDaemonReady(ctx, request.OwnerSID, request.StateRoot); err != nil {
+		return errors.Join(err, daemon.Uninstall(ctx), lifecycle.Uninstall(ctx))
+	}
+	if err := localdaemon.RemoveWindowsLegacyTask(ctx, request.OwnerSID); err != nil {
+		return errors.Join(err, daemon.Uninstall(ctx), lifecycle.Uninstall(ctx))
+	}
+	return nil
 }
 
 func windowsRoleInstallers(layout service.Layout, allowMissingExecutable bool) (*service.Installer, *service.Installer, *service.Installer, error) {

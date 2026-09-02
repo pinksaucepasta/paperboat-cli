@@ -112,6 +112,82 @@ func TestWindowsHostServicesCleanSSHWhenRuntimeRecoveryFails(t *testing.T) {
 	}
 }
 
+func TestWindowsRepairPlanKeepsSSHUntilFinalLifecycleRepair(t *testing.T) {
+	var events []string
+	err := executeWindowsServiceRepairPlan("host", func() error {
+		events = append(events, "ssh")
+		return nil
+	}, func() error {
+		events = append(events, "recover")
+		return nil
+	}, func() error {
+		events = append(events, "binary-config")
+		return nil
+	}, func() error {
+		events = append(events, "lifecycle-repair")
+		return nil
+	}, func() error {
+		events = append(events, "cleanup-ssh")
+		return nil
+	})
+	if err != nil || !reflect.DeepEqual(events, []string{"ssh", "recover", "binary-config", "lifecycle-repair"}) {
+		t.Fatalf("events=%q err=%v", events, err)
+	}
+}
+
+func TestWindowsRepairPlanCleansSSHOnlyAfterARepairPhaseFails(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		failureAt  string
+		wantEvents []string
+	}{
+		{name: "recovery", failureAt: "recover", wantEvents: []string{"ssh", "recover", "cleanup-ssh"}},
+		{name: "binary-config", failureAt: "binary-config", wantEvents: []string{"ssh", "recover", "binary-config", "cleanup-ssh"}},
+		{name: "lifecycle", failureAt: "lifecycle-repair", wantEvents: []string{"ssh", "recover", "binary-config", "lifecycle-repair", "cleanup-ssh"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var events []string
+			failure := errors.New(test.failureAt + " failed")
+			phase := func(name string) func() error {
+				return func() error {
+					events = append(events, name)
+					if name == test.failureAt {
+						return failure
+					}
+					return nil
+				}
+			}
+			err := executeWindowsServiceRepairPlan("host", phase("ssh"), phase("recover"), phase("binary-config"), phase("lifecycle-repair"), phase("cleanup-ssh"))
+			if !errors.Is(err, failure) || !reflect.DeepEqual(events, test.wantEvents) {
+				t.Fatalf("events=%q err=%v", events, err)
+			}
+		})
+	}
+}
+
+func TestWindowsClientRepairPlanRepairsBeforeSSHCleanup(t *testing.T) {
+	var events []string
+	err := executeWindowsServiceRepairPlan("client", func() error {
+		events = append(events, "unexpected-ssh")
+		return nil
+	}, func() error {
+		events = append(events, "recover")
+		return nil
+	}, func() error {
+		events = append(events, "binary-config")
+		return nil
+	}, func() error {
+		events = append(events, "lifecycle-repair")
+		return nil
+	}, func() error {
+		events = append(events, "cleanup-ssh")
+		return nil
+	})
+	if err != nil || !reflect.DeepEqual(events, []string{"recover", "binary-config", "lifecycle-repair", "cleanup-ssh"}) {
+		t.Fatalf("events=%q err=%v", events, err)
+	}
+}
+
 func TestWindowsActivatorOwnershipAcceptsOnlyVersionedReleaseBinary(t *testing.T) {
 	layout, err := service.DefaultLayout("windows")
 	if err != nil {

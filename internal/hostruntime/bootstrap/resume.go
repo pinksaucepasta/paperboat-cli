@@ -143,6 +143,15 @@ func PrepareAuthenticatedSetupResume(stateRoot, serverURL, publicIdentityKey, di
 			if exactAuthenticatedBinding && !expired {
 				return existing, nil
 			}
+			// A server-issued material response is itself durable recovery
+			// authority. If the exact authenticated Host journal expired after
+			// material was persisted, keep its verifier and operation ID so the
+			// authenticated host-setup endpoint can renew it. Do not permit this
+			// path after local installation progress: those checkpoints have their
+			// own recovery flow and must not be silently replayed by setup.
+			if exactAuthenticatedBinding && expired && existing.Material != nil && !existing.RuntimeEnrolled && !existing.ClientInstalled {
+				return existing, nil
+			}
 			if !exactAuthenticatedBinding || !expired || existing.Material != nil || existing.RuntimeEnrolled || existing.ClientInstalled {
 				return ResumeRecord{}, ErrResumeBinding
 			}

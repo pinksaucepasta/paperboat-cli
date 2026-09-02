@@ -30,6 +30,9 @@ func windowsRuntimeServiceDefinitions(layout service.Layout) []windowsRuntimeSer
 // plan also covers a crash journal whose rollback would otherwise start Hostd
 // before the SSH callback runs.
 func executeWindowsServiceInstallPlan(setupMode string, installSSH, recoverRuntime, installRuntime, cleanupSSH func() error) error {
+	if installSSH == nil || recoverRuntime == nil || installRuntime == nil || cleanupSSH == nil {
+		return ErrInvalidRequest
+	}
 	switch setupMode {
 	case "host":
 		// Hostd validates the managed SSH loopback endpoint as it starts. The
@@ -50,6 +53,47 @@ func executeWindowsServiceInstallPlan(setupMode string, installSSH, recoverRunti
 			return err
 		}
 		if err := installRuntime(); err != nil {
+			return err
+		}
+		return cleanupSSH()
+	default:
+		return ErrInvalidRequest
+	}
+}
+
+// executeWindowsServiceRepairPlan is the bounded repair ordering boundary.
+// Host-mode repair keeps the managed-SSH service installed from the first
+// phase through lifecycle repair. Removing it between recovery and repair
+// creates a Windows SCM deletion race and lets Hostd start without its
+// required loopback authority. Cleanup is reserved for a failed phase after
+// the SSH prerequisite has been established.
+func executeWindowsServiceRepairPlan(setupMode string, installSSH, recoverRuntime, repairRuntime, repairServices, cleanupSSH func() error) error {
+	if installSSH == nil || recoverRuntime == nil || repairRuntime == nil || repairServices == nil || cleanupSSH == nil {
+		return ErrInvalidRequest
+	}
+	switch setupMode {
+	case "host":
+		if err := installSSH(); err != nil {
+			return err
+		}
+		if err := recoverRuntime(); err != nil {
+			return errors.Join(err, cleanupSSH())
+		}
+		if err := repairRuntime(); err != nil {
+			return errors.Join(err, cleanupSSH())
+		}
+		if err := repairServices(); err != nil {
+			return errors.Join(err, cleanupSSH())
+		}
+		return nil
+	case "client":
+		if err := recoverRuntime(); err != nil {
+			return err
+		}
+		if err := repairRuntime(); err != nil {
+			return err
+		}
+		if err := repairServices(); err != nil {
 			return err
 		}
 		return cleanupSSH()

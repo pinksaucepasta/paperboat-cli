@@ -231,6 +231,33 @@ func TestAuthenticatedHostSetupResumeReusesLiveAndReplacesOnlyExactExpiredEmptyJ
 	if err != nil || loaded.Verifier != first.Verifier || loaded.ExpectedUserMachineID != "mch_1" || loaded.ExpectedGeneration != 7 {
 		t.Fatalf("mismatched authenticated journal was changed: %+v err=%v", loaded, err)
 	}
+	if err := ClearResume(root); err != nil {
+		t.Fatal(err)
+	}
+	// An authenticated setup can crash after the server has issued material
+	// but before the runtime is installed. The exact machine-bound journal must
+	// remain usable for endpoint recovery after that material expires.
+	expiredMaterial := first
+	expiredMaterial.PairingStarted = true
+	expiredMaterial.PairingExpiresAt = now.Add(-time.Minute)
+	expiredMaterial.Material = &Material{
+		Schema: "paperboat.byod-installation/v1", UserMachineID: "mch_1", UserMachineEnrollmentID: "ume_1", EnvironmentID: "env_1",
+		ControlURL: server, HelperID: "helper_1", ReuseIdentity: true, ExpiresAt: now.Add(-time.Minute),
+		Artifact:            &ArtifactTarget{Schema: ArtifactTargetSchemaV1, Kind: ArtifactKindPB, Version: "2026.08.22.22", Platform: runtime.GOOS, Architecture: runtime.GOARCH, RepositoryURL: server, TargetPath: releaseindex.AssetName(runtime.GOOS, runtime.GOARCH)},
+		HelperListenAddress: "127.0.0.1:38080", InstallationGeneration: 7, SetupRoles: []string{"host"}, SetupMode: "host",
+		ClientSession: &ClientSession{Schema: "paperboat.cli-session/v1", SessionID: "cls_1", AccessToken: "access-012345678901234567890123456789", RefreshToken: "refresh-012345678901234567890123456789", TokenType: "Bearer", ExpiresIn: 3600},
+	}
+	encoded, err := json.Marshal(expiredMaterial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := atomicfile.Write(ResumePath(root), encoded, atomicfile.CurrentOwnerOptions(0o600)); err != nil {
+		t.Fatal(err)
+	}
+	reused, err := PrepareAuthenticatedSetupResume(root, server, publicKey, "Victus", "mch_1", 7, now)
+	if err != nil || reused.Verifier != first.Verifier || reused.SetupOperationID != first.SetupOperationID || reused.Material == nil {
+		t.Fatalf("expired material resume=%+v err=%v", reused, err)
+	}
 }
 
 func TestAuthenticatedHostSetupMaterialCannotChangeMachineGenerationOrVerifiedArtifact(t *testing.T) {
