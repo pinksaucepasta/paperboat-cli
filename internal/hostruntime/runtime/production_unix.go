@@ -1588,7 +1588,12 @@ func (s *runtimeObservationService) Start(ctx context.Context) error {
 	err := s.sender.Send(initial)
 	cancel()
 	if err != nil {
-		return err
+		// Presence is the required part of this service. A first observation
+		// can fail while credentials, DNS, or an auxiliary local store is
+		// recovering. Do not let one transient failure make the optional
+		// component disappear permanently: install the stable loop and let its
+		// bounded sends retry on the normal heartbeat cadence.
+		slog.Warn("initial runtime observation failed; continuing heartbeat retries", "error", err)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1689,10 +1694,14 @@ func (s *runtimeObservationSender) Send(ctx context.Context) error {
 	environmentObservationSent := false
 	if s.environment != nil {
 		observation, err := s.environment.NextObservation(now)
-		if err != nil && !errors.Is(err, envinject.ErrNotReady) {
-			return err
-		}
-		if err == nil {
+		if err != nil {
+			if !errors.Is(err, envinject.ErrNotReady) {
+				// ENV is an auxiliary observation. Its local encrypted store can
+				// be unavailable or revoked while machine presence remains valid;
+				// never suppress the authenticated heartbeat in that case.
+				slog.Warn("runtime environment observation failed", "error", err)
+			}
+		} else {
 			environmentObservation = &observation
 			environmentObservationSent = true
 		}
@@ -1772,17 +1781,10 @@ func (s *runtimeObservationSender) Send(ctx context.Context) error {
 	if environmentObservation != nil {
 		bundle, err := envinject.DecodeRuntimeResponse(responseBody)
 		if err != nil {
-			if environmentObservationSent && s.onEnvironmentObservation != nil {
-				s.onEnvironmentObservation()
-			}
-			return err
-		}
-		if bundle != nil {
+			slog.Warn("runtime environment response could not be applied", "error", err)
+		} else if bundle != nil {
 			if err := s.environment.Apply(ctx, *bundle); err != nil {
-				if environmentObservationSent && s.onEnvironmentObservation != nil {
-					s.onEnvironmentObservation()
-				}
-				return err
+				slog.Warn("runtime environment bundle could not be applied", "error", err)
 			}
 		}
 	}
