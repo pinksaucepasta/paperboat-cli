@@ -369,7 +369,20 @@ if [ "$pair" = true ]; then
   set -- "$@" --setup-mode "$pair_mode"
   [ -z "$enrollment_token" ] || set -- "$@" --enrollment-token "$enrollment_token"
   [ -z "$enrollment_token_file" ] || set -- "$@" --enrollment-token-file "$enrollment_token_file"
-  exec "$target" pair "$@"
+  # Pairing is the final step of a fresh replacement. Do not exec here:
+  # leaving the shell alive gives us a rollback boundary when the CLI has
+  # created user state but cannot finish enrollment. cleanup_existing removes
+  # the known Paperboat services and state; remove the exact requested target
+  # as well because --install-dir may point outside the default layout.
+  if "$target" pair "$@"; then
+    :
+  else
+    pair_status=$?
+    echo "pb installer: pairing failed; rolling back the fresh installation" >&2
+    cleanup_existing || true
+    remove_privileged_file "$target"
+    exit "$pair_status"
+  fi
 fi
 if [ -n "$setup_mode" ]; then
   set -- "$@" --mode "$setup_mode"

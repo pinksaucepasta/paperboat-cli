@@ -2243,6 +2243,8 @@ func unpairCommand() *cobra.Command {
 			registration.InstallationGeneration = machine.InstallationGeneration
 			registration.SetupRoles = machine.SetupRoles
 			registration.SetupMode = "client"
+			registration.SSHUser = ""
+			registration.SSHPort = 0
 			registration.UpdatedAt = time.Now().UTC()
 			if err := identityStore.SaveRegistration(registration); err != nil {
 				return fmt.Errorf("save machine registration: %w", err)
@@ -2355,7 +2357,7 @@ func uninstallCommand() *cobra.Command {
 					}
 					return purgeUserPaperboatState(command, preservedInboxes)
 				}},
-			})
+				})
 			if cleanupErr != nil {
 				fmt.Fprintln(command.OutOrStdout(), "Paperboat attempted every local removal step. The Paperboat Inbox was preserved.")
 				return uninstallCleanupError{err: cleanupErr}
@@ -2392,7 +2394,13 @@ func performUninstallCleanup(steps []uninstallCleanupStep) error {
 }
 
 func purgeUserPaperboatState(command *cobra.Command, preserved []string) error {
+	result := config.PurgeCredentialStore()
 	var paths []string
+	if home, err := os.UserHomeDir(); err == nil {
+		paths = append(paths, filepath.Join(home, ".local", "bin", "pb"))
+	} else {
+		result = errors.Join(result, err)
+	}
 	configPath, _ := command.Flags().GetString("config")
 	if configPath != "" {
 		if cfg, err := config.Load(configPath); err == nil && filepath.IsAbs(cfg.Auth.ProfileDir) {
@@ -2426,7 +2434,6 @@ func purgeUserPaperboatState(command *cobra.Command, preserved []string) error {
 	if root, err := command.Flags().GetString("state-root"); err == nil && root != "" {
 		paths = append(paths, filepath.Clean(root))
 	}
-	var result error
 	for _, path := range paths {
 		if !filepath.IsAbs(path) || filesystemRoot(path) {
 			result = errors.Join(result, errors.New("refusing unsafe Paperboat removal path"))

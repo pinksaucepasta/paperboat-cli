@@ -45,3 +45,10 @@ func bootstrapSSHFields(setupMode, sshUser string, sshPort uint16) (string, uint
 	}
 	return strings.TrimSpace(sshUser), sshPort
 }
+
+func unixBootstrapSSHFields(setupMode, username string) (string, uint16) {
+	if setupMode != "host" {
+		return "", 0
+	}
+	return bootstrapSSHFields(setupMode, username, 22)
+}

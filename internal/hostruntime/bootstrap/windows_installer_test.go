@@ -40,7 +40,13 @@ func TestWindowsInstallerDoesNotRequestUACFromElevatedSession(t *testing.T) {
 	if !strings.Contains(script, "$name = [string]$env:COMPUTERNAME") || !strings.Contains(script, "$name = $name.Trim().ToLowerInvariant()") {
 		t.Fatal("Windows installer does not normalize the default machine name")
 	}
-	cleanup := strings.Index(script, "foreach ($statePath in @(")
+	if !strings.Contains(script, "function Invoke-FreshPairRollback") || !strings.Contains(script, "rolling back the fresh installation") || !strings.Contains(script, "-EncodedCommand' $encodedPayload") {
+		t.Fatal("Windows fresh pairing failure must invoke the fixed-path elevated rollback")
+	}
+	if !strings.Contains(script, "Remove-Item -LiteralPath $programRoot -Recurse -Force") || !strings.Contains(script, "Start-Process -FilePath $installed -ArgumentList @('purge') -Wait") {
+		t.Fatal("Windows fresh pairing rollback must purge services before removing the installed payload")
+	}
+	cleanup := strings.LastIndex(script, "foreach ($statePath in @(")
 	installedCheck := strings.LastIndex(script, "if (-not (Assert-InstalledVersion $installedPb $version))")
 	if cleanup < 0 || installedCheck < 0 || cleanup < installedCheck {
 		t.Fatal("Windows fresh installer clears user state before verified elevated installation")

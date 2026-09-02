@@ -194,6 +194,12 @@ type SecretStore interface {
 	Delete(ref string) error
 }
 
+// PurgeCredentialStore removes the complete production Paperboat credential
+// namespace. A product uninstall cannot depend only on profile indexes: an
+// interrupted older uninstall may already have removed those indexes while
+// leaving OS-backed secrets behind.
+func PurgeCredentialStore() error { return purgeCredentialStore() }
+
 type FileSecretStore struct{ Dir string }
 
 func (s FileSecretStore) path(ref string) string { return filepath.Join(s.Dir, ref+".secret") }

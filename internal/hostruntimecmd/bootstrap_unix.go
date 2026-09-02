@@ -166,7 +166,8 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 		}
 		return err
 	}
-	if err := saveBootstrapRegistration(identityStore, *serverURL, material, "", 0); err != nil {
+	sshUser, sshPort := unixBootstrapSSHFields(material.SetupMode, account.Username)
+	if err := saveBootstrapRegistration(identityStore, *serverURL, material, sshUser, sshPort); err != nil {
 		return fmt.Errorf("save machine registration: %w", err)
 	}
 	if !shouldInstallBootstrapHostRuntime(material) {

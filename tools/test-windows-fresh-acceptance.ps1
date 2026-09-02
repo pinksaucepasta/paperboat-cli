@@ -6,8 +6,10 @@
     The default phase is Audit and never changes files, services, scheduled
     tasks, credentials, or release state. Fresh, Full, and Update phases are
     deliberately mutation-gated: they require -ExecuteMutation and the exact
-    -Confirmation value below. The enrollment token is read from a caller
-    supplied file and is never placed in an argument, output, or diagnostic.
+    -Confirmation value below. Fresh enrollment accepts either a protected file
+    containing a raw token (legacy) or a protected file containing the
+    dashboard-generated p= field, URL, or command. Enrollment material is never
+    placed in output or diagnostics.
 
     Run on a disposable Windows machine from an elevated PowerShell prompt:
 
@@ -16,9 +18,9 @@
       .\test-windows-fresh-acceptance.ps1 -Phase Audit
 
       # Fresh enrollment, restart identity check, update convergence, and
-      # post-update health checks. The token file remains caller-owned.
+      # post-update health checks. The dashboard command file remains caller-owned.
       .\test-windows-fresh-acceptance.ps1 -Phase Full `
-        -EnrollmentTokenFile C:\secure\paperboat-enrollment-token.txt `
+        -EnrollmentBootstrapFile C:\secure\paperboat-enrollment-command.txt `
         -ExecuteMutation `
         -Confirmation RUN-FRESH-WINDOWS-ACCEPTANCE
 
@@ -30,6 +32,8 @@
     This is an acceptance harness, not an installer replacement. It invokes
     the repository's signed tools/install.ps1 and the installed pb commands.
     It intentionally does not accept a token value as a PowerShell parameter.
+    EnrollmentBootstrapFile also accepts the aliases EnrollmentURLFile and
+    EnrollmentCommandFile.
 #>
 [CmdletBinding()]
 param(
@@ -45,6 +49,8 @@ param(
     [ValidateSet('host', 'client')]
     [string]$SetupMode = '',
     [string]$EnrollmentTokenFile = '',
+    [Alias('EnrollmentURLFile', 'EnrollmentCommandFile')]
+    [string]$EnrollmentBootstrapFile = '',
     [int]$ReadinessTimeoutSeconds = 90,
     [int]$UpdateTimeoutSeconds = 300,
     [switch]$ExecuteMutation,
@@ -291,7 +297,7 @@ function Format-WindowsServiceArgument([string]$Value) {
 
 function Read-PaperboatSSHConfig([pscustomobject]$Paths) {
     Assert-SafeOwnedRoot $Paths.SSHStateRoot
-    if (-not (Test-Path -LiteralPath $Paths.SSHConfig -PathType Leaf) -or Test-ReparsePoint $Paths.SSHConfig) {
+    if (-not (Test-Path -LiteralPath $Paths.SSHConfig -PathType Leaf) -or (Test-ReparsePoint $Paths.SSHConfig)) {
         Fail 'The managed Paperboat OpenSSH configuration is missing or unsafe.'
     }
     try {
@@ -326,7 +332,7 @@ function Read-PaperboatSSHConfig([pscustomobject]$Paths) {
 
 function Assert-PaperboatSSH([pscustomobject]$Paths) {
     $sshConfig = Read-PaperboatSSHConfig $Paths
-    if (-not (Test-Path -LiteralPath $Paths.SSHDPath -PathType Leaf) -or Test-ReparsePoint $Paths.SSHDPath) {
+    if (-not (Test-Path -LiteralPath $Paths.SSHDPath -PathType Leaf) -or (Test-ReparsePoint $Paths.SSHDPath)) {
         Fail 'The approved Paperboat OpenSSH daemon binary is missing or unsafe.'
     }
     $service = Get-ServiceRecord 'PaperboatSshd'
@@ -554,7 +560,7 @@ function Get-StatusMachine($Status, [pscustomobject]$Config) {
 
 function Get-IdentityFingerprint([pscustomobject]$Config) {
     $identityPath = Join-Path ([string]$Config.state_root) 'machine-identity.json'
-    if (-not (Test-Path -LiteralPath $identityPath -PathType Leaf) -or Test-ReparsePoint $identityPath) {
+    if (-not (Test-Path -LiteralPath $identityPath -PathType Leaf) -or (Test-ReparsePoint $identityPath)) {
         Fail 'The protected machine identity file is missing or unsafe.'
     }
     try {
@@ -617,15 +623,15 @@ function Wait-ForHealthy([pscustomobject]$Paths, [int]$TimeoutSeconds) {
 
 function Assert-Installed([pscustomobject]$Paths) {
     $config = Read-InstallConfig $Paths
-    if (-not (Test-Path -LiteralPath $Paths.Binary -PathType Leaf) -or Test-ReparsePoint $Paths.Binary) {
+    if (-not (Test-Path -LiteralPath $Paths.Binary -PathType Leaf) -or (Test-ReparsePoint $Paths.Binary)) {
         Fail 'The installed Paperboat executable is missing or unsafe.'
     }
-    if (-not (Test-Path -LiteralPath $Paths.TokenFile -PathType Leaf) -or Test-ReparsePoint $Paths.TokenFile) {
+    if (-not (Test-Path -LiteralPath $Paths.TokenFile -PathType Leaf) -or (Test-ReparsePoint $Paths.TokenFile)) {
         Fail 'The installed Paperboat hostd token is missing or unsafe.'
     }
     foreach ($name in $ExpectedServiceNames) {
         $definition = Join-Path $Paths.ServicesRoot ($name + '.json')
-        if (-not (Test-Path -LiteralPath $definition -PathType Leaf) -or Test-ReparsePoint $definition) {
+        if (-not (Test-Path -LiteralPath $definition -PathType Leaf) -or (Test-ReparsePoint $definition)) {
             Fail 'A managed Paperboat service declaration is missing or unsafe.'
         }
     }
@@ -649,7 +655,7 @@ function Assert-Installed([pscustomobject]$Paths) {
 
 function Read-EnrollmentToken([string]$Path) {
     if ([string]::IsNullOrWhiteSpace($Path) -or -not [IO.Path]::IsPathRooted($Path) -or
-        -not (Test-Path -LiteralPath $Path -PathType Leaf) -or Test-ReparsePoint $Path) {
+        -not (Test-Path -LiteralPath $Path -PathType Leaf) -or (Test-ReparsePoint $Path)) {
         Fail 'EnrollmentTokenFile must be an absolute regular non-reparse file.'
     }
     $token = (Get-Content -LiteralPath $Path -Raw -ErrorAction Stop).Trim()
@@ -659,14 +665,106 @@ function Read-EnrollmentToken([string]$Path) {
     return $token
 }
 
+function Read-EnrollmentBootstrap([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not [IO.Path]::IsPathRooted($Path) -or
+        -not (Test-Path -LiteralPath $Path -PathType Leaf) -or (Test-ReparsePoint $Path)) {
+        Fail 'EnrollmentBootstrapFile must be an absolute regular non-reparse file.'
+    }
+    try {
+        $content = (Get-Content -LiteralPath $Path -Raw -ErrorAction Stop).Trim()
+    } catch {
+        Fail 'EnrollmentBootstrapFile could not be read.'
+    }
+    if ([string]::IsNullOrWhiteSpace($content) -or $content.Length -gt 16KB) {
+        Fail 'EnrollmentBootstrapFile is empty or too large.'
+    }
+
+    # The dashboard intentionally emits an opaque hostname-bound p= value. Do
+    # not parse or print that value; extract only the exact HTTPS endpoint from
+    # either the URL itself, its p= field, or the dashboard's generated
+    # PowerShell command.
+    $urlMatches = [regex]::Matches($content, '(?i)https://get\.pprbt\.dev/install\?p=[A-Za-z0-9-]+')
+    if ($urlMatches.Count -eq 1) {
+        $url = $urlMatches[0].Value
+    } elseif ($content -match '^p=([A-Za-z0-9-]+)$') {
+        # A protected capture containing only the dashboard's p= field is also
+        # accepted, which lets an operator avoid storing the whole command.
+        $url = 'https://get.pprbt.dev/install?' + $content
+    } else {
+        Fail 'EnrollmentBootstrapFile must contain exactly one dashboard enrollment URL, p= field, or command.'
+    }
+    try {
+        $uri = [Uri]::new($url)
+    } catch {
+        Fail 'The dashboard enrollment URL is invalid.'
+    }
+    if ($uri.Scheme -cne 'https' -or $uri.Host -cne 'get.pprbt.dev' -or
+        $uri.AbsolutePath -cne '/install' -or $uri.Fragment -ne '' -or
+        $uri.Query -notmatch '^\?p=([A-Za-z0-9-]+)$') {
+        Fail 'The dashboard enrollment URL is not an approved protected bootstrap endpoint.'
+    }
+    $parameter = $uri.Query.Substring(3)
+    if ($parameter -notmatch '^(?:[0-9A-Z]{26}|[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?-[0-9A-Z]{26})$') {
+        Fail 'The dashboard enrollment URL has an invalid protected parameter.'
+    }
+    return $url
+}
+
+function Invoke-FreshBootstrapInstaller([string]$BootstrapURL) {
+    $powershell = Join-Path $PSHOME 'powershell.exe'
+    if (-not (Test-Path -LiteralPath $powershell -PathType Leaf) -or (Test-ReparsePoint $powershell)) {
+        Fail 'Windows PowerShell executable is unavailable.'
+    }
+    $scratch = Join-Path ([IO.Path]::GetTempPath()) ('paperboat-dashboard-bootstrap-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $scratch -Force | Out-Null
+    $bootstrapPath = Join-Path $scratch 'bootstrap.ps1'
+    $stdoutPath = Join-Path $scratch 'stdout'
+    $stderrPath = Join-Path $scratch 'stderr'
+    try {
+        try {
+            # The endpoint response contains the protected token preamble. It
+            # stays in a private temporary file and is never sent as an argument
+            # or included in output.
+            $response = Invoke-WebRequest -UseBasicParsing -Uri $BootstrapURL -Headers @{ 'User-Agent' = 'PowerShell/PaperboatAcceptance' } -TimeoutSec 30 -MaximumRedirection 0 -ErrorAction Stop
+        } catch {
+            Fail 'The dashboard-generated protected bootstrap could not be fetched.'
+        }
+        $body = [string]$response.Content
+        if ([string]::IsNullOrWhiteSpace($body) -or $body.Length -gt 1MB) {
+            Fail 'The dashboard-generated protected bootstrap response is invalid.'
+        }
+        Set-Content -LiteralPath $bootstrapPath -Value $body -NoNewline -Encoding UTF8 -ErrorAction Stop
+        if ((Test-ReparsePoint $bootstrapPath) -or -not (Test-Path -LiteralPath $bootstrapPath -PathType Leaf)) {
+            Fail 'The dashboard-generated protected bootstrap file is unsafe.'
+        }
+        $argumentLine = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ($bootstrapPath -replace '"', '\"') + '"'
+        $process = Start-Process -FilePath $powershell -ArgumentList $argumentLine -Wait -PassThru -WindowStyle Hidden -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+        if ($process.ExitCode -ne 0) {
+            Fail 'The dashboard-generated protected bootstrap failed.'
+        }
+    } finally {
+        Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
+        $body = $null
+        $response = $null
+    }
+    Check 'dashboard-generated protected bootstrap completed without exposing enrollment material'
+}
+
 function Invoke-FreshInstaller([pscustomobject]$Paths) {
     if (-not $ExecuteMutation -or $Confirmation -cne $RequiredConfirmation) {
         Fail ('Fresh enrollment is mutation-gated. Supply -ExecuteMutation and -Confirmation ' + $RequiredConfirmation + '.')
     }
+    if (-not [string]::IsNullOrWhiteSpace($EnrollmentTokenFile) -and -not [string]::IsNullOrWhiteSpace($EnrollmentBootstrapFile)) {
+        Fail 'Supply only one of EnrollmentTokenFile or EnrollmentBootstrapFile.'
+    }
+    if (-not [string]::IsNullOrWhiteSpace($EnrollmentBootstrapFile)) {
+        Invoke-FreshBootstrapInstaller (Read-EnrollmentBootstrap $EnrollmentBootstrapFile)
+        return
+    }
     if ([string]::IsNullOrWhiteSpace($InstallerPath)) {
         $InstallerPath = Join-Path $ScriptRoot 'install.ps1'
     }
-    if (-not (Test-Path -LiteralPath $InstallerPath -PathType Leaf) -or Test-ReparsePoint $InstallerPath) {
+    if (-not (Test-Path -LiteralPath $InstallerPath -PathType Leaf) -or (Test-ReparsePoint $InstallerPath)) {
         Fail 'The Windows bootstrap installer script is missing or unsafe.'
     }
     $token = Read-EnrollmentToken $EnrollmentTokenFile

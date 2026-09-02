@@ -270,6 +270,7 @@ mode=$9
 
 state_root=/root/.local/state/paperboat/runtime
 pb=/usr/local/libexec/paperboat/pb
+install_dir=/usr/local/libexec/paperboat
 readonly hostd_socket=/run/paperboat-hostd/hostd.sock
 readonly updater_socket=/run/paperboat-updated/control.sock
 
@@ -526,7 +527,7 @@ printf 'install_stage=official_installer\n'
 export PAPERBOAT_RELEASE_METADATA_URL="$metadata_url"
 export PAPERBOAT_GITHUB_REPOSITORY=pinksaucepasta/paperboat-cli
 curl --fail --location --silent --show-error --proto '=https' --proto-redir '=https' --tlsv1.2 "$installer_url" |
-  sh -s -- --version "$expected_version" --install-dir "$INSTALL_DIR" --no-setup
+  sh -s -- --version "$expected_version" --install-dir "$install_dir" --no-setup
 
 [[ -x "$pb" ]] || die "official installer did not create $pb"
 installed_sha=$(sha256sum "$pb" | awk '{print $1}')

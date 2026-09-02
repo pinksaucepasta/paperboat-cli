@@ -1007,61 +1007,67 @@ func Purge(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	var result error
+	cleanup := func(name string, operation func() error) {
+		if err := operation(); err != nil {
+			result = errors.Join(result, fmt.Errorf("%s: %w", name, err))
+		}
+	}
+	// Purge is a recovery boundary. Keep attempting every independently owned
+	// cleanup even when one stale service, task, or firewall record is already
+	// unavailable. Returning on the first error strands later-owned roots and
+	// makes a retry look like a fresh failure instead of converging.
 	if err := preflight.Recover(ctx); err != nil {
-		return err
+		result = errors.Join(result, fmt.Errorf("recover Windows runtime lifecycle: %w", err))
 	}
 	persisted, persistedErr := LoadWindowsRuntimeConfig()
 	if errors.Is(persistedErr, os.ErrNotExist) {
 		persistedErr = nil
 	}
 	if persistedErr != nil {
-		return persistedErr
+		result = errors.Join(result, fmt.Errorf("read Windows runtime metadata: %w", persistedErr))
 	}
 	// Remove retired logon tasks even when an interrupted uninstall already
 	// removed ProgramData and its owner SID record. The task names are strictly
 	// limited to Paperboat's hashed legacy daemon namespace.
-	if err := localdaemon.RemoveAllWindowsLegacyTasks(ctx); err != nil {
-		return err
-	}
+	cleanup("remove retired Windows daemon tasks", func() error { return localdaemon.RemoveAllWindowsLegacyTasks(ctx) })
 	// The updater's one-shot activator can survive an interrupted activation
 	// after its versioned executable has been removed. Delete its exact owned
 	// SCM declaration before removing release slots.
-	if err := removeWindowsActivatorService(ctx, layout); err != nil {
-		return err
-	}
+	cleanup("remove Windows update activator service", func() error { return removeWindowsActivatorService(ctx, layout) })
 	if _, err := os.Stat(WindowsProgramDataRoot()); errors.Is(err, os.ErrNotExist) {
-		return nil
+		return result
 	} else if err != nil {
-		return err
+		result = errors.Join(result, fmt.Errorf("inspect Windows ProgramData root: %w", err))
 	}
 	// Windows OpenSSH is a shared WinGet dependency. Purge only removes the
 	// dedicated PaperboatSshd service, Paperboat SSH keys/configuration, and
 	// firewall deltas that Paperboat recorded as its own. This must happen
 	// before the Paperboat runtime slots are removed because their fixed path
 	// is the ownership proof for PaperboatSshd.
-	if err := removePaperboatSSHState(ctx, windowsOpenSSHConfig(layout, "")); err != nil {
-		return err
-	}
+	cleanup("remove Paperboat OpenSSH state", func() error {
+		return removePaperboatSSHState(ctx, windowsOpenSSHConfig(layout, ""))
+	})
+	// Remove SCM declarations before force-terminating any orphaned image. The
+	// runtime services have an automatic crash-restart policy; killing their
+	// processes first lets SCM bring them back while the release roots are being
+	// deleted, which was the observed uninstall non-convergence.
+	cleanup("remove Windows runtime services and slots", func() error { return uninstallWindows(ctx, true) })
 	// A service can have been removed already while its old pb.exe process is
-	// still alive. Terminate only the fixed Paperboat executable before deleting
-	// the release slots, otherwise pb.rollback.exe remains locked and a fresh
-	// dashboard install fails halfway through cleanup.
-	if err := terminatePaperboatProcesses(ctx); err != nil {
-		return err
-	}
-	if err := uninstallWindows(ctx, true); err != nil {
-		return err
-	}
+	// still alive. Terminate only the fixed Paperboat executable after SCM no
+	// longer owns a restartable declaration, otherwise pb.rollback.exe remains
+	// locked and a fresh dashboard install fails halfway through cleanup.
+	cleanup("terminate stale Paperboat processes", func() error { return terminatePaperboatProcesses(ctx) })
 	if persisted.OwnerSID != "" {
 		if lockPath, lockErr := windowsLocalDaemonLockPath(persisted.StateRoot); lockErr != nil {
-			return lockErr
+			result = errors.Join(result, fmt.Errorf("resolve legacy Windows daemon lock: %w", lockErr))
 		} else {
-			if err := localdaemon.RemoveWindowsLegacyService(ctx, lockPath, persisted.OwnerSID); err != nil {
-				return err
-			}
+			cleanup("remove legacy Windows daemon service", func() error {
+				return localdaemon.RemoveWindowsLegacyService(ctx, lockPath, persisted.OwnerSID)
+			})
 		}
 	}
-	return nil
+	return result
 }
 
 func terminatePaperboatProcesses(ctx context.Context) error {

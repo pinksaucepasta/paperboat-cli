@@ -107,6 +107,56 @@ function Test-Administrator {
   return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function Invoke-FreshPairRollback {
+  # The pair command runs in the original user's process, after __install has
+  # crossed the machine replacement boundary. Roll back both scopes when that
+  # final step fails. The elevated payload derives fixed Paperboat paths; it
+  # never accepts a caller-provided deletion root.
+  foreach ($statePath in @(
+    (Join-Path $env:LOCALAPPDATA 'Paperboat'),
+    (Join-Path $env:APPDATA 'Paperboat')
+  )) {
+    Remove-Item -LiteralPath $statePath -Recurse -Force -ErrorAction SilentlyContinue
+  }
+  $rollbackPayload = @'
+$ErrorActionPreference = 'Stop'
+$programRoot = Join-Path ${env:ProgramFiles} 'Paperboat'
+$installed = Join-Path $programRoot 'bin\pb.exe'
+$purgeError = $null
+try {
+  if (Test-Path -LiteralPath $installed -PathType Leaf) {
+    $purge = Start-Process -FilePath $installed -ArgumentList @('purge') -Wait -PassThru -WindowStyle Hidden
+    if ($purge.ExitCode -ne 0) { throw "Paperboat runtime purge failed with exit code $($purge.ExitCode)." }
+  }
+} catch {
+  $purgeError = $_
+}
+try {
+  # __install --fresh owns this exact root. Remove the payload only after the
+  # executable has exited, so the rollback is safe on Windows file locking.
+  Remove-Item -LiteralPath $programRoot -Recurse -Force -ErrorAction SilentlyContinue
+} catch {
+  if ($null -eq $purgeError) { $purgeError = $_ }
+}
+if ($null -ne $purgeError) { throw $purgeError }
+'@
+  $encodedPayload = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($rollbackPayload))
+  $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+  try {
+    if (Test-Administrator) {
+      & $powershell '-NoProfile' '-NonInteractive' '-EncodedCommand' $encodedPayload
+      if ($LASTEXITCODE -ne 0) { throw "rollback exited with code $LASTEXITCODE" }
+    } else {
+      $rollback = Start-Process -FilePath $powershell -ArgumentList @('-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedPayload) -Verb RunAs -PassThru -Wait -WindowStyle Hidden
+      if ($rollback.ExitCode -ne 0) { throw "rollback exited with code $($rollback.ExitCode)" }
+    }
+  } catch {
+    # Preserve the pair failure as the primary result, but make an incomplete
+    # rollback visible so support can safely retry cleanup.
+    Write-Warning "Paperboat fresh-install rollback did not complete: $($_.Exception.Message)"
+  }
+}
+
 if ($freshEnrollment -or -not (Assert-InstalledVersion $installedPb $version) -or (Get-FileHash -Algorithm SHA256 -LiteralPath $installedPb -ErrorAction SilentlyContinue).Hash.ToLowerInvariant() -ne $actual) {
   # __install is implemented by the downloaded pb.exe itself. This is the
   # only binary-install elevation boundary and avoids downloading another
@@ -168,5 +218,10 @@ if ($freshEnrollment) {
   # dashboard command. The installed pb elevates only its machine-service
   # commit after this user-owned state has been created.
   & $installedPb pair --server $server --enrollment-token $token --name $name "--setup-mode=$setupMode"
-  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  if ($LASTEXITCODE -ne 0) {
+    $pairExitCode = $LASTEXITCODE
+    Write-Warning "Paperboat pairing failed with exit code $pairExitCode; rolling back the fresh installation."
+    Invoke-FreshPairRollback
+    exit $pairExitCode
+  }
 }

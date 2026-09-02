@@ -1153,6 +1153,20 @@ func TestRemovePathPreservingNeverRemovesCleanupRootInsideInbox(t *testing.T) {
 	}
 }
 
+func TestRemovePathPreservingRemovesDanglingPaperboatSymlink(t *testing.T) {
+	root := t.TempDir()
+	link := filepath.Join(root, "pb")
+	if err := os.Symlink(filepath.Join(root, "missing-paperboat-binary"), link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := removePathPreserving(link, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(link); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("dangling CLI symlink remains: %v", err)
+	}
+}
+
 func TestRemovePathPreservingRefusesSymlinkAncestorOfInbox(t *testing.T) {
 	external := t.TempDir()
 	if err := os.Mkdir(filepath.Join(external, "Inbox"), 0o700); err != nil {
