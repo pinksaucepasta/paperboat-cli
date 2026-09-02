@@ -259,7 +259,7 @@ func NewClientCoordinator(ctx context.Context, config HostConfig, dependencies H
 	healthSource.set(runtime, workerComponents)
 	host := &Host{runtime: runtime, hostd: daemon, workers: workers, http: httpService, handler: mux, health: healthSource, transferRoot: filepath.Join(config.Runtime.StateRoot, "file-transfers"), cleanupUnstarted: durable.Close, updateGate: dependencies.UpdateGate}
 	if host.updateGate == nil {
-		host.updateGate, err = newStandaloneUpdateGate(standaloneUpdateGateConfig{MachineID: config.MachineID, StatePath: filepath.Join(config.Runtime.StateRoot, "updates", "deployment-gate.json"), Health: mux, Workloads: host.WorkloadStatus})
+		host.updateGate, err = newStandaloneUpdateGate(standaloneUpdateGateConfig{MachineID: config.MachineID, StatePath: filepath.Join(config.Runtime.StateRoot, "updates", "standalone-deployment-gate.json"), Health: mux, Workloads: host.WorkloadStatus})
 		if err != nil {
 			return nil, errors.Join(ErrHostInvalid, err)
 		}
@@ -602,7 +602,7 @@ func NewHost(ctx context.Context, config HostConfig, dependencies HostDependenci
 	healthSource.set(runtime, workerComponents)
 	host := &Host{runtime: runtime, hostd: daemon, workers: workers, http: httpService, handler: mux, sessions: sessions, executions: executions, health: healthSource, transferRoot: filepath.Join(config.Runtime.StateRoot, "file-transfers"), cleanupUnstarted: durable.Close, updateGate: dependencies.UpdateGate}
 	if host.updateGate == nil {
-		host.updateGate, err = newStandaloneUpdateGate(standaloneUpdateGateConfig{MachineID: config.MachineID, StatePath: filepath.Join(config.Runtime.StateRoot, "updates", "deployment-gate.json"), Health: mux, Workloads: host.WorkloadStatus})
+		host.updateGate, err = newStandaloneUpdateGate(standaloneUpdateGateConfig{MachineID: config.MachineID, StatePath: filepath.Join(config.Runtime.StateRoot, "updates", "standalone-deployment-gate.json"), Health: mux, Workloads: host.WorkloadStatus})
 		if err != nil {
 			return nil, errors.Join(ErrHostInvalid, err)
 		}
