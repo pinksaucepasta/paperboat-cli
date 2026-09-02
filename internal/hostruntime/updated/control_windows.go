@@ -98,7 +98,7 @@ func (c *windowsController) tufSource() (workerupdate.TUFSource, error) {
 	return newWindowsTUFSource(c.config)
 }
 
-func (c *windowsController) run(ctx context.Context) error {
+func (c *windowsController) run(ctx context.Context, ready func() error) error {
 	if c == nil || c.scheduler == nil || !validPipePath(c.socketPath) {
 		return ErrInvalidWindowsConfig
 	}
@@ -119,6 +119,11 @@ func (c *windowsController) run(ctx context.Context) error {
 		_ = listener.Close()
 	}()
 	go func() { _ = c.scheduler.Run(ctx) }()
+	if ready != nil {
+		if err := ready(); err != nil {
+			return err
+		}
+	}
 	for {
 		connection, acceptErr := listener.Accept()
 		if acceptErr != nil {

@@ -27,8 +27,8 @@ func runUpdated(ctx context.Context, args []string, _ io.Writer, _ io.Writer) er
 	if err != nil {
 		return err
 	}
-	return service.RunWindowsSystemService("PaperboatUpdated", func(serviceCtx context.Context) error {
-		return updated.RunWindows(serviceCtx, workerConfig)
+	return service.RunWindowsSystemServiceWithReady("PaperboatUpdated", func(serviceCtx context.Context, ready func() error) error {
+		return updated.RunWindowsWithReady(serviceCtx, workerConfig, ready)
 	})
 }
 

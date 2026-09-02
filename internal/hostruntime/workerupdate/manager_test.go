@@ -281,6 +281,13 @@ func TestWorkerUpdateRejectsTamperedArtifactBeforeCandidateStart(t *testing.T) {
 	if fixture.starter.starts != 0 || fixture.hostd.activations != 0 {
 		t.Fatalf("candidate started after failed verification: starts=%d activations=%d", fixture.starter.starts, fixture.hostd.activations)
 	}
+	journal, loadErr := updateflow.Load(fixture.paths.journal)
+	if loadErr != nil || journal.Stage != updateflow.StageIdle || journal.LastFailure != updateflow.FailureVerification || journal.ActiveVersion != fixture.active.Version {
+		t.Fatalf("journal=%+v err=%v", journal, loadErr)
+	}
+	if recoverErr := fixture.manager.Recover(context.Background()); recoverErr != nil {
+		t.Fatalf("failed verification stranded restart recovery: %v", recoverErr)
+	}
 }
 
 func TestWorkerUpdateRejectsNativeSignatureBeforeCandidateStart(t *testing.T) {

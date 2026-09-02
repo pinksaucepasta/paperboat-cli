@@ -290,9 +290,14 @@ func (m *Manager) Activate(ctx context.Context, release Release) (Result, error)
 		return Result{Version: m.active.Version}, err
 	}
 	if err = m.stage(ctx, release); err != nil {
-		journal.LastFailure = updateflow.FailureVerification
-		_ = m.write(journal)
-		return Result{Version: m.active.Version}, err
+		// No candidate has started and no live state has changed. Return the
+		// durable transaction to idle so a transient download, proxy, or
+		// signature-source failure cannot strand the updater in "checking"
+		// across a service restart. Preserve the typed verification failure for
+		// status and retry diagnostics.
+		cleanupErr := m.removeStaged()
+		writeErr := m.write(m.idleJournal(journal, updateflow.FailureVerification, ""))
+		return Result{Version: m.active.Version}, errors.Join(err, cleanupErr, writeErr)
 	}
 	m.record(ctx, EventDownloading, journal, release, "")
 	journal = withRelease(journal, release, m.config.BinaryStaged)

@@ -7,11 +7,97 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
 )
+
+func TestSystemServiceEntryDoesNotReportRunningBeforeReadiness(t *testing.T) {
+	runStarted := make(chan struct{})
+	allowReady := make(chan struct{})
+	result := make(chan struct {
+		failed bool
+		code   uint32
+	}, 1)
+	requests := make(chan svc.ChangeRequest)
+	statuses := make(chan svc.Status, 8)
+	entry := &systemServiceEntry{
+		waitReady: true,
+		run: func(ctx context.Context, ready func() error) error {
+			close(runStarted)
+			select {
+			case <-allowReady:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			if err := ready(); err != nil {
+				return err
+			}
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+	go func() {
+		failed, code := entry.Execute(nil, requests, statuses)
+		result <- struct {
+			failed bool
+			code   uint32
+		}{failed: failed, code: code}
+	}()
+
+	if status := <-statuses; status.State != svc.StartPending {
+		t.Fatalf("initial service state=%d want start pending", status.State)
+	}
+	<-runStarted
+	select {
+	case status := <-statuses:
+		t.Fatalf("service reported state=%d before readiness", status.State)
+	default:
+	}
+
+	close(allowReady)
+	if status := <-statuses; status.State != svc.Running {
+		t.Fatalf("ready service state=%d want running", status.State)
+	}
+	requests <- svc.ChangeRequest{Cmd: svc.Stop}
+	if status := <-statuses; status.State != svc.StopPending {
+		t.Fatalf("stop service state=%d want stop pending", status.State)
+	}
+	if status := <-statuses; status.State != svc.Stopped || status.Win32ExitCode != 0 {
+		t.Fatalf("final service status=%+v want clean stop", status)
+	}
+	select {
+	case outcome := <-result:
+		if outcome.failed || outcome.code != 0 {
+			t.Fatalf("service outcome failed=%v code=%d", outcome.failed, outcome.code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("service entry did not stop")
+	}
+}
+
+func TestSystemServiceEntryFailsIfRunExitsBeforeReadiness(t *testing.T) {
+	statuses := make(chan svc.Status, 8)
+	requests := make(chan svc.ChangeRequest)
+	entry := &systemServiceEntry{
+		waitReady: true,
+		run: func(context.Context, func() error) error {
+			return errors.New("control listener failed")
+		},
+	}
+	failed, code := entry.Execute(nil, requests, statuses)
+	if !failed || code != 1 {
+		t.Fatalf("service outcome failed=%v code=%d want failure", failed, code)
+	}
+	if status := <-statuses; status.State != svc.StartPending {
+		t.Fatalf("initial service state=%d want start pending", status.State)
+	}
+	if status := <-statuses; status.State != svc.Stopped || status.Win32ExitCode != 1 {
+		t.Fatalf("failed service status=%+v", status)
+	}
+}
 
 func TestOnlyContextCanceledDoesNotHideJoinedFailure(t *testing.T) {
 	if !onlyContextCanceled(context.Canceled) || !onlyContextCanceled(errors.Join(context.Canceled, context.Canceled)) {

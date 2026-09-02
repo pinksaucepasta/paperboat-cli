@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -56,18 +57,73 @@ func RunWindowsSystemService(name string, run func(context.Context) error) error
 	if name == "" || len(name) > 256 || run == nil {
 		return ErrWindowsServiceEntry
 	}
-	return svc.Run(name, &systemServiceEntry{run: run})
+	return svc.Run(name, &systemServiceEntry{run: func(ctx context.Context, _ func() error) error { return run(ctx) }})
 }
 
-type systemServiceEntry struct{ run func(context.Context) error }
+// RunWindowsSystemServiceWithReady is the SCM entry point for a long-lived
+// LocalSystem service whose process owns an application control endpoint. The
+// callback must be invoked only after that endpoint accepts connections. SCM
+// remains in StartPending until the callback succeeds, so service lifecycle
+// installation cannot report success while the updater is still initializing.
+func RunWindowsSystemServiceWithReady(name string, run func(context.Context, func() error) error) error {
+	if name == "" || len(name) > 256 || run == nil {
+		return ErrWindowsServiceEntry
+	}
+	return svc.Run(name, &systemServiceEntry{run: run, waitReady: true})
+}
+
+type systemServiceEntry struct {
+	run       func(context.Context, func() error) error
+	waitReady bool
+}
 
 func (s *systemServiceEntry) Execute(_ []string, requests <-chan svc.ChangeRequest, statuses chan<- svc.Status) (bool, uint32) {
-	statuses <- svc.Status{State: svc.StartPending}
+	statuses <- svc.Status{State: svc.StartPending, WaitHint: 90_000, CheckPoint: 1}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	readyCh := make(chan struct{}, 1)
+	var readyOnce sync.Once
+	ready := func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if s.waitReady {
+			readyOnce.Do(func() { readyCh <- struct{}{} })
+		}
+		return nil
+	}
 	done := make(chan error, 1)
-	go func() { done <- s.run(ctx) }()
+	go func() {
+		if s.waitReady {
+			done <- s.run(ctx, ready)
+			return
+		}
+		done <- s.run(ctx, nil)
+	}()
 	accepts := svc.AcceptStop | svc.AcceptShutdown
+	if s.waitReady {
+		select {
+		case <-readyCh:
+		case <-done:
+			statuses <- stoppedServiceStatus(1, true)
+			return true, 1
+		case request := <-requests:
+			switch request.Cmd {
+			case svc.Interrogate:
+				statuses <- request.CurrentStatus
+			case svc.Stop, svc.Shutdown:
+				statuses <- svc.Status{State: svc.StopPending, Accepts: accepts}
+				cancel()
+				err := <-done
+				if err != nil && !errors.Is(err, context.Canceled) {
+					statuses <- stoppedServiceStatus(1, true)
+					return true, 1
+				}
+				statuses <- stoppedServiceStatus(0, false)
+				return false, 0
+			}
+		}
+	}
 	statuses <- svc.Status{State: svc.Running, Accepts: accepts}
 	for {
 		select {

@@ -50,6 +50,14 @@ var ErrInvalidWindowsConfig = errors.New("invalid Windows updater configuration"
 // normal update controller connects through the protected named-pipe client;
 // this service intentionally keeps its public SCM invocation argument-free.
 func RunWindows(ctx context.Context, config WindowsConfig) error {
+	return RunWindowsWithReady(ctx, config, nil)
+}
+
+// RunWindowsWithReady is the SCM service entry used by the durable updater
+// declaration. The callback runs only after the protected control listener has
+// been created, allowing the SCM wrapper to delay Running until the updater
+// can accept control requests.
+func RunWindowsWithReady(ctx context.Context, config WindowsConfig, ready func() error) error {
 	if !validWindowsConfig(config) {
 		return ErrInvalidWindowsConfig
 	}
@@ -114,7 +122,7 @@ func RunWindows(ctx context.Context, config WindowsConfig) error {
 	if err != nil {
 		return err
 	}
-	return controller.run(ctx)
+	return controller.run(ctx, ready)
 }
 
 func validWindowsConfig(config WindowsConfig) bool {
