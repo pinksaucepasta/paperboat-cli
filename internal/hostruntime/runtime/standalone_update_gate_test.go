@@ -99,6 +99,44 @@ func TestStandaloneUpdateGateRejectsDrainWithProtectedWorkloads(t *testing.T) {
 	}
 }
 
+func TestStandaloneUpdateGateRollsBackAfterDrainFailsBeforeRecordingDrain(t *testing.T) {
+	health := http.NewServeMux()
+	registerHostLivenessAndDiagnostics(health, nil, nil, nil, nil)
+	protected := true
+	gate, err := newStandaloneUpdateGate(standaloneUpdateGateConfig{
+		MachineID: "machine_01",
+		StatePath: filepath.Join(t.TempDir(), "gate.json"),
+		Health:    health,
+		Workloads: func() hostdproto.WorkloadStatus {
+			if protected {
+				return hostdproto.WorkloadStatus{Generation: 2, Protected: 1}
+			}
+			return hostdproto.WorkloadStatus{Generation: 2}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetResponse, err := gate.HandleUpdateGate(context.Background(), standaloneGateRequest(hostdproto.UpdateGateTarget, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := targetResponse.Target
+	if _, err := gate.HandleUpdateGate(context.Background(), standaloneGateRequest(hostdproto.UpdateGateCandidate, &target)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gate.HandleUpdateGate(context.Background(), standaloneGateRequest(hostdproto.UpdateGateDrain, &target)); !errors.Is(err, errStandaloneUpdateGate) {
+		t.Fatalf("protected workload drain error=%v", err)
+	}
+	protected = false
+	if _, err := gate.HandleUpdateGate(context.Background(), standaloneGateRequest(hostdproto.UpdateGateRollback, &target)); err != nil {
+		t.Fatalf("rollback after failed drain: %v", err)
+	}
+	if len(gate.transactions) != 0 {
+		t.Fatalf("rollback retained transaction: %+v", gate.transactions)
+	}
+}
+
 func TestHostsAlwaysExposeUpdateGate(t *testing.T) {
 	root := t.TempDir()
 	runtimeConfig := runtimeconfig.Config{Profile: runtimeconfig.BYOD, StateRoot: root, Version: "test", Limits: runtimeconfig.DefaultLimits, Resources: runtimeconfig.DefaultResources}

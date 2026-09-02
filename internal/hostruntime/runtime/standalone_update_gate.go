@@ -138,7 +138,10 @@ func (g *standaloneUpdateGate) HandleUpdateGate(ctx context.Context, request hos
 			}
 		}
 	case hostdproto.UpdateGateRollback:
-		if !exists || transaction.Committed || !transaction.Drained || transaction.Version != request.Version || transaction.Manifest != request.ManifestSHA256 || transaction.Path != request.Path || transaction.Status != request.ExpectedStatus || transaction.Samples != request.Samples || transaction.Target != target {
+		// Drain may fail before it records Drained=true. The updater still issues
+		// rollback to close that exact transaction and re-probe the unchanged
+		// active path. Requiring Drained here strands every such recovery forever.
+		if !exists || transaction.Committed || !transaction.PolicyBound || transaction.Version != request.Version || transaction.Manifest != request.ManifestSHA256 || transaction.Path != request.Path || transaction.Status != request.ExpectedStatus || transaction.Samples != request.Samples || transaction.Target != target {
 			return hostdproto.UpdateGateResponse{}, errStandaloneUpdateGate
 		}
 		if workloads := g.config.Workloads(); workloads.Protected != 0 {
