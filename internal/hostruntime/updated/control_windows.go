@@ -218,7 +218,10 @@ func (c *windowsController) invoke(ctx context.Context, request ControlRequest) 
 		// automatic activation callback and could stage, stop services, and roll
 		// back a release merely because the user asked what version was current.
 		c.checkMu.Lock()
-		result, err := c.scheduler.CheckNow(ctx)
+		result, err := c.scheduler.ObserveCheck(ctx, func(ctx context.Context) (autoupdate.Result, error) {
+			workerResult, resolveErr := resolveRelease(ctx, c.activeVersion, c.resolve)
+			return autoupdate.Result{Version: workerResult.Version}, resolveErr
+		})
 		c.checkMu.Unlock()
 		response.Version, response.Updated, response.Observation = result.Version, false, c.scheduler.Snapshot()
 		return response, err

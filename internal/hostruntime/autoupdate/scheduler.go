@@ -101,14 +101,28 @@ func (s *Scheduler) Run(ctx context.Context) error {
 }
 
 func (s *Scheduler) CheckNow(ctx context.Context) (Result, error) {
-	err := s.runOnce(ctx)
-	state := s.Snapshot()
-	return Result{Version: state.Version, Updated: state.Updated}, err
+	return s.runCheck(ctx, s.config.Check)
 }
 
 func (s *Scheduler) runOnce(ctx context.Context) error {
+	_, err := s.runCheck(ctx, s.config.Check)
+	return err
+}
+
+// ObserveCheck records a caller-supplied check using the scheduler's normal
+// success and retry bookkeeping without invoking the automatic activation
+// callback. It is used by read-only control operations such as `pb update
+// check`.
+func (s *Scheduler) ObserveCheck(ctx context.Context, check Check) (Result, error) {
+	if check == nil {
+		return Result{}, ErrInvalidConfig
+	}
+	return s.runCheck(ctx, check)
+}
+
+func (s *Scheduler) runCheck(ctx context.Context, check Check) (Result, error) {
 	checkedAt := s.config.Now().UTC()
-	result, err := s.config.Check(ctx)
+	result, err := check(ctx)
 	s.mu.Lock()
 	state := s.state
 	state.CheckedAt = checkedAt
@@ -126,7 +140,7 @@ func (s *Scheduler) runOnce(ctx context.Context) error {
 	if s.config.Observe != nil {
 		s.config.Observe(state)
 	}
-	return err
+	return result, err
 }
 
 func (s *Scheduler) jitteredInterval() time.Duration {

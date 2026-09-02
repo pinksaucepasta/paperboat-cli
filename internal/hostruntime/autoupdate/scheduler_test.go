@@ -60,6 +60,40 @@ func TestSchedulerBackoffIsBoundedAndSuccessResetsFailures(t *testing.T) {
 	}
 }
 
+func TestObserveCheckRecordsReadOnlySuccessWithoutCallingConfiguredCheck(t *testing.T) {
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	var automaticCalls atomic.Uint32
+	scheduler, err := New(Config{
+		Check: func(context.Context) (Result, error) {
+			automaticCalls.Add(1)
+			return Result{Version: "activated", Updated: true}, nil
+		},
+		Now:    func() time.Time { return now },
+		Random: func(time.Duration) (time.Duration, error) { return 0, nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := scheduler.ObserveCheck(context.Background(), func(context.Context) (Result, error) {
+		return Result{}, errors.New("offline")
+	}); err == nil {
+		t.Fatal("read-only failure was not returned")
+	}
+	result, err := scheduler.ObserveCheck(context.Background(), func(context.Context) (Result, error) {
+		return Result{Version: "2026.09.02.6"}, nil
+	})
+	if err != nil || result.Version != "2026.09.02.6" || result.Updated {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if automaticCalls.Load() != 0 {
+		t.Fatalf("configured activation check called %d times", automaticCalls.Load())
+	}
+	state := scheduler.Snapshot()
+	if state.Version != result.Version || state.Updated || state.Failure != "" || state.Failures != 0 {
+		t.Fatalf("state=%+v", state)
+	}
+}
+
 func TestSchedulerCancellationStopsPromptly(t *testing.T) {
 	started := make(chan struct{})
 	scheduler, err := New(Config{Check: func(ctx context.Context) (Result, error) {

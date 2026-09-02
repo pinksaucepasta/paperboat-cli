@@ -197,7 +197,10 @@ func (s *Service) Check(ctx context.Context) (workerupdate.Result, error) {
 	// never call Manager.Check, which performs the full activation transaction
 	// (including the health-monitoring hold) and made `pb update check` appear
 	// hung while also unexpectedly installing an update.
-	result, err := s.scheduler.CheckNow(ctx)
+	result, err := s.scheduler.ObserveCheck(ctx, func(ctx context.Context) (autoupdate.Result, error) {
+		workerResult, resolveErr := resolveRelease(ctx, s.manager.ActiveVersion(), s.source.Resolve)
+		return autoupdate.Result{Version: workerResult.Version}, resolveErr
+	})
 	return workerupdate.Result{Version: result.Version, Updated: false}, err
 }
 
