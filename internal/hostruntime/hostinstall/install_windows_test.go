@@ -120,6 +120,17 @@ func TestWindowsHostRuntimeFailurePreservesManagedSSHState(t *testing.T) {
 	}
 }
 
+func TestWindowsRepairRequestCarriesPersistedReadinessEndpoint(t *testing.T) {
+	request := windowsRepairRequest(WindowsRuntimeConfig{
+		SetupMode: "host", OwnerSID: "S-1-5-21-1-2-3-4",
+		StateRoot:     `C:\Users\Pujan\AppData\Local\Paperboat\runtime`,
+		ListenAddress: "127.0.0.1:8080",
+	})
+	if request.SetupMode != "host" || request.OwnerSID != "S-1-5-21-1-2-3-4" || request.StateRoot == "" || request.HelperListenAddress != "127.0.0.1:8080" {
+		t.Fatalf("repair request=%+v", request)
+	}
+}
+
 func TestRunWindowsInstallPhaseReturnsNamedDeadline(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	started := make(chan struct{})

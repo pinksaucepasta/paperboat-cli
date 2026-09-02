@@ -842,13 +842,11 @@ func Repair(ctx context.Context) error {
 		return err
 	}
 	// Build the pending lifecycle boundary before reading or migrating the
-	// persisted config, then recover it before any security or service-state
-	// mutation. Missing binaries are valid at this recovery boundary.
+	// persisted config. Missing binaries are valid at this recovery boundary;
+	// host-mode SSH is restored below before this manager is allowed to recover
+	// a journal that may restart Hostd.
 	preflight, err := newWindowsLifecycleManager(Request{Platform: "windows"}, layout, true)
 	if err != nil {
-		return err
-	}
-	if err := preflight.Recover(ctx); err != nil {
 		return err
 	}
 	config, err := LoadWindowsRuntimeConfig()
@@ -865,7 +863,27 @@ func Repair(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	request := Request{SetupMode: config.SetupMode, OwnerSID: config.OwnerSID, StateRoot: config.StateRoot}
+	// The persisted helper endpoint is required both for the authenticated
+	// Hostd readiness probe and for deterministic recovery. Older repair code
+	// passed only the user state and owner SID, allowing SCM rollback to restore
+	// Hostd without an application probe or an SSH readiness boundary.
+	request := windowsRepairRequest(config)
+	sshPrepared := false
+	if request.SetupMode == "host" {
+		// Recover can restore a previously-running Hostd from its journal. Make
+		// PaperboatSshd healthy first so that rollback never starts Hostd against
+		// an absent managed-SSH loopback endpoint.
+		if err := installWindowsSSHAfterActivation(ctx, request, layout); err != nil {
+			return fmt.Errorf("prepare Paperboat OpenSSH before lifecycle recovery: %w", err)
+		}
+		sshPrepared = true
+	}
+	if err := preflight.Recover(ctx); err != nil {
+		if sshPrepared {
+			return errors.Join(err, cleanupWindowsSSHAfterRuntimeFailure(ctx, request, layout))
+		}
+		return err
+	}
 	if err := removeWindowsSSHBeforeActivation(ctx, request, layout); err != nil {
 		return err
 	}
@@ -891,6 +909,19 @@ func Repair(ctx context.Context) error {
 		return err
 	}
 	return installWindowsRoleServices(ctx, request, layout, "")
+}
+
+// windowsRepairRequest carries the persisted values needed to reconstruct the
+// native role boundary. In particular, HelperListenAddress enables the same
+// authenticated Hostd readiness probe used during installation; repair must
+// not silently fall back to SCM running state alone.
+func windowsRepairRequest(config WindowsRuntimeConfig) Request {
+	return Request{
+		SetupMode:           config.SetupMode,
+		OwnerSID:            config.OwnerSID,
+		StateRoot:           config.StateRoot,
+		HelperListenAddress: config.ListenAddress,
+	}
 }
 
 func reconcileWindowsRepairVersion(ctx context.Context, config WindowsRuntimeConfig, layout service.Layout) (WindowsRuntimeConfig, error) {
@@ -1187,14 +1218,17 @@ func installWindowsRoleServices(ctx context.Context, request Request, layout ser
 	if err != nil {
 		return err
 	}
-	if err := lifecycle.Recover(ctx); err != nil {
-		return err
-	}
-	if err := prepareWindowsLocalDaemonMigrationAndState(ctx, request.OwnerSID, request.StateRoot); err != nil {
-		return fmt.Errorf("migrate Paperboat local daemon task: %w", err)
-	}
 	return executeWindowsServiceInstallPlan(request.SetupMode,
 		func() error { return installWindowsSSHAfterActivation(ctx, request, layout) },
+		func() error {
+			if err := lifecycle.Recover(ctx); err != nil {
+				return err
+			}
+			if err := prepareWindowsLocalDaemonMigrationAndState(ctx, request.OwnerSID, request.StateRoot); err != nil {
+				return fmt.Errorf("migrate Paperboat local daemon task: %w", err)
+			}
+			return nil
+		},
 		func() error {
 			var lifecycleErr error
 			if upgradeMode == "" {

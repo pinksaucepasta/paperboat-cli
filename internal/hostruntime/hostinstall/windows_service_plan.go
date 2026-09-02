@@ -23,7 +23,13 @@ func windowsRuntimeServiceDefinitions(layout service.Layout) []windowsRuntimeSer
 	}
 }
 
-func executeWindowsServiceInstallPlan(setupMode string, installSSH, installRuntime, cleanupSSH func() error) error {
+// executeWindowsServiceInstallPlan is the ordering boundary for a Windows
+// role transition. Hostd performs a managed-SSH loopback reconciliation during
+// startup, so host-mode recovery must not restore/start Hostd until Paperboat's
+// dedicated OpenSSH service is installed and healthy. Keeping recovery in this
+// plan also covers a crash journal whose rollback would otherwise start Hostd
+// before the SSH callback runs.
+func executeWindowsServiceInstallPlan(setupMode string, installSSH, recoverRuntime, installRuntime, cleanupSSH func() error) error {
 	switch setupMode {
 	case "host":
 		// Hostd validates the managed SSH loopback endpoint as it starts. The
@@ -32,11 +38,17 @@ func executeWindowsServiceInstallPlan(setupMode string, installSSH, installRunti
 		if err := installSSH(); err != nil {
 			return err
 		}
+		if err := recoverRuntime(); err != nil {
+			return errors.Join(err, cleanupSSH())
+		}
 		if err := installRuntime(); err != nil {
 			return errors.Join(err, cleanupSSH())
 		}
 		return nil
 	case "client":
+		if err := recoverRuntime(); err != nil {
+			return err
+		}
 		if err := installRuntime(); err != nil {
 			return err
 		}

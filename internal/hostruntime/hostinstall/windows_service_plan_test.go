@@ -36,13 +36,16 @@ func TestWindowsHostServicesInstallSSHBeforeStartingRuntime(t *testing.T) {
 		events = append(events, "ssh")
 		return nil
 	}, func() error {
+		events = append(events, "recover")
+		return nil
+	}, func() error {
 		events = append(events, "runtime")
 		return nil
 	}, func() error {
 		events = append(events, "cleanup-ssh")
 		return nil
 	})
-	if err != nil || !reflect.DeepEqual(events, []string{"ssh", "runtime"}) {
+	if err != nil || !reflect.DeepEqual(events, []string{"ssh", "recover", "runtime"}) {
 		t.Fatalf("events=%q err=%v", events, err)
 	}
 }
@@ -54,13 +57,16 @@ func TestWindowsHostServicesCleanSSHWhenRuntimeFails(t *testing.T) {
 		events = append(events, "ssh")
 		return nil
 	}, func() error {
+		events = append(events, "recover")
+		return nil
+	}, func() error {
 		events = append(events, "runtime")
 		return runtimeFailure
 	}, func() error {
 		events = append(events, "cleanup-ssh")
 		return nil
 	})
-	if !errors.Is(err, runtimeFailure) || !reflect.DeepEqual(events, []string{"ssh", "runtime", "cleanup-ssh"}) {
+	if !errors.Is(err, runtimeFailure) || !reflect.DeepEqual(events, []string{"ssh", "recover", "runtime", "cleanup-ssh"}) {
 		t.Fatalf("events=%q err=%v", events, err)
 	}
 }
@@ -71,13 +77,37 @@ func TestWindowsClientServicesCleanSSHAfterRuntimeStarts(t *testing.T) {
 		events = append(events, "unexpected-ssh-install")
 		return nil
 	}, func() error {
+		events = append(events, "recover")
+		return nil
+	}, func() error {
 		events = append(events, "runtime")
 		return nil
 	}, func() error {
 		events = append(events, "cleanup-ssh")
 		return nil
 	})
-	if err != nil || !reflect.DeepEqual(events, []string{"runtime", "cleanup-ssh"}) {
+	if err != nil || !reflect.DeepEqual(events, []string{"recover", "runtime", "cleanup-ssh"}) {
+		t.Fatalf("events=%q err=%v", events, err)
+	}
+}
+
+func TestWindowsHostServicesCleanSSHWhenRuntimeRecoveryFails(t *testing.T) {
+	var events []string
+	recoveryFailure := errors.New("recovery failed")
+	err := executeWindowsServiceInstallPlan("host", func() error {
+		events = append(events, "ssh")
+		return nil
+	}, func() error {
+		events = append(events, "recover")
+		return recoveryFailure
+	}, func() error {
+		events = append(events, "runtime")
+		return nil
+	}, func() error {
+		events = append(events, "cleanup-ssh")
+		return nil
+	})
+	if !errors.Is(err, recoveryFailure) || !reflect.DeepEqual(events, []string{"ssh", "recover", "cleanup-ssh"}) {
 		t.Fatalf("events=%q err=%v", events, err)
 	}
 }
