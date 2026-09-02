@@ -1440,6 +1440,13 @@ func (p *Pool) publishAvailabilityLocked(class peerquic.Class, state *classState
 	if snapshot, ok := p.availabilitySnapshotLocked(class); ok {
 		p.publishApplicationAvailabilityLocked(class, snapshot)
 	}
+	// Standby ownership is part of the pool state transition, not optional
+	// telemetry. Publish it while the exact selected/standby tuple is protected
+	// by the pool lock so callers that observe the adopted standby cannot race
+	// ahead of the asynchronous notification goroutine.
+	if owner, ok := notification.selectedConnection.(StandbyAware); ok {
+		owner.SetStandby(notification.fallbackConnection)
+	}
 	go p.publishAvailability(notification)
 }
 
@@ -1509,9 +1516,6 @@ func (p *Pool) publishAvailability(notification availabilityNotification) {
 		if owner, ok := notification.previousConnection.(PreferredAware); ok {
 			owner.SetPreferred(notification.selectedConnection)
 		}
-	}
-	if owner, ok := notification.selectedConnection.(StandbyAware); ok {
-		owner.SetStandby(notification.fallbackConnection)
 	}
 }
 

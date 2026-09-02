@@ -206,7 +206,7 @@ func TestCandidatePerformsReadyActivateAndFencesPriorWorker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := first.Ready(context.Background()); err != nil {
+	if _, err := candidateReady(t, first); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := first.Activate(context.Background()); err != nil {
@@ -216,7 +216,7 @@ func TestCandidatePerformsReadyActivateAndFencesPriorWorker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := second.Ready(context.Background()); err != nil {
+	if _, err := candidateReady(t, second); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := second.Activate(context.Background()); err != nil {
@@ -227,6 +227,22 @@ func TestCandidatePerformsReadyActivateAndFencesPriorWorker(t *testing.T) {
 	}
 	if err := second.Heartbeat(context.Background()); err != nil {
 		t.Fatalf("active worker heartbeat=%v", err)
+	}
+}
+
+func candidateReady(t *testing.T, candidate *Candidate) (Status, error) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		status, err := candidate.Ready(context.Background())
+		var operation *net.OpError
+		if err == nil || !errors.As(err, &operation) {
+			return status, err
+		}
+		if time.Now().After(deadline) {
+			return Status{}, err
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

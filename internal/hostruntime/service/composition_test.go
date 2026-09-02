@@ -12,15 +12,21 @@ import (
 )
 
 type fakeNativeController struct {
-	mu     sync.Mutex
-	status NativeControllerStatus
-	apply  int
-	start  int
-	stop   int
+	mu       sync.Mutex
+	status   NativeControllerStatus
+	apply    int
+	start    int
+	stop     int
+	startErr error
 }
 
 func (c *fakeNativeController) Apply(context.Context, string, bool) error { return nil }
-func (c *fakeNativeController) Remove(context.Context, string) error      { return nil }
+func (c *fakeNativeController) Remove(context.Context, string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.status = NativeControllerStatus{}
+	return nil
+}
 
 func (c *fakeNativeController) Inspect(context.Context, string) (NativeControllerStatus, error) {
 	c.mu.Lock()
@@ -47,6 +53,9 @@ func (c *fakeNativeController) Start(context.Context, string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.start++
+	if c.startErr != nil {
+		return c.startErr
+	}
 	c.status.Running, c.status.Ready = true, true
 	return nil
 }
@@ -324,6 +333,101 @@ func TestHostLifecycleManagerRollsBackPrivilegedHostWithSupervisorAndUpdater(t *
 	}
 	if controls[HostKind].start == 0 || controls[HostdKind].start == 0 || controls[UpdaterKind].start == 0 {
 		t.Fatalf("all three components must reach start before updater probe failure: host=%d hostd=%d updater=%d", controls[HostKind].start, controls[HostdKind].start, controls[UpdaterKind].start)
+	}
+}
+
+func TestLifecycleManagerRepairsMissingThirdComponentAtomically(t *testing.T) {
+	root := t.TempDir()
+	binary := filepath.Join(root, "pb")
+	if err := os.WriteFile(binary, []byte("binary"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	controls := []*fakeNativeController{
+		{status: NativeControllerStatus{Registered: true, Enabled: true, Running: true, Ready: true}},
+		{status: NativeControllerStatus{Registered: true, Enabled: true, Running: true, Ready: true}},
+		{},
+	}
+	kinds := []string{HostdKind, DaemonKind, UpdaterKind}
+	arguments := []string{"__runtime-hostd", "__runtime-local-daemon", "__runtime-updated"}
+	components := make([]TransactionalComponent, 0, len(kinds))
+	var updaterDefinition string
+	for index, kind := range kinds {
+		installer, err := New(Config{Platform: "linux", Kind: kind, ConfigRoot: root, Executable: binary, User: "root", Group: "root", Arguments: []string{arguments[index]}, Controller: controls[index]})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if index < 2 {
+			if err := atomicWrite(installer.DefinitionPath(), []byte("old "+kind), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		} else {
+			updaterDefinition = installer.DefinitionPath()
+		}
+		component, err := installer.NativeComponent(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		components = append(components, component)
+	}
+	manager, err := NewLifecycleManager(LifecycleConfig{StateRoot: filepath.Join(root, "state"), Components: components})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Repair(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for index, control := range controls {
+		status := control.snapshot()
+		if !status.Registered || !status.Enabled || !status.Running || !status.Ready {
+			t.Fatalf("component %s was not repaired: %+v", kinds[index], status)
+		}
+	}
+	if _, err := os.Stat(updaterDefinition); err != nil {
+		t.Fatalf("updater declaration was not restored: %v", err)
+	}
+}
+
+func TestLifecycleManagerRollsBackFirstTwoAfterThirdComponentFailure(t *testing.T) {
+	root := t.TempDir()
+	binary := filepath.Join(root, "pb")
+	if err := os.WriteFile(binary, []byte("binary"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	kinds := []string{HostdKind, DaemonKind, UpdaterKind}
+	arguments := []string{"__runtime-hostd", "__runtime-local-daemon", "__runtime-updated"}
+	failure := errors.New("updated start failed")
+	controls := []*fakeNativeController{{}, {}, {startErr: failure}}
+	components := make([]TransactionalComponent, 0, len(kinds))
+	installers := make([]*Installer, 0, len(kinds))
+	for index, kind := range kinds {
+		installer, err := New(Config{Platform: "linux", Kind: kind, ConfigRoot: root, Executable: binary, User: "root", Group: "root", Arguments: []string{arguments[index]}, Controller: controls[index]})
+		if err != nil {
+			t.Fatal(err)
+		}
+		component, err := installer.NativeComponent(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		installers = append(installers, installer)
+		components = append(components, component)
+	}
+	manager, err := NewLifecycleManager(LifecycleConfig{StateRoot: filepath.Join(root, "state"), Components: components})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Install(context.Background()); !errors.Is(err, failure) {
+		t.Fatalf("install err=%v, want third-component failure", err)
+	}
+	for index, control := range controls {
+		if got := control.snapshot(); got != (NativeControllerStatus{}) {
+			t.Fatalf("component %s was not rolled back: %+v", kinds[index], got)
+		}
+		if _, statErr := os.Stat(installers[index].DefinitionPath()); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("component %s declaration remains: %v", kinds[index], statErr)
+		}
+	}
+	if _, statErr := os.Stat(filepath.Join(root, "state", "service-lifecycle.json")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("lifecycle journal remains: %v", statErr)
 	}
 }
 

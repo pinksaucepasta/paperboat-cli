@@ -1120,7 +1120,7 @@ func uninstallWindows(ctx context.Context, purge bool) error {
 	if err != nil {
 		return err
 	}
-	lifecycle, err := newWindowsLifecycleManagerForInstallers(layout, hostd, updater, nil)
+	lifecycle, err := newWindowsLifecycleManagerForInstallers(layout, hostd, daemon, updater, nil)
 	if err != nil {
 		return err
 	}
@@ -1130,9 +1130,6 @@ func uninstallWindows(ctx context.Context, purge bool) error {
 		return err
 	}
 	if err := lifecycle.Uninstall(ctx); err != nil {
-		return err
-	}
-	if err := daemon.Uninstall(ctx); err != nil {
 		return err
 	}
 	if err := winenv.RemoveMachinePath(filepath.Dir(layout.Binary)); err != nil {
@@ -1244,23 +1241,40 @@ func removeWindowsActivatorService(ctx context.Context, layout service.Layout) e
 }
 
 func installWindowsRoleServices(ctx context.Context, request Request, layout service.Layout, upgradeMode string) error {
+	hostd, updater, daemon, err := windowsRoleInstallers(layout, false)
+	if err != nil {
+		return err
+	}
+	lifecycle, err := newWindowsLifecycleManagerForInstallers(layout, hostd, daemon, updater, &request)
+	if err != nil {
+		return err
+	}
 	return executeWindowsServiceInstallPlan(request.SetupMode,
 		func() error { return installWindowsSSHAfterActivation(ctx, request, layout) },
 		func() error {
+			if err := lifecycle.Recover(ctx); err != nil {
+				return err
+			}
 			if err := prepareWindowsLocalDaemonMigrationAndState(ctx, request.OwnerSID, request.StateRoot); err != nil {
 				return fmt.Errorf("migrate Paperboat local daemon task: %w", err)
 			}
 			return nil
 		},
 		func() error {
-			if err := installWindowsServices(ctx, layout, upgradeMode); err != nil {
+			var err error
+			if upgradeMode == "" {
+				err = lifecycle.Install(ctx)
+			} else {
+				err = lifecycle.Repair(ctx)
+			}
+			if err != nil {
 				return err
 			}
 			if err := waitWindowsLocalDaemonReady(ctx, request.OwnerSID, request.StateRoot); err != nil {
-				return err
+				return errors.Join(err, lifecycle.Uninstall(ctx))
 			}
 			if err := localdaemon.RemoveWindowsLegacyTask(ctx, request.OwnerSID); err != nil {
-				return err
+				return errors.Join(err, lifecycle.Uninstall(ctx))
 			}
 			return nil
 		},
@@ -1268,81 +1282,27 @@ func installWindowsRoleServices(ctx context.Context, request Request, layout ser
 	)
 }
 
-// installWindowsServices preserves the native dependency order proven by the
-// Windows acceptance path: Hostd, LocalDaemon, then Updated. Updated repairs
-// LocalDaemon before publishing readiness, so starting it while the outer
-// installer holds the LocalDaemon migration mutex creates a cross-process
-// lock cycle. Keep each independently rollback-safe installer in the proven
-// order rather than composing Updated into that outer lock transaction.
-func installWindowsServices(ctx context.Context, layout service.Layout, upgradeMode string) error {
-	for _, item := range windowsRuntimeServiceDefinitions(layout) {
-		installer, err := service.New(service.Config{
-			Platform: "windows", Kind: item.kind, ConfigRoot: WindowsProgramDataRoot(),
-			Executable: item.executable, User: "Paperboat", Group: "Paperboat",
-			Arguments: item.arguments, Controller: service.WindowsController{}, UpgradeMode: upgradeMode,
-		})
-		if err != nil {
-			return err
-		}
-		if err := installer.Install(ctx); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func repairWindowsServices(ctx context.Context, layout service.Layout, kinds ...string) error {
-	wanted := make(map[string]struct{}, len(kinds))
-	for _, kind := range kinds {
-		wanted[kind] = struct{}{}
-	}
-	for _, item := range windowsRuntimeServiceDefinitions(layout) {
-		if len(wanted) != 0 {
-			if _, ok := wanted[item.kind]; !ok {
-				continue
-			}
-		}
-		installer, err := service.New(service.Config{
-			Platform: "windows", Kind: item.kind, ConfigRoot: WindowsProgramDataRoot(),
-			Executable: item.executable, User: "Paperboat", Group: "Paperboat",
-			Arguments: item.arguments, Controller: service.WindowsController{}, UpgradeMode: service.UpgradeReload,
-		})
-		if err != nil {
-			return err
-		}
-		if err := installer.Install(ctx); err != nil {
-			return err
-		}
-		controller := service.WindowsController{}
-		if err := controller.Start(ctx, installer.DefinitionPath()); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // repairWindowsRoleServices repairs the native role declarations after the
 // persisted config and runtime binary have been restored. PaperboatSshd is
 // intentionally not installed here: host-mode repair establishes it before
 // lifecycle recovery and keeps it in place until this final phase succeeds.
 func repairWindowsRoleServices(ctx context.Context, request Request, layout service.Layout) error {
-	// Repair existing declarations without restarting healthy services. The
-	// post-overhaul Installer.Install path stopped each existing role in turn;
-	// restarting Hostd also replaced the updater's control dependency while
-	// repair was waiting for Updated readiness. Restore the old idempotent
-	// declaration repair behavior and explicitly start only stopped roles.
-	// Updated refuses to run an independently supplied binary until that exact
-	// version is present in signed release metadata. Repairing Hostd and the
-	// local daemon must not therefore wait for an uncommitted updater candidate.
-	// Signed release activation installs Updated after the version is committed.
-	if err := repairWindowsServices(ctx, layout, service.HostdKind, service.DaemonKind); err != nil {
+	hostd, updater, daemon, err := windowsRoleInstallers(layout, false)
+	if err != nil {
+		return err
+	}
+	lifecycle, err := newWindowsLifecycleManagerForInstallers(layout, hostd, daemon, updater, &request)
+	if err != nil {
+		return err
+	}
+	if err := lifecycle.Repair(ctx); err != nil {
 		return err
 	}
 	if err := waitWindowsLocalDaemonReady(ctx, request.OwnerSID, request.StateRoot); err != nil {
-		return err
+		return errors.Join(err, lifecycle.Uninstall(ctx))
 	}
 	if err := localdaemon.RemoveWindowsLegacyTask(ctx, request.OwnerSID); err != nil {
-		return err
+		return errors.Join(err, lifecycle.Uninstall(ctx))
 	}
 	return nil
 }
@@ -1372,14 +1332,14 @@ func windowsRoleInstallers(layout service.Layout, allowMissingExecutable bool) (
 }
 
 func newWindowsLifecycleManager(request Request, layout service.Layout, allowMissingExecutable bool) (*service.LifecycleManager, error) {
-	hostd, updater, _, err := windowsRoleInstallers(layout, allowMissingExecutable)
+	hostd, updater, daemon, err := windowsRoleInstallers(layout, allowMissingExecutable)
 	if err != nil {
 		return nil, err
 	}
-	return newWindowsLifecycleManagerForInstallers(layout, hostd, updater, &request)
+	return newWindowsLifecycleManagerForInstallers(layout, hostd, daemon, updater, &request)
 }
 
-func newWindowsLifecycleManagerForInstallers(_ service.Layout, hostd, updater *service.Installer, request *Request) (*service.LifecycleManager, error) {
+func newWindowsLifecycleManagerForInstallers(_ service.Layout, hostd, daemon, updater *service.Installer, request *Request) (*service.LifecycleManager, error) {
 	var probe func(context.Context) error
 	if request != nil && request.HelperListenAddress != "" {
 		var err error
@@ -1388,7 +1348,28 @@ func newWindowsLifecycleManagerForInstallers(_ service.Layout, hostd, updater *s
 			return nil, err
 		}
 	}
-	return service.NewHostLifecycleManager(service.HostLifecycleConfig{StateRoot: filepath.Join(WindowsProgramDataRoot(), "service-lifecycle"), Hostd: hostd, Updater: updater, HostdProbe: probe})
+	hostdComponent, err := hostd.NativeComponent(probe)
+	if err != nil {
+		return nil, err
+	}
+	var daemonProbe func(context.Context) error
+	if request != nil && request.OwnerSID != "" && request.StateRoot != "" {
+		daemonProbe = func(ctx context.Context) error {
+			return waitWindowsLocalDaemonReady(ctx, request.OwnerSID, request.StateRoot)
+		}
+	}
+	daemonComponent, err := daemon.NativeComponent(daemonProbe)
+	if err != nil {
+		return nil, err
+	}
+	updaterComponent, err := updater.NativeComponent(nil)
+	if err != nil {
+		return nil, err
+	}
+	return service.NewLifecycleManager(service.LifecycleConfig{
+		StateRoot:  filepath.Join(WindowsProgramDataRoot(), "service-lifecycle"),
+		Components: []service.TransactionalComponent{hostdComponent, daemonComponent, updaterComponent},
+	})
 }
 
 func Validate(request Request, _ int) error {

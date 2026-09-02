@@ -82,10 +82,11 @@ func TestStandaloneUpdateGateCompletesWithNoProtectedWorkloads(t *testing.T) {
 	}
 }
 
-func TestStandaloneUpdateGateRejectsDrainWithProtectedWorkloads(t *testing.T) {
+func TestStandaloneUpdateGateFencesProtectedWorkloadsAcrossCutover(t *testing.T) {
 	health := http.NewServeMux()
 	registerHostLivenessAndDiagnostics(health, nil, nil, nil, nil)
-	gate, err := newStandaloneUpdateGate(standaloneUpdateGateConfig{MachineID: "machine_01", StatePath: filepath.Join(t.TempDir(), "gate.json"), Health: health, Workloads: func() hostdproto.WorkloadStatus { return hostdproto.WorkloadStatus{Generation: 2, Protected: 1} }})
+	workloads := hostdproto.WorkloadStatus{Generation: 2, Protected: 3}
+	gate, err := newStandaloneUpdateGate(standaloneUpdateGateConfig{MachineID: "machine_01", StatePath: filepath.Join(t.TempDir(), "gate.json"), Health: health, Workloads: func() hostdproto.WorkloadStatus { return workloads }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,24 +95,59 @@ func TestStandaloneUpdateGateRejectsDrainWithProtectedWorkloads(t *testing.T) {
 	if _, err := gate.HandleUpdateGate(context.Background(), standaloneGateRequest(hostdproto.UpdateGateCandidate, &target)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := gate.HandleUpdateGate(context.Background(), standaloneGateRequest(hostdproto.UpdateGateDrain, &target)); !errors.Is(err, errStandaloneUpdateGate) {
-		t.Fatalf("protected workload drain error=%v", err)
+	if _, err := gate.HandleUpdateGate(context.Background(), standaloneGateRequest(hostdproto.UpdateGateDrain, &target)); err != nil {
+		t.Fatalf("stable workload drain: %v", err)
+	}
+	workloads.Generation++
+	if _, err := gate.HandleUpdateGate(context.Background(), standaloneGateRequest(hostdproto.UpdateGateStability, &target)); !errors.Is(err, errStandaloneUpdateGate) {
+		t.Fatalf("changed workload fence error=%v", err)
 	}
 }
 
-func TestStandaloneUpdateGateRollsBackAfterDrainFailsBeforeRecordingDrain(t *testing.T) {
+func TestStandaloneUpdateGateCompletesWithStableProtectedWorkloads(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "gate.json")
+	workloads := hostdproto.WorkloadStatus{Generation: 7, Protected: 4}
 	health := http.NewServeMux()
 	registerHostLivenessAndDiagnostics(health, nil, nil, nil, nil)
-	protected := true
+	config := standaloneUpdateGateConfig{MachineID: "machine_01", StatePath: statePath, Health: health, Workloads: func() hostdproto.WorkloadStatus { return workloads }}
+	gate, err := newStandaloneUpdateGate(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetResponse, err := gate.HandleUpdateGate(context.Background(), standaloneGateRequest(hostdproto.UpdateGateTarget, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := targetResponse.Target
+	for _, operation := range []string{hostdproto.UpdateGateCandidate, hostdproto.UpdateGateDrain} {
+		if _, err := gate.HandleUpdateGate(context.Background(), standaloneGateRequest(operation, &target)); err != nil {
+			t.Fatalf("%s: %v", operation, err)
+		}
+	}
+	reloaded, err := newStandaloneUpdateGate(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, operation := range []string{hostdproto.UpdateGateStability, hostdproto.UpdateGateCommit} {
+		if _, err := reloaded.HandleUpdateGate(context.Background(), standaloneGateRequest(operation, &target)); err != nil {
+			t.Fatalf("%s: %v", operation, err)
+		}
+	}
+}
+
+func TestStandaloneUpdateGateRollsBackAfterInvalidWorkloadSnapshot(t *testing.T) {
+	health := http.NewServeMux()
+	registerHostLivenessAndDiagnostics(health, nil, nil, nil, nil)
+	valid := false
 	gate, err := newStandaloneUpdateGate(standaloneUpdateGateConfig{
 		MachineID: "machine_01",
 		StatePath: filepath.Join(t.TempDir(), "gate.json"),
 		Health:    health,
 		Workloads: func() hostdproto.WorkloadStatus {
-			if protected {
+			if valid {
 				return hostdproto.WorkloadStatus{Generation: 2, Protected: 1}
 			}
-			return hostdproto.WorkloadStatus{Generation: 2}
+			return hostdproto.WorkloadStatus{Protected: 1}
 		},
 	})
 	if err != nil {
@@ -128,7 +164,7 @@ func TestStandaloneUpdateGateRollsBackAfterDrainFailsBeforeRecordingDrain(t *tes
 	if _, err := gate.HandleUpdateGate(context.Background(), standaloneGateRequest(hostdproto.UpdateGateDrain, &target)); !errors.Is(err, errStandaloneUpdateGate) {
 		t.Fatalf("protected workload drain error=%v", err)
 	}
-	protected = false
+	valid = true
 	if _, err := gate.HandleUpdateGate(context.Background(), standaloneGateRequest(hostdproto.UpdateGateRollback, &target)); err != nil {
 		t.Fatalf("rollback after failed drain: %v", err)
 	}

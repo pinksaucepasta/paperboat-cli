@@ -37,14 +37,18 @@ type standaloneUpdateGate struct {
 }
 
 type standaloneUpdateTransaction struct {
-	Version, Manifest, Path string
-	Status                  int
-	Samples                 uint16
-	Target                  hostdproto.UpdateGateTargetBinding
-	Created                 time.Time
-	PolicyBound             bool
-	Drained                 bool
-	Committed               bool
+	Version            string
+	Manifest           string
+	Path               string
+	Status             int
+	Samples            uint16
+	Target             hostdproto.UpdateGateTargetBinding
+	Created            time.Time
+	PolicyBound        bool
+	Drained            bool
+	Committed          bool
+	WorkloadGeneration uint64
+	ProtectedWorkloads uint64
 }
 
 type standaloneUpdateGateDisk struct {
@@ -110,13 +114,24 @@ func (g *standaloneUpdateGate) HandleUpdateGate(ctx context.Context, request hos
 		if !exists || transaction.Committed || !transaction.PolicyBound || transaction.Version != request.Version || transaction.Manifest != request.ManifestSHA256 || transaction.Target != target {
 			return hostdproto.UpdateGateResponse{}, errStandaloneUpdateGate
 		}
-		if workloads := g.config.Workloads(); workloads.Protected != 0 {
+		workloads := g.config.Workloads()
+		if workloads.Generation == 0 && workloads.Protected != 0 {
 			return hostdproto.UpdateGateResponse{}, errStandaloneUpdateGate
 		}
+		// Sessions, previews, tunnels, and transfers are owned by stable hostd,
+		// not by the replaceable worker. Their presence must therefore fence the
+		// cutover, not block every update forever. Record the exact stable-host
+		// snapshot and require it to remain unchanged through activation.
 		transaction.Drained = true
+		transaction.WorkloadGeneration = workloads.Generation
+		transaction.ProtectedWorkloads = workloads.Protected
 		g.transactions[request.TransactionID] = transaction
 	case hostdproto.UpdateGateStability:
 		if !exists || transaction.Committed || !transaction.Drained || transaction.Version != request.Version || transaction.Manifest != request.ManifestSHA256 || transaction.Path != request.Path || transaction.Status != request.ExpectedStatus || transaction.Samples != request.Samples || transaction.Target != target {
+			return hostdproto.UpdateGateResponse{}, errStandaloneUpdateGate
+		}
+		workloads := g.config.Workloads()
+		if workloads.Generation != transaction.WorkloadGeneration || workloads.Protected != transaction.ProtectedWorkloads {
 			return hostdproto.UpdateGateResponse{}, errStandaloneUpdateGate
 		}
 		deadline := g.config.Now().Add(time.Duration(request.WindowMillis) * time.Millisecond)
@@ -144,9 +159,6 @@ func (g *standaloneUpdateGate) HandleUpdateGate(ctx context.Context, request hos
 		if !exists || transaction.Committed || !transaction.PolicyBound || transaction.Version != request.Version || transaction.Manifest != request.ManifestSHA256 || transaction.Path != request.Path || transaction.Status != request.ExpectedStatus || transaction.Samples != request.Samples || transaction.Target != target {
 			return hostdproto.UpdateGateResponse{}, errStandaloneUpdateGate
 		}
-		if workloads := g.config.Workloads(); workloads.Protected != 0 {
-			return hostdproto.UpdateGateResponse{}, errStandaloneUpdateGate
-		}
 		if err := g.probe(ctx, request); err != nil {
 			return hostdproto.UpdateGateResponse{}, err
 		}
@@ -159,6 +171,10 @@ func (g *standaloneUpdateGate) HandleUpdateGate(ctx context.Context, request hos
 			return hostdproto.UpdateGateResponse{}, errStandaloneUpdateGate
 		}
 		if !exists || !transaction.PolicyBound || !transaction.Drained || transaction.Version != request.Version || transaction.Manifest != request.ManifestSHA256 || transaction.Target != target {
+			return hostdproto.UpdateGateResponse{}, errStandaloneUpdateGate
+		}
+		workloads := g.config.Workloads()
+		if workloads.Generation != transaction.WorkloadGeneration || workloads.Protected != transaction.ProtectedWorkloads {
 			return hostdproto.UpdateGateResponse{}, errStandaloneUpdateGate
 		}
 		transaction.Drained, transaction.Committed = false, true
@@ -246,7 +262,7 @@ func (g *standaloneUpdateGate) load() error {
 	}
 	for id, transaction := range disk.Transactions {
 		request := hostdproto.UpdateGateRequest{Operation: hostdproto.UpdateGateTarget, TransactionID: id, Version: transaction.Version, ManifestSHA256: transaction.Manifest}
-		if request.Validate() != nil || transaction.Target != g.target() || transaction.Target.Validate() != nil || transaction.Created.IsZero() || transaction.Committed && transaction.Drained || transaction.Drained && !transaction.PolicyBound {
+		if request.Validate() != nil || transaction.Target != g.target() || transaction.Target.Validate() != nil || transaction.Created.IsZero() || transaction.Committed && transaction.Drained || transaction.Drained && (!transaction.PolicyBound || transaction.WorkloadGeneration == 0 && transaction.ProtectedWorkloads != 0) || !transaction.Drained && !transaction.Committed && (transaction.WorkloadGeneration != 0 || transaction.ProtectedWorkloads != 0) {
 			return errStandaloneUpdateGate
 		}
 	}
