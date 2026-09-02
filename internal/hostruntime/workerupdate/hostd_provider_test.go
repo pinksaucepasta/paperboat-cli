@@ -20,7 +20,7 @@ func (c *recordingHostdGateClient) UpdateGate(_ context.Context, request hostdpr
 }
 
 func TestHostdDeploymentProviderCarriesExactSignedPolicyAndTargetFence(t *testing.T) {
-	target := hostdproto.UpdateGateTargetBinding{MachineID: "machine_01", AccountID: "account_01", HostID: "host_01", TunnelID: "tunnel_01", ConnectorID: "connector_01", EdgeNodeID: "edge_01", ProcessEpoch: 2, SessionGeneration: 3, ConfigGeneration: 4, RouteGeneration: 5, FailureDomain: "hel1-a"}
+	target := hostdproto.UpdateGateTargetBinding{Scope: hostdproto.UpdateGateScopeTunnel, MachineID: "machine_01", AccountID: "account_01", HostID: "host_01", TunnelID: "tunnel_01", ConnectorID: "connector_01", EdgeNodeID: "edge_01", ProcessEpoch: 2, SessionGeneration: 3, ConfigGeneration: 4, RouteGeneration: 5, FailureDomain: "hel1-a"}
 	client := &recordingHostdGateClient{target: target}
 	provider := HostdDeploymentProvider{Client: client}
 	resolved, err := provider.CurrentTarget(context.Background(), TargetRequest{TransactionID: "transaction_01", Version: "2026.08.31.1", ManifestSHA256: strings.Repeat("a", 64)})

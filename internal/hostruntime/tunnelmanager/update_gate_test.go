@@ -57,7 +57,7 @@ func updateGateActive(t *testing.T, tunnelID string, generation uint64) Active {
 }
 
 func TestUpdateGateRejectsEveryStaleLiveTargetFence(t *testing.T) {
-	current := hostdproto.UpdateGateTargetBinding{MachineID: "machine_01", AccountID: "account_01", HostID: "host_01", TunnelID: "tunnel_01", ConnectorID: "connector_01", EdgeNodeID: "edge_01", ProcessEpoch: 2, SessionGeneration: 3, ConfigGeneration: 4, RouteGeneration: 5, FailureDomain: "hel1-a"}
+	current := hostdproto.UpdateGateTargetBinding{Scope: hostdproto.UpdateGateScopeTunnel, MachineID: "machine_01", AccountID: "account_01", HostID: "host_01", TunnelID: "tunnel_01", ConnectorID: "connector_01", EdgeNodeID: "edge_01", ProcessEpoch: 2, SessionGeneration: 3, ConfigGeneration: 4, RouteGeneration: 5, FailureDomain: "hel1-a"}
 	request := hostdproto.UpdateGateRequest{Operation: hostdproto.UpdateGateCandidate, ExpectedTarget: &current}
 	if !matchesUpdateGateTarget(request, current) {
 		t.Fatal("exact target rejected")

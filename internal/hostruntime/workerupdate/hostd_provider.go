@@ -71,7 +71,7 @@ func (p HostdDeploymentProvider) call(ctx context.Context, request hostdproto.Up
 }
 
 func deploymentTargetFromHostd(value hostdproto.UpdateGateTargetBinding) (DeploymentTarget, error) {
-	target := DeploymentTarget{MachineID: value.MachineID, AccountID: value.AccountID, HostID: value.HostID, TunnelID: value.TunnelID, ConnectorID: value.ConnectorID, EdgeNodeID: value.EdgeNodeID, ProcessEpoch: value.ProcessEpoch, SessionGeneration: value.SessionGeneration, ConfigGeneration: value.ConfigGeneration, RouteGeneration: value.RouteGeneration, FailureDomain: value.FailureDomain}
+	target := DeploymentTarget{Scope: value.Scope, MachineID: value.MachineID, AccountID: value.AccountID, HostID: value.HostID, TunnelID: value.TunnelID, ConnectorID: value.ConnectorID, EdgeNodeID: value.EdgeNodeID, ProcessEpoch: value.ProcessEpoch, SessionGeneration: value.SessionGeneration, ConfigGeneration: value.ConfigGeneration, RouteGeneration: value.RouteGeneration, FailureDomain: value.FailureDomain}
 	if validateDeploymentTarget(target) != nil {
 		return DeploymentTarget{}, ErrHostdActivationProvider
 	}
@@ -79,7 +79,7 @@ func deploymentTargetFromHostd(value hostdproto.UpdateGateTargetBinding) (Deploy
 }
 
 func hostdTarget(value DeploymentTarget) hostdproto.UpdateGateTargetBinding {
-	return hostdproto.UpdateGateTargetBinding{MachineID: value.MachineID, AccountID: value.AccountID, HostID: value.HostID, TunnelID: value.TunnelID, ConnectorID: value.ConnectorID, EdgeNodeID: value.EdgeNodeID, ProcessEpoch: value.ProcessEpoch, SessionGeneration: value.SessionGeneration, ConfigGeneration: value.ConfigGeneration, RouteGeneration: value.RouteGeneration, FailureDomain: value.FailureDomain}
+	return hostdproto.UpdateGateTargetBinding{Scope: value.Scope, MachineID: value.MachineID, AccountID: value.AccountID, HostID: value.HostID, TunnelID: value.TunnelID, ConnectorID: value.ConnectorID, EdgeNodeID: value.EdgeNodeID, ProcessEpoch: value.ProcessEpoch, SessionGeneration: value.SessionGeneration, ConfigGeneration: value.ConfigGeneration, RouteGeneration: value.RouteGeneration, FailureDomain: value.FailureDomain}
 }
 
 var _ SignedDeploymentProvider = HostdDeploymentProvider{}

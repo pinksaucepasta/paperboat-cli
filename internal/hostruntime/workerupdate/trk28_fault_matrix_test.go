@@ -204,7 +204,7 @@ func TestTRK28EdgeCanaryFailurePreservesOldGeneration(t *testing.T) {
 func TestTRK28ExactGenerationFenceRejectsZeroValues(t *testing.T) {
 	base := deploymentTarget()
 	toWire := func(target DeploymentTarget) hostdproto.UpdateGateTargetBinding {
-		return hostdproto.UpdateGateTargetBinding{MachineID: target.MachineID, AccountID: target.AccountID, HostID: target.HostID, TunnelID: target.TunnelID, ConnectorID: target.ConnectorID, EdgeNodeID: target.EdgeNodeID, ProcessEpoch: target.ProcessEpoch, SessionGeneration: target.SessionGeneration, ConfigGeneration: target.ConfigGeneration, RouteGeneration: target.RouteGeneration, FailureDomain: target.FailureDomain}
+		return hostdproto.UpdateGateTargetBinding{Scope: target.Scope, MachineID: target.MachineID, AccountID: target.AccountID, HostID: target.HostID, TunnelID: target.TunnelID, ConnectorID: target.ConnectorID, EdgeNodeID: target.EdgeNodeID, ProcessEpoch: target.ProcessEpoch, SessionGeneration: target.SessionGeneration, ConfigGeneration: target.ConfigGeneration, RouteGeneration: target.RouteGeneration, FailureDomain: target.FailureDomain}
 	}
 	valid := toWire(base)
 	request := hostdproto.UpdateGateRequest{Operation: hostdproto.UpdateGateCommit, TransactionID: "transaction_1", Version: "2026.08.31.1", ManifestSHA256: strings.Repeat("a", 64), ExpectedTarget: &valid}

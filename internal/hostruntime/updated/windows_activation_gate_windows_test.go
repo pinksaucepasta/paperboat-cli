@@ -49,6 +49,7 @@ func (p *windowsGateTestProvider) Commit(context.Context, workerupdate.CommitReq
 func TestWindowsActivationGateRequestsUseCandidateThenActiveState(t *testing.T) {
 	journal := testWindowsActivationJournal()
 	provider := &windowsGateTestProvider{target: workerupdate.DeploymentTarget{
+		Scope:     hostdproto.UpdateGateScopeTunnel,
 		MachineID: "machine-1", AccountID: "account-1", HostID: "host-1", TunnelID: "tunnel-1", ConnectorID: "connector-1", EdgeNodeID: "edge-1", ProcessEpoch: 2, SessionGeneration: 3, ConfigGeneration: 4, RouteGeneration: 5, FailureDomain: "edge-a",
 	}}
 	gate, err := workerupdate.NewDeploymentActivationGate(workerupdate.DeploymentActivationGateConfig{Provider: provider})

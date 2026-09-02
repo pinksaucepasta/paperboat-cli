@@ -16,6 +16,7 @@ import (
 var ErrInvalidDeploymentGate = errors.New("invalid signed update deployment gate")
 
 type DeploymentTarget struct {
+	Scope             string
 	MachineID         string
 	AccountID         string
 	HostID            string
@@ -117,12 +118,13 @@ func (g *deploymentActivationGate) Candidate(ctx context.Context, request GateRe
 	if err != nil {
 		return err
 	}
+	standalone := target.Scope == hostdproto.UpdateGateScopeStandalone
 	return g.config.Provider.ProbeCandidate(ctx, CanaryProbeRequest{
 		TransactionID: request.TransactionID, Version: request.Candidate.Version,
 		ManifestSHA256: request.Candidate.ManifestSHA256, Target: target,
 		Path: request.Candidate.CanaryPath, ExpectedStatus: request.Candidate.CanaryStatus,
 		Timeout: deadlineBudget(ctx), Samples: request.Candidate.CanarySamples,
-		RequireEdge: true, RequireConnector: true, RequireRoute: true, RequireOrigin: true,
+		RequireEdge: !standalone, RequireConnector: !standalone, RequireRoute: !standalone, RequireOrigin: !standalone,
 	})
 }
 
@@ -222,12 +224,26 @@ func (r GateRequest) validateState(state string) error {
 var deploymentIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 
 func validateDeploymentTarget(target DeploymentTarget) error {
-	for _, value := range []string{target.MachineID, target.AccountID, target.HostID, target.TunnelID, target.ConnectorID, target.EdgeNodeID, target.FailureDomain} {
+	for _, value := range []string{target.MachineID, target.FailureDomain} {
 		if !deploymentIDPattern.MatchString(value) {
 			return ErrInvalidDeploymentGate
 		}
 	}
-	if target.ProcessEpoch == 0 || target.SessionGeneration == 0 || target.ConfigGeneration == 0 || target.RouteGeneration == 0 {
+	switch target.Scope {
+	case hostdproto.UpdateGateScopeStandalone:
+		if target.AccountID != "" || target.HostID != "" || target.TunnelID != "" || target.ConnectorID != "" || target.EdgeNodeID != "" || target.ProcessEpoch != 0 || target.SessionGeneration != 0 || target.ConfigGeneration != 0 || target.RouteGeneration != 0 {
+			return ErrInvalidDeploymentGate
+		}
+	case hostdproto.UpdateGateScopeTunnel:
+		for _, value := range []string{target.AccountID, target.HostID, target.TunnelID, target.ConnectorID, target.EdgeNodeID} {
+			if !deploymentIDPattern.MatchString(value) {
+				return ErrInvalidDeploymentGate
+			}
+		}
+		if target.ProcessEpoch == 0 || target.SessionGeneration == 0 || target.ConfigGeneration == 0 || target.RouteGeneration == 0 {
+			return ErrInvalidDeploymentGate
+		}
+	default:
 		return ErrInvalidDeploymentGate
 	}
 	return nil

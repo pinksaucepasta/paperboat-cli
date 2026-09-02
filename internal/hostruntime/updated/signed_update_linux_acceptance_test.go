@@ -500,7 +500,7 @@ type signedAcceptanceDeploymentProvider struct {
 }
 
 func signedAcceptanceTarget() workerupdate.DeploymentTarget {
-	return workerupdate.DeploymentTarget{MachineID: "mch_trk28_acceptance", AccountID: "acct_trk28", HostID: "host_trk28", TunnelID: "tunnel_trk28", ConnectorID: "connector_trk28", EdgeNodeID: "edge_trk28", ProcessEpoch: 2, SessionGeneration: 3, ConfigGeneration: 4, RouteGeneration: 5, FailureDomain: "hetzner_edge"}
+	return workerupdate.DeploymentTarget{Scope: hostdproto.UpdateGateScopeTunnel, MachineID: "mch_trk28_acceptance", AccountID: "acct_trk28", HostID: "host_trk28", TunnelID: "tunnel_trk28", ConnectorID: "connector_trk28", EdgeNodeID: "edge_trk28", ProcessEpoch: 2, SessionGeneration: 3, ConfigGeneration: 4, RouteGeneration: 5, FailureDomain: "hetzner_edge"}
 }
 
 func (p *signedAcceptanceDeploymentProvider) CurrentTarget(context.Context, workerupdate.TargetRequest) (workerupdate.DeploymentTarget, error) {

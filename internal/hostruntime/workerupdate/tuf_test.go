@@ -24,7 +24,7 @@ func (c *failureDomainClient) UpdateGate(_ context.Context, request hostdproto.U
 }
 
 func validFailureDomainTarget(machineID, domain string) hostdproto.UpdateGateTargetBinding {
-	return hostdproto.UpdateGateTargetBinding{MachineID: machineID, AccountID: "account_1", HostID: "host_1", TunnelID: "tunnel_1", ConnectorID: "connector_1", EdgeNodeID: "edge_1", ProcessEpoch: 2, SessionGeneration: 3, ConfigGeneration: 4, RouteGeneration: 5, FailureDomain: domain}
+	return hostdproto.UpdateGateTargetBinding{Scope: hostdproto.UpdateGateScopeTunnel, MachineID: machineID, AccountID: "account_1", HostID: "host_1", TunnelID: "tunnel_1", ConnectorID: "connector_1", EdgeNodeID: "edge_1", ProcessEpoch: 2, SessionGeneration: 3, ConfigGeneration: 4, RouteGeneration: 5, FailureDomain: domain}
 }
 
 func TestActiveVersionPermittedEnforcesSignedRevocations(t *testing.T) {

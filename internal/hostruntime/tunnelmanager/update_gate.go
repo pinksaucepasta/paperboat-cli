@@ -413,7 +413,7 @@ func (g *UpdateGate) current() (hostdproto.UpdateGateTargetBinding, Active, stri
 	if identity.SessionGeneration == 0 {
 		return hostdproto.UpdateGateTargetBinding{}, nil, "", "", ErrUpdateGateUnavailable
 	}
-	target := hostdproto.UpdateGateTargetBinding{MachineID: g.config.MachineID, AccountID: identity.AccountID, HostID: identity.HostID, TunnelID: identity.TunnelID, ConnectorID: identity.ConnectorID, EdgeNodeID: info.EdgeID, ProcessEpoch: identity.ProcessGeneration, SessionGeneration: identity.SessionGeneration, ConfigGeneration: identity.Generation, RouteGeneration: routeGeneration, FailureDomain: info.FailureDomain}
+	target := hostdproto.UpdateGateTargetBinding{Scope: hostdproto.UpdateGateScopeTunnel, MachineID: g.config.MachineID, AccountID: identity.AccountID, HostID: identity.HostID, TunnelID: identity.TunnelID, ConnectorID: identity.ConnectorID, EdgeNodeID: info.EdgeID, ProcessEpoch: identity.ProcessGeneration, SessionGeneration: identity.SessionGeneration, ConfigGeneration: identity.Generation, RouteGeneration: routeGeneration, FailureDomain: info.FailureDomain}
 	return target, active, routeID, hostname, nil
 }
 

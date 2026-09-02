@@ -7,7 +7,7 @@ import (
 )
 
 func updateGateTargetFixture() UpdateGateTargetBinding {
-	return UpdateGateTargetBinding{MachineID: "machine_01", AccountID: "account_01", HostID: "host_01", TunnelID: "tunnel_01", ConnectorID: "connector_01", EdgeNodeID: "edge_01", ProcessEpoch: 2, SessionGeneration: 3, ConfigGeneration: 4, RouteGeneration: 5, FailureDomain: "hel1-a"}
+	return UpdateGateTargetBinding{Scope: UpdateGateScopeTunnel, MachineID: "machine_01", AccountID: "account_01", HostID: "host_01", TunnelID: "tunnel_01", ConnectorID: "connector_01", EdgeNodeID: "edge_01", ProcessEpoch: 2, SessionGeneration: 3, ConfigGeneration: 4, RouteGeneration: 5, FailureDomain: "hel1-a"}
 }
 
 func TestUpdateGateFrameBindsSignedPolicyAndLiveTarget(t *testing.T) {
@@ -73,5 +73,16 @@ func TestUpdateGateCommitRequiresExactTargetAndNoProbeFields(t *testing.T) {
 		if err := candidate.Validate(); err == nil {
 			t.Fatalf("case %d accepted", index)
 		}
+	}
+}
+
+func TestUpdateGateStandaloneTargetRejectsFabricatedTunnelState(t *testing.T) {
+	target := UpdateGateTargetBinding{Scope: UpdateGateScopeStandalone, MachineID: "machine_01", FailureDomain: "standalone"}
+	if err := target.Validate(); err != nil {
+		t.Fatalf("valid standalone target rejected: %v", err)
+	}
+	target.TunnelID = "tunnel_fake"
+	if err := target.Validate(); err == nil {
+		t.Fatal("standalone target accepted fabricated tunnel identity")
 	}
 }

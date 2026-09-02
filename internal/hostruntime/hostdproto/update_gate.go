@@ -7,6 +7,9 @@ import (
 )
 
 const (
+	UpdateGateScopeStandalone = "standalone"
+	UpdateGateScopeTunnel     = "tunnel"
+
 	UpdateGateTarget    = "target"
 	UpdateGateCandidate = "candidate"
 	UpdateGateDrain     = "drain"
@@ -82,6 +85,7 @@ func (m UpdateGateRequest) validate() error {
 // UpdateGateTargetBinding is populated only by stable hostd from its current
 // authenticated carrier and route state.
 type UpdateGateTargetBinding struct {
+	Scope             string `json:"scope"`
 	MachineID         string `json:"machine_id"`
 	AccountID         string `json:"account_id"`
 	HostID            string `json:"host_id"`
@@ -107,12 +111,26 @@ type UpdateGateResponse struct {
 
 func (UpdateGateResponse) messageType() Type { return TypeUpdateGateResponse }
 func (m UpdateGateResponse) validate() error {
-	for _, value := range []string{m.Target.MachineID, m.Target.AccountID, m.Target.HostID, m.Target.TunnelID, m.Target.ConnectorID, m.Target.EdgeNodeID, m.Target.FailureDomain} {
+	for _, value := range []string{m.Target.MachineID, m.Target.FailureDomain} {
 		if !updateGateIDPattern.MatchString(value) {
 			return ErrInvalidFrame
 		}
 	}
-	if m.Target.ProcessEpoch == 0 || m.Target.SessionGeneration == 0 || m.Target.ConfigGeneration == 0 || m.Target.RouteGeneration == 0 {
+	switch m.Target.Scope {
+	case UpdateGateScopeStandalone:
+		if m.Target.AccountID != "" || m.Target.HostID != "" || m.Target.TunnelID != "" || m.Target.ConnectorID != "" || m.Target.EdgeNodeID != "" || m.Target.ProcessEpoch != 0 || m.Target.SessionGeneration != 0 || m.Target.ConfigGeneration != 0 || m.Target.RouteGeneration != 0 {
+			return ErrInvalidFrame
+		}
+	case UpdateGateScopeTunnel:
+		for _, value := range []string{m.Target.AccountID, m.Target.HostID, m.Target.TunnelID, m.Target.ConnectorID, m.Target.EdgeNodeID} {
+			if !updateGateIDPattern.MatchString(value) {
+				return ErrInvalidFrame
+			}
+		}
+		if m.Target.ProcessEpoch == 0 || m.Target.SessionGeneration == 0 || m.Target.ConfigGeneration == 0 || m.Target.RouteGeneration == 0 {
+			return ErrInvalidFrame
+		}
+	default:
 		return ErrInvalidFrame
 	}
 	return nil

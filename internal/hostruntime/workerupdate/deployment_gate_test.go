@@ -45,7 +45,7 @@ func (p *recordingDeploymentProvider) Commit(_ context.Context, request CommitRe
 }
 
 func deploymentTarget() DeploymentTarget {
-	return DeploymentTarget{MachineID: "machine_1", AccountID: "account_1", HostID: "host_1", TunnelID: "tunnel_1", ConnectorID: "connector_1", EdgeNodeID: "edge_1", ProcessEpoch: 2, SessionGeneration: 3, ConfigGeneration: 4, RouteGeneration: 5, FailureDomain: "hel1-a"}
+	return DeploymentTarget{Scope: hostdproto.UpdateGateScopeTunnel, MachineID: "machine_1", AccountID: "account_1", HostID: "host_1", TunnelID: "tunnel_1", ConnectorID: "connector_1", EdgeNodeID: "edge_1", ProcessEpoch: 2, SessionGeneration: 3, ConfigGeneration: 4, RouteGeneration: 5, FailureDomain: "hel1-a"}
 }
 
 func TestDeploymentActivationGateBindsEverySignedFence(t *testing.T) {
@@ -133,5 +133,32 @@ func TestDeploymentActivationGateRejectsInvalidCurrentTarget(t *testing.T) {
 	request := GateRequest{TransactionID: "txn_1", Previous: release, Candidate: release, Worker: hostdproto.Status{State: hostdproto.StateCandidate, WorkerID: "worker_2", APIVersion: 1, Epoch: 2}}
 	if err := gate.Candidate(context.Background(), request); err == nil {
 		t.Fatal("invalid current target accepted")
+	}
+}
+
+func TestDeploymentGateAcceptsTruthfulStandaloneTarget(t *testing.T) {
+	target := DeploymentTarget{Scope: hostdproto.UpdateGateScopeStandalone, MachineID: "machine_1", FailureDomain: "standalone"}
+	if err := validateDeploymentTarget(target); err != nil {
+		t.Fatalf("valid standalone target rejected: %v", err)
+	}
+	target.EdgeNodeID = "edge_fake"
+	if err := validateDeploymentTarget(target); err == nil {
+		t.Fatal("standalone target accepted fabricated edge identity")
+	}
+}
+
+func TestDeploymentGateDoesNotInventTunnelRequirementsForStandalone(t *testing.T) {
+	provider := &recordingDeploymentProvider{target: DeploymentTarget{Scope: hostdproto.UpdateGateScopeStandalone, MachineID: "machine_1", FailureDomain: "standalone"}}
+	gate, err := NewDeploymentActivationGate(DeploymentActivationGateConfig{Provider: provider})
+	if err != nil {
+		t.Fatal(err)
+	}
+	release := Release{Version: "2026.09.02.2", SHA256: strings.Repeat("c", 64), Length: 10, Platform: runtime.GOOS, Architecture: runtime.GOARCH, HostdAPIMin: 1, HostdAPIMax: 2, RuntimeAPIMin: 1, RuntimeAPIMax: 2, ManifestSHA256: strings.Repeat("a", 64), CanaryPath: "/healthz", CanaryStatus: 200, CanarySamples: 2, CanaryTimeout: time.Second, DrainTimeout: time.Second, StabilityWindow: time.Minute, StabilityInterval: time.Second, RollbackTimeout: time.Second}
+	request := GateRequest{TransactionID: "txn_standalone", Previous: release, Candidate: release, Worker: hostdproto.Status{State: hostdproto.StateCandidate, WorkerID: "worker_2", APIVersion: 1, Epoch: 2}}
+	if err := gate.Candidate(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if provider.canary.RequireEdge || provider.canary.RequireConnector || provider.canary.RequireRoute || provider.canary.RequireOrigin {
+		t.Fatalf("standalone canary invented tunnel requirements: %+v", provider.canary)
 	}
 }

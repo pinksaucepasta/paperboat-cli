@@ -1137,6 +1137,11 @@ func newProductionClientCoordinator(ctx context.Context, version string, environ
 			return nil, errors.Join(ErrProductionInvalid, assemblyErr)
 		}
 		dependencies.TunnelManager = tunnelAssembly
+		updateGate, gateErr := tunnelmanager.NewUpdateGate(tunnelmanager.UpdateGateConfig{MachineID: registration.MachineID, Manager: tunnelAssembly.Manager.Manager, StatePath: filepath.Join(runtimeConfig.StateRoot, "updates", "deployment-gate.json")})
+		if gateErr != nil {
+			return nil, errors.Join(ErrProductionInvalid, gateErr)
+		}
+		dependencies.UpdateGate = updateGate
 		networkHandler.SetCanonical(tunnelAssembly)
 	}
 	return NewClientCoordinator(ctx, HostConfig{Runtime: runtimeConfig, ListenAddress: listen, WorkspaceRoot: registration.InboxPath, EnvironmentID: registration.EnvironmentID, MachineID: registration.MachineID, InboxPath: registration.InboxPath, ShutdownTimeout: 30 * time.Second, RecoveryExitSignal: recoveryExitSignal, FileTransferPolicy: transferPolicy}, dependencies)

@@ -257,7 +257,14 @@ func NewClientCoordinator(ctx context.Context, config HostConfig, dependencies H
 		return nil, errors.Join(ErrHostInvalid, err)
 	}
 	healthSource.set(runtime, workerComponents)
-	return &Host{runtime: runtime, hostd: daemon, workers: workers, http: httpService, handler: mux, health: healthSource, transferRoot: filepath.Join(config.Runtime.StateRoot, "file-transfers"), cleanupUnstarted: durable.Close, updateGate: dependencies.UpdateGate}, nil
+	host := &Host{runtime: runtime, hostd: daemon, workers: workers, http: httpService, handler: mux, health: healthSource, transferRoot: filepath.Join(config.Runtime.StateRoot, "file-transfers"), cleanupUnstarted: durable.Close, updateGate: dependencies.UpdateGate}
+	if host.updateGate == nil {
+		host.updateGate, err = newStandaloneUpdateGate(standaloneUpdateGateConfig{MachineID: config.MachineID, StatePath: filepath.Join(config.Runtime.StateRoot, "updates", "deployment-gate.json"), Health: mux, Workloads: host.WorkloadStatus})
+		if err != nil {
+			return nil, errors.Join(ErrHostInvalid, err)
+		}
+	}
+	return host, nil
 }
 
 func transferWorkloadCount(root string) uint64 {
@@ -593,7 +600,14 @@ func NewHost(ctx context.Context, config HostConfig, dependencies HostDependenci
 		return nil, errors.Join(ErrHostInvalid, err)
 	}
 	healthSource.set(runtime, workerComponents)
-	return &Host{runtime: runtime, hostd: daemon, workers: workers, http: httpService, handler: mux, sessions: sessions, executions: executions, health: healthSource, transferRoot: filepath.Join(config.Runtime.StateRoot, "file-transfers"), cleanupUnstarted: durable.Close, updateGate: dependencies.UpdateGate}, nil
+	host := &Host{runtime: runtime, hostd: daemon, workers: workers, http: httpService, handler: mux, sessions: sessions, executions: executions, health: healthSource, transferRoot: filepath.Join(config.Runtime.StateRoot, "file-transfers"), cleanupUnstarted: durable.Close, updateGate: dependencies.UpdateGate}
+	if host.updateGate == nil {
+		host.updateGate, err = newStandaloneUpdateGate(standaloneUpdateGateConfig{MachineID: config.MachineID, StatePath: filepath.Join(config.Runtime.StateRoot, "updates", "deployment-gate.json"), Health: mux, Workloads: host.WorkloadStatus})
+		if err != nil {
+			return nil, errors.Join(ErrHostInvalid, err)
+		}
+	}
+	return host, nil
 }
 
 func commandWithManagedEnvironment(command pty.Command, managed envinject.EnvironmentSource) (pty.Command, error) {
