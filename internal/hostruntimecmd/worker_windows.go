@@ -254,7 +254,7 @@ func runOwnerHostd(ctx context.Context, output io.Writer, install hostinstall.Wi
 		shutdownWindowsStableHost(host)
 		return err
 	}
-	worker, err := startWindowsRuntimeWorker(ctx, executable, socket, tokenPath, "runtime-"+strings.ReplaceAll(buildinfo.Version, " ", "-"))
+	worker, err := startWindowsRuntimeWorker(ctx, executable, socket, tokenPath, install.OwnerSID, "runtime-"+strings.ReplaceAll(buildinfo.Version, " ", "-"))
 	if err == nil {
 		_, err = worker.Ready(ctx)
 	}
@@ -328,16 +328,21 @@ func runWorker(ctx context.Context, args []string, input io.Reader, output, stde
 	flags.SetOutput(stderr)
 	socket := flags.String("socket", "", "hostd lifecycle named pipe")
 	tokenPath := flags.String("token-file", "", "hostd capability token")
+	ownerSID := flags.String("owner-sid", "", "enrolled Windows owner SID")
 	workerID := flags.String("worker-id", "", "runtime worker identity")
 	version := flags.String("version", buildinfo.Version, "runtime version")
 	apiMin := flags.Uint("api-min", 1, "minimum hostd API")
 	apiMax := flags.Uint("api-max", 1, "maximum hostd API")
 	heartbeat := flags.Duration("heartbeat", 5*time.Second, "hostd heartbeat interval")
 	waitActivation := flags.Bool("wait-activation", false, "wait for private supervisor activation")
-	if flags.Parse(args) != nil || flags.NArg() != 0 || !validWindowsPipe(*socket) || !filepath.IsAbs(*tokenPath) || filepath.Clean(*tokenPath) != *tokenPath || *workerID == "" || *version == "" || *apiMin == 0 || *apiMin > 1024 || *apiMax < *apiMin || *apiMax > 1024 || *heartbeat < time.Second || *heartbeat > time.Minute {
+	if flags.Parse(args) != nil {
 		return errors.New("invalid worker invocation")
 	}
-	token, err := readWindowsHostdToken(*tokenPath)
+	parsedOwnerSID, ownerSIDErr := windows.StringToSid(*ownerSID)
+	if flags.NArg() != 0 || !validWindowsPipe(*socket) || !filepath.IsAbs(*tokenPath) || filepath.Clean(*tokenPath) != *tokenPath || ownerSIDErr != nil || parsedOwnerSID == nil || !parsedOwnerSID.IsValid() || parsedOwnerSID.String() != *ownerSID || *workerID == "" || *version == "" || *apiMin == 0 || *apiMin > 1024 || *apiMax < *apiMin || *apiMax > 1024 || *heartbeat < time.Second || *heartbeat > time.Minute {
+		return errors.New("invalid worker invocation")
+	}
+	token, err := readWindowsHostdTokenForSID(*tokenPath, *ownerSID)
 	if err != nil {
 		return err
 	}
@@ -486,15 +491,16 @@ type windowsRuntimeWorker struct {
 	ready    hostdproto.Status
 }
 
-func startWindowsRuntimeWorker(ctx context.Context, executable, socket, tokenPath, workerID string) (*windowsRuntimeWorker, error) {
-	return startWindowsRuntimeWorkerForRelease(ctx, executable, socket, tokenPath, workerID, buildinfo.Version, 1, 1)
+func startWindowsRuntimeWorker(ctx context.Context, executable, socket, tokenPath, ownerSID, workerID string) (*windowsRuntimeWorker, error) {
+	return startWindowsRuntimeWorkerForRelease(ctx, executable, socket, tokenPath, ownerSID, workerID, buildinfo.Version, 1, 1)
 }
 
-func startWindowsRuntimeWorkerForRelease(ctx context.Context, executable, socket, tokenPath, workerID, version string, apiMin, apiMax uint16) (*windowsRuntimeWorker, error) {
-	if version == "" || apiMin == 0 || apiMin > apiMax || apiMax > 1024 {
+func startWindowsRuntimeWorkerForRelease(ctx context.Context, executable, socket, tokenPath, ownerSID, workerID, version string, apiMin, apiMax uint16) (*windowsRuntimeWorker, error) {
+	sid, sidErr := windows.StringToSid(ownerSID)
+	if sidErr != nil || sid == nil || !sid.IsValid() || sid.String() != ownerSID || version == "" || apiMin == 0 || apiMin > apiMax || apiMax > 1024 {
 		return nil, errors.New("Windows runtime worker release parameters are invalid")
 	}
-	command := exec.CommandContext(ctx, executable, "__runtime-worker", "--socket", socket, "--token-file", tokenPath, "--worker-id", workerID, "--version", version, "--api-min", strconv.FormatUint(uint64(apiMin), 10), "--api-max", strconv.FormatUint(uint64(apiMax), 10), "--wait-activation")
+	command := exec.CommandContext(ctx, executable, "__runtime-worker", "--socket", socket, "--token-file", tokenPath, "--owner-sid", ownerSID, "--worker-id", workerID, "--version", version, "--api-min", strconv.FormatUint(uint64(apiMin), 10), "--api-max", strconv.FormatUint(uint64(apiMax), 10), "--wait-activation")
 	processlaunch.ConfigureBackground(command)
 	control, err := command.StdinPipe()
 	if err != nil {
@@ -568,11 +574,17 @@ func (w *windowsRuntimeWorker) Stop(ctx context.Context) error {
 	case <-ctx.Done():
 		_ = w.command.Process.Kill()
 		return ctx.Err()
-	case err := <-done:
-		return err
+	case <-done:
+		// Stop is a cleanup operation. The private worker intentionally exits
+		// non-zero when activation input is closed or it was already fenced;
+		// once Wait confirms the process is gone, cleanup succeeded.
+		return nil
 	case <-time.After(5 * time.Second):
-		_ = w.command.Process.Kill()
-		return <-done
+		if err := w.command.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			return err
+		}
+		<-done
+		return nil
 	}
 }
 

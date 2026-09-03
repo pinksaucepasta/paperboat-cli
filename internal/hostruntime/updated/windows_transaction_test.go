@@ -11,10 +11,11 @@ import (
 )
 
 type recordingWindowsActivationBackend struct {
-	events             []string
-	fail               string
-	stoppedLocalDaemon bool
-	startedLocalDaemon bool
+	events              []string
+	fail                string
+	failStartOnRollback bool
+	stoppedLocalDaemon  bool
+	startedLocalDaemon  bool
 }
 
 func (b *recordingWindowsActivationBackend) event(name string) error {
@@ -48,6 +49,10 @@ func (b *recordingWindowsActivationBackend) SetServiceTargets(_ context.Context,
 }
 func (b *recordingWindowsActivationBackend) StartServices(_ context.Context, h, u, ssh, localDaemon bool) error {
 	b.startedLocalDaemon = b.startedLocalDaemon || localDaemon
+	if b.failStartOnRollback && slices.Contains(b.events, "journal:rolling_back") {
+		b.events = append(b.events, "start")
+		return errors.New("injected start")
+	}
 	return b.event("start")
 }
 func (b *recordingWindowsActivationBackend) VerifyHealth(context.Context, windowsActivationJournal) error {
@@ -173,9 +178,35 @@ func TestWindowsActivationCandidateFailureLeavesOldRouteUndrained(t *testing.T) 
 	if slices.Contains(b.events, "drain") || slices.Contains(b.events, "stop") || slices.Contains(b.events, "restore") {
 		t.Fatalf("candidate failure touched old route/services: %q", b.events)
 	}
-	wantTail := []string{"journal:candidate_validating", "candidate", "journal:rolling_back", "candidate_stop", "quarantine", "journal:rolled_back"}
+	wantTail := []string{"journal:candidate_validating", "candidate", "journal:rolling_back", "candidate_stop", "quarantine", "start", "journal:rolled_back"}
 	if len(b.events) < len(wantTail) || !reflect.DeepEqual(b.events[len(b.events)-len(wantTail):], wantTail) {
 		t.Fatalf("events=%q want tail=%q", b.events, wantTail)
+	}
+}
+
+func TestWindowsActivationCandidateRollbackWaitsForPreviousServices(t *testing.T) {
+	b := &recordingWindowsActivationBackend{fail: "candidate"}
+	journal := testWindowsActivationJournal()
+	journal.LocalDaemonWasRunning = true
+	result, err := executeWindowsActivation(context.Background(), b, journal)
+	if err == nil || result.Stage != windowsActivationRolledBack {
+		t.Fatalf("result=%+v events=%q err=%v", result, b.events, err)
+	}
+	start := slices.Index(b.events, "start")
+	terminal := slices.Index(b.events, "journal:rolled_back")
+	if start < 0 || terminal < 0 || start >= terminal || !b.startedLocalDaemon {
+		t.Fatalf("previous services were not restored before terminal rollback: %q", b.events)
+	}
+}
+
+func TestWindowsActivationCandidateRollbackRemainsRecoverableIfRestartFails(t *testing.T) {
+	b := &recordingWindowsActivationBackend{fail: "candidate", failStartOnRollback: true}
+	result, err := executeWindowsActivation(context.Background(), b, testWindowsActivationJournal())
+	if err == nil || result.Stage != windowsActivationRollingBack {
+		t.Fatalf("result=%+v events=%q err=%v", result, b.events, err)
+	}
+	if slices.Contains(b.events, "journal:rolled_back") {
+		t.Fatalf("published terminal rollback after previous services failed to restart: %q", b.events)
 	}
 }
 

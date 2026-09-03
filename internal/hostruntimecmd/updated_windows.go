@@ -87,7 +87,7 @@ func windowsUpdatedConfigFor(config hostinstall.WindowsRuntimeConfig, layout ser
 	tokenFile := config.TokenFile
 	return updated.WindowsConfig{StateRoot: layout.UpdateStateRoot, RuntimeStateRoot: config.StateRoot, Binary: layout.Binary, BinaryRollback: layout.BinaryRollback, BinaryStaged: layout.BinaryStaged, OwnerSID: config.OwnerSID, MachineID: config.MachineID, RepositoryURL: config.Artifact.RepositoryURL, TokenFile: tokenFile, InstallState: filepath.Join(hostinstall.WindowsProgramDataRoot(), "runtime-install.json"), ControlSocket: `\\.\pipe\PaperboatUpdatedControl`, HostdSocket: layout.HostdSocket, HealthURL: "http://" + config.ListenAddress + "/healthz", ActiveVersion: runningVersion, Architecture: config.Artifact.Architecture, AutomaticActivation: true, SetupMode: config.SetupMode,
 		CandidateStarter: func(ctx context.Context, request workerupdate.StartRequest) (workerupdate.Worker, error) {
-			return startWindowsRuntimeWorkerForRelease(ctx, request.Executable, request.HostdEndpoint, tokenFile, request.WorkerID, request.Release.Version, request.Release.HostdAPIMin, request.Release.HostdAPIMax)
+			return startWindowsRuntimeWorkerForRelease(ctx, request.Executable, request.HostdEndpoint, tokenFile, config.OwnerSID, request.WorkerID, request.Release.Version, request.Release.HostdAPIMin, request.Release.HostdAPIMax)
 		},
 	}
 }

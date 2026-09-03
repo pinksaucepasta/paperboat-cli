@@ -889,3 +889,45 @@ was performed by this acceptance run.
   state was preserved. Version/service/updater, restart persistence, status,
   doctor, preview, and tunnel checks remain blocked by the missing native
   services.
+
+### Windows Victus `.11` fresh install and `.12` updater diagnosis
+
+Status: `.11` fresh installation succeeded; `.12` was downloaded and verified
+but its pre-cutover worker failed before readiness. Source fixes are locally
+verified and final release acceptance is pending.
+
+- The dashboard-issued one-shot Windows Host command installed `.11` through
+  the supported installer and completed enrollment. `PaperboatHostd`,
+  `PaperboatLocalDaemon`, `PaperboatUpdated`, and `PaperboatSshd` were Running,
+  Automatic, LocalSystem, and bound to the canonical binary. `/healthz` returned
+  `{"live":true}` and the machine appeared online through the control plane.
+- `pb status` and `pb doctor` then exposed `control_plane_unavailable` even
+  though direct authenticated inventory and server heartbeat were healthy. The
+  verifier-only host lacked an account-root signing seed, and optional automatic
+  E2EE approval incorrectly failed the entire inventory. The intended typed
+  nonfatal behavior was recovered from historical commit
+  `4b6dcca0deaada1b3a779c2e900de14d074d6ee4` and updated for the canonical
+  `TrustedKeys` representation in commits `65a0412` and `7720faa` (`.12`).
+- The normal `.11` `pb update --json` path downloaded the exact signed `.12`
+  target, SHA-256 `8061d697038e0dc33240e6fb2b3b28eddd85a0de42f68acbfa2fd6b5987e485c`,
+  length `50058752`, then left the activation journal at `rolling_back` with
+  failure `EOF exit status 1`. The canonical `.11` binary and active Hostd,
+  LocalDaemon, and SSH services remained intact; Updated stopped after its
+  deliberate activator handoff.
+- Root cause was introduced by `5c3ff3c`: the LocalSystem activator launched
+  the staged candidate without the enrolled owner SID. The child inferred
+  `S-1-5-18` and rejected the correct token ACL, which contains SYSTEM full,
+  Administrators full, and the enrolled owner read. Direct execution as the
+  enrolled owner reached `ready 2 1`, proving the protocol and staged binary
+  were sound. The fix passes the exact enrolled SID and retains strict ACL
+  validation.
+- Two recovery defects were also recorded and fixed: candidate cleanup treated
+  a confirmed already-exited child as fatal, and a pre-drain candidate failure
+  did not restart the old updater before recording terminal rollback. Cleanup
+  is now idempotent after process exit, and terminal candidate rollback is
+  published only after the prior service set is live.
+- Local evidence after the fixes: affected Windows packages pass normal and
+  race tests; affected packages and `cmd/pb` cross-compile for Windows amd64
+  and arm64; both Windows CLI binaries build; `git diff --check` passes. Final
+  supported update, reboot persistence, status/doctor, preview, and tunnel E2E
+  remain mandatory before Windows is accepted.

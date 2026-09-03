@@ -16,7 +16,7 @@ import (
 
 func TestWindowsWorkerRejectsNonPipeEndpoint(t *testing.T) {
 	err := runWorker(context.Background(), []string{
-		"--socket", `C:\\unsafe.sock`, "--token-file", `C:\\token`, "--worker-id", "runtime-test",
+		"--socket", `C:\\unsafe.sock`, "--token-file", `C:\\token`, "--owner-sid", "S-1-5-21-1", "--worker-id", "runtime-test",
 	}, strings.NewReader(""), nilWriter{}, nilWriter{})
 	if err == nil || !strings.Contains(err.Error(), "invalid worker invocation") {
 		t.Fatalf("err = %v, want invalid Windows worker invocation", err)

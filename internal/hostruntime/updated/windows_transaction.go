@@ -239,6 +239,19 @@ func rollbackWindowsCandidate(ctx context.Context, backend windowsActivationBack
 	if criticalErr != nil {
 		return journal, errors.Join(cause, criticalErr, quarantineErr)
 	}
+	// The updater that received the update request deliberately hands the
+	// transaction to the one-shot activator and exits before this function runs.
+	// A pre-drain candidate failure therefore has to bring the previously live
+	// services back before it can publish a terminal rollback. Without this
+	// restart, a failed canary leaves PaperboatUpdated stopped even though no
+	// binary or service target was changed. Use an independent bounded cleanup
+	// context so an activator cancellation cannot strand the old service set.
+	startCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	startErr := backend.StartServices(startCtx, journal.OldHostd.WasRunning, journal.OldUpdater.WasRunning, journal.OldSSH.WasRunning, journal.LocalDaemonWasRunning)
+	cancel()
+	if startErr != nil {
+		return journal, errors.Join(cause, startErr, quarantineErr)
+	}
 	journal.Stage = windowsActivationRolledBack
 	if err := backend.WriteJournal(journal); err != nil {
 		return journal, errors.Join(cause, quarantineErr, err)
