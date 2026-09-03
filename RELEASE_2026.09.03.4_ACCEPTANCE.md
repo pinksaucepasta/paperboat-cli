@@ -342,4 +342,33 @@ In progress after completing the initial platform failure discovery:
 
 ## Final retest
 
-Not started.
+Started against official release `2026.09.03.5`.
+
+### Control-plane and edge regressions fixed before machine mutation
+
+- `paperboat-server` previously returned HTTP 500 after persisting runtime
+  presence when an auxiliary environment, availability, or update observation
+  failed. The handler now preserves the durable observation and returns HTTP
+  202 with typed `auxiliary_rejections`. Focused normal and race checks passed;
+  the production container is running and healthy and `/readyz` reports ready.
+- `paperboat-tunnel` health counted only legacy routes, so a canonical route
+  made Docker report unhealthy despite every transport component being ready.
+  Health now counts legacy and canonical routes. Focused normal and race checks
+  passed; the production tunnel container is running and healthy with
+  `route_drift=false`.
+
+### macOS final-release retest attempt
+
+- Supported uninstall completed and removed binaries, state, and launchd
+  services. The remaining empty product directory and package receipt contain
+  no executable or runtime state.
+- The official `.5` macOS arm64 package matched release metadata and installed
+  successfully. Ad-hoc signing is accepted for this development release;
+  Developer ID credentials are intentionally unavailable and are not tracked
+  as a defect.
+- The protected dashboard enrollment command was supplied without logging its
+  secret. Pairing returned HTTP 400 `invalid_user_machine_pairing`, confirming
+  that the one-shot artifact was already consumed or invalid. The `.5`
+  installer rollback then removed the package payload, state, and services.
+- Final `.5` service, restart, updater, doctor, preview, and tunnel acceptance
+  requires a fresh dashboard-issued Host enrollment command.
