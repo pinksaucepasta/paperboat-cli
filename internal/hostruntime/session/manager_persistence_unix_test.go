@@ -57,6 +57,9 @@ func TestManagerRecoversHistoryInputAndRestartGeneration(t *testing.T) {
 		t.Fatalf("decision=%#v err=%v", decision, err)
 	}
 	waitState(t, manager, created.ID, Exited)
+	// History persistence is asynchronous. Wait for the durable replay to
+	// contain the completed output before closing and reopening its store.
+	waitLatest(t, manager, created.ID, 7)
 	if err := state.Close(); err != nil {
 		t.Fatal(err)
 	}

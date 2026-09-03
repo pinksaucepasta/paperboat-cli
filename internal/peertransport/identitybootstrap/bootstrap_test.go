@@ -315,6 +315,35 @@ func TestFreshBootstrapUsesEndpointScopedSigningKeyAndExactlyReplays(t *testing.
 	}
 }
 
+func TestFreshBootstrapBackdatesCertificateForBoundedWindowsClockSkew(t *testing.T) {
+	clientNow := time.Date(2026, 9, 3, 12, 0, 16, 0, time.UTC)
+	serverNow := clientNow.Add(-16 * time.Second)
+	root := t.TempDir()
+	store := config.ProfileStore{Path: root, Secrets: config.FileSecretStore{Dir: filepath.Join(root, "secrets")}}
+	client := freshBootstrapClientFunc(func(_ context.Context, _ string, input api.E2EEBootstrapInput) (api.E2EEBootstrapResult, error) {
+		public, err := base64.RawURLEncoding.Strict().DecodeString(input.RootPublicKey)
+		if err != nil {
+			return api.E2EEBootstrapResult{}, err
+		}
+		raw, err := base64.RawURLEncoding.Strict().DecodeString(input.Certificate.Certificate)
+		if err != nil {
+			return api.E2EEBootstrapResult{}, err
+		}
+		certificate, err := endpointidentity.Verify(raw, ed25519.PublicKey(public), endpointidentity.Expected{AccountID: "account_1", Role: endpointidentity.RoleCLI, EndpointID: "cli_fresh", Generation: 1}, serverNow)
+		if err != nil {
+			return api.E2EEBootstrapResult{}, err
+		}
+		if !certificate.Claims.IssuedAt.Equal(clientNow.Add(-CertificateClockSkew)) || !certificate.Claims.ExpiresAt.Equal(clientNow.Add(CertificateLifetime)) {
+			t.Fatalf("certificate times=%s..%s", certificate.Claims.IssuedAt, certificate.Claims.ExpiresAt)
+		}
+		return bootstrapResult(input), nil
+	})
+	_, err := EnrollCLI(context.Background(), CLIRequest{Store: store, Client: client, Issuer: "https://api.example.test", AccountID: "account_1", CLIClientSessionID: "cli_fresh", Now: func() time.Time { return clientNow }, Fresh: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestEnrollCLIFailsClosedWhenEstablishedRootIsUnavailable(t *testing.T) {
 	for _, tc := range []struct {
 		name string

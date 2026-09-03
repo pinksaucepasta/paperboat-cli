@@ -209,6 +209,53 @@ func TestWindowsInstallerRollbackUsesTheSameBoundedElevationContract(t *testing.
 	}
 }
 
+func TestWindowsInstallerUsesAProtectedOneShotEnrollmentTokenFile(t *testing.T) {
+	script := windowsInstallerScript(t)
+	if strings.Contains(script, "'--enrollment-token', $token") || strings.Contains(script, "--enrollment-token $token") {
+		t.Fatal("Windows installer must never pass the enrollment token in process arguments")
+	}
+	for _, required := range []string{
+		"$tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())",
+		"function Test-RegularNonReparseFile",
+		"[IO.FileMode]::CreateNew",
+		"[IO.FileAccess]::Write",
+		"[IO.FileShare]::None",
+		"function New-EnrollmentTokenFile",
+		"Set-Acl -LiteralPath $path -AclObject $security -ErrorAction Stop",
+		"D:P(A;;FA;;;SY)(A;;FA;;;",
+		"'--enrollment-token-file', $tokenFile",
+		"function Remove-EnrollmentTokenFile",
+		"finally {",
+		"Remove-EnrollmentTokenFile $tokenFile",
+	} {
+		if !strings.Contains(script, required) {
+			t.Fatalf("Windows installer is missing protected token-file handling: %q", required)
+		}
+	}
+	pairStart := strings.Index(script, "$tokenFile = New-EnrollmentTokenFile $token")
+	cleanupStart := strings.Index(script[pairStart:], "Remove-EnrollmentTokenFile $tokenFile")
+	if pairStart < 0 || cleanupStart < 0 {
+		t.Fatal("Windows installer must clean the token file after pairing")
+	}
+}
+
+func TestWindowsInstallerReportsFreshRollbackUserStateFailures(t *testing.T) {
+	script := windowsInstallerScript(t)
+	suppressedStateRemoval := "Remove-Item -LiteralPath $statePath -Recurse -Force -ErrorAction SilentlyContinue"
+	if strings.Contains(script, suppressedStateRemoval) {
+		t.Fatal("Windows fresh-install state rollback must not suppress user-state deletion failures")
+	}
+	if !strings.Contains(script, "Remove-Item -LiteralPath $statePath -Recurse -Force -ErrorAction Stop") ||
+		!strings.Contains(script, "user state remains after rollback") ||
+		!strings.Contains(script, "if ($null -eq $rollbackError) { $rollbackError = $_ }") ||
+		!strings.Contains(script, "Write-Warning \"Paperboat fresh-install rollback did not complete") {
+		t.Fatal("Windows fresh-install rollback must report user-state cleanup failures")
+	}
+	if !strings.Contains(script, "exit $pairExitCode") {
+		t.Fatal("Windows fresh-install rollback must preserve the primary pairing exit code")
+	}
+}
+
 func TestWindowsInstallerStagesAndUnblocksTheVerifiedBootstrap(t *testing.T) {
 	script := windowsInstallerScript(t)
 	if !strings.Contains(script, "Unblock-File -LiteralPath $download") {

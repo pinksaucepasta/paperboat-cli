@@ -22,6 +22,7 @@ type approvalClient struct {
 	root       api.E2EERoot
 	pending    []api.PendingEndpointIdentity
 	registered api.EndpointCertificateDocument
+	register   func(api.EndpointCertificateDocument) error
 }
 
 func (c *approvalClient) E2EERoot(context.Context) (api.E2EERoot, error) { return c.root, nil }
@@ -29,6 +30,11 @@ func (c *approvalClient) PendingE2EEEndpoints(context.Context) ([]api.PendingEnd
 	return append([]api.PendingEndpointIdentity(nil), c.pending...), nil
 }
 func (c *approvalClient) RegisterEndpointCertificate(_ context.Context, _ string, document api.EndpointCertificateDocument) (api.EndpointCertificateDocument, error) {
+	if c.register != nil {
+		if err := c.register(document); err != nil {
+			return api.EndpointCertificateDocument{}, err
+		}
+	}
 	c.registered = document
 	return document, nil
 }
@@ -90,6 +96,65 @@ func TestApproveCLIRequiresCLIRoleAndSignsNewSessionKeys(t *testing.T) {
 	}
 	if _, err := ApproveMachine(context.Background(), ApprovalRequest{Store: store, Client: client, Issuer: "https://api.example.test", AccountID: "account_1", CLIClientSessionID: "cli_existing", RequestID: "per_0123456789abcdef", SafetyCode: code, Now: func() time.Time { return now }}); err == nil {
 		t.Fatal("machine signer accepted a CLI request")
+	}
+}
+
+func TestApproveMachineBackdatesCertificateForServerClockSkew(t *testing.T) {
+	approverNow := time.Date(2026, 9, 3, 12, 0, 16, 0, time.UTC)
+	serverNow := approverNow.Add(-16 * time.Second)
+	root := t.TempDir()
+	store := config.ProfileStore{Path: root, Secrets: config.FileSecretStore{Dir: filepath.Join(root, "secrets")}}
+	keys, err := store.PeerIdentityKeys("https://api.example.test", "account_1", "cli_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootPublic := append(ed25519.PublicKey(nil), keys.RootPrivate.Public().(ed25519.PublicKey)...)
+	rootFingerprint := sha256.Sum256(rootPublic)
+	clearKeys(&keys)
+	noise := sha256.Sum256([]byte("machine-noise-skew"))
+	quicPublic, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := machineSafetyCode("machine_skew", 2, noise, quicPublic)
+	client := &approvalClient{
+		root: api.E2EERoot{
+			Version: 1, PublicKey: base64.RawURLEncoding.EncodeToString(rootPublic),
+			Fingerprint: hex.EncodeToString(rootFingerprint[:]), Generation: 1,
+		},
+		pending: []api.PendingEndpointIdentity{{
+			RequestID: "per_0123456789abcdef", EndpointID: "machine_skew", State: "pending", Generation: 2,
+			NoisePublicKey: base64.RawURLEncoding.EncodeToString(noise[:]),
+			QUICPublicKey:  base64.RawURLEncoding.EncodeToString(quicPublic),
+			CreatedAt:      serverNow.Add(-time.Minute), ExpiresAt: serverNow.Add(4 * time.Minute), SafetyCode: code,
+		}},
+		register: func(document api.EndpointCertificateDocument) error {
+			raw, err := base64.RawURLEncoding.Strict().DecodeString(document.Certificate)
+			if err != nil {
+				return err
+			}
+			defer clear(raw)
+			_, err = endpointidentity.Verify(raw, rootPublic, endpointidentity.Expected{
+				AccountID: "account_1", Role: endpointidentity.RoleMachine, EndpointID: "machine_skew", Generation: 2,
+			}, serverNow)
+			return err
+		},
+	}
+	result, err := ApproveMachine(context.Background(), ApprovalRequest{
+		Store: store, Client: client, Issuer: "https://api.example.test", AccountID: "account_1", CLIClientSessionID: "cli_1",
+		RequestID: "per_0123456789abcdef", SafetyCode: code, Now: func() time.Time { return approverNow },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := client.registered.IssuedAt, approverNow.Add(-CertificateClockSkew).Format(time.RFC3339); got != want {
+		t.Fatalf("issued_at=%q want=%q", got, want)
+	}
+	if got, want := client.registered.ExpiresAt, approverNow.Add(CertificateLifetime).Format(time.RFC3339); got != want {
+		t.Fatalf("expires_at=%q want=%q", got, want)
+	}
+	if result.Certificate.Claims.IssuedAt.After(serverNow) {
+		t.Fatalf("certificate is not valid at server clock: issued_at=%s server_now=%s", result.Certificate.Claims.IssuedAt, serverNow)
 	}
 }
 

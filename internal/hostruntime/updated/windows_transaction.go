@@ -393,7 +393,13 @@ func windowsActivationBlocksVersion(journal windowsActivationJournal, version st
 }
 
 func windowsActivationNeedsControllerRecovery(journal windowsActivationJournal, activeVersion string) bool {
-	return journal.Stage == windowsActivationRollbackReady && journal.PreviousVersion == activeVersion && journal.Version != activeVersion
+	// Keep the controller's recovery decision aligned with the startup path.
+	// Both paths use resumeWindowsActivation, whose predicate covers every
+	// nonterminal stage that the activator can safely resume, including an
+	// interrupted rolling_back phase. The caller has already established that
+	// the journal fences activeVersion; the predicate below preserves the same
+	// candidate-version guard used by startup recovery.
+	return windowsActivationNeedsResume(journal, activeVersion, false)
 }
 
 func windowsActivationNeedsResume(journal windowsActivationJournal, activeVersion string, activatorOwnsTransaction bool) bool {

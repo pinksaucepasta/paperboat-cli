@@ -131,7 +131,10 @@ func TestSocketRoundTripsUpdateGateResponse(t *testing.T) {
 func TestSocketRepliesWithTypedErrorsAndBoundsRequests(t *testing.T) {
 	config := testSocketConfig(t)
 	config.RequestTimeout = 100 * time.Millisecond
-	config.MaxConcurrent = 1
+	// startSocketServer proves accept-loop readiness with a short-lived
+	// connection. Leave a second slot so that probe cannot transiently consume
+	// the only admission while this test opens its real request.
+	config.MaxConcurrent = 2
 	_, cancel, done := startSocketServer(t, config)
 	defer stopSocketServer(t, cancel, done)
 
@@ -278,7 +281,14 @@ func startSocketServer(t *testing.T, config SocketConfig) (*Server, context.Canc
 	deadline := time.Now().Add(time.Second)
 	for {
 		if info, err := os.Lstat(config.SocketPath); err == nil && info.Mode()&os.ModeSocket != 0 {
-			return server, cancel, done
+			// A stale pathname can be visible for the few instructions between
+			// bind and the accept loop becoming reachable. Prove readiness with a
+			// real connection instead of treating directory visibility as ready.
+			connection, dialErr := net.DialTimeout("unix", config.SocketPath, 50*time.Millisecond)
+			if dialErr == nil {
+				_ = connection.Close()
+				return server, cancel, done
+			}
 		}
 		select {
 		case err := <-done:

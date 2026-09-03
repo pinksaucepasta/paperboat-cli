@@ -202,7 +202,16 @@ func (c *windowsController) invoke(ctx context.Context, request ControlRequest) 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	response := ControlResponse{Schema: ControlProtocolV1, Status: "ok", Version: c.activeVersion, Observation: c.scheduler.Snapshot()}
-	blocked, blockErr := c.activationBlockedContext(ctx)
+	var blocked bool
+	var blockErr error
+	if request.Operation == "status" || request.Operation == "check" {
+		// Read-only operations may report a fenced transaction, but must not
+		// hand its journal to the activator. Recovery is reserved for paths
+		// that can mutate the transaction.
+		blocked, blockErr = c.activationBlockedReadOnlyContext(ctx)
+	} else {
+		blocked, blockErr = c.activationBlockedContext(ctx)
+	}
 	if blockErr != nil {
 		return response, blockErr
 	}
@@ -211,7 +220,7 @@ func (c *windowsController) invoke(ctx context.Context, request ControlRequest) 
 	}
 	switch request.Operation {
 	case "status":
-		if journal, err := loadWindowsActivationJournal(c.config); err == nil {
+		if journal, err := loadWindowsActivationJournalForController(c.config); err == nil {
 			response.Transaction = windowsTransactionState(journal)
 			if journal.Version == c.activeVersion {
 				response.Pending = journal.Stage != windowsActivationCommitted
@@ -373,11 +382,30 @@ func (c *windowsController) activationBlocked() (bool, error) {
 	return c.activationBlockedContext(context.Background())
 }
 
+// activationBlockedReadOnlyContext reports whether the active version is
+// fenced by a nonterminal transaction without attempting to hand the journal
+// back to the one-shot activator. Status and check requests use this path so
+// diagnostics cannot mutate SCM, binaries, or the journal.
+func (c *windowsController) activationBlockedReadOnlyContext(_ context.Context) (bool, error) {
+	if c == nil {
+		return true, ErrWindowsActivationUnavailable
+	}
+	journal, err := loadWindowsActivationJournalForController(c.config)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return true, err
+	}
+	return windowsActivationBlocksVersion(journal, c.activeVersion), nil
+}
+
 // activationBlockedContext also repairs a live updater that started while an
-// activator owned a rollback. Startup can observe that owner and continue, but
-// the owner may then exit before publishing rolled_back (for example after a
-// failed rollback verification). In that case no later service start occurs,
-// so the controller must reclaim the durable rollback_ready journal itself.
+// activator owned a transaction. Startup can observe that owner and continue,
+// but the owner may then exit before publishing a terminal journal (for
+// example after a failed rollback verification). In that case no later
+// service start occurs, so the controller must reclaim any nonterminal journal
+// that the activator can safely resume.
 //
 // The recovery helper repeats the SCM owner check immediately before creating
 // or starting the activator service. activationMu only serializes requests in
@@ -404,9 +432,10 @@ func (c *windowsController) activationBlockedContext(ctx context.Context) (bool,
 	}
 	if windowsActivationNeedsControllerRecovery(journal, c.activeVersion) {
 		if _, resumeErr := resumeWindowsActivationForController(ctx, c.config); resumeErr != nil {
-			// A stale rollback must remain fenced if SCM recovery is temporarily
-			// unavailable. Preserve the typed control error so clients can retry
-			// instead of treating this as an unrelated check failure.
+			// A stale transaction must remain fenced if SCM recovery is
+			// temporarily unavailable. Preserve the typed control error so
+			// clients can retry instead of treating this as an unrelated check
+			// failure.
 			return true, errors.Join(ErrWindowsActivationUnavailable, resumeErr)
 		}
 		// The activator owns the transaction asynchronously. Re-read the

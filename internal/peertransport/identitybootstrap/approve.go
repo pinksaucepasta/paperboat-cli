@@ -106,7 +106,13 @@ func approveEndpoint(ctx context.Context, request ApprovalRequest, wantRole endp
 	}
 	var noisePublic [32]byte
 	copy(noisePublic[:], noise)
-	certificate, err := endpointidentity.Sign(keys.RootPrivate, endpointidentity.Claims{AccountID: request.AccountID, Role: wantRole, EndpointID: selected.EndpointID, NoisePublicKey: noisePublic, QUICPublicKey: ed25519.PublicKey(quic), Generation: selected.Generation, Serial: 1, IssuedAt: now, ExpiresAt: now.Add(CertificateLifetime)})
+	// Approval is performed by a paired endpoint, while the newly approved
+	// endpoint and the control plane may have slightly different wall clocks.
+	// Keep the certificate valid at the control plane when the signer is ahead,
+	// using the same bounded skew as fresh bootstrap issuance.
+	issuedAt := now.Add(-CertificateClockSkew)
+	expiresAt := now.Add(CertificateLifetime)
+	certificate, err := endpointidentity.Sign(keys.RootPrivate, endpointidentity.Claims{AccountID: request.AccountID, Role: wantRole, EndpointID: selected.EndpointID, NoisePublicKey: noisePublic, QUICPublicKey: ed25519.PublicKey(quic), Generation: selected.Generation, Serial: 1, IssuedAt: issuedAt, ExpiresAt: expiresAt})
 	clear(noise)
 	clear(quic)
 	if err != nil {
@@ -122,7 +128,7 @@ func approveEndpoint(ctx context.Context, request ApprovalRequest, wantRole endp
 		roleName, operationPrefix = "cli", "op_peer_cli_cert_"
 	}
 	operationID := operationPrefix + hex.EncodeToString(fingerprint[:16])
-	document := api.EndpointCertificateDocument{Version: 1, AccountID: request.AccountID, KeyID: trustedRoot.KeyID, EndpointID: selected.EndpointID, Role: roleName, Generation: selected.Generation, Serial: 1, IssuedAt: now.Format(time.RFC3339), ExpiresAt: now.Add(CertificateLifetime).Format(time.RFC3339), Certificate: base64.RawURLEncoding.EncodeToString(raw), CertificateFingerprint: hex.EncodeToString(fingerprint[:])}
+	document := api.EndpointCertificateDocument{Version: 1, AccountID: request.AccountID, KeyID: trustedRoot.KeyID, EndpointID: selected.EndpointID, Role: roleName, Generation: selected.Generation, Serial: 1, IssuedAt: issuedAt.Format(time.RFC3339), ExpiresAt: expiresAt.Format(time.RFC3339), Certificate: base64.RawURLEncoding.EncodeToString(raw), CertificateFingerprint: hex.EncodeToString(fingerprint[:])}
 	response, err := request.Client.RegisterEndpointCertificate(ctx, operationID, document)
 	if err != nil {
 		return Result{}, err

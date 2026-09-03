@@ -17,7 +17,14 @@ import (
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/trustedkeys"
 )
 
-const CertificateLifetime = 90 * 24 * time.Hour
+const (
+	CertificateLifetime = 90 * 24 * time.Hour
+	// New endpoint certificates are backdated by the contract's bounded clock
+	// skew so a client whose wall clock is slightly ahead of the control plane
+	// can enroll. Expiry remains anchored to the observed client time and is
+	// still checked strictly by every verifier.
+	CertificateClockSkew = time.Minute
+)
 
 var ErrInvalid = errors.New("invalid E2EE identity bootstrap")
 var ErrPairingRequired = errors.New("this account already has an E2EE root; approval from a paired CLI or a recovery key is required")
@@ -530,7 +537,7 @@ func loadOrCreateCertificate(request Request, keys config.PeerIdentityKeys, root
 
 func createPeerCertificate(request Request, keys config.PeerIdentityKeys, rootPublic ed25519.PublicKey, now time.Time) (endpointidentity.Certificate, []byte, error) {
 	quicPublic := keys.QUICPrivate.Public().(ed25519.PublicKey)
-	certificate, err := endpointidentity.Sign(keys.RootPrivate, endpointidentity.Claims{AccountID: request.AccountID, Role: endpointidentity.RoleCLI, EndpointID: request.CLIClientSessionID, NoisePublicKey: keys.NoisePublic, QUICPublicKey: quicPublic, Generation: 1, Serial: 1, IssuedAt: now, ExpiresAt: now.Add(CertificateLifetime)})
+	certificate, err := endpointidentity.Sign(keys.RootPrivate, endpointidentity.Claims{AccountID: request.AccountID, Role: endpointidentity.RoleCLI, EndpointID: request.CLIClientSessionID, NoisePublicKey: keys.NoisePublic, QUICPublicKey: quicPublic, Generation: 1, Serial: 1, IssuedAt: now.Add(-CertificateClockSkew), ExpiresAt: now.Add(CertificateLifetime)})
 	if err != nil {
 		return endpointidentity.Certificate{}, nil, err
 	}

@@ -36,7 +36,9 @@ if ([string]$assetMetadata.platform -ne 'windows' -or [string]$assetMetadata.arc
 $expectedUrl = "https://github.com/$repo/releases/download/$version/$asset"
 if ([string]$assetMetadata.url -ne $expectedUrl) { throw 'Paperboat release asset URL is not an immutable GitHub release URL.' }
 
-$dir = Join-Path $env:TEMP ('Paperboat\bootstrap-' + [guid]::NewGuid().ToString('N'))
+$tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
+if (-not [IO.Path]::IsPathRooted($tempRoot)) { throw 'Paperboat temporary directory must be absolute.' }
+$dir = Join-Path $tempRoot ('Paperboat\bootstrap-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 $download = Join-Path $dir $asset
 $partial = "$download.download"
@@ -230,6 +232,70 @@ function Publish-ProcessCapture([string]$StandardOutputPath, [string]$StandardEr
   }
 }
 
+function Test-RegularNonReparseFile([string]$Path) {
+  if ([string]::IsNullOrWhiteSpace($Path) -or -not [IO.Path]::IsPathRooted($Path)) { return $false }
+  try {
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    return (-not $item.PSIsContainer) -and (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)
+  } catch {
+    return $false
+  }
+}
+
+function New-EnrollmentTokenFile([string]$Token) {
+  if ([string]::IsNullOrWhiteSpace($Token)) { throw 'Paperboat enrollment token is empty.' }
+  $path = Join-Path $dir ('enrollment-token-' + [guid]::NewGuid().ToString('N') + '.txt')
+  if (-not [IO.Path]::IsPathRooted($path)) { throw 'Paperboat enrollment token file path must be absolute.' }
+  $stream = $null
+  try {
+    # CreateNew prevents an attacker from replacing a predictable path with a
+    # reparse point before the token is written.
+    $stream = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    $bytes = [Text.Encoding]::ASCII.GetBytes($Token)
+    $stream.Write($bytes, 0, $bytes.Length)
+    $stream.Flush()
+  } catch {
+    if ($null -ne $stream) { $stream.Dispose() }
+    Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+    throw "Could not create the protected Paperboat enrollment token file: $($_.Exception.Message)"
+  } finally {
+    if ($null -ne $stream) { $stream.Dispose() }
+  }
+  if (-not (Test-RegularNonReparseFile $path)) {
+    Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+    throw 'Paperboat enrollment token file is not a regular non-reparse file.'
+  }
+
+  try {
+    $userSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    if ([string]::IsNullOrWhiteSpace($userSid)) { throw 'current Windows user SID is unavailable' }
+    $security = New-Object System.Security.AccessControl.FileSecurity
+    $sddl = 'O:' + $userSid + 'D:P(A;;FA;;;SY)(A;;FA;;;' + $userSid + ')'
+    $security.SetSecurityDescriptorSddlForm($sddl)
+    Set-Acl -LiteralPath $path -AclObject $security -ErrorAction Stop
+  } catch {
+    Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+    throw "Could not protect the Paperboat enrollment token file: $($_.Exception.Message)"
+  }
+  if (-not (Test-RegularNonReparseFile $path)) {
+    Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+    throw 'Paperboat enrollment token file became unsafe before pairing.'
+  }
+  return $path
+}
+
+function Remove-EnrollmentTokenFile([string]$Path) {
+  if ([string]::IsNullOrWhiteSpace($Path)) { return }
+  try {
+    if (Test-Path -LiteralPath $Path) {
+      Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+    }
+    if (Test-Path -LiteralPath $Path) { throw 'token file remains after cleanup' }
+  } catch {
+    throw "Could not remove the Paperboat enrollment token file: $($_.Exception.Message)"
+  }
+}
+
 function Assert-InstalledRelease([string]$Path, [string]$ExpectedVersion, [string]$ExpectedHash) {
   if (-not (Assert-InstalledVersion $Path $ExpectedVersion)) { return $false }
   try {
@@ -245,11 +311,19 @@ function Invoke-FreshPairRollback {
   # crossed the machine replacement boundary. Roll back both scopes when that
   # final step fails. The elevated payload derives fixed Paperboat paths; it
   # never accepts a caller-provided deletion root.
+  $rollbackError = $null
   foreach ($statePath in @(
     (Join-Path $env:LOCALAPPDATA 'Paperboat'),
     (Join-Path $env:APPDATA 'Paperboat')
   )) {
-    Remove-Item -LiteralPath $statePath -Recurse -Force -ErrorAction SilentlyContinue
+    try {
+      if (Test-Path -LiteralPath $statePath) {
+        Remove-Item -LiteralPath $statePath -Recurse -Force -ErrorAction Stop
+        if (Test-Path -LiteralPath $statePath) { throw "user state remains after rollback: $statePath" }
+      }
+    } catch {
+      if ($null -eq $rollbackError) { $rollbackError = $_ }
+    }
   }
   $rollbackPayload = @'
 $ErrorActionPreference = 'Stop'
@@ -309,10 +383,9 @@ if ($null -ne $purgeError) { throw $purgeError }
     $rollbackExitCode = Wait-InstallerProcess $rollback 'Paperboat fresh-install rollback'
     if ($rollbackExitCode -ne 0) { throw "rollback exited with code $rollbackExitCode" }
   } catch {
-    # Preserve the pair failure as the primary result, but make an incomplete
-    # rollback visible so support can safely retry cleanup.
-    Write-Warning "Paperboat fresh-install rollback did not complete: $($_.Exception.Message)"
+    if ($null -eq $rollbackError) { $rollbackError = $_ }
   }
+  if ($null -ne $rollbackError) { throw $rollbackError }
 }
 
 if ($freshEnrollment -or -not (Assert-InstalledRelease $installedPb $version $actual)) {
@@ -371,7 +444,10 @@ if ($freshEnrollment) {
     (Join-Path $env:LOCALAPPDATA 'Paperboat'),
     (Join-Path $env:APPDATA 'Paperboat')
   )) {
-    Remove-Item -LiteralPath $statePath -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $statePath) {
+      Remove-Item -LiteralPath $statePath -Recurse -Force -ErrorAction Stop
+      if (Test-Path -LiteralPath $statePath) { throw "Paperboat user state remains after fresh cleanup: $statePath" }
+    }
   }
   if ([string]::IsNullOrWhiteSpace($name)) {
     $name = [string]$env:COMPUTERNAME
@@ -384,17 +460,47 @@ if ($freshEnrollment) {
   # the dashboard shell's stdin/stdout/stderr pipes cannot keep the installer
   # alive after pairing completes. No elevation is used for this user-owned
   # profile/DPAPI operation.
-  $pairArguments = @('pair', '--server', $server, '--enrollment-token', $token, '--name', $name, "--setup-mode=$setupMode")
-  $pairInput = Join-Path $dir 'pair.stdin'
-  $pairOutput = Join-Path $dir 'pair.stdout'
-  $pairError = Join-Path $dir 'pair.stderr'
-  New-Item -ItemType File -Path $pairInput -Force | Out-Null
-  $pairProcess = Start-IsolatedInstallerProcess -FilePath $installedPb -ArgumentList $pairArguments -StandardInputPath $pairInput -StandardOutputPath $pairOutput -StandardErrorPath $pairError
-  $pairExitCode = Wait-InstallerProcess $pairProcess 'Paperboat pairing'
-  Publish-ProcessCapture $pairOutput $pairError
-  if ($pairExitCode -ne 0) {
-    Write-Warning "Paperboat pairing failed with exit code $pairExitCode; rolling back the fresh installation."
-    Invoke-FreshPairRollback
+  $pairFailed = $false
+  $tokenFile = $null
+  $tokenCleanupError = $null
+  try {
+    $tokenFile = New-EnrollmentTokenFile $token
+    $pairArguments = @('pair', '--server', $server, '--enrollment-token-file', $tokenFile, '--name', $name, "--setup-mode=$setupMode")
+    if ([string]$pairArguments[4] -match '\s') { $pairArguments[4] = '"' + $pairArguments[4] + '"' }
+    if ([string]$pairArguments[6] -match '\s') { $pairArguments[6] = '"' + $pairArguments[6] + '"' }
+    $pairInput = Join-Path $dir 'pair.stdin'
+    $pairOutput = Join-Path $dir 'pair.stdout'
+    $pairError = Join-Path $dir 'pair.stderr'
+    New-Item -ItemType File -Path $pairInput -Force | Out-Null
+    $pairProcess = Start-IsolatedInstallerProcess -FilePath $installedPb -ArgumentList $pairArguments -StandardInputPath $pairInput -StandardOutputPath $pairOutput -StandardErrorPath $pairError
+    $pairExitCode = Wait-InstallerProcess $pairProcess 'Paperboat pairing'
+    Publish-ProcessCapture $pairOutput $pairError
+    if ($pairExitCode -ne 0) {
+      $pairFailed = $true
+      Write-Warning "Paperboat pairing failed with exit code $pairExitCode; rolling back the fresh installation."
+      try {
+        Invoke-FreshPairRollback
+      } catch {
+        # Preserve the pair failure as the primary result, but make an
+        # incomplete rollback visible so support can safely retry cleanup.
+        Write-Warning "Paperboat fresh-install rollback did not complete: $($_.Exception.Message)"
+      }
+    }
+  } finally {
+    if ($null -ne $tokenFile) {
+      try {
+        Remove-EnrollmentTokenFile $tokenFile
+      } catch {
+        $tokenCleanupError = $_
+        Write-Warning "Paperboat enrollment token cleanup did not complete: $($_.Exception.Message)"
+      }
+    }
+    $token = $null
+  }
+  if ($pairFailed) {
     exit $pairExitCode
+  }
+  if ($null -ne $tokenCleanupError) {
+    throw $tokenCleanupError
   }
 }

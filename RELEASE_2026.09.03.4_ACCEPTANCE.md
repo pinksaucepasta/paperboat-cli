@@ -37,6 +37,29 @@ candidate passes the complete three-platform acceptance matrix.
 
 ## Issue ledger
 
+### WIN-007: fresh E2EE bootstrap rejects a slightly fast Windows clock
+
+- Severity: fresh-enrollment blocker.
+- Reproduction: use a new dashboard-issued Windows Host enrollment on Victus
+  while Windows Time is stopped and the local wall clock is about 16 seconds
+  ahead of the control plane.
+- Actual: the installer reaches E2EE bootstrap, then the server rejects the
+  newly signed endpoint certificate with `certificate_expired` at the
+  `certificate_not_current` validation boundary. No native service mutation is
+  reached.
+- Proven root cause: endpoint certificates used the client wall clock as the
+  exact `issued_at`, while verification allowed no future skew. The captured
+  request and both clocks prove the certificate was not yet current at the
+  server. This is not a stale installer or Windows service failure.
+- Fix status: implemented with the existing contract's bounded 60-second
+  clock skew on both fresh bootstrap and paired-endpoint approval issuance.
+  Expiry remains anchored to the observed client time and strictly enforced.
+  Deterministic tests reproduce the 16-second skew and verify acceptance at
+  the slower server clock. Focused normal, race, peer-transport, runtime,
+  installer, updater, service, host-install, and Windows elevation suites pass;
+  Windows amd64 and arm64 runtime test binaries compile. Fresh Victus
+  acceptance on the final candidate remains mandatory.
+
 ### MAC-005: fresh `.10` Host service does not become ready
 
 - Severity: fresh-enrollment blocker
