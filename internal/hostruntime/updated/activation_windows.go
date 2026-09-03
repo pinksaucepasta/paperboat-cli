@@ -1429,6 +1429,17 @@ func resumeWindowsActivation(ctx context.Context, config WindowsConfig) (bool, e
 	if err := nativesignature.New(nil).Verify(verifyCtx, journal.Updater.Path, "windows", journal.Architecture); err != nil {
 		return false, err
 	}
+	// Signature verification can take long enough for an activator that was
+	// already starting to become visible in SCM. Re-check ownership immediately
+	// before mutating the activator service so this updater never steals a live
+	// transaction during that handoff window.
+	activatorOwnsTransaction, err = windowsActivatorOwnsTransaction()
+	if err != nil {
+		return false, err
+	}
+	if activatorOwnsTransaction {
+		return false, nil
+	}
 	if err := installWindowsActivatorService(journal.Updater.Path); err != nil {
 		return false, err
 	}

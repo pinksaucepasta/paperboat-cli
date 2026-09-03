@@ -29,6 +29,13 @@ var ErrWindowsActivationUnavailable = errors.New("Windows updater activation is 
 var windowsActivationHandoffDelay = 2 * time.Second
 var startWindowsActivator = startWindowsActivatorService
 
+// resumeWindowsActivationForController is a seam for the controller's
+// recovery path. Keeping the startup and live-controller paths on the same
+// implementation is important: both paths must perform the SCM owner check
+// before handing the journal back to the one-shot activator.
+var resumeWindowsActivationForController = resumeWindowsActivation
+var loadWindowsActivationJournalForController = loadWindowsActivationJournal
+
 type windowsController struct {
 	activeVersion string
 	ownerSID      string
@@ -37,6 +44,7 @@ type windowsController struct {
 	scheduler     *autoupdate.Scheduler
 	mu            sync.Mutex
 	checkMu       sync.Mutex
+	activationMu  sync.Mutex
 	config        WindowsConfig
 	source        workerupdate.TUFSource
 	handoff       chan struct{}
@@ -194,7 +202,7 @@ func (c *windowsController) invoke(ctx context.Context, request ControlRequest) 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	response := ControlResponse{Schema: ControlProtocolV1, Status: "ok", Version: c.activeVersion, Observation: c.scheduler.Snapshot()}
-	blocked, blockErr := c.activationBlocked()
+	blocked, blockErr := c.activationBlockedContext(ctx)
 	if blockErr != nil {
 		return response, blockErr
 	}
@@ -327,7 +335,7 @@ func activationRequested(channel <-chan struct{}) bool {
 func (c *windowsController) checkRelease(ctx context.Context) (autoupdate.Result, error) {
 	c.checkMu.Lock()
 	defer c.checkMu.Unlock()
-	blocked, err := c.activationBlocked()
+	blocked, err := c.activationBlockedContext(ctx)
 	if err != nil {
 		return autoupdate.Result{Version: c.activeVersion}, err
 	}
@@ -362,12 +370,55 @@ func (c *windowsController) checkRelease(ctx context.Context) (autoupdate.Result
 }
 
 func (c *windowsController) activationBlocked() (bool, error) {
-	journal, err := loadWindowsActivationJournal(c.config)
+	return c.activationBlockedContext(context.Background())
+}
+
+// activationBlockedContext also repairs a live updater that started while an
+// activator owned a rollback. Startup can observe that owner and continue, but
+// the owner may then exit before publishing rolled_back (for example after a
+// failed rollback verification). In that case no later service start occurs,
+// so the controller must reclaim the durable rollback_ready journal itself.
+//
+// The recovery helper repeats the SCM owner check immediately before creating
+// or starting the activator service. activationMu only serializes requests in
+// this controller; the SCM check remains the cross-process ownership guard.
+func (c *windowsController) activationBlockedContext(ctx context.Context) (bool, error) {
+	if c == nil {
+		return true, ErrWindowsActivationUnavailable
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	c.activationMu.Lock()
+	defer c.activationMu.Unlock()
+
+	journal, err := loadWindowsActivationJournalForController(c.config)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	}
 	if err != nil {
 		return true, err
+	}
+	if !windowsActivationBlocksVersion(journal, c.activeVersion) {
+		return false, nil
+	}
+	if windowsActivationNeedsControllerRecovery(journal, c.activeVersion) {
+		if _, resumeErr := resumeWindowsActivationForController(ctx, c.config); resumeErr != nil {
+			// A stale rollback must remain fenced if SCM recovery is temporarily
+			// unavailable. Preserve the typed control error so clients can retry
+			// instead of treating this as an unrelated check failure.
+			return true, errors.Join(ErrWindowsActivationUnavailable, resumeErr)
+		}
+		// The activator owns the transaction asynchronously. Re-read the
+		// journal so a very fast rollback completion unblocks this request,
+		// while a still-running recovery remains fenced.
+		journal, err = loadWindowsActivationJournalForController(c.config)
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		if err != nil {
+			return true, err
+		}
 	}
 	return windowsActivationBlocksVersion(journal, c.activeVersion), nil
 }

@@ -2,6 +2,7 @@ package bootstrap
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -13,6 +14,81 @@ func windowsInstallerScript(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return string(body)
+}
+
+func windowsSourceFile(t *testing.T, relativePath string) string {
+	t.Helper()
+	body, err := os.ReadFile(filepath.Join("../../../", relativePath))
+	if err != nil {
+		t.Fatalf("read %s: %v", relativePath, err)
+	}
+	return string(body)
+}
+
+func requireSourceOrder(t *testing.T, source, description string, markers ...string) {
+	t.Helper()
+	previous := -1
+	for _, marker := range markers {
+		position := strings.Index(source, marker)
+		if position < 0 {
+			t.Fatalf("%s is missing %q", description, marker)
+		}
+		if position <= previous {
+			t.Fatalf("%s has incorrect order at %q", description, marker)
+		}
+		previous = position
+	}
+}
+
+func TestWindowsFreshInstallPurgesInterruptedActivationBeforeStaging(t *testing.T) {
+	command := windowsSourceFile(t, "cmd/pb/install_command_windows.go")
+	hostInstall := windowsSourceFile(t, "internal/hostruntime/hostinstall/install_windows.go")
+	activation := windowsSourceFile(t, "internal/hostruntime/updated/activation_windows.go")
+	updatedService := windowsSourceFile(t, "internal/hostruntime/updated/service_windows.go")
+
+	// The dashboard command must enter the supported cleanup boundary before
+	// the privileged fresh install. This prevents an expired uninstall helper
+	// from being confused with the activation journal it is about to remove.
+	requireSourceOrder(t, command, "fresh Windows command",
+		"if fresh {",
+		"recoverWindowsUninstall()",
+		"hostinstall.InstallStandaloneBinary(command.Context(), source, version, fresh)",
+	)
+
+	// InstallStandaloneBinary delegates fresh replacement to Purge before it
+	// creates or stages any new release files. Purge owns both the updater state
+	// root (where activation/journal.json lives) and the release root (where
+	// versions/<version> and rollback slots live).
+	installStart := strings.Index(hostInstall, "func InstallStandaloneBinary")
+	purgeStart := strings.Index(hostInstall, "func Purge(ctx context.Context)")
+	if installStart < 0 || purgeStart < 0 || purgeStart <= installStart {
+		t.Fatal("Windows fresh-install and purge boundaries are missing")
+	}
+	installBody := hostInstall[installStart:purgeStart]
+	requireSourceOrder(t, installBody, "fresh standalone install",
+		"if fresh {",
+		"if err := Purge(ctx); err != nil",
+		"layout, err := service.DefaultLayout(\"windows\")",
+		"return stageWindowsBinary(ctx, source, layout.Binary, rollback, artifact, \"\")",
+	)
+	purgeBody := hostInstall[purgeStart:]
+	requireSourceOrder(t, purgeBody, "fresh purge cleanup",
+		"removeWindowsActivatorService(ctx, layout)",
+		"uninstallWindows(ctx, true)",
+		"layout.ReleasesRoot, filepath.Join(WindowsProgramDataRoot(), \"services\"), filepath.Join(WindowsProgramDataRoot(), \"service-lifecycle\"), layout.UpdateStateRoot",
+	)
+	if !strings.Contains(purgeBody, "terminatePaperboatProcesses(ctx)") {
+		t.Fatal("fresh purge must terminate stale Paperboat processes before returning")
+	}
+
+	// Assert that the path removed by fresh Purge is exactly the updater state
+	// root used by the activation journal, rather than an unrelated user path.
+	if !strings.Contains(activation, "filepath.Join(stateRoot, \"activation\", \"journal.json\")") {
+		t.Fatal("Windows activation journal path is not rooted in its supplied state root")
+	}
+	if !strings.Contains(updatedService, "config.StateRoot == layout.UpdateStateRoot") {
+		t.Fatal("Windows updater state root is not bound to the fixed layout")
+	}
 }
 
 func TestWindowsInstallerUsesBoundedElevationForInteractiveAndUnattendedSessions(t *testing.T) {

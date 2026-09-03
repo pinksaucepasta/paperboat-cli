@@ -392,6 +392,10 @@ func windowsActivationBlocksVersion(journal windowsActivationJournal, version st
 	return journal.Stage != windowsActivationCommitted && journal.Stage != windowsActivationRolledBack && (journal.Version == version || journal.PreviousVersion == version)
 }
 
+func windowsActivationNeedsControllerRecovery(journal windowsActivationJournal, activeVersion string) bool {
+	return journal.Stage == windowsActivationRollbackReady && journal.PreviousVersion == activeVersion && journal.Version != activeVersion
+}
+
 func windowsActivationNeedsResume(journal windowsActivationJournal, activeVersion string, activatorOwnsTransaction bool) bool {
 	if journal.Stage == windowsActivationCommitted || journal.Stage == windowsActivationRolledBack || activeVersion == journal.Version {
 		return false
