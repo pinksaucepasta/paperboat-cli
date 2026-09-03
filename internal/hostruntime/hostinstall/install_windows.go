@@ -1252,40 +1252,24 @@ func removeWindowsActivatorService(ctx context.Context, layout service.Layout) e
 }
 
 func installWindowsRoleServices(ctx context.Context, request Request, layout service.Layout, upgradeMode string) error {
-	hostd, updater, daemon, err := windowsRoleInstallers(layout, false)
-	if err != nil {
-		return err
-	}
-	lifecycle, err := newWindowsLifecycleManagerForInstallers(layout, hostd, daemon, updater, &request)
-	if err != nil {
-		return err
-	}
 	return executeWindowsServiceInstallPlan(request.SetupMode,
 		func() error { return installWindowsSSHAfterActivation(ctx, request, layout) },
 		func() error {
-			if err := lifecycle.Recover(ctx); err != nil {
-				return err
-			}
 			if err := prepareWindowsLocalDaemonMigrationAndState(ctx, request.OwnerSID, request.StateRoot); err != nil {
 				return fmt.Errorf("migrate Paperboat local daemon task: %w", err)
 			}
 			return nil
 		},
 		func() error {
-			var err error
-			if upgradeMode == "" {
-				err = lifecycle.Install(ctx)
-			} else {
-				err = lifecycle.Repair(ctx)
-			}
+			cleanupServices, err := installWindowsServicesWithRollback(ctx, request, layout, upgradeMode)
 			if err != nil {
 				return err
 			}
 			if err := waitWindowsLocalDaemonReady(ctx, request.OwnerSID, request.StateRoot); err != nil {
-				return errors.Join(err, lifecycle.Uninstall(ctx))
+				return errors.Join(err, rollbackWindowsServicePlan(cleanupServices))
 			}
 			if err := localdaemon.RemoveWindowsLegacyTask(ctx, request.OwnerSID); err != nil {
-				return errors.Join(err, lifecycle.Uninstall(ctx))
+				return errors.Join(err, rollbackWindowsServicePlan(cleanupServices))
 			}
 			return nil
 		},
@@ -1293,27 +1277,133 @@ func installWindowsRoleServices(ctx context.Context, request Request, layout ser
 	)
 }
 
+type windowsServicePlanInstaller struct {
+	installer  *service.Installer
+	controller service.WindowsController
+	component  *service.NativeTransactionalComponent
+}
+
+func (step windowsServicePlanInstaller) DefinitionPath() string {
+	return step.installer.DefinitionPath()
+}
+
+func (step windowsServicePlanInstaller) Install(ctx context.Context) error {
+	if step.component == nil {
+		return service.ErrInvalidDefinition
+	}
+	return step.component.Install(ctx)
+}
+
+func (step windowsServicePlanInstaller) Start(ctx context.Context) error {
+	if step.component != nil {
+		return step.component.Start(ctx)
+	}
+	return step.controller.Start(ctx, step.installer.DefinitionPath())
+}
+
+func (step windowsServicePlanInstaller) Uninstall(ctx context.Context) error {
+	if step.component == nil {
+		return service.ErrInvalidDefinition
+	}
+	return step.component.Uninstall(ctx)
+}
+
+func installWindowsServicesWithRollback(ctx context.Context, request Request, layout service.Layout, upgradeMode string) (func() error, error) {
+	return executeWindowsServiceStepsWithHook(ctx, windowsRuntimeServiceDefinitions(layout), func(item windowsRuntimeServiceDefinition) (windowsServicePlanStep, error) {
+		installer, err := service.New(service.Config{
+			Platform: "windows", Kind: item.kind, ConfigRoot: WindowsProgramDataRoot(),
+			Executable: item.executable, User: "Paperboat", Group: "Paperboat",
+			Arguments: item.arguments, Controller: service.WindowsController{}, UpgradeMode: upgradeMode,
+		})
+		if err != nil {
+			return nil, err
+		}
+		controller := service.WindowsController{}
+		component, err := service.NewNativeTransactionalComponent(service.NativeTransactionalComponentConfig{Installer: installer, Controller: controller})
+		if err != nil {
+			return nil, err
+		}
+		return windowsServicePlanInstaller{installer: installer, controller: controller, component: component}, nil
+	}, windowsServiceRegistrationPresent, true, func(_ int, definition windowsRuntimeServiceDefinition) error {
+		if definition.kind != service.DaemonKind {
+			return nil
+		}
+		return waitWindowsLocalDaemonReady(ctx, request.OwnerSID, request.StateRoot)
+	})
+}
+
+// windowsServiceRegistrationPresent records the native SCM state before the
+// installer publishes a declaration. Definition files are durable recovery
+// metadata, not proof that a service is registered: a stale file must not make
+// rollback leave a service created by the current attempt behind. Inspect
+// also rejects a same-name foreign registration or orphaned SCM service.
+func windowsServiceRegistrationPresent(ctx context.Context, path string) (bool, error) {
+	status, err := (service.WindowsController{}).Inspect(ctx, path)
+	if err != nil {
+		return false, err
+	}
+	return status.Registered, nil
+}
+
+func repairWindowsServices(ctx context.Context, layout service.Layout, kinds ...string) error {
+	_, err := repairWindowsServicesWithRollback(ctx, layout, kinds...)
+	return err
+}
+
+func repairWindowsServicesWithRollback(ctx context.Context, layout service.Layout, kinds ...string) (func() error, error) {
+	wanted := make(map[string]struct{}, len(kinds))
+	for _, kind := range kinds {
+		wanted[kind] = struct{}{}
+	}
+	definitions := make([]windowsRuntimeServiceDefinition, 0, len(wanted))
+	for _, item := range windowsRuntimeServiceDefinitions(layout) {
+		if len(wanted) == 0 {
+			definitions = append(definitions, item)
+			continue
+		}
+		if _, ok := wanted[item.kind]; ok {
+			definitions = append(definitions, item)
+		}
+	}
+	return executeWindowsServiceSteps(ctx, definitions, func(item windowsRuntimeServiceDefinition) (windowsServicePlanStep, error) {
+		installer, err := service.New(service.Config{
+			Platform: "windows", Kind: item.kind, ConfigRoot: WindowsProgramDataRoot(),
+			Executable: item.executable, User: "Paperboat", Group: "Paperboat",
+			Arguments: item.arguments, Controller: service.WindowsController{}, UpgradeMode: service.UpgradeReload,
+		})
+		if err != nil {
+			return nil, err
+		}
+		controller := service.WindowsController{}
+		component, err := service.NewNativeTransactionalComponent(service.NativeTransactionalComponentConfig{Installer: installer, Controller: controller})
+		if err != nil {
+			return nil, err
+		}
+		return windowsServicePlanInstaller{installer: installer, controller: controller, component: component}, nil
+	}, windowsServiceRegistrationPresent, true)
+}
+
+func rollbackWindowsServicePlan(cleanup func() error) error {
+	if cleanup == nil {
+		return nil
+	}
+	return cleanup()
+}
+
 // repairWindowsRoleServices repairs the native role declarations after the
 // persisted config and runtime binary have been restored. PaperboatSshd is
 // intentionally not installed here: host-mode repair establishes it before
 // lifecycle recovery and keeps it in place until this final phase succeeds.
 func repairWindowsRoleServices(ctx context.Context, request Request, layout service.Layout) error {
-	hostd, updater, daemon, err := windowsRoleInstallers(layout, false)
+	cleanupServices, err := repairWindowsServicesWithRollback(ctx, layout, service.HostdKind, service.DaemonKind)
 	if err != nil {
-		return err
-	}
-	lifecycle, err := newWindowsLifecycleManagerForInstallers(layout, hostd, daemon, updater, &request)
-	if err != nil {
-		return err
-	}
-	if err := lifecycle.Repair(ctx); err != nil {
 		return err
 	}
 	if err := waitWindowsLocalDaemonReady(ctx, request.OwnerSID, request.StateRoot); err != nil {
-		return errors.Join(err, lifecycle.Uninstall(ctx))
+		return errors.Join(err, rollbackWindowsServicePlan(cleanupServices))
 	}
 	if err := localdaemon.RemoveWindowsLegacyTask(ctx, request.OwnerSID); err != nil {
-		return errors.Join(err, lifecycle.Uninstall(ctx))
+		return errors.Join(err, rollbackWindowsServicePlan(cleanupServices))
 	}
 	return nil
 }

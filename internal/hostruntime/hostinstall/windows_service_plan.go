@@ -1,9 +1,12 @@
 package hostinstall
 
 import (
+	"context"
 	"errors"
+	"os"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
 )
@@ -13,6 +16,118 @@ var standaloneVersionPattern = regexp.MustCompile(`^[0-9]{4}\.[0-9]{2}\.[0-9]{2}
 type windowsRuntimeServiceDefinition struct {
 	kind, executable string
 	arguments        []string
+}
+
+// windowsServicePlanStep is the small lifecycle surface needed by the
+// ordered Windows role plan. Keeping the sequencing/rollback policy separate
+// from the native service implementation makes it deterministic to test and
+// prevents a later role failure from leaving a service created by this exact
+// attempt behind.
+type windowsServicePlanStep interface {
+	DefinitionPath() string
+	Install(context.Context) error
+	Start(context.Context) error
+	Uninstall(context.Context) error
+}
+
+const windowsServicePlanRollbackTimeout = 45 * time.Second
+
+func windowsServiceDeclarationPresent(path string) (bool, error) {
+	_, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// executeWindowsServiceSteps applies one ordered role plan. The
+// preexisting callback must report the native service-manager registration
+// observed before the declaration is written. This is deliberately separate
+// from declaration-file existence: a stale declaration with no SCM service is
+// still created by this attempt and must be removed if a later step fails.
+// The returned cleanup removes only registrations that did not exist before
+// this call. On an install/start error, the same cleanup is run before the
+// error is returned. Existing registrations are deliberately never
+// uninstalled by a failed replacement.
+func executeWindowsServiceSteps(
+	ctx context.Context,
+	definitions []windowsRuntimeServiceDefinition,
+	makeStep func(windowsRuntimeServiceDefinition) (windowsServicePlanStep, error),
+	preexisting func(context.Context, string) (bool, error),
+	startAfterInstall bool,
+) (func() error, error) {
+	return executeWindowsServiceStepsWithHook(ctx, definitions, makeStep, preexisting, startAfterInstall, nil)
+}
+
+func executeWindowsServiceStepsWithHook(
+	ctx context.Context,
+	definitions []windowsRuntimeServiceDefinition,
+	makeStep func(windowsRuntimeServiceDefinition) (windowsServicePlanStep, error),
+	preexisting func(context.Context, string) (bool, error),
+	startAfterInstall bool,
+	afterStart func(int, windowsRuntimeServiceDefinition) error,
+) (func() error, error) {
+	if ctx == nil || makeStep == nil {
+		return nil, service.ErrInvalidDefinition
+	}
+	if preexisting == nil {
+		preexisting = func(_ context.Context, path string) (bool, error) {
+			return windowsServiceDeclarationPresent(path)
+		}
+	}
+	created := make([]windowsServicePlanStep, 0, len(definitions))
+	rolledBack := false
+	rollback := func() error {
+		if rolledBack {
+			return nil
+		}
+		rolledBack = true
+		rollbackContext, cancel := context.WithTimeout(context.Background(), windowsServicePlanRollbackTimeout)
+		defer cancel()
+		var result error
+		for index := len(created) - 1; index >= 0; index-- {
+			if err := created[index].Uninstall(rollbackContext); err != nil {
+				result = errors.Join(result, err)
+			}
+		}
+		return result
+	}
+	for index, definition := range definitions {
+		step, err := makeStep(definition)
+		if err != nil {
+			return nil, errors.Join(err, rollback())
+		}
+		if step == nil || step.DefinitionPath() == "" {
+			return nil, errors.Join(service.ErrInvalidDefinition, rollback())
+		}
+		present, err := preexisting(ctx, step.DefinitionPath())
+		if err != nil {
+			return nil, errors.Join(err, rollback())
+		}
+		// Record ownership before Install. Native Enable can create an SCM
+		// entry and then return an error while applying recovery/configuration;
+		// waiting until Install succeeds would strand that partial registration.
+		if !present {
+			created = append(created, step)
+		}
+		if err := step.Install(ctx); err != nil {
+			return nil, errors.Join(err, rollback())
+		}
+		if startAfterInstall {
+			if err := step.Start(ctx); err != nil {
+				return nil, errors.Join(err, rollback())
+			}
+			if afterStart != nil {
+				if err := afterStart(index, definition); err != nil {
+					return nil, errors.Join(err, rollback())
+				}
+			}
+		}
+	}
+	return rollback, nil
 }
 
 func windowsRuntimeServiceDefinitions(layout service.Layout) []windowsRuntimeServiceDefinition {

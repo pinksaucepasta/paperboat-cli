@@ -179,7 +179,7 @@ function Wait-RollbackProcess($Process, [string]$Operation) {
 }
 try {
   if (Test-Path -LiteralPath $installed -PathType Leaf) {
-    $purge = Start-Process -FilePath $installed -ArgumentList @('purge') -PassThru -WindowStyle Hidden
+    $purge = Start-Process -FilePath $installed -ArgumentList @('__runtime-service', 'purge') -PassThru -WindowStyle Hidden
     $purgeExitCode = Wait-RollbackProcess $purge 'Paperboat runtime purge'
     if ($purgeExitCode -ne 0) { throw "Paperboat runtime purge failed with exit code $purgeExitCode." }
   }

@@ -1,12 +1,192 @@
 package hostinstall
 
 import (
+	"context"
 	"errors"
 	"reflect"
 	"testing"
 
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
 )
+
+type fakeWindowsServicePlanStep struct {
+	path         string
+	events       *[]string
+	installErr   error
+	startErr     error
+	uninstallErr error
+}
+
+func (step *fakeWindowsServicePlanStep) DefinitionPath() string { return step.path }
+
+func (step *fakeWindowsServicePlanStep) Install(context.Context) error {
+	*step.events = append(*step.events, "install:"+step.path)
+	return step.installErr
+}
+
+func (step *fakeWindowsServicePlanStep) Start(context.Context) error {
+	*step.events = append(*step.events, "start:"+step.path)
+	return step.startErr
+}
+
+func (step *fakeWindowsServicePlanStep) Uninstall(ctx context.Context) error {
+	if ctx == nil || ctx.Err() != nil {
+		return errors.New("rollback context was not live")
+	}
+	*step.events = append(*step.events, "uninstall:"+step.path)
+	return step.uninstallErr
+}
+
+func TestWindowsServiceStepsInstallInDependencyOrderAndRollbackOnlyNewDeclarations(t *testing.T) {
+	definitions := []windowsRuntimeServiceDefinition{
+		{kind: service.HostdKind, executable: `C:\Paperboat\pb.exe`},
+		{kind: service.DaemonKind, executable: `C:\Paperboat\pb.exe`},
+		{kind: service.UpdaterKind, executable: `C:\Paperboat\pb.exe`},
+	}
+	present := map[string]bool{"daemon": true}
+	var events []string
+	updaterFailure := errors.New("updated service failed")
+	makeStep := func(definition windowsRuntimeServiceDefinition) (windowsServicePlanStep, error) {
+		return &fakeWindowsServicePlanStep{path: definition.kind, events: &events, installErr: map[string]error{service.UpdaterKind: updaterFailure}[definition.kind]}, nil
+	}
+	declarationPresent := func(_ context.Context, path string) (bool, error) { return present[path], nil }
+	_, err := executeWindowsServiceSteps(context.Background(), definitions, makeStep, declarationPresent, false)
+	if !errors.Is(err, updaterFailure) {
+		t.Fatalf("install err=%v want updater failure", err)
+	}
+	want := []string{"install:hostd", "install:daemon", "install:updater", "uninstall:updater", "uninstall:hostd"}
+	if !reflect.DeepEqual(events, want) {
+		t.Fatalf("events=%q want=%q", events, want)
+	}
+}
+
+func TestWindowsServiceStepsTreatStaleDeclarationAsNewWhenSCMIsAbsent(t *testing.T) {
+	definitions := []windowsRuntimeServiceDefinition{
+		{kind: service.HostdKind},
+		{kind: service.DaemonKind},
+	}
+	// The hostd declaration is left behind by an interrupted install, but SCM
+	// has no matching registration. The native registration snapshot, not the
+	// declaration file, must determine rollback ownership.
+	declarations := map[string]bool{service.HostdKind: true}
+	registered := map[string]bool{}
+	inspected := map[string]bool{}
+	var events []string
+	installFailure := errors.New("daemon service failed")
+	makeStep := func(definition windowsRuntimeServiceDefinition) (windowsServicePlanStep, error) {
+		return &fakeWindowsServicePlanStep{
+			path:       definition.kind,
+			events:     &events,
+			installErr: map[string]error{service.DaemonKind: installFailure}[definition.kind],
+		}, nil
+	}
+	preexisting := func(_ context.Context, path string) (bool, error) {
+		inspected[path] = true
+		return registered[path], nil
+	}
+	_, err := executeWindowsServiceSteps(context.Background(), definitions, makeStep, preexisting, false)
+	if !errors.Is(err, installFailure) {
+		t.Fatalf("install err=%v want daemon failure", err)
+	}
+	want := []string{"install:hostd", "install:daemon", "uninstall:daemon", "uninstall:hostd"}
+	if !reflect.DeepEqual(events, want) {
+		t.Fatalf("events=%q want=%q", events, want)
+	}
+	if !declarations[service.HostdKind] || registered[service.HostdKind] || !inspected[service.HostdKind] {
+		t.Fatalf("stale declaration fixture was not inspected: declarations=%v registered=%v inspected=%v", declarations, registered, inspected)
+	}
+}
+
+func TestWindowsServiceStepsCleanupAfterPostInstallReadinessFailure(t *testing.T) {
+	definitions := []windowsRuntimeServiceDefinition{
+		{kind: service.HostdKind},
+		{kind: service.DaemonKind},
+	}
+	var events []string
+	makeStep := func(definition windowsRuntimeServiceDefinition) (windowsServicePlanStep, error) {
+		return &fakeWindowsServicePlanStep{path: definition.kind, events: &events}, nil
+	}
+	// The daemon was registered before this attempt. A post-install readiness
+	// failure must remove only the hostd registration created by this attempt.
+	preexisting := func(_ context.Context, path string) (bool, error) {
+		return path == service.DaemonKind, nil
+	}
+	cleanup, err := executeWindowsServiceSteps(context.Background(), definitions, makeStep, preexisting, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate the caller's local-daemon readiness failure by invoking the
+	// returned cleanup before handing the failure back to its caller.
+	if err := cleanup(); err != nil {
+		t.Fatalf("post-install cleanup err=%v", err)
+	}
+	if err := cleanup(); err != nil {
+		t.Fatalf("idempotent cleanup err=%v", err)
+	}
+	want := []string{"install:hostd", "install:daemon", "uninstall:hostd"}
+	if !reflect.DeepEqual(events, want) {
+		t.Fatalf("events=%q want=%q", events, want)
+	}
+}
+
+func TestWindowsServiceStepsReadinessHookRunsBeforeUpdater(t *testing.T) {
+	definitions := []windowsRuntimeServiceDefinition{
+		{kind: service.HostdKind},
+		{kind: service.DaemonKind},
+		{kind: service.UpdaterKind},
+	}
+	var events []string
+	makeStep := func(definition windowsRuntimeServiceDefinition) (windowsServicePlanStep, error) {
+		return &fakeWindowsServicePlanStep{path: definition.kind, events: &events}, nil
+	}
+	_, err := executeWindowsServiceStepsWithHook(
+		context.Background(), definitions, makeStep,
+		func(context.Context, string) (bool, error) { return false, nil }, true,
+		func(_ int, definition windowsRuntimeServiceDefinition) error {
+			if definition.kind == service.DaemonKind {
+				events = append(events, "ready:"+definition.kind)
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"install:hostd", "start:hostd",
+		"install:daemon", "start:daemon", "ready:daemon",
+		"install:updater", "start:updater",
+	}
+	if !reflect.DeepEqual(events, want) {
+		t.Fatalf("events=%q want=%q", events, want)
+	}
+}
+
+func TestWindowsServiceStepsStartFailureRollsBackInReverseOrderWithLiveContext(t *testing.T) {
+	definitions := []windowsRuntimeServiceDefinition{
+		{kind: service.HostdKind},
+		{kind: service.DaemonKind},
+		{kind: service.UpdaterKind},
+	}
+	var events []string
+	startFailure := errors.New("local daemon was not ready")
+	makeStep := func(definition windowsRuntimeServiceDefinition) (windowsServicePlanStep, error) {
+		return &fakeWindowsServicePlanStep{path: definition.kind, events: &events, startErr: map[string]error{service.DaemonKind: startFailure}[definition.kind]}, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cleanup, err := executeWindowsServiceSteps(ctx, definitions, makeStep, func(context.Context, string) (bool, error) { return false, nil }, true)
+	if !errors.Is(err, startFailure) {
+		t.Fatalf("start err=%v want daemon failure", err)
+	}
+	want := []string{"install:hostd", "start:hostd", "install:daemon", "start:daemon", "uninstall:daemon", "uninstall:hostd"}
+	if !reflect.DeepEqual(events, want) {
+		t.Fatalf("events=%q want=%q", events, want)
+	}
+	if cleanup != nil {
+		t.Fatal("failed service plan returned cleanup handle")
+	}
+	cancel()
+}
 
 func TestWindowsRuntimeServicesUseCanonicalBinary(t *testing.T) {
 	layout, err := service.DefaultLayout("windows")

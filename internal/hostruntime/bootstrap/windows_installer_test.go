@@ -70,6 +70,7 @@ func TestWindowsInstallerRollbackUsesTheSameBoundedElevationContract(t *testing.
 	script := windowsInstallerScript(t)
 	if !strings.Contains(script, "function Invoke-FreshPairRollback") ||
 		!strings.Contains(script, "function Wait-RollbackProcess") ||
+		!strings.Contains(script, "-ArgumentList @('__runtime-service', 'purge')") ||
 		!strings.Contains(script, "$purgeExitCode = Wait-RollbackProcess $purge 'Paperboat runtime purge'") ||
 		!strings.Contains(script, "$rollbackExitCode = Wait-InstallerProcess $rollback 'Paperboat fresh-install rollback'") {
 		t.Fatal("fresh pairing rollback must wait on each returned process with a bounded direct wait")

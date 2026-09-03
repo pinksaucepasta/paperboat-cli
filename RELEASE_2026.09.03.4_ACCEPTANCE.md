@@ -8,6 +8,22 @@ candidate passes the complete three-platform acceptance matrix.
 
 ## Release under test
 
+### Final candidate 2026.09.03.10
+
+- Tag: `2026.09.03.10`
+- Commit: `5279785989da5fc16e127943da369e08d85a9b3e`
+- GitHub Actions run: `33715204674` (`success`)
+- Published at: `2026-09-03T04:35:05Z`
+- GitHub release contains exactly the five expected assets. Their GitHub
+  SHA-256 digests and lengths exactly match production
+  `https://api.pprbt.dev/current.json`.
+- The macOS arm64 package was downloaded independently, matched SHA-256
+  `5b5122f7b479a9b415f05b2b841c1705701d66e2cd06255f39c4e561e5b28855`,
+  installed successfully on the clean Mac, and both installed copies report
+  `2026.09.03.10` with identical bytes.
+- Fresh dashboard enrollment and the complete platform matrix remain in
+  progress.
+
 - Tag: `2026.09.03.4`
 - Commit: `7d58d4de569330c091d87360ee7417bb6058157b`
 - GitHub Actions run: `33694021891` (`success`)
@@ -20,6 +36,33 @@ candidate passes the complete three-platform acceptance matrix.
   this is accepted and is not a cause of the current runtime investigation.
 
 ## Issue ledger
+
+### MAC-005: fresh `.10` Host service does not become ready
+
+- Severity: fresh-enrollment blocker
+- Reproduction: from a clean Mac, run the exact current dashboard-issued Host
+  command with the unique name `mac-final-20260903`.
+- Verified prerequisites: the displayed token hash exactly matched the current
+  `awaiting_bootstrap` server row; the official macOS arm64 package downloaded,
+  verified, and installed; pairing was accepted.
+- Actual: native Host setup then returned `native service did not become ready:
+  hostd`, classified the failure as `service_install`, and rolled the fresh
+  installation back with exit status 1. The rollback removed the binaries,
+  service definitions, and runtime state as designed.
+- Status: root-cause capture in progress. No code change has been made.
+
+### DASH-001: Copy enrollment command can leave a previous command in clipboard
+
+- Severity: acceptance reliability defect
+- Reproduction: create successive enrollments in the local dashboard and use
+  `Copy one-shot enrollment command` after the new command is visible.
+- Actual: the system clipboard retained the prior failed/expired command. The
+  prior token hash was proven not to match the current enrollment row.
+- Safety consequence: the copied stale command cannot claim the new enrollment,
+  but it causes misleading `invalid_user_machine_pairing` failures.
+- Workaround used for evidence only: read the currently rendered command and
+  verify its token digest against the current server row before execution.
+- Status: recorded for correction after the platform blocker is diagnosed.
 
 ### SERVER-001: dashboard POSIX enrollment response is not an executable script
 
@@ -576,3 +619,273 @@ finished and their complete failure sets are recorded.
   downloaded-credential UI while the current page renders one-shot installer
   commands. This is recorded separately and is not being used to justify a
   product-contract change in this platform recovery batch.
+
+### Dadape ARM64 pre-enrollment attempt against `2026.09.03.10`
+
+Status: canonical product state is clean; fresh Host enrollment and all
+post-enrollment checks are blocked because no protected dashboard-issued Host
+bootstrap command was supplied.
+
+- Target: `ssh -p 6000 anvit@152.67.0.60`, verified as `dadape`, Debian Linux
+  `aarch64`, user `anvit`.
+- Initial inventory found the stale user CLI
+  `/home/anvit/.local/bin/pb`, version `2026.09.01.11`, plus user runtime
+  state, a running `paperboat-local-daemon.service`, and no canonical hostd,
+  updater, or privileged system units. Hostd/updater sockets were absent.
+- The supported command
+  `printf 'UNINSTALL PAPERBOAT\\n%s\\n' "$(hostname)" | "$HOME/.local/bin/pb" uninstall`
+  was run twice with the exact confirmations and returned exit code 0 each
+  time. The old CLI remained because the pre-fix binary did not remove its own
+  user executable; user state, local daemon state, and system runtime state
+  were removed.
+- Production `current.json` was verified as schema
+  `paperboat.release-current/v1`, version `2026.09.03.10`, repository
+  `pinksaucepasta/paperboat-cli`. The ARM64 asset was downloaded from its
+  immutable GitHub release URL and verified at exactly 44,171,426 bytes with
+  SHA-256
+  `0304f8ec7e6410480670e6981d9836f90d9aa6fa9c385f0b11c00ee155410812`.
+- The no-parameter public bootstrap probe
+  `curl -fsSL https://get.pprbt.dev/install | sh -s -- --version 2026.09.03.10 --no-setup`
+  returned HTTP 400 (`invalid enrollment parameter`); it did not install or
+  mutate the target. The observed shell pipeline status was 0 because the
+  empty `sh` process was the final pipeline command; the HTTP response is the
+  authoritative result.
+- The verified `.10` binary was then used from a temporary path to invoke the
+  supported `pb uninstall` confirmations once more. It returned exit code 0
+  and removed the stale CLI. Final inventory confirmed no user CLI, user
+  Paperboat state, `/var/lib/paperboat*` runtime files, `/usr/local/libexec/paperboat`,
+  system or user Paperboat units, hostd/updater sockets, or Paperboat process.
+- One empty legacy directory remains at `/var/lib/paperboat-hostd` (owned by
+  `anvit`, mode `0700`), and the empty per-user runtime directory
+  `/run/user/1000/paperboat` remains. `/var/lib/paperboat-hostd` is not a path
+  referenced by the current host installer or purge code; no manual `rmdir`
+  or broad deletion was performed.
+- Filename-only searches on the local workspace and Dadape found no protected
+  enrollment/bootstrap command, and all enrollment-related environment
+  variables were unset. No dashboard token was fabricated, printed, retried,
+  or written to the repository.
+- Because enrollment input was absent, `.10` install/pair, updater apply,
+  service/reboot persistence, `pb status`, `pb doctor`, preview E2E, and tunnel
+  E2E were not attempted. The next required input is one fresh,
+  hostname-bound dashboard Host bootstrap command, supplied through a
+  protected file or directly to the interactive shell without logging it.
+
+### Windows Victus `.10` acceptance attempt: target offline
+
+Status: blocked before mutation. No dashboard command was consumed and no
+Paperboat or OpenSSH state was changed.
+
+- Read-only preflight command attempted on 2026-09-03:
+  `ssh -o ConnectTimeout=10 -o PreferredAuthentications=password
+  -o PubkeyAuthentication=no pujan@victus "hostname; whoami; powershell
+  -NoLogo -NoProfile -NonInteractive -Command \"Get-Date -Format o;
+  Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,
+  BuildNumber,LastBootUpTime | Format-List; Get-Service | Where-Object {
+  $_.Name -match 'Paperboat|paperboat|pb' } | Select-Object Name,Status,
+  StartType | Format-Table -AutoSize\""`.
+- Actual result: `ssh: connect to host victus port 22: Operation timed out`.
+- Independent local Tailscale check: `tailscale ping --c 3 --timeout=5s victus`
+  timed out on all three probes; `tailscale status --json` reported
+  `Victus`, `100.109.59.7`, `online=false`, with no current handshake.
+- The acceptance harness, fresh dashboard-issued one-shot install, supported
+  cleanup, service checks, restart persistence, update, `pb status`, `pb doctor`,
+  preview E2E, and tunnel E2E were not attempted because the target was not
+  reachable. A fresh protected enrollment command is still required after the
+  target returns online.
+
+### macOS fresh one-shot `.10` enrollment failure
+
+Status: reproduced twice with a hostname-bound dashboard command. Enrollment succeeds, but the native host service never becomes ready and the installer performs its documented fresh-install rollback.
+
+- Target: local `apple`, macOS `darwin/arm64`, account `pujan.pm`.
+- Exact fresh hostname used for the latest run: `mac-final-20260903e`.
+- The one-shot dashboard command installed the signed `.pkg`, reported `Enrollment accepted`, and entered managed host-service setup.
+- Running the command without cached sudo authorization displayed no administrator-password prompt and timed out at `native service did not become ready: hostd`.
+- Repeating with `sudo -v` successfully authorized immediately beforehand produced the same hostd readiness failure. Therefore missing interactive sudo prompting is a separate installer UX defect, not the proven hostd startup root cause.
+- The rollback removed `/usr/local/bin/pb`, both launchd jobs, and both plist declarations. The configured hostd/updater log files exist but contain no process output.
+- No manual package install was used for this acceptance run. The dashboard one-shot command was the only installer entry point.
+- Required fixes: preserve actionable launchd/bootstrap/process-exit diagnostics through rollback, correct the hostd launch/readiness regression, and make the piped one-shot installer obtain administrator authorization through the controlling terminal when sudo is not already authorized.
+
+### Windows Victus `.10` fresh bootstrap: consumed run failed before installation
+
+Status: blocked. The protected dashboard-issued command was transferred with an
+integrity check and consumed exactly once. No retry or manual install/uninstall
+was performed.
+
+- Target: `ssh pujan@victus`, verified as `VICTUS`, Windows 11 IoT Enterprise
+  LTSC, build `10.0.26100`, 64-bit. The SSH session was elevated
+  (`IsInRole(Administrator) = True`).
+- The tracked acceptance harness was copied only as acceptance tooling. Local
+  Git blob hash: `9bd3986883f5a7b96bc589f21294604c920aba09`; local and remote
+  byte SHA-256: `bc0ab9f8b5fccd0c21fcd26859a41e2d816af6bd7f8d5754a1e3200d5dc442df`;
+  size: `43,539` bytes. `-Phase Audit` made no changes and returned the
+  harness's generic failure because stale `.6` runtime state was present.
+- The protected command file was copied to
+  `C:\Users\Pujan\AppData\Local\Temp\pb-victus-enroll-command` with mode
+  `0600`-equivalent ACLs (SYSTEM, Administrators, and Pujan only). Local and
+  remote size: `198` bytes. Local and remote SHA-256:
+  `b2cd772cae987ed7dfaaf120289cfb4f3135033996e57a761e9462c5602c12c2`.
+- An initial wrapper parse error occurred before reading the protected file;
+  the remote hash remained unchanged, so that attempt did not consume the
+  command. The corrected elevated PowerShell wrapper then invoked the command
+  once, removed the protected file in `finally`, and reported exactly:
+  `bootstrap_exit=1` and `bootstrap_exception=System.Management.Automation.RemoteException`.
+  The protected file was absent afterward.
+- The wrapper redirected all child output with `*> $null`. Consequently the
+  exact installer stdout/stderr from the consumed run was not retained and
+  cannot be recovered from this execution. This is an observability loss in
+  the wrapper, not evidence of a specific installer root cause.
+- Read-only post-run inventory at `2026-09-03T05:25:17.8578083Z` found no
+  Paperboat service, process, scheduled task, or temporary installer script.
+  Existing state was unchanged: `runtime-install.json` still described
+  artifact version `2026.09.03.6`, and no new profile or service state existed.
+  No Paperboat-related Application or System event was present in the recent
+  Windows Event Log query; the only recent service-install event was unrelated
+  `UsbNcm Host Service` (Service Control Manager, event `7045`).
+- A second read-only inventory at `2026-09-03T05:30:48.9802915Z` confirmed
+  `elevated=True`, `PAPERBOAT_SERVICES=none`, `PAPERBOAT_PROCESSES=none`,
+  `PAPERBOAT_TASKS=none`, and `temp_command_present=False`. The unchanged
+  `runtime-install.json` SHA-256 was
+  `179b2a07f1658000300a97e1d1b4842a8468b6eda88687a000fd1ad70efa929a`; its
+  control URL remained `https://api.pprbt.dev`, state root remained
+  `C:\Users\Pujan\AppData\Local\Paperboat\runtime`, and artifact remained
+  `.6` / `pb-windows-amd64.exe` / `https://get.pprbt.dev/tuf`.
+- The only retained Paperboat-state SSH service log is
+  `C:\ProgramData\Paperboat\ssh\logs\service.log`, 80 bytes, SHA-256
+  `dfecd45abb3148b962dec13a2e8b398bbe3c5b8cc8e2a458524430e7fd9497ca`, with
+  exactly `Server listening on ::1 port 38222.` and `Server listening on
+  127.0.0.1 port 38222.`. The lifecycle lock is zero bytes; no hostd/updater
+  helper log or service entry was created by the consumed run.
+- A direct Service Control Manager query for the last 60 minutes returned only
+  the unrelated event `7045` at `2026-09-03T05:13:30Z` (`UsbNcm Host Service`,
+  kernel driver). Application and System queries filtered for Paperboat,
+  hostd, and updater returned `none`.
+- The installer command itself returned a nested PowerShell remote exception,
+  but the wrapper suppressed the nested error text. With no child output,
+  service/helper event, process, or state transition, the exact product failure
+  cannot be distinguished from an endpoint/download/elevation failure. Do not
+  retry the consumed enrollment command until that root cause is proven and a
+  new protected command is authorized.
+- Since the required enrollment did not complete, `.10` version/service,
+  updater, status/doctor, restart persistence, preview, and tunnel checks are
+  blocked. Existing OpenSSH state was preserved.
+
+### macOS launchd log-ownership validation and source regression evidence
+
+Status: source fix validated locally on 2026-09-03; package acceptance remains
+the required end-to-end check.
+
+- The current `renderLaunchd` rule in
+  `internal/hostruntime/service/service.go:312-320` emits `/var/log/<label>.log`
+  only when `config.User == "root"`. User-scoped hostd retains its explicit
+  `UserName`/`GroupName` at lines `321-325` but receives no privileged log
+  path. The regression test at
+  `internal/hostruntime/service/service_test.go:181-214` creates a `0600`
+  root-only log fixture and asserts that a `pujan.pm` hostd plist has neither
+  `StandardOutPath` nor `StandardErrorPath` nor `/var/log/`.
+- The piped macOS installer prompt fix remains at `tools/install.sh:354-361`:
+  `sudo installer` receives `/dev/tty` when available, while
+  `prepare_privileges` already authenticates with `/dev/tty` at lines
+  `157-184`. The shell syntax check passed; no password was printed or stored.
+- Historical comparison: commit `1a4d61d64533923df92de50de52122a4c9afd639`
+  (`preserve macOS service diagnostics and rollback credentials`) first added
+  `StandardOutPath`/`StandardErrorPath` for Worker, Host, Hostd, and Updater in
+  `internal/hostruntime/service/service.go`. The current guard is the minimal
+  correction for non-root launchd jobs; no package payload, helper staging,
+  ProgramArguments, ownership, or updater lifecycle change was made here.
+- Isolated native launchd smoke used only labels
+  `com.pinksaucepasta.paperboat.test-root-log` and
+  `com.pinksaucepasta.paperboat.test-no-log`, each running `/bin/sleep 30` as
+  `pujan.pm:staff`, from canonical `/Library/LaunchDaemons` plist paths. With
+  the pre-existing `/var/log/com.pinksaucepasta.paperboat.hostd.log`
+  (`0600`, uid 0, gid 0, zero bytes), the root-log job bootstrapped with rc 0
+  but after two seconds reported `active count = 0`, `state = not running`,
+  `last exit code = 78: EX_CONFIG`, and `execs = 0`. The no-log control
+  bootstrapped with rc 0 and reported `state = running`, `execs = 1`, and a
+  `pujan.pm` `/bin/sleep 30` process. Both bootouts returned rc 0.
+- Cleanup completed: both temporary jobs were booted out, both temporary
+  `/Library/LaunchDaemons` plists were unlinked, temporary `/tmp` plists were
+  removed, both labels return `Could not find service`, and the pre-existing
+  hostd log remains unchanged (`0600`, uid 0, gid 0, size 0).
+- Targeted source checks passed:
+  `go test ./internal/hostruntime/service -run
+  'TestLaunchdDefinitionIsEscapedValidXML|TestLaunchdNonRootHostdDoesNotUsePreexistingRootOnlyLog|TestHostServiceDefinitionsRunAsRootInBootDomain' -count=1 -v`;
+  `go test ./internal/hostruntime/service ./internal/hostruntimecmd
+  ./internal/hostruntime/hostinstall`; `sh -n tools/install.sh`;
+  `tools/test-macos-install-preservation.sh`; `tools/test-install-current-release.sh`;
+  `tools/test-pair-install-rollback.sh`; and `git diff --check`.
+- The opt-in composed lifecycle tests were invoked with
+  `PAPERBOAT_NATIVE_SERVICE_TEST=1`; both intentionally skip at
+  `internal/hostruntime/service/native_composed_darwin_test.go:20-24` and
+  `native_darwin_test.go:115-119` because raw Go test binaries do not model
+  installed macOS package provenance. They pass as skipped; real package
+  acceptance remains the authoritative native lifecycle test.
+- Reference evidence matches the ownership rule. Tailscale's system daemon
+  plist at `/Users/pujan.pm/workspace/github.com/pujan-modha/tailscale/cmd/tailscaled/install_darwin.go:23-47`
+  runs `/usr/local/bin/tailscaled` as a root LaunchDaemon and declares no
+  stdout/stderr paths; its install/load/start flow is at lines `103-146`.
+  Cloudflared's `/Users/pujan.pm/workspace/github.com/pujan-modha/cloudflared/cmd/cloudflared/macos_service.go:90-129`
+  resolves root paths under `/Library` and user paths under the user's
+  `~/Library`, including user-owned `~/Library/Logs`; lines `135-145`
+  explicitly distinguish a system LaunchDaemon from a user LaunchAgent.
+  Therefore a non-root Paperboat hostd must not target a pre-existing root-only
+  `/var/log` file; omitting that path is consistent with both precedents.
+
+### Windows Victus `.10` first corrected enrollment: endpoint succeeded, native services rolled back
+
+Status: partially installed, then failed service acceptance. The corrected
+dashboard-issued command was consumed once. No retry or manual install/uninstall
+was performed by this acceptance run.
+
+- Protected command source: local `/tmp/pb-victus-enroll-command-fixed`, mode
+  `0600`, 182 bytes, SHA-256
+  `6eff4dc530475125a4cf84c03b8ae19fd851bd6c1dcbf35fda4e161f4c34321f`.
+  Remote copy had the same size and SHA-256 and ACL entries only for SYSTEM,
+  Administrators, and Pujan. The PowerShell session reported
+  `elevated=True` before invocation.
+- Capture wrapper metadata is in
+  `C:\Users\Pujan\AppData\Local\Temp\pb-victus-enroll-20260903T0540.meta.log`:
+  `start_utc=2026-09-03T05:38:33.3980996Z`,
+  `end_utc=2026-09-03T05:40:31.6908549Z`, `elevated=True`, `exit=1`,
+  `stdout_bytes=0`, `stderr_bytes=395`. The wrapper process exited; no
+  Paperboat process remained in the later exact-name query.
+- Exact captured installer stdout was empty. Exact captured stderr was:
+  `powershell.exe : Completing one-shot machine enrollment...`, followed by
+  the standard PowerShell `NativeCommandError` record at the wrapper's
+  `& powershell.exe` invocation, `CategoryInfo=NotSpecified` and
+  `FullyQualifiedErrorId=NativeCommandError`. The wrapper console ended with
+  `bootstrap_exit=1` and the SSH transport emitted only CLIXML progress
+  records saying `Preparing modules for first use.` twice.
+- The protected capture files remain at
+  `C:\Users\Pujan\AppData\Local\Temp\pb-victus-enroll-20260903T0540.stdout.log`
+  (0 bytes, SHA-256
+  `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`) and
+  `.stderr.log` (395 bytes, SHA-256
+  `2a6fc1a15563de1dee13b08937b7a65a7dc2e6f2a4be012910b571c8aa4b18bd`), with
+  metadata SHA-256
+  `ecf1463756cc608c6fdbf57bed70d835530ef5505654ea866af048ca2a39ee4d`.
+- The server trace for this run records the enrollment pairing POST as HTTP
+  `201` and the installer endpoint as HTTP `200` at approximately
+  `2026-09-03T05:39Z`; therefore the dashboard command itself reached the
+  server and was not rejected as an invalid enrollment. The visible installer
+  failure occurred after the endpoint began its one-shot enrollment.
+- Read-only post-run inventory at `2026-09-03T05:46:31.6907352Z` found
+  `C:\Program Files\Paperboat\bin\pb.exe`, 50,030,592 bytes, SHA-256
+  `7dc9d4161a34624d8337d21a1cb1d755713bcf977e9f26ea37101f386a23ce8c`,
+  matching the `.10` Windows AMD64 release asset. `pb.rollback` also remained
+  at 50,030,592 bytes. `runtime-install.json` was absent.
+- Service Control Manager recorded installation of `Paperboat OpenSSH Server`
+  at `2026-09-03T05:40:21Z` and `PaperboatHostd` at
+  `2026-09-03T05:40:30Z`. At `2026-09-03T05:47:07.9535741Z`, `sc.exe query`
+  returned error `1060` (service does not exist) for `PaperboatHostd`,
+  `Paperboat OpenSSH Server`, `PaperboatUpdater`, and `PaperboatUpdated`, and
+  all four corresponding service registry keys were absent. Exact product
+  process query returned `none`. No explicit service-delete event was found,
+  but the install events followed by absent service definitions, absent
+  runtime-install state, and the retained rollback binary prove the service
+  setup was not durable and is consistent with installer rollback.
+- The retained Paperboat-state SSH log remained only the two listener lines on
+  ports 38222; no hostd/updater helper log was created. Existing OpenSSH
+  state was preserved. Version/service/updater, restart persistence, status,
+  doctor, preview, and tunnel checks remain blocked by the missing native
+  services.

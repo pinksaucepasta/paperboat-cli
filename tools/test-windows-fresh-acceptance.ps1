@@ -27,6 +27,10 @@
     The script does not perform cleanup automatically. After a successful
     run, inspect the printed cleanup boundary and use the product's supported
     unpair/uninstall flow separately if the disposable machine is to be reset.
+    If a fresh installer exits unsuccessfully, the harness watches the fixed
+    Paperboat startup-error logs before rollback and preserves exact bounded
+    bytes plus hashes in a private temporary evidence directory. Diagnostic
+    contents are never printed.
 
 .NOTES
     This is an acceptance harness, not an installer replacement. It invokes
@@ -62,6 +66,9 @@ $ErrorActionPreference = 'Stop'
 
 Set-Variable -Name ScriptRoot -Value (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Variable -Name RequiredConfirmation -Value 'RUN-FRESH-WINDOWS-ACCEPTANCE'
+Set-Variable -Name WindowsInstallerTimeoutSeconds -Value 1200
+Set-Variable -Name WindowsStartupDiagnosticMaxBytes -Value 64KB
+Set-Variable -Name WindowsStartupDiagnosticPollMilliseconds -Value 200
 # Runtime role declarations live under ServicesRoot. PaperboatSshd is a
 # separately-owned OpenSSH declaration under ProgramData\Paperboat\ssh and is
 # validated by the host-role readiness check below.
@@ -121,6 +128,12 @@ function Get-PaperboatPaths {
         SSHDPath          = Join-Path $openSSHRoot 'sshd.exe'
         SSHStateRoot      = $sshStateRoot
         SSHConfig         = Join-Path $sshStateRoot 'sshd_config'
+        StartupErrorPaths = @(
+            (Join-Path $programDataRoot 'PaperboatHostd-startup-error.log'),
+            (Join-Path $programDataRoot 'PaperboatHostd-worker-startup-error.log'),
+            (Join-Path $programDataRoot 'PaperboatUpdated-startup-error.log'),
+            (Join-Path $programDataRoot 'PaperboatUpdated-worker-startup-error.log')
+        )
         LocalAppDataRoot  = $localAppDataRoot
         RoamingAppDataRoot = $roamingAppDataRoot
     }
@@ -726,7 +739,184 @@ function Read-EnrollmentBootstrap([string]$Path) {
     return $url
 }
 
-function Invoke-FreshBootstrapInstaller([string]$BootstrapURL) {
+function Get-WindowsStartupDiagnosticSources([pscustomobject]$Paths) {
+    foreach ($path in @($Paths.StartupErrorPaths)) {
+        [pscustomobject]@{
+            Name = [IO.Path]::GetFileName([string]$path)
+            Path = [string]$path
+        }
+    }
+}
+
+function New-WindowsStartupEvidenceRoot {
+    $root = Join-Path ([IO.Path]::GetTempPath()) ('paperboat-windows-startup-evidence-' + [guid]::NewGuid().ToString('N'))
+    if ([IO.Path]::IsPathRooted($root) -eq $false -or $root -ne [IO.Path]::GetFullPath($root)) {
+        Fail 'Windows startup evidence path is not an absolute clean path.'
+    }
+    if (Test-Path -LiteralPath $root) {
+        Fail 'Windows startup evidence path already exists.'
+    }
+    New-Item -ItemType Directory -Path $root -Force -ErrorAction Stop | Out-Null
+    Assert-SafeOwnedRoot $root
+    return $root
+}
+
+function Copy-WindowsStartupDiagnostic([pscustomobject]$Source, [string]$EvidenceRoot) {
+    if ($null -eq $Source -or [string]::IsNullOrWhiteSpace($Source.Name) -or
+        [string]::IsNullOrWhiteSpace($Source.Path) -or
+        -not [IO.Path]::IsPathRooted([string]$Source.Path) -or
+        [string]$Source.Path -ne [IO.Path]::GetFullPath([string]$Source.Path) -or
+        [string]$Source.Name -ne [IO.Path]::GetFileName([string]$Source.Path) -or
+        [string]$Source.Name -notmatch '^(?:PaperboatHostd|PaperboatHostd-worker|PaperboatUpdated|PaperboatUpdated-worker)-startup-error\.log$') {
+        Fail 'Windows startup diagnostic source is outside the fixed Paperboat log set.'
+    }
+    if (-not (Test-Path -LiteralPath $Source.Path -PathType Leaf) -or (Test-ReparsePoint $Source.Path)) {
+        return $null
+    }
+
+    $destination = Join-Path $EvidenceRoot ([string]$Source.Name)
+    $temporary = $destination + '.tmp-' + [guid]::NewGuid().ToString('N')
+    for ($attempt = 0; $attempt -lt 3; $attempt++) {
+        try {
+            $before = Get-Item -LiteralPath $Source.Path -Force -ErrorAction Stop
+            if (-not $before.PSIsContainer -and $before.Length -gt 0) {
+                if ($before.Length -gt $WindowsStartupDiagnosticMaxBytes) {
+                    Fail 'Windows startup diagnostic exceeded the bounded evidence size.'
+                }
+                $bytes = [IO.File]::ReadAllBytes([string]$Source.Path)
+                $after = Get-Item -LiteralPath $Source.Path -Force -ErrorAction Stop
+                if ($after.Length -ne $before.Length -or $bytes.Length -ne $before.Length) {
+                    continue
+                }
+                [IO.File]::WriteAllBytes($temporary, $bytes)
+                Move-Item -LiteralPath $temporary -Destination $destination -Force -ErrorAction Stop | Out-Null
+                $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $destination -ErrorAction Stop).Hash.ToLowerInvariant()
+                return [pscustomobject]@{
+                    Name      = [string]$Source.Name
+                    Path      = $destination
+                    Size      = [int64]$bytes.Length
+                    SHA256    = $hash
+                    Captured  = [DateTime]::UtcNow.ToString('o')
+                }
+            }
+        } catch [System.IO.FileNotFoundException] {
+            return $null
+        } catch [System.IO.DirectoryNotFoundException] {
+            return $null
+        } catch [System.IO.IOException] {
+            Start-Sleep -Milliseconds 25
+        } finally {
+            $bytes = $null
+            Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+        }
+    }
+    return $null
+}
+
+function Capture-WindowsStartupDiagnostics([pscustomobject]$Paths, [string]$EvidenceRoot, [hashtable]$Captured) {
+    foreach ($source in @(Get-WindowsStartupDiagnosticSources $Paths)) {
+        $copy = Copy-WindowsStartupDiagnostic $source $EvidenceRoot
+        if ($null -ne $copy) {
+            $Captured[$copy.Name] = $copy
+        }
+    }
+}
+
+function Write-WindowsStartupEvidenceMetadata([string]$EvidenceRoot, [int]$ExitCode, [string]$Outcome, [hashtable]$Captured) {
+    $metadata = [ordered]@{
+        schema       = 'paperboat.windows-startup-evidence/v1'
+        outcome      = $Outcome
+        exit_code    = $ExitCode
+        diagnostics  = @($Captured.Values | Sort-Object Name | ForEach-Object {
+            [ordered]@{
+                name     = [string]$_.Name
+                file     = [string]$_.Path
+                size     = [int64]$_.Size
+                sha256   = [string]$_.SHA256
+                captured = [string]$_.Captured
+            }
+        })
+    }
+    $body = ConvertTo-Json -InputObject $metadata -Depth 5 -Compress
+    [IO.File]::WriteAllText((Join-Path $EvidenceRoot 'metadata.json'), ($body + "`r`n"))
+}
+
+function Report-WindowsStartupEvidence([string]$EvidenceRoot, [int]$ExitCode, [string]$Outcome, [hashtable]$Captured) {
+    Write-WindowsStartupEvidenceMetadata $EvidenceRoot $ExitCode $Outcome $Captured
+    if ($Captured.Count -eq 0) {
+        return
+    }
+    $summary = @($Captured.Values | Sort-Object Name | ForEach-Object {
+        [string]$_.Name + '=' + [string]$_.Size + ' bytes sha256=' + [string]$_.SHA256
+    })
+    Check ('Windows startup diagnostics preserved at ' + $EvidenceRoot + ': ' + [string]::Join(', ', [string[]]$summary))
+}
+
+function Invoke-WindowsInstallerProcess([string]$Executable, [string]$ArgumentLine, [string]$StdoutPath, [string]$StderrPath, [pscustomobject]$Paths, [string]$FailureMessage) {
+    $evidenceRoot = New-WindowsStartupEvidenceRoot
+    $captured = @{}
+    $process = $null
+    $timedOut = $false
+    $keepEvidence = $false
+    try {
+        try {
+            $process = Start-Process -FilePath $Executable -ArgumentList $ArgumentLine -PassThru -WindowStyle Hidden -RedirectStandardOutput $StdoutPath -RedirectStandardError $StderrPath -ErrorAction Stop
+        } catch {
+            $keepEvidence = $true
+            Capture-WindowsStartupDiagnostics $Paths $evidenceRoot $captured
+            Report-WindowsStartupEvidence $evidenceRoot -1 'not-started' $captured
+            Fail $FailureMessage
+        }
+        $deadline = [DateTime]::UtcNow.AddSeconds($WindowsInstallerTimeoutSeconds)
+        while ($true) {
+            Capture-WindowsStartupDiagnostics $Paths $evidenceRoot $captured
+            $process.Refresh()
+            if ($process.HasExited) {
+                break
+            }
+            if ([DateTime]::UtcNow -ge $deadline) {
+                $timedOut = $true
+                $keepEvidence = $true
+                Report-WindowsStartupEvidence $evidenceRoot -1 'timeout' $captured
+                Fail 'The Windows bootstrap installer exceeded its bounded timeout.'
+            }
+            Start-Sleep -Milliseconds $WindowsStartupDiagnosticPollMilliseconds
+        }
+        $process.WaitForExit()
+        Capture-WindowsStartupDiagnostics $Paths $evidenceRoot $captured
+        $exitCode = [int]$process.ExitCode
+        if ($exitCode -ne 0) {
+            $keepEvidence = $true
+            Report-WindowsStartupEvidence $evidenceRoot $exitCode 'failed' $captured
+            if ($captured.Count -gt 0) {
+                Fail ($FailureMessage + ' Startup diagnostics were preserved for inspection.')
+            }
+            Fail ($FailureMessage + ' No startup diagnostic was captured before rollback.')
+        }
+        if ($captured.Count -gt 0) {
+            $keepEvidence = $true
+            Report-WindowsStartupEvidence $evidenceRoot $exitCode 'succeeded-with-diagnostic' $captured
+        }
+    } finally {
+        if ($timedOut -and $null -ne $process) {
+            try {
+                $process.Refresh()
+                if (-not $process.HasExited) {
+                    Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+                    $process.WaitForExit(5000)
+                }
+            } catch {
+                # The bounded installer failure is already being reported. Do
+                # not replace it with cleanup noise or captured process text.
+            }
+        }
+        if (-not $keepEvidence) {
+            Remove-Item -LiteralPath $evidenceRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Invoke-FreshBootstrapInstaller([string]$BootstrapURL, [pscustomobject]$Paths) {
     $powershell = Join-Path $PSHOME 'powershell.exe'
     if (-not (Test-Path -LiteralPath $powershell -PathType Leaf) -or (Test-ReparsePoint $powershell)) {
         Fail 'Windows PowerShell executable is unavailable.'
@@ -754,10 +944,7 @@ function Invoke-FreshBootstrapInstaller([string]$BootstrapURL) {
             Fail 'The dashboard-generated protected bootstrap file is unsafe.'
         }
         $argumentLine = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ($bootstrapPath -replace '"', '\"') + '"'
-        $process = Start-Process -FilePath $powershell -ArgumentList $argumentLine -Wait -PassThru -WindowStyle Hidden -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
-        if ($process.ExitCode -ne 0) {
-            Fail 'The dashboard-generated protected bootstrap failed.'
-        }
+        Invoke-WindowsInstallerProcess $powershell $argumentLine $stdoutPath $stderrPath $Paths 'The dashboard-generated protected bootstrap failed.'
     } finally {
         Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
         $body = $null
@@ -774,7 +961,7 @@ function Invoke-FreshInstaller([pscustomobject]$Paths) {
         Fail 'Supply only one of EnrollmentTokenFile or EnrollmentBootstrapFile.'
     }
     if (-not [string]::IsNullOrWhiteSpace($EnrollmentBootstrapFile)) {
-        Invoke-FreshBootstrapInstaller (Read-EnrollmentBootstrap $EnrollmentBootstrapFile)
+        Invoke-FreshBootstrapInstaller (Read-EnrollmentBootstrap $EnrollmentBootstrapFile) $Paths
         return
     }
     if ([string]::IsNullOrWhiteSpace($InstallerPath)) {
@@ -815,10 +1002,7 @@ function Invoke-FreshInstaller([pscustomobject]$Paths) {
         if (-not [string]::IsNullOrWhiteSpace($ExpectedVersion)) { $env:PAPERBOAT_VERSION = $ExpectedVersion }
         if (-not [string]::IsNullOrWhiteSpace($ReleaseMetadataUrl)) { $env:PAPERBOAT_RELEASE_METADATA_URL = $ReleaseMetadataUrl }
         $argumentLine = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ($InstallerPath -replace '"', '\"') + '"'
-        $process = Start-Process -FilePath $powershell -ArgumentList $argumentLine -Wait -PassThru -WindowStyle Hidden -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
-        if ($process.ExitCode -ne 0) {
-            Fail 'The signed Windows bootstrap installer failed.'
-        }
+        Invoke-WindowsInstallerProcess $powershell $argumentLine $stdoutPath $stderrPath $Paths 'The signed Windows bootstrap installer failed.'
     } finally {
         Remove-Item Env:PAPERBOAT_ENROLLMENT_TOKEN -ErrorAction SilentlyContinue
         foreach ($name in @('PAPERBOAT_SERVER', 'PAPERBOAT_MACHINE_NAME', 'PAPERBOAT_VERSION', 'PAPERBOAT_RELEASE_METADATA_URL')) {
