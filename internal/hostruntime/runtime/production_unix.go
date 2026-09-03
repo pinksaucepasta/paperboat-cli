@@ -455,6 +455,7 @@ func newProductionHost(ctx context.Context, version string, environ func(string)
 	var runtimeEnvironment interface {
 		NextObservation(time.Time) (envinject.Observation, error)
 		Apply(context.Context, envinject.Bundle) error
+		BindingState() envinject.BindingState
 	}
 	var environmentBootstrap Service
 	var environmentObservationOnce sync.Once
@@ -1711,6 +1712,7 @@ type runtimeObservationSender struct {
 	environment interface {
 		NextObservation(time.Time) (envinject.Observation, error)
 		Apply(context.Context, envinject.Bundle) error
+		BindingState() envinject.BindingState
 	}
 	onEnvironmentObservation func()
 	receiptPath              string
@@ -1775,7 +1777,7 @@ func (s *runtimeObservationSender) Send(ctx context.Context) error {
 		SampledAt:          now,
 		Environment:        environmentObservation,
 		Availability:       availabilityState,
-		RuntimeDiagnostics: s.runtimeDiagnostics(now, environmentObservation != nil),
+		RuntimeDiagnostics: s.runtimeDiagnostics(now, environmentObservation != nil && s.environment.BindingState() == envinject.BindingActive),
 		RelayLatency:       relayLatency,
 		Update:             s.updateObservationFrom(now, availabilityState, updaterState, updaterErr),
 	})

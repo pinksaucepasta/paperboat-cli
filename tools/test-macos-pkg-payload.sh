@@ -1,12 +1,13 @@
 #!/bin/sh
 set -eu
 
+repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+
 if [ "$(uname -s)" != Darwin ]; then
   echo 'macOS PKG payload: skipped (requires Darwin)'
   exit 0
 fi
 
-repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 version=2026.09.02.999
 temporary=$(mktemp -d "${TMPDIR:-/tmp}/paperboat-macos-pkg.XXXXXX")
 cleanup() { rm -rf -- "$temporary"; }
@@ -82,4 +83,13 @@ for executable in "$cli" "$helper"; do
   fi
 done
 
-echo 'macOS PKG payload: both destinations, version, and ad-hoc signatures verified'
+# The package intentionally carries one executable, while setup writes the
+# durable launchd updater declaration that invokes that executable with its
+# private role. Keep this package smoke test coupled to that service contract
+# so a package cannot silently lose the updater entry point.
+service_components="$repository_root/internal/hostruntime/service/components.go"
+grep -F 'UpdaterLabel' "$service_components" >/dev/null
+grep -F 'Arguments: []string{"__runtime-updated"}' "$service_components" >/dev/null
+grep -F 'install -m 0755 "$cli_payload" "$helper_payload"' "$repository_root/tools/build-macos-pkg.sh" >/dev/null
+
+echo 'macOS PKG payload: unified CLI/helper bytes, updater role, version, and ad-hoc signatures verified'

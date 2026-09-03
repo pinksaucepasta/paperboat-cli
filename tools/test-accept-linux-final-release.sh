@@ -27,6 +27,18 @@ remote_body=$(awk '
   echo 'remote official-installer invocation does not use the canonical install directory' >&2
   exit 1
 }
+[[ "$remote_body" == *'systemctl show -p ExecStart --value "$unit"'* ]] || {
+  echo 'remote acceptance body does not inspect the installed service command' >&2
+  exit 1
+}
+[[ "$remote_body" == *'expected_argument=__runtime-updated'* ]] || {
+  echo 'remote acceptance body does not require the paperboat-updated role' >&2
+  exit 1
+}
+[[ "$remote_body" == *'paperboat-updated.service'* && "$remote_body" == *'enabled=$(systemctl is-enabled "$unit"'* ]] || {
+  echo 'remote acceptance body does not report persistent paperboat-updated state' >&2
+  exit 1
+}
 if [[ "$remote_body" == *'${INSTALL_DIR}'* || "$remote_body" == *'$INSTALL_DIR'* ]]; then
   echo 'remote acceptance body still references unset INSTALL_DIR' >&2
   exit 1

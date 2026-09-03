@@ -386,6 +386,19 @@ jobs:
             echo "macOS PKG reported an unexpected version: ${package_version:-<missing>} (want $RELEASE_VERSION)" >&2
             exit 1
           fi
+          payload_files=$(pkgutil --payload-files dist/pb-darwin-arm64.pkg)
+          for expected in \
+            './usr/local/bin/pb' \
+            './Library/PrivilegedHelperTools/Paperboat/pb'; do
+            if ! printf '%s\n' "$payload_files" | grep -Fqx "$expected"; then
+              echo "macOS PKG is missing the unified runtime payload $expected" >&2
+              exit 1
+            fi
+          done
+          if printf '%s\n' "$payload_files" | grep -Eq '(^|/)(Application Support|LaunchDaemons)(/|$)|\.plist$'; then
+            echo 'macOS PKG must not publish updater state or service declarations' >&2
+            exit 1
+          fi
       - name: Notarize and staple macOS PKG
         if: env.APPLE_ID != '' && env.APPLE_TEAM_ID != '' && env.APPLE_APP_PASSWORD != '' && env.APPLE_INSTALLER_SIGNING_IDENTITY != ''
         shell: bash

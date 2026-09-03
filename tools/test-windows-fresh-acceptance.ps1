@@ -277,6 +277,9 @@ function Assert-ServiceSet([pscustomobject]$Paths, [bool]$RequireRunning) {
     Assert-ServiceRecord 'PaperboatHostd' '__runtime-hostd' $Paths $RequireRunning
     Assert-ServiceRecord 'PaperboatLocalDaemon' '__runtime-local-daemon' $Paths $RequireRunning
     Assert-ServiceRecord 'PaperboatUpdated' '__runtime-updated' $Paths $RequireRunning
+    if ($RequireRunning) {
+        Check 'PaperboatUpdated is persistent, active, and runs the unified pb __runtime-updated role'
+    }
     foreach ($name in @('PaperboatHost', 'PaperboatRuntimeConfig', 'PaperboatRuntime')) {
         if ($null -ne (Get-ServiceRecord $name)) {
             Fail 'An obsolete or duplicate Paperboat Windows service is installed.'

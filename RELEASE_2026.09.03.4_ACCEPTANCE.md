@@ -126,7 +126,13 @@ macOS, Linux, and Windows test pass has been recorded here.
   logged database connection refusal during the reboot window, and continued
   returning 500 afterward. It must be repaired in the control plane/deployment
   batch, not by weakening client retries.
-- Fix status: server-side follow-up required before final E2E acceptance.
+- Root cause: auxiliary ENV storage failed after durable machine presence had
+  already succeeded, but the handler still converted that auxiliary failure
+  into HTTP 500. A fresh Host also advertised ENV before its new recipient key
+  was authorized, exercising this path continuously.
+- Fix status: implemented on both sides. The server preserves HTTP 202 and
+  reports typed auxiliary rejection codes after durable presence succeeds; the
+  runtime withholds the ENV capability until the exact binding is active.
 
 ### LINUX-006: managed SSH readiness rejects a normal wildcard sshd listener
 
@@ -141,7 +147,30 @@ macOS, Linux, and Windows test pass has been recorded here.
   Host mode. The resulting machine registration omits `ssh_user` and
   `ssh_port`, so production managed SSH is not constructed despite a healthy
   loopback target. Windows supplies its managed SSH user and port correctly.
-- Fix status: source fix pending in the current batch.
+- Fix status: implemented in the current batch.
+
+### LINUX-007: fresh Host advertises ENV Injection before its recipient key is authorized
+
+- Severity: persistent control-plane heartbeat failure
+- Reproduction: perform a fresh Host enrollment into an account whose encrypted
+  ENV authority already exists, then inspect the runtime ENV cache, active
+  authority bindings, and `/v1/runtime-observations` results.
+- Expected: the runtime does not advertise `environment_injection` until its
+  exact installation-generation recipient key is active, and pending key
+  authorization cannot turn the otherwise healthy heartbeat into HTTP 500.
+- Actual: the fresh Host created recipient
+  `envk_cOVMa89_G8f2PgEeOKW8aXlk8ISI7oGIorxqoxcKKr8`, while the active authority
+  had no binding for machine `mch_e8ce6d5666eb5c8be69f62768c5541c3`.
+  Its cache remained authority-null but the runtime still sent the ENV
+  capability and observation every 15 seconds. The server recorded machine
+  presence, then its auxiliary ENV response path returned HTTP 500.
+- Evidence: runtime cache and high-water files on Hetzner at
+  `2026-09-03T00:01Z`, active authority generation 5 and binding inventory from
+  PostgreSQL, plus the continuous hostd/server 500 logs already recorded for
+  LINUX-005.
+- Fix status: implemented. Capability publication requires exact verified
+  binding state, while the server isolates transient auxiliary storage failure
+  without weakening ENV integrity or machine heartbeat durability.
 
 ### WIN-001: Windows fresh-acceptance harness does not parse
 

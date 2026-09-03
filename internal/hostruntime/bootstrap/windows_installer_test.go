@@ -43,7 +43,7 @@ func TestWindowsInstallerDoesNotRequestUACFromElevatedSession(t *testing.T) {
 	if !strings.Contains(script, "function Invoke-FreshPairRollback") || !strings.Contains(script, "rolling back the fresh installation") || !strings.Contains(script, "-EncodedCommand' $encodedPayload") {
 		t.Fatal("Windows fresh pairing failure must invoke the fixed-path elevated rollback")
 	}
-	if !strings.Contains(script, "Remove-Item -LiteralPath $programRoot -Recurse -Force") || !strings.Contains(script, "Start-Process -FilePath $installed -ArgumentList @('purge') -Wait") {
+	if !strings.Contains(script, "Remove-Item -LiteralPath $programRoot -Recurse -Force -ErrorAction Stop") || !strings.Contains(script, "Test-Path -LiteralPath $programRoot") || !strings.Contains(script, "Start-Process -FilePath $installed -ArgumentList @('purge') -Wait") {
 		t.Fatal("Windows fresh pairing rollback must purge services before removing the installed payload")
 	}
 	cleanup := strings.LastIndex(script, "foreach ($statePath in @(")

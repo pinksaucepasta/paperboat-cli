@@ -134,7 +134,10 @@ try {
 try {
   # __install --fresh owns this exact root. Remove the payload only after the
   # executable has exited, so the rollback is safe on Windows file locking.
-  Remove-Item -LiteralPath $programRoot -Recurse -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $programRoot -Recurse -Force -ErrorAction Stop
+  if (Test-Path -LiteralPath $programRoot) {
+    throw "Paperboat fresh-install payload remains after rollback."
+  }
 } catch {
   if ($null -eq $purgeError) { $purgeError = $_ }
 }

@@ -448,13 +448,19 @@ verify() {
   printf 'canonical_pb_version=%s\n' "$(printf '%s' "$version_output" | one_line)"
   grep -F "Version $expected_version" <<<"$version_output" >/dev/null || die "canonical pb version is not $expected_version"
 
-  local unit enabled active pid executable proc_sha
+  local unit expected_argument enabled active pid executable proc_sha exec_start
   for unit in paperboat-hostd.service paperboat-updated.service; do
+    expected_argument=__runtime-hostd
+    [[ "$unit" == paperboat-updated.service ]] && expected_argument=__runtime-updated
     enabled=$(systemctl is-enabled "$unit" 2>&1 || true)
     active=$(systemctl is-active "$unit" 2>&1 || true)
     printf 'unit=%s enabled=%s active=%s\n' "$unit" "$enabled" "$active"
     [[ "$enabled" == enabled ]] || die "$unit is not enabled"
     [[ "$active" == active ]] || die "$unit is not active"
+    exec_start=$(systemctl show -p ExecStart --value "$unit" 2>/dev/null || true)
+    [[ "$exec_start" == *"$pb"* ]] || die "$unit does not invoke the canonical pb binary"
+    [[ "$exec_start" == *"$expected_argument"* ]] || die "$unit does not invoke the expected runtime role"
+    printf 'unit=%s exec_start=%s\n' "$unit" "$(printf '%s' "$exec_start" | one_line)"
     pid=$(systemctl show -p MainPID --value "$unit" 2>/dev/null || true)
     [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 1 )) || die "$unit has no live MainPID"
     executable=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)

@@ -559,6 +559,7 @@ func (p runtimeTestEnvironmentProcessor) Apply(_ context.Context, cache envinjec
 func TestRuntimeObservationAppliesEncryptedBundleAndAcknowledgesIt(t *testing.T) {
 	variables := map[string]string{"GLOBAL_TOKEN": "global-secret", "MACHINE_TOKEN": "machine-secret"}
 	var observations []envinject.Observation
+	requestCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -574,9 +575,13 @@ func TestRuntimeObservationAppliesEncryptedBundleAndAcknowledgesIt(t *testing.T)
 		if err := json.Unmarshal(body, &request); err != nil {
 			t.Fatal(err)
 		}
+		requestCount++
 		observations = append(observations, request.Environment)
-		if !slices.Contains(request.RuntimeDiagnostics.Capabilities, "environment_injection") {
-			t.Fatal("ENV observation was sent without the matching runtime capability")
+		if requestCount == 1 && slices.Contains(request.RuntimeDiagnostics.Capabilities, "environment_injection") {
+			t.Fatal("unverified ENV binding advertised environment_injection")
+		}
+		if requestCount > 1 && !slices.Contains(request.RuntimeDiagnostics.Capabilities, "environment_injection") {
+			t.Fatal("verified ENV binding omitted environment_injection")
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)

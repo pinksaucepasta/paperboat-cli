@@ -7,6 +7,11 @@ python3 - \
   "$repository_root/.github/workflows/release.yml" \
   "$repository_root/tools/build-release-asset.sh" \
   "$repository_root/tools/build-macos-pkg.sh" \
+  "$repository_root/tools/test-macos-pkg-payload.sh" \
+  "$repository_root/tools/accept-linux-final-release.sh" \
+  "$repository_root/tools/test-windows-fresh-acceptance.ps1" \
+  "$repository_root/internal/hostruntime/service/components.go" \
+  "$repository_root/internal/hostruntime/hostinstall/windows_service_plan.go" \
   "$repository_root/Makefile" \
   "$repository_root/tools/tuf-repository/main.go" \
   "$repository_root/packaging/windows/scripts/sign-and-verify.ps1" <<'PY'
@@ -14,10 +19,27 @@ import pathlib
 import re
 import sys
 
-workflow_path, release_builder_path, pkg_builder_path, makefile_path, tuf_path, windows_signer_path = map(pathlib.Path, sys.argv[1:])
+(
+    workflow_path,
+    release_builder_path,
+    pkg_builder_path,
+    macos_pkg_test_path,
+    linux_acceptance_path,
+    windows_acceptance_path,
+    service_components_path,
+    windows_service_plan_path,
+    makefile_path,
+    tuf_path,
+    windows_signer_path,
+) = map(pathlib.Path, sys.argv[1:])
 workflow = workflow_path.read_text(encoding='utf-8')
 release_builder = release_builder_path.read_text(encoding='utf-8')
 pkg_builder = pkg_builder_path.read_text(encoding='utf-8')
+macos_pkg_test = macos_pkg_test_path.read_text(encoding='utf-8')
+linux_acceptance = linux_acceptance_path.read_text(encoding='utf-8')
+windows_acceptance = windows_acceptance_path.read_text(encoding='utf-8')
+service_components = service_components_path.read_text(encoding='utf-8')
+windows_service_plan = windows_service_plan_path.read_text(encoding='utf-8')
 makefile = makefile_path.read_text(encoding='utf-8')
 tuf_repository = tuf_path.read_text(encoding='utf-8')
 windows_signer = windows_signer_path.read_text(encoding='utf-8')
@@ -122,6 +144,54 @@ if "Only unified Paperboat PE .exe files may be signed" not in windows_signer:
 for value in ('pkgbuild', 'productsign', '--sign', 'pkgutil --expand'):
     if value not in pkg_builder:
         raise SystemExit(f'macOS package builder is missing {value}')
+for value in (
+    "helper_payload=\"$payload/Library/PrivilegedHelperTools/Paperboat/pb\"",
+    'install -m 0755 "$cli_payload" "$helper_payload"',
+    'codesign --verify --strict "$helper_payload"',
+):
+    if value not in pkg_builder:
+        raise SystemExit(f'macOS package does not carry the unified privileged runtime: {value}')
+for value in (
+    "'./usr/local/bin/pb'",
+    "'./Library/PrivilegedHelperTools/Paperboat/pb'",
+    "cmp -s \"$cli\" \"$helper\"",
+):
+    if value not in macos_pkg_test:
+        raise SystemExit(f'macOS package payload test does not verify the unified runtime: {value}')
+
+# Native hosts do not publish a second updater artifact. Their durable service
+# declaration invokes the exact installed release executable with the updater
+# role, and the acceptance checks must prove that declaration is persistent,
+# active, and still points at that binary after a restart/update boundary.
+for value in (
+    'paperboat-updated.service',
+    'UpdaterLabel',
+    'Arguments: []string{"__runtime-updated"}',
+):
+    if value not in service_components:
+        raise SystemExit(f'native service declarations omit the updater role: {value}')
+for value in (
+    '{kind: service.UpdaterKind, executable: layout.Binary, arguments: []string{"__runtime-updated"}}',
+):
+    if value not in windows_service_plan:
+        raise SystemExit(f'Windows service declarations omit the unified updater role: {value}')
+for value in (
+    'systemctl show -p ExecStart --value "$unit"',
+    'expected_argument=__runtime-updated',
+    'paperboat-updated.service',
+    'systemctl restart paperboat-hostd.service paperboat-updated.service',
+):
+    if value not in linux_acceptance:
+        raise SystemExit(f'Linux acceptance does not verify persistent unified updater service: {value}')
+for value in (
+    "'PaperboatUpdated'",
+    "'__runtime-updated'",
+    "[string]$service.StartMode -ne 'Auto'",
+    'Restart-Hostd',
+    'Invoke-Update',
+):
+    if value not in windows_acceptance:
+        raise SystemExit(f'Windows acceptance does not verify persistent unified updater service: {value}')
 for value in ('pb-launcher', 'launcher-windows', 'paperboat-runtime', 'paperboat-hostd', 'paperboat-updater'):
     if value in makefile:
         raise SystemExit(f'Makefile retains retired role artifact {value}')

@@ -114,6 +114,10 @@ func (t *initialFailureObservationTransport) RoundTrip(request *http.Request) (*
 
 type failingLivenessEnvironment struct{}
 
+func (failingLivenessEnvironment) BindingState() envinject.BindingState {
+	return envinject.BindingUnknown
+}
+
 func (failingLivenessEnvironment) NextObservation(time.Time) (envinject.Observation, error) {
 	return envinject.Observation{}, errors.New("environment observation store unavailable")
 }

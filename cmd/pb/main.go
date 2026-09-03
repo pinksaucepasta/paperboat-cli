@@ -2357,7 +2357,7 @@ func uninstallCommand() *cobra.Command {
 					}
 					return purgeUserPaperboatState(command, preservedInboxes)
 				}},
-				})
+			})
 			if cleanupErr != nil {
 				fmt.Fprintln(command.OutOrStdout(), "Paperboat attempted every local removal step. The Paperboat Inbox was preserved.")
 				return uninstallCleanupError{err: cleanupErr}
