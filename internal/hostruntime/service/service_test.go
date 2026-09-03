@@ -173,8 +173,8 @@ func TestLaunchdDefinitionIsEscapedValidXML(t *testing.T) {
 	if !strings.Contains(string(data), "<key>ProgramArguments</key>") || !strings.Contains(string(data), Label) {
 		t.Fatalf("plist=%s", data)
 	}
-	if strings.Contains(string(data), "StandardOutPath") || !strings.Contains(string(data), "<key>UserName</key>") {
-		t.Fatalf("plist must use unified logging and an explicit user: %s", data)
+	if !strings.Contains(string(data), "<key>StandardOutPath</key>") || !strings.Contains(string(data), "<string>/var/log/"+Label+".log</string>") || !strings.Contains(string(data), "<key>UserName</key>") {
+		t.Fatalf("plist must use a durable bounded diagnostic path and an explicit user: %s", data)
 	}
 }
 
@@ -200,6 +200,9 @@ func TestHostServiceDefinitionsRunAsRootInBootDomain(t *testing.T) {
 				}
 			} else if !strings.HasSuffix(installer.DefinitionPath(), "/Library/LaunchDaemons/"+HostLabel+".plist") || !strings.Contains(definition, "<string>"+HostLabel+"</string>") || !strings.Contains(definition, "<key>UserName</key>") {
 				t.Fatalf("path=%s definition=%s", installer.DefinitionPath(), definition)
+			}
+			if platform == "darwin" && (!strings.Contains(definition, "<key>StandardErrorPath</key>") || !strings.Contains(definition, "/var/log/"+HostLabel+".log")) {
+				t.Fatalf("launchd service lacks durable diagnostics: %s", definition)
 			}
 		})
 	}

@@ -250,6 +250,13 @@ cleanup_existing() {
   fi
   rm -f "$HOME/.ssh/paperboat_config" "$HOME/.ssh/paperboat-managed-ssh.pub" \
     "$HOME/.ssh/.paperboat-config-install-v1.json" "$HOME/.ssh/.paperboat-config-transaction-v1.json"
+  # A failed fresh pairing can create OS-backed identity material before the
+  # native service transaction is attempted. Remove the entire product-owned
+  # macOS namespace here as well as through `pb uninstall`, because rollback
+  # may already have removed the executable needed to invoke that command.
+  if [ "$os" = darwin ] && command -v security >/dev/null 2>&1; then
+    while security delete-generic-password -s paperboat >/dev/null 2>&1; do :; done
+  fi
   if [ "$os" = darwin ]; then
     remove_privileged_file /usr/local/libexec/paperboat/pb
   else

@@ -302,10 +302,16 @@ func renderLaunchd(config Config) ([]byte, error) {
 		RunAtLoad            bool              `plist:"RunAtLoad"`
 		KeepAlive            bool              `plist:"KeepAlive"`
 		Umask                uint64            `plist:"Umask"`
+		StandardOutPath      string            `plist:"StandardOutPath,omitempty"`
+		StandardErrorPath    string            `plist:"StandardErrorPath,omitempty"`
 	}{
 		Label: label, ProcessType: "Background",
 		ProgramArguments:     append([]string{config.Executable}, config.Arguments...),
 		EnvironmentVariables: config.Environment, RunAtLoad: true, KeepAlive: true, Umask: 0o77,
+	}
+	if config.Kind == WorkerKind || config.Kind == HostKind || config.Kind == HostdKind || config.Kind == UpdaterKind {
+		definition.StandardOutPath = "/var/log/" + label + ".log"
+		definition.StandardErrorPath = definition.StandardOutPath
 	}
 	// launchd user agents inherit the logged-in user and reject UserName and
 	// GroupName keys. System services retain explicit identity fields.
