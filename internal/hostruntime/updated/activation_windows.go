@@ -1058,13 +1058,29 @@ func (b *windowsSCMActivationBackend) VerifyHealth(ctx context.Context, journal 
 	if err != nil {
 		return err
 	}
-	stabilityCtx, stabilityCancel := context.WithTimeout(ctx, journal.StabilityWindow)
+	// Hostd owns and observes the complete signed stability window. Give the
+	// local RPC enough time to return its terminal result after that window;
+	// using the window itself as the transport deadline races a successful
+	// final observation with deadline expiry.
+	stabilityCtx, stabilityCancel := context.WithTimeout(ctx, windowsStabilityCallTimeout(journal.StabilityWindow, journal.StabilityInterval))
 	stabilityErr := b.config.ActivationGate.Active(stabilityCtx, activeRequest)
 	stabilityCancel()
 	if stabilityErr != nil {
 		return stabilityErr
 	}
 	return nil
+}
+
+func windowsStabilityCallTimeout(window, interval time.Duration) time.Duration {
+	const maximumCompletionMargin = 30 * time.Second
+	margin := interval
+	if margin < time.Second {
+		margin = time.Second
+	}
+	if margin > maximumCompletionMargin {
+		margin = maximumCompletionMargin
+	}
+	return window + margin
 }
 
 func waitForWindowsUpdaterVersion(ctx context.Context, want string, timeout, retryDelay time.Duration, status func(context.Context) (ControlResponse, error)) error {
