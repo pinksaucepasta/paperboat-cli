@@ -307,7 +307,7 @@ func newWindowsRegressionCoordinator(t *testing.T, endpoint http.Handler, lifecy
 		TunnelEnrollment:  endpoint,
 	}
 	if lifecycle != nil {
-		dependencies.TunnelManager = lifecycle.(*windowsRegressionEndpoint)
+		dependencies.TunnelEnrollmentLifecycle = lifecycle
 	}
 	host, err := NewClientCoordinator(context.Background(), HostConfig{
 		Runtime:       config,

@@ -1148,6 +1148,7 @@ func newProductionClientCoordinator(ctx context.Context, version string, environ
 			return nil, errors.Join(ErrProductionInvalid, enrollmentErr)
 		}
 		dependencies.TunnelEnrollment = tunnelEnrollment
+		dependencies.TunnelEnrollmentLifecycle = platformTunnelEnrollmentLifecycle(tunnelEnrollment)
 		dependencies.TunnelManager = tunnelEnrollment
 	} else {
 		tunnelAssembly, assemblyErr := productionTunnelAssembly(ctx, tunnelProvider, ProductionTunnelAssemblyInputs{

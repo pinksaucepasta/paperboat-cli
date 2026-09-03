@@ -82,6 +82,7 @@ type HostDependencies struct {
 	CodexSessions             *codexsession.Manager
 	LocalControlToken         string
 	TunnelEnrollment          http.Handler
+	TunnelEnrollmentLifecycle Service
 	ManagedSSH                *managedssh.Host
 	ManagedSSHService         Service
 	TunnelManager             stablehostd.TunnelWorkloads
@@ -221,6 +222,9 @@ func NewClientCoordinator(ctx context.Context, config HostConfig, dependencies H
 	}
 	if dependencies.PreviewRecovery != nil {
 		components = append(components, stablehostd.Component{Name: "preview_recovery", Required: false, Service: dependencies.PreviewRecovery})
+	}
+	if dependencies.TunnelEnrollmentLifecycle != nil {
+		components = append(components, stablehostd.Component{Name: "tunnel_enrollment", Required: true, Service: dependencies.TunnelEnrollmentLifecycle})
 	}
 	if nativePeerService != nil {
 		components = append(components, stablehostd.Component{Name: "peer_transport", Required: true, Service: nativePeerService})
