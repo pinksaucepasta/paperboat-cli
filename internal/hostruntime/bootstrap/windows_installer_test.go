@@ -28,22 +28,56 @@ func TestWindowsInstallerUsesBoundedElevationForInteractiveAndUnattendedSessions
 		t.Fatal("Windows installer must fail closed before RunAs in noninteractive non-admin sessions")
 	}
 	adminBranch := strings.Index(script, "if ($administrator) {")
-	directStart := strings.Index(script, "& $runAsPath @arguments")
-	runAsStart := strings.Index(script, "$process = Start-Process -FilePath $runAsPath -ArgumentList $elevatedArguments -Verb RunAs -PassThru -WindowStyle Hidden")
-	if adminBranch < 0 || directStart < adminBranch || runAsStart < directStart {
-		t.Fatal("Windows installer must execute directly for administrators and retain RunAs for interactive non-administrators")
+	adminStart := strings.Index(script, "$process = Start-IsolatedInstallerProcess -FilePath $runAsPath -ArgumentList $processArguments -StandardInputPath $installInput")
+	runAsStart := strings.Index(script, "$process = Start-IsolatedInstallerProcess -FilePath $runAsPath -ArgumentList $processArguments -Elevated")
+	if adminBranch < 0 || adminStart < adminBranch || runAsStart < adminStart {
+		t.Fatal("Windows installer must isolate administrator launches and retain RunAs for interactive non-administrators")
 	}
-	if strings.Contains(script, "-Verb RunAs -PassThru -Wait") {
+	if strings.Contains(script, "& $runAsPath @arguments") || strings.Contains(script, "& $installedPb pair") {
+		t.Fatal("Windows installer must not directly invoke a child through the caller's pipes")
+	}
+	if strings.Contains(script, "-Verb RunAs -PassThru -Wait") || strings.Contains(script, "Start-Process -FilePath $runAsPath -ArgumentList $processArguments -Wait") {
 		t.Fatal("Windows installer must not wait on the RunAs process tree")
 	}
 	waitStart := strings.Index(script, "$installExitCode = Wait-InstallerProcess $process 'Paperboat self-install'")
 	if waitStart < runAsStart {
 		t.Fatal("Windows installer must create the elevated process before waiting for its root")
 	}
-	if !strings.Contains(script, "function Wait-InstallerProcess") ||
+	if !strings.Contains(script, "function Start-IsolatedInstallerProcess") ||
+		!strings.Contains(script, "$parameters.Verb = 'RunAs'") ||
+		!strings.Contains(script, "-Elevated") ||
+		!strings.Contains(script, "RedirectStandardInput") ||
+		!strings.Contains(script, "RedirectStandardOutput") ||
+		!strings.Contains(script, "RedirectStandardError") ||
+		!strings.Contains(script, "function Wait-InstallerProcess") ||
 		!strings.Contains(script, "$Process.WaitForExit(1200000)") ||
-		!strings.Contains(script, "$Process.Kill()") {
+		!strings.Contains(script, "Stop-IsolatedInstallerProcess") {
 		t.Fatal("Windows installer must use a bounded wait on the returned elevated process")
+	}
+}
+
+func TestWindowsInstallerPropagatesChildExitAndCleansTimeout(t *testing.T) {
+	script := windowsInstallerScript(t)
+	for _, required := range []string{
+		"return [int]$Process.ExitCode",
+		"if ($installExitCode -ne 0)",
+		"if ($pairExitCode -ne 0)",
+		"exit $pairExitCode",
+		"try { $Process.Kill($true) } catch { $Process.Kill() }",
+		"if (-not $Process.WaitForExit(5000))",
+		"exceeded the 20 minute limit and could not be stopped",
+	} {
+		if !strings.Contains(script, required) {
+			t.Fatalf("Windows installer is missing bounded child result handling: %q", required)
+		}
+	}
+	for _, line := range strings.Split(script, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
+		if strings.Contains(line, "Start-Process -Wait") {
+			t.Fatal("Windows installer must use the explicit root wait for every installer child")
+		}
 	}
 }
 
@@ -86,8 +120,11 @@ func TestWindowsInstallerRollbackUsesTheSameBoundedElevationContract(t *testing.
 	if !strings.Contains(script, "$name = [string]$env:COMPUTERNAME") || !strings.Contains(script, "$name = $name.Trim().ToLowerInvariant()") {
 		t.Fatal("Windows installer does not normalize the default machine name")
 	}
-	if !strings.Contains(script, "& $installedPb pair --server $server --enrollment-token $token") || strings.Contains(script, "$pairProcess = Start-Process") {
-		t.Fatal("Windows installer must pair in the original user's process")
+	if !strings.Contains(script, "$pairProcess = Start-IsolatedInstallerProcess -FilePath $installedPb -ArgumentList $pairArguments") ||
+		!strings.Contains(script, "-StandardInputPath $pairInput") ||
+		!strings.Contains(script, "-StandardOutputPath $pairOutput") ||
+		!strings.Contains(script, "-StandardErrorPath $pairError") {
+		t.Fatal("Windows installer must pair in the original user context with isolated standard handles")
 	}
 	cleanup := strings.LastIndex(script, "foreach ($statePath in @(")
 	installedCheck := strings.LastIndex(script, "if (-not (Assert-InstalledRelease $installedPb $version $actual))")

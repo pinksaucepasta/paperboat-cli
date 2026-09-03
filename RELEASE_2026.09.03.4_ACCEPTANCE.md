@@ -931,3 +931,56 @@ verified and final release acceptance is pending.
   and arm64; both Windows CLI binaries build; `git diff --check` passes. Final
   supported update, reboot persistence, status/doctor, preview, and tunnel E2E
   remain mandatory before Windows is accepted.
+
+### Windows Victus `.14` through `.16` full baseline before consolidated fixes
+
+Status: native lifecycle and update persistence pass; preview, tunnel activation,
+and installer-process completion fail. These failures were captured before the
+next code change so the next Windows release can carry one consolidated fix set.
+
+- Fresh dashboard-issued `.14` Host installation created machine
+  `mch_ce82bed1672ac8e19864593f07c64db5`. All four canonical services were
+  Running and Automatic, `/healthz` returned `200 {"live":true}`, and the
+  Windows verifier passed 11/11 checks. The functional install completed, but
+  its outer SSH PowerShell process PID 9420 remained alive with no `pb`
+  descendant or network activity. Its anonymous pipes were held only by the
+  PowerShell process. The unbounded direct child invocations were introduced
+  in commit `3fcb153e` in `tools/install.ps1`.
+- Normal `.14` to `.15` update reached `services_live`, passed signed canary,
+  drain, service, hash, and heartbeat checks, then rolled back at the exact
+  10-minute stability boundary with `hostd update activation provider failed
+  i/o timeout`. The durable gate recorded `PolicyBound=true`, `Drained=true`,
+  and `Committed=false`; no SCM or application failure existed. The Windows
+  caller used the signed stability window itself as the RPC deadline, racing a
+  successful hostd terminal response. Commit `f79975b` adds a bounded response
+  margin without shortening or weakening the signed observation.
+- Normal `.14` to `.16` update then completed the full stability window and
+  committed. CLI/runtime both report `.16`; LocalDaemon was stopped only during
+  the reversible window and restored afterward. Before and after a normal
+  Windows reboot, all four services were Running and Automatic, health was
+  live, and the verifier passed 11/11 checks.
+- A bounded Python fixture on `127.0.0.1:58237` returned the expected body
+  directly. `pb preview 58237 --duration 10m --json` failed before allocation:
+  `preview owner session unavailable: acquire: preview owner-session lease is
+  no longer active`. No preview for that target was created.
+- `pb tunnel create victus-e2e-20260903 --port 58237 --duration 10m --json
+  --wait --timeout 2m` persisted tunnel `tun_DZWmN2I5FFdaHARqbLUR4w` but reported
+  `tunnel connector enrollment temporarily unavailable`. Status and doctor
+  remained `tunnel_pending`, with connector, edge, and origin pending. Supported
+  deletion also remained active and timed out after two minutes because no
+  connector became available.
+- Preview root cause was confirmed from the Windows S4U runtime path. The
+  private PAC configurator correctly rejects session 0/LocalSystem instead of
+  writing the wrong HKCU. That optional start error caused hostd to invoke the
+  whole preview assembly's shutdown, permanently closing the otherwise healthy
+  owner-session manager while leaving its HTTP route mounted. The exact CLI
+  error was therefore a deterministic lifecycle coupling defect, not an API or
+  origin failure.
+- Tunnel root cause was confirmed from both client state and control-plane
+  persistence. Enrollment issue and exchange succeeded, producing connector
+  `con_eOEqGZq4t6OXyKpQWdzi5w`, but the server recorded zero connector sessions
+  and the client never attempted the control WebSocket. The stable host mounted
+  `ProductionTunnelEnrollment` only as an HTTP handler and never registered its
+  lifecycle service, so its activator remained unstarted and returned
+  `ErrUnavailable` before network activation. The delete timeout is downstream
+  of that missing connector lifecycle.

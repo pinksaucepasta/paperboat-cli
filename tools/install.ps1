@@ -80,18 +80,96 @@ function Stage-TrustedBootstrap([string]$Source) {
   return $staged
 }
 
+function Start-IsolatedInstallerProcess {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$FilePath,
+    [Parameter(Mandatory = $true)]
+    [object[]]$ArgumentList,
+    [switch]$Elevated,
+    [string]$StandardInputPath,
+    [string]$StandardOutputPath,
+    [string]$StandardErrorPath
+  )
+  if ([string]::IsNullOrWhiteSpace($FilePath)) { throw 'Installer process path is empty.' }
+  $parameters = @{
+    FilePath = $FilePath
+    ArgumentList = $ArgumentList
+    PassThru = $true
+    WindowStyle = 'Hidden'
+    ErrorAction = 'Stop'
+  }
+  if ($Elevated) {
+    # ShellExecute's RunAs verb is the only supported way to show the normal
+    # Windows consent/password dialog. ShellExecute owns the new process
+    # handles, so it does not inherit the caller's anonymous pipes.
+    $parameters.Verb = 'RunAs'
+  } else {
+    # CreateProcess inherits standard handles unless all three are redirected.
+    # The empty input file gives a child deterministic EOF instead of the
+    # installer's caller pipe, and the output files let us propagate diagnostics
+    # after the child root has exited.
+    if ([string]::IsNullOrWhiteSpace($StandardInputPath) -or
+        [string]::IsNullOrWhiteSpace($StandardOutputPath) -or
+        [string]::IsNullOrWhiteSpace($StandardErrorPath)) {
+      throw 'Non-elevated installer processes require isolated standard handles.'
+    }
+    $parameters.RedirectStandardInput = $StandardInputPath
+    $parameters.RedirectStandardOutput = $StandardOutputPath
+    $parameters.RedirectStandardError = $StandardErrorPath
+  }
+  try {
+    return Start-Process @parameters
+  } catch {
+    if ($Elevated) {
+      throw "Installer process could not request administrator approval: $($_.Exception.Message)"
+    }
+    throw "Installer process could not start: $($_.Exception.Message)"
+  }
+}
+
+function Stop-IsolatedInstallerProcess($Process) {
+  if ($null -eq $Process) { return }
+  try {
+    if (-not $Process.HasExited) {
+      # .NET 5+ supports the entireProcessTree overload. Windows PowerShell
+      # falls back to the root process, which is still safe because every
+      # standard handle is redirected and no caller pipe can remain open.
+      try { $Process.Kill($true) } catch { $Process.Kill() }
+    }
+  } catch { }
+}
+
+function Wait-InstallerProcess($Process, [string]$Operation) {
+  if ($null -eq $Process) { throw "$Operation did not return a process handle." }
+  # Never use Start-Process -Wait: it can wait for a detached descendant tree.
+  # WaitForExit waits this process root only, and the caller's pipe handles were
+  # excluded by Start-IsolatedInstallerProcess.
+  if (-not $Process.WaitForExit(1200000)) {
+    Stop-IsolatedInstallerProcess $Process
+    if (-not $Process.WaitForExit(5000)) {
+      throw "$Operation exceeded the 20 minute limit and could not be stopped."
+    }
+    throw "$Operation exceeded the 20 minute limit."
+  }
+  return [int]$Process.ExitCode
+}
+
 function Assert-InstalledVersion([string]$Path, [string]$ExpectedVersion) {
   if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
   $capture = [IO.Path]::GetTempFileName()
   $captureError = "$capture.err"
+  $captureInput = "$capture.in"
+  New-Item -ItemType File -Path $captureInput -Force | Out-Null
   try {
-    $probe = Start-Process -FilePath $Path -ArgumentList '--version' -Wait -PassThru -WindowStyle Hidden -RedirectStandardOutput $capture -RedirectStandardError $captureError
-    if ($probe.ExitCode -ne 0) { return $false }
+    $probe = Start-IsolatedInstallerProcess -FilePath $Path -ArgumentList @('--version') -StandardInputPath $captureInput -StandardOutputPath $capture -StandardErrorPath $captureError
+    $probeExitCode = Wait-InstallerProcess $probe 'Paperboat version probe'
+    if ($probeExitCode -ne 0) { return $false }
     $output = ((Get-Content -LiteralPath $capture -Raw -ErrorAction SilentlyContinue) + (Get-Content -LiteralPath $captureError -Raw -ErrorAction SilentlyContinue))
   } catch {
     return $false
   } finally {
-    Remove-Item -LiteralPath $capture,$captureError -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $capture,$captureError,$captureInput -Force -ErrorAction SilentlyContinue
   }
   $versionMatches = [regex]::Matches($output, '(Version[\t ]+[0-9A-Za-z._-]+)')
   return $versionMatches.Count -eq 1 -and $versionMatches[0].Groups[1].Value -eq ("Version " + $ExpectedVersion)
@@ -125,19 +203,31 @@ function Test-InteractiveUac {
   }
 }
 
-function Wait-InstallerProcess($Process, [string]$Operation) {
-  if ($null -eq $Process) { throw "$Operation did not return a process handle." }
-  # Start-Process -Wait waits the entire process tree. WaitForExit waits only
-  # the elevated installer root, so a detached helper cannot hold the outer
-  # bootstrap open after the installer has reported its exit code.
-  if (-not $Process.WaitForExit(1200000)) {
-    try { $Process.Kill() } catch { }
-    if (-not $Process.WaitForExit(5000)) {
-      throw "$Operation exceeded the 20 minute limit and could not be stopped."
+function Read-ProcessCapture([string]$StandardOutputPath, [string]$StandardErrorPath) {
+  $parts = @()
+  foreach ($path in @($StandardOutputPath, $StandardErrorPath)) {
+    if (-not [string]::IsNullOrWhiteSpace($path) -and (Test-Path -LiteralPath $path -PathType Leaf)) {
+      $part = [string](Get-Content -LiteralPath $path -Raw -ErrorAction SilentlyContinue)
+      if ($part.Length -gt 1048576) { $part = $part.Substring(0, 1048576) }
+      if ($part.Length -gt 0) { $parts += $part }
     }
-    throw "$Operation exceeded the 20 minute limit."
   }
-  return [int]$Process.ExitCode
+  $text = [string]::Join('', [string[]]$parts)
+  if ($text.Length -gt 2000) { return $text.Substring(0, 2000) }
+  return $text
+}
+
+function Publish-ProcessCapture([string]$StandardOutputPath, [string]$StandardErrorPath) {
+  if (-not [string]::IsNullOrWhiteSpace($StandardOutputPath) -and (Test-Path -LiteralPath $StandardOutputPath -PathType Leaf)) {
+    $stdout = [string](Get-Content -LiteralPath $StandardOutputPath -Raw -ErrorAction SilentlyContinue)
+    if ($stdout.Length -gt 1048576) { $stdout = $stdout.Substring(0, 1048576) }
+    if ($stdout.Length -gt 0) { [Console]::Out.Write($stdout) }
+  }
+  if (-not [string]::IsNullOrWhiteSpace($StandardErrorPath) -and (Test-Path -LiteralPath $StandardErrorPath -PathType Leaf)) {
+    $stderr = [string](Get-Content -LiteralPath $StandardErrorPath -Raw -ErrorAction SilentlyContinue)
+    if ($stderr.Length -gt 1048576) { $stderr = $stderr.Substring(0, 1048576) }
+    if ($stderr.Length -gt 0) { [Console]::Error.Write($stderr) }
+  }
 }
 
 function Assert-InstalledRelease([string]$Path, [string]$ExpectedVersion, [string]$ExpectedHash) {
@@ -201,16 +291,23 @@ if ($null -ne $purgeError) { throw $purgeError }
   $encodedPayload = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($rollbackPayload))
   $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
   try {
+    $rollbackArguments = @('-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedPayload)
     if (Test-Administrator) {
-      & $powershell '-NoProfile' '-NonInteractive' '-EncodedCommand' $encodedPayload
-      if ($LASTEXITCODE -ne 0) { throw "rollback exited with code $LASTEXITCODE" }
+      $rollbackInput = Join-Path $dir 'rollback.stdin'
+      $rollbackOutput = Join-Path $dir 'rollback.stdout'
+      $rollbackError = Join-Path $dir 'rollback.stderr'
+      New-Item -ItemType File -Path $rollbackInput -Force | Out-Null
+      $rollback = Start-IsolatedInstallerProcess -FilePath $powershell -ArgumentList $rollbackArguments -StandardInputPath $rollbackInput -StandardOutputPath $rollbackOutput -StandardErrorPath $rollbackError
     } elseif (-not (Test-InteractiveUac)) {
       throw 'Paperboat fresh-install rollback requires an elevated administrator PowerShell session when no interactive UAC desktop is available.'
     } else {
-      $rollback = Start-Process -FilePath $powershell -ArgumentList @('-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedPayload) -Verb RunAs -PassThru -WindowStyle Hidden
-      $rollbackExitCode = Wait-InstallerProcess $rollback 'Paperboat fresh-install rollback'
-      if ($rollbackExitCode -ne 0) { throw "rollback exited with code $rollbackExitCode" }
+      # RunAs is intentionally kept on the interactive branch so Windows can
+      # display its normal consent/password prompt. The process root is still
+      # waited explicitly, never with Start-Process -Wait.
+      $rollback = Start-IsolatedInstallerProcess -FilePath $powershell -ArgumentList $rollbackArguments -Elevated
     }
+    $rollbackExitCode = Wait-InstallerProcess $rollback 'Paperboat fresh-install rollback'
+    if ($rollbackExitCode -ne 0) { throw "rollback exited with code $rollbackExitCode" }
   } catch {
     # Preserve the pair failure as the primary result, but make an incomplete
     # rollback visible so support can safely retry cleanup.
@@ -234,24 +331,27 @@ if ($freshEnrollment -or -not (Assert-InstalledRelease $installedPb $version $ac
     $arguments[2] = $installerExecutable
   }
   $runAsPath = if ($null -ne $installerExecutable) { $installerExecutable } else { $download }
+  $processArguments = @($arguments)
+  if ([string]$processArguments[2] -match '\s') { $processArguments[2] = '"' + $processArguments[2] + '"' }
+  $installInput = Join-Path $dir 'install.stdin'
+  $installOutput = Join-Path $dir 'install.stdout'
+  $installError = Join-Path $dir 'install.stderr'
+  New-Item -ItemType File -Path $installInput -Force | Out-Null
   if ($administrator) {
-    # Keep the elevated path in-process so an administrator SSH session does
-    # not depend on an interactive desktop UAC broker. Use the trusted staged
-    # copy when available, otherwise retain the verified download path.
-    & $runAsPath @arguments
-    if ($LASTEXITCODE -ne 0) { throw "Paperboat self-install failed with exit code $LASTEXITCODE." }
+    # An administrator token does not need UAC. Start a separate process anyway
+    # so the downloaded executable cannot inherit the caller's SSH/pipe handles.
+    $process = Start-IsolatedInstallerProcess -FilePath $runAsPath -ArgumentList $processArguments -StandardInputPath $installInput -StandardOutputPath $installOutput -StandardErrorPath $installError
   } else {
-    $elevatedArguments = @($arguments)
-    if ([string]$arguments[2] -match '\s') { $elevatedArguments[2] = '"' + $arguments[2] + '"' }
-    try {
-      # Do not use Start-Process -Wait here. It waits the entire child tree,
-      # including any helper that is intentionally detached by __install.
-      $process = Start-Process -FilePath $runAsPath -ArgumentList $elevatedArguments -Verb RunAs -PassThru -WindowStyle Hidden
-    } catch {
-      throw "Paperboat self-install could not request administrator approval: $($_.Exception.Message)"
-    }
-    $installExitCode = Wait-InstallerProcess $process 'Paperboat self-install'
-    if ($installExitCode -ne 0) { throw "Paperboat self-install failed with exit code $installExitCode." }
+    # RunAs preserves the visible UAC/password experience. ShellExecute starts
+    # the elevated root outside the caller's anonymous pipe handles.
+    $process = Start-IsolatedInstallerProcess -FilePath $runAsPath -ArgumentList $processArguments -Elevated
+  }
+  $installExitCode = Wait-InstallerProcess $process 'Paperboat self-install'
+  Publish-ProcessCapture $installOutput $installError
+  if ($installExitCode -ne 0) {
+    $detail = Read-ProcessCapture $installOutput $installError
+    if ([string]::IsNullOrWhiteSpace($detail)) { throw "Paperboat self-install failed with exit code $installExitCode." }
+    throw "Paperboat self-install failed with exit code $($installExitCode): $detail"
   }
 }
 if (-not (Assert-InstalledRelease $installedPb $version $actual)) { throw "Installed Paperboat does not match verified release $version." }
@@ -280,13 +380,19 @@ if ($freshEnrollment) {
   $first = $token.Substring(0, 1)
   $setupMode = if ('02468BDFHJLNPRTVXZ'.Contains($first)) { 'host' } else { 'client' }
   Remove-Item Env:PAPERBOAT_ENROLLMENT_TOKEN -ErrorAction SilentlyContinue
-  # Pair in the original user's process so the CLI profile, DPAPI credentials,
-  # endpoint identity, and daemon state belong to the user who pasted the
-  # dashboard command. The installed pb elevates only its machine-service
-  # commit after this user-owned state has been created.
-  & $installedPb pair --server $server --enrollment-token $token --name $name "--setup-mode=$setupMode"
-  if ($LASTEXITCODE -ne 0) {
-    $pairExitCode = $LASTEXITCODE
+  # Pair in the original user's security context, but use an isolated child so
+  # the dashboard shell's stdin/stdout/stderr pipes cannot keep the installer
+  # alive after pairing completes. No elevation is used for this user-owned
+  # profile/DPAPI operation.
+  $pairArguments = @('pair', '--server', $server, '--enrollment-token', $token, '--name', $name, "--setup-mode=$setupMode")
+  $pairInput = Join-Path $dir 'pair.stdin'
+  $pairOutput = Join-Path $dir 'pair.stdout'
+  $pairError = Join-Path $dir 'pair.stderr'
+  New-Item -ItemType File -Path $pairInput -Force | Out-Null
+  $pairProcess = Start-IsolatedInstallerProcess -FilePath $installedPb -ArgumentList $pairArguments -StandardInputPath $pairInput -StandardOutputPath $pairOutput -StandardErrorPath $pairError
+  $pairExitCode = Wait-InstallerProcess $pairProcess 'Paperboat pairing'
+  Publish-ProcessCapture $pairOutput $pairError
+  if ($pairExitCode -ne 0) {
     Write-Warning "Paperboat pairing failed with exit code $pairExitCode; rolling back the fresh installation."
     Invoke-FreshPairRollback
     exit $pairExitCode

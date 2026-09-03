@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -177,7 +178,27 @@ func (a *productionPreviewAssembly) Start(ctx context.Context) error {
 	if a == nil || a.privateAccess == nil || ctx == nil {
 		return ErrProductionInvalid
 	}
-	return a.privateAccess.Start(ctx)
+	return startPreviewPrivateAccess(ctx, a.privateAccess, runtime.GOOS == "windows")
+}
+
+type previewPrivateAccessLifecycle interface {
+	Start(context.Context) error
+}
+
+// Windows installs the stable host runtime in a service-owned process. Its
+// private-preview PAC belongs to the interactive user's registry and can be
+// unavailable while that service is starting. Keep the machine preview,
+// owner-session, and durable tunnel runtimes alive when only this optional
+// user-scoped integration cannot start.
+func startPreviewPrivateAccess(ctx context.Context, service previewPrivateAccessLifecycle, isolateFailure bool) error {
+	if service == nil || ctx == nil {
+		return ErrProductionInvalid
+	}
+	err := service.Start(ctx)
+	if isolateFailure {
+		return nil
+	}
+	return err
 }
 
 func (a *productionPreviewAssembly) Shutdown(ctx context.Context) error {
