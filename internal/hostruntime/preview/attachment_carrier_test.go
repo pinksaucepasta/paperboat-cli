@@ -150,6 +150,9 @@ func TestAttachmentCarrierAdmitsBeforeProviderAndObservesOriginBeforeLeaseReady(
 	if readyCalls != 1 {
 		t.Fatalf("lease ready calls = %d, want one", readyCalls)
 	}
+	if got := allocator.originResults(); len(got) != 1 || !got[0] {
+		t.Fatalf("origin observations = %#v, want one successful observation", got)
+	}
 	want := []string{"allocate", "wait-admission", "provider", "wait-edge-ready", "observe-origin", "lease-ready"}
 	if got := allocator.events(); !equalStrings(got, want) {
 		t.Fatalf("attachment lifecycle = %#v, want %#v", got, want)

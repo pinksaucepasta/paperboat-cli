@@ -167,7 +167,11 @@ func (c *AttachmentCarrier) Run(ctx context.Context, lease Lease, ready func(Lea
 			if !ok {
 				return classifyAttachmentCarrierError(fmt.Errorf("%w: attachment readiness observer is unavailable", ErrAttachmentClientUnavailable))
 			}
-			next, err := observer.ObserveOrigin(ctx, request, observedAttachment, observed.OriginState == "ready")
+			// DataCarrierPreviewCarrier invokes this callback only after its
+			// bounded origin probe succeeds. The observed lease is a copy of the
+			// pre-probe dispatch projection, so its old OriginState is not an
+			// observation source.
+			next, err := observer.ObserveOrigin(ctx, request, observedAttachment, true)
 			if err != nil {
 				return classifyAttachmentCarrierError(err)
 			}
