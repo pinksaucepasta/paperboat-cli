@@ -2,6 +2,6 @@
 
 package runtime
 
-func platformTunnelEnrollmentLifecycle(*ProductionTunnelEnrollment) Service {
-	return nil
+func platformTunnelEnrollmentLifecycle(service *ProductionTunnelEnrollment) Service {
+	return service
 }

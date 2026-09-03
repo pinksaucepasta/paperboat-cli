@@ -1040,6 +1040,12 @@ candidate retest.
   activator therefore remained unstarted and returned locally before opening
   the control WebSocket. Host composition now registers the same lifecycle;
   focused runtime/tunnel tests pass and Windows amd64 compiles.
+- History review found the paired POSIX client-mode regression in the same
+  lifecycle helper: Linux/macOS returned a nil enrollment lifecycle even
+  though their local endpoint was mounted. The helper now returns the one
+  production service on every native platform. Linux and macOS tests protect
+  the identity of that lifecycle owner; normal, race, Linux amd64, and macOS
+  arm64 checks pass.
 - A later clean Victus attempt exposed a separate release-distribution defect:
   `paperboat-server/deploy/releases/windows` was an Aug 29 snapshot rather than
   the current release-owned `paperboat/tools/install.ps1`. Pairing failed after
