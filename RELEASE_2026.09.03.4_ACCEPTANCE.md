@@ -294,6 +294,22 @@ candidate passes the complete three-platform acceptance matrix.
   compilation pass. Final Victus acceptance pending. The unrelated GitHub
   Actions runner and normal system OpenSSH remain explicitly out of scope.
 
+### WIN-006: earlier helpers leave expired protected records
+
+- Severity: clean-install blocker and disk residue.
+- Victus retained thirteen direct `%TEMP%\\Paperboat Uninstall\\<32-hex>`
+  directories. Four contained expired plans, statuses stuck in `removing`,
+  and 50-70 MB helper executables; every recorded process was dead. Nine were
+  empty. The pending reboot list contained only the four executable paths,
+  proving the older helper did not schedule its plan, status, or directory.
+- Fix status: fixed locally. Before creating a new helper, Paperboat now
+  inspects only the fixed uninstall namespace and removes an entry only when
+  it is direct 32-hex ownership, non-reparse, exact three-file shape with
+  protected DACLs, a strict expired five-minute plan, and no live recorded
+  process. Empty 32-hex legacy entries are removed. Unknown, malformed, and
+  active records fail closed without mutation. The focused tests pass natively
+  on Victus. Final release and clean-state acceptance pending.
+
 ## macOS test record
 
 - Pre-clean inventory:

@@ -122,6 +122,115 @@ func TestWindowsUninstallSchedulesCompleteHelperDirectoryDeletion(t *testing.T) 
 	}
 }
 
+func TestRecoverExpiredWindowsUninstallHelpersRemovesOnlyValidatedInactiveRecords(t *testing.T) {
+	previousRunning := windowsProcessIsRunning
+	previousHelperRunning := windowsHelperIsRunning
+	previousRoot := windowsUninstallRoot
+	testRoot := filepath.Join(t.TempDir(), "Paperboat Uninstall")
+	windowsUninstallRoot = func() string { return testRoot }
+	windowsProcessIsRunning = func(processID uint32) (bool, error) {
+		if processID != 4242 {
+			t.Fatalf("unexpected process ID %d", processID)
+		}
+		return false, nil
+	}
+	windowsHelperIsRunning = func(string) (bool, error) { return false, nil }
+	t.Cleanup(func() {
+		windowsProcessIsRunning = previousRunning
+		windowsHelperIsRunning = previousHelperRunning
+		windowsUninstallRoot = previousRoot
+	})
+	root := windowsUninstallRoot()
+	directory := filepath.Join(root, "0123456789abcdef0123456789abcdef")
+	_ = os.RemoveAll(root)
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := protectWindowsUninstallPath(directory, true); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Add(-10 * time.Minute)
+	statusPath := filepath.Join(directory, "status.json")
+	plan := windowsUninstallPlan{Schema: windowsUninstallPlanSchema, ProcessIDs: []uint32{4242}, StatusPath: statusPath, CreatedAt: now, ExpiresAt: now.Add(5 * time.Minute)}
+	if err := writeProtectedWindowsUninstallJSON(filepath.Join(directory, "plan.json"), plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeProtectedWindowsUninstallJSON(statusPath, windowsUninstallStatus{Schema: windowsUninstallStatusSchema, State: "failed", UpdatedAt: now, CompletedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	helper := filepath.Join(directory, "paperboat-uninstall-helper.exe")
+	if err := os.WriteFile(helper, []byte("old helper"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := protectWindowsUninstallPath(helper, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := recoverExpiredWindowsUninstallHelpers(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(directory); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expired helper remains: %v", err)
+	}
+}
+
+func TestRecoverExpiredWindowsUninstallHelpersRefusesActiveOrMalformedRecords(t *testing.T) {
+	previousRunning := windowsProcessIsRunning
+	previousHelperRunning := windowsHelperIsRunning
+	previousRoot := windowsUninstallRoot
+	testRoot := filepath.Join(t.TempDir(), "Paperboat Uninstall")
+	windowsUninstallRoot = func() string { return testRoot }
+	windowsHelperIsRunning = func(string) (bool, error) { return false, nil }
+	t.Cleanup(func() {
+		windowsProcessIsRunning = previousRunning
+		windowsHelperIsRunning = previousHelperRunning
+		windowsUninstallRoot = previousRoot
+	})
+	root := windowsUninstallRoot()
+	_ = os.RemoveAll(root)
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	directory := filepath.Join(root, "fedcba9876543210fedcba9876543210")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := protectWindowsUninstallPath(directory, true); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Add(-10 * time.Minute)
+	statusPath := filepath.Join(directory, "status.json")
+	plan := windowsUninstallPlan{Schema: windowsUninstallPlanSchema, ProcessIDs: []uint32{4343}, StatusPath: statusPath, CreatedAt: now, ExpiresAt: now.Add(5 * time.Minute)}
+	if err := writeProtectedWindowsUninstallJSON(filepath.Join(directory, "plan.json"), plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeProtectedWindowsUninstallJSON(statusPath, windowsUninstallStatus{Schema: windowsUninstallStatusSchema, State: "failed", UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	helper := filepath.Join(directory, "paperboat-uninstall-helper.exe")
+	if err := os.WriteFile(helper, []byte("old helper"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := protectWindowsUninstallPath(helper, false); err != nil {
+		t.Fatal(err)
+	}
+	windowsProcessIsRunning = func(uint32) (bool, error) { return true, nil }
+	if err := recoverExpiredWindowsUninstallHelpers(); err == nil || !strings.Contains(err.Error(), "still active") {
+		t.Fatalf("active helper recovery error = %v", err)
+	}
+	if _, err := os.Stat(directory); err != nil {
+		t.Fatalf("active helper was removed: %v", err)
+	}
+	windowsProcessIsRunning = func(uint32) (bool, error) { return false, nil }
+	if err := os.WriteFile(filepath.Join(directory, "unexpected"), []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := recoverExpiredWindowsUninstallHelpers(); err == nil || !strings.Contains(err.Error(), "contents") {
+		t.Fatalf("malformed helper recovery error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(directory, "unexpected")); err != nil {
+		t.Fatalf("malformed helper record was mutated: %v", err)
+	}
+}
+
 func TestCopyWindowsUninstallHelperVerifiesExactBytes(t *testing.T) {
 	directory := t.TempDir()
 	if err := protectWindowsUninstallPath(directory, true); err != nil {
