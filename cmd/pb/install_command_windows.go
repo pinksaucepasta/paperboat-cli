@@ -28,6 +28,11 @@ func platformInstallCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if fresh {
+				if err := recoverWindowsUninstall(); err != nil {
+					return err
+				}
+			}
 			return hostinstall.InstallStandaloneBinary(command.Context(), source, version, fresh)
 		},
 	}

@@ -1035,8 +1035,9 @@ func Purge(ctx context.Context) error {
 	// after its versioned executable has been removed. Delete its exact owned
 	// SCM declaration before removing release slots.
 	cleanup("remove Windows update activator service", func() error { return removeWindowsActivatorService(ctx, layout) })
+	programDataPresent := true
 	if _, err := os.Stat(WindowsProgramDataRoot()); errors.Is(err, os.ErrNotExist) {
-		return result
+		programDataPresent = false
 	} else if err != nil {
 		result = errors.Join(result, fmt.Errorf("inspect Windows ProgramData root: %w", err))
 	}
@@ -1045,9 +1046,11 @@ func Purge(ctx context.Context) error {
 	// firewall deltas that Paperboat recorded as its own. This must happen
 	// before the Paperboat runtime slots are removed because their fixed path
 	// is the ownership proof for PaperboatSshd.
-	cleanup("remove Paperboat OpenSSH state", func() error {
-		return removePaperboatSSHState(ctx, windowsOpenSSHConfig(layout, ""))
-	})
+	if programDataPresent {
+		cleanup("remove Paperboat OpenSSH state", func() error {
+			return removePaperboatSSHState(ctx, windowsOpenSSHConfig(layout, ""))
+		})
+	}
 	// Remove SCM declarations before force-terminating any orphaned image. The
 	// runtime services have an automatic crash-restart policy; killing their
 	// processes first lets SCM bring them back while the release roots are being

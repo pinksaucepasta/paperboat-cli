@@ -213,8 +213,8 @@ func TestRecoverExpiredWindowsUninstallHelpersRefusesActiveOrMalformedRecords(t 
 		t.Fatal(err)
 	}
 	windowsProcessIsRunning = func(uint32) (bool, error) { return true, nil }
-	if err := recoverExpiredWindowsUninstallHelpers(); err == nil || !strings.Contains(err.Error(), "still active") {
-		t.Fatalf("active helper recovery error = %v", err)
+	if err := recoverExpiredWindowsUninstallHelpers(); err != nil {
+		t.Fatalf("active helper blocked safe recovery scan: %v", err)
 	}
 	if _, err := os.Stat(directory); err != nil {
 		t.Fatalf("active helper was removed: %v", err)
@@ -223,11 +223,25 @@ func TestRecoverExpiredWindowsUninstallHelpersRefusesActiveOrMalformedRecords(t 
 	if err := os.WriteFile(filepath.Join(directory, "unexpected"), []byte("keep"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := recoverExpiredWindowsUninstallHelpers(); err == nil || !strings.Contains(err.Error(), "contents") {
-		t.Fatalf("malformed helper recovery error = %v", err)
+	if err := recoverExpiredWindowsUninstallHelpers(); err != nil {
+		t.Fatalf("malformed helper blocked safe recovery scan: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(directory, "unexpected")); err != nil {
 		t.Fatalf("malformed helper record was mutated: %v", err)
+	}
+}
+
+func TestFreshWindowsInstallRecoversExpiredHelpersBeforeMutation(t *testing.T) {
+	previous := recoverWindowsUninstall
+	want := errors.New("recovery failed")
+	called := false
+	recoverWindowsUninstall = func() error { called = true; return want }
+	t.Cleanup(func() { recoverWindowsUninstall = previous })
+	command := platformInstallCommand()
+	command.SetArgs([]string{"--source", `C:\staged\pb.exe`, "--version", "2026.09.03.10", "--fresh"})
+	err := command.ExecuteContext(context.Background())
+	if !called || !errors.Is(err, want) {
+		t.Fatalf("fresh install recovery called=%t error=%v", called, err)
 	}
 }
 

@@ -31,6 +31,8 @@ const (
 	windowsUninstallStatusSchema = "paperboat.windows-uninstall-status/v1"
 )
 
+var errUnrecoverableWindowsHelperRecord = errors.New("unrecoverable prior Windows uninstall helper record")
+
 var (
 	purgeWindowsHostRuntime    = hostinstall.Purge
 	windowsUninstallExecutable = os.Executable
@@ -38,6 +40,7 @@ var (
 	windowsProcessIsRunning    = isWindowsProcessRunning
 	windowsHelperIsRunning     = windowsExecutableIsRunning
 	windowsUninstallRoot       = func() string { return filepath.Join(os.TempDir(), "Paperboat Uninstall") }
+	recoverWindowsUninstall    = recoverExpiredWindowsUninstallHelpers
 )
 
 type windowsUninstallPlan struct {
@@ -95,7 +98,7 @@ func unsafeCleanupPathTraversal(path string, info os.FileInfo) (bool, error) {
 }
 
 func launchWindowsUninstallHelper(ctx context.Context, inboxPaths []string) (string, error) {
-	if err := recoverExpiredWindowsUninstallHelpers(); err != nil {
+	if err := recoverWindowsUninstall(); err != nil {
 		return "", err
 	}
 	executable, err := windowsUninstallExecutable()
@@ -169,84 +172,92 @@ func recoverExpiredWindowsUninstallHelpers() error {
 	if attributes, err := windows.GetFileAttributes(rootPointer); err != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
 		return errors.New("invalid prior Windows uninstall helper root")
 	}
+	var result error
 	for _, entry := range entries {
 		if !entry.IsDir() || !isWindowsUninstallIdentifier(entry.Name()) {
 			continue
 		}
 		directory := filepath.Join(root, entry.Name())
 		if err := recoverExpiredWindowsUninstallHelper(directory); err != nil {
-			return err
+			if errors.Is(err, errUnrecoverableWindowsHelperRecord) {
+				continue
+			}
+			result = errors.Join(result, err)
 		}
 	}
-	return nil
+	return result
 }
 
 func recoverExpiredWindowsUninstallHelper(directory string) error {
 	info, err := os.Lstat(directory)
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return errors.New("invalid prior Windows uninstall helper entry")
+		return fmt.Errorf("%w: invalid entry", errUnrecoverableWindowsHelperRecord)
 	}
 	directoryPointer, err := windows.UTF16PtrFromString(directory)
 	if err != nil {
-		return errors.New("invalid prior Windows uninstall helper entry")
+		return fmt.Errorf("%w: invalid entry", errUnrecoverableWindowsHelperRecord)
 	}
 	if attributes, err := windows.GetFileAttributes(directoryPointer); err != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-		return errors.New("invalid prior Windows uninstall helper entry")
+		return fmt.Errorf("%w: invalid entry", errUnrecoverableWindowsHelperRecord)
+	}
+	expectedDirectoryDACL := strings.ReplaceAll(uninstallWindowsSDDL(), "(A;;", "(A;OICI;")
+	if !windowssecurity.ProtectedDACLMatches(directory, expectedDirectoryDACL) {
+		return fmt.Errorf("%w: invalid directory permissions", errUnrecoverableWindowsHelperRecord)
 	}
 	planPath := filepath.Join(directory, "plan.json")
 	statusPath := filepath.Join(directory, "status.json")
 	helperPath := filepath.Join(directory, "paperboat-uninstall-helper.exe")
 	entries, err := os.ReadDir(directory)
 	if err != nil {
-		return errors.New("invalid prior Windows uninstall helper contents")
+		return fmt.Errorf("%w: invalid contents", errUnrecoverableWindowsHelperRecord)
 	}
 	if len(entries) == 0 {
 		return os.Remove(directory)
 	}
 	if len(entries) != 3 {
-		return errors.New("invalid prior Windows uninstall helper contents")
+		return fmt.Errorf("%w: invalid contents", errUnrecoverableWindowsHelperRecord)
 	}
 	allowed := map[string]bool{"plan.json": true, "status.json": true, "paperboat-uninstall-helper.exe": true}
 	for _, entry := range entries {
 		if entry.IsDir() || !allowed[strings.ToLower(entry.Name())] {
-			return errors.New("invalid prior Windows uninstall helper contents")
+			return fmt.Errorf("%w: invalid contents", errUnrecoverableWindowsHelperRecord)
 		}
 	}
 	for _, path := range []string{planPath, statusPath, helperPath} {
 		if !windowssecurity.ProtectedDACLMatches(path, uninstallWindowsSDDL()) {
-			return errors.New("invalid prior Windows uninstall helper permissions")
+			return fmt.Errorf("%w: invalid permissions", errUnrecoverableWindowsHelperRecord)
 		}
 		pathInfo, err := os.Lstat(path)
 		if err != nil || !pathInfo.Mode().IsRegular() || pathInfo.Mode()&os.ModeSymlink != 0 {
-			return errors.New("invalid prior Windows uninstall helper contents")
+			return fmt.Errorf("%w: invalid contents", errUnrecoverableWindowsHelperRecord)
 		}
 		pathPointer, err := windows.UTF16PtrFromString(path)
 		if err != nil {
-			return errors.New("invalid prior Windows uninstall helper contents")
+			return fmt.Errorf("%w: invalid contents", errUnrecoverableWindowsHelperRecord)
 		}
 		if attributes, err := windows.GetFileAttributes(pathPointer); err != nil || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-			return errors.New("invalid prior Windows uninstall helper contents")
+			return fmt.Errorf("%w: invalid contents", errUnrecoverableWindowsHelperRecord)
 		}
 	}
 	plan, err := readExpiredWindowsUninstallPlan(planPath, statusPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %v", errUnrecoverableWindowsHelperRecord, err)
 	}
 	for _, processID := range plan.ProcessIDs {
 		running, err := windowsProcessIsRunning(processID)
 		if err != nil {
-			return fmt.Errorf("inspect prior Windows uninstall helper process: %w", err)
+			return fmt.Errorf("%w: process identity unavailable", errUnrecoverableWindowsHelperRecord)
 		}
 		if running {
-			return errors.New("prior Windows uninstall helper is still active")
+			return fmt.Errorf("%w: prior helper is still active", errUnrecoverableWindowsHelperRecord)
 		}
 	}
 	running, err := windowsHelperIsRunning(helperPath)
 	if err != nil {
-		return fmt.Errorf("inspect prior Windows uninstall helper image: %w", err)
+		return fmt.Errorf("%w: helper image identity unavailable", errUnrecoverableWindowsHelperRecord)
 	}
 	if running {
-		return errors.New("prior Windows uninstall helper is still active")
+		return fmt.Errorf("%w: prior helper is still active", errUnrecoverableWindowsHelperRecord)
 	}
 	for _, path := range []string{planPath, statusPath, helperPath} {
 		if err := os.Remove(path); err != nil {
@@ -336,12 +347,18 @@ func windowsExecutableIsRunning(path string) (bool, error) {
 	for err = windows.Process32First(snapshot, &entry); err == nil; err = windows.Process32Next(snapshot, &entry) {
 		handle, openErr := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, entry.ProcessID)
 		if openErr != nil {
+			if strings.EqualFold(windows.UTF16ToString(entry.ExeFile[:]), filepath.Base(path)) {
+				return false, openErr
+			}
 			continue
 		}
 		buffer := make([]uint16, 32768)
 		size := uint32(len(buffer))
 		queryErr := windows.QueryFullProcessImageName(handle, 0, &buffer[0], &size)
 		windows.CloseHandle(handle)
+		if queryErr != nil && strings.EqualFold(windows.UTF16ToString(entry.ExeFile[:]), filepath.Base(path)) {
+			return false, queryErr
+		}
 		if queryErr == nil && strings.EqualFold(windows.UTF16ToString(buffer[:size]), path) {
 			return true, nil
 		}
