@@ -1008,6 +1008,47 @@ next code change so the next Windows release can carry one consolidated fix set.
   `ErrUnavailable` before network activation. The delete timeout is downstream
   of that missing connector lifecycle.
 
+### Windows Victus `.23` service, preview, and tunnel regression batch
+
+Status: service persistence, updater, doctor, and preview pass. Two independent
+tunnel/installer regressions are fixed locally and require one consolidated
+candidate retest.
+
+- Fresh `.23` Host installation produced machine
+  `mch_6ceb0c90a05444765e82d1e67a2fab7e`. After the managed-SSH server fix,
+  all four services were Running and Automatic before and after reboot,
+  `/healthz` returned `{"live":true}`, `pb doctor --json` was healthy,
+  `pb update check --json` verified the current target, and the Windows release
+  verifier passed 11/11 checks.
+- The managed-SSH startup failure was an account-wide key-set overflow: the
+  server returned 65 active keys while the bounded client contract accepts at
+  most 64. Registration now fails closed at capacity and retrieval returns the
+  newest 64 deterministically. Focused tests and isolated PostgreSQL acceptance
+  passed; the server fix is deployed.
+- Preview `prv_239e296e1d282519f9e11e143bb8a05c` reached ready and served the
+  expected fixture twice with HTTP 200. First byte was 0.865 seconds on the
+  first request and 0.693 seconds on the second. Supported stop succeeded; the
+  prior first-load hang did not reproduce.
+- Tunnel `tun_t2dS4QxSlw9yYQ41mfiwTQ` persisted and exchanged connector
+  `con_2uH2dyzxUjJGzvP0d-3NOQ`, but no connector session was created. Database
+  evidence shows the connector active-desired with no session/heartbeat/ready
+  state and config generation 1 pending; server logs contain enrollment issue
+  201 and exchange 202 but no control or carrier-bootstrap request.
+- Proven tunnel root cause: production Host composition assigned the
+  `ProductionTunnelEnrollment` as handler and tunnel workload but omitted
+  `TunnelEnrollmentLifecycle`. Client composition did include it. The
+  activator therefore remained unstarted and returned locally before opening
+  the control WebSocket. Host composition now registers the same lifecycle;
+  focused runtime/tunnel tests pass and Windows amd64 compiles.
+- A later clean Victus attempt exposed a separate release-distribution defect:
+  `paperboat-server/deploy/releases/windows` was an Aug 29 snapshot rather than
+  the current release-owned `paperboat/tools/install.ps1`. Pairing failed after
+  fresh replacement and the stale script had no `Invoke-FreshPairRollback`,
+  leaving a partial `.22` user state with no services. The served installer is
+  now byte-identical to the canonical installer, including isolated child
+  processes, token-file custody, UAC handling, and fresh-pair rollback. Server
+  template tests now assert these contracts.
+
 ## Final candidate deterministic acceptance slots
 
 Status: required before `2026.09.03.23` can be accepted. The existing

@@ -60,6 +60,10 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusForbidden, "forbidden")
 		case errors.Is(err, ErrConflict):
 			writeError(w, http.StatusConflict, "enrollment_conflict")
+		case errors.Is(err, ErrActivation):
+			writeError(w, http.StatusServiceUnavailable, "activation_unavailable")
+		case errors.Is(err, ErrSecretStore):
+			writeError(w, http.StatusServiceUnavailable, "credential_store_unavailable")
 		default:
 			writeError(w, http.StatusServiceUnavailable, "runtime_unavailable")
 		}
@@ -129,6 +133,12 @@ func (c *LocalClient) Enroll(ctx context.Context, tunnel, key string) (Projectio
 		return Projection{}, ErrUnavailable
 	}
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		var envelope struct {
+			Error struct {
+				Code string `json:"code"`
+			} `json:"error"`
+		}
+		_ = json.Unmarshal(raw, &envelope)
 		switch resp.StatusCode {
 		case http.StatusUnauthorized:
 			return Projection{}, ErrAuthentication
@@ -137,6 +147,12 @@ func (c *LocalClient) Enroll(ctx context.Context, tunnel, key string) (Projectio
 		case http.StatusConflict:
 			return Projection{}, ErrConflict
 		default:
+			if envelope.Error.Code == "activation_unavailable" {
+				return Projection{}, ErrActivation
+			}
+			if envelope.Error.Code == "credential_store_unavailable" {
+				return Projection{}, ErrSecretStore
+			}
 			return Projection{}, ErrUnavailable
 		}
 	}

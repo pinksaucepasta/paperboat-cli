@@ -1377,7 +1377,7 @@ func (c *Client) ManagedSSHAuthorizedKeys(ctx context.Context, machineID, keyID 
 		return ManagedSSHAuthorizedKeys{}, err
 	}
 	if set.Type != "authorized_key_set" || set.Version != 1 || set.MachineID != machineID || set.MachineGeneration != generation || len(set.Keys) > 64 {
-		return ManagedSSHAuthorizedKeys{}, errors.New("paperboat-server returned an invalid managed SSH authorized-key set")
+		return ManagedSSHAuthorizedKeys{}, fmt.Errorf("paperboat-server returned an invalid managed SSH authorized-key set: got type=%q version=%d machine=%q generation=%d keys=%d expected machine=%q generation=%d", set.Type, set.Version, set.MachineID, set.MachineGeneration, len(set.Keys), machineID, generation)
 	}
 	return set, nil
 }

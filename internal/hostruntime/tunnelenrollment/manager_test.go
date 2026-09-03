@@ -703,6 +703,21 @@ func TestConnectorCredentialProofTranscriptMatchesContract(t *testing.T) {
 	}
 }
 
+func TestLocalClientPreservesTypedActivationFailure(t *testing.T) {
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		writeError(w, http.StatusServiceUnavailable, "activation_unavailable")
+	}))
+	defer local.Close()
+	client, err := NewLocalClient(local.URL, "local-token", local.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Enroll(t.Context(), "tunnel_04", "local-request-activation"); !errors.Is(err, ErrActivation) {
+		t.Fatalf("err=%v", err)
+	}
+}
+
 func TestManagerMapsStaleRevokedAndUnavailableMachineIdentity(t *testing.T) {
 	tests := []struct {
 		name   string

@@ -120,6 +120,22 @@ func TestMachineSSHDescriptorRequiresExactScope(t *testing.T) {
 	}
 }
 
+func TestManagedSSHAuthorizedKeysReportsSafeContractMismatch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/machines/machine_1/ssh-authorized-keys" {
+			http.NotFound(w, r)
+			return
+		}
+		writeData(w, http.StatusOK, ManagedSSHAuthorizedKeys{Type: "authorized_key_set", Version: 1, MachineID: "machine_1", MachineGeneration: 2})
+	}))
+	defer server.Close()
+
+	_, err := New(server.URL, config.Credential{}, server.Client()).ManagedSSHAuthorizedKeys(t.Context(), "machine_1", "credential_1", 1, []byte("proof"))
+	if err == nil || !strings.Contains(err.Error(), `got type="authorized_key_set" version=1 machine="machine_1" generation=2 keys=0 expected machine="machine_1" generation=1`) {
+		t.Fatalf("err=%v", err)
+	}
+}
+
 func TestClientConfigurationRejectsInvalidURL(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		writeData(w, http.StatusOK, ClientConfiguration{Version: "1", MachinesURL: "/dashboard/machines"})

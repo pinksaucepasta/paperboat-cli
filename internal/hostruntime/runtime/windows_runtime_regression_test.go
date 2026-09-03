@@ -287,6 +287,36 @@ func TestWindowsHostDoesNotDoubleStartProductionTunnelEnrollment(t *testing.T) {
 	}
 }
 
+// TestWindowsHostProductionCompositionStartsTunnelEnrollment protects the
+// production host-mode regression where the enrollment handler was mounted
+// but its lifecycle was omitted. In that state enrollment reached exchange,
+// then every connector activation failed locally before opening control.
+func TestWindowsHostProductionCompositionStartsTunnelEnrollment(t *testing.T) {
+	endpoint := &windowsRegressionEndpoint{}
+	host := newWindowsRegressionHostWithDependencies(t, HostDependencies{
+		TunnelEnrollment:          endpoint,
+		TunnelEnrollmentLifecycle: endpoint,
+		TunnelManager:             endpoint,
+	})
+	if err := host.StartStable(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	host.handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/v1/tunnel-connectors/enroll", nil))
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("enrollment endpoint status=%d, want %d", response.Code, http.StatusNoContent)
+	}
+	if starts, shutdowns, calls := endpoint.counts(); starts != 1 || shutdowns != 0 || calls != 1 {
+		t.Fatalf("production host enrollment starts=%d shutdowns=%d calls=%d, want 1/0/1", starts, shutdowns, calls)
+	}
+	if err := host.ShutdownStable(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if starts, shutdowns, calls := endpoint.counts(); starts != 1 || shutdowns != 1 || calls != 1 {
+		t.Fatalf("after shutdown starts=%d shutdowns=%d calls=%d, want 1/1/1", starts, shutdowns, calls)
+	}
+}
+
 func newWindowsRegressionCoordinator(t *testing.T, endpoint http.Handler, lifecycle Service) *Host {
 	t.Helper()
 	root := t.TempDir()
@@ -324,6 +354,13 @@ func newWindowsRegressionCoordinator(t *testing.T, endpoint http.Handler, lifecy
 }
 
 func newWindowsRegressionHost(t *testing.T, enrollment http.Handler, lifecycle stablehostd.TunnelWorkloads) *Host {
+	return newWindowsRegressionHostWithDependencies(t, HostDependencies{
+		TunnelEnrollment: enrollment,
+		TunnelManager:    lifecycle,
+	})
+}
+
+func newWindowsRegressionHostWithDependencies(t *testing.T, extra HostDependencies) *Host {
 	t.Helper()
 	root := t.TempDir()
 	config := runtimeconfig.Config{
@@ -333,13 +370,7 @@ func newWindowsRegressionHost(t *testing.T, enrollment http.Handler, lifecycle s
 		Limits:    runtimeconfig.DefaultLimits,
 		Resources: runtimeconfig.DefaultResources,
 	}
-	host, err := NewHost(context.Background(), HostConfig{
-		Runtime:        config,
-		ListenAddress:  "127.0.0.1:0",
-		WorkspaceRoot:  root,
-		AgentTokenFile: root + "\\agent\\token",
-		MachineID:      "machine_windows_regression",
-	}, HostDependencies{
+	dependencies := HostDependencies{
 		Authorizer: func(string) (server.Authorizer, error) { return hostAuthorizer{}, nil },
 		Listener: func() (net.Listener, error) {
 			return newWindowsRegressionListener(), nil
@@ -348,9 +379,17 @@ func newWindowsRegressionHost(t *testing.T, enrollment http.Handler, lifecycle s
 			return windowsRegressionSessionLauncher{}, nil
 		},
 		LocalControlToken: "local-control-token",
-		TunnelEnrollment:  enrollment,
-		TunnelManager:     lifecycle,
-	})
+	}
+	dependencies.TunnelEnrollment = extra.TunnelEnrollment
+	dependencies.TunnelEnrollmentLifecycle = extra.TunnelEnrollmentLifecycle
+	dependencies.TunnelManager = extra.TunnelManager
+	host, err := NewHost(context.Background(), HostConfig{
+		Runtime:        config,
+		ListenAddress:  "127.0.0.1:0",
+		WorkspaceRoot:  root,
+		AgentTokenFile: root + "\\agent\\token",
+		MachineID:      "machine_windows_regression",
+	}, dependencies)
 	if err != nil {
 		t.Fatal(err)
 	}
