@@ -1007,3 +1007,94 @@ next code change so the next Windows release can carry one consolidated fix set.
   lifecycle service, so its activator remained unstarted and returned
   `ErrUnavailable` before network activation. The delete timeout is downstream
   of that missing connector lifecycle.
+
+## Final candidate deterministic acceptance slots
+
+Status: required before `2026.09.03.23` can be accepted. The existing
+platform notes and the standalone Windows checklist preserve historical
+evidence; the slots below are the release decision record for one fresh,
+cross-platform run. A source test, a local-only route probe, or a verifier
+that does not exercise the installed release does not fill a slot.
+
+### Run and evidence contract
+
+- Use one disposable target per matrix column: macOS arm64, Linux amd64, and
+  Windows amd64. Pin the candidate version and architecture asset from
+  production metadata, and record the asset size and SHA-256 before mutation.
+- Start with the supported clean audit. Put the dashboard-issued Host
+  bootstrap command or URL in a protected operator-owned file, consume it once,
+  and never print, copy, retry, or place its opaque value in this ledger. A
+  missing, expired, or already-consumed bootstrap blocks only the dependent
+  stages; it is not a reason to consume another one.
+- Every slot is an independent bounded operation. Record
+  `state` (`passed`, `failed`, or `blocked-by-prerequisite`), UTC start and end,
+  exit code, duration, redacted stdout/stderr paths, the relevant object or
+  state snapshot, and a SHA-256 of the evidence manifest. Continue independent
+  diagnostics after a failure.
+- Use the fixed fixture contract from
+  `tools/preview-e2e-target/main.go:12-38`: loopback `127.0.0.1:38142`, path
+  `/http`, exact body `preview-http-ok\n`. The external client must make two
+  separate, bounded requests for each feature, with the first and second loads
+  recorded separately. Record HTTP status and body SHA-256, but redact opaque
+  endpoint URLs, credentials, cookies, and authorization headers.
+- Do not manufacture a clean baseline with raw service deletion, broad path
+  removal, or manual state edits. Use the product's supported stop, delete,
+  unpair, and uninstall flows, then preserve any failed cleanup plan or log.
+
+### Required stage slots
+
+The action and pass condition are normative. Replace each platform cell with
+the slot record defined above; feature cells must also include the request
+status, body SHA-256, and stable resource ID or generation (redacted where
+opaque).
+
+| Slot | Deterministic action and pass condition | macOS arm64 | Linux amd64 | Windows amd64 |
+| --- | --- | --- | --- | --- |
+| Fresh install | From a clean audit, verify pinned metadata and the immutable asset, run the official installer in install-only/fresh mode as appropriate, and consume exactly one protected Host bootstrap. Require the candidate version and digest, Host identity, setup mode, expected services, and live health. | `state=__; started_utc=__; finished_utc=__; exit_code=__; evidence=__; manifest_sha256=__` | `state=__; started_utc=__; finished_utc=__; exit_code=__; evidence=__; manifest_sha256=__` | `state=__; started_utc=__; finished_utc=__; exit_code=__; evidence=__; manifest_sha256=__` |
+| Services and health | Verify the installed service definitions, ownership, executable paths, role arguments, automatic-start/recovery declarations, live process hashes, loopback listeners, and `/healthz` 200 response with exactly `{"live":true}`. Run redacted `pb status --json`. | `state=__; started_utc=__; finished_utc=__; exit_code=__; evidence=__; manifest_sha256=__` | `state=__; started_utc=__; finished_utc=__; exit_code=__; evidence=__; manifest_sha256=__` | `state=__; started_utc=__; finished_utc=__; exit_code=__; evidence=__; manifest_sha256=__` |
+| Reboot persistence | Snapshot machine/environment IDs, alias, setup mode, identity fingerprint, candidate digest, services, health, SSH/listeners, and updater state. Restart the Host service, wait for bounded readiness, reboot the OS once through its normal path, and repeat the snapshot. Require all durable identity and service values to remain unchanged. | `state=__; started_utc=__; finished_utc=__; exit_code=__; evidence=__; manifest_sha256=__` | `state=__; started_utc=__; finished_utc=__; exit_code=__; evidence=__; manifest_sha256=__` | `state=__; started_utc=__; finished_utc=__; exit_code=__; evidence=__; manifest_sha256=__` |
+| Updater | Invoke the signed `pb update --json` path once, poll the bounded `pb update status --json` convergence window, and recapture services, health, digest, and identity. Require verified target metadata, committed activation, no pending/failure/maintenance state, and an unchanged identity fingerprint. | `state=__; started_utc=__; finished_utc=__; exit_code=__; evidence=__; manifest_sha256=__` | `state=__; started_utc=__; finished_utc=__; exit_code=__; evidence=__; manifest_sha256=__` | `state=__; started_utc=__; finished_utc=__; exit_code=__; evidence=__; manifest_sha256=__` |
+| Doctor | After install, reboot, and update, run `pb doctor --json`, `pb status --json`, and the supported local health checks. Require the doctor schema, typed result, authentication, local state, and runtime reachability to be healthy. | `state=__; started_utc=__; finished_utc=__; exit_code=__; evidence=__; manifest_sha256=__` | `state=__; started_utc=__; finished_utc=__; exit_code=__; evidence=__; manifest_sha256=__` | `state=__; started_utc=__; finished_utc=__; exit_code=__; evidence=__; manifest_sha256=__` |
+| Preview first load | Start the fixed fixture, run one `pb preview 38142 --duration <bounded> --json`, wait for the preview to report ready, and make the first external HTTP request to its returned route. Require HTTP 200 and the exact fixture body, with the preview ID/lease and first request timestamp recorded. | `state=__; http_status=__; body_sha256=__; resource_id=__; evidence=__` | `state=__; http_status=__; body_sha256=__; resource_id=__; evidence=__` | `state=__; http_status=__; body_sha256=__; resource_id=__; evidence=__` |
+| Preview second load | Keep the same preview alive and make a distinct second external request using the same route. Require HTTP 200, the same body SHA-256, the same preview ID/lease, and no extra preview or owner session. Run `pb preview list --json` before supported stop. | `state=__; http_status=__; body_sha256=__; resource_id=__; evidence=__` | `state=__; http_status=__; body_sha256=__; resource_id=__; evidence=__` | `state=__; http_status=__; body_sha256=__; resource_id=__; evidence=__` |
+| Tunnel first load | Start the fixed fixture and create one unique disposable tunnel with the supported `pb tunnel create <name> --port 38142 --duration <bounded> --wait --json` flow. Wait for connector, edge, origin, and overall status `ready`, then make the first external request to the stable endpoint. | `state=__; http_status=__; body_sha256=__; tunnel_id=__; generation=__; evidence=__` | `state=__; http_status=__; body_sha256=__; tunnel_id=__; generation=__; evidence=__` | `state=__; http_status=__; body_sha256=__; tunnel_id=__; generation=__; evidence=__` |
+| Tunnel second load | Keep the same tunnel and stable endpoint, make a distinct second external request, and run tunnel status/doctor. Require HTTP 200, the same body SHA-256 and generation, overall status `ready`, and the same durable tunnel ID. Leave teardown to the cleanup slot. | `state=__; http_status=__; body_sha256=__; tunnel_id=__; generation=__; evidence=__` | `state=__; http_status=__; body_sha256=__; tunnel_id=__; generation=__; evidence=__` | `state=__; http_status=__; body_sha256=__; tunnel_id=__; generation=__; evidence=__` |
+| Cleanup | Stop the preview and delete the disposable tunnel through supported commands, wait for terminal operation state, then run the exact supported `pb uninstall` confirmation flow. Run the platform clean audit and independent inventories within a bounded window. Require no Paperboat services/tasks, processes, listeners, PATH entries, binaries, state/config/token files, or helper plans/status residue, apart from the explicitly preserved Paperboat Inbox; preserve any failed helper evidence. | `state=__; started_utc=__; finished_utc=__; exit_code=__; evidence=__; manifest_sha256=__` | `state=__; started_utc=__; finished_utc=__; exit_code=__; evidence=__; manifest_sha256=__` | `state=__; started_utc=__; finished_utc=__; exit_code=__; evidence=__; manifest_sha256=__` |
+
+### Implementation and precedent references
+
+The slot boundaries are based on the repository harnesses and the five local
+reference implementations required by the workspace policy:
+
+- Linux release verification distinguishes read-only checks at
+  `tools/accept-linux-final-release.sh:438-513` from the install-only mutation
+  path at `tools/accept-linux-final-release.sh:515-557`; its latter path must
+  not be reported as a fresh enrollment by itself.
+- Windows fresh/full/update mutation gates and bounded persistence checks are
+  at `tools/test-windows-fresh-acceptance.ps1:956-1061` and
+  `tools/test-windows-fresh-acceptance.ps1:1086-1161`. The standalone verifier
+  remains read-only and is not a substitute for the feature slots.
+- Preview readiness and external fixture probing are defined by
+  `cmd/pb/preview_command.go:145-180,369-461`,
+  `tools/preview-e2e-target/main.go:12-38`, and
+  `tools/gate8-e2e.sh:276-290`.
+- Tunnel status/doctor, durable create/wait, and supported delete are defined
+  by `cmd/pb/tunnel_command.go:448-618,1296-1493,1863-1916`.
+- Tailscale's root LaunchDaemon install and unload flow is at
+  `/Users/pujan.pm/workspace/github.com/pujan-modha/tailscale/cmd/tailscaled/install_darwin.go:23-47,53-146`.
+  Cloudflared's root/user path ownership and LaunchDaemon/LaunchAgent split is
+  at
+  `/Users/pujan.pm/workspace/github.com/pujan-modha/cloudflared/cmd/cloudflared/macos_service.go:90-145`.
+- Headscale's bounded reconnect grace and deferred session cleanup are at
+  `/Users/pujan.pm/workspace/github.com/pujan-modha/headscale/hscontrol/poll.go:149-192`,
+  with failed-reconnect cleanup coverage at
+  `/Users/pujan.pm/workspace/github.com/pujan-modha/headscale/hscontrol/poll_test.go:220-279`.
+- zrok's cancellable reconnect loop and bounded reconnect configuration are at
+  `/Users/pujan.pm/workspace/github.com/pujan-modha/zrok/sdk/golang/pubsub/subscriber.go:62-138`;
+  the corresponding lifecycle contract is documented at
+  `/Users/pujan.pm/workspace/github.com/pujan-modha/zrok/sdk/golang/pubsub/README.md:61-126`.
+  No focused `*_test.go` exists under that pubsub directory.
+- localtunnel's retry, one-time URL emission, reconnect, and close behavior is
+  at `/Users/pujan.pm/workspace/github.com/pujan-modha/localtunnel/lib/Tunnel.js:44-163`,
+  with external HTTPS body and close coverage at
+  `/Users/pujan.pm/workspace/github.com/pujan-modha/localtunnel/localtunnel.spec.js:26-54,65-161`.
