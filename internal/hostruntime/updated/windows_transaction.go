@@ -45,6 +45,7 @@ type windowsActivationJournal struct {
 	OldHostd, NewHostd, OldUpdater, NewUpdater, OldSSH, NewSSH    windowsServiceTarget
 	PreviousCLIRecord, NewCLIRecord                               string
 	LocalDaemonWasRunning                                         bool
+	PreDrainRollback                                              bool
 	Failure                                                       string
 	ManifestSHA256                                                string
 	CanaryPath                                                    string
@@ -88,6 +89,13 @@ func executeWindowsActivation(ctx context.Context, backend windowsActivationBack
 			return journal, backend.FinalizeServices(ctx, journal)
 		}
 		return journal, nil
+	}
+	// A candidate can fail before the durable drain boundary. Persisting that
+	// fact keeps crash recovery from asking the rollback gate to verify a drain
+	// that never happened. Post-drain and legacy ambiguous journals retain the
+	// strict rollback-gate path below.
+	if journal.PreDrainRollback {
+		return rollbackWindowsCandidate(ctx, backend, journal, errors.New("interrupted pre-drain rollback recovered"))
 	}
 	if journal.Stage == windowsActivationRollbackReady {
 		return completeWindowsRollback(ctx, backend, journal, errors.New("interrupted rollback recovered"))
@@ -231,6 +239,7 @@ func rollbackWindowsCandidate(ctx context.Context, backend windowsActivationBack
 		ctx = context.Background()
 	}
 	journal.Stage = windowsActivationRollingBack
+	journal.PreDrainRollback = true
 	journal.Failure = boundedWindowsActivationFailure(cause)
 	journalErr := backend.WriteJournal(journal)
 	stopErr := backend.StopCandidate(ctx, journal)
@@ -253,6 +262,7 @@ func rollbackWindowsCandidate(ctx context.Context, backend windowsActivationBack
 		return journal, errors.Join(cause, startErr, quarantineErr)
 	}
 	journal.Stage = windowsActivationRolledBack
+	journal.PreDrainRollback = false
 	if err := backend.WriteJournal(journal); err != nil {
 		return journal, errors.Join(cause, quarantineErr, err)
 	}

@@ -133,6 +133,36 @@ func TestWindowsActivationRollbackReadyResumeOnlyStartsOldServices(t *testing.T)
 	}
 }
 
+func TestWindowsActivationResumesInterruptedPreDrainRollbackWithoutRollbackGate(t *testing.T) {
+	for _, stage := range []windowsActivationStage{windowsActivationRollingBack, windowsActivationRollbackReady} {
+		t.Run(string(stage), func(t *testing.T) {
+			journal := testWindowsActivationJournal()
+			journal.Stage = stage
+			journal.PreDrainRollback = true
+			b := &recordingWindowsActivationBackend{}
+			result, err := executeWindowsActivation(context.Background(), b, journal)
+			if err == nil || result.Stage != windowsActivationRolledBack || result.PreDrainRollback {
+				t.Fatalf("result=%+v err=%v", result, err)
+			}
+			if slices.Contains(b.events, "verifyRollback") || !slices.Contains(b.events, "candidate_stop") || !slices.Contains(b.events, "start") {
+				t.Fatalf("events=%q", b.events)
+			}
+		})
+	}
+}
+
+func TestWindowsActivationAmbiguousRollbackReadyRetainsStrictRollbackGate(t *testing.T) {
+	journal := testWindowsActivationJournal()
+	journal.Stage = windowsActivationRollbackReady
+	b := &recordingWindowsActivationBackend{}
+	if _, err := executeWindowsActivation(context.Background(), b, journal); err == nil {
+		t.Fatal("expected recovery cause")
+	}
+	if !slices.Contains(b.events, "verifyRollback") || slices.Contains(b.events, "candidate_stop") {
+		t.Fatalf("events=%q", b.events)
+	}
+}
+
 func TestWindowsActivationDoesNotStartOldUpdaterBeforeRollbackReadyIsDurable(t *testing.T) {
 	b := &recordingWindowsActivationBackend{fail: "journal:rollback_ready"}
 	result, err := rollbackWindowsActivation(context.Background(), b, testWindowsActivationJournal(), errors.New("candidate failed"))
