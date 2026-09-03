@@ -109,7 +109,7 @@ func TestAuthenticatedMachineSourceReportsMissingSignerWithoutHidingInventory(t 
 		case "/v1/e2ee/pending-endpoints":
 			_ = json.NewEncoder(writer).Encode(map[string]any{"data": []api.PendingEndpointIdentity{{RequestID: "per_cli_0123456789", EndpointID: "cli_new", Role: "cli", State: "pending", Generation: 1, CreatedAt: time.Now().UTC(), ExpiresAt: time.Now().UTC().Add(time.Minute), SafetyCode: "abcde-fghij"}}})
 		case "/v1/e2ee/root":
-			_ = json.NewEncoder(writer).Encode(map[string]any{"data": api.E2EERoot{Version: 1, PublicKey: base64.RawURLEncoding.EncodeToString(rootPublic), Fingerprint: hex.EncodeToString(rootFingerprint[:]), Generation: 1}})
+			_ = json.NewEncoder(writer).Encode(map[string]any{"data": api.E2EERoot{Version: 1, TrustedKeys: []api.E2EEKey{{KeyID: "aek_" + hex.EncodeToString(rootFingerprint[:]), PublicKey: base64.RawURLEncoding.EncodeToString(rootPublic), Fingerprint: hex.EncodeToString(rootFingerprint[:]), Generation: 1}}}})
 		default:
 			http.NotFound(writer, request)
 		}

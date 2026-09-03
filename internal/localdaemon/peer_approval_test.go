@@ -166,7 +166,7 @@ func TestApproveOwnedPeerEnrollmentsVerifierOnlyReturnsTypedNonSignerForMixedPen
 		case "/v1/e2ee/pending-endpoints":
 			_ = json.NewEncoder(w).Encode(map[string]any{"data": pending})
 		case "/v1/e2ee/root":
-			_ = json.NewEncoder(w).Encode(map[string]any{"data": api.E2EERoot{Version: 1, PublicKey: base64.RawURLEncoding.EncodeToString(rootPublic), Fingerprint: hex.EncodeToString(rootSum[:]), Generation: 1}})
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": api.E2EERoot{Version: 1, TrustedKeys: []api.E2EEKey{{KeyID: "aek_" + hex.EncodeToString(rootSum[:]), PublicKey: base64.RawURLEncoding.EncodeToString(rootPublic), Fingerprint: hex.EncodeToString(rootSum[:]), Generation: 1}}}})
 		default:
 			http.NotFound(w, r)
 		}
@@ -217,7 +217,7 @@ func TestApproveOwnedPeerEnrollmentsVerifierOnlyRootFailuresRemainHard(t *testin
 						_, _ = w.Write([]byte(`{"error":{"code":"temporarily_unavailable","message":"unavailable"}}`))
 						return
 					}
-					_ = json.NewEncoder(w).Encode(map[string]any{"data": api.E2EERoot{Version: 1, PublicKey: base64.RawURLEncoding.EncodeToString(remotePublic), Fingerprint: hex.EncodeToString(remoteFingerprint[:]), Generation: 1}})
+					_ = json.NewEncoder(w).Encode(map[string]any{"data": api.E2EERoot{Version: 1, TrustedKeys: []api.E2EEKey{{KeyID: "aek_" + hex.EncodeToString(remoteFingerprint[:]), PublicKey: base64.RawURLEncoding.EncodeToString(remotePublic), Fingerprint: hex.EncodeToString(remoteFingerprint[:]), Generation: 1}}}})
 				default:
 					http.NotFound(w, r)
 				}

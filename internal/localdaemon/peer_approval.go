@@ -1,18 +1,14 @@
 package localdaemon
 
 import (
-	"bytes"
 	"context"
-	"crypto/ed25519"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/hex"
 	"errors"
 	"fmt"
 
 	"github.com/pinksaucepasta/paperboat/internal/api"
 	"github.com/pinksaucepasta/paperboat/internal/config"
 	"github.com/pinksaucepasta/paperboat/internal/peertransport/identitybootstrap"
+	"github.com/pinksaucepasta/paperboat/internal/peertransport/trustedkeys"
 )
 
 var ErrPeerApprovalSignerUnavailable = errors.New("peer enrollment signer is unavailable")
@@ -106,12 +102,12 @@ func validateVerifierOnlyRoot(ctx context.Context, store config.ProfileStore, pr
 	if err != nil {
 		return err
 	}
-	decoded, decodeErr := base64.RawURLEncoding.Strict().DecodeString(remote.PublicKey)
-	defer clear(decoded)
-	fingerprint := sha256.Sum256(decoded)
-	if decodeErr != nil || len(local) != ed25519.PublicKeySize || len(decoded) != ed25519.PublicKeySize ||
-		base64.RawURLEncoding.EncodeToString(decoded) != remote.PublicKey || remote.Version != 1 || remote.Generation != 1 ||
-		remote.Fingerprint != hex.EncodeToString(fingerprint[:]) || !bytes.Equal(local, decoded) {
+	trusted, err := trustedkeys.Root(remote)
+	if err != nil {
+		return errors.New("automatic peer enrollment returned an invalid account root")
+	}
+	defer trustedkeys.Clear(trusted)
+	if _, ok := trustedkeys.ByPublic(trusted, local); !ok {
 		return errors.New("automatic peer enrollment verifier root does not match the account root")
 	}
 	return nil
