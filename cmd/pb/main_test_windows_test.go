@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -17,6 +18,7 @@ import (
 	"github.com/adrg/xdg"
 	"github.com/pinksaucepasta/paperboat/internal/localapi"
 	"github.com/pinksaucepasta/paperboat/internal/localdaemon"
+	"golang.org/x/sys/windows"
 )
 
 func TestWindowsUninstallPlanIsProtectedBoundedAndHelperIsNonRecursive(t *testing.T) {
@@ -92,6 +94,31 @@ func TestWindowsUninstallHandoffAcceptsOnlyReadyProtectedStatus(t *testing.T) {
 func TestWindowsUninstallRequiresConfirmedDaemonStopBeforeProductRemoval(t *testing.T) {
 	if !platformRequiresConfirmedDaemonStop() {
 		t.Fatal("Windows uninstall may remove product/state after uncertain daemon termination")
+	}
+}
+
+func TestWindowsUninstallSchedulesCompleteHelperDirectoryDeletion(t *testing.T) {
+	previous := moveWindowsFileAtReboot
+	var deleted []string
+	moveWindowsFileAtReboot = func(path *uint16) error {
+		deleted = append(deleted, windows.UTF16PtrToString(path))
+		return nil
+	}
+	t.Cleanup(func() { moveWindowsFileAtReboot = previous })
+	scheduleWindowsUninstallDirectoryDeletion(`C:\unrelated`)
+	if len(deleted) != 0 {
+		t.Fatalf("unsafe helper directory scheduled deletions: %v", deleted)
+	}
+	directory := filepath.Join(os.TempDir(), "Paperboat Uninstall", "0123456789abcdef0123456789abcdef")
+	scheduleWindowsUninstallDirectoryDeletion(directory)
+	want := []string{
+		filepath.Join(directory, "plan.json"),
+		filepath.Join(directory, "status.json"),
+		filepath.Join(directory, "paperboat-uninstall-helper.exe"),
+		directory,
+	}
+	if !reflect.DeepEqual(deleted, want) {
+		t.Fatalf("scheduled helper deletions=%v want=%v", deleted, want)
 	}
 }
 

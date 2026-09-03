@@ -256,6 +256,12 @@ if ($freshEnrollment -or -not (Assert-InstalledRelease $installedPb $version $ac
 }
 if (-not (Assert-InstalledRelease $installedPb $version $actual)) { throw "Installed Paperboat does not match verified release $version." }
 
+# The trusted bootstrap is needed only across the elevation boundary. Never
+# accumulate verified staging copies after the installed digest is proven.
+if ($null -ne $installerExecutable) {
+  Remove-Item -LiteralPath $installerExecutable -Force -ErrorAction SilentlyContinue
+}
+
 if ($freshEnrollment) {
   # Only cross the replacement boundary after the verified elevated install
   # has succeeded. If UAC is denied or the elevated process cannot start,

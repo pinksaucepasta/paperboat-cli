@@ -110,4 +110,9 @@ func TestWindowsInstallerStagesAndUnblocksTheVerifiedBootstrap(t *testing.T) {
 		!strings.Contains(script, "$arguments[2] = $installerExecutable") {
 		t.Fatal("Windows installer must retain a safe staged source fallback")
 	}
+	verification := strings.LastIndex(script, "Installed Paperboat does not match verified release $version")
+	cleanup := strings.LastIndex(script, "Remove-Item -LiteralPath $installerExecutable -Force -ErrorAction SilentlyContinue")
+	if verification < 0 || cleanup < verification {
+		t.Fatal("Windows installer must remove the trusted bootstrap only after proving the installed release")
+	}
 }

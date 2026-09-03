@@ -207,7 +207,20 @@ function Assert-CleanAbsence([pscustomobject]$Paths) {
             Fail 'Paperboat-owned state is not absent during clean preflight.'
         }
     }
-    Check 'clean absence: services, retired tasks, Paperboat processes, and owned state roots'
+    $machinePath = [string][Environment]::GetEnvironmentVariable('Path', 'Machine')
+    foreach ($entry in @($machinePath -split ';')) {
+        if ([string]::Equals($entry.Trim().Trim('"'), (Join-Path $Paths.InstallRoot 'bin'), [StringComparison]::OrdinalIgnoreCase)) {
+            Fail 'The Paperboat machine PATH entry remains during clean preflight.'
+        }
+    }
+    $helperRoot = Join-Path $env:TEMP 'Paperboat Uninstall'
+    if (Test-Path -LiteralPath $helperRoot) {
+        $helperEntries = @(Get-ChildItem -LiteralPath $helperRoot -Force -ErrorAction Stop)
+        if ($helperEntries.Count -ne 0) {
+            Fail 'Paperboat uninstall helper residue remains during clean preflight.'
+        }
+    }
+    Check 'clean absence: services, retired tasks, processes, PATH, helper state, and owned roots'
 }
 
 function Read-InstallConfig([pscustomobject]$Paths) {

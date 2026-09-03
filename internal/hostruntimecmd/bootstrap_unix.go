@@ -87,7 +87,7 @@ func runBootstrap(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	if err := machinename.Validate(strings.TrimSpace(*name)); err != nil {
 		return fmt.Errorf("invalid machine name: %w", err)
 	}
-	account, err := user.Current()
+	account, err := currentUnixUser()
 	if err != nil || account.Username == "" {
 		return errors.New("could not resolve enrolled user")
 	}
@@ -522,7 +522,7 @@ func validateUserShell(path string) (string, error) {
 }
 
 func accountLoginShell() string {
-	current, err := user.Current()
+	current, err := currentUnixUser()
 	if err != nil || current.Username == "" {
 		return ""
 	}

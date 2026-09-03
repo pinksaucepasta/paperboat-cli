@@ -1130,30 +1130,32 @@ func uninstallWindows(ctx context.Context, purge bool) error {
 	if err != nil {
 		return err
 	}
-	// Recovery must be a separate fail-closed step. Do not delete binaries or
-	// machine configuration if the previous journal cannot be reconciled.
+	var result error
+	// Recovery remains fail closed for service declarations and binaries, but
+	// independently-owned registration residue must still converge. A corrupt
+	// lifecycle journal must not strand the fixed machine PATH entry forever.
+	recovered := true
 	if err := lifecycle.Recover(ctx); err != nil {
-		return err
+		result = errors.Join(result, err)
+		recovered = false
 	}
-	if err := lifecycle.Uninstall(ctx); err != nil {
-		return err
+	if recovered {
+		result = errors.Join(result, lifecycle.Uninstall(ctx))
 	}
-	if err := winenv.RemoveMachinePath(filepath.Dir(layout.Binary)); err != nil {
-		return err
-	}
+	result = errors.Join(result, winenv.RemoveMachinePath(filepath.Dir(layout.Binary)))
 	for _, path := range []string{WindowsInstallConfigPath(), WindowsHostdTokenPath()} {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
+			result = errors.Join(result, err)
 		}
 	}
 	if purge {
 		for _, path := range []string{layout.ReleasesRoot, filepath.Join(WindowsProgramDataRoot(), "services"), filepath.Join(WindowsProgramDataRoot(), "service-lifecycle"), layout.UpdateStateRoot} {
 			if err := os.RemoveAll(path); err != nil {
-				return err
+				result = errors.Join(result, err)
 			}
 		}
 	}
-	return nil
+	return result
 }
 
 func serviceNameForKind(kind string) string {

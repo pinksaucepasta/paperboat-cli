@@ -3,6 +3,9 @@
 Status: testing in progress. No source fixes are permitted until the complete
 macOS, Linux, and Windows test pass has been recorded here.
 
+This ledger continues across subsequent release candidates until one final
+candidate passes the complete three-platform acceptance matrix.
+
 ## Release under test
 
 - Tag: `2026.09.03.4`
@@ -17,6 +20,41 @@ macOS, Linux, and Windows test pass has been recorded here.
   this is accepted and is not a cause of the current runtime investigation.
 
 ## Issue ledger
+
+### SERVER-001: dashboard POSIX enrollment response is not an executable script
+
+- Severity: fresh-enrollment blocker
+- Reproduction: issue a dashboard Host enrollment and pipe the protected
+  `get.pprbt.dev/install?p=...` response to `bash`.
+- Expected: the response begins with `#!/bin/sh`, exports the embedded one-shot
+  enrollment values, and executes the installer.
+- Actual: the response placed shell assignments before the shebang, so the
+  bootstrap could silently do no installation.
+- Root cause: `release_handlers.go` prepended assignments to the base script
+  rather than injecting them after its shebang.
+- Fix status: fixed and deployed in paperboat-server commit `e7b3ff4`. The
+  response now keeps the shebang first, exports both values, and fails closed
+  if the base installer has no exact shebang. Focused normal/race tests pass.
+
+### MAC-004: release enrollment resolves the macOS user from poisoned environment
+
+- Severity: fresh-enrollment and service-persistence blocker
+- Reproduction: on UID 501 whose real account is `pujan.pm`, execute the
+  dashboard-issued enrollment from an environment containing `USER=pujan`.
+- Expected: the LaunchDaemon uses the authoritative UID 501 account name
+  `pujan.pm`.
+- Actual: the generated hostd plist used `UserName=pujan`. launchd failed
+  account resolution and later reported service initialization failure. The
+  same installed ad-hoc helper runs directly as the user and root and also
+  succeeds under a minimal root LaunchDaemon, disproving signing, file mode,
+  ownership, helper bytes, and helper path as the cause.
+- Root cause: release assets are built with `CGO_ENABLED=0`; pure-Go
+  `os/user.Current()` is environment-backed. Enrollment trusted that value
+  instead of resolving the kernel UID.
+- Fix status: fixed locally by resolving `os.Getuid()` through
+  `user.LookupId`. A regression test poisons `USER` and `LOGNAME`; focused
+  normal/race hostruntimecmd, hostinstall, and service tests pass. Final release
+  and fresh macOS acceptance pending.
 
 ### MAC-001: complete uninstall leaves a dangling user CLI symlink
 
@@ -181,7 +219,8 @@ macOS, Linux, and Windows test pass has been recorded here.
 - Actual: PowerShell `ParserError` beginning at line 294 because expressions
   such as `-or Test-ReparsePoint ...` require a parenthesized function call.
   The same invalid form exists at lines 329, 557, 620, 623, 628, 652, and 669.
-- Fix status: not started.
+- Fix status: fixed in the current tree. Function-call operands are
+  parenthesized throughout the harness; final execution on Victus is pending.
 
 ### WIN-002: supported unpair cannot persist the machine transition
 
@@ -203,8 +242,12 @@ macOS, Linux, and Windows test pass has been recorded here.
   `Failed: remove user Paperboat state`. Immediate helper status remains
   `removing`; services are absent but product roots/processes remain, so
   cleanup cannot yet be accepted.
-- Fix status: not started. First determine whether the helper reaches a
-  terminal state or is stuck.
+- Root cause: the elevated helper inherited the SSH session's
+  kill-on-job-close job because its process creation omitted
+  `CREATE_BREAKAWAY_FROM_JOB`. It reached `removing` and was killed when the
+  SSH caller closed. Release `2026.09.03.7` already contains the isolated
+  breakaway fix and regression test.
+- Fix status: source fixed. Final fresh Victus acceptance pending.
 - Follow-up at `2026-09-03T05:01+05:30`: cleanup did not converge. Hostd and
   Paperboat SSH services/processes returned to running, LocalDaemon remained
   installed but stopped, and all three product roots remained. No terminal
@@ -217,7 +260,39 @@ macOS, Linux, and Windows test pass has been recorded here.
   parameter, while the Windows harness requires a raw 26-character enrollment
   token file. The supported dashboard output intentionally does not reveal
   that raw token.
-- Fix status: not started.
+- Fix status: fixed in the current tree. The harness accepts the protected
+  dashboard bootstrap URL/command through `EnrollmentBootstrapFile`, extracts
+  only the exact `https://get.pprbt.dev/install?p=...` endpoint, and neither
+  parses nor prints the opaque value. Final execution on Victus is pending.
+
+### WIN-005: failed uninstall handoff leaves protected installation residue
+
+- Severity: fresh-install blocker
+- Read-only Victus inventory after the failed supported uninstall found no
+  canonical binary and no Paperboat SCM services, but retained
+  `C:\ProgramData\Paperboat\runtime-install.json`, `hostd.token`, managed SSH
+  state, service lifecycle state, the stale machine PATH entry, and four
+  stopped temporary uninstall helpers.
+- The retained install metadata is version `2026.09.03.6`, `committed=false`;
+  its configured runtime state root is absent. Windows event history proves
+  Hostd and managed OpenSSH were registered during the attempt and later
+  removed.
+- Expected: the elevated uninstall helper reaches a durable terminal result and
+  removes all product-owned state and PATH only after owned services/processes
+  have stopped.
+- Actual: the parent reported `remove user Paperboat state`, while the detached
+  helpers never completed the protected residue cleanup.
+- Additional root causes: machine PATH removal was conditional on successful
+  lifecycle recovery, successful installs retained trusted bootstrap copies,
+  and helper completion scheduled only the executable for reboot deletion,
+  leaving its plan, status, and directory indefinitely.
+- Fix status: fixed locally. Machine PATH and independently owned state cleanup
+  now continue after lifecycle errors while service/binary mutation remains
+  fail closed. The exact helper directory is scheduled child-first for
+  removal, successful install removes its staging copy, and the Windows audit
+  checks PATH and helper residue. Focused tests and Windows amd64/arm64 test
+  compilation pass. Final Victus acceptance pending. The unrelated GitHub
+  Actions runner and normal system OpenSSH remain explicitly out of scope.
 
 ## macOS test record
 

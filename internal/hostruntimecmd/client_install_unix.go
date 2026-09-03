@@ -25,7 +25,7 @@ type ClientInstallConfig struct {
 }
 
 func InstallClient(ctx context.Context, config ClientInstallConfig, stdin io.Reader, stdout, stderr io.Writer) error {
-	account, err := user.Current()
+	account, err := currentUnixUser()
 	if err != nil {
 		return err
 	}

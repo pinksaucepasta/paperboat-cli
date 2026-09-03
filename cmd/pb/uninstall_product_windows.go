@@ -33,6 +33,7 @@ const (
 var (
 	purgeWindowsHostRuntime    = hostinstall.Purge
 	windowsUninstallExecutable = os.Executable
+	moveWindowsFileAtReboot    = func(path *uint16) error { return windows.MoveFileEx(path, nil, windows.MOVEFILE_DELAY_UNTIL_REBOOT) }
 )
 
 type windowsUninstallPlan struct {
@@ -168,6 +169,8 @@ func runWindowsUninstallHelper(ctx context.Context, planPath string) error {
 	if err != nil {
 		return err
 	}
+	helperDirectory := filepath.Dir(planPath)
+	defer scheduleWindowsUninstallDirectoryDeletion(helperDirectory)
 	scheduleWindowsUninstallHelperDeletion()
 	status := func(state string, statusErr error) error {
 		value := windowsUninstallStatus{Schema: windowsUninstallStatusSchema, State: state, UpdatedAt: time.Now().UTC()}
@@ -389,7 +392,27 @@ func scheduleWindowsUninstallHelperDeletion() {
 	if err != nil {
 		return
 	}
-	_ = windows.MoveFileEx(path, nil, windows.MOVEFILE_DELAY_UNTIL_REBOOT)
+	_ = moveWindowsFileAtReboot(path)
+}
+
+// scheduleWindowsUninstallDirectoryDeletion removes the exact helper files
+// after the helper exits. MoveFileEx processes deletions in registration order
+// at reboot, so children are removed before their private directory.
+func scheduleWindowsUninstallDirectoryDeletion(directory string) {
+	if !filepath.IsAbs(directory) || !strings.EqualFold(filepath.Base(filepath.Dir(directory)), "Paperboat Uninstall") {
+		return
+	}
+	for _, path := range []string{
+		filepath.Join(directory, "plan.json"),
+		filepath.Join(directory, "status.json"),
+		filepath.Join(directory, "paperboat-uninstall-helper.exe"),
+		directory,
+	} {
+		pointer, err := windows.UTF16PtrFromString(path)
+		if err == nil {
+			_ = moveWindowsFileAtReboot(pointer)
+		}
+	}
 }
 
 func writeProtectedWindowsUninstallJSON(path string, value any) error {
