@@ -304,6 +304,18 @@ Testing in progress on Victus.
 - Fresh acceptance is currently blocked by WIN-001 through WIN-004. No raw
   service deletion, firewall mutation, or broad deletion was used.
 
+### Windows final-release retest checkpoint
+
+- The `.5` acceptance harness correctly refused the existing partial install;
+  it did not reach fresh installation or consume the protected enrollment
+  artifact.
+- Current exact state: `PaperboatHostd` and `PaperboatSshd` are running,
+  `PaperboatLocalDaemon` is installed but stopped, `PaperboatUpdated` is
+  absent, all three product roots remain, and four product `pb.exe` processes
+  are running from Program Files.
+- The temporary acceptance scheduled task was removed. Victus is neither
+  clean nor accepted, and must not be reported as a `.5` result.
+
 ## Fix batch
 
 In progress after completing the initial platform failure discovery:
