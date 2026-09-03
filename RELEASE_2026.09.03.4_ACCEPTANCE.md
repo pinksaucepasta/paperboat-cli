@@ -263,6 +263,29 @@ Testing in progress on Hetzner `coolify`.
 - Preview and tunnel E2E remain pending because the supplied Linux harness does
   not exercise them.
 
+### Linux final-release retest attempt
+
+- Official `current.json` now reports `2026.09.03.5`; its Linux amd64 asset
+  was downloaded and verified by the acceptance harness before touching the
+  machine.
+- Supported uninstall was run with the exact confirmations on Hetzner
+  `coolify`. It completed successfully. The pre-fix `.4` user link was found
+  as a dangling `/root/.local/bin/pb` symlink and was removed by the supported
+  fresh-install rollback path; no Paperboat runtime state, services, sockets,
+  or canonical binaries remain. Production server, tunnel, containers, and
+  database were not touched.
+- The protected dashboard enrollment command in
+  `/tmp/paperboat-enroll-coolify-fresh-20260903.mgNsKZ` was supplied directly
+  to the remote shell without logging its secret. The official installer
+  downloaded `.5`, but server pairing returned HTTP 400
+  `invalid_user_machine_pairing`. The installer completed its rollback and a
+  second remote inventory confirmed the machine is clean.
+- This enrollment artifact is consumed/invalid for the current server state;
+  final `.5` Host setup, service/restart/boot persistence, doctor, and preview
+  or tunnel E2E cannot be completed until a fresh valid dashboard-issued Host
+  enrollment command is available. No credential was fabricated or retried
+  through an unsupported path.
+
 ## Windows test record
 
 Testing in progress on Victus.
