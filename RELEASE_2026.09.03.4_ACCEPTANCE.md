@@ -12,8 +12,9 @@ macOS, Linux, and Windows test pass has been recorded here.
   amd64/arm64.
 - Production `current.json`: `2026.09.03.4`; all five sizes and SHA-256 values
   match the GitHub release.
-- Development limitation, not a defect for this pass: the macOS PKG is not
-  Developer ID signed or notarized because those credentials do not exist yet.
+- Development package status: the macOS PKG uses the established ad-hoc
+  development signature. Controlled old/current LaunchDaemon execution proves
+  this is accepted and is not a cause of the current runtime investigation.
 
 ## Issue ledger
 
@@ -375,12 +376,112 @@ Started against official release `2026.09.03.5`.
   services. The remaining empty product directory and package receipt contain
   no executable or runtime state.
 - The official `.5` macOS arm64 package matched release metadata and installed
-  successfully. Ad-hoc signing is accepted for this development release;
-  Developer ID credentials are intentionally unavailable and are not tracked
-  as a defect.
+  successfully. Its established ad-hoc development signature is accepted and
+  is not a defect or a supported root-cause hypothesis for this investigation.
 - The protected dashboard enrollment command was supplied without logging its
   secret. Pairing returned HTTP 400 `invalid_user_machine_pairing`, confirming
   that the one-shot artifact was already consumed or invalid. The `.5`
   installer rollback then removed the package payload, state, and services.
 - Final `.5` service, restart, updater, doctor, preview, and tunnel acceptance
   requires a fresh dashboard-issued Host enrollment command.
+
+### Full diagnostic pass against `2026.09.03.6`
+
+Status: evidence collection in progress. No additional product-code changes
+are permitted until the macOS, Linux, and Windows diagnostic passes have all
+finished and their complete failure sets are recorded.
+
+- Release workflow `33701796581` completed successfully and production
+  `current.json` reports `2026.09.03.6`.
+- The macOS dashboard enrollment used a new unique Host name. Pairing was
+  accepted, so the previous token and duplicate-name failures were not
+  involved.
+- Native service setup failed because hostd never served its loopback
+  `/healthz`; the installer then rolled back the fresh package, services,
+  executable, machine state, and Keychain credentials.
+- The opt-in composed native launchd test also missed readiness, but that run
+  did not preserve the live launchd projection and therefore did not prove a
+  product launchd regression. A later controlled comparison used unique
+  LaunchDaemon labels and identical root-owned paths for the known-working
+  `2026.09.02.12` binary and current `2026.09.03.6` binary. Both were accepted
+  and executed by system launchd. Developer ID, ad-hoc signing, package
+  executability, and AppleSystemPolicy are therefore ruled out as causes.
+- Both configured launchd stdout/stderr files remained empty and transactional
+  rollback removed the declarations before launchd state could be inspected.
+  This is a confirmed diagnostic-preservation defect in addition to the
+  service readiness failure.
+- Windows supported cleanup removed services, processes, scheduled tasks,
+  listeners, PATH entry, and user identity state, but left the installed
+  binary, ProgramData residue, and four uninstall-helper plans permanently in
+  `removing`. Exact evidence is in
+  `acceptance/WINDOWS_CLEANUP_EVIDENCE_2026-09-03.md`.
+- Linux and Windows fresh `.6` diagnostic runs use separate dashboard-issued,
+  hostname-bound one-shot enrollments. They are collecting every independent
+  stage result before any new source fix is made.
+- Linux release provenance and download succeeded, but the first installation
+  exchange returned HTTP 410 and the subsequent pairing returned the generic
+  HTTP 400 `invalid_user_machine_pairing`. Server state showed the supposedly
+  fresh `coolify-diag-20260903` enrollment already `ready` and bound to a
+  different machine identity before the Hetzner installer used it. The
+  installer rolled back completely: no binary, services, sockets, runtime
+  identity, doctor, preview, or tunnel prerequisite remained. This is a
+  cross-machine dashboard enrollment isolation defect, not a reused-command
+  retry; no replacement token was issued during the evidence pass.
+- Windows began from the recorded incomplete-cleanup residue. The dashboard
+  command entered the hosted installer, which launched a hidden elevated
+  `RunAs -Wait` process. The elevated inner install wrote `inner_exit=0`, then
+  removed the canonical binary and left no Paperboat service, but the outer
+  non-interactive PowerShell/SSH process remained blocked for more than nine
+  minutes. No prompt could be displayed or answered through that channel.
+  This confirms both that the supported installer cannot complete unattended
+  elevation over the documented remote acceptance surface and that its exit-0
+  inner cleanup is not equivalent to a completed fresh installation. Service,
+  updater, persistence, doctor, preview, and tunnel checks are consequently
+  blocked by the failed installation prerequisite.
+
+### Historical regression audit before the fix batch
+
+- Enrollment isolation: before server commit `17f316c`, the control plane
+  generated a 48-character opaque token and hashed the complete token. The
+  Windows enrollment change introduced a 26-character token whose first two
+  characters encode role and shell, but deliberately excluded those two
+  characters from the credential hash. Dashboard commit `822ea0b` then began
+  rewriting those characters locally when the user changed role or platform.
+  This made multiple displayed commands aliases for the same one-shot
+  credential and explains the cross-machine claim observed on Linux. The
+  correct server request contract for immutable role and shell already exists;
+  the fix restores full-token hashing and removes client-side token mutation.
+- Windows elevation: no Paperboat history contains
+  `CREATE_BREAKAWAY_FROM_JOB`; current and prior helpers use only
+  `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`. The Victus native probe proves
+  that an explicit breakaway child survives the SSH job while the shipped
+  helper does not. Commit `3a15e5b` added a timeout only after blocking
+  `Start-Process -Verb RunAs -Wait`, so it cannot bound the observed broker
+  wait. Service declaration and restart persistence remain based on the
+  established `790babd` ordered lifecycle and are not being rewritten.
+- macOS launchd: the install transaction, binary staging, hostd/updater
+  definitions, service arguments, controller, native test child, health port,
+  and test executable-copy helper are unchanged from known-working
+  `2026.09.02.12`. Unique-label system-launchd execution succeeds for both the
+  old and current binaries. The failed reused-label native run was not valid
+  evidence of a signing or executable-policy regression; the remaining
+  investigation is limited to full runtime state and readiness dependencies.
+- Historical production evidence at
+  `/private/tmp/paperboat-macos-preclean-20260902T231744Z.log` records release
+  `2026.09.03.3` running the same direct helper path as a system LaunchDaemon,
+  with hostd, updater, socket, token, and `{"live":true}` health present.
+  Comparing `790babd..1a4d61d` shows no production executable path, service
+  identity, environment, activation ordering, or updater-declaration change.
+- The AppleSystemPolicy rejection belongs only to the native test fixture:
+  commit `5c3ff3c` introduced a raw copied `service.test` executable, and the
+  retained launchd log reports an absent CMS blob for that fixture. Applying
+  a full ad-hoc signature to the copied fixture did not change launchd's
+  rejection, while packaged binaries from both the known-good and current
+  releases execute under launchd. This is a package-provenance-invalid test
+  fixture, not a Developer ID or product signing defect. The opt-in Darwin
+  fixture tests now skip explicitly; final macOS acceptance uses the actual
+  installed package.
+- Dashboard source/test drift: current browser tests still describe an older
+  downloaded-credential UI while the current page renders one-shot installer
+  commands. This is recorded separately and is not being used to justify a
+  product-contract change in this platform recovery batch.

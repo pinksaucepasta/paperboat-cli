@@ -107,6 +107,49 @@ function Test-Administrator {
   return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function Test-InteractiveUac {
+  # A UAC broker needs a desktop that can display and receive the consent
+  # prompt. OpenSSH and service/CI sessions are deliberately rejected here so
+  # an unattended install fails immediately instead of waiting forever on a
+  # prompt nobody can answer.
+  if (-not [System.Environment]::UserInteractive) { return $false }
+  if (-not [string]::IsNullOrWhiteSpace([string]$env:SSH_CONNECTION) -or
+      -not [string]::IsNullOrWhiteSpace([string]$env:SSH_CLIENT) -or
+      -not [string]::IsNullOrWhiteSpace([string]$env:SSH_TTY)) {
+    return $false
+  }
+  try {
+    return (Get-Process -Id $PID -ErrorAction Stop).SessionId -ne 0
+  } catch {
+    return $false
+  }
+}
+
+function Wait-InstallerProcess($Process, [string]$Operation) {
+  if ($null -eq $Process) { throw "$Operation did not return a process handle." }
+  # Start-Process -Wait waits the entire process tree. WaitForExit waits only
+  # the elevated installer root, so a detached helper cannot hold the outer
+  # bootstrap open after the installer has reported its exit code.
+  if (-not $Process.WaitForExit(1200000)) {
+    try { $Process.Kill() } catch { }
+    if (-not $Process.WaitForExit(5000)) {
+      throw "$Operation exceeded the 20 minute limit and could not be stopped."
+    }
+    throw "$Operation exceeded the 20 minute limit."
+  }
+  return [int]$Process.ExitCode
+}
+
+function Assert-InstalledRelease([string]$Path, [string]$ExpectedVersion, [string]$ExpectedHash) {
+  if (-not (Assert-InstalledVersion $Path $ExpectedVersion)) { return $false }
+  try {
+    $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $Path -ErrorAction Stop).Hash.ToLowerInvariant()
+    return $hash -eq $ExpectedHash
+  } catch {
+    return $false
+  }
+}
+
 function Invoke-FreshPairRollback {
   # The pair command runs in the original user's process, after __install has
   # crossed the machine replacement boundary. Roll back both scopes when that
@@ -123,10 +166,22 @@ $ErrorActionPreference = 'Stop'
 $programRoot = Join-Path ${env:ProgramFiles} 'Paperboat'
 $installed = Join-Path $programRoot 'bin\pb.exe'
 $purgeError = $null
+function Wait-RollbackProcess($Process, [string]$Operation) {
+  if ($null -eq $Process) { throw "$Operation did not return a process handle." }
+  if (-not $Process.WaitForExit(1200000)) {
+    try { $Process.Kill() } catch { }
+    if (-not $Process.WaitForExit(5000)) {
+      throw "$Operation exceeded the 20 minute limit and could not be stopped."
+    }
+    throw "$Operation exceeded the 20 minute limit."
+  }
+  return [int]$Process.ExitCode
+}
 try {
   if (Test-Path -LiteralPath $installed -PathType Leaf) {
-    $purge = Start-Process -FilePath $installed -ArgumentList @('purge') -Wait -PassThru -WindowStyle Hidden
-    if ($purge.ExitCode -ne 0) { throw "Paperboat runtime purge failed with exit code $($purge.ExitCode)." }
+    $purge = Start-Process -FilePath $installed -ArgumentList @('purge') -PassThru -WindowStyle Hidden
+    $purgeExitCode = Wait-RollbackProcess $purge 'Paperboat runtime purge'
+    if ($purgeExitCode -ne 0) { throw "Paperboat runtime purge failed with exit code $purgeExitCode." }
   }
 } catch {
   $purgeError = $_
@@ -149,9 +204,12 @@ if ($null -ne $purgeError) { throw $purgeError }
     if (Test-Administrator) {
       & $powershell '-NoProfile' '-NonInteractive' '-EncodedCommand' $encodedPayload
       if ($LASTEXITCODE -ne 0) { throw "rollback exited with code $LASTEXITCODE" }
+    } elseif (-not (Test-InteractiveUac)) {
+      throw 'Paperboat fresh-install rollback requires an elevated administrator PowerShell session when no interactive UAC desktop is available.'
     } else {
-      $rollback = Start-Process -FilePath $powershell -ArgumentList @('-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedPayload) -Verb RunAs -PassThru -Wait -WindowStyle Hidden
-      if ($rollback.ExitCode -ne 0) { throw "rollback exited with code $($rollback.ExitCode)" }
+      $rollback = Start-Process -FilePath $powershell -ArgumentList @('-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedPayload) -Verb RunAs -PassThru -WindowStyle Hidden
+      $rollbackExitCode = Wait-InstallerProcess $rollback 'Paperboat fresh-install rollback'
+      if ($rollbackExitCode -ne 0) { throw "rollback exited with code $rollbackExitCode" }
     }
   } catch {
     # Preserve the pair failure as the primary result, but make an incomplete
@@ -160,43 +218,43 @@ if ($null -ne $purgeError) { throw $purgeError }
   }
 }
 
-if ($freshEnrollment -or -not (Assert-InstalledVersion $installedPb $version) -or (Get-FileHash -Algorithm SHA256 -LiteralPath $installedPb -ErrorAction SilentlyContinue).Hash.ToLowerInvariant() -ne $actual) {
+if ($freshEnrollment -or -not (Assert-InstalledRelease $installedPb $version $actual)) {
   # __install is implemented by the downloaded pb.exe itself. This is the
   # only binary-install elevation boundary and avoids downloading another
   # executable.
   $arguments = @('__install', '--source', $download, '--version', $version)
   if ($freshEnrollment) { $arguments += '--fresh' }
-  # An already-elevated SSH or deployment process has no interactive desktop
-  # on which Windows can show another UAC prompt. Starting it with RunAs in
-  # that environment returns Access is denied even though the caller already
-  # has a full administrator token. Execute directly in that case; ordinary
-  # desktop terminals still use RunAs and show the normal UAC prompt.
+  $administrator = Test-Administrator
+  if (-not $administrator -and -not (Test-InteractiveUac)) {
+    throw 'Paperboat installation requires administrator privileges. Run PowerShell as Administrator for unattended or SSH execution, or rerun this command from an interactive desktop to approve the UAC prompt.'
+  }
   $installerExecutable = $null
   try { $installerExecutable = Stage-TrustedBootstrap $download } catch { $installerExecutable = $null }
   if ($null -ne $installerExecutable) {
     $arguments[2] = $installerExecutable
   }
   $runAsPath = if ($null -ne $installerExecutable) { $installerExecutable } else { $download }
-  if (Test-Administrator) {
-    # The trusted Program Files staging directory is intentionally not
-    # user-readable. An already elevated process can execute the original
-    # verified download from the user's temp directory directly.
-    & $download @arguments
+  if ($administrator) {
+    # Keep the elevated path in-process so an administrator SSH session does
+    # not depend on an interactive desktop UAC broker. Use the trusted staged
+    # copy when available, otherwise retain the verified download path.
+    & $runAsPath @arguments
     if ($LASTEXITCODE -ne 0) { throw "Paperboat self-install failed with exit code $LASTEXITCODE." }
   } else {
     $elevatedArguments = @($arguments)
-    if ($runAsPath.Contains(' ')) { $elevatedArguments[2] = '"' + $arguments[2] + '"' }
-    $installOutput = Join-Path $dir 'install.stdout'
-    $installError = Join-Path $dir 'install.stderr'
-    $process = Start-Process -FilePath $runAsPath -ArgumentList $elevatedArguments -Verb RunAs -PassThru -Wait -WindowStyle Hidden -RedirectStandardOutput $installOutput -RedirectStandardError $installError
-    if ($process.ExitCode -ne 0) {
-      $detail = ((Get-Content -LiteralPath $installOutput -Raw -ErrorAction SilentlyContinue) + (Get-Content -LiteralPath $installError -Raw -ErrorAction SilentlyContinue)).Trim()
-      if ($detail.Length -gt 2000) { $detail = $detail.Substring(0, 2000) }
-      throw "Paperboat self-install failed with exit code $($process.ExitCode): $detail"
+    if ([string]$arguments[2] -match '\s') { $elevatedArguments[2] = '"' + $arguments[2] + '"' }
+    try {
+      # Do not use Start-Process -Wait here. It waits the entire child tree,
+      # including any helper that is intentionally detached by __install.
+      $process = Start-Process -FilePath $runAsPath -ArgumentList $elevatedArguments -Verb RunAs -PassThru -WindowStyle Hidden
+    } catch {
+      throw "Paperboat self-install could not request administrator approval: $($_.Exception.Message)"
     }
+    $installExitCode = Wait-InstallerProcess $process 'Paperboat self-install'
+    if ($installExitCode -ne 0) { throw "Paperboat self-install failed with exit code $installExitCode." }
   }
 }
-if (-not (Assert-InstalledVersion $installedPb $version)) { throw "Installed Paperboat does not report release $version." }
+if (-not (Assert-InstalledRelease $installedPb $version $actual)) { throw "Installed Paperboat does not match verified release $version." }
 
 if ($freshEnrollment) {
   # Only cross the replacement boundary after the verified elevated install

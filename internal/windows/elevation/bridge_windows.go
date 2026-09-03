@@ -1229,12 +1229,21 @@ func createProcessForRun(executable, parameters, directory string) (windows.Hand
 		ShowWindow: windows.SW_HIDE,
 	}
 	var process windows.ProcessInformation
-	flags := uint32(windows.CREATE_NO_WINDOW | windows.CREATE_NEW_PROCESS_GROUP)
+	// The caller can be attached to a kill-on-job-close SSH/deployment job.
+	// BREAKAWAY_OK on that job is only useful when the child explicitly asks to
+	// leave it. Do not retry without this flag: a successful in-job fallback
+	// would look detached to the caller but would die as soon as the session
+	// closes.
+	flags := createProcessFlagsForRun()
 	if err := windows.CreateProcess(nil, commandLine, nil, nil, false, flags, nil, workingDirectory, &startup, &process); err != nil {
 		return 0, err
 	}
 	_ = windows.CloseHandle(process.Thread)
 	return process.Process, nil
+}
+
+func createProcessFlagsForRun() uint32 {
+	return uint32(windows.CREATE_NO_WINDOW | windows.CREATE_NEW_PROCESS_GROUP | windows.CREATE_BREAKAWAY_FROM_JOB)
 }
 
 func shellExecuteEx(executable, parameters, directory string) (windows.Handle, error) {

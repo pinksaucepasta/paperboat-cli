@@ -14,6 +14,18 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+func TestCreateProcessForRunRequestsBreakawayFromParentJob(t *testing.T) {
+	flags := createProcessFlagsForRun()
+	if flags&windows.CREATE_BREAKAWAY_FROM_JOB == 0 {
+		t.Fatal("detached elevated processes must explicitly break away from the caller job")
+	}
+	for _, required := range []uint32{windows.CREATE_NO_WINDOW, windows.CREATE_NEW_PROCESS_GROUP} {
+		if flags&required == 0 {
+			t.Fatalf("detached process flags=%#x do not include %#x", flags, required)
+		}
+	}
+}
+
 func assertRenameBlocked(t *testing.T, from, to string) {
 	t.Helper()
 	fromPtr, err := windows.UTF16PtrFromString(from)
