@@ -14,7 +14,7 @@ Build exactly the five native assets in a clean absolute directory:
 go run ./tools/release-plan manifest \
   -version 2026.08.31.1 \
   -source-commit 0123456789abcdef0123456789abcdef01234567 \
-  -toolchain go1.26.6 \
+  -toolchain go1.27.1 \
   -artifacts /absolute/path/to/five-assets \
   -output /absolute/path/to/manifest.json
 

@@ -1,6 +1,6 @@
 module github.com/pinksaucepasta/paperboat
 
-go 1.26.6
+go 1.27.1
 
 require (
 	github.com/Microsoft/go-winio v0.6.2

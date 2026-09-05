@@ -178,10 +178,7 @@ func TestRuntimeObservationServiceContinuesAfterInitialAcceptance(t *testing.T) 
 		t.Fatalf("read first heartbeat receipt: %v", err)
 	}
 	waitForRuntimeObservationLivenessCalls(t, transport, 4)
-	secondReceipt, err := readServerHeartbeatReceipt(sender.receiptPath)
-	if err != nil {
-		t.Fatalf("read refreshed heartbeat receipt: %v", err)
-	}
+	secondReceipt := waitForServerHeartbeatReceiptAfter(t, sender.receiptPath, firstReceipt.AcceptedAt)
 	if !secondReceipt.AcceptedAt.After(firstReceipt.AcceptedAt) {
 		t.Fatalf("heartbeat receipt did not refresh: first=%s second=%s", firstReceipt.AcceptedAt, secondReceipt.AcceptedAt)
 	}

@@ -287,7 +287,7 @@ func TestCIOnlineSigningRejectsUnauthorizedKeyWithoutLoadingRootKeys(t *testing.
 func TestVerifyPublishedRejectsTamperedSignedDeploymentPolicy(t *testing.T) {
 	t.Setenv("PAPERBOAT_TUF_CI", "1")
 	t.Setenv("PAPERBOAT_RELEASE_SOURCE_COMMIT", strings.Repeat("c", 40))
-	t.Setenv("PAPERBOAT_RELEASE_TOOLCHAIN", "go1.26.6")
+	t.Setenv("PAPERBOAT_RELEASE_TOOLCHAIN", "go1.27.1")
 	for index, name := range roles {
 		seed := bytes.Repeat([]byte{byte(index + 11)}, ed25519.SeedSize)
 		t.Setenv(tufKeyEnvironmentName(name), base64.RawStdEncoding.EncodeToString(seed))

@@ -21,7 +21,7 @@ func testManifest(t *testing.T) Manifest {
 		sum := sha256.Sum256(body)
 		artifacts = append(artifacts, Artifact{Name: spec.Name, Platform: spec.Platform, Architecture: spec.Architecture, Format: spec.Format, Length: int64(len(body)), SHA256: hex.EncodeToString(sum[:])})
 	}
-	return Manifest{Schema: ManifestSchema, Version: testVersion, SourceCommit: "0123456789abcdef0123456789abcdef01234567", Toolchain: "go1.26.6", Artifacts: artifacts}
+	return Manifest{Schema: ManifestSchema, Version: testVersion, SourceCommit: "0123456789abcdef0123456789abcdef01234567", Toolchain: "go1.27.1", Artifacts: artifacts}
 }
 
 func TestBuildManifestRequiresExactReproducibleAssetSet(t *testing.T) {

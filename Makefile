@@ -8,7 +8,7 @@ PROTOCOL_VERSION ?= 1
 DEFAULT_SERVER_URL ?= https://api.pprbt.dev
 # The configured control-plane origin also serves current.json and TUF.
 DEFAULT_RELEASE_URL ?= $(DEFAULT_SERVER_URL)
-GO_VERSION  := 1.26.6
+GO_VERSION  := 1.27.1
 SQLC_VERSION := v1.30.0
 GO_ROOT     := $(shell GOTOOLCHAIN=go$(GO_VERSION) go env GOROOT)
 export PATH := $(GO_ROOT)/bin:$(PATH)

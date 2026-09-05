@@ -175,7 +175,7 @@ checks the declared length and SHA-256 before installation.
 
 ## Stack
 
-Go - distributed as native static binaries for Windows, macOS, and Linux (Cobra, Go 1.26.6).
+Go - distributed as native static binaries for Windows, macOS, and Linux (Cobra, Go 1.27.1).
 Windows amd64 and arm64 are stable after native release qualification.
 
 ## Layout

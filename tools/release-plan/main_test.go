@@ -28,7 +28,7 @@ func TestReleasePlanCommandEndToEnd(t *testing.T) {
 	statePath := filepath.Join(root, "state.json")
 	quarantinePath := filepath.Join(root, "quarantine.json")
 	revocationPath := filepath.Join(root, "revocation.json")
-	if err := run([]string{"manifest", "-version", "2026.08.31.1", "-source-commit", "0123456789abcdef0123456789abcdef01234567", "-toolchain", "go1.26.6", "-artifacts", artifacts, "-output", manifestPath}); err != nil {
+	if err := run([]string{"manifest", "-version", "2026.08.31.1", "-source-commit", "0123456789abcdef0123456789abcdef01234567", "-toolchain", "go1.27.1", "-artifacts", artifacts, "-output", manifestPath}); err != nil {
 		t.Fatalf("manifest: %v", err)
 	}
 	if err := run([]string{"plan", "-manifest", manifestPath, "-policy-revision", "7", "-severity", "security", "-cohort-seed", "release-seed", "-output", planPath}); err != nil {

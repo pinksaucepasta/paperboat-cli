@@ -56,7 +56,7 @@ plan="$temporary/deployment-plan.json"
   go run ./tools/release-plan manifest \
     -version "$version" \
     -source-commit 1111111111111111111111111111111111111111 \
-    -toolchain go1.26.6 \
+    -toolchain go1.27.1 \
     -artifacts "$artifacts" \
     -output "$manifest"
   go run ./tools/release-plan plan \
@@ -127,12 +127,12 @@ PY
   cd "$workspace_root/paperboat-server"
   PAPERBOAT_TRK35_RELEASE_BUNDLE="$release_tree" \
     PAPERBOAT_TRK35_RELEASE_VERSION="$version" \
-    GOTOOLCHAIN=go1.26.6 \
+    GOTOOLCHAIN=go1.27.1 \
     go test -tags trk35_release_candidate ./internal/releases \
       -run '^TestTRK35ExternalBundleReady$' -count=1
   PAPERBOAT_TRK35_RELEASE_BUNDLE="$release_tree" \
     PAPERBOAT_TRK35_RELEASE_VERSION="$version" \
-    GOTOOLCHAIN=go1.26.6 \
+    GOTOOLCHAIN=go1.27.1 \
     go test -race -tags trk35_release_candidate ./internal/releases \
       -run '^TestTRK35ExternalBundleReady$' -count=1
 )
