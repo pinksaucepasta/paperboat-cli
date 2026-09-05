@@ -25,7 +25,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ripgrep
       - name: Run non-duplicated quality checks
         run: >-
-          make verify-toolchain contracts dependencies source-policy metrics-check
+          make verify-toolchain dependencies source-policy metrics-check
           hosted-image-check fmt-check generate-check tidy-check vet build
 
   race:

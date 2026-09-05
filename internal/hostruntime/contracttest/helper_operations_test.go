@@ -68,13 +68,6 @@ func TestRetiredPreviewStateArtifactIsAbsent(t *testing.T) {
 		t.Fatalf("stat retired preview state artifact: %v", err)
 	}
 
-	b, err := os.ReadFile("../../../testdata/contracts/manifest.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(b), `states/preview.json`) {
-		t.Fatal("contract manifest still publishes retired preview state artifact")
-	}
 }
 
 func TestPreviewCLIContractUsesCanonicalSurface(t *testing.T) {

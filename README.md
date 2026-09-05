@@ -12,9 +12,6 @@ Control-plane requests identify the CLI and protocol version so incompatible cli
 an actionable upgrade error instead of malformed session data. See
 [docs/operations.md](docs/operations.md) for security and outage handling.
 
-See [AGENTS.md](AGENTS.md) for repository ownership and engineering requirements, and
-[docs/operations.md](docs/operations.md) for security and outage handling.
-
 ## Usage
 
 ```sh
@@ -150,12 +147,20 @@ truncated at `observability.max_event_log_bytes` rather than growing without lim
 
 ## Build
 
+Install Go and `ripgrep` before running development checks. The Makefile selects the
+pinned Go toolchain and runs the pinned `sqlc` generator. Run commands from this
+repository's root:
+
 ```sh
 make build      # -> bin/pb
+make check      # formatting, generated code, vet, tests, and build
 make release-assets   # the five native release assets in dist/
 make install    # install pb
-make test       # unit tests (paste parser + file-transfer pipeline)
+make test       # Go test suite
 ```
+
+Release packaging additionally needs the platform signing and publishing credentials.
+It is not required for a local development build.
 
 `YYYY.MM.DD.X` tags build and publish the five native assets after their platform checks and
 GitHub API digest verification. Use `tools/release-version.sh next` to generate the next tag;

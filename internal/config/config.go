@@ -1,6 +1,6 @@
 // Package config loads paperboat configuration and credential profiles. Everything that could reasonably
 // change is data-driven here — nothing about endpoints, limits, agents, or
-// machine catalogs are hardcoded in command logic. See AGENTS.md ("No hardcoding").
+// machine catalogs are hardcoded in command logic.
 package config
 
 import (

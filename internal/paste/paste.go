@@ -3,7 +3,7 @@
 // paste to a VM-side path before the remote agent sees it. It is the risk
 // center of the CLI and is covered by unit tests.
 //
-// Guarantees (see AGENTS.md):
+// Guarantees:
 //   - Pasted text that is not a validated absolute file path passes through untouched.
 //   - Paste framing (ESC[200~ … ESC[201~) and ordering are preserved.
 //   - Upload holds only the affected paste; the rest of the stream keeps

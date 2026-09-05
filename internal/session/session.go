@@ -1,7 +1,7 @@
 // Package session runs the transparent terminal wrapper: it puts the local
 // terminal into raw mode, streams bytes to/from the remote PTY, propagates
 // window resizes, and passes the remote exit code back. Correct raw-mode
-// handling and clean teardown are the UX bar (see AGENTS.md).
+// handling and clean teardown are the UX bar.
 package session
 
 import (

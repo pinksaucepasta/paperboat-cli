@@ -36,7 +36,7 @@ type goldenVector struct {
 }
 
 func TestGoldenVector(t *testing.T) {
-	file, err := os.Open("../../../testdata/contracts/environment-e2ee-v1/vectors.json")
+	file, err := os.Open("../../testdata/contracts/environment-e2ee-v1/vectors.json")
 	if err != nil {
 		t.Fatal(err)
 	}

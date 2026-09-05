@@ -2,11 +2,9 @@
 
 This document is the authority for the `paperboat.connector` v1 control
 session. `fixtures/vectors.ndjson` contains normative wire examples. The Go
-implementation in `paperboat/internal/connectorprotocol` is the canonical
-implementation source; `sync-consumers.sh` copies it and the shared tests to
-`paperboat-server` and `paperboat-tunnel`. Consumer copies must be byte
-identical. Server-only SQL persistence is deliberately outside that shared
-file set.
+implementation in `paperboat/internal/connectorprotocol` and its tests own this
+repository's behavior. Update affected peer implementations and their tests when the
+wire behavior changes. Server-only SQL persistence remains outside this package.
 
 ## 1. Wire envelope and bounds
 
@@ -482,9 +480,5 @@ operation-only exchange response.
 
 ## 9. Verification and ownership
 
-Run `contracts/connector-v1/validate.sh` from the workspace root. It verifies
-the family manifest and digests, validates all normative vectors and bootstrap
-schema vectors, checks all three consumer copies, and runs
-`sync-consumers.sh --check` so implementation
-drift is detected. The root frozen contract approval ledger is intentionally
-unchanged; this family has its own versioned manifest and validator.
+Run `go test ./internal/connectorprotocol ./internal/contracttest` in this repository.
+Retain positive/negative wire and bootstrap cases.

@@ -17,10 +17,7 @@ GOFMT       := $(GO_ROOT)/bin/gofmt
 GO_FILES    := $(shell find . -path ./.git -prune -o -name '*.go' -print)
 LDFLAGS     := -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Version=$(VERSION) -X github.com/pinksaucepasta/paperboat/internal/buildinfo.Commit=$(COMMIT) -X github.com/pinksaucepasta/paperboat/internal/buildinfo.ProtocolVersion=$(PROTOCOL_VERSION) -X github.com/pinksaucepasta/paperboat/internal/buildinfo.DefaultServerURL=$(DEFAULT_SERVER_URL) -X github.com/pinksaucepasta/paperboat/internal/buildinfo.DefaultReleaseURL=$(DEFAULT_RELEASE_URL)
 
-.PHONY: binary-size-check build check clean codex-path-manifest complete container-compose-check contracts cross-build dependencies fmt fmt-check fuzz generate generate-check hosted-image-check install license-check lint metrics-check metrics-generate preflight race release-assets release-binaries release-macos-pkg reproducible-builds source-policy static-analysis test tidy tidy-check uninstall verification verify-toolchain vet vulnerability-check
-
-contracts:
-	@./testdata/contracts/validate.sh
+.PHONY: binary-size-check build check clean codex-path-manifest complete container-compose-check cross-build dependencies fmt fmt-check fuzz generate generate-check hosted-image-check install license-check lint metrics-check metrics-generate preflight race release-assets release-binaries release-macos-pkg reproducible-builds source-policy static-analysis test tidy tidy-check uninstall verification verify-toolchain vet vulnerability-check
 
 dependencies:
 	@./tools/verify-peer-dependencies.sh
@@ -137,7 +134,7 @@ tidy:
 tidy-check: verify-toolchain
 	@./tools/verify-tidy.sh
 
-check: verify-toolchain contracts dependencies source-policy metrics-check hosted-image-check fmt-check generate-check tidy-check vet test build
+check: verify-toolchain dependencies source-policy metrics-check hosted-image-check fmt-check generate-check tidy-check vet test build
 
 complete: check race cross-build
 

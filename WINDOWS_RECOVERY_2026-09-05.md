@@ -48,6 +48,12 @@ No acceptance requirement is inferred from compilation or previous releases.
 
 ## Recovery changes under verification
 
+- Corrected managed SSH diagnosis: exact all-user effective key count is 65,
+  above the existing64 cap. Fresh CLI session is active and authorized; target
+  fingerprint is absent. RegisterClient intentionally rejects capacity with
+  ErrUnavailable mapped404. Earlier one-key count was not the authoritative
+  all-user count and did not rule this out. No credentials were deleted.
+
 - Confirmed second-preview root cause: edge handler binds admissions once per
   accepted carrier. The second route reuses pvc_ses_cd707599eafe37a81bd69b869c443da7
   but is never dynamically attached/observed ready. Fix in progress in edge
@@ -131,3 +137,62 @@ No acceptance requirement is inferred from compilation or previous releases.
   environment-variables/page.tsx:432 (`enrollmentProof`) and
   environment-e2ee.ts:1189 (`ArrayBuffer | SharedArrayBuffer`). Neither file is
   changed in this recovery pass. These are outside the Windows runtime scope.
+
+## Published 2026.09.05.0 acceptance in progress
+
+- Release workflow 33937054688 succeeded for all five assets and TUF publication.
+  Public `https://get.pprbt.dev/current.json` selects `2026.09.05.0`.
+- Fresh dashboard-issued Windows Host installation, alias `victus-release-0905`,
+  returned exit 0. Installed SHA256 is
+  `e627c2b6659e716b8cb6e955dc716ad2ef433c98c84769ac5ef9ce8afd1248d0`,
+  matching the published Windows amd64 asset.
+- Windows machine `mch_b2979f85f7071eea9e88d7fb5cea7a88`, environment
+  `env_13e7e04176adb06dc9868db1369de383`, generation 1. All four services
+  (Hostd, LocalDaemon, Sshd, Updated) run automatically from the canonical binary.
+  Doctor healthy; explicit `pb update --json` succeeds with no update needed.
+- Reboot confirmed at `2026-09-05T01:59:11.5000000Z`. At 02:00 UTC, all four
+  services are running automatically, identity remains generation 1, doctor healthy.
+  Managed SSH still reports `ssh_key_rejected`, consistent with the recorded account
+  key-cap failure. Updater status reports `last_failure: check_failed` at
+  01:59:42 with next retry 02:04:42; this is unresolved evidence, not a healthy
+  scheduled-check claim. Server-facing update health concurrently says healthy.
+- macOS fresh dashboard-issued Host command for `mac-release-0905` installed the
+  PKG and accepted enrollment, then failed `native service did not become ready:
+  hostd` and rolled back, exit 1. No macOS code or network settings changed.
+  launchd records hostd inactive at 07:29:16 and 07:29:26 local time, then removal.
+  `/usr/local/bin/pb` is absent after rollback; hostd log is an empty root-owned file.
+  This does not establish Developer ID/signing as the cause. macOS downstream
+  feature acceptance cannot pass after this failed supported installation.
+- Full edge `make check` passes after formatting-only correction to deployment.go.
+  Same-carrier dynamic preview route reconciliation has unit and race coverage;
+  live deployment and preview verification are still pending.
+- Release publication now serves TUF timestamp 245, expiring
+  `2026-09-06T01:50:12.495338843Z`. Expiry enforcement remains enabled.
+- Fresh release tunnel test with independently verified live origin at
+  `127.0.0.1:38142/http` still fails: `pb tunnel create windows-release-0905
+  --port 38142 --duration 20m --wait --json` exits 1, preserves
+  `tun_h_rZZ2FAjGjzsccHea2AIg`, and reports connector activation uncertain/unavailable.
+  No external tunnel success is claimed. A redacted diagnostic bundle was captured:
+  correlation `pb-e3a4fd21ff0e65d7c25fb174d357c659`, SHA256
+  `2501a9a96289343e238ccf694212ae56622153e4fc0ca357bc8d835e15470a35`.
+  It records repeated `metadata_warm` degradation and SSH key rejection but no
+  exact tunnel activation diagnostic. Live root cause remains unproven.
+- Windows scheduled updater retry at `2026-09-05T02:04:42.1150265Z` completed:
+  `last_failure` is now absent, CLI/runtime remain 2026.09.05.0, no activation
+  pending, next regular check `2026-09-05T08:24:40.835247693Z`. The boot-time
+  check failure recovered through the existing scheduler without intervention.
+- First fresh .05.0 preview on the prior edge image reached ready:
+  `prv_5f0e005c9faca77796c3382a9b28ae4a`, endpoint
+  `https://a235ijqyyiornemwae3a.preview.pprbt.dev`. External `/http` requests
+  returned exact body and HTTP 200 in 0.836s and 0.692s; `/sse` delivered both
+  events; `/stream` returned the exact POST body. Public `/ws` returned HTTP 502,
+  while the same local origin returned HTTP 101 with the correct handshake.
+  WebSocket E2E fails; this is independent of same-session route reconciliation.
+- Supported `preview stop` succeeded and projected stopped/released/down.
+  The observing foreground command then exited 1 with misleading session-invalid
+  guidance. No evidence that the machine credential was revoked by the stop.
+- Linux ARM64 .05.0 fresh dashboard installation on Dadape accepted enrollment
+  but hostd failed `start stable managed_ssh_authority: managed SSH host authority
+  is unavailable`, request `req_2eee8b461181b7c610395a4a`. Installer rolled back.
+  Later platform tests are blocked by installation, not passed. Account key-cap
+  saturation is correlated only; it is not a proven cause of this host failure.
