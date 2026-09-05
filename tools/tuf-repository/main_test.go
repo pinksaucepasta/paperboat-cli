@@ -147,6 +147,118 @@ func TestCISigningPublishesCompleteSupportedRelease(t *testing.T) {
 	}
 }
 
+func TestRefreshRenewsOnlySnapshotAndTimestamp(t *testing.T) {
+	repository := newPublishedTestRepository(t, "2026.08.22.16")
+
+	rootBefore := readTestMetadata(t, filepath.Join(repository, "metadata", "root.json"))
+	targetsBefore := readTestMetadata(t, filepath.Join(repository, "metadata", "targets.json"))
+	snapshotBefore := readTestMetadata(t, filepath.Join(repository, "metadata", "snapshot.json"))
+	timestampBefore := readTestMetadata(t, filepath.Join(repository, "metadata", "timestamp.json"))
+	if err := refresh(repository); err != nil {
+		t.Fatal(err)
+	}
+
+	rootAfter := readTestMetadata(t, filepath.Join(repository, "metadata", "root.json"))
+	targetsAfter := readTestMetadata(t, filepath.Join(repository, "metadata", "targets.json"))
+	snapshotAfter := readTestMetadata(t, filepath.Join(repository, "metadata", "snapshot.json"))
+	timestampAfter := readTestMetadata(t, filepath.Join(repository, "metadata", "timestamp.json"))
+	if !bytes.Equal(rootBefore, rootAfter) {
+		t.Fatal("refresh changed root metadata")
+	}
+	if !bytes.Equal(targetsBefore, targetsAfter) {
+		t.Fatal("refresh changed targets metadata")
+	}
+
+	root, targets, snapshot, timestamp, err := loadSet(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previousSnapshot, err := metadata.Snapshot().FromBytes(snapshotBefore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previousTimestamp, err := metadata.Timestamp().FromBytes(timestampBefore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Signed.Version != previousSnapshot.Signed.Version+1 || timestamp.Signed.Version != previousTimestamp.Signed.Version+1 {
+		t.Fatalf("versions after refresh: snapshot=%d timestamp=%d, before snapshot=%d timestamp=%d", snapshot.Signed.Version, timestamp.Signed.Version, previousSnapshot.Signed.Version, previousTimestamp.Signed.Version)
+	}
+	if !snapshot.Signed.Expires.After(time.Now().UTC()) || !timestamp.Signed.Expires.After(time.Now().UTC()) {
+		t.Fatalf("refresh did not produce future expirations: snapshot=%s timestamp=%s", snapshot.Signed.Expires, timestamp.Signed.Expires)
+	}
+	if root.Signed.Version == 0 || targets.Signed.Version == 0 || snapshot.Signed.Meta["targets.json"].Version != targets.Signed.Version || timestamp.Signed.Meta["snapshot.json"].Version != snapshot.Signed.Version {
+		t.Fatalf("refreshed metadata references are inconsistent: root=%d targets=%d snapshot=%d timestamp=%d", root.Signed.Version, targets.Signed.Version, snapshot.Signed.Version, timestamp.Signed.Version)
+	}
+	if bytes.Equal(snapshotBefore, snapshotAfter) || bytes.Equal(timestampBefore, timestampAfter) {
+		t.Fatal("refresh did not rewrite snapshot and timestamp metadata")
+	}
+	if err := verifyPublished(repository); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRefreshRejectsExpiredTargetsWithoutChangingMetadata(t *testing.T) {
+	repository := newPublishedTestRepository(t, "2026.08.22.17")
+	targetsPath := filepath.Join(repository, "metadata", "targets.json")
+	targets, err := metadata.Targets().FromFile(targetsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targets.Signed.Expires = time.Now().UTC().Add(-time.Minute)
+	if err := os.WriteFile(targetsPath, mustMetadataBytes(targets), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	timestampBefore := readTestMetadata(t, filepath.Join(repository, "metadata", "timestamp.json"))
+	if err := refresh(repository); err == nil || !strings.Contains(err.Error(), "expired targets metadata") {
+		t.Fatalf("expired targets refresh error = %v", err)
+	}
+	if timestampAfter := readTestMetadata(t, filepath.Join(repository, "metadata", "timestamp.json")); !bytes.Equal(timestampBefore, timestampAfter) {
+		t.Fatal("failed refresh changed timestamp metadata")
+	}
+}
+
+func newPublishedTestRepository(t *testing.T, version string) string {
+	t.Helper()
+	t.Setenv("PAPERBOAT_TUF_CI", "1")
+	for index, name := range roles {
+		t.Setenv(tufKeyEnvironmentName(name), base64.RawStdEncoding.EncodeToString(bytes.Repeat([]byte{byte(index + 31)}, ed25519.SeedSize)))
+	}
+	repository := filepath.Join(t.TempDir(), "repository")
+	if err := initialize(repository); err != nil {
+		t.Fatal(err)
+	}
+	artifacts := t.TempDir()
+	for _, target := range supportedReleaseTargets() {
+		name := releaseAssetName(target.platform, target.architecture)
+		if err := os.WriteFile(filepath.Join(artifacts, name), []byte("test release asset "+name), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	evidencePaths := make(map[string]string, 2)
+	for _, architecture := range []string{"amd64", "arm64"} {
+		evidence := []byte(`{"schema":"paperboat.windows-native-qualification/v1","release_version":"` + version + `","platform":"windows","architecture":"` + architecture + `","status":"passed","native_tested":true,"windows_build":"26100","runner":"refresh-test-` + architecture + `"}`)
+		evidencePath := filepath.Join(artifacts, windowsNativeQualificationTarget(architecture))
+		if err := os.WriteFile(evidencePath, evidence, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		evidencePaths[architecture] = evidencePath
+	}
+	if err := publish(repository, version, artifacts, evidencePaths, 1, "routine", false); err != nil {
+		t.Fatal(err)
+	}
+	return repository
+}
+
+func readTestMetadata(t *testing.T, path string) []byte {
+	t.Helper()
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return body
+}
+
 func TestCIOnlineSigningRejectsUnauthorizedKeyWithoutLoadingRootKeys(t *testing.T) {
 	t.Setenv("PAPERBOAT_TUF_CI", "1")
 	for index, name := range roles {

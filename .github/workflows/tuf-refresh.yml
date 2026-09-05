@@ -1,0 +1,217 @@
+name: TUF metadata refresh
+
+on:
+  schedule:
+    # Refresh at an off-peak minute every six hours (UTC).
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: paperboat-release-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    name: Refresh signed TUF metadata
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 25
+    environment: paperboat-tuf-published
+    env:
+      PAPERBOAT_TUF_CI: '1'
+      RELEASE_URL: ${{ vars.PAPERBOAT_DEFAULT_RELEASE_URL }}
+      RELEASE_HOST: ${{ vars.PAPERBOAT_RELEASE_HOST }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Validate protected release endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          from urllib.parse import urlsplit
+
+          release = os.environ.get('RELEASE_URL', '')
+          parsed = urlsplit(release)
+          if (
+              not release
+              or release != release.strip()
+              or any(char.isspace() for char in release)
+              or parsed.scheme != 'https'
+              or not parsed.hostname
+              or parsed.username
+              or parsed.password
+              or parsed.query
+              or parsed.fragment
+              or parsed.port not in (None, 443)
+              or parsed.path != '/tuf'
+          ):
+              raise SystemExit('PAPERBOAT_DEFAULT_RELEASE_URL must be an HTTPS URL using the exact /tuf path')
+          host = os.environ.get('RELEASE_HOST', '')
+          if not host or host != host.strip() or any(char.isspace() for char in host) or '/' in host or ':' in host:
+              raise SystemExit('PAPERBOAT_RELEASE_HOST must be a canonical SSH host name or IPv4 address')
+          PY
+      - name: Configure protected release origin identity
+        env:
+          PAPERBOAT_RELEASE_SSH_KEY: ${{ secrets.PAPERBOAT_RELEASE_SSH_KEY }}
+          PAPERBOAT_RELEASE_KNOWN_HOSTS: ${{ secrets.PAPERBOAT_RELEASE_KNOWN_HOSTS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$PAPERBOAT_RELEASE_SSH_KEY" || { echo 'PAPERBOAT_RELEASE_SSH_KEY is required' >&2; exit 1; }
+          test -n "$PAPERBOAT_RELEASE_KNOWN_HOSTS" || { echo 'PAPERBOAT_RELEASE_KNOWN_HOSTS is required' >&2; exit 1; }
+          install -d -m 0700 "$HOME/.ssh"
+          printf '%s\n' "$PAPERBOAT_RELEASE_SSH_KEY" > "$HOME/.ssh/paperboat-release"
+          printf '%s\n' "$PAPERBOAT_RELEASE_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 0600 "$HOME/.ssh/paperboat-release" "$HOME/.ssh/known_hosts"
+      - name: Fetch and validate production TUF signing state
+        env:
+          PAPERBOAT_TUF_KEY_TARGETS_1: ${{ secrets.PAPERBOAT_TUF_KEY_TARGETS_1 }}
+          PAPERBOAT_TUF_KEY_TARGETS_2: ${{ secrets.PAPERBOAT_TUF_KEY_TARGETS_2 }}
+          PAPERBOAT_TUF_KEY_SNAPSHOT_1: ${{ secrets.PAPERBOAT_TUF_KEY_SNAPSHOT_1 }}
+          PAPERBOAT_TUF_KEY_TIMESTAMP_2: ${{ secrets.PAPERBOAT_TUF_KEY_TIMESTAMP_2 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in PAPERBOAT_TUF_KEY_TARGETS_1 PAPERBOAT_TUF_KEY_TARGETS_2 PAPERBOAT_TUF_KEY_SNAPSHOT_1 PAPERBOAT_TUF_KEY_TIMESTAMP_2; do
+            test -n "${!name}" || { echo "$name is required" >&2; exit 1; }
+          done
+          repository="$RUNNER_TEMP/tuf-production"
+          mkdir -p "$repository/targets"
+          ssh -i "$HOME/.ssh/paperboat-release" -o BatchMode=yes -o StrictHostKeyChecking=yes "root@$RELEASE_HOST" \
+            'tar -C /opt/paperboat/releases/current/tuf -cf - metadata' | tar -C "$repository" -xf -
+          install -m 0600 tools/tuf-repository/active-signing-state.json "$repository/.signing-state.json"
+          go run ./tools/tuf-repository validate-signers \
+            -repository "$repository" \
+            -trusted-root "$GITHUB_WORKSPACE/internal/hostruntime/bootstrap/trusted-root.json"
+          go run ./tools/tuf-repository verify-published -repository "$repository"
+          printf 'PAPERBOAT_TUF_REPOSITORY=%s\n' "$repository" >> "$GITHUB_ENV"
+      - name: Refresh snapshot and timestamp metadata
+        env:
+          PAPERBOAT_TUF_KEY_TARGETS_1: ${{ secrets.PAPERBOAT_TUF_KEY_TARGETS_1 }}
+          PAPERBOAT_TUF_KEY_TARGETS_2: ${{ secrets.PAPERBOAT_TUF_KEY_TARGETS_2 }}
+          PAPERBOAT_TUF_KEY_SNAPSHOT_1: ${{ secrets.PAPERBOAT_TUF_KEY_SNAPSHOT_1 }}
+          PAPERBOAT_TUF_KEY_TIMESTAMP_2: ${{ secrets.PAPERBOAT_TUF_KEY_TIMESTAMP_2 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          go run ./tools/tuf-repository refresh -repository "$PAPERBOAT_TUF_REPOSITORY"
+          go run ./tools/tuf-repository verify-published -repository "$PAPERBOAT_TUF_REPOSITORY"
+          python3 - "$PAPERBOAT_TUF_REPOSITORY/metadata/targets.json" "$PAPERBOAT_TUF_REPOSITORY/metadata/snapshot.json" "$PAPERBOAT_TUF_REPOSITORY/metadata/timestamp.json" <<'PY' >> "$GITHUB_ENV"
+          import json
+          import pathlib
+          import sys
+
+          targets, snapshot, timestamp = (json.loads(pathlib.Path(path).read_text()) for path in sys.argv[1:])
+          print(f'PAPERBOAT_REFRESH_TARGETS_VERSION={targets["signed"]["version"]}')
+          print(f'PAPERBOAT_REFRESH_TARGETS_EXPIRES={targets["signed"]["expires"]}')
+          print(f'PAPERBOAT_REFRESH_SNAPSHOT_VERSION={snapshot["signed"]["version"]}')
+          print(f'PAPERBOAT_REFRESH_TIMESTAMP_VERSION={timestamp["signed"]["version"]}')
+          print(f'PAPERBOAT_REFRESH_TIMESTAMP_EXPIRES={timestamp["signed"]["expires"]}')
+          PY
+      - name: Stage refreshed metadata with the live release bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          live_bundle="$RUNNER_TEMP/paperboat-live-release.tgz"
+          staged="$RUNNER_TEMP/paperboat-tuf-refresh"
+          ssh -i "$HOME/.ssh/paperboat-release" -o BatchMode=yes -o StrictHostKeyChecking=yes "root@$RELEASE_HOST" \
+            'tar -C /opt/paperboat/releases/current -czf - current.json install windows tuf' > "$live_bundle"
+          mkdir -p "$staged"
+          tar -C "$staged" -xzf "$live_bundle"
+          test -f "$staged/current.json"
+          test -f "$staged/install"
+          test -f "$staged/windows"
+          test -d "$staged/tuf/metadata"
+          test -d "$staged/tuf/targets"
+          test -z "$(find "$staged/tuf/targets" -mindepth 1 -print -quit)"
+          live_metadata="$RUNNER_TEMP/paperboat-live-tuf-metadata"
+          mv "$staged/tuf/metadata" "$live_metadata"
+          cp -R "$PAPERBOAT_TUF_REPOSITORY/metadata" "$staged/tuf/metadata"
+          cmp "$live_metadata/root.json" "$staged/tuf/metadata/root.json"
+          cmp "$live_metadata/targets.json" "$staged/tuf/metadata/targets.json"
+          python3 - "$live_metadata/snapshot.json" "$staged/tuf/metadata/snapshot.json" "$live_metadata/timestamp.json" "$staged/tuf/metadata/timestamp.json" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          old_snapshot, new_snapshot, old_timestamp, new_timestamp = (json.loads(pathlib.Path(path).read_text()) for path in sys.argv[1:])
+          if new_snapshot['signed']['version'] <= old_snapshot['signed']['version']:
+              raise SystemExit('refreshed snapshot version is not strictly greater than the live version')
+          if new_timestamp['signed']['version'] <= old_timestamp['signed']['version']:
+              raise SystemExit('refreshed timestamp version is not strictly greater than the live version')
+          PY
+          release_version=$(python3 - "$staged/current.json" <<'PY'
+          import json
+          import pathlib
+          import re
+          import sys
+
+          value = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          version = value.get('version')
+          if value.get('schema') != 'paperboat.release-current/v1' or not isinstance(version, str) or not re.fullmatch(r'20[0-9]{2}\.[0-9]{2}\.[0-9]{2}\.(0|[1-9][0-9]*)', version):
+              raise SystemExit('live current.json has an invalid release identity')
+          print(version)
+          PY
+          )
+          bundle="$RUNNER_TEMP/paperboat-tuf-refresh-$release_version.tgz"
+          tar -C "$staged" -czf "$bundle" current.json install windows tuf
+          digest=$(sha256sum "$bundle" | awk '{print $1}')
+          {
+            printf 'PAPERBOAT_REFRESH_VERSION=%s\n' "$release_version"
+            printf 'PAPERBOAT_REFRESH_BUNDLE=%s\n' "$bundle"
+            printf 'PAPERBOAT_REFRESH_BUNDLE_SHA256=%s\n' "$digest"
+          } >> "$GITHUB_ENV"
+      - name: Atomically activate refreshed metadata on the origin
+        shell: bash
+        run: |
+          set -euo pipefail
+          remote_bundle="/opt/paperboat/releases/staging/paperboat-tuf-refresh-$PAPERBOAT_REFRESH_VERSION-$GITHUB_RUN_ID.tgz"
+          remote_script="/opt/paperboat/releases/staging/publish-tuf-origin-refresh-$GITHUB_RUN_ID.sh"
+          scp -i "$HOME/.ssh/paperboat-release" -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            "$PAPERBOAT_REFRESH_BUNDLE" "root@$RELEASE_HOST:$remote_bundle"
+          scp -i "$HOME/.ssh/paperboat-release" -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            tools/publish-tuf-origin.sh "root@$RELEASE_HOST:$remote_script"
+          ssh -i "$HOME/.ssh/paperboat-release" -o BatchMode=yes -o StrictHostKeyChecking=yes "root@$RELEASE_HOST" \
+            "chmod 0700 '$remote_script' && '$remote_script' '$remote_bundle' /opt/paperboat/releases '$PAPERBOAT_REFRESH_VERSION' '$PAPERBOAT_REFRESH_BUNDLE_SHA256'"
+      - name: Verify refreshed metadata is public and fresh
+        shell: bash
+        run: |
+          set -euo pipefail
+          public_timestamp="$RUNNER_TEMP/public-timestamp.json"
+          public_snapshot="$RUNNER_TEMP/public-snapshot.json"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --connect-timeout 5 --max-time 15 --max-filesize 1048576 \
+            --header 'Cache-Control: no-cache' "$RELEASE_URL/metadata/timestamp.json" -o "$public_timestamp"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --connect-timeout 5 --max-time 15 --max-filesize 1048576 \
+            --header 'Cache-Control: no-cache' "$RELEASE_URL/metadata/snapshot.json" -o "$public_snapshot"
+          python3 - "$public_timestamp" "$public_snapshot" <<'PY'
+          import json
+          import pathlib
+          import sys
+          from datetime import datetime, timezone
+
+          timestamp = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          snapshot = json.loads(pathlib.Path(sys.argv[2]).read_text())
+          timestamp_signed = timestamp.get('signed', {})
+          snapshot_signed = snapshot.get('signed', {})
+          if timestamp_signed.get('version') != int(__import__('os').environ['PAPERBOAT_REFRESH_TIMESTAMP_VERSION']):
+              raise SystemExit('public timestamp version does not match the refreshed metadata')
+          if timestamp_signed.get('meta', {}).get('snapshot.json', {}).get('version') != int(__import__('os').environ['PAPERBOAT_REFRESH_SNAPSHOT_VERSION']):
+              raise SystemExit('public timestamp does not reference the refreshed snapshot')
+          if snapshot_signed.get('version') != int(__import__('os').environ['PAPERBOAT_REFRESH_SNAPSHOT_VERSION']):
+              raise SystemExit('public snapshot version does not match the refreshed metadata')
+          expires = datetime.fromisoformat(timestamp_signed['expires'].replace('Z', '+00:00'))
+          if expires <= datetime.now(timezone.utc):
+              raise SystemExit('public timestamp metadata is still expired')
+          print(f"public timestamp version={timestamp_signed['version']} expires={timestamp_signed['expires']}")
+          PY

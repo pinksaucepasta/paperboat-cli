@@ -781,7 +781,11 @@ func refresh(repo string) error {
 	if err != nil {
 		return err
 	}
-	if err := validateTargetsForPublication(targets, time.Now().UTC()); err != nil {
+	now := time.Now().UTC()
+	if err := validateRefreshMetadataFreshness(root, targets, now); err != nil {
+		return err
+	}
+	if err := validateTargetsForPublication(targets, now); err != nil {
 		return fmt.Errorf("release publication preflight failed: %w", err)
 	}
 	state, err := loadSigningState(repo, root, "snapshot", "timestamp")
@@ -789,20 +793,36 @@ func refresh(repo string) error {
 		return err
 	}
 	snapshot.Signed.Version++
-	snapshot.Signed.Expires = time.Now().UTC().Add(7 * 24 * time.Hour)
+	snapshot.Signed.Expires = now.Add(7 * 24 * time.Hour)
 	snapshot.Signed.Meta["targets.json"] = metadata.MetaFile(targets.Signed.Version)
 	snapshot.ClearSignatures()
 	if err := sign(snapshot, state.Roles["snapshot"]...); err != nil {
 		return err
 	}
 	timestamp.Signed.Version++
-	timestamp.Signed.Expires = time.Now().UTC().Add(24 * time.Hour)
+	timestamp.Signed.Expires = now.Add(24 * time.Hour)
 	timestamp.Signed.Meta["snapshot.json"] = metadata.MetaFile(snapshot.Signed.Version)
 	timestamp.ClearSignatures()
 	if err := sign(timestamp, state.Roles["timestamp"]...); err != nil {
 		return err
 	}
 	return writeSet(repo, root, targets, snapshot, timestamp)
+}
+
+func validateRefreshMetadataFreshness(root *metadata.Metadata[metadata.RootType], targets *metadata.Metadata[metadata.TargetsType], now time.Time) error {
+	if root == nil || !root.Signed.Expires.After(now) {
+		if root == nil {
+			return errors.New("cannot refresh metadata with a missing root expiration")
+		}
+		return fmt.Errorf("cannot refresh metadata with expired root metadata: expires %s", root.Signed.Expires.UTC().Format(time.RFC3339Nano))
+	}
+	if targets == nil || !targets.Signed.Expires.After(now) {
+		if targets == nil {
+			return errors.New("cannot refresh metadata with a missing targets expiration")
+		}
+		return fmt.Errorf("cannot refresh metadata with expired targets metadata: expires %s", targets.Signed.Expires.UTC().Format(time.RFC3339Nano))
+	}
+	return nil
 }
 
 // mutateRollout changes only the signed static deployment policy carried by
