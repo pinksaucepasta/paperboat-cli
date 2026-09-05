@@ -231,17 +231,27 @@ func TestRecoverExpiredWindowsUninstallHelpersRefusesActiveOrMalformedRecords(t 
 	}
 }
 
-func TestFreshWindowsInstallRecoversExpiredHelpersBeforeMutation(t *testing.T) {
-	previous := recoverWindowsUninstall
+func TestFreshWindowsInstallPassesRecoveryIntoVerifiedInstallBoundary(t *testing.T) {
+	previousRecovery := recoverWindowsUninstall
+	previousInstall := installStandaloneBinaryWithFreshRecovery
 	want := errors.New("recovery failed")
 	called := false
 	recoverWindowsUninstall = func() error { called = true; return want }
-	t.Cleanup(func() { recoverWindowsUninstall = previous })
+	installStandaloneBinaryWithFreshRecovery = func(_ context.Context, _, _ string, fresh bool, recoverFresh func() error) error {
+		if !fresh {
+			t.Fatal("fresh install callback received non-fresh request")
+		}
+		return recoverFresh()
+	}
+	t.Cleanup(func() {
+		recoverWindowsUninstall = previousRecovery
+		installStandaloneBinaryWithFreshRecovery = previousInstall
+	})
 	command := platformInstallCommand()
 	command.SetArgs([]string{"--source", `C:\staged\pb.exe`, "--version", "2026.09.03.10", "--fresh"})
 	err := command.ExecuteContext(context.Background())
 	if !called || !errors.Is(err, want) {
-		t.Fatalf("fresh install recovery called=%t error=%v", called, err)
+		t.Fatalf("fresh install recovery callback called=%t error=%v", called, err)
 	}
 }
 

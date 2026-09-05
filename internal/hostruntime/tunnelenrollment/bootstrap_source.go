@@ -368,11 +368,19 @@ func (s *HTTPSProductionAssemblySource) openControlStream(ctx context.Context, r
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, errors.Join(ErrUnavailable, err)
+		if response != nil {
+			code := ActivationDiagnosticControlHTTPUnavailable
+			switch response.StatusCode {
+			case http.StatusUnauthorized, http.StatusForbidden:
+				code = ActivationDiagnosticControlHTTPDenied
+			}
+			return nil, errors.Join(ErrUnavailable, &ActivationDiagnostic{Code: code})
+		}
+		return nil, errors.Join(ErrUnavailable, &ActivationDiagnostic{Code: ActivationDiagnosticControlNetworkTLS, Cause: err})
 	}
 	if connection.Subprotocol() != controlSubprotocol {
 		_ = connection.Close(websocket.StatusPolicyViolation, "connector subprotocol required")
-		return nil, ErrUnavailable
+		return nil, errors.Join(ErrUnavailable, &ActivationDiagnostic{Code: ActivationDiagnosticInvalidSessionConfig})
 	}
 	connection.SetReadLimit(connectorprotocol.MaxFrameBytes + 4)
 	return websocket.NetConn(ctx, connection, websocket.MessageBinary), nil

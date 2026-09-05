@@ -58,8 +58,13 @@ func TestProductionAssemblyActivatorRequiresStableLifecycleAndReferenceSigner(t 
 		t.Fatal(err)
 	}
 	request := activationRequestFixture()
-	if _, err := activator.Activate(context.Background(), request); !errors.Is(err, ErrUnavailable) {
+	_, err = activator.Activate(context.Background(), request)
+	if !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("activation before stable start error = %v", err)
+	}
+	var lifecycleDiagnostic *ActivationDiagnostic
+	if !errors.As(err, &lifecycleDiagnostic) || lifecycleDiagnostic.Code != ActivationDiagnosticLifecycleUnavailable {
+		t.Fatalf("activation lifecycle diagnostic = %+v, err=%v", lifecycleDiagnostic, err)
 	}
 	if err := activator.Start(context.Background()); err != nil {
 		t.Fatal(err)

@@ -47,7 +47,11 @@ func newProductionTunnelEnrollmentService(controlURL, stateRoot, hostID, localCo
 		MachineTLSCertificate: identityStore.CurrentTLSCertificateWithURIs,
 		Report: func(observation tunnelmanager.Observation) {
 			if observation.Err != nil {
-				slog.Warn("durable tunnel reconciliation failed", "tunnel_id", observation.TunnelID, "connector_id", observation.ConnectorID, "code", observation.Code, "retryable", observation.Retryable, "error", observation.Err)
+				diagnostic := tunnelenrollment.ActivationDiagnosticCodeOf(observation.Err)
+				if diagnostic == "" {
+					diagnostic = observation.Code
+				}
+				slog.Warn("durable tunnel reconciliation failed", "tunnel_id", observation.TunnelID, "connector_id", observation.ConnectorID, "code", observation.Code, "diagnostic", diagnostic, "retryable", observation.Retryable)
 			}
 		},
 	})

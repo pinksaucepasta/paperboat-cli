@@ -706,15 +706,42 @@ func TestConnectorCredentialProofTranscriptMatchesContract(t *testing.T) {
 func TestLocalClientPreservesTypedActivationFailure(t *testing.T) {
 	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		writeError(w, http.StatusServiceUnavailable, "activation_unavailable")
+		writeError(w, http.StatusServiceUnavailable, "activation_unavailable", string(ActivationDiagnosticControlNetworkTLS))
 	}))
 	defer local.Close()
 	client, err := NewLocalClient(local.URL, "local-token", local.Client())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.Enroll(t.Context(), "tunnel_04", "local-request-activation"); !errors.Is(err, ErrActivation) {
+	_, err = client.Enroll(t.Context(), "tunnel_04", "local-request-activation")
+	if !errors.Is(err, ErrActivation) {
 		t.Fatalf("err=%v", err)
+	}
+	var diagnostic *ActivationDiagnostic
+	if !errors.As(err, &diagnostic) || diagnostic.Code != ActivationDiagnosticControlNetworkTLS {
+		t.Fatalf("activation diagnostic = %+v, err=%v", diagnostic, err)
+	}
+	if strings.Contains(err.Error(), "control.example") || strings.Contains(err.Error(), "token=") {
+		t.Fatalf("activation error exposed unsafe cause: %v", err)
+	}
+}
+
+func TestLocalClientRejectsUnsafeActivationDiagnostic(t *testing.T) {
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		writeError(w, http.StatusServiceUnavailable, "activation_unavailable", "wss://control.example/control?token=secret")
+	}))
+	defer local.Close()
+	client, err := NewLocalClient(local.URL, "local-token", local.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Enroll(t.Context(), "tunnel_04", "local-request-unsafe-activation")
+	if !errors.Is(err, ErrActivation) || errors.As(err, new(*ActivationDiagnostic)) {
+		t.Fatalf("unsafe diagnostic was accepted: %v", err)
+	}
+	if strings.Contains(err.Error(), "control.example") || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("unsafe response leaked into error: %v", err)
 	}
 }
 

@@ -7,6 +7,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var installStandaloneBinaryWithFreshRecovery = hostinstall.InstallStandaloneBinaryWithFreshRecovery
+
 func platformInstallCommand() *cobra.Command {
 	command := &cobra.Command{
 		Use:           "__install",
@@ -29,11 +31,9 @@ func platformInstallCommand() *cobra.Command {
 				return err
 			}
 			if fresh {
-				if err := recoverWindowsUninstall(); err != nil {
-					return err
-				}
+				return installStandaloneBinaryWithFreshRecovery(command.Context(), source, version, true, recoverWindowsUninstall)
 			}
-			return hostinstall.InstallStandaloneBinary(command.Context(), source, version, fresh)
+			return hostinstall.InstallStandaloneBinary(command.Context(), source, version, false)
 		},
 	}
 	command.Flags().String("source", "", "verified downloaded pb.exe")

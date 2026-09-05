@@ -40,25 +40,25 @@ func requireSourceOrder(t *testing.T, source, description string, markers ...str
 	}
 }
 
-func TestWindowsFreshInstallPurgesInterruptedActivationBeforeStaging(t *testing.T) {
+func TestWindowsFreshInstallVerifiesReleaseBeforeCleanupAndStaging(t *testing.T) {
 	command := windowsSourceFile(t, "cmd/pb/install_command_windows.go")
 	hostInstall := windowsSourceFile(t, "internal/hostruntime/hostinstall/install_windows.go")
 	activation := windowsSourceFile(t, "internal/hostruntime/updated/activation_windows.go")
 	updatedService := windowsSourceFile(t, "internal/hostruntime/updated/service_windows.go")
 
-	// The dashboard command must enter the supported cleanup boundary before
-	// the privileged fresh install. This prevents an expired uninstall helper
-	// from being confused with the activation journal it is about to remove.
+	// The recovery callback is passed into the privileged installer. The
+	// installer invokes it only after signed-release validation, so stale helper
+	// cleanup cannot precede the validation boundary.
 	requireSourceOrder(t, command, "fresh Windows command",
+		"var installStandaloneBinaryWithFreshRecovery = hostinstall.InstallStandaloneBinaryWithFreshRecovery",
 		"if fresh {",
-		"recoverWindowsUninstall()",
-		"hostinstall.InstallStandaloneBinary(command.Context(), source, version, fresh)",
+		"return installStandaloneBinaryWithFreshRecovery(command.Context(), source, version, true, recoverWindowsUninstall)",
 	)
 
-	// InstallStandaloneBinary delegates fresh replacement to Purge before it
-	// creates or stages any new release files. Purge owns both the updater state
-	// root (where activation/journal.json lives) and the release root (where
-	// versions/<version> and rollback slots live).
+	// InstallStandaloneBinary must reject an expired/mismatched signed release
+	// before it reaches Purge or removes machine-wide state. Purge owns both the
+	// updater state root (where activation/journal.json lives) and the release
+	// root (where versions/<version> and rollback slots live).
 	installStart := strings.Index(hostInstall, "func InstallStandaloneBinary")
 	purgeStart := strings.Index(hostInstall, "func Purge(ctx context.Context)")
 	if installStart < 0 || purgeStart < 0 || purgeStart <= installStart {
@@ -67,10 +67,31 @@ func TestWindowsFreshInstallPurgesInterruptedActivationBeforeStaging(t *testing.
 	installBody := hostInstall[installStart:purgeStart]
 	requireSourceOrder(t, installBody, "fresh standalone install",
 		"if fresh {",
-		"if err := Purge(ctx); err != nil",
+		"verifiedTarget, err = verifyStandaloneReleaseForInstall(ctx, source, artifact)",
+		"if recoverFresh != nil",
+		"if err := recoverFresh(); err != nil",
+		"if err := purgeStandaloneInstall(ctx); err != nil",
+		"os.RemoveAll(WindowsProgramDataRoot())",
 		"layout, err := service.DefaultLayout(\"windows\")",
-		"return stageWindowsBinary(ctx, source, layout.Binary, rollback, artifact, \"\")",
+		"return stageWindowsBinary(ctx, source, layout.Binary, rollback, artifact, \"\", &verifiedTarget)",
 	)
+	if !strings.Contains(installBody, "return err\n\t\t}") {
+		t.Fatal("signed-release preflight failure must return before fresh cleanup")
+	}
+	if !strings.Contains(installBody, "FetchVerifiedReleaseIndex(preflightCtx") ||
+		!strings.Contains(installBody, "sha256.New()") ||
+		!strings.Contains(installBody, "nativesignature.New(nil).Verify(verifyCtx") {
+		t.Fatal("fresh Windows install must preflight signed metadata, source digest, and Authenticode")
+	}
+	if !strings.Contains(installBody, "Architecture: runtime.GOARCH") || !strings.Contains(installBody, "index.Component(\"pb\")") || !strings.Contains(installBody, "target.Architecture != artifact.Architecture") {
+		t.Fatal("fresh Windows install must bind the signed pb component to the running Windows architecture")
+	}
+	if !strings.Contains(installBody, "context.WithTimeout(ctx, windowsReleasePreflightTimeout)") {
+		t.Fatal("signed-release metadata preflight must have a bounded context")
+	}
+	if !strings.Contains(installBody, "verifyStandaloneReleaseForInstall") || !strings.Contains(installBody, "purgeStandaloneInstall(ctx)") {
+		t.Fatal("fresh installer must use injectable verification and cleanup boundaries")
+	}
 	purgeBody := hostInstall[purgeStart:]
 	requireSourceOrder(t, purgeBody, "fresh purge cleanup",
 		"removeWindowsActivatorService(ctx, layout)",

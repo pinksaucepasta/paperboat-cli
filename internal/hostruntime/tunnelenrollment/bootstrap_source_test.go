@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"io"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -129,6 +130,18 @@ func (t *controlDialDeadlineTransport) RoundTrip(request *http.Request) (*http.R
 	return nil, context.DeadlineExceeded
 }
 
+type controlDialStatusTransport struct{}
+
+func (*controlDialStatusTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: http.StatusForbidden,
+		Status:     "403 Forbidden",
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader("forbidden control secret")),
+		Request:    request,
+	}, nil
+}
+
 func TestHTTPSProductionAssemblySourceBoundsControlHandshake(t *testing.T) {
 	request, _ := productionActivationRequest(t)
 	transport := &controlDialDeadlineTransport{deadline: make(chan time.Time, 1)}
@@ -145,6 +158,10 @@ func TestHTTPSProductionAssemblySourceBoundsControlHandshake(t *testing.T) {
 	if !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("error = %v, want unavailable", err)
 	}
+	var diagnostic *ActivationDiagnostic
+	if !errors.As(err, &diagnostic) || diagnostic.Code != ActivationDiagnosticControlNetworkTLS {
+		t.Fatalf("control handshake diagnostic = %+v, error = %v", diagnostic, err)
+	}
 	select {
 	case deadline := <-transport.deadline:
 		if deadline.IsZero() || !deadline.After(started) || deadline.After(started.Add(controlDialTimeout+time.Second)) {
@@ -152,6 +169,26 @@ func TestHTTPSProductionAssemblySourceBoundsControlHandshake(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("control dial transport was not called")
+	}
+}
+
+func TestHTTPSProductionAssemblySourcePreservesDeniedControlDiagnostic(t *testing.T) {
+	request, _ := productionActivationRequest(t)
+	source, err := NewHTTPSProductionAssemblySource(HTTPSProductionAssemblySourceConfig{
+		ControlURL: "https://control.example", StateRoot: t.TempDir(), HostID: request.HostID,
+		Transport: &controlDialStatusTransport{}, Auth: &bootstrapMachineAuth{}, Clock: bootstrapClock{now: time.Now().UTC()}, Origins: bootstrapOrigins{},
+		MachineTLSCertificate: bootstrapMachineTLSCertificate(t),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = source.openControlStream(context.Background(), request)
+	var diagnostic *ActivationDiagnostic
+	if !errors.As(err, &diagnostic) || diagnostic.Code != ActivationDiagnosticControlHTTPDenied {
+		t.Fatalf("control HTTP diagnostic = %+v, error = %v", diagnostic, err)
+	}
+	if strings.Contains(err.Error(), "forbidden control secret") || strings.Contains(err.Error(), "control.example") {
+		t.Fatalf("control HTTP error exposed unsafe details: %v", err)
 	}
 }
 

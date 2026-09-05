@@ -61,7 +61,7 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, ErrConflict):
 			writeError(w, http.StatusConflict, "enrollment_conflict")
 		case errors.Is(err, ErrActivation):
-			writeError(w, http.StatusServiceUnavailable, "activation_unavailable")
+			writeError(w, http.StatusServiceUnavailable, "activation_unavailable", activationDiagnosticCodeOf(err))
 		case errors.Is(err, ErrSecretStore):
 			writeError(w, http.StatusServiceUnavailable, "credential_store_unavailable")
 		default:
@@ -72,9 +72,13 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusCreated)
 	_ = json.NewEncoder(w).Encode(projection)
 }
-func writeError(w http.ResponseWriter, status int, code string) {
+func writeError(w http.ResponseWriter, status int, code string, diagnostic ...string) {
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]string{"code": code}})
+	errorBody := map[string]string{"code": code}
+	if len(diagnostic) > 0 && validActivationDiagnosticCode(ActivationDiagnosticCode(diagnostic[0])) {
+		errorBody["diagnostic"] = diagnostic[0]
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"error": errorBody})
 }
 
 type LocalClient struct {
@@ -135,7 +139,8 @@ func (c *LocalClient) Enroll(ctx context.Context, tunnel, key string) (Projectio
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
 		var envelope struct {
 			Error struct {
-				Code string `json:"code"`
+				Code       string `json:"code"`
+				Diagnostic string `json:"diagnostic"`
 			} `json:"error"`
 		}
 		_ = json.Unmarshal(raw, &envelope)
@@ -148,6 +153,9 @@ func (c *LocalClient) Enroll(ctx context.Context, tunnel, key string) (Projectio
 			return Projection{}, ErrConflict
 		default:
 			if envelope.Error.Code == "activation_unavailable" {
+				if code := ActivationDiagnosticCode(envelope.Error.Diagnostic); validActivationDiagnosticCode(code) {
+					return Projection{}, &ActivationDiagnostic{Code: code}
+				}
 				return Projection{}, ErrActivation
 			}
 			if envelope.Error.Code == "credential_store_unavailable" {

@@ -8,6 +8,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pinksaucepasta/paperboat/internal/connectorprotocol"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/connectorrotation"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/hoststate"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/tunnelmanager"
 )
@@ -94,7 +96,7 @@ func (a *ProductionAssemblyActivator) Activate(ctx context.Context, request Acti
 	a.mu.Lock()
 	if !a.started || a.closed || a.lifetime == nil {
 		a.mu.Unlock()
-		return Projection{}, ErrUnavailable
+		return Projection{}, &ActivationDiagnostic{Code: ActivationDiagnosticLifecycleUnavailable, Cause: ErrUnavailable}
 	}
 	if current := a.assemblies[key]; current != nil {
 		if !sameActivation(current.request, request) {
@@ -140,10 +142,10 @@ func (a *ProductionAssemblyActivator) activate(ctx context.Context, request Acti
 	}
 	config, err := a.source.ResolveProductionAssembly(ctx, request, signer)
 	if err != nil {
-		return Projection{}, nil, errors.Join(ErrActivation, err)
+		return Projection{}, nil, activationFailure(err)
 	}
 	if err := validateResolvedAssembly(request, config); err != nil {
-		return Projection{}, nil, err
+		return Projection{}, nil, activationFailure(err)
 	}
 
 	ready := make(chan tunnelmanager.ActiveChange, 1)
@@ -161,12 +163,12 @@ func (a *ProductionAssemblyActivator) activate(ctx context.Context, request Acti
 	}
 	assembly, _, err := tunnelmanager.OpenProductionAssembly(config)
 	if err != nil {
-		return Projection{}, nil, errors.Join(ErrActivation, err)
+		return Projection{}, nil, activationFailure(err)
 	}
 	if binder, ok := a.source.(ProductionAssemblyBinder); ok {
 		if err := binder.BindProductionAssembly(request, assembly); err != nil {
 			_ = assembly.Shutdown(context.Background())
-			return Projection{}, nil, errors.Join(ErrActivation, err)
+			return Projection{}, nil, activationFailure(err)
 		}
 	}
 	a.mu.Lock()
@@ -174,11 +176,11 @@ func (a *ProductionAssemblyActivator) activate(ctx context.Context, request Acti
 	a.mu.Unlock()
 	if lifetime == nil {
 		_ = assembly.Shutdown(context.Background())
-		return Projection{}, nil, ErrUnavailable
+		return Projection{}, nil, &ActivationDiagnostic{Code: ActivationDiagnosticLifecycleUnavailable, Cause: ErrUnavailable}
 	}
 	if err := assembly.Start(lifetime); err != nil {
 		_ = assembly.Shutdown(context.Background())
-		return Projection{}, nil, errors.Join(ErrActivation, err)
+		return Projection{}, nil, activationFailure(err)
 	}
 	if active, ok := assembly.Manager.ActiveForTunnel(request.TunnelID); ok && active != nil && active.ConnectorID() == request.ConnectorID {
 		return a.readyProjection(request, config), assembly, nil
@@ -194,6 +196,31 @@ func (a *ProductionAssemblyActivator) activate(ctx context.Context, request Acti
 		_ = assembly.Shutdown(context.Background())
 		return Projection{}, nil, ctx.Err()
 	}
+}
+
+func activationFailure(err error) error {
+	if err == nil {
+		return nil
+	}
+	var diagnostic *ActivationDiagnostic
+	if errors.As(err, &diagnostic) {
+		return err
+	}
+	var code ActivationDiagnosticCode
+	switch {
+	case errors.Is(err, tunnelmanager.ErrProductionIdentityMissing),
+		errors.Is(err, tunnelmanager.ErrProductionControlMissing):
+		code = ActivationDiagnosticLifecycleUnavailable
+	case connectorprotocol.CodeOf(err) != "",
+		errors.Is(err, connectorrotation.ErrControlSessionInvalid),
+		errors.Is(err, tunnelmanager.ErrProductionAssemblyInvalid),
+		errors.Is(err, tunnelmanager.ErrProductionControlRestartRequired):
+		code = ActivationDiagnosticInvalidSessionConfig
+	}
+	if code == "" {
+		return errors.Join(ErrActivation, err)
+	}
+	return &ActivationDiagnostic{Code: code, Cause: errors.Join(ErrActivation, err)}
 }
 
 func (a *ProductionAssemblyActivator) readyProjection(request ActivationRequest, config tunnelmanager.ProductionAssemblyConfig) Projection {

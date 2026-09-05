@@ -282,10 +282,12 @@ func validateConnectorSessionIdentity(identity connector.DataCarrierIdentity) er
 }
 
 // Start starts the one serialized durable reconciliation loop and, when a
-// control stream provider is configured, synchronously acquires the first
-// authenticated bootstrap stream before returning. The stream itself is then
-// owned by a bounded control goroutine, so hostd never needs an out-of-band
-// RunControl call.
+// control stream provider is configured, acquires the first authenticated
+// bootstrap stream in the control lifecycle. Initial acquisition is retried
+// with the same bounded backoff as reconnects, so a transient WSS outage does
+// not turn a durable activation into a terminal local failure. The stream is
+// then owned by a bounded control goroutine, so hostd never needs an out-of-
+// band RunControl call.
 func (a *ProductionAssembly) Start(ctx context.Context) error {
 	if a == nil || a.Manager == nil || ctx == nil {
 		return ErrProductionAssemblyInvalid
@@ -315,24 +317,73 @@ func (a *ProductionAssembly) Start(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	stream, err := a.controlStream(controlCtx)
-	if err != nil || stream == nil {
+	// StartDeferred intentionally skips inline reconciliation. The initial
+	// control worker acquires and authenticates WSS before waking the manager;
+	// this keeps the Welcome-bound carrier source closed until a real stream
+	// exists and lets activation remain pending while the edge recovers.
+	go a.runInitialControlLoop(controlCtx, done)
+	return nil
+}
+
+// runInitialControlLoop owns the first control stream attempt. It runs after
+// Start returns so lifecycle startup never waits on the control endpoint. A
+// successful stream is the readiness boundary: only then may the control loop
+// start and the manager reconcile the Welcome-bound carrier source.
+func (a *ProductionAssembly) runInitialControlLoop(ctx context.Context, done chan struct{}) {
+	stream, err := a.acquireInitialControl(ctx)
+	if err != nil {
+		a.finishControl(done, err)
+		return
+	}
+	go a.runControlLoop(ctx, done, a.Control, a.controlRunner, stream, a.helloRequestID)
+	a.Manager.Notify()
+}
+
+func (a *ProductionAssembly) acquireInitialControl(ctx context.Context) (io.ReadWriteCloser, error) {
+	if a == nil || ctx == nil || a.controlStream == nil {
+		return nil, ErrProductionControlMissing
+	}
+	for attempt := 1; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		stream, err := a.controlStream(ctx)
+		if err == nil && stream != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				_ = stream.Close()
+				return nil, ctxErr
+			}
+			return stream, nil
+		}
 		if stream != nil {
 			_ = stream.Close()
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
 		}
 		if err == nil {
 			err = ErrProductionControlMissing
 		}
-		finalErr := errors.Join(ErrProductionControlMissing, err)
-		a.finishControl(done, finalErr)
-		return errors.Join(finalErr, a.Shutdown(context.Background()))
+		failure := errors.Join(ErrProductionControlMissing, err)
+		a.reportControlFailure(failure, attempt)
+		if err := waitProductionControlReconnect(ctx, productionControlReconnectDelay(attempt, a.connectorID)); err != nil {
+			return nil, err
+		}
 	}
-	go a.runControlLoop(controlCtx, done, a.Control, a.controlRunner, stream, a.helloRequestID)
-	// StartDeferred intentionally skips inline reconciliation. Wake the loop
-	// after control ownership is established so Welcome can release the
-	// session-bound carrier prepare gate without waiting for the interval tick.
-	a.Manager.Notify()
-	return nil
+}
+
+func waitProductionControlReconnect(ctx context.Context, delay time.Duration) error {
+	if ctx == nil {
+		return ErrProductionAssemblyInvalid
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // RunControl is the explicit test/embedding hook for one already-authenticated

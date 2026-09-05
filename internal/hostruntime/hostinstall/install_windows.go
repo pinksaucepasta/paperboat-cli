@@ -9,6 +9,7 @@ package hostinstall
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -39,16 +40,22 @@ import (
 	"golang.org/x/sys/windows/svc/mgr"
 )
 
-const SchemaV1 = "paperboat.host-install/v1"
+const (
+	SchemaV1                       = "paperboat.host-install/v1"
+	windowsReleasePreflightTimeout = 2 * time.Minute
+)
 
 var (
 	ErrInvalidRequest = errors.New("invalid privileged installation request")
 	ErrNotPrivileged  = errors.New("privileged installation requires administrator approval")
 	ErrNotInstalled   = errors.New("Paperboat Windows host runtime is not installed")
 
-	removePaperboatSSHService = windowsopenssh.RemoveServiceOwned
-	removePaperboatSSHState   = windowsopenssh.RemovePaperboatState
-	setupPaperboatSSH         = windowsopenssh.Setup
+	removePaperboatSSHService           = windowsopenssh.RemoveServiceOwned
+	removePaperboatSSHState             = windowsopenssh.RemovePaperboatState
+	setupPaperboatSSH                   = windowsopenssh.Setup
+	isAdministratorForStandaloneInstall = isAdministrator
+	verifyStandaloneReleaseForInstall   = verifyStandaloneRelease
+	purgeStandaloneInstall              = Purge
 )
 
 type Request struct {
@@ -118,15 +125,47 @@ func WindowsHostdTokenPath() string { return filepath.Join(WindowsProgramDataRoo
 // The downloaded pb.exe invokes this command itself, so no launcher or
 // updater executable is fetched or installed separately.
 func InstallStandaloneBinary(ctx context.Context, source, version string, fresh bool) error {
-	if !isAdministrator() || ctx == nil || !safeAbsolute(source) || !standaloneVersionPattern.MatchString(version) {
+	return installStandaloneBinary(ctx, source, version, fresh, nil)
+}
+
+// InstallStandaloneBinaryWithFreshRecovery is the fresh-install entry point
+// used by the command layer when it must recover stale uninstall-helper
+// records. The recovery callback runs only after the signed release preflight
+// succeeds and immediately before the fresh replacement boundary.
+func InstallStandaloneBinaryWithFreshRecovery(ctx context.Context, source, version string, fresh bool, recoverFresh func() error) error {
+	return installStandaloneBinary(ctx, source, version, fresh, recoverFresh)
+}
+
+func installStandaloneBinary(ctx context.Context, source, version string, fresh bool, recoverFresh func() error) error {
+	if !isAdministratorForStandaloneInstall() || ctx == nil || !safeAbsolute(source) || !standaloneVersionPattern.MatchString(version) {
 		return ErrInvalidRequest
 	}
+	artifact := bootstrap.ArtifactTarget{
+		Schema: bootstrap.ArtifactTargetSchemaV1, Kind: bootstrap.ArtifactKindPB, Version: version,
+		Platform: "windows", Architecture: runtime.GOARCH, RepositoryURL: "https://get.pprbt.dev/tuf",
+		TargetPath: releaseindex.AssetName("windows", runtime.GOARCH),
+	}
+	var verifiedTarget releaseindex.Target
 	if fresh {
+		// A fresh replacement must prove the signed release and the exact source
+		// bytes before removing any existing service, credential, or machine state.
+		// Pairing performs the same TUF verification later, but doing it there
+		// would leave a failed fresh install with its old enrollment already gone.
+		var err error
+		verifiedTarget, err = verifyStandaloneReleaseForInstall(ctx, source, artifact)
+		if err != nil {
+			return err
+		}
+		if recoverFresh != nil {
+			if err := recoverFresh(); err != nil {
+				return fmt.Errorf("recover prior Windows uninstall helper: %w", err)
+			}
+		}
 		// Dashboard enrollment is a replacement boundary. Remove the old
 		// services, credentials, managed SSH host keys, and machine-wide state
 		// before staging the verified runtime so a new machine identity cannot
 		// inherit authority from an earlier enrollment.
-		if err := Purge(ctx); err != nil {
+		if err := purgeStandaloneInstall(ctx); err != nil {
 			return fmt.Errorf("purge previous Paperboat enrollment: %w", err)
 		}
 		if err := os.RemoveAll(WindowsProgramDataRoot()); err != nil {
@@ -145,13 +184,70 @@ func InstallStandaloneBinary(ctx context.Context, source, version string, fresh 
 	if err := winenv.EnsureMachinePath(filepath.Dir(layout.Binary)); err != nil {
 		return fmt.Errorf("register Paperboat command path: %w", err)
 	}
-	artifact := bootstrap.ArtifactTarget{
-		Schema: bootstrap.ArtifactTargetSchemaV1, Kind: bootstrap.ArtifactKindPB, Version: version,
-		Platform: "windows", Architecture: runtime.GOARCH, RepositoryURL: "https://get.pprbt.dev/tuf",
-		TargetPath: releaseindex.AssetName("windows", runtime.GOARCH),
-	}
 	rollback := filepath.Join(layout.ReleasesRoot, "pb.rollback")
-	return stageWindowsBinary(ctx, source, layout.Binary, rollback, artifact, "")
+	if fresh {
+		return stageWindowsBinary(ctx, source, layout.Binary, rollback, artifact, "", &verifiedTarget)
+	}
+	return stageWindowsBinary(ctx, source, layout.Binary, rollback, artifact, "", nil)
+}
+
+func verifyStandaloneRelease(ctx context.Context, source string, artifact bootstrap.ArtifactTarget) (releaseindex.Target, error) {
+	if ctx == nil || !safeAbsolute(source) {
+		return releaseindex.Target{}, ErrInvalidRequest
+	}
+	if err := bootstrap.VerifyArtifactTarget(artifact); err != nil {
+		return releaseindex.Target{}, fmt.Errorf("%w: invalid signed release target: %v", ErrInvalidRequest, err)
+	}
+	preflightRoot, err := os.MkdirTemp("", "paperboat-install-preflight-")
+	if err != nil {
+		return releaseindex.Target{}, fmt.Errorf("prepare signed release preflight: %w", err)
+	}
+	defer os.RemoveAll(preflightRoot)
+	preflightCtx, cancelPreflight := context.WithTimeout(ctx, windowsReleasePreflightTimeout)
+	defer cancelPreflight()
+	index, err := bootstrap.FetchVerifiedReleaseIndex(preflightCtx, artifact.RepositoryURL, preflightRoot, nil, time.Now().UTC())
+	if err != nil {
+		return releaseindex.Target{}, fmt.Errorf("%w: verify signed release metadata: %v", ErrInvalidRequest, err)
+	}
+	target, ok := index.Component("pb")
+	if !ok || index.Version != artifact.Version || target.TargetPath != artifact.TargetPath || target.Platform != artifact.Platform || target.Architecture != artifact.Architecture {
+		return releaseindex.Target{}, fmt.Errorf("%w: signed release metadata does not match requested Paperboat version %s", ErrInvalidRequest, artifact.Version)
+	}
+	info, err := os.Lstat(source)
+	if err != nil {
+		return releaseindex.Target{}, fmt.Errorf("%w: inspect downloaded Paperboat release: %v", ErrInvalidRequest, err)
+	}
+	if !info.Mode().IsRegular() {
+		return releaseindex.Target{}, fmt.Errorf("%w: downloaded Paperboat release is not a regular file", ErrInvalidRequest)
+	}
+	if info.Size() != target.Length {
+		return releaseindex.Target{}, fmt.Errorf("%w: downloaded Paperboat release length does not match signed metadata", ErrInvalidRequest)
+	}
+	file, err := os.Open(source)
+	if err != nil {
+		return releaseindex.Target{}, fmt.Errorf("%w: open downloaded Paperboat release: %v", ErrInvalidRequest, err)
+	}
+	digest := sha256.New()
+	written, copyErr := io.Copy(digest, io.LimitReader(file, target.Length+1))
+	closeErr := file.Close()
+	if copyErr != nil || closeErr != nil {
+		return releaseindex.Target{}, fmt.Errorf("%w: hash downloaded Paperboat release: %v", ErrInvalidRequest, errors.Join(copyErr, closeErr))
+	}
+	if written != target.Length || hex.EncodeToString(digest.Sum(nil)) != target.SHA256 {
+		return releaseindex.Target{}, fmt.Errorf("%w: downloaded Paperboat release digest does not match signed metadata", ErrInvalidRequest)
+	}
+	if err := secureWindowsFile(source, ""); err != nil {
+		return releaseindex.Target{}, fmt.Errorf("%w: validate downloaded Paperboat release: %v", ErrInvalidRequest, err)
+	}
+	if err := binarytarget.Validate(source, "windows", artifact.Architecture); err != nil {
+		return releaseindex.Target{}, fmt.Errorf("%w: downloaded Paperboat executable format: %v", ErrInvalidRequest, err)
+	}
+	verifyCtx, cancel := context.WithTimeout(preflightCtx, 30*time.Second)
+	defer cancel()
+	if err := nativesignature.New(nil).Verify(verifyCtx, source, "windows", artifact.Architecture); err != nil {
+		return releaseindex.Target{}, fmt.Errorf("%w: downloaded Paperboat Authenticode: %v", ErrInvalidRequest, err)
+	}
+	return target, nil
 }
 
 func LoadWindowsRuntimeConfig() (WindowsRuntimeConfig, error) {
@@ -368,7 +464,7 @@ func Install(ctx context.Context, request Request) error {
 	}
 	runtimeCurrent, runtimeRollback, _ := windowsRuntimePaths(layout)
 	if err := runWindowsInstallPhase(ctx, "stage verified Paperboat runtime", func() error {
-		return stageWindowsBinary(ctx, request.Executable, runtimeCurrent, runtimeRollback, request.Artifact, request.OwnerSID)
+		return stageWindowsBinary(ctx, request.Executable, runtimeCurrent, runtimeRollback, request.Artifact, request.OwnerSID, nil)
 	}); err != nil {
 		return err
 	}
@@ -1927,7 +2023,7 @@ func windowsRuntimePaths(layout service.Layout) (current, rollback, staged strin
 	return layout.Binary, layout.BinaryRollback, layout.BinaryStaged
 }
 
-func stageWindowsBinary(ctx context.Context, source, current, rollback string, artifact bootstrap.ArtifactTarget, ownerSID string) error {
+func stageWindowsBinary(ctx context.Context, source, current, rollback string, artifact bootstrap.ArtifactTarget, ownerSID string, expectedTarget *releaseindex.Target) error {
 	if err := ensureWindowsExecutableDirectory(filepath.Dir(current), ownerSID); err != nil {
 		return fmt.Errorf("prepare runtime slot: %w", err)
 	}
@@ -1953,6 +2049,12 @@ func stageWindowsBinary(ctx context.Context, source, current, rollback string, a
 	body, err := os.ReadFile(source)
 	if err != nil || len(body) < 1 || len(body) > 256<<20 {
 		return fmt.Errorf("%w: read staged runtime", ErrInvalidRequest)
+	}
+	if expectedTarget != nil {
+		digest := sha256.Sum256(body)
+		if int64(len(body)) != expectedTarget.Length || hex.EncodeToString(digest[:]) != expectedTarget.SHA256 {
+			return fmt.Errorf("%w: staged runtime bytes do not match signed metadata", ErrInvalidRequest)
+		}
 	}
 	var suffix [16]byte
 	if _, err := rand.Read(suffix[:]); err != nil {
@@ -2096,7 +2198,7 @@ func repairWindowsRuntimeBinary(ctx context.Context, config WindowsRuntimeConfig
 		restoreCurrent()
 		return err
 	}
-	if err := stageWindowsBinary(ctx, artifactPath, current, rollback, config.Artifact, config.OwnerSID); err != nil {
+	if err := stageWindowsBinary(ctx, artifactPath, current, rollback, config.Artifact, config.OwnerSID, nil); err != nil {
 		restoreCurrent()
 		return err
 	}

@@ -11,11 +11,43 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/bootstrap"
+	"github.com/pinksaucepasta/paperboat/internal/hostruntime/releaseindex"
 	"github.com/pinksaucepasta/paperboat/internal/hostruntime/service"
 	"github.com/pinksaucepasta/paperboat/internal/windowsopenssh"
 	"github.com/pinksaucepasta/paperboat/internal/windowssecurity"
 	"golang.org/x/sys/windows"
 )
+
+func TestFreshStandaloneInstallVerifiesBeforeCleanup(t *testing.T) {
+	previousAdministrator := isAdministratorForStandaloneInstall
+	previousVerify := verifyStandaloneReleaseForInstall
+	previousPurge := purgeStandaloneInstall
+	t.Cleanup(func() {
+		isAdministratorForStandaloneInstall = previousAdministrator
+		verifyStandaloneReleaseForInstall = previousVerify
+		purgeStandaloneInstall = previousPurge
+	})
+	verificationCalled, recoveryCalled, purgeCalled := false, false, false
+	want := errors.New("signed release rejected")
+	isAdministratorForStandaloneInstall = func() bool { return true }
+	verifyStandaloneReleaseForInstall = func(context.Context, string, bootstrap.ArtifactTarget) (releaseindex.Target, error) {
+		verificationCalled = true
+		return releaseindex.Target{}, want
+	}
+	purgeStandaloneInstall = func(context.Context) error {
+		purgeCalled = true
+		return nil
+	}
+	source := filepath.Join(t.TempDir(), "pb.exe")
+	err := installStandaloneBinary(context.Background(), source, "2026.09.05.1", true, func() error {
+		recoveryCalled = true
+		return nil
+	})
+	if !verificationCalled || !errors.Is(err, want) || recoveryCalled || purgeCalled {
+		t.Fatalf("verification=%t error=%v recovery=%t purge=%t", verificationCalled, err, recoveryCalled, purgeCalled)
+	}
+}
 
 func TestStaleWindowsRuntimeProcessScriptIncludesEveryInstalledRuntimeRole(t *testing.T) {
 	pattern := regexp.MustCompile(staleWindowsRuntimeProcessPattern)
